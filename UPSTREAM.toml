@@ -1,0 +1,37 @@
+# What this app has taken from the two projects it follows. `scripts/upstream.py` shows what has changed in them since,
+# and `scripts/upstream.py --mark` moves these after a port.
+
+[straydog]
+path = "../Straydog"
+branch = "origin/main"
+commit = "a96969c"
+# The app uses it as a program: its command line and its API.
+watch = [
+    "crates/straydog/src/main.rs",
+    "crates/straydog/src/setup/mod.rs",
+    "crates/straydog/src/config.rs",
+    "crates/straydog-api/src",
+]
+
+[dogmind]
+path = "../Dogmind"
+branch = "origin/main"
+commit = "bb68f7b"
+# What was ported by hand. The prompt and the schemas come by `scripts/sync_dogmind.py`.
+watch = [
+    "src/dogmind/core/prompt.py",
+    "src/dogmind/core/agent_loop.py",
+    "src/dogmind/core/agent_compaction.py",
+    "src/dogmind/llm/client.py",
+    "src/dogmind/llm/model_compat.py",
+    "src/dogmind/llm/codex_app_server.py",
+    "src/dogmind/safety/permission_mode.py",
+    "src/dogmind/safety/command_critical.py",
+    "src/dogmind/safety/command_rules.py",
+    "src/dogmind/tools/filesystem.py",
+    "src/dogmind/tools/file_read.py",
+    "src/dogmind/tools/patch_exact.py",
+    "src/dogmind/tools/shell.py",
+    "src/dogmind/tools/diff.py",
+    "src/dogmind/tools/todo_tools.py",
+]

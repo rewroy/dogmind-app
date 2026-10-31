@@ -1,0 +1,36 @@
+{
+ "disabled_features": [
+  "apps",
+  "browser_use",
+  "computer_use",
+  "code_mode",
+  "goals",
+  "hooks",
+  "image_generation",
+  "in_app_browser",
+  "memories",
+  "multi_agent",
+  "network_proxy",
+  "plugins",
+  "remote_plugin",
+  "shell_tool",
+  "skill_mcp_dependency_install",
+  "tool_suggest",
+  "unified_exec",
+  "view_image",
+  "workspace_dependencies"
+ ],
+ "forbidden_method_parts": [
+  "applypatch",
+  "browser",
+  "commandexecution",
+  "computer",
+  "dynamictool",
+  "execcommand",
+  "filechange",
+  "mcp",
+  "permissions",
+  "requestuserinput"
+ ],
+ "context_fallback": 131072
+}
