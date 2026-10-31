@@ -1,0 +1,3 @@
+# As in Straydog: its GPU library is built /MT, so the executable links the C/C++ runtime statically.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

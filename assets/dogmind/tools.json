@@ -1,0 +1,342 @@
+[
+ {
+  "function": {
+   "description": "Edit existing files atomically using exact text replacements.\nUse ``edits`` by default with path, exact old_string, new_string, and optional ``count``; all edits validate before one transaction. Read each target once and list it in expected_files; do not include line numbers. Successive edits may use the successful replacement without another read. Re-read for externally changed or unknown sha, missing context, or when the guard requests it. After a failed patch with unchanged bytes and available source, revise the payload without repeating the read. After success, inspect applied_diff and validation_warnings.",
+   "name": "apply_patch",
+   "parameters": {
+    "additionalProperties": false,
+    "properties": {
+     "edits": {
+      "description": "Preferred exact replacements, applied atomically in array order.",
+      "items": {
+       "properties": {
+        "allow_empty_file": {
+         "default": false,
+         "description": "Set true only to deliberately leave THIS file with no content.",
+         "type": "boolean"
+        },
+        "count": {
+         "default": 1,
+         "description": "Exact observed match count. Use the smallest complete repeated block when count > 1.",
+         "maximum": 32,
+         "minimum": 1,
+         "type": "integer"
+        },
+        "new_string": {
+         "description": "Maximum 16384 characters.",
+         "type": "string"
+        },
+        "old_string": {
+         "description": "Maximum 16384 characters.",
+         "minLength": 1,
+         "type": "string"
+        },
+        "path": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path",
+        "old_string",
+        "new_string"
+       ],
+       "type": "object"
+      },
+      "maxItems": 32,
+      "minItems": 1,
+      "type": "array"
+     },
+     "expected_files": {
+      "description": "Paths expected to be modified by this patch. Use workspace-relative paths for workspace files; use the exact absolute path for approved outside-workspace files.",
+      "items": {
+       "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+     },
+     "purpose": {
+      "description": "Short reason shown in approval UI.",
+      "maxLength": 160,
+      "type": "string"
+     }
+    },
+    "required": [
+     "expected_files"
+    ],
+    "type": "object"
+   }
+  },
+  "type": "function"
+ },
+ {
+  "function": {
+   "description": "Create a new file. Succeeds only when the target path does not exist. For existing files, use apply_patch. If the intended target is outside the workspace, use the exact absolute path after external write approval; do not create a workspace copy.",
+   "name": "create_file",
+   "parameters": {
+    "additionalProperties": false,
+    "properties": {
+     "content": {
+      "description": "File content",
+      "type": "string"
+     },
+     "if_exists": {
+      "description": "Always 'fail' - create_file cannot overwrite existing files.",
+      "enum": [
+       "fail"
+      ],
+      "type": "string"
+     },
+     "path": {
+      "description": "File path (workspace-relative, or exact absolute outside-workspace path only with explicit/configured external write approval; do not shorten external targets to a basename)",
+      "type": "string"
+     },
+     "purpose": {
+      "description": "Short reason shown in approval UI.",
+      "maxLength": 160,
+      "type": "string"
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ],
+    "type": "object"
+   }
+  },
+  "type": "function"
+ },
+ {
+  "function": {
+   "description": "Run tests, builds, installs, or other state-changing shell commands.\nDownloads and installs work: network commands such as curl, wget, package installs (npm, pip, uv, cargo) and remote git ask the user to approve network access for that command, so run them instead of assuming the network is unavailable. Other commands run without network; approving a generic or inline interpreter command does not grant it network access. Avoid heredocs and inline interpreter code when a workspace script or a dedicated file-edit tool can express the same operation. These forms obscure effects and require human approval. PLATFORM: Windows (cmd.exe). For directory listings use list_files; do not use execute_command for file inspection. Use `findstr` not `grep`, `del` not `rm`, `copy` not `cp`, `move` not `mv`, `where` not `which`. git / python / uv / node / npm work normally. Prefer the dedicated read_file / search_files tools over shelling out to inspect files. Set cwd instead of `cd ... &&`. An AppContainer Access denied result does not prove the workspace is outside the allowed boundary.",
+   "name": "execute_command",
+   "parameters": {
+    "additionalProperties": false,
+    "properties": {
+     "command": {
+      "description": "Shell command to execute. Do not redirect output to a log merely to inspect it; stdout and stderr are captured.",
+      "type": "string"
+     },
+     "cwd": {
+      "default": ".",
+      "description": "Working directory (workspace-relative); use this instead of `cd ... &&`.",
+      "type": "string"
+     },
+     "purpose": {
+      "description": "Why this command runs, in 1 short sentence — shown in the approval UI next to risk_level. Required above ``safe`` risk.",
+      "maxLength": 240,
+      "type": "string"
+     },
+     "risk_level": {
+      "description": "Self-classify the effect using the prompt's command-risk levels; be conservative.",
+      "enum": [
+       "safe",
+       "low",
+       "medium",
+       "high"
+      ],
+      "type": "string"
+     },
+     "timeout_seconds": {
+      "default": 180,
+      "description": "Timeout in seconds. Default 180; raise for slow suites/installs (up to ~600).",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "command"
+    ],
+    "type": "object"
+   }
+  },
+  "type": "function"
+ },
+ {
+  "function": {
+   "description": "List directory entries; use {\"path\":\".\"} for the workspace root.\nSend a JSON object; use {} for defaults.",
+   "name": "list_files",
+   "parameters": {
+    "additionalProperties": false,
+    "properties": {
+     "path": {
+      "default": ".",
+      "description": "Directory path (workspace-relative or absolute); omitted or '.' means the workspace root. Outside-workspace paths share read_file's lease prompt.",
+      "type": "string"
+     },
+     "recursive": {
+      "default": false,
+      "description": "List recursively (excludes node_modules, .venv, __pycache__ etc.)",
+      "type": "boolean"
+     }
+    },
+    "required": [],
+    "type": "object"
+   }
+  },
+  "type": "function"
+ },
+ {
+  "function": {
+   "description": "Read paginated text.\nUnsupported binaries are refused.",
+   "name": "read_file",
+   "parameters": {
+    "additionalProperties": false,
+    "properties": {
+     "limit": {
+      "default": 500,
+      "description": "Window size: text lines (default 500, max 2000), PDF pages (5, max 20), or spreadsheet data rows per sheet (20, max 50).",
+      "type": "integer"
+     },
+     "path": {
+      "description": "Workspace-relative or absolute path. Outside paths request a read lease; use read_file, not cat/head via execute_command.",
+      "type": "string"
+     },
+     "start_line": {
+      "default": 1,
+      "description": "1-based text line, PDF page, or spreadsheet data row. For text only, -N starts N lines from the end.",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "type": "object"
+   }
+  },
+  "type": "function"
+ },
+ {
+  "function": {
+   "description": "Search workspace text with regex (default) or literal matching.\nSet literal=true for literal text: punctuation is not regex syntax. Both modes use smart-case: uppercase in the pattern makes matching case-sensitive.",
+   "name": "search_files",
+   "parameters": {
+    "additionalProperties": false,
+    "properties": {
+     "file_glob": {
+      "description": "File glob filter",
+      "type": "string"
+     },
+     "literal": {
+      "default": false,
+      "description": "Treat the pattern as literal text instead of regex; inherited by batch queries.",
+      "type": "boolean"
+     },
+     "path": {
+      "default": ".",
+      "description": "Directory to search (workspace-relative or absolute). Outside-workspace paths share read_file's lease prompt.",
+      "type": "string"
+     },
+     "pattern": {
+      "description": "Search pattern (regex unless literal=true). Invalid regex is retried as a literal. Required unless ``queries`` is provided.",
+      "type": "string"
+     },
+     "timeout_seconds": {
+      "default": 30,
+      "description": "Search timeout in seconds (1-120). Use a larger value for slow Windows hosts.",
+      "type": "integer"
+     }
+    },
+    "required": [],
+    "type": "object"
+   }
+  },
+  "type": "function"
+ },
+ {
+  "function": {
+   "description": "Show file changes against a run baseline, workspace baseline, or Git index.\nSession/workspace scopes also work outside Git. Results remain valid until a write.",
+   "name": "show_diff",
+   "parameters": {
+    "additionalProperties": false,
+    "properties": {
+     "paths": {
+      "description": "Optional workspace-relative paths to filter diff",
+      "items": {
+       "type": "string"
+      },
+      "type": "array"
+     },
+     "scope": {
+      "description": "session = changes since this run's captured workspace baseline; workspace = all current repository changes; staged/unstaged = Git index split",
+      "enum": [
+       "workspace",
+       "staged",
+       "unstaged",
+       "session"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [
+     "scope"
+    ],
+    "type": "object"
+   }
+  },
+  "type": "function"
+ },
+ {
+  "function": {
+   "description": "Manage a durable checklist only for multi-step work where persistent state reduces coordination risk.\nSend only changed ids when updating. Keep at most one item doing; call only for changes, close finished items promptly, and do not give a final answer while items are pending or doing.",
+   "name": "todo",
+   "parameters": {
+    "additionalProperties": false,
+    "properties": {
+     "merge": {
+      "default": true,
+      "description": "true (default): update items by id / append new ones. false: replace the whole list with a fresh plan.",
+      "type": "boolean"
+     },
+     "todos": {
+      "description": "One or more state-changing checklist items in priority order.",
+      "items": {
+       "additionalProperties": false,
+       "properties": {
+        "id": {
+         "description": "Short stable id, e.g. 'step-1' or 'add-tests'.",
+         "maxLength": 64,
+         "minLength": 1,
+         "type": "string"
+        },
+        "related_files": {
+         "description": "Optional file paths this step touches.",
+         "items": {
+          "type": "string"
+         },
+         "maxItems": 10,
+         "type": "array"
+        },
+        "status": {
+         "description": "Optional. Fresh plans default the first item to doing and the rest to pending; merges preserve existing status and default new items to pending.",
+         "enum": [
+          "pending",
+          "doing",
+          "done",
+          "blocked"
+         ],
+         "type": "string"
+        },
+        "text": {
+         "description": "What this step does. Required for new items; omit when only updating status of a known id.",
+         "maxLength": 500,
+         "type": "string"
+        }
+       },
+       "required": [
+        "id"
+       ],
+       "type": "object"
+      },
+      "maxItems": 60,
+      "minItems": 1,
+      "type": "array"
+     }
+    },
+    "required": [
+     "todos"
+    ],
+    "type": "object"
+   }
+  },
+  "type": "function"
+ }
+]
