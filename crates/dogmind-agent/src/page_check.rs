@@ -14,6 +14,14 @@ use serde_json::Value;
 const LIMIT: Duration = Duration::from_secs(20);
 /// (not `--disable-breakpad` or `--disable-crash-reporter`: with those the browser crashes in about half its runs in the sandbox, against about 1 in 30 finally without. What keeps a crash
 /// from raising a dialog is the error mode and the job's limit, in `sandbox`.)
+/// The flags, with what a debug build is told to add (for a look at what the browser does in the sandbox).
+fn flags() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(more) = std::env::var("DOGMIND_PAGE_FLAGS") {
+        return format!("{FLAGS} {more}");
+    }
+    FLAGS.to_string()
+}
 const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-extensions --disable-background-networking --disable-sync --disable-component-update --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
 /// How long a page runs before it is read, unless the model asks for longer, for an animation, and the most it may.
 const WAIT_MS: u64 = 1500;
@@ -471,7 +479,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         Some(file) => (plain(file), file_url(file)),
         None => (name.clone(), name.clone()),
     };
-    let line = format!("\"{}\" {FLAGS} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --dump-dom \"{address}\"", program.display());
+    let browser_flags = flags();
+    let line = format!("\"{}\" {browser_flags} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --dump-dom \"{address}\"", program.display());
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
     for _ in 0..TRIES {
@@ -479,6 +488,10 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel)?;
         let _ = crate::sandbox::run("rmdir /s /q \"%TEMP%\\dogmind-page\"", &cwd, workspace, false, Duration::from_secs(20), cancel);
         (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
+        #[cfg(debug_assertions)]
+        if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
+            eprintln!("--- browser, {:?} {:?}:\n{err}\n--- dom: {} bytes", done.status, done.ended, dom.len());
+        }
         finished = done.status == Some(0) && !dom.trim().is_empty();
         how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
         if finished || started.elapsed() > LIMIT / 2 || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension") {
@@ -528,7 +541,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             continue;
         }
         // (a window larger than the frame by what the browser takes of it, and at least its least width)
-        let line = format!("\"{}\" {FLAGS} --window-size={},{} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --screenshot=\"{}\" \"{}\"", program.display(), view.width.max(600) + 64, view.height + 160, shot.display(), plain(&frame));
+        let line = format!("\"{}\" {} --window-size={},{} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --screenshot=\"{}\" \"{}\"", program.display(), flags(), view.width.max(600) + 64, view.height + 160, shot.display(), plain(&frame));
         let mut taken = false;
         for _ in 0..3 {
             let _ = std::fs::remove_file(&shot);
