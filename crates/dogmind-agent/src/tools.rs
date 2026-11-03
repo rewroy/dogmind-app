@@ -1781,6 +1781,11 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> 
     // First: all that follows here looks in that folder as the person, and it may be anywhere, a share on another machine included.
     crate::sandbox::writable_root(&cwd, &resolve(workspace, "."), home.as_deref()).map_err(|error| format!("{error}. The command was not started; changing its spelling cannot repair this"))?;
     let started_with_init = git_init_first(line);
+    // What would be refused is refused before the app makes anything: a refusal says nothing was started, and `.git` would have been.
+    let after_init: &str = started_with_init.as_ref().map_or(line, |(_, rest)| rest);
+    if let Some(word) = opened_on_the_desktop(after_init, &cwd) {
+        return Err(format!("not run: `{word}` would open on the user's screen and not run here. Nothing was started. Name the program that runs it, as in `python x.py` or `node x.js`; a page or a picture cannot be opened from a command."));
+    }
     let mut said_by_init = String::new();
     let line: &str = if let Some((words, rest)) = &started_with_init {
         let mut command = Command::new(crate::bundled::git_program());
@@ -1800,14 +1805,15 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> 
     } else {
         line
     };
-    if let Some(word) = opened_on_the_desktop(line, &cwd) {
-        return Err(format!("not run: `{word}` would open on the user's screen and not run here. Nothing was started. Name the program that runs it, as in `python x.py` or `node x.js`; a page or a picture cannot be opened from a command."));
-    }
     let network = crate::safety::wants_network(arguments);
     let started = Instant::now();
     let before = file_states(&cwd);
     // Spelled as `cwd` is, or a path with `..` in it would not be seen as holding it.
-    let done = crate::sandbox::run(&with_stand_ins(line), &cwd, &resolve(workspace, "."), network, timeout, cancel).map_err(|error| format!("{error}. The command was not started; changing its spelling cannot repair this"))?;
+    let done = crate::sandbox::run(&with_stand_ins(line), &cwd, &resolve(workspace, "."), network, timeout, cancel).map_err(|error| {
+        // (the app's `git init` has run by then, and what is said is what is there)
+        let started = if started_with_init.is_some() { "`git init` ran, and made .git there; the rest of the line was not started" } else { "The command was not started" };
+        format!("{error}. {started}; changing its spelling cannot repair this")
+    })?;
     let (out, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
     let mut report = String::new();
     if !done.shown.is_empty() {
@@ -2496,6 +2502,17 @@ mod tests {
         for line in ["git init ../other", "git init --template=x", "git init --separate-git-dir=C:\\x", "git status", "echo x && git init", "git init > C:\\x", "git init\ndel x", "git init -c core.hooksPath=x"] {
             assert_eq!(git_init_first(line), None, "{line}");
         }
+    }
+
+    /// A line whose rest would be refused is refused before the app's `git init`: it says nothing was started, and nothing was.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_line_makes_no_repository_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.log"), "x").unwrap();
+        let said = execute_command(&json!({"command": "git init && app.log"}), dir.path(), &AtomicBool::new(false)).unwrap_err();
+        assert!(said.contains("Nothing was started"), "{said}");
+        assert!(!dir.path().join(".git").exists(), "the repository was made before the line was refused");
     }
 
     /// As cmd.exe runs what comes of it, with no sandbox: what it prints, on this machine's python and node if it has them.
