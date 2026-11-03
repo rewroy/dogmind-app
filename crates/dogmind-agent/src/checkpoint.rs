@@ -16,6 +16,22 @@ pub struct Saved {
     pub path: PathBuf,
     /// The copy's name in the folder; none when the file did not exist.
     pub copy: Option<String>,
+    /// Where the path led when it was saved, through links and junctions. A rewind is the app's write, outside the sandbox: a folder a
+    /// command has since made a junction to somewhere else would take what is put back there, so a path that leads elsewhere now is left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real: Option<PathBuf>,
+}
+
+impl Saved {
+    fn of(path: &Path, copy: Option<String>) -> Saved {
+        Saved { path: path.to_path_buf(), copy, real: crate::safety::real_path(path) }
+    }
+
+    /// Whether the path leads somewhere else than when it was saved. One saved before this was kept is taken as it is.
+    fn leads_elsewhere(&self) -> bool {
+        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
+        self.real.as_ref().is_some_and(|then| crate::safety::real_path(&self.path).is_none_or(|now| key(&now) != key(then)))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,14 +102,14 @@ impl Checkpoints {
 
     fn copy_of(&mut self, path: &Path) -> Result<Saved, String> {
         if !path.exists() {
-            return Ok(Saved { path: path.to_path_buf(), copy: None });
+            return Ok(Saved::of(path, None));
         }
         std::fs::create_dir_all(&self.folder).map_err(|error| format!("{}: {error}", self.folder.display()))?;
         let name = format!("{}.bin", self.index.next_copy);
         self.index.next_copy += 1;
         // A copy, not a read: the file may be larger than this machine's memory.
         std::fs::copy(path, self.folder.join(&name)).map_err(|error| format!("{}: {error}", path.display()))?;
-        Ok(Saved { path: path.to_path_buf(), copy: Some(name) })
+        Ok(Saved::of(path, Some(name)))
     }
 
     /// Before an edit: what the files hold now, unless this turn already has them. The first copy is the one that counts.
@@ -157,6 +173,10 @@ impl Checkpoints {
         let title = self.turn(id).map_or(String::new(), |turn| turn.title.clone());
         let mut keep = Vec::new();
         for saved in &plan {
+            if saved.leads_elsewhere() {
+                restored.failed.push(format!("{}: a link on its way leads somewhere else than when it was saved, so nothing was put there", saved.path.display()));
+                continue;
+            }
             match self.copy_of(&saved.path) {
                 Ok(current) => keep.push(current),
                 Err(error) => {
@@ -225,6 +245,35 @@ mod tests {
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap()
+    }
+
+    /// A folder made a junction to somewhere else after its files were saved takes nothing a rewind would have put back, and loses
+    /// nothing it would have taken away; the rest of the rewind goes on.
+    #[cfg(windows)]
+    #[test]
+    fn a_rewind_puts_nothing_where_a_junction_now_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (work, elsewhere) = (dir.path().join("work"), dir.path().join("elsewhere"));
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let (planted, made, plain) = (work.join("sub").join("run.bat"), work.join("sub").join("new.txt"), work.join("a.txt"));
+        std::fs::write(&planted, "payload").unwrap();
+        std::fs::write(&plain, "before").unwrap();
+        let mut marks = Checkpoints::open(&dir.path().join("session.jsonl"));
+        marks.begin("one", "t", Some(1)).unwrap();
+        marks.before_edit(&[planted.clone(), made.clone(), plain.clone()]).unwrap();
+        std::fs::write(&plain, "after").unwrap();
+        // (what a command in the sandbox can do: the folder goes, and a junction to elsewhere takes its name)
+        std::fs::remove_dir_all(work.join("sub")).unwrap();
+        let status = std::process::Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(work.join("sub")).arg(&elsewhere).stdout(std::process::Stdio::null()).status().unwrap();
+        assert!(status.success());
+        std::fs::write(elsewhere.join("new.txt"), "theirs").unwrap();
+        let restored = marks.restore(1, "t");
+        assert!(!elsewhere.join("run.bat").exists(), "nothing written through the junction");
+        assert_eq!(read(&elsewhere.join("new.txt")), "theirs", "nothing removed through it");
+        assert_eq!(read(&plain), "before", "the rest is rewound");
+        assert_eq!(restored.failed.len(), 2, "{:?}", restored.failed);
+        std::fs::remove_dir(work.join("sub")).unwrap();
     }
 
     #[test]
