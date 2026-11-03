@@ -307,7 +307,29 @@ pub fn cap(text: &str, limit: usize) -> String {
 }
 
 /// As much of the end as of the start.
-fn cap_evenly(text: &str, limit: usize) -> String {
+/// What a command printed, whole, when its report shows only part of it: in a file to read the rest of with read_file or search_files,
+/// as Deepseek Harness keeps a long output, and not by running the command again (a build or a test run, minutes of it). Kept a week.
+fn kept_whole(out: &str, err: &str) -> Option<PathBuf> {
+    keep_whole_as("command", &format!("stdout:\n{out}\nstderr:\n{err}\n"))
+}
+
+/// A long result, whole, in a file of its own kind (`command`, `search`) in the temporary folder.
+fn keep_whole_as(kind: &str, whole: &str) -> Option<PathBuf> {
+    const KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
+    let folder = std::env::temp_dir().join("dogmind-output");
+    std::fs::create_dir_all(&folder).ok()?;
+    for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+        if entry.metadata().ok().and_then(|meta| meta.modified().ok()).and_then(|at| at.elapsed().ok()).is_some_and(|age| age > KEPT) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let file = folder.join(format!("{kind}-{}.txt", chrono::Local::now().format("%Y%m%d-%H%M%S%3f")));
+    std::fs::write(&file, whole).ok()?;
+    Some(file)
+}
+
+/// The head and the tail of a long output, and where all of it is when it was kept.
+fn cap_evenly(text: &str, limit: usize, whole: Option<&Path>) -> String {
     if text.len() <= limit {
         return text.to_string();
     }
@@ -318,7 +340,11 @@ fn cap_evenly(text: &str, limit: usize) -> String {
     while !text.is_char_boundary(tail) {
         tail += 1;
     }
-    format!("{}\n--- truncated: {} bytes left out; run it again through findstr to see them ---\n{}", &text[..head], tail - head, &text[tail..])
+    let rest = match whole {
+        Some(file) => format!("all of it is in {}: read the part you need from there with read_file or search_files, rather than run it again", file.display()),
+        None => "run it again through findstr to see them".to_string(),
+    };
+    format!("{}\n--- truncated: {} bytes left out; {rest} ---\n{}", &text[..head], tail - head, &text[tail..])
 }
 
 fn text_arg<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -974,6 +1000,12 @@ fn search_files(arguments: &Value, workspace: &Path, secrets_besides: &[PathBuf]
     }
     if !stopped.is_empty() {
         out.push_str(&format!("--- stopped: {stopped}; {matches} matches so far, narrow the path or pattern ---\n"));
+    }
+    // (more than is shown: all of it in a file, as a long command's output is)
+    if out.len() > MAX_OUTPUT {
+        if let Some(file) = keep_whole_as("search", &out) {
+            return Ok(format!("{}\n--- all {matches} matches are in {}: read the part you need there, or narrow the pattern ---\n", cap(&out, MAX_OUTPUT), file.display()));
+        }
     }
     Ok(cap(&out, MAX_OUTPUT))
 }
@@ -1924,7 +1956,8 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> 
     // (with the cause said above, a traceback's middle tells nothing more, and it is read again with every later request)
     report.push_str(&sandbox_notes(line, &resolve(workspace, "."), done.status, &err));
     let most_err = if no_network.is_some() { MAX_COMMAND_ERR / 6 } else { MAX_COMMAND_ERR };
-    report.push_str(&format!("stdout:\n{said_by_init}{}\nstderr:\n{}\n", cap_evenly(&out, MAX_COMMAND_OUT), cap_evenly(&err, most_err)));
+    let whole = (out.len() > MAX_COMMAND_OUT || err.len() > most_err).then(|| kept_whole(&out, &err)).flatten();
+    report.push_str(&format!("stdout:\n{said_by_init}{}\nstderr:\n{}\n", cap_evenly(&out, MAX_COMMAND_OUT, whole.as_deref()), cap_evenly(&err, most_err, whole.as_deref())));
     match done.status {
         Some(code) => report.push_str(&format!("exit_code: {code}")),
         None => report.push_str(&format!("exit_code: none, {} after {} s", done.ended, started.elapsed().as_secs())),
@@ -2838,9 +2871,21 @@ mod tests {
     #[test]
     fn what_is_cut_from_a_command_keeps_its_end() {
         let text = format!("start\n{}\nthe test failed at the end", "x".repeat(50_000));
-        let kept = cap_evenly(&text, 1000);
+        let kept = cap_evenly(&text, 1000, None);
         assert!(kept.len() < 1200 && kept.starts_with("start") && kept.ends_with("the test failed at the end") && kept.contains("truncated"));
-        assert_eq!(cap_evenly("short", 1000), "short");
+        assert_eq!(cap_evenly("short", 1000, None), "short");
+    }
+
+    /// What is cut from a long output is kept whole, and the report says where: the model reads the rest there, not by running it again.
+    #[test]
+    fn a_long_outputs_whole_is_kept_where_the_report_says() {
+        let out = format!("first line\n{}\nlast line", "middle\n".repeat(20_000));
+        let file = kept_whole(&out, "a warning").unwrap();
+        let kept = std::fs::read_to_string(&file).unwrap();
+        assert!(kept.contains("first line") && kept.contains("last line") && kept.contains("stderr:\na warning"), "{}", &kept[..80]);
+        let report = cap_evenly(&out, 1000, Some(&file));
+        assert!(report.contains(&format!("all of it is in {}", file.display())) && report.contains("read_file"), "{report}");
+        let _ = std::fs::remove_file(file);
     }
 
     #[cfg(windows)]
