@@ -349,7 +349,11 @@ impl Shell for RealShell {
         let _ = std::fs::remove_file(menu.join(SHORTCUT));
         let _ = std::fs::remove_file(menu.join(OLD_SHORTCUT));
         // SAFETY: the name ends in a zero.
-        unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide(UNINSTALL_KEY).as_ptr()) };
+        let status = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide(UNINSTALL_KEY).as_ptr()) };
+        // (gone already is as good as gone; anything else is said, and the install stays to be removed again)
+        if status != 0 && status != 2 {
+            return Err(format!("the entry in Installed apps could not be removed (error {status})"));
+        }
         Ok(())
     }
 }
