@@ -858,7 +858,8 @@ pub struct GitInfo {
 
 /// None outside a repository.
 pub fn git_info(workspace: &Path) -> Option<GitInfo> {
-    let status = git(workspace, &["-c", "core.quotepath=off", "status", "--porcelain=v2", "--branch"]).ok()?;
+    // (the files under the workspace: in a folder of a larger repository, that repository's other changes are not counted as this one's)
+    let status = git(workspace, &["-c", "core.quotepath=off", "status", "--porcelain=v2", "--branch", "--", "."]).ok()?;
     let mut info = GitInfo::default();
     let mut oid = "";
     for line in status.lines() {
@@ -1050,7 +1051,9 @@ fn show_diff(arguments: &Value, workspace: &Path, baseline: Option<&crate::basel
         let changes = baseline.changes(workspace, &paths);
         return Ok(if changes.is_empty() { format!("no differences ({scope}): nothing has changed since this session began") } else { cap(&changes, MAX_OUTPUT) });
     }
-    let mut args = vec!["diff", "--no-ext-diff", "--no-color"];
+    // (only what is under the workspace: a workspace that is a folder of a larger repository saw that repository's every change, which is
+    // not its work and may be what its owner never meant to show)
+    let mut args = vec!["diff", "--no-ext-diff", "--no-color", "--relative"];
     match scope {
         "staged" => args.push("--cached"),
         "unstaged" => {}
@@ -2145,6 +2148,33 @@ mod tests {
         run(&["commit", "-q", "-m", "second"]);
         assert!(show_diff(&json!({"scope": "session"}), dir.path(), Some(&baseline)).unwrap().contains("+b"), "since the session began, not since the last commit");
         assert!(show_diff(&json!({"scope": "workspace"}), dir.path(), Some(&baseline)).unwrap().starts_with("no differences"));
+    }
+
+    /// A workspace that is a folder of a larger repository: its diff and its counts are of what is under it, and the rest of the repository's
+    /// changes are not shown to the model as its work (a real run's first show_diff in an empty folder printed its parent's every change).
+    #[test]
+    fn a_workspace_in_a_larger_repository_sees_only_its_own_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.com"];
+            all.extend(args);
+            git(dir.path(), &all).unwrap();
+        };
+        run(&["init", "-q"]);
+        std::fs::create_dir_all(dir.path().join("work")).unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "old\n").unwrap();
+        std::fs::write(dir.path().join("work").join("page.txt"), "a\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.path().join("secret.txt"), "not for the model\n").unwrap();
+        let work = dir.path().join("work");
+        let said = show_diff(&json!({"scope": "workspace"}), &work, None).unwrap();
+        assert!(said.starts_with("no differences") && !said.contains("not for the model"), "{said}");
+        std::fs::write(work.join("page.txt"), "b\n").unwrap();
+        let said = show_diff(&json!({"scope": "unstaged"}), &work, None).unwrap();
+        assert!(said.contains("+b") && !said.contains("secret"), "{said}");
+        let info = git_info(&work).unwrap();
+        assert_eq!(info.changed, 1, "the folder's one change, not the repository's two");
     }
 
     #[test]
