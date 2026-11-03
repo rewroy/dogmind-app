@@ -842,7 +842,11 @@ impl Agent {
     }
 
     /// A message goes in the conversation and on disk together.
-    fn push(&mut self, message: Message) {
+    fn push(&mut self, mut message: Message) {
+        // (when the person said it, and when an answer was given, show beside them)
+        if message.at.is_none() && matches!(message.role.as_str(), "user" | "assistant") {
+            message.at = Some(crate::message::written_now());
+        }
         if let Some(session) = &mut self.session {
             if let Err(error) = session.append(&message) {
                 let _ = self.events.send(Event::Notice(format!("the session could not be saved: {error}")));
