@@ -4,6 +4,8 @@ description = "Dogmind's installer: one executable with the package on its end"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
 build = "build.rs"
 
 [[bin]]
