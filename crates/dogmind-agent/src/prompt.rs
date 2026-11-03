@@ -264,7 +264,8 @@ mod tests {
         let prompt = system_prompt(folder.path(), false, "", "");
         assert!(prompt.len() < 5_500, "the system prompt has grown to {} characters", prompt.len());
         let tools = crate::tools::schemas_for(false, false, false, Vec::new()).to_string();
-        assert!(tools.len() < 5_150, "the tools have grown to {} characters", tools.len());
+        // (5,150 until check_page took views and a wait: pictures at a phone's width and after an animation were what a real model, asked, missed most)
+        assert!(tools.len() < 5_300, "the tools have grown to {} characters", tools.len());
         assert!(user_message_in("x", "2026-11-02 20:01:18 +09:00", None).len() < 60, "what rides on every message");
     }
 
