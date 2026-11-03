@@ -23,7 +23,7 @@ pub fn needed(used: u64, window: u64) -> bool {
     window > 0 && used + reserve(window) >= window
 }
 
-/// Where the middle ends: a turn's first message, so that no tool result loses its call.
+/// Where the head ends: past the results of a round it holds, so that no tool result loses its call.
 fn turn_start(messages: &[Message], mut at: usize) -> usize {
     while at < messages.len() && messages[at].role == "tool" {
         at += 1;
@@ -31,11 +31,29 @@ fn turn_start(messages: &[Message], mut at: usize) -> usize {
     at
 }
 
-/// Stage 0. Returns the characters saved.
-pub fn trim_tool_outputs(messages: &mut [Message], want: usize) -> usize {
-    let end = messages.len().saturating_sub(RECENT);
+/// Where what is kept of the newest begins: at the call of the round a result there answers, back from it. (Forward, past the results,
+/// a round of more calls than are kept went whole into the summary, the one the model had just made and not yet read.)
+fn round_start(messages: &[Message], mut at: usize) -> usize {
+    while at > 0 && at < messages.len() && messages[at].role == "tool" {
+        at -= 1;
+    }
+    at
+}
+
+/// The first message of the round the model is in: its calls, answered and not yet read. The length when it is in none.
+fn round_in_progress(messages: &[Message]) -> usize {
+    match messages.iter().rposition(|message| message.role != "tool") {
+        Some(at) if at + 1 < messages.len() && messages[at].tool_calls.is_some() => at,
+        _ => messages.len(),
+    }
+}
+
+/// Stage 0. Returns the characters saved. Past the head unless `head` too; and neither the newest messages nor the round in
+/// progress, whose results the model has not read yet, unless `all`: a last resort, when nothing else is left to take.
+pub fn trim_tool_outputs(messages: &mut [Message], want: usize, head: bool, all: bool) -> usize {
+    let end = if all { messages.len() } else { messages.len().saturating_sub(RECENT).min(round_in_progress(messages)) };
     let mut saved = 0;
-    for message in messages.iter_mut().take(end).skip(1 + HEAD) {
+    for message in messages.iter_mut().take(end).skip(if head { 1 } else { 1 + HEAD }) {
         if saved >= want {
             break;
         }
@@ -114,7 +132,7 @@ pub fn strip_thinking(messages: &mut [Message]) {
 /// Whether anything lies between the head and the newest `keep` messages, for a checkpoint to sum up.
 pub fn has_a_middle(messages: &[Message], keep: usize) -> bool {
     let head_end = turn_start(messages, (1 + HEAD).min(messages.len()));
-    turn_start(messages, messages.len().saturating_sub(keep).max(head_end)) > head_end
+    round_start(messages, messages.len().saturating_sub(keep)).max(head_end) > head_end
 }
 
 pub fn worth_a_checkpoint(messages: &[Message]) -> bool {
@@ -124,7 +142,7 @@ pub fn worth_a_checkpoint(messages: &[Message]) -> bool {
 /// `[system, *head, summary, *recent]`, keeping the newest `keep` messages.
 pub fn apply_checkpoint(messages: &[Message], checkpoint: &str, keep: usize) -> Vec<Message> {
     let head_end = turn_start(messages, (1 + HEAD).min(messages.len()));
-    let recent_start = turn_start(messages, messages.len().saturating_sub(keep).max(head_end));
+    let recent_start = round_start(messages, messages.len().saturating_sub(keep)).max(head_end);
     let mut out = messages[..head_end].to_vec();
     let mut summary = format!("{SUMMARY_HEADER}{}", checkpoint.trim());
     // A model's sum of it may not have the words: what is being worked on must be there in the person's own.
@@ -231,11 +249,35 @@ mod tests {
     fn stage_0_trims_only_old_tool_outputs() {
         let mut messages = conversation(10);
         let last_tool = messages.iter().rposition(|m| m.role == "tool").unwrap();
-        let saved = trim_tool_outputs(&mut messages, usize::MAX);
+        let saved = trim_tool_outputs(&mut messages, usize::MAX, false, false);
         assert!(saved > 0);
         assert_eq!(messages[last_tool].content.as_ref().unwrap().len(), 5000);
         assert!(messages[3].content.as_ref().unwrap().len() == 5000, "the head stays");
         assert!(messages.iter().filter(|m| m.role == "tool").any(|m| m.content.as_ref().unwrap().contains("trimmed")));
+    }
+
+    /// A round of more calls than a checkpoint keeps stays whole, its calls and every result, and stage 0 leaves its results alone
+    /// unless nothing else is left: the model has not read them yet.
+    #[test]
+    fn the_round_in_progress_stays_whole_whatever_its_size() {
+        let mut messages = conversation(10);
+        let calls: Vec<ToolCall> = (0..13).map(|at| ToolCall { id: format!("p{at}"), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: "{}".into() } }).collect();
+        messages.push(Message::text("user", "read them all"));
+        messages.push(Message { role: "assistant".into(), tool_calls: Some(calls), ..Message::default() });
+        messages.extend((0..13).map(|at| Message::tool_result(&format!("p{at}"), "y".repeat(5000))));
+        for keep in [4, 12] {
+            let out = apply_checkpoint(&messages, "the state", keep);
+            no_orphans(&out);
+            assert_eq!(out.iter().filter(|m| m.tool_call_id.as_deref().is_some_and(|id| id.starts_with('p'))).count(), 13, "keep {keep}");
+            assert!(out.iter().any(|m| m.tool_calls.as_ref().is_some_and(|calls| calls.len() == 13)), "keep {keep}");
+        }
+        assert!(has_a_middle(&messages, 4));
+        let mut trimmed = messages.clone();
+        trim_tool_outputs(&mut trimmed, usize::MAX, true, false);
+        assert!(trimmed.iter().rev().take(13).all(|m| m.content.as_ref().unwrap().len() == 5000), "the round in progress is not trimmed");
+        assert!(trimmed[3].content.as_ref().unwrap().contains("trimmed"), "the head is, when asked");
+        trim_tool_outputs(&mut trimmed, usize::MAX, true, true);
+        assert!(trimmed.iter().rev().take(13).all(|m| m.content.as_ref().unwrap().contains("trimmed")), "all of it, as a last resort");
     }
 
     #[test]
