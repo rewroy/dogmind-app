@@ -142,8 +142,10 @@ struct Host {
     document: Cell<*mut c_void>,
     /// While emoji are given their face: TOM writes nothing to a read-only text, its formats included.
     unlocked: Cell<bool>,
-    /// The window's element in UI Automation, once it is asked for: what a screen reader reads (ccess).
+    /// The window's element in UI Automation, once it is asked for: what a screen reader reads (`access`).
     access: std::cell::RefCell<Option<windows::Win32::UI::Accessibility::IRawElementProviderSimple>>,
+    /// What that element is called, in English (`lang::t` says it in the person's language): the window's own name would be all of its text.
+    name: Cell<&'static str>,
     /// The text's rectangle, as EM_SETRECT gave it: the window's client area where none was given.
     view: Cell<Option<RECT>>,
     /// The page's colour, around the text's rectangle as within it.
@@ -253,6 +255,7 @@ impl Host {
             document: Cell::new(std::ptr::null_mut()),
             unlocked: Cell::new(false),
             access: std::cell::RefCell::new(None),
+            name: Cell::new("Conversation"),
             view: Cell::new(None),
             background: Cell::new(unsafe { GetSysColor(COLOR_WINDOW) }),
             char_format: std::cell::UnsafeCell::new(char_format),
@@ -674,6 +677,7 @@ unsafe extern "system" fn notify(this: *mut Host, code: u32, data: *mut c_void) 
         return S_OK;
     }
     let id = GetDlgCtrlID(host.window);
+    // (EN_CHANGE comes with a CHANGENOTIFY, which a window's parent is not given: below 0x700 a notification is a command, whatever comes with it)
     if code >= 0x0700 && !data.is_null() {
         let header = data as *mut windows_sys::Win32::UI::Controls::NMHDR;
         (*header).hwndFrom = host.window;
@@ -682,18 +686,20 @@ unsafe extern "system" fn notify(this: *mut Host, code: u32, data: *mut c_void) 
         if SendMessageW(parent, WM_NOTIFY, id as WPARAM, data as LPARAM) != 0 {
             return S_FALSE;
         }
-    } else if data.is_null() {
+    } else if code < 0x0700 {
         SendMessageW(parent, WM_COMMAND, ((code as usize) << 16) | (id as usize & 0xFFFF), host.window as LPARAM);
     }
     S_OK
 }
 
-/// What is typed here goes through the IME of the window's own: this one is read only.
-unsafe extern "system" fn imm_get_context(_this: *mut Host) -> *mut c_void {
-    std::ptr::null_mut()
+/// The window's input context: what is composed with an IME goes into the text through it.
+unsafe extern "system" fn imm_get_context(this: *mut Host) -> *mut c_void {
+    windows_sys::Win32::UI::Input::Ime::ImmGetContext(host(this).window)
 }
 
-unsafe extern "system" fn imm_release_context(_this: *mut Host, _context: *mut c_void) {}
+unsafe extern "system" fn imm_release_context(this: *mut Host, context: *mut c_void) {
+    windows_sys::Win32::UI::Input::Ime::ImmReleaseContext(host(this).window, context);
+}
 
 unsafe extern "system" fn get_selection_bar_width(_this: *mut Host, width: *mut i32) -> i32 {
     *width = 0;
@@ -770,9 +776,57 @@ pub unsafe fn register(instance: windows_sys::Win32::Foundation::HINSTANCE) {
     RegisterClassW(&class);
 }
 
-/// Whether the transcript is made this way: yes, unless DOGMIND_TEXTVIEW says 0 (Msftedit's window, drawn with GDI, as it was).
+/// Whether the transcript, the composer and the panels' document are made this way: yes, unless DOGMIND_TEXTVIEW says 0 (Msftedit's
+/// windows, drawn with GDI, as they were).
 pub fn wanted() -> bool {
     std::env::var("DOGMIND_TEXTVIEW").map_or(true, |value| value != "0")
+}
+
+/// What a window of this class is called in UI Automation, in English. Nothing for one of another class.
+pub unsafe fn set_name(window: HWND, name: &'static str) {
+    let host = GetWindowLongPtrW(window, 0) as *const Host;
+    if !host.is_null() && is_of_class(window) {
+        (*host).name.set(name);
+    }
+}
+
+/// (a test's way to see Japanese composed in a window of this class, with no keyboard: this message, registered, sent to it)
+#[cfg(debug_assertions)]
+fn test_ime_message() -> u32 {
+    static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MESSAGE.get_or_init(|| unsafe { RegisterWindowMessageW(crate::paint::wide("DogmindTestIme").as_ptr()) })
+}
+
+/// The window takes the focus of its own thread, and its input context composes にほんご: shown as it is composed (0), settled (1), or
+/// given up (2).
+#[cfg(debug_assertions)]
+unsafe fn test_ime(window: HWND, step: WPARAM) {
+    use windows_sys::Win32::UI::Input::Ime::{ImmGetContext, ImmNotifyIME, ImmReleaseContext, ImmSetCompositionStringW, ImmSetOpenStatus, CPS_CANCEL, CPS_COMPLETE, NI_COMPOSITIONSTR, SCS_SETSTR};
+    SetFocus(window);
+    let context = ImmGetContext(window);
+    if context.is_null() {
+        return;
+    }
+    match step {
+        0 => {
+            ImmSetOpenStatus(context, 1);
+            let text: Vec<u16> = "にほんご".encode_utf16().collect();
+            ImmSetCompositionStringW(context, SCS_SETSTR, text.as_ptr().cast(), (text.len() * 2) as u32, std::ptr::null(), 0);
+        }
+        1 => {
+            ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
+        }
+        _ => {
+            ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+        }
+    }
+    ImmReleaseContext(window, context);
+}
+
+unsafe fn is_of_class(window: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let length = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+    String::from_utf16_lossy(&class[..length]) == CLASS
 }
 
 unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -797,6 +851,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         return DefWindowProcW(window, message, wparam, lparam);
     }
     let host = &*this;
+    #[cfg(debug_assertions)]
+    if message == test_ime_message() {
+        test_ime(window, wparam);
+        return 0;
+    }
     match message {
         WM_PAINT => {
             let mut paint: PAINTSTRUCT = std::mem::zeroed();
@@ -908,7 +967,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
 /// the target's (one for its class, made once); everything else in it is the target's own.
 mod color {
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::ffi::c_void;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use windows::core::Interface;
@@ -962,9 +1023,125 @@ mod color {
 
     unsafe extern "system" fn draw_glyph_run(this: *mut c_void, origin: Vector2, run: *const DWRITE_GLYPH_RUN, brush: *mut c_void, mode: DWRITE_MEASURING_MODE) {
         let plain: Glyphs = std::mem::transmute(PLAIN.load(Ordering::Relaxed));
-        if !in_colour(this, origin, run, brush, mode, plain) {
+        if !in_colour(this, origin, run, brush, mode, plain) && !in_emoji_face(this, origin, run, brush, mode, plain) {
             plain(this, origin, run, brush, mode);
         }
+    }
+
+    thread_local! {
+        /// The faces runs came in, each with what its emoji glyphs stand for, where it is Segoe UI Symbol. Each is held, so that no other face
+        /// comes to have its address while it is here.
+        static FACES: RefCell<Vec<(IDWriteFontFace, Option<Rc<HashMap<u16, u32>>>)>> = const { RefCell::new(Vec::new()) };
+        static EMOJI: RefCell<Option<Option<IDWriteFontFace>>> = const { RefCell::new(None) };
+    }
+
+    /// The emoji in Segoe UI Symbol, by glyph: what each stands for. None for any other face.
+    unsafe fn symbol_emoji(face: &IDWriteFontFace) -> Option<Rc<HashMap<u16, u32>>> {
+        FACES.with(|faces| {
+            let mut faces = faces.borrow_mut();
+            if let Some((_, found)) = faces.iter().find(|(held, _)| held.as_raw() == face.as_raw()) {
+                return found.clone();
+            }
+            let family = face.cast::<IDWriteFontFace3>().ok().and_then(|face| face.GetFamilyNames().ok()).and_then(|names| {
+                let mut name = [0u16; 64];
+                names.GetString(0, &mut name).ok()?;
+                Some(String::from_utf16_lossy(&name[..name.iter().position(|unit| *unit == 0).unwrap_or(64)]))
+            });
+            let found = (family.as_deref() == Some("Segoe UI Symbol")).then(|| {
+                let points: Vec<u32> = (0x2300..=0x2BFF).chain(0x1F000..=0x1FAFF).filter(|point| super::emoji::is_emoji(*point)).collect();
+                let mut glyphs = vec![0u16; points.len()];
+                let _ = face.GetGlyphIndices(points.as_ptr(), points.len() as u32, glyphs.as_mut_ptr());
+                let mut map = HashMap::new();
+                for (glyph, point) in glyphs.into_iter().zip(points) {
+                    if glyph != 0 {
+                        map.entry(glyph).or_insert(point);
+                    }
+                }
+                Rc::new(map)
+            });
+            if faces.len() >= 16 {
+                faces.remove(0);
+            }
+            faces.push((face.clone(), found.clone()));
+            found
+        })
+    }
+
+    fn emoji_face() -> Option<IDWriteFontFace> {
+        EMOJI.with(|cell| {
+            cell.borrow_mut()
+                .get_or_insert_with(|| unsafe {
+                    let write: IDWriteFactory = write()?.cast().ok()?;
+                    let mut collection: Option<IDWriteFontCollection> = None;
+                    write.GetSystemFontCollection(&mut collection, false).ok()?;
+                    let collection = collection?;
+                    let (mut index, mut exists) = (0u32, windows::core::BOOL(0));
+                    collection.FindFamilyName(windows::core::w!("Segoe UI Emoji"), &mut index, &mut exists).ok()?;
+                    if !exists.as_bool() {
+                        return None;
+                    }
+                    let font = collection.GetFontFamily(index).ok()?.GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL).ok()?;
+                    font.CreateFontFace().ok()
+                })
+                .clone()
+        })
+    }
+
+    /// A run in Segoe UI Symbol, where RichEdit sets emoji in a plain text (the composer), and no face can be set on a part of it: its emoji
+    /// are drawn from Segoe UI Emoji, in colour, each where the run puts its glyph; the rest of it as it was. False where it has none.
+    unsafe fn in_emoji_face(this: *mut c_void, origin: Vector2, run: *const DWRITE_GLYPH_RUN, brush: *mut c_void, mode: DWRITE_MEASURING_MODE, plain: Glyphs) -> bool {
+        let run = &*run;
+        let count = run.glyphCount as usize;
+        // (right to left, or sideways, the places are not simply one after another)
+        if count == 0 || run.bidiLevel & 1 != 0 || run.isSideways.as_bool() || run.glyphAdvances.is_null() {
+            return false;
+        }
+        let Some(face) = run.fontFace.as_ref() else { return false };
+        let Some(points) = symbol_emoji(face) else { return false };
+        let glyphs = std::slice::from_raw_parts(run.glyphIndices, count);
+        if !glyphs.iter().any(|glyph| points.contains_key(glyph)) {
+            return false;
+        }
+        let Some(emoji) = emoji_face() else { return false };
+        let advances = std::slice::from_raw_parts(run.glyphAdvances, count);
+        let mut x = origin.X;
+        let mut at = 0;
+        while at < count {
+            let coloured = points.contains_key(&glyphs[at]);
+            let mut end = at;
+            let mut width = 0.0;
+            while end < count && points.contains_key(&glyphs[end]) == coloured {
+                width += advances[end];
+                end += 1;
+            }
+            let place = Vector2 { X: x, Y: origin.Y };
+            let mut swapped: Vec<u16> = Vec::new();
+            if coloured {
+                let wanted: Vec<u32> = glyphs[at..end].iter().map(|glyph| points[glyph]).collect();
+                swapped = vec![0u16; wanted.len()];
+                if emoji.GetGlyphIndices(wanted.as_ptr(), wanted.len() as u32, swapped.as_mut_ptr()).is_err() {
+                    swapped.clear();
+                }
+            }
+            let (font, indices) = if swapped.is_empty() { (face, glyphs[at..].as_ptr()) } else { (&emoji, swapped.as_ptr()) };
+            let part = DWRITE_GLYPH_RUN {
+                // (borrowed, not held: the part is gone before the run is)
+                fontFace: std::mem::transmute_copy(font),
+                fontEmSize: run.fontEmSize,
+                glyphCount: (end - at) as u32,
+                glyphIndices: indices,
+                glyphAdvances: advances[at..].as_ptr(),
+                glyphOffsets: if run.glyphOffsets.is_null() { std::ptr::null() } else { run.glyphOffsets.add(at) },
+                isSideways: run.isSideways,
+                bidiLevel: run.bidiLevel,
+            };
+            if swapped.is_empty() || !in_colour(this, place, &part, brush, mode, plain) {
+                plain(this, place, &part, brush, mode);
+            }
+            x += width;
+            at = end;
+        }
+        true
     }
 
     /// The run in its colour layers. False where it has none (DWRITE_E_NOCOLOR), and is drawn as it was.
@@ -1041,6 +1218,10 @@ mod emoji {
     const EM_GETTEXTLENGTHEX: u32 = WM_USER + 95;
     const EM_SETTEXTEX: u32 = WM_USER + 97;
     const EM_GETOLEINTERFACE: u32 = WM_USER + 60;
+    const EM_GETTEXTMODE: u32 = WM_USER + 90;
+    // ITextDocument::Undo's counts that hold the undo list, and let it go on
+    const TOM_SUSPEND: i32 = -9_999_995;
+    const TOM_RESUME: i32 = -9_999_994;
     const IID_ITEXTDOCUMENT: GUID = GUID::from_u128(0x8cc497c0_a1df_11ce_8098_00aa0047be5d);
     const FACE: &str = "Segoe UI Emoji";
     /// How far before what was written the text is looked at: a sequence (a ZWJ, a skin tone) may be written in two pieces.
@@ -1060,7 +1241,16 @@ mod emoji {
         (range[0], range[1])
     }
 
+    /// A plain text (TM_PLAINTEXT) has one format for all of it: a face set on its emoji would be set on every word. Its emoji take their
+    /// colours where they are drawn (`color::in_emoji_face`).
+    unsafe fn is_plain(host: &Host) -> bool {
+        host.send(EM_GETTEXTMODE, 0, 0).1 & 1 != 0
+    }
+
     pub unsafe fn touched(host: &Host, message: u32, wparam: WPARAM) -> Option<Touched> {
+        if !matches!(message, EM_REPLACESEL | EM_SETTEXTEX | EM_STREAMIN | WM_SETTEXT | EM_SETCHARFORMAT) || is_plain(host) {
+            return None;
+        }
         match message {
             EM_REPLACESEL => Some(Touched::From(selection(host).0)),
             // SETTEXTEX: ST_SELECTION; STREAMIN: SFF_SELECTION
@@ -1106,6 +1296,9 @@ mod emoji {
             return;
         }
         let face = windows::core::BSTR::from(FACE);
+        // (a face is no edit the person made: Ctrl+Z does not take it back first)
+        let undo: unsafe extern "system" fn(*mut c_void, i32, *mut i32) -> i32 = std::mem::transmute(*(*(document as *const *const usize)).add(22));
+        undo(document, TOM_SUSPEND, std::ptr::null_mut());
         host.unlocked.set(true);
         host.bits_changed(super::READONLY);
         for (start, end) in runs {
@@ -1113,6 +1306,7 @@ mod emoji {
         }
         host.unlocked.set(false);
         host.bits_changed(super::READONLY);
+        undo(document, TOM_RESUME, std::ptr::null_mut());
     }
 
     unsafe fn document(host: &Host) -> *mut c_void {
@@ -1162,8 +1356,13 @@ mod emoji {
         (0x27B0, 0x27B0), (0x27BF, 0x27BF), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50), (0x2B55, 0x2B55),
     ];
 
+    /// An emoji by itself, with no selector after it.
+    pub fn is_emoji(point: u32) -> bool {
+        (0x1F000..=0x1FAFF).contains(&point) || PRESENTED.iter().any(|(low, high)| (*low..=*high).contains(&point))
+    }
+
     fn begins(point: u32, next: Option<u32>) -> bool {
-        next == Some(0xFE0F) || (0x1F000..=0x1FAFF).contains(&point) || PRESENTED.iter().any(|(low, high)| (*low..=*high).contains(&point))
+        next == Some(0xFE0F) || is_emoji(point)
     }
 
     /// What goes on with the emoji before it: a joiner and what it joins, a selector, a keycap, a skin tone, a tag.
@@ -1355,7 +1554,11 @@ mod access {
         /// Its name, where the window's own would be all of its text.
         fn GetPropertyValue(&self, property: UIA_PROPERTY_ID) -> Result<VARIANT> {
             Ok(match property {
-                UIA_NamePropertyId => VARIANT::from(crate::lang::t("Conversation")),
+                UIA_NamePropertyId => {
+                    let host = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(self.window.0, 0) } as *const Host;
+                    let name = if host.is_null() { "Conversation" } else { unsafe { (*host).name.get() } };
+                    VARIANT::from(crate::lang::t(name))
+                }
                 UIA_ControlTypePropertyId => VARIANT::from(UIA_PaneControlTypeId.0),
                 _ => VARIANT::default(),
             })
