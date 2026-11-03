@@ -636,8 +636,11 @@ impl Workbench {
         let given = text_arg(arguments, "path")?;
         let path = resolve(workspace, given);
         let content = text_arg(arguments, "content")?;
-        let going_on = self.cut_file.as_ref() == Some(&path);
-        let append = going_on || arguments.get("append").and_then(Value::as_bool) == Some(true);
+        let said = arguments.get("append").and_then(Value::as_bool);
+        // A write cut off goes on from where it was cut, unless the model says it is the whole (append false), or writes it again from its
+        // first line: added on, that would be there twice.
+        let going_on = self.cut_file.as_ref() == Some(&path) && said != Some(false) && !rewrites_from_the_top(&path, content);
+        let append = going_on || said == Some(true);
         let mut before = Vec::new();
         let exists = path.exists();
         // (what of it the conversation has been shown, when there is less than all of it)
@@ -679,10 +682,10 @@ impl Workbench {
         written_whole(&path, &written, exists).map_err(|error| format!("{given}: {error}: {}", if exists { "the file is as it was" } else { "it was not made" }))?;
         let lines = file_text(&written).0.lines().count();
         self.seen.insert(path.clone(), sha16(&written));
-        self.covered.insert(path, seen_in_part.unwrap_or(lines));
-        if going_on {
+        if self.cut_file.as_ref() == Some(&path) {
             self.cut_file = None;
         }
+        self.covered.insert(path, seen_in_part.unwrap_or(lines));
         let word = if !exists { "created" } else if append { "added to" } else { "replaced" };
         let said = format!("{word} {given}: now {lines} lines, {} bytes", written.len());
         Ok(if self.in_japanese { said + &not_japanese_note(content) } else { said })
@@ -804,6 +807,17 @@ impl Workbench {
         }
         Ok(self.todos.iter().map(|item| format!("[{}] {}: {}", item["status"].as_str().unwrap_or("pending"), item["id"].as_str().unwrap_or(""), item["text"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"))
     }
+}
+
+/// Whether `content` begins as the file does: written again from its first line, not going on from its last.
+fn rewrites_from_the_top(path: &Path, content: &str) -> bool {
+    let Ok(bytes) = std::fs::read(path) else { return false };
+    let plain = |text: &str| text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    let (text, content) = (plain(&file_text(&bytes).0), plain(content));
+    // (its first three lines, as far as 120 characters: a part written on from where a cut left it never begins so)
+    let three: usize = text.split_inclusive('\n').take(3).map(str::len).sum();
+    let head: String = text[..three].chars().take(120).collect();
+    head.trim().chars().count() >= 20 && content.starts_with(&head)
 }
 
 /// How a file is written, for what is written to it to be written the same way: its encoding, whether it begins with a byte order mark,
@@ -2834,6 +2848,24 @@ mod tests {
         bench.run("apply_patch", &json!({"edits": [{"path": "page.html", "old_string": "a", "new_string": "b"}]}), dir.path(), &cancel).unwrap();
         bench.run("create_file", &json!({"path": "page.html", "content": "<p>c</p>\n"}), dir.path(), &cancel).unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("page.html")).unwrap(), "<p>c</p>\n", "written whole, not added to");
+    }
+
+    /// A write cut off goes on from where it was cut; written again from its first line, or said to be whole, it takes the file's place.
+    #[test]
+    fn a_cut_write_written_again_from_the_top_is_not_there_twice() {
+        let (dir, mut bench, cancel) = bench();
+        let head = "<!DOCTYPE html>\n<html lang=\"ja\">\n<head><title>A page</title></head>\n";
+        bench.run("create_file", &json!({"path": "page.html", "content": head}), dir.path(), &cancel).unwrap();
+        bench.note_cut(dir.path().join("page.html"));
+        bench.run("create_file", &json!({"path": "page.html", "content": "<body></body>\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("page.html")).unwrap(), format!("{head}<body></body>\n"), "it goes on");
+        bench.note_cut(dir.path().join("page.html"));
+        let again = format!("{head}<body><p>all of it</p></body>\n</html>\n");
+        bench.run("create_file", &json!({"path": "page.html", "content": again}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("page.html")).unwrap(), again, "from the top, it is the whole");
+        bench.note_cut(dir.path().join("page.html"));
+        bench.run("create_file", &json!({"path": "page.html", "content": "short\n", "append": false}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("page.html")).unwrap(), "short\n", "said to be whole");
     }
 
     /// An edit to a CRLF file whose new_string has CRLF already keeps one CR before each LF.

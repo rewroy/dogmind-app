@@ -353,6 +353,10 @@ impl Provider for Anthropic {
                 assembly.event(data.trim_start(), on)?;
             }
         }
+        // No word of why it stopped: the connection went in the middle of the answer, which is not an answer to keep as said.
+        if assembly.stop.is_empty() && assembly.refused.is_none() {
+            return Err(LlmError::Transient(llm::SERVER_GONE.to_string()));
+        }
         assembly.finish()
     }
 }
@@ -367,6 +371,45 @@ mod tests {
             assembly.event(&event.to_string(), &mut |_| {}).unwrap();
         }
         assembly
+    }
+
+    /// An answer whose connection went before it said why it stopped is not one: it is asked again, not kept as said.
+    #[test]
+    fn an_answer_cut_off_before_its_stop_is_not_taken_for_one() {
+        use std::io::{Read, Write};
+        let answer = |events: &[Value]| -> Result<Completion, LlmError> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let body: String = events.iter().map(|event| format!("event: x\ndata: {event}\n\n")).collect();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut block = [0u8; 65536];
+                while let Ok(count @ 1..) = stream.read(&mut block) {
+                    request.extend_from_slice(&block[..count]);
+                    let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&request[..at]).to_lowercase();
+                    let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                    if request.len() >= at + 4 + length {
+                        break;
+                    }
+                }
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+            });
+            let claude = Anthropic::new(&format!("http://127.0.0.1:{port}/v1"), "k".into()).unwrap();
+            let messages = [Message::text("user", "hi")];
+            claude.stream(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false }, &AtomicBool::new(false), &mut |_| {})
+        };
+        let start = [
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Half of"}}),
+        ];
+        assert!(matches!(answer(&start), Err(LlmError::Transient(_))));
+        let whole: Vec<Value> = start.iter().cloned().chain([json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}), json!({"type": "message_stop"})]).collect();
+        assert_eq!(answer(&whole).unwrap().content, "Half of");
     }
 
     #[test]
