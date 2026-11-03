@@ -9,9 +9,9 @@ With Smart App Control on, Windows will not run it at all.
 To run a model on this PC: an NVIDIA GPU with a current driver, and about 75 GB to download (about 76 GB free on the drive while it comes; 70 GB stay).
 Without one, the app can reach a model on another computer, an online service, Codex or Claude.
 
-Update: run the new DogmindSetup.exe, which asks the app to close and keeps your settings and sessions. From a zip: quit from the tray icon (closing the window leaves it running), and extract the new zip over this folder.
+Update: new versions are at https://github.com/rewroy/DogmindApp/releases. Run the new DogmindSetup.exe, which asks the app to close and keeps your settings and sessions. From a zip: quit from the tray icon (closing the window leaves it running), and extract the new zip over this folder.
 Remove: Windows Settings > Apps > Installed apps, or Settings > General > Remove this app from this PC in the app; from a zip, delete this folder after that.
-A problem: /report in the app writes a report, with no key or conversation in it, and says where the file is. Read it, and send it to whoever you had this app from, in any way you like.
+A problem: /report in the app writes a report, with no key or conversation in it, and says where the file is. Read it, and attach it at https://github.com/rewroy/DogmindApp/issues with what you were doing.
 Licenses: LICENSE.txt
 
 
@@ -26,7 +26,7 @@ zip の中から直接起動しないでください。Windows 11 が必要で�
 この PC でモデルを動かすには: NVIDIA の GPU と新しいドライバー、約 75 GB のダウンロード (ドライブの空きが約 76 GB 必要で、70 GB が残ります) が必要です。
 なくても、別のコンピューターやオンラインサービス、Codex、Claude のモデルを使えます。
 
-更新: 新しい DogmindSetup.exe を実行してください。アプリに閉じるよう依頼し、設定とセッションはそのまま残します。zip の場合は、トレイのアイコンから終了し (ウィンドウを閉じただけでは動き続けます)、新しい zip をこのフォルダに上書きで展開してください。
+更新: 新しい版は https://github.com/rewroy/DogmindApp/releases にあります。新しい DogmindSetup.exe を実行してください。アプリに閉じるよう依頼し、設定とセッションはそのまま残します。zip の場合は、トレイのアイコンから終了し (ウィンドウを閉じただけでは動き続けます)、新しい zip をこのフォルダに上書きで展開してください。
 削除: Windows の設定 > アプリ > インストールされているアプリ、またはアプリの 設定 > 一般 > この PC からアプリを削除。zip の場合は、そのあとこのフォルダを削除してください。
-問題があるとき: アプリで /report を実行するとレポートを作成し (キーや会話は含みません)、ファイルの場所を表示します。内容を確認し、このアプリを受け取った相手に好きな方法で送ってください。
+問題があるとき: アプリで /report を実行するとレポートを作成し (キーや会話は含みません)、ファイルの場所を表示します。内容を確認し、何をしていたかを添えて https://github.com/rewroy/DogmindApp/issues に添付してください。
 ライセンス: LICENSE.txt

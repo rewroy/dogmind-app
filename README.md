@@ -4,8 +4,9 @@ Dogmind as a native Windows application. For a server, run `straydog`; for a ter
 window. It is a product of its own, which uses Straydog as a program: put a new `straydog.exe` beside it and that is the
 update.
 
-- **Light.** Plain Win32 and RichEdit: no WebView and no GPU memory for drawing, so that the VRAM stays with the model. IME
-  input, selection and copy are the system's own.
+- **Light.** Win32, drawn with Direct2D and DirectWrite on the CPU, and RichEdit for the text: no GPU memory for drawing, so that
+  the VRAM stays with the model, and a WebView2 only while a preview is open. IME input, selection and copy are the system's own.
+  Japanese is set in BIZ UDGothic, shipped beside the app and used from there: nothing is installed on the PC.
 - **Engine beside it.** `straydog.exe` runs as a child process, only when it is used, and is reached only by its command line
   and its OpenAI-compatible API. The window's process never loads the GPU's libraries.
 - **Sessions by workspace.** The sidebar lists each workspace's sessions; a new one starts by choosing its folder.
@@ -38,13 +39,14 @@ a rail at the transcript's right edge has a mark for each of your messages: the 
 
 ## Updating, removing, and when something goes wrong
 
-To update, run the new `DogmindSetup-VERSION.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. A failure leaves the program as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
+New versions are published at [Releases](https://github.com/rewroy/DogmindApp/releases). To update, run the new `DogmindSetup-VERSION.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. Every file takes its place or none does: a failure puts back what was there, so the program is as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
 
 To remove it, *Settings > General > Remove this app from this PC* takes away the settings, sessions, logs, the keys in Credential Manager, what was opened to the sandbox and the AppContainer
 profiles, and the model unless you keep it. Installed apps opens the same page, and closing it then takes away the program and its entries; from a zip, delete the folder it runs from. Workspaces stay as they are.
 
 A crash leaves a text file in `%LOCALAPPDATA%\DogmindApp\crashes`, and the next start says so. `/report`, or *About > Write a problem report*, writes `report.txt` in `%LOCALAPPDATA%\DogmindApp`, with no key, server address or
-conversation in it, and says where it is, to read and send however you like. `WHERE_REPORTS_GO` in `crash.rs` is the one place for an address, once there is a public one. Whoever makes a release keeps its `dogmind_app.pdb` and `straydog.pdb`: the addresses in a crash are read with them.
+conversation in it, and says where it is: read it, and attach it to an [issue](https://github.com/rewroy/DogmindApp/issues) with what you were doing. Nothing is sent by itself. Whoever makes a release keeps its `dogmind_app.pdb` and `straydog.pdb`: the addresses in a crash are read with them.
+Please report a security problem privately, as [SECURITY.md](SECURITY.md) says, and not in a public issue.
 
 The app is not signed yet. Windows shows *Windows protected your PC* for it (*More info > Run anyway*), and with Smart App Control on, Windows will not run it at all.
 
@@ -52,8 +54,13 @@ The app is not signed yet. Windows shows *Windows protected your PC* for it (*Mo
 
 The icon is `assets/app.ico`, made from the artwork `assets/app.png` by `scripts/make_icon.py`.
 
-MIT (`LICENSE`). `scripts/package.py` puts one `LICENSE.txt` beside the executable, with Dogmind's (Apache-2.0), Straydog's (MIT),
-Lucide's (ISC), the CUDA toolkit's, the WebView2 SDK's and every Rust crate in the app and in `straydog.exe` with its license's words. After a dependency changes, here or in Straydog, run `python scripts/licenses.py`.
+This repository is MIT (`LICENSE`). What it has taken from Dogmind, the agent it follows, stays under Dogmind's
+Apache-2.0 (`assets/licenses/dogmind-LICENSE.txt`): `assets/dogmind/` as Dogmind writes it, and the system prompt, tool schemas
+and agent loop that began as Dogmind's and were changed here (see *What it has of Dogmind* below). The icons in `assets/lucide/`
+are Lucide's (ISC, `assets/lucide/LICENSE`).
+
+`scripts/package.py` puts one `LICENSE.txt` beside the executable, with Dogmind's (Apache-2.0), Straydog's (MIT),
+Lucide's (ISC), BIZ UDGothic's (SIL OFL 1.1), the CUDA toolkit's, the WebView2 SDK's, the bundled tools' and every Rust crate in the app and in `straydog.exe` with its license's words. After a dependency changes, here or in Straydog, run `python scripts/licenses.py`.
 
 ## Building
 

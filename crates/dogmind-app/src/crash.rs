@@ -7,9 +7,9 @@ use std::sync::OnceLock;
 use crate::lang::tf;
 use crate::settings::Settings;
 
-/// Where reports go, when there is somewhere a stranger can reach: the only address the app itself knows, kept here alone. There is none yet (the project's repository is not
-/// public), and a report's words then only say where the file is, for the person to send however they like.
-pub const WHERE_REPORTS_GO: Option<&str> = None;
+/// Where reports go: the public repository's issues, the only address for them the app itself knows, kept here alone. With none, a
+/// report's words would only say where the file is, for the person to send however they like.
+pub const WHERE_REPORTS_GO: Option<&str> = Some("https://github.com/rewroy/DogmindApp/issues");
 
 const FOLDER: &str = "crashes";
 const MOST_LOG_LINES: usize = 200;
@@ -154,13 +154,11 @@ mod tests {
     }
 
     #[test]
-    fn a_report_says_where_the_file_is_and_names_no_address_that_leads_nowhere() {
+    fn a_report_says_where_the_file_is_and_where_to_send_it() {
         let words = report_words("C:\\data\\report.txt");
-        assert!(words.contains("C:\\data\\report.txt") && words.contains("any way you like"), "{words}");
-        assert_eq!(WHERE_REPORTS_GO, None, "no address until the repository is public: a stranger cannot see it");
-        assert!(!words.contains("http"), "{words}");
-        let with = report_words_with("f.txt", Some("https://example.com/issues"));
-        assert!(with.contains("f.txt") && with.contains("https://example.com/issues"), "{with}");
+        assert!(words.contains("C:\\data\\report.txt") && words.contains("https://github.com/rewroy/DogmindApp/issues"), "{words}");
+        let without = report_words_with("f.txt", None);
+        assert!(without.contains("f.txt") && without.contains("any way you like") && !without.contains("http"), "{without}");
     }
 
     #[test]
