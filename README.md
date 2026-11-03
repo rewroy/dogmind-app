@@ -77,7 +77,12 @@ The agent loop, its stop conditions and retries; the system prompt; `read_file`,
 `create_file`, `execute_command`, `show_diff` and `todo`; the approval model (*default*, *accept edits*, *auto*, the Paw Note);
 three-stage compaction; sessions, in its own files; `DOGMIND.md`.
 
-Not yet: Toybox, plugins, subagents and Dog Nose Work.
+Not yet: Toybox, plugins, general subagents and Dog Nose Work.
+
+What it has of its own for a long look, as Deepseek Harness keeps one out of the conversation: `explore` hands a question to a
+helper with a context of its own and only the looking tools, and only its answer joins the conversation. A file of more than 800
+lines read with no place in it comes as its outline, a turn that has read 96 KB of files is told so once, and a long command
+output or search result is kept whole in `%TEMP%\dogmind-output` for a week, its report saying where.
 
 `execute_command` runs in an AppContainer, `DogmindApp.Exec`, as in Dogmind: a command can write only in the workspace, read
 that, the per-user toolchains on PATH and what every app may read, and has no network unless it was approved for it, each
