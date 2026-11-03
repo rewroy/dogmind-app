@@ -259,9 +259,9 @@ pub struct Workbench {
     cut_file: Option<PathBuf>,
     /// What has been read of each file and what it was then, while that is still in the conversation.
     reads: HashMap<(PathBuf, i64, i64), String>,
-    /// What this turn has read of files into the conversation, in bytes, and whether it has been told how much.
+    /// What this turn has read of files into the conversation, in bytes, and how many times it has been told how much.
     pub read_this_turn: usize,
-    pub read_told: bool,
+    pub read_told: usize,
     /// What holds keys besides what reads as such: the app's own folder, and the files its settings name.
     pub secrets: Vec<PathBuf>,
 }
@@ -571,11 +571,12 @@ impl Workbench {
         if same && result.is_ok() {
             return Ok(UNCHANGED_READ.to_string());
         }
-        // Once a turn, past this much: what it read stays in every later request, and a look further can go to a helper.
+        // At each so much more in a turn: what it read stays in every later request, and a look further can go to a helper. (Once was
+        // not enough: a real model told at 96 KB went on to 390.)
         let result = result.map(|text| {
             self.read_this_turn += text.len();
-            if self.read_this_turn > READ_TOLD_PAST && !self.read_told {
-                self.read_told = true;
+            if self.read_this_turn > READ_TOLD_PAST * (self.read_told + 1) {
+                self.read_told = self.read_this_turn / READ_TOLD_PAST;
                 format!("{text}--- this turn has read {} KB of files into the conversation, where it stays for every later request. To look further, give the question to explore: only its answer joins ---\n", self.read_this_turn / 1024)
             } else {
                 text
@@ -587,7 +588,7 @@ impl Workbench {
     /// A new turn: what it reads is counted from nothing.
     pub fn new_turn(&mut self) {
         self.read_this_turn = 0;
-        self.read_told = false;
+        self.read_told = 0;
     }
 
     /// What was read may no longer be in the conversation.
@@ -2815,18 +2816,19 @@ mod tests {
         }
     }
 
-    /// A turn that has read much is told so once, and pointed at explore; a new turn counts from nothing.
+    /// A turn that has read much is told so, and again at each as much more, and pointed at explore; a new turn counts from nothing.
     #[test]
-    fn a_turn_that_reads_much_is_told_once_and_pointed_at_explore() {
+    fn a_turn_that_reads_much_is_told_so_and_pointed_at_explore() {
         let (dir, mut bench, cancel) = bench();
         std::fs::write(dir.path().join("big.txt"), (0..400).map(|at| format!("line {at} {}\n", "x".repeat(70))).collect::<String>()).unwrap();
         let read = |bench: &mut Workbench, start: i64| bench.run("read_file", &json!({"path": "big.txt", "start_line": start, "limit": 400}), dir.path(), &cancel).unwrap();
-        let notes = |bench: &mut Workbench| (1..=5).map(|start| read(bench, start)).filter(|out| out.contains("give the question to explore")).count();
-        assert_eq!(notes(&mut bench), 1, "told once in a turn");
+        let notes = |bench: &mut Workbench| (1..=9).map(|start| read(bench, start)).filter(|out| out.contains("give the question to explore")).count();
+        let told = notes(&mut bench);
+        assert!(told >= 2 && told == bench.read_this_turn / READ_TOLD_PAST, "at each 96 KB: {told} for {} bytes", bench.read_this_turn);
         bench.new_turn();
         // (lines read again unchanged are not sent again, and count for nothing)
         std::fs::write(dir.path().join("big.txt"), (0..400).map(|at| format!("other {at} {}\n", "y".repeat(70))).collect::<String>()).unwrap();
-        assert_eq!(notes(&mut bench), 1, "and once again in the next");
+        assert_eq!(notes(&mut bench), told, "and so again in the next");
     }
 
     /// A long file read with no place in it comes as its head and where its parts begin; asked for a place, it comes as lines, as before;
