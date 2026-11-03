@@ -23,6 +23,10 @@ use crate::tools::{self, Workbench};
 use crate::web::WebSettings;
 
 const MAX_ITERATIONS: usize = 300;
+/// An `explore` helper's requests: past these it is asked to answer with what it has.
+const HELPER_STEPS: usize = 20;
+/// What its answer brings back into the conversation.
+const HELPER_ANSWER: usize = 8 * 1024;
 const TRANSIENT_RETRIES: u32 = 3;
 const OVERFLOW_RETRIES: u32 = 2;
 /// In a row: a long job meets failures along the way, and a model that gets nowhere meets nothing else.
@@ -1578,6 +1582,12 @@ impl Agent {
                 return failed;
             }
         }
+        if name == "explore" {
+            let result = self.explore(&arguments);
+            let failed = usize::from(result.is_err());
+            self.finish_call(&call.id, result, false, started.elapsed());
+            return failed;
+        }
         let edited = edited_paths(name, &arguments, &self.workspace);
         if !edited.is_empty() {
             if let Some(Err(error)) = self.marks.as_mut().map(|marks| marks.before_edit(&edited)) {
@@ -1605,6 +1615,49 @@ impl Agent {
         let failed = usize::from(result.as_ref().map_or(true, |output| name == "execute_command" && command_failed(output)));
         self.finish_call(&call.id, result, false, started.elapsed());
         failed
+    }
+
+    /// A look across many files, by a helper with a context of its own (`explore`), as Deepseek Harness's subagents do: what it reads fills
+    /// its context and not this one, and only its answer joins the conversation. It has the looking tools only, and each of its calls goes
+    /// through the gate as the session's own do; one that would need the person's leave is not made, and it is told to say so.
+    fn explore(&mut self, arguments: &Value) -> Result<String, String> {
+        let Some(provider) = self.provider.clone() else { return Err(llm::NOT_READY.into()) };
+        let task = arguments.get("task").and_then(Value::as_str).map(str::trim).filter(|task| !task.is_empty()).ok_or_else(|| "task is empty: say what to look into".to_string())?;
+        let schemas = tools::helper_schemas();
+        let mut messages = vec![Message::text("system", prompt::helper_prompt(&self.workspace)), Message::text("user", task)];
+        let (baseline, secrets) = (self.bench.baseline.clone(), self.gate.secrets.clone());
+        // (half of the window for what it reads: the rest for its thinking and its answer)
+        let room = (self.window as usize).saturating_mul(CHARS_A_TOKEN) / 2;
+        for step in 0..=HELPER_STEPS {
+            if self.cancelled() {
+                return Err("stopped".into());
+            }
+            let last = step == HELPER_STEPS || messages.iter().map(Message::chars).sum::<usize>() > room;
+            if last {
+                messages.push(Message::text("user", prompt::HELPER_ENOUGH));
+            }
+            let request = Request { model: &self.model, messages: &messages, tools: if last { None } else { Some(&schemas) }, effort: self.effort.as_deref(), images: None, japanese_letters: false };
+            let completion = provider.stream(&request, &self.cancel, &mut |_| {}).map_err(|error| format!("the helper's request failed: {error}"))?;
+            if completion.tool_calls.is_empty() || last {
+                let answer = completion.content.trim();
+                return if answer.is_empty() { Err("the helper ended with nothing to say".into()) } else { Ok(tools::cap(answer, HELPER_ANSWER)) };
+            }
+            messages.push(completion.message());
+            for call in &completion.tool_calls {
+                let text = call.function.arguments.trim();
+                let arguments: Value = serde_json::from_str(if text.is_empty() { "{}" } else { text }).unwrap_or(Value::Null);
+                let name = call.function.name.as_str();
+                let result = if !tools::HELPER_TOOLS.contains(&name) {
+                    Err(format!("{name} is not yours: you have read_file, search_files, find_files and list_files"))
+                } else if self.gate.check(name, &arguments, &self.workspace) != Verdict::Allow {
+                    Err("this needs the user's leave, which only the agent that asked you can ask for: say in your answer that you could not read it".into())
+                } else {
+                    Workbench::run_read(name, &arguments, &self.workspace, baseline.as_deref(), &secrets, &self.cancel).0
+                };
+                messages.push(Message::tool_result(&call.id, result.unwrap_or_else(|error| format!("error: {error}"))));
+            }
+        }
+        Err("the helper ran out of requests".into())
     }
 
     /// The picture a `read_file` names, if it names one.
@@ -2041,7 +2094,7 @@ mod tests {
         assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "so are the tools");
         assert_eq!(second[2]["reasoning_content"], "thinking");
         assert!(bodies[0].get("tool_choice").is_none() && bodies[0].get("max_tokens").is_none());
-        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 12, "Dogmind's eight and the app's four");
+        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 13, "Dogmind's eight and the app's five");
     }
 
     #[test]
@@ -2057,6 +2110,33 @@ mod tests {
         let messages = bodies[1]["messages"].as_array().unwrap();
         assert_eq!(messages[3]["role"], "tool");
         assert_eq!(messages[3]["tool_call_id"], "call-1");
+    }
+
+    /// A look handed to a helper: its own requests, with its own prompt and the looking tools only, and back in the conversation only
+    /// its answer, not what it read.
+    #[test]
+    fn an_explore_helper_looks_in_its_own_context_and_only_its_answer_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "the needle is here\n").unwrap();
+        let (client, bodies) = server(vec![
+            call_answer("explore", serde_json::json!({"task": "Where is the needle?"})),
+            call_answer("search_files", serde_json::json!({"pattern": "needle"})),
+            text_answer("The needle is at a.txt:1."),
+            text_answer("found it"),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("find the needle".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:The needle is at a.txt:1.")), "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let helper = bodies[1]["messages"].as_array().unwrap();
+        assert!(helper[0]["content"].as_str().unwrap().starts_with("You look into a project for another agent"), "{}", helper[0]);
+        assert_eq!(helper[1]["content"], "Where is the needle?");
+        let names: Vec<&str> = bodies[1]["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["list_files", "read_file", "search_files", "find_files"]);
+        assert!(bodies[2]["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool" && message["content"].as_str().unwrap().contains("the needle is here")), "the helper saw what it searched");
+        let after = serde_json::to_string(&bodies[3]["messages"]).unwrap();
+        assert!(after.contains("The needle is at a.txt:1.") && !after.contains("the needle is here"), "the conversation has the answer, and not what the helper read: {after}");
     }
 
     #[test]

@@ -12541,6 +12541,7 @@ pub(crate) fn tool_name(tool: &str) -> &str {
         "web_search" => "Web search",
         "web_read" => "Read the web",
         "check_page" => "Check a page",
+        "explore" => "Look into",
         other => other,
     }
 }
@@ -13387,7 +13388,7 @@ mod tests {
     #[test]
     fn every_constant_word_has_its_japanese() {
         let mut words: Vec<&str> = COMMANDS.iter().map(|(_, about)| *about).collect();
-        words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page"].map(tool_name));
+        words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page", "explore"].map(tool_name));
         words.extend(EFFORTS.iter().map(|(_, name)| *name));
         words.extend(MODES.iter().map(|(_, name)| *name));
         words.extend(THEMES.iter().map(|(_, name)| *name));

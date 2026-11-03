@@ -207,6 +207,21 @@ pub fn user_message_in(text: &str, now: &str, language: Option<&str>) -> String 
 /// How what goes back to a model stopped from writing code in its reasoning begins.
 pub const DRAFT_NOTE: &str = "[From the app, not the user] ";
 pub const CONTINUE_NUDGE: &str = "Your last answer was cut off by the output limit. Continue exactly where it stopped.";
+/// What an `explore` helper is told: a context of its own, which it fills so that the conversation that asked does not, and an answer
+/// that is all the other agent will see of it.
+pub fn helper_prompt(workspace: &Path) -> String {
+    format!(
+        "You look into a project for another agent, and answer it. The project is at {}; relative paths start there.\n\
+         - Find the places first: search_files for words and names, find_files for file names. Then read only the lines that answer the task, with read_file's start_line and limit. A long file read with neither comes as its outline.\n\
+         - You can read and search, and nothing else. Change nothing, and suggest no changes unless the task asks for them.\n\
+         - Answer with what you found: each fact with its file and line (`path:line`), and what you looked for and did not find. Quote only the lines that matter. Your answer is all the other agent sees, so leave nothing in it that is not for that agent.\n\
+         - Write in the language the task is written in.",
+        workspace.display()
+    )
+}
+/// What a helper that has used its requests is told: an answer, with what it has.
+pub const HELPER_ENOUGH: &str = "[From the app] That is as much looking as there is room for. Answer now, with what you have found, and say what you did not get to.";
+
 /// The app's word to the model: files changed, and nothing has looked at them since. Marked as the app's: a real model took it for the person's, and argued with itself over what they wanted.
 pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, or it would not be worth running, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";
 
@@ -274,7 +289,8 @@ mod tests {
         let tools = crate::tools::schemas_for(false, false, false, Vec::new()).to_string();
         // (5,150 until check_page took views and a wait: pictures at a phone's width and after an animation were what a real model, asked, missed most;
         // then steps, to click and type in a page as Playwright would, which the person asked for)
-        assert!(tools.len() < 5_550, "the tools have grown to {} characters", tools.len());
+        // (then explore, a look by a helper in a context of its own, which saves a review far more than it costs: 197K tokens of one went on reading)
+        assert!(tools.len() < 5_800, "the tools have grown to {} characters", tools.len());
         assert!(user_message_in("x", "2026-11-02 20:01:18 +09:00", None).len() < 60, "what rides on every message");
     }
 
