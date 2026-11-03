@@ -2710,6 +2710,12 @@ mod tests {
         assert!(!plain("https://user:pass@example.com/"));
         assert!(!plain(&format!("https://example.com/{}", "a".repeat(49))));
         assert!(!plain("https://example.com/C:\\Users\\me/x"));
+        // (a key in a path, short of what a search query is looked at for, carries as much)
+        assert!(!plain("https://example.com/k/1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d"), "32 hex digits");
+        assert!(!plain("https://example.com/x/Zk9xQ2Vb8LmN4pRt7sWy3uHa"), "24 of base64");
+        assert!(plain("https://github.com/rust-lang/rust/blob/master/library/std/src/lib.rs"));
+        assert!(plain("https://example.com/items/550e8400-e29b-41d4-a716-446655440000"), "a UUID's parts");
+        assert!(plain("https://docs.python.org/3/library/concurrent.futures.html"));
     }
 
     #[test]

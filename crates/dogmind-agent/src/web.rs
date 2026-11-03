@@ -249,6 +249,13 @@ pub fn address_carries_nothing(url: &str) -> bool {
     if path.chars().count() > MOST_PATH || path.split('/').any(|piece| piece.chars().count() > MOST_PIECE) {
         return false;
     }
+    // A run of letters and digits as a key is written, too short for what a search query is looked at for: 20 hex digits and more (a
+    // 32-digit key among them), or 24 of base64, with both letters and digits. A word, a date, a number or a UUID's parts are not.
+    static RUNS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let runs = RUNS.get_or_init(|| Regex::new(r"[0-9A-Fa-f]{20,}|[A-Za-z0-9+_=]{24,}").expect("the pattern is valid"));
+    if runs.find_iter(path).any(|run| run.as_str().chars().any(|c| c.is_ascii_digit()) && run.as_str().chars().any(|c| c.is_ascii_alphabetic())) {
+        return false;
+    }
     query_problem(&json!({"queries": [path]})).is_none()
 }
 
