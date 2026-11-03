@@ -299,6 +299,22 @@ fn take_the_place(new: &Path, path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// A file's whole text, written beside it and then in its place: a write that fails on the way (a full disk, the app ended) leaves the file
+/// as it was, where writing over it left it empty or cut.
+fn written_whole(path: &Path, bytes: &[u8], exists: bool) -> std::io::Result<()> {
+    let new = written_beside(path);
+    let done = std::fs::File::create(&new)
+        .and_then(|mut out| {
+            std::io::Write::write_all(&mut out, bytes)?;
+            out.sync_all()
+        })
+        .and_then(|()| if exists { take_the_place(&new, path) } else { std::fs::rename(&new, path) });
+    if done.is_err() {
+        let _ = std::fs::remove_file(&new);
+    }
+    done
+}
+
 /// Every file's new text, or none: each is written whole beside its file first, and only when all of them are on the disk do they take
 /// the files' places, one by one. A failure on the way puts back what had changed. No file is ever left part written, and what is said
 /// of a failure is what the files are.
@@ -625,7 +641,7 @@ impl Workbench {
             before.clear();
         }
         before.extend_from_slice(content.as_bytes());
-        std::fs::write(&path, &before).map_err(|error| format!("{given}: {error}"))?;
+        written_whole(&path, &before, exists).map_err(|error| format!("{given}: {error}: {}", if exists { "the file is as it was" } else { "it was not made" }))?;
         self.seen.insert(path, sha16(&before));
         if going_on {
             self.cut_file = None;
@@ -2655,6 +2671,29 @@ mod tests {
         // And done again with nothing in the way, both change.
         bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap();
         assert_eq!((std::fs::read_to_string(&first).unwrap(), std::fs::read_to_string(&second).unwrap()), ("ALPHA\n".to_string(), "BETA\n".to_string()));
+    }
+
+    /// A file written again that cannot take its new text is as it was, not emptied, and nothing is left beside it.
+    #[test]
+    fn a_file_written_again_that_fails_is_as_it_was() {
+        let (dir, mut bench, cancel) = bench();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "alpha\n").unwrap();
+        bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
+        let mut locked = std::fs::metadata(&file).unwrap().permissions();
+        locked.set_readonly(true);
+        std::fs::set_permissions(&file, locked.clone()).unwrap();
+        let write = json!({"path": "a.txt", "content": "omega\n"});
+        let said = bench.run("create_file", &write, dir.path(), &cancel).unwrap_err();
+        locked.set_readonly(false);
+        std::fs::set_permissions(&file, locked).unwrap();
+        assert!(said.contains("the file is as it was"), "{said}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+        let left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.contains("dogmind-edit")).collect();
+        assert!(left.is_empty(), "{left:?}");
+        bench.run("create_file", &write, dir.path(), &cancel).unwrap();
+        bench.run("create_file", &json!({"path": "new.txt", "content": "made\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!((std::fs::read_to_string(&file).unwrap(), std::fs::read_to_string(dir.path().join("new.txt")).unwrap()), ("omega\n".to_string(), "made\n".to_string()));
     }
 
     #[test]
