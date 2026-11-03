@@ -397,13 +397,12 @@ pub(crate) const BUNDLED_FILES: [&str; 2] = ["BIZUDGothic-Regular.ttf", "BIZUDGo
 
 /// Where the fonts are: `fonts\\` beside the program, and for a build that has not been packaged, what fetch_tools.py has fetched.
 pub(crate) fn font_folders() -> Vec<std::path::PathBuf> {
-    let mut folders: Vec<std::path::PathBuf> = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|folder| folder.join("fonts"))).into_iter().collect();
+    let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|folder| folder.join("fonts")));
     #[cfg(debug_assertions)]
-    {
-        let cache = std::env::var_os("DOGMIND_TOOLS_CACHE").map(std::path::PathBuf::from).or_else(|| std::env::var_os("LOCALAPPDATA").map(|local| std::path::Path::new(&local).join("DogmindBuild").join("tools-cache")));
-        folders.extend(cache);
-    }
-    folders
+    let cache = std::env::var_os("DOGMIND_TOOLS_CACHE").map(std::path::PathBuf::from).or_else(|| std::env::var_os("LOCALAPPDATA").map(|local| std::path::Path::new(&local).join("DogmindBuild").join("tools-cache")));
+    #[cfg(not(debug_assertions))]
+    let cache = None;
+    beside.into_iter().chain(cache).collect()
 }
 
 /// The fonts for this process alone, which installs nothing: its RichEdits are in it and see them, and a browser it starts does not.
