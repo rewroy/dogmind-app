@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -485,8 +485,9 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
     for _ in 0..TRIES {
         let started = std::time::Instant::now();
-        let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel)?;
-        let _ = crate::sandbox::run("rmdir /s /q \"%TEMP%\\dogmind-page\"", &cwd, workspace, false, Duration::from_secs(20), cancel);
+        let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
+        clear_profile(&cwd, workspace);
+        let done = done?;
         (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
         #[cfg(debug_assertions)]
         if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
@@ -494,7 +495,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         }
         finished = done.status == Some(0) && !dom.trim().is_empty();
         how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
-        if finished || started.elapsed() > LIMIT / 2 || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension") {
+        if finished || cancel.load(Ordering::Relaxed) || started.elapsed() > LIMIT / 2 || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension") {
             break;
         }
         // (its crashes come together: a real run lost all four tries inside 6.5 s, and that page opened ten times of ten afterwards. Why is not known.)
@@ -532,6 +533,10 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     // still showed.
     let taken_at = chrono::Local::now().format("%Y%m%d-%H%M%S%3f").to_string();
     for view in &views {
+        if cancel.load(Ordering::Relaxed) {
+            out.push_str(&format!("No picture at {} was taken: the turn was stopped.\n", view.label));
+            continue;
+        }
         let tag = view.label.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
         let (frame, shot, picture) = (temp.join("dogmind-frame.html"), temp.join("dogmind-shot.png"), temp.join(format!("dogmind-page-{taken_at}-{tag}.png")));
         let _ = std::fs::remove_file(&picture);
@@ -544,9 +549,12 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let line = format!("\"{}\" {} --window-size={},{} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --screenshot=\"{}\" \"{}\"", program.display(), flags(), view.width.max(600) + 64, view.height + 160, shot.display(), plain(&frame));
         let mut taken = false;
         for _ in 0..3 {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let _ = std::fs::remove_file(&shot);
             let _ = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
-            let _ = crate::sandbox::run("rmdir /s /q \"%TEMP%\\dogmind-page\"", &cwd, workspace, false, Duration::from_secs(20), cancel);
+            clear_profile(&cwd, workspace);
             // (a browser that fell over while writing it leaves an empty file, or one that cannot be read)
             let Ok(whole) = image::open(&shot) else { continue };
             if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
@@ -563,6 +571,12 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         });
     }
     Ok(out)
+}
+
+/// The browser's profile, gone after each run. Not stopped by the turn's Stop, which is what most often ends a run early: under it, the
+/// removal ended as it began and the profile stayed. A browser that did not start has its profile go too.
+fn clear_profile(cwd: &Path, workspace: &Path) {
+    let _ = crate::sandbox::run("rmdir /s /q \"%TEMP%\\dogmind-page\"", cwd, workspace, false, Duration::from_secs(20), &AtomicBool::new(false));
 }
 
 /// The pictures of checks more than a week old: each has a name of its own, and they would gather in the sandbox's temporary folder.
