@@ -960,6 +960,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             return was as LRESULT;
         }
         WM_DPICHANGED_AFTERPARENT => {
+            // (laid out again at the new size of things, as when the rect changes: drawing reads the DPI each time, and the layout did not)
+            if !host.services.get().is_null() {
+                host.rect_changed();
+            }
             InvalidateRect(window, std::ptr::null(), 0);
             return 0;
         }
