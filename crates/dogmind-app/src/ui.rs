@@ -2118,6 +2118,16 @@ unsafe fn text_document(edit: HWND) -> *mut core::ffi::c_void {
     if found < 0 { std::ptr::null_mut() } else { document }
 }
 
+/// What `text_document` gave, given back.
+unsafe fn release_document(document: *mut core::ffi::c_void) {
+    if document.is_null() {
+        return;
+    }
+    let vtable = *(document as *const *const usize);
+    let release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32 = std::mem::transmute(*vtable.add(2));
+    release(document);
+}
+
 /// While text goes in piece by piece, the control lays nothing out: `ITextDocument::Freeze`, and `Unfreeze`.
 unsafe fn hold_layout(document: *mut core::ffi::c_void, hold: bool) {
     if document.is_null() {
@@ -12117,6 +12127,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 let _ = parked.agent.commands.send(Command::Quit);
             }
             app.engine = None;
+            // (before the controls go, after this: the document holds the text services, and they hold the control's host, which goes with
+            // its window whether anything holds it or not)
+            release_document(std::mem::replace(&mut app.transcript_document, std::ptr::null_mut()));
             PostQuitMessage(0);
             0
         }
