@@ -1848,6 +1848,22 @@ mod tests {
     }
 
     #[test]
+    fn several_processes_share_one_memory_cap() {
+        let holder = tempfile::tempdir().unwrap();
+        let place = holder.path().join("work");
+        std::fs::create_dir_all(&place).unwrap();
+        // Each alone fits under the cap; four together do not.
+        let one = "try { $a = [Runtime.InteropServices.Marshal]::AllocHGlobal(500000000); Write-Output held; Start-Sleep 8 } catch { Write-Output refused }";
+        let line = format!("powershell -NoProfile -Command \"$p = 1..4 | ForEach-Object {{ $i = New-Object Diagnostics.ProcessStartInfo 'powershell.exe', '-NoProfile -Command {}'; $i.UseShellExecute = $false; [Diagnostics.Process]::Start($i) }}; $p | ForEach-Object {{ $_.WaitForExit() }}\"", one);
+        let done = run_limited(&line, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(1200u64 << 20)).unwrap();
+        let said = decode(&done.stdout);
+        eprintln!("status {:?} out {} err {}", done.status, said.trim(), decode(&done.stderr).trim());
+        assert!(said.contains("held"), "one fits: {said}");
+        assert!(said.matches("held").count() < 4, "four of 500 MB under a cap of 1200 MB: {said}");
+        drop(holder);
+    }
+
+    #[test]
     fn a_folder_outside_the_workspace_does_not_run() {
         let folder = work_folder("cwd");
         assert!(run("echo x", Path::new("C:\\Windows"), &folder, false, Duration::from_secs(5), &AtomicBool::new(false)).is_err());
