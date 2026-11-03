@@ -4,6 +4,8 @@ description = "Dogmind's agent loop, tools and approvals, over any OpenAI-compat
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
