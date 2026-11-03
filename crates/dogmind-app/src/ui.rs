@@ -1855,6 +1855,9 @@ struct App {
     /// When the person last did.
     scrolled_up_at: Option<std::time::Instant>,
     line_start: bool,
+    /// Thinking has gone into the transcript and no answer has followed it yet: the answer begins on a line of its own, whether the thinking
+    /// is shown by then or not.
+    thinking_written: bool,
     in_code: bool,
     /// The level of the heading being written; none is 0.
     heading: u8,
@@ -3310,6 +3313,11 @@ impl App {
                 show(*button, false);
             }
         }
+    }
+
+    /// One of the buttons an answer has beside it: copy, or branch.
+    fn is_answer_button(&self, window: HWND) -> bool {
+        !window.is_null() && (self.copy_buttons.contains(&window) || self.fork_buttons.contains(&window))
     }
 
     /// The pointer over the transcript, at this height, or gone from it.
@@ -9567,12 +9575,14 @@ impl App {
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.thinking.clear();
                 self.answer.clear();
+                self.thinking_written = false;
                 self.set_activity(t("Thinking…").into());
             }
             Event::Reasoning(text) => {
                 if self.settings.show_thinking {
                     self.append(&text, Style::Thinking);
                     self.line_start = text.ends_with('\n');
+                    self.thinking_written = true;
                 }
                 self.thinking.push_str(&text);
                 self.set_activity(t("Thinking…").into());
@@ -9581,7 +9591,8 @@ impl App {
                 if self.answer.is_empty() {
                     // (the words coming say so: the ring alone says it is not done)
                     self.set_activity(" ".into());
-                    if self.settings.show_thinking {
+                    // The thinking that went in ends here, shown still or hidden since: the answer is not written on after it.
+                    if std::mem::take(&mut self.thinking_written) {
                         self.end_line();
                     }
                 }
@@ -10943,10 +10954,10 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
     }
     if message == WM_MOUSELEAVE {
         app.copy_tracked = false;
-        // (onto a copy button: it was shown to be used)
+        // (onto an answer's copy or branch button: it was shown to be used)
         let mut point = POINT { x: 0, y: 0 };
         GetCursorPos(&mut point);
-        if !app.copy_buttons.contains(&WindowFromPoint(point)) {
+        if !app.is_answer_button(WindowFromPoint(point)) {
             app.copy_pointer_at(None);
         }
         app.run_hover = None;
@@ -11466,12 +11477,14 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_BUTTON_LEFT => {
-            // The pointer has left a copy button: back to the transcript it stays shown, elsewhere it goes as the transcript's leaving would have.
-            if app.copy_buttons.contains(&(wparam as HWND)) {
+            // The pointer has left an answer's button: back to the transcript, or onto the other button, they stay shown; elsewhere they go as the
+            // transcript's leaving would have. (The branch button was left out of this, and going onto it hid both, the pointer was over the
+            // transcript again, and they came back: over and over.)
+            if app.is_answer_button(wparam as HWND) {
                 let mut point = POINT { x: 0, y: 0 };
                 GetCursorPos(&mut point);
                 let under = WindowFromPoint(point);
-                if under != app.transcript && !app.copy_buttons.contains(&under) {
+                if under != app.transcript && !app.is_answer_button(under) {
                     app.copy_pointer_at(None);
                 }
             }
@@ -13118,6 +13131,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             wheel_rest: 0,
             scrolled_up_at: None,
             line_start: true,
+            thinking_written: false,
             in_code: false,
             heading: 0,
             italic: false,
