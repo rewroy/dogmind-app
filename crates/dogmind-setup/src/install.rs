@@ -274,12 +274,13 @@ fn through_a_link(folder: &Path, file: &str) -> bool {
     false
 }
 
-/// What the app left beside itself when it replaced its own running file.
+/// What was left beside the app's files when they were replaced while it ran from them (`NAME.previous-TIME.EXT`), in its folder and in fonts.
 fn remove_old_copies(folder: &Path) {
-    for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name.starts_with("dogmind-app.previous-") && name.ends_with(".exe") {
-            let _ = std::fs::remove_file(entry.path());
+    for place in [folder.to_path_buf(), folder.join("fonts")] {
+        for entry in std::fs::read_dir(&place).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().contains(".previous-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
 }
@@ -447,7 +448,7 @@ mod tests {
         scene.run(&mut first, None, None).unwrap();
         let folder = scene.folder();
         // What the machine and the person have added since.
-        tree(&folder, &[("tools\\.open-to-sandbox", b""), ("notes.txt", b"mine"), ("dogmind-app.previous-1.exe", b"old copy")]);
+        tree(&folder, &[("tools\\.open-to-sandbox", b""), ("notes.txt", b"mine"), ("dogmind-app.previous-1.exe", b"old copy"), ("straydog.previous-1.exe", b"old engine")]);
         // The person's data is elsewhere: it is what the data folder holds, and no part of this comes near it.
         let data = scene.dir.path().join("DogmindApp");
         tree(&data, &[("settings.json", b"{}"), ("sessions\\one.jsonl", b"s"), ("models\\m.gguf", b"m")]);
@@ -460,7 +461,7 @@ mod tests {
         assert!(!folder.join("tools\\old").exists(), "what is gone from the package goes, with its folder");
         assert_eq!(std::fs::read(folder.join("notes.txt")).unwrap(), b"mine", "a person's file stays");
         assert!(folder.join("tools\\.open-to-sandbox").exists(), "and what says the folder is open: its entries are still on it, and new files inherit them");
-        assert!(!folder.join("dogmind-app.previous-1.exe").exists());
+        assert!(!folder.join("dogmind-app.previous-1.exe").exists() && !folder.join("straydog.previous-1.exe").exists());
         assert_eq!(read_manifest(&folder).unwrap().version, "2.0.0");
         assert_eq!(walk(&data), ["models\\m.gguf", "sessions\\one.jsonl", "settings.json"]);
     }

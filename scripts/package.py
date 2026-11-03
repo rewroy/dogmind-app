@@ -15,6 +15,7 @@ an error for it to be missing, as an app without it behaves differently from wha
 
 LICENSE.txt holds this app's license, those of Dogmind, Straydog, Lucide and the CUDA toolkit whose libraries go beside the engine, and the list of Rust crates in the executable.
 """
+import filecmp
 import importlib.util
 import json
 import os
@@ -22,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 import zipfile
 from pathlib import Path, PureWindowsPath
@@ -129,6 +131,28 @@ def extract(archive, target, strip=None, keep=lambda name: True):
 
 def size_of(folder):
     return sum(file.stat().st_size for file in folder.rglob("*") if file.is_file())
+
+
+def put(source, target):
+    """`source` at `target`, even with the app running from this folder: a file that is the same already is left alone, and one in use (the
+    app, its engine, their libraries, a font it loaded) is moved aside first as NAME.previous-TIME.EXT, which Windows allows for a file in use,
+    where the copy running goes on reading it. The app sees its new build and restarts into it; what was moved aside goes at the next run."""
+    source, target = Path(source), Path(target)
+    if target.is_file() and target.stat().st_size == source.stat().st_size and filecmp.cmp(source, target, shallow=False):
+        return
+    try:
+        shutil.copy(source, target)
+    except PermissionError:
+        target.rename(target.with_name(f"{target.stem}.previous-{time.strftime('%H%M%S')}{target.suffix}"))
+        shutil.copy(source, target)
+
+
+def remove(target):
+    """A file that is no longer shipped: moved aside if it is in use, as `put` does."""
+    try:
+        target.unlink()
+    except PermissionError:
+        target.rename(target.with_name(f"{target.stem}.previous-{time.strftime('%H%M%S')}{target.suffix}"))
 
 
 def install_wheel(wheel, site, files):
@@ -301,33 +325,37 @@ def main():
     target = ROOT / "dist" / "DogmindApp"
     target.mkdir(parents=True, exist_ok=True)
     parts = list(PARTS)
-    # (what an update left beside the exe is not part of what is shipped)
-    for old in target.glob("dogmind-app.previous-*.exe"):
-        old.unlink()
+    # (what an update moved aside is not part of what is shipped; one still in use goes next time)
+    for old in [*target.glob("*.previous-*"), *target.glob("fonts/*.previous-*")]:
+        try:
+            old.unlink()
+        except PermissionError:
+            pass
     tool_licenses = assemble_tools(target / "tools")
     # The Japanese face, loaded by the app for itself and installed nowhere. Beside the exe and not in it: Windows maps a file as it needs it, and nothing of it comes to memory before.
     tools = fetched()
     lock = json.loads(tools.LOCK.read_text(encoding="utf-8"))["fonts"]
     (target / "fonts").mkdir(exist_ok=True)
     for item in lock["files"]:
-        shutil.copy(tools.fetch(item["url"], item["file"], item["sha256"]), target / "fonts" / item["file"])
+        put(tools.fetch(item["url"], item["file"], item["sha256"]), target / "fonts" / item["file"])
     font_license = tools.fetch(lock["license"]["url"], lock["license"]["file"], lock["license"]["sha256"])
     parts.append(("BIZ UDGothic", font_license, "The Japanese type of the interface, in fonts\\, from Morisawa's open release (github.com/googlefonts/morisawa-biz-ud-gothic)."))
     # What a person reads first: how to get past SmartScreen, update and remove it.
-    shutil.copy(ROOT / "assets" / "READ-ME-FIRST.txt", target / "READ-ME-FIRST.txt")
-    # (copy, not copy2: a file's date here says when it was installed, or an update looks as if it changed nothing)
-    shutil.copy(ROOT / "target" / "release" / "dogmind-app.exe", target / "dogmind-app.exe")
+    put(ROOT / "assets" / "READ-ME-FIRST.txt", target / "READ-ME-FIRST.txt")
+    # (copy, not copy2: a file's date here says when it was installed, or an update looks as if it changed nothing; and the running app sees it as new)
+    put(ROOT / "target" / "release" / "dogmind-app.exe", target / "dogmind-app.exe")
     straydog = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT.parent / "Straydog" / "target" / "release" / "straydog.exe"
     if straydog.is_file():
-        shutil.copy(straydog, target / "straydog.exe")
+        put(straydog, target / "straydog.exe")
         # The cuBLAS it links, from the toolkit it was built with: a machine with none, or with another, needs its own beside it.
         libraries, toolkit = cublas_for(straydog, toolkits())
         if not libraries:
             sys.exit(f"the cuBLAS {straydog} imports is in none of {[str(place) for place in toolkits()]}: name its toolkit after it")
         for old in target.glob("cublas*64_*.dll"):
-            old.unlink()
+            if old.name not in {library.name for library in libraries}:
+                remove(old)
         for library in libraries:
-            shutil.copy(library, target / library.name)
+            put(library, target / library.name)
         parts.append(("NVIDIA CUDA Toolkit", toolkit / "LICENSE", "The cuBLAS libraries beside the engine."))
     else:
         print(f"no straydog.exe at {straydog}: the app will ask for one", file=sys.stderr)
@@ -349,7 +377,7 @@ def main():
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zip_file:
         for file in sorted(target.rglob("*")):
             # (`.open-to-sandbox` belongs to a folder that has been opened on this machine)
-            if file.is_file() and file.suffix.lower() != ".pdb" and file.name != ".open-to-sandbox":
+            if file.is_file() and file.suffix.lower() != ".pdb" and file.name != ".open-to-sandbox" and ".previous-" not in file.name:
                 zip_file.write(file, Path("DogmindApp") / file.relative_to(target))
     print(f"{archive}: {archive.stat().st_size / 1048576:.0f} MB, {size_of(target) / 1048576:.0f} MB unpacked")
     make_setup(target, ROOT / "dist" / f"DogmindSetup-{version}.exe", version)

@@ -353,6 +353,7 @@ const JA: &[(&str, &str)] = &[
     ("A skill turned off is neither offered to the model nor started with /name. A session already under way keeps its list, but cannot read one that is off.", "オフにしたスキルはモデルに示されず、/名前 でも起動しません。始まっているセッションは一覧をそのまま持ちますが、オフのスキルは読めません。"),
     ("This project's", "このプロジェクト"),
     ("Memory", "記憶"),
+    ("A new version is here. The app restarts into it when this work is done.", "新しいバージョンが届きました。この作業が終わったら、アプリを再起動して切り替えます。"),
     ("This project", "このプロジェクトについて"),
     ("You, in every project", "あなたについて（すべてのプロジェクト）"),
     ("What the model keeps from one session to the next, and a new session reads. Remove what is wrong or should not be kept.", "モデルがセッションをまたいで覚えていることで、新しいセッションが読み込みます。間違っているものや残したくないものは削除してください。"),

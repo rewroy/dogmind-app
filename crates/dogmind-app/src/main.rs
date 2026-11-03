@@ -28,10 +28,20 @@ fn main() -> ExitCode {
     dogmind_agent::sandbox::no_error_boxes();
     // Before any font is made.
     let _ = paint::japanese_face();
-    let first = std::env::args_os().nth(1);
-    // (from Add or remove programs: `dogmind-uninstall.exe` opens the page that does it, as Settings would)
-    if first.as_deref() == Some(std::ffi::OsStr::new("--remove")) {
-        return ui::run(None, true);
+    let mut folder = None;
+    let mut restart = ui::Restart::default();
+    let mut arguments = std::env::args_os().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.to_str() {
+            // (from Add or remove programs: `dogmind-uninstall.exe` opens the page that does it, as Settings would)
+            Some("--remove") => return ui::run(None, true, ui::Restart::default()),
+            // (from a copy of this app that is giving way to a newer one: see `ui::Restart`)
+            Some("--after") => restart.after = arguments.next().and_then(|pid| pid.to_str()?.parse().ok()),
+            Some("--resume") => restart.resume = arguments.next().map(std::path::PathBuf::from),
+            Some("--hidden") => restart.hidden = true,
+            _ if folder.is_none() => folder = Some(std::path::PathBuf::from(argument)),
+            _ => {}
+        }
     }
-    ui::run(first.map(std::path::PathBuf::from), false)
+    ui::run(folder, false, restart)
 }
