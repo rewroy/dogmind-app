@@ -1256,6 +1256,8 @@ mod emoji {
 /// The transcript in UI Automation, as a RichEdit window has it: a document whose text a screen reader can read and move through. A
 /// windowless RichEdit makes that element itself (`IRicheditWindowlessAccessibility`); the host gives it a place (a site) under an element
 /// of its own for the window, which UI Automation is given for it.
+// (Windows's names for UI Automation's constants, which are matched on there)
+#[allow(non_upper_case_globals)]
 mod access {
     use std::ffi::c_void;
 
