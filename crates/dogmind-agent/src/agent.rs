@@ -279,6 +279,31 @@ pub fn start(config: Config, events: Sender<Event>, wake: Box<dyn Fn() + Send>) 
     Handle { commands, cancel, live, interject }
 }
 
+/// `run`, with the person's Stop passed on to `halt` within 15 ms of it: a stream that the app stops too has a flag of its own, and the
+/// person's is never set by anything else.
+fn with_the_persons_stop<R>(person: &AtomicBool, halt: &AtomicBool, run: impl FnOnce() -> R) -> R {
+    struct Over<'a>(&'a AtomicBool);
+    impl Drop for Over<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+    let running = AtomicBool::new(true);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while running.load(Ordering::Relaxed) {
+                if person.load(Ordering::Relaxed) {
+                    halt.store(true, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        });
+        // (on the way out however it goes, a panic too, or the scope would wait for the watch for ever)
+        let _over = Over(&running);
+        run()
+    })
+}
+
 /// How long before asking again. A server that says it is busy or loading needs longer than one that dropped a connection.
 fn retry_pause(attempt: u32, said: &str) -> Duration {
     let first = if said == llm::SERVER_BUSY { 5.0 } else { 1.5 };
@@ -1147,7 +1172,10 @@ impl Agent {
             let may_stop_drafting = cuts && drafts_stopped < MAX_DRAFTS_STOPPED && !wrote;
             let (draft_fences, draft_lines) = (DRAFT_FENCES, DRAFT_LINES);
             let (mut code_lines, mut line_starts) = (0usize, 0usize);
-            let cancel = self.cancel.clone();
+            // The app's own stops (a draft, a file cut to get it on disk) end the stream through a flag of the stream's: on the person's,
+            // and taken back after, a Stop pressed as one of them fired was taken for it, and the turn went on. The person's is passed on to it.
+            let halt = AtomicBool::new(self.cancelled());
+            let cancel = &halt;
             let events = self.events.clone();
             let wake = &self.wake;
             let (workspace, bench) = (&self.workspace, &self.bench);
@@ -1157,7 +1185,12 @@ impl Agent {
             self.emit(Event::RequestStarted);
             self.emit(Event::Usage { used: base, window, usage: Usage::default() });
             let mut meter = StreamMeter::new(base, Instant::now());
-            let result = provider.stream(&request, &self.cancel, &mut |delta| {
+            let person = &self.cancel;
+            let result = with_the_persons_stop(person, &halt, || provider.stream(&request, &halt, &mut |delta| {
+                // (at once while words come, as the stream looks at its flag after each: the watch is for the wait before them)
+                if person.load(Ordering::Relaxed) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
                 let now = Instant::now();
                 let mut told = match delta {
                     Delta::Reasoning(text) => {
@@ -1209,18 +1242,15 @@ impl Agent {
                     }
                     wake();
                 }
-            });
-            // (it had all come by the time the stop was looked at, or the request failed first: no one needs what was cut, and what follows must not take the stop for the person's)
-            if (cut || drafting) && !matches!(result, Err(LlmError::Cancelled)) {
-                self.cancel.store(false, Ordering::Relaxed);
-            }
+            }));
+            // (a Stop of the person's, whatever else stopped the stream, is the turn's end)
+            let stopped_by_the_app = (cut || drafting) && !self.cancelled();
             let base = self.messages.len();
             let saved = if cuts { cut_answer(&written, &reasoned, &calling, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) } else { None };
             // Writing a file out in its reasoning: every token of it is typed again in the call. It goes on from what it had decided, in a request of which all but the last few tokens are
             // read already. Whatever it was thinking about before is left to it, however long: only this is stopped, and what it is told is to write. Its connection has closed by now, so
             // the engine is not writing into nothing. (The tokens it wrote were spent all the same.)
-            if drafting && matches!(result, Err(LlmError::Cancelled)) {
-                self.cancel.store(false, Ordering::Relaxed);
+            if drafting && stopped_by_the_app && matches!(result, Err(LlmError::Cancelled)) {
                 generated += meter.tokens;
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
@@ -1232,8 +1262,7 @@ impl Agent {
             let mut completion = match result {
                 Ok(completion) => completion,
                 // Ended here, not by the person: the rest goes on in the next call.
-                Err(LlmError::Cancelled) if cut && saved.is_some() => {
-                    self.cancel.store(false, Ordering::Relaxed);
+                Err(LlmError::Cancelled) if cut && stopped_by_the_app && saved.is_some() => {
                     // (an answer cut here has no count of its own, and it is the long ones that come this way)
                     generated += meter.tokens;
                     let (answer, path, tail) = saved.expect("just looked at");
@@ -2914,6 +2943,29 @@ mod tests {
         assert_eq!(bodies.lock().unwrap().len(), 1, "not a Japanese conversation");
     }
 
+    /// The person's Stop reaches a stream's own flag while it runs; what the app sets on that flag never reaches the person's, so a Stop
+    /// pressed as the app stopped a draft is still there after.
+    #[test]
+    fn the_persons_stop_reaches_the_stream_and_the_apps_does_not_reach_the_person() {
+        let (person, halt) = (AtomicBool::new(false), AtomicBool::new(false));
+        let seen = with_the_persons_stop(&person, &halt, || {
+            halt.store(true, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(60));
+            person.load(Ordering::Relaxed)
+        });
+        assert!(!seen && !person.load(Ordering::Relaxed));
+        let halt = AtomicBool::new(false);
+        let began = Instant::now();
+        with_the_persons_stop(&person, &halt, || {
+            person.store(true, Ordering::Relaxed);
+            while !halt.load(Ordering::Relaxed) && began.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        assert!(halt.load(Ordering::Relaxed) && began.elapsed() < Duration::from_millis(500), "{:?}", began.elapsed());
+        assert!(person.load(Ordering::Relaxed), "the person's stays");
+    }
+
     /// A stop that met a failure on the way must not read as the person's: the turn goes on as after any failure.
     #[test]
     fn a_draft_stopped_as_the_server_fails_does_not_end_the_turn_as_stopped() {
@@ -3485,11 +3537,15 @@ mod tests {
     #[test]
     fn a_word_to_go_on_does_not_outlive_a_stopped_turn() {
         let dir = tempfile::tempdir().unwrap();
-        let cut_and_stopped: Step = Box::new(|cancel: &AtomicBool| {
-            cancel.store(true, Ordering::Relaxed);
+        // (the person's Stop, as the answer ended: the flag a stream is given is its own)
+        let person = Arc::new(std::sync::OnceLock::<Arc<AtomicBool>>::new());
+        let pressed = person.clone();
+        let cut_and_stopped: Step = Box::new(move |_: &AtomicBool| {
+            pressed.get().expect("given before the turn").store(true, Ordering::Relaxed);
             Ok(llm::Completion { content: "part".into(), finish: "length".into(), ..llm::Completion::default() })
         });
         let (run, provider) = scripted(dir.path(), vec![cut_and_stopped, says("answer")], Mode::Default);
+        person.set(run.handle.cancel.clone()).unwrap();
         run.handle.commands.send(Command::Send("write".into())).unwrap();
         let path = session_file(&run);
         until_end(&run, Decision::Reject);
