@@ -926,11 +926,6 @@ unsafe fn field_cue(edit: HWND, words: &str) {
     SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as LPARAM);
 }
 
-/// Which answer the pointer is on: the first whose copy button's row is not above it. `rows`: from the last answer up, each with that row's height in the transcript.
-fn copy_under(rows: &[(usize, i32)], pointer: Option<i32>, button: i32) -> Option<usize> {
-    let pointer = pointer?;
-    rows.iter().rev().find(|(_, y)| y + button > pointer).map(|(at, _)| *at)
-}
 
 /// When a session began, as short as it can be said: the time today, the day this year, or else the year. `today`: as `today_text` says it.
 fn short_when(created: &str, today: &str) -> String {
@@ -1911,11 +1906,8 @@ struct App {
     selected_provider: Option<usize>,
     list_procedure: isize,
     transcript_procedure: isize,
-    /// The answers on screen and their copy buttons' rows, from the last up.
-    copy_rows: Vec<(usize, i32)>,
-    /// Where the pointer is over the transcript, and the answer that makes it.
-    copy_pointer: Option<i32>,
-    copy_tracked: bool,
+    /// The transcript has asked to be told when the pointer leaves it.
+    pointer_tracked: bool,
     /// About's line for the engine, once it has been read.
     engine_version: Option<String>,
     /// Where the session's name stands over the conversation, and when it was last clicked: twice names it.
@@ -1925,7 +1917,6 @@ struct App {
     folder_told: PathBuf,
     /// What Always would do, when that is more than this one call.
     always_line: String,
-    copy_hover: Option<usize>,
     /// The page and kind of connection the fields' empty words are for.
     cues_for: Option<(Panel, Kind)>,
     doc_procedure: isize,
@@ -3288,12 +3279,7 @@ impl App {
                 }
             }
         }
-        // Where each stands, for the pointer to be measured against without asking the control again.
-        self.copy_rows = in_view.iter().map(|(at, point)| (*at, point.y)).collect();
-        self.copy_hover = copy_under(&self.copy_rows, self.copy_pointer, size);
-        let last = if self.running { None } else { self.answers.len().checked_sub(1) };
-        let hover = self.copy_hover;
-        in_view.retain(|(at, _)| Some(*at) == last || Some(*at) == hover);
+        // (every answer's, not only the last one's and the one under the pointer: shown only there, they were not found)
         let used = in_view.len().min(self.copy_buttons.len());
         // (a branch is of a saved session, and not of an answer still coming)
         let forks = self.current_session.is_some();
@@ -3324,19 +3310,6 @@ impl App {
         }
     }
 
-    /// One of the buttons an answer has beside it: copy, or branch.
-    fn is_answer_button(&self, window: HWND) -> bool {
-        !window.is_null() && (self.copy_buttons.contains(&window) || self.fork_buttons.contains(&window))
-    }
-
-    /// The pointer over the transcript, at this height, or gone from it.
-    unsafe fn copy_pointer_at(&mut self, y: Option<i32>) {
-        self.copy_pointer = y;
-        let under = copy_under(&self.copy_rows, y, scale(self.dpi, ds::size::ICON_BUTTON));
-        if under != self.copy_hover {
-            self.place_copy_buttons();
-        }
-    }
 
     /// A new session with the conversation through this answer, opened: to go on from there another way. The answer is found in the saved
     /// session by its words, and by how many answers before it have the same.
@@ -10968,22 +10941,13 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
     if message == WM_MOUSEMOVE && !(app.links.is_empty() && app.runs.is_empty()) {
         app.track_link(lparam);
     }
-    if message == WM_MOUSEMOVE {
-        if !app.copy_tracked && !forced_hover() {
-            app.copy_tracked = true;
-            let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: window, dwHoverTime: 0 };
-            TrackMouseEvent(&mut track);
-        }
-        app.copy_pointer_at(Some(((lparam >> 16) & 0xFFFF) as i16 as i32));
+    if message == WM_MOUSEMOVE && !app.pointer_tracked && !forced_hover() {
+        app.pointer_tracked = true;
+        let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: window, dwHoverTime: 0 };
+        TrackMouseEvent(&mut track);
     }
     if message == WM_MOUSELEAVE {
-        app.copy_tracked = false;
-        // (onto an answer's copy or branch button: it was shown to be used)
-        let mut point = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut point);
-        if !app.is_answer_button(WindowFromPoint(point)) {
-            app.copy_pointer_at(None);
-        }
+        app.pointer_tracked = false;
         app.run_hover = None;
         if app.link_hover.take().is_some() {
             InvalidateRect(app.window, &app.status_area, 0);
@@ -11498,20 +11462,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
     match message {
         WM_WAKE => {
             app.drain();
-            0
-        }
-        WM_BUTTON_LEFT => {
-            // The pointer has left an answer's button: back to the transcript, or onto the other button, they stay shown; elsewhere they go as the
-            // transcript's leaving would have. (The branch button was left out of this, and going onto it hid both, the pointer was over the
-            // transcript again, and they came back: over and over.)
-            if app.is_answer_button(wparam as HWND) {
-                let mut point = POINT { x: 0, y: 0 };
-                GetCursorPos(&mut point);
-                let under = WindowFromPoint(point);
-                if under != app.transcript && !app.is_answer_button(under) {
-                    app.copy_pointer_at(None);
-                }
-            }
             0
         }
         WM_SIZE => {
@@ -13199,15 +13149,12 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             selected_provider: None,
             list_procedure: 0,
             transcript_procedure: 0,
-            copy_rows: Vec::new(),
-            copy_pointer: None,
-            copy_tracked: false,
+            pointer_tracked: false,
             engine_version: None,
             title_area: rect(0, 0, 0, 0),
             title_clicked: None,
             folder_told: PathBuf::new(),
             always_line: String::new(),
-            copy_hover: None,
             cues_for: None,
             doc_procedure: 0,
             note_procedure: 0,
