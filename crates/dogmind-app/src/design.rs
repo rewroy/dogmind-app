@@ -23,6 +23,8 @@ pub mod radius {
     pub const CONTROL: i32 = 8;
     /// A card: the composer, a list's frame.
     pub const CARD: i32 = 12;
+    /// A card in the conversation, whose corners are drawn over the control's square ones: what the person wrote, a block of code or output.
+    pub const CARD_CORNER: i32 = 10;
     pub const DIALOG: i32 = 14;
 }
 

@@ -1604,6 +1604,8 @@ struct App {
     block_targets: Vec<Option<usize>>,
     /// Where the block being written is kept in `shown`.
     open_block: Option<usize>,
+    /// A block has begun and its first row is still to come: that row is where its card is found.
+    block_card_due: bool,
     /// Where the last run of text went in the transcript.
     last_inserted: (i32, i32),
     /// The links in the transcript, in order: where they are and where they lead.
@@ -1860,7 +1862,7 @@ unsafe fn child_area(window: HWND, parent: HWND) -> (i32, i32, i32, i32) {
 /// How large the conversation's words are, in percent of the sizes written here: what the settings chose. The app's own chrome keeps its sizes, as its rows are laid out for them.
 static TEXT_SCALE: AtomicU32 = AtomicU32::new(100);
 
-fn text_scale() -> i32 {
+pub(crate) fn text_scale() -> i32 {
     TEXT_SCALE.load(Ordering::Relaxed) as i32
 }
 
@@ -2176,7 +2178,7 @@ impl App {
             _ => match self.para {
                 Para::Normal => para_format(11, 0, 0, 120),
                 Para::AfterList => para_format(11, 0, 80, 120),
-                Para::AfterBlock => para_format(11, 0, 200, 120),
+                Para::AfterBlock => para_format(11, 0, 300, 120),
                 Para::Quote => para_format(11, 280, 40, 40),
                 Para::Item(indent) => {
                     const TEXT_AT: i32 = 280;
@@ -2285,7 +2287,11 @@ impl App {
         let first = self.insert_rtf(rtf::row(row), Some(row.color));
         if row.right {
             let start = text_start(self.transcript, first);
-            self.user_cards.push(UserCard { start, shape: None, looked_at: None });
+            self.user_cards.push(UserCard { start, kind: CardKind::Person, shape: None, looked_at: None });
+        } else if std::mem::take(&mut self.block_card_due) {
+            // (a block's first row: the block's corners are rounded as a card's are, from where its first line begins)
+            let start = text_start(self.transcript, first);
+            self.user_cards.push(UserCard { start, kind: CardKind::Block, shape: None, looked_at: None });
         }
     }
 
@@ -2301,10 +2307,10 @@ impl App {
         let device = if given.is_null() { GetDC(edit) } else { given };
         let mut client: RECT = std::mem::zeroed();
         GetClientRect(edit, &mut client);
-        let radius = scale(self.dpi, ds::size::THUMB);
-        let back = theme::user_back();
+        let radius = scale(self.dpi, ds::radius::CARD_CORNER);
         let mut view: Option<ViewPixels> = None;
         for user_card in self.user_cards.iter_mut().rev() {
+            let back = user_card.kind.back();
             let mut point = POINT { x: 0, y: 0 };
             SendMessageW(edit, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, user_card.start as LPARAM);
             if point.y < client.bottom {
@@ -2516,6 +2522,7 @@ impl App {
             first = range.first;
         });
         self.blocks.push(CodeBlock { at: first, found: false, text: String::new() });
+        self.block_card_due = true;
         if !self.replaying {
             self.shown.push(Shown::Block(String::new()));
             self.open_block = Some(self.shown.len() - 1);
@@ -2581,8 +2588,9 @@ impl App {
     /// What opens and closes a block: a little space, and what the code is in if it says.
     unsafe fn block_edge(&mut self, label: &str) {
         let shown = if label.is_empty() { " " } else { label };
-        let points = if label.is_empty() { 5 } else { 8 };
-        self.append_row(&rtf::Row { lines: &[shown], face: UI_FACE, points, color: theme::muted(), back: theme::code_back(), width: self.text_twips, right: false, column: 0, padding: (260, 40) });
+        let points = if label.is_empty() { 6 } else { 8 };
+        // (room enough over and under the lines, which the rounded corners also take some of)
+        self.append_row(&rtf::Row { lines: &[shown], face: UI_FACE, points, color: theme::muted(), back: theme::code_back(), width: self.text_twips, right: false, column: 0, padding: (260, 80) });
     }
 
     /// A line of code in an answer; a diff in its colours.
@@ -3079,12 +3087,21 @@ impl App {
             "apply_patch" => self.show_diff(output, 40),
             "execute_command" => {
                 let (above, lines) = toolrun::command_lines(output);
+                if above == 0 && lines.is_empty() {
+                    return;
+                }
+                // A block of its own, with room over and under it, as a block of code has.
+                self.gap_after_a_block();
+                self.begin_block();
+                self.block_edge("");
                 if above > 0 {
                     self.block_line(&tf("… {0} lines above", &[&above]), theme::muted(), 9);
                 }
                 for line in &lines {
                     self.block_line(line, theme::code(), 9);
                 }
+                self.block_edge("");
+                self.open_block = None;
                 self.line_start = true;
             }
             _ => {}
@@ -3541,9 +3558,9 @@ impl App {
         let widest = lines.iter().map(|line| width_on(device, self.fonts.body, line)).max().unwrap_or(0);
         SelectObject(device, previous);
         ReleaseDC(self.transcript, device);
-        // The body font is drawn a size larger in the transcript than it was measured here.
-        let padding = (200, 100);
-        let wanted = i64::from(widest) * 1440 * 115 / 100 / i64::from(self.dpi) + i64::from(padding.0) * 2 + 120;
+        // The body font is drawn a size larger in the transcript than it was measured here, and at the size the settings chose.
+        let padding = (260, 200);
+        let wanted = i64::from(widest) * 1440 * 115 * i64::from(text_scale()) / 10000 / i64::from(self.dpi) + i64::from(padding.0) * 2 + 120;
         let most = (self.text_twips * 4 / 5).max(800);
         let wanted = if images.is_empty() {
             wanted as i32
@@ -3581,7 +3598,7 @@ impl App {
         let start = text_start(self.transcript, first);
         self.picture_blocks.push(PictureBlock { start, paths: pictures.iter().map(|(path, _)| path.clone()).collect(), tiles });
         if alone {
-            self.user_cards.push(UserCard { start, shape: None, looked_at: None });
+            self.user_cards.push(UserCard { start, kind: CardKind::Person, shape: None, looked_at: None });
         }
         if !self.replaying {
             self.place_pictures();
@@ -5304,7 +5321,10 @@ impl App {
                 for (skill, toggle) in self.skills.iter().zip(&self.skill_toggles) {
                     let whose = if skill.scope == "project" { t("This project's") } else { t("Yours, in every folder") };
                     form.toggle_beside(&skill.name, *toggle, whose);
-                    form.note(&skill.description.split_whitespace().collect::<Vec<_>>().join(" "), theme::muted());
+                    // (about two lines: some are written for a model, a page long)
+                    let about = skill.description.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let short: String = about.chars().take(160).collect();
+                    form.note(&if short.len() < about.len() { format!("{}…", short.trim_end()) } else { short }, theme::muted());
                 }
                 form.note(&log, log_color);
             }
@@ -10116,6 +10136,11 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
         SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
         return 1;
     }
+    // Over italic words (the thinking) RichEdit slants its I-beam, and keeps it slanted wherever the pointer goes next: the plain one, over all of the text.
+    if message == WM_SETCURSOR && wparam as HWND == window && (lparam & 0xFFFF) as u32 == HTCLIENT {
+        SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_IBEAM));
+        return 1;
+    }
     if message == WM_LBUTTONUP {
         let mut range = CharRange { first: 0, last: 0 };
         SendMessageW(window, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(range) as LPARAM);
@@ -10236,9 +10261,28 @@ unsafe fn text_start(edit: HWND, first: i32) -> i32 {
 /// A card of what the person wrote: where its text begins, and once it has been seen whole, where its edges are from there.
 struct UserCard {
     start: i32,
+    kind: CardKind,
     shape: Option<CardShape>,
     /// When it was last looked for and not seen whole: a card taller than the view is never seen whole, and all the view's pixels are not read for each of its paints.
     looked_at: Option<std::time::Instant>,
+}
+
+/// What a card is, which says its colour: the theme's of now, as a card outlives a change of theme.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CardKind {
+    /// What the person wrote.
+    Person,
+    /// A block of code or of a command's output.
+    Block,
+}
+
+impl CardKind {
+    fn back(self) -> u32 {
+        match self {
+            CardKind::Person => theme::user_back(),
+            CardKind::Block => theme::code_back(),
+        }
+    }
 }
 
 /// A card's edges from the start of its text, and the colour of the page around it.
@@ -12054,6 +12098,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool) -> ExitCode {
             request_live: None,
             block_targets: vec![None; BLOCK_POOL],
             open_block: None,
+            block_card_due: false,
             last_inserted: (0, 0),
             links: Vec::new(),
             link_hover: None,
