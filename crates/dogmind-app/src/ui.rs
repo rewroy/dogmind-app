@@ -1133,6 +1133,20 @@ impl Form {
         self.end_row(height);
     }
 
+    /// A row of a list of things to switch: its name across the row, and the switch at the right end with what it is set to just before it.
+    unsafe fn toggle_at_end(&mut self, words: &str, window: HWND, state: &str) {
+        let height = self.s(ds::size::CONTROL);
+        let (across, tall) = (self.s(ds::size::TOGGLE_WIDTH), self.s(ds::size::TOGGLE_HEIGHT));
+        let state_width = text_width(self.fonts.small, state) + self.s(ds::space::S);
+        let switch_x = self.width - across;
+        let state_x = switch_x - self.s(ds::space::S) - state_width;
+        self.shapes.push(Shape::Text { area: rect(0, self.y, (state_x - self.s(ds::space::M)).max(0), height), text: words.to_string(), font: FontKind::Body, color: theme::text(), flags: ONE_LINE });
+        self.shapes.push(Shape::Text { area: rect(state_x, self.y, state_width, height), text: state.to_string(), font: FontKind::Small, color: theme::muted(), flags: ONE_LINE | DT_RIGHT });
+        place(window, switch_x, self.y + (height - tall) / 2, across, tall);
+        self.used.push(window);
+        self.end_row(height);
+    }
+
     /// A field: the system's edit on a frame of ours, which shows when it has the focus.
     unsafe fn field(&mut self, words: &str, edit: HWND) {
         let height = self.s(ds::size::CONTROL);
@@ -5392,8 +5406,7 @@ impl App {
                     form.note(t("A skill turned off is neither offered to the model nor started with /name. A session already under way keeps its list, but cannot read one that is off."), theme::muted());
                 }
                 for (skill, toggle) in self.skills.iter().zip(&self.skill_toggles) {
-                    let whose = if skill.scope == "project" { t("This project's") } else { t("Yours, in every folder") };
-                    form.toggle_beside(&skill.name, *toggle, whose);
+                    form.toggle_at_end(&skill.name, *toggle, if self.settings.skill_is_on(&skill.name) { t("Enabled") } else { t("Disabled") });
                     // (about two lines: some are written for a model, a page long)
                     let about = skill.description.split_whitespace().collect::<Vec<_>>().join(" ");
                     let short: String = about.chars().take(160).collect();
@@ -11190,6 +11203,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                             let _ = parked.agent.commands.send(Command::SetSkillsOff(off.clone()));
                         }
                         app.update_toggles();
+                        // (the words beside the switch say which it is now)
+                        app.layout();
                     }
                 }
                 _ if (ID_THEME_SEGMENT..ID_THEME_SEGMENT + 3).contains(&id) => {
