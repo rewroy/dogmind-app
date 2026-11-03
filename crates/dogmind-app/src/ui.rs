@@ -8128,7 +8128,7 @@ impl App {
                 let (settings, folder) = (self.settings.clone(), self.folder.clone());
                 std::thread::spawn(move || {
                     let mut say = |text: String| poster.send(Note::Status(generation, text));
-                    let client = match engine::start_alone(&straydog, &settings, &folder, &current, &mut say) {
+                    let mut client = match engine::start_alone(&straydog, &settings, &folder, &current, &mut say) {
                         Ok(started) => {
                             let client = engine::client(started.port);
                             poster.send(Note::EngineStarted(generation, started));
@@ -8141,6 +8141,9 @@ impl App {
                     };
                     let mut say = |text: String| poster.send(Note::Status(generation, text));
                     let result = engine::wait_ready(&client, &current, &mut say).and_then(|()| client.describe());
+                    if let Ok(info) = &result {
+                        client.suppresses_letters = info.suppresses_letters;
+                    }
                     poster.send(match result {
                         Ok(info) => Note::Connected { generation, model: if provider.model.is_empty() { info.model } else { provider.model }, window: info.context, straydog: info.straydog, vision: info.vision, provider: Arc::new(client) },
                         Err(error) => Note::ConnectFailed(generation, engine::in_plain_words(&error)),
