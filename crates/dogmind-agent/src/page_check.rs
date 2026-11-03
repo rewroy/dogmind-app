@@ -303,6 +303,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         if finished || started.elapsed() > LIMIT / 2 || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension") {
             break;
         }
+        // (its crashes come together: a real run lost all four tries inside 6.5 s, and that page opened ten times of ten afterwards. Why is not known.)
+        std::thread::sleep(Duration::from_secs(3));
     }
     let folder_url = format!("file:///{}/", plain(&root).replace('\\', "/"));
     let name = page.strip_prefix(workspace).unwrap_or(&page).display().to_string();
