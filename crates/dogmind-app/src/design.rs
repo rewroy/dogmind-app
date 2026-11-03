@@ -49,8 +49,6 @@ pub mod size {
     pub const BUTTON_PADDING: i32 = 44;
     /// A line of small words.
     pub const TEXT_LINE: i32 = 22;
-    /// A line of the approval card's words.
-    pub const NOTE_LINE: i32 = 21;
     /// A message waiting above the composer, and the row after it.
     pub const QUEUE_STEP: i32 = 30;
     /// The panel on the right: its margin and the gap between its groups, and what a mark takes before its words.
