@@ -99,15 +99,26 @@ pub(crate) fn inside(workspace: &Path, path: &Path) -> bool {
 }
 
 /// Folders of keys, and the stores of browsers and of Windows, wherever they are.
-const SECRET_FOLDERS: [&str; 20] = [
+const SECRET_FOLDERS: [&str; 30] = [
     "/.ssh/", "/.gnupg/", "/.aws/", "/.azure/", "/.kube/", "/.docker/", "/.config/gcloud/", "/.config/gh/", "/github cli/", "/.dogmind/vault",
     "/google/chrome/user data/", "/microsoft/edge/user data/", "/bravesoftware/brave-browser/user data/", "/vivaldi/user data/", "/mozilla/firefox/", "/opera software/",
     "/microsoft/credentials/", "/microsoft/protect/", "/microsoft/vault/", "/microsoft/crypto/",
+    // (cloud keys, password stores, and the sign-ins of chat apps, which keep a token where a page could ask for it; a project of the same
+    // name elsewhere is not one of them)
+    "/.config/rclone/", "/.password-store/", "/.config/op/", "/appdata/local/1password/", "/appdata/roaming/bitwarden/", "/.terraform.d/",
+    "/appdata/roaming/slack/", "/appdata/roaming/discord/", "/appdata/roaming/telegram desktop/",
+    // (what was typed at PowerShell, passwords on a command line among it)
+    "/microsoft/windows/powershell/psreadline/",
 ];
 /// Files by the start of their names: `/.env` is `.env.local` too.
 const SECRET_NAMES: [&str; 12] = ["/credentials", "/.git-credentials", "/.env", "/.netrc", "/_netrc", "/.npmrc", "/.pypirc", "/.pgpass", "/.my.cnf", "/id_rsa", "/id_ed25519", "/id_ecdsa"];
 /// Tools' own sign-ins, whole.
-const SECRET_FILES: [&str; 6] = ["/.codex/auth.json", "/.claude/.credentials.json", "/.claude.json", "/token.json", "/tokens.json", "/.token"];
+const SECRET_FILES: [&str; 14] = [
+    "/.codex/auth.json", "/.claude/.credentials.json", "/.claude.json", "/token.json", "/tokens.json", "/.token",
+    "/.terraformrc", "/terraform.rc", "/rclone.conf",
+    // (shells' histories: a password typed on a line stays in them)
+    "/.bash_history", "/.zsh_history", "/.python_history", "/.psql_history", "/.mysql_history",
+];
 const SECRET_EXTENSIONS: [&str; 8] = [".pem", ".key", ".pfx", ".p12", ".ppk", ".kdbx", ".jks", ".keystore"];
 /// What a file named like a secret is when it ends so: a template of one, or the code that handles them. Neither holds a key, and every project has them.
 const NOT_SECRETS: [&str; 16] = [".example", ".sample", ".template", ".dist", ".md", ".rs", ".py", ".js", ".ts", ".go", ".java", ".cs", ".c", ".h", ".cpp", ".rb"];
@@ -575,7 +586,9 @@ pub fn delegated(mode: Mode, tool: &str, risk: Risk, reason: Option<&str>, safe_
     }
     match mode {
         Mode::Default => false,
-        Mode::AcceptEdits => !command,
+        // (edits, and nothing else: an MCP server's tool is a program the person chose, outside the sandbox, and it can send a mail as
+        // well as read one. As "not a command" it went unasked here.)
+        Mode::AcceptEdits => matches!(tool, "create_file" | "apply_patch"),
         Mode::Auto => true,
         Mode::Plan => false,
     }
@@ -881,6 +894,10 @@ mod tests {
             "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data", "C:\\Users\\me\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Cookies",
             "C:\\Users\\me\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\a\\key4.db", "C:\\Users\\me\\AppData\\Local\\BraveSoftware\\Brave-Browser\\User Data\\x",
             "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Credentials\\x", "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Protect\\x",
+            "C:\\Users\\me\\.config\\rclone\\rclone.conf", "C:\\Users\\me\\AppData\\Roaming\\rclone\\rclone.conf", "C:\\Users\\me\\.password-store\\mail.gpg",
+            "C:\\Users\\me\\AppData\\Roaming\\Bitwarden\\data.json", "C:\\Users\\me\\AppData\\Roaming\\Slack\\Local Storage\\leveldb\\x.log",
+            "C:\\Users\\me\\AppData\\Roaming\\discord\\Local Storage\\x", "C:\\Users\\me\\.terraform.d\\credentials.tfrc.json", "C:\\Users\\me\\.terraformrc",
+            "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt", "C:\\Users\\me\\.bash_history",
             // Other spellings of them.
             "C:\\USERS\\ME\\.SSH\\ID_RSA", "c:/users/me/.Ssh/x", "C:\\work\\..\\Users\\me\\.ssh\\x", "..\\..\\Users\\me\\.aws\\credentials", "sub\\..\\.ENV",
         ] {
@@ -895,7 +912,9 @@ mod tests {
     fn what_only_looks_like_a_secret_does_not_ask() {
         let gate = Gate::new();
         let root = Path::new("C:\\work");
-        for path in ["src\\token.rs", "keyboard.rs", "environment.txt", "docs\\ssh.md", "a.pem.txt", "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe"] {
+        for path in ["src\\token.rs", "keyboard.rs", "environment.txt", "docs\\ssh.md", "a.pem.txt", "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe",
+            // (a project named after one of those apps is not their store)
+            "C:\\Projects\\slack\\bot.py", "C:\\Projects\\discord-bot\\index.js", "C:\\Projects\\rclone\\README.md", "docs\\history.md"] {
             assert_eq!(read_verdict(&gate, path, root), Verdict::Allow, "{path}");
         }
     }
@@ -1059,6 +1078,8 @@ mod tests {
         assert!(!delegated(Mode::Default, "apply_patch", Risk::Low, None, false));
         assert!(delegated(Mode::AcceptEdits, "apply_patch", Risk::Low, None, false));
         assert!(!delegated(Mode::AcceptEdits, "execute_command", Risk::Low, None, false));
+        assert!(!delegated(Mode::AcceptEdits, "mcp__mail__send", Risk::Medium, None, false), "an MCP tool is not an edit");
+        assert!(delegated(Mode::Auto, "mcp__mail__send", Risk::Medium, None, false));
         assert!(delegated(Mode::Auto, "execute_command", Risk::Medium, None, false));
         assert!(!delegated(Mode::Auto, "execute_command", Risk::High, None, false));
         assert!(!delegated(Mode::Auto, "create_file", Risk::Low, Some("outside the workspace"), false));
