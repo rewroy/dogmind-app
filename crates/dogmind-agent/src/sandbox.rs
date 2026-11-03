@@ -1459,9 +1459,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
             std::thread::spawn(move || {
                 // SAFETY: ownership of the read end came here.
                 let mut file = File::from_raw_handle(raw as _);
-                let mut bytes = Vec::new();
-                let _ = file.read_to_end(&mut bytes);
-                bytes
+                kept_of(&mut file, KEPT_HEAD, KEPT_TAIL)
             })
         };
         let (stdout, stderr) = (capture(out_read), capture(err_read));
@@ -1507,9 +1505,53 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
     }
 }
 
+/// What is kept of a command's output, at most: its start and its end. A command that printed without end (a loop, a log of gigabytes)
+/// was read whole into the app's memory, all of it, before any of it was cut.
+const KEPT_HEAD: usize = 4 << 20;
+const KEPT_TAIL: usize = 4 << 20;
+
+/// All a stream gives, as its first `head` bytes and its last `tail`, with what was between them said and not kept.
+fn kept_of(stream: &mut impl Read, head: usize, tail: usize) -> Vec<u8> {
+    let (mut start, mut end, mut dropped) = (Vec::new(), std::collections::VecDeque::<u8>::new(), 0u64);
+    let mut block = [0u8; 64 * 1024];
+    loop {
+        let count = match stream.read(&mut block) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        let mut chunk = &block[..count];
+        if start.len() < head {
+            let taken = (head - start.len()).min(chunk.len());
+            start.extend_from_slice(&chunk[..taken]);
+            chunk = &chunk[taken..];
+        }
+        end.extend(chunk);
+        if end.len() > tail {
+            let over = end.len() - tail;
+            end.drain(..over);
+            dropped += over as u64;
+        }
+    }
+    if dropped > 0 {
+        start.extend_from_slice(format!("\n--- {dropped} bytes in the middle of this output were not kept ---\n").as_bytes());
+    }
+    start.extend(end);
+    start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An output past what is kept has its start and its end, and says what went between them.
+    #[test]
+    fn an_endless_output_keeps_its_start_and_end_and_says_what_went() {
+        let text: Vec<u8> = b"BEGIN".iter().copied().chain(std::iter::repeat_n(b'x', 1000)).chain(b"END".iter().copied()).collect();
+        let kept = kept_of(&mut std::io::Cursor::new(text.clone()), 100, 50);
+        let said = String::from_utf8(kept).unwrap();
+        assert!(said.starts_with("BEGIN") && said.ends_with("END") && said.contains("858 bytes in the middle of this output were not kept"), "{said}");
+        assert_eq!(kept_of(&mut std::io::Cursor::new(b"short".to_vec()), 100, 50), b"short");
+    }
 
     #[test]
     fn a_command_gets_a_desktop_in_a_station_of_its_own_and_no_error_boxes() {
