@@ -146,6 +146,9 @@ struct Host {
     access: std::cell::RefCell<Option<windows::Win32::UI::Accessibility::IRawElementProviderSimple>>,
     /// What that element is called, in English (`lang::t` says it in the person's language): the window's own name would be all of its text.
     name: Cell<&'static str>,
+    /// What the services asked to have drawn again while the window drew nothing (WM_SETREDRAW off): asked again when it draws once more.
+    /// An invisible window keeps no such request, and a line that changed meanwhile would stay as it was, in part.
+    missed: Cell<Option<RECT>>,
     /// The text's rectangle, as EM_SETRECT gave it: the window's client area where none was given.
     view: Cell<Option<RECT>>,
     /// The page's colour, around the text's rectangle as within it.
@@ -256,6 +259,7 @@ impl Host {
             unlocked: Cell::new(false),
             access: std::cell::RefCell::new(None),
             name: Cell::new("Conversation"),
+            missed: Cell::new(None),
             view: Cell::new(None),
             background: Cell::new(unsafe { GetSysColor(COLOR_WINDOW) }),
             char_format: std::cell::UnsafeCell::new(char_format),
@@ -288,6 +292,15 @@ impl Host {
         let activate: unsafe extern "system" fn(*mut c_void, *const RECT) -> i32 = self.slot(slot::IN_PLACE_ACTIVATE);
         let rect = self.text_rect();
         activate(self.services.get(), &rect);
+    }
+
+    /// A part to be drawn again once the window draws: added to what is missed already.
+    fn missing(&self, area: RECT) {
+        let all = match self.missed.get() {
+            Some(was) => RECT { left: was.left.min(area.left), top: was.top.min(area.top), right: was.right.max(area.right), bottom: was.bottom.max(area.bottom) },
+            None => area,
+        };
+        self.missed.set(Some(all));
     }
 
     unsafe fn bits_changed(&self, mask: u32) {
@@ -519,7 +532,11 @@ unsafe extern "system" fn set_scroll_pos(this: *mut Host, bar: i32, position: i3
 }
 
 unsafe extern "system" fn invalidate_rect(this: *mut Host, area: *const RECT, erase: i32) {
-    InvalidateRect(host(this).window, area, erase);
+    let host = host(this);
+    if IsWindowVisible(host.window) == 0 {
+        host.missing(if area.is_null() { host.client() } else { *area });
+    }
+    InvalidateRect(host.window, area, erase);
 }
 
 unsafe extern "system" fn view_change(this: *mut Host, update: i32) {
@@ -548,8 +565,13 @@ unsafe extern "system" fn kill_timer(this: *mut Host, id: u32) {
     KillTimer(host(this).window, id as usize);
 }
 
+/// Pixels moved by as much as the text: where the window draws nothing, none move, and all of it is to be drawn once it does.
 unsafe extern "system" fn scroll_window_ex(this: *mut Host, dx: i32, dy: i32, scroll: *const RECT, clip: *const RECT, region: HRGN, update: *mut RECT, flags: u32) {
-    ScrollWindowEx(host(this).window, dx, dy, scroll, clip, region, update, flags as _);
+    let host = host(this);
+    if IsWindowVisible(host.window) == 0 {
+        host.missing(host.client());
+    }
+    ScrollWindowEx(host.window, dx, dy, scroll, clip, region, update, flags as _);
 }
 
 unsafe extern "system" fn set_capture(this: *mut Host, capture: i32) {
@@ -943,9 +965,16 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             host.bits_changed(PROPERTIES | SCROLLBARCHANGE);
         }
         WM_SETREDRAW => {
-            // (the services hold their drawing; the window, as any, keeps its visible bit off meanwhile)
+            // The window keeps its visible bit off meanwhile, as any does; turned on, it is visible before the services hear of it, and what
+            // they asked to have drawn while it was not is asked again.
+            let result = DefWindowProcW(window, message, wparam, lparam);
             host.send(message, wparam, lparam);
-            return DefWindowProcW(window, message, wparam, lparam);
+            if wparam != 0 {
+                if let Some(missed) = host.missed.take() {
+                    InvalidateRect(window, &missed, 0);
+                }
+            }
+            return result;
         }
         _ => {}
     }
@@ -1632,6 +1661,55 @@ mod access {
                 }
                 Ok(array)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The face of each character of a window of the class, by position.
+    unsafe fn faces(window: HWND, length: i32) -> Vec<String> {
+        (0..length)
+            .map(|at| {
+                let range = [at, at + 1];
+                SendMessageW(window, WM_USER + 55, 0, range.as_ptr() as LPARAM); // EM_EXSETSEL
+                let mut format = [0u8; 116];
+                format[..4].copy_from_slice(&116u32.to_le_bytes());
+                SendMessageW(window, WM_USER + 58, 1, format.as_mut_ptr() as LPARAM); // EM_GETCHARFORMAT, SCF_SELECTION
+                let face: Vec<u16> = format[26..90].chunks(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).take_while(|unit| *unit != 0).collect();
+                String::from_utf16_lossy(&face)
+            })
+            .collect()
+    }
+
+    /// Emoji written after paragraphs, in pieces as an answer comes, are in an emoji face, and the words beside them are not: the places
+    /// read back are the places the face is set at.
+    #[test]
+    fn emoji_get_their_face_and_their_neighbours_do_not() {
+        unsafe {
+            register(windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()));
+            let (class, title) = (crate::paint::wide(CLASS), crate::paint::wide(""));
+            let window = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_POPUP | ES_MULTILINE | ES_READONLY, 0, 0, 400, 300, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+            assert!(!window.is_null());
+            for piece in ["一行目です。\r", "二行目\r", "三行目 👋 に", "ほんご ✨\r", "四 🐶🎉 end"] {
+                SendMessageW(window, WM_USER + 177, usize::MAX, -1); // EM_SETSEL to the end
+                let text = crate::paint::wide(piece);
+                SendMessageW(window, 0xC2, 0, text.as_ptr() as LPARAM); // EM_REPLACESEL
+            }
+            let written: Vec<u16> = "一行目です。\r二行目\r三行目 👋 にほんご ✨\r四 🐶🎉 end".encode_utf16().collect();
+            let faces = faces(window, written.len() as i32);
+            let emoji = emoji::runs(&written);
+            let wrong: Vec<String> = faces
+                .iter()
+                .enumerate()
+                // (an emoji RichEdit sets in Segoe UI Symbol again, as it does some of the Basic Multilingual Plane's, takes its colours where it is drawn)
+                .filter(|(at, face)| if emoji.iter().any(|(start, end)| (*start..*end).contains(at)) { !matches!(face.as_str(), "Segoe UI Emoji" | "Segoe UI Symbol") } else { face.as_str() == "Segoe UI Emoji" })
+                .map(|(at, face)| format!("{at} {:?} {face}", char::decode_utf16([written[at]]).next()))
+                .collect();
+            assert!(wrong.is_empty(), "in the wrong face: {wrong:?}\nall: {faces:?}");
+            DestroyWindow(window);
         }
     }
 }
