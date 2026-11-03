@@ -249,7 +249,9 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
         }
         remove_empty_folders(folder, previous.files.iter().map(String::as_str));
     }
-    remove_old_copies(folder);
+    // (copies of what this version has, or the last one had: the last one's own may have been moved aside before it went)
+    let ours: HashSet<String> = new_files.iter().cloned().chain(previous.iter().flat_map(|manifest| manifest.files.iter().map(|file| file.to_lowercase()))).collect();
+    remove_old_copies(folder, &ours);
     (job.write_uninstaller)(&folder.join(UNINSTALLER)).map_err(|error| say(&folder.join(UNINSTALLER), &error))?;
     let mut files: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
     files.push(UNINSTALLER.to_string());
@@ -274,11 +276,21 @@ fn through_a_link(folder: &Path, file: &str) -> bool {
     false
 }
 
-/// What was left beside the app's files when they were replaced while it ran from them (`NAME.previous-TIME.EXT`), in its folder and in fonts.
-fn remove_old_copies(folder: &Path) {
-    for place in [folder.to_path_buf(), folder.join("fonts")] {
+/// The file a copy moved aside stood for: `NAME.previous-TIME.EXT` stood for `NAME.EXT`, TIME being digits. None for any other name.
+fn stood_for(name: &str) -> Option<String> {
+    let (stem, rest) = name.split_once(".previous-")?;
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    let extension = &rest[digits..];
+    (!stem.is_empty() && digits > 0 && (extension.is_empty() || extension.starts_with('.'))).then(|| format!("{stem}{extension}"))
+}
+
+/// What was left beside the app's files when they were replaced while it ran from them (`NAME.previous-TIME.EXT`), in its folder and in fonts:
+/// a copy of one of `ours` (the install's files, as the manifest names them, in lower case), and nothing else. A person's file of such a name stays.
+fn remove_old_copies(folder: &Path, ours: &HashSet<String>) {
+    for (place, within) in [(folder.to_path_buf(), ""), (folder.join("fonts"), "fonts\\")] {
         for entry in std::fs::read_dir(&place).into_iter().flatten().flatten() {
-            if entry.file_name().to_string_lossy().contains(".previous-") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if stood_for(&name).is_some_and(|original| ours.contains(&format!("{within}{original}").to_lowercase())) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -341,7 +353,7 @@ pub fn remove(folder: &Path, shell: &dyn Shell, on: &mut dyn FnMut(f64)) -> Resu
     for (root, name) in [("tools", ".open-to-sandbox")] {
         let _ = std::fs::remove_file(folder.join(root).join(name));
     }
-    remove_old_copies(folder);
+    remove_old_copies(folder, &manifest.files.iter().map(|file| file.to_lowercase()).collect());
     remove_empty_folders(folder, manifest.files.iter().map(String::as_str));
     if problems.is_empty() {
         let _ = std::fs::remove_file(folder.join(MANIFEST));
@@ -448,7 +460,7 @@ mod tests {
         scene.run(&mut first, None, None).unwrap();
         let folder = scene.folder();
         // What the machine and the person have added since.
-        tree(&folder, &[("tools\\.open-to-sandbox", b""), ("notes.txt", b"mine"), ("dogmind-app.previous-1.exe", b"old copy"), ("straydog.previous-1.exe", b"old engine")]);
+        tree(&folder, &[("tools\\.open-to-sandbox", b""), ("notes.txt", b"mine"), ("notes.previous-1.txt", b"mine too"), ("dogmind-app.previous-1.exe", b"old copy"), ("same.previous-163000.dll", b"old library")]);
         // The person's data is elsewhere: it is what the data folder holds, and no part of this comes near it.
         let data = scene.dir.path().join("DogmindApp");
         tree(&data, &[("settings.json", b"{}"), ("sessions\\one.jsonl", b"s"), ("models\\m.gguf", b"m")]);
@@ -461,7 +473,8 @@ mod tests {
         assert!(!folder.join("tools\\old").exists(), "what is gone from the package goes, with its folder");
         assert_eq!(std::fs::read(folder.join("notes.txt")).unwrap(), b"mine", "a person's file stays");
         assert!(folder.join("tools\\.open-to-sandbox").exists(), "and what says the folder is open: its entries are still on it, and new files inherit them");
-        assert!(!folder.join("dogmind-app.previous-1.exe").exists() && !folder.join("straydog.previous-1.exe").exists());
+        assert!(!folder.join("dogmind-app.previous-1.exe").exists() && !folder.join("same.previous-163000.dll").exists(), "a copy of the program's own file, moved aside, goes");
+        assert_eq!(std::fs::read(folder.join("notes.previous-1.txt")).unwrap(), b"mine too", "a person's file of that kind of name stays: it is no copy of the program's");
         assert_eq!(read_manifest(&folder).unwrap().version, "2.0.0");
         assert_eq!(walk(&data), ["models\\m.gguf", "sessions\\one.jsonl", "settings.json"]);
     }
