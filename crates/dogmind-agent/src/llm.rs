@@ -411,7 +411,7 @@ impl Client {
 
     /// Why this server could not be asked, with what a person can do about it. A system's socket error is left out; a certificate's is not.
     fn no_answer(&self, failure: Failure) -> String {
-        let at = format!("{}:{}", self.base.host, self.base.port);
+        let at = format!("{}:{}", self.base.host_for_header(), self.base.port);
         match failure {
             Failure::Connect(detail) if !detail.contains("os error") && !detail.contains(&at) => format!("{NO_ANSWER}{detail}"),
             _ => format!("{NO_ANSWER}{at}"),

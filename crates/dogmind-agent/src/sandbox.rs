@@ -323,8 +323,15 @@ fn refusal_with(workspace: &Path, home: Option<&Path>, own: &[PathBuf]) -> Optio
         if crate::safety::keys_folder(folder) {
             return Some(format!("{} is a place keys are kept, so a command does not run in it", workspace.display()));
         }
-        if own.iter().map(|folder| key(&real(folder))).any(|own| under(&own, &place) || under(&place, &own)) {
-            return Some(format!("{} holds this app's own files, or lies among them, and what a command wrote there would run outside its sandbox: a command runs only in a folder of its own", workspace.display()));
+        // (a folder of the app's own stays closed whatever: what a command could write over in it, or rename away from under it with its
+        // parent's leave, runs the next time with none of the sandbox. Writing a Deny on it would not hold against that.)
+        if let Some(at) = own.iter().position(|folder| {
+            let own = key(&real(folder));
+            under(&own, &place) || under(&place, &own)
+        }) {
+            // (the first is what the app runs from: a copy run from elsewhere leaves this folder free; the rest are what it keeps)
+            let way = if at == 0 { ". To work on a folder that holds a build of this app, run a copy of the app from another folder, as the one Dogmind's installer puts in %LOCALAPPDATA%\\Programs\\Dogmind" } else { "" };
+            return Some(format!("{} holds this app's own files ({}), or lies among them, and what a command wrote there would run outside its sandbox: a command runs only in a folder of its own{way}", workspace.display(), own[at].display()));
         }
         if let Some(home) = home {
             if under(&key(home), &place) || under(&key(&real(home)), &place) {
