@@ -356,8 +356,9 @@ pub fn remove(folder: &Path, shell: &dyn Shell, on: &mut dyn FnMut(f64)) -> Resu
     remove_old_copies(folder, &manifest.files.iter().map(|file| file.to_lowercase()).collect());
     remove_empty_folders(folder, manifest.files.iter().map(String::as_str));
     if problems.is_empty() {
-        let _ = std::fs::remove_file(folder.join(MANIFEST));
+        // (the entries first: with the manifest gone, nothing could take them away again, and they would stand for a program that is not there)
         shell.remove_entries()?;
+        let _ = std::fs::remove_file(folder.join(MANIFEST));
     } else {
         // (a file still in use: the entries stay, so that it can be done again)
         return Err(problems.join("\n"));
@@ -380,6 +381,8 @@ mod tests {
     #[derive(Default)]
     struct FakeShell {
         said: RefCell<Vec<String>>,
+        /// Its entries cannot be taken away (a key the registry will not give up).
+        stuck: std::cell::Cell<bool>,
     }
 
     impl Shell for FakeShell {
@@ -388,9 +391,27 @@ mod tests {
             Ok(())
         }
         fn remove_entries(&self) -> Result<(), String> {
+            if self.stuck.get() {
+                return Err("the entry could not be removed".into());
+            }
             self.said.borrow_mut().push("remove".to_string());
             Ok(())
         }
+    }
+
+    /// Entries that cannot be taken away leave the manifest, so that the removal can be done again and take them then.
+    #[test]
+    fn a_removal_whose_entries_stay_keeps_what_can_remove_them_again() {
+        let scene = Scene::new();
+        let mut package = scene.package("1.0.0", &[("dogmind-app.exe", b"app")]);
+        scene.run(&mut package, None, None).unwrap();
+        let folder = scene.folder();
+        scene.shell.stuck.set(true);
+        assert!(remove(&folder, &scene.shell, &mut |_| {}).is_err());
+        assert!(read_manifest(&folder).is_some(), "the manifest stays with the entries");
+        scene.shell.stuck.set(false);
+        remove(&folder, &scene.shell, &mut |_| {}).unwrap();
+        assert!(read_manifest(&folder).is_none() && scene.shell.said.borrow().last().unwrap() == "remove");
     }
 
     struct Scene {
