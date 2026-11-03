@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -101,7 +101,7 @@ pub fn schemas() -> Value {
             "wait_ms": {"type": "integer"},
             "steps": {"type": "string", "description": "JS run after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results"}
         }), &[]),
-        function("command_status", "How a background command is doing, and its output once it has ended.", json!({"id": {"type": "string"}}), &[]),
+        function("command_status", "A background command's state, and what it printed since the last look.", json!({"id": {"type": "string"}}), &[]),
         function("command_stop", "End a background command.", json!({"id": {"type": "string"}}), &["id"]),
         function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
     ])
@@ -142,6 +142,46 @@ struct Job {
     result: Arc<Mutex<Option<Result<String, String>>>>,
     /// Its output has been in a report of all of them: the next such report says so in a line.
     told: AtomicBool,
+    /// What it has printed while it runs, and how far a look at it has got.
+    live: Arc<Live>,
+    looked: AtomicU64,
+}
+
+/// What a command has printed so far, its two streams as they came, for a look while it runs. A dev server never ends, and what it said
+/// (where it listens, the error it stopped on) was out of reach until it did. Only the end is kept.
+#[derive(Default)]
+pub struct Live(Mutex<(std::collections::VecDeque<u8>, u64)>);
+
+/// What is kept of a running command's output for a look, and what one look shows of what is new.
+const LIVE_KEPT: usize = 64 * 1024;
+const LIVE_SHOWN: usize = 4 * 1024;
+
+impl Live {
+    pub fn push(&self, bytes: &[u8]) {
+        let mut kept = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        kept.0.extend(bytes);
+        kept.1 += bytes.len() as u64;
+        let over = kept.0.len().saturating_sub(LIVE_KEPT);
+        kept.0.drain(..over);
+    }
+
+    /// What came after its first `from` bytes, at most the last `most` of it, and where the next look starts.
+    fn since(&self, from: u64, most: usize) -> (String, u64) {
+        let kept = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (buffer, total) = (&kept.0, kept.1);
+        let new = total.saturating_sub(from);
+        let shown = (new.min(buffer.len() as u64) as usize).min(most);
+        let mut bytes: Vec<u8> = buffer.iter().skip(buffer.len() - shown).copied().collect();
+        // (a look may start in the middle of a character)
+        let cut = bytes.iter().take_while(|byte| (0x80..0xC0).contains(*byte)).count();
+        bytes.drain(..cut);
+        let mut text = String::new();
+        if new > shown as u64 {
+            text.push_str(&format!("({} bytes before this are not shown)\n", new - shown as u64));
+        }
+        text.push_str(&String::from_utf8_lossy(&bytes));
+        (text, total)
+    }
 }
 
 /// Commands going on in the background. They do not outlive the session that started them.
@@ -169,18 +209,18 @@ fn background_arguments(arguments: &Value) -> Value {
 }
 
 /// A command on a thread of its own, with what ends it and where its result will be. It has minutes to itself unless the call says otherwise.
-fn spawn_command(arguments: &Value, workspace: &Path) -> (Arc<AtomicBool>, CommandResult) {
+fn spawn_command(arguments: &Value, workspace: &Path) -> (Arc<AtomicBool>, CommandResult, Arc<Live>) {
     let mut given = arguments.clone();
     if given.get("timeout_seconds").is_none() {
         given["timeout_seconds"] = json!(3600);
     }
-    let (cancel, result): (_, CommandResult) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
-    let (stop, done, place) = (cancel.clone(), result.clone(), workspace.to_path_buf());
+    let (cancel, result, live): (_, CommandResult, _) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)), Arc::new(Live::default()));
+    let (stop, done, place, printed) = (cancel.clone(), result.clone(), workspace.to_path_buf(), live.clone());
     std::thread::spawn(move || {
-        let outcome = execute_command(&given, &place, &stop);
+        let outcome = execute_command(&given, &place, &stop, Some(printed));
         *done.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
     });
-    (cancel, result)
+    (cancel, result, live)
 }
 
 /// Its result, once it has one. None when `wait` runs out first. A stop from the person ends it, and that is waited for too: what it printed is part of the answer.
@@ -435,15 +475,15 @@ impl Workbench {
     }
 
     fn start_job(&mut self, arguments: &Value, workspace: &Path) -> Result<String, String> {
-        let (cancel, result) = spawn_command(&background_arguments(arguments), workspace);
-        let id = self.add_job(arguments, cancel, result)?;
+        let (cancel, result, live) = spawn_command(&background_arguments(arguments), workspace);
+        let id = self.add_job(arguments, cancel, result, live)?;
         Ok(format!("started as {id}. Go on with other work, and use command_status for it; do not wait in a loop."))
     }
 
-    fn add_job(&mut self, arguments: &Value, cancel: Arc<AtomicBool>, result: CommandResult) -> Result<String, String> {
+    fn add_job(&mut self, arguments: &Value, cancel: Arc<AtomicBool>, result: CommandResult, live: Arc<Live>) -> Result<String, String> {
         let id = format!("job{}", self.jobs.0.len() + 1);
         let command = text_arg(arguments, "command")?.to_string();
-        self.jobs.0.push(Job { id: id.clone(), command, started: Instant::now(), cancel, result, told: AtomicBool::new(false) });
+        self.jobs.0.push(Job { id: id.clone(), command, started: Instant::now(), cancel, result, told: AtomicBool::new(false), live, looked: AtomicU64::new(0) });
         Ok(id)
     }
 
@@ -457,11 +497,11 @@ impl Workbench {
         if let Some(fields) = given.as_object_mut() {
             fields.remove("timeout_seconds");
         }
-        let (stop, result) = spawn_command(&given, workspace);
+        let (stop, result, live) = spawn_command(&given, workspace);
         if let Some(outcome) = wait_for_command(&result, &stop, cancel, wait) {
             return outcome;
         }
-        let id = self.add_job(arguments, stop, result)?;
+        let id = self.add_job(arguments, stop, result, live)?;
         Ok(format!("still running after {} s, so it goes on in the background as {id}. Go on with other work and use command_status for it: do not run it again, and do not wait in a loop.", wait.as_secs()))
     }
 
@@ -479,7 +519,17 @@ impl Workbench {
                 job.told.store(true, Ordering::Relaxed);
                 format!("{} did not run: {}\n{error}", job.id, job.command)
             }
-            None => format!("{} is running, for {} s: {}", job.id, job.started.elapsed().as_secs(), job.command),
+            None => {
+                let (printed, next) = job.live.since(job.looked.load(Ordering::Relaxed), LIVE_SHOWN);
+                let first = job.looked.swap(next, Ordering::Relaxed) == 0;
+                let said = match (printed.is_empty(), first) {
+                    (true, true) => "it has printed nothing yet".to_string(),
+                    (true, false) => "it has printed nothing since the last look".to_string(),
+                    (false, true) => format!("what it has printed:\n{printed}"),
+                    (false, false) => format!("what it has printed since the last look:\n{printed}"),
+                };
+                format!("{} is running, for {} s: {}\n{said}", job.id, job.started.elapsed().as_secs(), job.command)
+            }
         };
         let lines: Vec<String> = self.jobs.0.iter().filter(|job| wanted.is_none_or(|id| job.id == id)).map(report).collect();
         if lines.is_empty() {
@@ -1922,8 +1972,9 @@ fn git_init_first(line: &str) -> Option<(Vec<String>, String)> {
     Some((kept, rest.to_string()))
 }
 
+/// `live` has what it prints as it prints it.
 #[cfg(windows)]
-fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
+fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, live: Option<Arc<Live>>) -> Result<String, String> {
     let line = on_one_line(text_arg(arguments, "command")?)?;
     let line = line.as_ref();
     let cwd = resolve(workspace, arguments.get("cwd").and_then(Value::as_str).unwrap_or("."));
@@ -1962,7 +2013,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> 
     let started = Instant::now();
     let before = file_states(&cwd);
     // Spelled as `cwd` is, or a path with `..` in it would not be seen as holding it.
-    let done = crate::sandbox::run(&with_stand_ins(line), &cwd, &resolve(workspace, "."), network, timeout, cancel).map_err(|error| {
+    let done = crate::sandbox::run_live(&with_stand_ins(line), &cwd, &resolve(workspace, "."), network, timeout, cancel, live).map_err(|error| {
         // (the app's `git init` has run by then, and what is said is what is there)
         let started = if started_with_init.is_some() { "`git init` ran, and made .git there; the rest of the line was not started" } else { "The command was not started" };
         format!("{error}. {started}; changing its spelling cannot repair this")
@@ -2011,7 +2062,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> 
 }
 
 #[cfg(not(windows))]
-fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
+fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, live: Option<Arc<Live>>) -> Result<String, String> {
     let line = text_arg(arguments, "command")?;
     let cwd = resolve(workspace, arguments.get("cwd").and_then(Value::as_str).unwrap_or("."));
     let timeout = Duration::from_secs(arguments.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(180).clamp(1, 3600));
@@ -2019,13 +2070,22 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> 
     command.current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     no_window(&mut command);
     let mut child = command.spawn().map_err(|error| format!("{}: {error}", cwd.display()))?;
-    let capture = |pipe: Option<Box<dyn Read + Send>>| std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut bytes);
-        }
-        bytes
-    });
+    let capture = |pipe: Option<Box<dyn Read + Send>>| {
+        let live = live.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let mut block = [0u8; 64 * 1024];
+                while let Ok(count @ 1..) = pipe.read(&mut block) {
+                    bytes.extend_from_slice(&block[..count]);
+                    if let Some(live) = &live {
+                        live.push(&block[..count]);
+                    }
+                }
+            }
+            bytes
+        })
+    };
     let stdout = capture(child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
     let stderr = capture(child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
     let started = Instant::now();
@@ -2131,13 +2191,55 @@ mod power_tests {
     fn an_ended_jobs_output_is_reported_once_among_all_and_its_timeout_is_not_its_life() {
         let mut bench = Workbench::default();
         let done: CommandResult = Arc::new(Mutex::new(Some(Ok("BUILD OUTPUT".to_string()))));
-        bench.add_job(&json!({"command": "cargo build"}), Arc::new(AtomicBool::new(false)), done).unwrap();
+        bench.add_job(&json!({"command": "cargo build"}), Arc::new(AtomicBool::new(false)), done, Arc::default()).unwrap();
         let first = bench.job_status(&json!({})).unwrap();
         let second = bench.job_status(&json!({})).unwrap();
         let by_id = bench.job_status(&json!({"id": "job1"})).unwrap();
         assert!(first.contains("BUILD OUTPUT") && !second.contains("BUILD OUTPUT") && second.contains("as reported before") && by_id.contains("BUILD OUTPUT"), "{first}\n{second}\n{by_id}");
         let given = background_arguments(&json!({"command": "cargo build", "background": true, "timeout_seconds": 60}));
         assert!(given.get("timeout_seconds").is_none() && given["command"] == "cargo build");
+    }
+
+    /// A job still running shows what it has printed, and the next look only what came after; a look past what one shows says how much it left out.
+    #[test]
+    fn a_running_job_shows_what_it_printed_since_the_last_look() {
+        let mut bench = Workbench::default();
+        let live: Arc<Live> = Arc::default();
+        bench.add_job(&json!({"command": "npm run dev"}), Arc::new(AtomicBool::new(false)), Arc::default(), live.clone()).unwrap();
+        assert!(bench.job_status(&json!({})).unwrap().ends_with("it has printed nothing yet"));
+        live.push("compiling\nlistening on http://localhost:5173\n".as_bytes());
+        let first = bench.job_status(&json!({"id": "job1"})).unwrap();
+        assert!(first.contains("is running") && first.contains("listening on http://localhost:5173"), "{first}");
+        assert!(bench.job_status(&json!({})).unwrap().ends_with("it has printed nothing since the last look"));
+        live.push("GET / 200\n".as_bytes());
+        let next = bench.job_status(&json!({})).unwrap();
+        assert!(next.contains("since the last look:\nGET / 200") && !next.contains("listening"), "{next}");
+        // (a look starting in the middle of a character starts after it)
+        live.push("あ".as_bytes());
+        live.push(&[b'x'; LIVE_SHOWN]);
+        let (shown, _) = live.since(0, LIVE_SHOWN + 1);
+        assert!(shown.starts_with('(') && !shown.contains('\u{FFFD}') && !shown.contains('あ') && shown.ends_with('x'), "{shown}");
+    }
+
+    /// What a real command in the sandbox prints reaches a look while it still runs: a server's ready line before it ends, which it never does.
+    #[cfg(windows)]
+    #[test]
+    fn what_a_command_in_the_sandbox_prints_is_seen_while_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bench, cancel) = (Workbench::default(), AtomicBool::new(false));
+        // (spelled with a caret, so that the line itself does not say what it prints)
+        let line = "echo ready^-now& powershell -NoProfile -Command \"Start-Sleep -Seconds 30\"";
+        bench.run("execute_command", &json!({"command": line, "background": true}), dir.path(), &cancel).unwrap();
+        let started = Instant::now();
+        let seen = loop {
+            let said = bench.job_status(&json!({"id": "job1"})).unwrap();
+            if said.contains("ready-now") || started.elapsed() > Duration::from_secs(25) {
+                break said;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        bench.job_stop(&json!({"id": "job1"})).unwrap();
+        assert!(seen.contains("is running") && seen.contains("printed:\nready-now"), "{seen}");
     }
 
     #[test]
@@ -2280,7 +2382,7 @@ mod change_tests {
     #[test]
     fn a_line_that_would_open_a_dialog_is_refused_before_any_sandbox_is_made() {
         let dir = tempfile::tempdir().unwrap();
-        let said = execute_command(&json!({"command": "x.py"}), dir.path(), &AtomicBool::new(false)).unwrap_err();
+        let said = execute_command(&json!({"command": "x.py"}), dir.path(), &AtomicBool::new(false), None).unwrap_err();
         assert!(said.contains("Nothing was started") && said.contains("python x.py"), "{said}");
     }
 
@@ -2721,7 +2823,7 @@ mod tests {
     fn a_refused_line_makes_no_repository_first() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("app.log"), "x").unwrap();
-        let said = execute_command(&json!({"command": "git init && app.log"}), dir.path(), &AtomicBool::new(false)).unwrap_err();
+        let said = execute_command(&json!({"command": "git init && app.log"}), dir.path(), &AtomicBool::new(false), None).unwrap_err();
         assert!(said.contains("Nothing was started"), "{said}");
         assert!(!dir.path().join(".git").exists(), "the repository was made before the line was refused");
     }
@@ -2829,7 +2931,7 @@ mod tests {
     #[test]
     fn a_command_for_a_place_it_cannot_run_in_is_refused_before_anything_looks_there() {
         let dir = tempfile::tempdir().unwrap();
-        let said = execute_command(&json!({"command": "x.py", "cwd": "\\\\127.0.0.1\\nothing-here"}), dir.path(), &AtomicBool::new(false)).unwrap_err();
+        let said = execute_command(&json!({"command": "x.py", "cwd": "\\\\127.0.0.1\\nothing-here"}), dir.path(), &AtomicBool::new(false), None).unwrap_err();
         assert!(said.contains("outside the workspace") && said.contains("was not started"), "{said}");
     }
 
