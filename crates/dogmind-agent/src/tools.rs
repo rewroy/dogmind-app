@@ -995,8 +995,9 @@ fn find_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
     Ok(format!("{}{}", names.join("\n"), if more { format!("\n--- truncated: the first {LIST_LIMIT}; narrow the pattern ---") } else { String::new() }))
 }
 
-/// What a listing gives the size of.
-const BIG_FILE: u64 = 256 * 1024;
+/// What a listing gives the size of: what is not read in one go. (At 256 KB, a real model reviewing a crate of 25 files ran three
+/// commands to count their lines before it read any.)
+const BIG_FILE: u64 = 32 * 1024;
 
 fn list_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
     let root = resolve(workspace, arguments.get("path").and_then(Value::as_str).unwrap_or("."));
@@ -1023,6 +1024,7 @@ fn list_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
             // (a large one says so here: a model about to read a log first asks how long it is, in a round of its own)
             names.push(match (folder, size >= BIG_FILE) {
                 (true, _) => format!("{name}/"),
+                (false, true) if size < 1 << 20 => format!("{name} ({} KB)", size / 1024),
                 (false, true) => format!("{name} ({:.1} MB)", size as f64 / 1_048_576.0),
                 (false, false) => name,
             });
@@ -3003,8 +3005,10 @@ mod tests {
         let (dir, mut bench, cancel) = bench();
         std::fs::write(dir.path().join("small.log"), "x").unwrap();
         std::fs::write(dir.path().join("app.log"), vec![b'x'; 1_677_722]).unwrap();
+        std::fs::write(dir.path().join("agent.rs"), vec![b'x'; 248 * 1024 + 7]).unwrap();
+        std::fs::write(dir.path().join("lib.rs"), vec![b'x'; 31 * 1024]).unwrap();
         let said = bench.run("list_files", &json!({"path": "."}), dir.path(), &cancel).unwrap();
-        assert_eq!(said, "app.log (1.6 MB)\nsmall.log");
+        assert_eq!(said, "agent.rs (248 KB)\napp.log (1.6 MB)\nlib.rs\nsmall.log");
     }
 
     #[test]
