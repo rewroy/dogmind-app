@@ -207,6 +207,10 @@ pub fn user_message_in(text: &str, now: &str, language: Option<&str>) -> String 
 /// How what goes back to a model stopped from writing code in its reasoning begins.
 pub const DRAFT_NOTE: &str = "[From the app, not the user] ";
 pub const CONTINUE_NUDGE: &str = "Your last answer was cut off by the output limit. Continue exactly where it stopped.";
+/// What the model is told when its connection broke while it was making calls: they were not made, and nothing says so otherwise.
+pub fn calls_broken_off(names: &[&str]) -> String {
+    format!("{DRAFT_NOTE}The connection broke while you were writing this, and the calls you had begun ({}) were not made: nothing of them ran. Go on from where it stopped, and make them again.", names.join(", "))
+}
 /// What an `explore` helper is told: a context of its own, which it fills so that the conversation that asked does not, and an answer
 /// that is all the other agent will see of it.
 pub fn helper_prompt(workspace: &Path) -> String {
