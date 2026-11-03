@@ -221,6 +221,8 @@ pub fn helper_prompt(workspace: &Path) -> String {
 }
 /// What a helper that has used its requests is told: an answer, with what it has.
 pub const HELPER_ENOUGH: &str = "[From the app] That is as much looking as there is room for. Answer now, with what you have found, and say what you did not get to.";
+/// What a call the helper makes after that is answered with.
+pub const HELPER_NO_MORE: &str = "error: not run. There is no more looking: answer now, in words, with what you have found, and say what you did not get to.";
 
 /// The app's word to the model: files changed, and nothing has looked at them since. Marked as the app's: a real model took it for the person's, and argued with itself over what they wanted.
 pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, or it would not be worth running, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";

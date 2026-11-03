@@ -350,7 +350,9 @@ impl Host {
     /// The text services for this host, made in the D2D mode it asks for. False where Msftedit has none to give.
     unsafe fn start(&self) -> bool {
         type Create = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32;
-        let library = LoadLibraryW(crate::paint::wide("Msftedit.dll").as_ptr());
+        // (loaded once, for as long as the app runs: what it makes lives in it. Once per window, each one's load was never given back.)
+        static LIBRARY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let library = *LIBRARY.get_or_init(|| LoadLibraryW(crate::paint::wide("Msftedit.dll").as_ptr()) as usize) as *mut c_void;
         if library.is_null() {
             return false;
         }
