@@ -1159,7 +1159,41 @@ mod color {
                     swapped.clear();
                 }
             }
-            let (font, indices) = if swapped.is_empty() { (face, glyphs[at..].as_ptr()) } else { (&emoji, swapped.as_ptr()) };
+            if !swapped.is_empty() {
+                // Each emoji in the room its Symbol glyph had, which is narrower than Segoe UI Emoji's: at its own size where it fits, a little
+                // smaller where it does not, and in the middle of it. At the run's size they stood over each other.
+                let mut face_metrics = DWRITE_FONT_METRICS::default();
+                emoji.GetMetrics(&mut face_metrics);
+                let mut sizes = vec![DWRITE_GLYPH_METRICS::default(); swapped.len()];
+                let known = face_metrics.designUnitsPerEm > 0 && emoji.GetDesignGlyphMetrics(swapped.as_ptr(), swapped.len() as u32, sizes.as_mut_ptr(), false).is_ok();
+                let mut left = x;
+                for (offset, glyph) in swapped.iter().enumerate() {
+                    let room = advances[at + offset];
+                    let natural = if known { sizes[offset].advanceWidth as f32 * run.fontEmSize / face_metrics.designUnitsPerEm as f32 } else { room };
+                    // (no smaller than this: fitted whole, some were too small to make out; a little over their room reads better)
+                    let scale = if natural > room && natural > 0.0 { (room / natural).max(0.85) } else { 1.0 };
+                    let wide = natural * scale;
+                    let one = DWRITE_GLYPH_RUN {
+                        fontFace: std::mem::transmute_copy(&emoji),
+                        fontEmSize: run.fontEmSize * scale,
+                        glyphCount: 1,
+                        glyphIndices: glyph,
+                        glyphAdvances: &wide,
+                        glyphOffsets: std::ptr::null(),
+                        isSideways: run.isSideways,
+                        bidiLevel: run.bidiLevel,
+                    };
+                    let place = Vector2 { X: left + (room - wide) / 2.0, Y: origin.Y };
+                    if !in_colour(this, place, &one, brush, mode, plain) {
+                        plain(this, place, &one, brush, mode);
+                    }
+                    left += room;
+                }
+                x += width;
+                at = end;
+                continue;
+            }
+            let (font, indices) = (face, glyphs[at..].as_ptr());
             let part = DWRITE_GLYPH_RUN {
                 // (borrowed, not held: the part is gone before the run is)
                 fontFace: std::mem::transmute_copy(font),
@@ -1171,9 +1205,7 @@ mod color {
                 isSideways: run.isSideways,
                 bidiLevel: run.bidiLevel,
             };
-            if swapped.is_empty() || !in_colour(this, place, &part, brush, mode, plain) {
-                plain(this, place, &part, brush, mode);
-            }
+            plain(this, place, &part, brush, mode);
             x += width;
             at = end;
         }
