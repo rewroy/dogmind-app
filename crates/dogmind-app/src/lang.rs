@@ -249,6 +249,8 @@ const JA: &[(&str, &str)] = &[
     ("when connected", "接続できたら"),
     ("when the engine is ready", "エンジンの準備ができたら"),
     ("at its next step", "次のステップの前に"),
+    ("Send it into this work now", "今の作業に割り込んで送る"),
+    ("Discard", "破棄"),
     ("Optional. Kept in Credential Manager", "任意。資格情報マネージャーに保存"),
     ("Anything with an OpenAI-compatible API", "OpenAI 互換の API があるもの"),
     ("Previous change (P)", "前の変更 (P)"),
@@ -765,7 +767,8 @@ pub const HELP_JA: &str = "# はじめに
 Ctrl+V\t画像やファイル
 
 # キー操作
-Enter\t送信
+Enter\t送信 (作業中なら次のステップの前に)
+Ctrl+Enter\t作業中なら、終わってから送信
 Shift+Enter\t改行
 Esc\t停止、却下、閉じる
 Ctrl+K\tコマンド (どこからでも)
