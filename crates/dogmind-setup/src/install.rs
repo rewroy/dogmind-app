@@ -227,15 +227,10 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     going_on.extend(entries.iter().filter(|entry| !ours.contains(&entry.path.to_lowercase())).map(|entry| entry.path.clone()));
     let version_here = previous.as_ref().map_or_else(|| package.version.clone(), |manifest| manifest.version.clone());
     write_manifest(folder, &Manifest { version: version_here, test: previous.as_ref().map_or(job.test, |manifest| manifest.test), files: going_on }).map_err(|error| say(&folder.join(MANIFEST), &error))?;
-    for (at, entry) in to_place.iter().enumerate() {
-        let target = folder.join(&entry.path);
-        on(Progress { stage: Stage::Placing, fraction: at as f64 / to_place.len().max(1) as f64, file: entry.path.clone() });
-        if let Err(error) = replace(&beside(&target), &target) {
-            if matches!(error.raw_os_error(), Some(5 | 32)) {
-                return Err(Failure::InUse(entry.path.clone()));
-            }
-            return Err(say(&target, &error));
-        }
+    let moved = place_all(folder, &to_place, on)?;
+    // (one a program still runs from cannot go: it stays, and goes with the next install)
+    for (_, aside) in moved {
+        let _ = std::fs::remove_file(aside);
     }
     on(Progress { stage: Stage::Finishing, fraction: 1.0, file: String::new() });
     // What the last version had and this one has not: nothing else in the folder is this program's to take.
@@ -258,6 +253,58 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     write_manifest(folder, &Manifest { version: package.version.clone(), test: job.test, files }).map_err(|error| say(&folder.join(MANIFEST), &error))?;
     job.shell.add_entries(folder, &package.version, package.total_bytes() / 1024).map_err(Failure::Said)?;
     Ok(outcome)
+}
+
+/// Every file waiting beside its place put in it, or none: half of two versions would run as neither. First what is there now is moved
+/// aside, each under a name of its own (Windows lets a program's file be renamed while it runs, and it runs on from there); then each new
+/// one comes into its place. Anything that fails on the way puts back what was moved, and what came goes back to waiting beside its
+/// place: the program is as it was, and running again goes on. What was moved aside, by where it stood, for the caller to take away.
+fn place_all(folder: &Path, to_place: &[&Entry], on: &mut dyn FnMut(Progress)) -> Result<Vec<(PathBuf, PathBuf)>, Failure> {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let steps = (to_place.len() * 2).max(1) as f64;
+    let (mut moved, mut placed): (Vec<(PathBuf, PathBuf)>, Vec<PathBuf>) = (Vec::new(), Vec::new());
+    let failed = |moved: &[(PathBuf, PathBuf)], placed: &[PathBuf], file: &str, target: &Path, error: std::io::Error| {
+        for done in placed.iter().rev() {
+            let _ = replace(done, &beside(done));
+        }
+        for (target, aside) in moved.iter().rev() {
+            let _ = replace(aside, target);
+        }
+        if matches!(error.raw_os_error(), Some(5 | 32)) { Failure::InUse(file.to_string()) } else { say(target, &error) }
+    };
+    for (at, entry) in to_place.iter().enumerate() {
+        let target = folder.join(&entry.path);
+        on(Progress { stage: Stage::Placing, fraction: at as f64 / steps, file: entry.path.clone() });
+        if std::fs::symlink_metadata(&target).is_err() {
+            continue;
+        }
+        let aside = aside_of(&target, stamp);
+        if let Err(error) = replace(&target, &aside) {
+            return Err(failed(&moved, &placed, &entry.path, &target, error));
+        }
+        moved.push((target, aside));
+    }
+    for (at, entry) in to_place.iter().enumerate() {
+        let target = folder.join(&entry.path);
+        on(Progress { stage: Stage::Placing, fraction: (to_place.len() + at) as f64 / steps, file: entry.path.clone() });
+        #[cfg(test)]
+        let refused = tests::REFUSE_PLACING.with(|refused| refused.borrow().as_deref() == Some(entry.path.as_str()));
+        #[cfg(not(test))]
+        let refused = false;
+        let result = if refused { Err(std::io::Error::from_raw_os_error(32)) } else { replace(&beside(&target), &target) };
+        if let Err(error) = result {
+            return Err(failed(&moved, &placed, &entry.path, &target, error));
+        }
+        placed.push(target);
+    }
+    Ok(moved)
+}
+
+/// The name a file is moved aside under: `NAME.previous-TIME.EXT`, as the app's own new builds do, and one no file has yet.
+fn aside_of(target: &Path, stamp: u64) -> PathBuf {
+    let stem = target.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let extension = target.extension().map(|extension| format!(".{}", extension.to_string_lossy())).unwrap_or_default();
+    (stamp..).map(|time| target.with_file_name(format!("{stem}.previous-{time}{extension}"))).find(|path| std::fs::symlink_metadata(path).is_err()).unwrap_or_default()
 }
 
 /// Whether the way to this file from the folder goes through a link. What it leads to is not in the folder, whatever the path says, and is not this program's to take.
@@ -377,6 +424,16 @@ mod tests {
     use crate::pack::tests::{noise, own_exe, tree};
     use crate::pack::pack;
     use std::cell::RefCell;
+
+    thread_local! {
+        /// The file whose coming into its place fails, as if something had opened its place in the moment between: for this thread's install.
+        pub static REFUSE_PLACING: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// The names in a folder that something was moved aside under.
+    fn moved_aside(folder: &Path) -> Vec<String> {
+        walk(folder).into_iter().filter(|name| name.contains(".previous-")).collect()
+    }
 
     #[derive(Default)]
     struct FakeShell {
@@ -534,11 +591,52 @@ mod tests {
         let failed = scene.run(&mut second, None, None).unwrap_err();
         assert_eq!(failed, Failure::InUse("b.dll".to_string()));
         assert_eq!(read_manifest(&folder).unwrap().version, "1.0.0", "not done until it is all done");
+        assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"one a", "the one before it is put back: no half of two versions");
+        assert!(moved_aside(&folder).is_empty(), "{:?}", walk(&folder));
         drop(held);
         let done = scene.run(&mut second, None, None).unwrap();
-        assert_eq!(done.already_there, 1, "the one in place stays: {done:?}");
+        assert_eq!((done.unpacked, done.already_there), (2, 0), "both were waiting, and are not unpacked again: {done:?}");
+        assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"two a");
         assert_eq!(std::fs::read(folder.join("b.dll")).unwrap(), b"two b");
         assert_eq!(read_manifest(&folder).unwrap().version, "2.0.0");
+        assert!(moved_aside(&folder).is_empty() && walk(&folder).iter().all(|name| !name.ends_with(WAITING)), "{:?}", walk(&folder));
+    }
+
+    /// A file that fails to come into its place, after others have come into theirs: all of them go back to waiting, and what was there
+    /// is put back, every file as it was.
+    #[test]
+    fn a_failure_while_placing_puts_every_file_back_as_it_was() {
+        let scene = Scene::new();
+        let mut first = scene.package("1.0.0", &[("a.exe", b"one a"), ("b.dll", b"one b"), ("tools\\c.py", b"one c")]);
+        scene.run(&mut first, None, None).unwrap();
+        let folder = scene.folder();
+        let mut second = scene.package("2.0.0", &[("a.exe", b"two a"), ("b.dll", b"two b"), ("tools\\c.py", b"two c"), ("tools\\d.py", b"new d")]);
+        REFUSE_PLACING.with(|refused| *refused.borrow_mut() = Some("tools\\c.py".into()));
+        let failed = scene.run(&mut second, None, None).unwrap_err();
+        REFUSE_PLACING.with(|refused| *refused.borrow_mut() = None);
+        assert_eq!(failed, Failure::InUse("tools\\c.py".to_string()));
+        for (file, was) in [("a.exe", "one a"), ("b.dll", "one b"), ("tools\\c.py", "one c")] {
+            assert_eq!(std::fs::read_to_string(folder.join(file)).unwrap(), was, "{file}");
+        }
+        assert!(!folder.join("tools\\d.py").exists(), "a new file is not there either");
+        assert!(moved_aside(&folder).is_empty(), "{:?}", walk(&folder));
+        assert_eq!(read_manifest(&folder).unwrap().version, "1.0.0");
+        let done = scene.run(&mut second, None, None).unwrap();
+        assert_eq!(done.unpacked, 4, "all were waiting: {done:?}");
+        assert_eq!(std::fs::read(folder.join("tools\\d.py")).unwrap(), b"new d");
+        assert_eq!(read_manifest(&folder).unwrap().version, "2.0.0");
+        assert!(moved_aside(&folder).is_empty() && walk(&folder).iter().all(|name| !name.ends_with(WAITING)), "{:?}", walk(&folder));
+    }
+
+    #[test]
+    fn a_file_is_moved_aside_under_a_name_no_file_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dogmind-app.exe");
+        assert_eq!(aside_of(&target, 7).file_name().unwrap(), "dogmind-app.previous-7.exe");
+        std::fs::write(dir.path().join("dogmind-app.previous-7.exe"), b"left by a run that was still going").unwrap();
+        assert_eq!(aside_of(&target, 7).file_name().unwrap(), "dogmind-app.previous-8.exe");
+        assert_eq!(aside_of(&dir.path().join("LICENSE"), 3).file_name().unwrap(), "LICENSE.previous-3");
+        assert_eq!(stood_for("LICENSE.previous-3").as_deref(), Some("LICENSE"), "and it is known again for what it stood for");
     }
 
     #[test]
@@ -625,7 +723,7 @@ mod tests {
         let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(folder.join("z.dll")).unwrap();
         assert_eq!(scene.run(&mut second, None, None).unwrap_err(), Failure::InUse("z.dll".to_string()));
         drop(held);
-        assert!(folder.join("m.dll").is_file(), "it had come as far as this");
+        assert!(!folder.join("m.dll").exists() && beside(&folder.join("m.dll")).is_file(), "the new file waits beside its place");
         assert_eq!(read_manifest(&folder).unwrap().version, "1.0.0");
         remove(&folder, &scene.shell, &mut |_| {}).unwrap();
         assert!(!folder.exists(), "{:?}", walk(&folder));
