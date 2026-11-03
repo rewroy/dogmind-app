@@ -10445,7 +10445,13 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
         if pixels != 0 {
             let mut position = POINT { x: 0, y: 0 };
             SendMessageW(window, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
-            position.y = (position.y + pixels).max(0);
+            // (no further than the end at the foot of the view: RichEdit takes a place past it, with nothing but the page under the last answer)
+            let mut bar: SCROLLINFO = std::mem::zeroed();
+            bar.cbSize = std::mem::size_of::<SCROLLINFO>() as u32;
+            bar.fMask = SIF_RANGE | SIF_PAGE;
+            GetScrollInfo(window, SB_VERT, &mut bar);
+            let last = (bar.nMax - bar.nPage as i32 + 1).max(0);
+            position.y = (position.y + pixels).clamp(0, last);
             SendMessageW(window, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
         }
         0

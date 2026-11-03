@@ -125,7 +125,7 @@ fn environment() -> String {
     }
     let shut = if shut.is_empty() { String::new() } else { format!(" Closed to the sandbox until the user runs /tools, by any path: {}: work without them, and say what /tools would add.", shut.join(", ")) };
     format!(
-        "## Environment\n- Windows. `execute_command` runs cmd.exe in a sandbox, so write cmd syntax. It can write only in the workspace (when that is a whole user folder or drive, only in the project folder its `cwd` names), it cannot read the user's other files except folders the first message names, and it has no network. curl, package installs and remote git ask the user by themselves; anything else that needs it sets `network: true`, which asks too.\n- Nothing can listen on or reach a local server, and nothing here can show how a page looks. A page using a CDN library cannot run here, and that is fine: write it once as one file, never download or build a library to check it, and say in your answer that it has not been run.\n- PowerShell starts at C:\\ in the sandbox and cannot move from there, so give it absolute paths, and `Start-Process` a `-WorkingDirectory`.\n- Stay in the workspace unless the user asks otherwise. What the sandbox refuses it refuses by every route, so say what you could not do instead of trying others.\n- On PATH, with no need to check: {}.{shut}\n\n",
+        "## Environment\n- Windows. `execute_command` runs cmd.exe in a sandbox, so write cmd syntax. It can write only in the workspace (when that is a whole user folder or drive, only in the project folder its `cwd` names), it cannot read the user's other files except folders the first message names, and it has no network. curl, package installs and remote git ask the user by themselves; anything else that needs it sets `network: true`, which asks too.\n- Nothing can listen on or reach a local server. `check_page` shows how a page looks, and its `steps` click and type in it as a person would. A page using a CDN library cannot run here, and that is fine: write it once as one file, never download or build a library to check it, and say in your answer that it has not been run.\n- PowerShell starts at C:\\ in the sandbox and cannot move from there, so give it absolute paths, and `Start-Process` a `-WorkingDirectory`.\n- Stay in the workspace unless the user asks otherwise. What the sandbox refuses it refuses by every route, so say what you could not do instead of trying others.\n- On PATH, with no need to check: {}.{shut}\n\n",
         found.join(", ")
     )
 }
@@ -264,8 +264,9 @@ mod tests {
         let prompt = system_prompt(folder.path(), false, "", "");
         assert!(prompt.len() < 5_500, "the system prompt has grown to {} characters", prompt.len());
         let tools = crate::tools::schemas_for(false, false, false, Vec::new()).to_string();
-        // (5,150 until check_page took views and a wait: pictures at a phone's width and after an animation were what a real model, asked, missed most)
-        assert!(tools.len() < 5_300, "the tools have grown to {} characters", tools.len());
+        // (5,150 until check_page took views and a wait: pictures at a phone's width and after an animation were what a real model, asked, missed most;
+        // then steps, to click and type in a page as Playwright would, which the person asked for)
+        assert!(tools.len() < 5_550, "the tools have grown to {} characters", tools.len());
         assert!(user_message_in("x", "2026-11-02 20:01:18 +09:00", None).len() < 60, "what rides on every message");
     }
 
