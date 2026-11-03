@@ -690,6 +690,20 @@ impl Outgoing {
     }
 }
 
+/// Now, as a message's time reads beside it.
+fn clock_now() -> String {
+    let now = dogmind_agent::message::written_now();
+    dogmind_agent::message::clock_words(&now, &now)
+}
+
+/// When a message of a saved session was written, as it reads beside it: its own time, or for one from before messages kept it, the time its
+/// first line gives. Nothing when neither says.
+fn written_words(message: &Message) -> String {
+    let today = dogmind_agent::message::written_now();
+    let at = message.at.as_deref().or_else(|| message.content.as_deref().and_then(dogmind_agent::prompt::said_at));
+    at.map_or(String::new(), |at| dogmind_agent::message::clock_words(at, &today))
+}
+
 /// A message of the person's, as the rail of turns beside the transcript knows it: where it begins, and its first words.
 struct TurnMark {
     start: i32,
@@ -1323,7 +1337,8 @@ enum Shown {
     Link(String, String, Para),
     /// `width`: none for the column's.
     Row { lines: Vec<String>, face: String, points: i32, color: u32, back: u32, width: Option<i32>, right: bool, padding: (i32, i32) },
-    Answer(String),
+    /// An answer's text, for its copy button, and when it was given, as its row says it (or nothing).
+    Answer(String, String),
     /// A line of code, coloured when it is drawn: `open` is whether a block comment runs into it.
     Code { line: String, language: String, open: bool },
     /// A Markdown table: its first row is the heading. Drawn afresh each time, as its colours and widths depend on the moment.
@@ -1358,10 +1373,21 @@ enum Style {
     Thinking,
     Tool,
     CopyRow,
+    /// When the person said what is in the card above it, at the card's right.
+    SaidAt,
+    /// When an answer was given, in its copy row, past where the button stands.
+    AnsweredAt,
     Output,
     Warn,
     Bad,
 }
+
+/// Where an answer's time begins in its row, in twips: past its copy button, an icon button wide at 100%, and a little room.
+const ANSWERED_AT_TAB: i32 = (ds::size::ICON_BUTTON + 10) * 15;
+const PFM_ALIGNMENT: u32 = 0x0000_0008;
+const PFM_RIGHTINDENT: u32 = 0x0000_0002;
+const PFA_LEFT: u16 = 1;
+const PFA_RIGHT: u16 = 2;
 
 /// What the parent window paints itself, recomputed by `layout`.
 enum Shape {
@@ -2058,7 +2084,9 @@ fn para_format(points: i32, indent: i32, before: i32, after: i32) -> ParaFormat 
     let mut format: ParaFormat = unsafe { std::mem::zeroed() };
     format.size = std::mem::size_of::<ParaFormat>() as u32;
     // (the offset too, at none: a paragraph after a list item would keep the item's hanging indent on its wrapped lines)
-    format.mask = PFM_STARTINDENT | PFM_OFFSET | PFM_SPACEBEFORE | PFM_SPACEAFTER | PFM_LINESPACING;
+    // (and at the left, said each time: a new paragraph takes the one before it's, and a time stands at the right)
+    format.mask = PFM_STARTINDENT | PFM_RIGHTINDENT | PFM_OFFSET | PFM_SPACEBEFORE | PFM_SPACEAFTER | PFM_LINESPACING | PFM_ALIGNMENT;
+    format.alignment = PFA_LEFT;
     format.start_indent = indent;
     format.space_before = before;
     format.space_after = after;
@@ -2308,6 +2336,7 @@ impl App {
             Style::Thinking => char_format(theme::faint(), CFE_ITALIC, ui, 10, None),
             Style::Tool => char_format(theme::muted(), 0, ui, 9, None),
             Style::CopyRow => char_format(theme::background(), 0, ui, 13, None),
+            Style::SaidAt | Style::AnsweredAt => char_format(theme::faint(), 0, ui, 9, None),
             Style::Output => char_format(theme::faint(), 0, mono, 9, None),
             Style::Warn => char_format(theme::warn(), 0, ui, 10, None),
             Style::Bad => char_format(theme::bad(), 0, ui, 10, None),
@@ -2316,6 +2345,21 @@ impl App {
             Style::Code => para_format(10, 240, 0, 0),
             Style::Output => para_format(9, 240, 0, 0),
             Style::Tool => para_format(9, 0, 60, 40),
+            Style::SaidAt => {
+                let mut said = para_format(9, 0, 60, 40);
+                said.alignment = PFA_RIGHT;
+                // (at the card's right edge: the control's text reaches past it by the room it keeps for its own bar)
+                said.mask |= PFM_RIGHTINDENT;
+                said.right_indent = GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi) * 3 / 5 * 1440 / self.dpi as i32;
+                said
+            }
+            Style::CopyRow | Style::AnsweredAt => {
+                let mut row = para_format(11, 0, 0, 120);
+                row.mask |= PFM_TABSTOPS;
+                row.tab_count = 1;
+                row.tabs[0] = ANSWERED_AT_TAB;
+                row
+            }
             Style::Title => para_format(15, 0, 160, 100),
             Style::Gap => para_format(6, 0, 0, 0),
             Style::Heading => para_format(13, 0, 240, 80),
@@ -2440,7 +2484,8 @@ impl App {
                 Some(turn) if std::mem::take(&mut self.turn_words_due) => turn.prompt = prompt,
                 _ => self.rail_turns.push(TurnMark { start, prompt }),
             }
-            // (a whole conversation opened, or written again, has the rail placed once it is all in)
+            // (a whole conversation opened, or written again, has the rail placed once it is all in; the second turn's card makes room for it,
+            // when it is in: show_user)
             if !self.replaying && !self.opening {
                 self.place_rail();
             }
@@ -2596,7 +2641,7 @@ impl App {
                     let width = width.map_or(self.text_twips, |width| width.min((self.text_twips * 4 / 5).max(800)));
                     self.append_row(&rtf::Row { lines: &lines, face, points: *points, color: *color, back: *back, width, right: *right, column: self.text_twips, padding: *padding });
                 }
-                Shown::Answer(text) => self.answer_row(text),
+                Shown::Answer(text, at) => self.answer_row(text, at),
                 Shown::Table(rows) => self.table_rows(rows),
                 Shown::Code { line, language, open } => {
                     self.code_row(line, language, *open);
@@ -3110,11 +3155,13 @@ impl App {
 
     /// A run begins right under an answer: that was a remark on the way, and its copy row goes. What ends a turn keeps one.
     unsafe fn run_follows(&mut self, at: usize) {
-        if matches!(self.shown.last(), Some(Shown::Answer(_))) {
+        if let Some(Shown::Answer(_, at)) = self.shown.last() {
+            // (the row's tab and time, and its end)
+            let length = if at.is_empty() { 1 } else { at.encode_utf16().count() as i32 + 2 };
             if let Some((first, _)) = self.answers.pop() {
                 self.shown.pop();
                 self.at_end(|edit| {
-                    let row = CharRange { first, last: first + 1 };
+                    let row = CharRange { first, last: first + length };
                     SendMessageW(edit, EM_EXSETSEL, 0, std::ptr::addr_of!(row) as LPARAM);
                     let nothing = wide("");
                     SendMessageW(edit, EM_REPLACESEL, 0, nothing.as_ptr() as LPARAM);
@@ -3124,14 +3171,14 @@ impl App {
         self.shown.push(Shown::Run(at));
     }
 
-    /// Below an answer, a row for its copy button.
-    unsafe fn mark_answer(&mut self, text: &str) {
+    /// Below an answer, a row for its copy button, and when it was given (`at`, as it is to read: or nothing).
+    unsafe fn mark_answer(&mut self, text: &str, at: &str) {
         self.end_line();
-        self.shown.push(Shown::Answer(text.to_string()));
-        self.answer_row(text);
+        self.shown.push(Shown::Answer(text.to_string(), at.to_string()));
+        self.answer_row(text, at);
     }
 
-    unsafe fn answer_row(&mut self, text: &str) {
+    unsafe fn answer_row(&mut self, text: &str, at: &str) {
         let mut end = CharRange { first: 0, last: 0 };
         self.at_end(|edit| {
             SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(end) as LPARAM);
@@ -3139,6 +3186,11 @@ impl App {
         self.answers.push((end.first, text.to_string()));
         // (the answer has its own place in `shown`, which writes this row again)
         self.unkept = true;
+        if !at.is_empty() {
+            // (a tab first: where the row begins is where its copy button stands, and the time goes past it)
+            self.append("\t", Style::CopyRow);
+            self.append(at, Style::AnsweredAt);
+        }
         self.append("\n", Style::CopyRow);
         self.unkept = false;
         self.line_start = true;
@@ -3389,7 +3441,7 @@ impl App {
         if !self.answer.is_empty() {
             self.last_answer = std::mem::take(&mut self.answer);
             let answer = self.last_answer.clone();
-            self.mark_answer(&answer);
+            self.mark_answer(&answer, &clock_now());
         }
     }
 
@@ -3701,7 +3753,8 @@ impl App {
     }
 
     /// What the person wrote: a card against the right edge, and what the model writes runs under it at full width.
-    unsafe fn show_user(&mut self, text: &str, images: &[(PathBuf, (i32, i32))]) {
+    /// `at`: when it was said, as it is to read under the card, or nothing.
+    unsafe fn show_user(&mut self, text: &str, images: &[(PathBuf, (i32, i32))], at: &str) {
         self.end_line();
         // (the first card keeps clear of the edge above it)
         if self.shown.is_empty() {
@@ -3738,8 +3791,24 @@ impl App {
         if !lines.is_empty() {
             self.append_row(&rtf::Row { lines: &lines, face: UI_FACE, points: 11, color: theme::text(), back: theme::user_back(), width, right: true, column: self.text_twips, padding });
         }
-        self.append("\n", Style::Tool);
+        if at.is_empty() {
+            self.append("\n", Style::Tool);
+        } else {
+            self.append(&format!("{at}\n"), Style::SaidAt);
+        }
         self.line_start = true;
+        // The second turn brings the rail, whose room narrows the conversation's column: the conversation is written again at it now, before
+        // an answer comes into it, and not on a timer, which would write it again in the middle of one.
+        if self.rail_turns.len() == 2 && !self.opening {
+            let before = self.text_twips;
+            self.layout();
+            if self.text_twips != before {
+                KillTimer(self.window, TIMER_REFLOW);
+                self.reflow();
+                self.place_copy_buttons();
+                self.place_thumb();
+            }
+        }
     }
 
     /// Where a message's pictures are kept with this session, and their sizes.
@@ -4829,8 +4898,17 @@ impl App {
                 place(self.feedback, after + s(ds::space::M), row + s(ds::size::FIELD_INSET), left + column - s(ds::space::L) - after - 2 * s(ds::space::M), s(ds::size::FIELD_TEXT));
                 bottom = top - s(ds::space::S);
             }
+            // The conversation's own column: the input's, less what the rail of turns needs beside it at each side, where the panel's edge does not
+            // leave that room already (with the scrollbar's strip, and as it stands centred, at both sides).
+            let rail_room = if self.rail_turns.len() >= 2 {
+                GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi) + s(RAIL_WIDTH) + s(ds::space::S)
+            } else {
+                0
+            };
+            let inset = (rail_room - (main_width - column) / 2).max(0);
+            let (text_left, text_column) = (left + inset, column - 2 * inset);
             // The width text goes in at, whether or not there is any yet: what is written first would have to be written again, as soon as it had gone in.
-            let twips = (i64::from(column) * 1440 / i64::from(self.dpi)) as i32;
+            let twips = (i64::from(text_column) * 1440 / i64::from(self.dpi)) as i32;
             if twips != self.text_twips {
                 self.text_twips = twips;
                 // Once the window has stopped moving: it writes the whole conversation again.
@@ -4865,12 +4943,13 @@ impl App {
                 place(self.transcript, main_left, top, main_width, bottom - top);
                 let bar = GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi);
                 // (the control keeps back this much of its text's width for the bar it has: measured, three fifths of the bar's own)
-                let area = RECT { left: left - main_left, top: 0, right: left - main_left + column + bar * 3 / 5, bottom: bottom - top };
+                let area = RECT { left: text_left - main_left, top: 0, right: text_left - main_left + text_column + bar * 3 / 5, bottom: bottom - top };
                 if self.transcript_rect != (area.left, area.right, area.bottom) {
                     self.transcript_rect = (area.left, area.right, area.bottom);
                     SendMessageW(self.transcript, EM_SETRECT, 0, std::ptr::addr_of!(area) as LPARAM);
                 }
-                self.column_right = main_left + area.right;
+                // (where its text ends: the control's room for its own bar is not text)
+                self.column_right = text_left + text_column;
                 // (the rail's place goes into the control's region, and that is set here too)
                 self.place_rail();
                 self.set_transcript_region();
@@ -8918,7 +8997,7 @@ impl App {
         self.scrolled_up_at = None;
         self.want_frames();
         let shown: Vec<(PathBuf, (i32, i32))> = out.images.iter().map(|attached| (attached.path.clone(), (attached.picture.width as i32, attached.picture.height as i32))).collect();
-        self.show_user(&out.card, &shown);
+        self.show_user(&out.card, &shown, &clock_now());
         // (from now: behind a warm-up its turn may not begin for most of a minute)
         self.set_activity(t("Thinking…").into());
         self.running = true;
@@ -9082,7 +9161,7 @@ impl App {
                     if let Some(text) = message.content.as_deref().filter(|text| !dogmind_agent::prompt::is_nudge(text)) {
                         self.flush_told_calls(&mut told);
                         let pictures: Vec<(PathBuf, (i32, i32))> = self.current_session.as_deref().map_or(Vec::new(), |session| message.images.iter().map(|image| (dogmind_agent::images::file_of(session, image), (image.width as i32, image.height as i32))).collect());
-                        self.show_user(typed_text(text), &pictures);
+                        self.show_user(typed_text(text), &pictures, &written_words(message));
                     }
                 }
                 "assistant" => {
@@ -9093,7 +9172,7 @@ impl App {
                         self.append_answer(text);
                         self.finish_answer();
                         self.last_answer = text.clone();
-                        self.mark_answer(text);
+                        self.mark_answer(text, &written_words(message));
                     }
                     for call in message.tool_calls.iter().flatten() {
                         // A session at work has calls still running, or still waiting for an answer: they say so when they end.
@@ -9495,7 +9574,7 @@ impl App {
                 if let Some(place) = self.interjected.iter().position(|known| *known == text) {
                     self.interjected.remove(place);
                 }
-                self.show_user(&text, &[]);
+                self.show_user(&text, &[], &clock_now());
                 self.layout();
             }
             Event::Approval(approval) => {

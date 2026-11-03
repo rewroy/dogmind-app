@@ -144,6 +144,8 @@ impl Completion {
             tool_call_id: None,
             provider_blocks: self.blocks.clone(),
             images: Vec::new(),
+            // (the conversation gives it one as it goes in)
+            at: None,
         }
     }
 }

@@ -229,6 +229,11 @@ pub fn with_note(message: &str, note: &str) -> String {
     }
 }
 
+/// When a message built by [`user_message`] was said, as its first line has it: how a session from before messages kept their time tells it.
+pub fn said_at(message: &str) -> Option<&str> {
+    message.strip_prefix(NOW_MARK)?.split_once(']').map(|(at, _)| at)
+}
+
 /// What a person typed, out of a message built by [`user_message`].
 pub fn typed_text(message: &str) -> &str {
     // (a session saved before the language moved has this, and perhaps no mark)
