@@ -352,7 +352,11 @@ impl Host {
         type Create = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32;
         // (loaded once, for as long as the app runs: what it makes lives in it. Once per window, each one's load was never given back.)
         static LIBRARY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let library = *LIBRARY.get_or_init(|| LoadLibraryW(crate::paint::wide("Msftedit.dll").as_ptr()) as usize) as *mut c_void;
+        let library = *LIBRARY.get_or_init(|| {
+            // (before the first text services: they keep the collection they are first given)
+            lent::the_shipped_face();
+            LoadLibraryW(crate::paint::wide("Msftedit.dll").as_ptr()) as usize
+        }) as *mut c_void;
         if library.is_null() {
             return false;
         }
@@ -1003,6 +1007,127 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
     }
 }
 
+/// The face shipped beside the app, for the text services too, on a Windows that has no copy of its own, with nothing installed. They
+/// find a face by its name in DirectWrite's system collection, which the fonts GDI holds for this process alone are not in: there it
+/// was Yu Gothic for the Japanese and Calibri for the rest. The process has one shared DirectWrite factory, and theirs is it; it is
+/// given a table of its own, whose GetSystemFontCollection answers with Windows's fonts and the shipped files in one collection. The
+/// fonts stay where they are, and nothing outside this process knows. Where anything here is not as it was found to be, nothing is
+/// changed, and they draw as before.
+mod lent {
+    use std::ffi::c_void;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+
+    use windows::core::{Interface, BOOL, HRESULT, HSTRING};
+    use windows::Win32::Graphics::DirectWrite::*;
+
+    const PLAIN: usize = std::mem::offset_of!(IDWriteFactory_Vtbl, GetSystemFontCollection) / size_of::<usize>();
+    const THIRD: usize = std::mem::offset_of!(IDWriteFactory3_Vtbl, GetSystemFontCollection) / size_of::<usize>();
+    /// No factory's table is longer: the walk along one stops here whatever it finds.
+    const MOST: usize = 512;
+
+    static WAS_THIRD: AtomicUsize = AtomicUsize::new(0);
+    /// The collection, as each of the two asks for it, held for as long as the app runs.
+    static PLAIN_ONE: AtomicUsize = AtomicUsize::new(0);
+    static THIRD_ONE: AtomicUsize = AtomicUsize::new(0);
+
+    /// The shipped face, beside the app (or fetched, for a build that was not packaged), lent before the first text services are made.
+    pub fn the_shipped_face() -> bool {
+        let Some(folder) = crate::paint::font_folders().into_iter().find(|folder| crate::paint::BUNDLED_FILES.iter().all(|file| folder.join(file).is_file())) else { return false };
+        let files: Vec<PathBuf> = crate::paint::BUNDLED_FILES.iter().map(|file| folder.join(file)).collect();
+        lend(&files, crate::paint::BUNDLED_FACE)
+    }
+
+    /// `family`, in `files`, to every user of the shared factory, once for the process: whether it is lent. Not where Windows has it.
+    pub fn lend(files: &[PathBuf], family: &str) -> bool {
+        static DONE: OnceLock<bool> = OnceLock::new();
+        *DONE.get_or_init(|| unsafe { put_in(files, family).is_some() })
+    }
+
+    unsafe fn has(collection: &IDWriteFontCollection, family: &str) -> bool {
+        let (mut index, mut exists) = (0u32, BOOL(0));
+        collection.FindFamilyName(&HSTRING::from(family), &mut index, &mut exists).is_ok() && exists.as_bool()
+    }
+
+    unsafe fn put_in(files: &[PathBuf], family: &str) -> Option<()> {
+        if files.is_empty() {
+            return None;
+        }
+        let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+        let mut system = None;
+        factory.GetSystemFontCollection(&mut system, false).ok()?;
+        if has(system.as_ref()?, family) {
+            return None;
+        }
+        let newer: IDWriteFactory6 = factory.cast().ok()?;
+        let builder = newer.CreateFontSetBuilder().ok()?;
+        for file in files {
+            builder.AddFontFile(&HSTRING::from(file.as_os_str())).ok()?;
+        }
+        builder.AddFontSet(&newer.GetSystemFontSet(false).ok()?).ok()?;
+        let merged: IDWriteFontCollection1 = newer.CreateFontCollectionFromFontSet(&builder.CreateFontSet().ok()?, DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE).ok()?.cast().ok()?;
+        let plain: IDWriteFontCollection = merged.cast().ok()?;
+        if !has(&plain, family) {
+            return None;
+        }
+        let object = factory.as_raw();
+        let table = *(object as *const *const usize);
+        let length = length_of(table)?;
+        if length <= PLAIN {
+            return None;
+        }
+        let mut copy: Vec<usize> = (0..length).map(|at| *table.add(at)).collect();
+        copy[PLAIN] = plain_collection as unsafe extern "system" fn(*mut c_void, *mut *mut c_void, BOOL) -> HRESULT as usize;
+        if length > THIRD {
+            WAS_THIRD.store(copy[THIRD], Ordering::Relaxed);
+            copy[THIRD] = third_collection as unsafe extern "system" fn(*mut c_void, BOOL, *mut *mut c_void, BOOL) -> HRESULT as usize;
+        }
+        PLAIN_ONE.store(plain.into_raw() as usize, Ordering::Relaxed);
+        THIRD_ONE.store(merged.into_raw() as usize, Ordering::Relaxed);
+        *(object as *mut *const usize) = Box::leak(copy.into_boxed_slice()).as_ptr();
+        // (the factory stays, and so its table: one made again, after the last user let it go, would have Windows's)
+        std::mem::forget(factory);
+        Some(())
+    }
+
+    /// How many slots the table has: as many as lead into DirectWrite's code, from the first, as every one of them does. A slot or two
+    /// past its end that happens to as well is copied and never called; one short of it would be called and lead nowhere.
+    unsafe fn length_of(table: *const usize) -> Option<usize> {
+        let module = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!("dwrite.dll").as_ptr()) as usize;
+        if module == 0 {
+            return None;
+        }
+        let header = module + *((module + 0x3C) as *const u32) as usize;
+        // (SizeOfImage, in the optional header after the file header)
+        let end = module + *((header + 24 + 56) as *const u32) as usize;
+        let length = (0..MOST).take_while(|at| (module..end).contains(&*table.add(*at))).count();
+        (length > 0).then_some(length)
+    }
+
+    unsafe fn give(kept: &AtomicUsize, out: *mut *mut c_void) -> HRESULT {
+        if out.is_null() {
+            return windows::Win32::Foundation::E_POINTER;
+        }
+        let raw = kept.load(Ordering::Relaxed) as *mut c_void;
+        let Some(held) = windows::core::IUnknown::from_raw_borrowed(&raw) else { return windows::Win32::Foundation::E_FAIL };
+        *out = held.clone().into_raw();
+        HRESULT(0)
+    }
+
+    unsafe extern "system" fn plain_collection(_this: *mut c_void, out: *mut *mut c_void, _check: BOOL) -> HRESULT {
+        give(&PLAIN_ONE, out)
+    }
+
+    unsafe extern "system" fn third_collection(this: *mut c_void, downloadable: BOOL, out: *mut *mut c_void, check: BOOL) -> HRESULT {
+        // (the fonts Windows could fetch are not in the merged one: who asks for them gets Windows's own)
+        if downloadable.as_bool() {
+            let was: unsafe extern "system" fn(*mut c_void, BOOL, *mut *mut c_void, BOOL) -> HRESULT = std::mem::transmute(WAS_THIRD.load(Ordering::Relaxed));
+            return was(this, downloadable, out, check);
+        }
+        give(&THIRD_ONE, out)
+    }
+}
 
 /// Colour glyphs, where the text services draw outlines only: for the time they draw, the target's table is a copy of its own whose
 /// DrawGlyphRun asks DirectWrite for the run's colour layers and draws those, as Direct2D does for text it is given to lay out. The copy is
@@ -1063,7 +1188,21 @@ mod color {
         WRITE.with(|cell| cell.borrow_mut().get_or_insert_with(|| unsafe { DWriteCreateFactory::<IDWriteFactory4>(DWRITE_FACTORY_TYPE_SHARED).ok() }).clone())
     }
 
+    #[cfg(test)]
+    thread_local! {
+        pub static DRAWN_IN: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
     unsafe extern "system" fn draw_glyph_run(this: *mut c_void, origin: Vector2, run: *const DWRITE_GLYPH_RUN, brush: *mut c_void, mode: DWRITE_MEASURING_MODE) {
+        #[cfg(test)]
+        if let Some(face) = (*run).fontFace.as_ref().and_then(|face| face.cast::<IDWriteFontFace3>().ok()) {
+            if let Ok(names) = face.GetFamilyNames() {
+                let length = names.GetStringLength(0).unwrap_or(0);
+                let mut name = vec![0u16; length as usize + 1];
+                let _ = names.GetString(0, &mut name);
+                DRAWN_IN.with(|drawn| drawn.borrow_mut().push(String::from_utf16_lossy(&name[..length as usize])));
+            }
+        }
         let plain: Glyphs = std::mem::transmute(PLAIN.load(Ordering::Relaxed));
         if !in_colour(this, origin, run, brush, mode, plain) && !in_emoji_face(this, origin, run, brush, mode, plain) {
             plain(this, origin, run, brush, mode);
@@ -1758,6 +1897,97 @@ mod tests {
                 .collect();
             assert!(wrong.is_empty(), "in the wrong face: {wrong:?}\nall: {faces:?}");
             DestroyWindow(window);
+        }
+    }
+
+    /// A TrueType font under another family name, for a face no Windows has: each `from` in its names becomes `to`, of as many letters,
+    /// and the sums over them are made again.
+    fn renamed(font: &[u8], from: &str, to: &str) -> Vec<u8> {
+        fn sum(bytes: &[u8]) -> u32 {
+            bytes.chunks(4).map(|four| {
+                let mut word = [0u8; 4];
+                word[..four.len()].copy_from_slice(four);
+                u32::from_be_bytes(word)
+            }).fold(0, u32::wrapping_add)
+        }
+        fn swap(bytes: &mut [u8], from: &[u8], to: &[u8]) {
+            let mut at = 0;
+            while at + from.len() <= bytes.len() {
+                if &bytes[at..at + from.len()] == from {
+                    bytes[at..at + from.len()].copy_from_slice(to);
+                    at += from.len();
+                } else {
+                    at += 1;
+                }
+            }
+        }
+        assert_eq!(from.len(), to.len());
+        let mut font = font.to_vec();
+        let word = |font: &[u8], at: usize| u32::from_be_bytes(font[at..at + 4].try_into().unwrap()) as usize;
+        let count = u16::from_be_bytes([font[4], font[5]]) as usize;
+        let table = |font: &[u8], tag: &[u8]| (0..count).map(|at| 12 + 16 * at).find(|record| &font[*record..*record + 4] == tag).map(|record| (record, word(font, record + 8), word(font, record + 12))).unwrap();
+        let utf16 = |text: &str| text.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>();
+        let (record, offset, length) = table(&font, b"name");
+        swap(&mut font[offset..offset + length], &utf16(from), &utf16(to));
+        swap(&mut font[offset..offset + length], from.as_bytes(), to.as_bytes());
+        let names = sum(&font[offset..offset + length]);
+        font[record + 4..record + 8].copy_from_slice(&names.to_be_bytes());
+        let (record, head, length) = table(&font, b"head");
+        font[head + 8..head + 12].fill(0);
+        let heads = sum(&font[head..head + length]);
+        font[record + 4..record + 8].copy_from_slice(&heads.to_be_bytes());
+        let whole = 0xB1B0_AFBAu32.wrapping_sub(sum(&font));
+        font[head + 8..head + 12].copy_from_slice(&whole.to_be_bytes());
+        font
+    }
+
+    /// A face in no Windows font folder, only in a file beside the app, is the one the text services draw in: nothing is installed. The
+    /// face is the shipped one under a name no Windows has. In a process of its own, as the text services keep the collection they were
+    /// first given, and other tests here may have made some before.
+    #[test]
+    fn a_face_only_in_a_file_beside_the_app_is_drawn_in() {
+        const NAME: &str = "textview::tests::a_face_only_in_a_file_beside_the_app_is_drawn_in";
+        let Some(file) = std::env::var_os("DOGMIND_TEST_LENT_FACE") else {
+            let regular = crate::paint::BUNDLED_FILES[0];
+            let Some(folder) = crate::paint::font_folders().into_iter().find(|folder| folder.join(regular).is_file()) else { return };
+            let dir = tempfile::tempdir().unwrap();
+            let copy = dir.path().join("QZXUDGothic-Regular.ttf");
+            std::fs::write(&copy, renamed(&std::fs::read(folder.join(regular)).unwrap(), "BIZ", "QZX")).unwrap();
+            let run = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", NAME, "--nocapture", "--test-threads=1"]).env("DOGMIND_TEST_LENT_FACE", &copy).output().unwrap();
+            let said = String::from_utf8_lossy(&run.stdout).into_owned() + &String::from_utf8_lossy(&run.stderr);
+            assert!(run.status.success() && said.contains("1 passed"), "{said}");
+            return;
+        };
+        let file = std::path::PathBuf::from(file);
+        unsafe {
+            assert!(lent::lend(std::slice::from_ref(&file), "QZX UDGothic"), "no Windows has this face, so it is lent");
+            // (as the app has it: in GDI too, for this process alone)
+            windows_sys::Win32::Graphics::Gdi::AddFontResourceExW(crate::paint::wide(&file.to_string_lossy()).as_ptr(), 0x10, std::ptr::null());
+            register(windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()));
+            let (class, title) = (crate::paint::wide(CLASS), crate::paint::wide(""));
+            let window = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_POPUP | ES_MULTILINE | ES_READONLY, 0, 0, 400, 300, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+            assert!(!window.is_null());
+            let text = crate::paint::wide("あいうえお abc 漢字");
+            SendMessageW(window, WM_SETTEXT, 0, text.as_ptr() as LPARAM);
+            let mut format = [0u8; 116];
+            format[..4].copy_from_slice(&116u32.to_le_bytes());
+            format[4..8].copy_from_slice(&0x2000_0000u32.to_le_bytes()); // CFM_FACE
+            for (at, unit) in "QZX UDGothic".encode_utf16().enumerate() {
+                format[26 + 2 * at..28 + 2 * at].copy_from_slice(&unit.to_le_bytes());
+            }
+            SendMessageW(window, WM_USER + 68, 4, format.as_mut_ptr() as LPARAM); // EM_SETCHARFORMAT, SCF_ALL
+            use windows_sys::Win32::Graphics::Gdi::{CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject};
+            let screen = GetDC(std::ptr::null_mut());
+            let (device, bitmap) = (CreateCompatibleDC(screen), CreateCompatibleBitmap(screen, 400, 300));
+            let was = SelectObject(device, bitmap);
+            SendMessageW(window, WM_PRINTCLIENT, device as WPARAM, 0);
+            SelectObject(device, was);
+            DeleteObject(bitmap);
+            DeleteDC(device);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            DestroyWindow(window);
+            let drawn = color::DRAWN_IN.with(|drawn| drawn.borrow().clone());
+            assert!(!drawn.is_empty() && drawn.iter().all(|face| face == "QZX UDGothic"), "drawn in {drawn:?}");
         }
     }
 }
