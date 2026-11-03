@@ -259,11 +259,13 @@ fn ends_with_this_process(child: &Child) -> Option<Ending> {
         if job.is_null() {
             return None;
         }
+        let ending = Ending(job);
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(job, JobObjectExtendedLimitInformation, std::ptr::addr_of!(limits).cast(), std::mem::size_of_val(&limits) as u32);
-        AssignProcessToJobObject(job, child.as_raw_handle() as _);
-        Some(Ending(job))
+        // (a job that does not hold it ends nothing: the server is then ended by its own Drop)
+        let held = SetInformationJobObject(job, JobObjectExtendedLimitInformation, std::ptr::addr_of!(limits).cast(), std::mem::size_of_val(&limits) as u32) != 0
+            && AssignProcessToJobObject(job, child.as_raw_handle() as _) != 0;
+        held.then_some(ending)
     }
 }
 
@@ -275,6 +277,25 @@ struct Running {
     _child: Option<Child>,
     #[cfg(windows)]
     _ending: Option<Ending>,
+}
+
+impl Drop for Running {
+    /// A server the job holds ends as the job closes, with all it started. One it does not hold (no job could be made, or the server was
+    /// in one already) is ended here, with what it started: a `Child` dropped leaves its process running, `npx` and `node` past the app.
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self._ending.is_some() {
+            return;
+        }
+        if let Some(child) = &mut self._child {
+            // (its PID is not another's while its handle is held here)
+            if matches!(child.try_wait(), Ok(None)) {
+                crate::tools::kill_tree(child.id());
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
 }
 
 type Starter = Arc<dyn Fn() -> Result<Arc<Running>, String> + Send + Sync>;

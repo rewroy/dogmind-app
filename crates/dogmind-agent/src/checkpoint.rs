@@ -66,6 +66,17 @@ fn folder_of(session: &Path) -> PathBuf {
     session.with_extension("checkpoints")
 }
 
+/// A kept copy in a file's place: copied beside it whole, then put in its place, as an edit is. Copied straight over it, a rewind that
+/// failed on the way (a full disk, the app ended) left the file cut or empty.
+fn put_back(copy: &Path, path: &Path) -> std::io::Result<()> {
+    let beside = crate::tools::written_beside(path);
+    let done = std::fs::copy(copy, &beside).and_then(|_| if path.exists() { crate::tools::take_the_place(&beside, path) } else { std::fs::rename(&beside, path) });
+    if done.is_err() {
+        let _ = std::fs::remove_file(&beside);
+    }
+    done
+}
+
 /// With a session that is deleted.
 pub fn remove_for(session: &Path) -> Result<(), String> {
     // (its pictures too: nothing else reads them)
@@ -198,8 +209,8 @@ impl Checkpoints {
                     if let Some(parent) = saved.path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    match std::fs::copy(self.folder.join(copy), &saved.path) {
-                        Ok(_) => restored.written.push(saved.path.clone()),
+                    match put_back(&self.folder.join(copy), &saved.path) {
+                        Ok(()) => restored.written.push(saved.path.clone()),
                         Err(error) => restored.failed.push(format!("{}: {error}", saved.path.display())),
                     }
                 }
@@ -274,6 +285,25 @@ mod tests {
         assert_eq!(read(&plain), "before", "the rest is rewound");
         assert_eq!(restored.failed.len(), 2, "{:?}", restored.failed);
         std::fs::remove_dir(work.join("sub")).unwrap();
+    }
+
+    /// A file that cannot take what a rewind puts back is as it was, with nothing left beside it, and the rewind says so.
+    #[test]
+    fn a_file_a_rewind_cannot_write_is_as_it_was() {
+        let mut f = fixture();
+        std::fs::write(&f.file, "before").unwrap();
+        f.marks.begin("one", "t", Some(1)).unwrap();
+        f.marks.before_edit(&[f.file.clone()]).unwrap();
+        std::fs::write(&f.file, "after").unwrap();
+        let mut locked = std::fs::metadata(&f.file).unwrap().permissions();
+        locked.set_readonly(true);
+        std::fs::set_permissions(&f.file, locked.clone()).unwrap();
+        let restored = f.marks.restore(1, "t");
+        locked.set_readonly(false);
+        std::fs::set_permissions(&f.file, locked).unwrap();
+        assert_eq!((read(&f.file), restored.failed.len()), ("after".to_string(), 1), "{:?}", restored.failed);
+        let left: Vec<String> = std::fs::read_dir(f.file.parent().unwrap()).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.contains("dogmind-edit")).collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
