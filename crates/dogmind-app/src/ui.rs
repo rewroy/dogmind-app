@@ -9643,6 +9643,11 @@ impl App {
                     self.tools_running.insert(id, (tool, summary));
                 }
             }
+            // (a look by a helper takes minutes: what it is reading now says it is getting somewhere)
+            Event::ToolProgress { tool, summary, .. } => {
+                let summary: String = summary.chars().take(120).collect();
+                self.set_activity(format!("{} — {}  {summary}", t(tool_name("explore")), t(tool_name(&tool))));
+            }
             Event::ToolEnded { id, ok, declined, elapsed, output, images } => {
                 self.end_line();
                 let (tool, summary) = self.tools_running.remove(&id).unwrap_or_default();
