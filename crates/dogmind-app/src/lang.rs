@@ -250,6 +250,8 @@ const JA: &[(&str, &str)] = &[
     ("when the engine is ready", "エンジンの準備ができたら"),
     ("at its next step", "次のステップの前に"),
     ("Send it into this work now", "今の作業に割り込んで送る"),
+    ("{0} does not run on this PC: it needs {1} of graphics memory free, and this PC has {2} for it.", "{0} はこの PC では動きません。グラフィックスメモリの空きが {1} 必要で、この PC で使えるのは {2} です。"),
+    ("{0} does not run on this PC.", "{0} はこの PC では動きません。"),
     ("Discard", "破棄"),
     ("Optional. Kept in Credential Manager", "任意。資格情報マネージャーに保存"),
     ("Anything with an OpenAI-compatible API", "OpenAI 互換の API があるもの"),

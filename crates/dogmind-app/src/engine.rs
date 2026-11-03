@@ -123,6 +123,9 @@ pub struct Catalog {
     pub machine: String,
     /// When nothing can run here. `entries` is empty then.
     pub refusal: Option<Refusal>,
+    /// The models Straydog has that do not run here, each with why, in a line: a model that is simply not in the list reads as one this app
+    /// does not offer.
+    pub not_here: Vec<String>,
 }
 
 /// The bundles `straydog fetch --help` offers: `Model: QUANT (68.0 GB), QUANT (75.8 GB); Model: ...`. What it does not say
@@ -175,9 +178,12 @@ fn how_it_runs(fit: &str) -> &'static str {
     }
 }
 
-/// `needs 10 GiB of VRAM; this machine has 6 GiB`, Straydog's words for too little.
+/// Straydog's words for too little graphics memory: `needs 10 GiB of VRAM; this machine has 6 GiB`, or as it says it now,
+/// `needs 14.8 GiB of VRAM free, with what `auto` leaves for the desktop; this machine has 12.2 GiB for it`.
 fn memory_short(note: &str) -> Option<(String, String)> {
-    let (needs, has) = note.strip_prefix("needs ")?.split_once(" of VRAM; this machine has ")?;
+    let (needs, rest) = note.strip_prefix("needs ")?.split_once(" of VRAM")?;
+    let has = rest.split_once("this machine has ")?.1;
+    let has = has.strip_suffix(" for it").unwrap_or(has);
     Some((needs.to_string(), has.to_string()))
 }
 
@@ -198,18 +204,32 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     let bundles = value.get("bundles")?.as_array()?;
     let mut entries = Vec::new();
     let mut shortest: Option<(f64, String, String)> = None;
+    // (each model that does not run here, by the least any of its bundles needs: a model, not a bundle, is what does not run)
+    let mut not_here: Vec<(String, Option<(f64, String, String)>)> = Vec::new();
     for bundle in bundles {
         let quant = word(bundle, "quant");
         if quant.is_empty() {
             continue;
         }
-        let Some(origin) = origin(&word(bundle, "model"), &quant) else { continue };
+        let model = word(bundle, "model");
+        let Some(origin) = origin(&model, &quant) else { continue };
         if !bundle.get("runs").and_then(Value::as_bool).unwrap_or(false) {
-            if let Some((needs, has)) = memory_short(&word(bundle, "note")) {
+            let short = memory_short(&word(bundle, "note")).map(|(needs, has)| {
                 let amount = needs.split(' ').next().and_then(|number| number.parse().ok()).unwrap_or(f64::MAX);
-                if shortest.as_ref().is_none_or(|(least, ..)| amount < *least) {
-                    shortest = Some((amount, needs, has));
+                (amount, needs, has)
+            });
+            if let Some((amount, needs, has)) = &short {
+                if shortest.as_ref().is_none_or(|(least, ..)| amount < least) {
+                    shortest = Some((*amount, needs.clone(), has.clone()));
                 }
+            }
+            match not_here.iter_mut().find(|(name, _)| *name == model) {
+                Some((_, least)) => {
+                    if short.as_ref().is_some_and(|(amount, ..)| least.as_ref().is_none_or(|(had, ..)| amount < had)) {
+                        *least = short;
+                    }
+                }
+                None => not_here.push((model, short)),
             }
             continue;
         }
@@ -257,7 +277,12 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     } else {
         shortest.map(|(_, needs, has)| Refusal::TooLittleMemory { needs, has })
     };
-    Some(Catalog { entries, machine: parts.join("  ·  "), refusal })
+    // (a model of which some bundle runs is in the list already)
+    let not_here = not_here.into_iter().filter(|(model, _)| !entries.iter().any(|entry| entry.name.starts_with(&format!("{model} ")))).map(|(model, short)| match short {
+        Some((_, needs, has)) => tf("{0} does not run on this PC: it needs {1} of graphics memory free, and this PC has {2} for it.", &[&model, &needs, &has]),
+        None => tf("{0} does not run on this PC.", &[&model]),
+    }).collect();
+    Some(Catalog { entries, machine: parts.join("  ·  "), refusal, not_here })
 }
 
 /// What `straydog --version` says.
@@ -997,6 +1022,24 @@ mod tests {
         let small = parse_list(small, true).unwrap();
         assert_eq!(small.refusal, Some(Refusal::TooLittleMemory { needs: "10 GiB".into(), has: "6 GiB".into() }), "the least it would take");
         assert_eq!(small.machine, "RTX 2060 (6 GB)  ·  34 GB of memory");
+    }
+
+    /// What Straydog 0.1.1 says on a 16 GB card: DeepSeek does not run, and the list says so instead of leaving it out unsaid.
+    #[test]
+    fn a_model_that_does_not_run_here_is_named_with_why() {
+        let note = |needs: &str| format!("needs {needs} GiB of VRAM free, with what `auto` leaves for the desktop; this machine has 12.2 GiB for it");
+        let list = format!(r#"{{"machine":{{"gpus":[{{"name":"RTX 5070 Ti","total_bytes":17179869184}}],"ram_bytes":66571993088}},"bundles":[
+            {{"model":"DeepSeek-V4.1-Flash","quant":"GSQ-RCO-IQ2_XXS","download_bytes":1,"runs":false,"fit":"too_little_vram","note":"{}"}},
+            {{"model":"DeepSeek-V4.1-Flash","quant":"GSQ-RCO-IQ2_XS","download_bytes":1,"runs":false,"fit":"too_little_vram","note":"{}"}},
+            {{"model":"Qwen3.8-Flash-Next","quant":"IQ2_XS","download_bytes":1,"runs":true,"fit":"ram"}}]}}"#, note("16.9"), note("14.8"));
+        let catalog = parse_list(&list, true).unwrap();
+        assert_eq!(catalog.entries.len(), 1);
+        assert_eq!(catalog.refusal, None);
+        assert_eq!(catalog.not_here.len(), 1);
+        assert!(catalog.not_here[0].starts_with("DeepSeek-V4.1-Flash") && catalog.not_here[0].contains("14.8 GiB") && catalog.not_here[0].contains("12.2 GiB") && !catalog.not_here[0].contains("16.9"), "{:?}", catalog.not_here);
+        // (and with nothing that runs, the least of it is the refusal's, in these words too)
+        let none = list.replace(r#""runs":true"#, &format!(r#""runs":false,"note":"{}""#, note("11.0")));
+        assert_eq!(parse_list(&none, true).unwrap().refusal, Some(Refusal::TooLittleMemory { needs: "11.0 GiB".into(), has: "12.2 GiB".into() }));
     }
 
     #[test]
