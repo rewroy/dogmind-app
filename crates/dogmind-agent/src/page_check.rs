@@ -547,18 +547,19 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         }
         // (a window larger than the frame by what the browser takes of it, and at least its least width)
         let line = format!("\"{}\" {} --window-size={},{} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --screenshot=\"{}\" \"{}\"", program.display(), flags(), view.width.max(600) + 64, view.height + 160, shot.display(), plain(&frame));
-        let mut taken = false;
+        let (mut taken, mut said_there) = (false, Vec::new());
         for _ in 0..3 {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             let _ = std::fs::remove_file(&shot);
-            let _ = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
+            let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
             clear_profile(&cwd, workspace);
             // (a browser that fell over while writing it leaves an empty file, or one that cannot be read)
             let Ok(whole) = image::open(&shot) else { continue };
             if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
                 taken = true;
+                said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref(), steps.is_some())).unwrap_or_default();
                 break;
             }
         }
@@ -569,8 +570,27 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         } else {
             format!("No picture at {} could be taken.\n", view.label)
         });
+        // What the page said at this size, where it says other than above: the console above is of the desktop's width, and a model that
+        // measured a phone's layout from a script was given the desktop's numbers.
+        if taken && !said_there.is_empty() && said_there != console {
+            out.push_str(&format!("Console at {}:\n", view.label));
+            for said in said_there.iter().take(MOST_LINES) {
+                out.push_str(&format!("  {said}\n"));
+            }
+        }
     }
     Ok(out)
+}
+
+/// What the page itself said in a run, as the check reports it: the steps' own markers left out, and the copy the steps ran in named as the page.
+fn page_console(err: &str, base_url: &str, page: Option<&Path>, with_steps: bool) -> Vec<String> {
+    let mut lines = console_lines(err, base_url);
+    if let (Some(page), true) = (page, with_steps) {
+        let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
+        lines.retain(|line| !line.contains("DOGMIND-STEPS-"));
+        lines.iter_mut().for_each(|line| *line = line.replace(STEPS_PAGE, &file_name));
+    }
+    lines
 }
 
 /// The browser's profile, gone after each run. Not stopped by the turn's Stop, which is what most often ends a run early: under it, the
@@ -801,9 +821,12 @@ mod tests {
     #[test]
     #[ignore = "starts Edge in the sandbox"]
     fn a_picture_at_a_phones_width_is_laid_out_at_it() {
-        let (dir, _) = page(&[("index.html", "<!DOCTYPE html><title>w</title><style>body{margin:0}.w{height:40px;background:#cc3333}@media(max-width:600px){.w{background:#3366cc}}</style><div class=w id=w></div><script>document.getElementById('w').textContent=innerWidth</script>")]);
+        let (dir, _) = page(&[("index.html", "<!DOCTYPE html><title>w</title><style>body{margin:0}.w{height:40px;background:#cc3333}@media(max-width:600px){.w{background:#3366cc}}</style><div class=w id=w></div><script>document.getElementById('w').textContent=innerWidth;console.log('width ' + innerWidth)</script>")]);
         let said = check_page(&serde_json::json!({"path": "index.html", "views": ["desktop", "mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
         println!("{said}");
+        // (what a script measures at the phone's width is said for it; at the desktop's too, where the picture's frame is not the window the
+        // console above was read in)
+        assert!(said.contains("Console at mobile:\n  index.html:1: width 390"), "{said}");
         let path = |label: &str| said.lines().find(|line| line.starts_with(&format!("How it looks at {label} "))).and_then(|line| line.split("`read_file` ").nth(1)).map(PathBuf::from).unwrap_or_else(|| panic!("{label}: {said}"));
         let (desktop, mobile) = (image::open(path("desktop")).unwrap().to_rgb8(), image::open(path("mobile")).unwrap().to_rgb8());
         assert_eq!((desktop.width(), desktop.height(), mobile.width(), mobile.height()), (1280, 800, 390, 844));
