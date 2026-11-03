@@ -156,6 +156,11 @@ struct Host {
     char_format: std::cell::UnsafeCell<Format<116>>,
     para_format: std::cell::UnsafeCell<Format<188>>,
     target: std::cell::RefCell<Option<(ID2D1Factory1, ID2D1DCRenderTarget)>>,
+    /// How far, in device-independent pixels, the text fades into the page at an edge it goes on past: a line the edge cuts in half
+    /// read as letters gone wrong. None for 0.
+    fade: Cell<i32>,
+    /// Whether text went on above and below the view when the fades were last drawn.
+    faded: Cell<(bool, bool)>,
 }
 
 static TABLE: HostTable = HostTable {
@@ -265,6 +270,70 @@ impl Host {
             char_format: std::cell::UnsafeCell::new(char_format),
             para_format: std::cell::UnsafeCell::new(para_format),
             target: std::cell::RefCell::new(None),
+            fade: Cell::new(0),
+            faded: Cell::new((false, false)),
+        }
+    }
+
+    /// Whether there is text above the view, and below it.
+    unsafe fn goes_on(&self) -> (bool, bool) {
+        if self.services.get().is_null() {
+            return (false, false);
+        }
+        let call: unsafe extern "system" fn(*mut c_void, *mut i32, *mut i32, *mut i32, *mut i32, *mut i32) -> i32 = self.slot(slot::GET_VSCROLL);
+        let (mut least, mut most, mut at, mut page, mut on) = (0, 0, 0, 0, 0);
+        if call(self.services.get(), &mut least, &mut most, &mut at, &mut page, &mut on) < 0 {
+            return (false, false);
+        }
+        (at > least, at + page < most)
+    }
+
+    /// The bands at the top and the bottom of the text where it fades, in the window's pixels: none when it does not.
+    fn fade_bands(&self) -> Option<(RECT, RECT)> {
+        let length = self.fade.get();
+        if length <= 0 {
+            return None;
+        }
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(self.window) }.max(96) as i32;
+        let (client, text) = (self.client(), self.text_rect());
+        let band = (length * dpi / 96).min((text.bottom - text.top) / 4).max(0);
+        Some((RECT { left: client.left, top: text.top, right: client.right, bottom: text.top + band }, RECT { left: client.left, top: text.bottom - band, right: client.right, bottom: text.bottom }))
+    }
+
+    /// The bands asked to be drawn again, as far in as `reach` more: what was in a band is somewhere else after a scroll, faded still.
+    unsafe fn bands_again(&self, reach: i32) {
+        if let Some((top, bottom)) = self.fade_bands() {
+            for band in [RECT { bottom: top.bottom + reach, ..top }, RECT { top: bottom.top - reach, ..bottom }] {
+                InvalidateRect(self.window, &band, 0);
+            }
+        }
+    }
+
+    /// The page's colour over the text, from none to all of it, at each edge the text goes on past: drawn last, in the window's
+    /// device-independent pixels, whatever part of it is being drawn.
+    unsafe fn draw_fades(&self, target: &ID2D1DCRenderTarget, dip: f32) {
+        let Some((top, bottom)) = self.fade_bands() else { return };
+        let (above, below) = self.goes_on();
+        self.faded.set((above, below));
+        if !above && !below {
+            return;
+        }
+        use windows::Win32::Graphics::Direct2D::Common::{D2D1_GRADIENT_STOP, D2D_RECT_F};
+        use windows::Win32::Graphics::Direct2D::{D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES};
+        let page = self.background.get();
+        let colour = |alpha: f32| D2D1_COLOR_F { r: (page & 0xFF) as f32 / 255.0, g: ((page >> 8) & 0xFF) as f32 / 255.0, b: ((page >> 16) & 0xFF) as f32 / 255.0, a: alpha };
+        let stops = [D2D1_GRADIENT_STOP { position: 0.0, color: colour(0.0) }, D2D1_GRADIENT_STOP { position: 1.0, color: colour(1.0) }];
+        let Ok(stops) = target.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+        // (each from where the text is whole to the edge that cuts it)
+        for (wanted, band, from, to) in [(above, top, top.bottom, top.top), (below, bottom, bottom.top, bottom.bottom)] {
+            if !wanted || band.bottom <= band.top {
+                continue;
+            }
+            let line = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: windows_numerics::Vector2 { X: 0.0, Y: from as f32 * dip }, endPoint: windows_numerics::Vector2 { X: 0.0, Y: to as f32 * dip } };
+            if let Ok(brush) = target.CreateLinearGradientBrush(&line, None, &stops) {
+                let area = D2D_RECT_F { left: band.left as f32 * dip, top: band.top as f32 * dip, right: band.right as f32 * dip, bottom: band.bottom as f32 * dip };
+                target.FillRectangle(&area, &brush);
+            }
         }
     }
 
@@ -449,6 +518,9 @@ impl Host {
                 let plain = color::on(target.as_raw());
                 let drawn = call(self.services.get(), target.as_raw(), &bounds, &mut update, 0);
                 color::off(target.as_raw(), plain);
+                if drawn >= 0 {
+                    self.draw_fades(&target, dip);
+                }
                 let ended = target.EndDraw(None, None);
                 if ended.is_err() {
                     *self.target.borrow_mut() = None;
@@ -529,6 +601,10 @@ unsafe extern "system" fn set_scroll_range(this: *mut Host, bar: i32, least: i32
     info.nMin = least;
     info.nMax = most;
     SetScrollInfo(host.window, bar as _, &info, redraw);
+    // (text past an edge that had none, or none past one that had: no scroll says so)
+    if bar == SB_VERT as i32 && host.fade.get() > 0 && host.goes_on() != host.faded.get() {
+        host.bands_again(0);
+    }
     1
 }
 
@@ -585,6 +661,9 @@ unsafe extern "system" fn scroll_window_ex(this: *mut Host, dx: i32, dy: i32, sc
         host.missing(host.client());
     }
     ScrollWindowEx(host.window, dx, dy, scroll, clip, region, update, flags as _);
+    if dy != 0 {
+        host.bands_again(dy.abs());
+    }
 }
 
 unsafe extern "system" fn set_capture(this: *mut Host, capture: i32) {
@@ -822,6 +901,15 @@ pub unsafe fn set_name(window: HWND, name: &'static str) {
     let host = GetWindowLongPtrW(window, 0) as *const Host;
     if !host.is_null() && is_of_class(window) {
         (*host).name.set(name);
+    }
+}
+
+/// The text of a window of this class fades into the page over `dips` at an edge it goes on past. Nothing for one of another class.
+pub unsafe fn fade_edges(window: HWND, dips: i32) {
+    let host = GetWindowLongPtrW(window, 0) as *const Host;
+    if !host.is_null() && is_of_class(window) {
+        (*host).fade.set(dips);
+        InvalidateRect(window, std::ptr::null(), 0);
     }
 }
 
