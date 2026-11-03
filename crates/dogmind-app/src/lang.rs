@@ -388,6 +388,7 @@ const JA: &[(&str, &str)] = &[
     ("Graphics memory limit (GB)", "グラフィックメモリの上限 (GB)"),
     ("Longest conversation", "会話の長さの上限"),
     ("Engine", "エンジン"),
+    ("Open the dashboard", "ダッシュボードを開く"),
     ("When to ask", "確認のしかた"),
     ("Web search and reading", "Web の検索と閲覧"),
     ("MCP servers", "MCP サーバー"),
