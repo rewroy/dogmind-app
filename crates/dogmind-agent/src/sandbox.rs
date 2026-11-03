@@ -1900,7 +1900,9 @@ mod tests {
         // Bit by bit, as a leak goes: it is said to have been stopped.
         let leak = "powershell -NoProfile -Command \"try { while ($true) { $null = [Runtime.InteropServices.Marshal]::AllocHGlobal(5000000) } } catch { 'refused'; exit 7 }\"";
         let leaked = run_limited(leak, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), None).unwrap();
-        assert!(leaked.status == Some(7) && leaked.out_of_memory == Some(cap), "{:?} {:?}", leaked.status, leaked.out_of_memory);
+        // (PowerShell catches the refusal and ends with 7, or now and then falls over in the middle of it with 0xC0000005: stopped all the
+        // same, and said to have been)
+        assert!(matches!(leaked.status, Some(7) | Some(-1073741819)) && leaked.out_of_memory == Some(cap), "{:?} {:?}", leaked.status, leaked.out_of_memory);
         let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap), None).unwrap();
         assert!(decode(&fine.stdout).contains("fine") && fine.out_of_memory.is_none());
         drop(holder);
