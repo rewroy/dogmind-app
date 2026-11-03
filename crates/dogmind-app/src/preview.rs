@@ -22,6 +22,9 @@ use crate::paint::theme;
 
 /// `.example` is reserved: no such host can exist anywhere else.
 const HOST: &str = "dogmind-preview.example";
+/// Where a written page finds the face shipped beside the app, on a Windows that has no copy of its own: the browser does not see the
+/// fonts this process holds, and nothing is installed for it. The two files are served from here, and nothing else is.
+const FONT_HOST: &str = "dogmind-fonts.example";
 
 /// Every connection of the browser goes to a proxy that is not there, WebSockets and addresses by number too, which a filter on
 /// requests would not see. The workspace's host is served inside the browser and does not go that way.
@@ -152,8 +155,33 @@ fn page_of(body: &str, base: &str) -> String {
         .replace("BACK", &css(theme::background())).replace("TEXT", &css(theme::text())).replace("LINE", &css(theme::line())).replace("ACCENT", &css(theme::accent_hover()))
         .replace("MUTED", &css(theme::muted())).replace("FAINT", &css(theme::faint())).replace("CODE", &css(theme::code_back()))
         .replace("MARK", &css(theme::raised())).replace("KEYWORD", &css(theme::accent_hover())).replace("STRING", &css(theme::good())).replace("NUMBER", &css(theme::warn()));
-    let allowed = format!("default-src 'none'; style-src 'unsafe-inline'; img-src https://{HOST} data:");
-    format!("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"{allowed}\"><base href=\"{base}\"><style>{sheet}</style></head><body>{body}</body></html>")
+    let allowed = format!("default-src 'none'; style-src 'unsafe-inline'; img-src https://{HOST} data:; font-src https://{FONT_HOST}");
+    format!("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"{allowed}\"><base href=\"{base}\"><style>{}{sheet}</style></head><body>{body}</body></html>", shipped_faces())
+}
+
+/// The shipped face for a written page: Windows's own copy where there is one, by either of the names it may go by, and else the file
+/// beside the app.
+fn shipped_faces() -> String {
+    let [regular, bold] = crate::paint::BUNDLED_FILES;
+    let face = crate::paint::BUNDLED_FACE;
+    // (a test's way to see the file used on a Windows that has its own copy)
+    let local = |names: [&str; 2]| if cfg!(debug_assertions) && std::env::var_os("DOGMIND_TEST_FONT_BY_ADDRESS").is_some() { String::new() } else { format!("local('{}'),local('{}'),", names[0], names[1]) };
+    format!(
+        "@font-face{{font-family:'{face}';src:{}url(https://{FONT_HOST}/{regular});font-weight:400}}@font-face{{font-family:'{face}';src:{}url(https://{FONT_HOST}/{bold});font-weight:700}}",
+        local([face, "BIZUDGothic-Regular"]),
+        local(["BIZ UDGothic Bold", "BIZUDGothic-Bold"])
+    )
+}
+
+/// The shipped font file a request is for, when it names one of them exactly.
+fn shipped_font(address: &str) -> Option<PathBuf> {
+    let rest = address.get(..8).filter(|scheme| scheme.eq_ignore_ascii_case("https://")).map(|_| &address[8..])?;
+    let (host, name) = rest.split_once('/')?;
+    if !host.eq_ignore_ascii_case(FONT_HOST) {
+        return None;
+    }
+    let name = crate::paint::BUNDLED_FILES.into_iter().find(|file| file.eq_ignore_ascii_case(name))?;
+    crate::paint::font_folders().into_iter().map(|folder| folder.join(name)).find(|file| file.is_file())
 }
 
 /// The page for a file of the workspace. NavigateToString takes no more than 2 MB, so a long file is shown from its start, and says so.
@@ -336,6 +364,15 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
         if let Some(args) = args {
             let request = args.Request()?;
             let address = text_of(|text| request.Uri(text));
+            if let Some(file) = shipped_font(&address) {
+                if let Some(responses) = responses.borrow().as_ref() {
+                    let stream = windows::Win32::UI::Shell::SHCreateStreamOnFileEx(&HSTRING::from(file.as_os_str()), (windows::Win32::System::Com::STGM_READ | windows::Win32::System::Com::STGM_SHARE_DENY_WRITE).0, 0, false, None)?;
+                    // (asked for as a font is, across origins: the page's own is none)
+                    let response = responses.CreateWebResourceResponse(&stream, 200, &HSTRING::from("OK"), &HSTRING::from("Content-Type: font/ttf\r\nAccess-Control-Allow-Origin: *"))?;
+                    args.SetResponse(&response)?;
+                }
+                return Ok(());
+            }
             if !stays_inside(&address) {
                 if let Some(responses) = responses.borrow().as_ref() {
                     let response = responses.CreateWebResourceResponse(None, 403, &HSTRING::from("Blocked by Dogmind's preview"), &HSTRING::new())?;
@@ -518,5 +555,29 @@ mod tests {
         for outside in ["https://unpkg.com/three", "http://dogmind-preview.example/a", "https://dogmind-preview.example.evil.com/a", "file:///C:/secret.txt", "http://127.0.0.1:8080/"] {
             assert!(!stays_inside(outside), "{outside}");
         }
+    }
+
+    /// A written page has the shipped face: Windows's copy first, and the file beside the app at an address that serves the two files
+    /// by their own names, and nothing else.
+    #[test]
+    fn the_shipped_face_is_served_by_its_names_and_nothing_else_is() {
+        for not in [
+            "https://dogmind-fonts.example/",
+            "https://dogmind-fonts.example/../BIZUDGothic-Regular.ttf",
+            "https://dogmind-fonts.example/sub/BIZUDGothic-Regular.ttf",
+            "https://dogmind-fonts.example/BIZUDGothic-Regular.ttf?x",
+            "https://dogmind-fonts.example/python.exe",
+            "http://dogmind-fonts.example/BIZUDGothic-Regular.ttf",
+            "https://dogmind-fonts.example.evil.com/BIZUDGothic-Regular.ttf",
+            "https://dogmind-preview.example/BIZUDGothic-Regular.ttf",
+        ] {
+            assert!(shipped_font(not).is_none(), "{not}");
+        }
+        if crate::paint::font_folders().iter().any(|folder| folder.join("BIZUDGothic-Bold.ttf").is_file()) {
+            assert!(shipped_font("HTTPS://Dogmind-Fonts.example/bizudgothic-bold.TTF").is_some_and(|file| file.ends_with("BIZUDGothic-Bold.ttf")));
+        }
+        let page = page_of("x", "https://dogmind-preview.example/");
+        assert!(page.contains("font-src https://dogmind-fonts.example\"") && page.contains("src:local('BIZ UDGothic'),local('BIZUDGothic-Regular'),url(https://dogmind-fonts.example/BIZUDGothic-Regular.ttf);font-weight:400"), "{page}");
+        assert!(page.contains("url(https://dogmind-fonts.example/BIZUDGothic-Bold.ttf);font-weight:700"), "{page}");
     }
 }
