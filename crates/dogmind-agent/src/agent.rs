@@ -110,6 +110,8 @@ pub enum Event {
     AssistantEnded,
     /// A request goes to the model. Whatever an earlier try of it was writing has gone.
     RequestStarted,
+    /// The session is being made shorter, which can be minutes of the model summing it up: till the next request, or the turn's end.
+    Compacting,
     /// More of the arguments of a tool call the model is still writing: `index` is which of its answer. Told every so often, and at once for a new call.
     ToolWriting { index: usize, tool: String, piece: String },
     ToolStarted { id: String, tool: String, summary: String },
@@ -1890,6 +1892,7 @@ impl Agent {
         if self.messages.is_empty() {
             return Ok(());
         }
+        self.emit(Event::Compacting);
         let found = self.messages.clone();
         self.bench.forget_reads();
         let worth = compaction::worth_a_checkpoint(&self.messages) || (forced && compaction::has_a_middle(&self.messages, FORCED_KEEP));
@@ -1915,7 +1918,7 @@ impl Agent {
         let trimmed_enough = saved >= over && over > 0;
         if trimmed_enough && !forced {
             self.used = self.used.saturating_sub((saved / CHARS_A_TOKEN) as u64);
-            self.emit(Event::Notice(format!("compacted: old tool outputs trimmed by {} KB", saved / 1024)));
+            self.emit(Event::Notice(format!("Session compacted: old tool outputs shortened by {} KB", saved / 1024)));
             self.save_snapshot();
             return Ok(());
         }
@@ -1951,7 +1954,7 @@ impl Agent {
                     return Err(llm::CONTEXT_FULL.into());
                 }
                 compaction::strip_thinking(&mut self.messages);
-                self.emit(Event::Notice(format!("compacted: every tool output trimmed by {} KB, the newest too, as nothing else fit", (saved + more) / 1024)));
+                self.emit(Event::Notice(format!("Session compacted: every tool output, the newest too, shortened by {} KB, as nothing else would fit", (saved + more) / 1024)));
                 self.save_snapshot();
                 return Ok(());
             }
@@ -1984,7 +1987,7 @@ impl Agent {
         }
         compaction::strip_thinking(&mut self.messages);
         self.use_estimate();
-        self.emit(Event::Notice("compacted: the oldest turns were dropped".into()));
+        self.emit(Event::Notice("Session compacted: the oldest turns were dropped".into()));
         self.save_snapshot();
         self.report_usage(None);
         Ok(())
@@ -2000,7 +2003,7 @@ impl Agent {
                 }
                 compaction::strip_thinking(&mut self.messages);
                 self.use_estimate();
-                self.emit(Event::Notice("compacted: the model wrote a checkpoint of the earlier turns".into()));
+                self.emit(Event::Notice("Session compacted: the earlier conversation is now a summary".into()));
                 self.save_snapshot();
                 self.report_usage(None);
                 Ok(true)
@@ -2539,14 +2542,17 @@ mod tests {
         run.handle.commands.send(Command::Send("hi".into())).unwrap();
         until_end(&run, Decision::Reject);
         run.handle.commands.send(Command::Compact).unwrap();
-        let mut said = Vec::new();
+        let (mut said, mut told_first) = (Vec::new(), false);
         loop {
             match run.events.recv_timeout(Duration::from_secs(20)).unwrap() {
                 Event::Notice(text) => said.push(text),
+                // (the app says what it waits for: it is no thinking)
+                Event::Compacting => told_first = said.is_empty(),
                 Event::TurnEnded { .. } => break,
                 _ => {}
             }
         }
+        assert!(told_first, "compacting is told before anything comes of it");
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("nothing to compact"));
         assert_eq!(bodies.lock().unwrap().len(), 1, "no request was made for it");
