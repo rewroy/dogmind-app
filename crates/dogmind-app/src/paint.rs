@@ -423,11 +423,7 @@ pub fn japanese_face() -> &'static str {
             }
         }
         // (or Windows's own copy, from its Japanese supplemental fonts: the same face)
-        let name = wide(BUNDLED_FACE);
-        let font = CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, name.as_ptr());
-        let here = face_is_here(BUNDLED_FACE, font);
-        DeleteObject(font);
-        if here { BUNDLED_FACE } else { FALLBACK_FACE }
+        if face_is_here(BUNDLED_FACE) { BUNDLED_FACE } else { FALLBACK_FACE }
     })
 }
 
@@ -633,17 +629,24 @@ fn partner_for(font: HFONT, units: &[u16]) -> Option<HFONT> {
     PARTNERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().find(|(latin, _)| *latin == font as isize).map(|(_, japanese)| *japanese as HFONT)
 }
 
-/// Whether Windows has this face by this name: `CreateFontW` gives something else for any name it does not know.
-unsafe fn face_is_here(face: &str, font: HFONT) -> bool {
-    let device = CreateCompatibleDC(std::ptr::null_mut());
-    let previous = SelectObject(device, font);
-    let mut name = [0u16; 64];
-    let length = GetTextFaceW(device, name.len() as i32, name.as_mut_ptr());
-    SelectObject(device, previous);
-    DeleteDC(device);
-    length > 0 && String::from_utf16_lossy(&name[..length as usize - 1]).eq_ignore_ascii_case(face)
+/// Whether Windows, or this process, has a family of this name. GDI is asked to list it: what a font made with the name says it is
+/// will not do, as Japanese Windows calls some faces by their Japanese names (BIZ UDGothic is BIZ UDゴシック), and that is no match.
+unsafe fn face_is_here(face: &str) -> bool {
+    unsafe extern "system" fn found(_font: *const LOGFONTW, _metrics: *const TEXTMETRICW, _kind: u32, seen: LPARAM) -> i32 {
+        *(seen as *mut bool) = true;
+        0
+    }
+    let mut wanted: LOGFONTW = std::mem::zeroed();
+    wanted.lfCharSet = DEFAULT_CHARSET as u8;
+    for (slot, unit) in wanted.lfFaceName.iter_mut().take(31).zip(face.encode_utf16()) {
+        *slot = unit;
+    }
+    let device = GetDC(std::ptr::null_mut());
+    let mut seen = false;
+    EnumFontFamiliesExW(device, &wanted, Some(found), std::ptr::addr_of_mut!(seen) as LPARAM, 0);
+    ReleaseDC(std::ptr::null_mut(), device);
+    seen
 }
-
 /// The artwork in the executable, at this size; null where it was built without it.
 unsafe fn resource_icon(size: i32) -> HICON {
     LoadImageW(GetModuleHandleW(std::ptr::null()), 1 as *const u16, IMAGE_ICON, size, size, LR_DEFAULTCOLOR) as HICON
@@ -751,7 +754,7 @@ impl Fonts {
         // In two faces; `Segoe UI` in place of the variable one on a Windows that has been kept without it.
         let pair = |face: &str, (japanese, japanese_weight): (&str, i32), points: i32, weight: i32| {
             let mut latin = make(face, points, weight);
-            let here = face_is_here(face, latin);
+            let here = face_is_here(face);
             if !here {
                 DeleteObject(latin);
                 latin = make(if weight > 400 { "Segoe UI Semibold" } else { "Segoe UI" }, points, weight);
@@ -1349,6 +1352,20 @@ mod bundled_face {
         for file in BUNDLED_FILES {
             let added = unsafe { AddFontResourceExW(wide(&folder.join(file).display().to_string()).as_ptr(), 0x10, std::ptr::null()) };
             assert!(added > 0, "{file}");
+        }
+    }
+
+    /// A face is there by its English name, whatever name the Windows it runs on gives it; one that is nowhere is not.
+    #[test]
+    fn a_face_is_found_by_its_english_name() {
+        unsafe {
+            assert!(face_is_here("Segoe UI"));
+            assert!(!face_is_here("No Such Face 7f3a"));
+            // (fetched or installed, the Japanese face is found by its English name, which a Japanese Windows does not give back)
+            let fetched = font_folders().into_iter().any(|folder| BUNDLED_FILES.iter().all(|file| folder.join(file).is_file()));
+            if fetched {
+                assert_eq!(japanese_face(), BUNDLED_FACE);
+            }
         }
     }
 
