@@ -764,6 +764,8 @@ mod tests {
         let said = check_page(&serde_json::json!({"url": format!("http://127.0.0.1:{port}/")}), dir.path(), &AtomicBool::new(false));
         println!("{said:?}");
         let text = match &said { Ok(text) | Err(text) => text.clone() };
+        // (a browser that did not run says nothing of what it could reach)
+        assert!(!text.contains("NOT CHECKED"), "the browser did not run, so this shows nothing: {text}");
         assert!(!text.contains("SECRET-OUTSIDE-THE-SANDBOX"), "{text}");
         assert!(!served.load(std::sync::atomic::Ordering::Relaxed), "the browser reached a server outside the sandbox");
     }
