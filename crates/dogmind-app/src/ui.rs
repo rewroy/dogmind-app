@@ -3084,7 +3084,7 @@ impl App {
                                 if opening == 1 {
                                     if let Some(picture) = self.answer_picture(url) {
                                         self.pending_text = text[end..].to_string();
-                                        self.show_tool_pictures(&[picture]);
+                                        self.picture_block(&[picture], false);
                                         return;
                                     }
                                 }
@@ -3899,6 +3899,12 @@ impl App {
 
     /// What a tool opened for the model to see, a picture the model read: under its call, at the left, where the person sees what the model saw.
     unsafe fn show_tool_pictures(&mut self, pictures: &[(PathBuf, (i32, i32))]) {
+        self.picture_block(pictures, true);
+    }
+
+    /// Pictures in a block at the left. `under_a_call`: a tool's, with a line under them before what the model does next; an answer's go
+    /// on to its next paragraph with a block's room, as a block of code does (with the line too there was twice a paragraph's gap).
+    unsafe fn picture_block(&mut self, pictures: &[(PathBuf, (i32, i32))], under_a_call: bool) {
         if pictures.is_empty() {
             return;
         }
@@ -3910,7 +3916,9 @@ impl App {
         let tiles = attach::Tiles::of(&sizes, room as i32, self.dpi);
         let width = ((i64::from(tiles.total_width()) * 1440 / i64::from(self.dpi)) as i32 + 2 * ACROSS + 40).clamp(800, most);
         self.append_pictures(pictures, width, true, false);
-        self.append("\n", Style::Tool);
+        if under_a_call {
+            self.append("\n", Style::Tool);
+        }
         self.line_start = true;
         self.para_next = Some(Para::AfterBlock);
     }
