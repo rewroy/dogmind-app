@@ -121,8 +121,25 @@ fn with_steps(html: &str, base: &str, steps: &str) -> String {
 
 /// The page in a frame of exactly this size: the browser's window has a least width of about 500 pixels whatever it is asked, and
 /// lays a page out a little smaller than the window, so a phone's width is only had inside a frame. The picture is cut to the frame.
-fn frame_page(page: &Path, view: &View) -> String {
-    format!("<!doctype html><meta charset=\"utf-8\"><style>html,body{{margin:0;overflow:hidden;background:#fff}}iframe{{border:0;display:block}}</style><iframe src=\"{}\" width=\"{}\" height=\"{}\"></iframe>", file_url(page), view.width, view.height)
+/// `src`: the page's address, a file's or a local server's, escaped already.
+fn frame_page(src: &str, view: &View) -> String {
+    format!("<!doctype html><meta charset=\"utf-8\"><style>html,body{{margin:0;overflow:hidden;background:#fff}}iframe{{border:0;display:block}}</style><iframe src=\"{src}\" width=\"{}\" height=\"{}\"></iframe>", view.width, view.height)
+}
+
+/// A page a server on this machine gives: http on localhost, 127.0.0.1 or [::1], with a port or none. Nothing that could leave the
+/// machine, and nothing cmd would read into on the browser's command line (`%`, a quote, a space).
+fn served_address(url: &str) -> Result<String, String> {
+    let refused = || format!("{url}: a url here is a server's on this machine, as http://localhost:8000/ or http://127.0.0.1:8000/page.html");
+    let lower = url.to_ascii_lowercase();
+    let rest = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://")).ok_or_else(refused)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if authority.starts_with("[::1]") { "[::1]" } else { authority.split(':').next().unwrap_or("") };
+    let port = &authority[host.len()..];
+    let port_ok = port.is_empty() || (port.len() > 1 && port.starts_with(':') && port[1..].chars().all(|c| c.is_ascii_digit()));
+    if !matches!(host, "localhost" | "127.0.0.1" | "[::1]") || !port_ok || url.chars().any(|c| matches!(c, '%' | '"' | '\\') || c.is_whitespace() || c.is_control()) {
+        return Err(refused());
+    }
+    Ok(url.to_string())
 }
 const TRIES: usize = 4;
 const MOST_LINES: usize = 25;
@@ -294,6 +311,10 @@ fn console_lines(err: &str, folder_url: &str) -> Vec<String> {
         if source.starts_with("chrome-extension:") || source.starts_with("chrome:") || source.starts_with("edge:") {
             return;
         }
+        // (the browser's own word on a page from a server, which no page here sends and none can change: an ad feature its policy names that it does not know)
+        if text.starts_with("Error with Permissions-Policy header: Unrecognized feature") {
+            return;
+        }
         let place = source.replace(folder_url, "").replace('\\', "/");
         let place = place.rsplit('/').next().unwrap_or("").to_string();
         let said: String = text.trim().chars().take(MOST_LINE).collect();
@@ -333,8 +354,12 @@ fn shown(dom: &str) -> (String, String) {
     (title, text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MOST_TEXT).collect())
 }
 
-fn report(page_name: &str, browser_name: &str, finished: bool, needs: &Needs, console: &[String], dom: &str) -> String {
-    let mut out = format!("{page_name} in headless {browser_name}, with no network.\n");
+/// `needs`: what a file page was read to need; a page a local server gives has none of that known.
+fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Needs>, console: &[String], dom: &str) -> String {
+    let served = needs.is_none();
+    let unknown = Needs::default();
+    let needs = needs.unwrap_or(&unknown);
+    let mut out = if served { format!("{page_name} in headless {browser_name}, with no network but this machine's own servers.\n") } else { format!("{page_name} in headless {browser_name}, with no network.\n") };
     if !finished {
         out.push_str("NOT CHECKED: the browser crashed or was stopped each time it was tried. This browser sometimes crashes in the sandbox, whatever the page, and a big WebGL drawing stops it too, so this says nothing about the page. What it had said by then is below. Running this check again changes nothing, and do not install anything to check it another way: say in your answer that the page was not checked.\n");
     }
@@ -348,9 +373,11 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: &Needs, co
         out.push_str(&format!("MISSING: {}.\n", needs.missing.join(", ")));
     }
     if needs.local_module {
-        out.push_str("A browser refuses a module script from file:// when the page is opened by double-click, which this check allows: that page needs a local server to be opened, or a plain script.\n");
+        out.push_str("A browser refuses a module script from file:// when the page is opened by double-click, which this check allows: that page needs a local server to be opened, or a plain script. To check it as served, start one in the background (as `python -m http.server 8000 --bind 127.0.0.1`) and give this its `url`.\n");
     }
-    if needs.run.is_empty() && needs.did_not_run.is_empty() {
+    if served {
+        // (what a server gives is not read here beforehand: its console says what ran)
+    } else if needs.run.is_empty() && needs.did_not_run.is_empty() {
         out.push_str("It has no script of its own.\n");
     } else if !needs.run.is_empty() {
         out.push_str(&format!("Ran: {}.\n", needs.run.join(", ")));
@@ -373,49 +400,69 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: &Needs, co
     out
 }
 
+/// A page of the workspace, by its path; or, by `url`, what a server on this machine gives, as one the model started in the background.
 pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
-    let given = arguments.get("path").and_then(Value::as_str).filter(|path| !path.is_empty()).ok_or("path is required: the page, under the workspace")?;
-    let path = if Path::new(given).is_absolute() { PathBuf::from(given) } else { workspace.join(given) };
-    let page = if path.is_dir() { path.join("index.html") } else { path };
-    if !page.is_file() {
-        return Err(format!("{given}: no such page"));
-    }
-    let (full, root) = (std::fs::canonicalize(&page).map_err(|error| format!("{given}: {error}"))?, std::fs::canonicalize(workspace).map_err(|error| format!("{given}: {error}"))?);
-    if !full.starts_with(&root) {
-        return Err(format!("{given} is outside the workspace: this opens only a page in it"));
-    }
-    let extension = page.extension().map_or(String::new(), |extension| extension.to_string_lossy().to_ascii_lowercase());
-    if !matches!(extension.as_str(), "html" | "htm" | "xhtml" | "svg") {
-        return Err(format!("{given} is not a page: this opens .html"));
-    }
-    // (its name goes on a command line that asks no one, and cmd works out `%CMDCMDLINE:~45,1%` even inside quotes: a file named so would be a command of the model's choosing)
-    if page.to_string_lossy().contains('%') {
-        return Err(format!("{given}: a name with % in it cannot be opened from here. Rename it first"));
-    }
+    let steps = arguments.get("steps").and_then(Value::as_str).filter(|steps| !steps.trim().is_empty());
+    let served = arguments.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty());
+    let plain = |path: &Path| path.display().to_string().trim_start_matches("\\\\?\\").to_string();
+    let root = std::fs::canonicalize(workspace).map_err(|error| format!("{}: {error}", workspace.display()))?;
+    let (page, name, needs) = match served {
+        Some(url) => {
+            if steps.is_some() {
+                return Err("steps run in a page file of the workspace: give its path rather than a url".to_string());
+            }
+            (None, served_address(url)?, None)
+        }
+        None => {
+            let given = arguments.get("path").and_then(Value::as_str).filter(|path| !path.is_empty()).ok_or("path is required: the page, under the workspace, or url: a server's on this machine")?;
+            let path = if Path::new(given).is_absolute() { PathBuf::from(given) } else { workspace.join(given) };
+            let page = if path.is_dir() { path.join("index.html") } else { path };
+            if !page.is_file() {
+                return Err(format!("{given}: no such page"));
+            }
+            let full = std::fs::canonicalize(&page).map_err(|error| format!("{given}: {error}"))?;
+            if !full.starts_with(&root) {
+                return Err(format!("{given} is outside the workspace: this opens only a page in it"));
+            }
+            let extension = page.extension().map_or(String::new(), |extension| extension.to_string_lossy().to_ascii_lowercase());
+            if !matches!(extension.as_str(), "html" | "htm" | "xhtml" | "svg") {
+                return Err(format!("{given} is not a page: this opens .html"));
+            }
+            // (its name goes on a command line that asks no one, and cmd works out `%CMDCMDLINE:~45,1%` even inside quotes: a file named so would be a command of the model's choosing)
+            if page.to_string_lossy().contains('%') {
+                return Err(format!("{given}: a name with % in it cannot be opened from here. Rename it first"));
+            }
+            let name = page.strip_prefix(workspace).unwrap_or(&page).display().to_string();
+            let needs = needs_of(&page);
+            (Some(page), name, Some(needs))
+        }
+    };
     let Some((program, browser_name)) = browser() else {
         return Err("neither Edge nor Chrome is on this machine, so the page could not be opened: say that it has not been run".to_string());
     };
     let views = views_of(arguments)?;
-    let steps = arguments.get("steps").and_then(Value::as_str).filter(|steps| !steps.trim().is_empty());
     // (steps take time of their own, as their waits count in it)
     let wait = arguments.get("wait_ms").and_then(Value::as_u64).unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS);
-    let needs = needs_of(&page);
-    let plain = |path: &Path| path.display().to_string().trim_start_matches("\\\\?\\").to_string();
-    let cwd = page.parent().unwrap_or(workspace).to_path_buf();
+    let cwd = page.as_deref().and_then(Path::parent).unwrap_or(workspace).to_path_buf();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // With steps, what is opened is a copy of the page with them in it, in the sandbox's own folder, that reads the page's own files from where they are.
-    let opened = match steps {
-        Some(steps) => {
+    let opened = match (&page, steps) {
+        (Some(page), Some(steps)) => {
             let temp = crate::sandbox::temp_folder().ok_or("the sandbox's folder could not be found, so the steps could not be run")?;
-            let html = std::fs::read_to_string(&page).map_err(|error| format!("{given}: {error}"))?;
+            let html = std::fs::read_to_string(page).map_err(|error| format!("{name}: {error}"))?;
             let base = file_url(page.parent().unwrap_or(workspace)) + "/";
             let copy = temp.join(STEPS_PAGE);
             std::fs::write(&copy, with_steps(&html, &base, steps)).map_err(|error| format!("{}: {error}", copy.display()))?;
-            copy
+            Some(copy)
         }
-        None => page.clone(),
+        (page, _) => page.clone(),
     };
-    let line = format!("\"{}\" {FLAGS} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --dump-dom \"{}\"", program.display(), plain(&opened));
+    // What the browser is given, on its command line and in the pictures' frame.
+    let (address, src) = match &opened {
+        Some(file) => (plain(file), file_url(file)),
+        None => (name.clone(), name.clone()),
+    };
+    let line = format!("\"{}\" {FLAGS} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --dump-dom \"{address}\"", program.display());
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
     for _ in 0..TRIES {
@@ -431,11 +478,14 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         // (its crashes come together: a real run lost all four tries inside 6.5 s, and that page opened ten times of ten afterwards. Why is not known.)
         std::thread::sleep(Duration::from_secs(3));
     }
-    let folder_url = format!("file:///{}/", plain(&root).replace('\\', "/"));
-    let name = page.strip_prefix(workspace).unwrap_or(&page).display().to_string();
-    let mut console = console_lines(&err, &folder_url);
+    // (what its console names is said from the workspace, or from the server's root)
+    let base_url = match served {
+        Some(url) => url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/") + "/",
+        None => format!("file:///{}/", plain(&root).replace('\\', "/")),
+    };
+    let mut console = console_lines(&err, &base_url);
     let mut steps_said = String::new();
-    if steps.is_some() {
+    if let (Some(page), Some(_)) = (&page, steps) {
         // (the copy's lines are the page's own; and whether the steps got to their end is said apart)
         let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
         let done = console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE"));
@@ -448,7 +498,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             (false, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms.\n"),
         };
     }
-    let said = format!("{}{steps_said}", report(&name, browser_name, finished, &needs, &console, &dom));
+    let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
     }
@@ -460,7 +510,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let (frame, shot, picture) = (temp.join("dogmind-frame.html"), temp.join("dogmind-shot.png"), temp.join(format!("dogmind-page-{tag}.png")));
         let _ = std::fs::remove_file(&picture);
         // (with steps, each picture is of the page after them, as they run again in its load)
-        if std::fs::write(&frame, frame_page(&opened, view)).is_err() {
+        if std::fs::write(&frame, frame_page(&src, view)).is_err() {
             out.push_str(&format!("No picture at {} could be taken.\n", view.label));
             continue;
         }
@@ -547,7 +597,7 @@ mod tests {
         assert_eq!(needs.did_not_run, ["main.js"]);
         assert_eq!(needs.run, ["the page's script 3"]);
         assert!(needs.local_module);
-        let said = report("index.html", "Edge", true, &needs, &[], "<html><body>hi</body></html>");
+        let said = report("index.html", "Edge", true, Some(&needs), &[], "<html><body>hi</body></html>");
         assert!(said.contains("DID NOT RUN"), "{said}");
         assert!(said.contains("a CDN library cannot load"), "{said}");
         assert!(!said.contains("no errors"), "it does not say all is well of what did not run: {said}");
@@ -611,8 +661,42 @@ mod tests {
     fn the_frame_names_the_page_by_an_address_nothing_in_its_name_can_end() {
         let url = file_url(Path::new("C:\\Users\\me\\My Site\\a&b \"#1\".html"));
         assert_eq!(url, "file:///C:/Users/me/My%20Site/a%26b%20%22%231%22.html");
-        let frame = frame_page(Path::new("C:\\w\\index.html"), &View { label: "mobile".into(), width: 390, height: 844 });
+        let frame = frame_page(&file_url(Path::new("C:\\w\\index.html")), &View { label: "mobile".into(), width: 390, height: 844 });
         assert!(frame.contains("src=\"file:///C:/w/index.html\" width=\"390\" height=\"844\""), "{frame}");
+    }
+
+    #[test]
+    fn a_url_is_a_server_on_this_machine_and_nothing_cmd_would_read_into() {
+        for good in ["http://localhost:8000/", "http://127.0.0.1:5173/app/index.html?x=1&y=2", "http://[::1]:8080", "http://localhost/", "HTTP://LOCALHOST:3000/a"] {
+            assert_eq!(served_address(good).as_deref(), Ok(good), "{good}");
+        }
+        for bad in ["http://example.com/", "http://localhost.evil.com/", "http://127.0.0.2/", "http://user@localhost/", "http://localhost:80a/", "file:///C:/x.html", "http://localhost:8000/%CMDCMDLINE%", "http://localhost:8000/a\"b", "http://localhost:8000/a b", "ftp://localhost/", "http://localhost:/"] {
+            assert!(served_address(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// With the real browser and a real server, both in the real sandbox: what a command serves on this machine, the check can read.
+    #[test]
+    #[ignore = "starts a server and Edge in the sandbox"]
+    fn a_page_a_local_server_gives_is_checked_by_its_url() {
+        let (dir, _) = page(&[
+            ("index.html", "<!DOCTYPE html><title>served</title><div id=o>wait</div><script type=module src=app.mjs></script>"),
+            ("app.mjs", "import { word } from './word.mjs'; document.getElementById('o').textContent = word; console.log('module ran: ' + location.origin);"),
+            ("word.mjs", "export const word = 'from a module';"),
+        ]);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (folder, halt) = (dir.path().to_path_buf(), stop.clone());
+        let server = std::thread::spawn(move || crate::sandbox::run("python -m http.server 8765 --bind 127.0.0.1", &folder, &folder, false, Duration::from_secs(90), &halt));
+        // (Python in the sandbox takes a few seconds to be listening the first time)
+        std::thread::sleep(Duration::from_secs(8));
+        let said = check_page(&serde_json::json!({"url": "http://127.0.0.1:8765/index.html"}), dir.path(), &AtomicBool::new(false));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = server.join();
+        let said = said.unwrap();
+        println!("{said}");
+        assert!(said.contains("module ran: http://127.0.0.1:8765") && said.contains("text: from a module"), "{said}");
+        assert!(!said.contains("Permissions-Policy"), "the browser's own words are not the page's: {said}");
+        assert!(said.contains("How it looks at desktop"), "{said}");
     }
 
     /// With the real browser, in the real sandbox: a phone's width is the width the page is laid out at, not the browser window's least.

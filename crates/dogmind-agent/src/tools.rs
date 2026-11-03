@@ -77,12 +77,13 @@ pub fn schemas() -> Value {
             "pattern": {"type": "string"},
             "path": {"type": "string"}
         }), &["pattern"]),
-        function("check_page", "Run a workspace page that uses no CDN library in a headless browser: what its scripts printed and threw, what it shows, and pictures of it.", json!({
+        function("check_page", "Open a page in a headless browser with no network: what its scripts printed and threw, what it shows, pictures.", json!({
             "path": {"type": "string"},
+            "url": {"type": "string", "description": "Instead of path: http://localhost:PORT/ of a server you started"},
             "views": {"type": "array", "items": {"type": "string"}, "description": "desktop (default), mobile, or WxH"},
             "wait_ms": {"type": "integer"},
-            "steps": {"type": "string", "description": "JS run in the page once it loads, before what it shows is read: await click(sel), fill(sel, text), press(key), check(sel), select(sel, value), wait(ms); text(sel), count(sel), visible(sel); console.log what to check"}
-        }), &["path"]),
+            "steps": {"type": "string", "description": "JS run after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results"}
+        }), &[]),
         function("command_status", "How a background command is doing, and its output once it has ended.", json!({"id": {"type": "string"}}), &[]),
         function("command_stop", "End a background command.", json!({"id": {"type": "string"}}), &["id"])
     ])
