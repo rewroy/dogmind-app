@@ -2128,7 +2128,16 @@ unsafe fn hold_layout(document: *mut core::ffi::c_void, hold: bool) {
 }
 
 unsafe fn rich_edit(parent: HWND, style: u32, background: u32, points: i32) -> HWND {
-    let edit = control(parent, "RICHEDIT50W", "", style | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_NOOLEDRAGDROP, 0, 0);
+    rich_edit_of("RICHEDIT50W", parent, style, background, points)
+}
+
+/// A RichEdit of this class: Msftedit's window, or the windowless one drawn with Direct2D (`textview`), which falls back to the first where it cannot be made.
+unsafe fn rich_edit_of(class: &str, parent: HWND, style: u32, background: u32, points: i32) -> HWND {
+    let style = style | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_NOOLEDRAGDROP;
+    let mut edit = control(parent, class, "", style, 0, 0);
+    if edit.is_null() && class != "RICHEDIT50W" {
+        edit = control(parent, "RICHEDIT50W", "", style, 0, 0);
+    }
     SendMessageW(edit, EM_SETBKGNDCOLOR, 0, background as LPARAM);
     SendMessageW(edit, EM_EXLIMITTEXT, 0, 256 << 20);
     let format = char_format(theme::text(), 0, UI_FACE, points, None);
@@ -12801,7 +12810,9 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let list_style = WS_VSCROLL | WS_CLIPSIBLINGS | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWVARIABLE) as u32;
         let edit_style = WS_TABSTOP | ES_AUTOHSCROLL as u32;
         // What is found stays selected while the focus is in the find field.
-        let transcript = rich_edit(window, WS_VSCROLL | WS_CLIPSIBLINGS | ES_DISABLENOSCROLL | ES_READONLY as u32 | ES_NOHIDESEL as u32 | WS_TABSTOP, theme::background(), 11);
+        crate::textview::register(instance);
+        let transcript_class = if crate::textview::wanted() { crate::textview::CLASS } else { "RICHEDIT50W" };
+        let transcript = rich_edit_of(transcript_class, window, WS_VSCROLL | WS_CLIPSIBLINGS | ES_DISABLENOSCROLL | ES_READONLY as u32 | ES_NOHIDESEL as u32 | WS_TABSTOP, theme::background(), 11);
         SendMessageW(transcript, EM_SETEDITSTYLE, SES_HIDEGRIDLINES, SES_HIDEGRIDLINES as LPARAM);
         // (it is written only by this program: an undo list would only grow with every format set)
         SendMessageW(transcript, WM_USER + 82, 0, 0); // EM_SETUNDOLIMIT
