@@ -25,8 +25,9 @@ use crate::web::WebSettings;
 const MAX_ITERATIONS: usize = 300;
 /// An `explore` helper's requests: past these it is asked to answer with what it has.
 const HELPER_STEPS: usize = 20;
-/// What its answer brings back into the conversation.
-const HELPER_ANSWER: usize = 8 * 1024;
+/// What its answer brings back into the conversation, in bytes: the 4,000 characters it is told of, in Japanese too. (At 8 KB, a real
+/// review's answer of ten findings lost four from its middle.)
+const HELPER_ANSWER: usize = 16 * 1024;
 const TRANSIENT_RETRIES: u32 = 3;
 const OVERFLOW_RETRIES: u32 = 2;
 /// In a row: a long job meets failures along the way, and a model that gets nowhere meets nothing else.
