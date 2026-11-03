@@ -23,8 +23,9 @@ use crate::tools::{self, Workbench};
 use crate::web::WebSettings;
 
 const MAX_ITERATIONS: usize = 300;
-/// An `explore` helper's requests: past these it is asked to answer with what it has.
+/// An `explore` helper's requests: past these it is asked to answer with what it has, and has as many more as this to do so.
 const HELPER_STEPS: usize = 20;
+const HELPER_PAST_ENOUGH: usize = 2;
 /// What its answer brings back into the conversation, in bytes: the 4,000 characters it is told of, in Japanese too. (At 8 KB, a real
 /// review's answer of ten findings lost four from its middle.)
 const HELPER_ANSWER: usize = 16 * 1024;
@@ -277,6 +278,13 @@ pub fn start(config: Config, events: Sender<Event>, wake: Box<dyn Fn() + Send>) 
         agent.run(inbox);
     });
     Handle { commands, cancel, live, interject }
+}
+
+/// What a model wrote before any tool call it wrote out in its own markup (DeepSeek's DSML, a `<tool_call>`): a server that was not
+/// offered tools, or did not read them as calls, passes them on as words.
+fn without_call_markup(text: &str) -> &str {
+    const MARKS: [&str; 4] = ["<｜DSML｜", "<｜tool▁calls", "<tool_call>", "<|tool_call"];
+    MARKS.iter().filter_map(|mark| text.find(mark)).min().map_or(text, |at| &text[..at])
 }
 
 /// A call's arguments as every step reads them, the gate and the run alike: none at all is an empty object.
@@ -1666,24 +1674,33 @@ impl Agent {
         let (baseline, secrets) = (self.bench.baseline.clone(), self.gate.secrets.clone());
         // (half of the window for what it reads: the rest for its thinking and its answer)
         let room = (self.window as usize).saturating_mul(CHARS_A_TOKEN) / 2;
-        for step in 0..=HELPER_STEPS {
+        let mut told_enough = false;
+        // (past its last word, a round or two for a model that calls a tool still: each call is turned down, and it is asked again)
+        for step in 0..=HELPER_STEPS + HELPER_PAST_ENOUGH {
             if self.cancelled() {
                 return Err("stopped".into());
             }
-            let last = step == HELPER_STEPS || messages.iter().map(Message::chars).sum::<usize>() > room;
-            if last {
+            let last = step >= HELPER_STEPS || messages.iter().map(Message::chars).sum::<usize>() > room;
+            if last && !told_enough {
                 messages.push(Message::text("user", prompt::HELPER_ENOUGH));
+                told_enough = true;
             }
-            let request = Request { model: &self.model, messages: &messages, tools: if last { None } else { Some(&schemas) }, effort: self.effort.as_deref(), images: None, japanese_letters: false };
+            // The tools are offered to the end. Not offered, a real model (DeepSeek-V4.1) went on calling one, in its own markup: that came back as
+            // the answer, and the agent that asked got that and nothing of what the helper had found.
+            let request = Request { model: &self.model, messages: &messages, tools: Some(&schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false };
             let completion = provider.stream(&request, &self.cancel, &mut |_| {}).map_err(|error| format!("the helper's request failed: {error}"))?;
-            if completion.tool_calls.is_empty() || last {
-                let answer = completion.content.trim();
-                return if answer.is_empty() { Err("the helper ended with nothing to say".into()) } else { Ok(tools::cap(answer, HELPER_ANSWER)) };
+            let answer = without_call_markup(&completion.content).trim().to_string();
+            if completion.tool_calls.is_empty() || (last && !answer.is_empty()) {
+                return if answer.is_empty() { Err("the helper ended with nothing to say".into()) } else { Ok(tools::cap(&answer, HELPER_ANSWER)) };
             }
             messages.push(completion.message());
             for call in &completion.tool_calls {
                 let arguments: Value = parse_arguments(&call.function.arguments).unwrap_or(Value::Null);
                 let name = call.function.name.as_str();
+                if last {
+                    messages.push(Message::tool_result(&call.id, prompt::HELPER_NO_MORE));
+                    continue;
+                }
                 self.emit(Event::ToolProgress { id: id.to_string(), tool: name.to_string(), summary: tools::summary(name, &arguments) });
                 let result = if !tools::HELPER_TOOLS.contains(&name) {
                     Err(format!("{name} is not yours: you have read_file, search_files, find_files and list_files"))
@@ -1695,7 +1712,7 @@ impl Agent {
                 messages.push(Message::tool_result(&call.id, result.unwrap_or_else(|error| format!("error: {error}"))));
             }
         }
-        Err("the helper ran out of requests".into())
+        Err("the helper went on calling tools after it was told to answer, and gave no answer".into())
     }
 
     /// The picture a `read_file` names, if it names one.
@@ -2175,6 +2192,28 @@ mod tests {
         assert!(bodies[2]["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool" && message["content"].as_str().unwrap().contains("the needle is here")), "the helper saw what it searched");
         let after = serde_json::to_string(&bodies[3]["messages"]).unwrap();
         assert!(after.contains("The needle is at a.txt:1.") && !after.contains("the needle is here"), "the conversation has the answer, and not what the helper read: {after}");
+    }
+
+    /// A helper that has used its requests is still offered its tools, so that a call is a call and not words; a call then is turned down,
+    /// and what it writes before any call markup is its answer.
+    #[test]
+    fn a_helper_past_its_last_word_is_turned_down_and_its_words_come_back_without_markup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        let mut script = vec![call_answer("explore", serde_json::json!({"task": "Look"}))];
+        script.extend((0..=HELPER_STEPS).map(|_| call_answer("list_files", serde_json::json!({"path": "."}))));
+        script.push(text_answer("Found: a.txt:1.\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read_file\">"));
+        script.push(text_answer("done"));
+        let (client, bodies) = server(script);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("look".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line == "tool:true:false:Found: a.txt:1."), "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let last_word = &bodies[HELPER_STEPS + 1];
+        assert!(last_word["tools"].as_array().is_some_and(|tools| !tools.is_empty()), "offered to the end");
+        let past = &bodies[HELPER_STEPS + 2]["messages"];
+        assert!(past.as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("There is no more looking"), "{past}");
     }
 
     #[test]
