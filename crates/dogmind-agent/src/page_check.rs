@@ -70,6 +70,55 @@ fn file_url(path: &Path) -> String {
     out
 }
 
+/// What a model's steps are run with, in the page: Playwright's way of saying them, done with the page's own DOM. A browser that stays open
+/// to be driven cannot run in the sandbox (node there cannot make the pipes Playwright speaks over, and a headless Edge that is kept open falls
+/// over within a second, where one that loads a page and ends does not), so the steps go in the page and run in the one load that is read.
+const STEPS_PRELUDE: &str = r#"<script>
+(async () => {
+  const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+  const find = (selector) => { const found = document.querySelector(selector); if (!found) throw new Error('nothing matches ' + selector); return found; };
+  const click = async (selector) => { find(selector).click(); await wait(50); };
+  const fill = async (selector, value) => { const field = find(selector); field.focus(); field.value = value; field.dispatchEvent(new Event('input', { bubbles: true })); field.dispatchEvent(new Event('change', { bubbles: true })); await wait(50); };
+  const check = async (selector, on = true) => { const box = find(selector); if (box.checked !== on) box.click(); await wait(50); };
+  const select = async (selector, value) => { const list = find(selector); list.value = value; list.dispatchEvent(new Event('change', { bubbles: true })); await wait(50); };
+  const press = async (key, selector) => { const target = selector ? find(selector) : (document.activeElement || document.body); for (const type of ['keydown', 'keypress', 'keyup']) target.dispatchEvent(new KeyboardEvent(type, { key, bubbles: true, cancelable: true })); if (key === 'Enter' && target.form) target.form.requestSubmit(); await wait(50); };
+  const text = (selector) => find(selector).textContent.trim();
+  const count = (selector) => document.querySelectorAll(selector).length;
+  const visible = (selector) => { const found = document.querySelector(selector); if (!found) return false; const box = found.getBoundingClientRect(); return box.width > 0 && box.height > 0 && getComputedStyle(found).visibility !== 'hidden'; };
+  await new Promise((done) => document.readyState === 'complete' ? done() : addEventListener('load', done));
+  try {
+    await (async () => {
+"#;
+const STEPS_END: &str = r#"
+    })();
+    console.log('DOGMIND-STEPS-DONE');
+  } catch (error) {
+    console.error('DOGMIND-STEPS-FAILED: ' + error.message);
+  }
+})();
+</script>"#;
+/// The copy of the page the steps run in, beside the pictures in the sandbox's own folder.
+const STEPS_PAGE: &str = "dogmind-steps.html";
+
+/// The page with the steps at its end and its folder as its base, so that what it names by a relative path is what it would have had.
+fn with_steps(html: &str, base: &str, steps: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = html.to_string();
+    // (one with a base of its own keeps it)
+    if !lower.contains("<base") {
+        let tag = format!("<base href=\"{base}\">");
+        let at = lower.find("<head").and_then(|head| lower[head..].find('>').map(|end| head + end + 1)).or_else(|| lower.find("<html").and_then(|html| lower[html..].find('>').map(|end| html + end + 1))).unwrap_or(0);
+        out.insert_str(at, &tag);
+    }
+    // (what the steps say cannot end the script they are in)
+    let script = format!("{STEPS_PRELUDE}{}{STEPS_END}", steps.replace("</script", "<\\/script").replace("</SCRIPT", "<\\/SCRIPT"));
+    match out.to_ascii_lowercase().rfind("</body>") {
+        Some(at) => out.insert_str(at, &script),
+        None => out.push_str(&script),
+    }
+    out
+}
+
 /// The page in a frame of exactly this size: the browser's window has a least width of about 500 pixels whatever it is asked, and
 /// lays a page out a little smaller than the window, so a phone's width is only had inside a frame. The picture is cut to the frame.
 fn frame_page(page: &Path, view: &View) -> String {
@@ -347,12 +396,26 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         return Err("neither Edge nor Chrome is on this machine, so the page could not be opened: say that it has not been run".to_string());
     };
     let views = views_of(arguments)?;
-    let wait = arguments.get("wait_ms").and_then(Value::as_u64).unwrap_or(WAIT_MS).min(MOST_WAIT_MS);
+    let steps = arguments.get("steps").and_then(Value::as_str).filter(|steps| !steps.trim().is_empty());
+    // (steps take time of their own, as their waits count in it)
+    let wait = arguments.get("wait_ms").and_then(Value::as_u64).unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS);
     let needs = needs_of(&page);
     let plain = |path: &Path| path.display().to_string().trim_start_matches("\\\\?\\").to_string();
     let cwd = page.parent().unwrap_or(workspace).to_path_buf();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let line = format!("\"{}\" {FLAGS} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --dump-dom \"{}\"", program.display(), plain(&page));
+    // With steps, what is opened is a copy of the page with them in it, in the sandbox's own folder, that reads the page's own files from where they are.
+    let opened = match steps {
+        Some(steps) => {
+            let temp = crate::sandbox::temp_folder().ok_or("the sandbox's folder could not be found, so the steps could not be run")?;
+            let html = std::fs::read_to_string(&page).map_err(|error| format!("{given}: {error}"))?;
+            let base = file_url(page.parent().unwrap_or(workspace)) + "/";
+            let copy = temp.join(STEPS_PAGE);
+            std::fs::write(&copy, with_steps(&html, &base, steps)).map_err(|error| format!("{}: {error}", copy.display()))?;
+            copy
+        }
+        None => page.clone(),
+    };
+    let line = format!("\"{}\" {FLAGS} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --dump-dom \"{}\"", program.display(), plain(&opened));
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
     for _ in 0..TRIES {
@@ -370,7 +433,22 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     }
     let folder_url = format!("file:///{}/", plain(&root).replace('\\', "/"));
     let name = page.strip_prefix(workspace).unwrap_or(&page).display().to_string();
-    let said = report(&name, browser_name, finished, &needs, &console_lines(&err, &folder_url), &dom);
+    let mut console = console_lines(&err, &folder_url);
+    let mut steps_said = String::new();
+    if steps.is_some() {
+        // (the copy's lines are the page's own; and whether the steps got to their end is said apart)
+        let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
+        let done = console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE"));
+        let failed = console.iter().find_map(|line| line.split_once("DOGMIND-STEPS-FAILED: ").map(|(_, why)| why.to_string()));
+        console.retain(|line| !line.contains("DOGMIND-STEPS-"));
+        console.iter_mut().for_each(|line| *line = line.replace(STEPS_PAGE, &file_name));
+        steps_said = match (done, failed) {
+            (_, Some(why)) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
+            (true, None) => "Steps: all ran. What it shows, and its pictures, are the page after them.\n".to_string(),
+            (false, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms.\n"),
+        };
+    }
+    let said = format!("{}{steps_said}", report(&name, browser_name, finished, &needs, &console, &dom));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
     }
@@ -381,7 +459,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let tag = view.label.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
         let (frame, shot, picture) = (temp.join("dogmind-frame.html"), temp.join("dogmind-shot.png"), temp.join(format!("dogmind-page-{tag}.png")));
         let _ = std::fs::remove_file(&picture);
-        if std::fs::write(&frame, frame_page(&page, view)).is_err() {
+        // (with steps, each picture is of the page after them, as they run again in its load)
+        if std::fs::write(&frame, frame_page(&opened, view)).is_err() {
             out.push_str(&format!("No picture at {} could be taken.\n", view.label));
             continue;
         }
@@ -570,5 +649,37 @@ mod tests {
         println!("{said}");
         assert!(said.contains("DID NOT RUN"), "{said}");
         assert!(!said.contains("NEVER"), "{said}");
+    }
+
+    #[test]
+    fn steps_go_at_the_end_of_the_page_with_its_folder_as_base_and_cannot_end_their_script() {
+        let page = with_steps("<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>", "file:///C:/w/", "await click('#a'); console.log('</script>')");
+        assert!(page.contains("<head><base href=\"file:///C:/w/\"><title>"), "{page}");
+        let (steps_at, body_end) = (page.find("click('#a')").unwrap(), page.rfind("</body>").unwrap());
+        assert!(page.find("<p>x</p>").unwrap() < steps_at && steps_at < body_end, "{page}");
+        assert!(page.contains("console.log('<\\/script>')") && page.matches("</script>").count() == 1, "{page}");
+        let bare = with_steps("<p>no head</p>", "file:///C:/w/", "1");
+        assert!(bare.starts_with("<base href=") && bare.ends_with("</script>"), "{bare}");
+        let based = with_steps("<head><base href=\"x/\"></head>", "file:///C:/w/", "1");
+        assert_eq!(based.matches("<base").count(), 1, "a page's own base stays");
+    }
+
+    /// With the real browser, in the real sandbox: the steps type and click as a person would, and the page is read after them.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn a_page_is_driven_by_its_steps() {
+        let (dir, _) = page(&[
+            ("index.html", "<!DOCTYPE html><title>todo</title><link rel=stylesheet href=style.css><input id=t><button id=add>add</button><ul id=l></ul><script src=app.js></script>"),
+            ("style.css", "li{color:#c33}"),
+            ("app.js", "document.getElementById('add').onclick=()=>{const li=document.createElement('li');li.textContent=document.getElementById('t').value;document.getElementById('l').append(li);console.log('added '+li.textContent)};"),
+        ]);
+        let steps = "await fill('#t', 'milk'); await click('#add'); console.log('items ' + count('li') + ' ' + text('li'));";
+        let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps, "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        assert!(said.contains("Steps: all ran") && said.contains("items 1 milk") && said.contains("app.js:1: added milk"), "{said}");
+        assert!(said.contains("text: add milk") || said.contains("milk"), "the page as the steps left it: {said}");
+        assert!(said.contains("How it looks at mobile"), "{said}");
+        let failed = check_page(&serde_json::json!({"path": "index.html", "steps": "await click('#nothing')"}), dir.path(), &AtomicBool::new(false)).unwrap();
+        assert!(failed.contains("STEPS FAILED: nothing matches #nothing"), "{failed}");
     }
 }
