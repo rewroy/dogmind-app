@@ -438,6 +438,7 @@ const JA: &[(&str, &str)] = &[
     ("Web", "Web"),
     ("Effort", "思考"),
     ("Conversation", "会話"),
+    ("Document", "ドキュメント"),
     ("Conversation length", "会話の長さ"),
     ("none", "なし"),
     ("not saved yet", "未保存"),

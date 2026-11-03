@@ -2127,10 +2127,6 @@ unsafe fn hold_layout(document: *mut core::ffi::c_void, hold: bool) {
     call(document, &mut count);
 }
 
-unsafe fn rich_edit(parent: HWND, style: u32, background: u32, points: i32) -> HWND {
-    rich_edit_of("RICHEDIT50W", parent, style, background, points)
-}
-
 /// A RichEdit of this class: Msftedit's window, or the windowless one drawn with Direct2D (`textview`), which falls back to the first where it cannot be made.
 unsafe fn rich_edit_of(class: &str, parent: HWND, style: u32, background: u32, points: i32) -> HWND {
     let style = style | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_NOOLEDRAGDROP;
@@ -11769,6 +11765,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         }
         WM_DRAWITEM => {
             let item = &*(lparam as *const DRAWITEMSTRUCT);
+            if item.hwndItem == app.composer_cue {
+                FillRect(item.hDC, &item.rcItem, app.brushes[2]);
+                draw_text(item.hDC, &get_text(app.composer_cue), item.rcItem, app.fonts.body, theme::faint(), DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+                return 1;
+            }
             if item.itemID != u32::MAX {
                 if item.hwndItem == app.side {
                     app.draw_side_row(item);
@@ -12816,8 +12817,11 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         SendMessageW(transcript, EM_SETEDITSTYLE, SES_HIDEGRIDLINES, SES_HIDEGRIDLINES as LPARAM);
         // (it is written only by this program: an undo list would only grow with every format set)
         SendMessageW(transcript, WM_USER + 82, 0, 0); // EM_SETUNDOLIMIT
-        let composer = rich_edit(window, WS_VSCROLL | WS_TABSTOP | WS_CLIPSIBLINGS | ES_WANTRETURN as u32, theme::surface(), 11);
+        let composer = rich_edit_of(transcript_class, window, WS_VSCROLL | WS_TABSTOP | WS_CLIPSIBLINGS | ES_WANTRETURN as u32, theme::surface(), 11);
         SendMessageW(composer, EM_SETTEXTMODE, (TM_PLAINTEXT | TM_MULTILEVELUNDO | TM_MULTICODEPAGE) as WPARAM, 0);
+        crate::textview::set_name(composer, "Message Dogmind");
+        let doc = rich_edit_of(transcript_class, window, WS_VSCROLL | ES_READONLY as u32, theme::background(), 10);
+        crate::textview::set_name(doc, "Document");
         let side = control(window, "LISTBOX", "", list_style, 0, ID_SIDE);
         let list = control(window, "LISTBOX", "", list_style, 0, ID_LIST);
         let chip = |id: isize, backdrop: u32| make_button(window, id, "", ButtonKind::Chip, backdrop);
@@ -12846,13 +12850,14 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             current_session: None,
             transcript,
             composer,
-            composer_cue: control(window, "STATIC", t("Message Dogmind"), SS_NOPREFIX, 0, 0),
+            // (drawn by the app, as what is typed is: its Latin and its Japanese each in its face, which a static control's one font cannot be)
+            composer_cue: control(window, "STATIC", t("Message Dogmind"), SS_NOPREFIX | 0x0D, 0, 0), // SS_OWNERDRAW
             send: make_button(window, ID_SEND, "arrow-up", ButtonKind::Round, theme::surface()),
             model_chip: chip(ID_MODEL_CHIP, theme::surface()),
             mode_chip: chip(ID_MODE_CHIP, theme::surface()),
             effort_chip: chip(ID_EFFORT_CHIP, theme::surface()),
             help_button: make_button(window, ID_HELP, "circle-question-mark", ButtonKind::Icon, theme::sidebar()),
-            doc: rich_edit(window, WS_VSCROLL | ES_READONLY as u32, theme::background(), 10),
+            doc,
             copy_buttons: (0..COPY_POOL).map(|at| make_button(window, ID_COPY_POOL + at as isize, "copy", ButtonKind::Icon, theme::background())).collect(),
             fork_buttons: (0..COPY_POOL).map(|at| make_button(window, ID_FORK_POOL + at as isize, "git-branch", ButtonKind::Icon, theme::background())).collect(),
             answers: Vec::new(),
@@ -13326,13 +13331,15 @@ mod tests {
                 let length = found.face.iter().position(|&unit| unit == 0).unwrap_or(32);
                 String::from_utf16_lossy(&found.face[..length])
             };
+            // (a Japanese Windows names the face in Japanese)
+            let japanese = |face: String| face == japanese_face() || (japanese_face() == crate::paint::BUNDLED_FACE && face == "BIZ UDゴシック");
             assert_eq!(face_of(0, 3), UI_FACE);
-            assert_eq!(face_of(4, 7), japanese_face());
+            assert!(japanese(face_of(4, 7)), "{}", face_of(4, 7));
             // A format over all of it, as a line of the transcript gets, leaves that as it was.
             let range = CharRange { first: 0, last: -1 };
             SendMessageW(edit, EM_EXSETSEL, 0, std::ptr::addr_of!(range) as LPARAM);
             SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION as WPARAM, std::ptr::addr_of!(format) as LPARAM);
-            assert_eq!(face_of(4, 7), japanese_face());
+            assert!(japanese(face_of(4, 7)), "{}", face_of(4, 7));
             DestroyWindow(edit);
         }
     }
