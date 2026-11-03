@@ -2090,7 +2090,9 @@ mod tests {
                 kept.lock().unwrap().push(serde_json::from_str::<Value>(&body).unwrap());
                 let answer = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{script}", script.len());
                 stream.write_all(answer.as_bytes()).unwrap();
-                // The client closes first, as with a keep-alive server: a server closing first can reset what is unread.
+                // The client closes first, as with a keep-alive server: a server closing first can reset what is unread. Not for ever: on
+                // this machine about one close in three hundred never reaches a server on loopback, and the next request waited behind it.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
             }
         });

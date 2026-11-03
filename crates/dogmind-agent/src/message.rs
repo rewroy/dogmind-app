@@ -76,7 +76,12 @@ impl Message {
         let calls = self.tool_calls.iter().flatten().map(|call| call.function.name.len() + call.function.arguments.len()).sum::<usize>();
         // (a picture by what it takes of the context, at the three characters a token this estimate counts: not by its bytes, which are not here)
         let pictures = self.images.iter().map(ImageRef::tokens).sum::<usize>() * 3;
-        self.content.as_deref().map_or(0, str::len) + self.reasoning_content.as_deref().map_or(0, str::len) + calls + pictures
+        // (Claude's thinking goes back with every request, in its blocks: its reasoning_content is empty)
+        let thinking = self.provider_blocks.as_ref().and_then(serde_json::Value::as_array).into_iter().flatten()
+            .filter_map(|block| block.get("thinking").or_else(|| block.get("data")).and_then(serde_json::Value::as_str))
+            .map(str::len)
+            .sum::<usize>();
+        self.content.as_deref().map_or(0, str::len) + self.reasoning_content.as_deref().map_or(0, str::len) + calls + pictures + thinking
     }
 
     /// As an OpenAI-compatible server or Codex reads it: without Claude's own form, nor when it was written.
@@ -116,6 +121,14 @@ mod tests {
         assert_eq!(clock_words("2026-11-02 20:01:18 +09:00", "2026-11-03 09:00"), "11/2 20:01");
         assert_eq!(clock_words("", "2026-11-03"), "");
         assert_eq!(clock_words("yesterday evening", "2026-11-03"), "");
+    }
+
+    /// Claude's thinking, which goes back in its blocks, counts toward what a message takes of the context; its text block is the content already.
+    #[test]
+    fn claudes_thinking_counts_toward_the_context() {
+        let plain = Message::text("assistant", "answer");
+        let thought = Message { provider_blocks: Some(serde_json::json!([{"type": "thinking", "thinking": "x".repeat(900), "signature": "s"}, {"type": "text", "text": "answer"}])), ..plain.clone() };
+        assert_eq!(thought.chars(), plain.chars() + 900);
     }
 
     /// The time is the session's and the person's: a request goes without it, and so its prefix is the same whenever it was said.
