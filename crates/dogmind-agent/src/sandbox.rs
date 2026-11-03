@@ -1863,6 +1863,26 @@ mod tests {
         drop(holder);
     }
 
+    /// A workspace in the person's profile: PowerShell cannot stand in it, for the container may not read `C:\Users` itself, which no grant of ours can change.
+    /// What the prompt and the notes tell the model to do instead works from there: absolute paths, and `Start-Process` given its folder.
+    #[test]
+    fn powershell_works_from_a_profile_by_absolute_paths() {
+        let holder = tempfile::tempdir().unwrap();
+        let folder = holder.path().join("work");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.txt"), "IN-A").unwrap();
+        let full = folder.display().to_string();
+        let done = command(&format!("powershell -NoProfile -Command \"Get-Content -LiteralPath '{full}\\a.txt'; Start-Process cmd.exe -ArgumentList '/c','echo started' -WorkingDirectory '{full}' -NoNewWindow -Wait\""), &folder, false);
+        let said = decode(&done.stdout);
+        assert!(said.contains("IN-A") && said.contains("started"), "{said} {}", decode(&done.stderr));
+        // ... and what it says without, which the notes know
+        let lost = command("powershell -NoProfile -Command \"Start-Process cmd.exe -ArgumentList '/c','echo started' -NoNewWindow -Wait\"", &folder, false);
+        if !decode(&lost.stdout).contains("started") {
+            assert!(crate::tools::powershell_lost_at_a_root(&decode(&lost.stderr), &folder), "{}", decode(&lost.stderr));
+        }
+        drop(holder);
+    }
+
     #[test]
     fn a_folder_outside_the_workspace_does_not_run() {
         let folder = work_folder("cwd");
