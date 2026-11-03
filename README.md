@@ -58,8 +58,12 @@ Lucide's (ISC), the CUDA toolkit's, the WebView2 SDK's and every Rust crate in t
 ## Building
 
 ```bat
+set "RUSTFLAGS=-C target-feature=+crt-static --remap-path-prefix=%USERPROFILE%=~"
 cargo build --release -p dogmind-app -p dogmind-setup
 ```
+
+A release is built so: a panic's message names the path of its source, and without the remap the builder's user folder is in
+every one. `RUSTFLAGS` takes the place of `.cargo/config.toml`'s flags, so the static C runtime is said again.
 
 `python -I scripts\package.py` then makes `dist\DogmindApp`, its zip and `dist\DogmindSetup-VERSION.exe`. The installer is `crates/dogmind-setup` and no tool besides: the package is on the end of that one executable, deflated file by file, and read as a stream. To try one in a scratch folder, `DogmindSetup.exe --test --dir FOLDER`: it writes no Start menu entry or registry key, only what they would say, in that folder.
 
