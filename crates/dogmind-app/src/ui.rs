@@ -1261,7 +1261,8 @@ enum Shown {
     /// A block of code begins here: all of it, for its copy button.
     Block(String),
     /// The pictures of a message and their sizes, at the top of its card. `alone`: no text under them.
-    Pictures { pictures: Vec<(PathBuf, (i32, i32))>, width: i32, alone: bool },
+    /// `right`: what the person sent; otherwise what a tool opened for the model.
+    Pictures { pictures: Vec<(PathBuf, (i32, i32))>, width: i32, alone: bool, right: bool },
     /// Tool calls as one row: which of `runs`.
     Run(usize),
 }
@@ -1550,6 +1551,8 @@ struct App {
     preview_making: bool,
     preview_blocked: u32,
     preview_hits: Vec<(RECT, PathBuf)>,
+    /// The right panel's way to the engine's dashboard, and where it goes.
+    dashboard_hit: Option<(RECT, String)>,
     preview_reload: HWND,
     preview_browser: HWND,
     preview_close: HWND,
@@ -1727,6 +1730,8 @@ struct App {
     follow_carried: f32,
     /// The view keeps to the end as text comes, until the person scrolls away from it.
     follow_end: bool,
+    /// What a fine wheel has sent the transcript that has not added up to a pixel yet, in 120ths.
+    wheel_rest: i32,
     /// When the person last did.
     scrolled_up_at: Option<std::time::Instant>,
     line_start: bool,
@@ -2494,7 +2499,7 @@ impl App {
                 Shown::Code { line, language, open } => {
                     self.code_row(line, language, *open);
                 }
-                Shown::Pictures { pictures, width, alone } => self.append_pictures(pictures, (*width).min((self.text_twips * 4 / 5).max(800)), *alone),
+                Shown::Pictures { pictures, width, alone, right } => self.append_pictures(pictures, (*width).min((self.text_twips * 4 / 5).max(800)), *alone, *right),
                 Shown::Run(at) => self.write_run(*at),
                 Shown::Block(code) => {
                     self.begin_block();
@@ -3610,8 +3615,8 @@ impl App {
         SelectObject(device, previous);
         ReleaseDC(self.transcript, device);
         // The body font is drawn a size larger in the transcript than it was measured here, and at the size the settings chose.
-        // (in twips: about 24 pixels at each side and 15 over and under at 100%, where the words had been tight against the card)
-        let padding = (360, 220);
+        // (in twips: about 16 pixels at each side and 15 over and under at 100%, where the words had been tight against the card)
+        let padding = (240, 220);
         let wanted = i64::from(widest) * 1440 * 115 * i64::from(text_scale()) / 10000 / i64::from(self.dpi) + i64::from(padding.0) * 2 + 120;
         let most = (self.text_twips * 4 / 5).max(800);
         let wanted = if images.is_empty() {
@@ -3625,7 +3630,7 @@ impl App {
         };
         let width = wanted.clamp(800, most);
         if !images.is_empty() {
-            self.append_pictures(images, width, lines.is_empty());
+            self.append_pictures(images, width, lines.is_empty(), true);
         }
         if !lines.is_empty() {
             self.append_row(&rtf::Row { lines: &lines, face: UI_FACE, points: 11, color: theme::text(), back: theme::user_back(), width, right: true, column: self.text_twips, padding });
@@ -3634,10 +3639,33 @@ impl App {
         self.line_start = true;
     }
 
+    /// Where a message's pictures are kept with this session, and their sizes.
+    fn pictures_of(&self, images: &[dogmind_agent::message::ImageRef]) -> Vec<(PathBuf, (i32, i32))> {
+        self.current_session.as_deref().map_or(Vec::new(), |session| images.iter().map(|image| (dogmind_agent::images::file_of(session, image), (image.width as i32, image.height as i32))).collect())
+    }
+
+    /// What a tool opened for the model to see, a picture the model read: under its call, at the left, where the person sees what the model saw.
+    unsafe fn show_tool_pictures(&mut self, pictures: &[(PathBuf, (i32, i32))]) {
+        if pictures.is_empty() {
+            return;
+        }
+        self.end_line();
+        const ACROSS: i32 = 200;
+        let most = (self.text_twips * 3 / 5).max(800);
+        let room = i64::from(most - 2 * ACROSS) * i64::from(self.dpi) / 1440;
+        let sizes: Vec<(i32, i32)> = pictures.iter().map(|(_, size)| *size).collect();
+        let tiles = attach::Tiles::of(&sizes, room as i32, self.dpi);
+        let width = ((i64::from(tiles.total_width()) * 1440 / i64::from(self.dpi)) as i32 + 2 * ACROSS + 40).clamp(800, most);
+        self.append_pictures(pictures, width, true, false);
+        self.append("\n", Style::Tool);
+        self.line_start = true;
+        self.para_next = Some(Para::AfterBlock);
+    }
+
     /// Room in a card for pictures, which come when they come into view: nothing is read now, however long the conversation.
-    unsafe fn append_pictures(&mut self, pictures: &[(PathBuf, (i32, i32))], width: i32, alone: bool) {
+    unsafe fn append_pictures(&mut self, pictures: &[(PathBuf, (i32, i32))], width: i32, alone: bool, right: bool) {
         if !self.replaying {
-            self.shown.push(Shown::Pictures { pictures: pictures.to_vec(), width, alone });
+            self.shown.push(Shown::Pictures { pictures: pictures.to_vec(), width, alone, right });
         }
         const ACROSS: i32 = 200;
         const DOWN: i32 = 100;
@@ -3646,11 +3674,12 @@ impl App {
         let tiles = attach::Tiles::of(&sizes, room as i32, self.dpi);
         // (the room above them is in the height of this row, and what is under them is the text's, or if none, this row's too)
         let height = (i64::from(tiles.total_height()) * 1440 / i64::from(self.dpi)) as i32 + if alone { 2 * DOWN } else { DOWN };
-        let first = self.insert_rtf(rtf::spacer_row(width, self.text_twips, height, theme::user_back(), (ACROSS, DOWN)), None);
+        let back = if right { theme::user_back() } else { theme::code_back() };
+        let first = self.insert_rtf(rtf::spacer_row(width, self.text_twips, height, back, (ACROSS, DOWN), right), None);
         let start = text_start(self.transcript, first);
         self.picture_blocks.push(PictureBlock { start, paths: pictures.iter().map(|(path, _)| path.clone()).collect(), tiles });
         if alone {
-            self.user_cards.push(UserCard { start, kind: CardKind::Person, shape: None, looked_at: None });
+            self.user_cards.push(UserCard { start, kind: if right { CardKind::Person } else { CardKind::Block }, shape: None, looked_at: None });
         }
         if !self.replaying {
             self.place_pictures();
@@ -4357,12 +4386,12 @@ impl App {
         // The panel on the right, when there is room for it beside a conversation.
         // A preview takes half of what the sidebar leaves, as a page needs the width.
         let room = width - sidebar;
-        let has_something = self.preview_file.is_some() || !self.todos.is_empty() || !self.changes.is_empty();
+        // (always there while it is on and there is room: it is also where the engine's dashboard is reached from)
         let right = if !chat || bare {
             0
         } else if self.preview_file.is_some() && room >= s(760) {
             (room / 2).max(s(380))
-        } else if self.preview_file.is_none() && has_something && self.settings.right_panel && room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS) {
+        } else if self.preview_file.is_none() && self.settings.right_panel && room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS) {
             s(ds::size::RIGHT_PANEL)
         } else {
             0
@@ -4370,6 +4399,7 @@ impl App {
         self.right_width = right;
         self.right_hits.clear();
         self.preview_hits.clear();
+        self.dashboard_hit = None;
         if self.preview_file.is_none() || right == 0 {
             if let Some(shown) = &self.preview {
                 shown.hide();
@@ -4382,7 +4412,7 @@ impl App {
             self.layout_right(&mut shapes, width - right + s(ds::size::RIGHT_GAP), right - 2 * s(ds::size::RIGHT_GAP), height);
         }
         // (no switch for what could not show)
-        let toggles = chat && !bare && (self.preview_file.is_some() || (has_something && room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS)));
+        let toggles = chat && !bare && (self.preview_file.is_some() || room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS));
         show(self.right_toggle, toggles);
         show(self.folder_chip, chat && !bare);
 
@@ -5771,8 +5801,27 @@ impl App {
             *y += s(ds::space::XL);
         };
 
-        // What fits, past the two headings: nothing is drawn off the bottom of the window.
-        let (max_tasks, max_changes) = share_rows(((height - y - s(90)) / row).max(2), self.todos.len(), self.changes.len());
+        // The engine, at the foot: what it is and the way to its dashboard.
+        self.dashboard_hit = None;
+        let foot = height - s(ds::space::L);
+        let mut engine_top = foot;
+        if let Some(url) = self.dashboard_url() {
+            let link = rect(x, foot - row, width, row);
+            shapes.push(Shape::Icon { name: "external-link", area: rect(x, link.top, s(ds::space::L), row), size: s(ds::size::ICON_SMALL), color: theme::accent_hover() });
+            shapes.push(Shape::Text { area: rect(x + s(ds::size::RIGHT_INDENT), link.top, width - s(ds::size::RIGHT_INDENT), row), text: t("Open the dashboard").to_string(), font: FontKind::Small, color: theme::accent_hover(), flags: ONE_LINE });
+            self.dashboard_hit = Some((rect(x - s(6), link.top, width + s(ds::space::M), row), url));
+            engine_top = link.top;
+        }
+        if !self.model.is_empty() {
+            engine_top -= row;
+            shapes.push(Shape::Text { area: rect(x, engine_top, width, row), text: self.model.clone(), font: FontKind::Small, color: theme::muted(), flags: ONE_LINE });
+        }
+        if engine_top < foot {
+            engine_top -= s(ds::size::QUEUE_STEP);
+            shapes.push(Shape::Text { area: rect(x, engine_top, width, s(ds::space::XL)), text: t("Engine").to_string(), font: FontKind::Strong, color: theme::muted(), flags: ONE_LINE });
+        }
+        // What fits, past the two headings and above the engine: nothing is drawn off the bottom of the window.
+        let (max_tasks, max_changes) = share_rows(((engine_top - y - s(60)) / row).max(2), self.todos.len(), self.changes.len());
         if !self.todos.is_empty() {
             heading(shapes, &mut y, t("Tasks").to_string());
         }
@@ -7725,7 +7774,7 @@ impl App {
             return;
         }
         // (a button that seems to do nothing is worse than one that says why)
-        if self.right_width == 0 && self.settings.right_panel && self.panel == Panel::Chat && !(self.todos.is_empty() && self.changes.is_empty()) {
+        if self.right_width == 0 && self.settings.right_panel && self.panel == Panel::Chat {
             self.say(t("The window is too narrow for the panel: make it wider."));
             return;
         }
@@ -8673,12 +8722,18 @@ impl App {
                         if let Some(result) = results.get(call.id.as_str()) {
                             let arguments = serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
                             let summary: String = dogmind_agent::tools::summary(&call.function.name, &arguments).chars().take(160).collect();
+                            let pictures = self.pictures_of(&result.images);
                             if self.settings.compact_tools {
                                 self.told_call(&call.function.name, &summary, result.content.as_deref().unwrap_or(""), &mut told);
+                                if !pictures.is_empty() {
+                                    self.flush_told_calls(&mut told);
+                                    self.show_tool_pictures(&pictures);
+                                }
                                 continue;
                             }
                             let name = t(tool_name(&call.function.name));
                             self.append(&if summary.is_empty() { format!("✓  {name}\n") } else { format!("✓  {name}  {summary}\n") }, Style::Tool);
+                            self.show_tool_pictures(&pictures);
                         }
                     }
                 }
@@ -9022,7 +9077,7 @@ impl App {
                     self.tools_running.insert(id, (tool, summary));
                 }
             }
-            Event::ToolEnded { id, ok, declined, elapsed, output } => {
+            Event::ToolEnded { id, ok, declined, elapsed, output, images } => {
                 self.end_line();
                 let (tool, summary) = self.tools_running.remove(&id).unwrap_or_default();
                 if self.tools_running.is_empty() || !self.settings.compact_tools {
@@ -9032,9 +9087,15 @@ impl App {
                     // Several in a row are looked at once.
                     SetTimer(self.window, TIMER_CHANGES, 500, None);
                 }
+                let pictures = self.pictures_of(&images);
                 if self.settings.compact_tools {
                     self.run_ended(&id, tool, summary, ok, declined, elapsed.as_secs_f64(), &output);
                     self.para_next = Some(Para::AfterBlock);
+                    if !pictures.is_empty() {
+                        // (under the run that opened them; what the model does next is a run of its own, below them)
+                        self.close_run();
+                        self.show_tool_pictures(&pictures);
+                    }
                     return;
                 }
                 let first = output.lines().next().unwrap_or("").chars().take(240).collect::<String>();
@@ -9044,6 +9105,7 @@ impl App {
                 } else if ok {
                     self.append(&format!("✓  {what}  ·  {:.1}s\n", elapsed.as_secs_f64()), Style::Tool);
                     self.show_tool_output(&tool, &output);
+                    self.show_tool_pictures(&pictures);
                 } else {
                     self.append(&format!("✗  {what}  —  {first}\n", ), Style::Bad);
                 }
@@ -10370,7 +10432,24 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
     if message == WM_PAINT {
         GetUpdateRect(window, &mut about_to_paint, 0);
     }
-    let result = CallWindowProcW(base, window, message, wparam, lparam);
+    let result = if message == WM_MOUSEWHEEL && wparam & 0x0008 == 0 {
+        // RichEdit turns a notch into lines, and its lines here are of every height: a card, a table's row, the room of a picture, a gap of
+        // six points. So a notch went far or hardly at all, and differently at another width of the window. It goes the same distance now,
+        // in pixels, with what a fine wheel sends kept until it adds up. (With Ctrl it is the control's zoom, left to it.)
+        let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+        app.wheel_rest -= delta * scale(app.dpi, 100);
+        let pixels = app.wheel_rest / 120;
+        app.wheel_rest -= pixels * 120;
+        if pixels != 0 {
+            let mut position = POINT { x: 0, y: 0 };
+            SendMessageW(window, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
+            position.y = (position.y + pixels).max(0);
+            SendMessageW(window, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
+        }
+        0
+    } else {
+        CallWindowProcW(base, window, message, wparam, lparam)
+    };
     if matches!(message, WM_VSCROLL | WM_MOUSEWHEEL | WM_KEYDOWN | WM_LBUTTONUP | WM_SIZE) {
         app.place_copy_buttons();
         app.place_thumb();
@@ -11010,7 +11089,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         WM_MOUSEMOVE if app.panel == Panel::Chat => {
             let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
             let within = |area: &RECT| x >= area.left && x < area.right && y >= area.top && y < area.bottom;
-            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _)| *area)).find(|area| within(area));
+            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
             app.hover_on(found);
             0
         }
@@ -11057,6 +11136,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.call_back(at);
             } else if let Some(file) = app.preview_hits.iter().find(|(area, _)| within(area)).map(|(_, file)| file.display().to_string()) {
                 app.open_preview(&file);
+            } else if let Some(url) = app.dashboard_hit.as_ref().filter(|(area, _)| within(area)).map(|(_, url)| url.clone()) {
+                open_in_browser(&url);
             } else if let Some((_, at)) = app.right_hits.iter().find(|(area, _)| within(area)).copied() {
                 app.change_wanted = Some(at);
                 app.set_panel(Panel::Diff);
@@ -12307,6 +12388,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             preview_making: false,
             preview_blocked: 0,
             preview_hits: Vec::new(),
+            dashboard_hit: None,
             preview_reload: make_button(window, ID_PREVIEW_RELOAD, "rotate-cw", ButtonKind::Icon, theme::sidebar()),
             preview_browser: make_button(window, ID_PREVIEW_BROWSER, "external-link", ButtonKind::Icon, theme::sidebar()),
             preview_close: make_button(window, ID_PREVIEW_CLOSE, "x", ButtonKind::Icon, theme::sidebar()),
@@ -12434,6 +12516,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             follow_speed: 0.0,
             follow_carried: 0.0,
             follow_end: true,
+            wheel_rest: 0,
             scrolled_up_at: None,
             line_start: true,
             in_code: false,

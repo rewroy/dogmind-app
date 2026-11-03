@@ -97,9 +97,10 @@ pub fn row(row: &Row) -> String {
 
 /// Room in a card for its pictures, which lie over it as windows of their own: a row of this exact height, against the right edge as the card is,
 /// with one blank character in it for the window to find its place by.
-pub fn spacer_row(width: i32, column: i32, height: i32, back: u32, padding: (i32, i32)) -> String {
+/// `right`: against the right edge, as what the person sent; otherwise at the left, as what a tool opened for the model.
+pub fn spacer_row(width: i32, column: i32, height: i32, back: u32, padding: (i32, i32), right: bool) -> String {
     let (across, down) = padding;
-    let left = (column - width).max(0);
+    let left = if right { (column - width).max(0) } else { 0 };
     format!(
         "{{\\rtf1\\ansi\\deff0{{\\fonttbl{{\\f0\\fnil {face};}}}}{{\\colortbl ;{back};}}\\trowd\\trgaph{across}\\trleft{left}\\trpaddt{down}\\trpaddb0\\trpaddft3\\trpaddfb3\\clcfpat1\\clcbpat1\\clshdng10000\\cellx{end}\\pard\\intbl\\ql\\sl-{height}\\slmult0\\sa0\\sb0\\f0\\fs2 \\u160?\\cell\\row}}",
         face = crate::paint::UI_FACE,
@@ -263,8 +264,11 @@ mod tests {
 
     #[test]
     fn room_for_pictures_is_a_row_of_an_exact_height_against_the_right_edge() {
-        let text = spacer_row(4000, 9000, 3000, 0x332211, (200, 100));
+        let text = spacer_row(4000, 9000, 3000, 0x332211, (200, 100), true);
         assert!(text.contains("\\trleft5000") && text.contains("\\cellx9000") && text.contains("\\sl-3000\\slmult0"), "{text}");
+        // (what a tool opened for the model stands at the left)
+        let left = spacer_row(4000, 9000, 3000, 0x332211, (200, 100), false);
+        assert!(left.contains("\\trleft0") && left.contains("\\cellx4000"), "{left}");
         assert!(text.contains("\\red17\\green34\\blue51;"), "{text}");
         assert!(text.starts_with("{\\rtf1") && text.ends_with("\\row}"), "{text}");
     }

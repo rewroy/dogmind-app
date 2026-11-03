@@ -107,7 +107,8 @@ pub enum Event {
     /// More of the arguments of a tool call the model is still writing: `index` is which of its answer. Told every so often, and at once for a new call.
     ToolWriting { index: usize, tool: String, piece: String },
     ToolStarted { id: String, tool: String, summary: String },
-    ToolEnded { id: String, ok: bool, declined: bool, elapsed: Duration, output: String },
+    /// `images`: what the call opened for the model to see, kept with the session, which the person sees too.
+    ToolEnded { id: String, ok: bool, declined: bool, elapsed: Duration, output: String, images: Vec<ImageRef> },
     /// Words written during the turn have reached it, between two of its steps.
     Interjected(String),
     Approval(Approval),
@@ -1625,7 +1626,7 @@ impl Agent {
         let saved = images::attach_file(path).and_then(|picture| images::save(&session, &picture, limit));
         match saved {
             // (a real model took a picture here for one the person had pasted, and said so in its answer)
-            Ok(image) => (Ok(format!("{shown}: this picture is what your read_file call opened, {} by {} pixels. The user did not send it.", image.width, image.height)), vec![image]),
+            Ok(image) => (Ok(format!("{shown}: this picture is what your read_file call opened, {} by {} pixels. The user did not send it, and sees it too, in the conversation under this call.", image.width, image.height)), vec![image]),
             Err(error) => (Err(format!("{shown}: {error}")), Vec::new()),
         }
     }
@@ -1648,7 +1649,7 @@ impl Agent {
                 output.push_str(&format!("\nnote: this call was cut off here, to get the work on disk. The file ends with this line: `{tail}`. Go straight on with the next line, in create_file with the same path, and write only what is missing: there is no need to think it over again."));
             }
         }
-        self.emit(Event::ToolEnded { id: id.to_string(), ok, declined, elapsed, output: output.clone() });
+        self.emit(Event::ToolEnded { id: id.to_string(), ok, declined, elapsed, output: output.clone(), images: images.clone() });
         self.push(Message { images, ..Message::tool_result(id, output) });
     }
 
