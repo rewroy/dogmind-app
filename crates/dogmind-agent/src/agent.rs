@@ -111,6 +111,8 @@ pub enum Event {
     /// More of the arguments of a tool call the model is still writing: `index` is which of its answer. Told every so often, and at once for a new call.
     ToolWriting { index: usize, tool: String, piece: String },
     ToolStarted { id: String, tool: String, summary: String },
+    /// What a call that takes a while (`explore`) is doing now: one of its own calls, by its tool and what it is on.
+    ToolProgress { id: String, tool: String, summary: String },
     /// `images`: what the call opened for the model to see, kept with the session, which the person sees too.
     ToolEnded { id: String, ok: bool, declined: bool, elapsed: Duration, output: String, images: Vec<ImageRef> },
     /// Words written during the turn have reached it, between two of its steps.
@@ -1583,7 +1585,7 @@ impl Agent {
             }
         }
         if name == "explore" {
-            let result = self.explore(&arguments);
+            let result = self.explore(&call.id, &arguments);
             let failed = usize::from(result.is_err());
             self.finish_call(&call.id, result, false, started.elapsed());
             return failed;
@@ -1620,7 +1622,7 @@ impl Agent {
     /// A look across many files, by a helper with a context of its own (`explore`), as Deepseek Harness's subagents do: what it reads fills
     /// its context and not this one, and only its answer joins the conversation. It has the looking tools only, and each of its calls goes
     /// through the gate as the session's own do; one that would need the person's leave is not made, and it is told to say so.
-    fn explore(&mut self, arguments: &Value) -> Result<String, String> {
+    fn explore(&mut self, id: &str, arguments: &Value) -> Result<String, String> {
         let Some(provider) = self.provider.clone() else { return Err(llm::NOT_READY.into()) };
         let task = arguments.get("task").and_then(Value::as_str).map(str::trim).filter(|task| !task.is_empty()).ok_or_else(|| "task is empty: say what to look into".to_string())?;
         let schemas = tools::helper_schemas();
@@ -1647,6 +1649,7 @@ impl Agent {
                 let text = call.function.arguments.trim();
                 let arguments: Value = serde_json::from_str(if text.is_empty() { "{}" } else { text }).unwrap_or(Value::Null);
                 let name = call.function.name.as_str();
+                self.emit(Event::ToolProgress { id: id.to_string(), tool: name.to_string(), summary: tools::summary(name, &arguments) });
                 let result = if !tools::HELPER_TOOLS.contains(&name) {
                     Err(format!("{name} is not yours: you have read_file, search_files, find_files and list_files"))
                 } else if self.gate.check(name, &arguments, &self.workspace) != Verdict::Allow {
