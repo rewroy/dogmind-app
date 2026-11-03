@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
-use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, DownloadStartingEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler, PermissionRequestedEventHandler, WebResourceRequestedEventHandler};
+use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, DownloadStartingEventHandler, ExecuteScriptCompletedHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler, PermissionRequestedEventHandler, WebResourceRequestedEventHandler};
 use windows::core::{Interface, HSTRING, PWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -147,17 +147,17 @@ fn css(color: u32) -> String {
 
 /// A file as a page: nothing runs in it, and only pictures of its own folder are let in. What it refers to is under `base`.
 fn page_of(body: &str, base: &str) -> String {
-    const SHEET: &str = "html{color-scheme:SCHEME}*{box-sizing:border-box}body{margin:0;padding:18px 20px;background:BACK;color:TEXT;font:15px/1.65 'Segoe UI Variable Text','BIZ UDGothic','Yu Gothic UI','Segoe UI',sans-serif;overflow-wrap:anywhere}h1,h2,h3,h4,h5,h6{line-height:1.3;margin:1.4em 0 .5em}h1{font-size:1.6em;border-bottom:1px solid LINE;padding-bottom:.25em}h2{font-size:1.3em}h3{font-size:1.1em}h1:first-child,h2:first-child,h3:first-child{margin-top:0}p{margin:0 0 .9em}a{color:ACCENT}ul,ol{margin:0 0 .9em;padding-left:1.6em}li{margin:.2em 0}blockquote{margin:0 0 .9em;padding:.1em 0 .1em 1em;border-left:3px solid LINE;color:MUTED}hr{border:0;border-top:1px solid LINE;margin:1.2em 0}img{max-width:100%}code{font:.9em Consolas,monospace;background:CODE;padding:.1em .3em;border-radius:4px}pre{background:CODE;padding:12px 14px;border-radius:8px;overflow:auto;margin:0 0 .9em}pre code{background:none;padding:0;font-size:13px;line-height:1.5}table{border-collapse:collapse;margin:0 0 .9em}th,td{border:1px solid LINE;padding:.3em .7em}th{background:CODE}.k{color:KEYWORD}.s{color:STRING}.c{color:MUTED}.n{color:NUMBER}pre.source{margin:0;padding:0;background:none;font:13px/1.55 Consolas,monospace;counter-reset:n;white-space:pre}pre.source .l{display:block;min-height:1.55em;counter-increment:n}pre.source .l::before{content:counter(n);display:inline-block;width:3.2em;margin-right:1em;text-align:right;color:FAINT;user-select:none}.cut{color:MUTED;font-size:13px;margin-top:1em}";
+    const SHEET: &str = "html{color-scheme:SCHEME}*{box-sizing:border-box}body{margin:0;padding:18px 20px;background:BACK;color:TEXT;font:15px/1.65 'Segoe UI Variable Text','BIZ UDGothic','Yu Gothic UI','Segoe UI',sans-serif;overflow-wrap:anywhere}h1,h2,h3,h4,h5,h6{line-height:1.3;margin:1.4em 0 .5em}h1{font-size:1.6em;border-bottom:1px solid LINE;padding-bottom:.25em}h2{font-size:1.3em}h3{font-size:1.1em}h1:first-child,h2:first-child,h3:first-child{margin-top:0}p{margin:0 0 .9em}a{color:ACCENT}ul,ol{margin:0 0 .9em;padding-left:1.6em}li{margin:.2em 0}blockquote{margin:0 0 .9em;padding:.1em 0 .1em 1em;border-left:3px solid LINE;color:MUTED}hr{border:0;border-top:1px solid LINE;margin:1.2em 0}img{max-width:100%}code{font:.9em Consolas,monospace;background:CODE;padding:.1em .3em;border-radius:4px}pre{background:CODE;padding:12px 14px;border-radius:8px;overflow:auto;margin:0 0 .9em}pre code{background:none;padding:0;font-size:13px;line-height:1.5}table{border-collapse:collapse;margin:0 0 .9em}th,td{border:1px solid LINE;padding:.3em .7em}th{background:CODE}.k{color:KEYWORD}.s{color:STRING}.c{color:MUTED}.n{color:NUMBER}pre.source{margin:0;padding:0;background:none;font:13px/1.55 Consolas,monospace;counter-reset:n;white-space:pre}pre.source .l{display:block;min-height:1.55em;counter-increment:n}pre.source .l::before{content:counter(n);display:inline-block;width:3.2em;margin-right:1em;text-align:right;color:FAINT;user-select:none}pre.source .m{background:MARK}pre.source .m:focus{outline:none}.cut{color:MUTED;font-size:13px;margin-top:1em}";
     let sheet = SHEET.replace("SCHEME", if theme::is_light() { "light" } else { "dark" })
         .replace("BACK", &css(theme::background())).replace("TEXT", &css(theme::text())).replace("LINE", &css(theme::line())).replace("ACCENT", &css(theme::accent_hover()))
         .replace("MUTED", &css(theme::muted())).replace("FAINT", &css(theme::faint())).replace("CODE", &css(theme::code_back()))
-        .replace("KEYWORD", &css(theme::accent_hover())).replace("STRING", &css(theme::good())).replace("NUMBER", &css(theme::warn()));
+        .replace("MARK", &css(theme::raised())).replace("KEYWORD", &css(theme::accent_hover())).replace("STRING", &css(theme::good())).replace("NUMBER", &css(theme::warn()));
     let allowed = format!("default-src 'none'; style-src 'unsafe-inline'; img-src https://{HOST} data:");
     format!("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"{allowed}\"><base href=\"{base}\"><style>{sheet}</style></head><body>{body}</body></html>")
 }
 
 /// The page for a file of the workspace. NavigateToString takes no more than 2 MB, so a long file is shown from its start, and says so.
-fn written_page(root: &Path, file: &Path, kind: &Written) -> Result<String, String> {
+fn written_page(root: &Path, file: &Path, kind: &Written, marked: Option<(usize, usize)>) -> Result<String, String> {
     const MOST_TEXT: usize = 256 * 1024;
     const MOST_PAGE: usize = 1800 * 1024;
     let bytes = std::fs::read(file).map_err(|error| format!("{}: {error}", file.display()))?;
@@ -172,11 +172,11 @@ fn written_page(root: &Path, file: &Path, kind: &Written) -> Result<String, Stri
     let text = &whole[..end];
     let mut body = match kind {
         Written::Markdown => markdown::to_html(text),
-        Written::Source(language) => markdown::source_html(text, language),
+        Written::Source(language) => markdown::source_html(text, language, marked),
     };
     if body.len() > MOST_PAGE {
         // (colour takes room: plain, it fits)
-        body = markdown::source_html(text, "");
+        body = markdown::source_html(text, "", marked);
     }
     if end < whole.len() {
         body.push_str(&format!("<p class=\"cut\">{}</p>", markdown::escape(&tf("Only the first {0} KB are shown.", &[&(MOST_TEXT / 1024)]))));
@@ -215,8 +215,10 @@ pub struct Preview {
     /// Requests that were turned away since the page was opened.
     pub blocked: Rc<Cell<u32>>,
     root: RefCell<Option<PathBuf>>,
-    /// The folder and the file shown now.
-    shown: RefCell<Option<(PathBuf, PathBuf)>>,
+    /// The folder and the file shown now, and the lines a link named in it.
+    shown: RefCell<Option<(PathBuf, PathBuf, Option<(usize, usize)>)>>,
+    /// The page coming has lines a link named: once it has loaded, the view goes to them.
+    to_lines: Rc<Cell<bool>>,
     environment: Rc<RefCell<Option<ICoreWebView2Environment>>>,
 }
 
@@ -361,12 +363,25 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
     // What was just written is what is shown, not what the cache has.
     let answered = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_, _| Ok(())));
     webview.CallDevToolsProtocolMethod(&HSTRING::from("Network.setCacheDisabled"), &HSTRING::from(r#"{"cacheDisabled":true}"#), &answered)?;
-    Ok(Preview { controller, webview, blocked, root: RefCell::new(None), shown: RefCell::new(None), environment })
+    // A source file opened at a link's lines is shown at them: the page has no script of its own, so this comes from here once it has loaded.
+    let to_lines = Rc::new(Cell::new(false));
+    let wanted = to_lines.clone();
+    webview.add_NavigationCompleted(&NavigationCompletedEventHandler::create(Box::new(move |sender, _| {
+        if wanted.replace(false) {
+            if let Some(webview) = sender {
+                let done = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
+                webview.ExecuteScript(&HSTRING::from("var here = document.getElementById('here'); if (here) { here.scrollIntoView({ block: 'center' }); }"), &done)?;
+            }
+        }
+        Ok(())
+    })), &mut token)?;
+    Ok(Preview { controller, webview, blocked, root: RefCell::new(None), shown: RefCell::new(None), to_lines, environment })
 }
 
 impl Preview {
-    /// Shows `file`, under `root`: only what is inside `root` can be reached from it.
-    pub unsafe fn open(&self, root: &Path, file: &Path) -> Result<(), String> {
+    /// Shows `file`, under `root`: only what is inside `root` can be reached from it. `lines`: those a link named, lit and in view, in a
+    /// source file.
+    pub unsafe fn open(&self, root: &Path, file: &Path, lines: Option<(usize, usize)>) -> Result<(), String> {
         let address = address_of(root, file).ok_or_else(|| format!("{} is not in the workspace", file.display()))?;
         let mapped = self.webview.cast::<ICoreWebView2_3>().map_err(|error| format!("this WebView2 is too old for a preview: {error}"))?;
         let host = HSTRING::from(HOST);
@@ -376,10 +391,11 @@ impl Preview {
             *self.root.borrow_mut() = Some(root.to_path_buf());
         }
         self.blocked.set(0);
-        *self.shown.borrow_mut() = Some((root.to_path_buf(), file.to_path_buf()));
+        *self.shown.borrow_mut() = Some((root.to_path_buf(), file.to_path_buf(), lines));
         match written(file) {
             Some(kind) => {
-                let page = written_page(root, file, &kind)?;
+                let page = written_page(root, file, &kind, lines)?;
+                self.to_lines.set(lines.is_some() && matches!(kind, Written::Source(_)));
                 self.background(theme::background());
                 self.webview.NavigateToString(&HSTRING::from(page)).map_err(|error| error.to_string())
             }
@@ -401,10 +417,10 @@ impl Preview {
     pub unsafe fn reload(&self) {
         self.blocked.set(0);
         // (a page written here is written again: the browser has only a string of it)
-        let written_now = self.shown.borrow().clone().filter(|(_, file)| written(file).is_some());
+        let written_now = self.shown.borrow().clone().filter(|(_, file, _)| written(file).is_some());
         match written_now {
-            Some((root, file)) => {
-                let _ = self.open(&root, &file);
+            Some((root, file, lines)) => {
+                let _ = self.open(&root, &file, lines);
             }
             None => {
                 let _ = self.webview.Reload();
@@ -414,7 +430,7 @@ impl Preview {
 
     /// The theme has changed: a page written here follows it.
     pub unsafe fn retheme(&self) {
-        if self.shown.borrow().as_ref().is_some_and(|(_, file)| written(file).is_some()) {
+        if self.shown.borrow().as_ref().is_some_and(|(_, file, _)| written(file).is_some()) {
             self.reload();
         }
     }
@@ -466,7 +482,7 @@ mod tests {
         std::fs::create_dir(root.join("doc")).unwrap();
         let file = root.join("doc").join("a.md");
         std::fs::write(&file, "# t\n\n<script>alert(1)</script>\n\n![p](p.png)\n").unwrap();
-        let page = written_page(root, &file, &Written::Markdown).unwrap();
+        let page = written_page(root, &file, &Written::Markdown, None).unwrap();
         assert!(!page.contains("<script>") && page.contains("&lt;script&gt;"), "{page}");
         assert!(page.contains("<base href=\"https://dogmind-preview.example/doc/\">"), "{page}");
         assert!(page.contains("default-src 'none'") && page.contains("<img src=\"p.png\""), "{page}");
@@ -478,12 +494,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let long = dir.path().join("long.txt");
         std::fs::write(&long, "あ\n".repeat(200_000)).unwrap();
-        let page = written_page(dir.path(), &long, &Written::Source("txt".to_string())).unwrap();
+        let page = written_page(dir.path(), &long, &Written::Source("txt".to_string()), None).unwrap();
         assert!(page.len() < 2 << 20, "{}", page.len());
         assert!(page.contains("class=\"cut\""));
         let binary = dir.path().join("b.txt");
         std::fs::write(&binary, b"MZ\0\0").unwrap();
-        assert!(written_page(dir.path(), &binary, &Written::Source("txt".to_string())).is_err());
+        assert!(written_page(dir.path(), &binary, &Written::Source("txt".to_string()), None).is_err());
     }
 
     #[test]
