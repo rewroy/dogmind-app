@@ -10,7 +10,7 @@ use std::io::Read;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::*;
@@ -1329,16 +1329,22 @@ unsafe fn pipe() -> Result<(Handle, Handle), String> {
 
 /// Runs `line` in the container and waits, ending it on `timeout` or on `cancel`.
 pub fn run(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool) -> Result<Output, String> {
-    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()))
+    run_live(line, cwd, workspace, network, timeout, cancel, None)
+}
+
+/// As `run`, with what it prints in `live` as it prints it.
+pub fn run_live(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
+    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), live)
 }
 
 /// A browser under those limits falls over in most runs, whichever of them is set (0xC0000005, 12 to 19 runs in 20, against none in 20 with none set). Its own window station
 /// keeps it from the person's clipboard and session in any case.
 pub fn run_browser(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, cancel: &AtomicBool) -> Result<Output, String> {
-    run_limited(line, cwd, workspace, false, timeout, cancel, 0, None)
+    run_limited(line, cwd, workspace, false, timeout, cancel, 0, None, None)
 }
 
-fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>) -> Result<Output, String> {
+#[allow(clippy::too_many_arguments)]
+fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
     no_error_boxes();
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     let root = writable_root(cwd, workspace, home.as_deref())?;
@@ -1456,10 +1462,11 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
             let raw = pipe.0;
             std::mem::forget(pipe);
             let raw = raw as usize;
+            let live = live.clone();
             std::thread::spawn(move || {
                 // SAFETY: ownership of the read end came here.
                 let mut file = File::from_raw_handle(raw as _);
-                kept_of(&mut file, KEPT_HEAD, KEPT_TAIL)
+                kept_of(&mut file, KEPT_HEAD, KEPT_TAIL, live.as_deref())
             })
         };
         let (stdout, stderr) = (capture(out_read), capture(err_read));
@@ -1510,8 +1517,8 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
 const KEPT_HEAD: usize = 4 << 20;
 const KEPT_TAIL: usize = 4 << 20;
 
-/// All a stream gives, as its first `head` bytes and its last `tail`, with what was between them said and not kept.
-fn kept_of(stream: &mut impl Read, head: usize, tail: usize) -> Vec<u8> {
+/// All a stream gives, as its first `head` bytes and its last `tail`, with what was between them said and not kept. `live` has it all as it comes.
+fn kept_of(stream: &mut impl Read, head: usize, tail: usize, live: Option<&crate::tools::Live>) -> Vec<u8> {
     let (mut start, mut end, mut dropped) = (Vec::new(), std::collections::VecDeque::<u8>::new(), 0u64);
     let mut block = [0u8; 64 * 1024];
     loop {
@@ -1519,6 +1526,9 @@ fn kept_of(stream: &mut impl Read, head: usize, tail: usize) -> Vec<u8> {
             Ok(0) | Err(_) => break,
             Ok(count) => count,
         };
+        if let Some(live) = live {
+            live.push(&block[..count]);
+        }
         let mut chunk = &block[..count];
         if start.len() < head {
             let taken = (head - start.len()).min(chunk.len());
@@ -1547,10 +1557,10 @@ mod tests {
     #[test]
     fn an_endless_output_keeps_its_start_and_end_and_says_what_went() {
         let text: Vec<u8> = b"BEGIN".iter().copied().chain(std::iter::repeat_n(b'x', 1000)).chain(b"END".iter().copied()).collect();
-        let kept = kept_of(&mut std::io::Cursor::new(text.clone()), 100, 50);
+        let kept = kept_of(&mut std::io::Cursor::new(text.clone()), 100, 50, None);
         let said = String::from_utf8(kept).unwrap();
         assert!(said.starts_with("BEGIN") && said.ends_with("END") && said.contains("858 bytes in the middle of this output were not kept"), "{said}");
-        assert_eq!(kept_of(&mut std::io::Cursor::new(b"short".to_vec()), 100, 50), b"short");
+        assert_eq!(kept_of(&mut std::io::Cursor::new(b"short".to_vec()), 100, 50, None), b"short");
     }
 
     #[test]
@@ -1884,14 +1894,14 @@ mod tests {
         std::fs::create_dir_all(&place).unwrap();
         let cap = 300u64 << 20;
         let greedy = "powershell -NoProfile -Command \"try { $a = [Runtime.InteropServices.Marshal]::AllocHGlobal(800000000); 'allocated' } catch { 'refused'; exit 7 }\"";
-        let done = run_limited(greedy, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap)).unwrap();
+        let done = run_limited(greedy, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), None).unwrap();
         eprintln!("status {:?}, out_of_memory {:?}, out {} err {}", done.status, done.out_of_memory, decode(&done.stdout).trim(), decode(&done.stderr));
         assert!(decode(&done.stdout).contains("refused") && done.status == Some(7), "{}", decode(&done.stdout));
         // Bit by bit, as a leak goes: it is said to have been stopped.
         let leak = "powershell -NoProfile -Command \"try { while ($true) { $null = [Runtime.InteropServices.Marshal]::AllocHGlobal(5000000) } } catch { 'refused'; exit 7 }\"";
-        let leaked = run_limited(leak, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap)).unwrap();
+        let leaked = run_limited(leak, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), None).unwrap();
         assert!(leaked.status == Some(7) && leaked.out_of_memory == Some(cap), "{:?} {:?}", leaked.status, leaked.out_of_memory);
-        let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap)).unwrap();
+        let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap), None).unwrap();
         assert!(decode(&fine.stdout).contains("fine") && fine.out_of_memory.is_none());
         drop(holder);
     }
@@ -1904,7 +1914,7 @@ mod tests {
         // Each alone fits under the cap; four together do not.
         let one = "try { $a = [Runtime.InteropServices.Marshal]::AllocHGlobal(500000000); Write-Output held; Start-Sleep 8 } catch { Write-Output refused }";
         let line = format!("powershell -NoProfile -Command \"$p = 1..4 | ForEach-Object {{ $i = New-Object Diagnostics.ProcessStartInfo 'powershell.exe', '-NoProfile -Command {}'; $i.UseShellExecute = $false; [Diagnostics.Process]::Start($i) }}; $p | ForEach-Object {{ $_.WaitForExit() }}\"", one);
-        let done = run_limited(&line, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(1200u64 << 20)).unwrap();
+        let done = run_limited(&line, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(1200u64 << 20), None).unwrap();
         let said = decode(&done.stdout);
         eprintln!("status {:?} out {} err {}", done.status, said.trim(), decode(&done.stderr).trim());
         assert!(said.contains("held"), "one fits: {said}");
