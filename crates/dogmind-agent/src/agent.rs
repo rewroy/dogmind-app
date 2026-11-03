@@ -1333,7 +1333,9 @@ impl Agent {
                     }
                     if kept {
                         self.emit(Event::Notice(llm::BROKE_OFF.into()));
-                        self.push(Message::text("user", prompt::CONTINUE_NUDGE));
+                        // (calls it had begun went with the connection: unsaid, a model takes them for made, and says it did what never ran)
+                        let begun: Vec<&str> = calling.iter().map(|call| call.function.name.as_str()).filter(|name| !name.is_empty()).collect();
+                        self.push(Message::text("user", if begun.is_empty() { prompt::CONTINUE_NUDGE.to_string() } else { prompt::calls_broken_off(&begun) }));
                     }
                     self.wait_to_retry(retry_pause(transient, &message));
                     continue;
@@ -2025,7 +2027,8 @@ impl Agent {
         let folder = self.picture_folder();
         let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false };
         let completion = provider.stream(&request, &self.cancel, &mut |_| {})?;
-        if !completion.tool_calls.is_empty() || completion.finish == "length" || completion.content.trim().is_empty() {
+        // (one with no word of how it ended may have been cut anywhere: the turns it would stand for go for good, so it must be whole)
+        if !completion.tool_calls.is_empty() || completion.finish == "length" || completion.finish.is_empty() || completion.content.trim().is_empty() {
             return Ok(None);
         }
         Ok(Some(completion.content))
@@ -3029,6 +3032,26 @@ mod tests {
         });
         assert!(halt.load(Ordering::Relaxed) && began.elapsed() < Duration::from_millis(500), "{:?}", began.elapsed());
         assert!(person.load(Ordering::Relaxed), "the person's stays");
+    }
+
+    /// A connection that broke while the model was making a call: what it wrote stays, and it is told the call was not made.
+    #[test]
+    fn calls_begun_when_the_connection_broke_are_said_not_to_have_been_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = format!(
+            "data: {}\n\ndata: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": "Writing it now."}}]}),
+            serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "create_file", "arguments": "{\"path\": \"a.txt\""}}]}}]})
+        );
+        let (client, bodies) = server(vec![broken, text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("write a.txt".into())).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled && log.last().unwrap() == "content:done", "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let said = bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+        assert!(said.contains("(create_file) were not made") && prompt::is_nudge(&said), "{said}");
+        assert!(!dir.path().join("a.txt").exists());
     }
 
     /// A stop that met a failure on the way must not read as the person's: the turn goes on as after any failure.
