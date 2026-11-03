@@ -912,6 +912,7 @@ impl Agent {
     /// `pictures`: newly attached. `kept`: already in the session's folder, as when a message is sent again.
     fn turn(&mut self, text: &str, pictures: Vec<Attachment>, kept: Vec<ImageRef>) {
         self.turn_began = std::time::SystemTime::now();
+        self.bench.new_turn();
         self.cancel.store(false, Ordering::Relaxed);
         self.emit(Event::TurnStarted);
         let new_session = self.messages.is_empty();
