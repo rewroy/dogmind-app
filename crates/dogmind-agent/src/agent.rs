@@ -1904,7 +1904,8 @@ impl Agent {
         }
         let target = self.window.saturating_sub(self.window * 15 / 100 + compaction::reserve(self.window));
         let over = self.expected_use().saturating_sub(target) as usize * CHARS_A_TOKEN;
-        let mut saved = compaction::trim_tool_outputs(&mut self.messages, over);
+        // (the head's too when this is asked for or refused: a first turn's reads are as old as any, and in a small window they alone can fill it)
+        let mut saved = compaction::trim_tool_outputs(&mut self.messages, over, forced || refused, false);
         saved += compaction::trim_images(&mut self.messages, over.saturating_sub(saved), refused);
         if saved > 0 {
             compaction::strip_thinking(&mut self.messages);
@@ -1935,9 +1936,22 @@ impl Agent {
         let kept = compaction::truncate(&self.messages, goal);
         if kept == self.messages {
             if compaction::needed(self.expected_use(), self.window) {
-                // Sent here by a refusal, or by a count that was too full: nothing went, so nothing will fit.
-                self.messages = found;
-                return Err(llm::CONTEXT_FULL.into());
+                // Last, every tool output, the newest round's too: a first turn of big reads in a small window is all head, and the
+                // session could otherwise send nothing ever again. The model reads the starts of them, and that they were cut.
+                // (what the server has counted goes down by what went of that; what it has not is counted afresh as it is)
+                let counted = |messages: &[Message], upto: usize| messages.iter().take(upto).map(Message::chars).sum::<usize>();
+                let before = counted(&self.messages, self.counted);
+                let more = compaction::trim_tool_outputs(&mut self.messages, usize::MAX, true, true);
+                self.used = self.used.saturating_sub((before.saturating_sub(counted(&self.messages, self.counted)) / CHARS_A_TOKEN) as u64);
+                if more == 0 || compaction::needed(self.expected_use(), self.window) {
+                    // Sent here by a refusal, or by a count that was too full: nothing went, so nothing will fit.
+                    self.messages = found;
+                    return Err(llm::CONTEXT_FULL.into());
+                }
+                compaction::strip_thinking(&mut self.messages);
+                self.emit(Event::Notice(format!("compacted: every tool output trimmed by {} KB, the newest too, as nothing else fit", (saved + more) / 1024)));
+                self.save_snapshot();
+                return Ok(());
             }
             // (what stage 0 did stays, and a reopened session must send it too)
             if self.messages != found {
@@ -3564,8 +3578,10 @@ mod tests {
         assert!(asked.iter().any(|message| user_text(message).contains("trimmed by compaction")));
     }
 
+    /// A tool result too big for what is left of a small context, in a first turn where nothing else can go, is cut to its start before
+    /// it is sent, and says so: the session would otherwise send nothing ever again. A context the prompt alone fills is said to be full.
     #[test]
-    fn a_big_tool_result_starts_a_compaction_before_it_is_sent() {
+    fn a_big_tool_result_is_cut_before_it_is_sent_when_nothing_else_can_go() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("big.txt"), format!("{}\n", "y".repeat(100)).repeat(2000)).unwrap();
         let (run, provider) = scripted(dir.path(), vec![calls(&[("read_file", serde_json::json!({"path": "big.txt", "limit": 2000}))]), says("done")], Mode::Default);
@@ -3573,8 +3589,16 @@ mod tests {
         run.handle.commands.send(Command::Provider(provider.clone(), "model".into(), 7_000)).unwrap();
         run.handle.commands.send(Command::Send("read it".into())).unwrap();
         let (failed, _) = turn_said(&run);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(provider.requests(), 2);
+        let result = provider.messages(1).into_iter().find(|message| message.role == "tool").unwrap();
+        assert!(result.content.as_deref().unwrap().contains("trimmed by compaction"), "{result:?}");
+        let (run, provider) = scripted(dir.path(), vec![says("done")], Mode::Default);
+        run.handle.commands.send(Command::Provider(provider.clone(), "model".into(), 1_000)).unwrap();
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        let (failed, _) = turn_said(&run);
         assert_eq!(failed, [llm::CONTEXT_FULL], "said before a request the server would refuse");
-        assert_eq!(provider.requests(), 1);
+        assert_eq!(provider.requests(), 0);
     }
 
     #[test]
