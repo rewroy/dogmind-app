@@ -1358,7 +1358,7 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
         notes.push_str("note: `where` cannot see every folder from the sandbox, so this does not say the program is missing. Run the program itself to find out.\n");
     }
     if (lower.contains("powershell") || lower.contains("pwsh")) && powershell_lost_at_a_root(err, workspace) {
-        notes.push_str("note: PowerShell starts at the root of a drive in the sandbox and cannot move from there, whatever `cwd` says: give it absolute paths. `[IO.File]` methods do take paths relative to `cwd`.\n");
+        notes.push_str("note: PowerShell starts at the root of a drive in the sandbox and cannot move from there, whatever `cwd` says: give it absolute paths, and `Start-Process` a `-WorkingDirectory`. `[IO.File]` methods do take paths relative to `cwd`.\n");
     }
     if lower.contains("git") && err.contains("failed to stat") {
         notes.push_str("note: git cannot look above the workspace from the sandbox, so this says only that the workspace is not a git repository. `git init` at the start of a line works.\n");
@@ -1402,7 +1402,11 @@ fn system_access_denied() -> &'static str {
 }
 
 /// PowerShell says this in the language of Windows, with the same names in its last lines, `(D:\\a:String)` and `ItemNotFoundException`, and on whichever drive it began.
-fn powershell_lost_at_a_root(err: &str, workspace: &Path) -> bool {
+/// `Start-Process` with no folder of its own cannot use that root either, and names no path: the drive it does not find is the provider's own name, in any language and either PowerShell.
+pub(crate) fn powershell_lost_at_a_root(err: &str, workspace: &Path) -> bool {
+    if err.contains("'Microsoft.PowerShell.Core\\FileSystem'") {
+        return true;
+    }
     let in_a_drive = |text: &str| {
         let bytes = text.as_bytes();
         bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
@@ -2607,6 +2611,7 @@ mod tests {
         assert!(sandbox_notes("where python", root, Some(1), "INFO: Could not find files for the given pattern(s).").contains("does not say the program is missing"));
         assert!(sandbox_notes("powershell -NoProfile -Command \"Get-Item a\"", root, Some(1), "Get-Item : Cannot find path 'C:\\a' because it does not exist.").contains("absolute paths"));
         assert!(sandbox_notes("powershell -NoProfile -Command \"Get-ChildItem\"", root, Some(1), "PermissionDenied: (C:\\:String) [Get-ChildItem]").contains("absolute paths"));
+        assert!(sandbox_notes("pwsh -c \"Start-Process x\"", root, Some(1), "Start-Process: Das Laufwerk wurde nicht gefunden. Ein Laufwerk mit dem Namen 'Microsoft.PowerShell.Core\\FileSystem' ist nicht vorhanden.").contains("-WorkingDirectory"));
         assert!(sandbox_notes("git status", root, Some(128), "fatal: failed to stat '        C:/Users': Permission denied").contains("not a git repository"));
         for (line, err) in [("git config user.name x", "error: could not lock config file .git/config: Permission denied"), ("git remote add o u", "error: could not lock config file .git/config: Permission denied"), ("echo x> .git\\hooks\\pre-commit", "Access is denied."), ("del .git\\config", "アクセスが拒否されました。")] {
             assert!(sandbox_notes(line, Path::new("C:\\work"), Some(1), err).contains("Tell the user the exact command"), "{line}");
