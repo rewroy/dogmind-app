@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, GetDC, GetSysColor, InvalidateRect, ReleaseDC, ScreenToClient, UpdateWindow, COLOR_WINDOW, HBITMAP, HDC, HRGN, PAINTSTRUCT};
+use windows_sys::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, GetDC, GetObjectType, GetSysColor, OBJ_BITMAP, InvalidateRect, ReleaseDC, ScreenToClient, UpdateWindow, COLOR_WINDOW, HBITMAP, HDC, HRGN, PAINTSTRUCT};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::Controls::{EnableScrollBar, SetScrollInfo, SetScrollPos, ShowScrollBar};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
@@ -545,14 +545,21 @@ unsafe extern "system" fn view_change(this: *mut Host, update: i32) {
     }
 }
 
-unsafe extern "system" fn create_caret(this: *mut Host, bitmap: HBITMAP, width: i32, height: i32) -> i32 {
-    CreateCaret(host(this).window, bitmap, width, height)
+/// The caret: solid, as wide as Windows's setting for text cursors at the window's DPI, as tall as the line. In D2D mode what the text
+/// services give for its picture is no bitmap (they leave the drawing of a caret to the host), and a caret made of it showed nothing.
+unsafe extern "system" fn create_caret(this: *mut Host, bitmap: HBITMAP, _width: i32, height: i32) -> i32 {
+    let window = host(this).window;
+    let picture = if !bitmap.is_null() && GetObjectType(bitmap) == OBJ_BITMAP as u32 { bitmap } else { std::ptr::null_mut() };
+    let mut setting: u32 = 1;
+    SystemParametersInfoW(SPI_GETCARETWIDTH, 0, std::ptr::addr_of_mut!(setting).cast(), 0);
+    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window).max(96);
+    let width = ((setting.max(1) * dpi + 48) / 96).max(1) as i32;
+    CreateCaret(window, picture, width, height)
 }
 
 unsafe extern "system" fn show_caret(this: *mut Host, show: i32) -> i32 {
     if show != 0 { ShowCaret(host(this).window) } else { HideCaret(host(this).window) }
 }
-
 unsafe extern "system" fn set_caret_pos(_this: *mut Host, x: i32, y: i32) -> i32 {
     SetCaretPos(x, y)
 }
