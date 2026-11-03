@@ -464,9 +464,15 @@ impl Workbench {
                 }
             };
             let text = &mut files[slot].2;
-            // A file with CRLF lines takes an edit written with LF.
-            let crlf = text.contains("\r\n") && !old.contains("\r\n");
-            let (old, new) = if crlf { (old.replace('\n', "\r\n"), new.replace('\n', "\r\n")) } else { (old.to_string(), new.to_string()) };
+            // A file with CRLF lines takes an edit written with LF: as written first, and else with CRLF lines, whichever is there as often as
+            // asked. (A file with both, as an editor that ended only its last line with CRLF leaves, took every edit as CRLF, and none of more
+            // than one line of its LF part could be found: a real model gave up and wrote the whole file again.)
+            let as_written = (old.to_string(), new.to_string());
+            let with_crlf = (old.contains('\n') && !old.contains("\r\n") && text.contains("\r\n")).then(|| (old.replace('\n', "\r\n"), new.replace('\n', "\r\n")));
+            let (old, new) = match with_crlf {
+                Some(crlf) if text.matches(as_written.0.as_str()).count() != count => crlf,
+                _ => as_written,
+            };
             let found = text.matches(&old).count();
             if found != count {
                 // What it took to find the place is what a retry needs: the same line, spaced differently, is the usual cause.
@@ -2286,6 +2292,21 @@ mod tests {
         let twice = json!({"edits": [{"path": "a.txt", "old_string": "x\ny", "new_string": "z\nw", "count": 2}], "expected_files": ["a.txt"]});
         bench.run("apply_patch", &twice, dir.path(), &cancel).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "z\r\nw\r\nz\r\nw\r\n");
+    }
+
+    /// A file of LF lines whose last line ends with CRLF, as PowerShell's Set-Content leaves one: an edit of its LF part, written with LF, is
+    /// found and keeps LF there; one of its CRLF part is found too.
+    #[test]
+    fn a_patch_fits_a_file_with_both_line_ends_where_it_is_written() {
+        let (dir, mut bench, cancel) = bench();
+        let file = dir.path().join("shop.py");
+        std::fs::write(&file, "def f(code):\n    if code == 'A':\n        return 1\n    return 0\n\nlast = 1\r\nend = 2\r\n").unwrap();
+        bench.run("read_file", &json!({"path": "shop.py"}), dir.path(), &cancel).unwrap();
+        let lf = json!({"edits": [{"path": "shop.py", "old_string": "    if code == 'A':\n        return 1", "new_string": "    if code.upper() == 'A':\n        return 1"}]});
+        bench.run("apply_patch", &lf, dir.path(), &cancel).unwrap();
+        let crlf = json!({"edits": [{"path": "shop.py", "old_string": "last = 1\nend = 2", "new_string": "last = 3\nend = 4"}]});
+        bench.run("apply_patch", &crlf, dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "def f(code):\n    if code.upper() == 'A':\n        return 1\n    return 0\n\nlast = 3\r\nend = 4\r\n");
     }
 
     #[test]
