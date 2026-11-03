@@ -15,6 +15,7 @@ mod markdown;
 mod highlight;
 mod paint;
 mod preview;
+mod render;
 mod rtf;
 mod settings;
 mod toolrun;

@@ -160,6 +160,9 @@ pub unsafe fn start_gdiplus() {
 
 /// A rounded rectangle, antialiased.
 pub unsafe fn rounded(device: HDC, area: RECT, radius: i32, fill: Option<u32>, border: Option<u32>) {
+    if crate::render::rounded(device, area, radius, fill, border) {
+        return;
+    }
     let mut graphics = std::ptr::null_mut();
     if GdipCreateFromHDC(device, &mut graphics) != 0 {
         return;
@@ -193,6 +196,9 @@ pub unsafe fn rounded(device: HDC, area: RECT, radius: i32, fill: Option<u32>, b
 
 /// What is in this area, darkened as it is behind a dialog.
 pub unsafe fn dim(device: HDC, area: RECT) {
+    if crate::render::dim(device, area, DIM_ALPHA) {
+        return;
+    }
     let mut graphics = std::ptr::null_mut();
     if GdipCreateFromHDC(device, &mut graphics) != 0 {
         return;
@@ -206,6 +212,9 @@ pub unsafe fn dim(device: HDC, area: RECT) {
 
 /// A speech bubble drawn like the dog: one thick line with round ends, whose underside flows out into a tail like a dog's.
 pub unsafe fn bubble(device: HDC, area: RECT, radius: i32, tip: (i32, i32), fill: u32, line: u32, thickness: f32) {
+    if bubble_by_render(device, area, radius, tip, fill, line, thickness) {
+        return;
+    }
     let mut graphics = std::ptr::null_mut();
     if GdipCreateFromHDC(device, &mut graphics) != 0 {
         return;
@@ -249,6 +258,38 @@ pub unsafe fn bubble(device: HDC, area: RECT, radius: i32, tip: (i32, i32), fill
     GdipDeleteGraphics(graphics);
 }
 
+/// The same bubble through Direct2D: its pieces as GDI+ was given them, in an area that holds the tail as well. False: not drawn.
+unsafe fn bubble_by_render(device: HDC, area: RECT, radius: i32, tip: (i32, i32), fill: u32, line: u32, thickness: f32) -> bool {
+    use crate::render::Piece::*;
+    let pad = thickness.ceil() as i32 + 2;
+    let bounds = RECT { left: area.left.min(tip.0) - pad, top: area.top - pad, right: area.right.max(tip.0) + pad, bottom: area.bottom.max(tip.1) + pad };
+    let (ox, oy) = (bounds.left as f32, bounds.top as f32);
+    let inset = thickness / 2.0;
+    let (x, y) = (area.left as f32 + inset - ox, area.top as f32 + inset - oy);
+    let (w, h) = ((area.right - area.left) as f32 - thickness, (area.bottom - area.top) as f32 - thickness);
+    let (r, d) = (radius as f32, (radius * 2) as f32);
+    let (right, bottom) = (x + w, y + h);
+    let (tip_x, tip_y) = (tip.0 as f32 - ox, tip.1 as f32 - oy);
+    let half = r * 0.46;
+    let root = (tip_x - half * 0.95).clamp(x + r + half, right - r - half);
+    let drop = tip_y - bottom;
+    let end = thickness * 0.55;
+    let (inner, outer) = ((tip_x + end * 0.1, tip_y - end * 0.9), (tip_x - end * 0.9, tip_y + end * 0.2));
+    let pieces = [
+        Arc(x, y, d, d, 180.0, 90.0),
+        Arc(right - d, y, d, d, 270.0, 90.0),
+        Arc(right - d, bottom - d, d, d, 0.0, 90.0),
+        Line(root + half, bottom),
+        Curve(root + half * 0.45, bottom, inner.0 - end * 0.8, inner.1 - drop * 0.25, inner.0, inner.1),
+        Curve(tip_x + end, tip_y - end * 0.2, tip_x, tip_y + end, outer.0, outer.1),
+        Curve(root - half * 0.05, tip_y, root - half * 0.6, bottom + drop * 0.45, root - half, bottom),
+        Line(x + r, bottom),
+        Arc(x, bottom - d, d, d, 90.0, 90.0),
+        Close,
+    ];
+    crate::render::figure(device, bounds, &pieces, Some(fill), Some((line, thickness)))
+}
+
 /// How wide a line of this type is.
 /// A ring with a bright arc on it, the arc's start at `degrees`.
 pub unsafe fn spinner(device: HDC, area: RECT, degrees: f32, ring: u32, arc: u32, thickness: f32) {
@@ -257,6 +298,18 @@ pub unsafe fn spinner(device: HDC, area: RECT, degrees: f32, ring: u32, arc: u32
 
 /// A ring with a bright arc on it, from `degrees` and this far round.
 pub unsafe fn ring_with_arc(device: HDC, area: RECT, degrees: f32, sweep: f32, ring: u32, arc: u32, thickness: f32) {
+    {
+        use crate::render::Piece::*;
+        let inset = thickness / 2.0;
+        let (width, height) = ((area.right - area.left) as f32 - thickness, (area.bottom - area.top) as f32 - thickness);
+        let circle = [Circle(inset + width / 2.0, inset + height / 2.0, width.min(height) / 2.0)];
+        if crate::render::figure(device, area, &circle, None, Some((ring, thickness))) {
+            if sweep > 0.0 {
+                crate::render::figure(device, area, &[Arc(inset, inset, width, height, degrees, sweep)], None, Some((arc, thickness)));
+            }
+            return;
+        }
+    }
     let mut graphics = std::ptr::null_mut();
     if GdipCreateFromHDC(device, &mut graphics) != 0 {
         return;
@@ -280,7 +333,11 @@ pub unsafe fn ring_with_arc(device: HDC, area: RECT, degrees: f32, sweep: f32, r
     GdipDeleteGraphics(graphics);
 }
 
+/// How wide a line of what the window draws itself is: measured as DirectWrite draws it (`width_on` is GDI's, for what a control draws).
 pub unsafe fn text_width(font: HFONT, text: &str) -> i32 {
+    if let Some((width, _)) = crate::render::measure(font, text, None) {
+        return width;
+    }
     let device = CreateCompatibleDC(std::ptr::null_mut());
     let width = width_on(device, font, text);
     DeleteDC(device);
@@ -301,8 +358,11 @@ pub unsafe fn width_on(device: HDC, font: HFONT, text: &str) -> i32 {
     size.cx
 }
 
-/// How tall this text is, wrapped to this width.
+/// How tall this text is, wrapped to this width, as the window draws it.
 pub unsafe fn text_height(font: HFONT, text: &str, width: i32) -> i32 {
+    if let Some((_, height)) = crate::render::measure(font, text, Some(width)) {
+        return height;
+    }
     let mut units: Vec<u16> = text.encode_utf16().collect();
     let device = CreateCompatibleDC(std::ptr::null_mut());
     if let Some(partner) = partner_for(font, &units) {
@@ -329,14 +389,14 @@ const UI_FACE_STRONG: &str = "Segoe UI Variable Text Semibold";
 /// The same at a size for headings. (Windows's name for it is cut off at its 31 characters.)
 const UI_FACE_LARGE: &str = "Segoe UI Variable Display Semib";
 /// What is Japanese in that type, shipped beside the app in `fonts\\`: a RichEdit is told, and `paint` draws it so.
-const BUNDLED_FACE: &str = "BIZ UDGothic";
+pub(crate) const BUNDLED_FACE: &str = "BIZ UDGothic";
 /// Without them, as a build that was not packaged is: Windows's own.
-const FALLBACK_FACE: &str = "Yu Gothic UI";
+pub(crate) const FALLBACK_FACE: &str = "Yu Gothic UI";
 const FALLBACK_FACE_STRONG: &str = "Yu Gothic UI Semibold";
-const BUNDLED_FILES: [&str; 2] = ["BIZUDGothic-Regular.ttf", "BIZUDGothic-Bold.ttf"];
+pub(crate) const BUNDLED_FILES: [&str; 2] = ["BIZUDGothic-Regular.ttf", "BIZUDGothic-Bold.ttf"];
 
 /// Where the fonts are: `fonts\\` beside the program, and for a build that has not been packaged, what fetch_tools.py has fetched.
-fn font_folders() -> Vec<std::path::PathBuf> {
+pub(crate) fn font_folders() -> Vec<std::path::PathBuf> {
     let mut folders: Vec<std::path::PathBuf> = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|folder| folder.join("fonts"))).into_iter().collect();
     #[cfg(debug_assertions)]
     {
@@ -607,6 +667,9 @@ pub fn title_height(width: i32) -> i32 {
 /// One of those drawings at this place and size, in the theme's text colour.
 unsafe fn draw_ink(device: HDC, source: &[u8], x: i32, y: i32, shown_width: i32, shown_height: i32) {
     let (width, height) = ink_size(source);
+    if crate::render::ink(device, &source[4..], width as u32, height as u32, theme::text(), rect(x, y, shown_width, shown_height)) {
+        return;
+    }
     let ink = (argb(theme::text()) & 0x00FF_FFFF).to_le_bytes();
     let pixels: Vec<u8> = source[4..].iter().flat_map(|&alpha| [ink[0], ink[1], ink[2], alpha]).collect();
     let mut graphics = std::ptr::null_mut();
@@ -688,12 +751,16 @@ impl Fonts {
         // In two faces; `Segoe UI` in place of the variable one on a Windows that has been kept without it.
         let pair = |face: &str, (japanese, japanese_weight): (&str, i32), points: i32, weight: i32| {
             let mut latin = make(face, points, weight);
-            if !face_is_here(face, latin) {
+            let here = face_is_here(face, latin);
+            if !here {
                 DeleteObject(latin);
                 latin = make(if weight > 400 { "Segoe UI Semibold" } else { "Segoe UI" }, points, weight);
             }
             let partner = make(japanese, points, japanese_weight);
             PARTNERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((latin as isize, partner as isize));
+            // (as DirectWrite names it: one family and its weights, where GDI has a name for each weight)
+            let family = if !here { "Segoe UI" } else if face == UI_FACE_LARGE { "Segoe UI Variable Display" } else { UI_FACE };
+            crate::render::register(latin, crate::render::Face { family: family.to_string(), weight: weight as u32, size: (points * dpi as i32) as f32 / 72.0 });
             latin
         };
         // (for a plain edit control, which has one font: the face its words are mostly in)
@@ -706,7 +773,11 @@ impl Fonts {
             title: pair(UI_FACE_LARGE, strong, design::points::TITLE, 600),
             heading: pair(UI_FACE_STRONG, strong, design::points::HEADING, 600),
             greeting: pair(UI_FACE_LARGE, strong, design::points::GREETING, 600),
-            code: make("Consolas", design::points::CODE, 400),
+            code: {
+                let code = make("Consolas", design::points::CODE, 400);
+                crate::render::register(code, crate::render::Face { family: "Consolas".into(), weight: 400, size: (design::points::CODE * dpi as i32) as f32 / 72.0 });
+                code
+            },
             field,
             dpi,
         }
@@ -716,6 +787,10 @@ impl Fonts {
 pub unsafe fn draw_text(device: HDC, text: &str, area: RECT, font: HFONT, color: u32, flags: u32) {
     if text.is_empty() {
         return; // DrawTextW reads even zero characters
+    }
+    // Through DirectWrite, with its colour emoji; GDI where it cannot start.
+    if crate::render::text(device, text, area, font, color, flags) {
+        return;
     }
     let mut units: Vec<u16> = text.encode_utf16().collect();
     let mut target = area;
