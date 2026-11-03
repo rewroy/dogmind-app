@@ -1,4 +1,4 @@
-//! The one small window, in the app's look: its colours by the theme Windows is set to, its type, a bar and two buttons.
+//! The one small window, in the app's look: its colours by the theme Windows is set to, its type, a bar and two buttons, and on the first page the folder with a button that changes it.
 
 use std::path::Path;
 use std::result::Result::Ok;
@@ -19,11 +19,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::install::{self, Failure, Install, Progress, Stage};
 use crate::pack::Package;
+use crate::place::{self, Refusal};
 use crate::system::{self, wide, Running};
 use crate::Options;
 
 const WM_WORKER: u32 = WM_APP + 1;
 const TIMER_POLL: usize = 1;
+/// The id of the button that changes the folder, beside 1 and 2 of the other two (what a dialog's Enter and Escape press).
+const CHANGE: isize = 10;
 /// How long a copy that was asked has to close, before the person is asked again.
 const CLOSING: Duration = Duration::from_secs(20);
 
@@ -130,6 +133,14 @@ pub fn japanese(options: &Options) -> bool {
     (unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() }) & 0x3FF == 0x11
 }
 
+/// Where a page puts the folder it shows.
+struct FolderRow {
+    label: RECT,
+    field: RECT,
+    change: Option<RECT>,
+    notice: RECT,
+}
+
 /// What a page says and what can be done on it.
 #[derive(Default, Clone)]
 struct View {
@@ -140,6 +151,18 @@ struct View {
     primary: Option<String>,
     secondary: Option<String>,
     problem: bool,
+    /// The folder, in a box of its own under the words, when this page is where it is shown; and the words of the button that changes it, when it can be.
+    folder: Option<String>,
+    change: Option<String>,
+    /// Under the folder: what was done with the person's choice, or why it cannot be used (`true`).
+    notice: Option<(String, bool)>,
+}
+
+/// What the first page says of the folder besides the folder.
+enum Notice {
+    /// What was chosen holds other things, so the install goes in a folder of its own inside it.
+    InSubfolder,
+    Refused(Refusal),
 }
 
 enum Message {
@@ -159,7 +182,7 @@ enum After {
 enum Page {
     /// Nothing can be done here: words and a way out.
     Refused(String, String),
-    Ready,
+    Ready { notice: Option<Notice> },
     CloseFirst { running: Vec<Running>, asked: bool, then: After },
     Closing { since: Instant, then: After },
     Working { progress: Option<Progress>, stopping: bool, update: bool },
@@ -179,6 +202,9 @@ struct App {
     window: HWND,
     primary: HWND,
     secondary: HWND,
+    change: HWND,
+    /// An install was there when this began: it is updated where it is, and the folder is not for the person to change.
+    fixed: bool,
     dpi: u32,
     colours: Colours,
     fonts: [HFONT; 3],
@@ -211,26 +237,51 @@ impl App {
         &self.options.folder
     }
 
+    fn notice_words(&self, notice: &Notice) -> String {
+        match notice {
+            Notice::InSubfolder => self.w("That folder is not empty, so it goes in a Dogmind folder inside it.", "選んだフォルダは空ではないため、その中の Dogmind フォルダにインストールします。"),
+            Notice::Refused(Refusal::SettingsFolder) => self.w(
+                "That is where the app keeps your settings and sessions (%LOCALAPPDATA%\\DogmindApp). Choose another folder.",
+                "そこはアプリの設定とセッションの保存先 (%LOCALAPPDATA%\\DogmindApp) です。別のフォルダを選んでください。",
+            ),
+            Notice::Refused(Refusal::NotWritable(why)) => {
+                if self.japanese {
+                    format!("管理者権限なしでは、そこにファイルを作れません ({why})。ドキュメントや別のドライブなど、ご自分のフォルダを選んでください。")
+                } else {
+                    format!("No file can be made there without an administrator ({why}). Choose a folder of your own, in Documents or on another drive.")
+                }
+            }
+        }
+    }
+
     fn view_of_page(&self) -> View {
         let folder = self.folder().display().to_string();
         match &self.page {
             Page::Refused(heading, detail) => View { heading: heading.clone(), detail: detail.clone(), secondary: Some(self.w("Close", "閉じる")), problem: true, ..View::default() },
-            Page::Ready => match &self.previous {
-                Some(previous) => View {
-                    heading: if self.japanese { format!("Dogmind App {previous} を {} に更新", self.version) } else { format!("Update Dogmind App {previous} to {}", self.version) },
-                    detail: if self.japanese { format!("{folder} のプログラムを置き換えます。設定、セッション、モデルはそのまま残ります。") } else { format!("This replaces the program in {folder}. Your settings, sessions and models are kept.") },
-                    primary: Some(self.w("Update", "更新")),
-                    secondary: Some(self.w("Cancel", "キャンセル")),
-                    ..View::default()
-                },
-                None => View {
-                    heading: if self.japanese { format!("Dogmind App {} をインストール", self.version) } else { format!("Install Dogmind App {}", self.version) },
-                    detail: if self.japanese { format!("{folder} に、あなた専用としてインストールします。管理者権限は不要です。スタート メニューと「インストールされているアプリ」に登録します。") } else { format!("It goes in {folder}, for you alone: no administrator is needed. It gets a place in the Start menu and in Installed apps.") },
-                    primary: Some(self.w("Install", "インストール")),
-                    secondary: Some(self.w("Cancel", "キャンセル")),
-                    ..View::default()
-                },
-            },
+            Page::Ready { notice } => {
+                let page = match &self.previous {
+                    Some(previous) => View {
+                        heading: if self.japanese { format!("Dogmind App {previous} を {} に更新", self.version) } else { format!("Update Dogmind App {previous} to {}", self.version) },
+                        detail: self.w("This replaces the program in the folder below. Your settings, sessions and models are kept.", "下のフォルダのプログラムを置き換えます。設定、セッション、モデルはそのまま残ります。"),
+                        primary: Some(self.w("Update", "更新")),
+                        secondary: Some(self.w("Cancel", "キャンセル")),
+                        ..View::default()
+                    },
+                    None => View {
+                        heading: if self.japanese { format!("Dogmind App {} をインストール", self.version) } else { format!("Install Dogmind App {}", self.version) },
+                        detail: self.w("It goes in the folder below, for you alone: no administrator is needed. It gets a place in the Start menu and in Installed apps.", "下のフォルダに、あなた専用としてインストールします。管理者権限は不要です。スタート メニューと「インストールされているアプリ」に登録します。"),
+                        primary: Some(self.w("Install", "インストール")),
+                        secondary: Some(self.w("Cancel", "キャンセル")),
+                        ..View::default()
+                    },
+                };
+                View {
+                    folder: Some(folder),
+                    change: (!self.fixed).then(|| self.w("Change...", "変更...")),
+                    notice: notice.as_ref().map(|notice| (self.notice_words(notice), matches!(notice, Notice::Refused(_)))),
+                    ..page
+                }
+            }
             Page::CloseFirst { running, asked, then } => {
                 let mut names: Vec<&str> = running.iter().map(|one| one.name.as_str()).collect();
                 names.sort_unstable();
@@ -320,7 +371,7 @@ impl App {
 
     unsafe fn refresh(&mut self) {
         self.view = self.view_of_page();
-        for (button, words) in [(self.primary, self.view.primary.clone()), (self.secondary, self.view.secondary.clone())] {
+        for (button, words) in [(self.primary, self.view.primary.clone()), (self.secondary, self.view.secondary.clone()), (self.change, self.view.change.clone())] {
             set_text(button, words.as_deref().unwrap_or(""));
             ShowWindow(button, if words.is_some() { SW_SHOWNA } else { SW_HIDE });
         }
@@ -328,6 +379,7 @@ impl App {
         InvalidateRect(self.window, std::ptr::null(), 0);
         InvalidateRect(self.primary, std::ptr::null(), 0);
         InvalidateRect(self.secondary, std::ptr::null(), 0);
+        InvalidateRect(self.change, std::ptr::null(), 0);
         if self.options.auto {
             self.press_by_itself();
         }
@@ -336,7 +388,9 @@ impl App {
     /// `--auto` under the test switch: what a person would press, so that a script needs no pointer or keyboard, and a code says how it ended.
     unsafe fn press_by_itself(&mut self) {
         match &self.page {
-            Page::Ready | Page::CloseFirst { asked: false, .. } | Page::AppWontStart(_) => {
+            // (a folder that was refused stays refused: nothing here chooses another, so it ends)
+            Page::Ready { notice: Some(Notice::Refused(_)) } => self.finish(1),
+            Page::Ready { .. } | Page::CloseFirst { asked: false, .. } | Page::AppWontStart(_) => {
                 PostMessageW(self.window, WM_COMMAND, 1, 0);
             }
             Page::CloseFirst { asked: true, .. } => {
@@ -373,6 +427,32 @@ impl App {
                 right -= width + gap;
             }
         }
+        if self.view.change.is_some() {
+            if let Some(at) = self.folder_row().change {
+                SetWindowPos(self.change, std::ptr::null_mut(), at.left, at.top, at.right - at.left, at.bottom - at.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+    }
+
+    /// Where the folder goes on a page that shows it, under the words: its label, its box, the button that changes it beside the box, and the notice under both.
+    unsafe fn folder_row(&self) -> FolderRow {
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(self.window, &mut client);
+        let s = |value: i32| scale(self.dpi, value);
+        let (margin, gap, height) = (s(24), s(8), s(36));
+        let device = GetDC(self.window);
+        let top = self.draw_text(device, false);
+        ReleaseDC(self.window, device);
+        let label = RECT { left: margin, top, right: client.right - margin, bottom: top + s(22) };
+        let mut field = RECT { left: margin, top: label.bottom, right: client.right - margin, bottom: label.bottom + height };
+        let change = self.view.change.as_ref().map(|words| {
+            let width = (self.text_width(self.fonts[2], words) + s(36)).max(s(96));
+            let button = RECT { left: field.right - width, ..field };
+            field.right = button.left - gap;
+            button
+        });
+        let notice = RECT { left: margin, top: field.bottom + s(8), right: client.right - margin, bottom: client.bottom - s(60) };
+        FolderRow { label, field, change, notice }
     }
 
     unsafe fn text_width(&self, font: HFONT, text: &str) -> i32 {
@@ -401,6 +481,26 @@ impl App {
         self.fonts = [make(strong, 13, 600), make(face, 10, 400), make(strong, 10, 600)];
     }
 
+    /// The heading beside the dog and its words under both, drawn (or, with `draw` false, only measured): where the page goes on from, in the window.
+    unsafe fn draw_text(&self, device: HDC, draw: bool) -> i32 {
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(self.window, &mut client);
+        let colours = self.colours;
+        let s = |value: i32| scale(self.dpi, value);
+        let (margin, dog) = (s(24), s(44));
+        let across = client.right - margin * 2;
+        let left = margin + dog + s(14);
+        let view = &self.view;
+        let measuring = if draw { 0 } else { DT_CALCRECT };
+        let mut y = margin;
+        y += draw_words(device, &view.heading, RECT { left, top: y + s(4), right: left + across - dog - s(14), bottom: y + dog + s(8) }, self.fonts[0], if view.problem { colours.bad } else { colours.text }, DT_WORDBREAK | measuring);
+        y = y.max(margin + dog + s(14));
+        if !view.detail.is_empty() {
+            y += draw_words(device, &view.detail, RECT { left: margin, top: y, right: margin + across, bottom: client.bottom - s(70) }, self.fonts[1], colours.muted, DT_WORDBREAK | DT_EDITCONTROL | measuring) + s(10);
+        }
+        y
+    }
+
     unsafe fn paint(&self, device: HDC) {
         let mut client: RECT = std::mem::zeroed();
         GetClientRect(self.window, &mut client);
@@ -410,17 +510,18 @@ impl App {
         FillRect(device, &client, brush);
         DeleteObject(brush);
         let margin = s(24);
-        let dog = s(44);
-        logo(device, margin, margin, dog, colours.text);
+        logo(device, margin, margin, s(44), colours.text);
         let across = client.right - margin * 2;
-        let mut y = margin;
-        let left = margin + dog + s(14);
+        let mut y = self.draw_text(device, true);
         let view = &self.view;
-        // (the heading beside the dog, its words under both)
-        y += draw_words(device, &view.heading, RECT { left, top: y + s(4), right: left + across - dog - s(14), bottom: y + dog + s(8) }, self.fonts[0], if view.problem { colours.bad } else { colours.text }, DT_WORDBREAK);
-        y = y.max(margin + dog + s(14));
-        if !view.detail.is_empty() {
-            y += draw_words(device, &view.detail, RECT { left: margin, top: y, right: margin + across, bottom: client.bottom - s(70) }, self.fonts[1], colours.muted, DT_WORDBREAK | DT_EDITCONTROL) + s(10);
+        if let Some(folder) = &view.folder {
+            let row = self.folder_row();
+            draw_words(device, &self.w("Install folder", "インストール先"), row.label, self.fonts[1], colours.muted, DT_SINGLELINE);
+            rounded(device, row.field, s(8), Some(colours.raised), None);
+            draw_words(device, folder, RECT { left: row.field.left + s(12), right: row.field.right - s(12), ..row.field }, self.fonts[1], colours.text, DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS);
+            if let Some((words, problem)) = &view.notice {
+                draw_words(device, words, row.notice, self.fonts[1], if *problem { colours.bad } else { colours.muted }, DT_WORDBREAK | DT_EDITCONTROL);
+            }
         }
         if let Some(fraction) = view.fraction {
             let bar = RECT { left: margin, top: y + s(4), right: margin + across, bottom: y + s(10) };
@@ -557,9 +658,38 @@ impl App {
         }
     }
 
+    /// The standard folder picker, started in the folder that is chosen now. What it gives is the folder, or a `Dogmind` folder inside it if it holds other things; and that is where the
+    /// install is, and what it is checked against, as soon as it is chosen, so that a person is told here and not after pressing Install.
+    unsafe fn on_change(&mut self) {
+        if self.fixed || !matches!(self.page, Page::Ready { .. }) {
+            return;
+        }
+        // (the picker runs its own message loop, in which this window's timer and painting go on: nothing is held of `self` through it)
+        let (window, start, title) = (self.window, self.folder().to_path_buf(), self.w("Choose the folder for Dogmind App", "Dogmind App のインストール先のフォルダを選択"));
+        let Some(picked) = self.options.pick.clone().or_else(|| system::pick_folder(window, &start, &title)) else { return };
+        let chosen = place::choose(&picked);
+        let notice = match place::check(&chosen, &place::settings_folders()) {
+            Err(refusal) => Some(Notice::Refused(refusal)),
+            Ok(()) if chosen != picked => Some(Notice::InSubfolder),
+            Ok(()) => None,
+        };
+        // (a folder that has an install in it is an update of that one)
+        self.previous = install::read_manifest(&chosen).map(|manifest| manifest.version);
+        self.options.folder = chosen;
+        self.page = Page::Ready { notice };
+        self.refresh();
+    }
+
     unsafe fn on_primary(&mut self) {
         match &self.page {
-            Page::Ready => self.clear_the_way(After::Install),
+            // Before anything is put there: this person can write in the folder, and it is not where their settings are.
+            Page::Ready { .. } => match place::check(self.folder(), &place::settings_folders()) {
+                Ok(()) => self.clear_the_way(After::Install),
+                Err(refusal) => {
+                    self.page = Page::Ready { notice: Some(Notice::Refused(refusal)) };
+                    self.refresh();
+                }
+            },
             Page::CloseFirst { running, then, .. } => {
                 let (pids, then) = (running.iter().map(|one| one.pid).collect::<Vec<u32>>(), *then);
                 system::ask_to_close(&pids);
@@ -691,6 +821,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             match wparam & 0xFFFF {
                 1 => app.on_primary(),
                 2 => app.on_secondary(),
+                10 => app.on_change(),
                 _ => {}
             }
             0
@@ -762,7 +893,8 @@ pub fn run(options: Options, start: Start) -> i32 {
         let window = CreateWindowExW(0, class_name.as_ptr(), title.as_ptr(), style, CW_USEDEFAULT, CW_USEDEFAULT, 200, 100, std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null());
         let app_is_a_test = options.test;
         let dpi = GetDpiForWindow(window);
-        let mut area = RECT { left: 0, top: 0, right: scale(dpi, 520), bottom: scale(dpi, 280) };
+        // (the first page has the folder on it, and what is said of it, under the words)
+        let mut area = RECT { left: 0, top: 0, right: scale(dpi, 520), bottom: scale(dpi, if matches!(start, Start::Install { .. }) { 320 } else { 280 }) };
         AdjustWindowRectExForDpi(&mut area, style, 0, 0, dpi);
         // (a test keeps off the person's screen and out of their way, however it was started)
         if app_is_a_test {
@@ -776,6 +908,8 @@ pub fn run(options: Options, start: Start) -> i32 {
         let button_class = wide("BUTTON");
         let empty = wide("");
         let button = |id: isize| CreateWindowExW(0, button_class.as_ptr(), empty.as_ptr(), WS_CHILD | WS_TABSTOP | BS_OWNERDRAW as u32, 0, 0, 10, 10, window, id as HMENU, instance, std::ptr::null());
+        // (made first, as the tab key goes in the order they are made: the folder's, then the page's)
+        let change = button(CHANGE);
         let (primary, secondary) = (button(1), button(2));
         let (sender, messages) = channel();
         let japanese = japanese(&options);
@@ -784,11 +918,12 @@ pub fn run(options: Options, start: Start) -> i32 {
             _ => (String::new(), None),
         };
         let page = match &start {
-            Start::Install { .. } => Page::Ready,
+            Start::Install { .. } => Page::Ready { notice: None },
             Start::Refuse(heading, detail) => Page::Refused(heading.clone(), detail.clone()),
             Start::Uninstall | Start::FinishRemoval => Page::Removing { fraction: 0.0 },
         };
-        let app = Box::into_raw(Box::new(App { options, japanese, version, previous, window, primary, secondary, dpi, colours, fonts: [std::ptr::null_mut(); 3], page, view: View::default(), sender, messages, stop: Arc::new(AtomicBool::new(false)), exit_code: 0, auto_tries: 0 }));
+        let fixed = previous.is_some();
+        let app = Box::into_raw(Box::new(App { options, japanese, version, previous, window, primary, secondary, change, fixed, dpi, colours, fonts: [std::ptr::null_mut(); 3], page, view: View::default(), sender, messages, stop: Arc::new(AtomicBool::new(false)), exit_code: 0, auto_tries: 0 }));
         APP.store(app as isize, Ordering::Relaxed);
         let app = &mut *app;
         app.make_fonts();

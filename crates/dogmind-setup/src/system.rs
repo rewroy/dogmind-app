@@ -47,6 +47,54 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
     (unsafe { GetDiskFreeSpaceExW(wide_path(existing).as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) } != 0).then_some(free)
 }
 
+/// The folder the standard picker was set up to ask for, before it is shown: folders only, real ones, and ones that are there. It starts in `start`, or the nearest folder above it that exists.
+fn folder_dialog(start: &Path, title: &str) -> windows::core::Result<windows::Win32::UI::Shell::IFileOpenDialog> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS};
+    // SAFETY: COM on this thread, begun by the caller; the strings live through each call.
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        dialog.SetOptions(dialog.GetOptions()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)?;
+        dialog.SetTitle(PCWSTR(HSTRING::from(title).as_ptr()))?;
+        if let Some(existing) = start.ancestors().find(|folder| folder.is_dir()) {
+            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide_path(existing).as_ptr()), None)?;
+            dialog.SetFolder(&item)?;
+        }
+        Ok(dialog)
+    }
+}
+
+/// The file system path of what the picker gave.
+fn path_of(item: &windows::Win32::UI::Shell::IShellItem) -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::SIGDN_FILESYSPATH;
+    // SAFETY: the system gives a string that ends in a zero, for the caller to free.
+    unsafe {
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = PathBuf::from(String::from_utf16_lossy(name.as_wide()));
+        CoTaskMemFree(Some(name.as_ptr().cast()));
+        Some(path)
+    }
+}
+
+/// The standard Windows folder picker, over `owner` and starting in `start`: the folder the person chose, or none if they backed out. It runs its own message loop until it is done.
+pub fn pick_folder(owner: HWND, start: &Path, title: &str) -> Option<PathBuf> {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    // SAFETY: COM on this thread, begun here and ended here if it was begun by this call.
+    unsafe {
+        let begun = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let picked = folder_dialog(start, title).ok().and_then(|dialog| {
+            dialog.Show(Some(windows::Win32::Foundation::HWND(owner))).ok()?;
+            path_of(&dialog.GetResult().ok()?)
+        });
+        if begun {
+            CoUninitialize();
+        }
+        picked
+    }
+}
+
 /// A running program: what it is, and what can be said of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Running {
@@ -234,7 +282,7 @@ fn entries_are_of(registered: Option<&str>, folder: &Path) -> bool {
 }
 
 /// Where Add or remove programs says the install is.
-fn registered_folder() -> Option<String> {
+pub fn registered_folder() -> Option<String> {
     use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
     let mut text = vec![0u16; 2048];
     let mut size = (text.len() * 2) as u32;
@@ -371,6 +419,30 @@ mod tests {
             link.GetPath(&mut found, std::ptr::null_mut(), 0).unwrap();
             let length = found.iter().position(|&unit| unit == 0).unwrap();
             assert_eq!(PathBuf::from(String::from_utf16_lossy(&found[..length])), target);
+        }
+    }
+
+    #[test]
+    fn the_folder_picker_is_set_up_for_folders_and_starts_where_it_is_told() {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS};
+        let dir = tempfile::tempdir().unwrap();
+        let deeper = dir.path().join("not there yet").join("Dogmind");
+        // SAFETY: COM on this thread, begun here; the dialog is built and read, and never shown.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let dialog = folder_dialog(&deeper, "Choose").unwrap();
+            let options = dialog.GetOptions().unwrap();
+            for wanted in [FOS_PICKFOLDERS, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST] {
+                assert!(options.contains(wanted), "{wanted:?} in {options:?}");
+            }
+            // It starts in the nearest folder that is there, since the one asked for is not.
+            let started = dialog.GetFolder().unwrap();
+            assert_eq!(path_of(&started).unwrap().canonicalize().unwrap(), dir.path().canonicalize().unwrap());
+            // A shell item comes back as the path it stands for.
+            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide_path(dir.path()).as_ptr()), None).unwrap();
+            assert_eq!(path_of(&item).unwrap().canonicalize().unwrap(), dir.path().canonicalize().unwrap());
         }
     }
 

@@ -2,7 +2,8 @@
 //!
 //!     dogmind-setup --pack FOLDER OUT.exe [--version V] [--level 0-9]    makes DogmindSetup.exe from this program and FOLDER (scripts/package.py does)
 //!     dogmind-setup --verify FILE.exe                                    unpacks all of it to nowhere, and says if every file is sound
-//!     DogmindSetup.exe [--dir FOLDER]                                    installs, or updates what is there, in %LOCALAPPDATA%\Programs\Dogmind or FOLDER
+//!     DogmindSetup.exe [--dir FOLDER]                                    installs, or updates what is there. It starts with FOLDER, else with the install Installed apps names if that is still
+//!                                                                        there, else with %LOCALAPPDATA%\Programs\Dogmind; a first install can be moved to another folder on its first page
 //!     dogmind-uninstall.exe --uninstall                                  what Installed apps runs: clears the way, and opens the app's own page for removing it
 //!
 //! `--test` is for trying it out: no real Start menu entry or registry key is written, what would be goes in files in the folder, `--dir` must be named, and only what runs from that
@@ -11,6 +12,7 @@
 
 mod install;
 mod pack;
+mod place;
 mod system;
 mod window;
 
@@ -27,6 +29,8 @@ pub struct Options {
     /// What a test asks to go wrong, or to go slowly enough to be seen.
     pub fail_after: Option<usize>,
     pub slowly: Duration,
+    /// What a test has the folder picker answer, so that the page after a choice can be seen without anyone choosing: the picker is not opened.
+    pub pick: Option<PathBuf>,
 }
 
 /// What the command line says.
@@ -183,7 +187,7 @@ fn main() {
     }
     let exe_folder = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.to_path_buf()));
     let removing = found.uninstall || found.after_remove || found.finish_removal;
-    let folder = found.dir.clone().or_else(|| if removing { exe_folder } else { system::default_folder() });
+    let folder = found.dir.clone().or_else(|| if removing { exe_folder } else { place::existing_install(system::registered_folder().as_deref(), system::default_folder()) });
     let Some(folder) = folder else { std::process::exit(fail("no folder to work in: name one with --dir")) };
     let test = found.test || (removing && install::read_manifest(&folder).is_some_and(|manifest| manifest.test));
     if found.after_remove {
@@ -197,6 +201,7 @@ fn main() {
         app_name: if test { std::env::var("DOGMIND_SETUP_APP_NAME").unwrap_or_else(|_| "dogmind-app.exe".to_string()) } else { "dogmind-app.exe".to_string() },
         fail_after: number_from("DOGMIND_SETUP_FAIL_AFTER", test).map(|count| count as usize),
         slowly: Duration::from_millis(number_from("DOGMIND_SETUP_SLOW_MS", test).unwrap_or(0)),
+        pick: if test { std::env::var_os("DOGMIND_SETUP_PICK").map(PathBuf::from) } else { None },
     };
     let start = if found.finish_removal {
         window::Start::FinishRemoval
