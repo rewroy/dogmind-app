@@ -4399,7 +4399,7 @@ impl App {
                 let mode = t(MODES.iter().find(|(known, _)| *known == mode).map_or("", |(_, name)| name));
                 let effort = t(EFFORTS.iter().find(|(known, _)| *known == self.settings.effort.as_deref()).map_or("Default", |(_, name)| name));
                 let lines = [
-                    format!("Dogmind App  {}", env!("CARGO_PKG_VERSION")),
+                    format!("Dogmind  {}", env!("CARGO_PKG_VERSION")),
                     format!("Build        {}", readable_build(env!("DOGMIND_APP_BUILD"))),
                     format!("Dogmind      {}", dogmind_agent::prompt::DOGMIND_COMMIT.trim().chars().take(10).collect::<String>()),
                     format!("Tools        {}", self.current_session.as_deref().and_then(session::tools_of).map_or("this session has not saved its own".to_string(), |tools| session::describe_tools(&tools))),
@@ -5851,7 +5851,7 @@ impl App {
                 // The two things this page is for, as a person would report them.
                 let engine = self.engine_version.clone().unwrap_or_else(|| "Straydog".to_string());
                 let build = readable_build(env!("DOGMIND_APP_BUILD")).replace(" (", "  ").replace(')', "");
-                for line in [format!("Dogmind App  {}  ({build})", env!("CARGO_PKG_VERSION")), engine] {
+                for line in [format!("Dogmind  {}  ({build})", env!("CARGO_PKG_VERSION")), engine] {
                     form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, s(ds::size::TEXT_LINE)), text: line, font: FontKind::Body, color: theme::soft(), flags: DT_CENTER | ONE_LINE });
                     form.y += s(ds::size::TEXT_LINE);
                 }
@@ -12695,7 +12695,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         if crate::machine::windows_build().is_some_and(|build| !crate::machine::is_supported(build)) {
             lang::set("system");
-            let (words, title) = (wide(t("Dogmind App needs Windows 11.")), wide("Dogmind App"));
+            let (words, title) = (wide(t("Dogmind needs Windows 11.")), wide("Dogmind"));
             MessageBoxW(std::ptr::null_mut(), words.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
             return ExitCode::FAILURE;
         }
