@@ -23,6 +23,8 @@ const MAX_COMMAND_ERR: usize = 6 * 1024;
 const MAX_READ: usize = 32 * 1024;
 /// A line of a minified file, as read: 65 KB of one once came back from a request for two lines.
 const MAX_LINE: usize = 2000;
+/// What a turn reads of files before it is told how much that is, and of explore: 96 KB, some 30,000 tokens.
+const READ_TOLD_PAST: usize = 96 * 1024;
 /// A file longer than this, read with no place in it, is shown as where its parts begin: a review that read every file from the top
 /// had a context of 197K tokens for 6,600 lines, most of them of no use to it.
 const OUTLINE_PAST: usize = 800;
@@ -205,6 +207,9 @@ pub struct Workbench {
     cut_file: Option<PathBuf>,
     /// What has been read of each file and what it was then, while that is still in the conversation.
     reads: HashMap<(PathBuf, i64, i64), String>,
+    /// What this turn has read of files into the conversation, in bytes, and whether it has been told how much.
+    pub read_this_turn: usize,
+    pub read_told: bool,
     /// What holds keys besides what reads as such: the app's own folder, and the files its settings name.
     pub secrets: Vec<PathBuf>,
 }
@@ -476,7 +481,26 @@ impl Workbench {
         let key = (path, number("start_line", 1), number("limit", 500));
         let same = self.reads.get(&key) == Some(&hash);
         self.reads.insert(key, hash);
-        if same && result.is_ok() { Ok(UNCHANGED_READ.to_string()) } else { result }
+        if same && result.is_ok() {
+            return Ok(UNCHANGED_READ.to_string());
+        }
+        // Once a turn, past this much: what it read stays in every later request, and a look further can go to a helper.
+        let result = result.map(|text| {
+            self.read_this_turn += text.len();
+            if self.read_this_turn > READ_TOLD_PAST && !self.read_told {
+                self.read_told = true;
+                format!("{text}--- this turn has read {} KB of files into the conversation, where it stays for every later request. To look further, give the question to explore: only its answer joins ---\n", self.read_this_turn / 1024)
+            } else {
+                text
+            }
+        });
+        result
+    }
+
+    /// A new turn: what it reads is counted from nothing.
+    pub fn new_turn(&mut self) {
+        self.read_this_turn = 0;
+        self.read_told = false;
     }
 
     /// What was read may no longer be in the conversation.
@@ -2612,6 +2636,20 @@ mod tests {
         for line in ["git init ../other", "git init --template=x", "git init --separate-git-dir=C:\\x", "git status", "echo x && git init", "git init > C:\\x", "git init\ndel x", "git init -c core.hooksPath=x"] {
             assert_eq!(git_init_first(line), None, "{line}");
         }
+    }
+
+    /// A turn that has read much is told so once, and pointed at explore; a new turn counts from nothing.
+    #[test]
+    fn a_turn_that_reads_much_is_told_once_and_pointed_at_explore() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join("big.txt"), (0..400).map(|at| format!("line {at} {}\n", "x".repeat(70))).collect::<String>()).unwrap();
+        let read = |bench: &mut Workbench, start: i64| bench.run("read_file", &json!({"path": "big.txt", "start_line": start, "limit": 400}), dir.path(), &cancel).unwrap();
+        let notes = |bench: &mut Workbench| (1..=5).map(|start| read(bench, start)).filter(|out| out.contains("give the question to explore")).count();
+        assert_eq!(notes(&mut bench), 1, "told once in a turn");
+        bench.new_turn();
+        // (lines read again unchanged are not sent again, and count for nothing)
+        std::fs::write(dir.path().join("big.txt"), (0..400).map(|at| format!("other {at} {}\n", "y".repeat(70))).collect::<String>()).unwrap();
+        assert_eq!(notes(&mut bench), 1, "and once again in the next");
     }
 
     /// A long file read with no place in it comes as its head and where its parts begin; asked for a place, it comes as lines, as before;
