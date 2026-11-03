@@ -273,6 +273,7 @@ const ID_MCP_TRUST: isize = 9700; // ..+ as many servers as there are
 const ID_VISION: isize = 9903;
 const ID_VISION_DELETE: isize = 9904;
 const ID_VISION_OFFER: isize = 9905;
+const ID_UPDATE_OFFER: isize = 9906;
 const ID_DIFF_PREVIOUS: isize = 9900;
 const ID_DIFF_NEXT: isize = 9901;
 const ID_DIFF_CLOSE: isize = 9902;
@@ -1444,9 +1445,16 @@ struct App {
     memory_remove: Vec<HWND>,
     /// The app's own file and its engine's, as they were when it started: a new build changes them.
     builds: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
-    /// A new build seen once, to be seen the same again before it is taken; and whether the person has been told it waits for the work.
+    /// A new build seen once, to be seen the same again before it is offered.
     update_seen: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
-    update_told: bool,
+    /// A new build is here, and the row above the input asks whether to restart into it; its button and its cross.
+    update_offer: bool,
+    update_offer_button: HWND,
+    update_offer_close: Option<RECT>,
+    /// The build the person said no to, with the cross: they are asked again only for a newer one.
+    update_declined: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
+    /// They said yes while work was going on: it restarts when the work is done.
+    restart_when_done: bool,
     read_folder_add: HWND,
     read_folder_stop: HWND,
     read_folder_remove: Vec<HWND>,
@@ -4374,6 +4382,7 @@ impl App {
                 show(*window, false);
             }
             show(self.vision_offer_button, false);
+            show(self.update_offer_button, false);
         }
         show(self.help_button, !bare && !squeezed);
         show(self.suggest, chat && !self.suggestions.is_empty());
@@ -4514,6 +4523,29 @@ impl App {
             self.activity_area = rect(left, card_top - s(ds::size::TEXT_ROW), column, s(ds::size::TEXT_LINE));
             let mut bottom = card_top - s(ds::size::QUEUE_STEP);
             self.queue_hits.clear();
+            self.update_offer_close = None;
+            show(self.update_offer_button, self.update_offer);
+            if self.update_offer {
+                let tall = s(ds::size::QUEUE_STEP) + s(ds::space::XS);
+                let row = rect(left, bottom - tall, column, tall);
+                shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
+                let (words, action) = if self.restart_when_done {
+                    (t("It restarts into the new version when this work is done."), t("Not now"))
+                } else {
+                    (t("A new version is here."), t("Restart to update"))
+                };
+                set_text_if_changed(self.update_offer_button, action);
+                let cross = s(ds::space::XL);
+                let across = (text_width(self.fonts.body, action) + s(ds::space::XL)).max(s(72));
+                let button_x = left + column - cross - s(ds::space::XS) - across;
+                place(self.update_offer_button, button_x, row.top + (tall - s(ds::size::ICON_BUTTON)) / 2, across, s(ds::size::ICON_BUTTON));
+                SetWindowPos(self.update_offer_button, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                shapes.push(Shape::Text { area: rect(left + s(ds::space::M), row.top, (button_x - left - s(ds::space::L)).max(0), tall), text: words.to_string(), font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
+                let close = rect(left + column - cross - s(ds::space::XS), row.top + (tall - cross) / 2, cross, cross);
+                shapes.push(Shape::Icon { name: "x", area: close, size: s(ds::space::M), color: theme::muted() });
+                self.update_offer_close = Some(close);
+                bottom -= tall + s(ds::space::XS);
+            }
             self.vision_offer_close = None;
             show(self.vision_offer_button, self.vision_offer.is_some());
             if let Some(offer) = self.vision_offer {
@@ -7049,8 +7081,8 @@ impl App {
     }
 
     /// A new build of the app or of its engine has come in over the files this copy runs from (`package.py` puts it beside the one in use, which
-    /// Windows lets it rename): this copy starts it and gives way, at once when it is idle and otherwise as soon as its work is done. A file still
-    /// being written is not taken for one: the same new size and time twice in a row is.
+    /// Windows lets it rename): a row above the input asks whether to restart into it, and the tray says so if the window is out of sight. Nothing
+    /// restarts unless the person says so. A file still being written is not taken for one: the same new size and time twice in a row is.
     unsafe fn look_for_update(&mut self) {
         let now: Vec<Option<(std::time::SystemTime, u64)>> = self.builds.iter().map(|(path, _)| stamp(path)).collect();
         let changed = self.builds.iter().zip(&now).any(|((_, was), is)| is.is_some() && is != was);
@@ -7062,14 +7094,31 @@ impl App {
             self.update_seen = Some(now);
             return;
         }
-        if self.at_work() {
-            if !self.update_told {
-                self.update_told = true;
-                self.say(t("A new version is here. The app restarts into it when this work is done."));
+        if self.restart_when_done {
+            if !self.at_work() {
+                self.restart_into_update();
             }
             return;
         }
-        self.restart_into_update();
+        if self.update_offer || self.update_declined.as_ref() == Some(&now) {
+            return;
+        }
+        self.update_offer = true;
+        self.tray_note(t("A new version of Dogmind is here"), t("Open the app to restart into it."));
+        self.layout();
+    }
+
+    /// The offer's button: restart now, or, with work going on, when it is done; pressed again then, not after all.
+    unsafe fn update_offer_pressed(&mut self) {
+        if self.restart_when_done {
+            self.restart_when_done = false;
+        } else if self.at_work() {
+            self.restart_when_done = true;
+        } else {
+            self.restart_into_update();
+            return;
+        }
+        self.layout();
     }
 
     unsafe fn restart_into_update(&mut self) {
@@ -10926,6 +10975,14 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.layout();
                 return 0;
             }
+            // (not this build: a newer one is offered again)
+            if app.update_offer_close.is_some_and(|close| within(&close)) {
+                app.update_offer = false;
+                app.restart_when_done = false;
+                app.update_declined = app.update_seen.clone();
+                app.layout();
+                return 0;
+            }
             if let Some(at) = app.queue_hits.iter().find(|(area, _)| within(area)).map(|(_, at)| *at) {
                 app.call_back(at);
             } else if let Some(file) = app.preview_hits.iter().find(|(area, _)| within(area)).map(|(_, file)| file.display().to_string()) {
@@ -11085,6 +11142,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                         }
                     }
                 }
+                ID_UPDATE_OFFER => app.update_offer_pressed(),
                 ID_VISION_OFFER => match app.vision_offer {
                     _ if app.setting_up => app.setup_cancel.store(true, Ordering::Relaxed),
                     Some(VisionOffer::Download(_)) => app.start_vision_setup(),
@@ -12101,7 +12159,11 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             memory_remove: Vec::new(),
             builds: Vec::new(),
             update_seen: None,
-            update_told: false,
+            update_offer: false,
+            update_offer_button: make_button(window, ID_UPDATE_OFFER, "", ButtonKind::Secondary, theme::surface()),
+            update_offer_close: None,
+            update_declined: None,
+            restart_when_done: false,
             read_folder_add: make_button(pane, ID_READ_FOLDER_ADD, "", ButtonKind::Secondary, theme::background()),
             read_folder_stop: make_button(pane, ID_READ_FOLDER_STOP, "", ButtonKind::Secondary, theme::background()),
             read_folder_remove: Vec::new(),
