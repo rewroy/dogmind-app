@@ -1749,6 +1749,11 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
         }
         notes.push_str("note: `pip install` puts packages in .pydeps in the workspace, and python finds them there. The bundled Python itself cannot be changed.\n");
     }
+    // (a real model ended its own server so, `taskkill /F /IM python.exe /T`: every session's commands run in the one sandbox, and a
+    // server another conversation started went too)
+    if (lower.contains("taskkill") && lower.contains("/im")) || (lower.contains("stop-process") && lower.contains("-name")) {
+        notes.push_str("note: a command started in the background is ended with command_stop and its id, with all it started. By name, this ends every such program the sandbox runs, those of the user's other conversations too.\n");
+    }
     if status == Some(0) {
         return notes;
     }
@@ -3324,6 +3329,10 @@ mod tests {
             assert!(sandbox_notes(line, Path::new("C:\\work"), Some(1), err).contains("Tell the user the exact command"), "{line}");
         }
         assert!(!sandbox_notes("git status", Path::new("C:\\work"), Some(1), "fatal: bad").contains("Tell the user"));
+        // (by name, whether it worked or not, a server is ended for every conversation; by its PID or id it is not said)
+        assert!(sandbox_notes("taskkill /F /IM python.exe /T", root, Some(0), "").contains("command_stop"));
+        assert!(sandbox_notes("powershell -Command \"Stop-Process -Name node\"", root, Some(1), "").contains("command_stop"));
+        assert!(!sandbox_notes("taskkill /PID 4242 /F", root, Some(0), "").contains("command_stop"));
         assert!(sandbox_notes("type C:\\elsewhere\\a.txt", root, Some(1), "Access is denied.").contains("cannot read outside the workspace"));
         assert!(sandbox_notes("type C:\\elsewhere\\a.txt", root, Some(1), "アクセスが拒否されました。").contains("`read_file`"));
         // On another drive, and in another language, the same.
