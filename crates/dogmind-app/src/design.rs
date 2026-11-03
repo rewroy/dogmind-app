@@ -78,6 +78,8 @@ pub mod size {
     /// A row of one line in a list of what can be chosen.
     pub const MENU_ROW: i32 = 36;
     pub const ICON_BUTTON: i32 = 28;
+    /// How far reading text fades into the page at an edge of its view that it goes on past: a little over a line.
+    pub const TEXT_FADE: i32 = 28;
     /// A link: small words, with room to be hit.
     pub const LINK: i32 = 24;
     pub const SIDEBAR: i32 = 272;

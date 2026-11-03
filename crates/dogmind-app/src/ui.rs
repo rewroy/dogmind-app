@@ -12813,6 +12813,10 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         crate::textview::set_name(composer, "Message Dogmind");
         let doc = rich_edit_of(transcript_class, window, WS_VSCROLL | ES_READONLY as u32, theme::background(), 10);
         crate::textview::set_name(doc, "Document");
+        // (a line an edge of the view cuts in half fades out there, as it does in a browser's chat, and does not read as letters gone wrong)
+        for reading in [transcript, doc] {
+            crate::textview::fade_edges(reading, ds::size::TEXT_FADE);
+        }
         let side = control(window, "LISTBOX", "", list_style, 0, ID_SIDE);
         let list = control(window, "LISTBOX", "", list_style, 0, ID_LIST);
         let chip = |id: isize, backdrop: u32| make_button(window, id, "", ButtonKind::Chip, backdrop);
