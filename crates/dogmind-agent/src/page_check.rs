@@ -739,6 +739,35 @@ mod tests {
         assert!(said.contains("How it looks at desktop"), "{said}");
     }
 
+    /// With the real browser, in the real sandbox: a server on this machine that no command started (this test's own, outside the sandbox)
+    /// is out of the browser's reach. Loopback from an app container reaches only what runs in the same container: what this app's commands
+    /// serve, and nothing else on the machine, so a page cannot lead the check to another program's local service.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn a_server_outside_the_sandbox_cannot_be_read() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = std::sync::Arc::new(AtomicBool::new(false));
+        let told = served.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut asked = [0u8; 2048];
+                let _ = stream.read(&mut asked);
+                told.store(true, std::sync::atomic::Ordering::Relaxed);
+                let body = "<!DOCTYPE html><title>outside</title><div>SECRET-OUTSIDE-THE-SANDBOX</div>";
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let said = check_page(&serde_json::json!({"url": format!("http://127.0.0.1:{port}/")}), dir.path(), &AtomicBool::new(false));
+        println!("{said:?}");
+        let text = match &said { Ok(text) | Err(text) => text.clone() };
+        assert!(!text.contains("SECRET-OUTSIDE-THE-SANDBOX"), "{text}");
+        assert!(!served.load(std::sync::atomic::Ordering::Relaxed), "the browser reached a server outside the sandbox");
+    }
+
     /// With the real browser, in the real sandbox: a phone's width is the width the page is laid out at, not the browser window's least.
     #[test]
     #[ignore = "starts Edge in the sandbox"]

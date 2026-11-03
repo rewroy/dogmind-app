@@ -26,15 +26,43 @@ impl Url {
             (None, Some(rest)) => (false, rest),
             _ => return Err(format!("{url}: a URL starts with http:// or https://")),
         };
-        let (authority, path) = rest.split_once('/').map_or((rest, ""), |(authority, path)| (authority, path));
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse().map_err(|_| format!("{url}: bad port"))?),
-            None => (authority, if tls { 443 } else { 80 }),
+        // (a fragment is the browser's, and never sent)
+        let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
+        // The host ends where the path or the query begins: `https://example.com?q=x` has no slash before its query.
+        let end = rest.find(['/', '?']).unwrap_or(rest.len());
+        let (authority, tail) = rest.split_at(end);
+        let (path, query) = tail.split_once('?').map_or((tail, None), |(path, query)| (path, Some(query)));
+        let default_port = if tls { 443 } else { 80 };
+        // An IPv6 address is in brackets, with colons of its own: `[::1]:8080`, `[::1]`.
+        let (host, port) = match authority.strip_prefix('[') {
+            Some(bracketed) => {
+                let (address, after) = bracketed.split_once(']').ok_or_else(|| format!("{url}: an IPv6 address with no closing bracket"))?;
+                let port = match after.strip_prefix(':') {
+                    Some(port) => port.parse().map_err(|_| format!("{url}: bad port"))?,
+                    None if after.is_empty() => default_port,
+                    None => return Err(format!("{url}: bad port")),
+                };
+                (address, port)
+            }
+            None => match authority.rsplit_once(':') {
+                Some((host, port)) => (host, port.parse().map_err(|_| format!("{url}: bad port"))?),
+                None => (authority, default_port),
+            },
         };
         if host.is_empty() {
             return Err(format!("{url}: no host"));
         }
-        Ok(Url { tls, host: host.to_string(), port, path: format!("/{}", path.trim_end_matches('/')) })
+        let mut path = format!("/{}", path.trim_start_matches('/').trim_end_matches('/'));
+        if let Some(query) = query {
+            path.push('?');
+            path.push_str(query);
+        }
+        Ok(Url { tls, host: host.to_string(), port, path })
+    }
+
+    /// The host as a request's Host header and a message name it: an IPv6 address in its brackets.
+    pub fn host_for_header(&self) -> String {
+        if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() }
     }
 
     pub fn join(&self, path: &str) -> Url {
@@ -236,7 +264,7 @@ pub fn request_at<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers
         Transport::Plain(socket)
     };
     // Keep-alive, and the connection closes when the response has been read: `Connection: close` meets resets on Windows.
-    let host = if url.port == if url.tls { 443 } else { 80 } { url.host.clone() } else { format!("{}:{}", url.host, url.port) };
+    let host = if url.port == if url.tls { 443 } else { 80 } { url.host_for_header() } else { format!("{}:{}", url.host_for_header(), url.port) };
     let accept = if headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("accept")) { "" } else { "Accept: */*\r\n" };
     let mut head = format!("{method} {} HTTP/1.1\r\nHost: {host}\r\n{accept}Connection: keep-alive\r\n", url.path);
     for (name, value) in headers {
@@ -638,6 +666,20 @@ pub(crate) mod tests {
         assert_eq!(secure.join("messages").path, "/v1/messages");
         assert!(Url::parse("ftp://example.com").is_err());
         assert!(Url::parse("http://").is_err());
+    }
+
+    /// A query with no path before it, an IPv6 address, and a fragment: each is where it belongs, and the fragment goes nowhere.
+    #[test]
+    fn a_url_with_a_query_and_no_path_or_an_ipv6_address_is_read_as_one() {
+        let query = Url::parse("https://example.com?q=x").unwrap();
+        assert_eq!((query.host.as_str(), query.port, query.path.as_str()), ("example.com", 443, "/?q=x"));
+        let with_path = Url::parse("http://example.com:8080/a/b/?q=1/2#frag").unwrap();
+        assert_eq!((with_path.host.as_str(), with_path.port, with_path.path.as_str()), ("example.com", 8080, "/a/b?q=1/2"));
+        let local = Url::parse("http://[::1]:8080/v1").unwrap();
+        assert_eq!((local.host.as_str(), local.port, local.path.as_str(), local.host_for_header()), ("::1", 8080, "/v1", "[::1]".to_string()));
+        let bare = Url::parse("http://[::1]/").unwrap();
+        assert_eq!((bare.host.as_str(), bare.port), ("::1", 80));
+        assert!(Url::parse("http://[::1/").is_err() && Url::parse("http://[::1]x/").is_err());
     }
 
     #[test]
