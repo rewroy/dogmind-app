@@ -889,8 +889,6 @@ unsafe fn draw_thumb(device: HDC, bitmap: HBITMAP, x: i32, y: i32, width: i32, h
 }
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
-/// To a button's parent: the pointer has left this one, in `wparam`.
-pub const WM_BUTTON_LEFT: u32 = WM_APP + 20;
 const FLAG_HOVER: isize = 1 << 8;
 const FLAG_PRESSED: isize = 1 << 9;
 const BACKDROP_SHIFT: isize = 16;
@@ -962,7 +960,6 @@ unsafe extern "system" fn button_procedure(window: HWND, message: u32, wparam: W
         WM_MOUSELEAVE => {
             SetWindowLongPtrW(window, GWLP_USERDATA, state & !FLAG_HOVER & !FLAG_PRESSED);
             InvalidateRect(window, std::ptr::null(), 0);
-            SendMessageW(GetParent(window), WM_BUTTON_LEFT, window as WPARAM, 0);
             0
         }
         // Hidden under the pointer, it gets no leaving: shown again, it would still look as if the pointer were on it.
