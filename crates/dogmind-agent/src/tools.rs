@@ -36,6 +36,14 @@ const MATCH_LIMIT: usize = 1000;
 const SEARCH_FILE_LIMIT: u64 = 16 << 20;
 const MOST_READ_WHOLE: u64 = 256 << 20;
 
+/// What an `explore` helper may call: it looks, and changes nothing.
+pub const HELPER_TOOLS: [&str; 4] = ["read_file", "search_files", "find_files", "list_files"];
+
+/// The helper's tools, as the session's are written.
+pub fn helper_schemas() -> Value {
+    Value::Array(schemas().as_array().into_iter().flatten().filter(|tool| tool["function"]["name"].as_str().is_some_and(|name| HELPER_TOOLS.contains(&name))).cloned().collect())
+}
+
 /// The tools every session has. Dogmind's names and meanings, in as few words as still say them: a local model reads all of this before a new session's first word, some 200 tokens a second, and it has no other use for them than knowing what to call.
 /// `assets/dogmind/tools.json` is what Dogmind itself says, to read when it changes.
 pub fn schemas() -> Value {
@@ -92,7 +100,8 @@ pub fn schemas() -> Value {
             "steps": {"type": "string", "description": "JS run after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results"}
         }), &[]),
         function("command_status", "How a background command is doing, and its output once it has ended.", json!({"id": {"type": "string"}}), &[]),
-        function("command_stop", "End a background command.", json!({"id": {"type": "string"}}), &["id"])
+        function("command_stop", "End a background command.", json!({"id": {"type": "string"}}), &["id"]),
+        function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
     ])
 }
 
@@ -1991,6 +2000,7 @@ pub fn summary(tool: &str, arguments: &Value) -> String {
         "remember" => text("note").chars().take(80).collect(),
         "forget" => text("words").to_string(),
         "command_status" | "command_stop" => text("id").to_string(),
+        "explore" => text("task").lines().next().unwrap_or("").chars().take(100).collect(),
         _ if tool.starts_with("mcp__") => arguments.to_string().chars().take(120).collect(),
         "web_search" => arguments.get("queries").and_then(Value::as_array).map_or(String::new(), |queries| queries.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
         _ => String::new(),
@@ -2250,7 +2260,7 @@ mod tests {
     fn every_generated_schema_has_a_tool() {
         let schemas = schemas();
         let names: Vec<&str> = schemas.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "todo", "find_files", "check_page", "command_status", "command_stop"]);
+        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "todo", "find_files", "check_page", "command_status", "command_stop", "explore"]);
     }
 
     #[test]

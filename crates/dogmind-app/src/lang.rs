@@ -158,6 +158,7 @@ const JA: &[(&str, &str)] = &[
     ("What may always run in this folder", "このフォルダで常に実行してよいもの"),
     ("Show or hide the thinking", "思考の表示を切り替える"),
     ("Open another program's folder on PATH to sandboxed commands, with one Windows prompt", "PATH にある別のプログラムのフォルダをサンドボックス内のコマンドに開く (Windows の確認が 1 回出ます)"),
+    ("Look into", "調査"),
     ("Check a page", "ページを確認"),
     ("How the agent should talk and work, for every new session", "エージェントの話し方と進め方 (新しいセッションすべてに適用)"),
     ("Open Straydog's dashboard in the browser", "Straydog のダッシュボードをブラウザーで開く"),
