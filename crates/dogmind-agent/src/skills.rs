@@ -101,7 +101,9 @@ fn walk(folder: &Path, depth: usize, scope: &'static str, found: &mut Vec<Skill>
         found.extend(read_skill(&file, scope));
         return;
     }
-    let mut folders: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.is_dir()).collect();
+    // (not a hidden folder: `.system` is a tool's own, as Codex's are, written for its tools and its agents. Codex's review-agent, for one,
+    // says to read every line itself and hand nothing on, and Dogmind's model, given it for a review, read 880 KB into one turn.)
+    let mut folders: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.is_dir() && !path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.'))).collect();
     folders.sort();
     for inner in folders {
         walk(&inner, depth + 1, scope, found);
@@ -245,7 +247,8 @@ mod tests {
         std::fs::create_dir_all(work.join(".git")).unwrap();
         write(&home.join(".claude/skills/one"), "---\ndescription: from Claude\n---\nb");
         write(&home.join(".claude/skills/synced/abc/deep"), "---\nname: deep\ndescription: nested\n---\nb");
-        write(&home.join(".codex/skills/.system/two"), "---\nname: two\ndescription: from Codex\n---\nb");
+        write(&home.join(".codex/skills/two"), "---\nname: two\ndescription: from Codex\n---\nb");
+        write(&home.join(".codex/skills/.system/review-agent"), "---\nname: review-agent\ndescription: Codex's own\n---\nb");
         write(&home.join(".agents/skills/three"), "---\nname: three\ndescription: shared\n---\nb");
         write(&home.join(".claude/skills/nameless"), "---\nname: nothing-said\n---\nb");
         write(&work.join(".claude/skills/one"), "---\nname: one\ndescription: the project's own\n---\nb");
@@ -255,6 +258,7 @@ mod tests {
             assert!(names.contains(&name), "{names:?}");
         }
         assert!(!names.contains(&"nothing-said"), "no description, nothing to choose it by");
+        assert!(!names.contains(&"review-agent"), "a tool's own, in a hidden folder, is not offered");
         let one = skills.iter().find(|skill| skill.name == "one").unwrap();
         assert_eq!((one.description.as_str(), one.scope), ("the project's own", "project"));
         assert_eq!(names.iter().filter(|name| **name == "one").count(), 1);
