@@ -123,7 +123,8 @@ const NOTICES: &[(&str, &str)] = &[
 
 /// What holds a number at its front or in its middle.
 const COUNTED: &[(&str, &str)] = &[
-    ("compacted: old tool outputs trimmed by {0} KB", "コンパクト化しました: 古いツール出力を {0} KB 削りました"),
+    ("Session compacted: old tool outputs shortened by {0} KB", "セッションを圧縮しました: 古いツール出力を {0} KB 短くしました"),
+    ("Session compacted: every tool output, the newest too, shortened by {0} KB, as nothing else would fit", "セッションを圧縮しました: ほかに減らせるものがないため、最新のものも含めてツール出力を {0} KB 短くしました"),
     ("{0} tool calls failed in this turn: stopped so that you can look", "このターンでツール呼び出しが {0} 回失敗したため、確認できるように止めました。"),
     ("the model made the same call {0} times with nothing edited in between: stopped so that you can look", "モデルが何も編集せずに同じ呼び出しを {0} 回繰り返したため、確認できるように止めました。"),
     ("stopped after {0} iterations", "{0} 回繰り返したところで止めました。もう一度送ると続けられます。"),
@@ -202,6 +203,7 @@ const JA: &[(&str, &str)] = &[
     ("vram", "GPU メモリの空きを待っています"),
     ("The settings could not be saved: {0}\n", "設定を保存できませんでした: {0}\n"),
     ("Thinking…", "考え中…"),
+    ("Compacting the session…", "セッションを圧縮しています…"),
     ("Writing…", "書いています…"),
     ("Waiting for the engine…", "エンジンの起動を待っています…"),
     ("{0} s", "{0} 秒"),
@@ -659,7 +661,7 @@ const JA: &[(&str, &str)] = &[
     ("Setting up {0}...", "{0} を準備中..."),
     ("Straydog is not what is connected, so it has no dashboard to open.", "接続先が Straydog ではないので、開けるダッシュボードがありません。"),
     ("Choose a turn.", "ターンを選んでください。"),
-    ("That part of the conversation was compacted or rewound past: only its files can go back.", "その部分の会話はコンパクト化または巻き戻し済みのため、ファイルしか戻せません。"),
+    ("That part of the conversation was compacted or rewound past: only its files can go back.", "その部分の会話は圧縮済みか巻き戻し済みのため、ファイルしか戻せません。"),
     ("Choose a rule.", "ルールを選んでください。"),
     ("Choose a folder from the list, or another one.", "リストのフォルダか、別のフォルダを選んでください。"),
     ("A session needs a folder to work in: choose one.", "セッションには作業フォルダが必要です。選んでください。"),
@@ -696,7 +698,7 @@ const JA: &[(&str, &str)] = &[
     (llm::UNFINISHED, "サーバーが回答を最後まで返しませんでした。会話はそのまま残っています。もう一度送ってください。"),
     (llm::UNREADABLE, "サーバーから読み取れない応答が届きました。会話はそのまま残っています。もう一度送ってください。"),
     (llm::BROKE_OFF, "回答が途中で切れました。続きを頼んでいます。"),
-    (llm::NO_CHECKPOINT, "モデルが要約を書けなかったため、古いターンを削除します。"),
+    (llm::NO_CHECKPOINT, "要約を作れなかったため、いちばん古いターンを削除して圧縮します。"),
     (llm::START_FAILED, "エンジンが読み込み中に停止しました。原因は /log で確認できます。もう一度入力すると再試行します。"),
     (llm::START_OUT_OF_MEMORY, "エンジンが読み込み中にメモリ不足になりました。他のアプリを閉じてから、もう一度入力してください。"),
     ("the Codex CLI was not found: install it, then sign in with ChatGPT", "Codex CLI が見つかりません。インストールしてから ChatGPT でサインインしてください。"),
@@ -714,10 +716,10 @@ const JA: &[(&str, &str)] = &[
     ("There is nothing to try again.", "やり直せるものがありません。"),
     ("This session has nothing to rewind.", "このセッションには巻き戻せるものがありません。"),
     ("That turn is gone.", "そのターンはもうありません。"),
-    ("That part of the conversation was compacted: it cannot go back.", "その部分の会話はコンパクト化されたため、戻せません。"),
-    ("compacted: the model wrote a checkpoint of the earlier turns", "コンパクト化しました: 以前のターンのチェックポイントをモデルが書きました"),
-    ("There is nothing to compact yet: the conversation is short.", "会話が短いので、まだコンパクト化するものがありません。"),
-    ("compacted: the oldest turns were dropped", "コンパクト化しました: 最も古いターンを削除しました"),
+    ("That part of the conversation was compacted: it cannot go back.", "その部分の会話は圧縮済みのため、戻せません。"),
+    ("Session compacted: the earlier conversation is now a summary", "セッションを圧縮しました: これまでの会話を要約に置き換えました"),
+    ("There is nothing to compact yet: the conversation is short.", "会話がまだ短いので、圧縮するものはありません。"),
+    ("Session compacted: the oldest turns were dropped", "セッションを圧縮しました: いちばん古いターンを削除しました"),
     ("the engine stopped answering: /log shows why, and writing again tries once more", "エンジンの応答が止まりました。原因は /log で確認できます。もう一度入力すると再試行します。"),
     ("another Straydog is running on this PC (process {0}). Two on one GPU fight over its memory and the machine's, so this one was not started. Close it and restart the engine, or reach it as an OpenAI-compatible provider.", "この PC で別の Straydog が動いています (プロセス {0})。1 つの GPU で 2 つ動かすとメモリを奪い合うため、起動しませんでした。それを閉じてからエンジンを起動し直すか、OpenAI 互換の接続先として接続してください。"),
     ("port {0} on this PC is taken. Choose another port for the engine in settings.json, or close what holds it.", "この PC のポート {0} は使用中です。settings.json でエンジンの別のポートを選ぶか、使っているものを閉じてください。"),
@@ -896,7 +898,8 @@ mod tests {
     fn a_number_in_the_agents_words_finds_its_place() {
         assert_eq!(in_japanese("stopped after 300 iterations"), "300 回繰り返したところで止めました。もう一度送ると続けられます。");
         assert_eq!(in_japanese("18 tool calls failed in this turn: stopped so that you can look"), "このターンでツール呼び出しが 18 回失敗したため、確認できるように止めました。");
-        assert_eq!(in_japanese("compacted: old tool outputs trimmed by 12 KB"), "コンパクト化しました: 古いツール出力を 12 KB 削りました");
+        assert_eq!(in_japanese("Session compacted: old tool outputs shortened by 12 KB"), "セッションを圧縮しました: 古いツール出力を 12 KB 短くしました");
+        assert_eq!(in_japanese("Session compacted: every tool output, the newest too, shortened by 30 KB, as nothing else would fit"), "セッションを圧縮しました: ほかに減らせるものがないため、最新のものも含めてツール出力を 30 KB 短くしました");
         assert_eq!(in_japanese("words no table has"), "words no table has");
     }
 

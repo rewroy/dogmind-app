@@ -1050,6 +1050,8 @@ struct Parked {
     failed: bool,
     todos: Vec<serde_json::Value>,
     web_seen: bool,
+    /// The session is being made shorter, and nothing has been asked of the model since.
+    compacting: bool,
 }
 
 #[derive(Clone)]
@@ -8185,6 +8187,7 @@ impl App {
             failed: false,
             todos: std::mem::take(&mut self.todos),
             web_seen: self.web_seen,
+            compacting: self.activity == t("Compacting the session…"),
         });
         self.running = false;
         self.stop_asked = false;
@@ -8265,7 +8268,7 @@ impl App {
         for (index, tool, raw) in parked.writing {
             self.run_writes(index, tool, &raw);
         }
-        self.set_activity(if parked.pending.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else { t("Thinking…").to_string() });
+        self.set_activity(if parked.pending.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
         self.update_buttons();
         self.update_status();
         if let Some(approval) = parked.pending {
@@ -9339,7 +9342,11 @@ impl App {
                 }
                 parked.tools_running.insert(id, (tool, summary.chars().take(160).collect()));
             }
-            Event::RequestStarted => parked.writing.clear(),
+            Event::RequestStarted => {
+                parked.writing.clear();
+                parked.compacting = false;
+            }
+            Event::Compacting => parked.compacting = true,
             Event::ToolWriting { index, tool, piece } => match parked.writing.iter_mut().find(|(at, _, _)| *at == index) {
                 Some((_, _, raw)) => raw.push_str(&piece),
                 None => parked.writing.push((index, tool, piece)),
@@ -9611,7 +9618,12 @@ impl App {
                 self.request_live = None;
                 self.end_of_answer();
             }
+            // (what a long session is waiting for, which is not the model thinking: it is asked to sum the session up, and nothing of that shows)
+            Event::Compacting => self.set_activity(t("Compacting the session…").into()),
             Event::RequestStarted => {
+                if self.activity == t("Compacting the session…") {
+                    self.set_activity(t("Thinking…").into());
+                }
                 // (the next answer does not start at the speed the last one ended)
                 (self.reveal_rate, self.reveal_carried) = (0.0, 0.0);
                 self.request_live = Some(std::time::Instant::now());
