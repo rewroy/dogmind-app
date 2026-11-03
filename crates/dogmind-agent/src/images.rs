@@ -110,6 +110,31 @@ pub fn is_picture(path: &Path) -> bool {
     image::guess_format(&head[..count]).ok().and_then(media_type_of).is_some()
 }
 
+/// Copies of what the person attached, as they were, in a folder commands can read: a model can put one in the workspace for a page to show,
+/// which it could not from the session's own folder. Named by the session and their place in the message, with a name a command line takes
+/// as it is. Copies older than a week go as new ones come.
+pub fn copies_for_commands(folder: &Path, session: &str, pictures: &[Attachment]) -> Vec<PathBuf> {
+    if std::fs::create_dir_all(folder).is_err() {
+        return Vec::new();
+    }
+    let week = std::time::Duration::from_secs(7 * 24 * 3600);
+    for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+        if entry.metadata().ok().and_then(|data| data.modified().ok()).and_then(|when| when.elapsed().ok()).is_some_and(|age| age > week) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let plain = |text: &str| text.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '-' }).collect::<String>();
+    let mut written = Vec::new();
+    for (at, picture) in pictures.iter().enumerate() {
+        let stem = Path::new(&picture.name).file_stem().map(|stem| plain(&stem.to_string_lossy())).filter(|stem| stem.chars().any(|c| c.is_ascii_alphanumeric())).unwrap_or_else(|| "picture".to_string());
+        let path = folder.join(format!("{}-{}-{stem}.{}", plain(session), at + 1, extension_of(&picture.media_type)));
+        if std::fs::write(&path, &picture.bytes).is_ok() {
+            written.push(path);
+        }
+    }
+    written
+}
+
 /// The folder a session keeps its pictures in: beside its file, and deleted with it.
 pub fn folder_of(session: &Path) -> PathBuf {
     session.with_extension("images")
@@ -243,6 +268,17 @@ pub(crate) fn openai_content(message: &Message, folder: Option<&Path>) -> Value 
 pub(crate) mod tests {
     use super::*;
     use image::RgbImage;
+
+    #[test]
+    fn attached_pictures_are_copied_as_they_were_under_names_a_command_takes() {
+        let dir = tempfile::tempdir().unwrap();
+        let picture = |name: &str, bytes: &[u8], media_type: &str| Attachment { name: name.into(), bytes: bytes.to_vec(), media_type: media_type.into(), width: 4, height: 3 };
+        let folder = dir.path().join("attachments");
+        let written = copies_for_commands(&folder, "20261103-151658", &[picture("レウ の写真.JPG", b"jpeg bytes", "image/jpeg"), picture("", b"png bytes", "image/png"), picture("my photo (2).webp", b"webp", "image/webp")]);
+        let names: Vec<String> = written.iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["20261103-151658-1-picture.jpg", "20261103-151658-2-picture.png", "20261103-151658-3-my-photo--2-.webp"]);
+        assert_eq!(std::fs::read(&written[0]).unwrap(), b"jpeg bytes", "the very bytes, not what a provider was sent");
+    }
 
     pub(crate) fn encoded(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
         // Not flat, so that a picture has a real size to shrink.

@@ -956,6 +956,16 @@ impl Agent {
         if self.mode == Mode::Plan {
             message = prompt::with_note(&message, "## Plan Mode\nThe user wants a plan first. Look as much as you need with the read-only tools, then set out what you would change and why, and stop there. Nothing can be changed in this mode: the user leaves it when they accept the plan.");
         }
+        // What was attached, as files: the model sees the pictures, but a page that shows one needs it in the workspace.
+        #[cfg(windows)]
+        if let (false, Some(folder), Some(session)) = (pictures.is_empty(), crate::sandbox::temp_folder(), self.session.as_ref()) {
+            let name = session.path.file_stem().map_or(String::new(), |stem| stem.to_string_lossy().into_owned());
+            let copies = images::copies_for_commands(&folder.join("attachments"), &name, &pictures);
+            let lines: Vec<String> = copies.iter().zip(&pictures).map(|(path, picture)| format!("- `{}`: {}x{}, {}", path.display(), picture.width, picture.height, picture.media_type)).collect();
+            if !lines.is_empty() {
+                message = prompt::with_note(&message, &format!("## Attached Pictures\nThe pictures above as files, which commands can read: copy one into the workspace for a page or a program to use it.\n{}", lines.join("\n")));
+            }
+        }
         if !self.rewound.is_empty() {
             let files: Vec<String> = self.rewound.drain(..).map(|path| format!("- {}", path.display())).collect();
             message = prompt::with_note(&message, &format!("## Files Restored\nThe user put these files back as they were earlier in this conversation. Your earlier edits to them are undone; read them again before relying on them:\n{}", files.join("\n")));
