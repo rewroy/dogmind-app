@@ -1,9 +1,12 @@
 //! What the app remembers: its providers and choices, as JSON in its own folder. The API keys stay out of it: a provider
-//! names a file or a variable that holds its key.
+//! says that Credential Manager holds its key, or names a variable or a file that does.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::keys::{self, KeyStore};
+use crate::lang::{t, tf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,9 +26,9 @@ impl Kind {
 
     pub fn label(self) -> &'static str {
         match self {
-            Kind::Embedded => "Straydog on this PC",
-            Kind::Server => "OpenAI-compatible (server or service)",
-            Kind::Codex => "Codex (ChatGPT plan)",
+            Kind::Embedded => "On this PC (Straydog)",
+            Kind::Server => "Another computer or an online service",
+            Kind::Codex => "ChatGPT plan (Codex)",
             Kind::Anthropic => "Claude (API key)",
         }
     }
@@ -41,39 +44,111 @@ pub struct ProviderConfig {
     /// Empty: what the provider offers first.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
-    /// A file holding the key, or `env:NAME`.
+    /// Where its key is: see `KeySource`. Never the key.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub api_key: String,
+}
+
+/// What the setting for a key says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySource {
+    None,
+    /// In Credential Manager, under this name: `credential:NAME`.
+    Stored(String),
+    /// In a variable of the environment: `env:NAME`.
+    Variable(String),
+    /// In a file: a path. Nothing offers this any more, and what was set so keeps working.
+    File(String),
+}
+
+impl KeySource {
+    pub fn of(setting: &str) -> KeySource {
+        let setting = setting.trim();
+        if setting.is_empty() {
+            KeySource::None
+        } else if let Some(target) = setting.strip_prefix(CREDENTIAL) {
+            KeySource::Stored(target.to_string())
+        } else if let Some(name) = setting.strip_prefix("env:") {
+            KeySource::Variable(name.to_string())
+        } else {
+            KeySource::File(setting.to_string())
+        }
+    }
+
+    /// The key it leads to; an empty setting is no key, and one that cannot be read is an error, in words without the key.
+    pub fn read(&self, owner: &str, store: &dyn KeyStore) -> Result<Option<String>, String> {
+        match self {
+            KeySource::None => Ok(None),
+            KeySource::Stored(target) => match store.read(target)? {
+                Some(key) => Ok(Some(key)),
+                None => Err(tf("{0}: the saved API key is gone. Paste it again in Settings.", &[&owner])),
+            },
+            KeySource::Variable(name) => crate::machine::fresh_variable(name).map(Some).ok_or_else(|| tf("{0} has no API key yet: paste one in Settings, under Connections. (It would come from the variable {1}, which is not set.)", &[&owner, &name])),
+            KeySource::File(path) => std::fs::read_to_string(path).map(|text| Some(text.trim().to_string())).map_err(|error| format!("{owner}: {path}: {error}")),
+        }
+    }
+}
+
+/// How a setting says Credential Manager has the key.
+pub const CREDENTIAL: &str = "credential:";
+
+/// A name for a new key in Credential Manager, not one that another setting uses. It stays when the provider is renamed.
+pub fn new_key_target(owner: &str, in_use: &[&str]) -> String {
+    let clean: String = owner.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
+    let taken = |name: &str| in_use.iter().any(|setting| matches!(KeySource::of(setting), KeySource::Stored(target) if target == name));
+    if !taken(&clean) {
+        return clean;
+    }
+    (2..).map(|at| format!("{clean}-{at}")).find(|name| !taken(name)).unwrap_or(clean)
+}
+
+/// Whether this can be the name of a variable of the environment; a key pasted there cannot.
+pub fn is_variable_name(name: &str) -> bool {
+    let mut letters = name.chars();
+    letters.next().is_some_and(|first| first.is_ascii_alphabetic() || first == '_') && letters.all(|c| c.is_ascii_alphanumeric() || c == '_') && !holds_a_key_itself(name)
 }
 
 impl ProviderConfig {
     /// The key it names; an empty setting is no key, one that cannot be read is an error.
     pub fn key(&self) -> Result<Option<String>, String> {
-        if self.api_key.is_empty() {
-            return Ok(None);
-        }
-        if let Some(name) = self.api_key.strip_prefix("env:") {
-            return std::env::var(name).map(Some).map_err(|_| format!("{}: the variable {name} is not set", self.name));
-        }
-        std::fs::read_to_string(&self.api_key).map(|text| Some(text.trim().to_string())).map_err(|error| format!("{}: {}: {error}", self.name, self.api_key))
+        KeySource::of(&self.api_key).read(&self.name, keys::store())
     }
 
     /// What is wrong with it as typed.
     pub fn problem(&self) -> Option<String> {
         if self.name.trim().is_empty() {
-            return Some("a provider needs a name".into());
+            return Some(t("A connection needs a name.").into());
         }
         if self.kind == Kind::Server && dogmind_agent::http::Url::parse(self.base_url.trim()).is_err() {
-            return Some("a server's URL looks like http://192.168.0.100:8080/v1".into());
+            return Some(t("An address looks like http://192.168.0.100:8080/v1").into());
         }
         if self.kind == Kind::Anthropic && !self.base_url.trim().is_empty() && dogmind_agent::http::Url::parse(self.base_url.trim()).is_err() {
-            return Some("the URL looks like https://api.anthropic.com/v1, or leave it empty".into());
+            return Some(t("An address looks like https://api.anthropic.com/v1, or leave it empty.").into());
         }
         if self.kind == Kind::Anthropic && self.api_key.trim().is_empty() {
-            return Some("Claude needs an API key: a file holding it, or env:ANTHROPIC_API_KEY".into());
+            return Some(t("Claude needs an API key: paste it here.").into());
+        }
+        if let KeySource::Variable(name) = KeySource::of(&self.api_key) {
+            if !is_variable_name(&name) {
+                return Some(t(VARIABLE_NAME_ONLY).into());
+            }
         }
         None
     }
+}
+
+/// What to do with a key where the name of a variable is asked for.
+pub const VARIABLE_NAME_ONLY: &str = "That is not the name of an environment variable. A key itself goes in the API key field above.";
+
+/// Whether what is in a setting that names where a key is looks like the key: the settings are a plain file, and its words would be shown in errors.
+pub fn holds_a_key_itself(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.starts_with("env:") || value.contains(['\\', '/', ' ', ':']) {
+        return false;
+    }
+    const OPENINGS: [&str; 7] = ["sk-", "sk_", "xai-", "gsk_", "ghp_", "AIza", "pk-"];
+    // (a file's name is short, or has its extension)
+    OPENINGS.iter().any(|opening| value.starts_with(opening)) || (value.chars().count() >= 24 && !value.contains('.'))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,6 +163,8 @@ pub struct Settings {
     pub effort: Option<String>,
     pub safe_commands: bool,
     pub show_thinking: bool,
+    /// Tool calls in a row as one line.
+    pub compact_tools: bool,
     /// The engine inside the app: its VRAM budget in GiB, its context in tokens and its port.
     pub vram: Option<f64>,
     pub context: Option<u32>,
@@ -102,8 +179,19 @@ pub struct Settings {
     pub web_tools: bool,
     /// What answers are written in: `auto`, `ja` or `en`.
     pub language: String,
-    /// A file holding a Brave Search API key, or `env:NAME`. Empty: the free indexes, which may refuse a program.
+    /// What the interface is written in: `system`, `en` or `ja`.
+    pub display_language: String,
+    /// How the window looks: `system`, `dark` or `light`.
+    pub theme: String,
+    /// The person has been told that closing the window leaves the app in the tray.
+    pub tray_told: bool,
+    /// Where a Brave Search API key is, as `KeySource` reads it. Empty: the free indexes, which may refuse a program.
     pub search_key: String,
+    /// Where the window was left, and how large, in pixels of the screen: left, top, right, bottom.
+    pub window: Option<[i32; 4]>,
+    pub maximized: bool,
+    /// Sessions kept at the top of the sidebar, by their files.
+    pub pinned: Vec<PathBuf>,
 }
 
 impl Default for Settings {
@@ -121,6 +209,7 @@ impl Default for Settings {
             effort: None,
             safe_commands: false,
             show_thinking: false,
+            compact_tools: true,
             vram: None,
             context: None,
             port: 18480,
@@ -130,15 +219,35 @@ impl Default for Settings {
             right_panel: true,
             web_tools: true,
             language: "auto".into(),
+            display_language: "system".into(),
+            theme: "system".into(),
+            tray_told: false,
             search_key: String::new(),
+            window: None,
+            maximized: false,
+            pinned: Vec::new(),
         }
     }
 }
 
 impl Settings {
-    /// A file that cannot be read gives the defaults, and the broken one is kept beside them.
+    /// What a new install begins with: files change and safe commands run without asking. Not `Default`, which fills in what a file does not say:
+    /// whoever has settings keeps what they had.
+    pub fn fresh() -> Settings {
+        Settings { mode: "accept_edits".into(), safe_commands: true, ..Settings::default() }
+    }
+
+    /// No file is a new install. A file that cannot be read gives the defaults, and the broken one is kept beside them.
     pub fn load(path: &Path) -> Settings {
-        let Ok(text) = std::fs::read_to_string(path) else { return Settings::default() };
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Settings::fresh(),
+            // (not text, or not to be had: kept as a broken one is, or the next save would be all that is left of it)
+            Err(_) => {
+                let _ = std::fs::rename(path, path.with_extension("json.broken"));
+                return Settings::default();
+            }
+        };
         match serde_json::from_str(&text) {
             Ok(settings) => settings,
             Err(_) => {
@@ -148,14 +257,61 @@ impl Settings {
         }
     }
 
-    /// Whole or not at all: the file changes by a rename.
+    /// Whole or not at all: the file changes by a rename, of one already on the disk. Unflushed, a crash leaves the new name on nothing but zeros.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let text = serde_json::to_string_pretty(self).map_err(|error| error.to_string())?;
+        let text = serde_json::to_string_pretty(&self.without_keys()).map_err(|error| error.to_string())?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
         }
         let part = path.with_extension("json.part");
-        std::fs::write(&part, text).and_then(|()| std::fs::rename(&part, path)).map_err(|error| format!("{}: {error}", path.display()))
+        let written = std::fs::File::create(&part).and_then(|mut file| {
+            std::io::Write::write_all(&mut file, text.as_bytes())?;
+            file.sync_all()
+        });
+        written.and_then(|()| std::fs::rename(&part, path)).map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    /// As the file may hold it: whatever else goes wrong, what looks like a key is not written.
+    fn without_keys(&self) -> Settings {
+        let mut clean = self.clone();
+        for provider in &mut clean.providers {
+            if holds_a_key_itself(&provider.api_key) {
+                provider.api_key.clear();
+            }
+        }
+        if holds_a_key_itself(&clean.search_key) {
+            clean.search_key.clear();
+        }
+        clean
+    }
+
+    /// A key an older version let into the file goes to the store, and the file says where it is now. `true`: something moved, and it is to be saved.
+    pub fn move_keys_to(&mut self, store: &dyn KeyStore) -> bool {
+        let mut moved = false;
+        for at in 0..self.providers.len() {
+            if holds_a_key_itself(&self.providers[at].api_key) {
+                let settings: Vec<&str> = self.providers.iter().map(|provider| provider.api_key.as_str()).chain([self.search_key.as_str()]).collect();
+                let target = new_key_target(&self.providers[at].name, &settings);
+                if store.write(&target, self.providers[at].api_key.trim()).is_ok() {
+                    self.providers[at].api_key = format!("{CREDENTIAL}{target}");
+                    moved = true;
+                }
+            }
+        }
+        if holds_a_key_itself(&self.search_key) && store.write(SEARCH_KEY_TARGET, self.search_key.trim()).is_ok() {
+            self.search_key = format!("{CREDENTIAL}{SEARCH_KEY_TARGET}");
+            moved = true;
+        }
+        moved
+    }
+
+    /// Whether the window is to be light now.
+    pub fn is_light(&self) -> bool {
+        match self.theme.as_str() {
+            "light" => true,
+            "dark" => false,
+            _ => crate::paint::theme::system_is_light(),
+        }
     }
 
     /// Remembers a folder as the latest one.
@@ -195,6 +351,9 @@ impl Settings {
     }
 }
 
+/// Under what Credential Manager keeps the search service's key.
+pub const SEARCH_KEY_TARGET: &str = "web-search";
+
 /// A VRAM budget as a person writes it: a number of GiB, or `auto` (or nothing) for what Straydog finds free.
 pub fn parse_vram(text: &str) -> Result<Option<f64>, String> {
     let text = text.trim();
@@ -203,17 +362,48 @@ pub fn parse_vram(text: &str) -> Result<Option<f64>, String> {
     }
     match text.parse::<f64>() {
         Ok(gib) if gib > 0.0 => Ok(Some(gib)),
-        _ => Err("VRAM is a number of GiB, or auto".to_string()),
+        _ => Err(t("The graphics memory limit is a number of GB, or leave it empty.").to_string()),
     }
 }
 
+/// As it stands in its field: empty is what the field's hint says, automatic.
 pub fn show_vram(vram: Option<f64>) -> String {
-    vram.map_or("auto".to_string(), |gib| gib.to_string())
+    vram.map_or(String::new(), |gib| gib.to_string())
 }
 
 /// The app's folder: settings, sessions, the engine's settings and its log.
 pub fn data_folder() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from).join("DogmindApp")
+    data_folder_from(std::env::var_os("DOGMIND_DATA").map(PathBuf::from), std::env::var_os("LOCALAPPDATA").map(PathBuf::from), std::env::temp_dir())
+}
+
+/// (`named`: for running the app beside another copy, with the sandbox's own profile left where the system keeps it, which moving LOCALAPPDATA would not. Only a folder of its own: this is
+/// what Remove empties. A variable with nothing in it, or that says nothing of where, would otherwise put all this wherever the app was started.)
+fn data_folder_from(named: Option<PathBuf>, local: Option<PathBuf>, temp: PathBuf) -> PathBuf {
+    if let Some(named) = named.filter(|folder| folder.is_absolute() && folder.parent().is_some()) {
+        return named;
+    }
+    local.filter(|folder| folder.is_absolute()).unwrap_or(temp).join("DogmindApp")
+}
+
+/// Whether `path` is `folder` or lies under it, as the same folder may be spelled in another case by the system and by a dialog.
+pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
+    let key = |path: &Path| path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let (path, folder) = (key(path), key(folder));
+    path == folder || path.starts_with(&format!("{folder}\\"))
+}
+
+/// What Remove takes out of the data folder, and only if it is what it should be: that folder can be named by a variable, and what is in it goes without another word. It says what it is by
+/// having the settings in it; it does not hold the person's home. `keep`: the model's folder, with whatever holds it, or what lies in it.
+pub fn what_remove_takes(data: &Path, keep: Option<&Path>, home: Option<&Path>) -> Result<Vec<PathBuf>, String> {
+    // (never started, so nothing to take)
+    if !data.exists() {
+        return Ok(Vec::new());
+    }
+    if data.parent().is_none() || home.is_some_and(|home| same_or_inside(home, data)) || !data.join("settings.json").is_file() {
+        return Err(tf("{0} does not look like this app's folder, so nothing in it was removed.", &[&data.display()]));
+    }
+    let kept = |path: &Path| keep.is_some_and(|keep| same_or_inside(keep, path) || same_or_inside(path, keep));
+    Ok(std::fs::read_dir(data).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| !kept(path)).collect())
 }
 
 #[cfg(test)]
@@ -221,9 +411,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_data_folder_is_a_folder_of_its_own_wherever_it_is_named() {
+        let temp = PathBuf::from("C:\\Temp");
+        let local = Some(PathBuf::from("C:\\Users\\me\\AppData\\Local"));
+        let at = |named: Option<&str>, local: Option<PathBuf>| data_folder_from(named.map(PathBuf::from), local, temp.clone());
+        assert_eq!(at(None, local.clone()), PathBuf::from("C:\\Users\\me\\AppData\\Local\\DogmindApp"));
+        assert_eq!(at(Some("D:\\other copy"), local.clone()), PathBuf::from("D:\\other copy"));
+        for not_one in ["C:\\", "D:\\", "relative", "", "\\rooted"] {
+            assert_eq!(at(Some(not_one), local.clone()), PathBuf::from("C:\\Users\\me\\AppData\\Local\\DogmindApp"), "{not_one}");
+        }
+        for empty in ["", "relative"] {
+            assert_eq!(at(None, Some(PathBuf::from(empty))), PathBuf::from("C:\\Temp\\DogmindApp"), "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn remove_takes_from_this_apps_folder_alone_and_leaves_the_model_however_its_path_is_spelled() {
+        let dir = tempfile::tempdir().unwrap();
+        // A folder a variable might name, with a person's files in it and no settings.
+        let other = dir.path().join("Documents");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("thesis.docx"), "years").unwrap();
+        assert!(what_remove_takes(&other, None, None).unwrap_err().contains("does not look like"));
+        // One that holds the home, whatever is in it.
+        let home = dir.path().join("Documents").join("me");
+        std::fs::write(other.join("settings.json"), "{}").unwrap();
+        assert!(what_remove_takes(&other, None, Some(&home)).is_err());
+        assert!(what_remove_takes(Path::new("C:\\"), None, None).is_err());
+        // Its own.
+        let data = dir.path().join("DogmindApp");
+        std::fs::create_dir_all(data.join("sessions")).unwrap();
+        std::fs::create_dir_all(data.join("models").join("q")).unwrap();
+        std::fs::write(data.join("settings.json"), "{}").unwrap();
+        let sorted = |mut paths: Vec<PathBuf>| {
+            paths.sort();
+            paths
+        };
+        assert_eq!(sorted(what_remove_takes(&data, None, None).unwrap()), [data.join("models"), data.join("sessions"), data.join("settings.json")]);
+        let shouting = PathBuf::from(data.join("MODELS").join("q").to_string_lossy().to_uppercase());
+        assert_eq!(sorted(what_remove_takes(&data, Some(&shouting), None).unwrap()), [data.join("sessions"), data.join("settings.json")], "as a dialog may spell it");
+        assert_eq!(what_remove_takes(&data, Some(&data), None).unwrap(), Vec::<PathBuf>::new(), "the model is loose in the folder: nothing can be told from it");
+        assert!(same_or_inside(&shouting, &data) && !same_or_inside(&dir.path().join("DogmindApp2"), &data));
+    }
+
+    #[test]
     fn a_vram_budget_is_auto_unless_a_number_is_given() {
         assert_eq!(Settings::default().vram, None);
-        assert_eq!(show_vram(None), "auto");
+        assert_eq!(show_vram(None), "");
         assert_eq!(show_vram(Some(8.0)), "8");
         for text in ["", "  ", "auto", "AUTO", " Auto "] {
             assert_eq!(parse_vram(text), Ok(None), "{text:?}");
@@ -238,7 +472,7 @@ mod tests {
     fn settings_come_back_as_saved() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub/settings.json");
-        assert_eq!(Settings::load(&path), Settings::default());
+        assert_eq!(Settings::load(&path), Settings::fresh());
         let mut settings = Settings::default();
         settings.providers.push(ProviderConfig { name: "homelab".into(), kind: Kind::Server, base_url: "http://192.168.0.100:8080/v1".into(), model: String::new(), api_key: "env:KEY".into() });
         settings.active = "homelab".into();
@@ -276,6 +510,11 @@ mod tests {
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(Settings::load(&path), Settings::default());
         assert!(path.with_extension("json.broken").is_file());
+        // Not even text: the same.
+        std::fs::remove_file(path.with_extension("json.broken")).unwrap();
+        std::fs::write(&path, [0xFFu8, 0xFE, 0x00, b'{']).unwrap();
+        assert_eq!(Settings::load(&path), Settings::default());
+        assert_eq!(std::fs::read(path.with_extension("json.broken")).unwrap(), [0xFFu8, 0xFE, 0x00, b'{'], "kept");
     }
 
     #[test]
@@ -289,6 +528,23 @@ mod tests {
     }
 
     #[test]
+    fn only_a_new_install_begins_by_accepting_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let new = Settings::load(&path);
+        assert_eq!((new.mode.as_str(), new.safe_commands), ("accept_edits", true), "no file: a new install");
+        std::fs::write(&path, r#"{"active": "Codex"}"#).unwrap();
+        let older = Settings::load(&path);
+        assert_eq!((older.mode.as_str(), older.safe_commands), ("default", false), "a file that does not say keeps what it had");
+        std::fs::write(&path, r#"{"mode": "plan", "safe_commands": false}"#).unwrap();
+        let saved = Settings::load(&path);
+        assert_eq!((saved.mode.as_str(), saved.safe_commands), ("plan", false), "what was chosen stays");
+        std::fs::write(&path, "{ not json").unwrap();
+        let broken = Settings::load(&path);
+        assert_eq!((broken.mode.as_str(), broken.safe_commands), ("default", false), "a broken file is not a new install");
+    }
+
+    #[test]
     fn a_key_comes_from_where_the_provider_says() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("key");
@@ -299,6 +555,81 @@ mod tests {
         assert_eq!(provider.key().unwrap().as_deref(), Some("secret"));
         provider.api_key = "env:DOGMIND_APP_NO_SUCH_VARIABLE".into();
         assert!(provider.key().is_err());
+    }
+
+    #[test]
+    fn what_looks_like_a_key_is_told_from_where_a_key_is() {
+        for key in ["sk-abc123", "  sk-proj-0123456789abcdefghij ", "ghp_abcdef", "AIzaSyA0123456789", "abcdefghijklmnopqrstuvwxyz012345"] {
+            assert!(holds_a_key_itself(key), "{key}");
+        }
+        for place in ["", "env:OPENAI_API_KEY", "credential:Claude", "C:\\keys\\openai.txt", "keys/openai.txt", "openai.key", "key", "a-long-file-name-of-a-key-for-this.txt"] {
+            assert!(!holds_a_key_itself(place), "{place}");
+        }
+    }
+
+    #[test]
+    fn a_key_is_never_written_to_the_settings() {
+        const KEY: &str = "sk-very-secret-0123456789";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let store = keys::MemoryKeys::default();
+        let target = new_key_target("Claude", &[]);
+        store.write(&target, KEY).unwrap();
+        let mut settings = Settings::default();
+        settings.providers[2].api_key = format!("{CREDENTIAL}{target}");
+        settings.save(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains(KEY));
+        assert!(written.contains("credential:Claude"));
+        assert_eq!(KeySource::of(&Settings::load(&path).providers[2].api_key).read("Claude", &store).unwrap().as_deref(), Some(KEY), "and it comes back from the store");
+        // Whatever put one there, the file does not take it.
+        settings.providers[0].api_key = KEY.into();
+        settings.search_key = KEY.into();
+        settings.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(KEY));
+        // Nor does what is shown of a setting or of a failure.
+        let gone = KeySource::Stored("nothing-here".into()).read("Claude", &store).unwrap_err();
+        assert!(!gone.contains(KEY) && !format!("{:?}", KeySource::of(&format!("{CREDENTIAL}{target}"))).contains(KEY), "{gone}");
+    }
+
+    #[test]
+    fn a_key_an_older_file_holds_moves_to_the_store() {
+        const KEY: &str = "sk-from-an-older-file-012345";
+        let store = keys::MemoryKeys::default();
+        let mut settings = Settings::default();
+        settings.providers[2].api_key = KEY.into();
+        settings.search_key = "BSAabcdefghijklmnopqrstuvwxyz0123".into();
+        assert!(settings.move_keys_to(&store));
+        assert_eq!(settings.providers[2].api_key, "credential:Claude");
+        assert_eq!(store.read("Claude").unwrap().as_deref(), Some(KEY));
+        assert_eq!(settings.search_key, format!("{CREDENTIAL}{SEARCH_KEY_TARGET}"));
+        assert!(!settings.move_keys_to(&store), "nothing left to move");
+    }
+
+    #[test]
+    fn what_a_setting_says_about_a_key_is_read_as_before() {
+        assert_eq!(KeySource::of(""), KeySource::None);
+        assert_eq!(KeySource::of(" env:ANTHROPIC_API_KEY "), KeySource::Variable("ANTHROPIC_API_KEY".into()));
+        assert_eq!(KeySource::of("C:\\keys\\a.txt"), KeySource::File("C:\\keys\\a.txt".into()));
+        assert_eq!(KeySource::of("credential:x"), KeySource::Stored("x".into()));
+    }
+
+    #[test]
+    fn a_key_gets_a_name_of_its_own() {
+        assert_eq!(new_key_target("Claude", &[]), "Claude");
+        assert_eq!(new_key_target("my server", &[]), "my-server");
+        assert_eq!(new_key_target("Claude", &["credential:Claude"]), "Claude-2");
+        assert_eq!(new_key_target("Claude", &["credential:Claude", "credential:Claude-2", "env:Claude-3"]), "Claude-3");
+    }
+
+    #[test]
+    fn a_variable_has_a_name_and_a_key_has_not() {
+        assert!(is_variable_name("ANTHROPIC_API_KEY") && is_variable_name("_x1"));
+        for name in ["", "1A", "a b", "sk-abc", "sk_live_0123456789abcdef0123456789"] {
+            assert!(!is_variable_name(name), "{name}");
+        }
+        let provider = ProviderConfig { name: "p".into(), kind: Kind::Server, base_url: "http://h:1/v1".into(), model: String::new(), api_key: "env:sk-oops".into() };
+        assert_eq!(provider.problem().as_deref(), Some(VARIABLE_NAME_ONLY));
     }
 
     #[test]

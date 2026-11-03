@@ -52,6 +52,9 @@ fn folder_of(session: &Path) -> PathBuf {
 
 /// With a session that is deleted.
 pub fn remove_for(session: &Path) -> Result<(), String> {
+    // (its pictures too: nothing else reads them)
+    let _ = std::fs::remove_dir_all(crate::images::folder_of(session));
+    let _ = std::fs::remove_dir_all(crate::baseline::folder_of(session));
     let folder = folder_of(session);
     match std::fs::remove_dir_all(&folder) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {error}", folder.display())),

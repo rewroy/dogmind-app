@@ -10,6 +10,8 @@ license = "MIT"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Function names and lines in a PDB beside the executable, kept by whoever releases it: what a crash report's addresses are read with. It does not ship, and the executable is no larger for it.
+debug = "line-tables-only"
 
 # As in Straydog: its hashing and decoding are unusable unoptimized.
 [profile.dev.package."*"]

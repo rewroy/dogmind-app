@@ -1,13 +1,15 @@
 //! Claude through the Messages API, by raw HTTP as Rust has no official SDK. Thinking blocks go back unchanged and the
 //! conversation is only appended to, as the API checks: `compaction::strip_thinking` is what a compaction does to them.
 
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
 use crate::http::{self, Url};
-use crate::llm::{Completion, Delta, LlmError, Provider, Request, Usage};
+use crate::images::{self, ImageLimit};
+use crate::llm::{self, Completion, Delta, LlmError, Provider, Request, Usage};
 use crate::message::{FunctionCall, Message, ToolCall};
 
 pub const DEFAULT_URL: &str = "https://api.anthropic.com/v1";
@@ -33,7 +35,8 @@ fn assistant_blocks(message: &Message) -> Value {
         blocks.push(json!({"type": "text", "text": text}));
     }
     for call in message.tool_calls.iter().flatten() {
-        let input: Value = serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
+        // (the API takes an object here and nothing else)
+        let input: Value = serde_json::from_str(&call.function.arguments).ok().filter(Value::is_object).unwrap_or_else(|| json!({}));
         blocks.push(json!({"type": "tool_use", "id": call.id, "name": call.function.name, "input": input}));
     }
     if blocks.is_empty() {
@@ -42,15 +45,33 @@ fn assistant_blocks(message: &Message) -> Value {
     Value::Array(blocks)
 }
 
-/// The system prompt and the messages as the API spells them: a response's tool results go in one user message.
+/// A message's words and pictures as the API spells them: plain words when there is no picture.
+fn user_content(message: &Message, folder: Option<&Path>) -> Value {
+    let (pictures, text) = images::loaded(message, folder);
+    if pictures.is_empty() {
+        return Value::String(text);
+    }
+    let mut blocks: Vec<Value> = pictures.iter().map(|picture| json!({"type": "image", "source": {"type": "base64", "media_type": picture.media_type, "data": picture.data}})).collect();
+    if !text.is_empty() {
+        blocks.push(json!({"type": "text", "text": text}));
+    }
+    Value::Array(blocks)
+}
+
+/// The system prompt and the messages, with no folder for pictures.
 pub fn convert(messages: &[Message]) -> (String, Vec<Value>) {
+    convert_in(messages, None)
+}
+
+/// The system prompt and the messages as the API spells them: a response's tool results go in one user message.
+pub fn convert_in(messages: &[Message], folder: Option<&Path>) -> (String, Vec<Value>) {
     let mut system = String::new();
     let mut out: Vec<Value> = Vec::new();
     let mut results: Vec<Value> = Vec::new();
     for message in messages {
         if message.role == "tool" {
             let text = message.content.clone().unwrap_or_default();
-            let mut block = json!({"type": "tool_result", "tool_use_id": message.tool_call_id, "content": text});
+            let mut block = json!({"type": "tool_result", "tool_use_id": message.tool_call_id, "content": user_content(message, folder)});
             if text.starts_with("error: ") {
                 block["is_error"] = json!(true);
             }
@@ -63,7 +84,7 @@ pub fn convert(messages: &[Message]) -> (String, Vec<Value>) {
         match message.role.as_str() {
             "system" => system.push_str(message.content.as_deref().unwrap_or("")),
             "assistant" => out.push(json!({"role": "assistant", "content": assistant_blocks(message)})),
-            _ => out.push(json!({"role": "user", "content": message.content.as_deref().unwrap_or("")})),
+            _ => out.push(json!({"role": "user", "content": user_content(message, folder)})),
         }
     }
     if !results.is_empty() {
@@ -96,7 +117,7 @@ pub fn tools_of(schemas: &Value) -> Vec<Value> {
 }
 
 pub fn request_body(request: &Request) -> Value {
-    let (system, messages) = convert(request.messages);
+    let (system, messages) = convert_in(request.messages, request.images);
     let mut body = json!({
         "model": request.model,
         "max_tokens": MAX_TOKENS,
@@ -122,12 +143,21 @@ fn classify(status: u16, body: &str) -> LlmError {
 }
 
 fn classify_error(status: u16, kind: &str, message: &str) -> LlmError {
-    let text = format!("Claude: {message}");
     if message.contains("prompt is too long") {
-        return LlmError::Overflow(text);
+        return LlmError::Overflow(llm::CONTEXT_FULL.to_string());
     }
-    if matches!(kind, "rate_limit_error" | "overloaded_error" | "api_error" | "timeout_error") || matches!(status, 408 | 409 | 429) || status >= 500 {
+    if llm::refuses_images(&message.to_lowercase()) {
+        return LlmError::NoVision(llm::NO_VISION.to_string());
+    }
+    if matches!(kind, "rate_limit_error" | "overloaded_error") || status == 429 {
+        return LlmError::Transient(llm::SERVER_BUSY.to_string());
+    }
+    let text = format!("Claude: {message}");
+    if matches!(kind, "api_error" | "timeout_error") || matches!(status, 408 | 409) || status >= 500 {
         return LlmError::Transient(text);
+    }
+    if matches!(kind, "authentication_error" | "permission_error") || matches!(status, 401 | 403) {
+        return LlmError::Rejected(llm::KEY_REFUSED.to_string());
     }
     LlmError::Rejected(text)
 }
@@ -146,7 +176,7 @@ struct Assembly {
 
 impl Assembly {
     fn event(&mut self, data: &str, on: &mut dyn FnMut(Delta)) -> Result<(), LlmError> {
-        let event: Value = serde_json::from_str(data).map_err(|error| LlmError::Transient(format!("bad event from Claude: {error}")))?;
+        let event: Value = serde_json::from_str(data).map_err(|_| LlmError::Transient(llm::UNREADABLE.to_string()))?;
         match event.get("type").and_then(Value::as_str).unwrap_or("") {
             "message_start" => {
                 if let Some(usage) = event.pointer("/message/usage") {
@@ -159,7 +189,7 @@ impl Assembly {
                 let block = event.get("content_block").and_then(Value::as_object).cloned().unwrap_or_default();
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     if let Some(name) = block.get("name").and_then(Value::as_str) {
-                        on(Delta::Tool(name));
+                        on(Delta::Tool(event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize, name));
                     }
                 }
                 let at = event.get("index").and_then(Value::as_u64).unwrap_or(self.blocks.len() as u64) as usize;
@@ -187,7 +217,10 @@ impl Assembly {
                         on(Delta::Reasoning(text("thinking")));
                     }
                     "signature_delta" => grow(block, "signature", text("signature")),
-                    "input_json_delta" => self.partial[at].push_str(text("partial_json")),
+                    "input_json_delta" => {
+                        self.partial[at].push_str(text("partial_json"));
+                        on(Delta::Arguments(at, text("partial_json")));
+                    }
                     _ => {}
                 }
             }
@@ -280,18 +313,27 @@ impl Anthropic {
     pub fn context_of(&self, model: &str) -> Result<u64, String> {
         let cancel = AtomicBool::new(false);
         let url = self.base.join(&format!("models/{model}"));
-        let mut response = http::request("GET", &url, &self.headers(), None, Duration::from_secs(10), &cancel).map_err(|failure| failure.to_string())?;
+        let mut response = http::request("GET", &url, &self.headers(), None, Duration::from_secs(10), &cancel).map_err(|failure| LlmError::from(failure).to_string())?;
         let status = response.status;
-        let text = response.text().map_err(|failure| failure.to_string())?;
+        let text = response.text().map_err(|failure| LlmError::from(failure).to_string())?;
         if status != 200 {
             return Err(classify(status, &text).to_string());
         }
-        let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        let value: Value = serde_json::from_str(&text).map_err(|_| llm::UNREADABLE.to_string())?;
         Ok(value.get("max_input_tokens").and_then(Value::as_u64).unwrap_or(DEFAULT_CONTEXT))
     }
 }
 
 impl Provider for Anthropic {
+    /// 5 MB as base64 is what it takes of one; past 2000 pixels a request of many pictures is refused.
+    fn image_limit(&self) -> ImageLimit {
+        ImageLimit { side: 2000, bytes: 3_750_000 }
+    }
+
+    fn images_in_tool_results(&self) -> bool {
+        true
+    }
+
     fn stream(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
         let text = request_body(request).to_string();
         let url = self.base.join("messages");
@@ -419,11 +461,11 @@ mod tests {
     fn a_request_is_what_the_current_api_takes() {
         let schemas = crate::tools::schemas();
         let messages = [Message::text("system", "s"), Message::text("user", "hi")];
-        let body = request_body(&Request { model: DEFAULT_MODEL, messages: &messages, tools: Some(&schemas), effort: Some("none") });
+        let body = request_body(&Request { model: DEFAULT_MODEL, messages: &messages, tools: Some(&schemas), effort: Some("none"), images: None, japanese_letters: false });
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "low");
         assert_eq!(body["system"], "s");
-        assert_eq!(body["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 12);
         assert_eq!(body["tools"][0]["eager_input_streaming"], true);
         assert!(body["tools"][0].get("input_schema").is_some());
         for field in ["temperature", "top_p", "top_k", "tool_choice"] {

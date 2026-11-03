@@ -102,11 +102,19 @@ impl Drop for Server {
 }
 
 impl Server {
-    fn start() -> Result<Server, LlmError> {
-        let executable = find_executable().ok_or_else(|| LlmError::Rejected("the Codex CLI was not found: install it, then sign in with ChatGPT".into()))?;
-        let config = codex_home().and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok()).unwrap_or_default();
-        let mut command = Command::new(executable);
-        command.args(arguments(&config)).env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    /// `stand_in`: what a test runs in place of the Codex CLI.
+    fn start(stand_in: Option<&StandIn>) -> Result<Server, LlmError> {
+        let mut command = match stand_in {
+            Some(stand_in) => stand_in(),
+            None => {
+                let executable = find_executable().ok_or_else(|| LlmError::Rejected("the Codex CLI was not found: install it, then sign in with ChatGPT".into()))?;
+                let config = codex_home().and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok()).unwrap_or_default();
+                let mut command = Command::new(executable);
+                command.args(arguments(&config));
+                command
+            }
+        };
+        command.env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         for name in KEPT_VARIABLES {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
@@ -204,21 +212,36 @@ fn output_schema() -> Value {
     })
 }
 
+#[cfg(test)]
 fn payload(request: &Request) -> String {
+    transcript(request).0
+}
+
+/// What a turn is given: the conversation as text, and its pictures as items of their own, which it names by their number.
+fn transcript(request: &Request) -> (String, Vec<Value>) {
+    let mut pictures = Vec::new();
     let messages: Vec<Value> = request.messages.iter().map(|message| {
         let mut value = serde_json::to_value(message.without_provider_blocks()).unwrap_or(Value::Null);
         if let Some(fields) = value.as_object_mut() {
             fields.remove("reasoning_content");
+            if fields.remove("images").is_some() {
+                let (loaded, text) = crate::images::loaded(message, request.images);
+                fields.insert("content".to_string(), json!(text));
+                let first = pictures.len() + 1;
+                pictures.extend(loaded.iter().map(|picture| json!({"type": "image", "url": picture.data_url()})));
+                fields.insert("attached_images".to_string(), json!((first..=pictures.len()).collect::<Vec<usize>>()));
+            }
         }
         value
     }).collect();
-    json!({
+    let text = json!({
         "instruction": "The Codex built-in tools are disabled, but the Dogmind tools listed in dogmind_tools are available. Request them through kind=tool_calls; Dogmind will execute them and return their results. Never claim that live workspace access is unavailable before requesting an appropriate Dogmind tool. A returned Dogmind tool error is specific to that call. Return a final answer, or request one or more Dogmind tools. Do not execute tools yourself.",
         "dogmind_tools": request.tools.cloned().unwrap_or(json!([])),
         "messages": messages,
         "tool_choice": "auto",
-        "turn_instruction": "Always include content and tool_calls; use an empty string or empty array for unused fields. Each tool-call arguments value must be a JSON-encoded object string matching that tool's schema.",
-    }).to_string()
+        "turn_instruction": "Always include content and tool_calls; use an empty string or empty array for unused fields. Each tool-call arguments value must be a JSON-encoded object string matching that tool's schema. A message's attached_images are the numbers of the images that come with this input, counted in order.",
+    }).to_string();
+    (text, pictures)
 }
 
 /// The structured answer as a completion.
@@ -268,23 +291,60 @@ fn final_text(turn: &Value) -> Option<String> {
         .or_else(|| messages.iter().rev().filter(|item| item.get("phase").and_then(Value::as_str) != Some("commentary")).find_map(|item| text(item)))
 }
 
+type StandIn = Box<dyn Fn() -> Command + Send + Sync>;
+
+/// A page of `model/list`, by id, with what the plan marks as its default ahead of the rest.
+fn models_of(page: &Value, models: &mut Vec<String>) {
+    for item in page.get("data").and_then(Value::as_array).into_iter().flatten() {
+        let Some(id) = item.get("id").or_else(|| item.get("model")).and_then(Value::as_str) else { continue };
+        if models.iter().any(|known| known == id) {
+            continue;
+        }
+        if item.get("isDefault").and_then(Value::as_bool) == Some(true) {
+            models.insert(0, id.to_string());
+        } else {
+            models.push(id.to_string());
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Codex {
     server: Mutex<Option<Server>>,
+    stand_in: Option<StandIn>,
 }
 
 impl Codex {
-    /// The models this ChatGPT plan offers.
+    /// The models this ChatGPT plan offers, as Codex lists them, the default first.
     pub fn models(&self) -> Result<Vec<String>, LlmError> {
+        const PAGES: usize = 20;
         let mut slot = self.server.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let server = match &mut *slot {
             Some(server) => server,
-            empty => empty.insert(Server::start()?),
+            empty => empty.insert(Server::start(self.stand_in.as_ref())?),
         };
         let cancel = AtomicBool::new(false);
-        let answer = server.request("model/list", json!({"includeHidden": false, "limit": 100}), &cancel, &mut |_| Ok(()))?;
-        Ok(answer.get("data").and_then(Value::as_array).into_iter().flatten()
-            .filter_map(|item| item.get("id").or_else(|| item.get("model")).and_then(Value::as_str).map(str::to_string)).collect())
+        let (mut models, mut cursor): (Vec<String>, Option<String>) = (Vec::new(), None);
+        for _ in 0..PAGES {
+            let mut params = json!({"includeHidden": false, "limit": 100});
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let answer = match server.request("model/list", params, &cancel, &mut |_| Ok(())) {
+                Ok(answer) => answer,
+                // (as after a turn: a server that failed here is not asked again)
+                Err(error) => {
+                    *slot = None;
+                    return Err(error);
+                }
+            };
+            models_of(&answer, &mut models);
+            cursor = answer.get("nextCursor").and_then(Value::as_str).filter(|cursor| !cursor.is_empty()).map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(models)
     }
 
     fn turn(server: &mut Server, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
@@ -297,7 +357,10 @@ impl Codex {
         if thread_id.is_empty() {
             return Err(LlmError::Transient("the Codex app-server returned no thread".into()));
         }
-        let mut params = json!({"threadId": thread_id, "input": [{"type": "text", "text": payload(request)}], "model": request.model, "outputSchema": output_schema(), "summary": "auto"});
+        let (text, pictures) = transcript(request);
+        let mut input = vec![json!({"type": "text", "text": text})];
+        input.extend(pictures);
+        let mut params = json!({"threadId": thread_id, "input": input, "model": request.model, "outputSchema": output_schema(), "summary": "auto"});
         if let Some(effort) = request.effort.filter(|effort| ["none", "minimal", "low", "medium", "high", "xhigh"].contains(effort)) {
             params["effort"] = json!(effort);
         }
@@ -352,10 +415,15 @@ fn observe(message: &Value, thread: &str, reasoning: &mut String, usage: &mut Op
 }
 
 impl Provider for Codex {
+    /// The whole conversation is one input: a tool's picture is as good as the person's.
+    fn images_in_tool_results(&self) -> bool {
+        true
+    }
+
     fn stream(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
         let mut slot = self.server.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if slot.is_none() {
-            *slot = Some(Server::start()?);
+            *slot = Some(Server::start(self.stand_in.as_ref())?);
         }
         let server = slot.as_mut().ok_or_else(|| LlmError::Transient("the Codex app-server did not start".into()))?;
         let result = Codex::turn(server, request, cancel, on);
@@ -370,6 +438,58 @@ impl Provider for Codex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This test program again, as the app-server of a plan with three models over two pages. It is what the tests below talk to; no Codex CLI and no account is involved.
+    #[test]
+    #[ignore = "started by the tests below, in place of the Codex CLI"]
+    fn stand_in_app_server() {
+        let mut out = std::io::stdout();
+        // (the test harness has left its own words on this line)
+        writeln!(out).unwrap();
+        for line in BufReader::new(std::io::stdin()).lines().map_while(Result::ok) {
+            let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+            let (id, method) = (message["id"].clone(), message["method"].as_str().unwrap_or("").to_string());
+            let answer = match method.as_str() {
+                "model/list" if message["params"].get("cursor").is_some() => json!({"data": [{"id": "gpt-chosen", "model": "gpt-chosen"}]}),
+                "model/list" => json!({"data": [{"id": "gpt-first"}, {"id": "gpt-default", "isDefault": true}], "nextCursor": "more"}),
+                "thread/start" => json!({"thread": {"id": format!("thread-{}", message["params"]["model"].as_str().unwrap_or(""))}}),
+                "initialize" | "turn/start" => json!({}),
+                _ => continue,
+            };
+            writeln!(out, "{}", json!({"jsonrpc": "2.0", "id": id, "result": answer})).unwrap();
+            if method == "turn/start" {
+                // What it answers is the model it was asked for, by the thread and by the turn.
+                let said = format!("{} {}", message["params"]["threadId"].as_str().unwrap_or(""), message["params"]["model"].as_str().unwrap_or(""));
+                let final_text = json!({"kind": "final", "content": said, "tool_calls": []}).to_string();
+                let turn = json!({"status": "completed", "items": [{"type": "agentMessage", "phase": "final_answer", "text": final_text}]});
+                writeln!(out, "{}", json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": message["params"]["threadId"], "turn": turn}})).unwrap();
+            }
+            out.flush().unwrap();
+        }
+    }
+
+    fn stood_in() -> Codex {
+        let stand_in: StandIn = Box::new(|| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["codex::tests::stand_in_app_server", "--exact", "--ignored", "--nocapture", "--test-threads=1"]);
+            command
+        });
+        Codex { stand_in: Some(stand_in), ..Codex::default() }
+    }
+
+    #[test]
+    fn the_models_are_the_plans_own_list_all_of_it_with_its_default_first() {
+        assert_eq!(stood_in().models().unwrap(), ["gpt-default", "gpt-first", "gpt-chosen"]);
+    }
+
+    #[test]
+    fn the_model_chosen_is_the_one_the_request_asks_for() {
+        let codex = stood_in();
+        let messages = [crate::message::Message::text("user", "hi")];
+        let request = Request { model: "gpt-chosen", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false };
+        let answer = codex.stream(&request, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(answer.content, "thread-gpt-chosen gpt-chosen");
+    }
 
     #[test]
     fn its_own_tools_and_every_mcp_server_are_off() {
@@ -422,7 +542,20 @@ mod tests {
     fn the_transcript_leaves_out_the_reasoning() {
         let message = crate::message::Message { role: "assistant".into(), content: Some("a".into()), reasoning_content: Some("secret".into()), ..Default::default() };
         let messages = [message];
-        let text = payload(&Request { model: "m", messages: &messages, tools: None, effort: None });
+        let text = payload(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false });
         assert!(!text.contains("secret") && text.contains("dogmind_tools"));
+    }
+
+    #[test]
+    fn a_picture_goes_beside_the_transcript_and_is_named_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("s.jsonl");
+        let bytes = crate::images::tests::encoded(8, 8, image::ImageFormat::Png);
+        let kept = crate::images::save(&session, &crate::images::attach_bytes("a", bytes.clone()).unwrap(), crate::images::ImageLimit::WIDE).unwrap();
+        let messages = [crate::message::Message { images: vec![kept], ..crate::message::Message::text("user", "what") }];
+        let folder = crate::images::folder_of(&session);
+        let (text, pictures) = transcript(&Request { model: "m", messages: &messages, tools: None, effort: None, images: Some(&folder), japanese_letters: false });
+        assert_eq!(pictures, [json!({"type": "image", "url": format!("data:image/png;base64,{}", crate::images::base64(&bytes))})]);
+        assert!(text.contains("\"attached_images\":[1]") && !text.contains("media_type") && !text.contains("base64"), "{text}");
     }
 }

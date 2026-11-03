@@ -4,7 +4,7 @@
 //!
 //! Grants are ACEs for this profile's SID, as AppContainers have no other way: they are written on the folders and persist.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::os::windows::io::FromRawHandle;
@@ -20,12 +20,16 @@ use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Pipes::CreatePipe;
-use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, SE_GROUP_ENABLED};
+use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, CreateDesktopW, CreateWindowStationW, EnumDesktopWindows, GetProcessWindowStation, GetUserObjectInformationW, SetProcessWindowStation, HDESK, UOI_NAME};
+use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SE_GROUP_ENABLED};
 use windows_sys::Win32::System::Threading::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowTextW};
 
 const PROFILE: &str = "DogmindApp.Exec";
-const READ_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-const READ_WRITE_EXECUTE: u32 = READ_EXECUTE | FILE_GENERIC_WRITE | DELETE;
+pub(crate) const READ_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+/// Going through a folder, and nothing of what is in it.
+pub(crate) const TRAVERSE: u32 = FILE_GENERIC_EXECUTE;
+pub(crate) const READ_WRITE_EXECUTE: u32 = READ_EXECUTE | FILE_GENERIC_WRITE | DELETE;
 /// `internetClient` and `privateNetworkClientServer`, for a command approved for the network.
 const NETWORK_CAPABILITIES: [&str; 2] = ["S-1-15-3-1", "S-1-15-3-3"];
 /// What a command inherits, as the agent's own environment may hold keys. TEMP and TMP are the profile's.
@@ -46,6 +50,147 @@ pub struct Output {
     pub status: Option<i32>,
     /// Why it has no status.
     pub ended: &'static str,
+    /// The windows it had open on its own desktop, which nobody can see.
+    pub shown: Vec<String>,
+    /// What was taken out of a repository the command made, as it would have run outside the sandbox.
+    pub disarmed: Vec<String>,
+    /// The memory it may use, when it failed having used all of it.
+    pub out_of_memory: Option<u64>,
+}
+
+/// So that nothing a command does can raise a box on the person's screen: not "the application was unable to start", which the system itself shows, on the desktop in use, whatever desktop
+/// the program is on, and not the crash dialog. Children have this from their parent, so it is set before any is started, and it stays set. It is said at the app's start too.
+pub fn no_error_boxes() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX};
+    // SAFETY: it takes flags and returns the old ones.
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+}
+
+/// What a command may do to the person's session, whatever it is: nothing of their clipboard, their settings or their windows.
+const UI_LIMITS: u32 = JOB_OBJECT_UILIMIT_DESKTOP | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS | JOB_OBJECT_UILIMIT_EXITWINDOWS | JOB_OBJECT_UILIMIT_GLOBALATOMS | JOB_OBJECT_UILIMIT_HANDLES | JOB_OBJECT_UILIMIT_READCLIPBOARD | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS | JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
+/// A dialog with no one to answer it is the end of a command: it would only wait out its time, at the cost of minutes of a slow model's.
+const MOST_DIALOG: Duration = Duration::from_secs(10);
+/// Read, draw and enumerate; never switch to it, which would take the person's screen away.
+const ON_ITS_DESKTOP: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0040 | 0x0080 | READ_CONTROL;
+
+/// A desktop of its own for one command, in a window station that is never shown. Whatever the command opens goes there.
+struct Desktop {
+    handle: HDESK,
+    /// As `lpDesktop` wants it, to the terminating nul.
+    name: Vec<u16>,
+}
+
+impl Drop for Desktop {
+    fn drop(&mut self) {
+        // SAFETY: the handle is this value's.
+        unsafe { CloseDesktop(self.handle) };
+    }
+}
+
+/// Lets the container use a window station or desktop: these rights, and a label it may write under, as a container runs at low integrity.
+unsafe fn let_container_use(object: HANDLE, sid: PSID, rights: u32) -> Result<(), String> {
+    let (mut old, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
+    if GetSecurityInfo(object, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), &mut old, std::ptr::null_mut(), &mut descriptor) != 0 {
+        return Err(last_error("a desktop's access list"));
+    }
+    let mut access: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    access.grfAccessPermissions = rights;
+    access.grfAccessMode = GRANT_ACCESS;
+    access.grfInheritance = NO_INHERITANCE;
+    access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    access.Trustee.ptstrName = sid as *mut u16;
+    let mut new: *mut ACL = std::ptr::null_mut();
+    let merged = SetEntriesInAclW(1, &access, old, &mut new);
+    let written = if merged == 0 { SetSecurityInfo(object, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), new, std::ptr::null()) } else { merged };
+    LocalFree(new as HLOCAL);
+    LocalFree(descriptor as HLOCAL);
+    if written != 0 {
+        return Err(format!("a desktop's access list could not be written (error {written})"));
+    }
+    let label = wide("S:(ML;;NW;;;LW)");
+    let mut low: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    if ConvertStringSecurityDescriptorToSecurityDescriptorW(label.as_ptr(), 1, &mut low, std::ptr::null_mut()) == 0 {
+        return Err(last_error("a desktop's label"));
+    }
+    let (mut present, mut sacl, mut defaulted): (BOOL, *mut ACL, BOOL) = (0, std::ptr::null_mut(), 0);
+    let labelled = GetSecurityDescriptorSacl(low, &mut present, &mut sacl, &mut defaulted) != 0 && SetSecurityInfo(object, SE_WINDOW_OBJECT, LABEL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), sacl) == 0;
+    LocalFree(low as HLOCAL);
+    if labelled { Ok(()) } else { Err("a desktop's label could not be written".to_string()) }
+}
+
+/// One window station for all commands, for as long as the app runs. One made by a program is not interactive: nothing in it can reach the screen, and the system does not show
+/// its hard errors, which it would show on the desktop in use from any desktop of the person's own station, for a program that has put its error mode back to the default.
+static STATION: Mutex<usize> = Mutex::new(0);
+/// Everything but ending the session and reading the screen.
+const ON_ITS_STATION: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0200 | READ_CONTROL;
+
+impl Desktop {
+    unsafe fn new(sid: PSID) -> Result<Desktop, String> {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let name = format!("DogmindExec-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+        let own = wide(&name);
+        let mut station = STATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *station == 0 {
+            // (with no name, as only an administrator can choose one: the system gives it one; WINSTA_ALL_ACCESS)
+            let made = CreateWindowStationW(std::ptr::null(), 0, 0x37F | READ_CONTROL | WRITE_DAC | WRITE_OWNER, std::ptr::null());
+            if made.is_null() {
+                return Err(last_error("a window station of its own"));
+            }
+            let_container_use(made as HANDLE, sid, ON_ITS_STATION)?;
+            *station = made as usize;
+        }
+        // A desktop is made in the process's station. The app's own threads have theirs already, and it is back in a moment.
+        let usual = GetProcessWindowStation();
+        if SetProcessWindowStation(*station as _) == 0 {
+            return Err(last_error("its window station"));
+        }
+        let handle = CreateDesktopW(own.as_ptr(), std::ptr::null(), std::ptr::null(), 0, 0x1000_0000, std::ptr::null());
+        let failed = handle.is_null().then(|| last_error("a desktop of its own"));
+        SetProcessWindowStation(usual);
+        drop(station);
+        if let Some(failed) = failed {
+            return Err(failed);
+        }
+        let mut station_name = [0u16; 128];
+        let mut needed = 0u32;
+        if GetUserObjectInformationW(*STATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) as HANDLE, UOI_NAME, station_name.as_mut_ptr().cast(), 256, &mut needed) == 0 {
+            CloseDesktop(handle);
+            return Err(last_error("its window station's name"));
+        }
+        let length = station_name.iter().position(|unit| *unit == 0).unwrap_or(0);
+        let desktop = Desktop { handle, name: wide(&format!("{}\\{name}", String::from_utf16_lossy(&station_name[..length]))) };
+        let_container_use(handle as HANDLE, sid, ON_ITS_DESKTOP)?;
+        Ok(desktop)
+    }
+
+    /// Its windows: their class and title.
+    unsafe fn windows(&self) -> Vec<(String, String)> {
+        unsafe extern "system" fn each(window: windows_sys::Win32::Foundation::HWND, found: LPARAM) -> BOOL {
+            let found = &mut *(found as *mut Vec<(String, String)>);
+            let (mut class, mut title) = ([0u16; 128], [0u16; 256]);
+            let class_length = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+            let title_length = GetWindowTextW(window, title.as_mut_ptr(), title.len() as i32).max(0) as usize;
+            let (class, title) = (String::from_utf16_lossy(&class[..class_length]), String::from_utf16_lossy(&title[..title_length]));
+            // (nothing is ever "visible" in a station with no screen. These are a program's own unseen helpers, there for any that uses windows at all)
+            const HELPERS: [&str; 8] = ["IME", "MSCTFIME", "GDI+", "Chrome_", "Base_", "tooltips", "CicMarshal", "OleMainThread"];
+            if !HELPERS.iter().any(|helper| class.starts_with(helper)) {
+                found.push((class, title));
+            }
+            1
+        }
+        let mut found: Vec<(String, String)> = Vec::new();
+        // (a desktop's windows can be listed only from its own station)
+        let station = STATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let usual = GetProcessWindowStation();
+        if SetProcessWindowStation(*station as _) != 0 {
+            EnumDesktopWindows(self.handle, Some(each), std::ptr::addr_of_mut!(found) as LPARAM);
+            SetProcessWindowStation(usual);
+        }
+        found
+    }
 }
 
 /// A command's output: UTF-8, as asked for, or for what ignored that (cmd.exe's own messages) the system's code page.
@@ -71,41 +216,134 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn wide_path(path: &Path) -> Vec<u16> {
+pub(crate) fn wide_path(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    let plain: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // (past this the ordinary spelling is refused, and what is deep in a tree is as much a part of it as what is not)
+    let prefix: &[u16] = if plain.len() >= 248 && path.is_absolute() && !path.as_os_str().to_string_lossy().starts_with("\\\\") { &[0x5c, 0x5c, 0x3f, 0x5c] } else { &[] };
+    prefix.iter().copied().chain(plain).chain(std::iter::once(0)).collect()
 }
 
 fn last_error(what: &str) -> String {
     format!("{what}: {}", std::io::Error::last_os_error())
 }
 
-fn key(path: &Path) -> String {
+pub(crate) fn key(path: &Path) -> String {
     path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
 /// Whether `inner` is `outer` or lies under it.
-fn under(inner: &str, outer: &str) -> bool {
+pub(crate) fn under(inner: &str, outer: &str) -> bool {
     inner == outer || inner.starts_with(&format!("{outer}\\"))
+}
+
+/// What the drive of a folder is, as far as a sandbox and a large file care.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Volume {
+    /// `NTFS`, `exFAT`, `FAT32`..., or empty for a network folder, whose answer may take long and changes nothing.
+    pub file_system: String,
+    /// Whether it keeps access lists at all. Without them nothing on it can be closed to a container, and an AppContainer's grants have nothing to be written on.
+    pub keeps_permissions: bool,
+    /// On another machine. A container has no network, so it cannot reach this at all.
+    pub remote: bool,
+}
+
+/// The drive of this folder, or of the nearest folder above it that exists.
+pub fn volume_of(path: &Path) -> Option<Volume> {
+    let existing = path.ancestors().find(|folder| folder.is_dir())?;
+    if existing.to_string_lossy().starts_with("\\\\") && !existing.to_string_lossy().starts_with("\\\\?\\") {
+        return Some(Volume { file_system: String::new(), keeps_permissions: true, remote: true });
+    }
+    let mut root = [0u16; 300];
+    // SAFETY: the name ends in a zero, and the buffers are as long as the calls are told.
+    unsafe {
+        if GetVolumePathNameW(wide_path(existing).as_ptr(), root.as_mut_ptr(), root.len() as u32) == 0 {
+            return None;
+        }
+        if GetDriveTypeW(root.as_ptr()) == 4 { // DRIVE_REMOTE
+            return Some(Volume { file_system: String::new(), keeps_permissions: true, remote: true });
+        }
+        let (mut flags, mut name) = (0u32, [0u16; 64]);
+        if GetVolumeInformationW(root.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(), &mut flags, name.as_mut_ptr(), name.len() as u32) == 0 {
+            return None;
+        }
+        let length = name.iter().position(|&unit| unit == 0).unwrap_or(name.len());
+        Some(Volume { file_system: String::from_utf16_lossy(&name[..length]), keeps_permissions: flags & 8 != 0, remote: false }) // FILE_PERSISTENT_ACLS
+    }
+}
+
+/// Whether this process could write in a folder and change who may read it, asked by opening it for those and changing nothing. (`None` where it cannot be opened for looking at all.)
+pub fn rights_on(folder: &Path) -> Option<(bool, bool)> {
+    let open = |access: u32| {
+        // SAFETY: the name ends in a zero; the handle is closed here.
+        unsafe {
+            let handle = CreateFileW(wide_path(folder).as_ptr(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut());
+            if handle == INVALID_HANDLE_VALUE {
+                return false;
+            }
+            CloseHandle(handle);
+            true
+        }
+    };
+    open(FILE_READ_ATTRIBUTES).then(|| (open(FILE_ADD_FILE), open(WRITE_DAC)))
+}
+
+/// Why a command cannot be contained on this drive, whatever the folder: it would not reach it, or nothing there could keep it in.
+fn drive_refusal(volume: &Volume, folder: &Path) -> Option<String> {
+    if volume.remote {
+        return Some(format!("{} is on a network drive, and a command has no network to reach it by: it runs only in a folder on a drive of this PC", folder.display()));
+    }
+    (!volume.keeps_permissions).then(|| format!("{} is on a drive with no file permissions ({}), so nothing there could keep a command inside its folder: it runs only in a folder on an NTFS drive", folder.display(), volume.file_system))
+}
+
+/// Where a path really leads, through links, junctions and short names. An ACE goes on what a path leads to, so that is what has to be judged: `C:\Documents and Settings\me` and
+/// `C:\Users\me\Local Settings` are there on every Windows, and read as nothing in particular.
+fn real(path: &Path) -> PathBuf {
+    crate::safety::real_path(path).unwrap_or_else(|| path.to_path_buf())
+}
+
+/// The folders a command writing in would be writing over this app itself: what it runs from, and what it remembers, with the lists of what it has given.
+fn own_folders() -> Vec<PathBuf> {
+    let program = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.to_path_buf()));
+    program.into_iter().chain(crate::workspace_grants::data_folder()).collect()
 }
 
 /// Why this folder cannot be the writable one: a command could then write over everything the person has.
 pub fn refusal(workspace: &Path, home: Option<&Path>) -> Option<String> {
-    let place = key(workspace);
-    if workspace.parent().is_none() || place.ends_with(':') {
-        return Some(format!("{} is a whole drive, so a command runs only in a project folder inside it", workspace.display()));
+    refusal_with(workspace, home, &own_folders())
+}
+
+fn refusal_with(workspace: &Path, home: Option<&Path>, own: &[PathBuf]) -> Option<String> {
+    let really = real(workspace);
+    for folder in [workspace, really.as_path()] {
+        let place = key(folder);
+        if folder.parent().is_none() || place.ends_with(':') {
+            return Some(format!("{} is a whole drive, so a command runs only in a project folder inside it", workspace.display()));
+        }
+        if crate::safety::keys_folder(folder) {
+            return Some(format!("{} is a place keys are kept, so a command does not run in it", workspace.display()));
+        }
+        if own.iter().map(|folder| key(&real(folder))).any(|own| under(&own, &place) || under(&place, &own)) {
+            return Some(format!("{} holds this app's own files, or lies among them, and what a command wrote there would run outside its sandbox: a command runs only in a folder of its own", workspace.display()));
+        }
+        if let Some(home) = home {
+            if under(&key(home), &place) || under(&key(&real(home)), &place) {
+                return Some(format!("{} holds your whole user folder, so a command runs only in a project folder inside it", workspace.display()));
+            }
+        }
     }
-    let home = home.map(key)?;
-    under(&home, &place).then(|| format!("{} holds your whole user folder, so a command runs only in a project folder inside it", workspace.display()))
+    None
 }
 
 /// The folder a command may write in. Normally the workspace; a workspace too wide to give away still has project folders in
 /// it, and one of those is given when the command says it runs there, and nothing more. What a person keeps in the usual
-/// places stays closed, and whatever the folder, the command has been through the approvals like any other.
+/// places stays closed, and whatever the folder, the command has been through the approvals like any other. It is the folder itself that is given, wherever the path to it goes through.
 pub fn writable_root(cwd: &Path, workspace: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
+    let (cwd, workspace, home) = (real(cwd), real(workspace), home.map(real));
+    let (cwd, workspace, home) = (cwd.as_path(), workspace.as_path(), home.as_deref());
     let Some(reason) = refusal(workspace, home) else {
         if !under(&key(cwd), &key(workspace)) {
-            return Err(format!("{} is outside the workspace: a command runs inside it", cwd.display()));
+            return Err(format!("{} is outside the workspace: a command runs inside it. `read_file`, `list_files` and `search_files` can look there; running something there takes the user opening it as the workspace", cwd.display()));
         }
         return Ok(workspace.to_path_buf());
     };
@@ -119,7 +357,7 @@ pub fn writable_root(cwd: &Path, workspace: &Path, home: Option<&Path>) -> Resul
     }
     let first = place[wide.len()..].trim_start_matches('\\');
     let first = first.split('\\').next().unwrap_or("");
-    if first.starts_with('.') || NOT_A_PROJECT.contains(&first) {
+    if first.starts_with('.') || NOT_A_PROJECT.contains(&first) || crate::safety::keys_folder(cwd) {
         return Err(format!("{} is not a project folder. {advice}", cwd.display()));
     }
     // Directly under one of the usual places would not be caught above when the workspace is itself one level higher.
@@ -131,11 +369,17 @@ pub fn writable_root(cwd: &Path, workspace: &Path, home: Option<&Path>) -> Resul
 
 /// The per-user folders to make readable: PATH's under the home, and the toolchain homes. Never the home itself.
 pub fn toolchain_folders(path_variable: &str, home: &Path) -> Vec<PathBuf> {
-    let home_key = key(home);
+    const TOO_WIDE: [&str; 3] = ["appdata", "appdata\\local", "appdata\\roaming"];
+    let home_key = key(&real(home));
     let mut folders: Vec<PathBuf> = std::env::split_paths(path_variable)
         .filter(|folder| {
-            let entry = key(folder);
-            entry != home_key && under(&entry, &home_key) && !entry.contains("\\.ssh")
+            // (as it would be opened: an entry that ends in `\.` is the home itself)
+            if folder.components().any(|part| part == std::path::Component::ParentDir) {
+                return false;
+            }
+            let entry = key(&real(&folder.components().collect::<PathBuf>()));
+            let wide = entry.strip_prefix(&format!("{home_key}\\")).is_some_and(|inside| TOO_WIDE.contains(&inside));
+            entry != home_key && under(&entry, &home_key) && !wide && !crate::safety::keys_folder(folder) && !entry.contains("\\.ssh")
         })
         .collect();
     folders.extend(TOOLCHAIN_HOMES.iter().map(|name| home.join(name)));
@@ -150,6 +394,7 @@ pub fn closed_tool_folders() -> Vec<PathBuf> {
     let Some(path) = std::env::var_os("PATH") else { return Vec::new() };
     let home = std::env::var_os("USERPROFILE").map_or(String::new(), |home| key(Path::new(&home)));
     let system = std::env::var_os("SystemRoot").map_or(String::new(), |root| key(Path::new(&root)));
+    let bundled = crate::bundled::root().is_some();
     // SAFETY: the SID lives as long as the process, and each call below gets the sizes it is given.
     unsafe {
         let Ok(sid) = profile_sid() else { return Vec::new() };
@@ -159,8 +404,32 @@ pub fn closed_tool_folders() -> Vec<PathBuf> {
             .filter(|folder| !under(&key(folder), &home) && !under(&key(folder), &system))
             // What a project's commands would want; an unrelated program's folder stays as it is.
             .filter(|folder| DEVELOPER_TOOLS.iter().any(|tool| ["exe", "cmd"].iter().any(|ext| folder.join(format!("{tool}.{ext}")).is_file())))
+            // (a person's own Node or Python is not what a command runs when these are beside the app)
+            .filter(|folder| !bundled || !crate::bundled::NAMES.iter().any(|name| folder.join(name).is_file()))
             .filter(|folder| !open_to_container(folder, sid))
             .collect()
+    }
+}
+
+/// Whether every container can read this already, as under Program Files, where a person who is not an administrator could not change that.
+pub fn open_to_every_container(folder: &Path) -> bool {
+    // SAFETY: the system's own well-known SID, freed by what makes it.
+    unsafe {
+        let text = wide("S-1-15-2-1");
+        let mut every: PSID = std::ptr::null_mut();
+        if ConvertStringSidToSidW(text.as_ptr(), &mut every) == 0 {
+            return false;
+        }
+        let found = open_to_container(folder, every);
+        LocalFree(every as HLOCAL);
+        found
+    }
+}
+
+/// Passing through the folders above, and nothing of what is in them.
+pub(crate) unsafe fn grant_way_to(folder: &Path, sid: PSID) {
+    for ancestor in folder.ancestors().skip(1).filter(|above| above.parent().is_some()) {
+        let _ = grant(ancestor, sid, TRAVERSE, false);
     }
 }
 
@@ -224,7 +493,7 @@ unsafe impl Sync for Sid {}
 static PROFILE_SID: Mutex<Option<Sid>> = Mutex::new(None);
 static GRANTED: Mutex<Option<HashSet<(String, u32, bool)>>> = Mutex::new(None);
 
-unsafe fn profile_sid() -> Result<PSID, String> {
+pub(crate) unsafe fn profile_sid() -> Result<PSID, String> {
     let mut slot = PROFILE_SID.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(sid) = &*slot {
         return Ok(sid.0);
@@ -239,7 +508,7 @@ unsafe fn profile_sid() -> Result<PSID, String> {
     Ok(sid)
 }
 
-unsafe fn has_grant(path: &[u16], sid: PSID, mask: u32, inherit: bool) -> bool {
+pub(crate) unsafe fn has_grant(path: &[u16], sid: PSID, mask: u32, inherit: bool) -> bool {
     let (mut dacl, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
     if GetNamedSecurityInfoW(path.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), &mut dacl, std::ptr::null_mut(), &mut descriptor) != 0 {
         return false;
@@ -267,8 +536,645 @@ unsafe fn has_grant(path: &[u16], sid: PSID, mask: u32, inherit: bool) -> bool {
     found
 }
 
+unsafe fn write_ace(path: &Path, name: &[u16], sid: PSID, mask: u32, inherit: bool, mode: ACCESS_MODE) -> Result<(), String> {
+    let (mut old, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
+    let read = GetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), &mut old, std::ptr::null_mut(), &mut descriptor);
+    if read != 0 {
+        return Err(format!("{}: its access list cannot be read (error {read})", path.display()));
+    }
+    let mut access: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    access.grfAccessPermissions = mask;
+    access.grfAccessMode = mode;
+    access.grfInheritance = if inherit { SUB_CONTAINERS_AND_OBJECTS_INHERIT } else { NO_INHERITANCE };
+    access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    access.Trustee.ptstrName = sid as *mut u16;
+    let mut new: *mut ACL = std::ptr::null_mut();
+    let merged = SetEntriesInAclW(1, &access, old, &mut new);
+    let written = if merged != 0 {
+        merged
+    } else {
+        SetNamedSecurityInfoW(name.as_ptr() as *mut u16, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), new, std::ptr::null())
+    };
+    if !new.is_null() {
+        LocalFree(new as HLOCAL);
+    }
+    LocalFree(descriptor as HLOCAL);
+    if written != 0 {
+        return Err(format!("{}: access could not be set (error {written})", path.display()));
+    }
+    Ok(())
+}
+
+/// An access list that can be changed one exact ACE at a time, leaving all the others as they are. `SetEntriesInAcl` cannot: it merges what it is given with what is there for that
+/// SID, and to revoke it takes away everything that SID has.
+pub(crate) struct Dacl {
+    aces: Vec<Vec<u8>>,
+    revision: u32,
+    control: u16,
+}
+
+impl Dacl {
+    /// What is on the object itself. Not by `GetNamedSecurityInfo`, which for a list that says nothing of auto-inheritance, as `Documents` and much else have, works out what it
+    /// should say by comparing with the parent: change the parent, and everything under it reads as keeping to itself with all its entries its own, while nothing on it has changed.
+    pub(crate) unsafe fn read(path: &Path) -> Result<Dacl, String> {
+        let memory = raw_descriptor(path)?;
+        let descriptor = memory.as_ptr() as PSECURITY_DESCRIPTOR;
+        let (mut control, mut version) = (0u16, 0u32);
+        GetSecurityDescriptorControl(descriptor, &mut control, &mut version);
+        let (mut present, mut dacl, mut defaulted): (BOOL, *mut ACL, BOOL) = (0, std::ptr::null_mut(), 0);
+        GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted);
+        let mut aces = Vec::new();
+        let mut revision = ACL_REVISION as u32;
+        if present != 0 && !dacl.is_null() {
+            revision = u32::from((*dacl).AclRevision);
+            for at in 0..u32::from((*dacl).AceCount) {
+                let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                if GetAce(dacl, at, &mut ace) != 0 {
+                    let size = usize::from((*(ace as *const ACE_HEADER)).AceSize);
+                    aces.push(std::slice::from_raw_parts(ace as *const u8, size).to_vec());
+                }
+            }
+        }
+        Ok(Dacl { aces, revision, control })
+    }
+
+    /// How an entry that came from the folder above reads on this object. On a list that takes part in auto-inheritance it is marked so. On one that says nothing of that it carries
+    /// no mark: the kernel leaves it off what it hands down from such a folder, and what shows it is only `GetNamedSecurityInfo` working it out.
+    pub(crate) fn flags_from_above(&self, folder: bool) -> u8 {
+        let marked = if self.control & SE_DACL_AUTO_INHERITED != 0 { INHERITED_ACE as u8 } else { 0 };
+        marked | if folder { (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8 } else { 0 }
+    }
+
+    /// Whether it has this from the folder above, in whichever form it came: what was made after the list changed may carry the mark while the list itself does not.
+    pub(crate) unsafe fn from_above(&self, sid: PSID, mask: u32, folder: bool) -> Option<u8> {
+        let plain = self.flags_from_above(folder) & !(INHERITED_ACE as u8);
+        let marked = plain | INHERITED_ACE as u8;
+        if self.has_exact(sid, mask, marked) {
+            Some(marked)
+        } else if self.control & SE_DACL_AUTO_INHERITED == 0 && self.has_exact(sid, mask, plain) {
+            Some(plain)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn protected(&self) -> bool {
+        self.control & SE_DACL_PROTECTED != 0
+    }
+
+    /// Whether this one allows `sid` exactly this, with exactly these flags, and was not inherited.
+    unsafe fn is_exact(ace: &[u8], sid: PSID, mask: u32, flags: u8) -> bool {
+        Dacl::is_allowed_for(ace, sid) && ace[1] == flags && u32::from_ne_bytes([ace[4], ace[5], ace[6], ace[7]]) == mask
+    }
+
+    unsafe fn is_allowed_for(ace: &[u8], sid: PSID) -> bool {
+        u32::from(ace[0]) == ACCESS_ALLOWED_ACE_TYPE && EqualSid(ace[8..].as_ptr() as PSID, sid) != 0
+    }
+
+    pub(crate) unsafe fn has_exact(&self, sid: PSID, mask: u32, flags: u8) -> bool {
+        self.aces.iter().any(|ace| Dacl::is_exact(ace, sid, mask, flags))
+    }
+
+    unsafe fn allowed_ace(sid: PSID, mask: u32, flags: u8) -> Vec<u8> {
+        let length = GetLengthSid(sid) as usize;
+        let size = 8 + length;
+        let mut ace = vec![0u8; size];
+        ace[0] = ACCESS_ALLOWED_ACE_TYPE as u8;
+        ace[1] = flags;
+        ace[2..4].copy_from_slice(&(size as u16).to_ne_bytes());
+        ace[4..8].copy_from_slice(&mask.to_ne_bytes());
+        std::ptr::copy_nonoverlapping(sid as *const u8, ace[8..].as_mut_ptr(), length);
+        ace
+    }
+
+    /// With one more, where the canonical order has it: after this object's own denials.
+    pub(crate) unsafe fn with_exact(&self, sid: PSID, mask: u32, flags: u8) -> Dacl {
+        let place = self.aces.iter().position(|ace| u32::from(ace[0]) != ACCESS_DENIED_ACE_TYPE || u32::from(ace[1]) & INHERITED_ACE != 0).unwrap_or(self.aces.len());
+        let mut aces = self.aces.clone();
+        aces.insert(place, Dacl::allowed_ace(sid, mask, flags));
+        Dacl { aces, revision: self.revision, control: self.control }
+    }
+
+    /// With one more that reads as inherited, where a folder's own would have put it: after what this object has of itself, and after inherited denials.
+    pub(crate) unsafe fn with_inherited(&self, sid: PSID, mask: u32, flags: u8) -> Dacl {
+        let place = self.aces.iter().position(|ace| u32::from(ace[1]) & INHERITED_ACE != 0 && u32::from(ace[0]) != ACCESS_DENIED_ACE_TYPE).unwrap_or(self.aces.len());
+        let mut aces = self.aces.clone();
+        aces.insert(place, Dacl::allowed_ace(sid, mask, flags));
+        Dacl { aces, revision: self.revision, control: self.control }
+    }
+
+    pub(crate) unsafe fn without_exact(&self, sid: PSID, mask: u32, flags: u8) -> Dacl {
+        Dacl { aces: self.aces.iter().filter(|ace| !Dacl::is_exact(ace, sid, mask, flags)).cloned().collect(), revision: self.revision, control: self.control }
+    }
+
+    /// Keeping its own list from now on, with what it inherited written into it, and nothing at all for this SID.
+    pub(crate) unsafe fn as_explicit_and_protected(&self, sid: PSID) -> Dacl {
+        let aces = self.aces.iter().filter(|ace| !Dacl::is_allowed_for(ace, sid)).map(|ace| {
+            let mut ace = ace.clone();
+            ace[1] &= !(INHERITED_ACE as u8);
+            ace
+        }).collect();
+        Dacl { aces, revision: self.revision, control: self.control | SE_DACL_PROTECTED }
+    }
+
+    /// As an ACL for a call that takes one. In `u32`s: an ACL must be aligned.
+    pub(crate) unsafe fn to_acl(&self) -> Vec<u32> {
+        let size = std::mem::size_of::<ACL>() + self.aces.iter().map(Vec::len).sum::<usize>();
+        let mut memory = vec![0u32; size.div_ceil(4)];
+        let acl = memory.as_mut_ptr() as *mut ACL;
+        InitializeAcl(acl, (memory.len() * 4) as u32, self.revision);
+        for ace in &self.aces {
+            AddAce(acl, self.revision, u32::MAX, ace.as_ptr().cast(), ace.len() as u32);
+        }
+        memory
+    }
+
+    /// On this object alone. What is under a folder keeps what it inherited from before: a walk through a tree is what takes the time.
+    pub(crate) unsafe fn write_alone(&self, path: &Path) -> Result<(), String> {
+        let mut acl = self.to_acl();
+        let mut alone: SECURITY_DESCRIPTOR = std::mem::zeroed();
+        let place = std::ptr::addr_of_mut!(alone) as PSECURITY_DESCRIPTOR;
+        let kept = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED;
+        // (asked for as well as said, or the kernel leaves off the flag that says this list takes part in inheritance; one without it stays without)
+        let flags = (self.control & kept) | if self.control & SE_DACL_AUTO_INHERITED != 0 { SE_DACL_AUTO_INHERIT_REQ } else { 0 };
+        if InitializeSecurityDescriptor(place, 1) == 0 || SetSecurityDescriptorDacl(place, 1, acl.as_mut_ptr().cast(), 0) == 0 || SetSecurityDescriptorControl(place, kept | SE_DACL_AUTO_INHERIT_REQ, flags) == 0 {
+            return Err(last_error(&path.display().to_string()));
+        }
+        set_on_handle(path, place, self.protected())
+    }
+}
+
+/// A security descriptor on this object alone, by a handle: `SetFileSecurity` drops the bit that makes a list keep to itself, and whatever walks a tree to do it takes minutes in some folders.
+unsafe fn set_on_handle(path: &Path, descriptor: PSECURITY_DESCRIPTOR, protected: bool) -> Result<(), String> {
+    let name = wide_path(path);
+    let handle = Handle(CreateFileW(name.as_ptr(), WRITE_DAC | READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut()));
+    if handle.0 == INVALID_HANDLE_VALUE {
+        return Err(last_error(&path.display().to_string()));
+    }
+    let keeps = if protected { PROTECTED_DACL_SECURITY_INFORMATION } else { UNPROTECTED_DACL_SECURITY_INFORMATION };
+    if SetKernelObjectSecurity(handle.0, DACL_SECURITY_INFORMATION | keeps, descriptor) == 0 {
+        return Err(last_error(&path.display().to_string()));
+    }
+    Ok(())
+}
+
+/// Where something recorded by its identity is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Located {
+    At(PathBuf),
+    /// Its drive is there, and it is not on it: deleted, or moved to another drive, which is a copy.
+    Gone,
+    /// The drive it was on is not here to ask.
+    DriveAway,
+}
+
+unsafe fn id_of_handle(handle: HANDLE) -> Option<FILE_ID_INFO> {
+    let mut info: FILE_ID_INFO = std::mem::zeroed();
+    (GetFileInformationByHandleEx(handle, FileIdInfo, std::ptr::addr_of_mut!(info).cast(), std::mem::size_of::<FILE_ID_INFO>() as u32) != 0).then_some(info)
+}
+
+unsafe fn open_for_id(path: &Path) -> Handle {
+    let name = wide_path(path);
+    Handle(CreateFileW(name.as_ptr(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut()))
+}
+
+/// What a file or folder is, whatever it is called and wherever on its drive it goes: its drive's serial number and its own number there.
+pub(crate) fn file_id(path: &Path) -> Option<String> {
+    // SAFETY: the handle is this function's, and `info` is as long as the call is told.
+    unsafe {
+        let handle = open_for_id(path);
+        if handle.0 == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let info = id_of_handle(handle.0)?;
+        let number: String = info.FileId.Identifier.iter().map(|byte| format!("{byte:02x}")).collect();
+        Some(format!("{:016x}:{number}", info.VolumeSerialNumber))
+    }
+}
+
+/// Where what had this identity is now, looking first where it was. `was_at` names the drive.
+pub(crate) fn locate(id: &str, was_at: &Path) -> Located {
+    if file_id(was_at).as_deref() == Some(id) {
+        return Located::At(was_at.to_path_buf());
+    }
+    let (Some((serial, number)), Some(root)) = (id.split_once(':'), was_at.ancestors().last()) else { return Located::Gone };
+    // SAFETY: the handles are this function's, the descriptor outlives the call, and the buffer is as long as the call is told.
+    unsafe {
+        let drive = open_for_id(root);
+        if drive.0 == INVALID_HANDLE_VALUE {
+            return Located::DriveAway;
+        }
+        let Some(info) = id_of_handle(drive.0) else { return Located::DriveAway };
+        if format!("{:016x}", info.VolumeSerialNumber) != serial {
+            return Located::DriveAway;
+        }
+        let mut wanted: FILE_ID_128 = std::mem::zeroed();
+        for (at, slot) in wanted.Identifier.iter_mut().enumerate() {
+            let Some(byte) = number.get(at * 2..at * 2 + 2).and_then(|text| u8::from_str_radix(text, 16).ok()) else { return Located::Gone };
+            *slot = byte;
+        }
+        let descriptor = FILE_ID_DESCRIPTOR { dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32, Type: ExtendedFileIdType, Anonymous: FILE_ID_DESCRIPTOR_0 { ExtendedFileId: wanted } };
+        let found = Handle(OpenFileById(drive.0, &descriptor, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(), FILE_FLAG_BACKUP_SEMANTICS));
+        if found.0 == INVALID_HANDLE_VALUE {
+            return Located::Gone;
+        }
+        let mut text = vec![0u16; 4096];
+        let length = GetFinalPathNameByHandleW(found.0, text.as_mut_ptr(), text.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) as usize;
+        if length == 0 || length >= text.len() {
+            return Located::Gone;
+        }
+        let path = String::from_utf16_lossy(&text[..length]);
+        Located::At(PathBuf::from(path.strip_prefix("\\\\?\\").unwrap_or(&path)))
+    }
+}
+
+/// The security descriptor on the object itself, in `u32`s as it must be aligned.
+unsafe fn raw_descriptor(path: &Path) -> Result<Vec<u32>, String> {
+    let name = wide_path(path);
+    let mut size = 0u32;
+    GetFileSecurityW(name.as_ptr(), DACL_SECURITY_INFORMATION, std::ptr::null_mut(), 0, &mut size);
+    if size == 0 {
+        return Err(last_error(&path.display().to_string()));
+    }
+    let mut memory = vec![0u32; (size as usize).div_ceil(4)];
+    if GetFileSecurityW(name.as_ptr(), DACL_SECURITY_INFORMATION, memory.as_mut_ptr().cast(), size, &mut size) == 0 {
+        return Err(last_error(&path.display().to_string()));
+    }
+    Ok(memory)
+}
+
+/// One exact ACE more on this object alone.
+pub(crate) unsafe fn add_exact_ace(path: &Path, sid: PSID, mask: u32, flags: u8) -> Result<(), String> {
+    Dacl::read(path)?.with_exact(sid, mask, flags).write_alone(path)
+}
+
+/// A path's access list in SDDL, as it is on the object at this moment.
+pub(crate) fn dacl_text(path: &Path) -> Result<String, String> {
+    // SAFETY: what each call is given lives until it returns, and the system's memory is freed once copied.
+    unsafe {
+        let memory = raw_descriptor(path)?;
+        let mut text: *mut u16 = std::ptr::null_mut();
+        if ConvertSecurityDescriptorToStringSecurityDescriptorW(memory.as_ptr() as PSECURITY_DESCRIPTOR, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut text, std::ptr::null_mut()) == 0 {
+            return Err(last_error("its access list"));
+        }
+        let length = (0..).take_while(|&at| *text.add(at) != 0).count();
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+        LocalFree(text as HLOCAL);
+        Ok(out)
+    }
+}
+
+/// Puts back on this object alone an access list as [`dacl_text`] gave it.
+pub(crate) fn restore_dacl_text(path: &Path, text: &str) -> Result<(), String> {
+    // SAFETY: what each call is given lives until it returns, and the system's memory is freed once used.
+    unsafe {
+        let sddl = wide(text);
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut()) == 0 {
+            return Err(last_error("its access list"));
+        }
+        let (mut control, mut version) = (0u16, 0u32);
+        GetSecurityDescriptorControl(descriptor, &mut control, &mut version);
+        // (as in `write_alone`)
+        if control & SE_DACL_AUTO_INHERITED != 0 {
+            SetSecurityDescriptorControl(descriptor, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERIT_REQ);
+        }
+        let done = set_on_handle(path, descriptor, control & SE_DACL_PROTECTED != 0);
+        LocalFree(descriptor as HLOCAL);
+        done
+    }
+}
+
+/// The container's SID in its text form.
+#[cfg(test)]
+pub(crate) fn profile_sid_text() -> String {
+    // SAFETY: the text is the system's to free, and is copied before that.
+    unsafe {
+        let sid = profile_sid().unwrap();
+        let mut text: *mut u16 = std::ptr::null_mut();
+        ConvertSidToStringSidW(sid, &mut text);
+        let length = (0..).take_while(|&at| *text.add(at) != 0).count();
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+        LocalFree(text as HLOCAL);
+        out
+    }
+}
+
+/// One of the lists of what was given, whole or not at all, before what it says is done. Flushed first: after a power cut a rename can stand on a file with nothing in it, and a list with
+/// nothing in it is folders left open with no one knowing.
+pub(crate) fn write_list(file: &Path, text: &str) -> Result<(), String> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let partial = file.with_extension("partial");
+    let written = File::create(&partial).and_then(|mut out| {
+        std::io::Write::write_all(&mut out, text.as_bytes())?;
+        out.sync_all()
+    });
+    written.map_err(|error| format!("{}: {error}", partial.display()))?;
+    std::fs::rename(&partial, file).map_err(|error| format!("{}: {error}", file.display()))
+}
+
+/// A list that cannot be read is kept beside where it was: the next thing written there would otherwise be all that is left of what it said.
+pub(crate) fn set_aside(file: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis());
+    let kept = file.with_extension(format!("damaged-{stamp}"));
+    let _ = std::fs::rename(file, &kept);
+    kept
+}
+
+/// That list next time, by looking: something may have taken one back.
+pub(crate) fn forget_grants() {
+    *GRANTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// This object's list, with exactly this for the container and nothing else for it, keeping its own list from now on. Windows does not honour a deny ACE for a container's SID: what
+/// keeps a container out is not being let in. `walk`: what is under it follows.
+unsafe fn limit_to(root: &Path, path: &Path, sid: PSID, keep: &[(u32, u8)], walk: bool) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let dacl = Dacl::read(path)?;
+    let has = dacl.aces.iter().filter(|ace| Dacl::is_allowed_for(ace, sid)).count();
+    if dacl.protected() && has == keep.len() && keep.iter().all(|(mask, flags)| dacl.has_exact(sid, *mask, *flags)) {
+        return Ok(());
+    }
+    // (what is already written down of one that keeps its own list stays: that is its list from before this)
+    crate::workspace_grants::before_guarding(root, path, dacl_text(path)?, dacl.protected())?;
+    let mut limited = dacl.as_explicit_and_protected(sid);
+    for (mask, flags) in keep {
+        limited = limited.with_exact(sid, *mask, *flags);
+    }
+    if !walk {
+        return limited.write_alone(path);
+    }
+    let (name, mut acl) = (wide_path(path), limited.to_acl());
+    let written = SetNamedSecurityInfoW(name.as_ptr() as *mut u16, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), acl.as_mut_ptr().cast(), std::ptr::null());
+    if written != 0 {
+        return Err(format!("{}: access could not be set (error {written})", path.display()));
+    }
+    Ok(())
+}
+
+/// What a command must not change in a repository: a hook, or a line of config, runs outside the sandbox the next time a person or this app uses git there. Looked at before each
+/// command, as the person's own git writes `config` anew, inheriting. Commits, branches and the rest go on as they do. The folder itself cannot be deleted or renamed by the
+/// container either, or a command could put another in its place. What a command makes of a repository it has just created is not seen until the next command starts.
+pub(crate) unsafe fn guard_repository(root: &Path, git: &Path, sid: PSID) -> Result<(), String> {
+    let Ok(what) = std::fs::symlink_metadata(git) else { return Ok(()) };
+    // A link is not gone through: an ACE would land on whatever it leads to, the person's own `config` or `hooks` anywhere, and that would be opened to commands.
+    let is_link = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|what| what.file_type().is_symlink());
+    if let Some(link) = [git.to_path_buf(), git.join("config"), git.join("hooks")].iter().find(|path| is_link(path)) {
+        return Err(format!("{} is a link, so it cannot be kept from what a command would plant there to run outside its sandbox: the command was not run. Replace the link with the folder itself", link.display()));
+    }
+    // A worktree's or a submodule's: one line, which says where git's folder is. A command that rewrites it has a repository of its own making, hooks and all.
+    if !what.is_dir() {
+        return limit_to(root, git, sid, &[(READ_EXECUTE, 0)], false);
+    }
+    // In a repository's own `.git` this has no business: only a worktree's folder under `worktrees` has one. It tells git to read its config and hooks from wherever it says, past all of this.
+    // Taken away before each command: the folder has to stay open for git's own new files, so nothing can stop it being made.
+    let elsewhere = git.join("commondir");
+    if elsewhere.exists() && std::fs::remove_file(&elsewhere).is_err() {
+        return Err(format!("{} would send git elsewhere for its config, and could not be taken away: the command was not run", elsewhere.display()));
+    }
+    let everything = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+    limit_to(root, git, sid, &[(READ_WRITE_EXECUTE & !DELETE, 0), (READ_WRITE_EXECUTE, everything | INHERIT_ONLY_ACE as u8)], false)?;
+    limit_to(root, &git.join("config"), sid, &[(READ_EXECUTE, 0)], false)?;
+    limit_to(root, &git.join("hooks"), sid, &[(READ_EXECUTE, everything)], true)
+}
+
+/// How far under the workspace a repository is looked for. A hook in one deeper or in what is skipped runs only for a person who goes there and uses git.
+const REPOSITORY_DEPTH: usize = 8;
+const MOST_FOLDERS_LOOKED_AT: usize = 4000;
+const MOST_REPOSITORIES: usize = 64;
+const NO_REPOSITORIES_HERE: [&str; 6] = ["node_modules", "target", ".venv", "venv", "__pycache__", crate::bundled::PY_DEPS];
+
+/// What git would use in each repository under a folder: a `.git`, or a folder that is a bare repository, which git takes as one when it is run there. The nearest first, with what a look of this
+/// size finds. It is done before and after every command.
+fn repositories_under(root: &Path) -> Vec<PathBuf> {
+    let (mut found, mut level, mut looked) = (Vec::new(), vec![root.to_path_buf()], 0usize);
+    for _ in 0..=REPOSITORY_DEPTH {
+        let mut next = Vec::new();
+        for folder in &level {
+            looked += 1;
+            if looked > MOST_FOLDERS_LOOKED_AT || found.len() >= MOST_REPOSITORIES {
+                return found;
+            }
+            let (mut inner, mut bare_marks) = (Vec::new(), 0);
+            for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                let folder_there = entry.file_type().is_ok_and(|kind| kind.is_dir());
+                bare_marks += usize::from(if folder_there { matches!(name.as_str(), "objects" | "refs") } else { name == "head" });
+                if name == ".git" {
+                    found.push(entry.path());
+                } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) && !NO_REPOSITORIES_HERE.iter().any(|skipped| name.eq_ignore_ascii_case(skipped)) {
+                    inner.push(entry.path());
+                }
+            }
+            if bare_marks == 3 {
+                found.push(folder.clone());
+            } else {
+                next.append(&mut inner);
+            }
+        }
+        level = next;
+    }
+    found
+}
+
+/// The repositories known of in each workspace: those there at the first command, and those made since and looked at.
+static KNOWN_REPOSITORIES: Mutex<Option<HashMap<String, HashSet<String>>>> = Mutex::new(None);
+
+/// Of these, those not known of until now, which are from then on. On a first look at a workspace nothing is new: what is there is the person's, hooks and all.
+fn newly_made(root: &Path, found: &[PathBuf]) -> Vec<PathBuf> {
+    let mut known = KNOWN_REPOSITORIES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let known = known.get_or_insert_with(HashMap::new);
+    let first_look = !known.contains_key(&key(root));
+    let here = known.entry(key(root)).or_default();
+    found.iter().filter(|git| here.insert(key(git)) && !first_look).cloned().collect()
+}
+
+/// The app itself has just made this one, and what it writes there after this has been asked about.
+pub fn note_made_by_the_app(root: &Path, folder: &Path) {
+    let mut known = KNOWN_REPOSITORIES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // (in a workspace not looked at yet there is nothing to say: the first look takes all that is there as it is)
+    if let Some(here) = known.get_or_insert_with(HashMap::new).get_mut(&key(root)) {
+        here.insert(key(&folder.join(".git")));
+    }
+}
+
+/// What of a new repository's config may stay: what git itself writes, and who commits. Anything else in a config can name a program to run (`core.fsmonitor`, `core.sshCommand`, an alias, a filter,
+/// a diff driver, `include.path`...), and a list of those would have to know them all.
+fn config_line_stays(section: &str, line: &str) -> bool {
+    let name = line.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+    let section = section.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    match section.as_str() {
+        // (`worktree` is what a submodule's says, and runs nothing)
+        "core" => ["repositoryformatversion", "filemode", "bare", "logallrefupdates", "symlinks", "ignorecase", "precomposeunicode", "autocrlf", "eol", "safecrlf", "longpaths", "quotepath", "worktree"].contains(&name.as_str()),
+        "user" => true,
+        // (not `worktreeConfig`, which makes a file that a command can still write into a second config)
+        "extensions" => ["objectformat", "refstorage"].contains(&name.as_str()),
+        "remote" => ["url", "pushurl", "fetch", "prune", "tagopt"].contains(&name.as_str()),
+        "branch" => ["remote", "merge", "rebase"].contains(&name.as_str()),
+        "init" => name == "defaultbranch",
+        "submodule" => ["url", "active"].contains(&name.as_str()),
+        _ => false,
+    }
+}
+
+/// A config's text with only what may stay, and the names of what was taken out. A section's name stays, or what is said under it would land in another.
+fn config_without_programs(text: &str) -> (String, Vec<String>) {
+    let (mut kept, mut gone, mut section, mut going_on, mut dropping) = (String::new(), Vec::new(), String::new(), false, false);
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim();
+        let continues = bare.ends_with('\\');
+        if going_on {
+            if !dropping {
+                kept.push_str(line);
+            }
+            going_on = continues;
+            continue;
+        }
+        if bare.starts_with('[') && !bare.contains(']') {
+            // (a section's name cut off is nothing git would read: the whole of what follows is not to be trusted)
+            gone.push(bare.to_string());
+            break;
+        }
+        if bare.starts_with('[') {
+            let (name, rest) = bare[1..].split_once(']').unwrap_or((&bare[1..], ""));
+            section = name.to_string();
+            kept.push_str(&format!("[{name}]\n"));
+            // (git takes a setting on the section's own line too)
+            let rest = rest.trim();
+            if !rest.is_empty() && !rest.starts_with(['#', ';']) {
+                if config_line_stays(&section, rest) {
+                    kept.push_str(&format!("\t{rest}\n"));
+                } else {
+                    gone.push(format!("{}.{}", section.split_whitespace().next().unwrap_or(""), rest.split('=').next().unwrap_or("").trim()));
+                }
+            }
+            going_on = false;
+            dropping = false;
+            continue;
+        }
+        if bare.is_empty() || bare.starts_with(['#', ';']) {
+            kept.push_str(line);
+            continue;
+        }
+        going_on = continues;
+        dropping = !config_line_stays(&section, bare);
+        if dropping {
+            gone.push(format!("{}.{}", section.split_whitespace().next().unwrap_or(""), bare.split('=').next().unwrap_or("").trim()));
+        } else {
+            kept.push_str(line);
+        }
+    }
+    (kept, gone)
+}
+
+/// What is in the place a `.git` file points to, if that is in the workspace: outside it a command could not have written anything.
+fn git_folder_of(git_file: &Path, root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(git_file).ok()?;
+    let named = text.trim().strip_prefix("gitdir:")?.trim();
+    let target = crate::safety::resolve(git_file.parent()?, named);
+    (crate::safety::inside(root, &target) && target.is_dir()).then_some(target)
+}
+
+/// Takes out of a repository a command made what would run as the person the next time git is used there: its hooks, and what its config names. Guarding it first would keep later commands from
+/// doing the same and leave what this one already did. `known`: repositories that were there before it, which are the person's and are not touched, whatever a worktree says of them.
+fn disarm_repository(git: &Path, root: &Path, known: &HashSet<String>) -> Vec<String> {
+    let mut said = Vec::new();
+    let disarm_folder = |folder: &Path, said: &mut Vec<String>| {
+        let hooks = folder.join("hooks");
+        if std::fs::symlink_metadata(&hooks).is_ok_and(|what| what.file_type().is_symlink()) {
+            if std::fs::remove_dir(&hooks).is_ok() || std::fs::remove_file(&hooks).is_ok() {
+                said.push("a link in place of its hooks".to_string());
+            }
+        } else {
+            for entry in std::fs::read_dir(&hooks).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".sample") {
+                    continue;
+                }
+                let gone = if entry.file_type().is_ok_and(|kind| kind.is_dir()) { std::fs::remove_dir_all(entry.path()) } else { std::fs::remove_file(entry.path()) };
+                if gone.is_ok() {
+                    said.push(format!("hooks/{name}"));
+                }
+            }
+        }
+        let config = folder.join("config");
+        // (git does not ask that it be UTF-8)
+        if let Ok(bytes) = std::fs::read(&config) {
+            let (kept, gone) = config_without_programs(&String::from_utf8_lossy(&bytes));
+            if !gone.is_empty() && std::fs::write(&config, kept).is_ok() {
+                said.extend(gone);
+            }
+        }
+    };
+    if git.is_dir() {
+        disarm_folder(git, &mut said);
+        return said;
+    }
+    // A worktree's or a submodule's: the folder it points to, and for a worktree, the repository that says it is part of.
+    let Some(folder) = git_folder_of(git, root) else { return said };
+    disarm_folder(&folder, &mut said);
+    if let Some(common) = std::fs::read_to_string(folder.join("commondir")).ok().map(|text| crate::safety::resolve(&folder, text.trim())) {
+        if crate::safety::inside(root, &common) && common.is_dir() && !known.contains(&key(&common)) {
+            disarm_folder(&common, &mut said);
+        }
+    }
+    said
+}
+
+/// Before a command, and after it for what that one made: every repository in reach, each new one disarmed and all of them guarded. Says what was taken out.
+unsafe fn look_after_repositories(root: &Path, sid: PSID) -> Result<Vec<String>, String> {
+    let found = repositories_under(root);
+    let new = newly_made(root, &found);
+    let mut said = Vec::new();
+    if !new.is_empty() {
+        let known: HashSet<String> = found.iter().filter(|git| !new.contains(git)).map(|git| key(git)).collect();
+        for git in &new {
+            let taken = disarm_repository(git, root, &known);
+            if !taken.is_empty() {
+                let shown = git.parent().and_then(|folder| folder.strip_prefix(root).ok()).map_or(String::new(), |place| place.display().to_string());
+                said.push(format!("{} in {}", taken.join(", "), if shown.is_empty() { "." } else { &shown }));
+            }
+        }
+    }
+    for git in &found {
+        guard_repository(root, git, sid)?;
+        // (a submodule's folder is in the outer `.git`, which is open to git's own new files; a worktree's has neither of these)
+        if git.is_file() {
+            if let Some(folder) = git_folder_of(git, root).filter(|folder| !folder.join("commondir").exists()) {
+                let everything = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+                limit_to(root, &folder.join("config"), sid, &[(READ_EXECUTE, 0)], false)?;
+                limit_to(root, &folder.join("hooks"), sid, &[(READ_EXECUTE, everything)], true)?;
+            }
+        }
+    }
+    Ok(said)
+}
+
+/// What the commands of one run may commit between them: what the machine could give without its running out of memory for everything else, as it once did, and less than all of its RAM, past which
+/// everything slows to a crawl. Some is always allowed: a command cannot be blamed for a machine that was already short.
+fn job_memory_cap() -> u64 {
+    const LEAST: u64 = 4 << 30;
+    const LEFT_FOR_THE_REST: u64 = 4 << 30;
+    let mut status: windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of_val(&status) as u32;
+    // SAFETY: the struct lives through the call, with its size set.
+    if unsafe { windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut status) } == 0 {
+        return u64::MAX;
+    }
+    memory_cap_from(status.ullAvailPageFile, status.ullTotalPhys, LEAST, LEFT_FOR_THE_REST)
+}
+
+fn memory_cap_from(commit_available: u64, ram: u64, least: u64, left_for_the_rest: u64) -> u64 {
+    commit_available.saturating_sub(left_for_the_rest).min(ram / 4 * 3).max(least)
+}
+
 /// One ACE for the profile, once: propagating it through a tree is what costs, and it persists.
-unsafe fn grant(path: &Path, sid: PSID, mask: u32, inherit: bool) -> Result<(), String> {
+pub(crate) unsafe fn grant(path: &Path, sid: PSID, mask: u32, inherit: bool) -> Result<(), String> {
     let memo = (key(path), mask, inherit);
     {
         let mut granted = GRANTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -278,51 +1184,80 @@ unsafe fn grant(path: &Path, sid: PSID, mask: u32, inherit: bool) -> Result<(), 
     }
     let name = wide_path(path);
     if !has_grant(&name, sid, mask, inherit) {
-        let (mut old, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
-        let read = GetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), &mut old, std::ptr::null_mut(), &mut descriptor);
-        if read != 0 {
-            return Err(format!("{}: its access list cannot be read (error {read})", path.display()));
-        }
-        let mut access: EXPLICIT_ACCESS_W = std::mem::zeroed();
-        access.grfAccessPermissions = mask;
-        access.grfAccessMode = GRANT_ACCESS;
-        access.grfInheritance = if inherit { SUB_CONTAINERS_AND_OBJECTS_INHERIT } else { NO_INHERITANCE };
-        access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-        access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-        access.Trustee.ptstrName = sid as *mut u16;
-        let mut new: *mut ACL = std::ptr::null_mut();
-        let merged = SetEntriesInAclW(1, &access, old, &mut new);
-        let written = if merged == 0 {
-            SetNamedSecurityInfoW(name.as_ptr() as *mut u16, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), new, std::ptr::null())
+        if inherit {
+            write_ace(path, &name, sid, mask, true, GRANT_ACCESS)?;
         } else {
-            merged
-        };
-        if !new.is_null() {
-            LocalFree(new as HLOCAL);
-        }
-        LocalFree(descriptor as HLOCAL);
-        if written != 0 {
-            return Err(format!("{}: access could not be granted (error {written})", path.display()));
+            // For this folder alone, and nothing else about its list changed: SetNamedSecurityInfo walks everything under a folder whatever the ACE says, and on the way to a workspace that
+            // can be the whole of a person's AppData, and SetFileSecurity takes off the bit that makes a list keep to itself, from a folder the person had closed.
+            add_exact_ace(path, sid, mask, 0)?;
         }
     }
     GRANTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashSet::new).insert(memo);
     Ok(())
 }
 
-unsafe fn prepare(workspace: &Path, sid: PSID) -> Result<(), String> {
+/// Folders commands may read and run from besides the toolchains: a skill's scripts, once it is in use.
+static ALSO_READABLE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+pub fn also_readable(folder: &Path) {
+    let mut folders = ALSO_READABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !folders.iter().any(|known| key(known) == key(folder)) {
+        folders.push(folder.to_path_buf());
+    }
+}
+
+unsafe fn prepare(workspace: &Path, sid: PSID, disarmed: &mut Vec<String>) -> Result<(), String> {
     grant(workspace, sid, READ_WRITE_EXECUTE, true)?;
+    // Each repository in the workspace. If one cannot be guarded the command does not run, as with any other containment.
+    *disarmed = look_after_repositories(workspace, sid)?;
+    for folder in ALSO_READABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter() {
+        let _ = grant(folder, sid, READ_EXECUTE, true);
+        for ancestor in folder.ancestors().skip(1).filter(|above| above.parent().is_some()) {
+            let _ = grant(ancestor, sid, FILE_GENERIC_EXECUTE, false);
+        }
+    }
     // The folders above: their attributes only, and only for shells that look at where they are. An OS-owned one may refuse, which costs little.
     for ancestor in workspace.ancestors().skip(1).filter(|folder| folder.parent().is_some()) {
         let _ = grant(ancestor, sid, FILE_GENERIC_EXECUTE, false);
     }
+    // (never a test's: these are the real home's folders, with real lists)
+    #[cfg(not(test))]
     if let (Some(path), Some(home)) = (std::env::var_os("PATH"), std::env::var_os("USERPROFILE")) {
-        for folder in toolchain_folders(&path.to_string_lossy(), Path::new(&home)) {
-            if folder.exists() {
-                let _ = grant(&folder, sid, READ_EXECUTE, true);
+        open_toolchains(&path.to_string_lossy(), Path::new(&home), crate::bundled::root().is_some(), sid);
+    }
+    Ok(())
+}
+
+pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: bool, sid: PSID) {
+    for folder in toolchain_folders(path_variable, home) {
+        // (a person's own Python or Node is not what runs, so nothing is opened for it)
+        let replaced = bundled && (crate::bundled::NAMES.iter().any(|name| folder.join(name).is_file()) || ["python", "npm", "nvm"].iter().any(|word| key(&folder).contains(word)));
+        if folder.exists() && !replaced {
+            let _ = grant(&folder, sid, READ_EXECUTE, true);
+            hold_out_secrets(&folder, sid);
+        }
+    }
+}
+
+/// What reads as a secret directly in a toolchain's folder is not given with it: `.cargo\credentials.toml` holds a person's token for crates.io, and is written anew by `cargo login`, so
+/// this is looked at each time. It goes on keeping its own list with what it inherited written into it, and nothing for the container: there is no taking this back, and nothing to take.
+unsafe fn hold_out_secrets(folder: &Path, sid: PSID) {
+    for item in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+        let path = item.path();
+        if item.file_type().is_ok_and(|kind| !kind.is_symlink()) && crate::safety::sensitive(&Path::new("/").join(item.file_name())) {
+            if let Ok(dacl) = Dacl::read(&path) {
+                if dacl.aces.iter().any(|ace| Dacl::is_allowed_for(ace, sid)) {
+                    let _ = dacl.as_explicit_and_protected(sid).write_alone(&path);
+                }
             }
         }
     }
-    Ok(())
+}
+
+/// The sandbox's own temp folder: what a command leaves there, the app can read.
+pub(crate) fn temp_folder() -> Option<PathBuf> {
+    // SAFETY: the SID lives as long as the process.
+    unsafe { profile_folder(profile_sid().ok()?) }
 }
 
 unsafe fn profile_folder(sid: PSID) -> Option<PathBuf> {
@@ -342,9 +1277,14 @@ unsafe fn profile_folder(sid: PSID) -> Option<PathBuf> {
     Some(path)
 }
 
-fn environment(temp: Option<&Path>) -> Vec<u16> {
+fn environment(temp: Option<&Path>, workspace: &Path) -> Vec<u16> {
     let mut block: Vec<(String, String)> = VARIABLES.iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
     let temp = temp.map(|path| path.display().to_string()).or_else(|| std::env::var("TEMP").ok()).unwrap_or_default();
+    if let Some(root) = crate::bundled::root() {
+        let added = crate::bundled::environment(&root, &std::env::var("PATH").unwrap_or_default(), &temp, workspace);
+        block.retain(|(name, _)| !added.iter().any(|(new, _)| new.eq_ignore_ascii_case(name)));
+        block.extend(added);
+    }
     // Where git looks for its per-user files: the person's profile is closed to a command, and it would warn on every run.
     block.push(("XDG_CONFIG_HOME".to_string(), temp.clone()));
     block.push(("TEMP".to_string(), temp.clone()));
@@ -382,12 +1322,35 @@ unsafe fn pipe() -> Result<(Handle, Handle), String> {
 
 /// Runs `line` in the container and waits, ending it on `timeout` or on `cancel`.
 pub fn run(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool) -> Result<Output, String> {
+    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()))
+}
+
+/// A browser under those limits falls over in most runs, whichever of them is set (0xC0000005, 12 to 19 runs in 20, against none in 20 with none set). Its own window station
+/// keeps it from the person's clipboard and session in any case.
+pub fn run_browser(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, cancel: &AtomicBool) -> Result<Output, String> {
+    run_limited(line, cwd, workspace, false, timeout, cancel, 0, None)
+}
+
+fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>) -> Result<Output, String> {
+    no_error_boxes();
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     let root = writable_root(cwd, workspace, home.as_deref())?;
+    if let Some(reason) = volume_of(&root).and_then(|volume| drive_refusal(&volume, &root)) {
+        return Err(reason);
+    }
+    // It counts as in use from before it is granted to when all it started has ended.
+    let _in_use = crate::workspace_grants::Use::new(&root);
     // SAFETY: every pointer below lives until the call that takes it returns, and the attribute list's buffers until the process is started.
     unsafe {
         let sid = profile_sid()?;
-        prepare(&root, sid)?;
+        let mut disarmed = Vec::new();
+        {
+            let _one = crate::workspace_grants::before_grant(&root)?;
+            prepare(&root, sid, &mut disarmed)?;
+            if let Some(tools) = crate::bundled::root() {
+                crate::bundled::open_to_sandbox(&tools)?;
+            }
+        }
         let (out_read, out_write) = pipe()?;
         let (err_read, err_write) = pipe()?;
         let nul = wide("NUL");
@@ -399,8 +1362,23 @@ pub fn run(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Dur
             return Err(last_error("a Job Object"));
         }
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(job.0, JobObjectExtendedLimitInformation, std::ptr::addr_of!(limits).cast(), std::mem::size_of_val(&limits) as u32);
+        // (the second: no process in it gets the crash dialog, whatever error mode it has given itself; it ends there, with the exception as its code)
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        if let Some(cap) = memory_cap.filter(|cap| *cap < usize::MAX as u64) {
+            // (both: with the job's alone a process went to 869 MB under a limit of 300 MB, on Windows 11 26300. With both, a process is refused at the limit.)
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            limits.JobMemoryLimit = cap as usize;
+            limits.ProcessMemoryLimit = cap as usize;
+        }
+        // (without it, what a command started outlives the app when that goes down)
+        if SetInformationJobObject(job.0, JobObjectExtendedLimitInformation, std::ptr::addr_of!(limits).cast(), std::mem::size_of_val(&limits) as u32) == 0 {
+            return Err(last_error("the limits that end what it starts"));
+        }
+        let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS { UIRestrictionsClass: ui_limits };
+        if SetInformationJobObject(job.0, JobObjectBasicUIRestrictions, std::ptr::addr_of!(ui).cast(), std::mem::size_of_val(&ui) as u32) == 0 {
+            return Err(last_error("the limits on what it can do to the screen"));
+        }
+        let desktop = Desktop::new(sid)?;
 
         let mut capability_sids: Vec<PSID> = Vec::new();
         if network {
@@ -436,6 +1414,8 @@ pub fn run(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Dur
         let mut startup: STARTUPINFOEXW = std::mem::zeroed();
         startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        let mut desktop_name = desktop.name.clone();
+        startup.StartupInfo.lpDesktop = desktop_name.as_mut_ptr();
         startup.StartupInfo.hStdInput = input.0;
         startup.StartupInfo.hStdOutput = out_write.0;
         startup.StartupInfo.hStdError = err_write.0;
@@ -443,7 +1423,7 @@ pub fn run(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Dur
         let shell = std::env::var("ComSpec").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
         // The code page first, so that a tool's output arrives as UTF-8 on a Japanese Windows.
         let mut command_line = wide(&format!("\"{shell}\" /d /s /c \"chcp 65001 >nul & {line}\""));
-        let block = environment(profile_folder(sid).as_deref());
+        let block = environment(profile_folder(sid).as_deref(), &root);
         let place = wide_path(cwd);
         let mut process: PROCESS_INFORMATION = std::mem::zeroed();
         let started = CreateProcessW(
@@ -480,6 +1460,7 @@ pub fn run(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Dur
         let (stdout, stderr) = (capture(out_read), capture(err_read));
 
         let began = Instant::now();
+        let (mut looked, mut dialog_since, mut last_seen): (Instant, Option<Instant>, Vec<(String, String)>) = (began, None, Vec::new());
         let ended = loop {
             if WaitForSingleObject(process_handle.0, 30) == WAIT_OBJECT_0 {
                 break "";
@@ -490,19 +1471,69 @@ pub fn run(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Dur
             if began.elapsed() > timeout {
                 break "timed out";
             }
+            if looked.elapsed() > Duration::from_secs(1) {
+                looked = Instant::now();
+                last_seen = desktop.windows();
+                if !last_seen.iter().any(|(class, _)| class == "#32770") {
+                    dialog_since = None;
+                } else if dialog_since.get_or_insert(looked).elapsed() > MOST_DIALOG {
+                    break "stopped, as it was waiting on a dialog nobody can see";
+                }
+            }
         };
+        let seen = desktop.windows();
+        let shown = (if seen.is_empty() { last_seen } else { seen }).into_iter().filter(|(class, title)| class == "#32770" || !title.is_empty()).map(|(_, title)| title).collect();
         let mut code = 0u32;
         let status = if ended.is_empty() && GetExitCodeProcess(process_handle.0, &mut code) != 0 { Some(code as i32) } else { None };
+        // How much it used, while there is a job to ask. An allocation refused near the limit is what shows: what it used may stop a little short of it.
+        let mut used: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        let asked = QueryInformationJobObject(job.0, JobObjectExtendedLimitInformation, std::ptr::addr_of_mut!(used).cast(), std::mem::size_of_val(&used) as u32, std::ptr::null_mut()) != 0;
+        let out_of_memory = memory_cap.filter(|cap| asked && status != Some(0) && used.PeakJobMemoryUsed as u64 >= cap / 10 * 9);
         // Whatever it left running goes with it, and that closes the pipes.
         TerminateJobObject(job.0, 1);
         drop(job);
-        Ok(Output { stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default(), status, ended })
+        // What it made, with nothing of its own left running to go on making it. (Not being able to guard this does not take back what has already run: the next command is what is refused.)
+        if let Ok(taken) = look_after_repositories(&root, sid) {
+            disarmed.extend(taken);
+        }
+        Ok(Output { stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default(), status, ended, shown, disarmed, out_of_memory })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_command_gets_a_desktop_in_a_station_of_its_own_and_no_error_boxes() {
+        no_error_boxes();
+        // SAFETY: it reads a flag of this process.
+        let mode = unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode() };
+        assert_eq!(mode & 0x8003, 0x8003, "what a child has from its parent: {mode:#x}");
+        // SAFETY: the SID lives as long as the process.
+        let desktop = unsafe { Desktop::new(profile_sid().unwrap()) }.unwrap();
+        let name = String::from_utf16_lossy(&desktop.name);
+        assert!(!name.to_ascii_lowercase().starts_with("winsta0"), "not the station of the person's screen: {name}");
+        assert!(name.contains('\\') && name.contains("DogmindExec-"), "{name}");
+        // SAFETY: as above.
+        assert!(unsafe { desktop.windows() }.is_empty());
+    }
+
+    #[test]
+    fn a_drive_that_cannot_contain_a_command_says_so_first() {
+        let folder = Path::new("E:\\work");
+        let plain = |file_system: &str, keeps_permissions: bool, remote: bool| Volume { file_system: file_system.into(), keeps_permissions, remote };
+        assert_eq!(drive_refusal(&plain("NTFS", true, false), folder), None);
+        assert!(drive_refusal(&plain("exFAT", false, false), folder).unwrap().contains("exFAT"));
+        assert!(drive_refusal(&plain("FAT32", false, false), folder).unwrap().contains("no file permissions"));
+        assert!(drive_refusal(&plain("", true, true), folder).unwrap().contains("network"));
+        let dir = tempfile::tempdir().unwrap();
+        let here = volume_of(&dir.path().join("not").join("yet")).unwrap();
+        assert!(!here.remote && here.keeps_permissions && !here.file_system.is_empty(), "{here:?}");
+        let rights = rights_on(dir.path()).unwrap();
+        assert_eq!(rights, (true, true), "one's own temporary folder");
+        assert_eq!(rights_on(&dir.path().join("not")), None);
+    }
 
     #[test]
     fn a_workspace_too_wide_still_has_project_folders_to_run_in() {
@@ -544,6 +1575,66 @@ mod tests {
         run(line, folder, folder, network, Duration::from_secs(60), &AtomicBool::new(false)).unwrap()
     }
 
+    /// Nothing is written: this only asks about a link to the real home, and what is made goes with the temp folder.
+    fn junction(link: &Path, target: &Path) {
+        let mut made = std::process::Command::new("cmd");
+        made.arg("/c").arg("mklink").arg("/J").arg(link).arg(target).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        crate::tools::no_window(&mut made);
+        assert!(made.status().unwrap().success());
+    }
+
+    #[test]
+    fn a_link_is_judged_by_where_it_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, projects) = (dir.path().join("me"), dir.path().join("projects"));
+        std::fs::create_dir_all(home.join("AppData\\Local")).unwrap();
+        std::fs::create_dir_all(home.join("work\\sub")).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        // A workspace that is a link to the home: its ACE would go on all of it.
+        let to_home = projects.join("innocent");
+        junction(&to_home, &home);
+        let refused = refusal(&to_home, Some(&home)).unwrap();
+        assert!(refused.contains("whole user folder"), "{refused}");
+        // In a home taken as the workspace, the links every Windows has in it. `Local Settings` is AppData\Local.
+        let local_settings = home.join("Local Settings");
+        junction(&local_settings, &home.join("AppData\\Local"));
+        assert!(writable_root(&local_settings, &home, Some(&home)).is_err(), "as AppData\\Local itself");
+        // A link inside an ordinary workspace to what is outside it.
+        let out = projects.join("out");
+        junction(&out, &home.join("work"));
+        assert!(writable_root(&out, &projects, Some(&home)).is_err(), "it leads outside");
+        // What is given is the folder, wherever the path to it went through.
+        let link_to_work = dir.path().join("link-to-work");
+        junction(&link_to_work, &home.join("work"));
+        assert_eq!(writable_root(&link_to_work.join("sub"), &link_to_work, Some(&home)).unwrap(), std::fs::canonicalize(home.join("work")).map(|full| PathBuf::from(full.to_string_lossy().trim_start_matches("\\\\?\\"))).unwrap());
+    }
+
+    /// The real home, which only a test that asks can reach. It writes nothing: this is what an ACE on it would have been for.
+    #[test]
+    fn a_link_to_the_real_home_or_a_short_name_for_it_is_the_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
+        let link = dir.path().join("to-home");
+        junction(&link, &home);
+        assert!(refusal(&link, Some(&home)).is_some());
+        std::fs::remove_dir(&link).unwrap();
+    }
+
+    #[test]
+    fn what_holds_this_app_or_keys_is_no_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, tools, data) = (dir.path().join("me"), dir.path().join("Tools"), dir.path().join("Tools\\Dogmind"));
+        std::fs::create_dir_all(&data).unwrap();
+        let own = [data.clone()];
+        assert!(refusal_with(&tools, Some(&home), &own).unwrap().contains("this app's own"), "it holds it");
+        assert!(refusal_with(&data, Some(&home), &own).is_some());
+        assert!(refusal_with(&data.join("tools"), Some(&home), &own).is_some(), "it lies among them");
+        assert_eq!(refusal_with(&dir.path().join("Tools2"), Some(&home), &own), None);
+        assert!(refusal_with(Path::new("C:\\Users\\me\\.ssh"), None, &[]).is_some());
+        assert!(refusal_with(Path::new("C:\\Users\\me\\.aws"), None, &[]).is_some());
+        assert_eq!(refusal_with(Path::new("C:\\Projects\\credentials-api"), None, &[]), None, "only named like one");
+    }
+
     #[test]
     fn only_a_project_folder_can_be_the_workspace() {
         let home = Path::new("C:\\Users\\me");
@@ -565,6 +1656,10 @@ mod tests {
         for gone in ["C:\\Windows", "C:\\Users\\me", "C:\\Users\\me\\.ssh", "C:\\Program Files\\Git\\cmd"] {
             assert!(!folders.contains(&PathBuf::from(gone)), "{gone}");
         }
+        // However PATH spells it, the home and what holds all of a person's programs' data are not toolchains, and nor is a place keys are kept.
+        let odd = toolchain_folders("C:\\Users\\me\\.;C:\\Users\\me\\x\\..;C:\\Users\\me\\AppData\\Local;C:\\Users\\me\\AppData;C:\\Users\\me\\.aws;C:\\Users\\me\\bin", Path::new("C:\\Users\\me"));
+        assert!(odd.contains(&PathBuf::from("C:\\Users\\me\\bin")));
+        assert!(!odd.iter().any(|folder| { let shown = folder.display().to_string(); shown.ends_with("\\.") || shown.ends_with("..") || shown.ends_with("AppData") || shown.ends_with("AppData\\Local") || shown.ends_with(".aws") }), "{odd:?}");
     }
 
     #[test]
@@ -607,6 +1702,149 @@ mod tests {
         let done = run("for /l %i in (0,0,1) do @rem", &folder, &folder, false, Duration::from_secs(1), &AtomicBool::new(false)).unwrap();
         assert_eq!((done.status, done.ended), (None, "timed out"));
         assert!(began.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn what_the_prompt_offers_for_dir_and_del_works() {
+        let folder = work_folder("no-root");
+        assert_eq!(command("mkdir sub & echo a> sub\\a.txt & echo a> b.txt", &folder, false).status, Some(0));
+        // That these still fail is why the prompt offers the others: they read the drive's root, which a container cannot.
+        let refused = command("dir", &folder, false);
+        println!("dir: {:?} {:?}", refused.status, decode(&refused.stderr));
+        let listed = command("powershell -NoProfile -Command \"(Get-ChildItem -Recurse -Name) -join ','\"", &folder, false);
+        let names = decode(&listed.stdout);
+        assert!(names.contains("b.txt") && names.contains("a.txt"), "{names} {}", decode(&listed.stderr));
+        let gone = command("powershell -NoProfile -Command \"[IO.File]::Delete('b.txt')\"", &folder, false);
+        assert_eq!(gone.status, Some(0), "{}", decode(&gone.stderr));
+        assert!(!folder.join("b.txt").exists());
+        let tree = command("powershell -NoProfile -Command \"[IO.Directory]::Delete('sub', $true)\"", &folder, false);
+        assert_eq!(tree.status, Some(0), "{}", decode(&tree.stderr));
+        assert!(!folder.join("sub").exists());
+    }
+
+    /// In a temp folder, which goes with the test. The one sandbox test written to run on its own: `--skip sandbox::` leaves it out with the others.
+    #[test]
+    fn a_command_cannot_plant_what_would_run_outside_the_sandbox_and_git_still_works() {
+        let holder = tempfile::tempdir().unwrap();
+        let (place, kept) = (holder.path().join("repo"), holder.path().to_path_buf());
+        std::fs::create_dir_all(&place).unwrap();
+        let host = |args: &[&str]| crate::tools::git(&place, args);
+        host(&["init", "-q"]).unwrap();
+        std::fs::write(place.join("a.txt"), "x\n").unwrap();
+        std::fs::write(place.join(".git/hooks/sample"), "x\n").unwrap();
+        let config = std::fs::read_to_string(place.join(".git/config")).unwrap();
+        let sandboxed = |line: &str| command(line, &place, false);
+        // First run: the workspace is granted and the repository guarded.
+        assert_eq!(sandboxed("echo ok> .git\\allowed.txt").status, Some(0), "the rest of .git is as it was");
+        for line in ["echo evil>> .git\\config", "del .git\\config", "ren .git\\config config.old", "echo evil> .git\\hooks\\pre-commit", "echo evil>> .git\\hooks\\sample", "del .git\\hooks\\sample", "ren .git\\hooks\\sample post-index-change", "ren .git\\hooks hooks.old", "mkdir .git\\hooks\\sub", "ren .git git.old"] {
+            sandboxed(line);
+            assert_eq!(std::fs::read_to_string(place.join(".git/config")).unwrap(), config, "{line}");
+            assert_eq!(std::fs::read_to_string(place.join(".git/hooks/sample")).unwrap(), "x\n", "{line}");
+            assert!(!place.join(".git/hooks/pre-commit").exists() && !place.join(".git/hooks/post-index-change").exists() && !place.join(".git/hooks/sub").exists(), "{line}");
+            assert!(place.join(".git/HEAD").is_file() && place.join(".git/hooks").is_dir(), "{line}");
+        }
+        // Work goes on, in the sandbox and outside it.
+        let added = sandboxed("git add a.txt");
+        assert_eq!(added.status, Some(0), "{}", decode(&added.stderr));
+        let committed = sandboxed("git -c user.name=t -c user.email=t@example.com commit -q -m first");
+        assert_eq!(committed.status, Some(0), "{}", decode(&committed.stderr));
+        let branched = sandboxed("git branch other");
+        assert_eq!(branched.status, Some(0), "{}", decode(&branched.stderr));
+        let refused = sandboxed("git config user.name x");
+        assert_ne!(refused.status, Some(0));
+        host(&["config", "user.name", "the person"]).expect("the person's own git is not refused");
+        // That wrote it anew, with no ACE: the next command guards it again.
+        sandboxed("echo evil>> .git\\config");
+        assert!(!std::fs::read_to_string(place.join(".git/config")).unwrap().contains("evil"));
+        // What is in it can go, as any file of the workspace can. What would run cannot, and nothing can stand in its place.
+        sandboxed("rmdir /s /q .git");
+        assert!(place.join(".git/config").is_file() && place.join(".git/hooks/sample").is_file());
+        drop(holder);
+        assert!(!kept.exists(), "nothing left behind");
+    }
+
+    /// In a temp folder too, and run on its own as the one above is.
+    #[test]
+    fn what_a_command_plants_in_a_repository_it_made_is_gone_when_it_ends_at_any_depth() {
+        let holder = tempfile::tempdir().unwrap();
+        let place = holder.path().join("work");
+        std::fs::create_dir_all(place.join("a/b/c")).unwrap();
+        let run_here = |line: &str| command(line, &place, false);
+        assert_eq!(run_here("echo first> first.txt").status, Some(0), "what is there at the first command is the person's");
+        // Made and planted in one line, three levels down.
+        // (by hand: under a user folder, where this temp folder is, `git init` itself cannot work in a container, and the app does it)
+        let planted = run_here("cd a\\b\\c && mkdir .git\\hooks .git\\objects .git\\refs && echo ref: refs/heads/master> .git\\HEAD && (echo [core]& echo repositoryformatversion = 0& echo fsmonitor = evil.exe& echo [alias]& echo x = !evil.exe)> .git\\config && echo evil> .git\\hooks\\pre-commit");
+        assert_eq!(planted.status, Some(0), "{}", decode(&planted.stderr));
+        let git = place.join("a/b/c/.git");
+        assert!(!git.join("hooks/pre-commit").exists(), "gone as soon as the command has ended");
+        let config = std::fs::read_to_string(git.join("config")).unwrap();
+        assert!(!config.contains("evil") && config.contains("repositoryformatversion"), "{config}");
+        assert!(planted.disarmed.join(" ").contains("hooks/pre-commit") && planted.disarmed.join(" ").contains("core.fsmonitor"), "{:?}", planted.disarmed);
+        assert!(git.join("hooks").is_dir(), "the folder itself is git's");
+        // From then on it is guarded as any other. Git still works there.
+        let cwd = place.join("a/b/c");
+        let later = command("echo evil> .git\\hooks\\post-commit", &cwd, false);
+        assert_ne!(later.status, Some(0));
+        assert!(!git.join("hooks/post-commit").exists());
+        let added = command("git status --short", &cwd, false);
+        assert_eq!(added.status, Some(0), "{}", decode(&added.stderr));
+        drop(holder);
+    }
+
+    #[test]
+    fn what_a_person_had_is_not_touched_and_a_config_keeps_what_git_writes() {
+        let holder = tempfile::tempdir().unwrap();
+        let place = holder.path().join("work");
+        std::fs::create_dir_all(place.join("deep/er")).unwrap();
+        let own = |args: &[&str], folder: &Path| crate::tools::git(folder, args).unwrap();
+        own(&["init", "-q"], &place.join("deep/er"));
+        std::fs::write(place.join("deep/er/.git/hooks/pre-commit"), "the person's\n").unwrap();
+        let config = place.join("deep/er/.git/config");
+        std::fs::write(&config, format!("{}[core]\n\tsshCommand = theirs\n", std::fs::read_to_string(&config).unwrap())).unwrap();
+        let before = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(command("echo x> x.txt", &place, false).disarmed, Vec::<String>::new());
+        assert_eq!(command("echo x> y.txt", &place, false).disarmed, Vec::<String>::new());
+        assert!(place.join("deep/er/.git/hooks/pre-commit").is_file() && std::fs::read_to_string(&config).unwrap() == before, "theirs");
+        // And guarded though it is deep.
+        command("echo evil> deep\\er\\.git\\hooks\\post-commit", &place, false);
+        assert!(!place.join("deep/er/.git/hooks/post-commit").exists());
+        drop(holder);
+        let (kept, gone) = config_without_programs("[core]\n\trepositoryformatversion = 0\n\tfsmonitor = evil\n\tbare = false\n[remote \"origin\"]\n\turl = https://x/y\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\tuploadpack = evil\n[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n[alias] x = !evil\n[filter \"f\"]\n\tclean = evil\\\n more evil\n\trequired\n[include]\n\tpath = evil\n[user]\n\tname = a\n");
+        for stays in ["repositoryformatversion = 0", "bare = false", "url = https://x/y", "refs/remotes/origin", "remote = origin", "merge = refs/heads/main", "name = a"] {
+            assert!(kept.contains(stays), "{stays}: {kept}");
+        }
+        assert!(!kept.contains("evil"), "{kept}");
+        for name in ["core.fsmonitor", "remote.uploadpack", "alias.x", "filter.clean", "include.path"] {
+            assert!(gone.iter().any(|said| said == name), "{name}: {gone:?}");
+        }
+    }
+
+    #[test]
+    fn what_a_command_may_use_leaves_the_machine_room_and_a_command_some() {
+        const G: u64 = 1 << 30;
+        assert_eq!(memory_cap_from(60 * G, 32 * G, 4 * G, 4 * G), 24 * G, "three quarters of its RAM");
+        assert_eq!(memory_cap_from(14 * G, 32 * G, 4 * G, 4 * G), 10 * G, "what can be given while the rest goes on");
+        assert_eq!(memory_cap_from(2 * G, 32 * G, 4 * G, 4 * G), 4 * G, "some, however short the machine");
+    }
+
+    /// In a temp folder, with a small limit of its own: nothing here comes near the machine's.
+    #[test]
+    fn a_command_past_its_memory_is_refused_it_and_said_to_have_been() {
+        let holder = tempfile::tempdir().unwrap();
+        let place = holder.path().join("work");
+        std::fs::create_dir_all(&place).unwrap();
+        let cap = 300u64 << 20;
+        let greedy = "powershell -NoProfile -Command \"try { $a = [Runtime.InteropServices.Marshal]::AllocHGlobal(800000000); 'allocated' } catch { 'refused'; exit 7 }\"";
+        let done = run_limited(greedy, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap)).unwrap();
+        eprintln!("status {:?}, out_of_memory {:?}, out {} err {}", done.status, done.out_of_memory, decode(&done.stdout).trim(), decode(&done.stderr));
+        assert!(decode(&done.stdout).contains("refused") && done.status == Some(7), "{}", decode(&done.stdout));
+        // Bit by bit, as a leak goes: it is said to have been stopped.
+        let leak = "powershell -NoProfile -Command \"try { while ($true) { $null = [Runtime.InteropServices.Marshal]::AllocHGlobal(5000000) } } catch { 'refused'; exit 7 }\"";
+        let leaked = run_limited(leak, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap)).unwrap();
+        assert!(leaked.status == Some(7) && leaked.out_of_memory == Some(cap), "{:?} {:?}", leaked.status, leaked.out_of_memory);
+        let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap)).unwrap();
+        assert!(decode(&fine.stdout).contains("fine") && fine.out_of_memory.is_none());
+        drop(holder);
     }
 
     #[test]

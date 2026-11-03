@@ -1,0 +1,570 @@
+//! Markdown as this app reads it: what the transcript needs to tell about a line as it streams, and a whole file as a page for the preview. Nothing a file
+//! holds reaches the page as HTML of its own: every character is escaped, and only what is written here makes a tag.
+
+use crate::highlight::{self, Kind};
+
+/// What stands at a `[`, when what follows may still be coming.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Link<'a> {
+    Whole { text: &'a str, url: &'a str, length: usize },
+    /// It may yet be one: more of the line tells.
+    Waiting,
+    No,
+}
+
+/// `rest` begins at the `[`.
+pub fn parse_link(rest: &str) -> Link<'_> {
+    const MOST: usize = 2000;
+    let Some(close) = rest.find(']') else {
+        return if rest.contains('\n') || rest.len() > MOST { Link::No } else { Link::Waiting };
+    };
+    if rest[..close].contains('\n') || close == 1 {
+        return Link::No;
+    }
+    let after = &rest[close + 1..];
+    if after.is_empty() {
+        return Link::Waiting;
+    }
+    if !after.starts_with('(') {
+        return Link::No;
+    }
+    let Some(end) = after.find(')') else {
+        return if after.contains('\n') || rest.len() > MOST { Link::No } else { Link::Waiting };
+    };
+    // (a title after the address is left out)
+    let Some(url) = after[1..end].split_whitespace().next() else { return Link::No };
+    Link::Whole { text: &rest[1..close], url, length: close + 1 + end + 1 }
+}
+
+/// What stands at a bare `http`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BareUrl {
+    /// This many bytes of it are the address.
+    Whole(usize),
+    Waiting,
+    No,
+}
+
+pub fn bare_url(rest: &str) -> BareUrl {
+    let is_start = rest.starts_with("http://") || rest.starts_with("https://");
+    if !is_start {
+        return if rest.len() < 8 && ("https://".starts_with(rest) || "http://".starts_with(rest)) { BareUrl::Waiting } else { BareUrl::No };
+    }
+    let end = rest.find(|c: char| !c.is_ascii_graphic() || matches!(c, '<' | '>' | '"' | '`'));
+    let Some(end) = end else {
+        return if rest.len() > 2000 { BareUrl::Whole(rest.len()) } else { BareUrl::Waiting };
+    };
+    let mut url = &rest[..end];
+    // What ends the sentence or the bracket around it is not in the address, unless the address opened that bracket itself.
+    loop {
+        let last = url.chars().last().unwrap_or(' ');
+        let unbalanced = |open: char, close: char| last == close && url.matches(close).count() > url.matches(open).count();
+        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | '_') || unbalanced('(', ')') || unbalanced('[', ']') {
+            url = &url[..url.len() - last.len_utf8()];
+        } else {
+            break;
+        }
+    }
+    if url.ends_with("://") { BareUrl::No } else { BareUrl::Whole(url.len()) }
+}
+
+/// An address to give the browser. Nothing else a model wrote is handed to the system to open.
+pub fn web_address(url: &str) -> Option<String> {
+    let lower = url.trim().to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://")).then(|| url.trim().to_string())
+}
+
+/// Whether a lone `*` opens emphasis here: `2 * 3` and `5*3` do not.
+pub fn opens_emphasis(before: Option<char>, after: char) -> bool {
+    !after.is_whitespace() && after != '*' && !before.is_some_and(|c| c.is_ascii_alphanumeric())
+}
+
+/// What a backslash can take the meaning from.
+pub fn is_escapable(c: char) -> bool {
+    matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '#' | '~' | '|' | '>' | '-' | '+' | '.' | '!')
+}
+
+/// `# a` is a heading, of this level; `#include` and `#1 の件` are not.
+pub fn heading_level(line: &str) -> Option<u8> {
+    let marks = line.chars().take_while(|c| *c == '#').count();
+    ((1..=6).contains(&marks) && line[marks..].starts_with(' ')).then_some(marks as u8)
+}
+
+/// A line that is all rule: `---`, `***`, `___`, with spaces if it likes.
+pub fn is_rule(line: &str) -> bool {
+    let marks: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    marks.len() >= 3 && ["-", "*", "_"].iter().any(|mark| marks.chars().all(|c| mark.starts_with(c)))
+}
+
+/// What is quoted on a line of a quotation.
+pub fn quoted(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('>')?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+/// Whether the start of a line, with no line's end yet, cannot be told from a mark that means something: it waits for more.
+pub fn undecided(head: &str) -> bool {
+    let count = head.chars().count();
+    if head.chars().all(|c| matches!(c, '-' | '*' | '_' | ' ')) {
+        return true;
+    }
+    if head.chars().all(|c| c == '#') {
+        return count <= 6;
+    }
+    if head.starts_with("- [") && count < 6 {
+        return true;
+    }
+    count < 4 && head.chars().all(|c| c.is_ascii_digit() || matches!(c, '`' | '#' | '-' | '*' | '.' | '>' | ' '))
+}
+
+pub fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// An address fit for a page: to the web or in the file's own folder, and not `javascript:` or the like.
+fn page_address(url: &str) -> String {
+    let scheme = url.split_once(':').map(|(before, _)| before).filter(|before| !before.contains(['/', '?', '#', '.']));
+    match scheme {
+        Some(scheme) if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") => "#".to_string(),
+        _ => escape(url),
+    }
+}
+
+/// A line's text as HTML: emphasis, code, links, pictures.
+pub fn inline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let (mut bold, mut italic, mut struck) = (false, false, false);
+    let mut before: Option<char> = None;
+    let mut at = 0;
+    while let Some(c) = text[at..].chars().next() {
+        let rest = &text[at..];
+        let next = rest[c.len_utf8()..].chars().next();
+        match c {
+            '\\' if next.is_some_and(is_escapable) => {
+                let taken = next.unwrap_or(' ');
+                out.push_str(&escape(&taken.to_string()));
+                at += 1 + taken.len_utf8();
+                before = Some(taken);
+                continue;
+            }
+            '`' => {
+                if let Some(end) = rest[1..].find('`') {
+                    out.push_str(&format!("<code>{}</code>", escape(&rest[1..1 + end])));
+                    at += end + 2;
+                    before = Some('`');
+                    continue;
+                }
+            }
+            '*' if next == Some('*') => {
+                out.push_str(if bold { "</strong>" } else { "<strong>" });
+                bold = !bold;
+                at += 2;
+                continue;
+            }
+            '*' if italic && before.is_some_and(|c| !c.is_whitespace()) => {
+                out.push_str("</em>");
+                italic = false;
+                at += 1;
+                continue;
+            }
+            '*' if !italic && next.is_some_and(|after| opens_emphasis(before, after)) => {
+                out.push_str("<em>");
+                italic = true;
+                at += 1;
+                continue;
+            }
+            '~' if next == Some('~') => {
+                out.push_str(if struck { "</del>" } else { "<del>" });
+                struck = !struck;
+                at += 2;
+                continue;
+            }
+            '!' if next == Some('[') => {
+                if let Link::Whole { text: alt, url, length } = parse_link(&rest[1..]) {
+                    out.push_str(&format!("<img src=\"{}\" alt=\"{}\">", page_address(url), escape(alt)));
+                    at += 1 + length;
+                    before = Some(')');
+                    continue;
+                }
+            }
+            '[' => {
+                if let Link::Whole { text: words, url, length } = parse_link(rest) {
+                    out.push_str(&format!("<a href=\"{}\">{}</a>", page_address(url), inline(words)));
+                    at += length;
+                    before = Some(')');
+                    continue;
+                }
+            }
+            'h' if !before.is_some_and(|c| c.is_ascii_alphanumeric()) => {
+                // (at the end of the text there is no more to come, so what would wait is read with an end after it)
+                let measured = match bare_url(rest) {
+                    BareUrl::Waiting => bare_url(&format!("{rest} ")),
+                    other => other,
+                };
+                if let BareUrl::Whole(length) = measured {
+                    let url = escape(&rest[..length]);
+                    out.push_str(&format!("<a href=\"{url}\">{url}</a>"));
+                    at += length;
+                    before = Some('/');
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        out.push_str(&escape(&c.to_string()));
+        before = Some(c);
+        at += c.len_utf8();
+    }
+    for (open, close) in [(struck, "</del>"), (italic, "</em>"), (bold, "</strong>")] {
+        if open {
+            out.push_str(close);
+        }
+    }
+    out
+}
+
+fn class_of(kind: Kind) -> Option<&'static str> {
+    match kind {
+        Kind::Plain => None,
+        Kind::Keyword => Some("k"),
+        Kind::Text => Some("s"),
+        Kind::Comment => Some("c"),
+        Kind::Number => Some("n"),
+    }
+}
+
+/// One line of code, in the colours of its language when it has any. Returns whether a block comment runs on past it.
+fn code_line(line: &str, language: &str, open: bool, out: &mut String) -> bool {
+    let Some((runs, still_open)) = highlight::runs(line, language, open) else {
+        out.push_str(&escape(line));
+        return false;
+    };
+    for (text, kind) in runs {
+        match class_of(kind) {
+            Some(class) => out.push_str(&format!("<span class=\"{class}\">{}</span>", escape(&text))),
+            None => out.push_str(&escape(&text)),
+        }
+    }
+    still_open
+}
+
+/// A whole source file: its lines numbered, in the colours of `language` when it knows them. `language` none: plain.
+pub fn source_html(text: &str, language: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    out.push_str("<pre class=\"source\">");
+    let mut open = false;
+    for line in text.lines() {
+        out.push_str("<span class=\"l\">");
+        open = code_line(line, language, open, &mut out);
+        out.push_str("</span>");
+    }
+    out.push_str("</pre>");
+    out
+}
+
+struct Item<'a> {
+    ordered: bool,
+    /// None, or whether its box is ticked.
+    task: Option<bool>,
+    text: &'a str,
+}
+
+fn indent_of(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ' || *c == '\t').map(|c| if c == '\t' { 4 } else { 1 }).sum()
+}
+
+fn item_of(line: &str) -> Option<Item<'_>> {
+    let trimmed = line.trim_start();
+    let (ordered, text) = if let Some(text) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")).or_else(|| trimmed.strip_prefix("+ ")) {
+        (false, text)
+    } else {
+        let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+        let rest = trimmed.get(digits..)?;
+        if digits == 0 || digits > 9 {
+            return None;
+        }
+        (true, rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") "))?)
+    };
+    let (task, text) = if let Some(text) = text.strip_prefix("[ ] ") {
+        (Some(false), text)
+    } else if let Some(text) = text.strip_prefix("[x] ").or_else(|| text.strip_prefix("[X] ")) {
+        (Some(true), text)
+    } else {
+        (None, text)
+    };
+    Some(Item { ordered, task, text })
+}
+
+/// Whether a line begins something a paragraph stops for.
+fn starts_block(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with("```") || trimmed.starts_with("~~~") || heading_level(trimmed).is_some() || is_rule(trimmed) || trimmed.starts_with('>') || item_of(line).is_some() || trimmed.starts_with('|')
+}
+
+/// A list from the line at `at`, with what is nested in it; where it ended.
+fn list(lines: &[&str], mut at: usize, out: &mut String) -> usize {
+    let indent = indent_of(lines[at]);
+    let ordered = item_of(lines[at]).is_some_and(|item| item.ordered);
+    out.push_str(if ordered { "<ol>" } else { "<ul>" });
+    while at < lines.len() {
+        let line = lines[at];
+        if line.trim().is_empty() {
+            let goes_on = lines.get(at + 1).is_some_and(|next| indent_of(next) > indent || (indent_of(next) == indent && item_of(next).is_some_and(|item| item.ordered == ordered)));
+            if goes_on {
+                at += 1;
+                continue;
+            }
+            break;
+        }
+        if indent_of(line) != indent {
+            break;
+        }
+        let Some(item) = item_of(line).filter(|item| item.ordered == ordered) else { break };
+        out.push_str("<li>");
+        if let Some(ticked) = item.task {
+            out.push_str(if ticked { "<input type=\"checkbox\" checked disabled> " } else { "<input type=\"checkbox\" disabled> " });
+        }
+        out.push_str(&inline(item.text));
+        at += 1;
+        // What stands further in belongs to this item, blank lines among it too.
+        let start = at;
+        while at < lines.len() {
+            if lines[at].trim().is_empty() {
+                if lines.get(at + 1).is_some_and(|next| indent_of(next) > indent) {
+                    at += 1;
+                    continue;
+                }
+                break;
+            }
+            if indent_of(lines[at]) <= indent {
+                break;
+            }
+            at += 1;
+        }
+        if start < at {
+            let least = lines[start..at].iter().filter(|line| !line.trim().is_empty()).map(|line| indent_of(line)).min().unwrap_or(0);
+            let inner: Vec<String> = lines[start..at].iter().map(|line| line.chars().skip(least).collect()).collect();
+            let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
+            blocks(&inner, out);
+        }
+        out.push_str("</li>");
+    }
+    out.push_str(if ordered { "</ol>" } else { "</ul>" });
+    at
+}
+
+fn blocks(lines: &[&str], out: &mut String) {
+    let mut at = 0;
+    while at < lines.len() {
+        let line = lines[at];
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            at += 1;
+        } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let fence = &trimmed[..3];
+            let language = trimmed[3..].trim().to_lowercase();
+            at += 1;
+            out.push_str("<pre><code>");
+            let mut open = false;
+            while at < lines.len() && !lines[at].trim_start().starts_with(fence) {
+                open = code_line(lines[at], &language, open, out);
+                out.push('\n');
+                at += 1;
+            }
+            out.push_str("</code></pre>");
+            at += 1;
+        } else if let Some(level) = heading_level(trimmed) {
+            out.push_str(&format!("<h{level}>{}</h{level}>", inline(trimmed[level as usize..].trim().trim_end_matches('#').trim())));
+            at += 1;
+        } else if is_rule(trimmed) {
+            out.push_str("<hr>");
+            at += 1;
+        } else if trimmed.starts_with('>') {
+            let mut inner = Vec::new();
+            while at < lines.len() {
+                let Some(text) = quoted(lines[at].trim_start()) else { break };
+                inner.push(text);
+                at += 1;
+            }
+            out.push_str("<blockquote>");
+            blocks(&inner, out);
+            out.push_str("</blockquote>");
+        } else if item_of(line).is_some() {
+            at = list(lines, at, out);
+        } else if trimmed.starts_with('|') && lines.get(at + 1).and_then(|next| crate::rtf::table_cells(next)).is_some_and(|cells| crate::rtf::is_table_rule(&cells)) {
+            let rule = crate::rtf::table_cells(lines[at + 1]).unwrap_or_default();
+            let aligned = |column: usize| match rule.get(column).map(String::as_str) {
+                Some(cell) if cell.starts_with(':') && cell.ends_with(':') => " style=\"text-align:center\"",
+                Some(cell) if cell.ends_with(':') => " style=\"text-align:right\"",
+                _ => "",
+            };
+            out.push_str("<table><thead><tr>");
+            for (column, cell) in crate::rtf::table_cells(line).unwrap_or_default().iter().enumerate() {
+                out.push_str(&format!("<th{}>{}</th>", aligned(column), escape(cell)));
+            }
+            out.push_str("</tr></thead><tbody>");
+            at += 2;
+            while at < lines.len() && lines[at].trim_start().starts_with('|') {
+                out.push_str("<tr>");
+                for (column, cell) in crate::rtf::table_cells(lines[at]).unwrap_or_default().iter().enumerate() {
+                    out.push_str(&format!("<td{}>{}</td>", aligned(column), escape(cell)));
+                }
+                out.push_str("</tr>");
+                at += 1;
+            }
+            out.push_str("</tbody></table>");
+        } else {
+            out.push_str("<p>");
+            out.push_str(&inline(trimmed));
+            at += 1;
+            while at < lines.len() && !starts_block(lines[at]) {
+                out.push('\n');
+                out.push_str(&inline(lines[at].trim()));
+                at += 1;
+            }
+            out.push_str("</p>");
+        }
+    }
+}
+
+/// A Markdown file as the body of a page.
+pub fn to_html(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    blocks(&lines, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_link_is_told_as_its_line_comes() {
+        assert_eq!(parse_link("[a](http://b) c"), Link::Whole { text: "a", url: "http://b", length: 13 });
+        assert_eq!(parse_link("[a](http://b \"title\")"), Link::Whole { text: "a", url: "http://b", length: 21 });
+        for coming in ["[", "[a", "[a]", "[a](", "[a](http://b"] {
+            assert_eq!(parse_link(coming), Link::Waiting, "{coming}");
+        }
+        for not in ["[a] b", "[a\n](b)", "[](b)", "[a]()", "[a\n", "[a](b\n"] {
+            assert_eq!(parse_link(not), Link::No, "{not}");
+        }
+    }
+
+    #[test]
+    fn a_bare_address_ends_where_the_sentence_begins() {
+        assert_eq!(bare_url("https://a.example/b c"), BareUrl::Whole(19));
+        assert_eq!(bare_url("https://a.example/b. Next"), BareUrl::Whole(19), "the full stop");
+        assert_eq!(bare_url("https://a.example/b) x"), BareUrl::Whole(19), "the bracket around it");
+        assert_eq!(bare_url("https://a.example/(b) x"), BareUrl::Whole(21), "a bracket of its own");
+        assert_eq!(bare_url("https://a.example/bを見て"), BareUrl::Whole(19), "Japanese after it");
+        for coming in ["h", "htt", "https:/", "https://a.example"] {
+            assert_eq!(bare_url(coming), BareUrl::Waiting, "{coming}");
+        }
+        for not in ["hello world", "http", "httpd is", "https:// x"] {
+            let told = bare_url(not);
+            assert!(told == BareUrl::No || (not == "http" && told == BareUrl::Waiting), "{not}: {told:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_web_goes_to_the_browser() {
+        assert_eq!(web_address(" https://a.example/b ").as_deref(), Some("https://a.example/b"));
+        assert_eq!(web_address("HTTP://a.example").as_deref(), Some("HTTP://a.example"));
+        for not in ["javascript:alert(1)", "file:///C:/x", "C:\\x.exe", "index.html", "ms-settings:", "\\\\host\\share"] {
+            assert_eq!(web_address(not), None, "{not}");
+        }
+    }
+
+    #[test]
+    fn emphasis_is_told_from_arithmetic() {
+        assert!(opens_emphasis(None, 'a'));
+        assert!(opens_emphasis(Some(' '), 'a'));
+        assert!(opens_emphasis(Some('は'), '強'), "Japanese has no space before it");
+        assert!(!opens_emphasis(Some(' '), ' '), "2 * 3");
+        assert!(!opens_emphasis(Some('5'), '3'), "5*3");
+    }
+
+    #[test]
+    fn marks_at_the_start_of_a_line_are_told_apart() {
+        assert_eq!(heading_level("# a"), Some(1));
+        assert_eq!(heading_level("### a"), Some(3));
+        for not in ["#include <a>", "#1 の件", "####### a", "a # b", "#"] {
+            assert_eq!(heading_level(not), None, "{not}");
+        }
+        for rule in ["---", "***", "___", "- - -", "-----------"] {
+            assert!(is_rule(rule), "{rule}");
+        }
+        for not in ["--", "--a", "-*-", "- a", ""] {
+            assert!(!is_rule(not), "{not}");
+        }
+        assert_eq!(quoted("> a"), Some("a"));
+        assert_eq!(quoted(">a"), Some("a"));
+        assert_eq!(quoted("a"), None);
+    }
+
+    #[test]
+    fn the_start_of_a_line_waits_only_while_it_could_be_a_mark() {
+        for waiting in ["-", "--", "---", "--------", "*", "**", "#", "######", "1", "12.", "`", "``", ">", "- [", "- [ ]", " "] {
+            assert!(undecided(waiting), "{waiting}");
+        }
+        for told in ["a", "1a", "#a", "- a", "1234", "#######", "**a", "- [ ] a"] {
+            assert!(!undecided(told), "{told}");
+        }
+    }
+
+    #[test]
+    fn a_line_of_markdown_makes_its_tags_and_no_others() {
+        assert_eq!(inline("a **b** *c* ~~d~~ `e*f`"), "a <strong>b</strong> <em>c</em> <del>d</del> <code>e*f</code>");
+        assert_eq!(inline("2 * 3 * 4"), "2 * 3 * 4");
+        assert_eq!(inline("[a](http://b)"), "<a href=\"http://b\">a</a>");
+        assert_eq!(inline("see https://a.example/b."), "see <a href=\"https://a.example/b\">https://a.example/b</a>.");
+        assert_eq!(inline("![p](x.png)"), "<img src=\"x.png\" alt=\"p\">");
+        assert_eq!(inline("\\*a\\*"), "*a*");
+        assert_eq!(inline("**open"), "<strong>open</strong>", "what stays open is closed");
+    }
+
+    #[test]
+    fn nothing_in_a_file_becomes_a_tag_or_a_script() {
+        let page = to_html("<script>alert(1)</script>\n\n[x](javascript:alert(1))\n\n![y](javascript:alert(2))\n\n| <b> |\n|---|\n| <i> |\n\n```\n<script>\n```\n\n<img src=x onerror=alert(3)>");
+        assert!(!page.contains("<script>") && !page.contains("<b>") && !page.contains("<i>") && !page.contains("<img src=x") && !page.contains("javascript:"), "{page}");
+        assert!(page.contains("&lt;script&gt;"), "{page}");
+    }
+
+    #[test]
+    fn a_file_comes_out_as_its_blocks() {
+        let page = to_html("# 見出し\n\n段落の\n続き\n\n- a\n  - b\n- [x] c\n\n1. d\n\n> e\n\n---\n\n| h | i |\n|:--|--:|\n| 1 | 2 |\n\n```rust\nfn a() {}\n```\n");
+        for wanted in ["<h1>見出し</h1>", "<p>段落の\n続き</p>", "<ul><li>a<ul><li>b</li></ul></li><li><input type=\"checkbox\" checked disabled> c</li></ul>", "<ol><li>d</li></ol>", "<blockquote><p>e</p></blockquote>", "<hr>", "<th>h</th><th style=\"text-align:right\">i</th>", "<td style=\"text-align:right\">2</td>", "<span class=\"k\">fn</span>"] {
+            assert!(page.contains(wanted), "{wanted} in {page}");
+        }
+    }
+
+    #[test]
+    fn a_list_and_a_quote_end_and_nothing_loops() {
+        for text in ["- a\nb", "  - a\n- b", "1. a\n- b", "- a\n\n\nb", ">", "```", "|a|\n|-|", "- a\n    \n", "* * *", "- ", "|"] {
+            let _ = to_html(text);
+        }
+        assert_eq!(to_html("- a\nb"), "<ul><li>a</li></ul><p>b</p>");
+        assert_eq!(to_html("1. a\n- b"), "<ol><li>a</li></ol><ul><li>b</li></ul>");
+    }
+
+    #[test]
+    fn source_keeps_its_lines_and_its_colours() {
+        let page = source_html("fn a() {\n  // <b>\n}\n", "rs");
+        assert_eq!(page.matches("class=\"l\"").count(), 3);
+        assert!(page.contains("<span class=\"k\">fn</span>") && page.contains("&lt;b&gt;"), "{page}");
+        let plain = source_html("a<b", "");
+        assert!(plain.contains("a&lt;b"), "{plain}");
+    }
+}

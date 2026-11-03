@@ -1,51 +1,190 @@
 //! The tools, each behaving as its Dogmind namesake says it does in the schema the model reads.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(not(windows))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use regex::RegexBuilder;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::prompt::TOOLS_JSON;
 use crate::safety::resolve;
 
-const MAX_OUTPUT: usize = 16384;
-const LIST_LIMIT: usize = 500;
+const MAX_OUTPUT: usize = 12 * 1024;
+/// A command's report keeps as much of its end as of its start: that is where a build or a test run says how it went.
+const MAX_COMMAND_OUT: usize = 12 * 1024;
+const MAX_COMMAND_ERR: usize = 6 * 1024;
+/// What one `read_file` brings back, whatever its `limit`: a local model pays for each token of it as it goes in, and it stays in the context.
+const MAX_READ: usize = 32 * 1024;
+/// A line of a minified file, as read: 65 KB of one once came back from a request for two lines.
+const MAX_LINE: usize = 2000;
+const LIST_LIMIT: usize = 300;
+const UNCHANGED_READ: &str = "--- the file has not changed since you read these same lines: they are above, and not repeated here ---";
 const MATCH_LIMIT: usize = 1000;
 const SEARCH_FILE_LIMIT: u64 = 16 << 20;
+const MOST_READ_WHOLE: u64 = 256 << 20;
 
+/// The tools every session has. Dogmind's names and meanings, in as few words as still say them: a local model reads all of this before a new session's first word, some 200 tokens a second, and it has no other use for them than knowing what to call.
+/// `assets/dogmind/tools.json` is what Dogmind itself says, to read when it changes.
 pub fn schemas() -> Value {
-    serde_json::from_str(TOOLS_JSON).expect("the generated schemas are JSON")
+    let function = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"type": "function", "function": {"name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required}}});
+    json!([
+        function("apply_patch", "Edit existing files by exact text replacement. All edits land together or none do. Read a file before editing it. old_string must occur exactly once (or `count` times) and has no line numbers. After a failure the file is unchanged, so correct old_string instead of reading again.", json!({
+            "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "count": {"type": "integer"}}, "required": ["path", "old_string", "new_string"]}}
+        }), &["edits"]),
+        function("create_file", "Write a file, new or one you have read. Over about 300 lines, write the first part, then add each further part with append=true: what is on disk survives a stop, and a long call is minutes with nothing to show.", json!({
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+            "append": {"type": "boolean", "description": "Add to the end of the file."}
+        }), &["path", "content"]),
+        function("execute_command", "Run a program, script, test, build, package manager or git, through cmd.exe in the sandbox the Environment section describes. Output is captured whole, so no redirect to a log and no `| head`. Not for reading files or listing folders.", json!({
+            "command": {"type": "string"},
+            "cwd": {"type": "string", "description": "Where to run, instead of `cd ... &&`. Default: the workspace."},
+            "timeout_seconds": {"type": "integer", "description": "How long to wait for it, default 180. Past that it goes on in the background."},
+            "purpose": {"type": "string", "description": "A few words on why, for the user when they are asked."},
+            "network": {"type": "boolean", "description": "Needs the network, and is not curl, a package install or remote git, which get it anyway. Asks the user."},
+            "background": {"type": "boolean", "description": "Start it and go on, for what takes minutes. Comes back with an id for command_status."}
+        }), &["command"]),
+        function("list_files", "List a folder. {} is the workspace.", json!({
+            "path": {"type": "string"},
+            "recursive": {"type": "boolean", "description": "Skips node_modules, .venv and the like."}
+        }), &[]),
+        function("read_file", "Read a text file as numbered lines, or see a picture where this model can be shown one.", json!({
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "description": "1-based. -N starts N lines from the end."},
+            "limit": {"type": "integer", "description": "Lines. Default 500, max 2000."}
+        }), &["path"]),
+        function("search_files", "Search file contents by regex, ignoring case unless the pattern has capitals. Skips what .gitignore skips.", json!({
+            "pattern": {"type": "string"},
+            "literal": {"type": "boolean", "description": "The pattern is plain text."},
+            "path": {"type": "string"},
+            "file_glob": {"type": "string"}
+        }), &["pattern"]),
+        function("show_diff", "Show file changes.", json!({
+            "scope": {"type": "string", "enum": ["session", "workspace", "staged", "unstaged"], "description": "session: since this session began. workspace: against HEAD, or outside git as session. staged, unstaged: git's index."},
+            "paths": {"type": "array", "items": {"type": "string"}}
+        }), &["scope"]),
+        function("todo", "A checklist, only for work with several separate deliverables. Send only what changed.", json!({
+            "todos": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "doing", "done", "blocked"]}}, "required": ["id"]}},
+            "merge": {"type": "boolean", "description": "false: replace the whole list."}
+        }), &["todos"]),
+        function("find_files", "Find files by name with a glob such as `**/*.rs`. Skips what .gitignore skips.", json!({
+            "pattern": {"type": "string"},
+            "path": {"type": "string"}
+        }), &["pattern"]),
+        function("check_page", "Run a workspace page that uses no CDN library in a headless browser: what its scripts printed and threw, and what it shows.", json!({"path": {"type": "string"}}), &["path"]),
+        function("command_status", "How a background command is doing, and its output once it has ended.", json!({"id": {"type": "string"}}), &[]),
+        function("command_stop", "End a background command.", json!({"id": {"type": "string"}}), &["id"])
+    ])
 }
 
-/// Independent reads run together; everything else runs alone and in order.
-/// With the web tools, when they are on.
-pub fn schemas_for(web: bool) -> Value {
+/// All the tools of a session: those every session has, and those that depend on what is on.
+pub fn schemas_for(web: bool, skills: bool, memory: bool, mcp: Vec<Value>) -> Value {
     let mut all = schemas();
-    if let (true, Some(list), Some(more)) = (web, all.as_array_mut(), crate::web::schemas().as_array().cloned()) {
-        list.extend(more);
+    let Some(list) = all.as_array_mut() else { return all };
+    let mut add = |more: Value| {
+        if let Some(more) = more.as_array() {
+            list.extend(more.iter().cloned());
+        }
+    };
+    if web {
+        add(crate::web::schemas());
     }
+    if skills {
+        add(json!([crate::skills::schema()]));
+    }
+    if memory {
+        add(crate::memory::schemas());
+    }
+    add(Value::Array(mcp));
     all
 }
 
+/// Independent reads run together; everything else runs alone and in order.
 pub fn is_read(tool: &str) -> bool {
-    matches!(tool, "read_file" | "list_files" | "search_files" | "show_diff")
+    matches!(tool, "read_file" | "list_files" | "search_files" | "show_diff" | "find_files")
+}
+
+struct Job {
+    id: String,
+    command: String,
+    started: Instant,
+    cancel: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<Result<String, String>>>>,
+}
+
+/// Commands going on in the background. They do not outlive the session that started them.
+#[derive(Default)]
+struct Jobs(Vec<Job>);
+
+impl Drop for Jobs {
+    fn drop(&mut self) {
+        for job in &self.0 {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+type CommandResult = Arc<Mutex<Option<Result<String, String>>>>;
+
+/// A command on a thread of its own, with what ends it and where its result will be. It has minutes to itself unless the call says otherwise.
+fn spawn_command(arguments: &Value, workspace: &Path) -> (Arc<AtomicBool>, CommandResult) {
+    let mut given = arguments.clone();
+    if given.get("timeout_seconds").is_none() {
+        given["timeout_seconds"] = json!(3600);
+    }
+    let (cancel, result): (_, CommandResult) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
+    let (stop, done, place) = (cancel.clone(), result.clone(), workspace.to_path_buf());
+    std::thread::spawn(move || {
+        let outcome = execute_command(&given, &place, &stop);
+        *done.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+    });
+    (cancel, result)
+}
+
+/// Its result, once it has one. None when `wait` runs out first. A stop from the person ends it, and that is waited for too: what it printed is part of the answer.
+fn wait_for_command(result: &CommandResult, stop: &AtomicBool, cancel: &AtomicBool, wait: Duration) -> Option<Result<String, String>> {
+    let started = Instant::now();
+    loop {
+        if let Some(outcome) = result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+            return Some(outcome);
+        }
+        let stopping = cancel.load(Ordering::Relaxed);
+        if stopping {
+            stop.store(true, Ordering::Relaxed);
+        } else if started.elapsed() >= wait {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[derive(Default)]
 pub struct Workbench {
+    /// The conversation is in Japanese, so what it writes is looked at for what is not.
+    pub in_japanese: bool,
     /// The hash of each file as this session last saw it: an edit needs a read of what is there now.
     seen: HashMap<PathBuf, String>,
     pub todos: Vec<Value>,
-    /// HEAD when the session began, for `show_diff`'s session scope.
-    pub baseline: Option<String>,
+    /// Where the session began, for `show_diff`. None until it has a file to keep that beside.
+    pub baseline: Option<Arc<crate::baseline::Baseline>>,
     pub web: crate::web::Web,
+    pub skills: Vec<crate::skills::Skill>,
+    /// The folder of the notes kept between sessions.
+    pub memory: Option<PathBuf>,
+    pub mcp: Option<Arc<crate::mcp::Hub>>,
+    jobs: Jobs,
+    /// A file whose `create_file` the app cut off to get it on disk: the next write to it goes on from there, whether or not the model says append.
+    cut_file: Option<PathBuf>,
+    /// What has been read of each file and what it was then, while that is still in the conversation.
+    reads: HashMap<(PathBuf, i64, i64), String>,
+    /// What holds keys besides what reads as such: the app's own folder, and the files its settings name.
+    pub secrets: Vec<PathBuf>,
 }
 
 fn sha16(bytes: &[u8]) -> String {
@@ -53,6 +192,8 @@ fn sha16(bytes: &[u8]) -> String {
 }
 
 /// Head and tail, with what is left out said between them.
+const MAX_APPLIED_DIFF: usize = 3000;
+
 pub fn cap(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
@@ -68,25 +209,40 @@ pub fn cap(text: &str, limit: usize) -> String {
     format!("{}\n--- truncated: {} bytes left out ---\n{}", &text[..head], tail - head, &text[tail..])
 }
 
+/// As much of the end as of the start.
+fn cap_evenly(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let (mut head, mut tail) = (limit / 2, text.len() - limit / 2);
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}\n--- truncated: {} bytes left out; run it again through findstr to see them ---\n{}", &text[..head], tail - head, &text[tail..])
+}
+
 fn text_arg<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
     arguments.get(name).and_then(Value::as_str).ok_or_else(|| format!("{name} is required"))
 }
 
 impl Workbench {
-    pub fn new(workspace: &Path) -> Workbench {
-        let baseline = git(workspace, &["rev-parse", "HEAD"]).ok().map(|head| head.trim().to_string());
-        Workbench { baseline, ..Workbench::default() }
+    pub fn new(_workspace: &Path) -> Workbench {
+        Workbench::default()
     }
 
     /// Runs a read that may share the workbench with others: what it saw comes back to record afterwards.
-    pub fn run_read(tool: &str, arguments: &Value, workspace: &Path, baseline: Option<&str>, cancel: &AtomicBool) -> (Result<String, String>, Option<(PathBuf, String)>) {
+    pub fn run_read(tool: &str, arguments: &Value, workspace: &Path, baseline: Option<&crate::baseline::Baseline>, secrets: &[PathBuf], cancel: &AtomicBool) -> (Result<String, String>, Option<(PathBuf, String)>) {
         match tool {
             "read_file" => match read_file(arguments, workspace) {
                 Ok((text, seen)) => (Ok(text), Some(seen)),
                 Err(error) => (Err(error), None),
             },
             "list_files" => (list_files(arguments, workspace), None),
-            "search_files" => (search_files(arguments, workspace, cancel), None),
+            "find_files" => (find_files(arguments, workspace), None),
+            "search_files" => (search_files(arguments, workspace, secrets, cancel), None),
             "show_diff" => (show_diff(arguments, workspace, baseline), None),
             other => (Err(format!("{other} is not a read")), None),
         }
@@ -96,42 +252,170 @@ impl Workbench {
         match tool {
             "apply_patch" => self.apply_patch(arguments, workspace),
             "create_file" => self.create_file(arguments, workspace),
-            "execute_command" => execute_command(arguments, workspace, cancel),
+            "execute_command" if arguments.get("background").and_then(Value::as_bool) == Some(true) => self.start_job(arguments, workspace),
+            "execute_command" => self.run_command(arguments, workspace, cancel),
+            #[cfg(windows)]
+            "check_page" => crate::page_check::check_page(arguments, workspace, cancel),
+            "command_status" => self.job_status(arguments),
+            "command_stop" => self.job_stop(arguments),
             "todo" => self.todo(arguments),
+            "skill" => self.read_skill(arguments),
+            _ if tool.starts_with("mcp__") => {
+                let hub = self.mcp.as_ref().ok_or("no MCP server is running")?;
+                // What a server says may come from anywhere: it is data, as a page is.
+                hub.call(tool, arguments, cancel).map(|text| crate::web::envelope(tool, &format!("{text}\n")))
+            }
+            "remember" | "forget" => {
+                let folder = self.memory.as_deref().ok_or("notes are not kept here")?;
+                if tool == "remember" { crate::memory::remember(folder, workspace, arguments) } else { crate::memory::forget(folder, workspace, arguments) }
+            }
             "web_search" | "web_read" if !self.web.settings.enabled => Err("the web tools are turned off in Settings".to_string()),
             "web_search" => self.web.search(arguments, cancel),
             "web_read" => self.web.read(arguments, cancel),
             _ => {
-                let (result, seen) = Workbench::run_read(tool, arguments, workspace, self.baseline.as_deref(), cancel);
+                let (result, seen) = Workbench::run_read(tool, arguments, workspace, self.baseline.as_deref(), &self.secrets, cancel);
                 if let Some((path, hash)) = seen {
-                    self.seen.insert(path, hash);
+                    return self.after_read(arguments, path, hash, result);
                 }
                 result
             }
         }
     }
 
-    pub fn record_seen(&mut self, path: PathBuf, hash: String) {
-        self.seen.insert(path, hash);
+    fn read_skill(&mut self, arguments: &Value) -> Result<String, String> {
+        let name = text_arg(arguments, "name")?;
+        if name.eq_ignore_ascii_case("list") && !self.skills.iter().any(|skill| skill.name.eq_ignore_ascii_case("list")) {
+            return Ok(crate::skills::listing(&self.skills));
+        }
+        let skill = self.skills.iter().find(|skill| skill.name.eq_ignore_ascii_case(name) && skill.for_the_model)
+            .ok_or_else(|| format!("no skill is called {name}: the Skills list has the names"))?;
+        #[cfg(windows)]
+        crate::sandbox::also_readable(&skill.folder);
+        crate::skills::instructions(skill)
+    }
+
+    fn start_job(&mut self, arguments: &Value, workspace: &Path) -> Result<String, String> {
+        let (cancel, result) = spawn_command(arguments, workspace);
+        let id = self.add_job(arguments, cancel, result)?;
+        Ok(format!("started as {id}. Go on with other work, and use command_status for it; do not wait in a loop."))
+    }
+
+    fn add_job(&mut self, arguments: &Value, cancel: Arc<AtomicBool>, result: CommandResult) -> Result<String, String> {
+        let id = format!("job{}", self.jobs.0.len() + 1);
+        let command = text_arg(arguments, "command")?.to_string();
+        self.jobs.0.push(Job { id: id.clone(), command, started: Instant::now(), cancel, result });
+        Ok(id)
+    }
+
+    /// A command waited for. One still at work when the time is up goes on in the background rather than end: what it had done would otherwise be done again, at the cost of a round
+    /// and of a longer wait from the start, and a model has no way to know beforehand how long a first build takes here.
+    fn run_command(&mut self, arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
+        text_arg(arguments, "command")?;
+        let wait = Duration::from_secs(arguments.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(180).clamp(1, 3600));
+        let mut given = arguments.clone();
+        // (its timeout is how long to wait: in the background it has the same as any other)
+        if let Some(fields) = given.as_object_mut() {
+            fields.remove("timeout_seconds");
+        }
+        let (stop, result) = spawn_command(&given, workspace);
+        if let Some(outcome) = wait_for_command(&result, &stop, cancel, wait) {
+            return outcome;
+        }
+        let id = self.add_job(arguments, stop, result)?;
+        Ok(format!("still running after {} s, so it goes on in the background as {id}. Go on with other work and use command_status for it: do not run it again, and do not wait in a loop.", wait.as_secs()))
+    }
+
+    fn job_status(&self, arguments: &Value) -> Result<String, String> {
+        let wanted = arguments.get("id").and_then(Value::as_str);
+        let report = |job: &Job| match &*job.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+            Some(Ok(output)) => format!("{} has ended: {}\n{output}", job.id, job.command),
+            Some(Err(error)) => format!("{} did not run: {}\n{error}", job.id, job.command),
+            None => format!("{} is running, for {} s: {}", job.id, job.started.elapsed().as_secs(), job.command),
+        };
+        let lines: Vec<String> = self.jobs.0.iter().filter(|job| wanted.is_none_or(|id| job.id == id)).map(report).collect();
+        if lines.is_empty() {
+            return Ok(wanted.map_or("no command has been started in the background".to_string(), |id| format!("there is no {id}")));
+        }
+        Ok(cap(&lines.join("\n\n"), MAX_OUTPUT))
+    }
+
+    fn job_stop(&self, arguments: &Value) -> Result<String, String> {
+        let id = text_arg(arguments, "id")?;
+        let job = self.jobs.0.iter().find(|job| job.id == id).ok_or_else(|| format!("there is no {id}"))?;
+        job.cancel.store(true, Ordering::Relaxed);
+        Ok(format!("{id} is being ended"))
+    }
+
+    /// A read has come back. The same lines of the same file as they were are already in the conversation, and are not sent again to be paid for twice.
+    pub fn after_read(&mut self, arguments: &Value, path: PathBuf, hash: String, result: Result<String, String>) -> Result<String, String> {
+        self.seen.insert(path.clone(), hash.clone());
+        let number = |name: &str, default: i64| arguments.get(name).and_then(Value::as_i64).unwrap_or(default);
+        let key = (path, number("start_line", 1), number("limit", 500));
+        let same = self.reads.get(&key) == Some(&hash);
+        self.reads.insert(key, hash);
+        if same && result.is_ok() { Ok(UNCHANGED_READ.to_string()) } else { result }
+    }
+
+    /// What was read may no longer be in the conversation.
+    pub fn forget_reads(&mut self) {
+        self.reads.clear();
     }
 
     /// Files went back: a patch must read them again first.
     pub fn forget_seen(&mut self) {
         self.seen.clear();
+        self.reads.clear();
+        self.cut_file = None;
     }
 
+    /// This file's write was cut off and is to go on.
+    pub fn note_cut(&mut self, path: PathBuf) {
+        self.cut_file = Some(path);
+    }
+
+    /// Whether the next write to this file goes on from what is there.
+    pub fn goes_on_with(&self, path: &Path) -> bool {
+        self.cut_file.as_deref() == Some(path)
+    }
+
+    /// A new file, or one the session knows as it is now. That guard is `apply_patch`'s: a model does not write over what it has not seen.
     fn create_file(&mut self, arguments: &Value, workspace: &Path) -> Result<String, String> {
-        let path = resolve(workspace, text_arg(arguments, "path")?);
+        let given = text_arg(arguments, "path")?;
+        let path = resolve(workspace, given);
         let content = text_arg(arguments, "content")?;
-        if path.exists() {
-            return Err(format!("{} exists: create_file cannot overwrite; use apply_patch", path.display()));
+        let going_on = self.cut_file.as_ref() == Some(&path);
+        let append = going_on || arguments.get("append").and_then(Value::as_bool) == Some(true);
+        let mut before = Vec::new();
+        let exists = path.exists();
+        if exists {
+            if path.is_dir() {
+                return Err(format!("{given} is a folder"));
+            }
+            // (first: what it has not read may be a model of 40 GB, and need not be held in memory to say so)
+            let Some(known) = self.seen.get(&path) else {
+                return Err(format!("{given} exists and has not been read in this session: read it first, then change it with apply_patch or write it again"));
+            };
+            before = std::fs::read(&path).map_err(|error| format!("{given}: {error}"))?;
+            if *known != sha16(&before) {
+                return Err(format!("{given} changed since it was read: read it again"));
+            }
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|error| format!("{given}: {error}"))?;
         }
-        std::fs::write(&path, content).map_err(|error| format!("{}: {error}", path.display()))?;
-        self.seen.insert(path.clone(), sha16(content.as_bytes()));
-        Ok(format!("created {} ({} bytes)", path.display(), content.len()))
+        if !append {
+            before.clear();
+        }
+        before.extend_from_slice(content.as_bytes());
+        std::fs::write(&path, &before).map_err(|error| format!("{given}: {error}"))?;
+        self.seen.insert(path, sha16(&before));
+        if going_on {
+            self.cut_file = None;
+        }
+        let lines = String::from_utf8_lossy(&before).lines().count();
+        let word = if !exists { "created" } else if append { "added to" } else { "replaced" };
+        let said = format!("{word} {given}: now {lines} lines, {} bytes", before.len());
+        Ok(if self.in_japanese { said + &not_japanese_note(content) } else { said })
     }
 
     /// Every edit is validated against the text before anything is written; then the files change together, or, when a
@@ -157,12 +441,16 @@ impl Workbench {
             let slot = match files.iter().position(|file| file.0 == path) {
                 Some(slot) => slot,
                 None => {
+                    if !path.exists() {
+                        return Err(format!("{}: it does not exist: nothing was changed", path.display()));
+                    }
+                    // (first, as in `create_file`)
+                    let Some(known) = self.seen.get(&path) else {
+                        return Err(format!("{given} has not been read in this session: read it first; nothing was changed"));
+                    };
                     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}: nothing was changed", path.display()))?;
-                    let hash = sha16(&bytes);
-                    match self.seen.get(&path) {
-                        None => return Err(format!("{given} has not been read in this session: read it first; nothing was changed")),
-                        Some(known) if *known != hash => return Err(format!("{given} changed since it was read: read it again; nothing was changed")),
-                        Some(_) => {}
+                    if *known != sha16(&bytes) {
+                        return Err(format!("{given} changed since it was read: read it again; nothing was changed"));
                     }
                     let text = String::from_utf8(bytes).map_err(|_| format!("{given} is not UTF-8 text: nothing was changed"))?;
                     files.push((path, text.clone(), text));
@@ -175,7 +463,11 @@ impl Workbench {
             let (old, new) = if crlf { (old.replace('\n', "\r\n"), new.replace('\n', "\r\n")) } else { (old.to_string(), new.to_string()) };
             let found = text.matches(&old).count();
             if found != count {
-                return Err(format!("edit {}: old_string occurs {found} times in {given}, not {count}: nothing was changed. Read the exact text; do not include line numbers", number + 1));
+                // What it took to find the place is what a retry needs: the same line, spaced differently, is the usual cause.
+                let hint = if found == 0 { nearest_line(text, &old) } else { String::new() };
+                // (edit 1 is the first: a model takes it either way, and goes looking in the wrong one)
+                let start: String = old.trim().chars().take(40).collect();
+                return Err(format!("edit {} of {} (`{start}`): old_string occurs {found} times in {given}, not {count}: nothing was changed. Read the exact text; do not include line numbers{hint}", number + 1, edits.len()));
             }
             let changed = text.replace(&old, &new);
             if changed.is_empty() && !edit.get("allow_empty_file").and_then(Value::as_bool).unwrap_or(false) {
@@ -191,12 +483,21 @@ impl Workbench {
                 }
                 return Err(format!("{}: {error}: the files are as they were", path.display()));
             }
-            report.push_str(&format!("--- applied_diff {} ---\n{}\n", path.display(), similar::TextDiff::from_lines(before, after).unified_diff().context_radius(2)));
+            // (the model wrote this change itself: enough to see that it landed where it meant, and a local model pays for every token of it, again in each later request's prefix)
+            let diff = similar::TextDiff::from_lines(before, after).unified_diff().context_radius(2).to_string();
+            let name = path.strip_prefix(workspace).unwrap_or(path).display().to_string();
+            report.push_str(&format!("--- applied_diff {name} ---\n{}\n", cap(&diff, MAX_APPLIED_DIFF)));
         }
         for (path, _, after) in files {
             self.seen.insert(path, sha16(after.as_bytes()));
         }
-        Ok(cap(&report, MAX_OUTPUT))
+        let mut said = cap(&report, MAX_OUTPUT);
+        if self.in_japanese {
+            for edit in edits {
+                said.push_str(&not_japanese_note(edit.get("new_string").and_then(Value::as_str).unwrap_or("")));
+            }
+        }
+        Ok(said)
     }
 
     fn todo(&mut self, arguments: &Value) -> Result<String, String> {
@@ -225,33 +526,181 @@ impl Workbench {
     }
 }
 
+/// A file's text and the name of what it was in. On a Japanese Windows that may be Shift_JIS, and what PowerShell's `>` writes is UTF-16.
+pub(crate) fn file_text(bytes: &[u8]) -> (String, &'static str) {
+    let wide = |pair: fn([u8; 2]) -> u16| String::from_utf16_lossy(&bytes[2..].chunks_exact(2).map(|two| pair([two[0], two[1]])).collect::<Vec<u16>>());
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return (wide(u16::from_le_bytes), "utf-16");
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return (wide(u16::from_be_bytes), "utf-16");
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return (text.to_string(), "utf-8");
+    }
+    match crate::web::from_code_page(bytes, 932) {
+        Some(text) => (text, "shift_jis"),
+        None => (String::from_utf8_lossy(bytes).into_owned(), "unknown"),
+    }
+}
+
 fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, String)), String> {
     let path = resolve(workspace, text_arg(arguments, "path")?);
+    if crate::images::is_picture(&path) {
+        return Err(format!("{} is a picture, and it cannot be read here: this model cannot be shown one by a tool. Say so, and ask the user to attach it to a message.", path.display()));
+    }
+    // (read whole to number its lines: one larger than memory would end the app, with all that is going on in it)
+    let size = std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?.len();
+    if size > MOST_READ_WHOLE {
+        return Err(format!("{} is too large to read here, at {} MB: use search_files for what is in it, or a command that prints a part of it", path.display(), size / 1_048_576));
+    }
     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if bytes.iter().take(8192).any(|&byte| byte == 0) {
+    let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+    if !utf16 && bytes.iter().take(8192).any(|&byte| byte == 0) {
         return Err(format!("{} is binary: unsupported binaries are refused", path.display()));
     }
     let hash = sha16(&bytes);
-    let text = String::from_utf8_lossy(&bytes);
+    let (text, encoding) = file_text(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     let limit = arguments.get("limit").and_then(Value::as_i64).unwrap_or(500).clamp(1, 2000) as usize;
     let start = arguments.get("start_line").and_then(Value::as_i64).unwrap_or(1);
     let first = if start < 0 { lines.len().saturating_sub(start.unsigned_abs() as usize) } else { (start.max(1) as usize) - 1 };
-    let mut out = format!("--- sha256={hash} encoding=utf-8 ---\n");
+    // (the guard on edits keeps its own hash: the model has no use for one)
+    let mut out = if encoding == "utf-8" { String::new() } else { format!("--- encoding={encoding} ---\n") };
+    if first >= lines.len() {
+        // (nothing below this line could mean a file that ends here or a read that went past it)
+        out.push_str(&if lines.is_empty() { "--- the file is empty ---\n".to_string() } else { format!("--- the file has only {} lines ---\n", lines.len()) });
+    }
+    let mut next = first;
     for (at, line) in lines.iter().enumerate().skip(first).take(limit) {
-        out.push_str(&format!("{}|{line}\n", at + 1));
+        let shown = if line.len() > MAX_LINE {
+            let mut cut = MAX_LINE;
+            while !line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}... ({} more bytes on this line)", &line[..cut], line.len() - cut)
+        } else {
+            (*line).to_string()
+        };
+        if out.len() + shown.len() > MAX_READ && next > first {
+            break;
+        }
+        out.push_str(&format!("{}|{shown}\n", at + 1));
+        next = at + 1;
     }
-    if first + limit < lines.len() {
-        out.push_str(&format!("--- {} more lines; continue with start_line={} ---\n", lines.len() - first - limit, first + limit + 1));
+    if next > first && next < lines.len() {
+        out.push_str(&format!("--- {} more lines; continue with start_line={} ---\n", lines.len() - next, next + 1));
     }
-    Ok((cap(&out, MAX_OUTPUT * 4), (path, hash)))
+    Ok((out, (path, hash)))
 }
 
-fn walker(root: &Path) -> ignore::WalkBuilder {
+/// What a walk through a project does not go into, as `.gitignore` does not always say so: outside a repository it is not read at all.
+const HEAVY: [&str; 6] = ["node_modules", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache", ".tox"];
+
+/// `deep`: going down through folders. A folder named as the place to look is looked in, and one level shows what is there.
+pub(crate) fn walker(root: &Path, deep: bool) -> ignore::WalkBuilder {
     let mut walk = ignore::WalkBuilder::new(root);
-    walk.hidden(false).filter_entry(|entry| entry.file_name() != ".git");
+    walk.hidden(false).filter_entry(move |entry| {
+        let name = entry.file_name();
+        name != ".git" && !(deep && entry.depth() > 0 && HEAVY.iter().any(|heavy| name == *heavy))
+    });
     walk
 }
+
+/// Where the first line of an edit that did not match is, if its words are there with other spacing.
+fn nearest_line(text: &str, old: &str) -> String {
+    let squeeze = |line: &str| line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(first) = old.lines().map(squeeze).find(|line| !line.is_empty()) else { return String::new() };
+    let places: Vec<String> = text.lines().enumerate().filter(|(_, line)| squeeze(line) == first).map(|(at, _)| (at + 1).to_string()).take(5).collect();
+    if !places.is_empty() {
+        return format!(". Its first line is at line {}, spaced differently or followed by other lines: read there", places.join(", "));
+    }
+    // One character different, as a Chinese form for a Japanese one, is what it cannot see in what it read: the line itself, to copy from, with no read for it.
+    let wanted: Vec<char> = first.chars().collect();
+    let shared = |line: &str| line.chars().filter(|letter| !letter.is_whitespace() && wanted.contains(letter)).count();
+    let best = text.lines().enumerate().map(|(at, line)| (shared(line), at, line)).max_by_key(|(count, at, _)| (*count, std::cmp::Reverse(*at)));
+    match best {
+        Some((count, at, line)) if count * 10 >= wanted.iter().filter(|letter| !letter.is_whitespace()).count() * 6 => format!(". The nearest is line {}, character for character: {}", at + 1, line.trim().chars().take(160).collect::<String>()),
+        _ => String::new(),
+    }
+}
+
+/// Han characters no Japanese text is written with: a local model's Chinese comes through in the middle of good Japanese, one word at a time, and it does not see it unless told.
+fn not_japanese(text: &str) -> Vec<char> {
+    use windows_sys::Win32::Globalization::{WideCharToMultiByte, WC_NO_BEST_FIT_CHARS};
+    const SHIFT_JIS: u32 = 932;
+    // Japanese all the same, and outside Shift_JIS: the forms the 2010 list of everyday kanji and newspapers use.
+    const JAPANESE_ANYWAY: &str = "塡剝頰噓俱繫鷗醬";
+    let mut found: Vec<char> = Vec::new();
+    for letter in text.chars().filter(|letter| ('\u{3400}'..='\u{9FFF}').contains(letter) && !JAPANESE_ANYWAY.contains(*letter)) {
+        if found.contains(&letter) || found.len() == 8 {
+            continue;
+        }
+        let unit = [letter as u32 as u16];
+        let (mut bytes, mut replaced) = ([0u8; 4], 0);
+        // SAFETY: both buffers are as long as the call is told.
+        let written = unsafe { WideCharToMultiByte(SHIFT_JIS, WC_NO_BEST_FIT_CHARS, unit.as_ptr(), 1, bytes.as_mut_ptr(), bytes.len() as i32, std::ptr::null(), &mut replaced) };
+        if written > 0 && replaced != 0 {
+            found.push(letter);
+        }
+    }
+    found
+}
+
+fn not_japanese_note(text: &str) -> String {
+    let found: String = not_japanese(text).into_iter().collect();
+    if found.is_empty() { String::new() } else { format!("\nnote: {found} in this text is Chinese, not Japanese. Use the Japanese word, here and in your answer.") }
+}
+
+pub(crate) fn has_letters_not_japanese(text: &str) -> bool {
+    text.lines().any(|line| !not_japanese(line).is_empty())
+}
+
+/// The letters of a Japanese conversation's answer worth asking about: not what it was given to read, and not a line that is Chinese on purpose, which says so or reads as Chinese throughout.
+pub(crate) fn slips_in_answer(answer: &str, given: &str) -> String {
+    const ABOUT_CHINESE: [&str; 5] = ["中国語", "中文", "簡体", "繁体", "台湾"];
+    let mut slips: Vec<char> = Vec::new();
+    for line in answer.lines().filter(|line| !ABOUT_CHINESE.iter().any(|word| line.contains(word))) {
+        let found = not_japanese(line);
+        let han = line.chars().filter(|letter| ('\u{3400}'..='\u{9FFF}').contains(letter)).count();
+        let kana = line.chars().any(|letter| ('\u{3040}'..='\u{30FF}').contains(&letter));
+        if !kana && han >= 8 && found.len() * 4 >= han {
+            continue;
+        }
+        slips.extend(found.into_iter().filter(|letter| !given.contains(*letter)));
+    }
+    slips.sort_unstable();
+    slips.dedup();
+    slips.truncate(8);
+    slips.into_iter().collect()
+}
+
+fn find_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
+    let pattern = text_arg(arguments, "pattern")?;
+    let root = resolve(workspace, arguments.get("path").and_then(Value::as_str).unwrap_or("."));
+    if !root.is_dir() {
+        return Err(format!("{} is not a folder", root.display()));
+    }
+    let mut globs = ignore::overrides::OverrideBuilder::new(&root);
+    globs.add(pattern).map_err(|error| format!("{pattern}: {error}"))?;
+    // Matched after the walk: given to the walk as an override, a glob would bring back what .gitignore leaves out.
+    let globs = globs.build().map_err(|error| format!("{pattern}: {error}"))?;
+    let mut names: Vec<String> = walker(&root, true).build().flatten()
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+        .filter(|entry| globs.matched(entry.path(), false).is_whitelist())
+        .map(|entry| entry.path().strip_prefix(&root).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/"))
+        .take(LIST_LIMIT + 1).collect();
+    names.sort();
+    if names.is_empty() {
+        return Ok(format!("no file under {} matches {pattern}", root.display()));
+    }
+    let more = names.len() > LIST_LIMIT;
+    names.truncate(LIST_LIMIT);
+    Ok(format!("{}{}", names.join("\n"), if more { format!("\n--- truncated: the first {LIST_LIMIT}; narrow the pattern ---") } else { String::new() }))
+}
+
+/// What a listing gives the size of.
+const BIG_FILE: u64 = 256 * 1024;
 
 fn list_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
     let root = resolve(workspace, arguments.get("path").and_then(Value::as_str).unwrap_or("."));
@@ -259,7 +708,7 @@ fn list_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
         return Err(format!("{} is not a folder", root.display()));
     }
     let recursive = arguments.get("recursive").and_then(Value::as_bool).unwrap_or(false);
-    let mut walk = walker(&root);
+    let mut walk = walker(&root, recursive);
     if !recursive {
         walk.max_depth(Some(1));
     }
@@ -271,16 +720,26 @@ fn list_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
         }
         let name = entry.path().strip_prefix(&root).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
         let folder = entry.file_type().is_some_and(|kind| kind.is_dir());
+        let size = entry.metadata().map_or(0, |data| data.len());
         files += 1;
-        bytes += entry.metadata().map_or(0, |data| data.len());
+        bytes += size;
         if names.len() < LIST_LIMIT {
-            names.push(if folder { format!("{name}/") } else { name });
+            // (a large one says so here: a model about to read a log first asks how long it is, in a round of its own)
+            names.push(match (folder, size >= BIG_FILE) {
+                (true, _) => format!("{name}/"),
+                (false, true) => format!("{name} ({:.1} MB)", size as f64 / 1_048_576.0),
+                (false, false) => name,
+            });
         }
         if files >= 50_000 {
             break;
         }
     }
     names.sort();
+    // (no words at all would read as a tool that did not answer)
+    if names.is_empty() {
+        return Ok(format!("{} is empty", root.display()));
+    }
     let mut out = names.join("\n");
     if files > LIST_LIMIT {
         out.push_str(&format!("\n--- truncated: showing first {LIST_LIMIT} of {files} files ({bytes} bytes); use search_files for targeted lookup ---"));
@@ -288,7 +747,7 @@ fn list_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
     Ok(out)
 }
 
-fn search_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
+fn search_files(arguments: &Value, workspace: &Path, secrets_besides: &[PathBuf], cancel: &AtomicBool) -> Result<String, String> {
     let pattern = text_arg(arguments, "pattern")?;
     let literal = arguments.get("literal").and_then(Value::as_bool).unwrap_or(false);
     let root = resolve(workspace, arguments.get("path").and_then(Value::as_str).unwrap_or("."));
@@ -302,14 +761,14 @@ fn search_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Res
         })
     }.map_err(|error| error.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(arguments.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(30).clamp(1, 300));
-    let mut walk = walker(&root);
+    let mut walk = walker(&root, true);
     if let Some(glob) = arguments.get("file_glob").and_then(Value::as_str) {
         let mut overrides = ignore::overrides::OverrideBuilder::new(&root);
         overrides.add(glob).map_err(|error| format!("file_glob: {error}"))?;
         walk.overrides(overrides.build().map_err(|error| format!("file_glob: {error}"))?);
     }
     let mut out = note.to_string();
-    let (mut matches, mut stopped) = (0usize, "");
+    let (mut matches, mut stopped, mut secrets) = (0usize, "", 0usize);
     for entry in walk.build().flatten() {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
@@ -319,6 +778,13 @@ fn search_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Res
             break;
         }
         if !entry.file_type().is_some_and(|kind| kind.is_file()) || entry.metadata().map_or(0, |data| data.len()) > SEARCH_FILE_LIMIT {
+            continue;
+        }
+        // `read_file` asks a person before it opens one of these, and a pattern of `.` would otherwise print it without asking. Searching a place that is itself one has been asked about.
+        // The same goes for what else holds keys here, of which a wider folder holds some: `%LOCALAPPDATA%` holds this app's sessions.
+        let among_the_others = secrets_besides.iter().any(|secret| crate::safety::inside(secret, entry.path()) && !crate::safety::inside(secret, &root));
+        if (crate::safety::sensitive(entry.path()) && !crate::safety::sensitive(&root)) || among_the_others {
+            secrets += 1;
             continue;
         }
         let Ok(bytes) = std::fs::read(entry.path()) else { continue };
@@ -345,6 +811,9 @@ fn search_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Res
     if matches == 0 {
         out.push_str("no matches\n");
     }
+    if secrets > 0 {
+        out.push_str(&format!("--- {secrets} files that may hold secrets were not searched: read_file asks the user for them ---\n"));
+    }
     if !stopped.is_empty() {
         out.push_str(&format!("--- stopped: {stopped}; {matches} matches so far, narrow the path or pattern ---\n"));
     }
@@ -353,7 +822,7 @@ fn search_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Res
 
 /// The workspace's files, as `@` offers them: what git ignores is left out.
 pub fn workspace_files(workspace: &Path, limit: usize) -> Vec<String> {
-    let mut names: Vec<String> = walker(workspace).build().flatten()
+    let mut names: Vec<String> = walker(workspace, true).build().flatten()
         .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
         .take(limit)
         .map(|entry| entry.path().strip_prefix(workspace).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/"))
@@ -451,17 +920,30 @@ pub fn workspace_changes(workspace: &Path) -> Result<Vec<FileChange>, String> {
     }
     let text = git(workspace, &args)?;
     let mut changes = split_git_diff(&text);
-    let others = git(workspace, &["-c", "core.quotepath=off", "ls-files", "--others", "--exclude-standard"])?;
-    for name in others.lines().take(MAX_UNTRACKED_SHOWN) {
+    changes.extend(untracked_changes(workspace, &[]));
+    Ok(changes)
+}
+
+/// The new files git knows of and does not track, under these paths or all. What it ignores is left out.
+pub(crate) fn untracked_names(workspace: &Path, paths: &[&str]) -> Vec<String> {
+    let mut args = vec!["--no-optional-locks", "-c", "core.quotepath=off", "ls-files", "--others", "--exclude-standard"];
+    if !paths.is_empty() {
+        args.push("--");
+        args.extend(paths);
+    }
+    git(workspace, &args).map_or(Vec::new(), |names| names.lines().map(str::to_string).collect())
+}
+
+fn untracked_changes(workspace: &Path, paths: &[&str]) -> Vec<FileChange> {
+    untracked_names(workspace, paths).iter().take(MAX_UNTRACKED_SHOWN).map(|name| {
         let path = workspace.join(name);
         let small = std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_UNTRACKED_BYTES);
         let content = if small { std::fs::read(&path).ok().and_then(|bytes| String::from_utf8(bytes).ok()) } else { None };
-        changes.push(match content {
+        match content {
             Some(content) => FileChange::between(name, None, Some(&content)),
             None => FileChange { path: name.to_string(), added: 0, removed: 0, diff: "A new file: too large, or not text.\n".to_string() },
-        });
-    }
-    Ok(changes)
+        }
+    }).collect()
 }
 
 fn split_git_diff(text: &str) -> Vec<FileChange> {
@@ -489,34 +971,98 @@ fn split_git_diff(text: &str) -> Vec<FileChange> {
     changes
 }
 
-fn git(workspace: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("git");
+pub(crate) fn git(workspace: &Path, args: &[&str]) -> Result<String, String> {
+    git_raw(workspace, args).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// What the app's own git must not do. It runs outside the sandbox, on a `.git` that a sandboxed command can write, and a repository's own config can name programs: `core.fsmonitor`
+/// runs one at a plain `git status`, and a `filter` at a plain `git diff`. So what the app asks of git never runs them, whoever planted them. Filters go by the names this repository's
+/// config gives them; a person's own in their global config are theirs, and stay.
+fn git_without_programs(workspace: &Path) -> Vec<String> {
+    let mut settings: Vec<String> = ["core.fsmonitor=false", "core.hooksPath=.no-hooks-here", "diff.external=", "log.showSignature=false"].iter().map(|setting| setting.to_string()).collect();
+    // (and no status of a submodule: git starts another git in it, on a config of its own that is not looked at here)
+    settings.push("diff.ignoreSubmodules=all".to_string());
+    // The worktree's config too, which `--local` leaves out and which a repository can turn on. (An older git has no `--show-scope`.)
+    let ask = |words: &[&str]| {
+        let mut command = Command::new(crate::bundled::git_program());
+        command.args(["config", "--includes", "--name-only", "--list"]).args(words).current_dir(workspace).stdin(Stdio::null()).stderr(Stdio::null());
+        no_window(&mut command);
+        command.output().ok().filter(|output| output.status.success())
+    };
+    let scoped = ask(&["--show-scope"]);
+    let told = scoped.as_ref().map_or_else(|| ask(&["--local"]).map_or(String::new(), |output| String::from_utf8_lossy(&output.stdout).into_owned()), |output| {
+        String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| line.strip_prefix("local\t").or_else(|| line.strip_prefix("worktree\t"))).collect::<Vec<_>>().join("\n")
+    });
+    {
+        for name in told.lines() {
+            let lower = name.to_ascii_lowercase();
+            if lower.starts_with("filter.") && [".clean", ".smudge", ".process"].iter().any(|end| lower.ends_with(end)) {
+                settings.push(format!("{name}="));
+            }
+            // (empty, it is a program git cannot start and the diff fails; a driver's `command` is left out by `--no-ext-diff` on every diff here)
+            if lower.starts_with("diff.") && lower.ends_with(".textconv") {
+                settings.push(format!("{name}=cat"));
+            }
+        }
+    }
+    settings
+}
+
+/// What git prints, to the byte: a file in it may not be UTF-8.
+pub(crate) fn git_raw(workspace: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut command = Command::new(crate::bundled::git_program());
+    for setting in git_without_programs(workspace) {
+        command.arg("-c").arg(setting);
+    }
     command.args(args).current_dir(workspace).stdin(Stdio::null());
     no_window(&mut command);
     let output = command.output().map_err(|error| format!("git: {error}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
 }
 
-fn show_diff(arguments: &Value, workspace: &Path, baseline: Option<&str>) -> Result<String, String> {
+fn show_diff(arguments: &Value, workspace: &Path, baseline: Option<&crate::baseline::Baseline>) -> Result<String, String> {
     let scope = arguments.get("scope").and_then(Value::as_str).unwrap_or("workspace");
+    let paths: Vec<&str> = arguments.get("paths").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+    let repository = git(workspace, &["rev-parse", "--is-inside-work-tree"]).is_ok();
+    if !repository && workspace.join(".git").exists() && matches!(scope, "staged" | "unstaged") {
+        return Err(format!("scope {scope} needs git, and the app could not run git on this folder's .git: use scope session"));
+    }
+    // Git run outside a repository answers with its usage, which tells a model nothing: no git diff goes there.
+    if !repository && matches!(scope, "staged" | "unstaged") {
+        return Err(format!("scope {scope} needs a git repository, and this folder is not one: use scope session"));
+    }
+    let head = baseline.and_then(|baseline| baseline.head.as_deref());
+    if scope == "session" && !repository && head.is_some() {
+        return Err("this session began in a git repository that is no longer here: read the files themselves".to_string());
+    }
+    // Where the session began, in a repository too: what was already uncommitted then is not its work, and a commit since is.
+    if scope == "session" || !repository {
+        let baseline = baseline.ok_or("this session has nothing to compare with yet: read the files themselves")?;
+        let changes = baseline.changes(workspace, &paths);
+        return Ok(if changes.is_empty() { format!("no differences ({scope}): nothing has changed since this session began") } else { cap(&changes, MAX_OUTPUT) });
+    }
     let mut args = vec!["diff", "--no-ext-diff", "--no-color"];
     match scope {
         "staged" => args.push("--cached"),
         "unstaged" => {}
-        "session" => args.push(baseline.ok_or("this session began outside a git repository: it has no baseline")?),
         // A repository with no commit yet has no HEAD to compare with.
         _ if git(workspace, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok() => args.push("HEAD"),
         _ => {}
     }
-    let paths: Vec<&str> = arguments.get("paths").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
     if !paths.is_empty() {
         args.push("--");
-        args.extend(paths);
+        args.extend(paths.iter().copied());
     }
-    let diff = git(workspace, &args)?;
+    let mut diff = git(workspace, &args).map_err(|error| error.lines().next().unwrap_or("git could not show this").to_string())?;
+    // (a new file is a change to a workspace, whatever git diff leaves out: creating only new files must not read as nothing done)
+    if scope == "workspace" {
+        for change in untracked_changes(workspace, &paths) {
+            diff.push_str(&format!("--- new file {} ---\n{}\n", change.path, change.diff));
+        }
+    }
     Ok(if diff.is_empty() { format!("no differences ({scope})") } else { cap(&diff, MAX_OUTPUT) })
 }
 
@@ -549,27 +1095,665 @@ pub(crate) fn kill_tree(pid: u32) {
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
 }
 
+/// What is in a folder by size and time, for saying what a command changed. None when there is too much to look through without keeping the command waiting.
+#[cfg(windows)]
+fn file_states(root: &Path) -> Option<BTreeMap<String, (u64, Option<std::time::SystemTime>)>> {
+    const LOOKING: Duration = Duration::from_millis(250);
+    const MOST_FILES: usize = 20_000;
+    let started = Instant::now();
+    let mut states = BTreeMap::new();
+    for entry in walker(root, true).build().flatten() {
+        if states.len() > MOST_FILES || started.elapsed() > LOOKING {
+            return None;
+        }
+        if entry.file_type().is_some_and(|kind| kind.is_file()) {
+            let data = entry.metadata().ok();
+            let name = entry.path().strip_prefix(root).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
+            states.insert(name, (data.as_ref().map_or(0, std::fs::Metadata::len), data.and_then(|data| data.modified().ok())));
+        }
+    }
+    Some(states)
+}
+
+/// What a command did, whatever its exit code says: a last step that failed has often been taken for all of it.
+#[cfg(windows)]
+fn described_changes(before: &BTreeMap<String, (u64, Option<std::time::SystemTime>)>, after: &BTreeMap<String, (u64, Option<std::time::SystemTime>)>) -> String {
+    const SHOWN: usize = 20;
+    let mut lines: Vec<String> = Vec::new();
+    for (name, state) in after {
+        match before.get(name) {
+            None => lines.push(format!("- created {name} ({} bytes)", state.0)),
+            Some(known) if known != state => lines.push(format!("- changed {name} ({} bytes)", state.0)),
+            _ => {}
+        }
+    }
+    lines.extend(before.keys().filter(|name| !after.contains_key(*name)).map(|name| format!("- deleted {name}")));
+    if lines.is_empty() {
+        return String::new();
+    }
+    let more = lines.len().saturating_sub(SHOWN);
+    lines.truncate(SHOWN);
+    let tail = if more > 0 { format!("\n- and {more} more") } else { String::new() };
+    format!("files changed by this command:\n{}{tail}\n", lines.join("\n"))
+}
+
+/// A command with no network that failed at reaching it says so where it is read first, as what it prints is a long way to get to one line.
+#[cfg(windows)]
+fn no_network_note(network: bool, status: Option<i32>, out: &str, err: &str) -> Option<&'static str> {
+    const SIGNS: [&str; 14] = ["getaddrinfo", "name or service not known", "could not resolve", "name resolution", "enotfound", "eai_again", "network is unreachable", "no such host", "forbidden by its access permissions", "10013", "11001", "名前解決", "リモート名を解決できません", "アクセス許可で禁じられた"];
+    if network || status == Some(0) {
+        return None;
+    }
+    let (out, err) = (out.to_lowercase(), err.to_lowercase());
+    SIGNS.iter().any(|sign| out.contains(sign) || err.contains(sign)).then_some("note: this command failed because it ran with no network, and nothing about the site or the code is known from it. If it needs the network, make the same call with network=true, and the user is asked to approve it.\n")
+}
+
+/// Whether a part of this command line is one of cmd's that fail in the sandbox wherever their file is.
+#[cfg(windows)]
+fn needs_drive_root(line: &str) -> bool {
+    line.split(['&', '|', '(', ')']).any(|part| {
+        let mut words = part.split_whitespace();
+        let first = words.next().unwrap_or("").trim_start_matches('@').to_ascii_lowercase();
+        let first = first.split(['/', '>', '<']).next().unwrap_or("");
+        matches!(first, "dir" | "del" | "erase" | "vol" | "tree" | "attrib" | "xcopy" | "robocopy") || (first == "where" && part.to_ascii_lowercase().contains("/r"))
+    })
+}
+
+/// A line's commands: split where cmd would split them, and not inside double quotes or after its escape, where `&` and `|` are only letters.
+#[cfg(windows)]
+fn commands_of(line: &str) -> Vec<&str> {
+    let (mut parts, mut start, mut quoted, mut escaped) = (Vec::new(), 0, false, false);
+    for (at, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if c == '^' && !quoted {
+            escaped = true;
+        } else if !quoted && matches!(c, '&' | '|' | '(' | ')' | '\n' | '\r') {
+            parts.push(&line[start..at]);
+            start = at + c.len_utf8();
+        }
+    }
+    parts.push(&line[start..]);
+    parts
+}
+
+/// A command's first word, its quotes off, and what follows it.
+#[cfg(windows)]
+fn first_word(text: &str) -> (&str, &str) {
+    let text = text.trim_start();
+    if let Some(rest) = text.strip_prefix('"') {
+        return rest.split_once('"').unwrap_or((rest, ""));
+    }
+    text.split_at(text.find([' ', '\t', '>', '<']).unwrap_or(text.len()))
+}
+
+/// A command's words, with their double quotes off. None where the line is more than plain words: what cmd makes of those is not for this to guess.
+#[cfg(windows)]
+fn plain_words(text: &str) -> Option<Vec<String>> {
+    if text.contains(['%', '^', '!', '<', '`']) {
+        return None;
+    }
+    let (mut words, mut word, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    for c in text.chars() {
+        if c == '"' {
+            quoted = !quoted;
+            any = true;
+        } else if c.is_whitespace() && !quoted {
+            if any {
+                words.push(std::mem::take(&mut word));
+                any = false;
+            }
+        } else {
+            word.push(c);
+            any = true;
+        }
+    }
+    if quoted {
+        return None;
+    }
+    if any {
+        words.push(word);
+    }
+    // "2>nul" says nothing here; any other redirection is the line's own business.
+    words.retain(|word| !word.eq_ignore_ascii_case("2>nul"));
+    (!words.iter().any(|word| word.contains('>'))).then_some(words)
+}
+
+/// What `dir` is asked for, in what runs in the sandbox: it lists a folder, a file or a pattern as `dir` does, in fewer words. `piped`: cmd reads what comes before a `|` again, and an `if` with parentheses does not survive that.
+#[cfg(windows)]
+fn dir_stand_in(words: &[String], piped: bool) -> String {
+    let recursive = words.iter().any(|word| word.eq_ignore_ascii_case("/s"));
+    let mut places: Vec<String> = words.iter().filter(|word| !word.starts_with('/')).map(|word| word.trim_end_matches('\\').to_string()).collect();
+    if places.is_empty() {
+        places.push(".".to_string());
+    }
+    let one = |place: &String| {
+        if recursive {
+            let (folder, mask) = if place.contains(['*', '?']) { place.rsplit_once('\\').unwrap_or((".", place.as_str())) } else { (place.as_str(), "*") };
+            return format!("for /r \"{folder}\" %d in ({mask}) do @echo %d");
+        }
+        if piped {
+            return format!("(for /d %d in (\"{place}\\*\") do @echo %~nxd\\) & (for %d in (\"{place}\\*\") do @echo %~nxd  %~zd)");
+        }
+        format!("if exist \"{place}\\*\" ((for /d %d in (\"{place}\\*\") do @echo %~nxd\\) & (for %d in (\"{place}\\*\") do @echo %~nxd  %~zd)) else if exist \"{place}\" (for %d in (\"{place}\") do @echo %~nxd  %~zd) else (echo File Not Found 1>&2)")
+    };
+    places.iter().map(one).collect::<Vec<_>>().join(" & ")
+}
+
+/// What `del` is asked for, in what runs in the sandbox. None for what asks more of it than deleting these files.
+#[cfg(windows)]
+fn del_stand_in(words: &[String]) -> Option<String> {
+    if !words.iter().filter(|word| word.starts_with('/')).all(|word| word.eq_ignore_ascii_case("/q") || word.eq_ignore_ascii_case("/f")) {
+        return None;
+    }
+    let files: Vec<&String> = words.iter().filter(|word| !word.starts_with('/')).collect();
+    if files.is_empty() || files.iter().any(|file| file.contains('\'')) {
+        return None;
+    }
+    let delete = |file: &str| format!("powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('{file}')\"");
+    Some(files.iter().map(|file| if file.contains(['*', '?']) { format!("for %d in (\"{file}\") do @{}", delete("%d")) } else { delete(file) }).collect::<Vec<_>>().join(" & "))
+}
+
+/// One step of a line, with `dir` or `del` in the forms that say plainly what they want replaced by what does that.
+#[cfg(windows)]
+fn step_stand_in(step: &str, piped: bool) -> Option<String> {
+    let bare = step.trim_start().trim_start_matches('@');
+    let word = bare.split_whitespace().next().unwrap_or("");
+    let (name, glued) = word.split_once('/').map_or((word, None), |(name, rest)| (name, Some(rest)));
+    let name = name.to_ascii_lowercase();
+    if !matches!(name.as_str(), "dir" | "del" | "erase") {
+        return None;
+    }
+    let mut words = plain_words(&bare[word.len()..])?;
+    words.extend(glued.into_iter().flat_map(|rest| rest.split('/')).map(|switch| format!("/{switch}")));
+    let text = if name == "dir" { dir_stand_in(&words, piped) } else { del_stand_in(&words)? };
+    Some(format!("{}({text})", &step[..step.len() - step.trim_start().len()]))
+}
+
+/// The line that runs: `dir` and `del` read the drive's root before anything else, which a container cannot, wherever their file is. A model reaches for them by habit however it is
+/// told, and each refusal is a round of a slow model's time. What the gate and the person saw is the line as the model wrote it. A line with parentheses or more than one line of its own is left as it is.
+#[cfg(windows)]
+fn with_stand_ins(line: &str) -> String {
+    if line.contains(['\n', '\r']) {
+        return line.to_string();
+    }
+    let (mut out, mut start, mut quoted, mut changed, mut after_a_pipe) = (String::new(), 0, false, false, false);
+    let mut step = |text: &str, piped: bool, after_a_pipe: bool, out: &mut String| {
+        // (`| head -60`, a model's habit from elsewhere, and a failed round each time. All of it is captured and cut to size anyway, and this passes it on as it is.)
+        if after_a_pipe && only_keeps_some_lines(text) {
+            changed = true;
+            out.push_str(" findstr \"^\"");
+            return;
+        }
+        match step_stand_in(text, piped) {
+            Some(stand_in) => {
+                changed = true;
+                out.push_str(&stand_in);
+            }
+            None => out.push_str(text),
+        }
+    };
+    for (at, c) in line.char_indices() {
+        if c == '"' {
+            quoted = !quoted;
+        } else if !quoted && matches!(c, '(' | ')') {
+            return line.to_string();
+        } else if !quoted && matches!(c, '&' | '|') {
+            let piped = c == '|' && !line[at + 1..].starts_with('|') && !line[..at].ends_with('|');
+            step(&line[start..at], piped, after_a_pipe, &mut out);
+            after_a_pipe = piped;
+            out.push(c);
+            start = at + 1;
+        }
+    }
+    step(&line[start..], false, after_a_pipe, &mut out);
+    if changed { out } else { line.to_string() }
+}
+
+/// `head`, `tail`, `head -5`, `tail -n 20`: nothing but which lines to keep.
+#[cfg(windows)]
+fn only_keeps_some_lines(step: &str) -> bool {
+    let mut words = step.split_whitespace();
+    if !matches!(words.next(), Some("head" | "tail")) {
+        return false;
+    }
+    let rest: Vec<&str> = words.collect();
+    let number = |word: &str| !word.is_empty() && word.trim_start_matches(['-', '+']).chars().all(|c| c.is_ascii_digit());
+    match rest[..] {
+        [] => true,
+        [one] => number(one) && one.starts_with('-') || one.strip_prefix("-n").is_some_and(number),
+        [switch, count] => switch == "-n" && number(count),
+        _ => false,
+    }
+}
+
+/// One line more where a sandbox's answer reads as something else: a model believes it, and the next rounds go on that.
+#[cfg(windows)]
+fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -> String {
+    let mut notes = String::new();
+    let lower = line.to_ascii_lowercase();
+    if crate::bundled::root().is_some() && lower.contains("pip") && lower.contains("install") {
+        // (a repository need not see them)
+        if workspace.join(crate::bundled::PY_DEPS).is_dir() {
+            let _ = std::fs::write(workspace.join(crate::bundled::PY_DEPS).join(".gitignore"), "*\n");
+        }
+        notes.push_str("note: `pip install` puts packages in .pydeps in the workspace, and python finds them there. The bundled Python itself cannot be changed.\n");
+    }
+    if status == Some(0) {
+        return notes;
+    }
+    if err.contains("Can not combine '--user' and '--target'") {
+        notes.push_str("note: leave out `--user`: `pip install` already keeps packages in the workspace.\n");
+    }
+    if crate::bundled::root().is_some() && (lower.contains("-m venv") || lower.contains("-m virtualenv")) {
+        notes.push_str("note: this Python has no venv. No venv is needed: `pip install` already keeps packages in the workspace.\n");
+    }
+    if crate::bundled::root().is_some() && (lower.contains("program files\\nodejs") || lower.contains("program files\\git") || lower.contains("appdata\\local\\programs\\python")) {
+        notes.push_str("note: run it by name. `python`, `node`, `npm` and `git` are on PATH; what is installed under that path is closed to the sandbox.\n");
+    }
+    // (it says this in the language of Windows, and ends with 1 for it and with 2 for anything else)
+    if first_word(line).0.eq_ignore_ascii_case("where") && status == Some(1) {
+        notes.push_str("note: `where` cannot see every folder from the sandbox, so this does not say the program is missing. Run the program itself to find out.\n");
+    }
+    if (lower.contains("powershell") || lower.contains("pwsh")) && powershell_lost_at_a_root(err, workspace) {
+        notes.push_str("note: PowerShell starts at the root of a drive in the sandbox and cannot move from there, whatever `cwd` says: give it absolute paths. `[IO.File]` methods do take paths relative to `cwd`.\n");
+    }
+    if lower.contains("git") && err.contains("failed to stat") {
+        notes.push_str("note: git cannot look above the workspace from the sandbox, so this says only that the workspace is not a git repository. `git init` at the start of a line works.\n");
+    }
+    let denied = says_access_denied(err, system_access_denied());
+    let lower_err = err.to_ascii_lowercase();
+    let in_git = lower.contains(".git\\config") || lower.contains(".git/config") || lower.contains(".git\\hooks") || lower.contains(".git/hooks");
+    if lower_err.contains("config file") || (denied && in_git) || (in_git && lower_err.contains("permission denied")) {
+        notes.push_str("note: the sandbox refuses changes to `.git\\config` and `.git\\hooks`, as what is written there would run outside it the next time git is used. Tell the user the exact command, for them to run.\n");
+    }
+    let root = workspace.to_string_lossy().to_lowercase();
+    let outside = line.split(|c: char| c.is_whitespace() || c == '"').any(|word| word.as_bytes().get(1) == Some(&b':') && !word.to_lowercase().starts_with(&root));
+    if denied && outside {
+        notes.push_str("note: a command cannot read outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there; for a command to read it, ask the user to name its folder there.\n");
+    }
+    notes
+}
+
+/// That something was refused access: by the code in what the program said where it gives one, which reads the same on every Windows. What only has words, `cmd`'s own commands, says
+/// what Windows calls it in its language: `system_words`, or what was seen in English and Japanese when that could not be read.
+fn says_access_denied(err: &str, system_words: &str) -> bool {
+    const CODES: [&str; 8] = ["[WinError 5]", "[Errno 13]", "(os error 5)", "0x80070005", "EACCES", "EPERM", "UnauthorizedAccessException", "PermissionDenied"];
+    CODES.iter().any(|code| err.contains(code)) || (!system_words.is_empty() && err.contains(system_words)) || err.contains("Access is denied") || err.contains("アクセスが拒否されました")
+}
+
+/// ERROR_ACCESS_DENIED in the words of this Windows: "Zugriff verweigert" on a German one.
+fn system_access_denied() -> &'static str {
+    #[cfg(windows)]
+    {
+        static WORDS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        WORDS.get_or_init(|| {
+            use windows_sys::Win32::System::Diagnostics::Debug::{FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS};
+            let mut buffer = [0u16; 256];
+            // SAFETY: the buffer is as long as the call is told.
+            let length = unsafe { FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, std::ptr::null(), 5, 0, buffer.as_mut_ptr(), buffer.len() as u32, std::ptr::null()) };
+            String::from_utf16_lossy(&buffer[..length as usize]).trim().trim_end_matches(['.', '。']).to_string()
+        })
+    }
+    #[cfg(not(windows))]
+    ""
+}
+
+/// PowerShell says this in the language of Windows, with the same names in its last lines, `(D:\\a:String)` and `ItemNotFoundException`, and on whichever drive it began.
+fn powershell_lost_at_a_root(err: &str, workspace: &Path) -> bool {
+    let in_a_drive = |text: &str| {
+        let bytes = text.as_bytes();
+        bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+    };
+    let root = workspace.to_string_lossy().to_lowercase();
+    let named = err.match_indices('(').map(|(at, _)| &err[at + 1..]).find_map(|rest| rest.split_once(":String)").map(|(path, _)| path)).filter(|path| in_a_drive(&format!("{path}\\")));
+    if let Some(path) = named {
+        // (the root itself refused, or a path under it that was not found: one of the workspace's own was asked for by its full name, and is only missing)
+        return !path.to_lowercase().starts_with(&root) && (path.len() == 3 || err.contains("ItemNotFoundException") || err.contains("PathNotFound"));
+    }
+    err.split_once("Cannot find path '").is_some_and(|(_, rest)| in_a_drive(rest) && !rest.to_lowercase().starts_with(&root))
+}
+
+const RUNS_ITSELF: [&str; 4] = ["exe", "com", "cmd", "bat"];
+
+/// Whether `start` would find a program under this name: by its path, or in the folder or on PATH, with an extension that runs or none. What it does not find it opens, or says it cannot find in a dialog of its own.
+#[cfg(windows)]
+fn is_program(word: &str, cwd: &Path) -> bool {
+    let extension = Path::new(word).extension().map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+    let names: Vec<String> = match extension {
+        Some(extension) if RUNS_ITSELF.contains(&extension.as_str()) => vec![word.to_string()],
+        Some(_) => return false,
+        None => RUNS_ITSELF.iter().map(|extension| format!("{word}.{extension}")).collect(),
+    };
+    // (what a command would find: the bundled tools first)
+    let path = crate::bundled::path_for_programs().map_or_else(|| std::env::var_os("PATH").unwrap_or_default(), std::ffi::OsString::from);
+    std::iter::once(cwd.to_path_buf()).chain(std::env::split_paths(&path)).any(|folder| names.iter().any(|name| folder.join(name).is_file()))
+}
+
+/// What this command would hand to whatever Windows has for that kind of file instead of running it. With nothing for it, that is a dialog on the person's screen asking how to open it,
+/// which no command can answer and which they did not ask for.
+///
+/// Refused: a first word that is a file of a kind that opens (`OPENS`, whether or not it is there), or any file there that is not a program; the same after `call` and `cmd /c`;
+/// `start` of anything that is not a program, an address or a folder too, and `start` of nothing.
+/// Let through: a program named as its first word (`python x.py`, `tool.exe a.py`, `python3.12 x.py`, `run.bat`); a file only as an argument (`echo x.py`, `type a.txt`); `start` of a program
+/// it finds, with its title and switches (`start "" /b python x.py`, `start /d sub /wait run.bat`).
+/// Not seen: the same asked of another shell (`powershell ./x.py`), and what `if` and `for` go on to run.
+#[cfg(windows)]
+fn opens_by_association(command: &str, cwd: &Path) -> Option<String> {
+    const OPENS: [&str; 22] = ["py", "pyw", "js", "mjs", "ts", "vbs", "wsf", "ps1", "sh", "bash", "html", "htm", "txt", "md", "json", "pdf", "png", "jpg", "jpeg", "gif", "svg", "log"];
+    // As cmd reads it: its escape is not in the name, and a switch may follow a name with no space, as in `cmd/c x` and `start/b x`.
+    let unescaped = command.trim().trim_start_matches('@').replace('^', "");
+    let (first, rest) = first_word(&unescaped);
+    let (first, joined) = match first.find('/').map(|at| first.split_at(at)) {
+        Some((name, switch)) if matches!(name.to_ascii_lowercase().as_str(), "cmd" | "cmd.exe" | "start") => (name, format!("{switch} {rest}")),
+        _ => (first, rest.to_string()),
+    };
+    let rest = joined.as_str();
+    match first.to_ascii_lowercase().as_str() {
+        "call" => return opens_by_association(rest, cwd),
+        "cmd" | "cmd.exe" => {
+            let lower = rest.to_ascii_lowercase();
+            // (what it runs may follow with no space: `cmd /c"x.txt"`)
+            let at = lower.find("/c").or_else(|| lower.find("/k"))?;
+            return opened_on_the_desktop(rest[at + 2..].trim().trim_matches('"'), cwd);
+        }
+        "start" => {
+            let mut rest = rest.trim_start();
+            // (quoted first, it is the window's title, whatever it says)
+            if rest.starts_with('"') {
+                rest = first_word(rest).1.trim_start();
+            }
+            loop {
+                let (word, after) = first_word(rest);
+                if !word.starts_with('/') {
+                    break;
+                }
+                rest = after.trim_start();
+                if matches!(word.to_ascii_lowercase().as_str(), "/d" | "/node" | "/affinity" | "/machine") {
+                    rest = first_word(rest).1.trim_start();
+                }
+            }
+            let target = first_word(rest).0;
+            return (!is_program(target, cwd) || target.is_empty()).then(|| format!("{first} {target}").trim_end().to_string());
+        }
+        _ => {}
+    }
+    let extension = Path::new(first).extension()?.to_string_lossy().to_ascii_lowercase();
+    (!RUNS_ITSELF.contains(&extension.as_str()) && (OPENS.contains(&extension.as_str()) || cwd.join(first).is_file())).then(|| first.to_string())
+}
+
+/// The first thing in this line that would open on the person's screen. What a `for` goes through is a list of words and no command: `for %f in (app.log) do @echo %~zf` opens nothing.
+#[cfg(windows)]
+fn opened_on_the_desktop(line: &str, cwd: &Path) -> Option<String> {
+    let commands = commands_of(line);
+    let of_a_for = |at: usize| at > 0 && {
+        let before = commands[at - 1].trim().trim_start_matches('@').to_ascii_lowercase();
+        before.starts_with("for ") && before.ends_with(" in")
+    };
+    commands.iter().enumerate().filter(|(at, _)| !of_a_for(*at)).find_map(|(_, command)| opens_by_association(command, cwd))
+}
+
+/// What cmd is to be given. It ends a line at its first line break and says nothing: of two commands the second never runs, and `python -c "` with its code on the next lines runs
+/// an empty program, with no output and exit code 0, which sent a model looking for what was wrong and then writing the same code into a file left behind in the workspace.
+/// So lines become commands joined by `&`, as they would run in a batch file, and code on several lines given to `python -c` or `node -e` goes as one line that runs the same text.
+/// None of that can be done for a line break in any other quotes, and that is refused, as only a part of what was asked would run.
+#[cfg(windows)]
+fn on_one_line(line: &str) -> Result<std::borrow::Cow<'_, str>, String> {
+    let line = line.trim_matches(['\n', '\r', ' ']);
+    if !line.contains(['\n', '\r']) {
+        return Ok(line.into());
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = after_comments(line);
+    while let Some(c) = rest.chars().next() {
+        match c {
+            '"' => {
+                let quoted = &rest[1..];
+                if let Some(run) = runs_code(&out).filter(|_| argument_end(quoted).is_some_and(|end| quoted[..end].contains('\n'))) {
+                    let end = argument_end(quoted).expect("just looked at");
+                    out.push_str(&format!("\"{run}('{}')\"", escaped_for_a_string(&argument_text(&quoted[..end]))));
+                    rest = &quoted[end + 1..];
+                    continue;
+                }
+                let Some(end) = quoted.find('"') else { return Err(LINE_BREAK_IN_QUOTES.to_string()) };
+                if quoted[..end].contains(['\n', '\r']) {
+                    return Err(LINE_BREAK_IN_QUOTES.to_string());
+                }
+                out.push_str(&rest[..end + 2]);
+                rest = &quoted[end + 1..];
+            }
+            // (its escape: at a line's end that line goes on, and otherwise what follows is only a letter, a quote as well)
+            '^' => {
+                let after = &rest[1..];
+                if after.starts_with(['\n', '\r']) {
+                    rest = after.trim_start_matches(['\n', '\r']);
+                } else {
+                    let next = after.chars().next().map_or(0, char::len_utf8);
+                    out.push_str(&rest[..1 + next]);
+                    rest = &after[next..];
+                }
+            }
+            '\n' | '\r' => {
+                rest = after_comments(rest.trim_start_matches(['\n', '\r', ' ', '\t']));
+                if rest.is_empty() {
+                    break;
+                }
+                let before = out.trim_end();
+                // (a block's parentheses take no `&` beside them)
+                let plain = before.ends_with(['(', '&', '|']) || rest.starts_with(')') || before.is_empty();
+                out.push_str(if plain { " " } else { " & " });
+            }
+            _ => {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    Ok(out.into())
+}
+
+/// What follows the comments that begin this. In a batch file a comment ends with its line; joined by `&`, a `rem` or a `::` would take all the lines after it with it, with nothing said and
+/// exit code 0.
+#[cfg(windows)]
+fn after_comments(mut rest: &str) -> &str {
+    loop {
+        let start = rest.trim_start_matches([' ', '\t', '@']);
+        let word: String = start.chars().take(4).collect::<String>().to_ascii_lowercase();
+        let is_rem = word.starts_with("rem") && word[3..].chars().next().is_none_or(|next| next.is_whitespace());
+        if !is_rem && !start.starts_with("::") {
+            return rest;
+        }
+        let Some(end) = start.find(['\n', '\r']) else { return "" };
+        rest = start[end..].trim_start_matches(['\n', '\r', ' ', '\t']);
+    }
+}
+
+#[cfg(windows)]
+const LINE_BREAK_IN_QUOTES: &str ="not run: cmd.exe ends a command at its first line break, and this one has a line break inside its quotes, so only a part of it would run. Nothing was started. Give it on one line: for a commit message several `-m`, for code `python -c` or `node -e` directly, or a file.";
+
+/// What code on several lines goes through, if what has been written of this line ends in a flag that takes code to run.
+#[cfg(windows)]
+fn runs_code(written: &str) -> Option<&'static str> {
+    let command = written.rsplit(['&', '|', '(']).next().unwrap_or(written).trim_start();
+    let mut words = command.split_whitespace();
+    let program = words.next()?.trim_matches('"').to_ascii_lowercase();
+    let program = program.rsplit(['\\', '/']).next().unwrap_or(&program).trim_end_matches(".exe").to_string();
+    let flag = words.next_back()?;
+    if (program == "python" || program == "python3" || program == "py") && flag == "-c" {
+        return Some("exec");
+    }
+    (program == "node" && matches!(flag, "-e" | "--eval" | "-p" | "--print")).then_some("eval")
+}
+
+/// Where an argument that opened with a double quote ends, as a program's own reading of its command line finds it: `\"` is a quote inside it.
+#[cfg(windows)]
+fn argument_end(text: &str) -> Option<usize> {
+    let mut slashes = 0;
+    for (at, c) in text.char_indices() {
+        match c {
+            '\\' => slashes += 1,
+            '"' if slashes % 2 == 0 => return Some(at),
+            _ => slashes = 0,
+        }
+        if c == '"' {
+            slashes = 0;
+        }
+    }
+    None
+}
+
+/// That argument as the program would get it.
+#[cfg(windows)]
+fn argument_text(raw: &str) -> String {
+    let (mut text, mut slashes) = (String::with_capacity(raw.len()), 0);
+    for c in raw.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                text.extend(std::iter::repeat_n('\\', slashes / 2));
+                text.push('"');
+                slashes = 0;
+            }
+            _ => {
+                text.extend(std::iter::repeat_n('\\', slashes));
+                text.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    text.extend(std::iter::repeat_n('\\', slashes));
+    text
+}
+
+/// As the inside of a single-quoted string in Python and in JavaScript. With no double quote left, all of it is one quoted stretch to cmd, which then takes nothing in it for its own; nor a `%`, which it would expand even there.
+#[cfg(windows)]
+fn escaped_for_a_string(code: &str) -> String {
+    let mut out = String::with_capacity(code.len() + 16);
+    for c in code.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '"' => out.push_str("\\x22"),
+            '%' => out.push_str("\\x25"),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// That one step of a line was refused says nothing of the steps before it, and the exit code is only the last one's.
+#[cfg(windows)]
+const DRIVE_ROOT_NOTE: &str = "note: the refusal of access and the exit code below come from `dir` or a command like it, and not from anything else in this line: what ran before it did run, and it is not about your file or your rights. {}\n";
+
+/// A `git init` this can do first, and what is left of the line after it. The words it takes are only those that change nothing but the name of the first branch and how much is said.
+#[cfg(windows)]
+fn git_init_first(line: &str) -> Option<(Vec<String>, String)> {
+    let line = line.trim();
+    if line.contains(['\n', '\r']) {
+        return None;
+    }
+    let (first, rest) = match line.find('&') {
+        Some(at) => (&line[..at], line[at..].trim_start_matches('&').trim_start()),
+        None => (line, ""),
+    };
+    if first.contains(['|', '>', '<', '"', '(', ')', '%', '^']) {
+        return None;
+    }
+    let mut words = first.split_whitespace();
+    if !(words.next()?.eq_ignore_ascii_case("git") && words.next()? == "init") {
+        return None;
+    }
+    let mut kept = Vec::new();
+    while let Some(word) = words.next() {
+        match word {
+            "." => {}
+            "-q" | "--quiet" => kept.push(word.to_string()),
+            "-b" | "--initial-branch" => kept.extend([word.to_string(), words.next()?.to_string()]),
+            _ if word.starts_with("--initial-branch=") => kept.push(word.to_string()),
+            _ => return None,
+        }
+    }
+    Some((kept, rest.to_string()))
+}
+
 #[cfg(windows)]
 fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
-    let line = text_arg(arguments, "command")?;
+    let line = on_one_line(text_arg(arguments, "command")?)?;
+    let line = line.as_ref();
     let cwd = resolve(workspace, arguments.get("cwd").and_then(Value::as_str).unwrap_or("."));
     let timeout = Duration::from_secs(arguments.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(180).clamp(1, 3600));
-    let network = crate::safety::uses_network(line);
+    // Under the user folder `git init` cannot work in the sandbox: it looks at every folder on the way, and a container cannot be let look at C:\\Users. It makes only `.git` in a folder
+    // the command may write in, with no hooks to bring, so the app does that much and the rest of the line runs as ever.
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    // First: all that follows here looks in that folder as the person, and it may be anywhere, a share on another machine included.
+    crate::sandbox::writable_root(&cwd, &resolve(workspace, "."), home.as_deref()).map_err(|error| format!("{error}. The command was not started; changing its spelling cannot repair this"))?;
+    let started_with_init = git_init_first(line);
+    let mut said_by_init = String::new();
+    let line: &str = if let Some((words, rest)) = &started_with_init {
+        let mut command = Command::new(crate::bundled::git_program());
+        command.args(["init", "--template="]).args(words).current_dir(&cwd).stdin(Stdio::null());
+        no_window(&mut command);
+        let output = command.output().map_err(|error| format!("git: {error}"))?;
+        said_by_init = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        if !output.status.success() {
+            return Ok(format!("stdout:\n\nstderr:\n{said_by_init}\nexit_code: {}", output.status.code().unwrap_or(1)));
+        }
+        if rest.is_empty() {
+            // (and if the line goes on, what the rest of it does there is a command's like any other)
+            crate::sandbox::note_made_by_the_app(&crate::sandbox::writable_root(&cwd, &resolve(workspace, "."), home.as_deref())?, &cwd);
+            return Ok(format!("stdout:\n{said_by_init}\nstderr:\n\nexit_code: 0"));
+        }
+        rest
+    } else {
+        line
+    };
+    if let Some(word) = opened_on_the_desktop(line, &cwd) {
+        return Err(format!("not run: `{word}` would open on the user's screen and not run here. Nothing was started. Name the program that runs it, as in `python x.py` or `node x.js`; a page or a picture cannot be opened from a command."));
+    }
+    let network = crate::safety::wants_network(arguments);
     let started = Instant::now();
+    let before = file_states(&cwd);
     // Spelled as `cwd` is, or a path with `..` in it would not be seen as holding it.
-    let done = crate::sandbox::run(line, &cwd, &resolve(workspace, "."), network, timeout, cancel).map_err(|error| format!("{error}. The command was not started; changing its spelling cannot repair this"))?;
+    let done = crate::sandbox::run(&with_stand_ins(line), &cwd, &resolve(workspace, "."), network, timeout, cancel).map_err(|error| format!("{error}. The command was not started; changing its spelling cannot repair this"))?;
     let (out, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
-    let mut report = format!("sandbox: appcontainer (filesystem/process isolation active)\nnetwork: {}\n", if network { "approved for this command" } else { "off" });
+    let mut report = String::new();
+    if !done.shown.is_empty() {
+        report.push_str(&format!("note: it opened a window that nobody can see, as nothing from a command reaches the screen: {}. Run what prints instead of what shows.\n", done.shown.iter().map(|title| if title.is_empty() { "a dialog" } else { title.as_str() }).take(4).collect::<Vec<_>>().join(", ")));
+    }
+    let no_network = no_network_note(network, done.status, &out, &err);
+    report.push_str(no_network.unwrap_or(""));
+    if let (Some(before), Some(after)) = (&before, file_states(&cwd)) {
+        report.push_str(&described_changes(before, &after));
+    }
     if done.status == Some(1) || done.status == Some(9009) {
-        // "Not found" from a folder the sandbox cannot read says the wrong thing: the program is there.
-        let looks_absent = err.contains("not recognized") || err.contains("認識されていません");
+        // "Not found" from a folder the sandbox cannot read says the wrong thing: the program is there. 9009 is cmd's code for it, in any language.
+        let looks_absent = done.status == Some(9009) || err.contains("not recognized") || err.contains("認識されていません");
+        if looks_absent && crate::bundled::root().is_none() {
+            report.push_str(crate::bundled::NOT_THERE);
+        }
         let closed = crate::sandbox::closed_tool_folders();
         if looks_absent && !closed.is_empty() {
             let names: Vec<String> = closed.iter().map(|folder| folder.display().to_string()).collect();
-            report.push_str(&format!("note: the sandbox cannot read these folders on PATH, so what is in them looks absent: {}. They are not missing. Tell the user that /tools opens them to commands, with one Windows prompt.\n", names.join(", ")));
+            report.push_str(&format!("note: the sandbox cannot read these folders on PATH, so what is in them looks absent: {}. They are not missing, and their full paths are closed too: do not try them. Tell the user that /tools opens them to commands, with one Windows prompt.\n", names.join(", ")));
         }
     }
-    report.push_str(&format!("stdout:\n{}\nstderr:\n{}\n", cap(&out, MAX_OUTPUT), cap(&err, MAX_OUTPUT / 2)));
+    if needs_drive_root(line) && says_access_denied(&err, system_access_denied()) {
+        report.push_str(&DRIVE_ROOT_NOTE.replace("{}", crate::prompt::NO_DRIVE_ROOT));
+    }
+    if !done.disarmed.is_empty() {
+        report.push_str(&format!("note: the app took this out of a repository a command made, as it would have run outside the sandbox the next time git is used there: {}. A hook or such a setting has to come from the user.\n", done.disarmed.join("; ")));
+    }
+    if let Some(cap) = done.out_of_memory {
+        report.push_str(&format!("note: this reached the {} GiB that commands may use on this machine, and was refused more. It needs to use less at a time.\n", cap >> 30));
+    }
+    // (with the cause said above, a traceback's middle tells nothing more, and it is read again with every later request)
+    report.push_str(&sandbox_notes(line, &resolve(workspace, "."), done.status, &err));
+    let most_err = if no_network.is_some() { MAX_COMMAND_ERR / 6 } else { MAX_COMMAND_ERR };
+    report.push_str(&format!("stdout:\n{said_by_init}{}\nstderr:\n{}\n", cap_evenly(&out, MAX_COMMAND_OUT), cap_evenly(&err, most_err)));
     match done.status {
         Some(code) => report.push_str(&format!("exit_code: {code}")),
         None => report.push_str(&format!("exit_code: none, {} after {} s", done.ended, started.elapsed().as_secs())),
@@ -624,14 +1808,78 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> 
 pub fn summary(tool: &str, arguments: &Value) -> String {
     let text = |name: &str| arguments.get(name).and_then(Value::as_str).unwrap_or("");
     match tool {
-        "read_file" | "list_files" | "create_file" => text("path").to_string(),
+        "read_file" | "list_files" | "create_file" | "check_page" => text("path").to_string(),
         "search_files" => format!("{} in {}", text("pattern"), arguments.get("path").and_then(Value::as_str).unwrap_or(".")),
         "execute_command" => text("command").lines().next().unwrap_or("").to_string(),
-        "apply_patch" => arguments.get("expected_files").and_then(Value::as_array).map_or(String::new(), |files| files.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
+        "apply_patch" => {
+            let named = arguments.get("expected_files").and_then(Value::as_array).filter(|files| !files.is_empty()).or_else(|| arguments.get("edits").and_then(Value::as_array));
+            let mut files: Vec<&str> = named.into_iter().flatten().filter_map(|item| item.as_str().or_else(|| item.get("path")?.as_str())).collect();
+            let mut seen = std::collections::HashSet::new();
+            files.retain(|file| seen.insert(*file));
+            // (a saved call has the shape the model wrote it in)
+            if files.is_empty() {
+                return text("path").to_string();
+            }
+            files.join(", ")
+        }
         "show_diff" => text("scope").to_string(),
         "web_read" => text("url").to_string(),
+        "find_files" => text("pattern").to_string(),
+        "skill" => text("name").to_string(),
+        "remember" => text("note").chars().take(80).collect(),
+        "forget" => text("words").to_string(),
+        "command_status" | "command_stop" => text("id").to_string(),
+        _ if tool.starts_with("mcp__") => arguments.to_string().chars().take(120).collect(),
         "web_search" => arguments.get("queries").and_then(Value::as_array).map_or(String::new(), |queries| queries.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod power_tests {
+    use super::*;
+
+    #[test]
+    fn files_are_found_by_name_and_what_git_ignores_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "skip.rs\n").unwrap();
+        for name in ["src/a.rs", "src/deep/b.rs", "src/c.txt", "skip.rs"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let found = find_files(&json!({"pattern": "**/*.rs"}), dir.path()).unwrap();
+        assert_eq!(found, "src/a.rs\nsrc/deep/b.rs");
+        assert!(find_files(&json!({"pattern": "*.zig"}), dir.path()).unwrap().starts_with("no file"));
+        assert!(find_files(&json!({}), dir.path()).is_err());
+    }
+
+    #[test]
+    fn an_edit_that_misses_says_where_its_line_is() {
+        assert!(nearest_line("a\n  fn  main( ) {\nb", "fn main( ) {\n  x").contains("line 2"));
+        assert_eq!(nearest_line("a\nb", "nowhere"), "");
+    }
+
+    #[test]
+    fn the_tools_of_a_session_depend_on_what_is_on() {
+        let names = |value: Value| value.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let plain = names(schemas_for(false, false, false, Vec::new()));
+        assert!(plain.contains(&"find_files".to_string()) && !plain.contains(&"skill".to_string()) && !plain.contains(&"web_read".to_string()) && !plain.contains(&"remember".to_string()));
+        let all = names(schemas_for(true, true, true, vec![json!({"type": "function", "function": {"name": "mcp__s__t"}})]));
+        assert!(all.contains(&"mcp__s__t".to_string()));
+        for tool in ["skill", "web_read", "remember", "forget", "command_status"] {
+            assert!(all.contains(&tool.to_string()), "{tool}");
+        }
+        let schemas = schemas_for(false, false, false, Vec::new());
+        let command = schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "execute_command").unwrap();
+        assert!(command["function"]["parameters"]["properties"].get("background").is_some());
+    }
+
+    #[test]
+    fn a_session_with_no_background_command_says_so() {
+        let bench = Workbench::default();
+        assert!(bench.job_status(&json!({})).unwrap().starts_with("no command"));
+        assert!(bench.job_stop(&json!({"id": "job1"})).is_err());
     }
 }
 
@@ -643,6 +1891,32 @@ mod change_tests {
         let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.com"];
         all.extend(args);
         git(dir, &all).unwrap();
+    }
+
+    #[test]
+    fn what_a_repository_plants_in_its_own_config_does_not_run_when_the_app_asks_git_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q"]);
+        std::fs::write(dir.path().join(".gitattributes"), "*.txt filter=planted diff=planted\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-q", "-m", "first"]);
+        // As a command in the sandbox could write them.
+        let config = dir.path().join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        for line in ["[core]\nfsmonitor = \"echo planted > marker1.txt\"", "[filter \"planted\"]\nclean = \"echo planted > marker2.txt; cat\"", "[diff \"planted\"]\ntextconv = \"echo planted > marker3.txt; cat\"", "[diff]\nexternal = \"echo planted > marker4.txt\""] {
+            text.push_str(line);
+            text.push('\n');
+        }
+        std::fs::write(&config, text).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        assert!(git_info(dir.path()).is_some());
+        assert!(workspace_changes(dir.path()).unwrap().iter().any(|change| change.path == "a.txt"));
+        let said = show_diff(&json!({"scope": "workspace"}), dir.path(), None).unwrap();
+        assert!(said.contains("+two"), "{said}");
+        for marker in ["marker1.txt", "marker2.txt", "marker3.txt", "marker4.txt"] {
+            assert!(!dir.path().join(marker).exists(), "{marker} ran");
+        }
     }
 
     #[test]
@@ -672,6 +1946,108 @@ mod change_tests {
         assert_eq!(changes.iter().map(|change| change.path.as_str()).collect::<Vec<_>>(), ["a.txt", "b.bin"]);
         assert_eq!(changes[0].added, 1);
         assert!(changes[1].diff.contains("not text"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn what_a_command_changed_is_said_whatever_its_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kept.txt"), "a").unwrap();
+        std::fs::write(dir.path().join("gone.txt"), "a").unwrap();
+        std::fs::write(dir.path().join("grows.txt"), "a").unwrap();
+        let before = file_states(dir.path()).unwrap();
+        assert_eq!(described_changes(&before, &before), "");
+        std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        std::fs::write(dir.path().join("grows.txt"), "abc").unwrap();
+        std::fs::write(dir.path().join("three.js"), "12345").unwrap();
+        let said = described_changes(&before, &file_states(dir.path()).unwrap());
+        assert!(said.contains("- created three.js (5 bytes)") && said.contains("- changed grows.txt (3 bytes)") && said.contains("- deleted gone.txt") && !said.contains("kept.txt"), "{said}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failure_with_no_network_says_so_at_the_top_and_only_then() {
+        let traceback = "Traceback (most recent call last):\nurllib.error.URLError: <urlopen error [Errno 11001] getaddrinfo failed>\n";
+        assert!(no_network_note(false, Some(1), "", traceback).unwrap().contains("network=true"));
+        assert!(no_network_note(false, Some(6), "curl: (6) Could not resolve host: unpkg.com", "").is_some());
+        assert!(no_network_note(true, Some(1), "", traceback).is_none(), "it had the network");
+        assert!(no_network_note(false, Some(0), "", traceback).is_none(), "it did not fail");
+        assert!(no_network_note(false, Some(1), "", "TypeError: nothing to do with it").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn what_would_open_on_the_desktop_is_told_from_what_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.xyz"), "x").unwrap();
+        std::fs::write(dir.path().join("run.bat"), "@echo x").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let opens = |line: &str| opened_on_the_desktop(line, dir.path());
+        for (line, word) in [
+            ("x.py", "x.py"), ("scripts\\x.py --flag", "scripts\\x.py"), ("\"C:\\a b\\x.ps1\" -v", "C:\\a b\\x.ps1"), ("@a.sh>out.txt", "a.sh"), ("data.xyz", "data.xyz"),
+            // Anywhere in a line.
+            ("cargo build && test.py", "test.py"), ("echo a & y.py", "y.py"), ("type a | z.py", "z.py"), ("cargo build || w.py", "w.py"), ("(q.py)", "q.py"), ("echo a\nb.py", "b.py"),
+            // Through what runs what it is given.
+            ("call x.py", "x.py"), ("cmd /c x.py", "x.py"), ("cmd /d /s /c \"echo a & x.py\"", "x.py"), ("cmd.exe /k x.html", "x.html"),
+            // What `start` would open and not run.
+            ("start index.html", "start index.html"), ("start \"\" index.html", "start index.html"), ("start /b x.py", "start x.py"), ("start https://example.com", "start https://example.com"),
+            ("start sub", "start sub"), ("start .", "start ."), ("start", "start"), ("start \"title\"", "start"), ("START no-such-program", "START no-such-program"), ("git status && start a.txt", "start a.txt"),
+        ] {
+            assert_eq!(opens(line).as_deref(), Some(word), "{line}");
+        }
+        for line in [
+            // A program, with files as its arguments.
+            "python x.py", "py -3 x.py", "node x.js", "tool.exe a.py", "C:\\Python314\\python.exe x.py", "python3.12 x.py", "run.bat", "cargo test && git status", "a.unknown",
+            // A file only as an argument.
+            "echo x.py", "type a.txt", "mkdir start", "echo start",
+            // `&` and `|` that split nothing.
+            "python -c \"print(1) & x.py\"", "echo \"a && b.py c\"", "echo a^&x.py",
+            // A shell given a program.
+            "cmd /c echo hi", "cmd /c \"python x.py\"", "call run.bat",
+            // `start` of a program it finds.
+            "start cmd /c echo hi", "start \"\" cmd", "start \"title\" /b cmd", "start /wait cmd", "start /d sub /wait cmd", "start \"\" run.bat", "start /b run.bat", "start run",
+        ] {
+            assert_eq!(opens(line), None, "{line}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_line_that_would_open_a_dialog_is_refused_before_any_sandbox_is_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let said = execute_command(&json!({"command": "x.py"}), dir.path(), &AtomicBool::new(false)).unwrap_err();
+        assert!(said.contains("Nothing was started") && said.contains("python x.py"), "{said}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_dir_does_not_read_as_the_whole_line_failing() {
+        assert!(DRIVE_ROOT_NOTE.contains("what ran before it did run"));
+    }
+
+    #[test]
+    fn a_session_is_told_of_the_network_as_a_thing_to_ask_for() {
+        let schemas = schemas_for(false, false, false, Vec::new());
+        let command = schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "execute_command").unwrap();
+        assert!(command["function"]["parameters"]["properties"].get("network").is_some());
+        assert!(command["function"]["parameters"]["properties"]["network"]["description"].as_str().unwrap().contains("Asks the user"));
+    }
+
+    #[test]
+    fn an_empty_folder_is_said_to_be() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(list_files(&json!({}), dir.path()).unwrap().ends_with("is empty"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_commands_that_read_the_drive_root_are_told_apart() {
+        for line in ["dir", "dir /b vendor", "dir/b", "@DEL a.txt", "mkdir x & dir x", "(erase a) && echo y", "where /r . *.txt", "type a | tree /f"] {
+            assert!(needs_drive_root(line), "{line}");
+        }
+        for line in ["mkdir dir", "echo dir", "type del.txt", "where python", "python dir.py", "rmdir /s /q vendor"] {
+            assert!(!needs_drive_root(line), "{line}");
+        }
     }
 
     #[test]
@@ -712,7 +2088,117 @@ mod tests {
     fn every_generated_schema_has_a_tool() {
         let schemas = schemas();
         let names: Vec<&str> = schemas.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "todo"]);
+        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "todo", "find_files", "check_page", "command_status", "command_stop"]);
+    }
+
+    #[test]
+    fn show_diff_outside_git_answers_in_a_line_and_never_with_gits_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        for scope in ["staged", "unstaged"] {
+            let said = show_diff(&json!({"scope": scope}), dir.path(), None).unwrap_err();
+            assert!(said.contains("use scope session") && !said.contains('\n') && !said.contains("usage"), "{said}");
+        }
+        for scope in ["session", "workspace"] {
+            let said = show_diff(&json!({"scope": scope}), dir.path(), None).unwrap_err();
+            assert!(!said.contains('\n') && !said.contains("usage"), "{said}");
+        }
+    }
+
+    #[test]
+    fn show_diff_in_a_repository_goes_on_as_it_did_and_says_a_bad_path_in_a_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.com"];
+            all.extend(args);
+            git(dir.path(), &all).unwrap();
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "first"]);
+        let sessions = tempfile::tempdir().unwrap();
+        let baseline = crate::baseline::Baseline::for_session(&sessions.path().join("s.jsonl"), dir.path());
+        std::fs::write(dir.path().join("a.txt"), "b\n").unwrap();
+        for scope in ["session", "workspace", "unstaged"] {
+            assert!(show_diff(&json!({"scope": scope}), dir.path(), Some(&baseline)).unwrap().contains("+b"), "{scope}");
+        }
+        assert!(show_diff(&json!({"scope": "staged"}), dir.path(), Some(&baseline)).unwrap().starts_with("no differences"));
+        std::fs::write(dir.path().join("only-new.txt"), "fresh
+").unwrap();
+        for scope in ["session", "workspace"] {
+            let said = show_diff(&json!({"scope": scope}), dir.path(), Some(&baseline)).unwrap();
+            assert!(said.contains("only-new.txt") && said.contains("+fresh"), "{scope}: {said}");
+        }
+        assert!(!show_diff(&json!({"scope": "workspace", "paths": ["a.txt"]}), dir.path(), Some(&baseline)).unwrap().contains("only-new"), "a filter holds for new files too");
+        std::fs::remove_file(dir.path().join("only-new.txt")).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "second"]);
+        assert!(show_diff(&json!({"scope": "session"}), dir.path(), Some(&baseline)).unwrap().contains("+b"), "since the session began, not since the last commit");
+        assert!(show_diff(&json!({"scope": "workspace"}), dir.path(), Some(&baseline)).unwrap().starts_with("no differences"));
+    }
+
+    #[test]
+    fn the_schemas_promise_only_what_the_tools_do() {
+        let text = schemas().to_string();
+        assert!(text.contains("outside git as session") && !text.contains("captured workspace baseline"));
+        for gone in ["PDF", "spreadsheet", "queries", "`del` not", "risk_level", "expected_files", "if_exists", "allow_empty_file"] {
+            assert!(!text.contains(gone), "{gone}");
+        }
+        assert!(text.contains("see a picture") && text.contains("append=true"));
+    }
+
+    #[test]
+    fn a_read_says_what_it_decoded_and_when_it_went_past_the_end() {
+        let (dir, mut bench, cancel) = bench();
+        let mut wide = vec![0xFF, 0xFE];
+        wide.extend("日本語\n".encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(dir.path().join("wide.txt"), wide).unwrap();
+        let out = bench.run("read_file", &json!({"path": "wide.txt"}), dir.path(), &cancel).unwrap();
+        assert!(out.contains("encoding=utf-16") && out.contains("1|日本語"), "{out}");
+        #[cfg(windows)]
+        {
+            std::fs::write(dir.path().join("sjis.txt"), [0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA]).unwrap();
+            let out = bench.run("read_file", &json!({"path": "sjis.txt"}), dir.path(), &cancel).unwrap();
+            assert!(out.contains("encoding=shift_jis") && out.contains("1|日本語"), "{out}");
+        }
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let past = bench.run("read_file", &json!({"path": "a.txt", "start_line": 9}), dir.path(), &cancel).unwrap();
+        assert!(past.contains("only 1 lines"), "{past}");
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+        assert!(bench.run("read_file", &json!({"path": "empty.txt"}), dir.path(), &cancel).unwrap().contains("the file is empty"));
+    }
+
+    #[test]
+    fn a_picture_read_with_no_way_to_show_it_says_so() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join("a.png"), crate::images::tests::encoded(8, 8, image::ImageFormat::Png)).unwrap();
+        let said = bench.run("read_file", &json!({"path": "a.png"}), dir.path(), &cancel).unwrap_err();
+        assert!(said.contains("is a picture") && !said.contains("binary"), "{said}");
+    }
+
+    #[test]
+    fn a_walk_stays_out_of_what_no_one_wrote_and_a_look_still_shows_it() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::create_dir_all(dir.path().join("node_modules/x")).unwrap();
+        std::fs::write(dir.path().join("node_modules/x/a.js"), "needle").unwrap();
+        std::fs::write(dir.path().join("b.js"), "needle").unwrap();
+        let deep = bench.run("list_files", &json!({"recursive": true}), dir.path(), &cancel).unwrap();
+        assert!(!deep.contains("node_modules"), "{deep}");
+        let found = bench.run("search_files", &json!({"pattern": "needle"}), dir.path(), &cancel).unwrap();
+        assert!(found.contains("b.js") && !found.contains("a.js"), "{found}");
+        assert!(bench.run("list_files", &json!({}), dir.path(), &cancel).unwrap().contains("node_modules/"), "one level shows it");
+        let named = bench.run("search_files", &json!({"pattern": "needle", "path": "node_modules"}), dir.path(), &cancel).unwrap();
+        assert!(named.contains("a.js"), "asked for by name: {named}");
+    }
+
+    #[test]
+    fn a_search_does_not_print_what_a_read_would_ask_about() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join(".env"), "API_KEY=sekret").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "sekret").unwrap();
+        let found = bench.run("search_files", &json!({"pattern": "sekret"}), dir.path(), &cancel).unwrap();
+        assert!(found.contains("a.txt") && !found.contains("API_KEY"), "{found}");
+        assert!(found.contains("1 files that may hold secrets"), "{found}");
     }
 
     #[test]
@@ -763,12 +2249,400 @@ mod tests {
     }
 
     #[test]
-    fn a_new_file_never_overwrites() {
+    fn a_file_is_written_over_only_as_this_session_knows_it() {
         let (dir, mut bench, cancel) = bench();
-        let create = json!({"path": "sub/a.txt", "content": "hi"});
-        bench.run("create_file", &create, dir.path(), &cancel).unwrap();
-        assert!(bench.run("create_file", &create, dir.path(), &cancel).is_err());
-        assert_eq!(std::fs::read_to_string(dir.path().join("sub/a.txt")).unwrap(), "hi");
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "theirs").unwrap();
+        let write = json!({"path": "a.txt", "content": "mine"});
+        let said = bench.run("create_file", &write, dir.path(), &cancel).unwrap_err();
+        assert!(said.contains("read it first"), "{said}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs");
+        bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
+        std::fs::write(&file, "changed since").unwrap();
+        assert!(bench.run("create_file", &write, dir.path(), &cancel).unwrap_err().contains("changed since it was read"));
+        bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
+        assert!(bench.run("create_file", &write, dir.path(), &cancel).unwrap().starts_with("replaced a.txt"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+    }
+
+    #[test]
+    fn a_new_file_makes_its_folders_and_append_adds_to_what_is_there() {
+        let (dir, mut bench, cancel) = bench();
+        let said = bench.run("create_file", &json!({"path": "sub/a.txt", "content": "one\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(said, "created sub/a.txt: now 1 lines, 4 bytes");
+        let said = bench.run("create_file", &json!({"path": "sub/a.txt", "content": "two\n", "append": true}), dir.path(), &cancel).unwrap();
+        assert_eq!(said, "added to sub/a.txt: now 2 lines, 8 bytes");
+        assert_eq!(std::fs::read_to_string(dir.path().join("sub/a.txt")).unwrap(), "one\ntwo\n");
+        // Written as this session left it, so an edit needs no read.
+        bench.run("apply_patch", &json!({"edits": [{"path": "sub/a.txt", "old_string": "two", "new_string": "2"}]}), dir.path(), &cancel).unwrap();
+        // Appending to what someone else's hands have been at is writing over what it has not seen.
+        std::fs::write(dir.path().join("sub/a.txt"), "theirs").unwrap();
+        assert!(bench.run("create_file", &json!({"path": "sub/a.txt", "content": "x", "append": true}), dir.path(), &cancel).is_err());
+        assert_eq!(std::fs::read_to_string(dir.path().join("sub/a.txt")).unwrap(), "theirs");
+    }
+
+    #[test]
+    fn after_a_cut_the_next_write_goes_on_once_and_then_writes_are_writes_again() {
+        let (dir, mut bench, cancel) = bench();
+        bench.run("create_file", &json!({"path": "a.txt", "content": "one\n"}), dir.path(), &cancel).unwrap();
+        bench.note_cut(dir.path().join("a.txt"));
+        bench.run("create_file", &json!({"path": "b.txt", "content": "other\n"}), dir.path(), &cancel).unwrap();
+        bench.run("create_file", &json!({"path": "a.txt", "content": "two\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\ntwo\n");
+        bench.run("create_file", &json!({"path": "a.txt", "content": "whole\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "whole\n");
+    }
+
+    #[test]
+    fn a_read_is_bounded_by_lines_and_bytes_and_says_where_to_go_on() {
+        let (dir, mut bench, cancel) = bench();
+        let mut minified = String::from("first\n");
+        minified.push_str(&"x".repeat(100_000));
+        minified.push_str("\nlast\n");
+        std::fs::write(dir.path().join("min.js"), &minified).unwrap();
+        let out = bench.run("read_file", &json!({"path": "min.js", "limit": 2}), dir.path(), &cancel).unwrap();
+        assert!(out.len() < MAX_LINE + 200, "{}", out.len());
+        assert!(out.starts_with("1|first\n2|xxx") && out.contains("98000 more bytes on this line") && out.ends_with("--- 1 more lines; continue with start_line=3 ---\n"), "{}", &out[out.len() - 120..]);
+        let long = "a line of an ordinary file with some words on it\n".repeat(5000);
+        std::fs::write(dir.path().join("long.txt"), &long).unwrap();
+        let out = bench.run("read_file", &json!({"path": "long.txt", "limit": 2000}), dir.path(), &cancel).unwrap();
+        assert!(out.len() < MAX_READ + 200, "{}", out.len());
+        let told: usize = out.rsplit_once("start_line=").unwrap().1.trim_end_matches(" ---\n").parse().unwrap();
+        assert!(out.contains(&format!("\n{}|", told - 1)) && !out.contains(&format!("\n{told}|")), "goes on where it stopped");
+        let next = bench.run("read_file", &json!({"path": "long.txt", "start_line": told, "limit": 1}), dir.path(), &cancel).unwrap();
+        assert!(next.starts_with(&format!("{told}|")), "{next}");
+        // A hash of no use to a model, and the encoding only when it is not what it would assume.
+        assert!(!out.contains("sha256"));
+    }
+
+    #[test]
+    fn an_edit_that_misses_by_a_character_is_shown_the_line_and_says_which_it_was() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join("a.txt"), "first line\n// 水平線の近くのもや\nlast line\n").unwrap();
+        bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
+        let edit = json!({"edits": [{"path": "a.txt", "old_string": "first line", "new_string": "one"}, {"path": "a.txt", "old_string": "// 水平线の近くのもや", "new_string": "x"}]});
+        let said = bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap_err();
+        assert!(said.contains("edit 2 of 2 (`// 水平线"), "{said}");
+        assert!(said.contains("line 2") && said.contains("水平線の近くのもや"), "{said}");
+        let nothing_like = json!({"edits": [{"path": "a.txt", "old_string": "zzz qqq", "new_string": "x"}]});
+        assert!(!bench.run("apply_patch", &nothing_like, dir.path(), &cancel).unwrap_err().contains("nearest"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_a_plain_git_init_at_the_start_of_a_line_is_done_by_the_app() {
+        assert_eq!(git_init_first("git init"), Some((vec![], String::new())));
+        assert_eq!(git_init_first("git init -q . && git add ."), Some((vec!["-q".to_string()], "git add .".to_string())));
+        assert_eq!(git_init_first("git init -b main & dir"), Some((vec!["-b".to_string(), "main".to_string()], "dir".to_string())));
+        for line in ["git init ../other", "git init --template=x", "git init --separate-git-dir=C:\\x", "git status", "echo x && git init", "git init > C:\\x", "git init\ndel x", "git init -c core.hooksPath=x"] {
+            assert_eq!(git_init_first(line), None, "{line}");
+        }
+    }
+
+    /// As cmd.exe runs what comes of it, with no sandbox: what it prints, on this machine's python and node if it has them.
+    #[cfg(windows)]
+    fn through_cmd(line: &str) -> String {
+        use std::os::windows::process::CommandExt;
+        const NO_WINDOW: u32 = 0x0800_0000;
+        let line = on_one_line(line).unwrap();
+        let output = Command::new("cmd").raw_arg(format!("/d /s /c \"chcp 65001 >nul & {line}\"")).creation_flags(NO_WINDOW).stdin(Stdio::null()).output().unwrap();
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n")
+    }
+
+    #[cfg(windows)]
+    fn has_program(name: &str) -> bool {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).any(|folder| folder.join(format!("{name}.exe")).is_file())
+    }
+
+    /// As it came from a real model in two of seven real jobs, each time an empty result, a wasted round and a script left in the workspace.
+    #[cfg(windows)]
+    #[test]
+    fn code_on_several_lines_runs_as_it_was_written() {
+        assert_eq!(through_cmd("echo one\necho two"), "one \ntwo\n", "both lines, where cmd alone runs the first");
+        assert_eq!(through_cmd("(echo a\necho b\n)"), "a \nb \n");
+        assert_eq!(through_cmd("echo a ^\nb"), "a b\n");
+        if !has_program("python") {
+            return;
+        }
+        let code = "python -I -c \"\nimport collections\nc = collections.Counter('aab')\nfor k, v in c.items():\n    print(k, v, '%d%%' % 5, \\\"q'\\\")\nprint('a\\tb & c | d > e')\n\"";
+        assert_eq!(through_cmd(code), "a 2 5% q'\nb 1 5% q'\na\tb & c | d > e\n");
+        assert_eq!(through_cmd("python -I -c \"\nimport sys\nprint(sys.argv[1:])\n\" x y"), "['x', 'y']\n", "what follows it stays its arguments");
+        assert_eq!(through_cmd("echo before && python -I -c \"\nprint(1)\n\" && echo after"), "before \n1\nafter\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_comment_ends_with_its_line_when_the_lines_are_joined() {
+        assert_eq!(on_one_line("rem first we build\npython x.py\nrem then we test\npython y.py").unwrap(), "python x.py & python y.py");
+        assert_eq!(on_one_line(":: note\r\npython x.py").unwrap(), "python x.py");
+        assert_eq!(on_one_line("@REM note\nREM other\necho a").unwrap(), "echo a");
+        assert_eq!(on_one_line("echo a\nrem only a note").unwrap(), "echo a");
+        assert_eq!(on_one_line("remove.exe a\nremark b").unwrap(), "remove.exe a & remark b", "a word that only begins so");
+        assert_eq!(through_cmd("rem note\necho ran"), "ran\n", "where cmd alone said nothing and ended with 0");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn what_opens_on_the_screen_is_seen_as_cmd_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let opens = |line: &str| opened_on_the_desktop(line, dir.path());
+        assert_eq!(opens("x.t^xt").as_deref(), Some("x.txt"));
+        assert_eq!(opens("^x.py").as_deref(), Some("x.py"));
+        assert_eq!(opens("cmd/c x.txt").as_deref(), Some("x.txt"));
+        assert_eq!(opens("cmd /c\"x.txt\"").as_deref(), Some("x.txt"));
+        assert_eq!(opens("cmd.exe/d/c x.py").as_deref(), Some("x.py"));
+        assert_eq!(opens("c^md /c x.txt").as_deref(), Some("x.txt"));
+        assert_eq!(opens("start/b x.html").as_deref(), Some("start x.html"));
+        assert_eq!(opens("s^tart x.html").as_deref(), Some("start x.html"));
+        assert_eq!(opens("cmd/c echo hi"), None);
+        assert_eq!(opens("start/b cmd"), None);
+    }
+
+    #[test]
+    fn a_file_too_large_to_hold_is_not_read_to_say_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let large = dir.path().join("model.gguf");
+        std::fs::File::create(&large).unwrap().set_len(MOST_READ_WHOLE + 1).unwrap();
+        let said = read_file(&json!({"path": "model.gguf"}), dir.path()).err().unwrap();
+        assert!(said.contains("too large"), "{said}");
+    }
+
+    #[test]
+    fn a_search_leaves_out_what_else_holds_keys_as_it_does_what_reads_as_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, keys) = (dir.path().join("DogmindApp"), dir.path().join("keys"));
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(app.join("sessions.jsonl"), "needle in a session\n").unwrap();
+        std::fs::write(keys.join("openai.txt"), "needle in a key\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle in a file\n").unwrap();
+        let secrets = [app.clone(), keys.join("openai.txt")];
+        let cancel = AtomicBool::new(false);
+        let said = search_files(&json!({"pattern": "needle"}), dir.path(), &secrets, &cancel).unwrap();
+        assert!(said.contains("needle in a file") && !said.contains("in a session") && !said.contains("in a key") && said.contains("2 files"), "{said}");
+        // The person has answered for that folder when it is what is searched.
+        assert!(search_files(&json!({"pattern": "needle", "path": app.to_str().unwrap()}), dir.path(), &secrets, &cancel).unwrap().contains("in a session"));
+    }
+
+    #[test]
+    fn a_repositorys_worktree_config_and_its_submodules_start_no_program_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| { git(dir.path(), args).unwrap(); };
+        run(&["init", "-q"]);
+        run(&["config", "extensions.worktreeConfig", "true"]);
+        run(&["config", "--worktree", "filter.planted.clean", "evil"]);
+        run(&["config", "filter.other.smudge", "evil"]);
+        let settings = git_without_programs(dir.path());
+        assert!(settings.contains(&"filter.planted.clean=".to_string()), "{settings:?}");
+        assert!(settings.contains(&"filter.other.smudge=".to_string()), "{settings:?}");
+        assert!(settings.contains(&"diff.ignoreSubmodules=all".to_string()), "{settings:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_command_for_a_place_it_cannot_run_in_is_refused_before_anything_looks_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let said = execute_command(&json!({"command": "x.py", "cwd": "\\\\127.0.0.1\\nothing-here"}), dir.path(), &AtomicBool::new(false)).unwrap_err();
+        assert!(said.contains("outside the workspace") && said.contains("was not started"), "{said}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn what_cannot_go_on_one_line_is_refused_and_what_is_one_line_is_left_alone() {
+        let refused = on_one_line("git commit -m \"first\nsecond\"").unwrap_err();
+        assert!(refused.starts_with("not run") && refused.contains("several `-m`"), "{refused}");
+        assert!(matches!(on_one_line("python -c \"print(1)\"\n"), Ok(std::borrow::Cow::Borrowed("python -c \"print(1)\""))));
+        assert_eq!(on_one_line("python -c \"print(1)\"\nnode -e \"\nconsole.log(1)\n\"").unwrap(), "python -c \"print(1)\" & node -e \"eval('\\nconsole.log(1)\\n')\"");
+        assert_eq!(runs_code("cd a && C:\\py\\python.exe -X utf8 -c "), Some("exec"));
+        assert_eq!(runs_code("echo -c "), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn what_a_for_goes_through_opens_nothing_and_what_it_runs_is_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.log"), "x").unwrap();
+        assert_eq!(opened_on_the_desktop("for %f in (app.log) do @echo %~zf bytes", dir.path()), None);
+        assert_eq!(opened_on_the_desktop("@for %f in (*.log) do echo %f", dir.path()), None);
+        assert_eq!(opened_on_the_desktop("(app.log)", dir.path()).as_deref(), Some("app.log"));
+        assert_eq!(opened_on_the_desktop("echo a & app.log", dir.path()).as_deref(), Some("app.log"));
+    }
+
+    #[test]
+    fn a_listing_says_how_large_a_large_file_is() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join("small.log"), "x").unwrap();
+        std::fs::write(dir.path().join("app.log"), vec![b'x'; 1_677_722]).unwrap();
+        let said = bench.run("list_files", &json!({"path": "."}), dir.path(), &cancel).unwrap();
+        assert_eq!(said, "app.log (1.6 MB)\nsmall.log");
+    }
+
+    #[test]
+    fn a_slip_in_an_answer_is_told_from_what_was_read_and_from_chinese_on_purpose() {
+        assert_eq!(slips_in_answer("会员割引を適用します。\n| 会员数 | 约 76 GB |", ""), "员约");
+        assert_eq!(slips_in_answer("会員割引を適用します。", ""), "", "good Japanese");
+        assert_eq!(slips_in_answer("頰と剝がすと塡補", ""), "", "Japanese outside Shift_JIS");
+        assert_eq!(slips_in_answer("ファイル名は 会员.txt です", "会员.txt\n"), "", "it was given that");
+        assert_eq!(slips_in_answer("中国語では「会员」と書きます。", ""), "", "it says it is Chinese");
+        assert_eq!(slips_in_answer("这是一个测试我们需要检查系统。\nこちらが訳です。", ""), "", "a whole line of Chinese is one asked for");
+    }
+
+    #[test]
+    fn chinese_in_a_japanese_conversation_is_pointed_out_where_it_is_written() {
+        assert_eq!(not_japanese("Gerstner 波を叠加したデモ。海の波、重ね合わせ、髙、ｱ。青透过"), ['叠', '过']);
+        let (dir, mut bench, cancel) = bench();
+        let plain = bench.run("create_file", &json!({"path": "a.txt", "content": "波を叠加した"}), dir.path(), &cancel).unwrap();
+        assert!(!plain.contains("note:"), "not in another language's conversation: {plain}");
+        bench.in_japanese = true;
+        let said = bench.run("create_file", &json!({"path": "b.txt", "content": "波を叠加した"}), dir.path(), &cancel).unwrap();
+        assert!(said.contains("note: 叠 in this text is Chinese"), "{said}");
+        let fine = bench.run("create_file", &json!({"path": "c.txt", "content": "波を重ねた"}), dir.path(), &cancel).unwrap();
+        assert!(!fine.contains("note:"), "{fine}");
+        let edit = json!({"edits": [{"path": "c.txt", "old_string": "重ねた", "new_string": "透过"}]});
+        let said = bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap();
+        assert!(said.contains("note: 透过 in this text is Chinese") || said.contains("note: 过 in this text is Chinese"), "{said}");
+    }
+
+    #[test]
+    fn a_patch_needs_no_list_of_files_and_says_where_it_landed_in_few_words() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
+        let edit = json!({"edits": [{"path": "a.txt", "old_string": "one", "new_string": "two"}]});
+        let said = bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap();
+        assert!(said.starts_with("--- applied_diff a.txt ---"), "{said}");
+        assert_eq!(summary("apply_patch", &edit), "a.txt");
+        assert_eq!(summary("apply_patch", &json!({"expected_files": ["b.txt"], "edits": [{"path": "b.txt"}]})), "b.txt", "a session from before");
+        assert_eq!(summary("apply_patch", &json!({"edits": [{"path": "a"}, {"path": "b"}, {"path": "a"}]})), "a, b");
+    }
+
+    #[test]
+    fn the_same_lines_of_an_unchanged_file_are_not_sent_twice() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let read = |bench: &mut Workbench, arguments: Value| bench.run("read_file", &arguments, dir.path(), &cancel).unwrap();
+        assert!(read(&mut bench, json!({"path": "a.txt"})).contains("1|one"));
+        assert_eq!(read(&mut bench, json!({"path": "a.txt"})), UNCHANGED_READ);
+        assert!(read(&mut bench, json!({"path": "a.txt", "start_line": 2})).contains("2|two"), "other lines are other lines");
+        bench.run("apply_patch", &json!({"edits": [{"path": "a.txt", "old_string": "one", "new_string": "ONE"}]}), dir.path(), &cancel).unwrap();
+        assert!(read(&mut bench, json!({"path": "a.txt"})).contains("1|ONE"), "changed");
+        bench.forget_reads();
+        assert!(read(&mut bench, json!({"path": "a.txt"})).contains("1|ONE"), "gone from the conversation");
+        // An edit still has what it needs after an answer of no lines.
+        assert_eq!(read(&mut bench, json!({"path": "a.txt"})), UNCHANGED_READ);
+        bench.run("apply_patch", &json!({"edits": [{"path": "a.txt", "old_string": "two", "new_string": "TWO"}]}), dir.path(), &cancel).unwrap();
+    }
+
+    #[test]
+    fn a_command_past_its_time_is_left_at_work_and_a_stop_ends_it() {
+        let (stop, cancel) = (AtomicBool::new(false), AtomicBool::new(false));
+        let result: CommandResult = Arc::new(Mutex::new(None));
+        assert!(wait_for_command(&result, &stop, &cancel, Duration::from_millis(30)).is_none());
+        assert!(!stop.load(Ordering::Relaxed), "it goes on");
+        *result.lock().unwrap() = Some(Ok("done".to_string()));
+        assert_eq!(wait_for_command(&result, &stop, &cancel, Duration::from_secs(5)).unwrap().unwrap(), "done");
+        // The person stops the turn: it ends, however long there was to wait, and its answer is waited for.
+        cancel.store(true, Ordering::Relaxed);
+        let (late, setter) = (result.clone(), std::thread::spawn({
+            let result = result.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(60));
+                *result.lock().unwrap() = Some(Ok("cut short".to_string()));
+            }
+        }));
+        assert_eq!(wait_for_command(&late, &stop, &cancel, Duration::from_millis(1)).unwrap().unwrap(), "cut short");
+        assert!(stop.load(Ordering::Relaxed));
+        setter.join().unwrap();
+    }
+
+    #[test]
+    fn what_is_cut_from_a_command_keeps_its_end() {
+        let text = format!("start\n{}\nthe test failed at the end", "x".repeat(50_000));
+        let kept = cap_evenly(&text, 1000);
+        assert!(kept.len() < 1200 && kept.starts_with("start") && kept.ends_with("the test failed at the end") && kept.contains("truncated"));
+        assert_eq!(cap_evenly("short", 1000), "short");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_pipe_to_head_or_tail_passes_the_output_on_and_nothing_else_is_touched() {
+        assert_eq!(with_stand_ins("set -e & python -m pytest -q 2>&1 | head -60"), "set -e & python -m pytest -q 2>&1 | findstr \"^\"");
+        for line in ["x | head", "x | tail -5", "x | tail -n 20", "x | head -n5"] {
+            assert_eq!(with_stand_ins(line), "x | findstr \"^\"", "{line}");
+        }
+        for same in ["head -5 a.txt", "x | head -c 5", "x | tail -f", "x || head -5", "echo head -5", "x | headline -5", "x | head -5 a.txt"] {
+            assert_eq!(with_stand_ins(same), same, "{same}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dir_and_del_in_their_plain_forms_get_a_stand_in_and_nothing_else_is_touched() {
+        for same in ["echo dir", "mkdir a", "python x.py", "dir > out.txt", "dir %TEMP%", "if exist x (del x)", "for %f in (*) do del %f", "del /s a.txt", "del /p a.txt", "del", "echo a & echo dir", "findstr \"dir | del\" a.txt", "dir\necho x"] {
+            assert_eq!(with_stand_ins(same), same, "{same}");
+        }
+        let dir = with_stand_ins("dir vendor");
+        assert!(dir.starts_with("(if exist \"vendor\\*\"") && dir.contains("for /d %d in (\"vendor\\*\")") && !dir.contains("dir vendor"), "{dir}");
+        assert_eq!(with_stand_ins("dir"), with_stand_ins("dir ."));
+        assert_eq!(with_stand_ins("dir /b vendor 2>nul"), with_stand_ins("dir vendor"));
+        assert_eq!(with_stand_ins("dir/b vendor"), with_stand_ins("dir vendor"));
+        assert_eq!(with_stand_ins("DIR \"my folder\\\""), with_stand_ins("dir \"my folder\""));
+        assert!(with_stand_ins("dir /s *.js").contains("for /r \".\" %d in (*.js) do @echo %d"));
+        assert!(with_stand_ins("dir /s vendor").contains("for /r \"vendor\" %d in (*) do @echo %d"));
+        let line = with_stand_ins("mkdir vendor 2>nul & curl -o vendor/a.js https://x.example/a.js & dir vendor");
+        assert!(line.starts_with("mkdir vendor 2>nul & curl -o vendor/a.js https://x.example/a.js & (if exist"), "{line}");
+        let del = with_stand_ins("del /q a.txt \"b c.txt\"");
+        assert_eq!(del, "(powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\" & powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('b c.txt')\")");
+        assert!(with_stand_ins("erase *.log").contains("for %d in (\"*.log\") do @powershell"));
+        let piped = with_stand_ins("dir /b vendor | findstr three");
+        assert!(piped.starts_with("((for /d %d in (\"vendor\\*\")") && !piped.contains("if exist") && piped.ends_with("| findstr three"), "{piped}");
+        assert!(with_stand_ins("dir vendor || echo none").contains("if exist"), "a second chance is not a pipe");
+        assert_eq!(with_stand_ins("del it's.txt"), "del it's.txt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_sandboxs_answer_that_reads_as_something_else_is_explained() {
+        let root = Path::new("C:\\work");
+        assert!(sandbox_notes("where python", root, Some(1), "INFO: Could not find files for the given pattern(s).").contains("does not say the program is missing"));
+        assert!(sandbox_notes("powershell -NoProfile -Command \"Get-Item a\"", root, Some(1), "Get-Item : Cannot find path 'C:\\a' because it does not exist.").contains("absolute paths"));
+        assert!(sandbox_notes("powershell -NoProfile -Command \"Get-ChildItem\"", root, Some(1), "PermissionDenied: (C:\\:String) [Get-ChildItem]").contains("absolute paths"));
+        assert!(sandbox_notes("git status", root, Some(128), "fatal: failed to stat '        C:/Users': Permission denied").contains("not a git repository"));
+        for (line, err) in [("git config user.name x", "error: could not lock config file .git/config: Permission denied"), ("git remote add o u", "error: could not lock config file .git/config: Permission denied"), ("echo x> .git\\hooks\\pre-commit", "Access is denied."), ("del .git\\config", "アクセスが拒否されました。")] {
+            assert!(sandbox_notes(line, Path::new("C:\\work"), Some(1), err).contains("Tell the user the exact command"), "{line}");
+        }
+        assert!(!sandbox_notes("git status", Path::new("C:\\work"), Some(1), "fatal: bad").contains("Tell the user"));
+        assert!(sandbox_notes("type C:\\elsewhere\\a.txt", root, Some(1), "Access is denied.").contains("cannot read outside the workspace"));
+        assert!(sandbox_notes("type C:\\elsewhere\\a.txt", root, Some(1), "アクセスが拒否されました。").contains("`read_file`"));
+        // On another drive, and in another language, the same.
+        assert!(sandbox_notes("powershell -c \"Get-Item a\"", Path::new("E:\\work"), Some(1), "Get-Item : Der Pfad \"D:\\a\" kann nicht gefunden werden.\n    + CategoryInfo : ObjectNotFound: (D:\\a:String) [Get-Item], ItemNotFoundException\n    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand").contains("absolute paths"));
+        assert!(sandbox_notes("powershell -c \"Get-ChildItem\"", Path::new("E:\\work"), Some(1), "Get-ChildItem : Der Zugriff wurde verweigert\n  + CategoryInfo : PermissionDenied: (D:\\:String) [Get-ChildItem], UnauthorizedAccessException").contains("absolute paths"));
+        assert!(!sandbox_notes("powershell -c \"Get-Item E:\\work\\a\"", Path::new("E:\\work"), Some(1), "    + CategoryInfo : ObjectNotFound: (E:\\work\\a:String) [Get-Item], ItemNotFoundException").contains("absolute paths"), "the workspace's own file is only missing");
+        assert!(sandbox_notes("where python", root, Some(1), "INFORMATION: Es wurden keine Dateien mit dem angegebenen Muster gefunden.").contains("Run the program itself"));
+        assert!(!sandbox_notes("where /?", root, Some(2), "FEHLER").contains("Run the program itself"), "something else went wrong");
+        for (err, by) in [("PermissionError: [WinError 5] Zugriff verweigert: 'x'", "Python"), ("PermissionError: [Errno 13] Permission denied: 'x'", "Python"), ("Error: EPERM: operation not permitted, open 'x'", "Node"), ("Error: EACCES: permission denied, open 'x'", "Node"), ("Zugriff verweigert (os error 5)", "Rust"), ("Ausnahme von HRESULT: 0x80070005", "COM"), ("+ FullyQualifiedErrorId : UnauthorizedAccess, System.UnauthorizedAccessException", "PowerShell")] {
+            assert!(says_access_denied(err, ""), "{by}: {err}");
+            assert!(sandbox_notes("type D:\\elsewhere\\a.txt", root, Some(1), err).contains("cannot read outside the workspace"), "{by}");
+        }
+        // What only has words, in the words of a German Windows.
+        assert!(says_access_denied("Zugriff verweigert\r\n", "Zugriff verweigert"));
+        assert!(!says_access_denied("Zugriff verweigert\r\n", ""), "as this test's Windows would not know them");
+        assert!(!says_access_denied("Datei nicht gefunden", "Zugriff verweigert"));
+        assert!(!says_access_denied("exit 5", "Zugriff verweigert"), "a code of a program's own says nothing");
+        let here = system_access_denied();
+        assert!(!here.is_empty() && !here.ends_with('.') && says_access_denied(&format!("{here}.\r\n"), here), "{here}");
+        for (line, status, err) in [("type C:\\work\\a.txt", Some(1), "Access is denied."), ("where python", Some(0), ""), ("python x.py", Some(1), "boom"), ("powershell -c x", Some(1), "boom")] {
+            assert_eq!(sandbox_notes(line, root, status, err), "", "{line}");
+        }
+    }
+
+    #[test]
+    fn a_skill_named_as_the_list_itself_is_read_and_otherwise_the_list_comes() {
+        let (dir, mut bench, cancel) = bench();
+        let skill = |name: &str| crate::skills::Skill { name: name.into(), description: "Does a thing".into(), folder: dir.path().to_path_buf(), scope: "user", for_the_model: true, for_the_person: true };
+        bench.skills = vec![skill("one"), skill("two")];
+        let said = bench.run("skill", &json!({"name": "list"}), dir.path(), &cancel).unwrap();
+        assert!(said.contains("- one: Does a thing") && said.contains("- two:"), "{said}");
     }
 
     #[test]

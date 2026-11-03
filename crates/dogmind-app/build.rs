@@ -40,7 +40,20 @@ fn icon_resources(ico: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Which source this is, for /status: the commit, whether the tree differed from it, and when it was built. A person comparing builds needs more than the version number.
+fn build_id() -> String {
+    let git = |args: &[&str]| std::process::Command::new("git").args(args).output().ok().filter(|output| output.status.success()).map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let commit = git(&["rev-parse", "--short=10", "HEAD"]).unwrap_or_else(|| "no commit".to_string());
+    let changes = git(&["--no-optional-locks", "status", "--porcelain"]).is_some_and(|status| !status.is_empty());
+    let built = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    format!("{commit}{}, built at {built}", if changes { " with changes" } else { "" })
+}
+
 fn main() {
+    println!("cargo:rustc-env=DOGMIND_APP_BUILD={}", build_id());
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=../dogmind-agent/src");
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../assets/app.ico");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
