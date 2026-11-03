@@ -271,7 +271,7 @@ fn sha16(bytes: &[u8]) -> String {
 }
 
 /// Where a file's new text is written whole before it takes the file's place: beside it, so that taking the place is a rename on one drive.
-fn written_beside(path: &Path) -> PathBuf {
+pub(crate) fn written_beside(path: &Path) -> PathBuf {
     let mut name = std::ffi::OsString::from(".");
     name.push(path.file_name().unwrap_or_default());
     name.push(format!(".dogmind-edit-{}", std::process::id()));
@@ -280,7 +280,7 @@ fn written_beside(path: &Path) -> PathBuf {
 
 /// One file's new text in place of the old, from where it was written beside it: Windows's ReplaceFile, which leaves the file what it was
 /// (its permissions, its attributes, when it was made) but its words.
-fn take_the_place(new: &Path, path: &Path) -> std::io::Result<()> {
+pub(crate) fn take_the_place(new: &Path, path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS};
