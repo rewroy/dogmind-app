@@ -7763,9 +7763,11 @@ impl App {
             return None;
         }
         let provider = self.settings.active_provider()?;
+        // (in the app's own language: the dashboard takes it from `lang` and keeps it, and an engine from before that ignores it)
+        let language = if lang::is_japanese() { "ja" } else { "en" };
         match provider.kind {
-            Kind::Embedded => Some(format!("http://127.0.0.1:{}/dashboard", self.settings.port)),
-            Kind::Server => Some(format!("{}/dashboard", provider.base_url.trim_end_matches('/').trim_end_matches("/v1"))),
+            Kind::Embedded => Some(format!("http://127.0.0.1:{}/dashboard?lang={language}", self.settings.port)),
+            Kind::Server => Some(format!("{}/dashboard?lang={language}", provider.base_url.trim_end_matches('/').trim_end_matches("/v1"))),
             _ => None,
         }
     }
