@@ -31,7 +31,7 @@ impl Rule {
     /// As the person reads it.
     pub fn label(&self) -> String {
         match (self.tool.as_str(), self.exact) {
-            (EDIT, _) => "Edits to files in this workspace".to_string(),
+            (EDIT, _) => "Edits to files in this folder".to_string(),
             (_, true) => self.prefix.clone(),
             _ => format!("{} ...", self.prefix),
         }

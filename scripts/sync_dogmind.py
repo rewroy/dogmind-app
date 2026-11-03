@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Generate assets/dogmind from a Dogmind checkout: the system prompt and the tool schemas the console implements.
+"""Generate assets/dogmind from a Dogmind checkout: what Dogmind says now. Its checkpoint prompt and Codex policy are used as they are; its system prompt and
+tool schemas are only there to read, as the app's own, much smaller ones are in crates/dogmind-agent, and --check says when they have changed.
 
 Run with Dogmind's own Python, which can import it:
 

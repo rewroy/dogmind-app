@@ -17,7 +17,7 @@ watch = [
 path = "../Dogmind"
 branch = "origin/main"
 commit = "bb68f7b"
-# What was ported by hand. The prompt and the schemas come by `scripts/sync_dogmind.py`.
+# What is followed by hand, the prompt and the tool schemas too: `scripts/sync_dogmind.py --check` says when Dogmind's words for those have changed. Its checkpoint prompt and Codex policy still come by that script as they are.
 watch = [
     "src/dogmind/core/prompt.py",
     "src/dogmind/core/agent_loop.py",

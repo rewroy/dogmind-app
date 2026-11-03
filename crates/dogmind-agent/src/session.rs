@@ -19,6 +19,8 @@ enum Line {
     Title { title: String },
     /// Web content has entered this conversation: for as long as the session lives, whatever a compaction leaves of it.
     WebSeen,
+    /// The tools this conversation is offered, the last of these lines counting: they are part of its prefix, and what is installed may differ when it is reopened.
+    Tools { tools: serde_json::Value },
 }
 
 pub struct Session {
@@ -52,8 +54,19 @@ pub struct Summary {
 impl Session {
     pub fn create(folder: &Path, workspace: &Path, now: &str, stamp: &str) -> Result<Session, String> {
         fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
-        let path = folder.join(format!("{stamp}.jsonl"));
-        let file = OpenOptions::new().create(true).append(true).open(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        // (two chats begun in one second must not share a file: their lines would make one conversation of the two)
+        let mut path = folder.join(format!("{stamp}.jsonl"));
+        let mut again = 1;
+        let file = loop {
+            match OpenOptions::new().create_new(true).append(true).open(&path) {
+                Ok(file) => break file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    again += 1;
+                    path = folder.join(format!("{stamp}-{again}.jsonl"));
+                }
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            }
+        };
         let mut session = Session { path, file };
         session.write(&Line::Meta { workspace: workspace.to_path_buf(), created: now.to_string() })?;
         Ok(session)
@@ -62,26 +75,32 @@ impl Session {
     /// The session's messages, and it ready to append to. A tool call left without its result (the app was closed
     /// during the call) gets one, as the server refuses a conversation without.
     pub fn open(path: &Path) -> Result<(Session, PathBuf, Vec<Message>), String> {
-        let reader = BufReader::new(File::open(path).map_err(|error| format!("{}: {error}", path.display()))?);
+        // (whatever a crash cut in two, a character too, and what is written next starts a line of its own)
+        let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let text = String::from_utf8_lossy(&bytes);
         let (mut workspace, mut messages) = (PathBuf::new(), Vec::new());
-        for line in reader.lines() {
-            let line = line.map_err(|error| error.to_string())?;
-            match serde_json::from_str(&line) {
+        for line in text.lines() {
+            match serde_json::from_str(line) {
                 Ok(Line::Meta { workspace: place, .. }) => workspace = place,
                 Ok(Line::Message { message }) => messages.push(message),
                 Ok(Line::Snapshot { messages: all }) => messages = all,
-                Ok(Line::Title { .. } | Line::WebSeen) => {}
+                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. }) => {}
                 Err(_) => {} // a line cut short by a crash
             }
         }
         complete_tool_calls(&mut messages);
-        let file = OpenOptions::new().append(true).open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut file = OpenOptions::new().append(true).open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        if bytes.last().is_some_and(|last| *last != b'\n') {
+            file.write_all(b"\n").map_err(|error| format!("{}: {error}", path.display()))?;
+        }
         Ok((Session { path: path.to_path_buf(), file }, workspace, messages))
     }
 
     fn write(&mut self, line: &Line) -> Result<(), String> {
-        let text = serde_json::to_string(line).map_err(|error| error.to_string())?;
-        writeln!(self.file, "{text}").map_err(|error| format!("{}: {error}", self.path.display()))
+        let mut text = serde_json::to_string(line).map_err(|error| error.to_string())?;
+        // (in one write: a crash then cuts at most this line)
+        text.push('\n');
+        self.file.write_all(text.as_bytes()).map_err(|error| format!("{}: {error}", self.path.display()))
     }
 
     pub fn append(&mut self, message: &Message) -> Result<(), String> {
@@ -92,6 +111,10 @@ impl Session {
         self.write(&Line::WebSeen)
     }
 
+    pub fn set_tools(&mut self, tools: &serde_json::Value) -> Result<(), String> {
+        self.write(&Line::Tools { tools: tools.clone() })
+    }
+
     pub fn snapshot(&mut self, messages: &[Message]) -> Result<(), String> {
         self.write(&Line::Snapshot { messages: messages.to_vec() })
     }
@@ -100,6 +123,25 @@ impl Session {
 pub fn web_seen(path: &Path) -> bool {
     let marked = serde_json::to_string(&Line::WebSeen).expect("a plain line serializes");
     File::open(path).map(BufReader::new).is_ok_and(|reader| reader.lines().map_while(Result::ok).any(|line| line == marked))
+}
+
+/// The tools a session was last offered; none in a file from before they were kept.
+pub fn tools_of(path: &Path) -> Option<serde_json::Value> {
+    let reader = BufReader::new(File::open(path).ok()?);
+    reader.lines().map_while(Result::ok).filter(|line| line.starts_with("{\"kind\":\"tools\"")).filter_map(|line| match serde_json::from_str(&line) {
+        Ok(Line::Tools { tools }) => Some(tools),
+        _ => None,
+    }).last()
+}
+
+/// What can be said in a line of a list of tools, so that a person can tell which a session was given: a reopened one keeps its own, whatever this build offers.
+pub fn describe_tools(tools: &serde_json::Value) -> String {
+    use sha2::Digest;
+    let version: String = sha2::Sha256::digest(tools.to_string().as_bytes()).iter().take(6).map(|byte| format!("{byte:02x}")).collect();
+    let list = tools.as_array().map_or(&[][..], Vec::as_slice);
+    let command = list.iter().find(|tool| tool["function"]["name"] == "execute_command");
+    let network = command.is_some_and(|tool| tool["function"]["parameters"]["properties"].get("network").is_some());
+    format!("{version}, {} tools, network parameter: {}", list.len(), if network { "yes" } else { "no" })
 }
 
 /// A session's messages as they are on disk, for a reader beside the agent that writes them: a call still running has
@@ -153,6 +195,7 @@ pub fn search(folder: &Path, query: &str) -> Vec<Hit> {
         let mut said = vec![summary.title.clone()];
         for message in read(&summary.path).ok()? {
             match (message.role.as_str(), message.content) {
+                ("user", Some(text)) if crate::prompt::is_nudge(&text) => {}
                 ("user", Some(text)) => said.push(typed_text(&text).to_string()),
                 ("assistant", Some(text)) => said.push(text),
                 _ => {}
@@ -254,6 +297,38 @@ mod tests {
     }
 
     #[test]
+    fn a_list_of_tools_is_told_from_another_in_a_line() {
+        let with = serde_json::json!([{"function": {"name": "execute_command", "parameters": {"properties": {"network": {}}}}}]);
+        let without = serde_json::json!([{"function": {"name": "execute_command", "parameters": {"properties": {}}}}]);
+        assert!(describe_tools(&with).ends_with("1 tools, network parameter: yes"), "{}", describe_tools(&with));
+        assert!(describe_tools(&without).ends_with("network parameter: no"));
+        assert_ne!(describe_tools(&with)[..12], describe_tools(&without)[..12]);
+    }
+
+    #[test]
+    fn two_sessions_begun_in_one_second_have_a_file_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Session::create(dir.path(), Path::new("w"), "now", "same").unwrap();
+        let second = Session::create(dir.path(), Path::new("w"), "now", "same").unwrap();
+        assert_ne!(first.path, second.path);
+    }
+
+    #[test]
+    fn the_tools_come_back_to_the_byte_and_the_last_ones_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
+        assert_eq!(tools_of(&session.path), None);
+        let tools = serde_json::json!([{"zebra": 1, "apple": {"é": "日本語\n"}}]);
+        session.set_tools(&serde_json::json!([])).unwrap();
+        session.append(&Message::text("user", "a")).unwrap();
+        session.set_tools(&tools).unwrap();
+        session.snapshot(&[Message::text("user", "b")]).unwrap();
+        assert_eq!(tools_of(&session.path).unwrap().to_string(), tools.to_string());
+        let (_, _, messages) = Session::open(&session.path).unwrap();
+        assert_eq!(messages.len(), 1, "a line of tools is no message");
+    }
+
+    #[test]
     fn a_call_cut_off_gets_a_result_and_a_cut_line_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "a").unwrap();
@@ -294,7 +369,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut first = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         first.append(&Message::text("system", "the system prompt mentions Banana")).unwrap();
-        first.append(&Message::text("user", crate::prompt::user_message("ハッシュテーブルの話", Path::new("Active"), "now"))).unwrap();
+        first.append(&Message::text("user", crate::prompt::user_message("ハッシュテーブルの話", "now"))).unwrap();
         first.append(&Message::text("assistant", "A HashMap keeps Cherry in a bucket")).unwrap();
         first.append(&Message::tool_result("1", "tool output with Plum")).unwrap();
         let mut second = Session::create(dir.path(), Path::new("w"), "now", "2").unwrap();
@@ -352,10 +427,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (stamp, text) in [("1", "first"), ("2", "second")] {
             let mut session = Session::create(dir.path(), Path::new("w"), "now", stamp).unwrap();
-            session.append(&Message::text("user", crate::prompt::user_message(text, Path::new("w"), "now"))).unwrap();
+            session.append(&Message::text("user", crate::prompt::user_message(text, "now"))).unwrap();
         }
         Session::create(dir.path(), Path::new("w"), "now", "3").unwrap();
         let titles: Vec<String> = list(dir.path()).into_iter().map(|summary| summary.title).collect();
         assert_eq!(titles, ["second", "first"]);
+    }
+}
+
+#[cfg(test)]
+mod crash_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_cut_by_a_crash_opens_and_goes_on_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cut.jsonl");
+        let whole = serde_json::to_string(&Line::Message { message: Message::text("user", "kept") }).unwrap();
+        // A line cut in the middle of a character, with no newline after it.
+        let mut bytes = format!("{whole}\n{{\"kind\":\"message\",\"message\":{{\"content\":\"").into_bytes();
+        bytes.extend_from_slice(&[0xE3, 0x81]);
+        std::fs::write(&path, bytes).unwrap();
+        let (mut session, _, messages) = Session::open(&path).unwrap();
+        assert_eq!(messages.len(), 1);
+        session.append(&Message::text("user", "after")).unwrap();
+        drop(session);
+        let (_, _, messages) = Session::open(&path).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content.as_deref(), Some("after"));
     }
 }
