@@ -690,6 +690,41 @@ impl Outgoing {
     }
 }
 
+/// A message of the person's, as the rail of turns beside the transcript knows it: where it begins, and its first words.
+struct TurnMark {
+    start: i32,
+    prompt: String,
+}
+
+/// The rail's measures, at 100%: from one mark to the next, the room above the first and under the last, its width, and a mark's length,
+/// as one is and as the one being read is.
+const RAIL_PITCH: i32 = 10;
+const RAIL_INSET: i32 = 6;
+const RAIL_WIDTH: i32 = 26;
+const RAIL_MARK: i32 = 10;
+const RAIL_MARK_READ: i32 = 18;
+
+/// Words for a tip on the rail: on one line, at most `most` letters, the marks markdown writes left out.
+fn rail_words(text: &str, most: usize) -> String {
+    let line = text.replace(['#', '*', '`', '>', '|'], "").split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut words: String = line.chars().take(most).collect();
+    if line.chars().count() > most {
+        words.push('…');
+    }
+    words
+}
+
+/// Where the marks of `count` turns stand in a rail `tall` high: each one's centre from the rail's top, for those in it. A ladder longer
+/// than the rail is moved so that the turn being read stands in its middle, and the ends of it are past the rail's.
+fn rail_marks(count: usize, reading: usize, tall: i32, pitch: i32, inset: i32) -> Vec<(usize, i32)> {
+    let whole = count as i32 * pitch + 2 * inset;
+    let shift = if whole <= tall { 0 } else { (inset + reading as i32 * pitch + pitch / 2 - tall / 2).clamp(0, whole - tall) };
+    (0..count).filter_map(|at| {
+        let y = inset + at as i32 * pitch + pitch / 2 - shift;
+        (y >= pitch / 2 && y <= tall - pitch / 2).then_some((at, y))
+    }).collect()
+}
+
 /// What a button on a message waiting above the input does.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum QueueAct {
@@ -1434,6 +1469,21 @@ struct App {
     answers: Vec<(i32, String)>,
     /// Each card of what the person wrote, in order: its corners are drawn over.
     user_cards: Vec<UserCard>,
+    /// The person's messages, in order, for the rail of turns.
+    rail_turns: Vec<TurnMark>,
+    /// A message's pictures are on the rail, and its words, coming next, are its words there.
+    turn_words_due: bool,
+    /// The rail beside the transcript, when it is shown: two turns or more, and room at the column's side.
+    rail: Option<RECT>,
+    /// The turn being read, and the one the pointer is on.
+    rail_reading: usize,
+    rail_hover: Option<usize>,
+    /// Each mark on the rail, and its turn.
+    rail_hits: Vec<(RECT, usize)>,
+    /// The marks as their tips stand now.
+    rail_tips: Vec<(RECT, usize)>,
+    /// Where the text column ends at the right, in the window.
+    column_right: i32,
     /// Which answer each visible copy button stands for.
     copy_targets: Vec<Option<usize>>,
     transcript_area: RECT,
@@ -1660,7 +1710,8 @@ struct App {
     queued: Vec<Outgoing>,
     /// Where the view was when what lies over the transcript was last placed.
     placed_at: i32,
-    transcript_region: (i32, i32),
+    /// What of the transcript control shows: its size less the scrollbar's strip, and the rail's place in it, cut out.
+    transcript_region: ((i32, i32), Option<(i32, i32, i32, i32)>),
     /// Words sent to the turn under way that have not reached it yet.
     interjected: Vec<String>,
     /// The buttons on what waits above the input: where, which message, and what each does.
@@ -1807,6 +1858,8 @@ struct App {
     catalog: Vec<CatalogEntry>,
     /// This PC, as Straydog sees it, for who is choosing a model.
     machine_line: String,
+    /// Straydog's models that do not run on this PC, each with why.
+    models_not_here: Vec<String>,
     /// When this PC cannot run a model of its own.
     refusal: Option<Refusal>,
     /// Leaving this PC: under way, or done, and then nothing is written any more.
@@ -2381,6 +2434,16 @@ impl App {
         if row.right {
             let start = text_start(self.transcript, first);
             self.user_cards.push(UserCard { start, kind: CardKind::Person, shape: None, looked_at: None });
+            let prompt = rail_words(&row.lines.join(" "), 50);
+            match self.rail_turns.last_mut() {
+                // (its pictures went first)
+                Some(turn) if std::mem::take(&mut self.turn_words_due) => turn.prompt = prompt,
+                _ => self.rail_turns.push(TurnMark { start, prompt }),
+            }
+            // (a whole conversation opened, or written again, has the rail placed once it is all in)
+            if !self.replaying && !self.opening {
+                self.place_rail();
+            }
         } else if std::mem::take(&mut self.block_card_due) {
             // (a block's first row: the block's corners are rounded as a card's are, from where its first line begins)
             let start = text_start(self.transcript, first);
@@ -2510,6 +2573,8 @@ impl App {
         set_text(edit, "");
         self.answers.clear();
         self.user_cards.clear();
+        self.rail_turns.clear();
+        self.turn_words_due = false;
         self.picture_blocks.clear();
         self.blocks.clear();
         self.links.clear();
@@ -3495,6 +3560,7 @@ impl App {
         moved(&mut selection.last);
         self.answers.iter_mut().for_each(|(place, _)| moved(place));
         self.user_cards.iter_mut().for_each(|card| moved(&mut card.start));
+        self.rail_turns.iter_mut().for_each(|turn| moved(&mut turn.start));
         self.picture_blocks.iter_mut().for_each(|block| moved(&mut block.start));
         self.blocks.iter_mut().for_each(|block| moved(&mut block.at));
         for (from, to, _) in &mut self.links {
@@ -3717,6 +3783,13 @@ impl App {
         self.picture_blocks.push(PictureBlock { start, paths: pictures.iter().map(|(path, _)| path.clone()).collect(), tiles });
         if alone {
             self.user_cards.push(UserCard { start, kind: if right { CardKind::Person } else { CardKind::Block }, shape: None, looked_at: None });
+        }
+        if right {
+            self.rail_turns.push(TurnMark { start, prompt: tf("{0} pictures", &[&pictures.len()]) });
+            self.turn_words_due = !alone;
+            if alone && !self.replaying && !self.opening {
+                self.place_rail();
+            }
         }
         if !self.replaying {
             self.place_pictures();
@@ -4791,17 +4864,16 @@ impl App {
                 self.transcript_area = rect(main_left, top, main_width, bottom - top);
                 place(self.transcript, main_left, top, main_width, bottom - top);
                 let bar = GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi);
-                // (setting it redraws the control and what is around it: only for a new size)
-                if self.transcript_region != (main_width - bar, bottom - top) {
-                    self.transcript_region = (main_width - bar, bottom - top);
-                    SetWindowRgn(self.transcript, CreateRectRgn(0, 0, main_width - bar, bottom - top), 1);
-                }
                 // (the control keeps back this much of its text's width for the bar it has: measured, three fifths of the bar's own)
                 let area = RECT { left: left - main_left, top: 0, right: left - main_left + column + bar * 3 / 5, bottom: bottom - top };
                 if self.transcript_rect != (area.left, area.right, area.bottom) {
                     self.transcript_rect = (area.left, area.right, area.bottom);
                     SendMessageW(self.transcript, EM_SETRECT, 0, std::ptr::addr_of!(area) as LPARAM);
                 }
+                self.column_right = main_left + area.right;
+                // (the rail's place goes into the control's region, and that is set here too)
+                self.place_rail();
+                self.set_transcript_region();
             }
         }
 
@@ -6062,6 +6134,9 @@ impl App {
                     draw_text(device, &text, words, self.fonts.body, theme::text(), ONE_LINE);
                 }
             }
+            if self.rail.is_some_and(|rail| overlaps(&rail, &dirty)) {
+                self.paint_rail(device);
+            }
             if let Some(thumb) = self.thumb.filter(|shown| self.has_messages && overlaps(shown, &dirty)) {
                 let color = if self.thumb_grab.is_some() { theme::muted() } else { theme::line() };
                 rounded(device, thumb, (thumb.right - thumb.left) / 2, Some(color), None);
@@ -6107,6 +6182,183 @@ impl App {
         bar
     }
 
+    /// What of the transcript control shows: not the strip at the panel's edge, where its scrollbar's thumb is drawn, nor the rail of turns.
+    /// Setting it redraws the control and what is around it: only when it changes.
+    unsafe fn set_transcript_region(&mut self) {
+        let area = self.transcript_area;
+        let bar = GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi);
+        let size = (area.right - area.left - bar, area.bottom - area.top);
+        let rail = self.rail.map(|rail| (rail.left - area.left, rail.top - area.top, rail.right - area.left, rail.bottom - area.top));
+        if (size, rail) == self.transcript_region {
+            return;
+        }
+        self.transcript_region = (size, rail);
+        let region = CreateRectRgn(0, 0, size.0, size.1);
+        if let Some((left, top, right, bottom)) = rail {
+            let cut = CreateRectRgn(left, top, right, bottom);
+            CombineRgn(region, region, cut, RGN_DIFF);
+            DeleteObject(cut);
+        }
+        SetWindowRgn(self.transcript, region, 1);
+    }
+
+    /// Where the rail of turns stands: two turns or more, at the panel's edge beside the scrollbar's strip, in the middle of the transcript's height,
+    /// where the text column leaves room for it.
+    unsafe fn rail_frame(&self) -> Option<RECT> {
+        if self.rail_turns.len() < 2 || !self.has_messages || self.panel != Panel::Chat {
+            return None;
+        }
+        let s = |value: i32| scale(self.dpi, value);
+        let area = self.transcript_area;
+        let right = area.right - GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi);
+        let left = right - s(RAIL_WIDTH);
+        if left < self.column_right + s(ds::space::S) {
+            return None;
+        }
+        let pitch = s(RAIL_PITCH);
+        let most = ((area.bottom - area.top) / 2).max(3 * pitch);
+        let tall = (self.rail_turns.len() as i32 * pitch + 2 * s(RAIL_INSET)).min(most);
+        let top = (area.top + area.bottom - tall) / 2;
+        Some(RECT { left, top, right, bottom: top + tall })
+    }
+
+    /// The turn being read: the last whose message begins above a third of the way down the view, and at the end of the conversation, the last.
+    unsafe fn reading_turn(&self) -> usize {
+        if self.rail_turns.is_empty() {
+            return 0;
+        }
+        let bar = self.transcript_bar();
+        if bar.nPage == 0 || bar.nPos + bar.nPage as i32 + 4 >= bar.nMax {
+            return self.rail_turns.len() - 1;
+        }
+        let area = self.transcript_area;
+        let point = POINT { x: (self.column_right - area.left) / 2, y: (area.bottom - area.top) / 3 };
+        let at = SendMessageW(self.transcript, EM_CHARFROMPOS_RICH, 0, std::ptr::addr_of!(point) as LPARAM) as i32;
+        self.rail_turns.iter().rposition(|turn| turn.start <= at).unwrap_or(0)
+    }
+
+    /// The rail where the view now is: which turn is being read, and where each mark stands. Only what changed is drawn again.
+    unsafe fn place_rail(&mut self) {
+        let frame = self.rail_frame();
+        let moved = match (&self.rail, &frame) {
+            (Some(a), Some(b)) => !same_rect(a, b),
+            (None, None) => false,
+            _ => true,
+        };
+        if moved {
+            for area in [self.rail, frame].into_iter().flatten() {
+                InvalidateRect(self.window, &area, 0);
+            }
+            self.rail = frame;
+            self.set_transcript_region();
+            if frame.is_none() {
+                self.rail_hover = None;
+            }
+        }
+        let reading = self.reading_turn();
+        let pitch = scale(self.dpi, RAIL_PITCH);
+        let hits: Vec<(RECT, usize)> = frame.map_or(Vec::new(), |frame| {
+            rail_marks(self.rail_turns.len(), reading, frame.bottom - frame.top, pitch, scale(self.dpi, RAIL_INSET)).into_iter()
+                .map(|(at, y)| (RECT { left: frame.left, top: frame.top + y - pitch / 2, right: frame.right, bottom: frame.top + y - pitch / 2 + pitch }, at)).collect()
+        });
+        let changed = reading != self.rail_reading || hits.len() != self.rail_hits.len() || hits.iter().zip(&self.rail_hits).any(|(a, b)| a.1 != b.1 || !same_rect(&a.0, &b.0));
+        if changed {
+            if let Some(frame) = frame {
+                InvalidateRect(self.window, &frame, 0);
+            }
+        }
+        self.rail_reading = reading;
+        self.rail_hits = hits;
+        self.tip_rail();
+    }
+
+    /// A turn's tip on the rail: what the person said, and the start of the last answer to it.
+    fn rail_tip(&self, at: usize) -> String {
+        let Some(turn) = self.rail_turns.get(at) else { return String::new() };
+        let end = self.rail_turns.get(at + 1).map_or(i32::MAX, |next| next.start);
+        let answer = self.answers.iter().rev().find(|(place, _)| *place > turn.start && *place < end).map(|(_, text)| rail_words(text, 120)).unwrap_or_default();
+        if answer.is_empty() { turn.prompt.clone() } else { format!("{}\n{answer}", turn.prompt) }
+    }
+
+    /// Each mark's tip, as one over its place in the window: passed on when the marks have moved, or an answer has come.
+    unsafe fn tip_rail(&mut self) {
+        let now: Vec<(RECT, usize)> = self.rail_hits.iter().map(|(area, at)| (*area, *at + 1000 * self.answers.len())).collect();
+        if now.len() == self.rail_tips.len() && now.iter().zip(&self.rail_tips).all(|(a, b)| a.1 == b.1 && same_rect(&a.0, &b.0)) {
+            return;
+        }
+        // (ids far from any window's handle, and from the waiting messages' buttons)
+        let id = |at: usize| usize::MAX - 4096 - at;
+        let mut tool: TTTOOLINFOW = std::mem::zeroed();
+        tool.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        tool.hwnd = self.window;
+        for at in 0..self.rail_tips.len() {
+            tool.uId = id(at);
+            SendMessageW(self.tooltip, TTM_DELTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
+        }
+        for (place, (area, turn)) in self.rail_hits.iter().enumerate() {
+            let text = wide(&self.rail_tip(*turn));
+            tool.uFlags = TTF_SUBCLASS;
+            tool.uId = id(place);
+            tool.rect = *area;
+            tool.lpszText = text.as_ptr() as *mut u16;
+            SendMessageW(self.tooltip, TTM_ADDTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
+        }
+        self.rail_tips = now;
+    }
+
+    /// The rail's marks, as thin bars from its right side: the one being read longer and brighter, the one the pointer is on in between.
+    unsafe fn paint_rail(&self, device: HDC) {
+        let Some(frame) = self.rail else { return };
+        let s = |value: i32| scale(self.dpi, value);
+        let thick = s(2).max(2);
+        let right = frame.right - s(ds::space::XS);
+        for (area, at) in &self.rail_hits {
+            let reading = *at == self.rail_reading;
+            let hover = self.rail_hover == Some(*at);
+            let length = s(if reading { RAIL_MARK_READ } else if hover { (RAIL_MARK + RAIL_MARK_READ) / 2 } else { RAIL_MARK });
+            let top = (area.top + area.bottom - thick) / 2;
+            let color = if reading { theme::text() } else if hover { theme::soft() } else { theme::faint() };
+            rounded(device, RECT { left: right - length, top, right, bottom: top + thick }, thick / 2, Some(color), None);
+        }
+    }
+
+    /// The view to a turn: its message near the top, as far as the conversation goes.
+    unsafe fn jump_to_turn(&mut self, at: usize) {
+        let Some(turn) = self.rail_turns.get(at) else { return };
+        let edit = self.transcript;
+        let mut point = POINT { x: 0, y: 0 };
+        SendMessageW(edit, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, turn.start as LPARAM);
+        let mut position = POINT { x: 0, y: 0 };
+        SendMessageW(edit, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
+        let bar = self.transcript_bar();
+        let last = (bar.nMax - bar.nPage as i32 + 1).max(0);
+        // (above its first line: the card's own room, and a little of the page over it)
+        position.y = (position.y + point.y - scale(self.dpi, 40)).clamp(0, last);
+        self.follow_end = position.y >= last;
+        if !self.follow_end {
+            self.scrolled_up_at = Some(std::time::Instant::now());
+        }
+        SendMessageW(edit, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
+        self.place_copy_buttons();
+        self.place_thumb();
+    }
+
+    /// The pointer over the rail: the mark it is on is drawn so, and the hand says it can be pressed.
+    unsafe fn rail_hover_at(&mut self, x: i32, y: i32) {
+        let on = self.rail_hits.iter().find(|(area, _)| x >= area.left && x < area.right && y >= area.top && y < area.bottom).map(|(_, at)| *at);
+        if on == self.rail_hover {
+            return;
+        }
+        if self.rail_hover.is_none() {
+            let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.window, dwHoverTime: 0 };
+            TrackMouseEvent(&mut track);
+        }
+        self.rail_hover = on;
+        if let Some(frame) = self.rail {
+            InvalidateRect(self.window, &frame, 0);
+        }
+    }
+
     /// The thumb where the view now is; only what moved is drawn again.
     unsafe fn place_thumb(&mut self) {
         let bar = self.transcript_bar();
@@ -6138,6 +6390,7 @@ impl App {
             self.thumb = thumb;
             InvalidateRect(self.window, &moved, 0);
         }
+        self.place_rail();
     }
 
     /// Dragging: the view follows the pointer.
@@ -6261,6 +6514,7 @@ impl App {
         self.panel_problem = false;
         self.panel_scroll = 0;
         self.machine_line.clear();
+        self.models_not_here.clear();
         self.refusal = None;
         self.list_rows.clear();
         self.progress = if self.setting_up { self.progress } else { None };
@@ -7313,7 +7567,12 @@ impl App {
         let folder = get_text(self.fields[0]);
         let free = if self.refusal.is_some() || folder.trim().is_empty() { None } else { crate::machine::free_bytes(Path::new(folder.trim())) };
         let free = free.map(|free| tf("{0} GB free on that drive", &[&(free / 1_000_000_000)]));
-        [Some(self.machine_line.clone()).filter(|line| !line.is_empty()), free].into_iter().flatten().collect::<Vec<_>>().join("  ·  ")
+        let machine = [Some(self.machine_line.clone()).filter(|line| !line.is_empty()), free].into_iter().flatten().collect::<Vec<_>>().join("  ·  ");
+        // (with nothing that runs here, the refusal says it for them all)
+        if self.refusal.is_some() || self.models_not_here.is_empty() {
+            return machine;
+        }
+        std::iter::once(machine).filter(|line| !line.is_empty()).chain(self.models_not_here.iter().cloned()).collect::<Vec<_>>().join("\n")
     }
 
     /// The model, when it lies in the folder this app removes.
@@ -8782,6 +9041,8 @@ impl App {
         self.shown.clear();
         self.answers.clear();
         self.user_cards.clear();
+        self.rail_turns.clear();
+        self.turn_words_due = false;
         self.picture_blocks.clear();
         self.blocks.clear();
         self.open_block = None;
@@ -9595,6 +9856,7 @@ impl App {
                     Ok(catalog) => {
                         self.catalog = catalog.entries;
                         self.machine_line = catalog.machine;
+                        self.models_not_here = catalog.not_here;
                         self.refusal = catalog.refusal;
                         self.show_setup_button();
                         self.list_rows = self.catalog.iter().map(|entry| ListRow {
@@ -11214,13 +11476,15 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             let within = |area: &RECT| x >= area.left && x < area.right && y >= area.top && y < area.bottom;
             let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
             app.hover_on(found);
+            app.rail_hover_at(x, y);
             0
         }
         WM_MOUSELEAVE => {
             app.hover_on(None);
+            app.rail_hover_at(-1, -1);
             0
         }
-        WM_SETCURSOR if wparam as HWND == window && app.hover_row.is_some() && (lparam & 0xFFFF) as u32 == HTCLIENT => {
+        WM_SETCURSOR if wparam as HWND == window && (app.hover_row.is_some() || app.rail_hover.is_some()) && (lparam & 0xFFFF) as u32 == HTCLIENT => {
             SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
             1
         }
@@ -11257,6 +11521,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             }
             if let Some((at, act)) = app.queue_hits.iter().find(|(area, _, _)| within(area)).map(|(_, at, act)| (*at, *act)) {
                 app.queue_act(at, act);
+            } else if let Some(at) = app.rail_hits.iter().find(|(area, _)| within(area)).map(|(_, at)| *at) {
+                app.jump_to_turn(at);
             } else if let Some(file) = app.preview_hits.iter().find(|(area, _)| within(area)).map(|(_, file)| file.display().to_string()) {
                 app.open_preview(&file);
             } else if let Some(url) = app.dashboard_hit.as_ref().filter(|(area, _)| within(area)).map(|(_, url)| url.clone()) {
@@ -12396,6 +12662,14 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             copy_buttons: (0..COPY_POOL).map(|at| make_button(window, ID_COPY_POOL + at as isize, "copy", ButtonKind::Icon, theme::background())).collect(),
             answers: Vec::new(),
             user_cards: Vec::new(),
+            rail_turns: Vec::new(),
+            turn_words_due: false,
+            rail: None,
+            rail_reading: 0,
+            rail_hover: None,
+            rail_hits: Vec::new(),
+            rail_tips: Vec::new(),
+            column_right: 0,
             copy_targets: vec![None; COPY_POOL],
             transcript_area: rect(0, 0, 0, 0),
             thumb: None,
@@ -12571,7 +12845,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             has_messages: false,
             queued: Vec::new(),
             placed_at: 0,
-            transcript_region: (0, 0),
+            transcript_region: ((0, 0), None),
             interjected: Vec::new(),
             queue_hits: Vec::new(),
             queue_tips: Vec::new(),
@@ -12670,6 +12944,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             rate: None,
             catalog: Vec::new(),
             machine_line: String::new(),
+            models_not_here: Vec::new(),
             refusal: None,
             leaving: Leaving::No,
             remove_all: make_button(pane, ID_REMOVE_ALL, "", ButtonKind::Secondary, theme::background()),
@@ -12906,6 +13181,20 @@ mod tests {
         for word in words {
             assert!(lang::has_japanese(word), "{word}");
         }
+    }
+
+    #[test]
+    fn the_rail_has_every_turn_while_they_fit_and_keeps_the_one_read_in_its_middle_when_not() {
+        // (three turns at a pitch of 10 with 6 over and under: 42 high)
+        assert_eq!(rail_marks(3, 0, 42, 10, 6), [(0, 11), (1, 21), (2, 31)]);
+        let long = rail_marks(100, 50, 100, 10, 6);
+        assert!(long.iter().any(|&(at, y)| at == 50 && (y - 50).abs() <= 5), "{long:?}");
+        assert!(long.iter().all(|&(_, y)| (5..=95).contains(&y)) && long.len() <= 10);
+        // (at either end of a long conversation the ladder stops at its own end)
+        assert_eq!(rail_marks(100, 0, 100, 10, 6)[0], (0, 11));
+        assert_eq!(rail_marks(100, 99, 100, 10, 6).last(), Some(&(99, 89)));
+        assert_eq!(rail_words("## 見出し\n**太字** の  `code`", 50), "見出し 太字 の code");
+        assert_eq!(rail_words("abcdef", 3), "abc…");
     }
 
     #[test]
