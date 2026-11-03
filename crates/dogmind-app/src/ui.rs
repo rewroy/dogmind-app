@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::os::windows::ffi::OsStrExt;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
@@ -50,7 +50,7 @@ use crate::paint::*;
 use crate::rtf;
 use crate::lang::{self, t, tf};
 use crate::markdown;
-use crate::settings::{self, Kind, ProviderConfig, Settings};
+use crate::settings::{self, Kind, ProviderConfig, Settings, TEXT_SIZES};
 
 const WM_WAKE: u32 = WM_APP + 1;
 const WM_PREVIEW_MADE: u32 = WM_APP + 2;
@@ -257,6 +257,8 @@ const ID_MODAL_CLOSE: isize = 9600;
 const ID_NAV: isize = 9601; // ..+ NAV_POOL
 const NAV_POOL: usize = 9;
 const ID_THEME_SEGMENT: isize = 9610; // ..+ 3
+const ID_TEXT_SIZE: isize = 9630; // ..+ TEXT_SIZES
+const ID_SKILL_TOGGLE: isize = 10000; // ..+ as many skills as there are
 const ID_MODE_SELECT: isize = 9614;
 const ID_KEY_REPLACE: isize = 9615;
 const ID_KEY_REMOVE: isize = 9616;
@@ -1415,6 +1417,10 @@ struct App {
     mcp_import: HWND,
     /// A switch for each MCP server, made when the Tools page first needs it.
     mcp_trust: Vec<HWND>,
+    /// The sizes of the conversation's words, on the Appearance page.
+    size_segments: [HWND; TEXT_SIZES.len()],
+    /// A switch for each skill found, made when the Skills page first needs it.
+    skill_toggles: Vec<HWND>,
     read_folder_add: HWND,
     read_folder_stop: HWND,
     read_folder_remove: Vec<HWND>,
@@ -1790,6 +1796,7 @@ fn agent_config(settings: &Settings, folder: &Path, workspace: PathBuf, mode: Mo
         japanese_system,
         instructions: Some(folder.join("instructions.md")),
         home: std::env::var_os("USERPROFILE").map(PathBuf::from),
+        skills_off: settings.skills_off.clone(),
         memory: Some(folder.join("memory")),
         mcp: Some(mcp),
     }
@@ -1850,6 +1857,13 @@ unsafe fn child_area(window: HWND, parent: HWND) -> (i32, i32, i32, i32) {
     (corner.x, corner.y, area.right - area.left, area.bottom - area.top)
 }
 
+/// How large the conversation's words are, in percent of the sizes written here: what the settings chose. The app's own chrome keeps its sizes, as its rows are laid out for them.
+static TEXT_SCALE: AtomicU32 = AtomicU32::new(100);
+
+fn text_scale() -> i32 {
+    TEXT_SCALE.load(Ordering::Relaxed) as i32
+}
+
 fn char_format(color: u32, effects: u32, face: &str, points: i32, back: Option<u32>) -> CharFormat {
     let mut names = [0u16; 32];
     for (slot, unit) in names.iter_mut().zip(face.encode_utf16()) {
@@ -1859,7 +1873,7 @@ fn char_format(color: u32, effects: u32, face: &str, points: i32, back: Option<u
         size: std::mem::size_of::<CharFormat>() as u32,
         mask: CFM_COLOR | CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_FACE | CFM_SIZE | CFM_BACKCOLOR,
         effects: effects | if back.is_none() { CFE_AUTOBACKCOLOR } else { 0 },
-        height: points * 20,
+        height: points * 20 * text_scale() / 100,
         offset: 0,
         color,
         char_set: 1, // DEFAULT_CHARSET
@@ -1900,7 +1914,7 @@ fn para_format(points: i32, indent: i32, before: i32, after: i32) -> ParaFormat 
     format.start_indent = indent;
     format.space_before = before;
     format.space_after = after;
-    format.line_spacing = points * 32; // twips: 1.6 times the type
+    format.line_spacing = points * 32 * text_scale() / 100; // twips: 1.6 times the type
     format.line_spacing_rule = 4; // exactly
     format
 }
@@ -2001,6 +2015,19 @@ impl App {
         if let Some(shown) = &self.preview {
             shown.retheme();
         }
+    }
+
+    /// The conversation's words at the size the settings now say: what is typed, the transcript (written again) and the page beside.
+    unsafe fn apply_text_size(&mut self) {
+        TEXT_SCALE.store(self.settings.text_percent(), Ordering::Relaxed);
+        for (edit, points) in [(self.transcript, 11), (self.composer, 11), (self.doc, 10)] {
+            let format = char_format(theme::text(), 0, UI_FACE, points, None);
+            SendMessageW(edit, EM_SETCHARFORMAT, SCF_ALL as WPARAM, std::ptr::addr_of!(format) as LPARAM);
+            associate_japanese(edit, points);
+        }
+        self.layout();
+        self.reflow();
+        repaint_all(self.window);
     }
 
     /// Follows Windows, then dark, then light.
@@ -3903,7 +3930,7 @@ impl App {
                     found.push(Suggestion { title: name.to_string(), detail: t(about).to_string(), insert: format!("{name} ") });
                 }
             }
-            for skill in self.skills.iter().filter(|skill| skill.for_the_person && format!("/{}", skill.name).to_lowercase().starts_with(&text.to_lowercase())) {
+            for skill in self.skills.iter().filter(|skill| skill.for_the_person && self.settings.skill_is_on(&skill.name) && format!("/{}", skill.name).to_lowercase().starts_with(&text.to_lowercase())) {
                 let about: String = skill.description.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(90).collect();
                 found.push(Suggestion { title: format!("/{}", skill.name), detail: about, insert: format!("/{} ", skill.name) });
             }
@@ -4171,7 +4198,11 @@ impl App {
                 DestroyWindow(self.window);
             }
             known if self.skills.iter().any(|skill| skill.for_the_person && skill.name.eq_ignore_ascii_case(known)) => {
-                self.send_or_wait(Outgoing::words(line.to_string()), false);
+                if self.settings.skill_is_on(known) {
+                    self.send_or_wait(Outgoing::words(line.to_string()), false);
+                } else {
+                    self.say(t("That skill is turned off. Settings > Skills turns it on."));
+                }
             }
             _ => return false,
         }
@@ -4331,7 +4362,7 @@ impl App {
             self.composer_lines = SendMessageW(self.composer, EM_GETLINECOUNT, 0, 0) as i32;
             // Pictures waiting to go stand above what is typed, in the same card.
             let strip = if self.attachments.is_empty() { 0 } else { s(76) };
-            let card_height = (s(70) + self.composer_lines * s(ds::space::XL)).clamp(s(94), (height / 2).max(s(94))) + strip;
+            let card_height = (s(70) + self.composer_lines * s(ds::space::XL) * text_scale() / 100).clamp(s(94), (height / 2).max(s(94))) + strip;
             let foot = height - s(ds::space::S) - status_height - s(ds::space::XS) - card_height;
             // What waits to be sent stands right above the input.
             let waiting = self.waiting_rows();
@@ -4831,7 +4862,9 @@ impl App {
     fn pane_controls(&self) -> Vec<HWND> {
         let mut all = self.shared_controls();
         all.extend(self.theme_segments);
+        all.extend(self.size_segments);
         all.extend(self.mcp_trust.iter().copied());
+        all.extend(self.skill_toggles.iter().copied());
         all.push(self.vision_delete);
         all.extend(self.read_folder_remove.iter().copied());
         all.extend([self.read_folder_add, self.read_folder_stop]);
@@ -5101,6 +5134,15 @@ impl App {
                     form.used.push(*segment);
                 }
                 form.end_row(height);
+                form.label(t("Text size"), height);
+                form.shapes.push(Shape::Round { area: rect(x, form.y, width, height), radius: form.s(ds::radius::CONTROL), fill: Some(theme::surface()), border: Some(theme::line()) });
+                let each = (width - form.s(ds::space::XS)) / TEXT_SIZES.len() as i32;
+                for (at, segment) in self.size_segments.iter().enumerate() {
+                    place(*segment, x + form.s(ds::space::HAIR) + at as i32 * each, form.y + form.s(ds::space::HAIR), each, height - form.s(ds::space::XS));
+                    form.used.push(*segment);
+                }
+                form.end_row(height);
+                form.note(t("The conversation, what you type and the page beside it."), theme::muted());
                 form.toggle(t("Show the model's thinking"), self.toggle_thinking);
                 form.toggle(t("Group tool calls into one line"), self.toggle_compact);
             }
@@ -5256,9 +5298,13 @@ impl App {
                 form.note(&log, log_color);
             }
             Panel::Skills => {
-                if !self.list_rows.is_empty() {
-                    let room = (view - s(ds::space::L)).max(s(100));
-                    form.list(self.list, ((self.list_rows.len() as i32) * s(46) + s(ds::space::S)).min(room));
+                if !self.skills.is_empty() {
+                    form.note(t("A skill turned off is neither offered to the model nor started with /name. A session already under way keeps its list, but cannot read one that is off."), theme::muted());
+                }
+                for (skill, toggle) in self.skills.iter().zip(&self.skill_toggles) {
+                    let whose = if skill.scope == "project" { t("This project's") } else { t("Yours, in every folder") };
+                    form.toggle_beside(&skill.name, *toggle, whose);
+                    form.note(&skill.description.split_whitespace().collect::<Vec<_>>().join(" "), theme::muted());
                 }
                 form.note(&log, log_color);
             }
@@ -6175,8 +6221,12 @@ impl App {
             }
             Panel::Skills => {
                 self.panel_title = t("Skills").into();
-                self.list_rows = self.skills.iter().map(|skill| ListRow { title: format!("{}  ·  {}", skill.name, skill.scope), detail: skill.description.split_whitespace().collect::<Vec<_>>().join(" "), active: false }).collect();
+                while self.skill_toggles.len() < self.skills.len() {
+                    let id = ID_SKILL_TOGGLE + self.skill_toggles.len() as isize;
+                    self.skill_toggles.push(make_button(self.pane, id, "", ButtonKind::Toggle, theme::background()));
+                }
                 self.panel_log = if self.skills.is_empty() { t("No skills yet.").into() } else { String::new() };
+                self.update_toggles();
             }
             Panel::Instructions => {
                 self.panel_title = t("Your instructions").into();
@@ -6636,8 +6686,15 @@ impl App {
             set_text(*segment, t(if at == 0 { "System" } else { name }));
             set_button_style(*segment, if self.settings.theme == known { ButtonKind::SegmentOn } else { ButtonKind::Segment }, theme::surface());
         }
+        for (segment, (percent, name)) in self.size_segments.iter().zip(TEXT_SIZES) {
+            set_text(*segment, t(name));
+            set_button_style(*segment, if self.settings.text_percent() == percent { ButtonKind::SegmentOn } else { ButtonKind::Segment }, theme::surface());
+        }
         for (toggle, (_, on)) in self.mcp_trust.iter().zip(self.mcp.trust()) {
             set_button_style(*toggle, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
+        }
+        for (toggle, skill) in self.skill_toggles.iter().zip(&self.skills) {
+            set_button_style(*toggle, if self.settings.skill_is_on(&skill.name) { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         }
         let mode = self.current_mode();
         set_text(self.mode_select, t(MODES.iter().find(|(known, _)| *known == mode).map_or("", |(_, name)| name)));
@@ -9060,6 +9117,10 @@ impl App {
                     self.skills = skills;
                     self.files = files;
                     self.branch = branch;
+                    if self.panel == Panel::Skills {
+                        // (another folder's skills: a switch for each, set as the settings say)
+                        self.set_panel(Panel::Skills);
+                    }
                     self.layout();
                 }
             }
@@ -10894,6 +10955,25 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                         }
                     }
                 }
+                _ if (ID_TEXT_SIZE..ID_TEXT_SIZE + TEXT_SIZES.len() as isize).contains(&id) => {
+                    app.settings.text_size = TEXT_SIZES[(id - ID_TEXT_SIZE) as usize].0;
+                    app.save();
+                    app.apply_text_size();
+                    app.update_toggles();
+                }
+                _ if (ID_SKILL_TOGGLE..ID_SKILL_TOGGLE + app.skill_toggles.len() as isize).contains(&id) => {
+                    if let Some(name) = app.skills.get((id - ID_SKILL_TOGGLE) as usize).map(|skill| skill.name.clone()) {
+                        let on = app.settings.skill_is_on(&name);
+                        app.settings.set_skill(&name, !on);
+                        app.save();
+                        let off = app.settings.skills_off.clone();
+                        let _ = app.agent.commands.send(Command::SetSkillsOff(off.clone()));
+                        for parked in &app.parked {
+                            let _ = parked.agent.commands.send(Command::SetSkillsOff(off.clone()));
+                        }
+                        app.update_toggles();
+                    }
+                }
                 _ if (ID_THEME_SEGMENT..ID_THEME_SEGMENT + 3).contains(&id) => {
                     app.on_menu(M_THEME + (id - ID_THEME_SEGMENT) as usize);
                     app.update_toggles();
@@ -11670,6 +11750,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool) -> ExitCode {
             let _ = saved.save(&folder.join("settings.json"));
         }
         lang::set(&saved.display_language);
+        // (before the transcript and the composer are made, whose first format takes it)
+        TEXT_SCALE.store(saved.text_percent(), Ordering::Relaxed);
         let chosen = folder_argument.filter(|path| path.is_dir()).or_else(|| saved.workspace.clone().filter(|path| path.is_dir()));
         let needs_folder = chosen.is_none();
         // Until a folder is chosen the start panel stays over the chat, and nothing can be sent.
@@ -11823,6 +11905,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool) -> ExitCode {
             variable_toggle: make_button(pane, ID_VARIABLE_TOGGLE, "", ButtonKind::Toggle, theme::background()),
             mcp_import: make_button(pane, ID_MCP_IMPORT, "", ButtonKind::Secondary, theme::background()),
             mcp_trust: Vec::new(),
+            size_segments: std::array::from_fn(|at| make_button(pane, ID_TEXT_SIZE + at as isize, "", ButtonKind::Segment, theme::surface())),
+            skill_toggles: Vec::new(),
             read_folder_add: make_button(pane, ID_READ_FOLDER_ADD, "", ButtonKind::Secondary, theme::background()),
             read_folder_stop: make_button(pane, ID_READ_FOLDER_STOP, "", ButtonKind::Secondary, theme::background()),
             read_folder_remove: Vec::new(),
@@ -12267,6 +12351,7 @@ mod tests {
         words.extend(EFFORTS.iter().map(|(_, name)| *name));
         words.extend(MODES.iter().map(|(_, name)| *name));
         words.extend(THEMES.iter().map(|(_, name)| *name));
+        words.extend(TEXT_SIZES.iter().map(|(_, name)| *name));
         words.extend(ANSWER_LANGUAGES.iter().map(|(_, name)| *name));
         words.extend([CODEX_MISSING, PATH_TOO_LONG, "As you write"]);
         for word in words {

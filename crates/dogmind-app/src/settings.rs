@@ -192,6 +192,32 @@ pub struct Settings {
     pub maximized: bool,
     /// Sessions kept at the top of the sidebar, by their files.
     pub pinned: Vec<PathBuf>,
+    /// How large the conversation's words are, in percent of the standard: one of `TEXT_SIZES`.
+    pub text_size: u32,
+    /// The skills turned off, by name.
+    pub skills_off: Vec<String>,
+}
+
+/// The sizes offered for the conversation's words, in percent, and their names.
+pub const TEXT_SIZES: [(u32, &str); 4] = [(90, "Small"), (100, "Standard"), (115, "Large"), (130, "Larger")];
+
+impl Settings {
+    /// The size chosen, or the standard for a value no version offered.
+    pub fn text_percent(&self) -> u32 {
+        TEXT_SIZES.iter().map(|(percent, _)| *percent).find(|percent| *percent == self.text_size).unwrap_or(100)
+    }
+
+    pub fn skill_is_on(&self, name: &str) -> bool {
+        !self.skills_off.iter().any(|off| off.eq_ignore_ascii_case(name))
+    }
+
+    /// Turns one skill on or off; its name is kept as found.
+    pub fn set_skill(&mut self, name: &str, on: bool) {
+        self.skills_off.retain(|off| !off.eq_ignore_ascii_case(name));
+        if !on {
+            self.skills_off.push(name.to_string());
+        }
+    }
 }
 
 impl Default for Settings {
@@ -226,6 +252,8 @@ impl Default for Settings {
             window: None,
             maximized: false,
             pinned: Vec::new(),
+            text_size: 100,
+            skills_off: Vec::new(),
         }
     }
 }
@@ -409,6 +437,18 @@ pub fn what_remove_takes(data: &Path, keep: Option<&Path>, home: Option<&Path>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_size_and_skills_off_come_from_an_older_file_as_standard_and_none() {
+        let mut older: Settings = serde_json::from_str(r#"{"active": "This PC", "theme": "dark"}"#).unwrap();
+        assert_eq!((older.text_percent(), older.skills_off.len()), (100, 0));
+        older.text_size = 97;
+        assert_eq!(older.text_percent(), 100, "a size no version offered");
+        older.set_skill("PDF", false);
+        assert!(!older.skill_is_on("pdf") && older.skill_is_on("xlsx"));
+        older.set_skill("pdf", true);
+        assert!(older.skill_is_on("PDF") && older.skills_off.is_empty());
+    }
 
     #[test]
     fn the_data_folder_is_a_folder_of_its_own_wherever_it_is_named() {

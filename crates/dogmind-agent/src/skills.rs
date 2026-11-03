@@ -137,6 +137,12 @@ pub fn discover(workspace: &Path, home: Option<&Path>) -> Vec<Skill> {
     found
 }
 
+/// Without the ones the person turned off, by name in any case: the same name in a project and in the home is one skill to them.
+pub fn without(mut skills: Vec<Skill>, off: &[String]) -> Vec<Skill> {
+    skills.retain(|skill| !off.iter().any(|name| name.eq_ignore_ascii_case(&skill.name)));
+    skills
+}
+
 /// Whether a skill says by name that it is for tools this session has not got, as Claude's for its browser and desktop do ("whose tools are named mcp__..."). Offered, one that begins "Read this skill
 /// before the first step that uses..." drew a real model in three real jobs, and one read all 6 KB of it to no use. A person can still ask for it by name.
 fn for_tools_not_here(skill: &Skill, tools: &[String]) -> bool {
@@ -308,6 +314,16 @@ mod tests {
         let with_chrome = prompt_section(&skills, &["mcp__claude-in-chrome__navigate".to_string()]);
         assert!(with_chrome.contains("chrome-browser") && !with_chrome.contains("built-in-browser"), "{with_chrome}");
         assert!(listing(&skills).contains("chrome-browser"), "named, or listed, it is still there");
+    }
+
+    #[test]
+    fn a_skill_turned_off_is_gone_whatever_its_case() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join(".claude/skills/pdf"), "---\nname: PDF\ndescription: d\n---\nb");
+        write(&dir.path().join(".claude/skills/xlsx"), "---\nname: xlsx\ndescription: d\n---\nb");
+        let left = without(discover(dir.path(), None), &["pdf".to_string()]);
+        assert_eq!(left.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(), ["xlsx"]);
+        assert_eq!(without(discover(dir.path(), None), &[]).len(), 2);
     }
 
     #[test]
