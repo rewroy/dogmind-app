@@ -204,6 +204,12 @@ def assemble_tools(target):
         for license_name in install_wheel(cached(wheel), site, files):
             parts.append((f"Python module {wheel['name']} {wheel['version']}: {Path(license_name).name}", site / license_name, None))
         module_files[wheel["name"]] = files
+    # A chart's Japanese words come out as empty boxes in matplotlib's own font: BIZ UDGothic goes where it looks first.
+    charts = site / "matplotlib" / "mpl-data"
+    for item in lock["fonts"]["files"]:
+        shutil.copy(cached(item), charts / "fonts" / "ttf" / item["file"])
+    with (charts / "matplotlibrc").open("a", encoding="utf-8", newline="\n") as settings:
+        settings.write("\nfont.sans-serif: BIZ UDGothic, DejaVu Sans\naxes.unicode_minus: False\n")
     # So that the first import of a large module is not its compiling, each time, in a folder a command cannot write in.
     subprocess.run([str(python / "python.exe"), "-I", "-m", "compileall", "-q", "-j", "2", "--invalidation-mode", "unchecked-hash", str(site)], check=True, cwd=python)
     for name, files in module_files.items():
