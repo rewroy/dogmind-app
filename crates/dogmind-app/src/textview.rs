@@ -1613,8 +1613,11 @@ mod access {
     }
 
     impl IRawElementProviderSimple_Impl for Window_Impl {
+        /// Called on the window's thread, as UI Automation does for one that does not say it keeps COM's rules: what it reads of the host
+        /// (its name, its elements) is the window's, and not for another thread. (This object is agile, and with COM's rules it was called
+        /// on the asking client's.)
         fn ProviderOptions(&self) -> Result<ProviderOptions> {
-            Ok(ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading)
+            Ok(ProviderOptions_ServerSideProvider)
         }
 
         fn GetPatternProvider(&self, _pattern: UIA_PATTERN_ID) -> Result<windows::core::IUnknown> {
