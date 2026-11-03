@@ -381,16 +381,15 @@ fn close_cut_write(raw: &str) -> Option<(String, String, String)> {
     }
 }
 
-/// The second code block in its reasoning opening is drafting; one is often a question about a line. Once told, the first is.
+/// The second code block in its reasoning opening is drafting; one is often a question about a line.
 const DRAFT_FENCES: usize = 3;
-const DRAFT_FENCES_ONCE_TOLD: usize = 1;
-/// In one turn of the person's: after that it has its way, as it would have without this.
-const MAX_DRAFTS_STOPPED: u32 = 3;
+/// In one turn of the person's: after that it has its way, as it would have without this. A real model, asked what got in its way, said the same
+/// note three times in one turn only delayed its first stroke: once is enough, and none once a file is written, when code in its reasoning is planning an edit.
+const MAX_DRAFTS_STOPPED: u32 = 1;
 const MOST_DECIDED: usize = 2500;
 /// Lines of code in its reasoning with no fence round them, as a real model drafted a shader: 36 such lines in 7,700 characters, with one fence that opened only at its end. No reasoning that was
-/// not drafting had more than 8, in 18 real sessions. Once told, a few are enough.
+/// not drafting had more than 8, in 18 real sessions.
 const DRAFT_LINES: usize = 10;
-const DRAFT_LINES_ONCE_TOLD: usize = 4;
 /// The long side of a picture a model reads back from its own work.
 const OWN_PICTURE_SIDE: u32 = 1024;
 /// What a request is told it has cost, each time this much more has gone by with something written: on a slow model, this is over three minutes.
@@ -1122,9 +1121,8 @@ impl Agent {
             let cuts = provider.keeps_cut_writes();
             let mut cut = false;
             let mut drafting = false;
-            let may_stop_drafting = cuts && drafts_stopped < MAX_DRAFTS_STOPPED;
-            let draft_fences = if drafts_stopped == 0 { DRAFT_FENCES } else { DRAFT_FENCES_ONCE_TOLD };
-            let draft_lines = if drafts_stopped == 0 { DRAFT_LINES } else { DRAFT_LINES_ONCE_TOLD };
+            let may_stop_drafting = cuts && drafts_stopped < MAX_DRAFTS_STOPPED && !wrote;
+            let (draft_fences, draft_lines) = (DRAFT_FENCES, DRAFT_LINES);
             let (mut code_lines, mut line_starts) = (0usize, 0usize);
             let cancel = self.cancel.clone();
             let events = self.events.clone();
@@ -3596,14 +3594,16 @@ mod tests {
     }
 
     #[test]
-    fn once_told_it_is_stopped_at_its_first_code_block_and_the_setting_stays() {
+    fn it_is_told_once_a_turn_and_then_left_to_write() {
         let dir = tempfile::tempdir().unwrap();
         let think = |text: &str| serde_json::json!({"choices": [{"delta": {"reasoning_content": text}}]});
         let long = |start: Vec<&str>| -> Vec<Value> { start.iter().map(|text| think(text)).chain((0..400).map(|_| think(" more of it"))).collect() };
+        // (drafting again, more than enough to be stopped the first time, and then its call)
+        let mut again = vec![think("Again.\n```\nd\n```\n```\ne\n```\n```\nf\n```\n")];
+        again.extend(whole_call(serde_json::json!({"path": "index.html", "content": "x\n"})));
         let (client, bodies) = trickling_server(vec![
             long(vec!["Plan.", "\n```\na\n```\n", "b\n```\nc"]),
-            long(vec!["Again.", "\n```\nd"]),
-            whole_call(serde_json::json!({"path": "index.html", "content": "x\n"})),
+            again,
             vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})],
         ]);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
@@ -3611,10 +3611,32 @@ mod tests {
         let (log, cancelled) = until_end(&run, Decision::Reject);
         assert!(!cancelled, "{log:?}");
         let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 4, "{log:?}");
-        let said = bodies[2]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
-        assert!(said.contains("Again.") && said.contains("Make the tool call now"), "{said}");
+        assert_eq!(bodies.len(), 3, "one note, then its call goes through: {log:?}");
+        let notes = bodies[2]["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "user" && message["content"].as_str().is_some_and(|text| text.starts_with(prompt::DRAFT_NOTE))).count();
+        assert_eq!(notes, 1);
+        assert!(dir.path().join("index.html").is_file());
         assert!(bodies.iter().all(|body| body.get("reasoning_effort") == bodies[0].get("reasoning_effort")));
+    }
+
+    #[test]
+    fn code_in_its_reasoning_after_a_file_is_written_is_planning_an_edit_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let think = |text: &str| serde_json::json!({"choices": [{"delta": {"reasoning_content": text}}]});
+        let mut edit = vec![think("Now the colour.\n```\na\n```\n```\nb\n```\n```\nc\n```\n")];
+        edit.extend(whole_call(serde_json::json!({"path": "second.html", "content": "y\n"})));
+        let (client, bodies) = trickling_server(vec![
+            whole_call(serde_json::json!({"path": "index.html", "content": "x\n"})),
+            edit,
+            vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})],
+        ]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled, "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "{log:?}");
+        assert!(!bodies[2]["messages"].as_array().unwrap().iter().any(|message| message["content"].as_str().is_some_and(|text| text.starts_with(prompt::DRAFT_NOTE))));
+        assert!(dir.path().join("second.html").is_file());
     }
 
     #[test]
