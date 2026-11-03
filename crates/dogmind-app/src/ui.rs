@@ -1888,8 +1888,6 @@ struct App {
     catalog: Vec<CatalogEntry>,
     /// This PC, as Straydog sees it, for who is choosing a model.
     machine_line: String,
-    /// Straydog's models that do not run on this PC, each with why.
-    models_not_here: Vec<String>,
     /// When this PC cannot run a model of its own.
     refusal: Option<Refusal>,
     /// Leaving this PC: under way, or done, and then nothing is written any more.
@@ -2481,11 +2479,15 @@ impl App {
         let first = self.insert_rtf(rtf::row(row), Some(row.color));
         if row.right {
             let start = text_start(self.transcript, first);
-            self.user_cards.push(UserCard { start, kind: CardKind::Person, shape: None, looked_at: None });
+            // Words under the message's pictures are the lower part of one card, which begins at the pictures: two cards, each rounded, were
+            // cut in the middle where they met.
+            let after_pictures = std::mem::take(&mut self.turn_words_due);
+            if !after_pictures {
+                self.user_cards.push(UserCard { start, kind: CardKind::Person, shape: None, looked_at: None });
+            }
             let prompt = rail_words(&row.lines.join(" "), 50);
             match self.rail_turns.last_mut() {
-                // (its pictures went first)
-                Some(turn) if std::mem::take(&mut self.turn_words_due) => turn.prompt = prompt,
+                Some(turn) if after_pictures => turn.prompt = prompt,
                 _ => self.rail_turns.push(TurnMark { start, prompt }),
             }
             // (a whole conversation opened, or written again, has the rail placed once it is all in; the second turn's card makes room for it,
@@ -2720,6 +2722,19 @@ impl App {
         }
     }
 
+    /// Room over a block of code or of a command's output: after another block, as for a table, and after words too, whose paragraph leaves
+    /// little under it (a list's item hardly any), so that the block stood tight under them. Not under a run of calls, whose output it is.
+    unsafe fn room_over_a_block(&mut self) {
+        let room = match self.shown.last() {
+            Some(Shown::Row { .. } | Shown::Code { .. } | Shown::Table(_) | Shown::Link(..)) => true,
+            Some(Shown::Text(text, style, _)) => *style != Style::Gap && !text.trim().is_empty(),
+            _ => false,
+        };
+        if room {
+            self.append("\n", Style::Gap);
+        }
+    }
+
     /// A block is about to begin here.
     unsafe fn begin_block(&mut self) {
         let mut first = 0;
@@ -2901,7 +2916,7 @@ impl App {
                         self.code_language = trimmed.trim_start_matches('`').trim().to_lowercase();
                         self.code_comment = false;
                         let label = self.code_language.clone();
-                        self.gap_after_a_block();
+                        self.room_over_a_block();
                         self.begin_block();
                         self.block_edge(&label);
                     } else {
@@ -3338,7 +3353,7 @@ impl App {
                     return;
                 }
                 // A block of its own, with room over and under it, as a block of code has.
-                self.gap_after_a_block();
+                self.room_over_a_block();
                 self.begin_block();
                 self.block_edge("");
                 if above > 0 {
@@ -3887,7 +3902,8 @@ impl App {
         let first = self.insert_rtf(rtf::spacer_row(width, self.text_twips, height, back, (ACROSS, DOWN), right), None);
         let start = text_start(self.transcript, first);
         self.picture_blocks.push(PictureBlock { start, paths: pictures.iter().map(|(path, _)| path.clone()).collect(), tiles });
-        if alone {
+        // (a message's card begins at its pictures, whether words follow them or not)
+        if alone || right {
             self.user_cards.push(UserCard { start, kind: if right { CardKind::Person } else { CardKind::Block }, shape: None, looked_at: None });
         }
         if right {
@@ -6630,7 +6646,6 @@ impl App {
         self.panel_problem = false;
         self.panel_scroll = 0;
         self.machine_line.clear();
-        self.models_not_here.clear();
         self.refusal = None;
         self.list_rows.clear();
         self.progress = if self.setting_up { self.progress } else { None };
@@ -7683,12 +7698,7 @@ impl App {
         let folder = get_text(self.fields[0]);
         let free = if self.refusal.is_some() || folder.trim().is_empty() { None } else { crate::machine::free_bytes(Path::new(folder.trim())) };
         let free = free.map(|free| tf("{0} GB free on that drive", &[&(free / 1_000_000_000)]));
-        let machine = [Some(self.machine_line.clone()).filter(|line| !line.is_empty()), free].into_iter().flatten().collect::<Vec<_>>().join("  ·  ");
-        // (with nothing that runs here, the refusal says it for them all)
-        if self.refusal.is_some() || self.models_not_here.is_empty() {
-            return machine;
-        }
-        std::iter::once(machine).filter(|line| !line.is_empty()).chain(self.models_not_here.iter().cloned()).collect::<Vec<_>>().join("\n")
+        [Some(self.machine_line.clone()).filter(|line| !line.is_empty()), free].into_iter().flatten().collect::<Vec<_>>().join("  ·  ")
     }
 
     /// The model, when it lies in the folder this app removes.
@@ -8595,11 +8605,14 @@ impl App {
             left += dot + s(ds::space::S);
         }
         let middle = (area.top + area.bottom) / 2;
+        // (a model short of graphics memory here: greyed, and there to choose)
+        let short = self.panel == Panel::Models && self.catalog.get(item.itemID as usize).is_some_and(|entry| !entry.runs);
+        let (title_color, detail_color) = if short { (theme::faint(), theme::faint()) } else { (theme::text(), theme::muted()) };
         if row.detail.is_empty() {
-            draw_text(device, &row.title, RECT { left, right: area.right - s(ds::space::M), ..area }, self.fonts.body, theme::text(), ONE_LINE);
+            draw_text(device, &row.title, RECT { left, right: area.right - s(ds::space::M), ..area }, self.fonts.body, title_color, ONE_LINE);
         } else {
-            draw_text(device, &row.title, RECT { left, right: area.right - s(ds::space::M), top: area.top + s(ds::space::XS), bottom: middle + s(ds::space::PIXEL) }, self.fonts.body, theme::text(), ONE_LINE);
-            draw_text(device, &row.detail, RECT { left, right: area.right - s(ds::space::M), top: middle, bottom: area.bottom - s(ds::space::XS) }, self.fonts.small, theme::muted(), ONE_LINE);
+            draw_text(device, &row.title, RECT { left, right: area.right - s(ds::space::M), top: area.top + s(ds::space::XS), bottom: middle + s(ds::space::PIXEL) }, self.fonts.body, title_color, ONE_LINE);
+            draw_text(device, &row.detail, RECT { left, right: area.right - s(ds::space::M), top: middle, bottom: area.bottom - s(ds::space::XS) }, self.fonts.small, detail_color, ONE_LINE);
         }
     }
 
@@ -9972,7 +9985,6 @@ impl App {
                     Ok(catalog) => {
                         self.catalog = catalog.entries;
                         self.machine_line = catalog.machine;
-                        self.models_not_here = catalog.not_here;
                         self.refusal = catalog.refusal;
                         self.show_setup_button();
                         self.list_rows = self.catalog.iter().map(|entry| ListRow {
@@ -10158,7 +10170,15 @@ impl App {
             }
         }
         let vision = if self.vision_for_installed().is_some() { self.vision_is_on() } else { self.vision_wanted };
-        let args = engine::setup_arguments(entry.quant.as_deref(), &folder, &engine::config_path(&self.folder), self.drafter, vision);
+        let mut args = engine::setup_arguments(entry.quant.as_deref(), &folder, &engine::config_path(&self.folder), self.drafter, vision);
+        // One short of graphics memory is set up only when chosen, and by a Straydog that is told so: it refuses otherwise.
+        if !entry.runs {
+            if !engine::setup_can_force(&straydog) {
+                self.problem_in_panel(t("This Straydog does not set up a model that it finds too big for this PC. A newer Straydog does."));
+                return;
+            }
+            args.push("--force".into());
+        }
         self.run_setup(straydog, args, tf("Setting up {0}...", &[&entry.name]));
     }
 
@@ -13065,7 +13085,6 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             rate: None,
             catalog: Vec::new(),
             machine_line: String::new(),
-            models_not_here: Vec::new(),
             refusal: None,
             leaving: Leaving::No,
             remove_all: make_button(pane, ID_REMOVE_ALL, "", ButtonKind::Secondary, theme::background()),
