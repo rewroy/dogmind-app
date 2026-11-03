@@ -1665,6 +1665,9 @@ struct App {
     /// How far a panel taller than the window has been scrolled, and how tall it is.
     panel_scroll: i32,
     panel_extent: i32,
+    /// A dialog page's thumb, in its pane, with how high the pane is and how far it can scroll; and where it is held while it is dragged.
+    pane_thumb: Option<(RECT, i32, i32)>,
+    pane_thumb_grab: Option<i32>,
     /// What the panel says at its foot is something wrong.
     panel_problem: bool,
     /// Stop was pressed and the work has not ended yet.
@@ -5121,10 +5124,14 @@ impl App {
         for control in self.pane_controls() {
             show(control, form.used.contains(&control));
         }
+        self.pane_thumb = None;
         if most > 0 {
             let tall = thumb_height(view, view, extent, s(ds::space::XXL));
             let at = thumb_offset(view - tall, self.panel_scroll, most);
-            form.shapes.push(Shape::Round { area: rect(card_width - pane_x - s(11), at, s(ds::size::THUMB), tall), radius: s(ds::size::THUMB) / 2, fill: Some(theme::line()), border: None });
+            let thumb = rect(card_width - pane_x - s(11), at, s(ds::size::THUMB), tall);
+            let held = self.pane_thumb_grab.is_some();
+            form.shapes.push(Shape::Round { area: thumb, radius: s(ds::size::THUMB) / 2, fill: Some(if held { theme::muted() } else { theme::line() }), border: None });
+            self.pane_thumb = Some((thumb, view, most));
         }
         self.pane_shapes = form.shapes;
         if IsWindowVisible(self.modal) == 0 {
@@ -8198,12 +8205,33 @@ impl App {
 
     /// Scrolls a panel taller than the window.
     unsafe fn scroll_panel(&mut self, by: i32) {
+        self.scroll_panel_to(self.panel_scroll + by);
+    }
+
+    /// The same, to a place. A dialog's page is laid out again alone: the window behind it does not change as it scrolls, and laying all of
+    /// it out again for every notch of the wheel made the page slow to follow.
+    unsafe fn scroll_panel_to(&mut self, to: i32) {
         let most = (self.panel_extent - self.panel_view()).max(0);
-        let to = (self.panel_scroll + by).clamp(0, most);
-        if to != self.panel_scroll {
-            self.panel_scroll = to;
+        let to = to.clamp(0, most);
+        if to == self.panel_scroll {
+            return;
+        }
+        self.panel_scroll = to;
+        if self.modal_open {
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(self.window, &mut client);
+            self.layout_modal(client.right, client.bottom);
+        } else {
             self.layout();
         }
+    }
+
+    /// The page where its thumb, held this far from its top, is at the pointer.
+    unsafe fn drag_pane_thumb(&mut self, y: i32) {
+        let (Some((thumb, view, most)), Some(grab)) = (self.pane_thumb, self.pane_thumb_grab) else { return };
+        let tall = thumb.bottom - thumb.top;
+        let to = (i64::from(y - grab) * i64::from(most) / i64::from((view - tall).max(1))) as i32;
+        self.scroll_panel_to(to);
     }
 
     /// A control Tab has reached comes into view.
@@ -10741,6 +10769,33 @@ unsafe extern "system" fn modal_procedure(window: HWND, message: u32, wparam: WP
             app.modal_pressed_outside = !within_card(lparam);
             0
         }
+        // The page's thumb: held, it goes with the pointer; pressed beside it, it comes to the pointer first. Its strip is a little wider than it, to be found.
+        WM_LBUTTONDOWN if window == app.pane && app.pane_thumb.is_some_and(|(thumb, _, _)| (lparam & 0xFFFF) as i16 as i32 >= thumb.left - scale(app.dpi, 8)) => {
+            let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            if let Some((thumb, _, _)) = app.pane_thumb {
+                let tall = thumb.bottom - thumb.top;
+                let grab = if y >= thumb.top && y < thumb.bottom { y - thumb.top } else { tall / 2 };
+                app.pane_thumb_grab = Some(grab);
+                SetCapture(window);
+                app.drag_pane_thumb(y);
+            }
+            0
+        }
+        WM_MOUSEMOVE if window == app.pane && app.pane_thumb_grab.is_some() => {
+            app.drag_pane_thumb(((lparam >> 16) & 0xFFFF) as i16 as i32);
+            0
+        }
+        WM_LBUTTONUP if window == app.pane && app.pane_thumb_grab.is_some() => {
+            ReleaseCapture();
+            0
+        }
+        WM_CAPTURECHANGED if window == app.pane && app.pane_thumb_grab.is_some() => {
+            app.pane_thumb_grab = None;
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(app.window, &mut client);
+            app.layout_modal(client.right, client.bottom);
+            0
+        }
         WM_LBUTTONUP if window == app.modal => {
             if std::mem::take(&mut app.modal_pressed_outside) && !within_card(lparam) {
                 app.set_panel(Panel::Chat);
@@ -10946,8 +11001,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_MOUSEWHEEL if app.panel != Panel::Chat => {
+            // (a notch is 120: about three lines of a page, as a browser goes)
             let notches = ((wparam >> 16) & 0xFFFF) as u16 as i16 as i32;
-            app.scroll_panel(-notches * scale(app.dpi, 60) / 120);
+            app.scroll_panel(-notches * scale(app.dpi, 120) / 120);
             0
         }
         WM_MOUSEMOVE if app.panel == Panel::Chat => {
@@ -12333,6 +12389,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             hover_row: None,
             panel_scroll: 0,
             panel_extent: 0,
+            pane_thumb: None,
+            pane_thumb_grab: None,
             panel_problem: false,
             stop_asked: false,
             connect_failed: false,
