@@ -1370,7 +1370,6 @@ enum Style {
     Heading,
     /// `###` and on.
     Subheading,
-    Code,
     InlineCode,
     Thinking,
     Tool,
@@ -2343,7 +2342,6 @@ impl App {
             Style::Gap => char_format(theme::background(), 0, ui, 6, None),
             Style::Heading => char_format(theme::text(), CFE_BOLD, ui, 13, None),
             Style::Subheading => char_format(theme::text(), CFE_BOLD, ui, 12, None),
-            Style::Code => char_format(theme::code(), 0, mono, 10, None),
             Style::InlineCode => char_format(theme::accent_hover(), 0, mono, 10, None),
             Style::Thinking => char_format(theme::faint(), CFE_ITALIC, ui, 10, None),
             Style::Tool => char_format(theme::muted(), 0, ui, 9, None),
@@ -2354,7 +2352,6 @@ impl App {
             Style::Bad => char_format(theme::bad(), 0, ui, 10, None),
         };
         let paragraph = match style {
-            Style::Code => para_format(10, 240, 0, 0),
             Style::Output => para_format(9, 240, 0, 0),
             Style::Tool => para_format(9, 0, 60, 40),
             Style::SaidAt => {

@@ -271,10 +271,6 @@ fn table() -> &'static HashMap<&'static str, Vec<Segment>> {
     TABLE.get_or_init(|| ICONS.iter().map(|(name, svg)| (*name, parse_svg(svg))).collect())
 }
 
-pub fn exists(name: &str) -> bool {
-    table().contains_key(name)
-}
-
 fn argb(color: u32) -> u32 {
     0xFF00_0000 | ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF)
 }
