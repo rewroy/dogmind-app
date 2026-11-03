@@ -513,10 +513,14 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     }
     // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. Not of a page that draws with WebGL, which ends the browser here.
     let Some(temp) = crate::sandbox::temp_folder() else { return Ok(said) };
+    forget_old_pictures(&temp);
     let mut out = said;
+    // Each picture by a name of its own: one name for every call had a later check, or another session's, write over a picture an answer
+    // still showed.
+    let taken_at = chrono::Local::now().format("%Y%m%d-%H%M%S%3f").to_string();
     for view in &views {
         let tag = view.label.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
-        let (frame, shot, picture) = (temp.join("dogmind-frame.html"), temp.join("dogmind-shot.png"), temp.join(format!("dogmind-page-{tag}.png")));
+        let (frame, shot, picture) = (temp.join("dogmind-frame.html"), temp.join("dogmind-shot.png"), temp.join(format!("dogmind-page-{taken_at}-{tag}.png")));
         let _ = std::fs::remove_file(&picture);
         // (with steps, each picture is of the page after them, as they run again in its load)
         if std::fs::write(&frame, frame_page(&src, view)).is_err() {
@@ -548,9 +552,36 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     Ok(out)
 }
 
+/// The pictures of checks more than a week old: each has a name of its own, and they would gather in the sandbox's temporary folder.
+fn forget_old_pictures(temp: &Path) {
+    const KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
+    for entry in std::fs::read_dir(temp).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let old = entry.metadata().ok().and_then(|meta| meta.modified().ok()).and_then(|at| at.elapsed().ok()).is_some_and(|age| age > KEPT);
+        if name.starts_with("dogmind-page-") && name.ends_with(".png") && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_week_old_picture_goes_and_a_new_one_and_other_files_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, new, other) = (dir.path().join("dogmind-page-20261020-101010000-desktop.png"), dir.path().join("dogmind-page-20261103-101010000-mobile.png"), dir.path().join("notes.png"));
+        for file in [&old, &new, &other] {
+            std::fs::write(file, b"png").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 3600);
+        for file in [&old, &other] {
+            std::fs::File::options().write(true).open(file).unwrap().set_modified(long_ago).unwrap();
+        }
+        forget_old_pictures(dir.path());
+        assert!(!old.exists() && new.exists() && other.exists());
+    }
 
     fn page(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
