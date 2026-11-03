@@ -65,6 +65,11 @@ fn words(text: &str) -> String {
     out
 }
 
+/// RTF's `\fs`: half points, at the size the settings chose for the conversation's words.
+fn half_points(points: i32) -> i32 {
+    points * 2 * crate::ui::text_scale() / 100
+}
+
 /// The fonts of a row: its own, and the Japanese one.
 fn font_table(face: &str) -> String {
     format!("{{\\fonttbl{{\\f0\\fnil {};}}{{\\f1\\fnil\\fcharset128 {};}}}}", escape(face), crate::paint::japanese_face())
@@ -83,7 +88,7 @@ pub fn row(row: &Row) -> String {
         // A block keeps to the column as a share of it, so that it follows the window; a card is as wide as its words.
         span = if row.right { "" } else { "\\trftsWidth2\\trwWidth5000" },
         cell_span = if row.right { "" } else { "\\clftsWidth2\\clwWidth5000" },
-        size = row.points * 2,
+        size = half_points(row.points),
         body = text.join("\\line "),
     )
 }
@@ -119,7 +124,7 @@ pub fn colored_row(runs: &[(String, u32)], face: &str, points: i32, back: u32, w
         "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{table}}}\\trowd\\trgaph{across}\\trleft0\\trpaddt{down}\\trpaddb{down}\\trpaddft3\\trpaddfb3\\trftsWidth2\\trwWidth5000\\clcfpat1\\clcbpat1\\clshdng10000\\clftsWidth2\\clwWidth5000\\cellx{width}\\pard\\intbl\\ql\\sl0\\sa0\\sb0\\f0\\fs{size} {body}\\cell\\row}}",
         fonts = font_table(face),
         back = channels(back),
-        size = points * 2,
+        size = half_points(points),
     )
 }
 
@@ -140,7 +145,7 @@ pub fn table_row(row: &TableRow) -> String {
     // (a line between two rows is the upper one's foot and the lower one's head: left unsaid, the head is black and wins)
     let frames: String = row.ends.iter().map(|end| format!("\\clbrdrt\\brdrs\\brdrw10\\brdrcf3\\clbrdrb\\brdrs\\brdrw10\\brdrcf3\\clcfpat1\\clcbpat1\\clshdng10000\\cellx{end}")).collect();
     let empty = String::new();
-    let cells: String = (0..row.ends.len()).map(|at| format!("\\pard\\intbl\\ql\\sl0\\sa0\\sb0\\f0\\fs{}\\cf2{} {}\\cell", row.points * 2, if row.bold { "\\b" } else { "" }, words(row.cells.get(at).unwrap_or(&empty)))).collect();
+    let cells: String = (0..row.ends.len()).map(|at| format!("\\pard\\intbl\\ql\\sl0\\sa0\\sb0\\f0\\fs{}\\cf2{} {}\\cell", half_points(row.points), if row.bold { "\\b" } else { "" }, words(row.cells.get(at).unwrap_or(&empty)))).collect();
     format!(
         "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{color};{line};}}\\trowd\\trgaph120\\trleft0\\trpaddt50\\trpaddb50\\trpaddft3\\trpaddfb3{frames}{cells}\\row}}",
         fonts = font_table(row.face),
