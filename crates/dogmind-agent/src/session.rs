@@ -120,15 +120,21 @@ impl Session {
     }
 }
 
+/// A session file's lines, each as far as it reads: a line a crash cut in the middle of a character is one line, and those after it are
+/// read too. (As text, reading stopped at it, and what came after (a name, the mark of web content) went unseen.)
+fn lines_of(path: &Path) -> std::io::Result<impl Iterator<Item = String>> {
+    let reader = BufReader::new(File::open(path)?);
+    Ok(reader.split(b'\n').map_while(Result::ok).map(|bytes| String::from_utf8_lossy(&bytes).trim_end_matches('\r').to_string()))
+}
+
 pub fn web_seen(path: &Path) -> bool {
     let marked = serde_json::to_string(&Line::WebSeen).expect("a plain line serializes");
-    File::open(path).map(BufReader::new).is_ok_and(|reader| reader.lines().map_while(Result::ok).any(|line| line == marked))
+    lines_of(path).is_ok_and(|mut lines| lines.any(|line| line == marked))
 }
 
 /// The tools a session was last offered; none in a file from before they were kept.
 pub fn tools_of(path: &Path) -> Option<serde_json::Value> {
-    let reader = BufReader::new(File::open(path).ok()?);
-    reader.lines().map_while(Result::ok).filter(|line| line.starts_with("{\"kind\":\"tools\"")).filter_map(|line| match serde_json::from_str(&line) {
+    lines_of(path).ok()?.filter(|line| line.starts_with("{\"kind\":\"tools\"")).filter_map(|line| match serde_json::from_str(&line) {
         Ok(Line::Tools { tools }) => Some(tools),
         _ => None,
     }).last()
@@ -147,9 +153,8 @@ pub fn describe_tools(tools: &serde_json::Value) -> String {
 /// A session's messages as they are on disk, for a reader beside the agent that writes them: a call still running has
 /// no result yet, and none is made up.
 pub fn read(path: &Path) -> Result<Vec<Message>, String> {
-    let reader = BufReader::new(File::open(path).map_err(|error| format!("{}: {error}", path.display()))?);
     let mut messages = Vec::new();
-    for line in reader.lines().map_while(Result::ok) {
+    for line in lines_of(path).map_err(|error| format!("{}: {error}", path.display()))? {
         match serde_json::from_str(&line) {
             Ok(Line::Message { message }) => messages.push(message),
             Ok(Line::Snapshot { messages: all }) => messages = all,
@@ -213,8 +218,19 @@ pub fn search(folder: &Path, query: &str) -> Vec<Hit> {
 /// A name for a session, as the person chose it.
 pub fn rename(path: &Path, title: &str) -> Result<(), String> {
     let text = serde_json::to_string(&Line::Title { title: title.to_string() }).map_err(|error| error.to_string())?;
+    // (after a line a crash cut short, on a line of its own: run on into it, the name was part of a line nothing reads)
+    let ends_a_line = std::fs::File::open(path).and_then(|mut file| {
+        use std::io::{Read, Seek, SeekFrom};
+        if file.seek(SeekFrom::End(0))? == 0 {
+            return Ok(true);
+        }
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        Ok(last[0] == b'\n')
+    }).unwrap_or(true);
     let mut file = OpenOptions::new().append(true).open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    writeln!(file, "{text}").map_err(|error| format!("{}: {error}", path.display()))
+    writeln!(file, "{}{text}", if ends_a_line { "" } else { "\n" }).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// A new session beside this one, with its conversation through its `through`th message (from 0): to go on from there another way, as
@@ -222,7 +238,9 @@ pub fn rename(path: &Path, title: &str) -> Result<(), String> {
 /// messages it keeps; `title`, when given, is its name. This one is only read. What changed in the workspace since is not undone: a branch
 /// of the conversation, not of the files.
 pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf, String> {
-    let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    // (as `open` reads it: a line a crash cut in the middle of a character is one line lost, not the whole session refused)
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text = String::from_utf8_lossy(&bytes);
     let (mut workspace, mut messages) = (PathBuf::new(), Vec::new());
     for line in text.lines() {
         match serde_json::from_str(line) {
@@ -299,7 +317,7 @@ pub fn list(folder: &Path) -> Vec<Summary> {
     paths.reverse();
     paths.into_iter().filter_map(|path| {
         let (mut workspace, mut created, mut title, mut messages, mut named) = (PathBuf::new(), String::new(), String::new(), 0, None);
-        for line in BufReader::new(File::open(&path).ok()?).lines().map_while(Result::ok) {
+        for line in lines_of(&path).ok()? {
             // Once it has its title, a message is only counted: its text may be megabytes.
             if line.starts_with("{\"kind\":\"title\"") {
                 if let Ok(Line::Title { title }) = serde_json::from_str(&line) {
@@ -380,6 +398,24 @@ mod tests {
         assert_eq!(messages.iter().map(|m| m.content.as_deref().unwrap()).collect::<Vec<_>>(), ["s", "sum", "new"]);
         again.append(&Message::text("assistant", "more")).unwrap();
         assert_eq!(Session::open(&path).unwrap().2.len(), 4);
+    }
+
+    /// A name given after a line a crash cut short is on a line of its own, and read; a session with such a line can still be branched.
+    #[test]
+    fn a_cut_line_takes_neither_the_name_after_it_nor_a_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261104-1").unwrap();
+        session.append(&Message::text("user", "hello")).unwrap();
+        session.append(&Message::text("assistant", "hi")).unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"kind\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"\xE3\x81").unwrap();
+        drop(file);
+        rename(&path, "named after the cut").unwrap();
+        assert_eq!(list(dir.path())[0].title, "named after the cut");
+        let copy = fork(&path, 1, None).unwrap();
+        assert_eq!(Session::open(&copy).unwrap().2.len(), 2);
     }
 
     /// A call without its result gets one; a result whose call a crash cut out of the file, or one given twice, goes.
