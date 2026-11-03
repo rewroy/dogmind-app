@@ -81,7 +81,16 @@ const STEPS_PRELUDE: &str = r#"<script>
   const fill = async (selector, value) => { const field = find(selector); field.focus(); field.value = value; field.dispatchEvent(new Event('input', { bubbles: true })); field.dispatchEvent(new Event('change', { bubbles: true })); await wait(50); };
   const check = async (selector, on = true) => { const box = find(selector); if (box.checked !== on) box.click(); await wait(50); };
   const select = async (selector, value) => { const list = find(selector); list.value = value; list.dispatchEvent(new Event('change', { bubbles: true })); await wait(50); };
-  const press = async (key, selector) => { const target = selector ? find(selector) : (document.activeElement || document.body); for (const type of ['keydown', 'keypress', 'keyup']) target.dispatchEvent(new KeyboardEvent(type, { key, bubbles: true, cancelable: true })); if (key === 'Enter' && target.form) target.form.requestSubmit(); await wait(50); };
+  const KEY = /^((Control|Shift|Alt|Meta)\+)*(Enter|Tab|Escape|Backspace|Delete|Space|Home|End|PageUp|PageDown|Arrow(Up|Down|Left|Right)|F\d{1,2}|.)$/;
+  const press = async (first, second) => {
+    // (as Playwright: press(selector, key), or press(key) on what has the focus; a key named first is taken as one)
+    let [selector, key] = second === undefined ? [null, first] : [first, second];
+    if (second !== undefined && KEY.test(first) && !KEY.test(second)) [selector, key] = [second, first];
+    const target = selector ? find(selector) : (document.activeElement || document.body);
+    for (const type of ['keydown', 'keypress', 'keyup']) target.dispatchEvent(new KeyboardEvent(type, { key, bubbles: true, cancelable: true }));
+    if (key === 'Enter' && target.form) target.form.requestSubmit();
+    await wait(50);
+  };
   const text = (selector) => find(selector).textContent.trim();
   const count = (selector) => document.querySelectorAll(selector).length;
   const visible = (selector) => { const found = document.querySelector(selector); if (!found) return false; const box = found.getBoundingClientRect(); return box.width > 0 && box.height > 0 && getComputedStyle(found).visibility !== 'hidden'; };
@@ -765,5 +774,18 @@ mod tests {
         assert!(said.contains("How it looks at mobile"), "{said}");
         let failed = check_page(&serde_json::json!({"path": "index.html", "steps": "await click('#nothing')"}), dir.path(), &AtomicBool::new(false)).unwrap();
         assert!(failed.contains("STEPS FAILED: nothing matches #nothing"), "{failed}");
+    }
+
+    /// `press` as Playwright has it, `press(selector, key)`, which a real model wrote and which failed as "nothing matches Enter"; the key alone,
+    /// on what has the focus; and the key first, as this once took it.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn a_key_is_pressed_as_playwright_says_it() {
+        let (dir, _) = page(&[
+            ("index.html", "<!DOCTYPE html><title>t</title><form id=f><input id=t></form><ul id=l></ul><script>document.getElementById('f').onsubmit=(e)=>{e.preventDefault();const li=document.createElement('li');li.textContent=document.getElementById('t').value;document.getElementById('l').append(li)};</script>"),
+        ]);
+        let steps = "await fill('#t', 'a'); await press('#t', 'Enter'); await fill('#t', 'b'); await press('Enter'); await fill('#t', 'c'); await press('Enter', '#t'); console.log('items ' + count('li'));";
+        let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps}), dir.path(), &AtomicBool::new(false)).unwrap();
+        assert!(said.contains("Steps: all ran") && said.contains("items 3"), "{said}");
     }
 }
