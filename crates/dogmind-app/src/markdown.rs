@@ -28,6 +28,21 @@ pub fn parse_link(rest: &str) -> Link<'_> {
     if !after.starts_with('(') {
         return Link::No;
     }
+    // `(<a path with spaces>)`, as CommonMark writes an address that has them
+    if let Some(inside) = after[1..].strip_prefix('<') {
+        let Some(close_angle) = inside.find('>') else {
+            return if inside.contains('\n') || rest.len() > MOST { Link::No } else { Link::Waiting };
+        };
+        let url = &inside[..close_angle];
+        if url.is_empty() || url.contains('\n') {
+            return Link::No;
+        }
+        let tail = &inside[close_angle + 1..];
+        let Some(end) = tail.find(')') else {
+            return if tail.contains('\n') || rest.len() > MOST { Link::No } else { Link::Waiting };
+        };
+        return Link::Whole { text: &rest[1..close], url, length: close + 1 + 2 + close_angle + 1 + end + 1 };
+    }
     let Some(end) = after.find(')') else {
         return if after.contains('\n') || rest.len() > MOST { Link::No } else { Link::Waiting };
     };
@@ -259,18 +274,35 @@ fn code_line(line: &str, language: &str, open: bool, out: &mut String) -> bool {
     still_open
 }
 
-/// A whole source file: its lines numbered, in the colours of `language` when it knows them. `language` none: plain.
-pub fn source_html(text: &str, language: &str) -> String {
+/// A whole source file: its lines numbered, in the colours of `language` when it knows them. `language` none: plain. `marked`: the lines
+/// a link named (from 1, the last included), lit, the first of them `here`, which takes the focus and so is scrolled to.
+pub fn source_html(text: &str, language: &str, marked: Option<(usize, usize)>) -> String {
     let mut out = String::with_capacity(text.len() * 2);
     out.push_str("<pre class=\"source\">");
     let mut open = false;
-    for line in text.lines() {
-        out.push_str("<span class=\"l\">");
+    for (at, line) in text.lines().enumerate() {
+        let number = at + 1;
+        match marked {
+            Some((first, _)) if number == first => out.push_str("<span class=\"l m\" id=\"here\" tabindex=\"-1\" autofocus>"),
+            Some((first, last)) if number > first && number <= last => out.push_str("<span class=\"l m\">"),
+            _ => out.push_str("<span class=\"l\">"),
+        }
         open = code_line(line, language, open, &mut out);
         out.push_str("</span>");
     }
     out.push_str("</pre>");
     out
+}
+
+/// The lines a link to a file names after its path, as GitHub writes them: `#L24` or `#L24-L30` (`#L24-30` too). The path, and the lines.
+pub fn lines_of_link(url: &str) -> (&str, Option<(usize, usize)>) {
+    let Some((path, fragment)) = url.rsplit_once("#L") else { return (url, None) };
+    let (first, last) = fragment.split_once('-').map_or((fragment, None), |(first, last)| (first, Some(last.trim_start_matches('L'))));
+    match (first.parse::<usize>(), last.map(str::parse::<usize>)) {
+        (Ok(first), None) if first > 0 => (path, Some((first, first))),
+        (Ok(first), Some(Ok(last))) if first > 0 && last >= first => (path, Some((first, last))),
+        _ => (url, None),
+    }
 }
 
 struct Item<'a> {
@@ -460,6 +492,9 @@ mod tests {
         for not in ["[a] b", "[a\n](b)", "[](b)", "[a]()", "[a\n", "[a](b\n"] {
             assert_eq!(parse_link(not), Link::No, "{not}");
         }
+        assert_eq!(parse_link("[a](<C:\\my pics\\x.png>) c"), Link::Whole { text: "a", url: "C:\\my pics\\x.png", length: 23 });
+        assert_eq!(parse_link("[a](<x y"), Link::Waiting);
+        assert_eq!(parse_link("[a](<x y>"), Link::Waiting);
     }
 
     #[test]
@@ -561,10 +596,23 @@ mod tests {
 
     #[test]
     fn source_keeps_its_lines_and_its_colours() {
-        let page = source_html("fn a() {\n  // <b>\n}\n", "rs");
+        let page = source_html("fn a() {\n  // <b>\n}\n", "rs", None);
         assert_eq!(page.matches("class=\"l\"").count(), 3);
         assert!(page.contains("<span class=\"k\">fn</span>") && page.contains("&lt;b&gt;"), "{page}");
-        let plain = source_html("a<b", "");
+        let plain = source_html("a<b", "", None);
         assert!(plain.contains("a&lt;b"), "{plain}");
+        let marked = source_html("a\nb\nc\nd\n", "", Some((2, 3)));
+        assert_eq!((marked.matches("class=\"l m\"").count(), marked.matches("id=\"here\"").count()), (2, 1), "{marked}");
+        assert!(marked.find("id=\"here\"").unwrap() < marked.find(">b<").unwrap_or(marked.find("b</span>").unwrap()), "{marked}");
+    }
+
+    #[test]
+    fn a_link_names_lines_as_github_does() {
+        assert_eq!(lines_of_link("src/app.js#L24"), ("src/app.js", Some((24, 24))));
+        assert_eq!(lines_of_link("src/app.js#L24-L30"), ("src/app.js", Some((24, 30))));
+        assert_eq!(lines_of_link("src/app.js#L24-30"), ("src/app.js", Some((24, 30))));
+        assert_eq!(lines_of_link("src/app.js"), ("src/app.js", None));
+        assert_eq!(lines_of_link("page.html#Lunch"), ("page.html#Lunch", None), "an anchor of its own stays");
+        assert_eq!(lines_of_link("a.rs#L30-L24"), ("a.rs#L30-L24", None));
     }
 }

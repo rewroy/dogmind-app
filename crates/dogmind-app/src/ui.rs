@@ -1662,6 +1662,8 @@ struct App {
     /// The file shown beside the conversation, and when it was last written. The browser exists only while one is shown.
     preview: Option<Preview>,
     preview_file: Option<PathBuf>,
+    /// The lines of it a link named, to be shown at: for a browser that is still starting too.
+    preview_lines: Option<(usize, usize)>,
     preview_written: Option<std::time::SystemTime>,
     preview_making: bool,
     preview_blocked: u32,
@@ -2459,12 +2461,16 @@ impl App {
         ((x - near.x).abs() < reach && y >= near.y - scale(self.dpi, 4) && y < near.y + reach).then_some(run)
     }
 
-    /// A click on a link: to the browser if it is on the web, beside the conversation if it is a file here, and nowhere otherwise.
+    /// A click on a link: to the browser if it is on the web, beside the conversation if it is a file here (at the lines it names, as
+    /// `src/app.js#L24`), and nowhere otherwise.
     unsafe fn open_link(&mut self, url: &str) {
         match markdown::web_address(url) {
             Some(address) => open_in_browser(&address),
             None => {
-                if self.workspace.join(url).is_file() {
+                let (path, lines) = markdown::lines_of_link(url);
+                if self.workspace.join(path).is_file() {
+                    self.open_preview_at(path, lines);
+                } else if self.workspace.join(url).is_file() {
                     self.open_preview(url);
                 }
             }
@@ -3072,8 +3078,17 @@ impl App {
                             }
                             markdown::Link::Whole { text: words, url, length } => {
                                 self.flush_run(&mut run);
-                                self.append_link(words, url);
                                 let end = at + opening + length;
+                                // A picture the answer shows, there in the conversation as a tool's is, when it is one on this PC: what is
+                                // after it goes on from a line of its own.
+                                if opening == 1 {
+                                    if let Some(picture) = self.answer_picture(url) {
+                                        self.pending_text = text[end..].to_string();
+                                        self.show_tool_pictures(&[picture]);
+                                        return;
+                                    }
+                                }
+                                self.append_link(words, url);
                                 while chars.peek().is_some_and(|(index, _)| *index < end) {
                                     chars.next();
                                 }
@@ -3861,6 +3876,20 @@ impl App {
                 self.place_thumb();
             }
         }
+    }
+
+    /// A picture an answer shows with `![what it shows](path)`: a file of the workspace, or one elsewhere on this PC that a tool gave the model
+    /// (check_page's), that is a picture, and its size. None: it stays a link, as one on the web does.
+    fn answer_picture(&self, url: &str) -> Option<(PathBuf, (i32, i32))> {
+        let url = url.trim();
+        let url = url.strip_prefix("file:///").unwrap_or(url);
+        let path = Path::new(url);
+        let file = if path.is_absolute() { path.to_path_buf() } else { self.workspace.join(path) };
+        if markdown::web_address(url).is_some() || !attach::is_image(&file) || !file.is_file() {
+            return None;
+        }
+        let (width, height) = image::image_dimensions(&file).ok()?;
+        Some((file, (width as i32, height as i32)))
     }
 
     /// Where a message's pictures are kept with this session, and their sizes.
@@ -5950,6 +5979,12 @@ impl App {
 
     /// Shows a file of the workspace beside the conversation. The first takes a moment: the browser is made now, not before.
     unsafe fn open_preview(&mut self, wanted: &str) {
+        self.open_preview_at(wanted, None);
+    }
+
+    /// The preview of a file, at these lines of it when they are given (a source file's: lit, and in view).
+    unsafe fn open_preview_at(&mut self, wanted: &str, lines: Option<(usize, usize)>) {
+        self.preview_lines = lines;
         let file = if Path::new(wanted).is_absolute() { PathBuf::from(wanted) } else { self.workspace.join(wanted) };
         if !file.is_file() {
             self.say(&tf("There is no {0} in this folder.", &[&wanted]));
@@ -5970,7 +6005,7 @@ impl App {
         self.preview_root = Some(root.clone());
         self.preview_blocked = 0;
         if let Some(shown) = &self.preview {
-            if let Err(error) = shown.open(&root, &file) {
+            if let Err(error) = shown.open(&root, &file, lines) {
                 self.close_preview();
                 self.say(&tf("The preview did not open: {0}", &[&error]));
                 return;
@@ -6004,7 +6039,7 @@ impl App {
                 // Closed while it started: it goes, with its memory.
                 let Some(file) = self.preview_file.clone() else { return };
                 let root = self.preview_root.clone().unwrap_or_else(|| self.workspace.clone());
-                let opened = made.open(&root, &file);
+                let opened = made.open(&root, &file, self.preview_lines);
                 self.preview = Some(made);
                 if let Err(error) = opened {
                     self.close_preview();
@@ -12922,6 +12957,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             delete_target: None,
             preview: None,
             preview_file: None,
+            preview_lines: None,
             preview_written: None,
             preview_making: false,
             preview_blocked: 0,
