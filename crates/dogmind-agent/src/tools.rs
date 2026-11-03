@@ -259,6 +259,9 @@ pub struct Workbench {
     cut_file: Option<PathBuf>,
     /// What has been read of each file and what it was then, while that is still in the conversation.
     reads: HashMap<(PathBuf, i64, i64), String>,
+    /// How many of each file's lines, from its first, the conversation has been shown as it is now: a file written whole over one
+    /// seen only in part loses the rest without a word.
+    covered: HashMap<PathBuf, usize>,
     /// What this turn has read of files into the conversation, in bytes, and how many times it has been told how much.
     pub read_this_turn: usize,
     pub read_told: usize,
@@ -563,7 +566,20 @@ impl Workbench {
 
     /// A read has come back. The same lines of the same file as they were are already in the conversation, and are not sent again to be paid for twice.
     pub fn after_read(&mut self, arguments: &Value, path: PathBuf, hash: String, result: Result<String, String>) -> Result<String, String> {
-        self.seen.insert(path.clone(), hash.clone());
+        if self.seen.insert(path.clone(), hash.clone()).is_some_and(|before| before != hash) {
+            self.covered.remove(&path);
+        }
+        if let Ok(text) = &result {
+            // (the lines shown in a row from where what was seen ends: an outline's head counts, and its parts after a gap do not)
+            let mut covered = self.covered.get(&path).copied().unwrap_or(0);
+            for number in text.lines().filter_map(|line| line.split_once('|')?.0.parse::<usize>().ok()) {
+                if number > covered + 1 {
+                    break;
+                }
+                covered = covered.max(number);
+            }
+            self.covered.insert(path.clone(), covered);
+        }
         let number = |name: &str, default: i64| arguments.get(name).and_then(Value::as_i64).unwrap_or(default);
         let key = (path, number("start_line", 1), number("limit", 500));
         let same = self.reads.get(&key) == Some(&hash);
@@ -594,12 +610,14 @@ impl Workbench {
     /// What was read may no longer be in the conversation.
     pub fn forget_reads(&mut self) {
         self.reads.clear();
+        self.covered.clear();
     }
 
     /// Files went back: a patch must read them again first.
     pub fn forget_seen(&mut self) {
         self.seen.clear();
         self.reads.clear();
+        self.covered.clear();
         self.cut_file = None;
     }
 
@@ -622,6 +640,8 @@ impl Workbench {
         let append = going_on || arguments.get("append").and_then(Value::as_bool) == Some(true);
         let mut before = Vec::new();
         let exists = path.exists();
+        // (what of it the conversation has been shown, when there is less than all of it)
+        let mut seen_in_part = None;
         if exists {
             if path.is_dir() {
                 return Err(format!("{given} is a folder"));
@@ -634,22 +654,37 @@ impl Workbench {
             if *known != sha16(&before) {
                 return Err(format!("{given} changed since it was read: read it again"));
             }
+            // Written whole, it takes the place of all of it: what the conversation has not been shown of it would go without a word.
+            let total = file_text(&before).0.lines().count();
+            let covered = self.covered.get(&path).copied().unwrap_or(0);
+            if covered < total {
+                if !append {
+                    return Err(format!("{given} has {total} lines, and this conversation has been shown {covered} of them from the top: written whole, the rest would be lost. Change a part with apply_patch, or read on from start_line={} before writing it whole. Nothing was written", covered + 1));
+                }
+                seen_in_part = Some(covered);
+            }
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| format!("{given}: {error}"))?;
         }
-        if !append {
-            before.clear();
-        }
-        before.extend_from_slice(content.as_bytes());
-        written_whole(&path, &before, exists).map_err(|error| format!("{given}: {error}: {}", if exists { "the file is as it was" } else { "it was not made" }))?;
-        self.seen.insert(path, sha16(&before));
+        // In the file's own form: its encoding, its byte order mark and its line ends. Appended as bytes, words went onto UTF-16 as UTF-8, and
+        // LF lines onto CRLF ones; written over, a mark PowerShell 5.1 needs to read Japanese went.
+        let written = if exists {
+            let form = Form::of(&before);
+            let new = form.bytes(content, !append).map_err(|why| format!("{given}: {why}. Nothing was written"))?;
+            if append { [before, new].concat() } else { new }
+        } else {
+            content.as_bytes().to_vec()
+        };
+        written_whole(&path, &written, exists).map_err(|error| format!("{given}: {error}: {}", if exists { "the file is as it was" } else { "it was not made" }))?;
+        let lines = file_text(&written).0.lines().count();
+        self.seen.insert(path.clone(), sha16(&written));
+        self.covered.insert(path, seen_in_part.unwrap_or(lines));
         if going_on {
             self.cut_file = None;
         }
-        let lines = String::from_utf8_lossy(&before).lines().count();
         let word = if !exists { "created" } else if append { "added to" } else { "replaced" };
-        let said = format!("{word} {given}: now {lines} lines, {} bytes", before.len());
+        let said = format!("{word} {given}: now {lines} lines, {} bytes", written.len());
         Ok(if self.in_japanese { said + &not_japanese_note(content) } else { said })
     }
 
@@ -697,7 +732,8 @@ impl Workbench {
             // asked. (A file with both, as an editor that ended only its last line with CRLF leaves, took every edit as CRLF, and none of more
             // than one line of its LF part could be found: a real model gave up and wrote the whole file again.)
             let as_written = (old.to_string(), new.to_string());
-            let with_crlf = (old.contains('\n') && !old.contains("\r\n") && text.contains("\r\n")).then(|| (old.replace('\n', "\r\n"), new.replace('\n', "\r\n")));
+            // (a new_string written with CRLF already keeps them, not one CR more)
+            let with_crlf = (old.contains('\n') && !old.contains("\r\n") && text.contains("\r\n")).then(|| (old.replace('\n', "\r\n"), new.replace("\r\n", "\n").replace('\n', "\r\n")));
             let (old, new) = match with_crlf {
                 Some(crlf) if text.matches(as_written.0.as_str()).count() != count => crlf,
                 _ => as_written,
@@ -724,7 +760,15 @@ impl Workbench {
             let name = path.strip_prefix(workspace).unwrap_or(path).display().to_string();
             report.push_str(&format!("--- applied_diff {name} ---\n{}\n", cap(&diff, MAX_APPLIED_DIFF)));
         }
-        for (path, _, after) in files {
+        for (path, before, after) in files {
+            // (seen whole before, it is seen whole after: the model wrote what changed)
+            if self.covered.get(&path).is_some_and(|covered| *covered >= before.lines().count()) {
+                self.covered.insert(path.clone(), after.lines().count());
+            }
+            // A write cut off and going on is not, once its file is patched: the next create_file of it is the model's own, whole or not as it says.
+            if self.cut_file.as_ref() == Some(&path) {
+                self.cut_file = None;
+            }
             self.seen.insert(path, sha16(after.as_bytes()));
         }
         let mut said = cap(&report, MAX_OUTPUT);
@@ -760,6 +804,63 @@ impl Workbench {
         }
         Ok(self.todos.iter().map(|item| format!("[{}] {}: {}", item["status"].as_str().unwrap_or("pending"), item["id"].as_str().unwrap_or(""), item["text"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"))
     }
+}
+
+/// How a file is written, for what is written to it to be written the same way: its encoding, whether it begins with a byte order mark,
+/// and whether its lines end with CRLF.
+struct Form {
+    encoding: &'static str,
+    mark: &'static [u8],
+    crlf: bool,
+}
+
+impl Form {
+    fn of(bytes: &[u8]) -> Form {
+        let (text, encoding) = file_text(bytes);
+        let mark: &'static [u8] = [&[0xEF, 0xBB, 0xBF][..], &[0xFF, 0xFE], &[0xFE, 0xFF]].into_iter().find(|mark| bytes.starts_with(mark)).unwrap_or(&[]);
+        // (as most of its lines end: an editor may have ended only its last one otherwise)
+        let ends = text.matches('\n').count();
+        Form { encoding, mark, crlf: ends > 0 && text.matches("\r\n").count() * 2 > ends }
+    }
+
+    /// `text` as this file has it; with its mark when it is the whole of the file.
+    fn bytes(&self, text: &str, whole: bool) -> Result<Vec<u8>, String> {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let text = if self.crlf { text.replace("\r\n", "\n").replace('\n', "\r\n") } else { text.to_string() };
+        let mut out = if whole { self.mark.to_vec() } else { Vec::new() };
+        match self.encoding {
+            "utf-8" => out.extend_from_slice(text.as_bytes()),
+            "utf-16" if self.mark == [0xFE, 0xFF] => out.extend(text.encode_utf16().flat_map(u16::to_be_bytes)),
+            "utf-16" => out.extend(text.encode_utf16().flat_map(u16::to_le_bytes)),
+            "shift_jis" => out.extend(shift_jis(&text)?),
+            _ => return Err("it is in an encoding this cannot write (not UTF-8, UTF-16 or Shift_JIS)".into()),
+        }
+        Ok(out)
+    }
+}
+
+/// Text in Shift_JIS, or which of its characters have no form there.
+fn shift_jis(text: &str) -> Result<Vec<u8>, String> {
+    in_code_page_932(text).ok_or_else(|| {
+        let missing: String = text.chars().filter(|letter| !letter.is_ascii() && in_code_page_932(&letter.to_string()).is_none()).take(8).collect();
+        format!("it is Shift_JIS, and these have no form there: {missing}. Leave them out, or ask the user whether it may become UTF-8")
+    })
+}
+
+fn in_code_page_932(text: &str) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Globalization::{WideCharToMultiByte, WC_NO_BEST_FIT_CHARS};
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    if wide.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = vec![0u8; wide.len() * 2];
+    let mut replaced = 0;
+    // SAFETY: both buffers are as long as the call is told, and a character takes at most two bytes in this code page.
+    let written = unsafe { WideCharToMultiByte(932, WC_NO_BEST_FIT_CHARS, wide.as_ptr(), wide.len() as i32, out.as_mut_ptr(), out.len() as i32, std::ptr::null(), &mut replaced) };
+    (written > 0 && replaced == 0).then(|| {
+        out.truncate(written as usize);
+        out
+    })
 }
 
 /// A file's text and the name of what it was in. On a Japanese Windows that may be Shift_JIS, and what PowerShell's `>` writes is UTF-16.
@@ -2674,6 +2775,70 @@ mod tests {
         // And done again with nothing in the way, both change.
         bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap();
         assert_eq!((std::fs::read_to_string(&first).unwrap(), std::fs::read_to_string(&second).unwrap()), ("ALPHA\n".to_string(), "BETA\n".to_string()));
+    }
+
+    /// What is written to a file is written in its form: UTF-16 with its mark, appended to as UTF-16; CRLF lines; a UTF-8 mark kept;
+    /// Shift_JIS, or nothing written when a character has no form there.
+    #[test]
+    fn a_file_is_written_in_its_own_encoding_and_line_ends() {
+        let (dir, mut bench, cancel) = bench();
+        let read = |bench: &mut Workbench, name: &str| bench.run("read_file", &json!({"path": name}), dir.path(), &cancel).unwrap();
+        let utf16 = |text: &str| [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect::<Vec<u8>>();
+        std::fs::write(dir.path().join("w.txt"), utf16("一行目\r\n")).unwrap();
+        read(&mut bench, "w.txt");
+        bench.run("create_file", &json!({"path": "w.txt", "content": "追加\n", "append": true}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("w.txt")).unwrap(), utf16("一行目\r\n追加\r\n"));
+        std::fs::write(dir.path().join("crlf.txt"), "a\r\nb\r\n").unwrap();
+        read(&mut bench, "crlf.txt");
+        bench.run("create_file", &json!({"path": "crlf.txt", "content": "x\ny\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("crlf.txt")).unwrap(), b"x\r\ny\r\n");
+        std::fs::write(dir.path().join("bom.ps1"), "\u{feff}Write-Host 'あ'\n").unwrap();
+        read(&mut bench, "bom.ps1");
+        bench.run("create_file", &json!({"path": "bom.ps1", "content": "Write-Host 'い'\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("bom.ps1")).unwrap(), "\u{feff}Write-Host 'い'\n");
+        std::fs::write(dir.path().join("sjis.txt"), [0x93, 0xFA, 0x96, 0x7B, 0x0A]).unwrap();
+        read(&mut bench, "sjis.txt");
+        let said = bench.run("create_file", &json!({"path": "sjis.txt", "content": "会员\n"}), dir.path(), &cancel).unwrap_err();
+        assert!(said.contains("Shift_JIS") && said.contains('员') && said.contains("Nothing was written"), "{said}");
+        assert_eq!(std::fs::read(dir.path().join("sjis.txt")).unwrap(), [0x93, 0xFA, 0x96, 0x7B, 0x0A]);
+        bench.run("create_file", &json!({"path": "sjis.txt", "content": "本日\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("sjis.txt")).unwrap(), [0x96, 0x7B, 0x93, 0xFA, 0x0A]);
+    }
+
+    /// A file shown only in part is not written whole over, as what was not shown would go; read on to its end, it is. Patched, a
+    /// write that was cut off no longer goes on from it.
+    #[test]
+    fn a_file_seen_in_part_is_not_written_whole_over() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join("long.txt"), (1..=600).map(|at| format!("line {at}\n")).collect::<String>()).unwrap();
+        bench.run("read_file", &json!({"path": "long.txt"}), dir.path(), &cancel).unwrap();
+        let write = json!({"path": "long.txt", "content": "short\n"});
+        let said = bench.run("create_file", &write, dir.path(), &cancel).unwrap_err();
+        assert!(said.contains("600 lines") && said.contains("shown 500") && said.contains("start_line=501"), "{said}");
+        bench.run("read_file", &json!({"path": "long.txt", "start_line": 501}), dir.path(), &cancel).unwrap();
+        bench.run("create_file", &write, dir.path(), &cancel).unwrap();
+        // (an outline shows its head, and not its parts after a gap)
+        let source: String = (0..60).map(|at| format!("fn part_{at}() {{\n{}}}\n", "    x();\n".repeat(14))).collect();
+        std::fs::write(dir.path().join("big.rs"), &source).unwrap();
+        assert!(bench.run("read_file", &json!({"path": "big.rs"}), dir.path(), &cancel).unwrap().contains("--- outline ---"));
+        assert!(bench.run("create_file", &json!({"path": "big.rs", "content": "fn main() {}\n"}), dir.path(), &cancel).unwrap_err().contains("shown 30"));
+        // A cut write's mark goes with a patch of its file.
+        std::fs::write(dir.path().join("page.html"), "<p>a</p>\n").unwrap();
+        bench.run("read_file", &json!({"path": "page.html"}), dir.path(), &cancel).unwrap();
+        bench.note_cut(dir.path().join("page.html"));
+        bench.run("apply_patch", &json!({"edits": [{"path": "page.html", "old_string": "a", "new_string": "b"}]}), dir.path(), &cancel).unwrap();
+        bench.run("create_file", &json!({"path": "page.html", "content": "<p>c</p>\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("page.html")).unwrap(), "<p>c</p>\n", "written whole, not added to");
+    }
+
+    /// An edit to a CRLF file whose new_string has CRLF already keeps one CR before each LF.
+    #[test]
+    fn an_edit_written_with_crlf_into_a_crlf_file_has_no_cr_more() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join("a.txt"), "one\r\ntwo\r\n").unwrap();
+        bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
+        bench.run("apply_patch", &json!({"edits": [{"path": "a.txt", "old_string": "one\ntwo", "new_string": "uno\r\ndos"}]}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"uno\r\ndos\r\n");
     }
 
     /// A file written again that cannot take its new text is as it was, not emptied, and nothing is left beside it.
