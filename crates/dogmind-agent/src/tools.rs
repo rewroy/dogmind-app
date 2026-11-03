@@ -140,6 +140,8 @@ struct Job {
     started: Instant,
     cancel: Arc<AtomicBool>,
     result: Arc<Mutex<Option<Result<String, String>>>>,
+    /// Its output has been in a report of all of them: the next such report says so in a line.
+    told: AtomicBool,
 }
 
 /// Commands going on in the background. They do not outlive the session that started them.
@@ -155,6 +157,16 @@ impl Drop for Jobs {
 }
 
 type CommandResult = Arc<Mutex<Option<Result<String, String>>>>;
+
+/// What a command started in the background runs with: not its timeout, which is how long a call waits for it, and a background one
+/// does not. As the model gave it, it was how long the job had before it was ended, and a long build was stopped in the middle without a word.
+fn background_arguments(arguments: &Value) -> Value {
+    let mut given = arguments.clone();
+    if let Some(fields) = given.as_object_mut() {
+        fields.remove("timeout_seconds");
+    }
+    given
+}
 
 /// A command on a thread of its own, with what ends it and where its result will be. It has minutes to itself unless the call says otherwise.
 fn spawn_command(arguments: &Value, workspace: &Path) -> (Arc<AtomicBool>, CommandResult) {
@@ -423,7 +435,7 @@ impl Workbench {
     }
 
     fn start_job(&mut self, arguments: &Value, workspace: &Path) -> Result<String, String> {
-        let (cancel, result) = spawn_command(arguments, workspace);
+        let (cancel, result) = spawn_command(&background_arguments(arguments), workspace);
         let id = self.add_job(arguments, cancel, result)?;
         Ok(format!("started as {id}. Go on with other work, and use command_status for it; do not wait in a loop."))
     }
@@ -431,7 +443,7 @@ impl Workbench {
     fn add_job(&mut self, arguments: &Value, cancel: Arc<AtomicBool>, result: CommandResult) -> Result<String, String> {
         let id = format!("job{}", self.jobs.0.len() + 1);
         let command = text_arg(arguments, "command")?.to_string();
-        self.jobs.0.push(Job { id: id.clone(), command, started: Instant::now(), cancel, result });
+        self.jobs.0.push(Job { id: id.clone(), command, started: Instant::now(), cancel, result, told: AtomicBool::new(false) });
         Ok(id)
     }
 
@@ -455,9 +467,18 @@ impl Workbench {
 
     fn job_status(&self, arguments: &Value) -> Result<String, String> {
         let wanted = arguments.get("id").and_then(Value::as_str);
+        // (asked for all of them, an ended one whose output was in such a report already is a line: all of them again each time pushed the
+        // middle ones out of the report, and the model was not told)
         let report = |job: &Job| match &*job.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
-            Some(Ok(output)) => format!("{} has ended: {}\n{output}", job.id, job.command),
-            Some(Err(error)) => format!("{} did not run: {}\n{error}", job.id, job.command),
+            Some(_) if wanted.is_none() && job.told.load(Ordering::Relaxed) => format!("{} has ended, as reported before (command_status with its id says it again): {}", job.id, job.command),
+            Some(Ok(output)) => {
+                job.told.store(true, Ordering::Relaxed);
+                format!("{} has ended: {}\n{output}", job.id, job.command)
+            }
+            Some(Err(error)) => {
+                job.told.store(true, Ordering::Relaxed);
+                format!("{} did not run: {}\n{error}", job.id, job.command)
+            }
             None => format!("{} is running, for {} s: {}", job.id, job.started.elapsed().as_secs(), job.command),
         };
         let lines: Vec<String> = self.jobs.0.iter().filter(|job| wanted.is_none_or(|id| job.id == id)).map(report).collect();
@@ -2102,6 +2123,21 @@ mod power_tests {
         let schemas = schemas_for(false, false, false, Vec::new());
         let command = schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "execute_command").unwrap();
         assert!(command["function"]["parameters"]["properties"].get("background").is_some());
+    }
+
+    /// A background job's output is reported once in a report of all of them, and after that in a line; asked by its id, again in full.
+    /// A background job runs without the timeout the model gave, which is how long a call waits.
+    #[test]
+    fn an_ended_jobs_output_is_reported_once_among_all_and_its_timeout_is_not_its_life() {
+        let mut bench = Workbench::default();
+        let done: CommandResult = Arc::new(Mutex::new(Some(Ok("BUILD OUTPUT".to_string()))));
+        bench.add_job(&json!({"command": "cargo build"}), Arc::new(AtomicBool::new(false)), done).unwrap();
+        let first = bench.job_status(&json!({})).unwrap();
+        let second = bench.job_status(&json!({})).unwrap();
+        let by_id = bench.job_status(&json!({"id": "job1"})).unwrap();
+        assert!(first.contains("BUILD OUTPUT") && !second.contains("BUILD OUTPUT") && second.contains("as reported before") && by_id.contains("BUILD OUTPUT"), "{first}\n{second}\n{by_id}");
+        let given = background_arguments(&json!({"command": "cargo build", "background": true, "timeout_seconds": 60}));
+        assert!(given.get("timeout_seconds").is_none() && given["command"] == "cargo build");
     }
 
     #[test]
