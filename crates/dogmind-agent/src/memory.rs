@@ -78,6 +78,21 @@ pub fn forget(folder: &Path, workspace: &Path, arguments: &Value) -> Result<Stri
     Ok(format!("{gone} notes forgotten"))
 }
 
+/// Every note kept for this project, then every one about the person, oldest first, with where it is kept: for the person to look at.
+pub fn notes(folder: &Path, workspace: &Path) -> Vec<(&'static str, String)> {
+    ["project", "user"].into_iter().flat_map(|scope| file_of(folder, workspace, scope).map(|file| notes_in(&file)).unwrap_or_default().into_iter().map(move |note| (scope, note))).collect()
+}
+
+/// One note gone, as the person chose it: `false` when it was not there any more.
+pub fn forget_one(folder: &Path, workspace: &Path, scope: &str, note: &str) -> Result<bool, String> {
+    let file = file_of(folder, workspace, scope)?;
+    let mut notes = notes_in(&file);
+    let Some(at) = notes.iter().position(|kept| kept == note) else { return Ok(false) };
+    notes.remove(at);
+    write(&file, &notes)?;
+    Ok(true)
+}
+
 /// For the prompt of a new session, the newest kept if they do not all fit.
 pub fn prompt_section(folder: &Path, workspace: &Path) -> String {
     let mut lines = Vec::new();
@@ -116,6 +131,19 @@ pub fn schemas() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_person_sees_every_note_and_takes_out_one_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (folder, workspace) = (dir.path().join("memory"), dir.path().join("work"));
+        for (note, scope) in [("Reu was a Newfoundland", "project"), ("answers in Japanese", "user"), ("Reu crossed the rainbow bridge", "project")] {
+            remember(&folder, &workspace, &json!({"note": note, "scope": scope})).unwrap();
+        }
+        assert_eq!(notes(&folder, &workspace), [("project", "Reu was a Newfoundland".to_string()), ("project", "Reu crossed the rainbow bridge".to_string()), ("user", "answers in Japanese".to_string())]);
+        assert!(forget_one(&folder, &workspace, "project", "Reu was a Newfoundland").unwrap());
+        assert!(!forget_one(&folder, &workspace, "project", "Reu was a Newfoundland").unwrap(), "already gone");
+        assert_eq!(notes(&folder, &workspace).len(), 2, "the other note that names Reu stays");
+    }
 
     #[test]
     fn a_note_reaches_later_sessions_of_its_scope() {
