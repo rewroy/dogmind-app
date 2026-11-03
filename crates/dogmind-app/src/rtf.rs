@@ -79,8 +79,10 @@ pub fn row(row: &Row) -> String {
     let (across, down) = row.padding;
     let left = if row.right { (row.column - row.width).max(0) } else { 0 };
     let text: Vec<String> = row.lines.iter().map(|line| words(line)).collect();
+    // A card's room round its words is its paragraph's indents and spacing: RichEdit gives a cell's own padding (trgaph, trpadd) only a few pixels, whatever it is asked.
+    let (gap, padded, paragraph) = if row.right { (0, 0, format!("\\li{across}\\ri{across}\\sb{down}\\sa{down}")) } else { (across, down, "\\sa0\\sb0".to_string()) };
     format!(
-        "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{color};}}\\trowd\\trgaph{across}\\trleft{left}\\trpaddt{down}\\trpaddb{down}\\trpaddft3\\trpaddfb3{span}\\clcfpat1\\clcbpat1\\clshdng10000{cell_span}\\cellx{end}\\pard\\intbl\\ql\\sl0\\sa0\\sb0\\f0\\fs{size}\\cf2 {body}\\cell\\row}}",
+        "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{color};}}\\trowd\\trgaph{gap}\\trleft{left}\\trpaddt{padded}\\trpaddb{padded}\\trpaddft3\\trpaddfb3{span}\\clcfpat1\\clcbpat1\\clshdng10000{cell_span}\\cellx{end}\\pard\\intbl\\ql\\sl0{paragraph}\\f0\\fs{size}\\cf2 {body}\\cell\\row}}",
         fonts = font_table(row.face),
         back = channels(row.back),
         color = channels(row.color),

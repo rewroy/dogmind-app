@@ -3610,7 +3610,8 @@ impl App {
         SelectObject(device, previous);
         ReleaseDC(self.transcript, device);
         // The body font is drawn a size larger in the transcript than it was measured here, and at the size the settings chose.
-        let padding = (260, 200);
+        // (in twips: about 24 pixels at each side and 15 over and under at 100%, where the words had been tight against the card)
+        let padding = (360, 220);
         let wanted = i64::from(widest) * 1440 * 115 * i64::from(text_scale()) / 10000 / i64::from(self.dpi) + i64::from(padding.0) * 2 + 120;
         let most = (self.text_twips * 4 / 5).max(800);
         let wanted = if images.is_empty() {
