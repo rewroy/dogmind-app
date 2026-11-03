@@ -473,7 +473,8 @@ A session goes on working when you open another.
 Ctrl+V\ta picture or a file
 
 # Keys
-Enter\tsend
+Enter\tsend; while it works, before its next step
+Ctrl+Enter\tsend after the work under way
 Shift+Enter\ta new line
 Esc\tstop, reject, or close
 Ctrl+K\tcommands, from anywhere
@@ -687,6 +688,40 @@ impl Outgoing {
     fn words(text: String) -> Outgoing {
         Outgoing { card: text.clone(), text, images: Vec::new() }
     }
+}
+
+/// What a button on a message waiting above the input does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum QueueAct {
+    /// Into the work under way, at its next step, rather than after it.
+    Now,
+    /// Back to the box, to be changed and sent again.
+    Edit,
+    /// Gone: it is not sent.
+    Drop,
+}
+
+impl QueueAct {
+    fn icon(self) -> &'static str {
+        match self {
+            QueueAct::Now => "arrow-up",
+            QueueAct::Edit => "pencil",
+            QueueAct::Drop => "x",
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            QueueAct::Now => "Send it into this work now",
+            QueueAct::Edit => "Edit",
+            QueueAct::Drop => "Discard",
+        }
+    }
+}
+
+/// The buttons a waiting message has, from the left: one that waits for the work under way to end, and is words only, can go into it now.
+fn queue_acts(can_go_now: bool) -> &'static [QueueAct] {
+    if can_go_now { &[QueueAct::Now, QueueAct::Edit, QueueAct::Drop] } else { &[QueueAct::Edit, QueueAct::Drop] }
 }
 
 /// How a message waiting above the input reads: its first line, and its pictures if any.
@@ -1628,8 +1663,10 @@ struct App {
     transcript_region: (i32, i32),
     /// Words sent to the turn under way that have not reached it yet.
     interjected: Vec<String>,
-    /// The crosses on what waits above the input.
-    queue_hits: Vec<(RECT, usize)>,
+    /// The buttons on what waits above the input: where, which message, and what each does.
+    queue_hits: Vec<(RECT, usize, QueueAct)>,
+    /// Those buttons as their tips stand now.
+    queue_tips: Vec<(RECT, QueueAct)>,
     /// The blocks of code in the transcript, each with a copy button while in view, and which it stands for.
     blocks: Vec<CodeBlock>,
     block_buttons: Vec<HWND>,
@@ -3820,6 +3857,33 @@ impl App {
         SendMessageW(self.tooltip, TTM_ADDTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
     }
 
+    /// Each button on the waiting messages says what it does, as a tip over its place in the window. Only a change is passed on: a tip begun
+    /// stays while the window is laid out again under it.
+    unsafe fn tip_queue_buttons(&mut self) {
+        let now: Vec<(RECT, QueueAct)> = self.queue_hits.iter().map(|(area, _, act)| (*area, *act)).collect();
+        if now.len() == self.queue_tips.len() && now.iter().zip(&self.queue_tips).all(|(a, b)| same_rect(&a.0, &b.0) && a.1 == b.1) {
+            return;
+        }
+        // (ids far from any window's handle, which the other tips are known by)
+        let id = |at: usize| usize::MAX - 64 - at;
+        let mut tool: TTTOOLINFOW = std::mem::zeroed();
+        tool.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        tool.hwnd = self.window;
+        for at in 0..self.queue_tips.len() {
+            tool.uId = id(at);
+            SendMessageW(self.tooltip, TTM_DELTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
+        }
+        for (at, (area, act)) in now.iter().enumerate() {
+            let text = wide(t(act.tip()));
+            tool.uFlags = TTF_SUBCLASS;
+            tool.uId = id(at);
+            tool.rect = *area;
+            tool.lpszText = text.as_ptr() as *mut u16;
+            SendMessageW(self.tooltip, TTM_ADDTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
+        }
+        self.queue_tips = now;
+    }
+
     /// These files are looked over, on another thread as a large one takes a while, and come to the next message. Why one cannot is said.
     unsafe fn attach_files(&mut self, paths: Vec<PathBuf>) {
         let poster = self.poster.clone();
@@ -4621,16 +4685,25 @@ impl App {
             }
             if !waiting.is_empty() {
                 let mut y = bottom - waiting_height;
-                for (at, (words, when)) in waiting.iter().take(3).enumerate() {
+                for (at, (words, when, now)) in waiting.iter().take(3).enumerate() {
                     let row = rect(left, y, column, s(ds::size::TEXT_ROW));
                     shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
+                    // Its buttons at the right end, the last of them where the one cross stood.
+                    let acts = queue_acts(*now);
+                    let step = s(26);
+                    let buttons = s(28) + (acts.len() as i32 - 1) * step;
+                    // (the words of when it goes keep a little way off the first button)
+                    let buttons_room = buttons + if acts.len() > 1 { s(ds::space::S) } else { 0 };
+                    for (place, act) in acts.iter().enumerate() {
+                        let x = left + column - buttons + place as i32 * step;
+                        let area = rect(x, y + s(ds::space::PIXEL), s(ds::space::XL), s(ds::space::XL));
+                        shapes.push(Shape::Icon { name: act.icon(), area, size: s(ds::space::M), color: theme::muted() });
+                        self.queue_hits.push((area, at, *act));
+                    }
                     let when = t(when);
                     let when_width = (text_width(self.fonts.small, when) + s(ds::space::S)).min(column * 45 / 100);
-                    shapes.push(Shape::Text { area: rect(left + column - s(28) - when_width, y, when_width, s(ds::size::TEXT_ROW)), text: when.into(), font: FontKind::Small, color: theme::faint(), flags: DT_RIGHT | ONE_LINE });
-                    shapes.push(Shape::Text { area: rect(left + s(ds::space::M), y, column - s(ds::size::BUTTON_PADDING) - when_width, s(ds::size::TEXT_ROW)), text: words.clone(), font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
-                    let cross = rect(left + column - s(28), y + s(ds::space::PIXEL), s(ds::space::XL), s(ds::space::XL));
-                    shapes.push(Shape::Icon { name: "x", area: cross, size: s(ds::space::M), color: theme::muted() });
-                    self.queue_hits.push((cross, at));
+                    shapes.push(Shape::Text { area: rect(left + column - buttons_room - when_width, y, when_width, s(ds::size::TEXT_ROW)), text: when.into(), font: FontKind::Small, color: theme::faint(), flags: DT_RIGHT | ONE_LINE });
+                    shapes.push(Shape::Text { area: rect(left + s(ds::space::M), y, (column - buttons_room - s(ds::space::M) - when_width).max(0), s(ds::size::TEXT_ROW)), text: words.clone(), font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
                     y += s(ds::size::QUEUE_STEP);
                 }
                 if waiting_more {
@@ -4638,6 +4711,7 @@ impl App {
                 }
                 bottom -= waiting_height + s(ds::space::XS);
             }
+            self.tip_queue_buttons();
             if band {
                 // As the lines wrap at this width, however many the text has. It scrolls past what fits.
                 SetWindowPos(self.note, std::ptr::null_mut(), 0, 0, column - s(ds::space::XXL), s(100), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -4958,7 +5032,7 @@ impl App {
         show(self.doc, false);
         // A row kept lit is one that is still there.
         if let Some(row) = self.hover_row {
-            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _)| area)).any(|area| same_rect(area, &row)) {
+            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).any(|area| same_rect(area, &row)) {
                 self.hover_row = None;
             }
         }
@@ -8519,6 +8593,12 @@ impl App {
     }
 
     unsafe fn send_message(&mut self) {
+        self.send_typed(true);
+    }
+
+    /// What is typed goes. `interjects`: while the model works, words reach it at its next step (Enter); otherwise they wait for the work to end
+    /// (Ctrl+Enter), to be sent into it from their row if wanted.
+    unsafe fn send_typed(&mut self, interjects: bool) {
         let text = get_text(self.composer);
         let text = text.trim().to_string();
         if text.is_empty() && self.attachments.is_empty() {
@@ -8538,7 +8618,7 @@ impl App {
         self.composer_typed_at = None;
         let images = std::mem::take(&mut self.attachments);
         self.show_attachments();
-        self.send_or_wait(Outgoing { card: text.clone(), text, images }, true);
+        self.send_or_wait(Outgoing { card: text.clone(), text, images }, interjects);
     }
 
     /// To the model now if it can take it, and otherwise when it can, shown above the input until then: a card in the transcript would stand in the
@@ -8588,46 +8668,79 @@ impl App {
         let _ = self.agent.commands.send(send_command(out));
     }
 
-    /// What waits above the input, in the order it will go: its words, and when it goes.
-    fn waiting_rows(&self) -> Vec<(String, &'static str)> {
+    /// What waits above the input, in the order it will go: its words, when it goes, and whether it can go into the work under way now.
+    fn waiting_rows(&self) -> Vec<(String, &'static str, bool)> {
         let then = if self.running { "after this work" } else if self.waiting_words() == "Connecting…" { "when connected" } else { "when the engine is ready" };
-        self.interjected.iter().map(|text| (waiting_words(text, 0), "at its next step")).chain(self.queued.iter().map(|item| (waiting_words(&item.card, item.images.len()), then))).collect()
+        // (what reaches a turn under way is words: pictures wait for it to end)
+        let now = self.running && self.connected;
+        self.interjected.iter().map(|text| (waiting_words(text, 0), "at its next step", false))
+            .chain(self.queued.iter().map(|item| (waiting_words(&item.card, item.images.len()), then, now && item.images.is_empty()))).collect()
     }
 
-    /// The cross on a waiting message: it does not go, and comes back to the box. One that has just reached the turn is past calling back.
-    unsafe fn call_back(&mut self, at: usize) {
-        let mut text = None;
-        let mut images = Vec::new();
+    /// A button on a waiting message.
+    unsafe fn queue_act(&mut self, at: usize, act: QueueAct) {
+        match act {
+            QueueAct::Now => self.send_into_work(at),
+            QueueAct::Edit => self.call_back(at),
+            QueueAct::Drop => {
+                self.take_waiting(at);
+                self.after_waiting_changed();
+            }
+        }
+    }
+
+    /// A message waiting for the work under way to end goes into it at its next step instead.
+    unsafe fn send_into_work(&mut self, at: usize) {
+        let Some(place) = at.checked_sub(self.interjected.len()) else { return };
+        if self.running && self.connected && self.queued.get(place).is_some_and(|item| item.images.is_empty()) {
+            let item = self.queued.remove(place);
+            self.send_or_wait(item, true);
+        }
+        self.after_waiting_changed();
+    }
+
+    /// A waiting message taken out of the line: its words and pictures, or None for words that have just reached the turn, past calling back.
+    fn take_waiting(&mut self, at: usize) -> Option<(String, Vec<Attached>)> {
         if at < self.interjected.len() {
             let words = self.interjected.remove(at);
             let mut waiting = self.agent.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(place) = waiting.iter().position(|known| *known == words) {
-                waiting.remove(place);
-                text = Some(words);
-            }
+            let place = waiting.iter().position(|known| *known == words)?;
+            waiting.remove(place);
+            Some((words, Vec::new()))
         } else if at - self.interjected.len() < self.queued.len() {
             let item = self.queued.remove(at - self.interjected.len());
-            text = Some(item.text);
-            images = item.images;
+            Some((item.text, item.images))
+        } else {
+            None
         }
-        if let Some(text) = text {
+    }
+
+    unsafe fn after_waiting_changed(&mut self) {
+        if self.queued.is_empty() && !self.running {
+            self.set_activity(String::new());
+        }
+        self.update_buttons();
+        self.layout();
+        self.focus_composer();
+    }
+
+    /// The pencil on a waiting message: it does not go, and comes back to the box to be changed. One that has just reached the turn is past calling
+    /// back.
+    unsafe fn call_back(&mut self, at: usize) {
+        if let Some((text, images)) = self.take_waiting(at) {
             let draft = get_text(self.composer);
             self.restoring_draft = true;
             set_text(self.composer, &if draft.trim().is_empty() { text } else { format!("{text}\r\n{draft}") });
             self.restoring_draft = false;
             SendMessageW(self.composer, EM_SETSEL, usize::MAX, -1);
-        }
-        for image in images {
-            if !self.attachments.iter().any(|attached| attached.path == image.path) && self.attachments.len() < attach::MOST_IMAGES {
-                self.attachments.push(image);
+            for image in images {
+                if !self.attachments.iter().any(|attached| attached.path == image.path) && self.attachments.len() < attach::MOST_IMAGES {
+                    self.attachments.push(image);
+                }
             }
         }
-        if self.queued.is_empty() && !self.running {
-            self.set_activity(String::new());
-        }
         self.show_attachments();
-        self.update_buttons();
-        self.focus_composer();
+        self.after_waiting_changed();
     }
 
     /// Back to what is being written, unless a dialog is open: its keys stay with it.
@@ -11099,7 +11212,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         WM_MOUSEMOVE if app.panel == Panel::Chat => {
             let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
             let within = |area: &RECT| x >= area.left && x < area.right && y >= area.top && y < area.bottom;
-            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
+            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
             app.hover_on(found);
             0
         }
@@ -11142,8 +11255,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.layout();
                 return 0;
             }
-            if let Some(at) = app.queue_hits.iter().find(|(area, _)| within(area)).map(|(_, at)| *at) {
-                app.call_back(at);
+            if let Some((at, act)) = app.queue_hits.iter().find(|(area, _, _)| within(area)).map(|(_, at, act)| (*at, *act)) {
+                app.queue_act(at, act);
             } else if let Some(file) = app.preview_hits.iter().find(|(area, _)| within(area)).map(|(_, file)| file.display().to_string()) {
                 app.open_preview(&file);
             } else if let Some(url) = app.dashboard_hit.as_ref().filter(|(area, _)| within(area)).map(|(_, url)| url.clone()) {
@@ -11800,7 +11913,7 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
         return true;
     }
     if key == VK_RETURN && message.hwnd == app.composer && !shift {
-        app.send_message();
+        app.send_typed(!control);
         return true;
     }
     if matches!(key, VK_PRIOR | VK_NEXT) && message.hwnd == app.composer && app.panel == Panel::Chat && app.has_messages {
@@ -12461,6 +12574,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             transcript_region: (0, 0),
             interjected: Vec::new(),
             queue_hits: Vec::new(),
+            queue_tips: Vec::new(),
             blocks: Vec::new(),
             block_buttons: (0..BLOCK_POOL).map(|at| make_button(window, ID_BLOCK_POOL + at as isize, "copy", ButtonKind::Icon, theme::code_back())).collect(),
             run_buttons: (0..RUN_POOL).map(|at| make_button(window, ID_RUN_POOL + at as isize, "chevron-right", ButtonKind::Icon, theme::background())).collect(),
@@ -12792,6 +12906,13 @@ mod tests {
         for word in words {
             assert!(lang::has_japanese(word), "{word}");
         }
+    }
+
+    #[test]
+    fn a_message_waiting_for_the_work_to_end_can_go_into_it() {
+        assert_eq!(queue_acts(true), [QueueAct::Now, QueueAct::Edit, QueueAct::Drop]);
+        assert_eq!(queue_acts(false), [QueueAct::Edit, QueueAct::Drop]);
+        assert!([QueueAct::Now, QueueAct::Edit, QueueAct::Drop].iter().all(|act| lang::has_japanese(act.tip())));
     }
 
     #[test]
