@@ -29,7 +29,7 @@ fn report_words_with(file: &str, address: Option<&str>) -> String {
 }
 
 fn version_line() -> String {
-    format!("Dogmind App {} ({}), Windows build {}", env!("CARGO_PKG_VERSION"), env!("DOGMIND_APP_BUILD"), crate::machine::windows_build().map_or("unknown".to_string(), |build| build.to_string()))
+    format!("Dogmind {} ({}), Windows build {}", env!("CARGO_PKG_VERSION"), env!("DOGMIND_APP_BUILD"), crate::machine::windows_build().map_or("unknown".to_string(), |build| build.to_string()))
 }
 
 fn seconds_now() -> u64 {
