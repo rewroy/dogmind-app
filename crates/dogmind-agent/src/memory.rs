@@ -28,13 +28,30 @@ fn notes_in(file: &Path) -> Vec<String> {
     std::fs::read_to_string(file).unwrap_or_default().lines().filter_map(|line| line.strip_prefix("- ")).map(str::to_string).collect()
 }
 
+// One change at a time, read and written whole: every session's agent and the window share these files. Two at once each read the
+// same notes and wrote back their own, and one note was gone.
+static FILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The notes, to change them: a file there that cannot be read is not taken for none, as the change would write over all of it.
+fn notes_to_change(file: &Path) -> Result<Vec<String>, String> {
+    match std::fs::read_to_string(file) {
+        Ok(text) => Ok(text.lines().filter_map(|line| line.strip_prefix("- ")).map(str::to_string).collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("{}: {error}: the notes cannot be read, and were not changed", file.display())),
+    }
+}
+
 fn write(file: &Path, notes: &[String]) -> Result<(), String> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
     let text: String = notes.iter().map(|note| format!("- {note}\n")).collect();
     let partial = file.with_extension("partial");
-    std::fs::write(&partial, text).map_err(|error| format!("{}: {error}", partial.display()))?;
+    // (on the disk before it takes the place: after a power cut, a rename that got there without its bytes leaves the notes empty)
+    std::fs::File::create(&partial).and_then(|mut out| {
+        std::io::Write::write_all(&mut out, text.as_bytes())?;
+        out.sync_all()
+    }).map_err(|error| format!("{}: {error}", partial.display()))?;
     std::fs::rename(&partial, file).map_err(|error| format!("{}: {error}", file.display()))
 }
 
@@ -48,7 +65,8 @@ pub fn remember(folder: &Path, workspace: &Path, arguments: &Value) -> Result<St
     }
     let scope = arguments.get("scope").and_then(Value::as_str).unwrap_or("project");
     let file = file_of(folder, workspace, scope)?;
-    let mut notes = notes_in(&file);
+    let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut notes = notes_to_change(&file)?;
     if notes.contains(&note) {
         return Ok("already remembered".to_string());
     }
@@ -65,9 +83,10 @@ pub fn forget(folder: &Path, workspace: &Path, arguments: &Value) -> Result<Stri
         return Err("words is required".into());
     }
     let mut gone = 0;
+    let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     for scope in ["project", "user"] {
         let file = file_of(folder, workspace, scope)?;
-        let mut notes = notes_in(&file);
+        let mut notes = notes_to_change(&file)?;
         let before = notes.len();
         notes.retain(|note| !note.to_lowercase().contains(&words));
         if notes.len() != before {
@@ -86,7 +105,8 @@ pub fn notes(folder: &Path, workspace: &Path) -> Vec<(&'static str, String)> {
 /// One note gone, as the person chose it: `false` when it was not there any more.
 pub fn forget_one(folder: &Path, workspace: &Path, scope: &str, note: &str) -> Result<bool, String> {
     let file = file_of(folder, workspace, scope)?;
-    let mut notes = notes_in(&file);
+    let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut notes = notes_to_change(&file)?;
     let Some(at) = notes.iter().position(|kept| kept == note) else { return Ok(false) };
     notes.remove(at);
     write(&file, &notes)?;
@@ -132,6 +152,24 @@ pub fn schemas() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Notes kept by many at once are all kept; notes that cannot be read are not written over.
+    #[test]
+    fn notes_kept_at_once_are_all_kept_and_unreadable_ones_are_not_written_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("C:/w");
+        std::thread::scope(|scope| {
+            for at in 0..8 {
+                let folder = dir.path();
+                scope.spawn(move || remember(folder, workspace, &json!({"note": format!("note {at}"), "scope": "user"})).unwrap());
+            }
+        });
+        assert_eq!(notes(dir.path(), workspace).len(), 8);
+        let file = dir.path().join("user.md");
+        std::fs::write(&file, [b'-', b' ', 0xFF, 0xFE, b'\n']).unwrap();
+        assert!(remember(dir.path(), workspace, &json!({"note": "one more", "scope": "user"})).unwrap_err().contains("not changed"));
+        assert_eq!(std::fs::read(&file).unwrap(), [b'-', b' ', 0xFF, 0xFE, b'\n']);
+    }
 
     #[test]
     fn the_person_sees_every_note_and_takes_out_one_alone() {

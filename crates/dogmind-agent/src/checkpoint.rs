@@ -101,7 +101,11 @@ impl Checkpoints {
         std::fs::create_dir_all(&self.folder).map_err(|error| format!("{}: {error}", self.folder.display()))?;
         let text = serde_json::to_string(&self.index).map_err(|error| error.to_string())?;
         let partial = self.folder.join("index.partial");
-        std::fs::write(&partial, text).map_err(|error| format!("{}: {error}", partial.display()))?;
+        // (on the disk before it takes the place: after a power cut, a rename that got there without its bytes leaves no turns to go back to)
+        std::fs::File::create(&partial).and_then(|mut out| {
+            std::io::Write::write_all(&mut out, text.as_bytes())?;
+            out.sync_all()
+        }).map_err(|error| format!("{}: {error}", partial.display()))?;
         std::fs::rename(&partial, self.folder.join(INDEX)).map_err(|error| format!("{}: {error}", self.folder.display()))
     }
 

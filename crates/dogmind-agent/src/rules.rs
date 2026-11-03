@@ -110,13 +110,31 @@ fn read(path: &Path) -> Vec<Rule> {
     std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }
 
+/// The rules, to change them. A file there that does not read as rules is moved aside first, to `NAME.unreadable-TIME.json`: taken for
+/// none, the next rule written took the place of all of them.
+fn read_to_change(path: &Path) -> Vec<Rule> {
+    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    match serde_json::from_slice(&bytes) {
+        Ok(rules) => rules,
+        Err(_) => {
+            let stem = path.file_stem().map_or(String::new(), |stem| stem.to_string_lossy().into_owned());
+            let _ = std::fs::rename(path, path.with_file_name(format!("{stem}.unreadable-{}.json", chrono::Local::now().format("%Y%m%d-%H%M%S"))));
+            Vec::new()
+        }
+    }
+}
+
 fn write(path: &Path, rules: &[Rule]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(rules).map_err(|error| error.to_string())?;
     let partial = path.with_extension("partial");
-    std::fs::write(&partial, text).map_err(|error| format!("{}: {error}", partial.display()))?;
+    // (on the disk before it takes the place: after a power cut, a rename that got there without its bytes leaves the file empty)
+    std::fs::File::create(&partial).and_then(|mut out| {
+        std::io::Write::write_all(&mut out, text.as_bytes())?;
+        out.sync_all()
+    }).map_err(|error| format!("{}: {error}", partial.display()))?;
     std::fs::rename(&partial, path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
@@ -133,7 +151,7 @@ pub fn list(path: &Path) -> Vec<Rule> {
 
 pub fn add(path: &Path, rule: Rule) -> Result<(), String> {
     let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut rules = read(path);
+    let mut rules = read_to_change(path);
     if !rules.contains(&rule) {
         rules.push(rule);
         write(path, &rules)?;
@@ -143,7 +161,7 @@ pub fn add(path: &Path, rule: Rule) -> Result<(), String> {
 
 pub fn remove(path: &Path, rule: &Rule) -> Result<(), String> {
     let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut rules = read(path);
+    let mut rules = read_to_change(path);
     rules.retain(|known| known != rule);
     write(path, &rules)
 }
@@ -155,6 +173,20 @@ mod tests {
 
     fn command(text: &str) -> Value {
         json!({ "command": text })
+    }
+
+    /// A rules file that does not read as rules is moved aside before the next rule is written, not written over with that one alone.
+    #[test]
+    fn rules_that_do_not_read_are_kept_aside_and_not_written_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        std::fs::write(&path, b"[{\"workspace\": \"C:\\\\w\", \"tool\"\0\0\0\0").unwrap();
+        let rule = Rule { workspace: PathBuf::from("C:\\w"), tool: COMMAND.to_string(), prefix: "npm test".into(), exact: false };
+        add(&path, rule.clone()).unwrap();
+        assert_eq!(list(&path), [rule]);
+        let aside: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.starts_with("permissions.unreadable-")).collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(std::fs::read(dir.path().join(&aside[0])).unwrap().starts_with(b"[{\"workspace\""), "what was there is kept");
     }
 
     #[test]
