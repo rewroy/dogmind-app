@@ -23,6 +23,13 @@ const MAX_COMMAND_ERR: usize = 6 * 1024;
 const MAX_READ: usize = 32 * 1024;
 /// A line of a minified file, as read: 65 KB of one once came back from a request for two lines.
 const MAX_LINE: usize = 2000;
+/// A file longer than this, read with no place in it, is shown as where its parts begin: a review that read every file from the top
+/// had a context of 197K tokens for 6,600 lines, most of them of no use to it.
+const OUTLINE_PAST: usize = 800;
+/// Lines of a file's head shown with its outline: what it says it is, and what it brings in.
+const OUTLINE_HEAD: usize = 30;
+/// Lines of an outline: past this, only the ones at the left edge.
+const OUTLINE_MOST: usize = 200;
 const LIST_LIMIT: usize = 300;
 const UNCHANGED_READ: &str = "--- the file has not changed since you read these same lines: they are above, and not repeated here ---";
 const MATCH_LIMIT: usize = 1000;
@@ -644,6 +651,15 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
     let hash = sha16(&bytes);
     let (text, encoding) = file_text(&bytes);
     let lines: Vec<&str> = text.lines().collect();
+    // A large file asked for with no place in it: where its parts begin, to read the one wanted, and not its first 500 lines, which stay
+    // in the context for the rest of the conversation whether they were the part or not.
+    let placed = arguments.get("start_line").is_some() || arguments.get("limit").is_some();
+    if !placed && lines.len() > OUTLINE_PAST {
+        let parts = outline(&lines);
+        if !parts.is_empty() {
+            return Ok((outlined(&lines, &parts, size), (path, hash)));
+        }
+    }
     let limit = arguments.get("limit").and_then(Value::as_i64).unwrap_or(500).clamp(1, 2000) as usize;
     let start = arguments.get("start_line").and_then(Value::as_i64).unwrap_or(1);
     let first = if start < 0 { lines.len().saturating_sub(start.unsigned_abs() as usize) } else { (start.max(1) as usize) - 1 };
@@ -674,6 +690,57 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
         out.push_str(&format!("--- {} more lines; continue with start_line={} ---\n", lines.len() - next, next + 1));
     }
     Ok((out, (path, hash)))
+}
+
+/// Where a file's parts begin, by line: functions, types, classes, sections, in the languages a project is mostly written in. Empty
+/// for a file of none of them, which is then read as any other.
+fn outline(lines: &[&str]) -> Vec<(usize, usize)> {
+    static STARTS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let starts = STARTS.get_or_init(|| {
+        regex::Regex::new(concat!(
+            r"^(?:",
+            // Rust
+            r"(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe|extern(?:\s+\x22[^\x22]*\x22)?)\s+)*(?:fn|struct|enum|trait|impl|mod|union|type|macro_rules!)\b",
+            // Python
+            r"|(?:async\s+)?def\s|class\s",
+            // JavaScript, TypeScript, Go, Java, C#, Kotlin, Swift
+            r"|(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|class|interface|enum|namespace)\b",
+            r"|func\s|(?:(?:public|private|protected|internal|static|final|override|virtual|sealed|partial|open)\s+)+[\w<>\[\],\s]+\(",
+            // Markdown
+            r"|#{1,4}\s",
+            r")"
+        ))
+        .unwrap()
+    });
+    let mut parts: Vec<(usize, usize)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(at, line)| {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            (indent <= 8 && starts.is_match(trimmed)).then_some((at, indent))
+        })
+        .collect();
+    if parts.len() > OUTLINE_MOST {
+        parts.retain(|(_, indent)| *indent == 0);
+        parts.truncate(OUTLINE_MOST);
+    }
+    parts
+}
+
+/// A large file, as its head and its outline: each part's first line with its number, to read with `start_line` and `limit`.
+fn outlined(lines: &[&str], parts: &[(usize, usize)], size: u64) -> String {
+    let shown = |line: &str| -> String { if line.len() > 160 { format!("{}…", &line[..line.floor_char_boundary(160)]) } else { line.to_string() } };
+    let mut out = format!("--- {} lines, {} KB: more than to read whole. Its first lines, then where its parts begin ---\n", lines.len(), size / 1024);
+    for (at, line) in lines.iter().enumerate().take(OUTLINE_HEAD) {
+        out.push_str(&format!("{}|{}\n", at + 1, shown(line)));
+    }
+    out.push_str("--- outline ---\n");
+    for (at, _) in parts.iter().filter(|(at, _)| *at >= OUTLINE_HEAD) {
+        out.push_str(&format!("{}|{}\n", at + 1, shown(lines[*at])));
+    }
+    out.push_str("--- read the part you need: read_file with start_line and limit, at a line above, or one search_files finds ---\n");
+    out
 }
 
 /// What a walk through a project does not go into, as `.gitignore` does not always say so: outside a repository it is not read at all.
@@ -2502,6 +2569,33 @@ mod tests {
         for line in ["git init ../other", "git init --template=x", "git init --separate-git-dir=C:\\x", "git status", "echo x && git init", "git init > C:\\x", "git init\ndel x", "git init -c core.hooksPath=x"] {
             assert_eq!(git_init_first(line), None, "{line}");
         }
+    }
+
+    /// A long file read with no place in it comes as its head and where its parts begin; asked for a place, it comes as lines, as before;
+    /// a long file of no language the outline knows is read as lines too.
+    #[test]
+    fn a_long_file_read_whole_comes_as_its_outline() {
+        let (dir, mut bench, cancel) = bench();
+        let mut source = String::from("//! What this module is.\nuse std::path::Path;\n");
+        for at in 0..60 {
+            source.push_str(&format!("\n/// Part {at}.\npub fn part_{at}(x: u32) -> u32 {{\n"));
+            for line in 0..14 {
+                source.push_str(&format!("    let v{line} = x + {at};\n"));
+            }
+            source.push_str("    x\n}\n");
+        }
+        std::fs::write(dir.path().join("big.rs"), &source).unwrap();
+        let out = bench.run("read_file", &json!({"path": "big.rs"}), dir.path(), &cancel).unwrap();
+        assert!(out.starts_with("--- ") && out.contains("--- outline ---") && out.contains("|pub fn part_59(x: u32) -> u32 {") && out.contains("start_line and limit"), "{}", &out[..out.len().min(600)]);
+        assert!(!out.contains("let v7 = x + 59;"), "the bodies are not in it");
+        assert!(out.len() < 8000, "{}", out.len());
+        // A place asked for is read as it was.
+        let part = bench.run("read_file", &json!({"path": "big.rs", "start_line": 100, "limit": 5}), dir.path(), &cancel).unwrap();
+        assert!(part.starts_with("100|") && !part.contains("outline"), "{part}");
+        // Lines of no language: read as lines.
+        std::fs::write(dir.path().join("big.log"), (0..1000).map(|at| format!("entry {at}\n")).collect::<String>()).unwrap();
+        let log = bench.run("read_file", &json!({"path": "big.log"}), dir.path(), &cancel).unwrap();
+        assert!(log.starts_with("1|entry 0") && log.contains("continue with start_line="), "{}", &log[..200]);
     }
 
     /// A line whose rest would be refused is refused before the app's `git init`: it says nothing was started, and nothing was.
