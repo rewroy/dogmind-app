@@ -255,10 +255,11 @@ const ID_BLOCK_POOL: isize = 340; // ..340 + BLOCK_POOL
 const BLOCK_POOL: usize = 12;
 const ID_MODAL_CLOSE: isize = 9600;
 const ID_NAV: isize = 9601; // ..+ NAV_POOL
-const NAV_POOL: usize = 9;
-const ID_THEME_SEGMENT: isize = 9610; // ..+ 3
+const NAV_POOL: usize = 10;
+const ID_THEME_SEGMENT: isize = 9640; // ..+ 3 (past ID_NAV's pool)
 const ID_TEXT_SIZE: isize = 9630; // ..+ TEXT_SIZES
 const ID_SKILL_TOGGLE: isize = 10000; // ..+ as many skills as there are
+const ID_MEMORY_REMOVE: isize = 10400; // ..+ as many notes as there are
 const ID_MODE_SELECT: isize = 9614;
 const ID_KEY_REPLACE: isize = 9615;
 const ID_KEY_REMOVE: isize = 9616;
@@ -1017,10 +1018,12 @@ enum Panel {
     Appearance,
     /// What the model can reach: the web, and other programs.
     Tools,
+    /// What the model keeps between sessions, for `/memory`.
+    Memory,
 }
 
 /// The places of the settings, in their list.
-const SETTINGS_PLACES: [(Panel, &str, &str); 9] = [
+const SETTINGS_PLACES: [(Panel, &str, &str); 10] = [
     (Panel::General, "settings", "General"),
     (Panel::Appearance, "sun", "Appearance"),
     (Panel::Providers, "plug", "Models and connections"),
@@ -1028,6 +1031,7 @@ const SETTINGS_PLACES: [(Panel, &str, &str); 9] = [
     (Panel::Permissions, "shield", "Permissions and safety"),
     (Panel::Tools, "wrench", "Tools"),
     (Panel::Skills, "book-open", "Skills"),
+    (Panel::Memory, "paw-print", "Memory"),
     (Panel::Instructions, "pencil", "Your instructions"),
     (Panel::About, "info", "About"),
 ];
@@ -1183,6 +1187,18 @@ impl Form {
         }
         let tall = text_height(self.fonts.small, words, self.width);
         self.shapes.push(Shape::Text { area: rect(0, self.y, self.width, tall + self.s(ds::space::HAIR)), text: words.to_string(), font: FontKind::Small, color, flags: DT_WORDBREAK });
+        self.y += tall + self.s(ds::space::M);
+    }
+
+    /// Words across the page with a button at their right, level with their first line: a row of a list the person can take things out of.
+    unsafe fn note_with_button(&mut self, words: &str, button: HWND) {
+        let height = self.s(ds::size::CONTROL);
+        let across = (text_width(self.fonts.body, &get_text(button)) + self.s(ds::space::XXL)).max(self.s(80));
+        let room = (self.width - across - self.s(ds::space::M)).max(self.s(80));
+        let tall = text_height(self.fonts.body, words, room).max(height);
+        self.shapes.push(Shape::Text { area: rect(0, self.y + self.s(ds::space::XS), room, tall), text: words.to_string(), font: FontKind::Body, color: theme::text(), flags: DT_WORDBREAK });
+        place(button, self.width - across, self.y, across, height);
+        self.used.push(button);
         self.y += tall + self.s(ds::space::M);
     }
 
@@ -1421,6 +1437,9 @@ struct App {
     size_segments: [HWND; TEXT_SIZES.len()],
     /// A switch for each skill found, made when the Skills page first needs it.
     skill_toggles: Vec<HWND>,
+    /// What the model keeps between sessions, as the Memory page last read it, and a button to take out each.
+    memory_notes: Vec<(&'static str, String)>,
+    memory_remove: Vec<HWND>,
     read_folder_add: HWND,
     read_folder_stop: HWND,
     read_folder_remove: Vec<HWND>,
@@ -4178,11 +4197,7 @@ impl App {
                 }
             }
             "plan" => self.on_menu(M_MODE + 3),
-            "memory" => {
-                let section = dogmind_agent::memory::prompt_section(&self.folder.join("memory"), &self.workspace);
-                let notes: Vec<&str> = section.lines().filter(|line| line.starts_with("- ")).collect();
-                self.say(&if notes.is_empty() { t("Nothing is kept yet. The model keeps what later sessions would want, and you can ask it to.").to_string() } else { notes.join("\n") });
-            }
+            "memory" => self.set_panel(Panel::Memory),
             "tools" => {
                 let closed = dogmind_agent::sandbox::closed_tool_folders();
                 if closed.is_empty() {
@@ -4882,6 +4897,7 @@ impl App {
         all.extend(self.size_segments);
         all.extend(self.mcp_trust.iter().copied());
         all.extend(self.skill_toggles.iter().copied());
+        all.extend(self.memory_remove.iter().copied());
         all.push(self.vision_delete);
         all.extend(self.read_folder_remove.iter().copied());
         all.extend([self.read_folder_add, self.read_folder_stop]);
@@ -5312,6 +5328,24 @@ impl App {
                     form.note(t("What a trusted server returns no longer makes later commands ask. Its own tools still ask."), theme::muted());
                 }
                 form.buttons(0, &[self.mcp_import]);
+                form.note(&log, log_color);
+            }
+            Panel::Memory => {
+                if !self.memory_notes.is_empty() {
+                    form.note(t("What the model keeps from one session to the next, and a new session reads. Remove what is wrong or should not be kept."), theme::muted());
+                }
+                for (scope, title) in [("project", t("This project")), ("user", t("You, in every project"))] {
+                    let mine: Vec<(usize, &String)> = self.memory_notes.iter().enumerate().filter(|(_, (kept, _))| *kept == scope).map(|(at, (_, note))| (at, note)).collect();
+                    if mine.is_empty() {
+                        continue;
+                    }
+                    form.section(title);
+                    for (at, note) in mine {
+                        if let Some(button) = self.memory_remove.get(at) {
+                            form.note_with_button(note, *button);
+                        }
+                    }
+                }
                 form.note(&log, log_color);
             }
             Panel::Skills => {
@@ -6238,6 +6272,18 @@ impl App {
                     self.list_rows.push(ListRow { title: turn.title.clone(), detail: format!("{}  ·  {files}{chat}", turn.at.get(..16).unwrap_or("")), active: false });
                 }
                 self.panel_log = t("Only the agent's own edits come back. What this overwrites is saved first.").into();
+            }
+            Panel::Memory => {
+                self.panel_title = t("Memory").into();
+                self.memory_notes = dogmind_agent::memory::notes(&self.folder.join("memory"), &self.workspace);
+                while self.memory_remove.len() < self.memory_notes.len() {
+                    let id = ID_MEMORY_REMOVE + self.memory_remove.len() as isize;
+                    self.memory_remove.push(make_button(self.pane, id, "", ButtonKind::Secondary, theme::background()));
+                }
+                for button in &self.memory_remove {
+                    set_text(*button, t("Remove"));
+                }
+                self.panel_log = if self.memory_notes.is_empty() { t("Nothing is kept yet. The model keeps what later sessions would want, and you can ask it to.").into() } else { String::new() };
             }
             Panel::Skills => {
                 self.panel_title = t("Skills").into();
@@ -11005,6 +11051,14 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     app.apply_text_size();
                     app.update_toggles();
                 }
+                _ if (ID_MEMORY_REMOVE..ID_MEMORY_REMOVE + app.memory_remove.len() as isize).contains(&id) => {
+                    if let Some((scope, note)) = app.memory_notes.get((id - ID_MEMORY_REMOVE) as usize).cloned() {
+                        match dogmind_agent::memory::forget_one(&app.folder.join("memory"), &app.workspace, scope, &note) {
+                            Ok(_) => app.set_panel(Panel::Memory),
+                            Err(error) => app.problem_in_panel(&error),
+                        }
+                    }
+                }
                 _ if (ID_SKILL_TOGGLE..ID_SKILL_TOGGLE + app.skill_toggles.len() as isize).contains(&id) => {
                     if let Some(name) = app.skills.get((id - ID_SKILL_TOGGLE) as usize).map(|skill| skill.name.clone()) {
                         let on = app.settings.skill_is_on(&name);
@@ -11951,6 +12005,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool) -> ExitCode {
             mcp_trust: Vec::new(),
             size_segments: std::array::from_fn(|at| make_button(pane, ID_TEXT_SIZE + at as isize, "", ButtonKind::Segment, theme::surface())),
             skill_toggles: Vec::new(),
+            memory_notes: Vec::new(),
+            memory_remove: Vec::new(),
             read_folder_add: make_button(pane, ID_READ_FOLDER_ADD, "", ButtonKind::Secondary, theme::background()),
             read_folder_stop: make_button(pane, ID_READ_FOLDER_STOP, "", ButtonKind::Secondary, theme::background()),
             read_folder_remove: Vec::new(),
