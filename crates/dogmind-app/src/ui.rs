@@ -4532,10 +4532,12 @@ impl App {
             // The session's name, as it scrolls under nothing: at a glance, which one this is.
             let strip = s(ds::size::TITLE_STRIP);
             let toggle = s(ds::size::ICON_BUTTON);
-            place(self.right_toggle, left + column - toggle, (strip - toggle) / 2, toggle, toggle);
+            // (at the right end of the conversation's own area, beside the panel it opens, not at the end of the column the words keep to)
+            let toggle_x = main_left + main_width - toggle - s(ds::space::M);
+            place(self.right_toggle, toggle_x, (strip - toggle) / 2, toggle, toggle);
             // (an empty session has no name to tell it by, and the dog says what it is)
             let (name, color) = if !self.session_title.is_empty() { (self.session_title.clone(), theme::text()) } else if self.has_messages { (t("New session").to_string(), theme::faint()) } else { (String::new(), theme::faint()) };
-            let title_room = if toggles { column - toggle - s(ds::space::S) } else { column };
+            let title_room = if toggles { column.min(toggle_x - s(ds::space::S) - left) } else { column };
             self.title_area = rect(left, 0, title_room, strip);
             shapes.push(Shape::Text { area: self.title_area, text: name, font: FontKind::Body, color, flags: ONE_LINE });
             // (what scrolls goes under an edge, and not into the name)
