@@ -263,16 +263,26 @@ pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf,
     Ok(copy.path)
 }
 
-/// Stub results for calls that have none, right after their assistant message.
+/// Stub results for calls that have none, right after their assistant message; and no result for a call that is not there (its line
+/// was what a crash cut), which a server refuses as surely.
 pub fn complete_tool_calls(messages: &mut Vec<Message>) {
     let mut at = 0;
     while at < messages.len() {
         let calls: Vec<String> = messages[at].tool_calls.iter().flatten().map(|call| call.id.clone()).collect();
-        at += 1;
+        if messages[at].role != "tool" {
+            at += 1;
+        }
         let mut answered = Vec::new();
         while at < messages.len() && messages[at].role == "tool" {
-            answered.extend(messages[at].tool_call_id.clone());
-            at += 1;
+            match messages[at].tool_call_id.clone().filter(|id| calls.contains(id) && !answered.contains(id)) {
+                Some(id) => {
+                    answered.push(id);
+                    at += 1;
+                }
+                None => {
+                    messages.remove(at);
+                }
+            }
         }
         for id in calls.iter().filter(|id| !answered.contains(id)) {
             messages.insert(at, Message::tool_result(id, "interrupted: this call did not finish"));
@@ -370,6 +380,35 @@ mod tests {
         assert_eq!(messages.iter().map(|m| m.content.as_deref().unwrap()).collect::<Vec<_>>(), ["s", "sum", "new"]);
         again.append(&Message::text("assistant", "more")).unwrap();
         assert_eq!(Session::open(&path).unwrap().2.len(), 4);
+    }
+
+    /// A call without its result gets one; a result whose call a crash cut out of the file, or one given twice, goes.
+    #[test]
+    fn every_call_has_one_result_and_every_result_its_call() {
+        let call = |id: &str| crate::message::ToolCall { id: id.into(), kind: "function".into(), function: crate::message::FunctionCall { name: "read_file".into(), arguments: "{}".into() } };
+        let asking = |ids: &[&str]| Message { role: "assistant".into(), tool_calls: Some(ids.iter().map(|id| call(id)).collect()), ..Message::default() };
+        let mut messages = vec![
+            Message::tool_result("lost", "its call is gone"),
+            Message::text("user", "go"),
+            Message::tool_result("cut", "its call was the line a crash cut"),
+            asking(&["a", "b"]),
+            Message::tool_result("a", "one"),
+            Message::tool_result("a", "one again"),
+            Message::text("user", "next"),
+            asking(&["c"]),
+        ];
+        complete_tool_calls(&mut messages);
+        let said: Vec<(String, Option<String>, Option<String>)> = messages.iter().map(|m| (m.role.clone(), m.tool_call_id.clone(), m.content.clone())).collect();
+        let tool = |id: &str, text: &str| ("tool".to_string(), Some(id.to_string()), Some(text.to_string()));
+        assert_eq!(said, [
+            ("user".to_string(), None, Some("go".to_string())),
+            ("assistant".to_string(), None, None),
+            tool("a", "one"),
+            tool("b", "interrupted: this call did not finish"),
+            ("user".to_string(), None, Some("next".to_string())),
+            ("assistant".to_string(), None, None),
+            tool("c", "interrupted: this call did not finish"),
+        ]);
     }
 
     #[test]
