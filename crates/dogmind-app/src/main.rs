@@ -18,6 +18,7 @@ mod preview;
 mod render;
 mod rtf;
 mod settings;
+mod textview;
 mod toolrun;
 mod ui;
 mod vision;

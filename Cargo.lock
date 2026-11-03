@@ -216,6 +216,7 @@ dependencies = [
  "tempfile",
  "webview2-com",
  "windows",
+ "windows-core",
  "windows-numerics",
  "windows-sys 0.59.0",
 ]
