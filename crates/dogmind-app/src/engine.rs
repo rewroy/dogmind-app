@@ -67,6 +67,8 @@ pub struct CatalogEntry {
     pub download_bytes: Option<u64>,
     pub vision_bytes: Option<u64>,
     pub drafter_bytes: Option<u64>,
+    /// Straydog says it runs on this PC as it is now. One that does not is short of graphics memory: shown greyed, and set up only when chosen.
+    pub runs: bool,
 }
 
 impl CatalogEntry {
@@ -121,17 +123,14 @@ pub struct Catalog {
     pub entries: Vec<CatalogEntry>,
     /// This PC's GPU and memory in a line, when Straydog says.
     pub machine: String,
-    /// When nothing can run here. `entries` is empty then.
+    /// When nothing can run here. `entries` has only bundles short of graphics memory then, if any.
     pub refusal: Option<Refusal>,
-    /// The models Straydog has that do not run here, each with why, in a line: a model that is simply not in the list reads as one this app
-    /// does not offer.
-    pub not_here: Vec<String>,
 }
 
 /// The bundles `straydog fetch --help` offers: `Model: QUANT (68.0 GB), QUANT (75.8 GB); Model: ...`. What it does not say
 /// is not offered, and Straydog's own choice always is.
 pub fn parse_catalog(help: &str) -> Vec<CatalogEntry> {
-    let mut entries = vec![CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, quant: None, name: t("The best for this PC").into(), origin: String::new(), detail: t("Straydog looks at this machine and chooses").into(), context: None, disk_bytes: None, licence: None }];
+    let mut entries = vec![CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, quant: None, name: t("The best for this PC").into(), origin: String::new(), detail: t("Straydog looks at this machine and chooses").into(), context: None, disk_bytes: None, licence: None, runs: true }];
     for line in help.lines().filter(|line| line.contains(" GB)")) {
         let line = line.split(". ").next().unwrap_or(line);
         for part in line.split(';') {
@@ -145,7 +144,7 @@ pub fn parse_catalog(help: &str) -> Vec<CatalogEntry> {
                     continue;
                 }
                 if let Some(origin) = origin(model, quant) {
-                    entries.push(CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, quant: Some(quant.to_string()), name: format!("{model} {quant}"), origin, detail: size.to_string(), context: None, disk_bytes: None, licence: licence_of(model) });
+                    entries.push(CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, quant: Some(quant.to_string()), name: format!("{model} {quant}"), origin, detail: size.to_string(), context: None, disk_bytes: None, licence: licence_of(model), runs: true });
                 }
             }
         }
@@ -203,9 +202,10 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     let word = |item: &Value, name: &str| item.get(name).and_then(Value::as_str).unwrap_or("").to_string();
     let bundles = value.get("bundles")?.as_array()?;
     let mut entries = Vec::new();
+    // Those short of graphics memory as this PC is now: after the rest, greyed and not recommended, and there to choose for whoever wants to
+    // try (with what else holds the card closed, it may start).
+    let mut short_entries = Vec::new();
     let mut shortest: Option<(f64, String, String)> = None;
-    // (each model that does not run here, by the least any of its bundles needs: a model, not a bundle, is what does not run)
-    let mut not_here: Vec<(String, Option<(f64, String, String)>)> = Vec::new();
     for bundle in bundles {
         let quant = word(bundle, "quant");
         if quant.is_empty() {
@@ -213,53 +213,57 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
         }
         let model = word(bundle, "model");
         let Some(origin) = origin(&model, &quant) else { continue };
-        if !bundle.get("runs").and_then(Value::as_bool).unwrap_or(false) {
-            let short = memory_short(&word(bundle, "note")).map(|(needs, has)| {
-                let amount = needs.split(' ').next().and_then(|number| number.parse().ok()).unwrap_or(f64::MAX);
-                (amount, needs, has)
-            });
-            if let Some((amount, needs, has)) = &short {
-                if shortest.as_ref().is_none_or(|(least, ..)| amount < least) {
-                    shortest = Some((*amount, needs.clone(), has.clone()));
-                }
+        let runs = bundle.get("runs").and_then(Value::as_bool).unwrap_or(false);
+        let short = if runs { None } else { memory_short(&word(bundle, "note")) };
+        if let Some((needs, has)) = &short {
+            let amount = needs.split(' ').next().and_then(|number| number.parse().ok()).unwrap_or(f64::MAX);
+            if shortest.as_ref().is_none_or(|(least, ..)| amount < *least) {
+                shortest = Some((amount, needs.clone(), has.clone()));
             }
-            match not_here.iter_mut().find(|(name, _)| *name == model) {
-                Some((_, least)) => {
-                    if short.as_ref().is_some_and(|(amount, ..)| least.as_ref().is_none_or(|(had, ..)| amount < had)) {
-                        *least = short;
-                    }
-                }
-                None => not_here.push((model, short)),
-            }
+        }
+        // (one that needs a GPU this PC has not, or a newer one, is not offered at all)
+        if !runs && short.is_none() {
             continue;
         }
         let download = bundle.get("download_bytes").and_then(Value::as_u64).unwrap_or(0);
         let disk_bytes = bundle.get("disk_bytes").and_then(Value::as_u64);
-        let recommended = bundle.get("recommended").and_then(Value::as_bool).unwrap_or(false);
+        let recommended = runs && bundle.get("recommended").and_then(Value::as_bool).unwrap_or(false);
         let size = match disk_bytes {
             Some(disk) => tf("{0} to download, {1} on the drive", &[&gb(download), &gb(disk)]),
             None => tf("{0} to download", &[&gb(download)]),
         };
-        let how = how_it_runs(&word(bundle, "fit"));
+        let how = match &short {
+            Some((needs, has)) => tf("Not recommended: it needs {0} of graphics memory free, and this PC has {1} for it", &[needs, has]),
+            None => how_it_runs(&word(bundle, "fit")).to_string(),
+        };
         let extra = |name: &str| bundle.get("extras").and_then(Value::as_array).into_iter().flatten().find(|extra| word(extra, "name") == name).and_then(|extra| extra.get("download_bytes")).and_then(Value::as_u64);
         let entry = CatalogEntry {
             download_bytes: Some(download),
             vision_bytes: extra("vision"),
             drafter_bytes: extra("mtp"),
-            name: format!("{} {quant}", word(bundle, "model")),
-            licence: licence_of(&word(bundle, "model")),
+            name: format!("{model} {quant}"),
+            licence: licence_of(&model),
             origin,
-            detail: format!("{}{size}{}{how}", if recommended { t("Recommended for this PC  ·  ") } else { "" }, if how.is_empty() { "" } else { "  ·  " }),
+            detail: if short.is_some() {
+                format!("{how}  ·  {size}")
+            } else {
+                format!("{}{size}{}{how}", if recommended { t("Recommended for this PC  ·  ") } else { "" }, if how.is_empty() { "" } else { "  ·  " })
+            },
             quant: Some(quant),
             context: bundle.get("context").and_then(Value::as_u64),
             disk_bytes,
+            runs,
         };
-        if recommended {
+        if !runs {
+            short_entries.push(entry);
+        } else if recommended {
             entries.insert(0, entry);
         } else {
             entries.push(entry);
         }
     }
+    let runnable = !entries.is_empty();
+    entries.extend(short_entries);
     let machine = value.get("machine");
     let gpus: Vec<String> = machine.and_then(|machine| machine.get("gpus")).and_then(Value::as_array).into_iter().flatten().map(|gpu| {
         format!("{} ({})", word(gpu, "name"), gb(gpu.get("total_bytes").and_then(Value::as_u64).unwrap_or(0)))
@@ -269,7 +273,8 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     if ram > 0 {
         parts.push(tf("{0} of memory", &[&gb(ram)]));
     }
-    let refusal = if !entries.is_empty() {
+    // (said whether or not the list has some that are short: they are there to try, and not what this PC runs)
+    let refusal = if runnable {
         None
     } else if gpus.is_empty() {
         let said = machine.map_or(String::new(), |machine| word(machine, "gpu_error"));
@@ -277,12 +282,7 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     } else {
         shortest.map(|(_, needs, has)| Refusal::TooLittleMemory { needs, has })
     };
-    // (a model of which some bundle runs is in the list already)
-    let not_here = not_here.into_iter().filter(|(model, _)| !entries.iter().any(|entry| entry.name.starts_with(&format!("{model} ")))).map(|(model, short)| match short {
-        Some((_, needs, has)) => tf("{0} does not run on this PC: it needs {1} of graphics memory free, and this PC has {2} for it.", &[&model, &needs, &has]),
-        None => tf("{0} does not run on this PC.", &[&model]),
-    }).collect();
-    Some(Catalog { entries, machine: parts.join("  ·  "), refusal, not_here })
+    Some(Catalog { entries, machine: parts.join("  ·  "), refusal })
 }
 
 /// What `straydog --version` says.
@@ -389,6 +389,14 @@ pub fn vision_arguments(installed: &crate::vision::Installed, config: &Path) -> 
     // (the model is there: without this its shards are all read again, for one small file)
     args.extend(["--no-dspark".to_string(), "--vision-only".to_string()]);
     args
+}
+
+/// Whether this Straydog's setup takes `--force`: a bundle it finds too big for this PC, set up because the person chose it.
+pub fn setup_can_force(straydog: &Path) -> bool {
+    let mut command = Command::new(straydog);
+    command.args(["setup", "--help"]).stdin(Stdio::null());
+    hidden(&mut command);
+    command.output().is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("--force"))
 }
 
 pub fn setup_arguments(quant: Option<&str>, folder: &Path, config: &Path, drafter: bool, vision: bool) -> Vec<String> {
@@ -1024,22 +1032,28 @@ mod tests {
         assert_eq!(small.machine, "RTX 2060 (6 GB)  ·  34 GB of memory");
     }
 
-    /// What Straydog 0.1.1 says on a 16 GB card: DeepSeek does not run, and the list says so instead of leaving it out unsaid.
+    /// What Straydog 0.1.1 says on a 16 GB card: DeepSeek does not run. It is in the list after the rest, greyed and not recommended, with why,
+    /// for whoever wants to try.
     #[test]
-    fn a_model_that_does_not_run_here_is_named_with_why() {
+    fn a_model_short_of_graphics_memory_is_listed_after_the_rest_not_recommended() {
         let note = |needs: &str| format!("needs {needs} GiB of VRAM free, with what `auto` leaves for the desktop; this machine has 12.2 GiB for it");
         let list = format!(r#"{{"machine":{{"gpus":[{{"name":"RTX 5070 Ti","total_bytes":17179869184}}],"ram_bytes":66571993088}},"bundles":[
             {{"model":"DeepSeek-V4.1-Flash","quant":"GSQ-RCO-IQ2_XXS","download_bytes":1,"runs":false,"fit":"too_little_vram","note":"{}"}},
             {{"model":"DeepSeek-V4.1-Flash","quant":"GSQ-RCO-IQ2_XS","download_bytes":1,"runs":false,"fit":"too_little_vram","note":"{}"}},
             {{"model":"Qwen3.8-Flash-Next","quant":"IQ2_XS","download_bytes":1,"runs":true,"fit":"ram"}}]}}"#, note("16.9"), note("14.8"));
         let catalog = parse_list(&list, true).unwrap();
-        assert_eq!(catalog.entries.len(), 1);
+        let names: Vec<(&str, bool)> = catalog.entries.iter().map(|entry| (entry.name.as_str(), entry.runs)).collect();
+        assert_eq!(names, [("Qwen3.8-Flash-Next IQ2_XS", true), ("DeepSeek-V4.1-Flash GSQ-RCO-IQ2_XXS", false), ("DeepSeek-V4.1-Flash GSQ-RCO-IQ2_XS", false)]);
         assert_eq!(catalog.refusal, None);
-        assert_eq!(catalog.not_here.len(), 1);
-        assert!(catalog.not_here[0].starts_with("DeepSeek-V4.1-Flash") && catalog.not_here[0].contains("14.8 GiB") && catalog.not_here[0].contains("12.2 GiB") && !catalog.not_here[0].contains("16.9"), "{:?}", catalog.not_here);
-        // (and with nothing that runs, the least of it is the refusal's, in these words too)
+        assert!(catalog.entries[1].detail.contains("16.9 GiB") && catalog.entries[1].detail.contains("12.2 GiB") && !catalog.entries[1].detail.starts_with("Recommended"), "{}", catalog.entries[1].detail);
+        // (and with nothing that runs, the least of it is the refusal's, in these words too; what is short is still there to try)
         let none = list.replace(r#""runs":true"#, &format!(r#""runs":false,"note":"{}""#, note("11.0")));
-        assert_eq!(parse_list(&none, true).unwrap().refusal, Some(Refusal::TooLittleMemory { needs: "11.0 GiB".into(), has: "12.2 GiB".into() }));
+        let none = parse_list(&none, true).unwrap();
+        assert_eq!(none.refusal, Some(Refusal::TooLittleMemory { needs: "11.0 GiB".into(), has: "12.2 GiB".into() }));
+        assert_eq!(none.entries.len(), 3);
+        // (one that needs a GPU this PC has not is not offered at all)
+        let no_gpu = list.replace(&note("16.9"), "needs a GPU");
+        assert_eq!(parse_list(&no_gpu, true).unwrap().entries.len(), 2);
     }
 
     #[test]
