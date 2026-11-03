@@ -361,7 +361,8 @@ pub fn engine_arguments(settings: &Settings, folder: &Path) -> Vec<String> {
 /// For a model that is there and has no vision file: setup does not fetch again what it has, and checks it. The drafter stays as the settings have it, for setup rewrites them; a DeepSeek drafter that is not there is not wanted here.
 pub fn vision_arguments(installed: &crate::vision::Installed, config: &Path) -> Vec<String> {
     let mut args = setup_arguments(Some(&installed.quant), &installed.model, config, installed.drafter, true);
-    args.push("--no-dspark".into());
+    // (the model is there: without this its shards are all read again, for one small file)
+    args.extend(["--no-dspark".to_string(), "--vision-only".to_string()]);
     args
 }
 
@@ -1052,6 +1053,7 @@ mod tests {
         let chosen = setup_arguments(None, Path::new("M"), Path::new("C"), true, false);
         assert!(chosen.contains(&"--no-vision".to_string()), "left out when asked");
         assert!(!chosen.contains(&"--no-mtp".to_string()) && !chosen.contains(&"--quant".to_string()));
+        assert!(!chosen.contains(&"--vision-only".to_string()), "only for a model already there");
     }
 
     #[test]
