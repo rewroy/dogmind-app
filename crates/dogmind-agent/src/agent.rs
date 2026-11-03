@@ -279,6 +279,15 @@ pub fn start(config: Config, events: Sender<Event>, wake: Box<dyn Fn() + Send>) 
     Handle { commands, cancel, live, interject }
 }
 
+/// A call's arguments as every step reads them, the gate and the run alike: none at all is an empty object.
+fn parse_arguments(text: &str) -> serde_json::Result<Value> {
+    serde_json::from_str(if text.trim().is_empty() { "{}" } else { text })
+}
+
+fn arguments_of(call: &crate::message::ToolCall) -> Option<Value> {
+    parse_arguments(&call.function.arguments).ok()
+}
+
 /// `run`, with the person's Stop passed on to `halt` within 15 ms of it: a stream that the app stops too has a flag of its own, and the
 /// person's is never set by anything else.
 fn with_the_persons_stop<R>(person: &AtomicBool, halt: &AtomicBool, run: impl FnOnce() -> R) -> R {
@@ -1547,34 +1556,30 @@ impl Agent {
     /// Whether a call can run with others. One that is not JSON goes alone, to be told so: taken as no arguments, a listing would answer it with the workspace's top.
     /// One that opens a picture goes alone too, as its answer is more than words.
     fn free_read(&self, call: &crate::message::ToolCall) -> bool {
-        let text = call.function.arguments.trim();
-        let Ok(arguments) = serde_json::from_str::<Value>(if text.is_empty() { "{}" } else { text }) else { return false };
+        let Some(arguments) = arguments_of(call) else { return false };
         // (the gate first: to see whether it is a picture is to open it)
         self.gate.check(&call.function.name, &arguments, &self.workspace) == Verdict::Allow && !(call.function.name == "read_file" && self.picture_at(&arguments).is_some())
     }
 
     fn run_reads(&mut self, calls: &[crate::message::ToolCall]) -> usize {
         let started = Instant::now();
-        for call in calls {
-            let arguments: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-            self.emit(Event::ToolStarted { id: call.id.clone(), tool: call.function.name.clone(), summary: tools::summary(&call.function.name, &arguments) });
+        // (each parsed as free_read did when it let it through, so what runs is what the gate saw)
+        let parsed: Vec<Value> = calls.iter().map(|call| arguments_of(call).unwrap_or_default()).collect();
+        for (call, arguments) in calls.iter().zip(&parsed) {
+            self.emit(Event::ToolStarted { id: call.id.clone(), tool: call.function.name.clone(), summary: tools::summary(&call.function.name, arguments) });
         }
         let (workspace, baseline, cancel, secrets) = (self.workspace.clone(), self.bench.baseline.clone(), self.cancel.clone(), self.gate.secrets.clone());
         let results: Vec<_> = std::thread::scope(|scope| {
-            let running: Vec<_> = calls.iter().map(|call| {
+            let running: Vec<_> = calls.iter().zip(&parsed).map(|(call, arguments)| {
                 let (workspace, baseline, cancel, secrets) = (&workspace, &baseline, &cancel, &secrets);
-                scope.spawn(move || {
-                    let arguments: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-                    Workbench::run_read(&call.function.name, &arguments, workspace, baseline.as_deref(), secrets, cancel)
-                })
+                scope.spawn(move || Workbench::run_read(&call.function.name, arguments, workspace, baseline.as_deref(), secrets, cancel))
             }).collect();
             running.into_iter().map(|thread| thread.join().unwrap_or((Err("the tool panicked".into()), None))).collect()
         });
         let mut failures = 0;
-        for (call, (result, seen)) in calls.iter().zip(results) {
-            let arguments: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+        for ((call, arguments), (result, seen)) in calls.iter().zip(&parsed).zip(results) {
             let result = match seen {
-                Some((path, hash)) => self.bench.after_read(&arguments, path, hash, result),
+                Some((path, hash)) => self.bench.after_read(arguments, path, hash, result),
                 None => result,
             };
             failures += usize::from(result.is_err());
@@ -1586,7 +1591,7 @@ impl Agent {
     fn run_one(&mut self, call: &crate::message::ToolCall) -> usize {
         let name = call.function.name.as_str();
         let started = Instant::now();
-        let arguments: Value = match serde_json::from_str(if call.function.arguments.trim().is_empty() { "{}" } else { &call.function.arguments }) {
+        let arguments: Value = match parse_arguments(&call.function.arguments) {
             Ok(arguments) => arguments,
             Err(error) => {
                 self.emit(Event::ToolStarted { id: call.id.clone(), tool: name.to_string(), summary: String::new() });
@@ -1677,8 +1682,7 @@ impl Agent {
             }
             messages.push(completion.message());
             for call in &completion.tool_calls {
-                let text = call.function.arguments.trim();
-                let arguments: Value = serde_json::from_str(if text.is_empty() { "{}" } else { text }).unwrap_or(Value::Null);
+                let arguments: Value = parse_arguments(&call.function.arguments).unwrap_or(Value::Null);
                 let name = call.function.name.as_str();
                 self.emit(Event::ToolProgress { id: id.to_string(), tool: name.to_string(), summary: tools::summary(name, &arguments) });
                 let result = if !tools::HELPER_TOOLS.contains(&name) {
