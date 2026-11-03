@@ -217,6 +217,52 @@ pub fn rename(path: &Path, title: &str) -> Result<(), String> {
     writeln!(file, "{text}").map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// A new session beside this one, with its conversation through its `through`th message (from 0): to go on from there another way, as
+/// DeepSeek Harness's fork does. It has the workspace, the tools this one was offered, its mark of web content, and the pictures of the
+/// messages it keeps; `title`, when given, is its name. This one is only read. What changed in the workspace since is not undone: a branch
+/// of the conversation, not of the files.
+pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf, String> {
+    let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let (mut workspace, mut messages) = (PathBuf::new(), Vec::new());
+    for line in text.lines() {
+        match serde_json::from_str(line) {
+            Ok(Line::Meta { workspace: place, .. }) => workspace = place,
+            Ok(Line::Message { message }) => messages.push(message),
+            Ok(Line::Snapshot { messages: all }) => messages = all,
+            _ => {}
+        }
+    }
+    if through >= messages.len() {
+        return Err(format!("{}: it has {} messages, not {}", path.display(), messages.len(), through + 1));
+    }
+    messages.truncate(through + 1);
+    complete_tool_calls(&mut messages);
+    let folder = path.parent().ok_or_else(|| format!("{}: no folder", path.display()))?;
+    let now = chrono::Local::now();
+    let mut copy = Session::create(folder, &workspace, &now.format("%Y-%m-%d %H:%M:%S %:z").to_string(), &now.format("%Y%m%d-%H%M%S").to_string())?;
+    if let Some(tools) = tools_of(path) {
+        copy.set_tools(&tools)?;
+    }
+    if web_seen(path) {
+        copy.mark_web_seen()?;
+    }
+    for message in &messages {
+        copy.append(message)?;
+    }
+    if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+        copy.write(&Line::Title { title: title.to_string() })?;
+    }
+    let (from, to) = (crate::images::folder_of(path), crate::images::folder_of(&copy.path));
+    for image in messages.iter().flat_map(|message| &message.images) {
+        // (one gone from the original is gone from the branch too: it says so where it would show)
+        if from.join(&image.file).is_file() {
+            fs::create_dir_all(&to).map_err(|error| format!("{}: {error}", to.display()))?;
+            fs::copy(from.join(&image.file), to.join(&image.file)).map_err(|error| format!("{}: {error}", to.display()))?;
+        }
+    }
+    Ok(copy.path)
+}
+
 /// Stub results for calls that have none, right after their assistant message.
 pub fn complete_tool_calls(messages: &mut Vec<Message>) {
     let mut at = 0;
@@ -277,6 +323,36 @@ mod tests {
 
     fn call(id: &str) -> ToolCall {
         ToolCall { id: id.into(), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: "{}".into() } }
+    }
+
+    #[test]
+    fn a_branch_has_the_conversation_through_its_message_and_its_pictures_and_the_original_is_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261103-1").unwrap();
+        session.set_tools(&serde_json::json!([{"function": {"name": "read_file"}}])).unwrap();
+        session.append(&Message::text("system", "s")).unwrap();
+        let mut asked = Message::text("user", "look at this");
+        asked.images.push(crate::message::ImageRef { file: "a.png".into(), media_type: "image/png".into(), width: 1, height: 1 });
+        session.append(&asked).unwrap();
+        session.append(&Message::text("assistant", "first answer")).unwrap();
+        session.append(&Message::text("user", "then this")).unwrap();
+        session.append(&Message::text("assistant", "second answer")).unwrap();
+        let path = session.path.clone();
+        drop(session);
+        fs::create_dir_all(crate::images::folder_of(&path)).unwrap();
+        fs::write(crate::images::folder_of(&path).join("a.png"), b"png").unwrap();
+        let before = fs::read(&path).unwrap();
+        let branch = fork(&path, 2, Some("a title (branch)")).unwrap();
+        assert_ne!(branch, path);
+        assert_eq!(fs::read(&path).unwrap(), before, "the original is only read");
+        let (_, workspace, messages) = Session::open(&branch).unwrap();
+        assert_eq!(workspace, Path::new("C:/w"));
+        assert_eq!(messages.iter().map(|m| m.content.as_deref().unwrap()).collect::<Vec<_>>(), ["s", "look at this", "first answer"]);
+        assert_eq!(fs::read(crate::images::folder_of(&branch).join("a.png")).unwrap(), b"png");
+        assert!(tools_of(&branch).is_some());
+        let listed = list(dir.path());
+        assert!(listed.iter().any(|summary| summary.path == branch && summary.title == "a title (branch)"), "{listed:?}");
+        assert!(fork(&path, 9, None).is_err());
     }
 
     #[test]

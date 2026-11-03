@@ -281,6 +281,8 @@ const ID_READ_FOLDER_ADD: isize = 9650;
 const ID_READ_FOLDER_STOP: isize = 9651;
 const ID_READ_FOLDER_REMOVE: isize = 9800; // ..+ as many folders as there are
 const ID_RUN_POOL: isize = 380; // ..380 + RUN_POOL
+/// Beside each copy button of an answer, one that branches the conversation from it.
+const ID_FORK_POOL: isize = 400; // ..400 + COPY_POOL
 const RUN_POOL: usize = 12;
 const TIMER_COPIED: usize = 3;
 const TIMER_SEARCH: usize = 4;
@@ -1382,8 +1384,8 @@ enum Style {
     Bad,
 }
 
-/// Where an answer's time begins in its row, in twips: past its copy button, an icon button wide at 100%, and a little room.
-const ANSWERED_AT_TAB: i32 = (ds::size::ICON_BUTTON + 10) * 15;
+/// Where an answer's time begins in its row, in twips: past its copy and branch buttons, each an icon button wide at 100%, and a little room.
+const ANSWERED_AT_TAB: i32 = (2 * ds::size::ICON_BUTTON + 12) * 15;
 const PFM_ALIGNMENT: u32 = 0x0000_0008;
 const PFM_RIGHTINDENT: u32 = 0x0000_0002;
 const PFA_LEFT: u16 = 1;
@@ -1491,6 +1493,8 @@ struct App {
     help_button: HWND,
     doc: HWND,
     copy_buttons: Vec<HWND>,
+    /// Beside each copy button, its answer's branch button: the conversation through that answer, as a session of its own.
+    fork_buttons: Vec<HWND>,
     /// Where each answer ends in the transcript, and its text.
     answers: Vec<(i32, String)>,
     /// Each card of what the person wrote, in order: its corners are drawn over.
@@ -3244,20 +3248,29 @@ impl App {
         let hover = self.copy_hover;
         in_view.retain(|(at, _)| Some(*at) == last || Some(*at) == hover);
         let used = in_view.len().min(self.copy_buttons.len());
+        // (a branch is of a saved session, and not of an answer still coming)
+        let forks = self.current_session.is_some();
         for (slot, (at, point)) in in_view.into_iter().rev().take(used).enumerate() {
-            let button = self.copy_buttons[slot];
-            let place = rect(area.left + point.x - scale(dpi, 2), area.top + point.y, size, size);
-            let showing = IsWindowVisible(button) != 0;
-            if !showing || child_area(button, self.window) != (place.left, place.top, size, size) {
-                // (it stays above the transcript once it is there, and to say so again costs more than the move)
-                SetWindowPos(button, HWND_TOP, place.left, place.top, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
-            }
-            if !showing {
-                show(button, true);
+            let left = area.left + point.x - scale(dpi, 2);
+            for (button, x, wanted) in [(self.copy_buttons[slot], left, true), (self.fork_buttons[slot], left + size, forks)] {
+                let showing = IsWindowVisible(button) != 0;
+                if !wanted {
+                    if showing {
+                        show(button, false);
+                    }
+                    continue;
+                }
+                if !showing || child_area(button, self.window) != (x, area.top + point.y, size, size) {
+                    // (it stays above the transcript once it is there, and to say so again costs more than the move)
+                    SetWindowPos(button, HWND_TOP, x, area.top + point.y, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
+                }
+                if !showing {
+                    show(button, true);
+                }
             }
             self.copy_targets[slot] = Some(at);
         }
-        for button in &self.copy_buttons[used..] {
+        for button in self.copy_buttons[used..].iter().chain(&self.fork_buttons[used..]) {
             if IsWindowVisible(*button) != 0 {
                 show(*button, false);
             }
@@ -3270,6 +3283,30 @@ impl App {
         let under = copy_under(&self.copy_rows, y, scale(self.dpi, ds::size::ICON_BUTTON));
         if under != self.copy_hover {
             self.place_copy_buttons();
+        }
+    }
+
+    /// A new session with the conversation through this answer, opened: to go on from there another way. The answer is found in the saved
+    /// session by its words, and by how many answers before it have the same.
+    unsafe fn fork_from_answer(&mut self, slot: usize) {
+        let Some(at) = self.copy_targets.get(slot).copied().flatten() else { return };
+        let Some(path) = self.current_session.clone() else { return };
+        let words = self.answers[at].1.clone();
+        let same_before = self.answers[..at].iter().filter(|(_, other)| *other == words).count();
+        let messages = session::read(&path).unwrap_or_default();
+        let found = messages.iter().enumerate().filter(|(_, message)| message.role == "assistant" && message.content.as_deref().map(str::trim) == Some(words.trim())).nth(same_before).map(|(place, _)| place);
+        let Some(through) = found else {
+            self.say(t("This answer is not in the saved session yet, so there is nothing to branch from. Try again once it is."));
+            return;
+        };
+        // (one with no name yet is named by its first message, as the original is)
+        let title = (!self.session_title.trim().is_empty()).then(|| tf("{0} (branch)", &[&self.session_title.trim()]));
+        match session::fork(&path, through, title.as_deref()) {
+            Ok(branch) => {
+                self.refresh_sessions();
+                self.open_session(branch);
+            }
+            Err(error) => self.say(&tf("The branch could not be made: {0}", &[&error])),
         }
     }
 
@@ -10518,6 +10555,9 @@ impl App {
         for button in self.copy_buttons.iter().chain(&self.block_buttons) {
             self.tip(*button, t("Copy"));
         }
+        for button in &self.fork_buttons {
+            self.tip(*button, t("Branch from here: a new session with the conversation up to this answer"));
+        }
         for button in &self.run_buttons {
             self.tip(*button, t("Show or hide these calls"));
         }
@@ -11885,6 +11925,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 ID_HELP => app.set_panel(Panel::Help),
                 _ if (ID_COPY_POOL..ID_COPY_POOL + COPY_POOL as isize).contains(&id) => app.copy_answer((id - ID_COPY_POOL) as usize),
+                _ if (ID_FORK_POOL..ID_FORK_POOL + COPY_POOL as isize).contains(&id) => app.fork_from_answer((id - ID_FORK_POOL) as usize),
                 _ if (ID_BLOCK_POOL..ID_BLOCK_POOL + BLOCK_POOL as isize).contains(&id) => app.copy_block((id - ID_BLOCK_POOL) as usize),
                 _ if (ID_RUN_POOL..ID_RUN_POOL + RUN_POOL as isize).contains(&id) => {
                     if let Some(run) = app.run_targets[(id - ID_RUN_POOL) as usize] {
@@ -12739,6 +12780,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             help_button: make_button(window, ID_HELP, "circle-question-mark", ButtonKind::Icon, theme::sidebar()),
             doc: rich_edit(window, WS_VSCROLL | ES_READONLY as u32, theme::background(), 10),
             copy_buttons: (0..COPY_POOL).map(|at| make_button(window, ID_COPY_POOL + at as isize, "copy", ButtonKind::Icon, theme::background())).collect(),
+            fork_buttons: (0..COPY_POOL).map(|at| make_button(window, ID_FORK_POOL + at as isize, "git-branch", ButtonKind::Icon, theme::background())).collect(),
             answers: Vec::new(),
             user_cards: Vec::new(),
             rail_turns: Vec::new(),
