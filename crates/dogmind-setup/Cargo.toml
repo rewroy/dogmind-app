@@ -1,6 +1,6 @@
 [package]
 name = "dogmind-setup"
-description = "Dogmind App's installer: one executable with the package on its end"
+description = "Dogmind's installer: one executable with the package on its end"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

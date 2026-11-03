@@ -306,7 +306,7 @@ const JA: &[(&str, &str)] = &[
     ("The download stopped and could not go on: {0}. What has arrived stays in the folder, and downloading again goes on from there.", "ダウンロードが止まり、続けられませんでした: {0}。受信済みの分はフォルダに残り、もう一度ダウンロードするとその続きから再開します。"),
     ("The connection dropped. Trying again in {0} seconds, from where it stopped ({1} of {2})...", "接続が切れました。{0} 秒後に、止まったところから再開します ({1}/{2})..."),
     ("This model takes {0} GB on its drive, and that drive has {1} GB free. Choose a folder on another drive, or make room.", "このモデルはドライブ上で {0} GB 使いますが、そのドライブの空きは {1} GB です。別のドライブのフォルダを選ぶか、空きを作ってください。"),
-    ("Dogmind App needs Windows 11.", "Dogmind App には Windows 11 が必要です。"),
+    ("Dogmind needs Windows 11.", "Dogmind には Windows 11 が必要です。"),
     ("This app ended unexpectedly last time. What happened is in {0}. /report writes a report you can send.", "前回、このアプリは予期せず終了しました。内容は {0} にあります。/report で送れるレポートを作成できます。"),
     ("Write a problem report", "問題のレポートを作成"),
     ("Write what can be sent about a problem", "問題について送れる内容を書き出します"),

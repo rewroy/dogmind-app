@@ -261,14 +261,14 @@ impl App {
             Page::Ready { notice } => {
                 let page = match &self.previous {
                     Some(previous) => View {
-                        heading: if self.japanese { format!("Dogmind App {previous} を {} に更新", self.version) } else { format!("Update Dogmind App {previous} to {}", self.version) },
+                        heading: if self.japanese { format!("Dogmind {previous} を {} に更新", self.version) } else { format!("Update Dogmind {previous} to {}", self.version) },
                         detail: self.w("This replaces the program in the folder below. Your settings, sessions and models are kept.", "下のフォルダのプログラムを置き換えます。設定、セッション、モデルはそのまま残ります。"),
                         primary: Some(self.w("Update", "更新")),
                         secondary: Some(self.w("Cancel", "キャンセル")),
                         ..View::default()
                     },
                     None => View {
-                        heading: if self.japanese { format!("Dogmind App {} をインストール", self.version) } else { format!("Install Dogmind App {}", self.version) },
+                        heading: if self.japanese { format!("Dogmind {} をインストール", self.version) } else { format!("Install Dogmind {}", self.version) },
                         detail: self.w("It goes in the folder below, for you alone: no administrator is needed. It gets a place in the Start menu and in Installed apps.", "下のフォルダに、あなた専用としてインストールします。管理者権限は不要です。スタート メニューと「インストールされているアプリ」に登録します。"),
                         primary: Some(self.w("Install", "インストール")),
                         secondary: Some(self.w("Cancel", "キャンセル")),
@@ -289,7 +289,7 @@ impl App {
                 let names = names.join(", ");
                 let goal = if *then == After::Install { self.w("before its files can be replaced", "ファイルを置き換える前に") } else { self.w("before it can be removed", "削除の前に") };
                 View {
-                    heading: self.w("Dogmind App is open", "Dogmind App が開いています"),
+                    heading: self.w("Dogmind is open", "Dogmind が開いています"),
                     detail: if *asked {
                         if self.japanese { format!("閉じませんでした ({names})。作業中ならウィンドウにそう表示されています。終わったらトレイのアイコンから終了して、もう一度試してください。") } else { format!("It has not closed ({names}). If it is working, its window says so: quit it from the tray icon when it is done, then try again.") }
                     } else if self.japanese {
@@ -337,7 +337,7 @@ impl App {
                 }
             }
             Page::Installed { update } => View {
-                heading: if *update { self.w("Dogmind App is updated", "Dogmind App を更新しました") } else { self.w("Dogmind App is ready", "Dogmind App の準備ができました") },
+                heading: if *update { self.w("Dogmind is updated", "Dogmind を更新しました") } else { self.w("Dogmind is ready", "Dogmind の準備ができました") },
                 detail: self.w("You can start it from the Start menu. To remove it: Settings > Apps > Installed apps, or Settings > General in the app.", "スタート メニューから起動できます。削除するには: Windows の設定 > アプリ > インストールされているアプリ、またはアプリの 設定 > 一般。"),
                 primary: Some(self.w("Start it", "起動する")),
                 secondary: Some(self.w("Close", "閉じる")),
@@ -353,7 +353,7 @@ impl App {
             },
             Page::Removing { fraction } => View { heading: self.w("Removing the program...", "プログラムを削除しています..."), fraction: Some(*fraction), ..View::default() },
             Page::Gone { left } => View {
-                heading: self.w("Dogmind App is removed", "Dogmind App を削除しました"),
+                heading: self.w("Dogmind is removed", "Dogmind を削除しました"),
                 detail: if left.is_empty() { String::new() } else if self.japanese { format!("{folder} には、これがインストールしたのではないものが残っています: {}", left.join(", ")) } else { format!("What it did not put there stays in {folder}: {}", left.join(", ")) },
                 secondary: Some(self.w("Close", "閉じる")),
                 ..View::default()
@@ -665,7 +665,7 @@ impl App {
             return;
         }
         // (the picker runs its own message loop, in which this window's timer and painting go on: nothing is held of `self` through it)
-        let (window, start, title) = (self.window, self.folder().to_path_buf(), self.w("Choose the folder for Dogmind App", "Dogmind App のインストール先のフォルダを選択"));
+        let (window, start, title) = (self.window, self.folder().to_path_buf(), self.w("Choose the folder for Dogmind", "Dogmind のインストール先のフォルダを選択"));
         let Some(picked) = self.options.pick.clone().or_else(|| system::pick_folder(window, &start, &title)) else { return };
         let chosen = place::choose(&picked);
         let notice = match place::check(&chosen, &place::settings_folders()) {
@@ -888,7 +888,7 @@ pub fn run(options: Options, start: Start) -> i32 {
             ..std::mem::zeroed()
         };
         RegisterClassW(&class);
-        let title = wide(if options.test { "Dogmind App (test)" } else { "Dogmind App" });
+        let title = wide(if options.test { "Dogmind (test)" } else { "Dogmind" });
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
         let window = CreateWindowExW(0, class_name.as_ptr(), title.as_ptr(), style, CW_USEDEFAULT, CW_USEDEFAULT, 200, 100, std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null());
         let app_is_a_test = options.test;

@@ -1,4 +1,4 @@
-# Dogmind App
+# Dogmind
 
 Dogmind as a native Windows application. For a server, run `straydog`; for a terminal, run `dogmind`; this is the one with a
 window. It is a product of its own, which uses Straydog as a program: put a new `straydog.exe` beside it and that is the

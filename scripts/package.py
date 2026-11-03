@@ -30,8 +30,8 @@ from pathlib import Path, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parent.parent
 PARTS = [
-    ("Dogmind App", ROOT / "LICENSE", None),
-    ("Dogmind", ROOT / "assets" / "licenses" / "dogmind-LICENSE.txt", "This app's agent follows the design and behaviour of Dogmind's. Its checkpoint prompt and Codex policy are Dogmind's, and its system prompt and tool descriptions are shortened and rewritten from Dogmind's."),
+    ("Dogmind (this program)", ROOT / "LICENSE", None),
+    ("Dogmind, the agent", ROOT / "assets" / "licenses" / "dogmind-LICENSE.txt", "This app's agent follows the design and behaviour of Dogmind's. Its checkpoint prompt and Codex policy are Dogmind's, and its system prompt and tool descriptions are shortened and rewritten from Dogmind's."),
     ("Straydog", ROOT / "assets" / "licenses" / "straydog-LICENSE.txt", "The engine, a separate program beside this one."),
     ("Lucide", ROOT / "assets" / "lucide" / "LICENSE", "The icons."),
     ("Rust crates in these executables", ROOT / "assets" / "licenses" / "third-party.txt", None),

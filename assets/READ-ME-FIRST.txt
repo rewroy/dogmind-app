@@ -1,4 +1,4 @@
-Dogmind App
+Dogmind
 
 Start: if you were given DogmindSetup.exe, run it: it needs no administrator and puts the app in the Start menu. From the zip: extract this whole zip to a folder of your own (Documents, or a folder of your own on any drive), then start dogmind-app.exe.
 Do not start it from inside the zip. It needs Windows 11.
@@ -15,7 +15,7 @@ A problem: /report in the app writes a report, with no key or conversation in it
 Licenses: LICENSE.txt
 
 
-Dogmind App
+Dogmind
 
 はじめかた: DogmindSetup.exe があれば実行してください。管理者権限は不要で、スタート メニューに登録されます。zip の場合は、この zip 全体を自分のフォルダ (ドキュメントや、任意のドライブのフォルダ) に展開し、dogmind-app.exe を起動してください。
 zip の中から直接起動しないでください。Windows 11 が必要です。

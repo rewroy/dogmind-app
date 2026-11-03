@@ -238,7 +238,7 @@ pub fn uninstall_values(folder: &Path, version: &str, kilobytes: u64) -> (Vec<(&
     let shown = folder.display();
     (
         vec![
-            ("DisplayName", "Dogmind App".to_string()),
+            ("DisplayName", NAME.to_string()),
             ("DisplayVersion", version.to_string()),
             ("Publisher", "rewroy".to_string()),
             ("InstallLocation", shown.to_string()),
@@ -250,7 +250,11 @@ pub fn uninstall_values(folder: &Path, version: &str, kilobytes: u64) -> (Vec<(&
 }
 
 const UNINSTALL_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DogmindApp";
-const SHORTCUT: &str = "Dogmind App.lnk";
+/// What the program is called, wherever the person sees it: its Start menu entry, Installed apps.
+pub const NAME: &str = "Dogmind";
+const SHORTCUT: &str = "Dogmind.lnk";
+/// The Start menu entry of before it was called Dogmind: an update takes it away, as it would lead to the same program twice.
+const OLD_SHORTCUT: &str = "Dogmind App.lnk";
 
 /// A shortcut to a program in its own folder.
 pub fn write_shortcut(place: &Path, target: &Path, description: &str) -> Result<(), String> {
@@ -313,7 +317,9 @@ fn start_menu() -> Result<PathBuf, String> {
 impl Shell for RealShell {
     fn add_entries(&self, folder: &Path, version: &str, kilobytes: u64) -> Result<(), String> {
         use windows_sys::Win32::System::Registry::{RegCloseKey, RegCreateKeyW, RegSetValueExW, HKEY_CURRENT_USER, REG_DWORD, REG_SZ};
-        write_shortcut(&start_menu()?.join(SHORTCUT), &folder.join("dogmind-app.exe"), "Dogmind App")?;
+        let menu = start_menu()?;
+        write_shortcut(&menu.join(SHORTCUT), &folder.join("dogmind-app.exe"), NAME)?;
+        let _ = std::fs::remove_file(menu.join(OLD_SHORTCUT));
         let (texts, numbers) = uninstall_values(folder, version, kilobytes);
         // SAFETY: the names end in zeros, and each value is as long as the call is told.
         unsafe {
@@ -339,7 +345,9 @@ impl Shell for RealShell {
         if !entries_are_of(registered_folder().as_deref(), &self.folder) {
             return Ok(());
         }
-        let _ = std::fs::remove_file(start_menu()?.join(SHORTCUT));
+        let menu = start_menu()?;
+        let _ = std::fs::remove_file(menu.join(SHORTCUT));
+        let _ = std::fs::remove_file(menu.join(OLD_SHORTCUT));
         // SAFETY: the name ends in a zero.
         unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide(UNINSTALL_KEY).as_ptr()) };
         Ok(())
@@ -358,7 +366,8 @@ impl Shell for TestShell {
     fn add_entries(&self, folder: &Path, version: &str, kilobytes: u64) -> Result<(), String> {
         let menu = self.folder.join(TEST_START_MENU);
         std::fs::create_dir_all(&menu).map_err(|error| error.to_string())?;
-        write_shortcut(&menu.join(SHORTCUT), &folder.join("dogmind-app.exe"), "Dogmind App")?;
+        write_shortcut(&menu.join(SHORTCUT), &folder.join("dogmind-app.exe"), NAME)?;
+        let _ = std::fs::remove_file(menu.join(OLD_SHORTCUT));
         let (texts, numbers) = uninstall_values(folder, version, kilobytes);
         let mut record = format!("HKCU\\{UNINSTALL_KEY}\n");
         for (name, value) in texts {
@@ -385,7 +394,7 @@ mod tests {
     fn add_or_remove_programs_is_told_what_runs_the_removal() {
         let (texts, numbers) = uninstall_values(Path::new("C:\\Users\\me\\AppData\\Local\\Programs\\Dogmind"), "1.2.3", 1_000_000);
         let text = |name: &str| texts.iter().find(|(key, _)| *key == name).unwrap().1.clone();
-        assert_eq!(text("DisplayName"), "Dogmind App");
+        assert_eq!(text("DisplayName"), "Dogmind");
         assert_eq!(text("DisplayVersion"), "1.2.3");
         assert_eq!(text("UninstallString"), "\"C:\\Users\\me\\AppData\\Local\\Programs\\Dogmind\\dogmind-uninstall.exe\" --uninstall", "in quotes: the path may have spaces");
         assert!(text("DisplayIcon").ends_with("dogmind-app.exe,0"));
@@ -410,7 +419,7 @@ mod tests {
         let (place, target) = (dir.path().join("x.lnk"), dir.path().join("\u{65e5}\u{672c} y").join("dogmind-app.exe"));
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, "").unwrap();
-        write_shortcut(&place, &target, "Dogmind App").unwrap();
+        write_shortcut(&place, &target, "Dogmind").unwrap();
         // SAFETY: COM on this thread, begun above; the buffer is as long as it is said to be.
         unsafe {
             let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
@@ -452,10 +461,22 @@ mod tests {
         let shell = TestShell { folder: dir.path().to_path_buf() };
         shell.add_entries(dir.path(), "1.0.0", 5).unwrap();
         let record = std::fs::read_to_string(dir.path().join(TEST_RECORD)).unwrap();
-        assert!(record.contains("DisplayName = Dogmind App") && record.contains("--uninstall"), "{record}");
+        assert!(record.contains("DisplayName = Dogmind\n") && record.contains("--uninstall"), "{record}");
         assert!(dir.path().join(TEST_START_MENU).join(SHORTCUT).is_file());
         shell.remove_entries().unwrap();
         assert!(!dir.path().join(TEST_RECORD).exists() && !dir.path().join(TEST_START_MENU).exists());
+    }
+
+    /// An update to the program called Dogmind takes away the Start menu entry it had as Dogmind App: one entry, by its name now.
+    #[test]
+    fn the_entry_of_the_old_name_goes_with_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let menu = dir.path().join(TEST_START_MENU);
+        std::fs::create_dir_all(&menu).unwrap();
+        std::fs::write(menu.join(OLD_SHORTCUT), b"old").unwrap();
+        let shell = TestShell { folder: dir.path().to_path_buf() };
+        shell.add_entries(dir.path(), "1.0.1", 5).unwrap();
+        assert!(menu.join(SHORTCUT).is_file() && !menu.join(OLD_SHORTCUT).exists());
     }
 
     #[test]

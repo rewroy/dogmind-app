@@ -505,7 +505,7 @@ pub(crate) unsafe fn profile_sid() -> Result<PSID, String> {
     if let Some(sid) = &*slot {
         return Ok(sid.0);
     }
-    let (name, display, description) = (wide(PROFILE), wide("Dogmind App commands"), wide("Where Dogmind App runs the commands you approve"));
+    let (name, display, description) = (wide(PROFILE), wide("Dogmind commands"), wide("Where Dogmind runs the commands you approve"));
     let mut sid: PSID = std::ptr::null_mut();
     let created = CreateAppContainerProfile(name.as_ptr(), display.as_ptr(), description.as_ptr(), std::ptr::null(), 0, &mut sid);
     if created < 0 && DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) < 0 {

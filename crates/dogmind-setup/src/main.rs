@@ -1,4 +1,4 @@
-//! Dogmind App's installer: one executable with the package on its end, no administrator and nothing to install it with.
+//! Dogmind's installer: one executable with the package on its end, no administrator and nothing to install it with.
 //!
 //!     dogmind-setup --pack FOLDER OUT.exe [--version V] [--level 0-9]    makes DogmindSetup.exe from this program and FOLDER (scripts/package.py does)
 //!     dogmind-setup --verify FILE.exe                                    unpacks all of it to nowhere, and says if every file is sound
@@ -221,7 +221,7 @@ fn start_of_install(options: &Options) -> window::Start {
     let japanese = window::japanese(options);
     let words = |english: &str, in_japanese: &str| (if japanese { in_japanese } else { english }).to_string();
     if system::windows_build().is_some_and(|build| build < 22000) {
-        return window::Start::Refuse(words("Dogmind App needs Windows 11", "Dogmind App には Windows 11 が必要です"), words("This version of Windows is older.", "この Windows はそれより前のバージョンです。"));
+        return window::Start::Refuse(words("Dogmind needs Windows 11", "Dogmind には Windows 11 が必要です"), words("This version of Windows is older.", "この Windows はそれより前のバージョンです。"));
     }
     let package = std::env::current_exe().and_then(|exe| pack::Package::open(&exe));
     match package {
