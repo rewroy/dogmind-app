@@ -9,7 +9,8 @@ update.
 - **Engine beside it.** `straydog.exe` runs as a child process, only when it is used, and is reached only by its command line
   and its OpenAI-compatible API. The window's process never loads the GPU's libraries.
 - **Sessions by workspace.** The sidebar lists each workspace's sessions; a new one starts by choosing its folder.
-- **Any model.** Providers are set under *Model > Providers*:
+- **Any model.** Providers are set in *Settings > Models and connections*, which the model chip's *Connections...* and `/providers`
+  also open:
 
 | Kind | What it is | Key |
 | --- | --- | --- |
@@ -23,15 +24,21 @@ as plain text.
 
 ## Using it
 
-It runs on Windows 11, without administrator rights. Run `DogmindSetup.exe`, which puts it in `%LOCALAPPDATA%\Programs\Dogmind`, in the Start menu and in Installed apps; or extract the whole zip to a folder of your own and start `dogmind-app.exe`.
+It runs on Windows 11, without administrator rights. Run `DogmindSetup-VERSION.exe` (as `DogmindSetup-0.1.0.exe`), which puts it in `%LOCALAPPDATA%\Programs\Dogmind`, in the Start menu and in Installed apps; or extract the whole zip to a folder of your own and start `dogmind-app.exe`.
 To run a model on this PC it takes an NVIDIA GPU with a current driver, and about 76 GB free on a drive (75 GB to download; 70 GB stay). Without one, use another computer, a service, Codex or Claude.
+*Settings > Models on this PC* lists what Straydog can set up here. A model that needs more free graphics memory than the card has now is listed too, greyed and marked not recommended with what it needs, for whoever wants to try it.
 The first run asks how to reach a model and where to work; `/setup` goes through it again. Type `/` for the commands and `@` for the workspace's files. Enter sends, Shift+Enter starts a new line, Esc stops; Ctrl+N
 starts a session, Ctrl+, opens the settings, Ctrl+Shift+C copies the last answer. A right click on a session renames or
 deletes it.
 
+While the model works, Enter puts what you type into the work before its next step, and Ctrl+Enter keeps it for after the work. Each
+waiting message has buttons to send it into the work now, to edit it, or to discard it. Each message shows its time; an answer's
+branch button starts a new session with the conversation up to that answer, to go on from there another way. From the second turn,
+a rail at the transcript's right edge has a mark for each of your messages: the one you are reading is longer, and a click goes to it.
+
 ## Updating, removing, and when something goes wrong
 
-To update, run the new `DogmindSetup.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. A failure leaves the program as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
+To update, run the new `DogmindSetup-VERSION.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. A failure leaves the program as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
 
 To remove it, *Settings > General > Remove this app from this PC* takes away the settings, sessions, logs, the keys in Credential Manager, what was opened to the sandbox and the AppContainer
 profiles, and the model unless you keep it. Installed apps opens the same page, and closing it then takes away the program and its entries; from a zip, delete the folder it runs from. Workspaces stay as they are.
