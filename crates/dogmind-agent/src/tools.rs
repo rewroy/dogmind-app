@@ -197,6 +197,81 @@ fn sha16(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().take(8).map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Where a file's new text is written whole before it takes the file's place: beside it, so that taking the place is a rename on one drive.
+fn written_beside(path: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(".dogmind-edit-{}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// One file's new text in place of the old, from where it was written beside it: Windows's ReplaceFile, which leaves the file what it was
+/// (its permissions, its attributes, when it was made) but its words.
+fn take_the_place(new: &Path, path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS};
+        let wide = |path: &Path| -> Vec<u16> { std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str()).chain(std::iter::once(0)).collect() };
+        let (replaced, replacement) = (wide(path), wide(new));
+        // SAFETY: both names end with a zero, and live through the call.
+        let done = unsafe { ReplaceFileW(replaced.as_ptr(), replacement.as_ptr(), std::ptr::null(), REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS, std::ptr::null(), std::ptr::null()) };
+        if done == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(new, path)
+    }
+}
+
+/// Every file's new text, or none: each is written whole beside its file first, and only when all of them are on the disk do they take
+/// the files' places, one by one. A failure on the way puts back what had changed. No file is ever left part written, and what is said
+/// of a failure is what the files are.
+fn write_all_or_none(files: &[(PathBuf, String, String)]) -> Result<(), String> {
+    let beside: Vec<PathBuf> = files.iter().map(|(path, _, _)| written_beside(path)).collect();
+    let forget = |from: usize| {
+        for new in &beside[from..] {
+            let _ = std::fs::remove_file(new);
+        }
+    };
+    for (at, (path, _, after)) in files.iter().enumerate() {
+        let written = std::fs::File::create(&beside[at]).and_then(|mut out| {
+            std::io::Write::write_all(&mut out, after.as_bytes())?;
+            out.sync_all()
+        });
+        if let Err(error) = written {
+            forget(0);
+            return Err(format!("{}: {error}: nothing was changed", path.display()));
+        }
+    }
+    for (at, (path, _, _)) in files.iter().enumerate() {
+        if let Err(error) = take_the_place(&beside[at], path) {
+            forget(at);
+            // (the old text goes back as the new went in: whole, beside, then in place)
+            let not_back: Vec<String> = files[..at]
+                .iter()
+                .filter(|(done, before, _)| {
+                    let back = written_beside(done);
+                    let put = std::fs::write(&back, before).and_then(|()| take_the_place(&back, done));
+                    if put.is_err() {
+                        let _ = std::fs::remove_file(&back);
+                    }
+                    put.is_err()
+                })
+                .map(|(done, _, _)| done.display().to_string())
+                .collect();
+            return Err(if not_back.is_empty() {
+                format!("{}: {error}: the files are as they were", path.display())
+            } else {
+                format!("{}: {error}: these have the new text, and could not be put back: {}; the rest are as they were", path.display(), not_back.join(", "))
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Head and tail, with what is left out said between them.
 const MAX_APPLIED_DIFF: usize = 3000;
 
@@ -488,13 +563,8 @@ impl Workbench {
             *text = changed;
         }
         let mut report = String::new();
-        for (written, (path, before, after)) in files.iter().enumerate() {
-            if let Err(error) = std::fs::write(path, after) {
-                for (undo, original, _) in &files[..written] {
-                    let _ = std::fs::write(undo, original);
-                }
-                return Err(format!("{}: {error}: the files are as they were", path.display()));
-            }
+        write_all_or_none(&files)?;
+        for (path, before, after) in &files {
             // (the model wrote this change itself: enough to see that it landed where it meant, and a local model pays for every token of it, again in each later request's prefix)
             let diff = similar::TextDiff::from_lines(before, after).unified_diff().context_radius(2).to_string();
             let name = path.strip_prefix(workspace).unwrap_or(path).display().to_string();
@@ -2279,6 +2349,34 @@ mod tests {
         let again = json!({"edits": [{"old_string": "beta", "new_string": "BETA"}], "expected_files": ["a.txt"]});
         bench.run("apply_patch", &again, dir.path(), &cancel).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "ALPHA\nBETA\ngamma\n");
+    }
+
+    /// A file that cannot take its new text leaves every file as it was, the ones already written put back, and no part-written file
+    /// or leftover beside them: what the failure says is what the files are.
+    #[test]
+    fn a_patch_that_fails_on_its_second_file_puts_the_first_back() {
+        let (dir, mut bench, cancel) = bench();
+        let (first, second) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        std::fs::write(&first, "alpha\n").unwrap();
+        std::fs::write(&second, "beta\n").unwrap();
+        bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
+        bench.run("read_file", &json!({"path": "b.txt"}), dir.path(), &cancel).unwrap();
+        // (read only: its new text is written beside it, and cannot take its place)
+        let mut locked = std::fs::metadata(&second).unwrap().permissions();
+        locked.set_readonly(true);
+        std::fs::set_permissions(&second, locked.clone()).unwrap();
+        let edit = json!({"edits": [{"path": "a.txt", "old_string": "alpha", "new_string": "ALPHA"}, {"path": "b.txt", "old_string": "beta", "new_string": "BETA"}], "expected_files": ["a.txt", "b.txt"]});
+        let said = bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap_err();
+        locked.set_readonly(false);
+        std::fs::set_permissions(&second, locked).unwrap();
+        assert!(said.contains("the files are as they were"), "{said}");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "alpha\n");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "beta\n");
+        let left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.contains("dogmind-edit")).collect();
+        assert!(left.is_empty(), "{left:?}");
+        // And done again with nothing in the way, both change.
+        bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap();
+        assert_eq!((std::fs::read_to_string(&first).unwrap(), std::fs::read_to_string(&second).unwrap()), ("ALPHA\n".to_string(), "BETA\n".to_string()));
     }
 
     #[test]
