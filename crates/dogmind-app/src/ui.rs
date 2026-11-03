@@ -286,6 +286,8 @@ const TIMER_SEARCH: usize = 4;
 const TIMER_CHANGES: usize = 5;
 const TIMER_REFLOW: usize = 6;
 const TIMER_RECONNECT: usize = 7;
+/// Whether a new build has come in over the app or the engine it runs.
+const TIMER_UPDATE: usize = 8;
 /// The conversation's width below which the panel on the right gives way, at 96 dpi.
 const RIGHT_NEEDS: i32 = 480;
 /// How often a server that cannot be reached is tried again, while something waits to be sent to it.
@@ -1440,6 +1442,11 @@ struct App {
     /// What the model keeps between sessions, as the Memory page last read it, and a button to take out each.
     memory_notes: Vec<(&'static str, String)>,
     memory_remove: Vec<HWND>,
+    /// The app's own file and its engine's, as they were when it started: a new build changes them.
+    builds: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+    /// A new build seen once, to be seen the same again before it is taken; and whether the person has been told it waits for the work.
+    update_seen: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
+    update_told: bool,
     read_folder_add: HWND,
     read_folder_stop: HWND,
     read_folder_remove: Vec<HWND>,
@@ -7036,8 +7043,59 @@ impl App {
     }
 
     /// An installer wants to replace these files. It closes as the tray's Quit does, unless it is working: then it stays, comes forward and says so, and the installer waits.
+    /// Work that a restart would cut short: a turn, a setup, a session working in the background, a folder being opened to commands.
+    fn at_work(&self) -> bool {
+        self.running || self.setting_up || !self.parked.is_empty() || self.read_folder_work.is_some() || self.pending.is_some()
+    }
+
+    /// A new build of the app or of its engine has come in over the files this copy runs from (`package.py` puts it beside the one in use, which
+    /// Windows lets it rename): this copy starts it and gives way, at once when it is idle and otherwise as soon as its work is done. A file still
+    /// being written is not taken for one: the same new size and time twice in a row is.
+    unsafe fn look_for_update(&mut self) {
+        let now: Vec<Option<(std::time::SystemTime, u64)>> = self.builds.iter().map(|(path, _)| stamp(path)).collect();
+        let changed = self.builds.iter().zip(&now).any(|((_, was), is)| is.is_some() && is != was);
+        if !changed || now.iter().any(Option::is_none) {
+            self.update_seen = None;
+            return;
+        }
+        if self.update_seen.as_ref() != Some(&now) {
+            self.update_seen = Some(now);
+            return;
+        }
+        if self.at_work() {
+            if !self.update_told {
+                self.update_told = true;
+                self.say(t("A new version is here. The app restarts into it when this work is done."));
+            }
+            return;
+        }
+        self.restart_into_update();
+    }
+
+    unsafe fn restart_into_update(&mut self) {
+        // (the name it was started by, which is the new build's now: the file it runs from was moved aside)
+        let Some(exe) = self.builds.first().map(|(path, _)| path.clone()) else { return };
+        let mut command = std::process::Command::new(&exe);
+        if self.workspace.is_dir() && self.workspace != Path::new(".") {
+            command.arg(&self.workspace);
+        }
+        command.arg("--after").arg(std::process::id().to_string());
+        if let Some(session) = &self.current_session {
+            command.arg("--resume").arg(session);
+        }
+        if IsWindowVisible(self.window) == 0 {
+            command.arg("--hidden");
+        }
+        if command.spawn().is_err() {
+            // (it stays as it is, and looks again later)
+            self.update_seen = None;
+            return;
+        }
+        DestroyWindow(self.window);
+    }
+
     unsafe fn asked_to_quit(&mut self) {
-        if self.running || self.setting_up || !self.parked.is_empty() || self.read_folder_work.is_some() {
+        if self.at_work() {
             // (a test's copy shows itself where it is, and takes no one's focus)
             if crate::machine::kept_from_the_real_machine() {
                 ShowWindow(self.window, SW_SHOWNA);
@@ -10756,6 +10814,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             }
             0
         }
+        WM_TIMER if wparam == TIMER_UPDATE => {
+            app.look_for_update();
+            0
+        }
         WM_TIMER if wparam == TIMER_RECONNECT => {
             KillTimer(window, TIMER_RECONNECT);
             if !app.connected && app.connect_failed && !app.queued.is_empty() {
@@ -11792,7 +11854,34 @@ unsafe fn already_running(folder: &Path) -> bool {
     true
 }
 
-pub fn run(folder_argument: Option<PathBuf>, remove_first: bool) -> ExitCode {
+/// How a copy started by an older one, which saw this build replace it, carries on where that one was.
+#[derive(Debug, Default)]
+pub struct Restart {
+    /// The older copy: this one waits for it to end, as only one may run on a data folder.
+    pub after: Option<u32>,
+    /// The session it had open.
+    pub resume: Option<PathBuf>,
+    /// It was in the tray, out of sight, and this one stays there too.
+    pub hidden: bool,
+}
+
+/// Waits, at most this long, for a process to end. One that is gone already, or cannot be looked at, is not waited for.
+unsafe fn wait_for_end(pid: u32, longest: std::time::Duration) {
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+    if !process.is_null() {
+        WaitForSingleObject(process, longest.as_millis() as u32);
+        CloseHandle(process);
+    }
+}
+
+/// When a file was last written, and how long it is: what a new build of it changes.
+fn stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let data = std::fs::metadata(path).ok()?;
+    Some((data.modified().ok()?, data.len())).filter(|(_, length)| *length > 0)
+}
+
+pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restart) -> ExitCode {
     // SAFETY: the Win32 calls below run on this one thread, on handles they created; `APP` is set once before any message
     // reaches the procedure and is only used on this thread.
     unsafe {
@@ -11804,6 +11893,9 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
         crate::crash::install(&settings::data_folder());
+        if let Some(pid) = restart.after {
+            wait_for_end(pid, std::time::Duration::from_secs(30));
+        }
         if already_running(&settings::data_folder()) {
             return ExitCode::SUCCESS;
         }
@@ -12007,6 +12099,9 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool) -> ExitCode {
             skill_toggles: Vec::new(),
             memory_notes: Vec::new(),
             memory_remove: Vec::new(),
+            builds: Vec::new(),
+            update_seen: None,
+            update_told: false,
             read_folder_add: make_button(pane, ID_READ_FOLDER_ADD, "", ButtonKind::Secondary, theme::background()),
             read_folder_stop: make_button(pane, ID_READ_FOLDER_STOP, "", ButtonKind::Secondary, theme::background()),
             read_folder_remove: Vec::new(),
@@ -12279,8 +12374,14 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool) -> ExitCode {
         DragAcceptFiles(window, 1);
         SendMessageW(app.tooltip, TTM_SETMAXTIPWIDTH, 0, scale(dpi, 420) as LPARAM);
         app.apply_language();
-        ShowWindow(window, if app.settings.maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
+        // (a copy that took over from one in the tray stays there, out of the person's way)
+        if !restart.hidden {
+            ShowWindow(window, if app.settings.maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
+        }
         SetTimer(window, TIMER_ENGINE, 1000, None);
+        // What this copy runs, to see a new build come in over it.
+        app.builds = std::env::current_exe().ok().into_iter().chain(engine::find(&app.settings)).map(|path| { let now = stamp(&path); (path, now) }).collect();
+        SetTimer(window, TIMER_UPDATE, 5000, None);
         app.update_status();
         app.refresh_sessions();
         if !needs_folder {
@@ -12311,6 +12412,10 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool) -> ExitCode {
             // No folder to come back to: it begins in the usual one, and the header changes it.
             if needs_folder {
                 app.finish_onboarding();
+            }
+            // The session the copy before this one had open, as the person left it.
+            if let Some(session) = restart.resume.filter(|session| session.is_file()) {
+                app.open_session(session);
             }
         }
 
