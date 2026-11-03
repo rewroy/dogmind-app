@@ -279,9 +279,29 @@ fn argb(color: u32) -> u32 {
     0xFF00_0000 | ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF)
 }
 
+/// The same through Direct2D, in the area's own pixels. False: not drawn.
+unsafe fn draw_by_render(device: HDC, segments: &[Segment], area: RECT, size: i32, color: u32) -> bool {
+    use crate::render::Piece;
+    let unit = size as f32 / 24.0;
+    let left = (area.right - area.left - size) as f32 / 2.0;
+    let top = (area.bottom - area.top - size) as f32 / 2.0;
+    let (px, py) = (|x: f32| left + x * unit, |y: f32| top + y * unit);
+    let pieces: Vec<Piece> = segments.iter().map(|segment| match *segment {
+        Segment::Start(x, y) => Piece::Start(px(x), py(y)),
+        Segment::Line(x, y) => Piece::Line(px(x), py(y)),
+        Segment::Curve(c1x, c1y, c2x, c2y, x, y) => Piece::Curve(px(c1x), py(c1y), px(c2x), py(c2y), px(x), py(y)),
+        Segment::Close => Piece::Close,
+        Segment::Circle(cx, cy, r) => Piece::Circle(px(cx), py(cy), r * unit),
+    }).collect();
+    crate::render::figure(device, area, &pieces, None, Some((color, (2.0 * unit).max(1.2))))
+}
+
 /// The icon `name`, centred in `area`, `size` pixels across, its stroke scaled with it.
 pub unsafe fn draw(device: HDC, name: &str, area: RECT, size: i32, color: u32) {
     let Some(segments) = table().get(name) else { return };
+    if draw_by_render(device, segments, area, size, color) {
+        return;
+    }
     let mut graphics = std::ptr::null_mut();
     if GdipCreateFromHDC(device, &mut graphics) != 0 {
         return;

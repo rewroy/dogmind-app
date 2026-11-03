@@ -20,7 +20,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 [target.'cfg(windows)'.dependencies]
 # The on-demand preview only; the loader is linked in, so there is no DLL to ship.
 webview2-com = "0.39"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+# The preview and the shell; and what the window draws itself, through Direct2D and DirectWrite on the CPU (see render.rs).
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi"] }
+windows-numerics = "0.3"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
