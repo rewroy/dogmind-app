@@ -77,7 +77,11 @@ pub fn schemas() -> Value {
             "pattern": {"type": "string"},
             "path": {"type": "string"}
         }), &["pattern"]),
-        function("check_page", "Run a workspace page that uses no CDN library in a headless browser: what its scripts printed and threw, and what it shows.", json!({"path": {"type": "string"}}), &["path"]),
+        function("check_page", "Run a workspace page that uses no CDN library in a headless browser: what its scripts printed and threw, what it shows, and pictures of it.", json!({
+            "path": {"type": "string"},
+            "views": {"type": "array", "items": {"type": "string"}, "description": "desktop (default), mobile, or WxH"},
+            "wait_ms": {"type": "integer"}
+        }), &["path"]),
         function("command_status", "How a background command is doing, and its output once it has ended.", json!({"id": {"type": "string"}}), &[]),
         function("command_stop", "End a background command.", json!({"id": {"type": "string"}}), &["id"])
     ])

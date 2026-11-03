@@ -14,7 +14,67 @@ use serde_json::Value;
 const LIMIT: Duration = Duration::from_secs(20);
 /// (not `--disable-breakpad` or `--disable-crash-reporter`: with those the browser crashes in about half its runs in the sandbox, against about 1 in 30 finally without. What keeps a crash
 /// from raising a dialog is the error mode and the job's limit, in `sandbox`.)
-const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-extensions --disable-background-networking --disable-sync --disable-component-update --enable-logging=stderr --log-level=0 --allow-file-access-from-files --window-size=1000,650 --virtual-time-budget=1500";
+const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-extensions --disable-background-networking --disable-sync --disable-component-update --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
+/// How long a page runs before it is read, unless the model asks for longer, for an animation, and the most it may.
+const WAIT_MS: u64 = 1500;
+const MOST_WAIT_MS: u64 = 10_000;
+
+/// A size to look at a page at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct View {
+    label: String,
+    width: u32,
+    height: u32,
+}
+
+/// The views asked for: `desktop`, `mobile` or `WIDTHxHEIGHT`, the desktop alone when none is. At most four, as each is a browser's run.
+fn views_of(arguments: &Value) -> Result<Vec<View>, String> {
+    let asked: Vec<String> = arguments.get("views").and_then(Value::as_array).map(|views| views.iter().filter_map(Value::as_str).map(|view| view.trim().to_ascii_lowercase()).collect()).unwrap_or_default();
+    let asked = if asked.is_empty() { vec!["desktop".to_string()] } else { asked };
+    let mut views = Vec::new();
+    for name in asked.iter().take(4) {
+        let (width, height) = match name.as_str() {
+            "desktop" => (1280, 800),
+            "mobile" => (390, 844),
+            other => {
+                let sized = other.split_once('x').and_then(|(width, height)| Some((width.trim().parse::<u32>().ok()?, height.trim().parse::<u32>().ok()?)));
+                let Some((width, height)) = sized else { return Err(format!("views: {other} is not desktop, mobile or WIDTHxHEIGHT")) };
+                (width.clamp(240, 2560), height.clamp(240, 4000))
+            }
+        };
+        let view = View { label: name.clone(), width, height };
+        if !views.contains(&view) {
+            views.push(view);
+        }
+    }
+    Ok(views)
+}
+
+/// A file as a browser's address, for a page that frames it: what would end the address or the attribute early is escaped.
+fn file_url(path: &Path) -> String {
+    let plain = path.display().to_string().trim_start_matches("\\\\?\\").replace('\\', "/");
+    let mut out = String::from("file:///");
+    for c in plain.chars() {
+        match c {
+            ' ' => out.push_str("%20"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            '"' => out.push_str("%22"),
+            '&' => out.push_str("%26"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '\'' => out.push_str("%27"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The page in a frame of exactly this size: the browser's window has a least width of about 500 pixels whatever it is asked, and
+/// lays a page out a little smaller than the window, so a phone's width is only had inside a frame. The picture is cut to the frame.
+fn frame_page(page: &Path, view: &View) -> String {
+    format!("<!doctype html><meta charset=\"utf-8\"><style>html,body{{margin:0;overflow:hidden;background:#fff}}iframe{{border:0;display:block}}</style><iframe src=\"{}\" width=\"{}\" height=\"{}\"></iframe>", file_url(page), view.width, view.height)
+}
 const TRIES: usize = 4;
 const MOST_LINES: usize = 25;
 const MOST_LINE: usize = 400;
@@ -286,11 +346,13 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     let Some((program, browser_name)) = browser() else {
         return Err("neither Edge nor Chrome is on this machine, so the page could not be opened: say that it has not been run".to_string());
     };
+    let views = views_of(arguments)?;
+    let wait = arguments.get("wait_ms").and_then(Value::as_u64).unwrap_or(WAIT_MS).min(MOST_WAIT_MS);
     let needs = needs_of(&page);
     let plain = |path: &Path| path.display().to_string().trim_start_matches("\\\\?\\").to_string();
     let cwd = page.parent().unwrap_or(workspace).to_path_buf();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let line = format!("\"{}\" {FLAGS} --user-data-dir=\"%TEMP%\\dogmind-page\" --dump-dom \"{}\"", program.display(), plain(&page));
+    let line = format!("\"{}\" {FLAGS} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --dump-dom \"{}\"", program.display(), plain(&page));
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
     for _ in 0..TRIES {
@@ -313,20 +375,39 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         return Ok(format!("{said}The browser's end: {how}.\n"));
     }
     // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. Not of a page that draws with WebGL, which ends the browser here.
-    let picture = crate::sandbox::temp_folder().map(|temp| temp.join("dogmind-page.png"));
-    let Some(picture) = picture else { return Ok(said) };
-    let _ = std::fs::remove_file(&picture);
-    let shot = format!("\"{}\" {FLAGS} --user-data-dir=\"%TEMP%\\dogmind-page\" --screenshot=\"{}\" \"{}\"", program.display(), picture.display(), plain(&page));
-    for _ in 0..3 {
+    let Some(temp) = crate::sandbox::temp_folder() else { return Ok(said) };
+    let mut out = said;
+    for view in &views {
+        let tag = view.label.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+        let (frame, shot, picture) = (temp.join("dogmind-frame.html"), temp.join("dogmind-shot.png"), temp.join(format!("dogmind-page-{tag}.png")));
         let _ = std::fs::remove_file(&picture);
-        let _ = crate::sandbox::run_browser(&shot, &cwd, workspace, LIMIT, cancel);
-        let _ = crate::sandbox::run("rmdir /s /q \"%TEMP%\\dogmind-page\"", &cwd, workspace, false, Duration::from_secs(20), cancel);
-        // (a browser that fell over while writing it leaves an empty file)
-        if std::fs::metadata(&picture).is_ok_and(|file| file.len() > 0) {
-            return Ok(format!("{said}How it looks, without WebGL drawing: `read_file` {}\n", picture.display()));
+        if std::fs::write(&frame, frame_page(&page, view)).is_err() {
+            out.push_str(&format!("No picture at {} could be taken.\n", view.label));
+            continue;
         }
+        // (a window larger than the frame by what the browser takes of it, and at least its least width)
+        let line = format!("\"{}\" {FLAGS} --window-size={},{} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --screenshot=\"{}\" \"{}\"", program.display(), view.width.max(600) + 64, view.height + 160, shot.display(), plain(&frame));
+        let mut taken = false;
+        for _ in 0..3 {
+            let _ = std::fs::remove_file(&shot);
+            let _ = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
+            let _ = crate::sandbox::run("rmdir /s /q \"%TEMP%\\dogmind-page\"", &cwd, workspace, false, Duration::from_secs(20), cancel);
+            // (a browser that fell over while writing it leaves an empty file, or one that cannot be read)
+            let Ok(whole) = image::open(&shot) else { continue };
+            if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
+                taken = true;
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&shot);
+        let _ = std::fs::remove_file(&frame);
+        out.push_str(&if taken {
+            format!("How it looks at {} ({}x{}), without WebGL drawing: `read_file` {}\n", view.label, view.width, view.height, picture.display())
+        } else {
+            format!("No picture at {} could be taken.\n", view.label)
+        });
     }
-    Ok(format!("{said}No picture of it could be taken.\n"))
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -436,6 +517,37 @@ mod tests {
         assert!(outside.contains("outside the workspace"), "{outside}");
         assert!(check_page(&serde_json::json!({"path": "a.txt"}), dir.path(), &cancel).unwrap_err().contains("not a page"));
         assert!(check_page(&serde_json::json!({"path": "gone.html"}), dir.path(), &cancel).unwrap_err().contains("no such page"));
+    }
+
+    #[test]
+    fn views_are_named_or_sized_and_the_desktop_is_the_default() {
+        let at = |views: Value| views_of(&serde_json::json!({"path": "a.html", "views": views})).map(|views| views.iter().map(|view| (view.label.clone(), view.width, view.height)).collect::<Vec<_>>());
+        assert_eq!(views_of(&serde_json::json!({"path": "a.html"})).unwrap(), [View { label: "desktop".into(), width: 1280, height: 800 }]);
+        assert_eq!(at(serde_json::json!(["Mobile", "desktop", "mobile"])).unwrap(), [("mobile".to_string(), 390, 844), ("desktop".to_string(), 1280, 800)]);
+        assert_eq!(at(serde_json::json!(["1280x2400", "10x99999"])).unwrap(), [("1280x2400".to_string(), 1280, 2400), ("10x99999".to_string(), 240, 4000)]);
+        assert!(at(serde_json::json!(["tablet"])).unwrap_err().contains("tablet"));
+    }
+
+    #[test]
+    fn the_frame_names_the_page_by_an_address_nothing_in_its_name_can_end() {
+        let url = file_url(Path::new("C:\\Users\\me\\My Site\\a&b \"#1\".html"));
+        assert_eq!(url, "file:///C:/Users/me/My%20Site/a%26b%20%22%231%22.html");
+        let frame = frame_page(Path::new("C:\\w\\index.html"), &View { label: "mobile".into(), width: 390, height: 844 });
+        assert!(frame.contains("src=\"file:///C:/w/index.html\" width=\"390\" height=\"844\""), "{frame}");
+    }
+
+    /// With the real browser, in the real sandbox: a phone's width is the width the page is laid out at, not the browser window's least.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn a_picture_at_a_phones_width_is_laid_out_at_it() {
+        let (dir, _) = page(&[("index.html", "<!DOCTYPE html><title>w</title><style>body{margin:0}.w{height:40px;background:#cc3333}@media(max-width:600px){.w{background:#3366cc}}</style><div class=w id=w></div><script>document.getElementById('w').textContent=innerWidth</script>")]);
+        let said = check_page(&serde_json::json!({"path": "index.html", "views": ["desktop", "mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        let path = |label: &str| said.lines().find(|line| line.starts_with(&format!("How it looks at {label} "))).and_then(|line| line.split("`read_file` ").nth(1)).map(PathBuf::from).unwrap_or_else(|| panic!("{label}: {said}"));
+        let (desktop, mobile) = (image::open(path("desktop")).unwrap().to_rgb8(), image::open(path("mobile")).unwrap().to_rgb8());
+        assert_eq!((desktop.width(), desktop.height(), mobile.width(), mobile.height()), (1280, 800, 390, 844));
+        assert_eq!(mobile.get_pixel(370, 20).0, [0x33, 0x66, 0xcc], "the phone's rules, across the whole of its width");
+        assert_eq!(desktop.get_pixel(1260, 20).0, [0xcc, 0x33, 0x33]);
     }
 
     /// With the real browser, in the real sandbox: what it was measured to do.
