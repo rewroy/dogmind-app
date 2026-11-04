@@ -338,9 +338,14 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
         format!("{} ({})", word(gpu, "name"), gb(gpu.get("total_bytes").and_then(Value::as_u64).unwrap_or(0)))
     }).collect();
     let ram = machine.and_then(|machine| machine.get("ram_bytes")).and_then(Value::as_u64).unwrap_or(0);
+    // (what is free now, when Straydog says: what other programs hold decides whether a model's experts stay in memory)
+    let free_ram = machine.and_then(|machine| machine.get("free_ram_bytes")).and_then(Value::as_u64);
     let mut parts = gpus.clone();
     if ram > 0 {
-        parts.push(tf("{0} of memory", &[&gb(ram)]));
+        parts.push(match free_ram {
+            Some(free) => tf("{0} of memory, {1} free now", &[&gb(ram), &gb(free)]),
+            None => tf("{0} of memory", &[&gb(ram)]),
+        });
     }
     // (said whether or not the list has some that are short: they are there to try, and not what this PC runs)
     let refusal = if runnable {
@@ -1252,6 +1257,9 @@ mod tests {
         let small = parse_list(small, true).unwrap();
         assert_eq!(small.refusal, Some(Refusal::TooLittleMemory { needs: "10 GiB".into(), has: "6 GiB".into() }), "the least it would take");
         assert_eq!(small.machine, "RTX 2060 (6 GB)  ·  34 GB of memory");
+        // (a Straydog that measures what is free says so too)
+        let free = r#"{"machine":{"gpus":[{"ordinal":0,"name":"RTX 5070 Ti","total_bytes":17066033152}],"ram_bytes":66126708736,"free_ram_bytes":30064771072},"bundles":[]}"#;
+        assert_eq!(parse_list(free, true).unwrap().machine, "RTX 5070 Ti (17 GB)  ·  66 GB of memory, 30 GB free now");
     }
 
     /// What Straydog 0.1.1 says on a 16 GB card: DeepSeek does not run. It is in the list after the rest, greyed and not recommended, with why,
