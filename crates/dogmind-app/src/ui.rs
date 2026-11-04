@@ -10239,8 +10239,8 @@ impl App {
             }
             Note::ReleaseLooked { on_its_own, outcome } => {
                 self.release_checking = false;
-                // Only a look that GitHub answered counts against the day: with no connection the next one is cheap, and may find one.
-                if outcome.was_answered() {
+                // Only a look that learned something counts against the day: after a refusal, an error or a page that is no release, the hourly timer asks again.
+                if outcome.learned_something() {
                     self.settings.last_update_check = Some(updates::now());
                     self.save();
                 }
