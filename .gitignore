@@ -1,6 +1,7 @@
 /target
 /target-ui
 /dist
+/dist-*
 /target-*
 __pycache__/
 /plan
