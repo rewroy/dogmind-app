@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "dogmind-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "flate2",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "dogmind-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dogmind-agent",
  "image",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "dogmind-setup"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "flate2",
  "sha2",
