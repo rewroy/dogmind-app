@@ -8,7 +8,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::checkpoint::{Checkpoints, Restored, Turn};
 use crate::compaction;
@@ -21,6 +21,7 @@ use crate::safety::{self, delegated, resolve, AlwaysScope, Gate, Mode, Risk, Ver
 use crate::session::{complete_tool_calls, Session};
 use crate::{mcp, memory, skills};
 use crate::tools::{self, Workbench};
+use crate::trajectory::{self, Clock, RequestNote, Trajectory};
 use crate::web::WebSettings;
 
 const MAX_ITERATIONS: usize = 300;
@@ -75,6 +76,8 @@ pub enum Command {
     WarmPrefix,
     /// The provider to use from now on, its model and its context (0: not known yet).
     Provider(Arc<dyn Provider>, String, u64),
+    /// How a connection to the provider went, for the trajectory: `at` is when it ended (a time as the trajectory writes them), `what` is `connect` or `loading_wait`.
+    Connection { at: String, what: String, ms: u64, outcome: String },
     Quit,
 }
 
@@ -590,6 +593,11 @@ impl DraftWatch {
         DraftWatch { shown, line_starts: 0, code_lines: 0, after_quote: false, marks: 0, block: None }
     }
 
+    /// What it had come to, for the trajectory: the lines of code of its own, and the fence marks of the blocks of it that are done.
+    fn stats(&self) -> (usize, usize) {
+        (self.code_lines, self.marks)
+    }
+
     /// Whether a line of the reasoning is one it was shown; none where it is too short to say.
     fn quote(&self, line: &str) -> Option<bool> {
         (line.len() >= QUOTE_MIN).then(|| self.shown.contains(line))
@@ -717,7 +725,7 @@ fn cut_answer(content: &str, reasoning: &str, calls: &[crate::message::ToolCall]
     let id = if last.id.is_empty() { format!("cut-{base}-{}", kept.len()) } else { last.id.clone() };
     let closed = crate::message::ToolCall { id, kind: "function".into(), function: crate::message::FunctionCall { name: last.function.name.clone(), arguments } };
     kept.push(closed);
-    Some((llm::Completion { content: content.to_string(), reasoning: reasoning.to_string(), tool_calls: kept, finish: "tool_calls".into(), usage: None, blocks: None }, path, tail))
+    Some((llm::Completion { content: content.to_string(), reasoning: reasoning.to_string(), tool_calls: kept, finish: "tool_calls".into(), usage: None, blocks: None, timings: None }, path, tail))
 }
 
 /// Whether a `create_file` kept where it was cut off would put part of a new text in place of a file that is there, with nothing to say the rest will ever come. A new file's part is more than
@@ -806,6 +814,90 @@ struct Agent {
     events: Sender<Event>,
     wake: Box<dyn Fn() + Send>,
     cancel: Arc<AtomicBool>,
+    /// How the run is recorded (`trajectory`): beside the session once there is one.
+    traj: Trajectory,
+    /// The tool calls that have begun and not ended, for the line each ends with.
+    running: HashMap<String, ToolMeta>,
+    /// The request whose calls, or whose stop or note, an event of the trajectory is about.
+    last_req: Option<String>,
+    /// How long the person was waited for, in the call that is being run, and why a call was refused when it was.
+    approval_wait: Option<Duration>,
+    refusal: Option<&'static str>,
+    /// Why a compaction went as it did, for its line.
+    compaction_stage: &'static str,
+}
+
+/// What a call's line in the trajectory needs from its beginning.
+struct ToolMeta {
+    name: String,
+    at: chrono::DateTime<chrono::Local>,
+    path: Option<String>,
+    cmd0: Option<String>,
+    args_bytes: usize,
+    /// The files it may write, resolved: what each is, after the call, is hashed.
+    edited: Vec<PathBuf>,
+    parallel: usize,
+    req: Option<String>,
+}
+
+/// A path as the trajectory says it: from the workspace when it is in it.
+fn path_for_trajectory(path: &str, workspace: &Path) -> String {
+    let resolved = resolve(workspace, path);
+    resolved.strip_prefix(workspace).map_or_else(|_| path.to_string(), |inside| inside.to_string_lossy().replace('\\', "/"))
+}
+
+/// The first word of a command, and no more: a program's name, never its arguments, which can hold a key or a person's words. A first word with an `=` in it is an assignment
+/// (`KEY=value cmd`), and says nothing.
+fn first_word_of(command: &str) -> Option<String> {
+    let word = command.split_whitespace().next()?.trim_matches(|c| c == '"' || c == '\'' || c == '&' || c == '.');
+    if word.contains('=') || word.contains('$') {
+        return Some("(assignment)".to_string());
+    }
+    let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    Some(name.chars().take(40).collect())
+}
+
+/// What the tool's own cap said it left out of an output, in all: `--- truncated: N bytes left out ---`.
+fn bytes_left_out(output: &str) -> u64 {
+    const MARK: &str = "--- truncated: ";
+    output.match_indices(MARK).filter_map(|(at, _)| {
+        let rest = &output[at + MARK.len()..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        rest[digits..].starts_with(" bytes left out").then(|| rest[..digits].parse::<u64>().ok()).flatten()
+    }).sum()
+}
+
+/// How a failure reads in `failed`: a class, never its text.
+pub fn failure_kind(text: &str) -> &'static str {
+    if text.contains("tool calls in a row failed") {
+        "failed_calls"
+    } else if text.contains("made the same call") {
+        "repeats"
+    } else if text.contains("the answer was cut off") {
+        "cut_off"
+    } else if text.starts_with("stopped after") {
+        "iterations"
+    } else if text == llm::UNFINISHED {
+        "unfinished"
+    } else if text == llm::CONTEXT_FULL || text == llm::MEMORY_FULL {
+        "context_full"
+    } else if llm::is_gone(text) || text == llm::ENGINE_GONE || text == llm::ENGINE_OUT_OF_MEMORY {
+        "server_gone"
+    } else if text == llm::KEY_REFUSED || text == llm::NOT_FOUND {
+        "refused"
+    } else if text == llm::SERVER_BUSY {
+        "busy"
+    } else if text == llm::NOT_READY {
+        "not_ready"
+    } else if text == llm::NO_VISION {
+        "no_vision"
+    } else if text.starts_with(llm::NO_ANSWER) {
+        "no_answer"
+    } else if llm::OPENINGS.iter().any(|opening| text.starts_with(opening)) {
+        "server_error"
+    } else {
+        "other"
+    }
 }
 
 enum Ended {
@@ -873,12 +965,25 @@ impl Agent {
             events,
             wake,
             cancel,
+            traj: Trajectory::new(),
+            running: HashMap::new(),
+            last_req: None,
+            approval_wait: None,
+            refusal: None,
+            compaction_stage: "",
         }
     }
 
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
         (self.wake)();
+    }
+
+    /// A failure the person is told of, and its class in the trajectory.
+    fn failed(&mut self, error: String) {
+        let req = self.last_req.clone();
+        self.traj.write("failed", req.as_deref(), json!({"kind": failure_kind(&error)}));
+        self.emit(Event::Failed(error));
     }
 
     fn run(&mut self, inbox: Receiver<Command>) {
@@ -891,6 +996,11 @@ impl Agent {
                     self.model = model;
                     self.window = window;
                     self.report_usage(None);
+                }
+                Command::Connection { at, what, ms, outcome } => {
+                    let mut line = json!({"what": what, "ms": ms, "outcome": outcome});
+                    line["at"] = json!(at);
+                    self.traj.write("connection", None, line);
                 }
                 Command::SetMode(mode) => self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode = mode,
                 Command::SetEffort(effort) => self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).effort = effort,
@@ -919,7 +1029,7 @@ impl Agent {
                     let failure = self.compact(true, false).err();
                     let cancelled = failure.is_some() && self.cancelled();
                     if let (Some(error), false) = (failure, cancelled) {
-                        self.emit(Event::Failed(error));
+                        self.failed(error);
                     }
                     self.emit(Event::TurnEnded { cancelled });
                 }
@@ -991,6 +1101,9 @@ impl Agent {
         self.messages.clear();
         self.session = None;
         self.marks = None;
+        self.traj.close();
+        self.running.clear();
+        self.last_req = None;
         self.always.clear();
         self.always_files.clear();
         self.always_folders.clear();
@@ -1033,6 +1146,9 @@ impl Agent {
                 }
                 self.session = Some(session);
                 self.marks = Some(Checkpoints::open(path));
+                self.traj.open(path);
+                self.running.clear();
+                self.last_req = None;
                 self.always.clear();
                 self.always_files.clear();
                 self.always_folders.clear();
@@ -1042,7 +1158,7 @@ impl Agent {
                 self.replay_todos();
                 self.report_usage(None);
             }
-            Err(error) => self.emit(Event::Failed(error)),
+            Err(error) => self.failed(error),
         }
     }
 
@@ -1120,6 +1236,7 @@ impl Agent {
             self.bench.baseline = Some(Arc::new(crate::baseline::Baseline::for_session(&path, &self.workspace)));
             self.session = Some(session);
             self.marks = Some(Checkpoints::open(&path));
+            self.traj.open(&path);
             self.push(Message::text("system", self.frozen_prompt()));
         }
         Ok(())
@@ -1144,14 +1261,18 @@ impl Agent {
         // (the tools the first message will find, or this was for nothing)
         self.load_extras();
         let messages = [Message::text("system", self.frozen_prompt()), Message::text("user", ".")];
+        let req_id = self.traj.request_id();
         let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false };
         // Its first word is enough, which stops it as Stop does: Stop itself ends it at once, for what was written during it to begin.
         self.cancel.store(false, Ordering::Relaxed);
         let mut answered = false;
-        let _ = provider.stream(&request, &self.cancel, &mut |_| {
+        let mut clock = Clock::start();
+        let streamed = provider.stream(&request, &self.cancel, &mut |_| {
+            clock.word();
             answered = true;
             self.cancel.store(true, Ordering::Relaxed);
         });
+        self.traced("warm", &req_id, &clock, &streamed);
         if answered {
             self.cancel.store(false, Ordering::Relaxed);
         }
@@ -1160,15 +1281,18 @@ impl Agent {
     /// `pictures`: newly attached. `kept`: already in the session's folder, as when a message is sent again.
     fn turn(&mut self, text: &str, pictures: Vec<Attachment>, kept: Vec<ImageRef>) {
         self.turn_began = std::time::SystemTime::now();
+        let turn_began = Instant::now();
         self.bench.new_turn();
         self.cancel.store(false, Ordering::Relaxed);
         self.emit(Event::TurnStarted);
         let new_session = self.messages.is_empty();
         if let Err(error) = self.ensure_session() {
-            self.emit(Event::Failed(error));
+            self.failed(error);
             self.emit(Event::TurnEnded { cancelled: false });
             return;
         }
+        self.traj.begin_turn();
+        self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": pictures.len() + kept.len(), "first": new_session}));
         let mut images = kept;
         if let Some(session) = self.session.as_ref().map(|session| session.path.clone()) {
             let limit = self.image_limit();
@@ -1176,7 +1300,7 @@ impl Agent {
                 match images::save(&session, picture, limit) {
                     Ok(image) => images.push(image),
                     Err(error) => {
-                        self.emit(Event::Failed(error));
+                        self.failed(error);
                         self.emit(Event::TurnEnded { cancelled: false });
                         return;
                     }
@@ -1249,6 +1373,18 @@ impl Agent {
                 let _ = session.snapshot(&self.messages);
             }
         }
+        let (cancelled, how) = match &ended {
+            Ended::Done => (false, "done"),
+            Ended::Cancelled => (true, "cancelled"),
+            Ended::Failed(_) => (false, "failed"),
+        };
+        // (written before the window is told: what hears of the turn's end may be the end of the process)
+        let (requests, tools) = (self.traj.turn_requests, self.traj.turn_tools);
+        if let Ended::Failed(error) = &ended {
+            let req = self.last_req.clone();
+            self.traj.write("failed", req.as_deref(), json!({"kind": failure_kind(error)}));
+        }
+        self.traj.write("turn_end", None, json!({"cancelled": cancelled, "ended": how, "requests": requests, "tools": tools, "ms": turn_began.elapsed().as_millis() as u64}));
         match ended {
             Ended::Done => self.emit(Event::TurnEnded { cancelled: false }),
             Ended::Cancelled => self.emit(Event::TurnEnded { cancelled: true }),
@@ -1373,6 +1509,8 @@ impl Agent {
         let mut repeats: HashMap<String, u32> = HashMap::new();
         let (mut unchecked, mut asked_to_check) = (false, false);
         let (mut said, mut asked_about_slips) = (String::new(), false);
+        // The request this one repeats, why, and how long it waited, for the trajectory.
+        let mut retry: Option<(String, &'static str, u64)> = None;
         for _ in 0..MAX_ITERATIONS {
             if self.cancelled() {
                 return Ended::Cancelled;
@@ -1384,6 +1522,8 @@ impl Agent {
                     return if self.cancelled() { Ended::Cancelled } else { Ended::Failed(error) };
                 }
             }
+            let req_id = self.traj.request_id();
+            self.last_req = Some(req_id.clone());
             let folder = self.picture_folder();
             let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters() };
             let mut written = String::new();
@@ -1407,6 +1547,7 @@ impl Agent {
             self.emit(Event::RequestStarted);
             self.emit(Event::Usage { used: base, window, usage: Usage::default() });
             let mut meter = StreamMeter::new(base, Instant::now());
+            let mut clock = Clock::start();
             let person = &self.cancel;
             let result = with_the_persons_stop(person, &halt, || provider.stream(&request, &halt, &mut |delta| {
                 // (at once while words come, as the stream looks at its flag after each: the watch is for the wait before them)
@@ -1414,6 +1555,7 @@ impl Agent {
                     cancel.store(true, Ordering::Relaxed);
                 }
                 let now = Instant::now();
+                clock.word();
                 let mut told = match delta {
                     Delta::Reasoning(text) => {
                         meter.count(text, now);
@@ -1464,6 +1606,15 @@ impl Agent {
             }));
             // (a Stop of the person's, whatever else stopped the stream, is the turn's end)
             let stopped_by_the_app = (cut || drafting) && !self.cancelled();
+            // (how it ended, as the trajectory says it: what ended it from outside is not in what the provider returned)
+            let end = match &result {
+                Err(LlmError::Cancelled) if drafting && stopped_by_the_app => "stopped_app:draft_stop".to_string(),
+                Err(LlmError::Cancelled) if cut && stopped_by_the_app => "stopped_app:cut_write".to_string(),
+                other => trajectory::end_of(other),
+            };
+            let (usage, timings) = result.as_ref().ok().map_or((None, None), |completion| (completion.usage.as_ref(), completion.timings.as_ref()));
+            let named: Vec<String> = calling.iter().map(|call| call.function.name.clone()).filter(|name| !name.is_empty()).collect();
+            self.traj.request(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take() });
             let base = self.messages.len();
             let saved = if cuts { cut_answer(&written, &reasoned, &calling, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) } else { None };
             // Writing a file out in its reasoning: every token of it is typed again in the call. It goes on from what it had decided, in a request of which all but the last few tokens are
@@ -1471,6 +1622,9 @@ impl Agent {
             // the engine is not writing into nothing. (The tokens it wrote were spent all the same.)
             if drafting && stopped_by_the_app && matches!(result, Err(LlmError::Cancelled)) {
                 generated += meter.tokens;
+                // (what it had come to when it was stopped, and what the stop cost: the tokens that are thrown away)
+                let (code_lines, fences) = watch.as_ref().map_or((0, 0), DraftWatch::stats);
+                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "code_lines": code_lines, "fences": fences}));
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
                 self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped)));
@@ -1485,6 +1639,7 @@ impl Agent {
                     // (an answer cut here has no count of its own, and it is the long ones that come this way)
                     generated += meter.tokens;
                     let (answer, path, tail) = saved.expect("just looked at");
+                    self.cut_write_noted("size", &answer, &path, meter.tokens);
                     self.note_cut_write(&answer, path, tail);
                     answer
                 }
@@ -1506,17 +1661,21 @@ impl Agent {
                         return if self.cancelled() { Ended::Cancelled } else { Ended::Failed(if error == llm::CONTEXT_FULL { message } else { error }) };
                     }
                     if kept {
+                        self.intervened("continue_nudge", json!({"why": "overflow"}));
                         self.push(Message::text("user", prompt::CONTINUE_NUDGE));
                     }
+                    retry = Some((req_id.clone(), "overflow", 0));
                     continue;
                 }
                 // What it had written of a file stays, as there is no knowing how long that was: the model goes on from there.
                 Err(LlmError::Transient(message)) if saved.is_some() && transient < TRANSIENT_RETRIES => {
                     transient += 1;
                     self.emit(Event::Notice(llm::BROKE_OFF.into()));
-                    self.wait_to_retry(retry_pause(transient, &message));
+                    let waited = self.wait_to_retry(retry_pause(transient, &message));
+                    retry = Some((req_id.clone(), "transient", waited));
                     generated += meter.tokens;
                     let (answer, path, tail) = saved.expect("just looked at");
+                    self.cut_write_noted("broken_connection", &answer, &path, meter.tokens);
                     self.note_cut_write(&answer, path, tail);
                     answer
                 }
@@ -1537,9 +1696,15 @@ impl Agent {
                         self.emit(Event::Notice(llm::BROKE_OFF.into()));
                         // (calls it had begun went with the connection: unsaid, a model takes them for made, and says it did what never ran)
                         let begun: Vec<&str> = calling.iter().map(|call| call.function.name.as_str()).filter(|name| !name.is_empty()).collect();
+                        if begun.is_empty() {
+                            self.intervened("continue_nudge", json!({"why": "broken_connection"}));
+                        } else {
+                            self.intervened("calls_broken_off", json!({"calls": begun}));
+                        }
                         self.push(Message::text("user", if begun.is_empty() { prompt::CONTINUE_NUDGE.to_string() } else { prompt::calls_broken_off(&begun) }));
                     }
-                    self.wait_to_retry(retry_pause(transient, &message));
+                    let waited = self.wait_to_retry(retry_pause(transient, &message));
+                    retry = Some((req_id.clone(), "transient", waited));
                     continue;
                 }
                 // Nothing to wait for and nothing to shorten: what came stays, and the conversation with it.
@@ -1564,8 +1729,9 @@ impl Agent {
             // The model's own limit in the middle of a file: as with a cut, what it wrote stays and it goes on.
             if cuts && completion.finish == "length" {
                 if let Some((answer, path, tail)) = cut_answer(&completion.content, &completion.reasoning, &completion.tool_calls, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) {
+                    self.cut_write_noted("length", &answer, &path, 0);
                     self.note_cut_write(&answer, path, tail);
-                    completion = llm::Completion { usage: completion.usage.take(), ..answer };
+                    completion = llm::Completion { usage: completion.usage.take(), timings: completion.timings.take(), ..answer };
                 }
             }
             if let Some(usage) = &completion.usage {
@@ -1585,6 +1751,7 @@ impl Agent {
                 if empties > EMPTY_RETRIES {
                     return Ended::Failed(llm::UNFINISHED.into());
                 }
+                retry = Some((req_id.clone(), "empty", 0));
                 continue;
             }
             said.push_str(&completion.content);
@@ -1619,6 +1786,7 @@ impl Agent {
                 // (a local model's: what a service costs is not minutes of someone's waiting. It goes on if the work is not done.)
                 if cuts && wrote && generated >= next_cost_note {
                     next_cost_note = generated + COST_NOTED_EVERY;
+                    self.intervened("cost_note", json!({"generated": generated}));
                     self.push(Message::text("user", cost_note(generated)));
                 }
                 continue;
@@ -1629,6 +1797,7 @@ impl Agent {
                 if cut_off > MAX_CONTINUES {
                     return Ended::Failed(format!("the answer was cut off {cut_off} times in a row: stopped so that you can look"));
                 }
+                self.intervened("continue_nudge", json!({"why": "length", "in_a_row": cut_off}));
                 self.push(Message::text("user", prompt::CONTINUE_NUDGE));
                 continue;
             }
@@ -1639,6 +1808,7 @@ impl Agent {
             // Once a turn: a model that says it is done without having run what it wrote gets one word about it.
             if unchecked && !asked_to_check && self.mode != Mode::Plan {
                 asked_to_check = true;
+                self.intervened("check_nudge", json!({}));
                 self.push(Message::text("user", prompt::CHECK_NUDGE));
                 continue;
             }
@@ -1647,6 +1817,7 @@ impl Agent {
                 let letters = self.slips_in(&said);
                 if !letters.is_empty() {
                     asked_about_slips = true;
+                    self.intervened("slip_note", json!({"letters": letters.chars().count()}));
                     self.push(Message::text("user", prompt::slip_note(&letters)));
                     continue;
                 }
@@ -1686,11 +1857,35 @@ impl Agent {
     }
 
     /// A person who stops the turn does not wait out the pause.
-    fn wait_to_retry(&self, pause: Duration) {
-        let until = Instant::now() + pause;
+    fn wait_to_retry(&self, pause: Duration) -> u64 {
+        let began = Instant::now();
+        let until = began + pause;
         while Instant::now() < until && !self.cancelled() {
             std::thread::sleep(Duration::from_millis(50));
         }
+        began.elapsed().as_millis() as u64
+    }
+
+    /// The line of a request that is not a step of the conversation (a helper's, a checkpoint's, the engine's warm-up): what came back, as far as it is known.
+    fn traced(&mut self, role: &'static str, req_id: &str, clock: &Clock, result: &Result<llm::Completion, LlmError>) {
+        let (usage, timings) = result.as_ref().ok().map_or((None, None), |completion| (completion.usage.as_ref(), completion.timings.as_ref()));
+        let (reasoning, content, calls) = result.as_ref().ok().map_or((0, 0, Vec::new()), |completion| (completion.reasoning.chars().count(), completion.content.chars().count(), completion.tool_calls.iter().map(|call| call.function.name.clone()).collect()));
+        // (a warm-up is ended by the app at its first word, which is how it is meant to end)
+        let end = if role == "warm" && matches!(result, Err(LlmError::Cancelled)) { "stopped_app:warm_up".to_string() } else { trajectory::end_of(result) };
+        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: 0, retry: None });
+    }
+
+    /// An intervention of the app's own, in the trajectory, for the request that was made last: the one it ended or follows.
+    fn intervened(&mut self, kind: &str, fields: Value) {
+        let req = self.last_req.clone();
+        self.traj.intervention(kind, req.as_deref(), fields);
+    }
+
+    /// A `create_file` kept where it was cut off, to be gone on with: its size, and why it was cut.
+    fn cut_write_noted(&mut self, why: &str, answer: &llm::Completion, path: &str, tokens_before: u64) {
+        let bytes = answer.tool_calls.last().map_or(0, |call| call.function.arguments.len());
+        let path = path_for_trajectory(path, &self.workspace);
+        self.intervened("cut_write", json!({"why": why, "bytes": bytes, "path": path, "tokens_before": tokens_before}));
     }
 
     /// What the model had written of an answer that ended early joins the conversation: it is on the screen, and it would otherwise be gone
@@ -1721,7 +1916,7 @@ impl Agent {
         }
         self.push(answer.message());
         self.emit(Event::AssistantEnded);
-        self.emit(Event::ToolStarted { id: call.id.clone(), tool: call.function.name.clone(), summary: tools::summary(&call.function.name, &arguments) });
+        self.tool_started(&call.id, &call.function.name, Some(&arguments), call.function.arguments.len(), 1);
         let started = Instant::now();
         let edited = edited_paths(&call.function.name, &arguments, &self.workspace);
         if let Some(Err(error)) = self.marks.as_mut().map(|marks| marks.before_edit(&edited)) {
@@ -1778,7 +1973,7 @@ impl Agent {
         // (each parsed as free_read did when it let it through, so what runs is what the gate saw)
         let parsed: Vec<Value> = calls.iter().map(|call| arguments_of(call).unwrap_or_default()).collect();
         for (call, arguments) in calls.iter().zip(&parsed) {
-            self.emit(Event::ToolStarted { id: call.id.clone(), tool: call.function.name.clone(), summary: tools::summary(&call.function.name, arguments) });
+            self.tool_started(&call.id, &call.function.name, Some(arguments), call.function.arguments.len(), calls.len());
         }
         let (workspace, baseline, cancel, secrets) = (self.workspace.clone(), self.bench.baseline.clone(), self.cancel.clone(), self.gate.secrets.clone());
         let results: Vec<_> = std::thread::scope(|scope| {
@@ -1806,20 +2001,22 @@ impl Agent {
         let arguments: Value = match parse_arguments(&call.function.arguments) {
             Ok(arguments) => arguments,
             Err(error) => {
-                self.emit(Event::ToolStarted { id: call.id.clone(), tool: name.to_string(), summary: String::new() });
+                self.tool_started(&call.id, name, None, call.function.arguments.len(), 1);
                 self.finish_call(&call.id, Err(format!("the arguments are not JSON: {error}")), false, started.elapsed());
                 return 1;
             }
         };
-        self.emit(Event::ToolStarted { id: call.id.clone(), tool: name.to_string(), summary: tools::summary(name, &arguments) });
+        self.tool_started(&call.id, name, Some(&arguments), call.function.arguments.len(), 1);
         match self.permission(name, &arguments) {
             Permission::Run => {}
-            Permission::Refused(message) => {
+            Permission::Refused(message, how) => {
+                self.refusal = Some(how);
                 self.finish_call(&call.id, Err(message), true, started.elapsed());
                 return 0;
             }
             // (a tool that does not exist, again and again, is a model that gets nowhere; a person's no is not)
             Permission::Denied(message) => {
+                self.refusal = Some("refused_gate");
                 self.finish_call(&call.id, Err(message), true, started.elapsed());
                 return 1;
             }
@@ -1886,13 +2083,18 @@ impl Agent {
             }
             let last = step >= HELPER_STEPS || messages.iter().map(Message::chars).sum::<usize>() > room;
             if last && !told_enough {
+                self.intervened("helper_enough", json!({"step": step}));
                 messages.push(Message::text("user", prompt::HELPER_ENOUGH));
                 told_enough = true;
             }
             // The tools are offered to the end. Not offered, a real model (DeepSeek-V4.1) went on calling one, in its own markup: that came back as
             // the answer, and the agent that asked got that and nothing of what the helper had found.
+            let req_id = self.traj.request_id();
             let request = Request { model: &self.model, messages: &messages, tools: Some(&schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false };
-            let completion = provider.stream(&request, &self.cancel, &mut |_| {}).map_err(|error| format!("the helper's request failed: {error}"))?;
+            let mut clock = Clock::start();
+            let streamed = provider.stream(&request, &self.cancel, &mut |_| clock.word());
+            self.traced("helper", &req_id, &clock, &streamed);
+            let completion = streamed.map_err(|error| format!("the helper's request failed: {error}"))?;
             let answer = without_call_markup(&completion.content).trim().to_string();
             if completion.tool_calls.is_empty() || (last && !answer.is_empty()) {
                 return if answer.is_empty() { Err("the helper ended with nothing to say".into()) } else { Ok(tools::cap(&answer, HELPER_ANSWER)) };
@@ -1951,6 +2153,83 @@ impl Agent {
         self.finish_call_with(id, result, declined, elapsed, Vec::new());
     }
 
+    /// A call begins: the app is told, and the call's line in the trajectory is begun. `arguments` is none for a call whose arguments were not JSON.
+    fn tool_started(&mut self, id: &str, name: &str, arguments: Option<&Value>, raw_len: usize, parallel: usize) {
+        let summary = arguments.map_or(String::new(), |arguments| tools::summary(name, arguments));
+        self.emit(Event::ToolStarted { id: id.to_string(), tool: name.to_string(), summary });
+        let path = arguments.and_then(|arguments| {
+            let named = arguments.get("path").and_then(Value::as_str).or_else(|| arguments.pointer("/edits/0/path").and_then(Value::as_str)).or_else(|| arguments.pointer("/expected_files/0").and_then(Value::as_str));
+            named.map(|path| path_for_trajectory(path, &self.workspace))
+        });
+        let cmd0 = if name == "execute_command" { arguments.and_then(|arguments| arguments.get("command")?.as_str()).and_then(first_word_of) } else { None };
+        let edited = arguments.map_or(Vec::new(), |arguments| edited_paths(name, arguments, &self.workspace));
+        #[cfg(windows)]
+        if name == "check_page" {
+            crate::page_check::forget_runs();
+        }
+        self.approval_wait = None;
+        self.refusal = None;
+        self.running.insert(id.to_string(), ToolMeta { name: name.to_string(), at: chrono::Local::now(), path, cmd0, args_bytes: raw_len, edited, parallel, req: self.last_req.clone() });
+    }
+
+    /// The call's line: how it ended and how long it ran, without the wait for the person (which has its own).
+    fn tool_ended(&mut self, id: &str, ok: bool, declined: bool, output: &str, elapsed: Duration) {
+        let Some(meta) = self.running.remove(id) else { return };
+        let wait = self.approval_wait.take();
+        let ran = elapsed.saturating_sub(wait.unwrap_or_default());
+        let outcome = if declined {
+            self.refusal.take().unwrap_or("declined_person")
+        } else if output.contains("exit_code: none, timed out") {
+            "timeout"
+        } else if !ok {
+            if self.cancelled() { "cancelled" } else { "error" }
+        } else {
+            "ok"
+        };
+        let mut line = json!({"id": id, "name": meta.name, "started": trajectory::stamp(meta.at), "ms": ran.as_millis() as u64, "outcome": outcome, "args_bytes": meta.args_bytes, "out_bytes": output.len()});
+        if let Some(wait) = wait {
+            line["wait_ms"] = json!(wait.as_millis() as u64);
+        }
+        let cut = bytes_left_out(output);
+        if cut > 0 {
+            line["out_cut_bytes"] = json!(cut);
+        }
+        if let Some(path) = &meta.path {
+            line["path"] = json!(path);
+        }
+        if let Some(word) = &meta.cmd0 {
+            line["cmd0"] = json!(word);
+        }
+        if meta.parallel > 1 {
+            line["parallel"] = json!(meta.parallel);
+        }
+        if meta.name == "execute_command" && ok {
+            if let Some((_, code)) = output.rsplit_once("exit_code: ") {
+                line["exit_code"] = code.trim().split(|c: char| !c.is_ascii_digit() && c != '-').next().and_then(|digits| digits.parse::<i64>().ok()).map_or(Value::Null, |code| json!(code));
+            }
+        }
+        // What each file it wrote is now, as a short hash: a file that comes back to a state it had is what the reader looks for.
+        if ok && matches!(meta.name.as_str(), "create_file" | "apply_patch") {
+            let edited: Vec<Value> = meta.edited.iter().filter_map(|file| {
+                let bytes = std::fs::read(file).ok()?;
+                Some(json!({"path": path_for_trajectory(&file.to_string_lossy(), &self.workspace), "hash": trajectory::short_hash(&bytes)}))
+            }).collect();
+            if let Some(first) = edited.first() {
+                line["edit_hash"] = first["hash"].clone();
+            }
+            if edited.len() > 1 {
+                line["edited"] = Value::Array(edited);
+            }
+        }
+        #[cfg(windows)]
+        if meta.name == "check_page" {
+            let runs: Vec<Value> = crate::page_check::take_runs().into_iter().map(|run| json!({"of": run.of, "end": run.end, "ms": run.ms})).collect();
+            line["browser_runs"] = Value::Array(runs);
+        }
+        self.traj.turn_tools += 1;
+        self.traj.write("tool", meta.req.as_deref(), line);
+    }
+
     fn finish_call_with(&mut self, id: &str, result: Result<String, String>, declined: bool, elapsed: Duration, images: Vec<ImageRef>) {
         let (ok, mut output) = match result {
             Ok(output) => (true, output),
@@ -1958,6 +2237,7 @@ impl Agent {
         };
         if self.repeated.remove(id) {
             output.push_str(REPEAT_NOTE);
+            self.intervened("repeat_note", json!({}));
         }
         if let Some((path, tail)) = self.cut_writes.remove(id) {
             if ok {
@@ -1965,6 +2245,7 @@ impl Agent {
                 output.push_str(&format!("\nnote: this call was cut off here, to get the work on disk. The file ends with this line: `{tail}`. Go straight on with the next line, in create_file with the same path, and write only what is missing: there is no need to think it over again."));
             }
         }
+        self.tool_ended(id, ok, declined, &output, elapsed);
         self.emit(Event::ToolEnded { id: id.to_string(), ok, declined, elapsed, output: output.clone(), images: images.clone() });
         self.push(Message { images, ..Message::tool_result(id, output) });
     }
@@ -1987,7 +2268,7 @@ impl Agent {
                 }
                 // (a person need not be asked about what no one gave it)
                 if crate::web::looks_signed(url) {
-                    return Permission::Refused("this signed address is not in anything you have been given, so it was made up. Use an address you have seen, or none".to_string());
+                    return Permission::Refused("this signed address is not in anything you have been given, so it was made up. Use an address you have seen, or none".to_string(), "refused_gate");
                 }
                 // Asked for, not refused: an address the person knows is fine. Never delegated, as it has a reason.
                 let reason = if plain {
@@ -2004,7 +2285,7 @@ impl Agent {
             Verdict::Ask { risk, reason } => (risk, reason),
         };
         if self.mode == Mode::Plan && (matches!(tool, "create_file" | "apply_patch") || tool.starts_with("mcp__") || (tool == "execute_command" && risk > Risk::Safe)) {
-            return Permission::Refused("plan mode: nothing changes yet. Finish looking and set out your plan; the user leaves this mode when they accept it".to_string());
+            return Permission::Refused("plan mode: nothing changes yet. Finish looking and set out your plan; the user leaves this mode when they accept it".to_string(), "refused_gate");
         }
         // What a page said may have become the model's next step. Edits stay inside the workspace and can be rewound;
         // a command can do anything the sandbox lets it, so a person looks, whatever the mode and the saved rules. That goes
@@ -2035,6 +2316,8 @@ impl Agent {
         }
         let rule = if free { rules::proposed(&self.gate, &self.workspace, tool, arguments, risk) } else { None };
         let (answer, answered) = channel();
+        let (asked_at, asked) = (chrono::Local::now(), Instant::now());
+        let risk_name = risk.name();
         // The line that runs is what is shown, with the line as written in it as `written_as`; the rules, "always" and its scope went by the line as written.
         let shown = runs_as.as_ref().unwrap_or(arguments);
         self.emit(Event::Approval(Approval {
@@ -2048,13 +2331,14 @@ impl Agent {
             scope: scope.clone(),
             answer,
         }));
-        loop {
+        // (whichever way it ends, the wait is recorded: what the person was waited for is time of the run that no model or tool had)
+        let (decision, permission) = loop {
             match answered.recv_timeout(Duration::from_millis(200)) {
                 Ok((Decision::Approve, _)) => {
                     if tool == "web_read" {
                         self.bench.web.note_found(arguments.get("url").and_then(Value::as_str).unwrap_or(""));
                     }
-                    return Permission::Run;
+                    break ("approve", Permission::Run);
                 }
                 Ok((Decision::Always, _)) => {
                     if tool == "web_read" {
@@ -2063,15 +2347,15 @@ impl Agent {
                     match scope {
                         Some(AlwaysScope::File(file)) => {
                             self.always_files.push(file);
-                            return Permission::Run;
+                            break ("always", Permission::Run);
                         }
                         Some(AlwaysScope::Folders(folders)) => {
                             self.always_folders.extend(folders);
-                            return Permission::Run;
+                            break ("always", Permission::Run);
                         }
                         Some(AlwaysScope::Network(reach)) => {
                             self.always_networks.push(reach);
-                            return Permission::Run;
+                            break ("always", Permission::Run);
                         }
                         None => {}
                     }
@@ -2085,19 +2369,24 @@ impl Agent {
                             self.always.insert(key);
                         }
                     }
-                    return Permission::Run;
+                    break ("always", Permission::Run);
                 }
                 Ok((Decision::Reject, feedback)) => {
-                    return Permission::Refused(match feedback {
+                    break ("reject", Permission::Refused(match feedback {
                         Some(text) if !text.trim().is_empty() => format!("the user declined this call and said: {text}"),
                         _ => "the user declined this call".to_string(),
-                    });
+                    }, "declined_person"));
                 }
-                Err(_) if self.cancelled() => return Permission::Refused("the user stopped the turn".into()),
+                Err(_) if self.cancelled() => break ("stopped", Permission::Refused("the user stopped the turn".into(), "cancelled")),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Permission::Refused("the approval window closed".into()),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break ("closed", Permission::Refused("the approval window closed".into(), "cancelled")),
             }
-        }
+        };
+        let wait = asked.elapsed();
+        self.approval_wait = Some(wait);
+        let req = self.last_req.clone();
+        self.traj.write("approval", req.as_deref(), json!({"tool": tool, "risk": risk_name, "asked": trajectory::stamp(asked_at), "answered": trajectory::now(), "wait_ms": wait.as_millis() as u64, "decision": decision}));
+        permission
     }
 
     /// A checkpoint first when there is enough to sum up: it extends what the engine holds, and only what follows the head is read again afterwards, where a trim
@@ -2108,6 +2397,15 @@ impl Agent {
         if self.messages.is_empty() {
             return Ok(());
         }
+        let (before, began) = (self.expected_use(), Instant::now());
+        self.compaction_stage = "none";
+        let result = self.compact_conversation(forced, refused);
+        let (after, req) = (self.expected_use(), self.last_req.clone());
+        self.traj.write("compaction", req.as_deref(), json!({"forced": forced, "refused": refused, "stage": self.compaction_stage, "before_tokens": before, "after_tokens": after, "ms": began.elapsed().as_millis() as u64, "outcome": if result.is_ok() { "ok" } else { "error" }}));
+        result
+    }
+
+    fn compact_conversation(&mut self, forced: bool, refused: bool) -> Result<(), String> {
         self.emit(Event::Compacting);
         let found = self.messages.clone();
         self.bench.forget_reads();
@@ -2133,6 +2431,7 @@ impl Agent {
         }
         let trimmed_enough = saved >= over && over > 0;
         if trimmed_enough && !forced {
+            self.compaction_stage = "trim";
             self.used = self.used.saturating_sub((saved / CHARS_A_TOKEN) as u64);
             self.emit(Event::Notice(format!("Session compacted: old tool outputs shortened by {} KB", saved / 1024)));
             self.save_snapshot();
@@ -2170,6 +2469,7 @@ impl Agent {
                     return Err(llm::CONTEXT_FULL.into());
                 }
                 compaction::strip_thinking(&mut self.messages);
+                self.compaction_stage = "trim_all";
                 self.emit(Event::Notice(format!("Session compacted: every tool output, the newest too, shortened by {} KB, as nothing else would fit", (saved + more) / 1024)));
                 self.save_snapshot();
                 return Ok(());
@@ -2198,6 +2498,7 @@ impl Agent {
             self.emit(Event::Notice(llm::NO_CHECKPOINT.into()));
         }
         self.messages = kept;
+        self.compaction_stage = "truncate";
         if let Some(marks) = &mut self.marks {
             marks.conversation_cut(0);
         }
@@ -2213,6 +2514,7 @@ impl Agent {
     fn checkpointed(&mut self, forced: bool) -> Result<bool, String> {
         match self.checkpoint() {
             Ok(Some(text)) => {
+                self.compaction_stage = "checkpoint";
                 self.messages = compaction::apply_checkpoint(&self.messages, &text, if forced { FORCED_KEEP } else { 12 });
                 if let Some(marks) = &mut self.marks {
                     marks.conversation_cut(0);
@@ -2244,8 +2546,12 @@ impl Agent {
         complete_tool_calls(&mut messages);
         messages.push(Message::text("user", prompt::CHECKPOINT_PROMPT));
         let folder = self.picture_folder();
+        let req_id = self.traj.request_id();
         let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false };
-        let completion = provider.stream(&request, &self.cancel, &mut |_| {})?;
+        let mut clock = Clock::start();
+        let streamed = provider.stream(&request, &self.cancel, &mut |_| clock.word());
+        self.traced("checkpoint", &req_id, &clock, &streamed);
+        let completion = streamed?;
         // (one with no word of how it ended may have been cut anywhere: the turns it would stand for go for good, so it must be whole)
         if !completion.tool_calls.is_empty() || completion.finish == "length" || completion.finish.is_empty() || completion.content.trim().is_empty() {
             return Ok(None);
@@ -2256,8 +2562,8 @@ impl Agent {
 
 enum Permission {
     Run,
-    /// By a person, or by a mode they chose.
-    Refused(String),
+    /// By a person, or by a mode they chose; and which: `declined_person`, `refused_gate` (the mode, or the app) or `cancelled` (the turn stopped while it was asked).
+    Refused(String, &'static str),
     /// By the rules: what is never allowed, or what does not exist.
     Denied(String),
 }
@@ -5086,5 +5392,185 @@ mod tests {
         let run = Run { handle, events, _sessions: sessions };
         let (log, _) = until_end(&run, Decision::Reject);
         assert!(log[0].starts_with("failed:the engine is not ready"), "{log:?}");
+    }
+
+    /// The lines of the trajectory this run has written, as the app's own folder has them beside the session.
+    fn trajectory_of(run: &Run) -> Vec<Value> {
+        let file = std::fs::read_dir(run._sessions.path()).unwrap().flatten().map(|entry| entry.path()).find(|path| trajectory::is_trajectory(path)).expect("a trajectory beside the session");
+        std::fs::read_to_string(file).unwrap().lines().map(|line| serde_json::from_str(line).expect("a line that is JSON")).collect()
+    }
+
+    fn of_kind<'a>(lines: &'a [Value], ev: &str) -> Vec<&'a Value> {
+        lines.iter().filter(|line| line["ev"] == ev).collect()
+    }
+
+    /// Everything up to the end of the turn, answering each approval as `decide` says, after `pause`.
+    fn until_end_deciding(run: &Run, pause: Duration, decide: impl Fn(&str) -> Decision) {
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::Approval(approval) => {
+                    std::thread::sleep(pause);
+                    approval.answer.send((decide(&approval.tool), None)).unwrap();
+                }
+                Event::TurnEnded { .. } => return,
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_runs_trajectory_has_its_events_in_order_with_their_times_and_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "content here").unwrap();
+        let (client, _) = server(vec![call_answer("read_file", serde_json::json!({"path": "a.txt"})), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("read it".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let lines = trajectory_of(&run);
+        let kinds: Vec<&str> = lines.iter().map(|line| line["ev"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["turn_start", "request", "tool", "request", "turn_end"], "{lines:?}");
+        let shape = regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d$").unwrap();
+        assert!(lines.iter().all(|line| shape.is_match(line["t"].as_str().unwrap()) && line["turn"] == 1), "every line is timed to the millisecond and is of turn 1");
+        let (first, tool, second) = (&lines[1], &lines[2], &lines[3]);
+        // The numbers are the session's own, from 1, and the tool is of the request that made it.
+        let id = first["req"].as_str().unwrap();
+        assert!(id.ends_with("/1") && second["req"].as_str().unwrap().ends_with("/2") && tool["req"] == first["req"], "{id}");
+        assert_eq!((first["end"].as_str(), first["calls"].clone()), (Some("tool_calls"), serde_json::json!(["read_file"])));
+        assert!(first["first_ms"].is_u64() && first["ms"].is_u64() && shape.is_match(first["started"].as_str().unwrap()));
+        assert_eq!((second["end"].as_str(), second["prompt"].as_u64(), second["completion"].as_u64(), second["tps"].as_f64()), (Some("stop"), Some(10), Some(2), Some(40.0)));
+        assert_eq!((second["reasoning_chars"].as_u64(), second["content_chars"].as_u64()), (Some("thinking".len() as u64), Some("done".len() as u64)));
+        assert_eq!((tool["name"].as_str(), tool["outcome"].as_str(), tool["path"].as_str()), (Some("read_file"), Some("ok"), Some("a.txt")));
+        assert!(tool["out_bytes"].as_u64().unwrap() > 0 && tool["ms"].is_u64());
+        assert_eq!((lines[4]["cancelled"].as_bool(), lines[4]["requests"].as_u64(), lines[4]["tools"].as_u64()), (Some(false), Some(2), Some(1)));
+    }
+
+    #[test]
+    fn a_stop_of_the_persons_and_a_stop_of_the_apps_are_recorded_as_each() {
+        // The person's.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _, _, _) = thinking_server(0, Vec::new());
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("go on".into())).unwrap();
+        loop {
+            if let Event::Reasoning(_) = run.events.recv_timeout(Duration::from_secs(10)).unwrap() {
+                break;
+            }
+        }
+        run.handle.cancel.store(true, Ordering::Relaxed);
+        let (_, cancelled) = until_end(&run, Decision::Reject);
+        assert!(cancelled);
+        let lines = trajectory_of(&run);
+        let requests = of_kind(&lines, "request");
+        assert_eq!((requests.len(), requests[0]["end"].as_str()), (1, Some("cancelled_person")), "{lines:?}");
+        assert!(requests[0]["first_ms"].is_u64() && requests[0]["reasoning_chars"].as_u64().unwrap() > 0);
+        assert_eq!(of_kind(&lines, "turn_end")[0]["cancelled"], true);
+        assert!(of_kind(&lines, "intervention").is_empty());
+        // The app's: a draft stopped, which goes on in a request that ends as any does.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _, _, _) = thinking_server(3, vec![text_answer("written")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("write it".into())).unwrap();
+        let (_, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled);
+        let lines = trajectory_of(&run);
+        let kinds: Vec<&str> = lines.iter().map(|line| line["ev"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["turn_start", "request", "intervention", "request", "turn_end"], "{lines:?}");
+        assert_eq!(lines[1]["end"], "stopped_app:draft_stop");
+        let stop = &lines[2];
+        assert_eq!(stop["kind"], "draft_stop");
+        assert_eq!(stop["req"], lines[1]["req"], "the request it ended");
+        assert!(stop["tokens_before"].as_u64().unwrap() > 0 && stop["fences"].as_u64().unwrap() >= 2, "{stop}");
+        assert_eq!(lines[3]["end"], "stop");
+        assert_eq!(of_kind(&lines, "turn_end")[0]["cancelled"], false);
+    }
+
+    #[test]
+    fn a_refused_call_and_an_approved_one_say_how_they_ended_and_how_long_the_person_was_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, _) = scripted(dir.path(), vec![
+            calls(&[("create_file", serde_json::json!({"path": "yes.txt", "content": "one\n"})), ("create_file", serde_json::json!({"path": "no.txt", "content": "two\n"}))]),
+            says("done"),
+        ], Mode::Default);
+        run.handle.commands.send(Command::Send("write both".into())).unwrap();
+        let asked = std::cell::Cell::new(0);
+        until_end_deciding(&run, Duration::from_millis(150), |_| {
+            asked.set(asked.get() + 1);
+            if asked.get() == 1 { Decision::Approve } else { Decision::Reject }
+        });
+        let lines = trajectory_of(&run);
+        let approvals = of_kind(&lines, "approval");
+        assert_eq!(approvals.iter().map(|line| line["decision"].as_str().unwrap()).collect::<Vec<_>>(), ["approve", "reject"], "{lines:?}");
+        assert!(approvals.iter().all(|line| line["wait_ms"].as_u64().unwrap() >= 140 && line["tool"] == "create_file" && line["asked"].is_string() && line["answered"].is_string()), "{approvals:?}");
+        let tools = of_kind(&lines, "tool");
+        assert_eq!(tools.iter().map(|line| line["outcome"].as_str().unwrap()).collect::<Vec<_>>(), ["ok", "declined_person"], "{lines:?}");
+        assert!(tools.iter().all(|line| line["wait_ms"].as_u64().unwrap() >= 140), "the wait is the person's, and is said apart");
+        // What ran is not charged the wait: a file written takes milliseconds, not the 150 that were waited.
+        assert!(tools[0]["ms"].as_u64().unwrap() < 140, "{:?}", tools[0]);
+        // A hash of the file as it is after the edit, and none for the one that was not written.
+        assert_eq!(tools[0]["edit_hash"].as_str().map(str::len), Some(12));
+        assert!(tools[1].get("edit_hash").is_none() && dir.path().join("yes.txt").exists() && !dir.path().join("no.txt").exists());
+        assert_eq!(tools[0]["path"], "yes.txt");
+    }
+
+    #[test]
+    fn what_was_said_and_what_was_written_are_in_no_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "OUTPUT-1a7f is what a file says").unwrap();
+        let calls_in_one = sse(&[
+            serde_json::json!({"choices": [{"delta": {"reasoning_content": "REASONING-7c1d"}}]}),
+            serde_json::json!({"choices": [{"delta": {"content": "ANSWER-4b2e"}}]}),
+            serde_json::json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c0", "function": {"name": "read_file", "arguments": serde_json::json!({"path": "a.txt"}).to_string()}},
+                {"index": 1, "id": "c1", "function": {"name": "create_file", "arguments": serde_json::json!({"path": "notes.txt", "content": "FILE-CONTENT-5e8a\n"}).to_string()}},
+                {"index": 2, "id": "c2", "function": {"name": "execute_command", "arguments": serde_json::json!({"command": "python -c COMMAND-TEXT-2d6c"}).to_string()}},
+            ]}, "finish_reason": "tool_calls"}]}),
+        ]);
+        let (client, _) = server(vec![calls_in_one, text_answer("FINAL-9e0b")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("PERSON-WORDS-9f3a please".into())).unwrap();
+        until_end_deciding(&run, Duration::ZERO, |tool| if tool == "create_file" { Decision::Approve } else { Decision::Reject });
+        let session = std::fs::read_dir(run._sessions.path()).unwrap().flatten().map(|entry| entry.path()).find(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !trajectory::is_trajectory(path)).unwrap();
+        let said = std::fs::read_to_string(&session).unwrap();
+        assert!(said.contains("REASONING-7c1d") && said.contains("COMMAND-TEXT-2d6c") && said.contains("PERSON-WORDS-9f3a"), "they are in the session, which is where they belong");
+        let text = std::fs::read_to_string(trajectory::file_of(&session)).unwrap();
+        for marker in ["OUTPUT-1a7f", "REASONING-7c1d", "ANSWER-4b2e", "FILE-CONTENT-5e8a", "COMMAND-TEXT-2d6c", "PERSON-WORDS-9f3a", "FINAL-9e0b"] {
+            assert!(!text.contains(marker), "{marker} is in the trajectory:\n{text}");
+        }
+        // What is there instead: a command's first word, and sizes.
+        let lines = trajectory_of(&run);
+        let command = of_kind(&lines, "tool").into_iter().find(|line| line["name"] == "execute_command").unwrap();
+        assert_eq!((command["cmd0"].as_str(), command["outcome"].as_str()), (Some("python"), Some("declined_person")));
+        assert!(command["args_bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn a_trajectory_is_beside_its_session_and_goes_when_the_session_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, _) = scripted(dir.path(), vec![says("a")], Mode::Default);
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        let session = session_file(&run);
+        until_end(&run, Decision::Reject);
+        let beside = trajectory::file_of(&session);
+        assert!(beside.exists());
+        assert_eq!(crate::session::list(session.parent().unwrap()).len(), 1, "a trajectory is not a session");
+        std::fs::remove_file(&session).unwrap();
+        crate::checkpoint::remove_for(&session).unwrap();
+        assert!(!beside.exists());
+    }
+
+    #[test]
+    fn a_session_opened_again_goes_on_counting_its_turns_and_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, _) = scripted(dir.path(), vec![says("a"), says("b")], Mode::Default);
+        run.handle.commands.send(Command::Send("one".into())).unwrap();
+        let session = session_file(&run);
+        until_end(&run, Decision::Reject);
+        run.handle.commands.send(Command::Resume(session.clone())).unwrap();
+        run.handle.commands.send(Command::Send("two".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let lines = trajectory_of(&run);
+        let requests: Vec<String> = of_kind(&lines, "request").iter().map(|line| line["req"].as_str().unwrap().rsplit('/').next().unwrap().to_string()).collect();
+        assert_eq!(requests, ["1", "2"], "{lines:?}");
+        assert_eq!(of_kind(&lines, "turn_start").iter().map(|line| line["turn"].as_u64().unwrap()).collect::<Vec<_>>(), [1, 2]);
     }
 }

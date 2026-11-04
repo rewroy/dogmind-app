@@ -131,6 +131,8 @@ pub struct Completion {
     pub usage: Option<Usage>,
     /// The provider's own form of the answer, to send back to it.
     pub blocks: Option<Value>,
+    /// What the server said of its own work at the stream's end, as it came: Straydog's engine puts its metrics there. For the trajectory.
+    pub timings: Option<Value>,
 }
 
 impl Completion {
@@ -179,6 +181,9 @@ impl Assembly {
             return Err(if event.get("fatal") == Some(&Value::Bool(true)) { LlmError::Down(gone_words(&error.to_string()).to_string()) } else { classify(0, &error.to_string()) });
         }
         let timings = event.get("timings");
+        if let Some(whole) = timings.filter(|whole| whole.is_object()) {
+            self.completion.timings = Some(whole.clone());
+        }
         if let Some(rate) = ["predicted_per_second", "decode_tokens_per_second"].iter().find_map(|name| timings?.get(*name)?.as_f64()) {
             self.rate = Some(rate);
         }
@@ -567,6 +572,17 @@ mod tests {
         assert_eq!(completion.finish, "tool_calls");
         let usage = completion.usage.unwrap();
         assert_eq!((usage.prompt, usage.cached, usage.completion, usage.tokens_per_second), (7, 5, 3, Some(41.5)));
+    }
+
+    #[test]
+    fn what_the_server_says_of_its_own_work_is_kept_as_it_came() {
+        let (completion, _) = feed(&[
+            r#"{"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3},"timings":{"ttft_seconds":1.5,"resumed_from":"live","prefill_experts":{"vram":4}}}"#,
+        ]);
+        assert_eq!(completion.timings, Some(json!({"ttft_seconds": 1.5, "resumed_from": "live", "prefill_experts": {"vram": 4}})));
+        let (none, _) = feed(&[r#"{"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}"#]);
+        assert_eq!(none.timings, None);
     }
 
     #[test]
