@@ -566,14 +566,162 @@ fn console_lines(err: &str, folder_url: &str) -> Vec<String> {
     lines
 }
 
+/// Elements that have no end tag.
+const VOID: [&str; 14] = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
+
+/// The attributes of an opening tag, as the browser's own serializer writes them (or as a person did): name in lower case, and the value if it has one. `>` inside a quoted value does
+/// not end the tag. Returns the attributes and where the tag ends in `dom` (just after its `>`).
+fn tag_of(dom: &str, at: usize) -> (String, Vec<(String, Option<String>)>, usize) {
+    let bytes = dom.as_bytes();
+    let (mut i, mut attributes) = (at + 1, Vec::new());
+    while i < bytes.len() && !(bytes[i].is_ascii_whitespace() || matches!(bytes[i], b'>' | b'/')) {
+        i += 1;
+    }
+    let name = dom[at + 1..i].to_ascii_lowercase();
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' {
+            break;
+        }
+        let from = i;
+        while i < bytes.len() && !(bytes[i].is_ascii_whitespace() || matches!(bytes[i], b'=' | b'>' | b'/')) {
+            i += 1;
+        }
+        let attribute = dom[from..i].to_ascii_lowercase();
+        let mut value = None;
+        let mut after = i;
+        while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+            after += 1;
+        }
+        if after < bytes.len() && bytes[after] == b'=' {
+            after += 1;
+            while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                after += 1;
+            }
+            let begin = after;
+            if after < bytes.len() && matches!(bytes[after], b'"' | b'\'') {
+                let quote = bytes[after];
+                after += 1;
+                while after < bytes.len() && bytes[after] != quote {
+                    after += 1;
+                }
+                value = Some(dom[begin + 1..after.min(bytes.len())].to_string());
+                after = (after + 1).min(bytes.len());
+            } else {
+                while after < bytes.len() && !(bytes[after].is_ascii_whitespace() || bytes[after] == b'>') {
+                    after += 1;
+                }
+                value = Some(dom[begin..after].to_string());
+            }
+            i = after;
+        }
+        if !attribute.is_empty() {
+            attributes.push((attribute, value));
+        }
+    }
+    (name, attributes, (i + 1).min(bytes.len()))
+}
+
+/// Whether an element is not seen as the page's DOM itself says: it has the `hidden` attribute, or `aria-hidden="true"`, or a `style` of `display:none` or `visibility:hidden`, or it is
+/// a `dialog` that is not open, or what a browser does not show of a page whatever it says (a script, a style, a template, the head, what `noscript` holds when scripts run, an svg).
+fn is_unseen(name: &str, attributes: &[(String, Option<String>)]) -> bool {
+    static STYLE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let style = STYLE.get_or_init(|| Regex::new(r"(?i)(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)\b").expect("the pattern is valid"));
+    let has = |wanted: &str| attributes.iter().any(|(attribute, _)| attribute == wanted);
+    let value = |wanted: &str| attributes.iter().find(|(attribute, _)| attribute == wanted).and_then(|(_, value)| value.as_deref());
+    matches!(name, "script" | "style" | "template" | "head" | "noscript" | "svg" | "title")
+        || has("hidden")
+        || value("aria-hidden").is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+        || value("style").is_some_and(|text| style.is_match(text))
+        || (name == "dialog" && !has("open"))
+}
+
+/// The words of a page's DOM that are not in an element it says is not seen (see `is_unseen`), in one line. Without steps there is no script of ours in the page to ask the browser
+/// what it shows (`document.body.innerText`, which the steps' run does say, and which is used when it is there), and a copy of the page with one in it is not the page: another
+/// address, and none at all for a page a server gives. So this reads the DOM, which gives away only what the DOM says: an element a style sheet hides by its class is read here, and
+/// not in a check with steps.
+fn visible_text(dom: &str) -> String {
+    // (the same bytes in lower case, to look for the end tag of what is not seen)
+    let (bytes, lower, mut text, mut at) = (dom.as_bytes(), dom.to_ascii_lowercase(), String::new(), 0);
+    while at < bytes.len() {
+        let Some(open) = dom[at..].find('<').map(|found| at + found) else {
+            text.push_str(&dom[at..]);
+            break;
+        };
+        text.push_str(&dom[at..open]);
+        text.push(' ');
+        let rest = &dom[open..];
+        if rest.starts_with("<!--") {
+            at = rest.find("-->").map_or(bytes.len(), |end| open + end + 3);
+        } else if rest.starts_with("<!") || rest.starts_with("<?") {
+            at = rest.find('>').map_or(bytes.len(), |end| open + end + 1);
+        } else if rest.starts_with("</") {
+            at = rest.find('>').map_or(bytes.len(), |end| open + end + 1);
+        } else if rest.as_bytes().get(1).is_some_and(u8::is_ascii_alphabetic) {
+            let (name, attributes, end) = tag_of(dom, open);
+            at = end;
+            if is_unseen(&name, &attributes) && !VOID.contains(&name.as_str()) && !rest[..end - open].ends_with("/>") {
+                // (to its end tag, with those of the same name inside it counted: what the DOM holds is balanced, as the browser's own tree)
+                let (mut depth, mut scan) = (1usize, end);
+                let (open_tag, close_tag) = (format!("<{name}"), format!("</{name}"));
+                while depth > 0 {
+                    let Some(close) = lower[scan..].find(&close_tag).map(|found| scan + found) else {
+                        scan = bytes.len();
+                        break;
+                    };
+                    // (those of the same name that open before that end tag each need one of their own)
+                    let mut from = scan;
+                    while let Some(found) = lower[from..close].find(&open_tag) {
+                        let after = from + found + open_tag.len();
+                        if lower[after..].starts_with(|next: char| next.is_ascii_whitespace() || matches!(next, '>' | '/')) {
+                            depth += 1;
+                        }
+                        from = after;
+                    }
+                    depth -= 1;
+                    scan = dom[close..].find('>').map_or(bytes.len(), |found| close + found + 1);
+                }
+                at = scan;
+            }
+        } else {
+            text.push('<');
+            at = open + 1;
+        }
+    }
+    let text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">");
+    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MOST_TEXT).collect()
+}
+
+/// The words a person sees, from the steps' own run: the page lays its text out itself, and says it on a line of the console, percent-encoded so that nothing in it can break the
+/// line. `None` where there is no such line (no steps, or they did not get to their end).
+fn steps_text(err: &str) -> Option<String> {
+    let line = err.lines().rev().find(|line| line.contains("DOGMIND-STEPS-TEXT:"))?;
+    let encoded = line.split_once("DOGMIND-STEPS-TEXT:")?.1.split(['"', ' ']).next().unwrap_or("");
+    let (mut bytes, raw) = (Vec::new(), encoded.as_bytes());
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = if raw[i] == b'%' { encoded.get(i + 1..i + 3).and_then(|pair| u8::from_str_radix(pair, 16).ok()) } else { None };
+        match hex {
+            Some(byte) => {
+                bytes.push(byte);
+                i += 3;
+            }
+            None => {
+                bytes.push(raw[i]);
+                i += 1;
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    Some(text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MOST_TEXT).collect())
+}
+
 /// The title and the words a person would read, from the page as its scripts left it.
 fn shown(dom: &str) -> (String, String) {
     let title = Regex::new(r"(?is)<title[^>]*>(.*?)</title\s*>").expect("the pattern is valid").captures(dom).map_or(String::new(), |found| found[1].trim().to_string());
-    let hidden = Regex::new(r"(?is)<(script|style|head|svg|template)\b.*?</(script|style|head|svg|template)\s*>").expect("the pattern is valid");
-    let text = hidden.replace_all(dom, " ");
-    let text = Regex::new(r"(?s)<[^>]*>").expect("the pattern is valid").replace_all(&text, " ");
-    let text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">");
-    (title, text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MOST_TEXT).collect())
+    (title, visible_text(dom))
 }
 
 /// `needs`: what a file page was read to need; a page a local server gives has none of that known.
@@ -584,6 +732,8 @@ struct Reading {
     steps_lost: Option<String>,
     /// What heads the console, if not `Console`: the console is that of the run that reads the page, at 1280x800, whatever views were asked for.
     console_head: Option<String>,
+    /// The words the page said it shows, at the end of the steps, where they ended.
+    seen: Option<String>,
 }
 
 /// The console's heading when none of the views asked for is the desktop's: the first block is still the console of a run at 1280x800, and under a plain "Console" a model that asked
@@ -634,7 +784,8 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
         }
     }
     if finished {
-        let (title, text) = shown(dom);
+        let (title, from_dom) = shown(dom);
+        let text = reading.seen.clone().unwrap_or(from_dom);
         out.push_str(&format!("Shows: title \"{title}\"; text: {}\n", if text.is_empty() { "none" } else { &text }));
     }
     out
@@ -773,7 +924,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             });
         }
     }
-    let reading = Reading { steps_lost, console_head: console_head(&views) };
+    let reading = Reading { steps_lost, console_head: console_head(&views), seen: steps_copy.as_ref().and_then(|_| steps_text(&err)) };
     let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
@@ -1130,6 +1281,44 @@ mod tests {
     }
 
     #[test]
+    fn what_a_page_shows_leaves_out_what_its_own_dom_says_is_not_seen() {
+        let dom = r#"<html><head><title>T</title></head><body>
+            <p id="empty" class="empty" hidden>EMPTY-MESSAGE</p>
+            <p style="color: red; display:none">NONE-A</p>
+            <p style='DISPLAY : NONE'>NONE-B</p>
+            <div style="visibility:hidden">INVISIBLE <span>INNER</span></div>
+            <div aria-hidden="true">ARIA</div>
+            <div aria-hidden="false">ARIA-FALSE-SEEN</div>
+            <div class="hidden" title="a > b" data-x='hidden'>CLASS-NAME-ONLY-SEEN</div>
+            <section hidden><section>NESTED</section><div>MORE-NESTED</div></section>after-the-nest
+            <template><b>TEMPLATE</b></template><noscript>NOSCRIPT</noscript><script>let a = "<p>SCRIPT</p>"</script><style>p{}</style>
+            <dialog>CLOSED-DIALOG</dialog><dialog open>OPEN-DIALOG</dialog>
+            <img src="a.png" hidden><input type="hidden" value="v"><br hidden>
+            <!-- COMMENT <p hidden> -->
+            <ul><li>milk</li><li style="display:none">gone</li><li>eggs &amp; bread</li></ul>
+            <svg><text>SVG</text></svg>
+            <button disabled>Add</button> 1 &lt; 2
+        </body></html>"#;
+        let (title, text) = shown(dom);
+        assert_eq!(title, "T");
+        for gone in ["EMPTY-MESSAGE", "NONE-A", "NONE-B", "INVISIBLE", "INNER", "ARIA ", "NESTED", "MORE-NESTED", "TEMPLATE", "NOSCRIPT", "SCRIPT", "CLOSED-DIALOG", "COMMENT", "gone", "SVG"] {
+            assert!(!text.contains(gone), "{gone} is not seen: {text}");
+        }
+        assert_eq!(text, "ARIA-FALSE-SEEN CLASS-NAME-ONLY-SEEN after-the-nest OPEN-DIALOG milk eggs & bread Add 1 < 2", "{text}");
+    }
+
+    #[test]
+    fn the_words_the_page_said_it_shows_are_read_from_its_console_line() {
+        let said = "[1:2:3/4:INFO:CONSOLE:5] \"DOGMIND-STEPS-TEXT:%E7%89%9B%E4%B9%B3%E3%82%92%E8%B2%B7%E3%81%86%20%E5%89%8A%E9%99%A4%0A2%20items%2C%20100%25\", source: file:///x (5)\n";
+        assert_eq!(steps_text(said).as_deref(), Some("牛乳を買う 削除 2 items, 100%"));
+        assert_eq!(steps_text("[1:2:3/4:INFO:CONSOLE:5] \"DOGMIND-STEPS-TEXT:\", source: file:///x (5)\n").as_deref(), Some(""));
+        assert_eq!(steps_text("nothing of the steps here"), None);
+        // the last one, when the page said it more than once; and what is cut is cut by characters
+        let twice = format!("\"DOGMIND-STEPS-TEXT:first\", source: x (1)\n\"DOGMIND-STEPS-TEXT:{}\", source: x (1)\n", "%E3%81%82".repeat(MOST_TEXT + 50));
+        assert_eq!(steps_text(&twice).unwrap().chars().count(), MOST_TEXT);
+    }
+
+    #[test]
     fn a_page_outside_the_workspace_or_not_a_page_is_refused_out_loud() {
         let (dir, _) = page(&[("index.html", "x"), ("a.txt", "x")]);
         let inner = dir.path().join("inner");
@@ -1238,6 +1427,26 @@ mod tests {
         assert_eq!((desktop.width(), desktop.height(), mobile.width(), mobile.height()), (1280, 800, 390, 844));
         assert_eq!(mobile.get_pixel(370, 20).0, [0x33, 0x66, 0xcc], "the phone's rules, across the whole of its width");
         assert_eq!(desktop.get_pixel(1260, 20).0, [0xcc, 0x33, 0x33]);
+    }
+
+    /// With the real browser, in the real sandbox: what a page hides is not in what it shows, with steps and without them. (A style sheet that hides by class is known to the page's own
+    /// text, which the steps have, and not to the DOM, which is all there is without them.)
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn what_a_page_hides_is_not_in_the_words_it_shows() {
+        let (dir, _) = page(&[(
+            "index.html",
+            "<!DOCTYPE html><title>todo</title><style>.gone{display:none}</style><ul id=l><li>milk</li></ul><p id=empty hidden>HIDDEN-ATTRIBUTE</p><p style=\"display:none\">HIDDEN-STYLE</p><p class=gone>HIDDEN-BY-CLASS</p><p>visible words</p>",
+        )]);
+        let without = check_page(&serde_json::json!({"path": "index.html", "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{without}");
+        let shows = |said: &str| said.lines().find(|line| line.starts_with("Shows: ")).map(str::to_string).unwrap_or_default();
+        assert!(shows(&without).contains("milk visible words") || shows(&without).contains("milk"), "{without}");
+        assert!(!shows(&without).contains("HIDDEN-ATTRIBUTE") && !shows(&without).contains("HIDDEN-STYLE"), "{without}");
+        let with = check_page(&serde_json::json!({"path": "index.html", "steps": "await wait(10);", "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{with}");
+        assert!(shows(&with).contains("milk visible words"), "{with}");
+        assert!(!shows(&with).contains("HIDDEN-ATTRIBUTE") && !shows(&with).contains("HIDDEN-STYLE") && !shows(&with).contains("HIDDEN-BY-CLASS"), "{with}");
     }
 
     /// With the real browser, in the real sandbox: asked only for a phone's width, the first console is labelled as the desktop's size, and the phone's own is under its name.
