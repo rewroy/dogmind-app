@@ -120,15 +120,21 @@ fn read(path: &Path) -> Vec<Rule> {
 }
 
 /// The rules, to change them. A file there that does not read as rules is moved aside first, to `NAME.unreadable-TIME.json`: taken for
-/// none, the next rule written took the place of all of them.
-fn read_to_change(path: &Path) -> Vec<Rule> {
-    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+/// none, the next rule written took the place of all of them. For the same reason a file that cannot be opened (another program holds it, or there is no access), or cannot be moved aside,
+/// refuses the change: only a file that is not there is no rules.
+fn read_to_change(path: &Path) -> Result<Vec<Rule>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("{}: {error}: the rules cannot be read, and were not changed", path.display())),
+    };
     match serde_json::from_slice(&bytes) {
-        Ok(rules) => rules,
+        Ok(rules) => Ok(rules),
         Err(_) => {
             let stem = path.file_stem().map_or(String::new(), |stem| stem.to_string_lossy().into_owned());
-            let _ = std::fs::rename(path, path.with_file_name(format!("{stem}.unreadable-{}.json", chrono::Local::now().format("%Y%m%d-%H%M%S"))));
-            Vec::new()
+            let aside = path.with_file_name(format!("{stem}.unreadable-{}.json", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+            std::fs::rename(path, &aside).map_err(|error| format!("{}: {error}: the rules do not read as rules and could not be moved aside, and were not changed", path.display()))?;
+            Ok(Vec::new())
         }
     }
 }
@@ -160,7 +166,7 @@ pub fn list(path: &Path) -> Vec<Rule> {
 
 pub fn add(path: &Path, rule: Rule) -> Result<(), String> {
     let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut rules = read_to_change(path);
+    let mut rules = read_to_change(path)?;
     if !rules.contains(&rule) {
         rules.push(rule);
         write(path, &rules)?;
@@ -170,7 +176,7 @@ pub fn add(path: &Path, rule: Rule) -> Result<(), String> {
 
 pub fn remove(path: &Path, rule: &Rule) -> Result<(), String> {
     let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut rules = read_to_change(path);
+    let mut rules = read_to_change(path)?;
     rules.retain(|known| known != rule);
     write(path, &rules)
 }
@@ -196,6 +202,49 @@ mod tests {
         let aside: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.starts_with("permissions.unreadable-")).collect();
         assert_eq!(aside.len(), 1, "{aside:?}");
         assert!(std::fs::read(dir.path().join(&aside[0])).unwrap().starts_with(b"[{\"workspace\""), "what was there is kept");
+    }
+
+    /// A rules file that is held by another program is not taken for none, and not written over with one rule alone: the change is refused, and the file is as it was.
+    #[cfg(windows)]
+    #[test]
+    fn rules_that_cannot_be_read_are_not_written_over() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let kept = Rule { workspace: PathBuf::from("C:\\w"), tool: COMMAND.to_string(), prefix: "npm test".into(), exact: false };
+        add(&path, kept.clone()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let other = Rule { prefix: "make".into(), ..kept.clone() };
+        {
+            let _held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+            let error = add(&path, other.clone()).unwrap_err();
+            assert!(error.contains("were not changed"), "{error}");
+            assert!(remove(&path, &kept).unwrap_err().contains("were not changed"));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before, "what was there is there");
+        add(&path, other.clone()).unwrap();
+        assert_eq!(list(&path), [kept, other], "and once it is free, a rule is added to them");
+    }
+
+    /// A file that does not read as rules and cannot be moved aside is not written over either: where it can be moved, it is, as before.
+    #[cfg(windows)]
+    #[test]
+    fn rules_that_do_not_read_and_cannot_be_moved_aside_are_not_written_over() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        std::fs::write(&path, b"[{\"workspace\": \"C:\\\\w\", \"tool\"\0\0\0\0").unwrap();
+        let rule = Rule { workspace: PathBuf::from("C:\\w"), tool: COMMAND.to_string(), prefix: "npm test".into(), exact: false };
+        {
+            // (others may read it, and none may move it)
+            let _held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+            let error = add(&path, rule.clone()).unwrap_err();
+            assert!(error.contains("could not be moved aside"), "{error}");
+        }
+        assert!(std::fs::read(&path).unwrap().starts_with(b"[{\"workspace\""), "what was there is there");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "nothing was made beside it");
+        add(&path, rule.clone()).unwrap();
+        assert_eq!(list(&path), [rule]);
     }
 
     /// A quoted program is the program, a quoted path with spaces in it is one word, and spaces inside quotes are not taken for gaps.
