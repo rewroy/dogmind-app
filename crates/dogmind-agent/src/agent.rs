@@ -3938,9 +3938,14 @@ mod tests {
     #[test]
     fn stop_cuts_a_warm_up_short_and_the_message_after_it_begins() {
         let dir = tempfile::tempdir().unwrap();
-        let reading: Step = Box::new(|cancel: &AtomicBool| {
+        // It has no end of its own: that it ends at all is Stop's doing, and it says so as it ends. (How long the message takes after that is not what this is about: its
+        // first turn asks git about the workspace, which on a machine running the whole suite takes seconds, and the warm-up had seen Stop in milliseconds.)
+        let cut = Arc::new(AtomicBool::new(false));
+        let ended_by_stop = cut.clone();
+        let reading: Step = Box::new(move |cancel: &AtomicBool| {
             for _ in 0..4000 {
                 if cancel.load(Ordering::Relaxed) {
+                    ended_by_stop.store(true, Ordering::Relaxed);
                     return Err(LlmError::Cancelled);
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -3952,11 +3957,10 @@ mod tests {
         while provider.requests() == 0 {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let pressed = std::time::Instant::now();
         run.handle.cancel.store(true, Ordering::Relaxed);
         run.handle.commands.send(Command::Send("hi".into())).unwrap();
         let (_, cancelled) = until_end(&run, Decision::Approve);
-        assert!(pressed.elapsed() < Duration::from_secs(5), "{:?}", pressed.elapsed());
+        assert!(cut.load(Ordering::Relaxed), "the warm-up ended by Stop, and the message came after it");
         assert!(!cancelled, "the flag is the warm-up's to have ended by: the turn clears it as it begins");
         assert_eq!(provider.requests(), 2);
     }
