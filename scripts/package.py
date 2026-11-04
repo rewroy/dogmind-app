@@ -58,6 +58,23 @@ def fetched():
     return module
 
 
+# matplotlib's own matplotlibrc has these two keys commented out, as its defaults. They are set where they are: matplotlib reads that file for its defaults with the `#` taken off the start of
+# every line, so a second, active line for either key (as appending them was) is a duplicate, and every `import matplotlib` said so, twice, on stderr.
+CHART_SETTINGS = (
+    (r"^#font\.sans-serif:[^\r\n]*", "font.sans-serif: BIZ UDGothic, DejaVu Sans"),
+    (r"^#axes\.unicode_minus:[ \t]*True", "axes.unicode_minus: False"),
+)
+
+
+def with_japanese_charts(text):
+    """matplotlibrc with BIZ UDGothic first among the sans-serif fonts and a hyphen for the minus, each key once, where it was. A file in which a key is not there exactly once is an error."""
+    for pattern, line in CHART_SETTINGS:
+        text, count = re.subn(pattern, line, text, flags=re.MULTILINE)
+        if count != 1:
+            sys.exit(f"matplotlibrc has {count} lines that match {pattern!r}, and not one: this matplotlib is set up another way, and CHART_SETTINGS has to follow")
+    return text
+
+
 # What a person's habits ask for and the embeddable build has no launcher for.
 PY_SHIM = """import subprocess, sys
 # `py`, `py -3`, `py -3.14`: there is one Python here.
@@ -242,8 +259,11 @@ def assemble_tools(target):
     charts = site / "matplotlib" / "mpl-data"
     for item in lock["fonts"]["files"]:
         shutil.copy(cached(item), charts / "fonts" / "ttf" / item["file"])
-    with (charts / "matplotlibrc").open("a", encoding="utf-8", newline="\n") as settings:
-        settings.write("\nfont.sans-serif: BIZ UDGothic, DejaVu Sans\naxes.unicode_minus: False\n")
+    rc = charts / "matplotlibrc"
+    with rc.open(encoding="utf-8", newline="") as settings:
+        text = with_japanese_charts(settings.read())
+    with rc.open("w", encoding="utf-8", newline="") as settings:
+        settings.write(text)
     # So that the first import of a large module is not its compiling, each time, in a folder a command cannot write in.
     subprocess.run([str(python / "python.exe"), "-I", "-m", "compileall", "-q", "-j", "2", "--invalidation-mode", "unchecked-hash", str(site)], check=True, cwd=python)
     for name, files in module_files.items():
