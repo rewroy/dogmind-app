@@ -682,7 +682,7 @@ fn draft_stopped_note(reasoned: &str, stopped_before: u32) -> String {
         }
         return format!("{}You started on the code in your reasoning again. What you have thought so far is here, and it is enough:\n{}\nMake the tool call now, with the code in it, and put no code in your reasoning.", prompt::DRAFT_NOTE, &decided[start..]);
     }
-    format!("{}You began writing code in your reasoning, and all of it would be typed again in the file. Your reasoning so far:\n{}\nDecide nothing more. Write it now, with `create_file` or `apply_patch`, and improve it afterwards.", prompt::DRAFT_NOTE, &decided[start..])
+    format!("{}You began writing code in your reasoning, and all of it would be typed again where it goes. Your reasoning so far:\n{}\nDecide nothing more. Write the code now, with `create_file` or `apply_patch`, or in your answer if no file is to be changed, and improve it afterwards.", prompt::DRAFT_NOTE, &decided[start..])
 }
 
 /// `apply_patch` with the path beside the edits, for all of them, or one edit's fields with no list, is how it comes out of a model often enough, and the call failing means every edit typed again.
@@ -3273,6 +3273,9 @@ mod tests {
         assert!(note.contains("A single page with sliders."), "{note}");
         assert!(!note.contains("void main"), "{note}");
         assert!(note.contains("`create_file`") && note.contains("`apply_patch`"), "{note}");
+        // (where the person asked for no file to change, it is not told to write one: the code goes in the answer)
+        assert!(note.contains("or in your answer if no file is to be changed"), "{note}");
+        assert!(!note.contains("in the file"), "{note}");
         assert!(prompt::is_nudge(&note), "not shown as something the person said");
         assert!(draft_stopped_note(&"x".repeat(9000), 0).len() < 3000);
         let again = draft_stopped_note("Sliders, then.\n```\nvoid", 1);
