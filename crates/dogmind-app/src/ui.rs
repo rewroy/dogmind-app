@@ -7817,6 +7817,7 @@ impl App {
                 problems.push(tf("{0} may still be open to commands: what was given could not be taken back.", &[&shown_path(&folder)]));
             }
             let keep = if keep_model { settings.models_folder.clone() } else { None };
+            let mut left = Vec::new();
             if its_own {
                 if let Err(error) = crate::keys::store().remove_all() {
                     problems.push(error);
@@ -7828,6 +7829,8 @@ impl App {
                         problems.push(format!("{}: {error}", path.display()));
                     }
                 }
+                // (what this app did not make stays where it is: the folder goes only if that leaves it empty)
+                left = settings::what_remove_leaves(&data, keep.as_deref());
                 if keep.is_none() {
                     let _ = std::fs::remove_dir(&data);
                 }
@@ -7838,6 +7841,10 @@ impl App {
             match (keep, settings.models_folder.clone().filter(|folder| !settings::same_or_inside(folder, &data))) {
                 (Some(model), _) | (None, Some(model)) => words.push_str(&format!("\n{}", tf("The model stays in {0}.", &[&shown_path(&model)]))),
                 _ => {}
+            }
+            if !left.is_empty() {
+                let names: Vec<String> = left.iter().map(|path| path.file_name().map_or(String::new(), |name| name.to_string_lossy().into_owned())).collect();
+                words.push_str(&format!("\n{}\n{}", tf("This app did not make these, so they stay in {0}:", &[&shown_path(&data)]), names.join("\n")));
             }
             if !problems.is_empty() {
                 words.push_str(&format!("\n{}\n{}", t("These could not be removed:"), problems.join("\n")));

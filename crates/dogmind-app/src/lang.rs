@@ -338,6 +338,7 @@ const JA: &[(&str, &str)] = &[
     ("It is done. To finish, close this and delete the folder this app runs from: {0}", "完了しました。最後に、これを閉じて、このアプリを実行しているフォルダを削除してください: {0}"),
     ("The model stays in {0}.", "モデルは {0} に残っています。"),
     ("These could not be removed:", "次のものは削除できませんでした:"),
+    ("This app did not make these, so they stay in {0}:", "次のものはこのアプリが作ったものではないため、{0} に残しています:"),
     ("As you write", "入力に合わせる"),
     ("This folder's path is too long for Windows to run a program in it, so commands will not start here. Files can still be read and edited. A folder with a shorter path has neither limit.", "このフォルダはパスが長すぎて Windows がプログラムを起動できないため、ここではコマンドを実行できません。ファイルの読み書きはできます。パスの短いフォルダならこの制限はありません。"),
     ("The first it offers", "最初に提供されるもの"),
