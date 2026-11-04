@@ -1,6 +1,13 @@
-# Dogmind
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img src="assets/logo.png" alt="Dogmind" width="160">
+  </picture>
+</p>
 
-[English](README.md)
+<h1 align="center">Dogmind</h1>
+
+<p align="center"><a href="README.md">English</a></p>
 
 Dogmind は、あなたの Windows PC で動く AI エージェントのネイティブアプリです。選んだフォルダのファイルを読み書きし、そこでコマンドを実行します。実行の前には確認を求めます。エンジンは別のプログラムの [Straydog](https://github.com/rewroy/Straydog) で、この PC でモデルを動かします。新しい `straydog.exe` をアプリの横に置けば、それがエンジンの更新になります。別のマシンのモデル、オンラインのサービス、Codex、Claude も使えます。
 
