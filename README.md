@@ -59,12 +59,9 @@ The app is not signed yet. Windows shows *Windows protected your PC* for it (*Mo
 
 The icon is `assets/app.ico`, made from the artwork `assets/app.png` by `scripts/make_icon.py`.
 
-This repository is MIT (`LICENSE`). What it has taken from Dogmind, the agent it follows, stays under Dogmind's
-Apache-2.0 (`assets/licenses/dogmind-LICENSE.txt`): `assets/dogmind/` as Dogmind writes it, and the system prompt, tool schemas
-and agent loop that began as Dogmind's and were changed here (see *What it has of Dogmind* below). The icons in `assets/lucide/`
-are Lucide's (ISC, `assets/lucide/LICENSE`).
+This repository is MIT (`LICENSE`). The icons in `assets/lucide/` are Lucide's (ISC, `assets/lucide/LICENSE`).
 
-`scripts/package.py` puts one `LICENSE.txt` beside the executable, with Dogmind's (Apache-2.0), Straydog's (MIT),
+`scripts/package.py` puts one `LICENSE.txt` beside the executable, with this app's (MIT), Straydog's (MIT),
 Lucide's (ISC), BIZ UDGothic's (SIL OFL 1.1), the CUDA toolkit's, the WebView2 SDK's, the bundled tools' and every Rust crate in the app and in `straydog.exe` with its license's words. After a dependency changes, here or in Straydog, run `python scripts/licenses.py`.
 
 ## Building
