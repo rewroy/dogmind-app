@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -114,9 +114,6 @@ const STEPS_END: &str = r#"
   }
 })();
 </script>"#;
-/// The copy of the page the steps run in, beside the pictures in the sandbox's own folder.
-const STEPS_PAGE: &str = "dogmind-steps.html";
-
 /// The page with the steps at its end and its folder as its base, so that what it names by a relative path is what it would have had.
 fn with_steps(html: &str, base: &str, steps: &str) -> String {
     let lower = html.to_ascii_lowercase();
@@ -159,11 +156,43 @@ fn served_address(url: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 const TRIES: usize = 4;
+/// How the browser's runs went, for the test that measures it: the page's runs and those that did not end well, the pictures' and those that left none.
+#[cfg(test)]
+static BROWSER_RUNS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+#[cfg(test)]
+fn note_run(picture: bool, bad: bool) {
+    BROWSER_RUNS[usize::from(picture) * 2].fetch_add(1, Ordering::Relaxed);
+    BROWSER_RUNS[usize::from(picture) * 2 + 1].fetch_add(u64::from(bad), Ordering::Relaxed);
+}
 const MOST_LINES: usize = 25;
 const MOST_LINE: usize = 400;
 const MOST_TEXT: usize = 400;
-/// (one at a time: they share a profile folder, and it goes when they are done)
+/// (one at a time in this process, as a browser's run takes a good part of the machine; against another process it is the names below that keep them apart)
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+/// Each run of the browser has names of its own in the sandbox's one temporary folder, which every session, every copy of the app and every test run shares: the profile, the
+/// frame and the shot of one run were once the same for all, and a run that ended removed the profile another was using, and wrote over the other's frame and shot.
+static RUNS_NAMED: AtomicU64 = AtomicU64::new(0);
+
+/// The id of a run: this process's, and the count of runs it has named.
+fn next_run() -> String {
+    format!("{}-{}", std::process::id(), RUNS_NAMED.fetch_add(1, Ordering::Relaxed))
+}
+
+fn profile_of(run: &str) -> String {
+    format!("dogmind-profile-{run}")
+}
+
+fn frame_of(run: &str) -> String {
+    format!("dogmind-frame-{run}.html")
+}
+
+fn shot_of(run: &str) -> String {
+    format!("dogmind-shot-{run}.png")
+}
+
+fn steps_page_of(run: &str) -> String {
+    format!("dogmind-steps-{run}.html")
+}
 
 fn browser() -> Option<(PathBuf, &'static str)> {
     const PLACES: [(&str, &str, &str); 6] = [
@@ -462,31 +491,39 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     let wait = arguments.get("wait_ms").and_then(Value::as_u64).unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS);
     let cwd = page.as_deref().and_then(Path::parent).unwrap_or(workspace).to_path_buf();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temp = crate::sandbox::temp_folder();
+    if let Some(temp) = &temp {
+        forget_old_pictures(temp);
+        forget_old_leftovers(temp, LEFTOVER_KEPT);
+    }
+    // (what this check makes in that folder goes when it ends, whichever way)
+    let mut made = Removing(Vec::new());
     // With steps, what is opened is a copy of the page with them in it, in the sandbox's own folder, that reads the page's own files from where they are.
-    let opened = match (&page, steps) {
-        (Some(page), Some(steps)) => {
-            let temp = crate::sandbox::temp_folder().ok_or("the sandbox's folder could not be found, so the steps could not be run")?;
-            let html = std::fs::read_to_string(page).map_err(|error| format!("{name}: {error}"))?;
-            let base = file_url(page.parent().unwrap_or(workspace)) + "/";
-            let copy = temp.join(STEPS_PAGE);
-            std::fs::write(&copy, with_steps(&html, &base, steps)).map_err(|error| format!("{}: {error}", copy.display()))?;
-            Some(copy)
-        }
-        (page, _) => page.clone(),
-    };
+    let (mut steps_copy, mut opened) = (None, page.clone());
+    if let (Some(page), Some(steps)) = (&page, steps) {
+        let temp = temp.as_ref().ok_or("the sandbox's folder could not be found, so the steps could not be run")?;
+        let html = std::fs::read_to_string(page).map_err(|error| format!("{name}: {error}"))?;
+        let base = file_url(page.parent().unwrap_or(workspace)) + "/";
+        let file_name = steps_page_of(&next_run());
+        let copy = temp.join(&file_name);
+        made.0.push(copy.clone());
+        std::fs::write(&copy, with_steps(&html, &base, steps)).map_err(|error| format!("{}: {error}", copy.display()))?;
+        (steps_copy, opened) = (Some(file_name), Some(copy));
+    }
     // What the browser is given, on its command line and in the pictures' frame.
     let (address, src) = match &opened {
         Some(file) => (plain(file), file_url(file)),
         None => (name.clone(), name.clone()),
     };
     let browser_flags = flags();
-    let line = format!("\"{}\" {browser_flags} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --dump-dom \"{address}\"", program.display());
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
     for _ in 0..TRIES {
         let started = std::time::Instant::now();
+        let profile = profile_of(&next_run());
+        let line = format!("\"{}\" {browser_flags} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --dump-dom \"{address}\"", program.display());
         let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
-        clear_profile(&cwd, workspace);
+        clear_profile(&profile, &cwd, workspace);
         let done = done?;
         (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
         #[cfg(debug_assertions)]
@@ -495,6 +532,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         }
         finished = done.status == Some(0) && !dom.trim().is_empty();
         how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
+        #[cfg(test)]
+        note_run(false, !finished);
         if finished || cancel.load(Ordering::Relaxed) || started.elapsed() > LIMIT / 2 || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension") {
             break;
         }
@@ -508,13 +547,13 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     };
     let mut console = console_lines(&err, &base_url);
     let mut steps_said = String::new();
-    if let (Some(page), Some(_)) = (&page, steps) {
+    if let (Some(page), Some(copy)) = (&page, &steps_copy) {
         // (the copy's lines are the page's own; and whether the steps got to their end is said apart)
         let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
         let done = console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE"));
         let failed = console.iter().find_map(|line| line.split_once("DOGMIND-STEPS-FAILED: ").map(|(_, why)| why.to_string()));
         console.retain(|line| !line.contains("DOGMIND-STEPS-"));
-        console.iter_mut().for_each(|line| *line = line.replace(STEPS_PAGE, &file_name));
+        console.iter_mut().for_each(|line| *line = line.replace(copy.as_str(), &file_name));
         steps_said = match (done, failed) {
             (_, Some(why)) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
             (true, None) => "Steps: all ran. What it shows, and its pictures, are the page after them.\n".to_string(),
@@ -526,8 +565,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         return Ok(format!("{said}The browser's end: {how}.\n"));
     }
     // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. Not of a page that draws with WebGL, which ends the browser here.
-    let Some(temp) = crate::sandbox::temp_folder() else { return Ok(said) };
-    forget_old_pictures(&temp);
+    let Some(temp) = temp else { return Ok(said) };
     let mut out = said;
     // Each picture by a name of its own: one name for every call had a later check, or another session's, write over a picture an answer
     // still showed.
@@ -538,7 +576,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             continue;
         }
         let tag = view.label.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
-        let (frame, shot, picture) = (temp.join("dogmind-frame.html"), temp.join("dogmind-shot.png"), temp.join(format!("dogmind-page-{taken_at}-{tag}.png")));
+        let run = next_run();
+        let (frame, shot, picture) = (temp.join(frame_of(&run)), temp.join(shot_of(&run)), temp.join(format!("dogmind-page-{taken_at}-{tag}.png")));
         let _ = std::fs::remove_file(&picture);
         // (with steps, each picture is of the page after them, as they run again in its load)
         if std::fs::write(&frame, frame_page(&src, view)).is_err() {
@@ -546,20 +585,25 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             continue;
         }
         // (a window larger than the frame by what the browser takes of it, and at least its least width)
-        let line = format!("\"{}\" {} --window-size={},{} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\dogmind-page\" --screenshot=\"{}\" \"{}\"", program.display(), flags(), view.width.max(600) + 64, view.height + 160, shot.display(), plain(&frame));
+        let (window_width, window_height) = (view.width.max(600) + 64, view.height + 160);
         let (mut taken, mut said_there) = (false, Vec::new());
         for _ in 0..3 {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             let _ = std::fs::remove_file(&shot);
+            let profile = profile_of(&next_run());
+            let line = format!("\"{}\" {browser_flags} --window-size={window_width},{window_height} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --screenshot=\"{}\" \"{}\"", program.display(), shot.display(), plain(&frame));
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
-            clear_profile(&cwd, workspace);
+            clear_profile(&profile, &cwd, workspace);
             // (a browser that fell over while writing it leaves an empty file, or one that cannot be read)
-            let Ok(whole) = image::open(&shot) else { continue };
+            let shot_image = image::open(&shot);
+            #[cfg(test)]
+            note_run(true, shot_image.is_err());
+            let Ok(whole) = shot_image else { continue };
             if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
                 taken = true;
-                said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref(), steps.is_some())).unwrap_or_default();
+                said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref().zip(steps_copy.as_deref()))).unwrap_or_default();
                 break;
             }
         }
@@ -583,20 +627,57 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
 }
 
 /// What the page itself said in a run, as the check reports it: the steps' own markers left out, and the copy the steps ran in named as the page.
-fn page_console(err: &str, base_url: &str, page: Option<&Path>, with_steps: bool) -> Vec<String> {
+/// `steps`: the page, and the name of the copy the steps ran in.
+fn page_console(err: &str, base_url: &str, steps: Option<(&Path, &str)>) -> Vec<String> {
     let mut lines = console_lines(err, base_url);
-    if let (Some(page), true) = (page, with_steps) {
+    if let Some((page, copy)) = steps {
         let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
         lines.retain(|line| !line.contains("DOGMIND-STEPS-"));
-        lines.iter_mut().for_each(|line| *line = line.replace(STEPS_PAGE, &file_name));
+        lines.iter_mut().for_each(|line| *line = line.replace(copy, &file_name));
     }
     lines
 }
 
-/// The browser's profile, gone after each run. Not stopped by the turn's Stop, which is what most often ends a run early: under it, the
-/// removal ended as it began and the profile stayed. A browser that did not start has its profile go too.
-fn clear_profile(cwd: &Path, workspace: &Path) {
-    let _ = crate::sandbox::run("rmdir /s /q \"%TEMP%\\dogmind-page\"", cwd, workspace, false, Duration::from_secs(20), &AtomicBool::new(false));
+/// Files a check makes in the sandbox's folder, removed when it ends, however it ends.
+struct Removing(Vec<PathBuf>);
+
+impl Drop for Removing {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
+/// The browser's profile of one run (by its name in the sandbox's folder), gone after the run: only that one, as others may be in use. Not stopped by the turn's Stop, which is what most
+/// often ends a run early: under it, the removal ended as it began and the profile stayed. A browser that did not start has its profile go too.
+fn clear_profile(profile: &str, cwd: &Path, workspace: &Path) {
+    let _ = crate::sandbox::run(&format!("rmdir /s /q \"%TEMP%\\{profile}\""), cwd, workspace, false, Duration::from_secs(20), &AtomicBool::new(false));
+}
+
+/// How long what a run left is kept: a run lasts minutes at most, and a copy of the app that is stopped mid-run, or crashes, leaves its profile, frame and shot.
+const LEFTOVER_KEPT: Duration = Duration::from_secs(3600);
+
+/// A run's id as `next_run` makes it: the process's id and the run's count.
+fn is_run_id(text: &str) -> bool {
+    text.split_once('-').is_some_and(|(process, count)| [process, count].iter().all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())))
+}
+
+/// Whether a name in the sandbox's folder is what a run of the browser makes (and nothing else is touched: the folder is every command's).
+fn is_run_leftover(name: &str) -> bool {
+    let id_between = |before: &str, after: &str| name.strip_prefix(before).and_then(|rest| rest.strip_suffix(after)).is_some_and(is_run_id);
+    id_between("dogmind-profile-", "") || id_between("dogmind-frame-", ".html") || id_between("dogmind-shot-", ".png") || id_between("dogmind-steps-", ".html")
+}
+
+/// What runs that did not end by themselves left in the folder, by name and by age: a run may be going on in another process.
+fn forget_old_leftovers(temp: &Path, kept: Duration) {
+    for entry in std::fs::read_dir(temp).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let old = entry.metadata().ok().and_then(|meta| meta.modified().ok()).and_then(|at| at.elapsed().ok()).is_some_and(|age| age >= kept);
+        if old && is_run_leftover(&name) {
+            let _ = if entry.file_type().is_ok_and(|kind| kind.is_dir()) { std::fs::remove_dir_all(entry.path()) } else { std::fs::remove_file(entry.path()) };
+        }
+    }
 }
 
 /// The pictures of checks more than a week old: each has a name of its own, and they would gather in the sandbox's temporary folder.
@@ -628,6 +709,63 @@ mod tests {
         }
         forget_old_pictures(dir.path());
         assert!(!old.exists() && new.exists() && other.exists());
+    }
+
+    #[test]
+    fn every_run_of_the_browser_has_names_of_its_own() {
+        let (first, second) = (next_run(), next_run());
+        assert_ne!(first, second);
+        assert!(first.starts_with(&format!("{}-", std::process::id())) && is_run_id(&first), "{first}");
+        let names = |run: &str| [profile_of(run), frame_of(run), shot_of(run), steps_page_of(run)];
+        for (one, other) in names(&first).iter().zip(names(&second).iter()) {
+            assert_ne!(one, other);
+        }
+        for name in names(&first) {
+            assert!(name.contains(&first) && is_run_leftover(&name), "{name}");
+        }
+        // (threads of a process count from the one count, so that two sessions of the app at once do not share a name; and another process has its own id in it)
+        let threads: Vec<_> = (0..8).map(|_| std::thread::spawn(|| (0..50).map(|_| next_run()).collect::<Vec<_>>())).collect();
+        let all: HashSet<String> = threads.into_iter().flat_map(|thread| thread.join().unwrap()).collect();
+        assert_eq!(all.len(), 400);
+        assert_ne!(profile_of("100-0"), profile_of("101-0"));
+    }
+
+    #[test]
+    fn a_sweep_removes_only_old_names_a_run_makes_and_leaves_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old_folders, old_files) = (["dogmind-profile-4242-7"], ["dogmind-frame-4242-7.html", "dogmind-shot-4242-7.png", "dogmind-steps-4242-7.html"]);
+        // What is not a run's, however old: the names the browser's runs once had, a name that only begins as theirs, a picture, and what a command made.
+        let kept_files = ["dogmind-frame.html", "dogmind-shot.png", "dogmind-steps.html", "dogmind-frame-4242-7.txt", "dogmind-frame-x-7.html", "dogmind-shot-4242-7-8.png", "dogmind-steps-4242-.html", "dogmind-page-20261020-101010000-desktop.png", "my-dogmind-frame-4242-7.html", "notes-4242-7"];
+        let kept_folders = ["dogmind-page", "dogmind-profile", "dogmind-profile-4242", "dogmind-profile-a-b", "dogmind-profile-4242-7-1", "work-4242-7"];
+        for folder in old_folders.iter().chain(&kept_folders) {
+            std::fs::create_dir_all(dir.path().join(folder).join("Default")).unwrap();
+            std::fs::write(dir.path().join(folder).join("Default").join("Preferences"), b"{}").unwrap();
+        }
+        for file in old_files.iter().chain(&kept_files) {
+            std::fs::write(dir.path().join(file), b"x").unwrap();
+        }
+        // A run still going: the same names, new.
+        let (live_folder, live_file) = (dir.path().join("dogmind-profile-4242-8"), dir.path().join("dogmind-frame-4242-8.html"));
+        std::fs::create_dir_all(&live_folder).unwrap();
+        std::fs::write(&live_file, b"x").unwrap();
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        for name in old_files.iter().chain(&kept_files).chain(&old_folders).chain(&kept_folders) {
+            let path = dir.path().join(name);
+            let mut options = std::fs::File::options();
+            options.write(true);
+            if path.is_dir() {
+                std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0200_0000);
+            }
+            options.open(&path).unwrap().set_modified(long_ago).unwrap();
+        }
+        forget_old_leftovers(dir.path(), LEFTOVER_KEPT);
+        for gone in old_folders.iter().chain(&old_files) {
+            assert!(!dir.path().join(gone).exists(), "{gone} should have gone");
+        }
+        for stays in kept_files.iter().chain(&kept_folders) {
+            assert!(dir.path().join(stays).exists(), "{stays} should have stayed");
+        }
+        assert!(live_folder.exists() && live_file.exists(), "a run that is going on keeps its names");
     }
 
     fn page(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
@@ -899,5 +1037,123 @@ mod tests {
         let steps = "await fill('#t', 'a'); await press('#t', 'Enter'); await fill('#t', 'b'); await press('Enter'); await fill('#t', 'c'); await press('Enter', '#t'); console.log('items ' + count('li'));";
         let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps}), dir.path(), &AtomicBool::new(false)).unwrap();
         assert!(said.contains("Steps: all ran") && said.contains("items 3"), "{said}");
+    }
+
+    /// What a batch of plain checks came to: the checks that said NOT CHECKED, the pictures not taken, and the browser's own runs behind them
+    /// (a run that crashed is tried again, so the checks alone hide most of the crashes).
+    #[derive(Debug, Default)]
+    struct Batch {
+        checks: u64,
+        not_checked: u64,
+        no_picture: u64,
+        page_runs: u64,
+        page_runs_bad: u64,
+        picture_runs: u64,
+        picture_runs_bad: u64,
+        /// Profiles, frames and shots of this process's runs still in the folder when the checks were done.
+        left_behind: u64,
+        seconds: u64,
+    }
+
+    impl Batch {
+        fn line(&self) -> String {
+            format!(
+                "checks={} not_checked={} no_picture={} page_runs={} page_runs_bad={} picture_runs={} picture_runs_bad={} left_behind={} seconds={}",
+                self.checks, self.not_checked, self.no_picture, self.page_runs, self.page_runs_bad, self.picture_runs, self.picture_runs_bad, self.left_behind, self.seconds
+            )
+        }
+
+        fn of(line: &str) -> Option<Batch> {
+            let field = |name: &str| line.split_whitespace().find_map(|part| part.strip_prefix(&format!("{name}="))).and_then(|value| value.parse::<u64>().ok());
+            Some(Batch {
+                checks: field("checks")?,
+                not_checked: field("not_checked")?,
+                no_picture: field("no_picture")?,
+                page_runs: field("page_runs")?,
+                page_runs_bad: field("page_runs_bad")?,
+                picture_runs: field("picture_runs")?,
+                picture_runs_bad: field("picture_runs_bad")?,
+                left_behind: field("left_behind")?,
+                seconds: field("seconds")?,
+            })
+        }
+    }
+
+    /// `checks` plain checks of one page, one after another, in this process.
+    fn plain_checks(checks: u64) -> Batch {
+        let (dir, _) = page(&[("index.html", "<!DOCTYPE html><title>plain</title><p>hello</p>")]);
+        for counter in &BROWSER_RUNS {
+            counter.store(0, Ordering::Relaxed);
+        }
+        let started = std::time::Instant::now();
+        let mut batch = Batch { checks, ..Batch::default() };
+        for _ in 0..checks {
+            let said = check_page(&serde_json::json!({"path": "index.html"}), dir.path(), &AtomicBool::new(false)).unwrap();
+            batch.not_checked += u64::from(said.contains("NOT CHECKED"));
+            batch.no_picture += said.matches("No picture at").count() as u64;
+        }
+        let runs: Vec<u64> = BROWSER_RUNS.iter().map(|counter| counter.load(Ordering::Relaxed)).collect();
+        (batch.page_runs, batch.page_runs_bad, batch.picture_runs, batch.picture_runs_bad) = (runs[0], runs[1], runs[2], runs[3]);
+        let ours = format!("-{}-", std::process::id());
+        let temp = crate::sandbox::temp_folder().unwrap();
+        batch.left_behind = std::fs::read_dir(temp).unwrap().flatten().filter(|entry| entry.file_name().to_str().is_some_and(|name| is_run_leftover(name) && name.contains(&ours))).count() as u64;
+        batch.seconds = started.elapsed().as_secs();
+        batch
+    }
+
+    fn batch_size() -> u64 {
+        std::env::var("DOGMIND_PAGE_BATCH").ok().and_then(|text| text.parse().ok()).unwrap_or(10)
+    }
+
+    /// The other process of the two-at-once test: the same checks in a process of its own, reported on a line the first reads. Without the first's variable it does nothing.
+    #[test]
+    #[ignore = "starts Edge in the sandbox; run by the test that runs two checks at once"]
+    fn a_batch_of_plain_checks_for_a_second_process() {
+        if std::env::var_os("DOGMIND_PAGE_PEER").is_none() {
+            return;
+        }
+        println!("BATCH {}", plain_checks(batch_size()).line());
+    }
+
+    /// With the real browser, in the real sandbox: plain checks one after another, and then two processes at once (as two sessions of the app, a
+    /// session and a test run, or two copies of the app are), counted by the checks that were lost and by the browser's runs behind them. How many
+    /// runs the browser loses depends on the machine (on one, about 6 in 10 with the runs alone or at once alike), so that is printed and not asserted;
+    /// what is asserted is that no run leaves its profile, frame or shot behind, which another run could not have taken from it. Run it alone, by name:
+    /// `DOGMIND_PAGE_BATCH=10 cargo test -p dogmind-agent --target-dir target-ui plain_checks_alone_and_two_at_once -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "starts Edge in the sandbox, 4 x DOGMIND_PAGE_BATCH times"]
+    fn plain_checks_alone_and_two_at_once_are_counted() {
+        let alone = plain_checks(batch_size());
+        println!("ALONE   {}", alone.line());
+        let mut peer = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["page_check::tests::a_batch_of_plain_checks_for_a_second_process", "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("DOGMIND_PAGE_PEER", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut told = String::new();
+        let mut stdout = peer.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            std::io::Read::read_to_string(&mut stdout, &mut told).ok();
+            told
+        });
+        let mine = plain_checks(batch_size());
+        println!("TOGETHER mine  {}", mine.line());
+        // (the other ends by itself; this stops only the process it started, if it has not)
+        let ended = std::time::Instant::now();
+        while peer.try_wait().unwrap().is_none() {
+            if ended.elapsed() > Duration::from_secs(15 * 60) {
+                let _ = peer.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let told = reader.join().unwrap();
+        let theirs = told.lines().find_map(|line| line.split_once("BATCH ")).and_then(|(_, line)| Batch::of(line)).unwrap_or_else(|| panic!("the other process said nothing usable: {told}"));
+        println!("TOGETHER theirs {}", theirs.line());
+        for (which, batch) in [("alone", &alone), ("mine", &mine), ("theirs", &theirs)] {
+            assert_eq!(batch.left_behind, 0, "{which}: {}", batch.line());
+        }
     }
 }
