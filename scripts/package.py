@@ -13,7 +13,7 @@ What comes out: the folder dist/DogmindApp, its zip, and the installer DogmindSe
 tools\\ beside the exe holds what commands run with, so that a person installs nothing: Python with its modules, Node.js, Git. It comes from the pins in tools.lock.json; it is
 an error for it to be missing, as an app without it behaves differently from what was tested.
 
-LICENSE.txt holds this app's license, those of Dogmind, Straydog, Lucide and the CUDA toolkit whose libraries go beside the engine, and the list of Rust crates in the executable.
+LICENSE.txt holds this app's license, those of Straydog, Lucide and the CUDA toolkit whose libraries go beside the engine, and the list of Rust crates in the executable.
 """
 import filecmp
 import importlib.util
@@ -31,7 +31,6 @@ from pathlib import Path, PureWindowsPath
 ROOT = Path(__file__).resolve().parent.parent
 PARTS = [
     ("Dogmind (this program)", ROOT / "LICENSE", None),
-    ("Dogmind, the agent", ROOT / "assets" / "licenses" / "dogmind-LICENSE.txt", "This app's agent follows the design and behaviour of Dogmind's. Its checkpoint prompt and Codex policy are Dogmind's, and its system prompt and tool descriptions are shortened and rewritten from Dogmind's."),
     ("Straydog", ROOT / "assets" / "licenses" / "straydog-LICENSE.txt", "The engine, a separate program beside this one."),
     ("Lucide", ROOT / "assets" / "lucide" / "LICENSE", "The icons."),
     ("Rust crates in these executables", ROOT / "assets" / "licenses" / "third-party.txt", None),

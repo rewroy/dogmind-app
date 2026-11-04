@@ -45,9 +45,9 @@ Windows 11 で、管理者権限なしで動きます。`DogmindSetup-VERSION.ex
 
 アイコンは `assets/app.ico` で、`scripts/make_icon.py` が元の絵 `assets/app.png` から作ります。
 
-このリポジトリは MIT ライセンスです（`LICENSE`）。このアプリが追いかけているエージェント Dogmind から取り入れたものは、Dogmind の Apache-2.0 のままです（`assets/licenses/dogmind-LICENSE.txt`）。対象は、Dogmind の文面そのままの `assets/dogmind/` と、Dogmind のものを元にここで手を加えたシステムプロンプト、ツールの定義、エージェントのループです（下の「Dogmind から取り入れたもの」を参照）。`assets/lucide/` のアイコンは Lucide のものです（ISC、`assets/lucide/LICENSE`）。
+このリポジトリは MIT ライセンスです（`LICENSE`）。`assets/lucide/` のアイコンは Lucide のものです（ISC、`assets/lucide/LICENSE`）。
 
-`scripts/package.py` は、実行ファイルの横に `LICENSE.txt` をひとつ置きます。中身は Dogmind（Apache-2.0）、Straydog（MIT）、Lucide（ISC）、BIZ UDゴシック（SIL OFL 1.1）、CUDA ツールキット、WebView2 SDK、同梱のツール、それにアプリと `straydog.exe` に含まれるすべての Rust クレートのライセンス文です。ここか Straydog の依存関係が変わったら、`python scripts/licenses.py` を実行してください。
+`scripts/package.py` は、実行ファイルの横に `LICENSE.txt` をひとつ置きます。中身はこのアプリ（MIT）、Straydog（MIT）、Lucide（ISC）、BIZ UDゴシック（SIL OFL 1.1）、CUDA ツールキット、WebView2 SDK、同梱のツール、それにアプリと `straydog.exe` に含まれるすべての Rust クレートのライセンス文です。ここか Straydog の依存関係が変わったら、`python scripts/licenses.py` を実行してください。
 
 ## ビルド
 
