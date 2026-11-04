@@ -114,28 +114,37 @@ impl Baseline {
     }
 
     fn take(folder: &Path, workspace: &Path) -> Baseline {
+        Baseline::take_within(folder, workspace, LOOKING)
+    }
+
+    fn take_within(folder: &Path, workspace: &Path, looking: Duration) -> Baseline {
         let head = git(workspace, &["rev-parse", "--verify", "-q", "HEAD"]).ok().map(|head| head.trim().to_string()).filter(|head| !head.is_empty());
-        let started = Instant::now();
         let (mut files, mut kept, mut whole) = (BTreeMap::new(), 0u64, true);
         match &head {
             Some(head) => {
                 let names: BTreeSet<String> = differing(workspace, head).into_iter().chain(untracked_names(workspace, &[])).collect();
+                // The time is for the copies. What git took to name the files is no reason to keep none of them: on a busy machine it
+                // was all of it, and what was changed before the session was taken for the session's work. Past the time each is still
+                // kept by its size and time, which costs nothing to ask, and only its copy is left out.
+                let started = Instant::now();
                 for name in names {
-                    if files.len() >= MOST_FILES || started.elapsed() > LOOKING {
+                    if files.len() >= MOST_FILES {
                         whole = false;
                         break;
                     }
                     let path = workspace.join(&name);
                     let entry = match std::fs::metadata(&path) {
-                        Ok(data) => entry_of(folder, &name, &path, &data, &mut kept),
+                        Ok(data) if started.elapsed() <= looking => entry_of(folder, &name, &path, &data, &mut kept),
+                        Ok(data) => Entry { size: data.len(), modified: modified(&data), ..Entry::default() },
                         Err(_) => Entry { gone: true, ..Entry::default() },
                     };
                     files.insert(name, entry);
                 }
             }
             None => {
+                let started = Instant::now();
                 for entry in walker(workspace, true).build().flatten() {
-                    if files.len() >= MOST_FILES || started.elapsed() > LOOKING {
+                    if files.len() >= MOST_FILES || started.elapsed() > looking {
                         whole = false;
                         break;
                     }
@@ -356,6 +365,22 @@ mod tests {
         std::fs::remove_file(work.path().join("mine.txt")).unwrap();
         let said = baseline.changes(work.path(), &[]);
         assert!(said.contains("created b.txt") && said.contains("deleted mine.txt") && said.contains("-untracked"), "{said}");
+    }
+
+    /// With no time for copies at all, as on a machine too busy for git to answer in time: what was changed before the session is
+    /// still known for what it was, and is not the session's.
+    #[test]
+    fn what_was_changed_before_is_not_the_sessions_even_with_no_time_to_copy_it() {
+        let (work, _keep, session) = fixture();
+        repository(work.path());
+        std::fs::write(work.path().join("a.txt"), "someone's own work\n").unwrap();
+        std::fs::write(work.path().join("mine.txt"), "untracked\n").unwrap();
+        let mut baseline = Baseline::take_within(&folder_of(&session), work.path(), Duration::ZERO);
+        baseline.session = session.clone();
+        assert_eq!(baseline.changes(work.path(), &[]), "", "nothing of it is the session's, and nothing is missing");
+        std::fs::write(work.path().join("a.txt"), "someone's own work\nand the session's\n").unwrap();
+        let said = baseline.changes(work.path(), &[]);
+        assert!(said.contains("changed a.txt") && !said.contains("mine.txt"), "{said}");
     }
 
     #[test]
