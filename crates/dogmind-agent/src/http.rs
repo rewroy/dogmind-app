@@ -870,13 +870,37 @@ pub(crate) mod tests {
     /// next ones a moment after.)
     #[test]
     fn a_server_that_closes_the_moment_it_has_answered_is_read_all_the_same() {
-        let cancel = AtomicBool::new(false);
         let answers: [&'static [u8]; 2] = [b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello", b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello"];
         for answer in answers {
             for round in 0..25 {
-                let server = lossy(0, answer, Then::ClosesAtOnceTheFirstTime);
-                let mut response = request("GET", &server.url, &[], None, Duration::from_secs(5), &cancel).ok().unwrap_or_else(|| panic!("round {round}: no answer"));
-                assert_eq!(response.text().unwrap(), "hello", "round {round}");
+                // On this machine a connection that its server closes at once is now and then lost whole: no byte, no close and no reset ever reach the client (plain sockets, with nothing of this
+                // code, 3 of 600), and a client waits for a silent server as long as it waits for any, which is not what is tried here. So a round has a few seconds to hear something, ended
+                // as Stop ends a request, and an attempt that heard nothing is made again on a server of its own; three of them in a row is a client that is not answered.
+                let mut lost = 0;
+                let said = loop {
+                    let server = lossy(0, answer, Then::ClosesAtOnceTheFirstTime);
+                    let cancel = AtomicBool::new(false);
+                    let (answered, watching) = std::sync::mpsc::channel::<()>();
+                    let said = std::thread::scope(|scope| {
+                        let stop = &cancel;
+                        scope.spawn(move || {
+                            if watching.recv_timeout(Duration::from_secs(5)) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                                stop.store(true, Ordering::Relaxed);
+                            }
+                        });
+                        let said = request("GET", &server.url, &[], None, Duration::from_secs(5), &cancel).and_then(|mut response| response.text());
+                        let _ = answered.send(());
+                        said
+                    });
+                    match said {
+                        Err(Failure::Cancelled) => {
+                            lost += 1;
+                            assert!(lost < 3, "round {round}: nothing came, three times");
+                        }
+                        said => break said,
+                    }
+                };
+                assert_eq!(said.unwrap_or_else(|failure| panic!("round {round}: no answer: {failure}")), "hello", "round {round}");
             }
         }
     }
