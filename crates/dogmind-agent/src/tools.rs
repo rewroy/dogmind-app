@@ -1562,6 +1562,9 @@ fn file_states(root: &Path) -> Option<BTreeMap<String, (u64, Option<std::time::S
     Some(states)
 }
 
+/// How a command's result begins to say what it changed in the workspace. The agent takes a result that has it for a write, as far as the calls that look at files are concerned.
+pub(crate) const CHANGED_BY_COMMAND: &str = "files changed by this command:\n";
+
 /// What a command did, whatever its exit code says: a last step that failed has often been taken for all of it.
 #[cfg(windows)]
 fn described_changes(before: &BTreeMap<String, (u64, Option<std::time::SystemTime>)>, after: &BTreeMap<String, (u64, Option<std::time::SystemTime>)>) -> String {
@@ -1581,7 +1584,7 @@ fn described_changes(before: &BTreeMap<String, (u64, Option<std::time::SystemTim
     let more = lines.len().saturating_sub(SHOWN);
     lines.truncate(SHOWN);
     let tail = if more > 0 { format!("\n- and {more} more") } else { String::new() };
-    format!("files changed by this command:\n{}{tail}\n", lines.join("\n"))
+    format!("{CHANGED_BY_COMMAND}{}{tail}\n", lines.join("\n"))
 }
 
 /// A command with no network that failed at reaching it says so where it is read first, as what it prints is a long way to get to one line.
