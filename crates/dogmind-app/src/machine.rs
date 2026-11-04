@@ -271,9 +271,37 @@ pub fn delete_profiles() {
     }
 }
 
+/// Whether Windows counts the connection by the amount: set as metered by the person, or one it knows is limited, over its limit or roaming. The app's own downloads of any size wait
+/// for the person on such a connection. What Windows cannot say, or a PC with no connection to say it of, is not metered: the request itself says that it cannot be made.
+/// It is asked on the window's thread, which has COM as an apartment for good: a thread of its own that began one, for this alone, would end it with the thread, and the classes this
+/// asks for are kept for the whole process in the apartment of the first that asked.
+pub fn connection_is_metered() -> bool {
+    use windows::Networking::Connectivity::NetworkInformation;
+    let cost = NetworkInformation::GetInternetConnectionProfile().ok().and_then(|profile| profile.GetConnectionCost().ok());
+    cost.and_then(|cost| Some(counts_by_the_amount(cost.NetworkCostType().ok()?, cost.Roaming().unwrap_or(false), cost.OverDataLimit().unwrap_or(false), cost.ApproachingDataLimit().unwrap_or(false)))).unwrap_or(false)
+}
+
+/// Fixed (a limit of data) and variable (paid by the amount) are metered, and so is anything that is roaming or at its limit.
+fn counts_by_the_amount(kind: windows::Networking::Connectivity::NetworkCostType, roaming: bool, over_limit: bool, near_limit: bool) -> bool {
+    use windows::Networking::Connectivity::NetworkCostType;
+    matches!(kind, NetworkCostType::Fixed | NetworkCostType::Variable) || roaming || over_limit || near_limit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connection_that_is_paid_by_the_amount_or_at_its_limit_is_metered() {
+        use windows::Networking::Connectivity::NetworkCostType;
+        assert!(counts_by_the_amount(NetworkCostType::Fixed, false, false, false));
+        assert!(counts_by_the_amount(NetworkCostType::Variable, false, false, false));
+        assert!(counts_by_the_amount(NetworkCostType::Unrestricted, true, false, false), "roaming");
+        assert!(counts_by_the_amount(NetworkCostType::Unrestricted, false, true, false), "over its limit");
+        assert!(counts_by_the_amount(NetworkCostType::Unknown, false, false, true), "near its limit");
+        assert!(!counts_by_the_amount(NetworkCostType::Unrestricted, false, false, false));
+        assert!(!counts_by_the_amount(NetworkCostType::Unknown, false, false, false), "what Windows cannot say is not metered");
+    }
 
     #[test]
     fn this_windows_is_read_and_the_baseline_is_eleven() {

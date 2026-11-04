@@ -196,7 +196,8 @@ pub struct Settings {
     pub text_size: u32,
     /// The skills turned off, by name.
     pub skills_off: Vec<String>,
-    /// Ask GitHub, now and then, whether a newer release is out (see `updates`). Off: the app never asks on its own. Nothing is downloaded or installed either way.
+    /// Ask GitHub, now and then, whether a newer release is out, and fetch its setup in the background when it is (see `updates`). Off: the app neither asks nor fetches on its own. Either way
+    /// nothing is installed unless the person presses Restart to update.
     pub check_for_updates: bool,
     /// When GitHub last answered such a question, in seconds since 1970: it is asked again a day later, at the soonest.
     pub last_update_check: Option<u64>,
@@ -430,7 +431,7 @@ pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
 }
 
 /// The folders this app makes in its data folder, by name.
-const MADE_FOLDERS: [&str; 6] = ["sessions", "memory", "preview", "crashes", "attachments", "models"];
+const MADE_FOLDERS: [&str; 7] = ["sessions", "memory", "preview", "crashes", "attachments", "models", "updates"];
 /// The beginnings of the names of the files it makes there: each as it is, written beside itself first (`.part`, `.partial`), or
 /// moved aside when it could not be read (`.broken`, `.unreadable-TIME.json`), or the engine's copies of its own (`engine.toml.old`).
 const MADE_FILES: [&str; 11] = ["settings.json", "engine.toml", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-", "workspace-grants.json", "read-folders.json", "mcp.json", "mcp.partial", "report.txt"];
@@ -554,7 +555,7 @@ mod tests {
     fn remove_takes_what_this_app_makes_and_leaves_what_another_put_there() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("DogmindApp");
-        for folder in ["sessions", "memory", "preview", "crashes", "attachments", "my photos", "settings.json.d"] {
+        for folder in ["sessions", "memory", "preview", "crashes", "attachments", "updates", "my photos", "settings.json.d"] {
             std::fs::create_dir_all(data.join(folder)).unwrap();
         }
         let made = ["settings.json", "settings.json.broken", "settings.json.part", "engine.toml", "engine.toml.old", "engine.toml.before-drafter", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-20261104-093000.json", "workspace-grants.json", "read-folders.json", "mcp.json", "report.txt"];
@@ -568,7 +569,7 @@ mod tests {
             names.sort();
             names
         };
-        let mut expected: Vec<String> = made.iter().chain(&["sessions", "memory", "preview", "crashes", "attachments"]).map(|name| name.to_string()).collect();
+        let mut expected: Vec<String> = made.iter().chain(&["sessions", "memory", "preview", "crashes", "attachments", "updates"]).map(|name| name.to_string()).collect();
         expected.sort();
         assert_eq!(names(what_remove_takes(&data, None, None).unwrap()), expected);
         assert_eq!(names(what_remove_leaves(&data, None)), ["Sessions.lnk", "my photos", "notes.txt", "permissions.txt", "settings.ini", "settings.json.d"], "a file of a folder's name is not the folder, nor a folder of a file's");

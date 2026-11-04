@@ -1,14 +1,23 @@
-//! Asking GitHub whether a newer release of Dogmind is out, and nothing more: the app downloads nothing and installs nothing by itself.
+//! Asking GitHub whether a newer release of Dogmind is out, and fetching its setup for the person to install: the app installs nothing without being told to.
 //! One GET of the project's list of releases goes out (the twenty newest, as GitHub orders them), with the program's name and version and nothing that says who is asking.
 //! The highest version in the list is the one that counts, by its tag and not by its place in the list or its date: a pre-release counts as well, a draft never does, and a tag
-//! that is no version is passed over. What comes back is a version and a page, and the person decides whether to open it.
+//! that is no version is passed over. What comes back is a version, a page, and, when the release has its setup among its files with the size and the SHA-256 GitHub publishes for
+//! it, that setup.
+//!
+//! A copy that an installer put in its folder (it has the installer's manifest) fetches that setup, on its own look or the person's: into the `updates` folder of its data, under a
+//! name that ends in `.partial` until its size and its hash are those GitHub published, and then under its own, with a note of what was checked, which stays for the next start.
+//! Anything else is deleted. Only github.com is asked, and where it sends the download on: `*.githubusercontent.com`, five times at most. A debug build pointed at a test server
+//! (`DOGMIND_TEST_RELEASES_URL`) may fetch from that same server as well; a build for release cannot.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
 use dogmind_agent::http::{self, Failure, Url};
+use sha2::{Digest, Sha256};
 
 /// The twenty newest releases, pre-releases included (`releases/latest` leaves them out, and answers 404 while every release of the project is one). A request that does not
 /// sign in is not given drafts. 404: the repository is not public yet.
@@ -24,9 +33,36 @@ const GIVE_UP_AFTER: Duration = Duration::from_secs(10);
 const MOST_OF_AN_ANSWER: usize = 4 << 20;
 /// A release's name is shown in a line of the window: past this it is cut.
 const MOST_OF_A_VERSION: usize = 40;
+/// Where a setup is first asked for, on github.com: this project's own downloads.
+const SETUP_DOWNLOADS: &str = "/rewroy/dogmind-app/releases/download/";
+/// What an address may come to, with the long signed ones GitHub's storage sends the download on to.
+const MOST_OF_AN_ADDRESS: usize = 4096;
+/// GitHub keeps no file of a release that is larger than this, and nothing larger is a setup of Dogmind.
+const MOST_OF_A_SETUP: u64 = 2 << 30;
+/// How many times a download may be sent on.
+const MOST_REDIRECTS: usize = 5;
+/// How long the first byte of a download is waited for.
+const CONNECT: Duration = Duration::from_secs(15);
 
 /// How long a look stands for: the app asks on its own at most once in this many seconds.
 pub const EVERY: u64 = 24 * 60 * 60;
+
+/// What the installer puts in the folder it installs to, and what says that a copy runs from an install: as `install::MANIFEST` of `dogmind-setup`, which this cannot link to.
+pub const INSTALL_MANIFEST: &str = "dogmind-install.txt";
+/// Where setups are kept, in the app's data folder.
+pub const FOLDER: &str = "updates";
+/// What is written beside a setup that has been checked, so that the next start has it and does not fetch it again.
+const RECORD: &str = "ready.txt";
+
+/// The setup of a release, as GitHub lists it among the release's files, with what it published of it to check it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setup {
+    /// Where it is fetched from (`browser_download_url`), already an address a setup may be fetched from.
+    pub url: String,
+    pub size: u64,
+    /// Its SHA-256, in lower case, as the `digest` GitHub publishes for the file says.
+    pub sha256: String,
+}
 
 /// The release that is newest, as the person is told of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +71,18 @@ pub struct Release {
     pub version: String,
     /// Where to read of it, already one of the addresses that may be opened.
     pub page: String,
+    /// Its setup, when it has `DogmindSetup-VERSION.exe` among its files with a SHA-256 digest: only then can the app fetch it. None: the person is given the page.
+    pub setup: Option<Setup>,
+}
+
+/// The name a release's setup has on GitHub and in the `updates` folder.
+pub fn setup_file_name(version: &str) -> String {
+    format!("DogmindSetup-{version}.exe")
+}
+
+/// A version fit to be in a file name: what a tag is made of, and no more.
+fn is_plain_version(version: &str) -> bool {
+    !version.is_empty() && version.chars().all(|letter| letter.is_ascii_alphanumeric() || matches!(letter, '.' | '-'))
 }
 
 /// What a look came to.
@@ -190,11 +238,18 @@ pub fn release_page(named: &str) -> String {
     }
 }
 
+/// `read_releases_for` with no test server: what the app reads of GitHub's own answer.
+#[cfg(test)]
+pub fn read_releases(body: &str, running: &str) -> Option<Outcome> {
+    read_releases_for(body, running, None)
+}
+
 /// What a `releases` answer (a list of releases) comes to for a program of version `running`. `None`: it is not that kind of answer.
 /// The list is not taken to be in any order: of the entries that are not drafts and whose tag is a version, pre-releases included, the one with the highest version is the
 /// newest (the first of two that are the same). No entry at all, or drafts only, is `NoRelease`; entries but none with a version in its tag is `UpToDate`, as a name that is no
 /// version is never newer.
-pub fn read_releases(body: &str, running: &str) -> Option<Outcome> {
+/// A setup may also be fetched from `test_server`: the server of a debug build that was pointed at one, and never anything in a build for release.
+fn read_releases_for(body: &str, running: &str, test_server: Option<&Url>) -> Option<Outcome> {
     let serde_json::Value::Array(list) = serde_json::from_str(body).ok()? else { return None };
     let (mut looked_like_releases, mut published) = (false, false);
     let mut newest: Option<(&str, &serde_json::Value)> = None;
@@ -216,14 +271,83 @@ pub fn read_releases(body: &str, running: &str) -> Option<Outcome> {
     }
     Some(match newest {
         Some((tag, entry)) if is_newer(tag, running) => {
-            let version: String = tag.strip_prefix(['v', 'V']).unwrap_or(tag).chars().take(MOST_OF_A_VERSION).collect();
+            let whole = tag.strip_prefix(['v', 'V']).unwrap_or(tag);
+            let version: String = whole.chars().take(MOST_OF_A_VERSION).collect();
             let named = entry.get("html_url").and_then(serde_json::Value::as_str).unwrap_or("");
-            Outcome::Newer(Release { version, page: release_page(named) })
+            // (a name that was cut is no name of a file: such a release is offered by its page)
+            let setup = if version == whole { setup_of(entry, &version, test_server) } else { None };
+            Outcome::Newer(Release { version, page: release_page(named), setup })
         }
         Some(_) => Outcome::UpToDate,
         None if published => Outcome::UpToDate,
         None => Outcome::NoRelease,
     })
+}
+
+/// The setup among the files of this release: `DogmindSetup-VERSION.exe`, with a size and a SHA-256 digest GitHub published for it and an address it may be fetched from. A release
+/// that lacks any of these has none: the app does not fetch what it could not check.
+fn setup_of(entry: &serde_json::Value, version: &str, test_server: Option<&Url>) -> Option<Setup> {
+    if !is_plain_version(version) {
+        return None;
+    }
+    let name = setup_file_name(version);
+    let asset = entry.get("assets")?.as_array()?.iter().find(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some(name.as_str()))?;
+    let size = asset.get("size")?.as_u64().filter(|size| (1..=MOST_OF_A_SETUP).contains(size))?;
+    let sha256 = digest_hex(asset.get("digest")?.as_str()?)?;
+    let url = asset.get("browser_download_url")?.as_str()?;
+    first_hop(url, test_server)?;
+    Some(Setup { url: url.to_string(), size, sha256 })
+}
+
+/// The hash in a `sha256:HEX` digest, in lower case. Another kind of digest, or a hash of another length, is none.
+fn digest_hex(digest: &str) -> Option<String> {
+    let hex = digest.trim().strip_prefix("sha256:")?;
+    (hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| hex.to_ascii_lowercase())
+}
+
+/// An address read for what it is, when it has nothing odd in it: all of it plain characters, and a host that is a name.
+fn plain_address(address: &str) -> Option<Url> {
+    let plain = address.len() <= MOST_OF_AN_ADDRESS && address.bytes().all(|byte| byte.is_ascii_graphic()) && !address.contains(['\\', '"', '<', '>']);
+    let mut url = Url::parse(address).ok().filter(|_| plain)?;
+    url.host = url.host.to_ascii_lowercase();
+    let name = !url.host.is_empty() && url.host.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b':'));
+    (name && !url.host.contains("..")).then_some(url)
+}
+
+/// Where a debug build's test server is, if that is where this address is too: the same loopback host and port, over plain HTTP.
+fn is_the_test_server(url: &Url, test_server: Option<&Url>) -> bool {
+    test_server.is_some_and(|server| !server.tls && !url.tls && matches!(server.host.as_str(), "127.0.0.1" | "localhost" | "::1") && url.host == server.host && url.port == server.port)
+}
+
+/// The address a setup is first fetched from: this project's own downloads on github.com, over https. Anything else, a lookalike's host or a file of another project, is none.
+fn first_hop(address: &str, test_server: Option<&Url>) -> Option<Url> {
+    let url = plain_address(address)?;
+    let github = url.tls && url.port == 443 && url.host == "github.com" && url.path.starts_with(SETUP_DOWNLOADS) && !url.path.contains("..");
+    (github || is_the_test_server(&url, test_server)).then_some(url)
+}
+
+/// Where a download may be sent on to: github.com, or a host of GitHub's storage (`*.githubusercontent.com`), over https.
+fn next_hop(address: &str, test_server: Option<&Url>) -> Option<Url> {
+    let url = plain_address(address)?;
+    let github = url.tls && url.port == 443 && (url.host == "github.com" || url.host.strip_suffix(".githubusercontent.com").is_some_and(|name| !name.is_empty()));
+    (github || is_the_test_server(&url, test_server)).then_some(url)
+}
+
+/// The server of a debug build that was pointed at one with `DOGMIND_TEST_RELEASES_URL`, which it may fetch a setup from as well. A build for release has none, whatever it is told.
+fn test_server() -> Option<Url> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("DOGMIND_TEST_RELEASES_URL").ok().and_then(|named| Url::parse(named.trim()).ok())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
+/// The server a look was made at, when it is the test server: a debug build, asked of a loopback address. A look at GitHub's has none, and a build for release asks GitHub alone.
+fn test_server_of(asked: &Url) -> Option<Url> {
+    (cfg!(debug_assertions) && !asked.tls).then(|| asked.clone())
 }
 
 /// Where to ask. A debug build can be pointed at a server of its own with `DOGMIND_TEST_RELEASES_URL`; a build for release cannot be told anything.
@@ -320,13 +444,261 @@ fn ask(address: &str, running: &str, give_up_after: Duration, stop: &AtomicBool)
             Err(failure) => return trouble(failure),
         }
     }
-    read_releases(&String::from_utf8_lossy(&body), running).unwrap_or(Outcome::Failed(Trouble::Unreadable))
+    read_releases_for(&String::from_utf8_lossy(&body), running, test_server_of(&url).as_ref()).unwrap_or(Outcome::Failed(Trouble::Unreadable))
+}
+
+/// Whether this folder is an install: the installer put its manifest there. A copy unpacked from the zip has none, and an update through the installer would turn its folder into
+/// an install, with a Start menu entry and an entry in Installed apps that its person did not ask for.
+pub fn is_install(folder: &Path) -> bool {
+    folder.join(INSTALL_MANIFEST).is_file()
+}
+
+/// The folder this copy runs from, when it is an install.
+pub fn install_folder() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let folder = exe.parent()?;
+    is_install(folder).then(|| folder.to_path_buf())
+}
+
+/// The release whose setup is to be fetched now, from what a look came to. Only a copy in an install can be updated through the installer. The app's own look fetches while the person
+/// has it switched on, and not the setup of a version whose notice they closed; a look the person asked for fetches whatever it finds, as that is what they asked it for.
+pub fn setup_to_fetch(outcome: &Outcome, on_its_own: bool, switched_on: bool, dismissed: Option<&str>, installed: bool) -> Option<Release> {
+    match outcome {
+        Outcome::Newer(release) if installed && release.setup.is_some() && (!on_its_own || (switched_on && is_to_be_told(&release.version, dismissed))) => Some(release.clone()),
+        _ => None,
+    }
+}
+
+/// What the installer is run with to update the install in `folder`: it waits for the programs with these numbers (this app, and the engine it started) to end, replaces the files, and
+/// starts the app again. `DogmindSetup.exe --update --dir FOLDER --wait-pid PID...`.
+pub fn setup_arguments(folder: &Path, wait_for: &[u32]) -> Vec<std::ffi::OsString> {
+    let mut arguments: Vec<std::ffi::OsString> = vec!["--update".into(), "--dir".into(), folder.as_os_str().to_os_string()];
+    for pid in wait_for {
+        arguments.extend(["--wait-pid".into(), pid.to_string().into()]);
+    }
+    arguments
+}
+
+/// Why a setup was not fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failed {
+    /// The person stopped it.
+    Cancelled,
+    /// The app's own try, on a connection that is metered: it waits for the person's.
+    Metered,
+    NotReached,
+    /// GitHub answered with this, and not with the file.
+    Refused(u16),
+    /// The address, or where the download was sent on to, is not one a setup may be fetched from, or it was sent on too many times.
+    NotAllowed,
+    /// What came is not what GitHub published: not its size, or not its hash.
+    DidNotMatch,
+    /// The file could not be written, or read.
+    Disk(String),
+}
+
+fn disk(error: std::io::Error) -> Failed {
+    Failed::Disk(error.to_string())
+}
+
+fn failed_of(failure: Failure) -> Failed {
+    match failure {
+        Failure::Cancelled => Failed::Cancelled,
+        Failure::Connect(_) | Failure::Stream(_) => Failed::NotReached,
+    }
+}
+
+/// A setup that has been fetched and checked, and waits in the `updates` folder to be run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ready {
+    pub version: String,
+    pub path: PathBuf,
+    pub size: u64,
+    pub sha256: String,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The size of a file and the SHA-256 of all of it, read a block at a time.
+fn hash_of(path: &Path) -> std::io::Result<(u64, String)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let (mut hasher, mut size, mut block) = (Sha256::new(), 0u64, vec![0u8; 1 << 20]);
+    loop {
+        let count = file.read(&mut block)?;
+        if count == 0 {
+            return Ok((size, hex(&hasher.finalize())));
+        }
+        hasher.update(&block[..count]);
+        size += count as u64;
+    }
+}
+
+impl Ready {
+    /// Whether the file is there at the size it was checked at.
+    pub fn is_there(&self) -> bool {
+        std::fs::metadata(&self.path).is_ok_and(|file| file.is_file() && file.len() == self.size)
+    }
+
+    /// Whether the file is still what was checked: all of its bytes, by their hash. A second or two for a setup of this size.
+    pub fn is_sound(&self) -> bool {
+        hash_of(&self.path).is_ok_and(|(size, sha256)| size == self.size && sha256 == self.sha256)
+    }
+}
+
+fn write_record(folder: &Path, ready: &Ready) -> std::io::Result<()> {
+    let text = format!("version {}\nsize {}\nsha256 {}\n", ready.version, ready.size, ready.sha256);
+    let partial = folder.join(format!("{RECORD}.partial"));
+    std::fs::write(&partial, text)?;
+    std::fs::rename(&partial, folder.join(RECORD))
+}
+
+/// What the note beside a checked setup says, as a setup that is there to be run, whether or not the file is. A note that is not in order is none.
+fn read_record(folder: &Path) -> Option<Ready> {
+    let text = std::fs::read_to_string(folder.join(RECORD)).ok()?;
+    let value = |name: &str| text.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')).map(str::trim);
+    let version = value("version").filter(|version| is_plain_version(version) && parse_version(version).is_some())?;
+    let size = value("size")?.parse().ok().filter(|size| (1..=MOST_OF_A_SETUP).contains(size))?;
+    let sha256 = digest_hex(&format!("sha256:{}", value("sha256")?))?;
+    Some(Ready { version: version.to_string(), path: folder.join(setup_file_name(version)), size, sha256 })
+}
+
+/// The setup a start finds already checked in the `updates` folder, when it is for a version later than the one that runs and the file is there: it is offered, and not fetched again.
+/// (The file's bytes are read again by `Ready::is_sound` before it is offered, off the window's thread.)
+pub fn kept(folder: &Path, running: &str) -> Option<Ready> {
+    read_record(folder).filter(|ready| is_newer(&ready.version, running) && ready.is_there())
+}
+
+/// The version a file of the `updates` folder is the setup of.
+fn version_of_setup_file(name: &str) -> Option<&str> {
+    name.strip_prefix("DogmindSetup-")?.strip_suffix(".exe").filter(|version| is_plain_version(version))
+}
+
+/// What a start takes out of the `updates` folder: any file that is still `.partial`, and the setup of a version that is not later than the one that runs, which has been done with.
+/// A setup of a later version stays, as the one that waits for the person. Nothing else in the folder is touched.
+pub fn clean_up(folder: &Path, running: &str) {
+    for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if (name.ends_with(".partial") || version_of_setup_file(&name).is_some_and(|version| !is_newer(version, running))) && entry.path().is_file() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    // (a note of a file that is not there is of nothing)
+    if folder.join(RECORD).exists() && kept(folder, running).is_none() {
+        let _ = std::fs::remove_file(folder.join(RECORD));
+    }
+}
+
+/// What a fetched setup leaves no use for: the setups of other versions, which the one that was checked has taken the place of.
+fn remove_other_setups(folder: &Path, keep: &str) {
+    for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name != keep && (name.ends_with(".partial") || version_of_setup_file(&name).is_some()) && entry.path().is_file() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The setup of a release in `folder`, checked: fetched from GitHub, or found there from an earlier try that was checked. `on` is told how many bytes of how many have come; `stop` ends it,
+/// and then, as after any failure, nothing of it is left. Run off the window's thread.
+pub fn obtain(version: &str, setup: &Setup, folder: &Path, on: &mut dyn FnMut(u64, u64), stop: &AtomicBool) -> Result<Ready, Failed> {
+    obtain_from(version, setup, folder, test_server().as_ref(), on, stop)
+}
+
+fn obtain_from(version: &str, setup: &Setup, folder: &Path, test_server: Option<&Url>, on: &mut dyn FnMut(u64, u64), stop: &AtomicBool) -> Result<Ready, Failed> {
+    if !is_plain_version(version) {
+        return Err(Failed::NotAllowed);
+    }
+    // (checked already, and kept: it is not fetched again)
+    if let Some(ready) = read_record(folder).filter(|ready| ready.version == version && ready.size == setup.size && ready.sha256 == setup.sha256 && ready.is_there()) {
+        return Ok(ready);
+    }
+    let first = first_hop(&setup.url, test_server).ok_or(Failed::NotAllowed)?;
+    std::fs::create_dir_all(folder).map_err(disk)?;
+    let name = setup_file_name(version);
+    let (partial, path) = (folder.join(format!("{name}.partial")), folder.join(&name));
+    // (the note is of a file that is about to be replaced)
+    let _ = std::fs::remove_file(folder.join(RECORD));
+    if let Err(failed) = stream(&first, setup, &partial, test_server, on, stop) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(failed);
+    }
+    if let Err(error) = std::fs::rename(&partial, &path) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(disk(error));
+    }
+    let ready = Ready { version: version.to_string(), path, size: setup.size, sha256: setup.sha256.clone() };
+    if let Err(error) = write_record(folder, &ready) {
+        let _ = std::fs::remove_file(&ready.path);
+        return Err(disk(error));
+    }
+    remove_other_setups(folder, &name);
+    Ok(ready)
+}
+
+/// The setup into `partial`, hashed as it comes. It is sent on at most five times, and only to github.com and GitHub's storage; its size is the one published, in its head if it says and
+/// in what arrives; and what arrives has the hash that was published. Anything else is an error, and the caller deletes the file.
+fn stream(first: &Url, setup: &Setup, partial: &Path, test_server: Option<&Url>, on: &mut dyn FnMut(u64, u64), stop: &AtomicBool) -> Result<(), Failed> {
+    // (what goes out says what program asks and that it wants the file: no sign-in, nothing of whoever is at the keyboard)
+    let headers = [("User-Agent".to_string(), format!("Dogmind/{}", env!("CARGO_PKG_VERSION"))), ("Accept".to_string(), "application/octet-stream".to_string())];
+    let (mut url, mut sent_on) = (first.clone(), 0);
+    let mut response = loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Failed::Cancelled);
+        }
+        let response = http::request("GET", &url, &headers, None, CONNECT, stop).map_err(failed_of)?;
+        match response.status {
+            200 => break response,
+            301 | 302 | 303 | 307 | 308 => {
+                sent_on += 1;
+                url = match response.header("location").and_then(|location| next_hop(location, test_server)) {
+                    Some(next) if sent_on <= MOST_REDIRECTS => next,
+                    _ => return Err(Failed::NotAllowed),
+                };
+            }
+            status => return Err(Failed::Refused(status)),
+        }
+    };
+    if response.header("content-length").is_some_and(|length| length.trim().parse::<u64>().ok() != Some(setup.size)) {
+        return Err(Failed::DidNotMatch);
+    }
+    let file = std::fs::File::create(partial).map_err(disk)?;
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+    let (mut hasher, mut done) = (Sha256::new(), 0u64);
+    on(0, setup.size);
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Failed::Cancelled);
+        }
+        match response.next() {
+            Ok(Some(bytes)) => {
+                done += bytes.len() as u64;
+                if done > setup.size {
+                    return Err(Failed::DidNotMatch);
+                }
+                hasher.update(&bytes);
+                out.write_all(&bytes).map_err(disk)?;
+                on(done, setup.size);
+            }
+            Ok(None) => break,
+            Err(failure) => return Err(failed_of(failure)),
+        }
+    }
+    let file = out.into_inner().map_err(|error| disk(error.into_error()))?;
+    file.sync_all().map_err(disk)?;
+    drop(file);
+    if done != setup.size || hex(&hasher.finalize()) != setup.sha256 {
+        return Err(Failed::DidNotMatch);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::net::TcpListener;
 
     /// One entry of what `releases` answers, as GitHub sends it (shortened: the assets and the author's other fields are not read).
@@ -363,7 +735,7 @@ mod tests {
 
     /// The release the person is told of for a tag.
     fn release(tag: &str) -> Release {
-        Release { version: tag.trim_start_matches('v').into(), page: format!("https://github.com/rewroy/dogmind-app/releases/tag/{tag}") }
+        Release { version: tag.trim_start_matches('v').into(), page: format!("https://github.com/rewroy/dogmind-app/releases/tag/{tag}"), setup: None }
     }
 
     /// What a list of these tags (none a draft; a tag with a hyphen a pre-release) comes to, in the order given.
@@ -375,7 +747,7 @@ mod tests {
     #[test]
     fn a_list_is_read_for_its_highest_version_and_that_ones_page() {
         let outcome = read_releases(&format!("[{V0_2_0}]"), "0.1.0");
-        assert_eq!(outcome, Some(Outcome::Newer(Release { version: "0.2.0".into(), page: "https://github.com/rewroy/dogmind-app/releases/tag/v0.2.0".into() })));
+        assert_eq!(outcome, Some(Outcome::Newer(Release { version: "0.2.0".into(), page: "https://github.com/rewroy/dogmind-app/releases/tag/v0.2.0".into(), setup: None })));
         assert_eq!(read_releases(&format!("[{V0_2_0}]"), "0.2.0"), Some(Outcome::UpToDate));
     }
 
@@ -415,9 +787,9 @@ mod tests {
     #[test]
     fn the_page_is_the_one_named_when_it_is_the_projects_and_the_name_is_cut() {
         // (no page named: the latest's is the one to open)
-        assert_eq!(read_releases(r#"[{"tag_name":"1.0.0"}]"#, "0.1.0"), Some(Outcome::Newer(Release { version: "1.0.0".into(), page: LATEST_PAGE.into() })));
+        assert_eq!(read_releases(r#"[{"tag_name":"1.0.0"}]"#, "0.1.0"), Some(Outcome::Newer(Release { version: "1.0.0".into(), page: LATEST_PAGE.into(), setup: None })));
         let evil = r#"[{"tag_name":"v1.0.0","html_url":"https://example.com/rewroy/dogmind-app/releases/tag/v1.0.0"}]"#;
-        assert_eq!(read_releases(evil, "0.1.0"), Some(Outcome::Newer(Release { version: "1.0.0".into(), page: LATEST_PAGE.into() })));
+        assert_eq!(read_releases(evil, "0.1.0"), Some(Outcome::Newer(Release { version: "1.0.0".into(), page: LATEST_PAGE.into(), setup: None })));
         let long = format!("[{{\"tag_name\":\"v1.0.0-{}\"}}]", "a".repeat(500));
         let Some(Outcome::Newer(found)) = read_releases(&long, "0.1.0") else { panic!("a long pre-release name") };
         assert_eq!(found.version.len(), MOST_OF_A_VERSION);
@@ -440,7 +812,7 @@ mod tests {
         assert_eq!(highest(&["v0.2.0", "v0.3.0-beta.1", "v0.2.5"]), "0.3.0-beta.1");
         // the first of two that are the same
         assert_eq!(read_tags(&["v0.2.0", "0.2.0"], "0.1.0"), Some(Outcome::Newer(release("v0.2.0"))));
-        assert_eq!(read_tags(&["0.2.0", "v0.2.0"], "0.1.0"), Some(Outcome::Newer(Release { version: "0.2.0".into(), page: "https://github.com/rewroy/dogmind-app/releases/tag/0.2.0".into() })));
+        assert_eq!(read_tags(&["0.2.0", "v0.2.0"], "0.1.0"), Some(Outcome::Newer(Release { version: "0.2.0".into(), page: "https://github.com/rewroy/dogmind-app/releases/tag/0.2.0".into(), setup: None })));
     }
 
     #[test]
@@ -458,7 +830,7 @@ mod tests {
         assert_eq!(read_releases(&list_of(&entries), "0.3.0-beta.1"), Some(Outcome::UpToDate));
         // (what is not `true` is not a draft)
         let odd = r#"[{"tag_name":"v0.9.0","draft":"yes"},{"tag_name":"v0.2.0","draft":null},{"tag_name":"v0.1.5"}]"#;
-        assert_eq!(read_releases(odd, "0.1.0"), Some(Outcome::Newer(Release { version: "0.9.0".into(), page: LATEST_PAGE.into() })));
+        assert_eq!(read_releases(odd, "0.1.0"), Some(Outcome::Newer(Release { version: "0.9.0".into(), page: LATEST_PAGE.into(), setup: None })));
     }
 
     #[test]
@@ -528,7 +900,7 @@ mod tests {
 
     #[test]
     fn only_a_look_that_learned_something_counts_against_the_day() {
-        let release = Release { version: "0.2.0".into(), page: LATEST_PAGE.into() };
+        let release = Release { version: "0.2.0".into(), page: LATEST_PAGE.into(), setup: None };
         for outcome in [Outcome::UpToDate, Outcome::Newer(release), Outcome::NoRelease] {
             assert!(outcome.learned_something(), "{outcome:?}");
         }
@@ -554,7 +926,7 @@ mod tests {
 
     #[test]
     fn only_the_apps_own_look_tells_and_only_of_a_release_not_closed_and_while_on() {
-        let release = Release { version: "0.2.0".into(), page: LATEST_PAGE.into() };
+        let release = Release { version: "0.2.0".into(), page: LATEST_PAGE.into(), setup: None };
         let newer = Outcome::Newer(release.clone());
         assert_eq!(release_to_tell(&newer, true, true, None), Some(release.clone()));
         assert_eq!(release_to_tell(&newer, true, true, Some("0.1.9")), Some(release.clone()));
@@ -637,7 +1009,7 @@ mod tests {
     fn a_newer_release_is_found_and_the_request_carries_only_the_program() {
         let (address, hearing) = answering(with_length("200 OK", &format!("[{V0_2_0}]")));
         let outcome = check_at(&address, "0.1.0", Duration::from_secs(10));
-        assert_eq!(outcome, Outcome::Newer(Release { version: "0.2.0".into(), page: "https://github.com/rewroy/dogmind-app/releases/tag/v0.2.0".into() }));
+        assert_eq!(outcome, Outcome::Newer(Release { version: "0.2.0".into(), page: "https://github.com/rewroy/dogmind-app/releases/tag/v0.2.0".into(), setup: None }));
         let head = hearing.recv_timeout(Duration::from_secs(5)).unwrap();
         let lines: Vec<&str> = head.split("\r\n").filter(|line| !line.is_empty()).collect();
         assert_eq!(lines[0], "GET /repos/rewroy/dogmind-app/releases?per_page=20 HTTP/1.1");
@@ -775,5 +1147,592 @@ mod tests {
         assert!(!outcome.learned_something());
         assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
         drop(silent);
+    }
+
+    // ---- the setup of a release: what is read of it, and fetching it ----
+
+    const GITHUB_SETUP: &str = "https://github.com/rewroy/dogmind-app/releases/download/v0.2.0/DogmindSetup-0.2.0.exe";
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// The list of releases GitHub answers with, for one release whose files are these (`{"name":..,"size":..}` and the like).
+    fn listing_with(tag: &str, assets: &[String]) -> String {
+        format!(
+            r#"[{{"id":1,"html_url":"https://github.com/rewroy/dogmind-app/releases/tag/{tag}","tag_name":"{tag}","name":"Dogmind {tag}","draft":false,"prerelease":false,"assets":[{}],"body":"Notes"}}]"#,
+            assets.join(",")
+        )
+    }
+
+    fn asset(name: &str, size: &str, digest: &str, url: &str) -> String {
+        format!(r#"{{"name":"{name}","size":{size},"digest":{digest},"browser_download_url":"{url}","state":"uploaded"}}"#)
+    }
+
+    fn github_asset() -> String {
+        asset("DogmindSetup-0.2.0.exe", "563000000", &format!("\"sha256:{HASH}\""), GITHUB_SETUP)
+    }
+
+    /// The setup the app reads of a list, for a program of version 0.1.0.
+    fn setup_read_from(body: &str) -> Option<Setup> {
+        match read_releases(body, "0.1.0") {
+            Some(Outcome::Newer(release)) => release.setup,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_release_with_its_setup_gives_its_address_size_and_digest() {
+        let body = listing_with("v0.2.0", &[asset("DogmindApp-0.2.0.zip", "30408704", "\"sha256:ffff\"", "https://github.com/x"), github_asset()]);
+        let Some(Outcome::Newer(release)) = read_releases(&body, "0.1.0") else { panic!("a newer release") };
+        assert_eq!(release.setup, Some(Setup { url: GITHUB_SETUP.into(), size: 563_000_000, sha256: HASH.into() }));
+        assert_eq!(release.page, "https://github.com/rewroy/dogmind-app/releases/tag/v0.2.0");
+        // the hash is kept as lower case, whichever way GitHub writes it
+        let upper = listing_with("v0.2.0", &[asset("DogmindSetup-0.2.0.exe", "5", &format!("\"sha256:{}\"", HASH.to_uppercase()), GITHUB_SETUP)]);
+        assert_eq!(setup_read_from(&upper).map(|setup| setup.sha256), Some(HASH.to_string()));
+        // a pre-release has its setup as any release does, by the name of its tag
+        let beta = listing_with("v0.3.0-beta.1", &[asset("DogmindSetup-0.3.0-beta.1.exe", "5", &format!("\"sha256:{HASH}\""), "https://github.com/rewroy/dogmind-app/releases/download/v0.3.0-beta.1/DogmindSetup-0.3.0-beta.1.exe")]);
+        assert!(setup_read_from(&beta).is_some());
+    }
+
+    #[test]
+    fn a_release_without_its_setup_or_its_digest_has_none_and_is_still_offered_by_its_page() {
+        let digest = format!("\"sha256:{HASH}\"");
+        let by = |name: &str, size: &str, digest: &str, url: &str| listing_with("v0.2.0", &[asset(name, size, digest, url)]);
+        let cases = [
+            ("no files at all", listing_with("v0.2.0", &[])),
+            ("no setup among them", by("DogmindApp-0.2.0.zip", "5", &digest, GITHUB_SETUP)),
+            ("the setup of another version", by("DogmindSetup-0.1.9.exe", "5", &digest, GITHUB_SETUP)),
+            ("a name that only ends alike", by("xDogmindSetup-0.2.0.exe", "5", &digest, GITHUB_SETUP)),
+            ("no digest", by("DogmindSetup-0.2.0.exe", "5", "null", GITHUB_SETUP)),
+            ("a digest of another kind", by("DogmindSetup-0.2.0.exe", "5", &format!("\"sha1:{}\"", &HASH[..40]), GITHUB_SETUP)),
+            ("a hash too short", by("DogmindSetup-0.2.0.exe", "5", "\"sha256:abcd\"", GITHUB_SETUP)),
+            ("a hash that is no hex", by("DogmindSetup-0.2.0.exe", "5", &format!("\"sha256:{}\"", "g".repeat(64)), GITHUB_SETUP)),
+            ("no size", by("DogmindSetup-0.2.0.exe", "null", &digest, GITHUB_SETUP)),
+            ("a size of nothing", by("DogmindSetup-0.2.0.exe", "0", &digest, GITHUB_SETUP)),
+            ("a size no release has", by("DogmindSetup-0.2.0.exe", "99999999999", &digest, GITHUB_SETUP)),
+            ("an address that is not https", by("DogmindSetup-0.2.0.exe", "5", &digest, "http://github.com/rewroy/dogmind-app/releases/download/v0.2.0/DogmindSetup-0.2.0.exe")),
+            ("an address on another host", by("DogmindSetup-0.2.0.exe", "5", &digest, "https://example.com/rewroy/dogmind-app/releases/download/v0.2.0/DogmindSetup-0.2.0.exe")),
+            ("an address on a host that only looks like it", by("DogmindSetup-0.2.0.exe", "5", &digest, "https://github.com.evil.example/rewroy/dogmind-app/releases/download/v0.2.0/DogmindSetup-0.2.0.exe")),
+            ("an address of another project", by("DogmindSetup-0.2.0.exe", "5", &digest, "https://github.com/someone/else/releases/download/v0.2.0/DogmindSetup-0.2.0.exe")),
+            ("an address that climbs out", by("DogmindSetup-0.2.0.exe", "5", &digest, "https://github.com/rewroy/dogmind-app/releases/download/../../../evil/x.exe")),
+            ("a local address, in a build that was not pointed at it", by("DogmindSetup-0.2.0.exe", "5", &digest, "http://127.0.0.1:8080/DogmindSetup-0.2.0.exe")),
+        ];
+        for (what, body) in cases {
+            let Some(Outcome::Newer(release)) = read_releases(&body, "0.1.0") else { panic!("{what}: still a newer release") };
+            assert_eq!(release.setup, None, "{what}");
+            assert_eq!(release.page, "https://github.com/rewroy/dogmind-app/releases/tag/v0.2.0", "{what}");
+        }
+        // a name that is no name of a file has no setup however well it is listed
+        let odd = listing_with("v0.2.0-a:b", &[asset("DogmindSetup-0.2.0-a:b.exe", "5", &digest, "https://github.com/rewroy/dogmind-app/releases/download/v0.2.0-a:b/x")]);
+        assert_eq!(setup_read_from(&odd), None);
+        let long = format!("v0.2.0-{}", "a".repeat(60));
+        let cut = listing_with(&long, &[asset(&format!("DogmindSetup-{}.exe", &long[1..]), "5", &digest, GITHUB_SETUP)]);
+        assert_eq!(setup_read_from(&cut), None);
+    }
+
+    #[test]
+    fn a_setup_is_asked_for_on_github_and_sent_on_to_github_and_its_storage_only() {
+        let first = |address: &str| first_hop(address, None).is_some();
+        assert!(first(GITHUB_SETUP));
+        assert!(first("https://GitHub.com/rewroy/dogmind-app/releases/download/v1/a.exe"));
+        for bad in [
+            "http://github.com/rewroy/dogmind-app/releases/download/v1/a.exe",
+            "https://github.com:8443/rewroy/dogmind-app/releases/download/v1/a.exe",
+            "https://github.com@evil.example/rewroy/dogmind-app/releases/download/v1/a.exe",
+            "https://evil.example@github.com/rewroy/dogmind-app/releases/download/v1/a.exe",
+            "https://objects.githubusercontent.com/rewroy/dogmind-app/releases/download/v1/a.exe",
+            "https://github.com/rewroy/dogmind-app/archive/v1.zip",
+            "https://github.com/rewroy/dogmind-app/releases/download/../../x",
+            "https://github.com/rewroy/dogmind-app/releases/download/v1/a b.exe",
+            "https://github.com/rewroy/dogmind-app/releases/download/v1/a\".exe",
+            "ftp://github.com/rewroy/dogmind-app/releases/download/v1/a.exe",
+            "/rewroy/dogmind-app/releases/download/v1/a.exe",
+            "",
+        ] {
+            assert!(!first(bad), "{bad}");
+        }
+        let next = |address: &str| next_hop(address, None).is_some();
+        for good in [
+            "https://github.com/rewroy/dogmind-app/releases/download/v1/a.exe",
+            "https://objects.githubusercontent.com/github-production-release-asset/1/2?X-Amz-Signature=abc&response-content-disposition=attachment%3B%20filename%3Da.exe",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2?sp=r&sig=abc%3D",
+            "https://RELEASE-ASSETS.githubusercontent.com/x",
+            "https://a.b.githubusercontent.com/x",
+        ] {
+            assert!(next(good), "{good}");
+        }
+        for bad in [
+            "http://objects.githubusercontent.com/x",
+            "https://githubusercontent.com/x",
+            "https://.githubusercontent.com/x",
+            "https://evilgithubusercontent.com/x",
+            "https://objects.githubusercontent.com.evil.example/x",
+            "https://evil.example/objects.githubusercontent.com",
+            "https://evil.example@objects.githubusercontent.com/x",
+            "https://objects.githubusercontent.com:8443/x",
+            "https://github.com.evil.example/x",
+            "https://example.com/x",
+            "file:///C:/Windows/System32/calc.exe",
+            "/relative/path",
+            "",
+        ] {
+            assert!(!next(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_debug_builds_own_test_server_is_let_in_beside_github() {
+        let server = Url::parse("http://127.0.0.1:5000/repos/x/releases").unwrap();
+        let named = |address: &str| Url::parse(address).unwrap();
+        assert!(is_the_test_server(&named("http://127.0.0.1:5000/download/a.exe"), Some(&server)));
+        // another port of it, another host, or a secure one, is not the server
+        for other in ["http://127.0.0.1:5001/a.exe", "http://localhost:5000/a.exe", "https://127.0.0.1:5000/a.exe", "http://192.168.0.1:5000/a.exe"] {
+            assert!(!is_the_test_server(&named(other), Some(&server)), "{other}");
+        }
+        assert!(!is_the_test_server(&named("http://127.0.0.1:5000/a.exe"), None), "no server was named: none is let in");
+        // a server that is not on this machine is not let in, whatever a test run is pointed at
+        let far = Url::parse("http://example.com:5000/x").unwrap();
+        assert!(!is_the_test_server(&named("http://example.com:5000/a.exe"), Some(&far)));
+        assert!(first_hop("http://127.0.0.1:5000/a.exe", Some(&server)).is_some() && next_hop("http://127.0.0.1:5000/a.exe", Some(&server)).is_some());
+        assert!(first_hop("http://127.0.0.1:5000/a.exe", None).is_none() && next_hop("http://127.0.0.1:5000/a.exe", None).is_none(), "a build for release has no server");
+        // the look at a server of the test's is where it is let in; the look at GitHub's is not, and a build for release never has one
+        assert_eq!(test_server_of(&server).is_some(), cfg!(debug_assertions));
+        assert!(test_server_of(&Url::parse("https://api.github.com/repos/rewroy/dogmind-app/releases").unwrap()).is_none());
+    }
+
+    /// What a server of the test's answers a path with.
+    enum Answer {
+        Whole(Vec<u8>),
+        /// These bytes, and then nothing, until the client goes: a download that has stopped coming.
+        Stalls(Vec<u8>),
+    }
+
+    /// A server on this machine for as many requests as come, each on a thread of its own: the paths it answers (the path is what the request asks for, its query too) and what each request said.
+    struct Server {
+        port: u16,
+        heard: Arc<std::sync::Mutex<Vec<String>>>,
+        done: Arc<AtomicBool>,
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.done.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl Server {
+        /// `routes` is told the port first: the answers name the server's own address.
+        fn start(routes: impl FnOnce(u16) -> Vec<(String, Answer)>) -> Server {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let routes = Arc::new(routes(port));
+            let (heard, done) = (Arc::new(std::sync::Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
+            let (heard_by, done_by) = (heard.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done_by.load(Ordering::Relaxed) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    let (routes, heard, done) = (routes.clone(), heard_by.clone(), done_by.clone());
+                    std::thread::spawn(move || {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                        let mut head = Vec::new();
+                        let mut block = [0u8; 1024];
+                        let began = std::time::Instant::now();
+                        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                            match stream.read(&mut block) {
+                                Ok(0) => return,
+                                Ok(count) => head.extend_from_slice(&block[..count]),
+                                Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) && began.elapsed() < Duration::from_secs(10) => {}
+                                Err(_) => return,
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&head).into_owned();
+                        let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                        heard.lock().unwrap().push(head);
+                        let found = routes.iter().find(|(known, _)| *known == path).map(|(_, answer)| answer);
+                        let (bytes, stalls) = match found {
+                            Some(Answer::Whole(bytes)) => (bytes.clone(), false),
+                            Some(Answer::Stalls(bytes)) => (bytes.clone(), true),
+                            None => (with_length("404 Not Found", "not here").into_bytes(), false),
+                        };
+                        let _ = stream.write_all(&bytes);
+                        let _ = stream.flush();
+                        // (the client has what the length says, and is not waited for; one that is to stall is waited for until it goes)
+                        let until = std::time::Instant::now() + if stalls { Duration::from_secs(20) } else { Duration::from_secs(2) };
+                        while !done.load(Ordering::Relaxed) && std::time::Instant::now() < until {
+                            match stream.read(&mut block) {
+                                Ok(0) => return,
+                                Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                                Ok(_) => {}
+                                Err(_) => return,
+                            }
+                        }
+                    });
+                }
+            });
+            Server { port, heard, done }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}{path}", self.port)
+        }
+
+        fn as_url(&self) -> Url {
+            Url::parse(&self.url("/")).unwrap()
+        }
+
+        /// The request line of each request it heard, in the order they came.
+        fn requests(&self) -> Vec<String> {
+            self.heard.lock().unwrap().iter().map(|head| head.lines().next().unwrap_or("").to_string()).collect()
+        }
+    }
+
+    fn file_bytes(length: usize, seed: u8) -> Vec<u8> {
+        (0..length).map(|at| (at as u8).wrapping_mul(31).wrapping_add((at >> 8) as u8).wrapping_add(seed)).collect()
+    }
+
+    fn sha_of(bytes: &[u8]) -> String {
+        hex(&Sha256::digest(bytes))
+    }
+
+    /// A whole answer: 200 and these bytes, with their length.
+    fn file_answer(bytes: &[u8]) -> Answer {
+        let mut answer = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n", bytes.len()).into_bytes();
+        answer.extend_from_slice(bytes);
+        Answer::Whole(answer)
+    }
+
+    fn redirect_to(location: &str) -> Answer {
+        Answer::Whole(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n").into_bytes())
+    }
+
+    /// What is in a folder, by name.
+    fn names_in(folder: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(folder).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    const SETUP_PATH: &str = "/download/DogmindSetup-0.2.0.exe";
+
+    /// The setup of 0.2.0 as a server of the test's has it: its bytes, and what GitHub would have published of them.
+    fn setup_at(server: &Server, path: &str, bytes: &[u8]) -> Setup {
+        Setup { url: server.url(path), size: bytes.len() as u64, sha256: sha_of(bytes) }
+    }
+
+    fn fetched(server: &Server, setup: &Setup, folder: &Path) -> Result<Ready, Failed> {
+        obtain_from("0.2.0", setup, folder, Some(&server.as_url()), &mut |_, _| {}, &AtomicBool::new(false))
+    }
+
+    #[test]
+    fn a_setup_with_the_size_and_hash_that_were_published_is_kept_whole_with_a_note_of_it() {
+        let bytes = file_bytes(300_000, 1);
+        let server = Server::start(|_| vec![(SETUP_PATH.into(), file_answer(&bytes))]);
+        let setup = setup_at(&server, SETUP_PATH, &bytes);
+        let folder = tempfile::tempdir().unwrap();
+        let mut told = Vec::new();
+        let ready = obtain_from("0.2.0", &setup, folder.path(), Some(&server.as_url()), &mut |done, total| told.push((done, total)), &AtomicBool::new(false)).unwrap();
+        assert_eq!(ready.path, folder.path().join("DogmindSetup-0.2.0.exe"));
+        assert_eq!(std::fs::read(&ready.path).unwrap(), bytes);
+        assert_eq!(names_in(folder.path()), ["DogmindSetup-0.2.0.exe", "ready.txt"], "no `.partial` is left");
+        assert_eq!(told.first(), Some(&(0, 300_000)));
+        assert_eq!(told.last(), Some(&(300_000, 300_000)));
+        assert!(told.windows(2).all(|pair| pair[0].0 <= pair[1].0), "progress only goes forward");
+        // what went out says what program asks and wants a file, and no more
+        let head = server.heard.lock().unwrap()[0].clone();
+        let lines: Vec<&str> = head.split("\r\n").filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines[0], format!("GET {SETUP_PATH} HTTP/1.1"));
+        assert!(lines.contains(&format!("User-Agent: Dogmind/{}", env!("CARGO_PKG_VERSION")).as_str()), "{head}");
+        let names: Vec<String> = lines[1..].iter().map(|line| line.split(':').next().unwrap().to_ascii_lowercase()).collect();
+        assert!(names.iter().all(|name| ["host", "accept", "user-agent", "connection"].contains(&name.as_str())), "{names:?}");
+        assert!(ready.is_sound() && ready.is_there());
+    }
+
+    #[test]
+    fn a_download_that_does_not_have_the_published_hash_is_refused_and_leaves_no_file() {
+        let (bytes, other) = (file_bytes(200_000, 1), file_bytes(200_000, 2));
+        let server = Server::start(|_| vec![(SETUP_PATH.into(), file_answer(&other))]);
+        let folder = tempfile::tempdir().unwrap();
+        // (the same length, so that only the hash can tell)
+        let failed = fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_err();
+        assert_eq!(failed, Failed::DidNotMatch);
+        assert_eq!(names_in(folder.path()), Vec::<String>::new(), "no setup, no `.partial`, no note");
+    }
+
+    #[test]
+    fn a_download_of_another_size_is_refused_whichever_way_it_says_so_and_leaves_no_file() {
+        let bytes = file_bytes(100_000, 3);
+        let published = Setup { url: String::new(), size: bytes.len() as u64, sha256: sha_of(&bytes) };
+        let chunked = |body: &[u8]| {
+            let mut answer = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", body.len()).into_bytes();
+            answer.extend_from_slice(body);
+            answer.extend_from_slice(b"\r\n0\r\n\r\n");
+            Answer::Whole(answer)
+        };
+        let longer = [bytes.clone(), b"extra".to_vec()].concat();
+        // (its head says another length; a body of chunks, with no length in its head, that is shorter; and one that is longer)
+        // (and the bytes that hash as GitHub published, for a size that is not the one it published: only the size can tell)
+        let size = bytes.len() as u64;
+        let cases = [
+            ("a length that is not the published", file_answer(&bytes[..bytes.len() - 1]), size),
+            ("chunks that come to less", chunked(&bytes[..bytes.len() - 10]), size),
+            ("chunks that come to more", chunked(&longer), size),
+            ("a hash as published, and less bytes than the size published", chunked(&bytes), size + 10),
+            ("a hash as published, and more bytes than the size published", chunked(&bytes), size - 10),
+            ("a hash as published, and a length in the head that is not the size published", file_answer(&bytes), size + 10),
+        ];
+        for (what, answer, published_size) in cases {
+            let server = Server::start(|_| vec![(SETUP_PATH.into(), answer)]);
+            let folder = tempfile::tempdir().unwrap();
+            let setup = Setup { url: server.url(SETUP_PATH), size: published_size, ..published.clone() };
+            assert_eq!(fetched(&server, &setup, folder.path()).unwrap_err(), Failed::DidNotMatch, "{what}");
+            assert_eq!(names_in(folder.path()), Vec::<String>::new(), "{what}");
+        }
+        // a server that has not the file says so, and that is not a size that did not match
+        let server = Server::start(|_| Vec::new());
+        let folder = tempfile::tempdir().unwrap();
+        assert_eq!(fetched(&server, &Setup { url: server.url(SETUP_PATH), ..published }, folder.path()).unwrap_err(), Failed::Refused(404));
+        assert_eq!(names_in(folder.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_download_sent_on_to_a_host_that_is_not_allowed_is_refused_and_not_followed() {
+        let bytes = file_bytes(50_000, 4);
+        for (what, location) in [
+            ("a host of someone else's", "https://evil.example/DogmindSetup-0.2.0.exe".to_string()),
+            ("a host that only ends like GitHub's storage", "https://evilgithubusercontent.com/x".to_string()),
+            ("github.com over plain http", "http://github.com/rewroy/dogmind-app/releases/download/v0.2.0/DogmindSetup-0.2.0.exe".to_string()),
+            ("a path with no host", "/download/other.exe".to_string()),
+            ("a file", "file:///C:/Windows/System32/cmd.exe".to_string()),
+        ] {
+            let server = Server::start(|_| vec![(SETUP_PATH.into(), redirect_to(&location))]);
+            let folder = tempfile::tempdir().unwrap();
+            let failed = fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_err();
+            assert_eq!(failed, Failed::NotAllowed, "{what}");
+            assert_eq!(server.requests().len(), 1, "{what}: it asked once, and went nowhere else");
+            assert_eq!(names_in(folder.path()), Vec::<String>::new(), "{what}");
+        }
+        // another port of the machine is not the server of the test's
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let elsewhere = format!("http://127.0.0.1:{}/x", other.local_addr().unwrap().port());
+        let server = Server::start(|_| vec![(SETUP_PATH.into(), redirect_to(&elsewhere))]);
+        let folder = tempfile::tempdir().unwrap();
+        assert_eq!(fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_err(), Failed::NotAllowed);
+        other.set_nonblocking(true).unwrap();
+        assert!(other.accept().is_err(), "nothing went to it");
+    }
+
+    #[test]
+    fn a_download_sent_on_to_an_allowed_host_is_followed_up_to_five_times() {
+        let bytes = file_bytes(80_000, 5);
+        // (the server of the test stands in for github.com and its storage, and is the one host allowed, over plain http, and only in a debug build)
+        let chain = |hops: usize| {
+            Server::start(|port| {
+                let mut routes = vec![(SETUP_PATH.to_string(), redirect_to(&format!("http://127.0.0.1:{port}/hop1?sig=a%3Db&x=1")))];
+                for hop in 1..=hops {
+                    let next = if hop == hops { format!("http://127.0.0.1:{port}/objects/file?sig=abc") } else { format!("http://127.0.0.1:{port}/hop{}?sig=a%3Db&x=1", hop + 1) };
+                    routes.push((format!("/hop{hop}?sig=a%3Db&x=1"), redirect_to(&next)));
+                }
+                routes.push(("/objects/file?sig=abc".to_string(), file_answer(&bytes)));
+                routes
+            })
+        };
+        // one hop is the redirect GitHub makes to its storage
+        let server = chain(1);
+        let folder = tempfile::tempdir().unwrap();
+        let ready = fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap();
+        assert_eq!(std::fs::read(ready.path).unwrap(), bytes);
+        assert_eq!(server.requests().len(), 3, "the address asked for, the one it sent on to, and the file: {:?}", server.requests());
+        // five is as far as it goes: the request that is sent on five times is the last
+        let server = chain(4);
+        let folder = tempfile::tempdir().unwrap();
+        assert!(fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).is_ok(), "five times is allowed");
+        assert_eq!(server.requests().len(), 6);
+        let server = chain(5);
+        let folder = tempfile::tempdir().unwrap();
+        assert_eq!(fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_err(), Failed::NotAllowed, "a sixth is not followed");
+        assert_eq!(server.requests().len(), 6, "{:?}", server.requests());
+        assert_eq!(names_in(folder.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_cancelled_download_leaves_no_file() {
+        let bytes = file_bytes(400_000, 6);
+        let mut head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len()).into_bytes();
+        head.extend_from_slice(&bytes[..50_000]);
+        // stopped from the progress it reports, with the rest of the file still to come
+        let server = Server::start(|_| vec![(SETUP_PATH.into(), Answer::Stalls(head.clone()))]);
+        let folder = tempfile::tempdir().unwrap();
+        let (setup, stop) = (setup_at(&server, SETUP_PATH, &bytes), AtomicBool::new(false));
+        let failed = obtain_from("0.2.0", &setup, folder.path(), Some(&server.as_url()), &mut |done, _| if done >= 10_000 { stop.store(true, Ordering::Relaxed) }, &stop).unwrap_err();
+        assert_eq!(failed, Failed::Cancelled);
+        assert_eq!(names_in(folder.path()), Vec::<String>::new());
+        // and stopped while nothing more comes at all: the read is let go of at once, and not at the end of the half hour the server may keep
+        let server = Server::start(|_| vec![(SETUP_PATH.into(), Answer::Stalls(head.clone()))]);
+        let (setup, stop) = (setup_at(&server, SETUP_PATH, &bytes), Arc::new(AtomicBool::new(false)));
+        let pressed = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            pressed.store(true, Ordering::Relaxed);
+        });
+        let began = std::time::Instant::now();
+        assert_eq!(obtain_from("0.2.0", &setup, folder.path(), Some(&server.as_url()), &mut |_, _| {}, &stop).unwrap_err(), Failed::Cancelled);
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        assert_eq!(names_in(folder.path()), Vec::<String>::new());
+        // (one that was stopped before it began asks no one)
+        let server = Server::start(|_| Vec::new());
+        assert_eq!(obtain_from("0.2.0", &setup_at(&server, SETUP_PATH, &bytes), folder.path(), Some(&server.as_url()), &mut |_, _| {}, &AtomicBool::new(true)).unwrap_err(), Failed::Cancelled);
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn an_address_that_is_not_allowed_is_not_asked_at_all() {
+        let server = Server::start(|_| Vec::new());
+        let folder = tempfile::tempdir().unwrap();
+        let bytes = file_bytes(10, 0);
+        // (in a build for release nothing but GitHub's own is: the test server is the debug build's)
+        let setup = Setup { url: server.url(SETUP_PATH), size: 10, sha256: sha_of(&bytes) };
+        assert_eq!(obtain_from("0.2.0", &setup, folder.path(), None, &mut |_, _| {}, &AtomicBool::new(false)).unwrap_err(), Failed::NotAllowed);
+        assert!(server.requests().is_empty());
+        for url in ["https://evil.example/x.exe", "http://github.com/rewroy/dogmind-app/releases/download/v0.2.0/a.exe"] {
+            assert_eq!(obtain_from("0.2.0", &Setup { url: url.into(), ..setup.clone() }, folder.path(), None, &mut |_, _| {}, &AtomicBool::new(false)).unwrap_err(), Failed::NotAllowed, "{url}");
+        }
+        // and a version that is no name of a file is not made into one
+        assert_eq!(obtain_from("0.2.0\\..\\x", &setup, folder.path(), Some(&server.as_url()), &mut |_, _| {}, &AtomicBool::new(false)).unwrap_err(), Failed::NotAllowed);
+        assert_eq!(names_in(folder.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn what_was_checked_is_offered_again_at_the_next_start_and_not_fetched_again() {
+        let bytes = file_bytes(250_000, 7);
+        let server = Server::start(|_| vec![(SETUP_PATH.into(), file_answer(&bytes))]);
+        let setup = setup_at(&server, SETUP_PATH, &bytes);
+        let folder = tempfile::tempdir().unwrap();
+        let first = fetched(&server, &setup, folder.path()).unwrap();
+        assert_eq!(server.requests().len(), 1);
+        // the next start: nothing asked, nothing fetched, and the same setup is there
+        let found = kept(folder.path(), "0.1.1").expect("it is there for the next start");
+        assert_eq!(found, first);
+        assert!(found.is_sound());
+        // (and what is found is offered only for a version later than the one that runs)
+        assert_eq!(kept(folder.path(), "0.2.0"), None);
+        assert_eq!(kept(folder.path(), "0.3.0"), None);
+        assert_eq!(kept(folder.path(), "0.2.0-beta.1").map(|ready| ready.version), Some("0.2.0".to_string()));
+        // a look that finds the same release again does not fetch it again
+        let again = fetched(&server, &setup, folder.path()).unwrap();
+        assert_eq!(again, first);
+        assert_eq!(server.requests().len(), 1, "the file that was checked is used: {:?}", server.requests());
+        // but a release that is not that one is fetched, and takes its place
+        let newer = file_bytes(260_000, 8);
+        let server_two = Server::start(|_| vec![("/download/DogmindSetup-0.2.1.exe".into(), file_answer(&newer))]);
+        let setup_two = setup_at(&server_two, "/download/DogmindSetup-0.2.1.exe", &newer);
+        let second = obtain_from("0.2.1", &setup_two, folder.path(), Some(&server_two.as_url()), &mut |_, _| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(names_in(folder.path()), ["DogmindSetup-0.2.1.exe", "ready.txt"], "the one it replaces is not kept as well");
+        assert_eq!(kept(folder.path(), "0.1.1"), Some(second));
+        // what is changed in the folder since is found out: the file's size at once, its bytes when they are read
+        let path = folder.path().join("DogmindSetup-0.2.1.exe");
+        let mut changed = newer.clone();
+        changed[100] ^= 1;
+        std::fs::write(&path, &changed).unwrap();
+        assert!(kept(folder.path(), "0.1.1").is_some_and(|ready| !ready.is_sound()), "the same length, other bytes");
+        std::fs::write(&path, &changed[..1000]).unwrap();
+        assert_eq!(kept(folder.path(), "0.1.1"), None, "a file that is shorter is not what was checked");
+    }
+
+    #[test]
+    fn the_start_takes_out_what_is_done_with_and_nothing_else() {
+        let folder = tempfile::tempdir().unwrap();
+        let put = |name: &str| std::fs::write(folder.path().join(name), name).unwrap();
+        for name in ["DogmindSetup-0.1.0.exe", "DogmindSetup-0.1.2.exe", "DogmindSetup-0.3.0.exe", "DogmindSetup-0.4.0.exe.partial", "DogmindSetup-0.9.9.exe.partial", "notes.txt", "DogmindSetup-0.1.1-beta.1.exe", "DogmindSetup-x.exe"] {
+            put(name);
+        }
+        let ready = Ready { version: "0.3.0".into(), path: folder.path().join("DogmindSetup-0.3.0.exe"), size: "DogmindSetup-0.3.0.exe".len() as u64, sha256: HASH.into() };
+        write_record(folder.path(), &ready).unwrap();
+        clean_up(folder.path(), "0.1.2");
+        // not later than 0.1.2: 0.1.0, 0.1.2 itself, a pre-release before it, and a name that is no version; any `.partial`; 0.3.0, which waits, stays, and so does a file that is not a setup
+        assert_eq!(names_in(folder.path()), ["DogmindSetup-0.3.0.exe", "notes.txt", "ready.txt"]);
+        assert_eq!(kept(folder.path(), "0.1.2"), Some(ready));
+        // the version that waits has been installed: it goes, and so does the note of it
+        clean_up(folder.path(), "0.3.0");
+        assert_eq!(names_in(folder.path()), ["notes.txt"]);
+        // a note of a file that is not there goes too, and so does one that is not in order
+        write_record(folder.path(), &Ready { version: "0.5.0".into(), path: folder.path().join("DogmindSetup-0.5.0.exe"), size: 5, sha256: HASH.into() }).unwrap();
+        clean_up(folder.path(), "0.3.0");
+        assert_eq!(names_in(folder.path()), ["notes.txt"]);
+        std::fs::write(folder.path().join("ready.txt"), "version ..\\x\nsize 5\nsha256 nothing\n").unwrap();
+        assert_eq!(read_record(folder.path()), None);
+        clean_up(folder.path(), "0.3.0");
+        assert_eq!(names_in(folder.path()), ["notes.txt"]);
+        // a start with no such folder has nothing to take, and makes none
+        clean_up(&folder.path().join("none"), "0.3.0");
+        assert!(!folder.path().join("none").exists());
+    }
+
+    /// (only a debug build lets a setup be fetched from the server of the test's: in a build for release the look finds no setup there, which is what is wanted of it)
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_automatic_download_starts_after_an_automatic_look_finds_a_newer_release_with_its_setup() {
+        let bytes = file_bytes(120_000, 9);
+        let server = Server::start(|port| {
+            let setup = asset("DogmindSetup-0.2.0.exe", &bytes.len().to_string(), &format!("\"sha256:{}\"", sha_of(&bytes)), &format!("http://127.0.0.1:{port}{SETUP_PATH}"));
+            vec![
+                ("/repos/rewroy/dogmind-app/releases?per_page=20".to_string(), Answer::Whole(with_length("200 OK", &listing_with("v0.2.0", &[setup])).into_bytes())),
+                (SETUP_PATH.to_string(), file_answer(&bytes)),
+            ]
+        });
+        let address = RELEASES.replacen("https://api.github.com", &format!("http://127.0.0.1:{}", server.port), 1);
+        // the app's own look, a little after its start
+        let outcome = check_at(&address, "0.1.0", Duration::from_secs(10));
+        let Outcome::Newer(release) = outcome.clone() else { panic!("{outcome:?}") };
+        assert_eq!(release.setup.as_ref().map(|setup| setup.size), Some(bytes.len() as u64));
+        // what the app does with it: on an install, with the switch on and the notice not closed, it goes and fetches
+        let to_fetch = setup_to_fetch(&outcome, true, true, None, true).expect("the setup is to be fetched on its own");
+        assert_eq!(to_fetch, release);
+        let setup = to_fetch.setup.clone().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let ready = obtain_from(&to_fetch.version, &setup, folder.path(), Some(&Url::parse(&address).unwrap()), &mut |_, _| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(std::fs::read(&ready.path).unwrap(), bytes);
+        assert_eq!(server.requests(), ["GET /repos/rewroy/dogmind-app/releases?per_page=20 HTTP/1.1", format!("GET {SETUP_PATH} HTTP/1.1").as_str()], "one look, one fetch");
+        // and when it is not to: not on a copy from the zip, not with the switch off, not for a version whose notice was closed, never for a look that found nothing newer
+        assert_eq!(setup_to_fetch(&outcome, true, true, None, false), None, "a copy from the zip is given the page");
+        assert_eq!(setup_to_fetch(&outcome, true, false, None, true), None, "switched off while the look was made: nothing on its own");
+        assert_eq!(setup_to_fetch(&outcome, true, true, Some("0.2.0"), true), None);
+        assert!(setup_to_fetch(&outcome, true, true, Some("0.1.9"), true).is_some());
+        // the person's own look fetches whatever the switch and the notice say: they asked
+        assert!(setup_to_fetch(&outcome, false, false, Some("0.2.0"), true).is_some());
+        assert_eq!(setup_to_fetch(&outcome, false, true, None, false), None, "but a copy from the zip is still given the page");
+        let page_only = Outcome::Newer(Release { setup: None, ..release });
+        assert_eq!(setup_to_fetch(&page_only, true, true, None, true), None);
+        for outcome in [Outcome::UpToDate, Outcome::NoRelease, Outcome::NotAsked, Outcome::Failed(Trouble::NotReached)] {
+            assert_eq!(setup_to_fetch(&outcome, false, true, None, true), None);
+        }
+    }
+
+    #[test]
+    fn the_installer_is_run_to_update_the_folder_after_this_app_and_its_engine_have_ended() {
+        let folder = Path::new("C:\\Users\\me\\AppData\\Local\\Programs\\Dogmind");
+        let words = |arguments: Vec<std::ffi::OsString>| arguments.into_iter().map(|word| word.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(words(setup_arguments(folder, &[100])), ["--update", "--dir", "C:\\Users\\me\\AppData\\Local\\Programs\\Dogmind", "--wait-pid", "100"]);
+        assert_eq!(words(setup_arguments(folder, &[100, 200])), ["--update", "--dir", "C:\\Users\\me\\AppData\\Local\\Programs\\Dogmind", "--wait-pid", "100", "--wait-pid", "200"]);
+    }
+
+    #[test]
+    fn a_copy_is_an_install_when_the_installers_manifest_is_in_its_folder() {
+        let folder = tempfile::tempdir().unwrap();
+        assert!(!is_install(folder.path()), "a copy unpacked from the zip");
+        std::fs::write(folder.path().join("dogmind-app.exe"), "x").unwrap();
+        std::fs::write(folder.path().join("LICENSE.txt"), "x").unwrap();
+        assert!(!is_install(folder.path()), "its files are not the installer's note");
+        std::fs::write(folder.path().join(INSTALL_MANIFEST), "version 0.1.1\nfile dogmind-app.exe\n").unwrap();
+        assert!(is_install(folder.path()), "what the installer wrote there");
+        assert!(!is_install(&folder.path().join("elsewhere")));
+        // a folder of that name is no file of the installer's
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir(other.path().join(INSTALL_MANIFEST)).unwrap();
+        assert!(!is_install(other.path()));
+        // the name is the one the installer writes, which this cannot link to
+        assert!(include_str!("../../dogmind-setup/src/install.rs").contains(&format!("pub const MANIFEST: &str = \"{INSTALL_MANIFEST}\";")));
     }
 }

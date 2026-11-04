@@ -641,6 +641,29 @@ enum VisionOffer {
     TurnOn,
 }
 
+/// Where the update to a newer release is, on a copy the installer put where it is.
+enum ReleaseUpdate {
+    None,
+    /// Its setup is on its way, fetched by a thread: how far, and what stops it.
+    Fetching { version: String, done: u64, total: u64, stop: Arc<AtomicBool> },
+    /// Its setup is here and checked, and waits for the person to restart into it.
+    Ready(updates::Ready),
+}
+
+/// What About says when the setup of an update was not fetched, and whether that is a trouble.
+fn fetch_words(failed: &updates::Failed) -> (String, bool) {
+    use updates::Failed;
+    match failed {
+        Failed::Cancelled => (t("The update download was cancelled, and its partial file deleted. The next automatic look tries again.").to_string(), false),
+        Failed::Metered => (t("The update was not downloaded: this connection is metered. Check for updates downloads it anyway.").to_string(), false),
+        Failed::NotReached => (t("The update could not be downloaded: GitHub could not be reached. Its partial file is deleted, and the next automatic look tries again.").to_string(), true),
+        Failed::Refused(status) => (tf("The update could not be downloaded: GitHub answered with an error ({0}). The next automatic look tries again.", &[status]), true),
+        Failed::NotAllowed => (t("The update was not downloaded: its address is not one Dogmind accepts. Nothing was changed.").to_string(), true),
+        Failed::DidNotMatch => (t("The download did not match the size and hash GitHub published, so it was deleted. Nothing was run or changed. The next automatic look tries again.").to_string(), true),
+        Failed::Disk(why) => (tf("The update could not be saved: {0}. Its partial file is deleted, and the next automatic look tries again.", &[why]), true),
+    }
+}
+
 enum Note {
     /// What fetching a vision file for this model would take; `None`: there is no such file for it.
     VisionSize(Option<u64>),
@@ -650,6 +673,10 @@ enum Note {
     EngineVersion(Option<String>, Option<u64>),
     /// A look at GitHub's latest release is over: whether the app made it on its own, and what it came to.
     ReleaseLooked { on_its_own: bool, outcome: updates::Outcome },
+    /// How far the setup of a newer release has come, of how many bytes.
+    ReleaseProgress { done: u64, total: u64 },
+    /// The setup of a newer release is fetched and checked and waits to be run, or why it is not.
+    ReleaseFetched(Result<updates::Ready, updates::Failed>),
     Status(u64, String),
     /// The models the provider just connected to offers.
     Models(u64, Vec<String>),
@@ -1610,13 +1637,20 @@ struct App {
     update_declined: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
     /// They said yes while work was going on: it restarts when the work is done.
     restart_when_done: bool,
-    /// A newer release on GitHub than this one, found on the app's own look: a row above the input tells of it (it is never fetched), with a button for its page and a cross.
+    /// A newer release on GitHub than this one, found on the app's own look: a row above the input tells of it, with a button for its page and a cross, unless its setup is being fetched or is here (`release_row`).
     release_offer: Option<updates::Release>,
     release_offer_button: HWND,
     release_offer_close: Option<RECT>,
     /// A look at GitHub is under way (a thread asks; the answer comes as a note), and what the last one came to, as the About page says it.
     release_checking: bool,
     release_outcome: Option<updates::Outcome>,
+    /// The folder this copy runs from when the installer put it there: only such a copy is updated through the installer. A copy unpacked from the zip is given the release's page.
+    install_folder: Option<PathBuf>,
+    /// The setup of a newer release: fetched on its own in the background and checked, then offered; and what the last try came to, as About says it, and whether that is a trouble.
+    release_update: ReleaseUpdate,
+    release_update_said: Option<(String, bool)>,
+    /// The cross of the row that offers it was pressed: it is offered again at the next start.
+    release_ready_closed: bool,
     /// The switch on the About page for the app's own looks.
     toggle_updates: HWND,
     read_folder_add: HWND,
@@ -4904,15 +4938,18 @@ impl App {
             let mut bottom = card_top - s(ds::size::QUEUE_STEP);
             self.queue_hits.clear();
             self.update_offer_close = None;
-            show(self.update_offer_button, self.update_offer);
-            if self.update_offer {
+            // (a new build over this one, or the setup of a release that was fetched and checked: the same row and the same button)
+            let ready_version = self.release_ready().map(|ready| ready.version.clone());
+            let update_shown = self.update_offer || ready_version.is_some();
+            show(self.update_offer_button, update_shown);
+            if update_shown {
                 let tall = s(ds::size::QUEUE_STEP) + s(ds::space::XS);
                 let row = rect(left, bottom - tall, column, tall);
                 shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
-                let (words, action) = if self.restart_when_done {
-                    (t("It restarts into the new version when this work is done."), t("Not now"))
-                } else {
-                    (t("A new version is here."), t("Restart to update"))
+                let (words, action) = match (&ready_version, self.restart_when_done, self.update_offer) {
+                    (_, true, _) => (t("It restarts into the new version when this work is done.").to_string(), t("Not now")),
+                    (Some(version), false, false) => (tf("Dogmind {0} is ready to install.", &[version]), t("Restart to update")),
+                    _ => (t("A new version is here.").to_string(), t("Restart to update")),
                 };
                 set_text_if_changed(self.update_offer_button, action);
                 let cross = s(ds::space::XL);
@@ -4920,7 +4957,7 @@ impl App {
                 let button_x = left + column - cross - s(ds::space::XS) - across;
                 place(self.update_offer_button, button_x, row.top + (tall - s(ds::size::ICON_BUTTON)) / 2, across, s(ds::size::ICON_BUTTON));
                 SetWindowPos(self.update_offer_button, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                shapes.push(Shape::Text { area: rect(left + s(ds::space::M), row.top, (button_x - left - s(ds::space::L)).max(0), tall), text: words.to_string(), font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
+                shapes.push(Shape::Text { area: rect(left + s(ds::space::M), row.top, (button_x - left - s(ds::space::L)).max(0), tall), text: words, font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
                 let close = rect(left + column - cross - s(ds::space::XS), row.top + (tall - cross) / 2, cross, cross);
                 shapes.push(Shape::Icon { name: "x", area: close, size: s(ds::space::M), color: theme::muted() });
                 self.update_offer_close = Some(close);
@@ -4949,10 +4986,11 @@ impl App {
                 self.vision_offer_close = Some(close);
                 bottom -= tall + s(ds::space::XS);
             }
-            // A newer release than this one is out, found by the app's own look: said quietly, and not fetched.
+            // A newer release than this one is out, found by the app's own look: said quietly, with its page. (A copy in an install fetches its setup, and then the row above says that.)
             self.release_offer_close = None;
-            show(self.release_offer_button, self.release_offer.is_some());
-            if let Some(release) = &self.release_offer {
+            let offered = self.release_row().cloned();
+            show(self.release_offer_button, offered.is_some());
+            if let Some(release) = &offered {
                 let tall = s(ds::size::QUEUE_STEP) + s(ds::space::XS);
                 let row = rect(left, bottom - tall, column, tall);
                 shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
@@ -5911,7 +5949,23 @@ impl App {
                         form.y += s(ds::size::LINK) + s(ds::space::S);
                     }
                 }
-                form.toggle_centered(t("Check for updates automatically"), self.toggle_updates);
+                // The update to it, as far as it has come: fetching, waiting to be run, or what became of the last try.
+                if let Some((words, problem)) = self.update_words() {
+                    let tall = text_height(self.fonts.small, &words, form.width);
+                    form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: words, font: FontKind::Small, color: if problem { theme::bad() } else { theme::soft() }, flags: DT_CENTER | DT_WORDBREAK });
+                    form.y += tall + s(ds::space::HAIR) + s(ds::space::S);
+                    if self.update_button_words().is_some() {
+                        let across = text_width(self.fonts.small, &get_text(self.buttons[3])) + s(ds::space::L);
+                        place(self.buttons[3], (form.width - across) / 2, form.y, across, s(ds::size::LINK));
+                        form.used.push(self.buttons[3]);
+                        form.y += s(ds::size::LINK) + s(ds::space::S);
+                    }
+                }
+                form.toggle_centered(t("Update automatically"), self.toggle_updates);
+                let what_it_does = t("It downloads in the background and asks before restarting.");
+                let tall = text_height(self.fonts.small, what_it_does, form.width);
+                form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: what_it_does.to_string(), font: FontKind::Small, color: theme::muted(), flags: DT_CENTER | DT_WORDBREAK });
+                form.y += tall + s(ds::space::HAIR) + s(ds::space::S);
                 let across = text_width(self.fonts.small, &get_text(self.buttons[0])) + s(ds::space::L);
                 place(self.buttons[0], (form.width - across) / 2, form.y, across, s(ds::size::LINK));
                 form.used.push(self.buttons[0]);
@@ -6858,10 +6912,10 @@ impl App {
                 self.panel_title = t("About").into();
                 self.read_engine_version();
                 set_text(self.buttons[0], t("Licenses"));
-                self.set_button_kinds(&[ButtonKind::Link, ButtonKind::Secondary, ButtonKind::Link]);
+                self.set_button_kinds(&[ButtonKind::Link, ButtonKind::Secondary, ButtonKind::Link, ButtonKind::Link]);
                 self.update_toggles();
                 self.show_release_controls();
-                self.tip(self.toggle_updates, t("Dogmind asks GitHub for the newest release at most once a day. It sends only its name and version, and downloads and installs nothing."));
+                self.tip(self.toggle_updates, t("Dogmind asks GitHub for the newest release at most once a day. It sends only its name and version. When there is a newer one, it downloads the setup in the background and checks it, and restarts into it only when you press Restart to update."));
             }
             Panel::General => {
                 self.panel_title = t("Settings").into();
@@ -7732,6 +7786,13 @@ impl App {
     /// Windows lets it rename): a row above the input asks whether to restart into it, and the tray says so if the window is out of sight. Nothing
     /// restarts unless the person says so. A file still being written is not taken for one: the same new size and time twice in a row is.
     unsafe fn look_for_update(&mut self) {
+        // (the setup of a release, fetched and checked: it restarts when the work is done, if the person said so)
+        if self.restart_when_done && !self.update_offer && self.ready_setup().is_some() {
+            if !self.at_work() {
+                self.hand_over_to_setup();
+            }
+            return;
+        }
         let now: Vec<Option<(std::time::SystemTime, u64)>> = self.builds.iter().map(|(path, _)| stamp(path)).collect();
         let changed = self.builds.iter().zip(&now).any(|((_, was), is)| is.is_some() && is != was);
         if !changed || now.iter().any(Option::is_none) {
@@ -7763,10 +7824,145 @@ impl App {
         } else if self.at_work() {
             self.restart_when_done = true;
         } else {
-            self.restart_into_update();
+            self.restart_into_newest();
             return;
         }
         self.layout();
+    }
+
+    /// Restart now: into the build that has come in over this one, or, if there is none, through the installer with the setup that was fetched.
+    unsafe fn restart_into_newest(&mut self) {
+        if self.update_offer || self.ready_setup().is_none() {
+            self.restart_into_update();
+        } else {
+            self.hand_over_to_setup();
+        }
+    }
+
+    /// The setup of a newer release fetched and checked, on a copy an installer put where it is.
+    fn ready_setup(&self) -> Option<&updates::Ready> {
+        match &self.release_update {
+            ReleaseUpdate::Ready(ready) if self.install_folder.is_some() => Some(ready),
+            _ => None,
+        }
+    }
+
+    /// The same, for the row above the input: not after its cross was pressed, until the next start.
+    fn release_ready(&self) -> Option<&updates::Ready> {
+        self.ready_setup().filter(|_| !self.release_ready_closed)
+    }
+
+    /// The release the row above the input tells of, with a button for its page: not while its setup is on its way or here, which have words of their own.
+    fn release_row(&self) -> Option<&updates::Release> {
+        self.release_offer.as_ref().filter(|release| match &self.release_update {
+            ReleaseUpdate::None => true,
+            ReleaseUpdate::Fetching { version, .. } => *version != release.version,
+            ReleaseUpdate::Ready(ready) => ready.version != release.version,
+        })
+    }
+
+    /// The setup that was fetched, run to update this install: it waits for this app, and the engine it started, to end, puts the files of the new version in their places, and starts the
+    /// app again. This quits as the tray's Quit does.
+    unsafe fn hand_over_to_setup(&mut self) {
+        let (Some(ready), Some(folder)) = (self.ready_setup().cloned(), self.install_folder.clone()) else { return };
+        self.restart_when_done = false;
+        if !ready.is_there() {
+            self.release_update = ReleaseUpdate::None;
+            self.release_update_said = Some((t("The downloaded update is gone. Check for updates to download it again.").to_string(), true));
+            self.release_update_changed();
+            return;
+        }
+        let waits_for: Vec<u32> = std::iter::once(std::process::id()).chain(self.engine.as_ref().map(Engine::id)).collect();
+        match std::process::Command::new(&ready.path).args(updates::setup_arguments(&folder, &waits_for)).spawn() {
+            Ok(_) => {
+                DestroyWindow(self.window);
+            }
+            Err(error) => {
+                let words = tf("The update could not be started: {0}", &[&error]);
+                if self.panel == Panel::Chat { self.say(&words) } else { self.problem_in_panel(&words) }
+                self.layout();
+            }
+        }
+    }
+
+    /// About's line about the update to a newer release: how far its setup has come, that it waits to be run, or what became of the last try, and whether that is a trouble.
+    fn update_words(&self) -> Option<(String, bool)> {
+        match &self.release_update {
+            ReleaseUpdate::Fetching { done, total, .. } => Some((tf("Downloading the update… {0}%", &[&(done * 100 / (*total).max(1))]), false)),
+            ReleaseUpdate::Ready(ready) => Some((tf("Dogmind {0} is ready to install.", &[&ready.version]), false)),
+            ReleaseUpdate::None => self.release_update_said.clone(),
+        }
+    }
+
+    /// The button under that line, if it has one: a way to stop the download, or to restart into what was fetched.
+    fn update_button_words(&self) -> Option<&'static str> {
+        match &self.release_update {
+            ReleaseUpdate::Fetching { .. } => Some(t("Cancel")),
+            ReleaseUpdate::Ready(_) if self.ready_setup().is_some() => Some(if self.restart_when_done { t("Not now") } else { t("Restart to update") }),
+            _ => None,
+        }
+    }
+
+    /// What About and the row above the input show of the update has changed.
+    unsafe fn release_update_changed(&mut self) {
+        if self.panel == Panel::About {
+            self.show_release_controls();
+        }
+        self.layout();
+    }
+
+    /// Fetches the setup of this release in the background, quietly: a thread tells how far it has come, and nothing in the window asks for anything until it is here and checked. The app's own
+    /// try waits for a connection that is not metered; the person's own does not.
+    unsafe fn fetch_release_setup(&mut self, release: updates::Release, on_its_own: bool) {
+        let Some(setup) = release.setup.clone() else { return };
+        if !matches!(self.release_update, ReleaseUpdate::None) {
+            return;
+        }
+        // (asked here, on the window's thread, which Windows answers in a moment)
+        if on_its_own && crate::machine::connection_is_metered() {
+            self.release_update_said = Some(fetch_words(&updates::Failed::Metered));
+            self.release_update_changed();
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        self.release_update = ReleaseUpdate::Fetching { version: release.version.clone(), done: 0, total: setup.size, stop: stop.clone() };
+        self.release_update_said = None;
+        let (poster, folder, version) = (self.poster.clone(), self.folder.join(updates::FOLDER), release.version);
+        std::thread::spawn(move || {
+            // (a note when the whole number of percent changes, and not more than five in a second)
+            let mut last: Option<(std::time::Instant, u64)> = None;
+            let result = updates::obtain(&version, &setup, &folder, &mut |done, total| {
+                let percent = done * 100 / total.max(1);
+                if done == total || last.is_none_or(|(at, was)| was != percent && at.elapsed() >= std::time::Duration::from_millis(200)) {
+                    last = Some((std::time::Instant::now(), percent));
+                    poster.send(Note::ReleaseProgress { done, total });
+                }
+            }, &stop);
+            poster.send(Note::ReleaseFetched(result));
+        });
+        self.release_update_changed();
+    }
+
+    /// At the start: what earlier updates left that is done with goes from the `updates` folder, and a setup fetched and checked before, for a later version than this one, is offered
+    /// again, and not fetched again. Its bytes are read again for that, off the window's thread.
+    fn tidy_updates(&self) {
+        let (poster, folder, installed) = (self.poster.clone(), self.folder.join(updates::FOLDER), self.install_folder.is_some());
+        std::thread::spawn(move || {
+            let running = env!("CARGO_PKG_VERSION");
+            updates::clean_up(&folder, running);
+            if !installed {
+                return;
+            }
+            match updates::kept(&folder, running) {
+                Some(ready) if ready.is_sound() => poster.send(Note::ReleaseFetched(Ok(ready))),
+                // (changed since it was checked: it is not run)
+                Some(ready) => {
+                    let _ = std::fs::remove_file(&ready.path);
+                    updates::clean_up(&folder, running);
+                }
+                None => {}
+            }
+        });
     }
 
     unsafe fn restart_into_update(&mut self) {
@@ -7820,6 +8016,9 @@ impl App {
     unsafe fn show_release_controls(&self) {
         set_text_if_changed(self.buttons[1], if self.release_checking { t("Checking…") } else { t("Check for updates") });
         set_text_if_changed(self.buttons[2], t("Open the release page"));
+        if let Some(words) = self.update_button_words() {
+            set_text_if_changed(self.buttons[3], words);
+        }
         EnableWindow(self.buttons[1], i32::from(!self.release_checking));
     }
 
@@ -10240,6 +10439,8 @@ impl App {
             }
             Note::ReleaseLooked { on_its_own, outcome } => {
                 self.release_checking = false;
+                // (on an install, a newer release with its setup is fetched in the background: the app's own look while the switch is on, the person's own look always)
+                let to_fetch = updates::setup_to_fetch(&outcome, on_its_own, self.settings.check_for_updates, self.settings.dismissed_update.as_deref(), self.install_folder.is_some());
                 // Only a look that learned something counts against the day: after a refusal, an error or a page that is no release, the hourly timer asks again.
                 if outcome.learned_something() {
                     self.settings.last_update_check = Some(updates::now());
@@ -10257,6 +10458,35 @@ impl App {
                     self.show_release_controls();
                 }
                 self.layout();
+                if let Some(release) = to_fetch {
+                    self.fetch_release_setup(release, on_its_own);
+                }
+            }
+            Note::ReleaseProgress { done, total } => {
+                if let ReleaseUpdate::Fetching { done: so_far, total: of, .. } = &mut self.release_update {
+                    (*so_far, *of) = (done, total);
+                    if self.panel == Panel::About {
+                        self.layout();
+                    }
+                }
+            }
+            Note::ReleaseFetched(Ok(ready)) => {
+                let again = matches!(&self.release_update, ReleaseUpdate::Ready(known) if known.version == ready.version);
+                self.release_update = ReleaseUpdate::Ready(ready);
+                self.release_update_said = None;
+                if !again {
+                    self.release_ready_closed = false;
+                    self.tray_note(t("A new version of Dogmind is here"), t("Open the app to restart into it."));
+                }
+                self.release_update_changed();
+            }
+            // (what is said of a try that did not come to an end; a setup that is already here stays)
+            Note::ReleaseFetched(Err(failed)) => {
+                if matches!(self.release_update, ReleaseUpdate::Fetching { .. }) {
+                    self.release_update = ReleaseUpdate::None;
+                    self.release_update_said = Some(fetch_words(&failed));
+                    self.release_update_changed();
+                }
             }
             Note::Report(result) => match result {
                 Ok(path) => {
@@ -10626,6 +10856,14 @@ impl App {
             (Panel::ConfirmRemove, 1) if self.model_in_the_data_folder().is_some() => self.leave_this_pc(true),
             (Panel::ConfirmRemove, _) => self.set_panel(Panel::General),
             (Panel::About, 1) => self.start_release_look(false),
+            (Panel::About, 3) => match &self.release_update {
+                ReleaseUpdate::Fetching { stop, .. } => stop.store(true, Ordering::Relaxed),
+                ReleaseUpdate::Ready(_) => {
+                    self.update_offer_pressed();
+                    self.show_release_controls();
+                }
+                ReleaseUpdate::None => {}
+            },
             (Panel::About, 2) => {
                 if let Some(updates::Outcome::Newer(release)) = self.release_outcome.clone() {
                     self.open_release(&release);
@@ -11892,6 +12130,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             if app.update_offer_close.is_some_and(|close| within(&close)) {
                 app.update_offer = false;
                 app.restart_when_done = false;
+                app.release_ready_closed = true;
                 app.update_declined = app.update_seen.clone();
                 app.layout();
                 return 0;
@@ -12292,6 +12531,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.remember_place();
             app.save();
             app.agent.cancel.store(true, Ordering::Relaxed);
+            // (a setup on its way is let go of, and its partial file is taken out at the next start)
+            if let ReleaseUpdate::Fetching { stop, .. } = &app.release_update {
+                stop.store(true, Ordering::Relaxed);
+            }
             dogmind_agent::workspace_grants::app_is_closing();
             let _ = app.agent.commands.send(Command::Quit);
             for parked in &app.parked {
@@ -13127,6 +13370,10 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             release_offer_close: None,
             release_checking: false,
             release_outcome: None,
+            install_folder: updates::install_folder(),
+            release_update: ReleaseUpdate::None,
+            release_update_said: None,
+            release_ready_closed: false,
             toggle_updates: make_button(pane, ID_TOGGLE_UPDATES, "", ButtonKind::Toggle, theme::background()),
             update_declined: None,
             restart_when_done: false,
@@ -13415,6 +13662,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         app.builds = std::env::current_exe().ok().into_iter().chain(engine::find(&app.settings)).map(|path| { let now = stamp(&path); (path, now) }).collect();
         SetTimer(window, TIMER_UPDATE, 5000, None);
         SetTimer(window, TIMER_RELEASES, FIRST_RELEASE_LOOK_MS, None);
+        app.tidy_updates();
         app.update_status();
         app.refresh_sessions();
         if !needs_folder {
