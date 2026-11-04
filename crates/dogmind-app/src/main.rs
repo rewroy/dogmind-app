@@ -21,6 +21,7 @@ mod settings;
 mod textview;
 mod toolrun;
 mod ui;
+mod updates;
 mod vision;
 
 use std::process::ExitCode;
