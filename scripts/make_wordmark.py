@@ -1,45 +1,44 @@
-# Builds assets/logo-wordmark.png and assets/logo-wordmark-dark.png: the dog (assets/logo.png) beside "Dogmind"
-# in Inter ExtraBold (SIL OFL), its corners rounded to match the dog's line. Run from the repo root.
-# Needs Pillow and numpy; set FONT to any bold sans if Inter is not installed.
-import sys
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+#!/usr/bin/env python3
+"""Make assets/logo-wordmark.png and assets/logo-wordmark-dark.png for the README: the dog (assets/logo.png) and the title (assets/title.svg)
+side by side, as one picture, in black and in white for GitHub's dark theme. Needs Pillow. From the repository root:
 
-SS = 4                      # supersample
-LOGO_H = 360 * SS           # dog height in the lockup
-FONT = "/usr/share/fonts/opentype/inter/Inter-ExtraBold.otf"
-TEXT = "Dogmind"
+    python scripts/make_wordmark.py
 
-logo = Image.open("assets/logo.png").convert("RGBA")
-logo = logo.crop(logo.getchannel("A").getbbox())
-logo = logo.resize((round(logo.width * LOGO_H / logo.height), LOGO_H), Image.LANCZOS)
+The title is read as make_logo.py reads it.
+"""
+from pathlib import Path
 
-# text mask, corners rounded by blur+threshold
-size = round(LOGO_H * 0.62)
-font = ImageFont.truetype(FONT, size)
-l, t, r, b = font.getbbox(TEXT)
-pad = 40 * SS
-m = Image.new("L", (r - l + pad * 2, b - t + pad * 2), 0)
-ImageDraw.Draw(m).text((pad - l, pad - t), TEXT, font=font, fill=255)
-rad = 7 * SS
-m = m.filter(ImageFilter.GaussianBlur(rad))
-m = m.point(lambda v: 255 if v > 118 else 0).filter(ImageFilter.GaussianBlur(1.2 * SS / 2))
-m = m.crop(m.getbbox())
+from PIL import Image
 
-gap = round(LOGO_H * 0.10)
-W = logo.width + gap + m.width
-H = LOGO_H
-base_a = Image.new("L", (W, H), 0)
-base_a.paste(logo.getchannel("A"), (0, 0))
-# center text on the dog's face vertically (slightly low to sit on the baseline of the muzzle)
-ty = (H - m.height) // 2 + round(H * 0.03)
-base_a.paste(m, (logo.width + gap, ty))
+import make_logo
 
-# dog's own pixels are black; keep alpha only, recolor
-final_w = 1200
-scale = final_w / W
-a = base_a.resize((final_w, round(H * scale)), Image.LANCZOS)
-for name, col in (("logo-wordmark.png", 0), ("logo-wordmark-dark.png", 255)):
-    img = Image.new("RGBA", a.size, (col, col, col, 0))
-    img.putalpha(a)
-    img.save("assets/" + name, optimize=True)
-    print(name, img.size)
+ROOT = Path(__file__).resolve().parent.parent
+WIDTH = 1200          # of the picture, in pixels
+DOG = 360             # the dog's height, and the lockup's, before scaling
+TITLE_OF_DOG = 0.52   # the title's height, as a part of the dog's
+GAP = 0.10            # between them, as a part of the dog's height
+
+
+def main():
+    dog = make_logo.trim(Image.open(ROOT / "assets" / "logo.png").convert("RGBA").getchannel("A"))
+    dog = dog.resize((round(dog.width * DOG / dog.height), DOG), Image.LANCZOS)
+
+    make_logo.TITLE_WIDTH = 2400
+    title = make_logo.title()
+    height = round(DOG * TITLE_OF_DOG)
+    title = title.resize((round(title.width * height / title.height), height), Image.LANCZOS)
+
+    gap = round(DOG * GAP)
+    ink = Image.new("L", (dog.width + gap + title.width, DOG), 0)
+    ink.paste(dog, (0, 0))
+    ink.paste(title, (dog.width + gap, (DOG - title.height) // 2))
+    ink = ink.resize((WIDTH, round(ink.height * WIDTH / ink.width)), Image.LANCZOS)
+
+    for name, shade in (("logo-wordmark.png", 17), ("logo-wordmark-dark.png", 255)):
+        picture = Image.new("RGBA", ink.size, (shade, shade, shade, 0))
+        picture.putalpha(ink)
+        picture.save(ROOT / "assets" / name, optimize=True)
+
+
+if __name__ == "__main__":
+    main()
