@@ -93,6 +93,45 @@ class Dist(unittest.TestCase):
             self.assertIn(f"dist / {name}", source)
 
 
+class Charts(unittest.TestCase):
+    # What matplotlib's own matplotlibrc has of these keys: commented out, as its defaults, with CRLF line ends, one with a comment after it that goes on over the next lines.
+    STOCK = (
+        "## for font.serif, font.sans-serif, and font.monospace, the first element of\r\n"
+        "#font.sans-serif: DejaVu Sans, Bitstream Vera Sans, Computer Modern Sans Serif, sans-serif\r\n"
+        "#font.cursive:    Apple Chancery, cursive\r\n\r\n"
+        "#axes.unicode_minus: True  # use Unicode for the minus symbol rather than hyphen.  See\r\n"
+        "                           # https://en.wikipedia.org/wiki/Plus_and_minus_signs#Character_codes\r\n"
+        "#axes.prop_cycle: cycler(color='tab10')\r\n"
+    )
+
+    def keys_as_matplotlib_reads_them(self, text):
+        # (it reads this file for its defaults with the `#` off the start of each line, and a key said twice is a "Duplicate key" on stderr at every import)
+        said = []
+        for line in text.splitlines():
+            line = (line[1:] if line.startswith("#") else line).split("#")[0].strip()
+            if ":" in line:
+                said.append(line.split(":", 1)[0].strip())
+        return said
+
+    def test_each_key_is_said_once_and_where_it_was(self):
+        done = package.with_japanese_charts(self.STOCK)
+        said = self.keys_as_matplotlib_reads_them(done)
+        for key in ["font.sans-serif", "axes.unicode_minus"]:
+            self.assertEqual(said.count(key), 1, key)
+        self.assertIn("\r\nfont.sans-serif: BIZ UDGothic, DejaVu Sans\r\n", done)
+        self.assertIn("\r\naxes.unicode_minus: False  # use Unicode for the minus symbol", done)
+        # nothing else moved: the same lines but those two, with the line ends they had
+        before, after = self.STOCK.split("\r\n"), done.split("\r\n")
+        self.assertEqual(len(before), len(after))
+        self.assertEqual([n for n, (a, b) in enumerate(zip(before, after)) if a != b], [1, 4])
+        self.assertNotIn("\n", done.replace("\r\n", ""))
+
+    def test_a_file_that_is_set_up_another_way_is_an_error_and_not_a_second_line(self):
+        for text in ["", "#font.sans-serif: DejaVu Sans\r\n", "#axes.unicode_minus: True\r\n", self.STOCK + "#font.sans-serif: Arial\r\n", "font.sans-serif: Arial\r\n#axes.unicode_minus: True\r\n"]:
+            with self.subTest(text), self.assertRaises(SystemExit):
+                package.with_japanese_charts(text)
+
+
 class Fetching(unittest.TestCase):
     def test_a_hash_that_is_not_the_one_pinned_leaves_nothing_in_the_cache(self):
         with tempfile.TemporaryDirectory() as folder:
