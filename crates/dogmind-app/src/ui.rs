@@ -677,6 +677,8 @@ enum Note {
     ReleaseProgress { done: u64, total: u64 },
     /// The setup of a newer release is fetched and checked and waits to be run, or why it is not.
     ReleaseFetched(Result<updates::Ready, updates::Failed>),
+    /// The setup that waits was read again through a handle no one else can write through, before it is run: that handle with it, to be held while it starts, or why it is not run.
+    SetupChecked(updates::Ready, Result<std::fs::File, updates::NotRun>),
     Status(u64, String),
     /// The models the provider just connected to offers.
     Models(u64, Vec<String>),
@@ -1645,6 +1647,8 @@ struct App {
     update_declined: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
     /// They said yes while work was going on: it restarts when the work is done.
     restart_when_done: bool,
+    /// The setup that waits is being checked before it is run (a thread reads all of its bytes: a second or two): the buttons that restart into it say so, and cannot be pressed again.
+    checking_setup: bool,
     /// A newer release on GitHub than this one, found on the app's own look: a row above the input tells of it, with a button for its page and a cross, unless its setup is being fetched or is here (`release_row`).
     release_offer: Option<updates::Release>,
     release_offer_button: HWND,
@@ -4959,7 +4963,10 @@ impl App {
                     (Some(version), false, false) => (tf("Dogmind {0} is ready to install.", &[version]), t("Restart to update")),
                     _ => (t("A new version is here.").to_string(), t("Restart to update")),
                 };
+                // (while the setup is read again before it is run, the button says so and waits)
+                let action = if self.checking_setup { t("Checking…") } else { action };
                 set_text_if_changed(self.update_offer_button, action);
+                EnableWindow(self.update_offer_button, i32::from(!self.checking_setup));
                 let cross = s(ds::space::XL);
                 let across = (text_width(self.fonts.body, action) + s(ds::space::XL)).max(s(72));
                 let button_x = left + column - cross - s(ds::space::XS) - across;
@@ -7821,6 +7828,9 @@ impl App {
 
     /// The offer's button: restart now, or, with work going on, when it is done; pressed again then, not after all.
     unsafe fn update_offer_pressed(&mut self) {
+        if self.checking_setup {
+            return;
+        }
         if self.restart_when_done {
             self.restart_when_done = false;
         } else if self.at_work() {
@@ -7865,26 +7875,69 @@ impl App {
 
     /// The setup that was fetched, run to update this install: it waits for this app, and the engine it started, to end, puts the files of the new version in their places, and starts the
     /// app again. This quits as the tray's Quit does.
+    /// Before it is run, all of its bytes are checked against the hash that was noted, through a handle that no one else can write through, held until the setup has started. That reads
+    /// 560 MB (a second or two), so a thread does it, and the buttons say so and wait; it comes back as a note (`setup_checked`).
     unsafe fn hand_over_to_setup(&mut self) {
-        let (Some(ready), Some(folder)) = (self.ready_setup().cloned(), self.install_folder.clone()) else { return };
-        self.restart_when_done = false;
-        if !ready.is_there() {
-            self.release_update = ReleaseUpdate::None;
-            self.release_update_said = Some((t("The downloaded update is gone. Check for updates to download it again.").to_string(), true));
-            self.release_update_changed();
+        if self.checking_setup {
             return;
         }
+        let (Some(ready), Some(_)) = (self.ready_setup().cloned(), self.install_folder.clone()) else { return };
+        self.restart_when_done = false;
+        if !ready.is_there() {
+            self.setup_is_gone();
+            return;
+        }
+        self.checking_setup = true;
+        self.release_update_changed();
+        let (poster, folder) = (self.poster.clone(), self.folder.join(updates::FOLDER));
+        std::thread::spawn(move || {
+            let held = ready.hold_if_sound();
+            // (not what was checked: it is not run, and it goes with its note)
+            if matches!(held, Err(updates::NotRun::Changed)) {
+                let _ = std::fs::remove_file(&ready.path);
+                updates::clean_up(&folder, env!("CARGO_PKG_VERSION"));
+            }
+            poster.send(Note::SetupChecked(ready, held));
+        });
+    }
+
+    /// What came of the check of the setup that waits: with the file sound and held, the setup is started, and this quits as the tray's Quit does; the handle is let go of once it has started.
+    unsafe fn setup_checked(&mut self, ready: updates::Ready, held: Result<std::fs::File, updates::NotRun>) {
+        self.checking_setup = false;
+        let held = match held {
+            Ok(held) if self.ready_setup() == Some(&ready) => held,
+            // (it is not the one that waits any more)
+            Ok(_) => return self.release_update_changed(),
+            Err(updates::NotRun::Changed) => return self.setup_is_gone(),
+            Err(updates::NotRun::Refused(error)) => return self.setup_not_started(&error),
+        };
+        // (work that began while it was read is not cut short: the press is kept, as it is when work is going on)
+        if self.at_work() {
+            drop(held);
+            self.restart_when_done = true;
+            return self.release_update_changed();
+        }
+        let Some(folder) = self.install_folder.clone() else { return };
         let waits_for: Vec<u32> = std::iter::once(std::process::id()).chain(self.engine.as_ref().map(Engine::id)).collect();
-        match std::process::Command::new(&ready.path).args(updates::setup_arguments(&folder, &waits_for)).spawn() {
+        match updates::run_held(&ready, held, &updates::setup_arguments(&folder, &waits_for)) {
             Ok(_) => {
                 DestroyWindow(self.window);
             }
-            Err(error) => {
-                let words = tf("The update could not be started: {0}", &[&error]);
-                if self.panel == Panel::Chat { self.say(&words) } else { self.problem_in_panel(&words) }
-                self.layout();
-            }
+            Err(error) => self.setup_not_started(&error.to_string()),
         }
+    }
+
+    /// The setup that waits is not there, or is not what was checked: it is not offered, and About says so.
+    unsafe fn setup_is_gone(&mut self) {
+        self.release_update = ReleaseUpdate::None;
+        self.release_update_said = Some((t("The downloaded update is gone. Check for updates to download it again.").to_string(), true));
+        self.release_update_changed();
+    }
+
+    unsafe fn setup_not_started(&mut self, error: &str) {
+        let words = tf("The update could not be started: {0}", &[&error]);
+        if self.panel == Panel::Chat { self.say(&words) } else { self.problem_in_panel(&words) }
+        self.release_update_changed();
     }
 
     /// About's line about the update to a newer release: how far its setup has come, that it waits to be run, or what became of the last try, and whether that is a trouble.
@@ -7900,7 +7953,7 @@ impl App {
     fn update_button_words(&self) -> Option<&'static str> {
         match &self.release_update {
             ReleaseUpdate::Fetching { .. } => Some(t("Cancel")),
-            ReleaseUpdate::Ready(_) if self.ready_setup().is_some() => Some(if self.restart_when_done { t("Not now") } else { t("Restart to update") }),
+            ReleaseUpdate::Ready(_) if self.ready_setup().is_some() => Some(if self.checking_setup { t("Checking…") } else if self.restart_when_done { t("Not now") } else { t("Restart to update") }),
             _ => None,
         }
     }
@@ -8059,6 +8112,7 @@ impl App {
             set_button_style(self.buttons[3], self.update_button_kind(), theme::background());
         }
         EnableWindow(self.buttons[1], i32::from(!self.release_checking));
+        EnableWindow(self.buttons[3], i32::from(!self.checking_setup));
     }
 
     /// What the About page says of the last look, and whether that is a trouble. Nothing while one is going on, and before any.
@@ -10530,6 +10584,7 @@ impl App {
                     self.offer_the_setup_kept();
                 }
             }
+            Note::SetupChecked(ready, held) => self.setup_checked(ready, held),
             Note::Report(result) => match result {
                 Ok(path) => {
                     let words = crate::crash::report_words(&shown_path(&path));
@@ -13456,6 +13511,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             toggle_updates: make_button(pane, ID_TOGGLE_UPDATES, "", ButtonKind::Toggle, theme::background()),
             update_declined: None,
             restart_when_done: false,
+            checking_setup: false,
             read_folder_add: make_button(pane, ID_READ_FOLDER_ADD, "", ButtonKind::Secondary, theme::background()),
             read_folder_stop: make_button(pane, ID_READ_FOLDER_STOP, "", ButtonKind::Secondary, theme::background()),
             read_folder_remove: Vec::new(),
