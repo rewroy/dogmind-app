@@ -842,10 +842,11 @@ struct ToolMeta {
     req: Option<String>,
 }
 
-/// A path as the trajectory says it: from the workspace when it is in it.
+/// A path as the trajectory says it: from the workspace when it is in it, and as its file name only when it is not (a picture a check made in the sandbox's folder: where that is says
+/// nothing of the run, and a person's folder names are in it).
 fn path_for_trajectory(path: &str, workspace: &Path) -> String {
     let resolved = resolve(workspace, path);
-    resolved.strip_prefix(workspace).map_or_else(|_| path.to_string(), |inside| inside.to_string_lossy().replace('\\', "/"))
+    resolved.strip_prefix(workspace).map_or_else(|_| format!("(outside the workspace)/{}", resolved.file_name().map_or(String::new(), |name| name.to_string_lossy().into_owned())), |inside| inside.to_string_lossy().replace('\\', "/"))
 }
 
 /// The first word of a command, and no more: a program's name, never its arguments, which can hold a key or a person's words. A first word with an `=` in it is an assignment
@@ -5546,6 +5547,14 @@ mod tests {
         // A call made again is told by the hash of its arguments, which says nothing of them.
         let hashes: Vec<&str> = of_kind(&lines, "tool").iter().map(|line| line["args_hash"].as_str().unwrap()).collect();
         assert!(hashes.iter().all(|hash| hash.len() == 12) && hashes.iter().collect::<std::collections::HashSet<_>>().len() == 3, "{hashes:?}");
+    }
+
+    #[test]
+    fn a_path_is_told_from_the_workspace_and_one_outside_it_by_its_name_alone() {
+        let workspace = Path::new("C:\\work\\site");
+        assert_eq!(path_for_trajectory("src\\a.rs", workspace), "src/a.rs");
+        assert_eq!(path_for_trajectory("C:\\work\\site\\b.html", workspace), "b.html");
+        assert_eq!(path_for_trajectory("C:\\Users\\someone\\AppData\\shot.png", workspace), "(outside the workspace)/shot.png");
     }
 
     #[test]
