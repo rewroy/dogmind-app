@@ -33,6 +33,7 @@ pub mod session;
 pub mod skills;
 pub mod tools;
 pub mod trajectory;
+pub mod trajectory_report;
 pub mod web;
 #[cfg(windows)]
 pub mod workspace_grants;

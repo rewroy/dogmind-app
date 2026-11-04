@@ -26,7 +26,34 @@ mod vision;
 
 use std::process::ExitCode;
 
+/// `dogmind-app --trajectory <file> [--engine-log <json>]`: how a run went, read from its trajectory (see `dogmind_agent::trajectory`). The app has no console of its own, so it
+/// takes its parent's, if there is one; where its output is redirected it goes there.
+fn print_trajectory(arguments: &[std::ffi::OsString]) -> ExitCode {
+    use std::io::Write;
+    #[cfg(windows)]
+    // SAFETY: a call with no pointers; it fails harmlessly when there is no console to take.
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
+    }
+    let arguments: Vec<String> = arguments.iter().map(|argument| argument.to_string_lossy().into_owned()).collect();
+    match dogmind_agent::trajectory_report::run(&arguments) {
+        Ok(text) => {
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(std::io::stderr(), "{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    // (a reader of the app's own record of a run, which prints and ends: no window)
+    let given: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if given.first().is_some_and(|first| first == "--trajectory") {
+        return print_trajectory(&given[1..]);
+    }
     // Before anything starts a child, which has this from its parent: no box on the person's screen from anything the app runs.
     dogmind_agent::sandbox::no_error_boxes();
     // Before any font is made.
