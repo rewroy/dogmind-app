@@ -1303,6 +1303,11 @@ mod tests {
         Whole(Vec<u8>),
         /// These bytes, and then nothing, until the client goes: a download that has stopped coming.
         Stalls(Vec<u8>),
+        /// These bytes, and then the server closes its end the moment it has written them, as an HTTP/1.0 server does, and as one does that was told `Connection: close`: the first time the
+        /// path is asked for, at once, which on Windows can reset what the client had not read yet; each time after, five milliseconds on, as a close that is kind to its reader.
+        Closes(Vec<u8>),
+        /// The same, this many milliseconds after, every time.
+        ClosesAfter(Vec<u8>, u64),
     }
 
     /// A server on this machine for as many requests as come, each on a thread of its own: the paths it answers (the path is what the request asks for, its query too) and what each request said.
@@ -1325,7 +1330,7 @@ mod tests {
             listener.set_nonblocking(true).unwrap();
             let port = listener.local_addr().unwrap().port();
             let routes = Arc::new(routes(port));
-            let (heard, done) = (Arc::new(std::sync::Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
+            let (heard, done) = (Arc::new(std::sync::Mutex::new(Vec::<String>::new())), Arc::new(AtomicBool::new(false)));
             let (heard_by, done_by) = (heard.clone(), done.clone());
             std::thread::spawn(move || {
                 while !done_by.load(Ordering::Relaxed) {
@@ -1350,15 +1355,24 @@ mod tests {
                         }
                         let head = String::from_utf8_lossy(&head).into_owned();
                         let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let earlier = heard.lock().unwrap().iter().filter(|known| known.split_whitespace().nth(1) == Some(path.as_str())).count();
                         heard.lock().unwrap().push(head);
                         let found = routes.iter().find(|(known, _)| *known == path).map(|(_, answer)| answer);
-                        let (bytes, stalls) = match found {
-                            Some(Answer::Whole(bytes)) => (bytes.clone(), false),
-                            Some(Answer::Stalls(bytes)) => (bytes.clone(), true),
-                            None => (with_length("404 Not Found", "not here").into_bytes(), false),
+                        let (bytes, stalls, closes_after) = match found {
+                            Some(Answer::Whole(bytes)) => (bytes.clone(), false, None),
+                            Some(Answer::Stalls(bytes)) => (bytes.clone(), true, None),
+                            Some(Answer::Closes(bytes)) => (bytes.clone(), false, Some(if earlier == 0 { 0u64 } else { 5 })),
+                            Some(Answer::ClosesAfter(bytes, milliseconds)) => (bytes.clone(), false, Some(*milliseconds)),
+                            None => (with_length("404 Not Found", "not here").into_bytes(), false, None),
                         };
                         let _ = stream.write_all(&bytes);
                         let _ = stream.flush();
+                        if let Some(milliseconds) = closes_after {
+                            if milliseconds > 0 {
+                                std::thread::sleep(Duration::from_millis(milliseconds));
+                            }
+                            return;
+                        }
                         // (the client has what the length says, and is not waited for; one that is to stall is waited for until it goes)
                         let until = std::time::Instant::now() + if stalls { Duration::from_secs(20) } else { Duration::from_secs(2) };
                         while !done.load(Ordering::Relaxed) && std::time::Instant::now() < until {
@@ -1554,6 +1568,39 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         assert_eq!(fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_err(), Failed::NotAllowed, "a sixth is not followed");
         assert_eq!(server.requests().len(), 6, "{:?}", server.requests());
+        assert_eq!(names_in(folder.path()), Vec::<String>::new());
+    }
+
+    /// What GitHub's storage, a proxy or a small server of someone's may be: it answers HTTP/1.0, or HTTP/1.1 with `Connection: close`, and closes its end the moment it has answered. The first
+    /// connection for each address is closed at once, which on Windows can reset it with the answer unread; the app asks again, and what it asks for is followed and checked all the same.
+    #[test]
+    fn a_download_is_followed_and_checked_from_a_server_that_closes_after_each_answer() {
+        let bytes = file_bytes(60_000, 12);
+        for (version, closing) in [("1.0", ""), ("1.1", "Connection: close\r\n")] {
+            for round in 0..20 {
+                let server = Server::start(|port| {
+                    let redirect = format!("HTTP/{version} 302 Found\r\n{closing}Location: http://127.0.0.1:{port}/storage/DogmindSetup-0.2.0.exe\r\nContent-Length: 0\r\n\r\n");
+                    let mut file = format!("HTTP/{version} 200 OK\r\n{closing}Content-Length: {}\r\n\r\n", bytes.len()).into_bytes();
+                    file.extend_from_slice(&bytes);
+                    vec![(SETUP_PATH.to_string(), Answer::Closes(redirect.into_bytes())), ("/storage/DogmindSetup-0.2.0.exe".to_string(), Answer::ClosesAfter(file, 20))]
+                });
+                let folder = tempfile::tempdir().unwrap();
+                let ready = fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_or_else(|failed| panic!("HTTP/{version} {closing:?}, round {round}: {failed:?}"));
+                assert_eq!(std::fs::read(&ready.path).unwrap(), bytes);
+                assert!(ready.is_sound());
+                let asked = server.requests();
+                assert!(asked.iter().any(|line| line.contains(SETUP_PATH)) && asked.iter().any(|line| line.contains("/storage/")), "{asked:?}");
+            }
+        }
+        // and what comes is still checked: the bytes of another file, under the right address and size, are refused
+        let server = Server::start(|port| {
+            let redirect = format!("HTTP/1.0 302 Found\r\nLocation: http://127.0.0.1:{port}/storage/DogmindSetup-0.2.0.exe\r\nContent-Length: 0\r\n\r\n");
+            let mut file = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len()).into_bytes();
+            file.extend_from_slice(&file_bytes(bytes.len(), 13));
+            vec![(SETUP_PATH.to_string(), Answer::Closes(redirect.into_bytes())), ("/storage/DogmindSetup-0.2.0.exe".to_string(), Answer::ClosesAfter(file, 20))]
+        });
+        let folder = tempfile::tempdir().unwrap();
+        assert_eq!(fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).err(), Some(Failed::DidNotMatch));
         assert_eq!(names_in(folder.path()), Vec::<String>::new());
     }
 
