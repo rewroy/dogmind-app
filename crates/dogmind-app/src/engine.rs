@@ -22,11 +22,12 @@ pub fn find(settings: &Settings) -> Option<PathBuf> {
     settings.straydog.clone().filter(|file| file.is_file()).or(beside.filter(|file| file.is_file())).or(on_path)
 }
 
-/// The bundles this app offers: the GSQ-RCO ones, by ISTA-DASLab. `straydog` itself still has the others, for who wants them.
-/// Straydog does not say where a bundle comes from, so a new one appears here when a line says so; `crates/straydog-engine/src/assets*.json`
-/// there name each bundle's repository.
+/// The bundles this app offers: the GSQ-RCO ones, by ISTA-DASLab, and Qwen3.8's (its `Qwen-UD-*` by Unsloth). `straydog` itself still has the
+/// others, for who wants them. Straydog does not say where a bundle comes from, so a new one appears here when a line says so;
+/// `crates/straydog-engine/src/assets*.json` there name each bundle's repository.
 fn origin(model: &str, quant: &str) -> Option<String> {
     match model {
+        "Qwen3.8-Flash-Next" if quant.starts_with("Qwen-UD-") => Some("by Qwen, quantized by Unsloth".to_string()),
         "Qwen3.8-Flash-Next" => Some("by Qwen, quantized by ISTA-DASLab".to_string()),
         "DeepSeek-V4.1-Flash" if quant.starts_with("GSQ-RCO") => Some("by DeepSeek, quantized by ISTA-DASLab".to_string()),
         _ => None,
@@ -1033,6 +1034,34 @@ mod tests {
         assert_eq!(catalog.refusal, None);
         assert!(parse_list("error: unexpected argument '--list'", true).is_none());
         assert!(parse_list("{}", true).is_none());
+    }
+
+    #[test]
+    fn qwens_unsloth_bundle_is_offered_and_says_who_made_it() {
+        // Straydog names Unsloth's UD-IQ1_M of Qwen3.8 `Qwen-UD-IQ1_M`, apart from DeepSeek's UD-IQ1_M, which this app does not offer
+        let list = r#"{"bundles":[
+            {"model":"Qwen3.8-Flash-Next","quant":"Qwen-UD-IQ1_M","download_bytes":68007094938,"runs":true,"recommended":true,"fit":"ram","extras":[{"name":"mtp","download_bytes":1},{"name":"vision","download_bytes":2}]},
+            {"model":"Qwen3.8-Flash-Next","quant":"IQ2_XS","download_bytes":68000000000,"runs":true},
+            {"model":"DeepSeek-V4.1-Flash","quant":"UD-IQ1_M","download_bytes":1,"runs":true}]}"#;
+        let entries = parse_list(list, true).unwrap().entries;
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["Qwen3.8-Flash-Next Qwen-UD-IQ1_M", "Qwen3.8-Flash-Next IQ2_XS"]);
+        assert_eq!(entries[0].origin, "by Qwen, quantized by Unsloth");
+        assert_eq!(entries[1].origin, "by Qwen, quantized by ISTA-DASLab");
+        assert_eq!(entries[0].licence.unwrap().name, "Qwen Community License 1.0", "a quantized file has its base model's terms");
+        assert_eq!((entries[0].drafter_bytes, entries[0].vision_bytes), (Some(1), Some(2)), "it shares Qwen3.8's drafter and vision file");
+        assert_eq!(engine_args_quant(&entries[0]), ["--quant", "Qwen-UD-IQ1_M"]);
+        let help = parse_catalog("      --quant <NAME>  Qwen3.8-Flash-Next: Qwen-UD-IQ1_M (68.0 GB), IQ2_XS (68.0 GB); DeepSeek-V4.1-Flash: UD-IQ1_M (1.0 GB). x\n");
+        let quants: Vec<&str> = help.iter().filter_map(|entry| entry.quant.as_deref()).collect();
+        assert_eq!(quants, ["Qwen-UD-IQ1_M", "IQ2_XS"]);
+        assert_eq!(help[1].origin, "by Qwen, quantized by Unsloth");
+    }
+
+    /// What `setup` is told of the bundle chosen.
+    fn engine_args_quant(entry: &CatalogEntry) -> Vec<String> {
+        let args = setup_arguments(entry.quant.as_deref(), Path::new("M"), Path::new("C"), true, true);
+        let at = args.iter().position(|arg| arg == "--quant").unwrap();
+        args[at..at + 2].to_vec()
     }
 
     #[test]
