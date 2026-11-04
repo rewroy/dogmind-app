@@ -214,6 +214,9 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
         }
         let model = word(bundle, "model");
         let Some(origin) = origin(&model, &quant) else { continue };
+        // What a person reads: Straydog's `label`, which for Qwen3.8's `Qwen-UD-IQ1_M` is `UD-IQ1_M` (an older one has none). `quant` stays the
+        // key `setup --quant` is given back.
+        let label = Some(word(bundle, "label")).filter(|label| !label.is_empty()).unwrap_or_else(|| quant.clone());
         let runs = bundle.get("runs").and_then(Value::as_bool).unwrap_or(false);
         let short = if runs { None } else { memory_short(&word(bundle, "note")) };
         if let Some((needs, has)) = &short {
@@ -242,7 +245,7 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
             download_bytes: Some(download),
             vision_bytes: extra("vision"),
             drafter_bytes: extra("mtp"),
-            name: format!("{model} {quant}"),
+            name: format!("{model} {label}"),
             licence: licence_of(&model),
             origin,
             detail: if short.is_some() {
@@ -1039,13 +1042,15 @@ mod tests {
     #[test]
     fn qwens_unsloth_bundle_is_offered_and_says_who_made_it() {
         // Straydog names Unsloth's UD-IQ1_M of Qwen3.8 `Qwen-UD-IQ1_M`, apart from DeepSeek's UD-IQ1_M, which this app does not offer
+        // and shows it as `UD-IQ1_M`, its `label`; an older Straydog without labels is shown its `quant`
         let list = r#"{"bundles":[
-            {"model":"Qwen3.8-Flash-Next","quant":"Qwen-UD-IQ1_M","download_bytes":68007094938,"runs":true,"recommended":true,"fit":"ram","extras":[{"name":"mtp","download_bytes":1},{"name":"vision","download_bytes":2}]},
+            {"model":"Qwen3.8-Flash-Next","quant":"Qwen-UD-IQ1_M","label":"UD-IQ1_M","download_bytes":68007094938,"runs":true,"recommended":true,"fit":"ram","extras":[{"name":"mtp","download_bytes":1},{"name":"vision","download_bytes":2}]},
             {"model":"Qwen3.8-Flash-Next","quant":"IQ2_XS","download_bytes":68000000000,"runs":true},
-            {"model":"DeepSeek-V4.1-Flash","quant":"UD-IQ1_M","download_bytes":1,"runs":true}]}"#;
+            {"model":"DeepSeek-V4.1-Flash","quant":"UD-IQ1_M","label":"UD-IQ1_M","download_bytes":1,"runs":true}]}"#;
         let entries = parse_list(list, true).unwrap().entries;
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, ["Qwen3.8-Flash-Next Qwen-UD-IQ1_M", "Qwen3.8-Flash-Next IQ2_XS"]);
+        assert_eq!(names, ["Qwen3.8-Flash-Next UD-IQ1_M", "Qwen3.8-Flash-Next IQ2_XS"]);
+        assert_eq!(entries[0].quant.as_deref(), Some("Qwen-UD-IQ1_M"), "the key, which setup is given back");
         assert_eq!(entries[0].origin, "by Qwen, quantized by Unsloth");
         assert_eq!(entries[1].origin, "by Qwen, quantized by ISTA-DASLab");
         assert_eq!(entries[0].licence.unwrap().name, "Qwen Community License 1.0", "a quantized file has its base model's terms");
