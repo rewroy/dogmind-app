@@ -84,12 +84,6 @@ fn legacy_labels(quant: &str) -> Option<(&str, &str, &str)> {
     })
 }
 
-/// The bundles this app offers, by model and provider: all `setup --list` has, a model or a provider new to this app too, but DeepSeek's by
-/// Unsloth. `straydog` itself still has those, for who wants them.
-fn is_offered(model: &str, provider: &str) -> bool {
-    !(model == DEEPSEEK && provider == UNSLOTH)
-}
-
 /// Whose model it is, and who made this file of it: its `creator` as Straydog says it (none, for a bundle that has none), and who quantized it.
 fn origin(creator: &str, provider: &str) -> String {
     if creator.is_empty() { format!("quantized by {provider}") } else { format!("by {creator}, quantized by {provider}") }
@@ -214,10 +208,8 @@ pub fn parse_catalog(help: &str) -> Vec<CatalogEntry> {
                 }
                 // (the model the help names is the table's, under the name it had then: `DeepSeek-V4.1-Flash` is `DeepSeek-V4.1-Flash-1017`'s start)
                 let Some((labelled, provider, quant)) = legacy_labels(quant).filter(|(labelled, ..)| labelled.starts_with(model)) else { continue };
-                if is_offered(labelled, provider) {
-                    let bundle = Bundle::new(labelled, provider, quant);
-                    entries.push(CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, name: bundle.name(), bundle: Some(bundle), origin: origin("", provider), detail: size.to_string(), context: None, disk_bytes: None, licence: None, runs: true });
-                }
+                let bundle = Bundle::new(labelled, provider, quant);
+                entries.push(CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, name: bundle.name(), bundle: Some(bundle), origin: origin("", provider), detail: size.to_string(), context: None, disk_bytes: None, licence: None, runs: true });
             }
         }
     }
@@ -281,7 +273,8 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     for bundle in bundles {
         let (model, provider, quant) = (word(bundle, "model"), word(bundle, "provider"), word(bundle, "quant"));
         // (a bundle with no provider is an older Straydog's: it has no name here)
-        if quant.is_empty() || provider.is_empty() || !is_offered(&model, &provider) {
+        // (every bundle the list has is offered: which come first, and which is recommended, is Straydog's to say)
+        if quant.is_empty() || provider.is_empty() {
             continue;
         }
         let runs = bundle.get("runs").and_then(Value::as_bool).unwrap_or(false);
@@ -1106,9 +1099,9 @@ mod tests {
         assert_eq!(entries[2].name, "Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS");
         assert_eq!(entries[3].bundle, Some(Bundle::new("DeepSeek-V4.1-Flash-1017", "ISTA-DASLab", "IQ2_XXS")));
         assert_eq!(entries[3].origin, "quantized by ISTA-DASLab", "it says no creator");
-        // (what the table does not know, what it gives to another model, and what is not offered, are left out)
+        // (what the table does not know, and what it gives to another model, are left out; DeepSeek's by Unsloth is offered as the rest)
         let left_out = parse_catalog("      --quant <NAME>  Qwen3.8-Flash-Next: Qwen-UD-IQ1_M (68.0 GB), UD-IQ1_M (68.0 GB); DeepSeek-V4.1-Flash: UD-IQ2_XXS (1.0 GB), IQ3_S (1.0 GB). x\n");
-        assert_eq!(left_out.len(), 1, "{:?}", names(&left_out));
+        assert_eq!(names(&left_out), ["The best for this PC", "DeepSeek-V4.1-Flash-1017 · Unsloth · UD-IQ2_XXS"]);
         assert_eq!(parse_catalog("something else entirely").len(), 1, "an unknown help still offers Straydog's choice");
     }
 
@@ -1212,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn all_the_list_has_is_offered_but_deepseeks_by_unsloth() {
+    fn all_the_list_has_is_offered_in_its_order() {
         let (qwen, deepseek) = ("Qwen3.8-Flash-Next", "DeepSeek-V4.1-Flash-1017");
         let list = format!(r#"{{"bundles":[{}]}}"#, [
             listed(deepseek, "ISTA-DASLab", "IQ2_XXS"), listed(deepseek, "ISTA-DASLab", "IQ2_XS"), listed(deepseek, "Unsloth", "UD-IQ2_XXS"), listed(deepseek, "Unsloth", "UD-IQ1_M"),
@@ -1222,14 +1215,12 @@ mod tests {
             format!(r#"{{"model":"{qwen}","quant":"Q2_0","download_bytes":1,"runs":true}}"#),
         ].join(","));
         let entries = parse_list(&list, true).unwrap().entries;
+        // (a model Straydog lists that this app has never heard of needs nothing of it; one without a provider is an older Straydog's)
         assert_eq!(names(&entries), [
             "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XXS", "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XS",
+            "DeepSeek-V4.1-Flash-1017 · Unsloth · UD-IQ2_XXS", "DeepSeek-V4.1-Flash-1017 · Unsloth · UD-IQ1_M",
             "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_S", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_XXS", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS", "Qwen3.8-Flash-Next · ISTA-DASLab · Q2_0",
             "Qwen3.8-Flash-Next · Unsloth · UD-IQ1_M", "Qwen3.6-35B-A3B · Unsloth · UD-Q8_K_XL"]);
-        assert!(is_offered(qwen, "Unsloth") && is_offered(deepseek, "ISTA-DASLab"));
-        assert!(!is_offered(deepseek, "Unsloth"));
-        // (a model Straydog lists that this app has never heard of needs nothing of it)
-        assert!(is_offered("Qwen3.6-35B-A3B", "ISTA-DASLab"));
     }
 
     #[test]
