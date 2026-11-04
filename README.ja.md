@@ -1,11 +1,9 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
-    <img src="assets/logo.png" alt="Dogmind" width="160">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-wordmark-dark.png">
+    <img src="assets/logo-wordmark.png" alt="Dogmind" width="360">
   </picture>
 </p>
-
-<h1 align="center">Dogmind</h1>
 
 <p align="center"><a href="README.md">English</a></p>
 
