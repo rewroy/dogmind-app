@@ -577,13 +577,27 @@ fn shown(dom: &str) -> (String, String) {
 }
 
 /// `needs`: what a file page was read to need; a page a local server gives has none of that known.
-/// `steps_lost`: what is said in place of the browser's crash when it was the steps that did not end (they began, and the browser was stopped with them still going).
-fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Needs>, console: &[String], dom: &str, steps_lost: Option<&str>) -> String {
+/// What reading a run adds to what the browser printed.
+#[derive(Default)]
+struct Reading {
+    /// Said in place of the browser's crash when it was the steps that did not end (they began, and the browser was stopped with them still going).
+    steps_lost: Option<String>,
+    /// What heads the console, if not `Console`: the console is that of the run that reads the page, at 1280x800, whatever views were asked for.
+    console_head: Option<String>,
+}
+
+/// The console's heading when none of the views asked for is the desktop's: the first block is still the console of a run at 1280x800, and under a plain "Console" a model that asked
+/// only for a phone's width read it as the phone's.
+fn console_head(views: &[View]) -> Option<String> {
+    (!views.iter().any(|view| view.label == "desktop")).then(|| "Console (as read at 1280x800)".to_string())
+}
+
+fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Needs>, console: &[String], dom: &str, reading: &Reading) -> String {
     let served = needs.is_none();
     let unknown = Needs::default();
     let needs = needs.unwrap_or(&unknown);
     let mut out = if served { format!("{page_name} in headless {browser_name}, with no network but this machine's own servers.\n") } else { format!("{page_name} in headless {browser_name}, with no network.\n") };
-    if let (false, Some(lost)) = (finished, steps_lost) {
+    if let (false, Some(lost)) = (finished, &reading.steps_lost) {
         out.push_str(lost);
     } else if !finished {
         out.push_str("NOT CHECKED: the browser crashed or was stopped each time it was tried. This browser sometimes crashes in the sandbox, whatever the page, and a big WebGL drawing stops it too, so this says nothing about the page. What it had said by then is below. Running this check again changes nothing, and do not install anything to check it another way: say in your answer that the page was not checked.\n");
@@ -607,10 +621,11 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
     } else if !needs.run.is_empty() {
         out.push_str(&format!("Ran: {}.\n", needs.run.join(", ")));
     }
+    let head = reading.console_head.as_deref().unwrap_or("Console");
     if console.is_empty() {
-        out.push_str(if needs.remote.is_empty() && finished { "Console: nothing, so no errors.\n" } else { "Console: nothing, which says little with that not loaded.\n" });
+        out.push_str(&if needs.remote.is_empty() && finished { format!("{head}: nothing, so no errors.\n") } else { format!("{head}: nothing, which says little with that not loaded.\n") });
     } else {
-        out.push_str("Console:\n");
+        out.push_str(&format!("{head}:\n"));
         for line in console.iter().take(MOST_LINES) {
             out.push_str(&format!("- {line}\n"));
         }
@@ -758,7 +773,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             });
         }
     }
-    let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, steps_lost.as_deref()));
+    let reading = Reading { steps_lost, console_head: console_head(&views) };
+    let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
     }
@@ -1074,7 +1090,7 @@ mod tests {
         assert_eq!(needs.did_not_run, ["main.js"]);
         assert_eq!(needs.run, ["the page's script 3"]);
         assert!(needs.local_module);
-        let said = report("index.html", "Edge", true, Some(&needs), &[], "<html><body>hi</body></html>", None);
+        let said = report("index.html", "Edge", true, Some(&needs), &[], "<html><body>hi</body></html>", &Reading::default());
         assert!(said.contains("DID NOT RUN"), "{said}");
         assert!(said.contains("a CDN library cannot load"), "{said}");
         assert!(!said.contains("no errors"), "it does not say all is well of what did not run: {said}");
@@ -1224,6 +1240,17 @@ mod tests {
         assert_eq!(desktop.get_pixel(1260, 20).0, [0xcc, 0x33, 0x33]);
     }
 
+    /// With the real browser, in the real sandbox: asked only for a phone's width, the first console is labelled as the desktop's size, and the phone's own is under its name.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn a_console_read_at_the_desktops_size_says_so_when_only_a_phones_width_was_asked() {
+        let (dir, _) = page(&[("index.html", "<!DOCTYPE html><title>w</title><script>console.log('innerW ' + innerWidth)</script>")]);
+        let said = check_page(&serde_json::json!({"path": "index.html", "views": ["320x568"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        assert!(said.contains("Console (as read at 1280x800):\n- index.html:1: innerW 1") && !said.contains("\nConsole:\n"), "{said}");
+        assert!(said.contains("Console at 320x568:\n  index.html:1: innerW 320"), "{said}");
+    }
+
     /// With the real browser, in the real sandbox: what it was measured to do.
     #[test]
     #[ignore = "starts Edge in the sandbox"]
@@ -1257,6 +1284,23 @@ mod tests {
         assert!(bare.starts_with("<base href=") && bare.ends_with("</script>"), "{bare}");
         let based = with_steps("<head><base href=\"x/\"></head>", "file:///C:/w/", "1", "k");
         assert_eq!(based.matches("<base").count(), 1, "a page's own base stays");
+    }
+
+    #[test]
+    fn the_first_console_says_it_is_of_the_desktops_size_when_the_desktop_was_not_asked_for() {
+        let heads = |views: Value| console_head(&views_of(&serde_json::json!({ "views": views })).unwrap());
+        assert_eq!(heads(serde_json::json!(["320x568"])).as_deref(), Some("Console (as read at 1280x800)"));
+        assert_eq!(heads(serde_json::json!(["mobile", "1024x768"])).as_deref(), Some("Console (as read at 1280x800)"));
+        assert_eq!(heads(serde_json::json!(["mobile", "desktop"])), None);
+        assert_eq!(heads(serde_json::json!(["desktop"])), None);
+        assert_eq!(console_head(&views_of(&serde_json::json!({})).unwrap()), None, "no views: the desktop");
+        let (needs, lines) = (Needs::default(), vec!["a.js:1: scrollW: 1248".to_string()]);
+        let said = |reading: &Reading, console: &[String]| report("index.html", "Edge", true, Some(&needs), console, "<html><body>hi</body></html>", reading);
+        let labelled = Reading { console_head: Some("Console (as read at 1280x800)".to_string()), ..Reading::default() };
+        assert!(said(&Reading::default(), &lines).contains("Console:\n- a.js:1: scrollW: 1248\n"), "{}", said(&Reading::default(), &lines));
+        assert!(said(&labelled, &lines).contains("Console (as read at 1280x800):\n- a.js:1: scrollW: 1248\n"), "{}", said(&labelled, &lines));
+        assert!(said(&Reading::default(), &[]).contains("Console: nothing, so no errors.\n"));
+        assert!(said(&labelled, &[]).contains("Console (as read at 1280x800): nothing, so no errors.\n"));
     }
 
     #[test]
