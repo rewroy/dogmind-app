@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 const POLL: Duration = Duration::from_millis(100);
 /// Nothing from the server for this long ends the request. A long prompt's prefill sends nothing for minutes.
 const IDLE_LIMIT: Duration = Duration::from_secs(1800);
+/// What a request that has a deadline says when the deadline comes before its answer is whole.
+const TOO_SLOW: &str = "the server did not answer in time";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Url {
@@ -198,6 +200,8 @@ pub struct Response<'a> {
     buffer: Vec<u8>,
     framing: Framing,
     cancel: &'a AtomicBool,
+    /// When the whole answer must be here, if it must: `fill` gives up at this time, whatever bytes have come.
+    deadline: Option<Instant>,
     /// The server ended the connection, or it was reset, while this waited for bytes: what is in `buffer` is all that came.
     lost: bool,
 }
@@ -205,7 +209,15 @@ pub struct Response<'a> {
 /// `headers` carry what a provider authenticates with; they go only to `url`.
 pub fn request<'a>(method: &str, url: &Url, headers: &[(String, String)], body: Option<&str>, connect: Duration, cancel: &'a AtomicBool) -> Result<Response<'a>, Failure> {
     let addresses: Vec<SocketAddr> = (url.host.as_str(), url.port).to_socket_addrs().map_err(|error| Failure::Connect(format!("{}: {error}", url.host)))?.collect();
-    request_at(&addresses, method, url, headers, body, connect, cancel)
+    request_at_until(&addresses, method, url, headers, body, connect, cancel, None)
+}
+
+/// As `request`, for a request whose whole answer, its last byte too, must come within `within` of now: past it the request ends with a failure that says the server did not answer
+/// in time, and it is not asked again. For a GET that asks something short of a server; a model's stream has no such end and keeps its idle limit.
+pub fn request_within<'a>(method: &str, url: &Url, headers: &[(String, String)], connect: Duration, cancel: &'a AtomicBool, within: Duration) -> Result<Response<'a>, Failure> {
+    let deadline = Instant::now() + within;
+    let addresses: Vec<SocketAddr> = (url.host.as_str(), url.port).to_socket_addrs().map_err(|error| Failure::Connect(format!("{}: {error}", url.host)))?.collect();
+    request_at_until(&addresses, method, url, headers, None, connect, cancel, Some(deadline))
 }
 
 /// How long an address with others after it is given. Many machines have an IPv6 address and no IPv6 route, and a name's IPv6 addresses come first:
@@ -261,12 +273,18 @@ const BETWEEN_TRIES: Duration = Duration::from_millis(50);
 /// nothing read afterwards brings the answer back. A request that changes nothing (GET and HEAD, with no body) is made again, on a new connection, up to `MOST_TRIES` times in all, when that
 /// is all that went wrong: nothing of the answer had come. Anything else is made once: a model's turn (a POST) is never asked twice, and one whose answer had begun is not asked again.
 pub fn request_at<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: &[(String, String)], body: Option<&str>, connect: Duration, cancel: &'a AtomicBool) -> Result<Response<'a>, Failure> {
+    request_at_until(addresses, method, url, headers, body, connect, cancel, None)
+}
+
+/// `request_at`, with the time by which the whole answer must be here, if there is one: the connections made again share it, and none is made after it.
+#[allow(clippy::too_many_arguments)]
+fn request_at_until<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: &[(String, String)], body: Option<&str>, connect: Duration, cancel: &'a AtomicBool, deadline: Option<Instant>) -> Result<Response<'a>, Failure> {
     let repeatable = body.is_none() && (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"));
     let mut tries = 1;
     loop {
         let mut lost_before_answer = false;
-        match request_once(addresses, method, url, headers, body, connect, cancel, &mut lost_before_answer) {
-            Err(_) if lost_before_answer && repeatable && tries < MOST_TRIES && !cancel.load(Ordering::Relaxed) => {
+        match request_once(addresses, method, url, headers, body, connect, cancel, deadline, &mut lost_before_answer) {
+            Err(_) if lost_before_answer && repeatable && tries < MOST_TRIES && !cancel.load(Ordering::Relaxed) && deadline.is_none_or(|by| Instant::now() < by) => {
                 tries += 1;
                 std::thread::sleep(BETWEEN_TRIES);
             }
@@ -277,7 +295,7 @@ pub fn request_at<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers
 
 /// One request, on a connection of its own. `lost_before_answer` says, when it fails, that the connection ended or was reset with no byte of the answer having come.
 #[allow(clippy::too_many_arguments)]
-fn request_once<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: &[(String, String)], body: Option<&str>, connect: Duration, cancel: &'a AtomicBool, lost_before_answer: &mut bool) -> Result<Response<'a>, Failure> {
+fn request_once<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: &[(String, String)], body: Option<&str>, connect: Duration, cancel: &'a AtomicBool, deadline: Option<Instant>, lost_before_answer: &mut bool) -> Result<Response<'a>, Failure> {
     let socket = connect_to(addresses, connect, cancel)?;
     let _ = socket.set_nodelay(true);
     let mut stream = if url.tls {
@@ -307,7 +325,7 @@ fn request_once<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: 
         stream.shut();
         return Err(failure);
     }
-    let mut response = Response { status: 0, headers: Vec::new(), stream, buffer: Vec::new(), framing: Framing::Close, cancel, lost: false };
+    let mut response = Response { status: 0, headers: Vec::new(), stream, buffer: Vec::new(), framing: Framing::Close, cancel, deadline, lost: false };
     if let Err(failure) = response.read_head() {
         *lost_before_answer = response.lost_with_nothing();
         return Err(failure);
@@ -339,6 +357,10 @@ impl Response<'_> {
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(Failure::Cancelled);
+            }
+            // (before each read, so that a server that sends a byte now and then runs out of time as one that sends none)
+            if self.deadline.is_some_and(|by| Instant::now() >= by) {
+                return Err(Failure::Stream(TOO_SLOW.into()));
             }
             match self.stream.read(&mut block) {
                 Ok(0) => {
@@ -536,7 +558,7 @@ pub(crate) mod tests {
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         stream.set_read_timeout(Some(POLL)).unwrap();
         let (held, _) = listener.accept().unwrap();
-        (Response { status: 0, headers: Vec::new(), stream: Transport::Plain(stream), buffer: bytes.to_vec(), framing, cancel, lost: false }, held)
+        (Response { status: 0, headers: Vec::new(), stream: Transport::Plain(stream), buffer: bytes.to_vec(), framing, cancel, deadline: None, lost: false }, held)
     }
 
     #[test]
@@ -813,6 +835,42 @@ pub(crate) mod tests {
 
     fn counted(server: &Lossy) -> usize {
         server.connections.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_request_with_a_deadline_ends_at_it_for_a_server_that_says_nothing_and_for_one_that_says_a_little_at_a_time() {
+        use std::time::Instant;
+        let cancel = AtomicBool::new(false);
+        let within = Duration::from_millis(400);
+        let on_time = |started: Instant| (within..Duration::from_secs(10)).contains(&started.elapsed());
+        // takes the connection and says nothing
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url { tls: false, host: "127.0.0.1".into(), port: listener.local_addr().unwrap().port(), path: "/".into() };
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(1).flatten().collect();
+            std::thread::sleep(Duration::from_secs(15));
+            drop(held);
+        });
+        let started = Instant::now();
+        let failed = request_within("GET", &url, &[], Duration::from_secs(5), &cancel, within).err().expect("nothing came");
+        assert!(matches!(failed, Failure::Stream(_)) && failed.to_string() == "the server did not answer in time", "{failed}");
+        assert!(on_time(started), "{:?}", started.elapsed());
+        // the head comes at once and the body a byte at a time, for longer than the deadline: the whole answer is what it holds
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url { tls: false, host: "127.0.0.1".into(), port: listener.local_addr().unwrap().port(), path: "/".into() };
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0u8; 4096]);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n");
+            while stream.write_all(b"x").is_ok() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        let mut response = request_within("GET", &url, &[], Duration::from_secs(5), &cancel, within).expect("the head came at once");
+        let failed = response.text().expect_err("the body did not come whole in time");
+        assert_eq!(failed.to_string(), "the server did not answer in time");
+        assert!(on_time(started), "{:?}", started.elapsed());
     }
 
     #[test]

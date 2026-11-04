@@ -376,6 +376,10 @@ impl Provider for Client {
 /// What a Straydog request names to have Han letters with no CP932 form refused.
 const NOT_CP932_HAN: &str = "not_cp932_han";
 
+/// How long the answer to one of the questions asked of a server (`/health`, the models, `/props`) is waited for, from asking to its last byte. A server that is up answers these at
+/// once, even while it loads a model.
+const ANSWER_WITHIN: Duration = Duration::from_secs(20);
+
 #[derive(Clone)]
 pub struct Client {
     pub base: Url,
@@ -449,8 +453,10 @@ impl Client {
         Ok(completion)
     }
 
-    fn get_json(&self, url: &Url, cancel: &AtomicBool) -> Result<(u16, Value), Failure> {
-        let mut response = http::request("GET", url, &self.headers(), None, Duration::from_secs(5), cancel)?;
+    /// One GET, whose whole answer must be here within `within`: a server that takes the connection and says nothing (a hung server, a proxy holding it) would otherwise hold
+    /// whoever asks for as long as a model's stream may be silent, half an hour. It is not asked again after that.
+    fn get_json(&self, url: &Url, cancel: &AtomicBool, within: Duration) -> Result<(u16, Value), Failure> {
+        let mut response = http::request_within("GET", url, &self.headers(), Duration::from_secs(5), cancel, within)?;
         let status = response.status;
         let text = response.text()?;
         Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
@@ -458,8 +464,12 @@ impl Client {
 
     /// What `/health` says: `ok`, or `loading` with its progress, or an error.
     pub fn health(&self) -> Result<Health, String> {
+        self.health_within(ANSWER_WITHIN)
+    }
+
+    fn health_within(&self, within: Duration) -> Result<Health, String> {
         let cancel = AtomicBool::new(false);
-        let (_, body) = self.get_json(&self.root("/health"), &cancel).map_err(|failure| self.no_answer(failure))?;
+        let (_, body) = self.get_json(&self.root("/health"), &cancel, within).map_err(|failure| self.no_answer(failure))?;
         Ok(match body.get("status").and_then(Value::as_str) {
             Some("ok") => Health::Ready,
             Some("loading") => Health::Loading(body.get("progress").cloned().unwrap_or(Value::Null)),
@@ -470,8 +480,13 @@ impl Client {
 
     /// The model's id, the context and whether Straydog answers here.
     pub fn describe(&self) -> Result<ServerInfo, String> {
+        self.describe_within(ANSWER_WITHIN)
+    }
+
+    /// Each of its two questions has `within` for its answer.
+    fn describe_within(&self, within: Duration) -> Result<ServerInfo, String> {
         let cancel = AtomicBool::new(false);
-        let (status, models) = self.get_json(&self.base.join("models"), &cancel).map_err(|failure| self.no_answer(failure))?;
+        let (status, models) = self.get_json(&self.base.join("models"), &cancel, within).map_err(|failure| self.no_answer(failure))?;
         // A key refused or an address that is not one is known now, and calling this ready would only move the news to the first message.
         if let Some(words) = refused_at_the_door(status) {
             return Err(words.to_string());
@@ -480,7 +495,7 @@ impl Client {
         if models.is_null() {
             return Err(NOT_FOUND.to_string());
         }
-        let (status, props) = self.get_json(&self.root("/props"), &cancel).map_err(|failure| self.no_answer(failure))?;
+        let (status, props) = self.get_json(&self.root("/props"), &cancel, within).map_err(|failure| self.no_answer(failure))?;
         // (no `/props` is a server without that part of llama-server's interface, and nothing against it; a refused key is the same refusal)
         if matches!(status, 401 | 403) {
             return Err(KEY_REFUSED.to_string());
@@ -675,36 +690,41 @@ mod tests {
         assert_eq!(shown(LlmError::from(Failure::Stream("reset (os error 10054)".into()))), SERVER_GONE);
     }
 
-    /// A server that answers `/props` with this and anything else with no model.
+    /// A server that answers `/props` with this and anything else with no model. Each connection is answered on a thread of its own: on this machine's loopback a client's close sometimes
+    /// never reaches the server, and a server that waited for it before taking the next connection would never answer the next question.
     fn described(props: &'static str) -> ServerInfo {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 4096];
-                let count = stream.read(&mut request).unwrap();
-                let body = if String::from_utf8_lossy(&request[..count]).starts_with("GET /props") { props } else { "{}" };
-                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
-                while matches!(stream.read(&mut request), Ok(count) if count > 0) {}
+            while let Ok((mut stream, _)) = listener.accept() {
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 4096];
+                    let Ok(count) = stream.read(&mut request) else { return };
+                    let body = if String::from_utf8_lossy(&request[..count]).starts_with("GET /props") { props } else { "{}" };
+                    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+                    while matches!(stream.read(&mut request), Ok(count) if count > 0) {}
+                });
             }
         });
         Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap().describe().unwrap()
     }
 
-    /// What `describe` makes of a server that answers everything with this.
+    /// What `describe` makes of a server that answers everything with this. Each connection is answered on a thread of its own (see `described`): the server never waits for one client's
+    /// close to take the next question.
     fn described_at(status: &'static str, body: &'static str) -> Result<ServerInfo, String> {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             while let Ok((mut stream, _)) = listener.accept() {
-                let mut request = [0u8; 4096];
-                let _ = stream.read(&mut request);
-                let _ = stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
-                // (closed by the client: closed here, what it had not read yet could be lost)
-                while matches!(stream.read(&mut request), Ok(count) if count > 0) {}
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+                    // (closed by the client: closed here, what it had not read yet could be lost)
+                    while matches!(stream.read(&mut request), Ok(count) if count > 0) {}
+                });
             }
         });
         Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap().describe()
@@ -724,6 +744,39 @@ mod tests {
         assert_eq!(described(r#"{"modalities": {"vision": true, "audio": false}}"#).vision, Some(true));
         assert_eq!(described(r#"{"modalities": {"vision": false, "audio": false}}"#).vision, Some(false));
         assert_eq!(described("{}").vision, None);
+    }
+
+    /// A server that takes every connection and answers none, holding each open as a hung server does; how many it took is counted.
+    fn takes_connections_and_says_nothing() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = taken.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        (port, taken)
+    }
+
+    #[test]
+    fn a_server_that_takes_the_connection_and_says_nothing_is_given_up_on_and_not_asked_again() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        let (port, taken) = takes_connections_and_says_nothing();
+        let client = Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap();
+        let (within, words) = (Duration::from_millis(400), format!("{NO_ANSWER}127.0.0.1:{port}"));
+        let started = Instant::now();
+        assert_eq!(client.health_within(within).unwrap_err(), words);
+        assert!((within..Duration::from_secs(10)).contains(&started.elapsed()), "gave up at its deadline: {:?}", started.elapsed());
+        assert_eq!(taken.load(Ordering::SeqCst), 1, "one connection, and no second ask");
+        let started = Instant::now();
+        assert_eq!(client.describe_within(within).unwrap_err(), words);
+        assert!((within..Duration::from_secs(10)).contains(&started.elapsed()), "gave up at its deadline: {:?}", started.elapsed());
+        assert_eq!(taken.load(Ordering::SeqCst), 2, "its first question ended it: the second was not asked");
     }
 
     #[test]
