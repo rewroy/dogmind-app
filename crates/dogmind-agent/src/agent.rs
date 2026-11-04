@@ -1856,7 +1856,7 @@ impl Agent {
         let free = risk < Risk::High && reason.is_none();
         let scope = self.gate.always_scope(tool, arguments, &self.workspace);
         // A file in the folder that runs in place of the installed program: "always" was said of the program the line names, and that is not what this runs. (in the line that runs as well as the one as written)
-        let planted = tool == "execute_command" && [Some(arguments), runs_as.as_ref()].into_iter().flatten().any(|call| safety::planted_program(call, &self.workspace).is_some());
+        let planted = tool == "execute_command" && [Some(arguments), runs_as.as_ref()].into_iter().flatten().any(|call| self.gate.planted_program(call, &self.workspace).is_some());
         // Something to say "always" to wherever that is not the same as saying it to anything: never of a high-risk command, nor of what a page may have asked for.
         let offered = !planted && match &scope {
             Some(AlwaysScope::Folders(_)) => true,
@@ -2815,21 +2815,22 @@ mod tests {
         tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")).unwrap()
     }
 
-    const PLANTED_NOTE: &str = "`frobnicate` here is the file frobnicate.cmd in this folder, not the installed program";
+    // (`attrib` and `hostname` are Windows's own, in System32 on every PATH: the programs these tests put a file in the place of)
+    const PLANTED_NOTE: &str = "`attrib` here is the file attrib.cmd in this folder, not the installed program";
 
     /// A rule answers for a command until a file in the folder takes the place of the program it names: then the person is asked, and told why.
     #[cfg(windows)]
     #[test]
     fn a_rule_runs_a_command_unasked_and_asks_once_a_file_in_the_folder_stands_in_for_its_program() {
         let dir = folder_for_commands();
-        let command = serde_json::json!({"command": "frobnicate now"});
+        let command = serde_json::json!({"command": "attrib now"});
         let (client, _) = server(vec![call_answer("execute_command", command.clone()), text_answer("done"), call_answer("execute_command", command.clone()), text_answer("again")]);
         let run = run_agent(dir.path(), client, Mode::Default);
         rules::add(&run._sessions.path().join("permissions.json"), rules::proposed(&Gate::new(), dir.path(), "execute_command", &command, Risk::Low).unwrap()).unwrap();
         run.handle.commands.send(Command::Send("go".into())).unwrap();
         let (log, _, reasons) = until_end_with_reasons(&run, Decision::Reject);
         assert!(reasons.is_empty() && log.iter().any(|line| line.starts_with("tool:") && !line.starts_with("tool:false:true:")), "no one was asked, and it ran: {log:?}");
-        std::fs::write(dir.path().join("frobnicate.cmd"), "@echo planted").unwrap();
+        std::fs::write(dir.path().join("attrib.cmd"), "@echo planted").unwrap();
         run.handle.commands.send(Command::Send("again".into())).unwrap();
         let (log, _, reasons) = until_end_with_reasons(&run, Decision::Reject);
         assert!(log.iter().any(|line| line == "approval:execute_command:low"), "{log:?}");
@@ -2843,14 +2844,14 @@ mod tests {
     fn always_for_the_session_does_not_reach_a_file_that_stands_in_for_the_program() {
         let dir = folder_for_commands();
         // (a line of two has no rule, so that "always" to it is for the session)
-        let command = serde_json::json!({"command": "frobnicate now & frobnicate again"});
+        let command = serde_json::json!({"command": "attrib now & attrib again"});
         let (client, _) = server(vec![call_answer("execute_command", command.clone()), text_answer("done"), call_answer("execute_command", command.clone()), text_answer("again")]);
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Send("go".into())).unwrap();
         let (log, _, reasons) = until_end_with_reasons(&run, Decision::Always);
         assert!(log.iter().any(|line| line == "approval:execute_command:low") && reasons == [None], "{log:?}");
         assert!(rules::list(&run._sessions.path().join("permissions.json")).is_empty());
-        std::fs::write(dir.path().join("frobnicate.cmd"), "@echo planted").unwrap();
+        std::fs::write(dir.path().join("attrib.cmd"), "@echo planted").unwrap();
         run.handle.commands.send(Command::Send("again".into())).unwrap();
         let (log, _, reasons) = until_end_with_reasons(&run, Decision::Reject);
         assert!(log.iter().any(|line| line == "approval:execute_command:low"), "{log:?}");
@@ -2862,11 +2863,11 @@ mod tests {
     #[test]
     fn a_mode_does_not_let_through_a_file_that_stands_in_for_the_program() {
         let dir = folder_for_commands();
-        std::fs::write(dir.path().join("frobnicate.cmd"), "@echo planted").unwrap();
-        std::fs::write(dir.path().join("git.cmd"), "@echo planted").unwrap();
+        std::fs::write(dir.path().join("attrib.cmd"), "@echo planted").unwrap();
+        std::fs::write(dir.path().join("hostname.cmd"), "@echo planted").unwrap();
         let (client, _) = server(vec![
-            call_answer("execute_command", serde_json::json!({"command": "frobnicate now"})),
-            call_answer("execute_command", serde_json::json!({"command": "git status"})),
+            call_answer("execute_command", serde_json::json!({"command": "attrib now"})),
+            call_answer("execute_command", serde_json::json!({"command": "hostname"})),
             text_answer("done"),
         ]);
         let run = run_agent(dir.path(), client, Mode::Auto);
@@ -2874,8 +2875,39 @@ mod tests {
         run.handle.commands.send(Command::Send("go".into())).unwrap();
         let (log, _, reasons) = until_end_with_reasons(&run, Decision::Reject);
         assert_eq!(log.iter().filter(|line| line.starts_with("approval:execute_command:")).count(), 2, "{log:?}");
-        assert_eq!(reasons, [Some(PLANTED_NOTE.to_string()), Some("`git` here is the file git.cmd in this folder, not the installed program".to_string())]);
+        assert_eq!(reasons, [Some(PLANTED_NOTE.to_string()), Some("`hostname` here is the file hostname.cmd in this folder, not the installed program".to_string())]);
         assert!(!log.iter().any(|line| line.starts_with("tool:true:")), "neither ran: {log:?}");
+    }
+
+    /// A file in the folder that no installed program has the name of is the project's own, as a `gradlew.bat` is: its command asks as any command does, with "always" and a rule on offer, and a rule answers for it.
+    #[cfg(windows)]
+    #[test]
+    fn a_projects_own_wrapper_in_the_folder_is_a_command_like_another() {
+        let dir = folder_for_commands();
+        std::fs::write(dir.path().join("gradlew.bat"), "@echo the wrapper ran
+").unwrap();
+        let command = serde_json::json!({"command": "gradlew build"});
+        let (client, _) = server(vec![call_answer("execute_command", command.clone()), text_answer("done"), call_answer("execute_command", command.clone()), text_answer("again")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let mut asked = Vec::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::Approval(approval) => {
+                    asked.push((approval.reason.clone(), approval.always_allowed, approval.rule.clone()));
+                    approval.answer.send((Decision::Reject, None)).unwrap();
+                }
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        let [(reason, always_allowed, rule)] = &asked[..] else { panic!("{asked:?}") };
+        assert!(reason.is_none() && *always_allowed, "no reason, and \"always\" is on offer: {asked:?}");
+        assert_eq!(rule.as_ref().map(|rule| rule.prefix.as_str()), Some("gradlew build"));
+        rules::add(&run._sessions.path().join("permissions.json"), rule.clone().unwrap()).unwrap();
+        run.handle.commands.send(Command::Send("again".into())).unwrap();
+        let (log, _, reasons) = until_end_with_reasons(&run, Decision::Reject);
+        assert!(reasons.is_empty() && log.iter().any(|line| line.starts_with("tool:") && line.contains("the wrapper ran")), "the rule answered, and the wrapper ran: {log:?}");
     }
 
     #[test]
