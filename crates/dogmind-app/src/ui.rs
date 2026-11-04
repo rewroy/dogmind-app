@@ -7833,6 +7833,7 @@ impl App {
             Outcome::UpToDate => (tf("Dogmind {0} is up to date.", &[&env!("CARGO_PKG_VERSION")]), false),
             Outcome::Newer(release) => (tf("Dogmind {0} is available.", &[&release.version]), false),
             Outcome::NoRelease => (t("No release has been published yet.").to_string(), false),
+            Outcome::NotAsked => (t("This test build asks no one.").to_string(), false),
             Outcome::Failed(Trouble::NotReached) => (t("Could not reach GitHub.").to_string(), true),
             Outcome::Failed(Trouble::TooSlow) => (t("GitHub did not answer in time.").to_string(), true),
             Outcome::Failed(Trouble::Refused(status)) => (tf("GitHub answered with an error ({0}). Try again later.", &[status]), true),

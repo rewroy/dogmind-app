@@ -42,8 +42,8 @@ a rail at the transcript's right edge has a mark for each of your messages: the 
 
 ## Updating, removing, and when something goes wrong
 
-New versions are published at [Releases](https://github.com/rewroy/dogmind-app/releases). The app asks GitHub for the latest release
-at most once a day, and says so quietly when there is a newer one, with a button that opens its page: it never downloads or installs
+New versions are published at [Releases](https://github.com/rewroy/dogmind-app/releases). The app asks GitHub for the newest release
+(a pre-release too) at most once a day, and says so quietly when there is a newer one, with a button that opens its page: it never downloads or installs
 anything by itself, and *Settings > About* has *Check for updates*, and a switch to turn the daily check off. The request carries
 nothing about you but the app's version. To update, run the new `DogmindSetup-VERSION.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. Every file takes its place or none does: a failure puts back what was there, so the program is as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
 
@@ -79,7 +79,7 @@ every one. `RUSTFLAGS` takes the place of `.cargo/config.toml`'s flags, so the s
 
 To release: raise `version` in the workspace's `Cargo.toml`, build and package as above, and publish a GitHub release tagged
 `vVERSION` (as `v0.1.0`) with `dist\DogmindSetup-VERSION.exe` and `dist\DogmindApp-VERSION.zip`, keeping the PDBs. The app's
-update check reads the latest published release: drafts and pre-releases are not offered.
+update check offers the newest release by its tag's version, pre-releases included, and never a draft; a tag that is not a version is passed over.
 
 No GPU toolkit is needed. To use the engine, copy a `straydog.exe` built by Straydog's README, with the toolkit's `cublas64_13.dll` and `cublasLt64_13.dll`, next to `dogmind-app.exe`.
 
