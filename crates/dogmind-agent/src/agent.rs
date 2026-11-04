@@ -834,6 +834,8 @@ struct ToolMeta {
     path: Option<String>,
     cmd0: Option<String>,
     args_bytes: usize,
+    /// A short hash of the arguments as they came, to tell a call made again: not what they said.
+    args_hash: String,
     /// The files it may write, resolved: what each is, after the call, is hashed.
     edited: Vec<PathBuf>,
     parallel: usize,
@@ -1916,7 +1918,7 @@ impl Agent {
         }
         self.push(answer.message());
         self.emit(Event::AssistantEnded);
-        self.tool_started(&call.id, &call.function.name, Some(&arguments), call.function.arguments.len(), 1);
+        self.tool_started(&call.id, &call.function.name, Some(&arguments), &call.function.arguments, 1);
         let started = Instant::now();
         let edited = edited_paths(&call.function.name, &arguments, &self.workspace);
         if let Some(Err(error)) = self.marks.as_mut().map(|marks| marks.before_edit(&edited)) {
@@ -1973,7 +1975,7 @@ impl Agent {
         // (each parsed as free_read did when it let it through, so what runs is what the gate saw)
         let parsed: Vec<Value> = calls.iter().map(|call| arguments_of(call).unwrap_or_default()).collect();
         for (call, arguments) in calls.iter().zip(&parsed) {
-            self.tool_started(&call.id, &call.function.name, Some(arguments), call.function.arguments.len(), calls.len());
+            self.tool_started(&call.id, &call.function.name, Some(arguments), &call.function.arguments, calls.len());
         }
         let (workspace, baseline, cancel, secrets) = (self.workspace.clone(), self.bench.baseline.clone(), self.cancel.clone(), self.gate.secrets.clone());
         let results: Vec<_> = std::thread::scope(|scope| {
@@ -2001,12 +2003,12 @@ impl Agent {
         let arguments: Value = match parse_arguments(&call.function.arguments) {
             Ok(arguments) => arguments,
             Err(error) => {
-                self.tool_started(&call.id, name, None, call.function.arguments.len(), 1);
+                self.tool_started(&call.id, name, None, &call.function.arguments, 1);
                 self.finish_call(&call.id, Err(format!("the arguments are not JSON: {error}")), false, started.elapsed());
                 return 1;
             }
         };
-        self.tool_started(&call.id, name, Some(&arguments), call.function.arguments.len(), 1);
+        self.tool_started(&call.id, name, Some(&arguments), &call.function.arguments, 1);
         match self.permission(name, &arguments) {
             Permission::Run => {}
             Permission::Refused(message, how) => {
@@ -2154,7 +2156,7 @@ impl Agent {
     }
 
     /// A call begins: the app is told, and the call's line in the trajectory is begun. `arguments` is none for a call whose arguments were not JSON.
-    fn tool_started(&mut self, id: &str, name: &str, arguments: Option<&Value>, raw_len: usize, parallel: usize) {
+    fn tool_started(&mut self, id: &str, name: &str, arguments: Option<&Value>, raw: &str, parallel: usize) {
         let summary = arguments.map_or(String::new(), |arguments| tools::summary(name, arguments));
         self.emit(Event::ToolStarted { id: id.to_string(), tool: name.to_string(), summary });
         let path = arguments.and_then(|arguments| {
@@ -2169,7 +2171,7 @@ impl Agent {
         }
         self.approval_wait = None;
         self.refusal = None;
-        self.running.insert(id.to_string(), ToolMeta { name: name.to_string(), at: chrono::Local::now(), path, cmd0, args_bytes: raw_len, edited, parallel, req: self.last_req.clone() });
+        self.running.insert(id.to_string(), ToolMeta { name: name.to_string(), at: chrono::Local::now(), path, cmd0, args_bytes: raw.len(), args_hash: trajectory::short_hash(raw.as_bytes()), edited, parallel, req: self.last_req.clone() });
     }
 
     /// The call's line: how it ended and how long it ran, without the wait for the person (which has its own).
@@ -2186,7 +2188,7 @@ impl Agent {
         } else {
             "ok"
         };
-        let mut line = json!({"id": id, "name": meta.name, "started": trajectory::stamp(meta.at), "ms": ran.as_millis() as u64, "outcome": outcome, "args_bytes": meta.args_bytes, "out_bytes": output.len()});
+        let mut line = json!({"id": id, "name": meta.name, "started": trajectory::stamp(meta.at), "ms": ran.as_millis() as u64, "outcome": outcome, "args_bytes": meta.args_bytes, "args_hash": meta.args_hash, "out_bytes": output.len()});
         if let Some(wait) = wait {
             line["wait_ms"] = json!(wait.as_millis() as u64);
         }
@@ -5541,6 +5543,9 @@ mod tests {
         let command = of_kind(&lines, "tool").into_iter().find(|line| line["name"] == "execute_command").unwrap();
         assert_eq!((command["cmd0"].as_str(), command["outcome"].as_str()), (Some("python"), Some("declined_person")));
         assert!(command["args_bytes"].as_u64().unwrap() > 0);
+        // A call made again is told by the hash of its arguments, which says nothing of them.
+        let hashes: Vec<&str> = of_kind(&lines, "tool").iter().map(|line| line["args_hash"].as_str().unwrap()).collect();
+        assert!(hashes.iter().all(|hash| hash.len() == 12) && hashes.iter().collect::<std::collections::HashSet<_>>().len() == 3, "{hashes:?}");
     }
 
     #[test]
@@ -5610,6 +5615,30 @@ mod tests {
         assert_eq!(sent, ids, "the server was told the same name for each request, in the order they were made");
         assert!(ids.iter().enumerate().all(|(at, id)| id.ends_with(&format!("/{}", at + 1))), "{ids:?}");
         assert!(sent.iter().all(|name| name.len() <= 64 && name.bytes().all(|byte| (0x21..=0x7e).contains(&byte))));
+    }
+
+    /// The reader, on a session this agent has written: a draft stopped, a file approved and a command turned down.
+    #[test]
+    fn the_reader_reads_a_session_the_agent_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _, _, _) = thinking_server(3, vec![
+            sse(&[serde_json::json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c0", "function": {"name": "create_file", "arguments": serde_json::json!({"path": "page.html", "content": "<p>hi</p>\n"}).to_string()}},
+                {"index": 1, "id": "c1", "function": {"name": "execute_command", "arguments": serde_json::json!({"command": "python page.py"}).to_string()}},
+            ]}, "finish_reason": "tool_calls"}]})]),
+            text_answer("made it"),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("write it".into())).unwrap();
+        until_end_deciding(&run, Duration::from_millis(50), |tool| if tool == "create_file" { Decision::Approve } else { Decision::Reject });
+        let session = std::fs::read_dir(run._sessions.path()).unwrap().flatten().map(|entry| entry.path()).find(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !trajectory::is_trajectory(path)).unwrap();
+        let said = crate::trajectory_report::report_files(&trajectory::file_of(&session), None).unwrap();
+        assert!(said.contains("turn 1: 8 characters, 0 pictures") && said.contains("wall "), "{said}");
+        assert!(said.contains("stopped_app:draft_stop") && said.contains("draft_stop at /1:") && said.contains("tokens thrown away"), "{said}");
+        assert!(said.contains("next: /2 wrote") && said.contains("called create_file, execute_command"), "{said}");
+        assert!(said.contains("create_file") && said.contains("page.html") && said.contains("declined_person") && said.contains("python"), "{said}");
+        assert!(said.contains("waiting for the person 0.1 s") || said.contains("waiting for the person 0.0 s"), "{said}");
+        assert!(said.contains("signs of going round in circles\n  none"), "{said}");
     }
 
     #[test]
