@@ -2910,6 +2910,28 @@ mod tests {
         assert!(reasons.is_empty() && log.iter().any(|line| line.starts_with("tool:") && line.contains("the wrapper ran")), "the rule answered, and the wrapper ran: {log:?}");
     }
 
+    /// A look runs no file of the folder: with a file there that answers to its program, which is not installed, it asks as any command does, with no reason and "always" on offer.
+    #[test]
+    fn a_look_that_a_file_in_the_folder_answers_to_asks_as_a_command_does() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("frobnicate.cmd"), "@echo hi").unwrap();
+        let (client, _) = server(vec![call_answer("execute_command", serde_json::json!({"command": "frobnicate --version"})), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let mut asked = Vec::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::Approval(approval) => {
+                    asked.push((approval.tool.clone(), approval.reason.clone(), approval.always_allowed));
+                    approval.answer.send((Decision::Reject, None)).unwrap();
+                }
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(asked, [("execute_command".to_string(), None, true)]);
+    }
+
     #[test]
     fn after_a_page_even_what_the_gate_calls_safe_asks() {
         let dir = tempfile::tempdir().unwrap();
