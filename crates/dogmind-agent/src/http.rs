@@ -198,6 +198,8 @@ pub struct Response<'a> {
     buffer: Vec<u8>,
     framing: Framing,
     cancel: &'a AtomicBool,
+    /// The server ended the connection, or it was reset, while this waited for bytes: what is in `buffer` is all that came.
+    lost: bool,
 }
 
 /// `headers` carry what a provider authenticates with; they go only to `url`.
@@ -248,8 +250,34 @@ pub fn answers(url: &Url) -> bool {
     connect_to(&addresses, Duration::from_secs(5), &AtomicBool::new(false)).is_ok()
 }
 
+/// How many times in all a request that can be asked again is made, when the connection is lost before the first byte of its answer, and how long it waits between.
+const MOST_TRIES: usize = 4;
+const BETWEEN_TRIES: Duration = Duration::from_millis(50);
+
 /// To these addresses, whatever the name would resolve to by now: for a caller that has looked at where it is going.
+/// Where something sits between this and a plain-HTTP server (a security product or a filtering proxy that reads the traffic, on this machine's own address too), or the server closes its
+/// end the moment it has answered (an HTTP/1.0 server does, and so does one that was told `Connection: close`), the connection can be reset on Windows while the answer is on its way,
+/// and what had come and was not read yet is gone with it: the client sees a reset where the answer was. Plain sockets of the standard library, with none of this code, do the same, and
+/// nothing read afterwards brings the answer back. A request that changes nothing (GET and HEAD, with no body) is made again, on a new connection, up to `MOST_TRIES` times in all, when that
+/// is all that went wrong: nothing of the answer had come. Anything else is made once: a model's turn (a POST) is never asked twice, and one whose answer had begun is not asked again.
 pub fn request_at<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: &[(String, String)], body: Option<&str>, connect: Duration, cancel: &'a AtomicBool) -> Result<Response<'a>, Failure> {
+    let repeatable = body.is_none() && (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"));
+    let mut tries = 1;
+    loop {
+        let mut lost_before_answer = false;
+        match request_once(addresses, method, url, headers, body, connect, cancel, &mut lost_before_answer) {
+            Err(_) if lost_before_answer && repeatable && tries < MOST_TRIES && !cancel.load(Ordering::Relaxed) => {
+                tries += 1;
+                std::thread::sleep(BETWEEN_TRIES);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// One request, on a connection of its own. `lost_before_answer` says, when it fails, that the connection ended or was reset with no byte of the answer having come.
+#[allow(clippy::too_many_arguments)]
+fn request_once<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: &[(String, String)], body: Option<&str>, connect: Duration, cancel: &'a AtomicBool, lost_before_answer: &mut bool) -> Result<Response<'a>, Failure> {
     let socket = connect_to(addresses, connect, cancel)?;
     let _ = socket.set_nodelay(true);
     let mut stream = if url.tls {
@@ -279,8 +307,11 @@ pub fn request_at<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers
         stream.shut();
         return Err(failure);
     }
-    let mut response = Response { status: 0, headers: Vec::new(), stream, buffer: Vec::new(), framing: Framing::Close, cancel };
-    response.read_head()?;
+    let mut response = Response { status: 0, headers: Vec::new(), stream, buffer: Vec::new(), framing: Framing::Close, cancel, lost: false };
+    if let Err(failure) = response.read_head() {
+        *lost_before_answer = response.lost_with_nothing();
+        return Err(failure);
+    }
     Ok(response)
 }
 
@@ -292,6 +323,11 @@ impl Drop for Response<'_> {
 }
 
 impl Response<'_> {
+    /// Whether the connection was lost (reset, or closed by the server) and not a byte of the answer had come: all there is to ask again for.
+    fn lost_with_nothing(&self) -> bool {
+        self.lost && self.buffer.is_empty()
+    }
+
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str())
     }
@@ -305,7 +341,10 @@ impl Response<'_> {
                 return Err(Failure::Cancelled);
             }
             match self.stream.read(&mut block) {
-                Ok(0) => return Ok(false),
+                Ok(0) => {
+                    self.lost = true;
+                    return Ok(false);
+                }
                 Ok(count) => {
                     self.buffer.extend_from_slice(&block[..count]);
                     return Ok(true);
@@ -316,7 +355,10 @@ impl Response<'_> {
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(Failure::Stream(error.to_string())),
+                Err(error) => {
+                    self.lost = matches!(error.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted);
+                    return Err(Failure::Stream(error.to_string()));
+                }
             }
         }
     }
@@ -494,7 +536,7 @@ pub(crate) mod tests {
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         stream.set_read_timeout(Some(POLL)).unwrap();
         let (held, _) = listener.accept().unwrap();
-        (Response { status: 0, headers: Vec::new(), stream: Transport::Plain(stream), buffer: bytes.to_vec(), framing, cancel }, held)
+        (Response { status: 0, headers: Vec::new(), stream: Transport::Plain(stream), buffer: bytes.to_vec(), framing, cancel, lost: false }, held)
     }
 
     #[test]
@@ -697,5 +739,145 @@ pub(crate) mod tests {
         let url = serve(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\n\r\nok");
         let mut response = request("GET", &url, &[], None, Duration::from_secs(5), &cancel).unwrap();
         assert_eq!((response.status, response.text().unwrap().as_str()), (503, "ok"));
+    }
+
+
+    /// What a server of the test's does with a connection once its request has come.
+    #[derive(Clone, Copy)]
+    enum Then {
+        /// Waits for the client to be done, as a keep-alive server does.
+        WaitsForTheClient,
+        /// Closes the moment it has answered the first time it answers, and five milliseconds on each time after: a close that resets what the client has not read, and one that is kind to it.
+        ClosesAtOnceTheFirstTime,
+    }
+
+    /// A server for as many connections as come, counting them. The first `lose` of them are lost before any answer: it waits until the request is there, and closes without reading it, which
+    /// resets the connection. The others read the request, write `answer`, and do `then`.
+    struct Lossy {
+        url: Url,
+        connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        done: std::sync::Arc<AtomicBool>,
+    }
+
+    impl Drop for Lossy {
+        fn drop(&mut self) {
+            self.done.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn lossy(lose: usize, answer: &'static [u8], then: Then) -> Lossy {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (connections, done) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+        let (counted, finished) = (connections.clone(), done.clone());
+        std::thread::spawn(move || {
+            while !finished.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let at = counted.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let _ = stream.set_nonblocking(false);
+                    if at < lose {
+                        // (the request is there, unread, when this closes: that resets the connection)
+                        std::thread::sleep(Duration::from_millis(30));
+                        return;
+                    }
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let (mut head, mut block) = (Vec::new(), [0u8; 4096]);
+                    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut block) {
+                            Ok(0) | Err(_) => return,
+                            Ok(count) => head.extend_from_slice(&block[..count]),
+                        }
+                    }
+                    let _ = stream.write_all(answer);
+                    let _ = stream.flush();
+                    match then {
+                        Then::WaitsForTheClient => while matches!(stream.read(&mut block), Ok(count) if count > 0) {},
+                        Then::ClosesAtOnceTheFirstTime => {
+                            if at > lose {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Lossy { url: Url { tls: false, host: "127.0.0.1".into(), port, path: "/".into() }, connections, done }
+    }
+
+    fn counted(server: &Lossy) -> usize {
+        server.connections.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_get_whose_connection_is_lost_before_any_answer_is_asked_again_a_few_times_and_no_more() {
+        let answer: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let cancel = AtomicBool::new(false);
+        // three connections lost, and the fourth answered
+        let server = lossy(3, answer, Then::WaitsForTheClient);
+        let mut response = request("GET", &server.url, &[], None, Duration::from_secs(5), &cancel).ok().expect("the fourth is answered");
+        assert_eq!((response.status, response.text().unwrap()), (200, "hello".to_string()));
+        assert_eq!(counted(&server), 4);
+        // a HEAD changes nothing either
+        let server = lossy(1, answer, Then::WaitsForTheClient);
+        assert!(request("HEAD", &server.url, &[], None, Duration::from_secs(5), &cancel).is_ok());
+        assert_eq!(counted(&server), 2);
+        // and where all are lost it is four in all: then it says so
+        let server = lossy(100, answer, Then::WaitsForTheClient);
+        let failed = request("GET", &server.url, &[], None, Duration::from_secs(5), &cancel).err().expect("all lost");
+        assert!(matches!(failed, Failure::Stream(_)), "{failed}");
+        assert_eq!(counted(&server), MOST_TRIES);
+    }
+
+    #[test]
+    fn a_post_is_never_asked_twice_and_a_get_that_is_stopped_is_not_asked_again() {
+        let answer: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let cancel = AtomicBool::new(false);
+        // a model's turn, lost before an answer: it is made the once, and the one who sent it is told
+        let server = lossy(1, answer, Then::WaitsForTheClient);
+        let failed = request("POST", &server.url, &[], Some("{}"), Duration::from_secs(5), &cancel).err().expect("a POST is not asked again");
+        assert!(matches!(failed, Failure::Stream(_)), "{failed}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(counted(&server), 1);
+        // a GET that is stopped is not asked again
+        let stopped = AtomicBool::new(true);
+        let server = lossy(100, answer, Then::WaitsForTheClient);
+        assert!(matches!(request("GET", &server.url, &[], None, Duration::from_secs(5), &stopped).err(), Some(Failure::Cancelled)));
+        assert_eq!(counted(&server), 0);
+    }
+
+    #[test]
+    fn only_a_connection_lost_with_nothing_of_the_answer_come_is_asked_again() {
+        let cancel = AtomicBool::new(false);
+        let (mut nothing, _held) = arrived(b"", Framing::Close, &cancel);
+        assert!(!nothing.lost_with_nothing(), "a connection that is there is not lost");
+        nothing.lost = true;
+        assert!(nothing.lost_with_nothing());
+        // the head had begun: what came is not nothing, and an answer that was begun is not asked for again
+        let (mut begun, _held_too) = arrived(b"HTTP/1.1 200 OK\r\nContent-Le", Framing::Close, &cancel);
+        begun.lost = true;
+        assert!(!begun.lost_with_nothing());
+    }
+
+    /// What a proxy, a storage host or a small server may be: HTTP/1.0, or HTTP/1.1 told to close, and it closes its end the moment it has answered. On Windows that can reset the connection
+    /// with the answer unread, and a client then sees a reset where the answer was: the request is asked again, and the answer is read. (The first connection is closed at once, the
+    /// next ones a moment after.)
+    #[test]
+    fn a_server_that_closes_the_moment_it_has_answered_is_read_all_the_same() {
+        let cancel = AtomicBool::new(false);
+        let answers: [&'static [u8]; 2] = [b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello", b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello"];
+        for answer in answers {
+            for round in 0..25 {
+                let server = lossy(0, answer, Then::ClosesAtOnceTheFirstTime);
+                let mut response = request("GET", &server.url, &[], None, Duration::from_secs(5), &cancel).ok().unwrap_or_else(|| panic!("round {round}: no answer"));
+                assert_eq!(response.text().unwrap(), "hello", "round {round}");
+            }
+        }
     }
 }
