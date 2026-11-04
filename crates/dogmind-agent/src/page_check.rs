@@ -155,7 +155,12 @@ fn served_address(url: &str) -> Result<String, String> {
     }
     Ok(url.to_string())
 }
-const TRIES: usize = 4;
+/// Tries of the browser for the page, and again for each picture. It ends with 0xc0000005 in about 6 runs of 10 on some machines, whatever the page, however long it was left alone, and whether
+/// the run before it ended well or not, so each try is as likely to end well as the first was; a run that crashes is over in about 1.5 s. Ten tries are lost about once in a hundred
+/// (4 were lost one time in six, and a picture's 3 two in five), and cost 15 s at the most when it is crashes that they go on, with nothing between them; a run that hangs is not tried again.
+const TRIES: usize = 10;
+/// No new try after this long in all: runs that crash late, or hang, would otherwise go on for minutes.
+const MOST_TRYING: Duration = Duration::from_secs(45);
 /// How the browser's runs went, for the test that measures it: the page's runs and those that did not end well, the pictures' and those that left none.
 #[cfg(test)]
 static BROWSER_RUNS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -518,13 +523,12 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     let browser_flags = flags();
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
+    let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
     for _ in 0..TRIES {
         let started = std::time::Instant::now();
-        let profile = profile_of(&next_run());
+        let profile = profiles.next();
         let line = format!("\"{}\" {browser_flags} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --dump-dom \"{address}\"", program.display());
-        let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
-        clear_profile(&profile, &cwd, workspace);
-        let done = done?;
+        let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel)?;
         (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
         #[cfg(debug_assertions)]
         if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
@@ -534,12 +538,11 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
         #[cfg(test)]
         note_run(false, !finished);
-        if finished || cancel.load(Ordering::Relaxed) || started.elapsed() > LIMIT / 2 || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension") {
+        if finished || cancel.load(Ordering::Relaxed) || started.elapsed() > LIMIT / 2 || trying.elapsed() > MOST_TRYING || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension") {
             break;
         }
-        // (its crashes come together: a real run lost all four tries inside 6.5 s, and that page opened ten times of ten afterwards. Why is not known.)
-        std::thread::sleep(Duration::from_secs(3));
     }
+    profiles.clear();
     // (what its console names is said from the workspace, or from the server's root)
     let base_url = match served {
         Some(url) => url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/") + "/",
@@ -587,32 +590,45 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         // (a window larger than the frame by what the browser takes of it, and at least its least width)
         let (window_width, window_height) = (view.width.max(600) + 64, view.height + 160);
         let (mut taken, mut said_there) = (false, Vec::new());
-        for _ in 0..3 {
-            if cancel.load(Ordering::Relaxed) {
+        let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
+        for _ in 0..TRIES {
+            if cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING {
                 break;
             }
             let _ = std::fs::remove_file(&shot);
-            let profile = profile_of(&next_run());
+            let started = std::time::Instant::now();
+            let profile = profiles.next();
             let line = format!("\"{}\" {browser_flags} --window-size={window_width},{window_height} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --screenshot=\"{}\" \"{}\"", program.display(), shot.display(), plain(&frame));
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
-            clear_profile(&profile, &cwd, workspace);
+            #[cfg(debug_assertions)]
+            if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
+                if let Ok(done) = &done {
+                    eprintln!("--- picture, {:?} {:?}: shot {} bytes\n{}", done.status, done.ended, std::fs::metadata(&shot).map_or(0, |meta| meta.len()), crate::sandbox::decode(&done.stderr));
+                }
+            }
             // (a browser that fell over while writing it leaves an empty file, or one that cannot be read)
             let shot_image = image::open(&shot);
             #[cfg(test)]
             note_run(true, shot_image.is_err());
-            let Ok(whole) = shot_image else { continue };
-            if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
-                taken = true;
-                said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref().zip(steps_copy.as_deref()))).unwrap_or_default();
+            if let Ok(whole) = shot_image {
+                if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
+                    taken = true;
+                    said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref().zip(steps_copy.as_deref()))).unwrap_or_default();
+                    break;
+                }
+            }
+            // (a sandbox that could not run it, or a run that hung and was ended, will not do better the next time)
+            if done.is_err() || started.elapsed() > LIMIT / 2 {
                 break;
             }
         }
+        profiles.clear();
         let _ = std::fs::remove_file(&shot);
         let _ = std::fs::remove_file(&frame);
         out.push_str(&if taken {
             format!("How it looks at {} ({}x{}), without WebGL drawing: `read_file` {}\n", view.label, view.width, view.height, picture.display())
         } else {
-            format!("No picture at {} could be taken.\n", view.label)
+            format!("No picture at {} could be taken: the browser ended without one each time it was tried, which says nothing of the page. Do not build other pages to measure the layout instead; say in your answer that there is no picture.\n", view.label)
         });
         // What the page said at this size, where it says other than above: the console above is of the desktop's width, and a model that
         // measured a phone's layout from a script was given the desktop's numbers.
@@ -649,10 +665,40 @@ impl Drop for Removing {
     }
 }
 
-/// The browser's profile of one run (by its name in the sandbox's folder), gone after the run: only that one, as others may be in use. Not stopped by the turn's Stop, which is what most
-/// often ends a run early: under it, the removal ended as it began and the profile stayed. A browser that did not start has its profile go too.
-fn clear_profile(profile: &str, cwd: &Path, workspace: &Path) {
-    let _ = crate::sandbox::run(&format!("rmdir /s /q \"%TEMP%\\{profile}\""), cwd, workspace, false, Duration::from_secs(20), &AtomicBool::new(false));
+/// The browser's profiles of the tries of one loop, each a name of its own in the sandbox's folder, all removed together when the loop is done (a try does not wait for the one before to be
+/// cleared): only these, as others may be in use. Not stopped by the turn's Stop, which is what most often ends a run early: under it, the removal ended as it began and the profile
+/// stayed. A browser that did not start has its profile go too, and so has one whose loop ended by an error.
+struct Profiles<'a> {
+    names: Vec<String>,
+    cwd: &'a Path,
+    workspace: &'a Path,
+}
+
+impl<'a> Profiles<'a> {
+    fn new(cwd: &'a Path, workspace: &'a Path) -> Self {
+        Profiles { names: Vec::new(), cwd, workspace }
+    }
+
+    /// The name of the next try's profile.
+    fn next(&mut self) -> String {
+        let name = profile_of(&next_run());
+        self.names.push(name.clone());
+        name
+    }
+
+    fn clear(&mut self) {
+        if self.names.is_empty() {
+            return;
+        }
+        let line = self.names.drain(..).map(|name| format!("rmdir /s /q \"%TEMP%\\{name}\"")).collect::<Vec<_>>().join(" & ");
+        let _ = crate::sandbox::run(&line, self.cwd, self.workspace, false, Duration::from_secs(20), &AtomicBool::new(false));
+    }
+}
+
+impl Drop for Profiles<'_> {
+    fn drop(&mut self) {
+        self.clear();
+    }
 }
 
 /// How long what a run left is kept: a run lasts minutes at most, and a copy of the app that is stopped mid-run, or crashes, leaves its profile, frame and shot.
@@ -728,6 +774,17 @@ mod tests {
         let all: HashSet<String> = threads.into_iter().flat_map(|thread| thread.join().unwrap()).collect();
         assert_eq!(all.len(), 400);
         assert_ne!(profile_of("100-0"), profile_of("101-0"));
+    }
+
+    #[test]
+    fn the_tries_of_one_loop_each_have_a_profile_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profiles = Profiles::new(dir.path(), dir.path());
+        let names: Vec<String> = (0..TRIES).map(|_| profiles.next()).collect();
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), TRIES);
+        assert!(names.iter().all(|name| is_run_leftover(name)), "{names:?}");
+        // (none of them was made, so the sandbox has nothing to remove: it is not run for them)
+        profiles.names.clear();
     }
 
     #[test]
