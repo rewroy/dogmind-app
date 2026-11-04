@@ -1,6 +1,7 @@
 //! Whether the model on this PC reads pictures, from its files: its vision file beside it, or set aside. The engine takes any such file it finds when it starts,
 //! and has no word for leaving one alone: a file set aside under another name is not found, is not a thing setup would fetch again while it is left out, and comes back by its own name.
 
+use crate::engine::Bundle;
 use std::path::{Path, PathBuf};
 
 const SET_ASIDE: &str = ".off";
@@ -9,9 +10,8 @@ const SET_ASIDE: &str = ".off";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Installed {
     pub model: PathBuf,
-    /// Whose bundle `quant` is, in `model_name`: settings an older setup wrote have none.
-    pub model_name: Option<String>,
-    pub quant: String,
+    /// The bundle, by `model_name`, `provider` and `quant`: settings an older setup wrote are read as Straydog reads them.
+    pub bundle: Bundle,
     /// It has an MTP drafter: setup is to keep it.
     pub drafter: bool,
     /// A file named by hand, in `model_vision`.
@@ -43,8 +43,7 @@ fn value_of(text: &str, key: &str) -> Option<String> {
 pub fn installed(config: &str) -> Option<Installed> {
     Some(Installed {
         model: PathBuf::from(value_of(config, "model")?),
-        model_name: value_of(config, "model_name"),
-        quant: value_of(config, "quant")?,
+        bundle: Bundle::from_settings(value_of(config, "model_name").as_deref(), value_of(config, "provider").as_deref(), &value_of(config, "quant")?),
         drafter: value_of(config, "model_draft").is_some(),
         named: value_of(config, "model_vision").map(PathBuf::from),
     })
@@ -137,12 +136,15 @@ mod tests {
 
     #[test]
     fn the_settings_are_read_as_setup_writes_them() {
+        // (settings of 0.1.3 and before have no model and no provider: the table read them)
         let read = installed("# Written by setup\nmodel = 'C:\\m\\IQ3_XXS'\nmodel_draft = 'C:\\m\\mtp'\nquant = \"IQ3_XXS\"\n").unwrap();
-        assert_eq!(read, Installed { model: PathBuf::from(r"C:\m\IQ3_XXS"), model_name: None, quant: "IQ3_XXS".into(), drafter: true, named: None });
+        assert_eq!(read, Installed { model: PathBuf::from(r"C:\m\IQ3_XXS"), bundle: Bundle::new("Qwen3.8-Flash-Next", "ISTA-DASLab", "IQ3_XXS"), drafter: true, named: None });
         assert_eq!(installed("port = 9000\n"), None, "no model set up");
-        // (a newer setup says whose bundle it is: two models may each have a UD-IQ1_M)
-        let read = installed("model = 'C:\\m\\UD-IQ1_M'\nmodel_name = \"Qwen3.8-Flash-Next\"\nquant = \"UD-IQ1_M\"\n").unwrap();
-        assert_eq!((read.model_name.as_deref(), read.quant.as_str()), (Some("Qwen3.8-Flash-Next"), "UD-IQ1_M"));
+        // (a newer setup says whose bundle it is, and who quantized it: two models may each have a UD-IQ1_M)
+        let read = installed("model = 'C:\\m\\UD-IQ1_M'\nmodel_name = \"Qwen3.8-Flash-Next\"\nprovider = \"Unsloth\"\nquant = \"UD-IQ1_M\"\n").unwrap();
+        assert_eq!(read.bundle, Bundle::new("Qwen3.8-Flash-Next", "Unsloth", "UD-IQ1_M"));
+        let old = installed("model = 'C:\\m\\GSQ-RCO-IQ2_XS'\nquant = \"GSQ-RCO-IQ2_XS\"\n").unwrap();
+        assert_eq!(old.bundle, Bundle::new("DeepSeek-V4.1-Flash-1017", "ISTA-DASLab", "IQ2_XS"));
     }
 
     #[test]
