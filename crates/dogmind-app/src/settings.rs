@@ -420,18 +420,44 @@ pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
     path == folder || path.starts_with(&format!("{folder}\\"))
 }
 
-/// What Remove takes out of the data folder, and only if it is what it should be: that folder can be named by a variable, and what is in it goes without another word. It says what it is by
-/// having the settings in it; it does not hold the person's home. `keep`: the model's folder, with whatever holds it, or what lies in it.
+/// The folders this app makes in its data folder, by name.
+const MADE_FOLDERS: [&str; 6] = ["sessions", "memory", "preview", "crashes", "attachments", "models"];
+/// The beginnings of the names of the files it makes there: each as it is, written beside itself first (`.part`, `.partial`), or
+/// moved aside when it could not be read (`.broken`, `.unreadable-TIME.json`), or the engine's copies of its own (`engine.toml.old`).
+const MADE_FILES: [&str; 11] = ["settings.json", "engine.toml", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-", "workspace-grants.json", "read-folders.json", "mcp.json", "mcp.partial", "report.txt"];
+
+/// Whether the app makes this, at the top of its data folder: a name of its own, a folder as a folder and a file as a file.
+fn made_here(path: &Path) -> bool {
+    let name = path.file_name().map(|name| name.to_string_lossy().to_lowercase()).unwrap_or_default();
+    match std::fs::symlink_metadata(path) {
+        Ok(what) if what.is_dir() => MADE_FOLDERS.contains(&name.as_str()),
+        Ok(what) if what.is_file() => MADE_FILES.iter().any(|made| name.starts_with(made)),
+        _ => false,
+    }
+}
+
+/// What Remove takes out of the data folder, and only if it is what it should be: that folder can be named by a variable. It says
+/// what it is by having this app's settings in it, and it does not hold the person's home. Even then only what this app makes there
+/// goes, by its name: a file or a folder of another's stays, and is said (`what_remove_leaves`). `keep`: the model's folder, with
+/// whatever holds it, or what lies in it.
 pub fn what_remove_takes(data: &Path, keep: Option<&Path>, home: Option<&Path>) -> Result<Vec<PathBuf>, String> {
     // (never started, so nothing to take)
     if !data.exists() {
         return Ok(Vec::new());
     }
-    if data.parent().is_none() || home.is_some_and(|home| same_or_inside(home, data)) || !data.join("settings.json").is_file() {
+    // (another program's settings.json is no sign: this app's always has its connections in it)
+    let ours = std::fs::read_to_string(data.join("settings.json")).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()).is_some_and(|settings| settings.get("providers").is_some_and(serde_json::Value::is_array));
+    if data.parent().is_none() || home.is_some_and(|home| same_or_inside(home, data)) || !ours {
         return Err(tf("{0} does not look like this app's folder, so nothing in it was removed.", &[&data.display()]));
     }
     let kept = |path: &Path| keep.is_some_and(|keep| same_or_inside(keep, path) || same_or_inside(path, keep));
-    Ok(std::fs::read_dir(data).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| !kept(path)).collect())
+    Ok(std::fs::read_dir(data).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| made_here(path) && !kept(path)).collect())
+}
+
+/// What is in the data folder that this app did not make, and Remove leaves where it is: for the person to be told.
+pub fn what_remove_leaves(data: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
+    let kept = |path: &Path| keep.is_some_and(|keep| same_or_inside(keep, path) || same_or_inside(path, keep));
+    std::fs::read_dir(data).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| !made_here(path) && !kept(path)).collect()
 }
 
 #[cfg(test)]
@@ -473,16 +499,19 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("thesis.docx"), "years").unwrap();
         assert!(what_remove_takes(&other, None, None).unwrap_err().contains("does not look like"));
+        // Another program's settings are no sign of this app's folder.
+        std::fs::write(other.join("settings.json"), "{\"theme\": \"dark\"}").unwrap();
+        assert!(what_remove_takes(&other, None, None).unwrap_err().contains("does not look like"));
         // One that holds the home, whatever is in it.
         let home = dir.path().join("Documents").join("me");
-        std::fs::write(other.join("settings.json"), "{}").unwrap();
+        std::fs::write(other.join("settings.json"), "{\"providers\": []}").unwrap();
         assert!(what_remove_takes(&other, None, Some(&home)).is_err());
         assert!(what_remove_takes(Path::new("C:\\"), None, None).is_err());
         // Its own.
         let data = dir.path().join("DogmindApp");
         std::fs::create_dir_all(data.join("sessions")).unwrap();
         std::fs::create_dir_all(data.join("models").join("q")).unwrap();
-        std::fs::write(data.join("settings.json"), "{}").unwrap();
+        std::fs::write(data.join("settings.json"), "{\"providers\": []}").unwrap();
         let sorted = |mut paths: Vec<PathBuf>| {
             paths.sort();
             paths
@@ -492,6 +521,31 @@ mod tests {
         assert_eq!(sorted(what_remove_takes(&data, Some(&shouting), None).unwrap()), [data.join("sessions"), data.join("settings.json")], "as a dialog may spell it");
         assert_eq!(what_remove_takes(&data, Some(&data), None).unwrap(), Vec::<PathBuf>::new(), "the model is loose in the folder: nothing can be told from it");
         assert!(same_or_inside(&shouting, &data) && !same_or_inside(&dir.path().join("DogmindApp2"), &data));
+    }
+
+    /// Even in its own folder, Remove takes only what this app makes there, by name: what another put there stays, and is said.
+    #[test]
+    fn remove_takes_what_this_app_makes_and_leaves_what_another_put_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("DogmindApp");
+        for folder in ["sessions", "memory", "preview", "crashes", "attachments", "my photos", "settings.json.d"] {
+            std::fs::create_dir_all(data.join(folder)).unwrap();
+        }
+        let made = ["settings.json", "settings.json.broken", "settings.json.part", "engine.toml", "engine.toml.old", "engine.toml.before-drafter", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-20261104-093000.json", "workspace-grants.json", "read-folders.json", "mcp.json", "report.txt"];
+        let theirs = ["notes.txt", "settings.ini", "permissions.txt", "Sessions.lnk"];
+        std::fs::write(data.join("settings.json"), "{\"providers\": [], \"active\": \"\"}").unwrap();
+        for file in made.iter().skip(1).chain(&theirs) {
+            std::fs::write(data.join(file), "x").unwrap();
+        }
+        let names = |paths: Vec<PathBuf>| {
+            let mut names: Vec<String> = paths.iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        let mut expected: Vec<String> = made.iter().chain(&["sessions", "memory", "preview", "crashes", "attachments"]).map(|name| name.to_string()).collect();
+        expected.sort();
+        assert_eq!(names(what_remove_takes(&data, None, None).unwrap()), expected);
+        assert_eq!(names(what_remove_leaves(&data, None)), ["Sessions.lnk", "my photos", "notes.txt", "permissions.txt", "settings.ini", "settings.json.d"], "a file of a folder's name is not the folder, nor a folder of a file's");
     }
 
     #[test]

@@ -39,10 +39,13 @@ a rail at the transcript's right edge has a mark for each of your messages: the 
 
 ## Updating, removing, and when something goes wrong
 
-New versions are published at [Releases](https://github.com/rewroy/DogmindApp/releases). To update, run the new `DogmindSetup-VERSION.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. Every file takes its place or none does: a failure puts back what was there, so the program is as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
+New versions are published at [Releases](https://github.com/rewroy/DogmindApp/releases). The app asks GitHub for the latest release
+at most once a day, and says so quietly when there is a newer one, with a button that opens its page: it never downloads or installs
+anything by itself, and *Settings > About* has *Check for updates*, and a switch to turn the daily check off. The request carries
+nothing about you but the app's version. To update, run the new `DogmindSetup-VERSION.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. Every file takes its place or none does: a failure puts back what was there, so the program is as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
 
-To remove it, *Settings > General > Remove this app from this PC* takes away the settings, sessions, logs, the keys in Credential Manager, what was opened to the sandbox and the AppContainer
-profiles, and the model unless you keep it. Installed apps opens the same page, and closing it then takes away the program and its entries; from a zip, delete the folder it runs from. Workspaces stay as they are.
+To remove it, *Settings > General > Remove this app from this PC* takes away the settings, sessions, logs, its keys in Credential Manager, what was opened to the sandbox and its AppContainer
+profile, and the model unless you keep it. In its data folder it takes only what it made there, by name: anything else stays, and it says what. Straydog's own sandbox profile stays, as the engine also runs as a server of its own. Installed apps opens the same page, and closing it then takes away the program and its entries: only the files its installer put there, and a folder only once it is empty. From a zip, delete the folder it runs from. Workspaces stay as they are.
 
 A crash leaves a text file in `%LOCALAPPDATA%\DogmindApp\crashes`, and the next start says so. `/report`, or *About > Write a problem report*, writes `report.txt` in `%LOCALAPPDATA%\DogmindApp`, with no key, server address or
 conversation in it, and says where it is: read it, and attach it to an [issue](https://github.com/rewroy/DogmindApp/issues) with what you were doing. Nothing is sent by itself. Whoever makes a release keeps its `dogmind_app.pdb` and `straydog.pdb`: the addresses in a crash are read with them.
@@ -73,6 +76,10 @@ A release is built so: a panic's message names the path of its source, and witho
 every one. `RUSTFLAGS` takes the place of `.cargo/config.toml`'s flags, so the static C runtime is said again.
 
 `python -I scripts\package.py` then makes `dist\DogmindApp`, its zip and `dist\DogmindSetup-VERSION.exe`. The installer is `crates/dogmind-setup` and no tool besides: the package is on the end of that one executable, deflated file by file, and read as a stream. To try one in a scratch folder, `DogmindSetup.exe --test --dir FOLDER`: it writes no Start menu entry or registry key, only what they would say, in that folder. Without `--test`, `--dir FOLDER` only chooses the folder the first page starts with.
+
+To release: raise `version` in the workspace's `Cargo.toml`, build and package as above, and publish a GitHub release tagged
+`vVERSION` (as `v0.1.0`) with `dist\DogmindSetup-VERSION.exe` and `dist\DogmindApp-VERSION.zip`, keeping the PDBs. The app's
+update check reads the latest published release: drafts and pre-releases are not offered.
 
 No GPU toolkit is needed. To use the engine, copy a `straydog.exe` built by Straydog's README, with the toolkit's `cublas64_13.dll` and `cublasLt64_13.dll`, next to `dogmind-app.exe`.
 

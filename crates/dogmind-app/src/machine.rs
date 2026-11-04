@@ -258,13 +258,14 @@ pub fn first_folder(data: &Path) -> PathBuf {
     }
 }
 
-/// The AppContainer profiles this app and its engine made. The ACEs that name them stay on what they were put on, and name no one once the profile has gone.
+/// The AppContainer profile this app made. The ACEs that name it stay on what they were put on, and name no one once the profile has gone.
+/// Not Straydog's worker: the engine runs as a server of its own too, with that same profile, and it is Straydog's to take.
 pub fn delete_profiles() {
     use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
     if kept_from_the_real_machine() {
         return;
     }
-    for name in ["DogmindApp.Exec", "Straydog.Worker"] {
+    for name in ["DogmindApp.Exec"] {
         // SAFETY: the name ends in a zero.
         unsafe { DeleteAppContainerProfile(wide(name).as_ptr()) };
     }
