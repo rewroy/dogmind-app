@@ -540,6 +540,7 @@ const JA: &[(&str, &str)] = &[
     ("It keeps running in the tray, with the engine loaded. Quit it from the tray icon's menu.", "エンジンを読み込んだままタスクトレイに常駐します。終了はトレイアイコンのメニューからどうぞ。"),
     // The approval card.
     ("\n\nin {0}", "\n\n場所: {0}"),
+    ("As written: {0}", "モデルが書いた行: {0}"),
     ("{0}\n... and {1} more characters", "{0}\n... 残り {1} 文字"),
     ("Always saves: {0}", "常に許可で保存されるルール: {0}"),
     ("Always allows this file, for this session: {0}", "常に許可: このセッションの間、このファイル: {0}"),

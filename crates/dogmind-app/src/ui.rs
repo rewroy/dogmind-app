@@ -12642,7 +12642,12 @@ fn approval_body(tool: &str, summary: &str, details: &str) -> String {
                 "" | "." => String::new(),
                 cwd => tf("\n\nin {0}", &[&cwd]),
             };
-            format!("{purpose}{}{place}", text("command"))
+            // (what runs is shown first: where the sandbox changes a line, the line the model wrote comes after it)
+            let written = match text("written_as") {
+                "" => String::new(),
+                written => format!("\n\n{}", tf("As written: {0}", &[&written])),
+            };
+            format!("{purpose}{}{written}{place}", text("command"))
         }
         "create_file" => format!("{purpose}{}\n\n{}", text("path"), cut(text("content"))),
         "apply_patch" => {
@@ -13859,6 +13864,19 @@ mod tests {
         for message in ["", "hello", "/usr/bin/env は何？", "/ は何", "/日本語", "/etc/hosts"] {
             assert!(!reads_as_command(message), "{message}");
         }
+    }
+
+    #[test]
+    fn a_command_the_sandbox_changed_is_shown_as_it_runs_with_the_line_as_written_after_it() {
+        let runs = "(powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\")";
+        let changed = serde_json::json!({"command": runs, "written_as": "del a.txt", "purpose": "clear it", "cwd": "sub"}).to_string();
+        assert_eq!(approval_body("execute_command", "s", &changed), format!("clear it\n\n{runs}\n\nAs written: del a.txt\n\nin sub"));
+        let plain = serde_json::json!({"command": runs}).to_string();
+        assert_eq!(approval_body("execute_command", "s", &plain), runs);
+        let empty = serde_json::json!({"command": runs, "written_as": ""}).to_string();
+        assert_eq!(approval_body("execute_command", "s", &empty), runs, "nothing is said of a line that was not changed");
+        // (the words are in the other language too)
+        assert!(crate::lang::has_japanese("As written: {0}"));
     }
 
     #[test]

@@ -329,6 +329,43 @@ fn retry_pause(attempt: u32, said: &str) -> Duration {
     Duration::from_secs_f64(first * f64::from(2u32.pow(attempt.saturating_sub(1))))
 }
 
+/// A command call as the sandbox will run it: its arguments with the line that runs in place of the line as written. None for any other call, and for a command
+/// that runs as it was written.
+fn as_run(tool: &str, arguments: &Value) -> Option<Value> {
+    if tool != "execute_command" {
+        return None;
+    }
+    let written = arguments.get("command")?.as_str()?;
+    let runs = tools::line_that_runs(written);
+    if runs == written {
+        return None;
+    }
+    let mut changed = arguments.clone();
+    changed["command"] = Value::String(runs);
+    Some(changed)
+}
+
+/// What the gate makes of a call, and for a command whose line is changed before it runs, what it makes of both lines: a person approves the line that runs, so that
+/// is weighed as well as the line as written, which is the one the rules and "always" go by. The second is what the person is shown, with the line as written in it.
+fn weigh(gate: &Gate, tool: &str, arguments: &Value, workspace: &Path) -> (Verdict, Option<Value>) {
+    let written = gate.check(tool, arguments, workspace);
+    let Some(mut shown) = as_run(tool, arguments) else { return (written, None) };
+    let verdict = both_weighed(written, gate.check(tool, &shown, workspace));
+    shown["written_as"] = arguments["command"].clone();
+    (verdict, Some(shown))
+}
+
+/// A verdict on the line as written and one on the line that runs, as one. Either may refuse. A line that only looks (`dir`) stays so whatever its stand-in is. Where both
+/// ask, the higher risk asks, with the reason the line as written has, or else the other's.
+fn both_weighed(written: Verdict, runs: Verdict) -> Verdict {
+    match (written, runs) {
+        (Verdict::Deny(reason), _) | (_, Verdict::Deny(reason)) => Verdict::Deny(reason),
+        (Verdict::Allow, _) => Verdict::Allow,
+        (asks, Verdict::Allow) => asks,
+        (Verdict::Ask { risk, reason }, Verdict::Ask { risk: other, reason: other_reason }) => Verdict::Ask { risk: risk.max(other), reason: reason.or(other_reason) },
+    }
+}
+
 /// What "this exact call, for the rest of the session" compares: all of it, as a call's summary shows only a command's first line and the start of a server's arguments.
 fn always_key(tool: &str, arguments: &Value) -> String {
     match tool {
@@ -1537,7 +1574,7 @@ impl Agent {
 
     /// Whether this call would run with no one asked.
     fn runs_unasked(&self, tool: &str, arguments: &Value) -> bool {
-        match self.gate.check(tool, arguments, &self.workspace) {
+        match weigh(&self.gate, tool, arguments, &self.workspace).0 {
             Verdict::Allow => true,
             Verdict::Deny(_) => false,
             Verdict::Ask { risk, reason } => self.mode != Mode::Plan && (delegated(self.mode, tool, risk, reason.as_deref(), self.safe_commands) || (risk < Risk::High && reason.is_none() && rules::allows(&self.rules, &self.gate, &self.workspace, tool, arguments))),
@@ -1772,7 +1809,8 @@ impl Agent {
     fn permission(&mut self, tool: &str, arguments: &Value) -> Permission {
         // What a page said may be why this is being done: keys are asked for each time then, and so is what a page could have planted.
         let from_web = self.web_seen && (tool == "execute_command" || tool == "remember" || tool.starts_with("mcp__"));
-        let (risk, mut reason) = match self.gate.check(tool, arguments, &self.workspace) {
+        let (verdict, runs_as) = weigh(&self.gate, tool, arguments, &self.workspace);
+        let (risk, mut reason) = match verdict {
             Verdict::Allow if tool == "web_read" => {
                 let url = arguments.get("url").and_then(Value::as_str).unwrap_or("");
                 if self.bench.web.is_known(url) || !self.web.enabled || crate::web::address_carries_nothing(url) {
@@ -1821,10 +1859,12 @@ impl Agent {
         }
         let rule = if free { rules::proposed(&self.gate, &self.workspace, tool, arguments, risk) } else { None };
         let (answer, answered) = channel();
+        // The line that runs is what is shown, with the line as written in it as `written_as`; the rules, "always" and its scope went by the line as written.
+        let shown = runs_as.as_ref().unwrap_or(arguments);
         self.emit(Event::Approval(Approval {
             tool: tool.to_string(),
-            summary: tools::summary(tool, arguments),
-            details: serde_json::to_string_pretty(arguments).unwrap_or_default(),
+            summary: tools::summary(tool, shown),
+            details: serde_json::to_string_pretty(shown).unwrap_or_default(),
             risk,
             reason,
             always_allowed: offered,
@@ -2274,6 +2314,80 @@ mod tests {
         run.handle.commands.send(Command::Send("go".into())).unwrap();
         let (log, _) = until_end(&run, Decision::Approve);
         assert!(log[0].starts_with("tool:false:true:") && log[0].contains("denied"), "{log:?}");
+    }
+
+    /// In the sandbox `del` is run as a call to PowerShell: a person is asked about that line, as the line the model wrote is not the one that runs.
+    #[cfg(windows)]
+    #[test]
+    fn a_person_is_asked_about_the_line_that_runs_with_the_line_as_written_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "keep").unwrap();
+        let (client, _) = server(vec![call_answer("execute_command", serde_json::json!({"command": "del a.txt", "purpose": "clear it"})), text_answer("ok")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let mut asked = Vec::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::Approval(approval) => {
+                    asked.push((approval.summary.clone(), approval.details.clone(), approval.risk));
+                    approval.answer.send((Decision::Reject, None)).unwrap();
+                }
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        let (summary, details, risk) = &asked[0];
+        assert!(summary.contains("[IO.File]::Delete('a.txt')"), "the line that runs: {summary}");
+        let shown: Value = serde_json::from_str(details).unwrap();
+        assert_eq!(shown["written_as"], "del a.txt");
+        assert!(shown["command"].as_str().unwrap().contains("[IO.File]::Delete('a.txt')"), "{details}");
+        assert_eq!(shown["purpose"], "clear it", "the rest of the call is as it was");
+        assert!(*risk >= Risk::Medium, "no lower than `del` is: {risk:?}");
+        assert!(dir.path().join("a.txt").exists(), "nothing ran");
+    }
+
+    /// The line that runs is weighed with the line as written, and a look stays a look.
+    #[cfg(windows)]
+    #[test]
+    fn both_the_line_as_written_and_the_line_that_runs_are_weighed() {
+        let (gate, work) = (Gate::new(), Path::new("C:\\work"));
+        let call = |line: &str| weigh(&gate, "execute_command", &serde_json::json!({"command": line, "cwd": ".", "risk_level": "low"}), work);
+        let (verdict, shown) = call("del a.txt");
+        assert!(matches!(verdict, Verdict::Ask { risk, .. } if risk >= Risk::Medium), "{verdict:?}");
+        let shown = shown.expect("`del` runs as something else");
+        assert_eq!(shown["written_as"], "del a.txt");
+        assert_eq!(shown["cwd"], ".", "the rest of the call is as it was");
+        assert!(shown["command"].as_str().unwrap().starts_with("(powershell"), "{shown}");
+        let (verdict, shown) = call("dir");
+        assert_eq!(verdict, Verdict::Allow, "a look is a look, whatever the sandbox runs in its place");
+        assert_eq!(shown.expect("`dir` runs as something else")["written_as"], "dir");
+        let (verdict, shown) = call("dir /b | head -5");
+        assert!(matches!(verdict, Verdict::Ask { risk: Risk::Low, .. }), "{verdict:?}");
+        assert!(shown.unwrap()["command"].as_str().unwrap().ends_with("| findstr \"^\""));
+        // (the second line of a command is changed too, once the lines are one)
+        let (verdict, shown) = call("echo a\ndel a.txt");
+        assert!(matches!(verdict, Verdict::Ask { .. }));
+        assert!(shown.unwrap()["command"].as_str().unwrap().contains("[IO.File]::Delete('a.txt')"));
+        for same in ["git status", "make", "del /s a.txt"] {
+            assert!(call(same).1.is_none(), "{same} runs as it is written");
+        }
+        assert!(weigh(&gate, "read_file", &serde_json::json!({"path": "del a.txt"}), work).1.is_none());
+    }
+
+    #[test]
+    fn a_refusal_of_either_line_is_a_refusal_and_the_higher_risk_asks() {
+        let ask = |risk, reason: Option<&str>| Verdict::Ask { risk, reason: reason.map(str::to_string) };
+        let deny = |reason: &str| Verdict::Deny(reason.to_string());
+        assert_eq!(both_weighed(Verdict::Allow, deny("that")), deny("that"), "even a look is not run if what runs is refused");
+        assert_eq!(both_weighed(ask(Risk::Low, None), deny("that")), deny("that"));
+        assert_eq!(both_weighed(deny("this"), ask(Risk::High, None)), deny("this"));
+        assert_eq!(both_weighed(deny("this"), deny("that")), deny("this"), "the written one's reason");
+        assert_eq!(both_weighed(Verdict::Allow, Verdict::Allow), Verdict::Allow);
+        assert_eq!(both_weighed(Verdict::Allow, ask(Risk::High, Some("x"))), Verdict::Allow, "a look stays a look");
+        assert_eq!(both_weighed(ask(Risk::Medium, Some("x")), Verdict::Allow), ask(Risk::Medium, Some("x")));
+        assert_eq!(both_weighed(ask(Risk::Low, None), ask(Risk::Medium, Some("y"))), ask(Risk::Medium, Some("y")));
+        assert_eq!(both_weighed(ask(Risk::High, Some("x")), ask(Risk::Low, Some("y"))), ask(Risk::High, Some("x")), "the written one's reason, else the other's");
     }
 
     #[test]
