@@ -84,14 +84,10 @@ fn legacy_labels(quant: &str) -> Option<(&str, &str, &str)> {
     })
 }
 
-/// The bundles this app offers, by model and provider: every Qwen3.8 bundle, and DeepSeek's by ISTA-DASLab. `straydog` itself still has the
-/// others (DeepSeek's by Unsloth), for who wants them.
+/// The bundles this app offers, by model and provider: all `setup --list` has, a model or a provider new to this app too, but DeepSeek's by
+/// Unsloth. `straydog` itself still has those, for who wants them.
 fn is_offered(model: &str, provider: &str) -> bool {
-    match model {
-        QWEN => true,
-        DEEPSEEK => provider == ISTA_DASLAB,
-        _ => false,
-    }
+    !(model == DEEPSEEK && provider == UNSLOTH)
 }
 
 /// Whose model it is, and who made this file of it: its `creator` as Straydog says it (none, for a bundle that has none), and who quantized it.
@@ -1216,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn every_qwen_bundle_is_offered_and_deepseeks_only_by_ista_daslab() {
+    fn all_the_list_has_is_offered_but_deepseeks_by_unsloth() {
         let (qwen, deepseek) = ("Qwen3.8-Flash-Next", "DeepSeek-V4.1-Flash-1017");
         let list = format!(r#"{{"bundles":[{}]}}"#, [
             listed(deepseek, "ISTA-DASLab", "IQ2_XXS"), listed(deepseek, "ISTA-DASLab", "IQ2_XS"), listed(deepseek, "Unsloth", "UD-IQ2_XXS"), listed(deepseek, "Unsloth", "UD-IQ1_M"),
@@ -1229,9 +1225,11 @@ mod tests {
         assert_eq!(names(&entries), [
             "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XXS", "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XS",
             "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_S", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_XXS", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS", "Qwen3.8-Flash-Next · ISTA-DASLab · Q2_0",
-            "Qwen3.8-Flash-Next · Unsloth · UD-IQ1_M"]);
+            "Qwen3.8-Flash-Next · Unsloth · UD-IQ1_M", "Qwen3.6-35B-A3B · Unsloth · UD-Q8_K_XL"]);
         assert!(is_offered(qwen, "Unsloth") && is_offered(deepseek, "ISTA-DASLab"));
-        assert!(!is_offered(deepseek, "Unsloth") && !is_offered("Qwen3.6-35B-A3B", "ISTA-DASLab"));
+        assert!(!is_offered(deepseek, "Unsloth"));
+        // (a model Straydog lists that this app has never heard of needs nothing of it)
+        assert!(is_offered("Qwen3.6-35B-A3B", "ISTA-DASLab"));
     }
 
     #[test]
