@@ -238,6 +238,11 @@ pub fn release_page(named: &str) -> String {
     }
 }
 
+/// The page of the release of this version, as a tag names it: for a setup that was fetched before this start, which no look has named the page of.
+pub fn release_page_of(version: &str) -> String {
+    release_page(&format!("{RELEASE_PAGES}tag/v{version}"))
+}
+
 /// `read_releases_for` with no test server: what the app reads of GitHub's own answer.
 #[cfg(test)]
 pub fn read_releases(body: &str, running: &str) -> Option<Outcome> {
@@ -960,6 +965,14 @@ mod tests {
             assert_eq!(release_page(bad), LATEST_PAGE, "{bad}");
         }
         assert_eq!(release_page(&format!("{good}{}", "a".repeat(400))), LATEST_PAGE);
+    }
+
+    #[test]
+    fn a_setup_kept_from_before_has_its_versions_tag_page() {
+        assert_eq!(release_page_of("0.2.0"), "https://github.com/rewroy/dogmind-app/releases/tag/v0.2.0");
+        assert_eq!(release_page_of("0.2.0-beta.1"), "https://github.com/rewroy/dogmind-app/releases/tag/v0.2.0-beta.1");
+        // (a name that is no version's is the page of the latest)
+        assert_eq!(release_page_of("1 --flag"), LATEST_PAGE);
     }
 
     #[cfg(debug_assertions)]
