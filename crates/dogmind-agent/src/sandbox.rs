@@ -1285,10 +1285,12 @@ unsafe fn profile_folder(sid: PSID) -> Option<PathBuf> {
     Some(path)
 }
 
-fn environment(temp: Option<&Path>, workspace: &Path) -> Vec<u16> {
+/// A command's environment, as the block CreateProcess takes. `build_tools` is asked for the compiler's folders only when the app has no `LIB` of its own: the command's start waits for it, so it
+/// is given the time the command has and the person's Stop (see `crate::msvc::found_before`).
+fn environment(temp: Option<&Path>, workspace: &Path, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<u16> {
     let block: Vec<(String, String)> = VARIABLES.iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
     let temp = temp.map(|path| path.display().to_string()).or_else(|| std::env::var("TEMP").ok()).unwrap_or_default();
-    let block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, crate::msvc::found);
+    let block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, build_tools);
     let mut out = Vec::new();
     for (name, value) in block {
         out.extend(format!("{name}={value}").encode_utf16());
@@ -1326,10 +1328,11 @@ fn path_of(mut block: Vec<(String, String)>, bundled: Option<&Path>, build_tools
 }
 
 /// Where a command's programs are found: its PATH, as this machine gives it to the sandbox. The gate asks, to tell a file in the folder that takes the place of an installed program from
-/// one that is the project's own.
+/// one that is the project's own. It asks while a command waits to be weighed, with nothing yet on the screen for the person to Stop, so it does not wait for Visual Studio's folders: the
+/// ones that are found by then are in it, and the look for them begins in the background if it has not.
 pub(crate) fn command_path() -> Vec<PathBuf> {
     let block: Vec<(String, String)> = ["PATH", "LIB", "INCLUDE"].into_iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
-    path_of(block, crate::bundled::root().as_deref(), crate::msvc::found)
+    path_of(block, crate::bundled::root().as_deref(), crate::msvc::known)
 }
 
 struct Handle(HANDLE);
@@ -1371,6 +1374,9 @@ pub fn run_browser(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, 
 
 #[allow(clippy::too_many_arguments)]
 fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
+    let asked_at = Instant::now();
+    // (the build tools are looked for while the folder is made ready below, and the environment then usually finds them ready)
+    crate::msvc::look_ahead();
     no_error_boxes();
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     let root = writable_root(cwd, workspace, home.as_deref())?;
@@ -1462,7 +1468,8 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let shell = std::env::var("ComSpec").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
         // The code page first, so that a tool's output arrives as UTF-8 on a Japanese Windows.
         let mut command_line = wide(&format!("\"{shell}\" /d /s /c \"chcp 65001 >nul & {line}\""));
-        let block = environment(profile_folder(sid).as_deref(), &root);
+        // (the look for the build tools may still be going on: the command's start waits for it no longer than the command has time, and not past Stop)
+        let block = environment(profile_folder(sid).as_deref(), &root, || crate::msvc::found_before(asked_at.checked_add(timeout).unwrap_or(asked_at + Duration::from_secs(3600)), cancel));
         let place = wide_path(cwd);
         let mut process: PROCESS_INFORMATION = std::mem::zeroed();
         let started = CreateProcessW(

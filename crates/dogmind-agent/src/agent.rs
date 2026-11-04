@@ -662,6 +662,9 @@ impl Agent {
         // The app's own folder: the sessions and the rules are there, and what keeps its keys.
         let mut gate = Gate::new();
         gate.secrets.extend(config.rules.parent().map(Path::to_path_buf));
+        // (Visual Studio's build tools are looked for from here, in the background: the gate weighs a command without waiting for them, and its environment then usually finds them ready)
+        #[cfg(windows)]
+        crate::msvc::look_ahead();
         Agent {
             tool_schemas: tools::schemas_for(config.web.enabled, false, false, Vec::new()),
             home: config.home,
