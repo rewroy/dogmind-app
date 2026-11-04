@@ -97,7 +97,8 @@ fn file_url(path: &Path) -> String {
 /// `page.waitForTimeout(ms)`, `page.locator(sel).click()`, `page.$eval`, `page.$$eval`) is mapped onto them, a few forms and no more, and any other name is the error it is, with the
 /// helpers there are in it. A browser that stays open
 /// to be driven cannot run in the sandbox (node there cannot make the pipes Playwright speaks over, and a headless Edge that is kept open falls
-/// over within a second, where one that loads a page and ends does not), so the steps go in the page and run in the one load that is read.
+/// over within a second, where one that loads a page and ends does not), so the steps go in the page and run in the load that is read. A reload they make as a statement (`location.reload()`,
+/// `await reload()`, `await page.reload()`) divides them into parts, a part in each load, and `with_steps` says why, and how, below.
 const STEPS_PRELUDE: &str = r#"<script>
 (async () => {
   const wait = (ms) => new Promise((done) => setTimeout(done, ms));
@@ -125,27 +126,164 @@ const STEPS_PRELUDE: &str = r#"<script>
   const page = {
     evaluate, locator,
     click: (selector) => click(selector), fill: (selector, value) => fill(selector, value), press: (selector, key) => press(selector, key), check: (selector) => check(selector), selectOption: (selector, value) => select(selector, value),
-    waitForTimeout: (ms) => wait(ms),
+    waitForTimeout: (ms) => wait(ms), reload: () => reload(),
     textContent: async (selector) => find(selector).textContent, isVisible: async (selector) => visible(selector),
     $eval: (selector, fn, ...args) => evaluate(fn, find(selector), ...args),
     $$eval: (selector, fn, ...args) => evaluate(fn, [...document.querySelectorAll(selector)], ...args),
   };
+  // (a reload that is not at the steps' top level, in a function or a callback, is made here, and runs them from the start again, as the page loads again)
+  const reload = async () => { location.reload(); await new Promise(() => {}); };
+  // (what a person sees of the page: the text the browser itself lays out, hidden elements left out; cut where a character is whole)
+  const seen = () => { try { return Array.from(document.body.innerText || '').slice(0, 2000).join(''); } catch (error) { return ''; } };
   await new Promise((done) => document.readyState === 'complete' ? done() : addEventListener('load', done));
-  try {
-    await (async () => {
 "#;
-const STEPS_END: &str = r#"
-    })();
+const STEPS_END: &str = r#"  ];
+  // Which part is due is kept in the tab's own storage, under this run's name: nothing there is the first load, `due:N` is what a reload of the steps' own asked for, and anything
+  // else (a part that was taken and not ended by a reload of the steps': the page's own script reloaded it) is no part due, so that none runs twice.
+  let state = null;
+  try { state = sessionStorage.getItem(key); } catch (error) { state = undefined; }
+  if (state === undefined && parts.length > 1) { console.error('DOGMIND-STEPS-FAILED: this page does not let the steps keep which part is next across a reload (its sessionStorage is refused)'); return; }
+  const index = state === null || state === undefined ? 0 : state.startsWith('due:') ? Number(state.slice(4)) : -1;
+  if (!(index >= 0 && index < parts.length)) return;
+  const keep = (value) => { try { sessionStorage.setItem(key, value); } catch (error) {} };
+  keep('ran:' + index);
+  console.log('DOGMIND-STEPS-PART ' + (index + 1) + '/' + parts.length);
+  try {
+    await parts[index]();
+    if (index + 1 < parts.length) {
+      keep('due:' + (index + 1));
+      location.reload();
+      await new Promise(() => {});
+    }
+    keep('done');
     console.log('DOGMIND-STEPS-DONE');
   } catch (error) {
+    keep('done');
     // (a name that is not here: the ones that are, once, as the model has no other place to read them)
-    const hint = error instanceof ReferenceError || /is not a function/.test(String(error && error.message)) ? ' (here: click, fill, press, check, select, wait, text, count, visible, evaluate, and page.click/fill/press/check/selectOption/waitForTimeout/textContent/isVisible/evaluate/$eval/$$eval/locator(sel); the rest is plain JavaScript in the page)' : '';
+    const hint = error instanceof ReferenceError || /is not a function/.test(String(error && error.message)) ? ' (here: click, fill, press, check, select, wait, reload, text, count, visible, evaluate, and page.click/fill/press/check/selectOption/waitForTimeout/reload/textContent/isVisible/evaluate/$eval/$$eval/locator(sel); the rest is plain JavaScript in the page)' : '';
     console.error('DOGMIND-STEPS-FAILED: ' + error.message + hint);
   }
+  console.log('DOGMIND-STEPS-TEXT:' + encodeURIComponent(seen()));
 })();
 </script>"#;
-/// The page with the steps at its end and its folder as its base, so that what it names by a relative path is what it would have had.
-fn with_steps(html: &str, base: &str, steps: &str) -> String {
+/// The most parts the steps are cut into by reloads. A page that reloads more often than that is not what a check is made of.
+const MOST_PARTS: usize = 5;
+
+/// How far a reload statement reaches, if `rest` begins with one: `location.reload()`, `window.location.reload()`, `await reload()` and `await page.reload()` (the `await` is as
+/// optional as the `;` after), with plain arguments if any.
+fn reload_statement(rest: &str) -> Option<usize> {
+    static PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| Regex::new(r"^(?:await\s+)?(?:(?:window\.)?location\.reload|reload|page\.reload)\s*\([^()]*\)[ \t]*;?").expect("the pattern is valid"));
+    pattern.find(rest).map(|found| found.end())
+}
+
+/// The end of the string, template or comment that begins at `at` in `bytes`, or `at` itself if none does. A template's `${...}` holds code, which has strings of its own.
+fn skip_quoted(bytes: &[u8], at: usize) -> usize {
+    let end = bytes.len();
+    match bytes[at] {
+        quote @ (b'"' | b'\'') => {
+            let mut i = at + 1;
+            while i < end && bytes[i] != quote && bytes[i] != b'\n' {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            (i + 1).min(end)
+        }
+        b'`' => {
+            let mut i = at + 1;
+            while i < end && bytes[i] != b'`' {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                } else if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    let mut depth = 1;
+                    i += 2;
+                    while i < end && depth > 0 {
+                        match bytes[i] {
+                            b'{' => depth += 1,
+                            b'}' => depth -= 1,
+                            b'"' | b'\'' | b'`' | b'/' => {
+                                let after = skip_quoted(bytes, i);
+                                if after > i {
+                                    i = after;
+                                    continue;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            (i + 1).min(end)
+        }
+        b'/' if bytes.get(at + 1) == Some(&b'/') => bytes[at..].iter().position(|byte| *byte == b'\n').map_or(end, |line| at + line),
+        b'/' if bytes.get(at + 1) == Some(&b'*') => bytes[at + 2..].windows(2).position(|pair| pair == b"*/").map_or(end, |close| at + 2 + close + 2),
+        _ => at,
+    }
+}
+
+/// The steps cut at each reload they make as a statement of their own, outside strings and comments and outside any bracket (a reload in a function, a callback or the block of a
+/// condition is not a cut: it is the page being loaded again from inside them, as it was). A reload ends the part before it; the part after it begins where it ends.
+fn split_steps(steps: &str) -> Vec<String> {
+    let bytes = steps.as_bytes();
+    let (mut parts, mut start, mut at, mut depth) = (Vec::new(), 0, 0, 0i32);
+    // (the last byte of code seen, and whether a line ended since: a statement begins after `;` or `}`, or on a line of its own)
+    let (mut last, mut line_ended) = (None::<u8>, true);
+    while at < bytes.len() {
+        let byte = bytes[at];
+        let after = skip_quoted(bytes, at);
+        if after > at {
+            if byte == b'/' {
+                // (a comment: a line that ends in it has ended)
+                line_ended |= steps[at..after].contains('\n') || after >= bytes.len() || bytes[after] == b'\n';
+            } else {
+                (last, line_ended) = (Some(byte), false);
+            }
+            at = after;
+            continue;
+        }
+        match byte {
+            b'\n' => line_ended = true,
+            b' ' | b'\t' | b'\r' => {}
+            b'(' | b'[' | b'{' => (depth, last, line_ended) = (depth + 1, Some(byte), false),
+            b')' | b']' | b'}' => (depth, last, line_ended) = (depth - 1, Some(byte), false),
+            _ => {
+                let word_begins = byte.is_ascii_alphabetic() && (at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || matches!(bytes[at - 1], b'_' | b'$' | b'.')));
+                let statement_begins = last.is_none() || matches!(last, Some(b';' | b'}')) || line_ended;
+                if depth == 0 && word_begins && statement_begins {
+                    if let Some(length) = reload_statement(&steps[at..]) {
+                        parts.push(steps[start..at].to_string());
+                        (at, start) = (at + length, at + length);
+                        (last, line_ended) = (Some(b';'), false);
+                        continue;
+                    }
+                }
+                (last, line_ended) = (Some(byte), false);
+            }
+        }
+        at += 1;
+    }
+    parts.push(steps[start..].to_string());
+    parts
+}
+
+/// The steps in the parts a reload makes of them, at most `MOST_PARTS`, and how many more there were.
+fn step_parts(steps: &str) -> (Vec<String>, usize) {
+    let mut parts = split_steps(steps);
+    let more = parts.len().saturating_sub(MOST_PARTS);
+    parts.truncate(MOST_PARTS);
+    (parts, more)
+}
+
+/// The numbers of the parts of the steps that began, in the order they did, from what the browser said: a line `DOGMIND-STEPS-PART 2/3` for each.
+fn parts_begun(err: &str) -> Vec<usize> {
+    err.lines().filter_map(|line| line.split_once("DOGMIND-STEPS-PART ").and_then(|(_, rest)| rest.split('/').next()?.trim().parse().ok())).collect()
+}
+
+/// The page with the steps at its end and its folder as its base, so that what it names by a relative path is what it would have had. `key`: the name under which the page keeps, in
+/// the tab's storage, which part of the steps is next.
+fn with_steps(html: &str, base: &str, steps: &str, key: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = html.to_string();
     // (one with a base of its own keeps it)
@@ -155,7 +293,9 @@ fn with_steps(html: &str, base: &str, steps: &str) -> String {
         out.insert_str(at, &tag);
     }
     // (what the steps say cannot end the script they are in)
-    let script = format!("{STEPS_PRELUDE}{}{STEPS_END}", steps.replace("</script", "<\\/script").replace("</SCRIPT", "<\\/SCRIPT"));
+    let (parts, _) = step_parts(steps);
+    let parts: String = parts.iter().map(|part| format!("    async () => {{\n{}\n    }},\n", part.replace("</script", "<\\/script").replace("</SCRIPT", "<\\/SCRIPT"))).collect();
+    let script = format!("{STEPS_PRELUDE}  const key = '{key}';\n  const parts = [\n{parts}{STEPS_END}");
     match out.to_ascii_lowercase().rfind("</body>") {
         Some(at) => out.insert_str(at, &script),
         None => out.push_str(&script),
@@ -437,12 +577,15 @@ fn shown(dom: &str) -> (String, String) {
 }
 
 /// `needs`: what a file page was read to need; a page a local server gives has none of that known.
-fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Needs>, console: &[String], dom: &str) -> String {
+/// `steps_lost`: what is said in place of the browser's crash when it was the steps that did not end (they began, and the browser was stopped with them still going).
+fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Needs>, console: &[String], dom: &str, steps_lost: Option<&str>) -> String {
     let served = needs.is_none();
     let unknown = Needs::default();
     let needs = needs.unwrap_or(&unknown);
     let mut out = if served { format!("{page_name} in headless {browser_name}, with no network but this machine's own servers.\n") } else { format!("{page_name} in headless {browser_name}, with no network.\n") };
-    if !finished {
+    if let (false, Some(lost)) = (finished, steps_lost) {
+        out.push_str(lost);
+    } else if !finished {
         out.push_str("NOT CHECKED: the browser crashed or was stopped each time it was tried. This browser sometimes crashes in the sandbox, whatever the page, and a big WebGL drawing stops it too, so this says nothing about the page. What it had said by then is below. Running this check again changes nothing, and do not install anything to check it another way: say in your answer that the page was not checked.\n");
     }
     if !needs.remote.is_empty() {
@@ -524,7 +667,9 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     };
     let views = views_of(arguments)?;
     // (steps take time of their own, as their waits count in it)
-    let wait = arguments.get("wait_ms").and_then(Value::as_u64).unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS);
+    let (parts, more_parts) = steps.map_or((Vec::new(), 0), step_parts);
+    // (each load after the first costs time of its own: a page's own, as a plain page is given)
+    let wait = arguments.get("wait_ms").and_then(Value::as_u64).unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS) + parts.len().saturating_sub(1) as u64 * WAIT_MS;
     let cwd = page.as_deref().and_then(Path::parent).unwrap_or(workspace).to_path_buf();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp = crate::sandbox::temp_folder();
@@ -540,10 +685,11 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let temp = temp.as_ref().ok_or("the sandbox's folder could not be found, so the steps could not be run")?;
         let html = std::fs::read_to_string(page).map_err(|error| format!("{name}: {error}"))?;
         let base = file_url(page.parent().unwrap_or(workspace)) + "/";
-        let file_name = steps_page_of(&next_run());
+        let run = next_run();
+        let file_name = steps_page_of(&run);
         let copy = temp.join(&file_name);
         made.0.push(copy.clone());
-        std::fs::write(&copy, with_steps(&html, &base, steps)).map_err(|error| format!("{}: {error}", copy.display()))?;
+        std::fs::write(&copy, with_steps(&html, &base, steps, &format!("dogmind-steps-{run}"))).map_err(|error| format!("{}: {error}", copy.display()))?;
         (steps_copy, opened) = (Some(file_name), Some(copy));
     }
     // What the browser is given, on its command line and in the pictures' frame.
@@ -580,21 +726,39 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         None => format!("file:///{}/", plain(&root).replace('\\', "/")),
     };
     let mut console = console_lines(&err, &base_url);
-    let mut steps_said = String::new();
+    let (mut steps_said, mut steps_lost) = (String::new(), None);
     if let (Some(page), Some(copy)) = (&page, &steps_copy) {
         // (the copy's lines are the page's own; and whether the steps got to their end is said apart)
         let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
         let done = console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE"));
         let failed = console.iter().find_map(|line| line.split_once("DOGMIND-STEPS-FAILED: ").map(|(_, why)| why.to_string()));
+        let began = parts_begun(&err);
+        // (a part that began more than once is the page loading itself again, and with it the steps, from where it was: not the browser's doing, and not a crash)
+        let again = began.iter().find(|part| began.iter().filter(|other| other == part).count() > 1).copied();
         console.retain(|line| !line.contains("DOGMIND-STEPS-"));
         console.iter_mut().for_each(|line| *line = line.replace(copy.as_str(), &file_name));
-        steps_said = match (done, failed) {
-            (_, Some(why)) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
-            (true, None) => "Steps: all ran. What it shows, and its pictures, are the page after them.\n".to_string(),
-            (false, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms.\n"),
+        let in_parts = if parts.len() > 1 { format!(" (in {} parts, one after each reload they make)", parts.len()) } else { String::new() };
+        steps_said = match (done, failed, again) {
+            (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
+            (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
+            (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
+            (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms.\n"),
         };
+        let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
+        steps_said.push_str(&more_note);
+        // (stopped with them going on: that says what the steps and the page did, and nothing of a crash)
+        if !finished && (again.is_some() || how == "timed out") {
+            if again.is_none() {
+                steps_said = more_note;
+            }
+            steps_lost = Some(match (again, began.is_empty()) {
+                (Some(_), _) => "NOT CHECKED: the steps began again and again until the browser was stopped, which is not the browser crashing: see the steps below. Running this check again changes nothing until that is changed.\n".to_string(),
+                (None, true) => format!("NOT CHECKED: the browser was stopped after {} s and the steps had not begun: the page had not finished loading, with its own scripts and anything it waits for (or it loads itself again and again). This is not the browser crashing.\n", LIMIT.as_secs()),
+                (None, false) => format!("NOT CHECKED: the browser was stopped after {} s with the steps still going: the page or the steps are slow or do not end (a wait, a loop, a load that waits for the network). This is not the browser crashing. Shorter steps, or a page that settles, will be read.\n", LIMIT.as_secs()),
+            });
+        }
     }
-    let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom));
+    let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, steps_lost.as_deref()));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
     }
@@ -910,7 +1074,7 @@ mod tests {
         assert_eq!(needs.did_not_run, ["main.js"]);
         assert_eq!(needs.run, ["the page's script 3"]);
         assert!(needs.local_module);
-        let said = report("index.html", "Edge", true, Some(&needs), &[], "<html><body>hi</body></html>");
+        let said = report("index.html", "Edge", true, Some(&needs), &[], "<html><body>hi</body></html>", None);
         assert!(said.contains("DID NOT RUN"), "{said}");
         assert!(said.contains("a CDN library cannot load"), "{said}");
         assert!(!said.contains("no errors"), "it does not say all is well of what did not run: {said}");
@@ -1084,20 +1248,87 @@ mod tests {
 
     #[test]
     fn steps_go_at_the_end_of_the_page_with_its_folder_as_base_and_cannot_end_their_script() {
-        let page = with_steps("<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>", "file:///C:/w/", "await click('#a'); console.log('</script>')");
+        let page = with_steps("<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>", "file:///C:/w/", "await click('#a'); console.log('</script>')", "k");
         assert!(page.contains("<head><base href=\"file:///C:/w/\"><title>"), "{page}");
         let (steps_at, body_end) = (page.find("click('#a')").unwrap(), page.rfind("</body>").unwrap());
         assert!(page.find("<p>x</p>").unwrap() < steps_at && steps_at < body_end, "{page}");
         assert!(page.contains("console.log('<\\/script>')") && page.matches("</script>").count() == 1, "{page}");
-        let bare = with_steps("<p>no head</p>", "file:///C:/w/", "1");
+        let bare = with_steps("<p>no head</p>", "file:///C:/w/", "1", "k");
         assert!(bare.starts_with("<base href=") && bare.ends_with("</script>"), "{bare}");
-        let based = with_steps("<head><base href=\"x/\"></head>", "file:///C:/w/", "1");
+        let based = with_steps("<head><base href=\"x/\"></head>", "file:///C:/w/", "1", "k");
         assert_eq!(based.matches("<base").count(), 1, "a page's own base stays");
     }
 
     #[test]
+    fn a_reload_the_steps_make_as_a_statement_divides_them_into_parts() {
+        // what a real model wrote: the part before the reload runs in the first load, the part after it in the next
+        let steps = "await fill('#input', 'x'); await click('#add-btn'); console.log('before reload:', count('li')); location.reload(); await wait(800); console.log('after reload:', count('li'))";
+        let parts = split_steps(steps);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts[0].ends_with("count('li')); ") && !parts[0].contains("reload();"), "{parts:?}");
+        assert!(parts[1].starts_with(" await wait(800);") && parts[1].contains("after reload"), "{parts:?}");
+        // each of the forms, with the `await` and the `;` as they are or are not
+        for reload in ["location.reload()", "window.location.reload();", "await reload();", "await reload()", "await page.reload();", "page.reload()", "location.reload(true);", "  await  page.reload( )  ;"] {
+            let parts = split_steps(&format!("await click('#a');\n{reload}\nawait click('#b');"));
+            assert_eq!(parts.len(), 2, "{reload}: {parts:?}");
+            assert!(parts[0].contains("#a") && !parts[0].contains("reload") && parts[1].contains("#b") && !parts[1].contains("reload"), "{reload}: {parts:?}");
+        }
+        // several, and a reload alone
+        assert_eq!(split_steps("a(); location.reload(); b(); await reload(); c();").len(), 3);
+        assert_eq!(split_steps("location.reload()").len(), 2);
+        assert_eq!(split_steps("await click('#a')"), vec!["await click('#a')".to_string()]);
+    }
+
+    #[test]
+    fn a_reload_in_a_string_a_comment_a_function_or_a_condition_is_not_a_cut() {
+        for steps in [
+            "console.log('location.reload()'); await click('#a');",
+            "console.log(\"await reload();\"); await click('#a');",
+            "console.log(`${1 + 1} location.reload() ${'}'} await reload();`); await click('#a');",
+            "// location.reload();\nawait click('#a');",
+            "/* location.reload();\n await reload(); */ await click('#a');",
+            "await click('#a'); // then location.reload();",
+            "const again = () => { location.reload(); }; await again();",
+            "const again = async function () { await page.reload(); }; await again();",
+            "setTimeout(() => location.reload(), 10); await wait(50);",
+            "if (count('li') > 2) { location.reload(); }",
+            "if (count('li') > 2) location.reload();",
+            "const where = window.mylocation.reload(); await click('#a'); foo.location.reload();",
+            "await click('#a'); const x = ['a', 'b'].map((n) => { location.reload(); return n; });",
+        ] {
+            assert_eq!(split_steps(steps), vec![steps.to_string()], "{steps}");
+        }
+        // one that is a statement, with others around that are not
+        let parts = split_steps("console.log('location.reload()'); const f = () => { location.reload(); };\nawait reload();\n// location.reload();\nawait click('#b');");
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts[0].contains("const f") && parts[1].contains("#b"), "{parts:?}");
+    }
+
+    #[test]
+    fn the_parts_are_at_most_so_many_and_the_rest_is_counted() {
+        let many = (0..8).map(|n| format!("log({n}); location.reload();")).collect::<String>() + " log(9);";
+        assert_eq!(split_steps(&many).len(), 9);
+        let (parts, more) = step_parts(&many);
+        assert_eq!((parts.len(), more), (MOST_PARTS, 9 - MOST_PARTS));
+        assert_eq!(step_parts("log(1)"), (vec!["log(1)".to_string()], 0));
+        // the page carries those parts, in order, each as a function of its own, with the name that keeps which is next
+        let page = with_steps("<body></body>", "file:///C:/w/", "log(1); location.reload(); log(2);", "dogmind-steps-9-1");
+        assert!(page.contains("const key = 'dogmind-steps-9-1';"), "{page}");
+        let (first, second) = (page.find("log(1);").unwrap(), page.find(" log(2);").unwrap());
+        assert!(first < second && page.matches("    async () => {\n").count() == 2, "{page}");
+        assert!(page.contains("sessionStorage") && !page.contains("location.reload(); log(2)"), "the reload between the parts is the page's, not a line of the steps");
+    }
+
+    #[test]
+    fn what_the_browser_said_of_the_parts_that_began_is_read_in_order() {
+        let said = "[1:2:3/4:INFO:CONSOLE:5] \"DOGMIND-STEPS-PART 1/3\", source: file:///x (5)\n[1:2:3/4:INFO:CONSOLE:5] \"fine\", source: a.js (1)\n[1:2:3/4:INFO:CONSOLE:5] \"DOGMIND-STEPS-PART 2/3\", source: file:///x (5)\n[1:2:3/4:INFO:CONSOLE:5] \"DOGMIND-STEPS-PART 2/3\", source: file:///x (5)\n";
+        assert_eq!(parts_begun(said), vec![1, 2, 2]);
+        assert!(parts_begun("nothing of the steps here").is_empty());
+    }
+
+    #[test]
     fn what_models_write_of_playwright_is_mapped_onto_the_helpers_and_the_rest_says_what_there_is() {
-        let page = with_steps("<body><p>x</p></body>", "file:///C:/w/", "await page.evaluate(() => 1)");
+        let page = with_steps("<body><p>x</p></body>", "file:///C:/w/", "await page.evaluate(() => 1)", "k");
         // each form, as a name the steps can use
         for form in [
             "const evaluate = async (fn, ...args)",
@@ -1141,6 +1372,51 @@ mod tests {
         assert!(said.contains("How it looks at mobile"), "{said}");
         let failed = check_page(&serde_json::json!({"path": "index.html", "steps": "await click('#nothing')"}), dir.path(), &AtomicBool::new(false)).unwrap();
         assert!(failed.contains("STEPS FAILED: nothing matches #nothing"), "{failed}");
+    }
+
+    /// With the real browser, in the real sandbox: steps that reload the page are run in parts, one in each load. What the first part put in the page's storage is there for the
+    /// second, and neither runs twice (they once ran from the top at every load, until the browser was stopped).
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn steps_that_reload_the_page_run_a_part_in_each_load() {
+        let (dir, _) = page(&[(
+            "index.html",
+            "<!DOCTYPE html><title>todo</title><input id=t><button id=add>add</button><ul id=l></ul><script>const items = JSON.parse(localStorage.getItem('items') || '[]'); const draw = () => { document.getElementById('l').innerHTML = items.map((x) => '<li>' + x + '</li>').join(''); }; document.getElementById('add').onclick = () => { items.push(document.getElementById('t').value); localStorage.setItem('items', JSON.stringify(items)); draw(); }; draw();</script>",
+        )]);
+        let steps = "await fill('#t', 'milk'); await click('#add'); console.log('before ' + count('li')); location.reload(); await wait(100); console.log('after ' + count('li') + ' ' + text('li'));";
+        let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps, "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        assert_eq!(said.matches("before 1").count(), 1, "{said}");
+        assert_eq!(said.matches("after 1 milk").count(), 1, "the item is there after the reload, once: {said}");
+        assert!(said.contains("Steps: all ran (in 2 parts") && !said.contains("STEPS"), "{said}");
+        // what it shows is the page after the last part
+        assert!(said.contains("text: add milk") || said.contains("milk"), "{said}");
+    }
+
+    /// With the real browser, in the real sandbox: a page whose own script reloads it once is not run twice by its steps, and steps that reload from inside a function neither loop nor end the browser.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn a_reload_the_page_makes_or_the_steps_make_in_a_function_does_not_run_them_again() {
+        let (dir, _) = page(&[
+            ("self.html", "<!DOCTYPE html><title>self</title><p>x</p><script>if (!sessionStorage.getItem('self')) { sessionStorage.setItem('self', '1'); location.reload(); }</script>"),
+            ("plain.html", "<!DOCTYPE html><title>plain</title><p>x</p>"),
+            ("loop.html", "<!DOCTYPE html><title>loop</title><p>x</p><script>sessionStorage.clear(); setTimeout(() => location.reload(), 200);</script>"),
+        ]);
+        let said = check_page(&serde_json::json!({"path": "self.html", "steps": "console.log('steps ran');", "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        assert_eq!(said.matches("steps ran").count(), 1, "{said}");
+        let started = std::time::Instant::now();
+        let said = check_page(&serde_json::json!({"path": "plain.html", "steps": "console.log('before'); const again = () => location.reload(); await again(); console.log('after');", "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        // (the load that follows the reload finds no part due, and runs nothing: each line once, and no loop to the end of the browser's time)
+        assert!(said.matches(": before
+").count() == 1 && said.matches(": after
+").count() == 1 && !said.contains("crashed"), "{said}");
+        assert!(started.elapsed() < Duration::from_secs(40), "it did not loop until the browser was stopped");
+        // a page that clears what the steps keep and reloads itself over and over does loop: that is said as the page's doing, not as the browser's crash
+        let said = check_page(&serde_json::json!({"path": "loop.html", "steps": "console.log('x');", "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        assert!(said.contains("STEPS DID NOT END: part 1 of them began") && !said.contains("crashed at random") && !said.contains("sometimes crashes"), "{said}");
     }
 
     /// `press` as Playwright has it, `press(selector, key)`, which a real model wrote and which failed as "nothing matches Enter"; the key alone,
@@ -1188,7 +1464,7 @@ mod tests {
         for wanted in ["Steps: all ran", "r1 1", "r2 5", "r3 todo", "r4 milk!", "r5 milk", "r6 milk true false", "r7 3 milk true", "r8 true b async"] {
             assert!(said.contains(wanted), "{wanted}: {said}");
         }
-        for (steps, wanted) in [("await page.goto('x')", "page.goto is not a function (here: click, fill, press, check, select, wait, text, count, visible, evaluate"), ("await foo(1)", "foo is not defined (here: click, fill")] {
+        for (steps, wanted) in [("await page.goto('x')", "page.goto is not a function (here: click, fill, press, check, select, wait, reload, text, count, visible, evaluate"), ("await foo(1)", "foo is not defined (here: click, fill")] {
             let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps}), dir.path(), &AtomicBool::new(false)).unwrap();
             assert!(said.contains(&format!("STEPS FAILED: {wanted}")), "{wanted}: {said}");
         }
@@ -1213,7 +1489,7 @@ mod tests {
         let (steps_copy, frame, shot) = (temp.join(steps_page_of(&own)), temp.join(frame_of(&own)), temp.join(shot_of(&own)));
         made.0.extend([steps_copy.clone(), frame.clone(), shot.clone()]);
         let html = std::fs::read_to_string(&index).unwrap();
-        std::fs::write(&steps_copy, with_steps(&html, &(file_url(dir.path()) + "/"), "await click('p'); console.log('steps done');")).unwrap();
+        std::fs::write(&steps_copy, with_steps(&html, &(file_url(dir.path()) + "/"), "await click('p'); console.log('steps done');", "dogmind-steps-probe")).unwrap();
         std::fs::write(&frame, frame_page(&file_url(&index), &View { label: "desktop".into(), width: 1280, height: 800 })).unwrap();
         let mut profiles = Profiles::new(dir.path(), dir.path());
         let (mut ends, mut bad, mut seconds) = (std::collections::BTreeMap::<String, usize>::new(), 0usize, 0f64);

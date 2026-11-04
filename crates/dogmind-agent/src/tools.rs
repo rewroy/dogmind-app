@@ -99,7 +99,7 @@ pub fn schemas() -> Value {
             "url": {"type": "string", "description": "Instead of path: http://localhost:PORT/ of a server you started"},
             "views": {"type": "array", "items": {"type": "string"}, "description": "desktop (default), mobile, or WxH"},
             "wait_ms": {"type": "integer"},
-            "steps": {"type": "string", "description": "JS run after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results"}
+            "steps": {"type": "string", "description": "JS run after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results. A reload (await reload()) starts the next part in the new load; variables do not carry over."}
         }), &[]),
         function("command_status", "A background command's state, and what it printed since the last look.", json!({"id": {"type": "string"}}), &[]),
         function("command_stop", "End a background command.", json!({"id": {"type": "string"}}), &["id"]),
