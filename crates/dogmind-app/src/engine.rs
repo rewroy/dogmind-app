@@ -328,6 +328,10 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
         }
     }
     let runnable = !entries.is_empty();
+    // Unsloth's bundles first, the ones supported first; in each part, the recommended first and then the list's order (a stable sort)
+    let unsloth_last = |entry: &CatalogEntry| !entry.bundle.as_ref().is_some_and(|bundle| bundle.provider.as_deref() == Some(UNSLOTH));
+    entries.sort_by_key(unsloth_last);
+    short_entries.sort_by_key(unsloth_last);
     entries.extend(short_entries);
     let machine = value.get("machine");
     let gpus: Vec<String> = machine.and_then(|machine| machine.get("gpus")).and_then(Value::as_array).into_iter().flatten().map(|gpu| {
@@ -1069,13 +1073,14 @@ mod tests {
             {{"model":"Qwen3.8-Flash-Next","provider":"ISTA-DASLab","quant":"IQ3_S","license":"Qwen Community License 1.0","license_url":"file:///C:/Windows/System32/calc.exe","download_bytes":1,"runs":true}}]}}"#,
             listed("Qwen3.8-Flash-Next", "ISTA-DASLab", "IQ2_XS"), listed("DeepSeek-V4.1-Flash-1017", "ISTA-DASLab", "IQ2_XS"));
         let entries = parse_list(&list, true).unwrap().entries;
+        // (Unsloth's first: then the list's order)
         assert_eq!(entries.len(), 4);
-        let qwen = entries[0].licence.clone().unwrap();
+        let qwen = entries[1].licence.clone().unwrap();
         assert_eq!(qwen.name, "Qwen Community License 1.0");
         assert!(qwen.terms.starts_with("https://huggingface.co/Qwen/"), "the base model's terms, which the quantized file inherits");
-        assert_eq!(entries[1].licence.clone().unwrap().name, "MIT");
-        assert!(entries[0].licence_line().unwrap().contains("Qwen Community License 1.0"));
-        assert_eq!(entries[2].licence, None, "a bundle that says no licence has no line");
+        assert_eq!(entries[2].licence.clone().unwrap().name, "MIT");
+        assert!(entries[1].licence_line().unwrap().contains("Qwen Community License 1.0"));
+        assert_eq!(entries[0].licence, None, "a bundle that says no licence has no line");
         assert_eq!(entries[3].licence, None, "an address that is no web address is not one to open in a browser");
         let help = parse_catalog("      --quant <NAME>  Qwen3.8-Flash-Next: IQ2_XS (68.0 GB). x\n");
         assert_eq!(help[0].licence_line(), None, "Straydog's own choice is no model yet");
@@ -1205,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn all_the_list_has_is_offered_in_its_order() {
+    fn all_the_list_has_is_offered_unsloths_first() {
         let (qwen, deepseek) = ("Qwen3.8-Flash-Next", "DeepSeek-V4.1-Flash-1017");
         let list = format!(r#"{{"bundles":[{}]}}"#, [
             listed(deepseek, "ISTA-DASLab", "IQ2_XXS"), listed(deepseek, "ISTA-DASLab", "IQ2_XS"), listed(deepseek, "Unsloth", "UD-IQ2_XXS"), listed(deepseek, "Unsloth", "UD-IQ1_M"),
@@ -1215,12 +1220,20 @@ mod tests {
             format!(r#"{{"model":"{qwen}","quant":"Q2_0","download_bytes":1,"runs":true}}"#),
         ].join(","));
         let entries = parse_list(&list, true).unwrap().entries;
-        // (a model Straydog lists that this app has never heard of needs nothing of it; one without a provider is an older Straydog's)
+        // (a model Straydog lists that this app has never heard of needs nothing of it; one without a provider is an older Straydog's;
+        // Unsloth's come first, each part in the list's order)
         assert_eq!(names(&entries), [
-            "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XXS", "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XS",
             "DeepSeek-V4.1-Flash-1017 · Unsloth · UD-IQ2_XXS", "DeepSeek-V4.1-Flash-1017 · Unsloth · UD-IQ1_M",
-            "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_S", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_XXS", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS", "Qwen3.8-Flash-Next · ISTA-DASLab · Q2_0",
-            "Qwen3.8-Flash-Next · Unsloth · UD-IQ1_M", "Qwen3.6-35B-A3B · Unsloth · UD-Q8_K_XL"]);
+            "Qwen3.8-Flash-Next · Unsloth · UD-IQ1_M", "Qwen3.6-35B-A3B · Unsloth · UD-Q8_K_XL",
+            "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XXS", "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XS",
+            "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_S", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_XXS", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS", "Qwen3.8-Flash-Next · ISTA-DASLab · Q2_0"]);
+        // one ISTA-DASLab's that Straydog recommends comes after Unsloth's, first of its own; and so with those short of graphics memory
+        let recommended = listed(qwen, "ISTA-DASLab", "IQ3_XXS").replace(r#""runs":true"#, r#""runs":true,"recommended":true"#);
+        let short = |provider: &str, quant: &str| listed(qwen, provider, quant).replace(r#""runs":true,"note":"n""#, r#""runs":false,"note":"needs 20 GiB of VRAM; this machine has 16 GiB""#);
+        let list = format!(r#"{{"bundles":[{}]}}"#, [listed(qwen, "ISTA-DASLab", "IQ2_XS"), recommended, listed(qwen, "Unsloth", "UD-IQ1_M"), short("ISTA-DASLab", "IQ3_S"), short("Unsloth", "UD-IQ3_XXS")].join(","));
+        assert_eq!(names(&parse_list(&list, true).unwrap().entries), [
+            "Qwen3.8-Flash-Next · Unsloth · UD-IQ1_M", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_XXS", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS",
+            "Qwen3.8-Flash-Next · Unsloth · UD-IQ3_XXS", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_S"]);
     }
 
     #[test]
