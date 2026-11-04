@@ -415,6 +415,7 @@ const JA: &[(&str, &str)] = &[
     ("Dogmind {0} is available.", "Dogmind {0} の新しいバージョンがあります。"),
     ("Open the release page", "リリースページを開く"),
     ("No release has been published yet.", "公開されているリリースはまだありません。"),
+    ("This test build asks no one.", "このテストビルドはどこにも問い合わせません。"),
     ("Could not reach GitHub.", "GitHub に接続できませんでした。"),
     ("GitHub did not answer in time.", "GitHub からの応答が時間内にありませんでした。"),
     ("GitHub answered with an error ({0}). Try again later.", "GitHub がエラーを返しました ({0})。しばらくしてからもう一度お試しください。"),
