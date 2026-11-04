@@ -243,6 +243,17 @@ pub fn is_nudge(text: &str) -> bool {
     text == CONTINUE_NUDGE || text.starts_with(DRAFT_NOTE) || Some(text) == CHECK_NUDGE.strip_prefix(DRAFT_NOTE)
 }
 
+/// Whether the person has said that no file is to change (「ファイルは変更しないでください」, "do not change any files", read-only): the turn is a look, and the code that is in its
+/// reasoning is for its answer, which is typed once. Only what says so plainly: a request that does not say it may change files.
+pub fn forbids_changes(text: &str) -> bool {
+    const WORDS: [&str; 33] = [
+        "変更しない", "変更はしない", "変更せず", "編集しない", "編集せず", "書き換えない", "書き換えず", "修正しない", "修正せず", "書き込まない", "触らない", "変えないで", "読むだけ", "見るだけ", "読み取り専用", "読み取りだけ", "ファイルを作らない",
+        "do not change", "don't change", "do not modify", "don't modify", "do not edit", "don't edit", "do not write", "don't write", "do not touch", "don't touch", "without changing", "without modifying", "without editing", "read-only", "read only", "no changes",
+    ];
+    let lower = text.to_lowercase();
+    WORDS.iter().any(|word| lower.contains(word))
+}
+
 /// A fact for this turn only, on a message built by [`user_message`], before what was typed and what it is to be answered in.
 pub fn with_note(message: &str, note: &str) -> String {
     match message.split_once('\n') {
@@ -272,6 +283,16 @@ pub fn typed_text(message: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_person_who_says_no_file_is_to_change_is_told_from_one_who_does_not() {
+        for no in ["ファイルは変更しないでください。", "コードは読むだけで、書き換えないで", "do not change files", "Don't modify anything, just report", "read-only please", "without changing the code"] {
+            assert!(super::forbids_changes(no), "{no}");
+        }
+        for yes in ["ToDo のページを index.html に作って", "ボタンの色を青系に変えて", "fix the bug in shop.py", "この問題点を調べて、重要なものを報告して", ""] {
+            assert!(!super::forbids_changes(yes), "{yes}");
+        }
+    }
+
     use super::*;
 
     #[test]
