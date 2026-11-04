@@ -511,6 +511,7 @@ const JA: &[(&str, &str)] = &[
     ("setting up the model", "モデルを準備中"),
     ("starts when you write", "入力すると起動します"),
     ("this address is not from your messages, a search or a page, and an address can carry data out", "このアドレスはあなたのメッセージにも検索結果にもページにも出ていません。アドレスにはデータを載せて外へ送れます。"),
+    ("web content is in this conversation, and an address can carry data out in its path", "この会話にはウェブの内容が含まれています。アドレスのパスにもデータを載せて外へ送れます。"),
     ("this query looks like it holds a secret or a private path, and it would go to a search index", "この検索語には秘密の値か個人のパスが含まれているようです。検索エンジンに送られます。"),
     ("the engine stopped", "エンジン停止"),
     ("connecting", "接続中"),
@@ -915,6 +916,13 @@ mod tests {
         assert_eq!(in_japanese("Session compacted: old tool outputs shortened by 12 KB"), "セッションを圧縮しました: 古いツール出力を 12 KB 短くしました");
         assert_eq!(in_japanese("Session compacted: every tool output, the newest too, shortened by 30 KB, as nothing else would fit"), "セッションを圧縮しました: ほかに減らせるものがないため、最新のものも含めてツール出力を 30 KB 短くしました");
         assert_eq!(in_japanese("words no table has"), "words no table has");
+    }
+
+    #[test]
+    fn the_reasons_an_address_asks_are_in_japanese() {
+        for reason in ["this address is not from your messages, a search or a page, and an address can carry data out", "web content is in this conversation, and an address can carry data out in its path"] {
+            assert_ne!(in_japanese(reason), reason);
+        }
     }
 
     #[test]

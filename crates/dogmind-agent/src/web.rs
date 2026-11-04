@@ -255,6 +255,15 @@ pub fn address_carries_nothing(url: &str) -> bool {
     const MOST_PIECE: usize = 48;
     const MOST_PATH: usize = 160;
     let Some((_, rest)) = url.split_once("://") else { return false };
+    // What the server reads, not what is written: to it `%3F` is a `?` (and `%253F` is, to one that decodes twice), and a key can be spelled in `%41`s.
+    let mut rest = rest.to_string();
+    for _ in 0..3 {
+        let plain = unpercent(&rest);
+        if plain == rest {
+            break;
+        }
+        rest = plain;
+    }
     if rest.contains('?') || rest.contains('#') || rest.contains('@') {
         return false;
     }
