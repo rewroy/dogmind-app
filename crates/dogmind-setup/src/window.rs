@@ -171,6 +171,8 @@ enum Message {
     Failed(Failure),
     Stopped,
     Removed(Result<Vec<String>, String>),
+    /// What an update waited for has ended, or been waited for as long as it will be.
+    Waited,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -216,6 +218,8 @@ struct App {
     exit_code: i32,
     /// When the app's page is what removes it: nothing is left to do but leave.
     auto_tries: u32,
+    /// Started with `--update` by the app: it began on the work itself, and when that is done the app is started again, and this closes. A failure keeps the window, with a way to start the app as it was.
+    updating: bool,
 }
 
 static APP: AtomicIsize = AtomicIsize::new(0);
@@ -313,7 +317,7 @@ impl App {
                 });
                 let can_stop = !matches!(stage, Some(Stage::Placing | Stage::Finishing)) && !stopping;
                 View {
-                    heading: if *stopping { self.w("Stopping...", "中止しています...") } else if *update { self.w("Updating...", "更新しています...") } else { self.w("Installing...", "インストールしています...") },
+                    heading: if *stopping { self.w("Stopping...", "中止しています...") } else if *update { self.w("Updating Dogmind...", "Dogmind を更新しています...") } else { self.w("Installing...", "インストールしています...") },
                     small,
                     fraction: Some(progress.as_ref().map_or(0.0, |progress| progress.fraction)),
                     secondary: can_stop.then(|| self.w("Cancel", "キャンセル")),
@@ -327,6 +331,16 @@ impl App {
                     Failure::Said(words) => words.clone(),
                     Failure::Stopped => String::new(),
                 };
+                if self.updating {
+                    return View {
+                        heading: self.w("The update did not finish", "更新を完了できませんでした"),
+                        detail: format!("{why} {}", self.w("Start Dogmind as it is, or try the update again.", "Dogmind をそのまま起動するか、もう一度更新を試してください。")),
+                        primary: Some(self.w("Try again", "もう一度試す")),
+                        secondary: Some(self.w("Start Dogmind", "Dogmind を起動")),
+                        problem: true,
+                        ..View::default()
+                    };
+                }
                 View {
                     heading: self.w("It did not finish", "完了できませんでした"),
                     detail: format!("{why} {}", self.w("What was done stays: trying again, or running this again, goes on from there.", "ここまでの作業は残っています。もう一度試すか、これをもう一度実行すれば続きから進みます。")),
@@ -400,6 +414,10 @@ impl App {
                 } else {
                     PostMessageW(self.window, WM_COMMAND, 1, 0);
                 }
+            }
+            // (an update that failed: what a person does is start the app as it was, which ends with the failure all the same)
+            Page::Failed { .. } if self.updating => {
+                PostMessageW(self.window, WM_COMMAND, 2, 0);
             }
             Page::Failed { .. } | Page::RemoveFailed(_) | Page::Refused(..) => self.finish(1),
             Page::Installed { .. } | Page::Gone { .. } => self.finish(0),
@@ -628,6 +646,32 @@ impl App {
         });
     }
 
+    /// `--update`: the page that works, at once. What the app was started with named is waited for off this thread (the window goes on answering), and then it is as if the person had pressed
+    /// Update: whoever still runs from the folder is asked, and then the files go in their places.
+    unsafe fn begin_update(&mut self) {
+        self.stop.store(false, Ordering::Relaxed);
+        self.page = Page::Working { progress: None, stopping: false, update: true };
+        self.refresh();
+        let (sender, window, pids) = (self.sender.clone(), self.window as isize, self.options.wait_pids.clone());
+        std::thread::spawn(move || {
+            system::wait_for_end(&pids, 30_000);
+            let _ = sender.send(Message::Waited);
+            // SAFETY: a message to a window that has gone is simply lost.
+            unsafe { PostMessageW(window as HWND, WM_WORKER, 0, 0) };
+        });
+    }
+
+    /// The app, started from the folder as the Installed page's button starts it; and this has done its work. `false`, with the window as it was, when the app cannot be started.
+    unsafe fn start_the_app_and_close(&mut self, code: i32) -> bool {
+        match system::start_program(&self.folder().join(&self.options.app_name), "", self.options.test) {
+            Ok(()) => {
+                self.finish(code);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Who is running, and on to `then` if no one is.
     unsafe fn clear_the_way(&mut self, then: After) {
         let running = system::running_from(self.folder(), !self.options.test);
@@ -715,8 +759,23 @@ impl App {
             }
             Page::Removing { .. } => {}
             Page::Gone { .. } | Page::Installed { .. } => self.finish(0),
+            // (an update that failed is of an app that is not running: its button starts it as it was, and the window's own close stays what it says)
+            Page::Failed { .. } if self.updating => {
+                if !self.start_the_app_and_close(1) {
+                    self.finish(1);
+                }
+            }
             Page::Failed { .. } | Page::RemoveFailed(_) | Page::Refused(..) => self.finish(1),
             _ => self.finish(2),
+        }
+    }
+
+    /// The window's own close button: what the secondary button does, but it never starts the app.
+    unsafe fn on_close(&mut self) {
+        if self.updating && matches!(self.page, Page::Failed { .. }) {
+            self.finish(1);
+        } else {
+            self.on_secondary();
         }
     }
 
@@ -743,8 +802,19 @@ impl App {
                     self.refresh();
                 }
                 Message::Installed(update) => {
+                    // (an update the app asked for does not wait to be told it is done: the app is back, and this is gone)
+                    if self.updating && self.start_the_app_and_close(0) {
+                        continue;
+                    }
                     self.page = Page::Installed { update };
                     self.refresh();
+                }
+                Message::Waited => {
+                    if self.stop.load(Ordering::Relaxed) {
+                        self.finish(2);
+                    } else {
+                        self.clear_the_way(After::Install);
+                    }
                 }
                 Message::Failed(failure) => {
                     self.page = Page::Failed { failure };
@@ -835,7 +905,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_CLOSE => {
-            app.on_secondary();
+            app.on_close();
             0
         }
         WM_DPICHANGED => {
@@ -858,6 +928,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
 /// What the window opens on.
 pub enum Start {
     Install { previous: Option<String>, version: String },
+    /// `--update`: the install that is there, updated at once, with no page before the work.
+    Update { previous: String, version: String },
     Refuse(String, String),
     /// `--uninstall`: the way cleared, then the app's own page.
     Uninstall,
@@ -915,15 +987,18 @@ pub fn run(options: Options, start: Start) -> i32 {
         let japanese = japanese(&options);
         let (version, previous) = match &start {
             Start::Install { previous, version } => (version.clone(), previous.clone()),
+            Start::Update { previous, version } => (version.clone(), Some(previous.clone())),
             _ => (String::new(), None),
         };
+        let updating = matches!(start, Start::Update { .. });
         let page = match &start {
             Start::Install { .. } => Page::Ready { notice: None },
+            Start::Update { .. } => Page::Working { progress: None, stopping: false, update: true },
             Start::Refuse(heading, detail) => Page::Refused(heading.clone(), detail.clone()),
             Start::Uninstall | Start::FinishRemoval => Page::Removing { fraction: 0.0 },
         };
         let fixed = previous.is_some();
-        let app = Box::into_raw(Box::new(App { options, japanese, version, previous, window, primary, secondary, change, fixed, dpi, colours, fonts: [std::ptr::null_mut(); 3], page, view: View::default(), sender, messages, stop: Arc::new(AtomicBool::new(false)), exit_code: 0, auto_tries: 0 }));
+        let app = Box::into_raw(Box::new(App { options, japanese, version, previous, window, primary, secondary, change, fixed, dpi, colours, fonts: [std::ptr::null_mut(); 3], page, view: View::default(), sender, messages, stop: Arc::new(AtomicBool::new(false)), exit_code: 0, auto_tries: 0, updating }));
         APP.store(app as isize, Ordering::Relaxed);
         let app = &mut *app;
         app.make_fonts();
@@ -932,6 +1007,7 @@ pub fn run(options: Options, start: Start) -> i32 {
         match start {
             Start::Uninstall => app.clear_the_way(After::OpenRemoval),
             Start::FinishRemoval => app.start_removal(),
+            Start::Update { .. } => app.begin_update(),
             _ => app.refresh(),
         }
         if !app_is_a_test && GetFocus().is_null() && app.view.primary.is_some() {

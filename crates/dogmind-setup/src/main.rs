@@ -4,6 +4,8 @@
 //!     dogmind-setup --verify FILE.exe                                    unpacks all of it to nowhere, and says if every file is sound
 //!     DogmindSetup.exe [--dir FOLDER]                                    installs, or updates what is there. It starts with FOLDER, else with the install Installed apps names if that is still
 //!                                                                        there, else with %LOCALAPPDATA%\Programs\Dogmind; a first install can be moved to another folder on its first page
+//!     DogmindSetup.exe --update --dir FOLDER [--wait-pid PID]...         what the app runs for an update it has downloaded: no question is asked. It waits for those
+//!                                                                        programs to end, updates the install in FOLDER (which must hold one), and starts the app again
 //!     dogmind-uninstall.exe --uninstall                                  what Installed apps runs: clears the way, and opens the app's own page for removing it
 //!
 //! `--test` is for trying it out: no real Start menu entry or registry key is written, what would be goes in files in the folder, `--dir` must be named, and only what runs from that
@@ -46,6 +48,8 @@ struct Arguments {
     uninstall: bool,
     after_remove: bool,
     finish_removal: bool,
+    /// The app runs this for an update it has fetched: the install in `dir` is updated without a first page, and the app is started again after it.
+    update: bool,
     wait_pids: Vec<u32>,
 }
 
@@ -69,6 +73,7 @@ fn parse(mut words: impl Iterator<Item = std::ffi::OsString>) -> Result<Argument
             "--uninstall" => found.uninstall = true,
             "--after-remove" => found.after_remove = true,
             "--finish-removal" => found.finish_removal = true,
+            "--update" => found.update = true,
             other => return Err(format!("{other}: not something this understands")),
         }
     }
@@ -83,7 +88,29 @@ fn check(found: &Arguments) -> Result<(), String> {
     if found.auto && !found.test {
         return Err("--auto is for --test".to_string());
     }
+    if found.update {
+        if found.dir.is_none() {
+            return Err("--update needs --dir: the folder of the install to update".to_string());
+        }
+        if found.pack.is_some() || found.verify.is_some() || found.uninstall || found.after_remove || found.finish_removal {
+            return Err("--update goes with --dir, --wait-pid, --test and --auto, and with nothing else".to_string());
+        }
+    }
     Ok(())
+}
+
+/// What an update that was started wrongly says on a window: nobody reads a command line the app started this with.
+fn refuse_the_update(found: &Arguments, words: &str) -> i32 {
+    let options = Options { folder: found.dir.clone().unwrap_or_default(), test: found.test, ..Options::default() };
+    let japanese = window::japanese(&options);
+    let detail = match (found.dir.is_none(), japanese) {
+        (true, true) => "更新するインストール先のフォルダが指定されていません。".to_string(),
+        (true, false) => "No folder was named for the install to update.".to_string(),
+        (false, true) => "この更新は、使えない引数で起動されました。".to_string(),
+        (false, false) => format!("This update was started with arguments that cannot go together ({words})."),
+    };
+    window::run(options, window::Start::Refuse((if japanese { "Dogmind を更新できません" } else { "Dogmind cannot be updated" }).to_string(), detail));
+    1
 }
 
 /// Windows's own: the entries, or under the test switch, or for an install made with it, what stands in for them.
@@ -174,10 +201,14 @@ fn number_from(name: &str, test: bool) -> Option<u64> {
 }
 
 fn main() {
-    let found = match parse(std::env::args_os().skip(1)).and_then(|found| check(&found).map(|()| found)) {
+    let found = match parse(std::env::args_os().skip(1)) {
         Ok(found) => found,
         Err(words) => std::process::exit(fail(&words)),
     };
+    if let Err(words) = check(&found) {
+        // (an update is started by the app, which reads no command line: it is said on a window; a test run says it where its caller reads)
+        std::process::exit(if found.update && !found.test { refuse_the_update(&found, &words) } else { fail(&words) });
+    }
     let version = found.version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     if let Some((folder, out)) = &found.pack {
         std::process::exit(do_pack(folder, out, &version, found.level.unwrap_or(9)));
@@ -208,7 +239,7 @@ fn main() {
     } else if found.uninstall {
         window::Start::Uninstall
     } else {
-        start_of_install(&options)
+        start_of_install(&options, found.update)
     };
     let code = window::run(options, start);
     if found.finish_removal {
@@ -217,16 +248,26 @@ fn main() {
     std::process::exit(code);
 }
 
-fn start_of_install(options: &Options) -> window::Start {
+/// The first thing the window shows: the install's page, or, for `--update`, the work itself, which has no page before it and must find an install to work on.
+fn start_of_install(options: &Options, updating: bool) -> window::Start {
     let japanese = window::japanese(options);
     let words = |english: &str, in_japanese: &str| (if japanese { in_japanese } else { english }).to_string();
     if system::windows_build().is_some_and(|build| build < 22000) {
         return window::Start::Refuse(words("Dogmind needs Windows 11", "Dogmind には Windows 11 が必要です"), words("This version of Windows is older.", "この Windows はそれより前のバージョンです。"));
     }
+    let previous = install::read_manifest(&options.folder).map(|manifest| manifest.version);
+    if updating && previous.is_none() {
+        let folder = options.folder.display();
+        return window::Start::Refuse(
+            words("Dogmind cannot be updated", "Dogmind を更新できません"),
+            if japanese { format!("{folder} には Dogmind のインストールがないため、更新するものがありません。") } else { format!("{folder} holds no install of Dogmind, so there is nothing to update.") },
+        );
+    }
     let package = std::env::current_exe().and_then(|exe| pack::Package::open(&exe));
-    match package {
-        Ok(package) => window::Start::Install { previous: install::read_manifest(&options.folder).map(|manifest| manifest.version), version: package.version },
-        Err(error) => window::Start::Refuse(words("This file cannot be used", "このファイルは使えません"), if japanese { format!("{error}。もう一度ダウンロードしてください。") } else { format!("{error}. Download it again.") }),
+    match (package, previous) {
+        (Ok(package), Some(previous)) if updating => window::Start::Update { previous, version: package.version },
+        (Ok(package), previous) => window::Start::Install { previous, version: package.version },
+        (Err(error), _) => window::Start::Refuse(words("This file cannot be used", "このファイルは使えません"), if japanese { format!("{error}。もう一度ダウンロードしてください。") } else { format!("{error}. Download it again.") }),
     }
 }
 
@@ -248,6 +289,24 @@ mod tests {
         assert!(args(&["--pack", "a"]).is_err());
         assert!(args(&["--whatever"]).is_err());
         assert_eq!(args(&["--wait-pid", "5", "--wait-pid", "6"]).unwrap().wait_pids, [5, 6]);
+    }
+
+    #[test]
+    fn an_update_names_its_folder_and_is_for_nothing_else() {
+        assert!(args(&["--update"]).unwrap().update);
+        assert!(check(&args(&["--update"]).unwrap()).unwrap_err().contains("--dir"), "an update with no folder has nothing to update");
+        assert!(check(&args(&["--update", "--wait-pid", "5"]).unwrap()).is_err());
+        let update = args(&["--update", "--dir", "C:\\x y", "--wait-pid", "5", "--wait-pid", "6"]).unwrap();
+        assert!(check(&update).is_ok());
+        assert_eq!((update.wait_pids.clone(), update.dir.clone()), (vec![5, 6], Some(PathBuf::from("C:\\x y"))));
+        // under the test switch as it is for an install: a scratch folder, and the person's screen left alone
+        assert!(check(&args(&["--update", "--test", "--dir", "x", "--auto"]).unwrap()).is_ok());
+        assert!(check(&args(&["--update", "--test"]).unwrap()).is_err());
+        for other in [&["--uninstall"][..], &["--after-remove"], &["--finish-removal"], &["--verify", "a.exe"], &["--pack", "a", "b"]] {
+            let mut words = vec!["--update", "--dir", "x"];
+            words.extend_from_slice(other);
+            assert!(check(&args(&words).unwrap()).unwrap_err().contains("--update"), "{other:?}");
+        }
     }
 
     #[test]
