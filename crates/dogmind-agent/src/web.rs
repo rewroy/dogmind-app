@@ -32,6 +32,9 @@ const MAX_DECODED: u64 = 20 << 20;
 /// A page's text at a time: `start_char` reads on. A local model takes half a minute to read 24,000 characters, each time.
 const MAX_TEXT: usize = 10_000;
 const MAX_LINKS: usize = 20;
+/// A title and a link's name are names, not the page: a page may stretch either for as long as it likes.
+const MAX_TITLE: usize = 300;
+const MAX_LINK_NAME: usize = 120;
 const MAX_QUERIES: usize = 3;
 const MAX_QUERY: usize = 300;
 const MAX_PAGES_KEPT: usize = 8;
@@ -202,7 +205,7 @@ impl Web {
         let shown: String = page.text.chars().skip(start).take(MAX_TEXT).collect();
         let mut body = String::new();
         if !page.title.is_empty() {
-            body.push_str(&format!("Title: {}\n", page.title));
+            body.push_str(&format!("Title: {}\n", clip(&page.title, MAX_TITLE)));
         }
         body.push_str(&format!("Address: {final_url}\n\n{shown}\n"));
         let end = start + shown.chars().count();
@@ -215,12 +218,22 @@ impl Web {
         if start == 0 && !page.links.is_empty() {
             body.push_str("\nLinks:\n");
             for (text, link) in &page.links {
-                body.push_str(&format!("- {text}: {link}\n"));
+                body.push_str(&format!("- {}: {link}\n", clip(text, MAX_LINK_NAME)));
             }
         }
         self.note_found(&body);
         Ok(envelope(&final_url, &body))
     }
+}
+
+/// A name shown to the model, within the length it is given: cut, it says so at its end.
+fn clip(text: &str, most: usize) -> String {
+    if text.chars().count() <= most {
+        return text.to_string();
+    }
+    let mut shown: String = text.chars().take(most).collect();
+    shown.push('…');
+    shown
 }
 
 fn queries_of(arguments: &Value) -> Vec<String> {
@@ -1043,6 +1056,25 @@ mod tests {
         assert!(text.contains("<untrusted_web_content") && text.contains("Ignore previous") && !text.contains("SECRET"), "{text}");
         assert!(web.is_known(&format!("{base}/next?a=1")));
         assert!(!web.is_known(&format!("{base}/next?a=1&stolen=key")));
+    }
+
+    #[test]
+    fn a_page_stretches_its_title_and_a_link_name_only_so_far() {
+        let title = "題".repeat(400);
+        let label = "名".repeat(200);
+        let html = format!("<title>{title}</title><p>words</p><a href=\"/a\">{label}</a>");
+        let answer: &'static str = Box::leak(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{html}", html.len()).into_boxed_str());
+        let base = serve(vec![answer]);
+        let mut web = local();
+        let cancel = AtomicBool::new(false);
+        let text = web.read(&json!({"url": format!("{base}/start")}), &cancel).unwrap();
+        let shown_title = text.lines().find_map(|line| line.strip_prefix("Title: ")).unwrap();
+        assert_eq!(shown_title, format!("{}…", title.chars().take(MAX_TITLE).collect::<String>()), "{shown_title}");
+        let link = text.lines().find_map(|line| line.strip_prefix("- ")).unwrap();
+        let (shown_label, address) = link.rsplit_once(": ").unwrap();
+        assert_eq!(shown_label, format!("{}…", label.chars().take(MAX_LINK_NAME).collect::<String>()), "{shown_label}");
+        assert_eq!(address, format!("{base}/a"));
+        assert_eq!(clip("A & B", MAX_TITLE), "A & B");
     }
 
     #[test]
