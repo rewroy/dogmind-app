@@ -23,6 +23,17 @@ fn flags() -> String {
     FLAGS.to_string()
 }
 const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-extensions --disable-background-networking --disable-sync --disable-component-update --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
+
+/// The command line of a run that dumps the page's DOM, as the sandbox's shell is given it: `%TEMP%` is the container's own folder, where the run's profile is.
+fn page_line(program: &Path, flags: &str, wait: u64, profile: &str, address: &str) -> String {
+    format!("\"{}\" {flags} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --dump-dom \"{address}\"", program.display())
+}
+
+/// The command line of a run that takes a picture of `frame` (a path) into `shot`, in a window of `window`.
+fn shot_line(program: &Path, flags: &str, window: (u32, u32), wait: u64, profile: &str, shot: &Path, frame: &str) -> String {
+    format!("\"{}\" {flags} --window-size={},{} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --screenshot=\"{}\" \"{frame}\"", program.display(), window.0, window.1, shot.display())
+}
+
 /// How long a page runs before it is read, unless the model asks for longer, for an animation, and the most it may.
 const WAIT_MS: u64 = 1500;
 const MOST_WAIT_MS: u64 = 10_000;
@@ -543,7 +554,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     for _ in 0..TRIES {
         let started = std::time::Instant::now();
         let profile = profiles.next();
-        let line = format!("\"{}\" {browser_flags} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --dump-dom \"{address}\"", program.display());
+        let line = page_line(&program, &browser_flags, wait, &profile, &address);
         let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel)?;
         (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
         #[cfg(debug_assertions)]
@@ -614,7 +625,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             let _ = std::fs::remove_file(&shot);
             let started = std::time::Instant::now();
             let profile = profiles.next();
-            let line = format!("\"{}\" {browser_flags} --window-size={window_width},{window_height} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --screenshot=\"{}\" \"{}\"", program.display(), shot.display(), plain(&frame));
+            let line = shot_line(&program, &browser_flags, (window_width, window_height), wait, &profile, &shot, &plain(&frame));
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
             #[cfg(debug_assertions)]
             if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
@@ -1177,6 +1188,60 @@ mod tests {
             let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps}), dir.path(), &AtomicBool::new(false)).unwrap();
             assert!(said.contains(&format!("STEPS FAILED: {wanted}")), "{wanted}: {said}");
         }
+    }
+
+    /// How the browser's own runs end, counted by their exit codes, on the command lines `check_page` runs (`page_line` and `shot_line`) and nothing between: a page that does
+    /// nothing, for `DOGMIND_PROBE_RUNS` runs (30), as `DOGMIND_PROBE_MODE` says: `dump` (the page's DOM), `shot` (a picture of it) or `steps` (the page with steps in it).
+    /// `DOGMIND_PAGE_FLAGS` adds flags to the browser's. `DOGMIND_PROBE_KEEP=FOLDER` keeps what the browser said in each run.
+    /// `DOGMIND_PROBE_RUNS=30 DOGMIND_PROBE_MODE=shot cargo test -p dogmind-agent --target-dir target-ui the_browsers_runs_are_counted_by_how_they_end -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "starts Edge in the sandbox, DOGMIND_PROBE_RUNS times"]
+    fn the_browsers_runs_are_counted_by_how_they_end() {
+        let runs: usize = std::env::var("DOGMIND_PROBE_RUNS").ok().and_then(|text| text.parse().ok()).unwrap_or(30);
+        let mode = std::env::var("DOGMIND_PROBE_MODE").unwrap_or_else(|_| "dump".to_string());
+        let keep = std::env::var_os("DOGMIND_PROBE_KEEP").map(PathBuf::from);
+        let (program, _) = browser().expect("Edge or Chrome is on this machine");
+        let (dir, index) = page(&[("index.html", "<!DOCTYPE html><title>plain</title><p>hello</p>")]);
+        let temp = crate::sandbox::temp_folder().expect("the sandbox's folder");
+        let (flags, wait) = (flags(), WAIT_MS);
+        let mut made = Removing(Vec::new());
+        let own = next_run();
+        let (steps_copy, frame, shot) = (temp.join(steps_page_of(&own)), temp.join(frame_of(&own)), temp.join(shot_of(&own)));
+        made.0.extend([steps_copy.clone(), frame.clone(), shot.clone()]);
+        let html = std::fs::read_to_string(&index).unwrap();
+        std::fs::write(&steps_copy, with_steps(&html, &(file_url(dir.path()) + "/"), "await click('p'); console.log('steps done');")).unwrap();
+        std::fs::write(&frame, frame_page(&file_url(&index), &View { label: "desktop".into(), width: 1280, height: 800 })).unwrap();
+        let mut profiles = Profiles::new(dir.path(), dir.path());
+        let (mut ends, mut bad, mut seconds) = (std::collections::BTreeMap::<String, usize>::new(), 0usize, 0f64);
+        for at in 0..runs {
+            let _ = std::fs::remove_file(&shot);
+            let profile = profiles.next();
+            let line = match mode.as_str() {
+                "shot" => shot_line(&program, &flags, (1344, 960), wait, &profile, &shot, &frame.display().to_string()),
+                "steps" => page_line(&program, &flags, 2 * wait, &profile, &steps_copy.display().to_string()),
+                _ => page_line(&program, &flags, wait, &profile, &index.display().to_string()),
+            };
+            let started = std::time::Instant::now();
+            let done = crate::sandbox::run_browser(&line, dir.path(), dir.path(), LIMIT, &AtomicBool::new(false));
+            seconds += started.elapsed().as_secs_f64();
+            let (end, well) = match &done {
+                Ok(done) => {
+                    let end = done.status.map_or(done.ended.to_string(), |code| format!("{:#x}", code as u32));
+                    let well = done.status == Some(0) && if mode == "shot" { image::open(&shot).is_ok() } else { !done.stdout.is_empty() };
+                    (end, well)
+                }
+                Err(error) => (format!("error: {error}"), false),
+            };
+            *ends.entry(end).or_default() += 1;
+            bad += usize::from(!well);
+            if let (Some(keep), Ok(done)) = (&keep, &done) {
+                let _ = std::fs::create_dir_all(keep);
+                let name = format!("{mode}-{at:03}-{}.txt", if well { "good" } else { "bad" });
+                let _ = std::fs::write(keep.join(name), format!("{:?} {:?}\n--- stdout {} bytes\n--- stderr\n{}", done.status, done.ended, done.stdout.len(), crate::sandbox::decode(&done.stderr)));
+            }
+        }
+        profiles.clear();
+        println!("PROBE mode={mode} runs={runs} bad={bad} ends={ends:?} seconds_each={:.2} flags={flags}", seconds / runs.max(1) as f64);
     }
 
     /// What a batch of plain checks came to: the checks that said NOT CHECKED, the pictures not taken, and the browser's own runs behind them
