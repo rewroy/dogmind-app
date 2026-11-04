@@ -10,6 +10,9 @@
 
 What comes out: the folder dist/DogmindApp, its zip, and the installer DogmindSetup-VERSION.exe, one file with that folder on its end.
 
+DOGMIND_DIST names the folder that takes the place of dist/ for all of it (DogmindApp, symbols-VERSION, the zip and the installer). A release made while the app runs from dist/DogmindApp
+sets it, as this replaces tools\\ whole and puts a new exe over the running one.
+
 tools\\ beside the exe holds what commands run with, so that a person installs nothing: Python with its modules, Node.js, Git. It comes from the pins in tools.lock.json; it is
 an error for it to be missing, as an app without it behaves differently from what was tested.
 
@@ -29,6 +32,14 @@ import zipfile
 from pathlib import Path, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def dist_folder():
+    """Where what is shipped is put: `dist` of this checkout, or the folder DOGMIND_DIST names (a relative one from where this is run)."""
+    named = os.environ.get("DOGMIND_DIST")
+    return Path(named).resolve() if named else ROOT / "dist"
+
+
 PARTS = [
     ("Dogmind (this program)", ROOT / "LICENSE", None),
     ("Straydog", ROOT / "assets" / "licenses" / "straydog-LICENSE.txt", "The engine, a separate program beside this one."),
@@ -321,7 +332,8 @@ def main():
         version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
         make_setup(Path(sys.argv[2]), Path(sys.argv[3]), version)
         return
-    target = ROOT / "dist" / "DogmindApp"
+    dist = dist_folder()
+    target = dist / "DogmindApp"
     target.mkdir(parents=True, exist_ok=True)
     parts = list(PARTS)
     # (what an update moved aside is not part of what is shipped; one still in use goes next time)
@@ -367,19 +379,19 @@ def main():
     print(f"{target}: " + ", ".join(sorted(file.name for file in target.iterdir())))
     # What a person is given. The debug symbols are not, but each release's are kept: a crash's addresses cannot be read without them.
     version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
-    symbols = ROOT / "dist" / f"symbols-{version}"
+    symbols = dist / f"symbols-{version}"
     symbols.mkdir(exist_ok=True)
     for pdb in (ROOT / "target" / "release" / "dogmind_app.pdb", straydog.with_name("straydog.pdb")):
         if pdb.is_file():
             shutil.copy(pdb, symbols / pdb.name)
-    archive = ROOT / "dist" / f"DogmindApp-{version}.zip"
+    archive = dist / f"DogmindApp-{version}.zip"
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zip_file:
         for file in sorted(target.rglob("*")):
             # (`.open-to-sandbox` belongs to a folder that has been opened on this machine)
             if file.is_file() and file.suffix.lower() != ".pdb" and file.name != ".open-to-sandbox" and ".previous-" not in file.name:
                 zip_file.write(file, Path("DogmindApp") / file.relative_to(target))
     print(f"{archive}: {archive.stat().st_size / 1048576:.0f} MB, {size_of(target) / 1048576:.0f} MB unpacked")
-    make_setup(target, ROOT / "dist" / f"DogmindSetup-{version}.exe", version)
+    make_setup(target, dist / f"DogmindSetup-{version}.exe", version)
 
 
 if __name__ == "__main__":

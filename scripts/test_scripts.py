@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """What the packaging scripts promise about what they fetch and unpack: python -I scripts/test_scripts.py. Nothing is fetched, and all of it stays in temporary folders."""
 import importlib.util
+import os
 import tempfile
 import unittest
 import urllib.request
@@ -72,6 +73,24 @@ class Unpacking(unittest.TestCase):
         package.refuse_unless_tools(self.target)
         (self.target / ".open-to-sandbox").write_text("")
         package.refuse_unless_tools(self.target)
+
+
+class Dist(unittest.TestCase):
+    def test_what_is_shipped_goes_to_dist_unless_the_environment_names_another_folder(self):
+        with mock.patch.dict("os.environ"):
+            os.environ.pop("DOGMIND_DIST", None)
+            self.assertEqual(package.dist_folder(), package.ROOT / "dist")
+            os.environ["DOGMIND_DIST"] = ""
+            self.assertEqual(package.dist_folder(), package.ROOT / "dist")
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict("os.environ", {"DOGMIND_DIST": folder}):
+            self.assertEqual(package.dist_folder(), Path(folder).resolve())
+
+    def test_no_path_in_it_is_dist_of_the_checkout_but_the_one_helper(self):
+        # The folder, its symbols, the zip and the installer all come from `dist_folder()`: a path built from the checkout's `dist` beside it would write where the environment says not to.
+        source = (HERE / "package.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count('ROOT / "dist"'), 1, "only dist_folder() names it")
+        for name in ['"DogmindApp"', 'f"symbols-{version}"', 'f"DogmindApp-{version}.zip"', 'f"DogmindSetup-{version}.exe"']:
+            self.assertIn(f"dist / {name}", source)
 
 
 class Fetching(unittest.TestCase):
