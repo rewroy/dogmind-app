@@ -2932,6 +2932,25 @@ mod tests {
         assert_eq!(asked, [("execute_command".to_string(), None, true)]);
     }
 
+    /// With the setting for safe commands, what is safe by its name still asks when a file in the folder answers to the name: it is the project's code that would run.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_in_the_folder_that_answers_to_a_safe_program_asks_even_with_safe_commands_on() {
+        let dir = folder_for_commands();
+        std::fs::write(dir.path().join("rg.cmd"), "@echo hi").unwrap();
+        let (client, _) = server(vec![
+            call_answer("execute_command", serde_json::json!({"command": "rg pattern"})),
+            call_answer("execute_command", serde_json::json!({"command": "rg --version"})),
+            text_answer("done"),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::SetSafeCommands(true)).unwrap();
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (log, _, _) = until_end_with_reasons(&run, Decision::Reject);
+        assert_eq!(log.iter().filter(|line| *line == "approval:execute_command:medium").count(), 2, "{log:?}");
+        assert!(!log.iter().any(|line| line.starts_with("tool:true:")), "neither ran: {log:?}");
+    }
+
     #[test]
     fn after_a_page_even_what_the_gate_calls_safe_asks() {
         let dir = tempfile::tempdir().unwrap();
