@@ -344,9 +344,16 @@ pub fn blocked_address(ip: IpAddr) -> bool {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return blocked_v4(mapped);
             }
-            let first = ip.segments()[0];
-            ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 || first == 0x2001 && ip.segments()[1] == 0x0db8
-                || (first == 0x0064 && ip.segments()[1] == 0xff9b)
+            let segments = ip.segments();
+            let first = segments[0];
+            // An IPv4 address written into an IPv6 one reaches the same machine: `::127.0.0.1` (the first 96 bits zero, `::` and `::1` among them)
+            // and 6to4's `2002:7f00:1::` (the IPv4 address in the next 32 bits).
+            let embedded = |high: u16, low: u16| blocked_v4(std::net::Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8));
+            if segments[..6].iter().all(|&segment| segment == 0) && embedded(segments[6], segments[7]) || first == 0x2002 && embedded(segments[1], segments[2]) {
+                return true;
+            }
+            ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 || first == 0x2001 && segments[1] == 0x0db8
+                || (first == 0x0064 && segments[1] == 0xff9b)
         }
     }
 }
@@ -1031,6 +1038,18 @@ mod tests {
         }
         for url in ["ftp://example.com/", "file:///c:/a", "http://user:pw@example.com/", "https://[::1]/", "https://example.com:8443/", "https://exa mple.com/", "javascript:alert(1)"] {
             assert!(target_of(url, &settings).is_err(), "{url}");
+        }
+    }
+
+    /// A name may be given an IPv6 address that holds an IPv4 one: it reaches the same machine, and is refused as that one is.
+    #[test]
+    fn an_ipv4_address_inside_an_ipv6_one_is_refused_as_it_would_be_alone() {
+        for ip in ["::127.0.0.1", "::192.168.0.1", "::10.0.0.1", "::169.254.169.254", "2002:7f00:1::1", "2002:c0a8:1::1", "2002:a9fe:a9fe::1", "2002:0a00:0001::"] {
+            assert!(blocked_address(ip.parse().unwrap()), "{ip}");
+        }
+        // (one that holds a public address is as public as it)
+        for ip in ["2002:0808:0808::1", "2002:0101:0101::", "::8.8.8.8", "2001:4860:4860::8888"] {
+            assert!(!blocked_address(ip.parse().unwrap()), "{ip}");
         }
     }
 
