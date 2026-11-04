@@ -19,6 +19,8 @@ pub mod mcp;
 pub mod memory;
 pub mod message;
 #[cfg(windows)]
+pub mod msvc;
+#[cfg(windows)]
 pub mod page_check;
 pub mod prompt;
 #[cfg(windows)]
