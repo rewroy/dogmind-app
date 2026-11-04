@@ -9,6 +9,8 @@ const SET_ASIDE: &str = ".off";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Installed {
     pub model: PathBuf,
+    /// Whose bundle `quant` is, in `model_name`: settings an older setup wrote have none.
+    pub model_name: Option<String>,
     pub quant: String,
     /// It has an MTP drafter: setup is to keep it.
     pub drafter: bool,
@@ -41,6 +43,7 @@ fn value_of(text: &str, key: &str) -> Option<String> {
 pub fn installed(config: &str) -> Option<Installed> {
     Some(Installed {
         model: PathBuf::from(value_of(config, "model")?),
+        model_name: value_of(config, "model_name"),
         quant: value_of(config, "quant")?,
         drafter: value_of(config, "model_draft").is_some(),
         named: value_of(config, "model_vision").map(PathBuf::from),
@@ -135,8 +138,11 @@ mod tests {
     #[test]
     fn the_settings_are_read_as_setup_writes_them() {
         let read = installed("# Written by setup\nmodel = 'C:\\m\\IQ3_XXS'\nmodel_draft = 'C:\\m\\mtp'\nquant = \"IQ3_XXS\"\n").unwrap();
-        assert_eq!(read, Installed { model: PathBuf::from(r"C:\m\IQ3_XXS"), quant: "IQ3_XXS".into(), drafter: true, named: None });
+        assert_eq!(read, Installed { model: PathBuf::from(r"C:\m\IQ3_XXS"), model_name: None, quant: "IQ3_XXS".into(), drafter: true, named: None });
         assert_eq!(installed("port = 9000\n"), None, "no model set up");
+        // (a newer setup says whose bundle it is: two models may each have a UD-IQ1_M)
+        let read = installed("model = 'C:\\m\\UD-IQ1_M'\nmodel_name = \"Qwen3.8-Flash-Next\"\nquant = \"UD-IQ1_M\"\n").unwrap();
+        assert_eq!((read.model_name.as_deref(), read.quant.as_str()), (Some("Qwen3.8-Flash-Next"), "UD-IQ1_M"));
     }
 
     #[test]
