@@ -1849,7 +1849,30 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     if denied && outside {
         notes.push_str("note: a command cannot read outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there; for a command to read it, ask the user to name its folder there.\n");
     }
+    // (a model's habit from elsewhere: cmd says only that it does not know the program, in the language of Windows, or Git's own copy fails at its start and says nothing a model can use)
+    let msys = err.contains("NtCreateDirectoryObject");
+    let unknown = status == Some(9009) || err.contains("not recognized") || err.contains("認識されていません");
+    let unix = unix_tools_in(line);
+    if !unix.is_empty() && (msys || unknown) {
+        let moves = unix.iter().any(|tool| matches!(tool.as_str(), "rm" | "cp" | "mv"));
+        notes.push_str(&format!("note: Unix tools do not run in the sandbox. Read, list and search with `read_file`, `list_files`, `find_files` and `search_files`{}.\n", if moves { "; `del`, `copy` and `move` do what `rm`, `cp` and `mv` do" } else { "" }));
+    }
+    if msys {
+        notes.push_str("note: programs from Git's `usr\\bin` (MSYS) cannot start in the sandbox, git hooks included.\n");
+    }
     notes
+}
+
+/// The Unix tools a line starts: the first word of each of its commands, when it is one of those a model reaches for from habit. By the line that runs, in which `| head` is no longer there.
+#[cfg(windows)]
+fn unix_tools_in(line: &str) -> Vec<String> {
+    const TOOLS: [&str; 14] = ["ls", "cat", "wc", "head", "tail", "grep", "sed", "awk", "find", "touch", "rm", "cp", "mv", "which"];
+    let runs = line_that_runs(line);
+    commands_of(&runs).into_iter().filter_map(|command| {
+        let first = first_word(command.trim_start().trim_start_matches('@')).0.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
+        let name = first.strip_suffix(".exe").unwrap_or(&first);
+        TOOLS.contains(&name).then(|| name.to_string())
+    }).collect()
 }
 
 /// That something was refused access: by the code in what the program said where it gives one, which reads the same on every Windows. What only has words, `cmd`'s own commands, says
@@ -3503,6 +3526,38 @@ mod tests {
         for (line, status, err) in [("type C:\\work\\a.txt", Some(1), "Access is denied."), ("where python", Some(0), ""), ("python x.py", Some(1), "boom"), ("powershell -c x", Some(1), "boom")] {
             assert_eq!(sandbox_notes(line, root, status, err), "", "{line}");
         }
+    }
+
+    /// A Unix habit that fails says what to use instead, whether cmd does not know the program (in English or in Japanese) or Git's own copy of it fails at its start.
+    #[cfg(windows)]
+    #[test]
+    fn a_unix_tool_that_fails_is_told_not_to_run_here_and_what_does_the_same() {
+        let root = Path::new("C:\\work");
+        let english = "'wc' is not recognized as an internal or external command,\r\noperable program or batch file.\r\n";
+        let japanese = "'wc' は、内部コマンドまたは外部コマンド、\r\n操作可能なプログラムまたはバッチ ファイルとして認識されていません。\r\n";
+        let msys = "      0 [main] cat (4021) C:\\Program Files\\Git\\usr\\bin\\cat.exe: *** fatal error - NtCreateDirectoryObject(&dir, 0xC0000022) failed\r\n";
+        for (line, status, err) in [("wc -l a.txt", Some(1), english), ("wc -l a.txt", Some(9009), japanese), ("dir | wc -l", Some(1), english), ("cd src & type a.txt && grep x a.txt", Some(1), english), ("\"C:\\Git\\usr\\bin\\ls.exe\" -l", Some(1), msys), ("cat a.txt", Some(127), msys), ("@echo off & head a.txt", Some(1), japanese)] {
+            let notes = sandbox_notes(line, root, status, err);
+            assert!(notes.contains("Unix tools do not run in the sandbox") && notes.contains("`read_file`, `list_files`, `find_files` and `search_files`"), "{line}: {notes}");
+            assert_eq!(notes.contains("usr\\bin"), err == msys, "{line}: the MSYS note is for the MSYS failure: {notes}");
+            assert!(notes.lines().all(|note| note.starts_with("note: ")) && notes.lines().count() <= 2, "{line}: {notes}");
+        }
+        for line in ["rm a.txt", "cp a b & mv b c", "dir | mv x y"] {
+            assert!(sandbox_notes(line, root, Some(1), english).contains("`del`, `copy` and `move` do what `rm`, `cp` and `mv` do"), "{line}");
+        }
+        assert!(!sandbox_notes("grep x a.txt", root, Some(1), english).contains("`del`, `copy`"), "only where one of those was tried");
+        // The MSYS failure of any program is said, and the Unix tools are not named when none was tried.
+        let hook = sandbox_notes("git commit -m x", root, Some(1), msys);
+        assert!(hook.contains("programs from Git's `usr\\bin` (MSYS) cannot start in the sandbox, git hooks included") && !hook.contains("Unix tools"), "{hook}");
+        // Not for a command that went well, nor a failure that is something else, nor a program that is not one of these.
+        assert_eq!(sandbox_notes("wc -l a.txt", root, Some(0), ""), "");
+        assert_eq!(sandbox_notes("echo x | wc -l", root, Some(0), ""), "");
+        assert_eq!(sandbox_notes("wc -l a.txt", root, Some(0), msys), "", "it went well");
+        assert_eq!(sandbox_notes("ls", root, Some(1), "boom"), "");
+        assert_eq!(sandbox_notes("grep x a.txt", root, Some(1), "FINDSTR: Cannot open a.txt"), "");
+        assert_eq!(sandbox_notes("frobnicate x", root, Some(1), "'frobnicate' is not recognized as an internal or external command,"), "");
+        assert_eq!(sandbox_notes("echo wc -l & frobnicate", root, Some(1), english), "", "a word of an argument is not a program");
+        assert_eq!(sandbox_notes("foo | head -5", root, Some(1), english), "", "`| head` is replaced, and does not run");
     }
 
     #[test]
