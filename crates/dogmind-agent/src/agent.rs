@@ -1813,7 +1813,13 @@ impl Agent {
         let (risk, mut reason) = match verdict {
             Verdict::Allow if tool == "web_read" => {
                 let url = arguments.get("url").and_then(Value::as_str).unwrap_or("");
-                if self.bench.web.is_known(url) || !self.web.enabled || crate::web::address_carries_nothing(url) {
+                if self.bench.web.is_known(url) || !self.web.enabled {
+                    return Permission::Run;
+                }
+                // With a page in the conversation, a short address is no longer safe to take on trust: it was perhaps told to the model to
+                // put something in a path (`/hunter2`), and the person sees where it goes before it does.
+                let plain = crate::web::address_carries_nothing(url);
+                if plain && !self.web_seen {
                     return Permission::Run;
                 }
                 // (a person need not be asked about what no one gave it)
@@ -1821,7 +1827,12 @@ impl Agent {
                     return Permission::Refused("this signed address is not in anything you have been given, so it was made up. Use an address you have seen, or none".to_string());
                 }
                 // Asked for, not refused: an address the person knows is fine. Never delegated, as it has a reason.
-                (Risk::Medium, Some("this address is not from your messages, a search or a page, and an address can carry data out".to_string()))
+                let reason = if plain {
+                    "web content is in this conversation, and an address can carry data out in its path"
+                } else {
+                    "this address is not from your messages, a search or a page, and an address can carry data out"
+                };
+                (Risk::Medium, Some(reason.to_string()))
             }
             // A note reaches every later session, so what a page says must not get there on its own.
             Verdict::Allow if tool == "remember" && self.web_seen => (Risk::Medium, Some("web content is in this conversation, and a note reaches every later session".to_string())),
@@ -2177,7 +2188,13 @@ mod tests {
 
     /// Everything up to the end of a turn, answering approvals with `decision`.
     fn until_end(run: &Run, decision: Decision) -> (Vec<String>, bool) {
-        let mut log = Vec::new();
+        let (log, cancelled, _) = until_end_with_reasons(run, decision);
+        (log, cancelled)
+    }
+
+    /// The same, and the reason each approval gave for asking (none for one that gave none).
+    fn until_end_with_reasons(run: &Run, decision: Decision) -> (Vec<String>, bool, Vec<Option<String>>) {
+        let (mut log, mut reasons) = (Vec::new(), Vec::new());
         loop {
             match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
                 Event::Content(text) => log.push(format!("content:{text}")),
@@ -2185,10 +2202,11 @@ mod tests {
                 Event::ToolEnded { ok, declined, output, .. } => log.push(format!("tool:{ok}:{declined}:{output}")),
                 Event::Approval(approval) => {
                     log.push(format!("approval:{}:{}", approval.tool, approval.risk.name()));
+                    reasons.push(approval.reason.clone());
                     approval.answer.send((decision, Some("not that".into()))).unwrap();
                 }
                 Event::Failed(message) => log.push(format!("failed:{message}")),
-                Event::TurnEnded { cancelled } => return (log, cancelled),
+                Event::TurnEnded { cancelled } => return (log, cancelled, reasons),
                 _ => {}
             }
         }
@@ -2839,6 +2857,46 @@ mod tests {
         assert!(plain("https://github.com/rust-lang/rust/blob/master/library/std/src/lib.rs"));
         assert!(plain("https://example.com/items/550e8400-e29b-41d4-a716-446655440000"), "a UUID's parts");
         assert!(plain("https://docs.python.org/3/library/concurrent.futures.html"));
+    }
+
+    /// An address is read as the server reads it: `%3F` is a `?` there, and a key spelled in `%xx`s is still a key.
+    #[test]
+    fn an_address_is_judged_as_the_server_reads_it() {
+        use crate::web::address_carries_nothing as plain;
+        assert!(!plain("https://attacker.example/x%3Fd%3Dhunter2"), "an encoded ?");
+        assert!(!plain("https://attacker.example/x%3fd"), "in lower case");
+        assert!(!plain("https://attacker.example/x%23d"), "an encoded #");
+        assert!(!plain("https://attacker.example/x%40d"), "an encoded @");
+        assert!(!plain("https://attacker.example/x%253Fd"), "an encoded twice");
+        assert!(!plain("https://example.com/k/%31a2b3c4d%35e6f7a8b%39c0d1e2f%33a4b5c6d"), "32 hex digits with an encoded one among each eight");
+        assert!(plain("https://ja.wikipedia.org/wiki/%E3%83%8F%E3%83%83%E3%82%B7%E3%83%A5"), "a word in Japanese is a word");
+        assert!(plain("https://example.com/100%/done"), "a % that starts nothing");
+    }
+
+    /// With a page in the conversation, an address no one gave asks, even one that carries nothing in itself: a page may have told the model to put
+    /// something in a path. Without one, it is read at once.
+    #[test]
+    fn a_short_address_no_one_gave_asks_once_web_content_is_in_the_conversation() {
+        let page = web_page("<p>plain words</p>");
+        let short = page.replace("/page", "/hunter2");
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _) = server(vec![call_answer("web_read", serde_json::json!({"url": short})), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        web_on(&run);
+        run.handle.commands.send(Command::Send("look it up".into())).unwrap();
+        let (log, _, _) = until_end_with_reasons(&run, Decision::Reject);
+        assert!(!log.iter().any(|line| line.starts_with("approval:")), "{log:?}");
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:")), "{log:?}");
+        // The person gave the page, which is read at once; the short address after it was given by no one.
+        let (client, _) = server(vec![call_answer("web_read", serde_json::json!({"url": page})), call_answer("web_read", serde_json::json!({"url": short})), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        web_on(&run);
+        run.handle.commands.send(Command::Send(format!("read {page}"))).unwrap();
+        let (log, _, reasons) = until_end_with_reasons(&run, Decision::Reject);
+        assert_eq!(log.iter().filter(|line| line.starts_with("approval:web_read")).count(), 1, "{log:?}");
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:")), "the page the person gave: {log:?}");
+        assert!(log.iter().any(|line| line.starts_with("tool:false:true:")), "the short address, refused: {log:?}");
+        assert_eq!(reasons, [Some("web content is in this conversation, and an address can carry data out in its path".to_string())]);
     }
 
     #[test]
