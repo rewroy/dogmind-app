@@ -2299,6 +2299,9 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     if !done.disarmed.is_empty() {
         report.push_str(&format!("note: the app took this out of a repository a command made, as it would have run outside the sandbox the next time git is used there: {}. A hook or such a setting has to come from the user.\n", done.disarmed.join("; ")));
     }
+    if let Some(why) = &done.unguarded {
+        report.push_str(&format!("note: after this command the app found what it cannot keep a command from planting something in, to run outside the sandbox: {why}. The next command will not start until the user has put that right.\n"));
+    }
     if let Some(cap) = done.out_of_memory {
         report.push_str(&format!("note: this reached the {} GiB that commands may use on this machine, and was refused more. It needs to use less at a time.\n", cap >> 30));
     }
@@ -3676,6 +3679,36 @@ mod tests {
         assert!(out.contains("hello") && out.contains("exit_code: 0"), "{out}");
         let failed = bench.run("execute_command", &json!({"command": "exit 3"}), dir.path(), &cancel).unwrap();
         assert!(failed.contains("exit_code: 3"), "{failed}");
+    }
+
+    /// In the real sandbox, in a temp folder: a command that makes a junction to another repository of the workspace is told in its own result what the app cannot keep a command from, and the
+    /// next one is not started. Nothing of the other repository is changed.
+    #[test]
+    fn a_link_a_command_made_to_a_repository_is_said_in_its_result_and_the_next_command_is_not_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine\\.git");
+        std::fs::create_dir_all(mine.join("hooks")).unwrap();
+        std::fs::write(mine.join("hooks\\pre-commit"), "the person's\n").unwrap();
+        std::fs::write(mine.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(mine.join("config"), "[alias]\n\tx = !echo\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        let (mut bench, cancel) = (Workbench::default(), AtomicBool::new(false));
+        let first = bench.run("execute_command", &json!({"command": "echo first"}), dir.path(), &cancel).unwrap();
+        assert!(first.contains("exit_code: 0") && !first.contains("cannot keep a command"), "{first}");
+        let made = bench.run("execute_command", &json!({"command": "mklink /J sub\\.git mine\\.git"}), dir.path(), &cancel).unwrap();
+        let link = dir.path().join("sub\\.git");
+        if !std::fs::symlink_metadata(&link).is_ok_and(|what| what.file_type().is_symlink()) {
+            eprintln!("the sandbox of this machine cannot make a junction to a repository it may write in: {made}");
+            return;
+        }
+        let next = bench.run("execute_command", &json!({"command": "echo second> second.txt"}), dir.path(), &cancel);
+        // (the link first, by itself, and not through)
+        std::fs::remove_dir(&link).unwrap();
+        assert!(made.contains("note: after this command the app found what it cannot keep a command from") && made.contains("is a link") && made.contains("until the user has put that right"), "{made}");
+        assert_eq!(std::fs::read_to_string(mine.join("hooks\\pre-commit")).unwrap(), "the person's\n");
+        assert_eq!(std::fs::read_to_string(mine.join("config")).unwrap(), "[alias]\n\tx = !echo\n");
+        let next = next.unwrap_err();
+        assert!(next.contains("is a link") && next.contains("The command was not started") && !dir.path().join("second.txt").exists(), "{next}");
     }
 
     #[test]
