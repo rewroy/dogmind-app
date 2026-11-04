@@ -32,11 +32,12 @@ pub(crate) const TRAVERSE: u32 = FILE_GENERIC_EXECUTE;
 pub(crate) const READ_WRITE_EXECUTE: u32 = READ_EXECUTE | FILE_GENERIC_WRITE | DELETE;
 /// `internetClient` and `privateNetworkClientServer`, for a command approved for the network.
 const NETWORK_CAPABILITIES: [&str; 2] = ["S-1-15-3-1", "S-1-15-3-3"];
-/// What a command inherits, as the agent's own environment may hold keys. TEMP and TMP are the profile's.
-const VARIABLES: [&str; 24] = [
+/// What a command inherits, as the agent's own environment may hold keys. TEMP and TMP are the profile's. The last three are a Developer prompt's, for a build to find the
+/// compiler's libraries and headers: a person who started the app from one has them, and a command is given them as they are.
+const VARIABLES: [&str; 27] = [
     "SystemRoot", "windir", "SystemDrive", "ComSpec", "OS", "PATH", "PATHEXT", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "ProgramData",
     "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles", "USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
-    "LANG", "CARGO_HOME", "RUSTUP_HOME", "PUBLIC",
+    "LANG", "CARGO_HOME", "RUSTUP_HOME", "PUBLIC", "LIB", "INCLUDE", "LIBPATH",
 ];
 /// Per-user toolchain homes that PATH alone does not reach; each is granted when it exists.
 const TOOLCHAIN_HOMES: [&str; 8] = [".cargo", ".rustup", ".local\\bin", "AppData\\Local\\Programs\\Python", "AppData\\Local\\Python", "AppData\\Roaming\\uv", "AppData\\Roaming\\npm", "AppData\\Roaming\\nvm"];
@@ -1285,10 +1286,25 @@ unsafe fn profile_folder(sid: PSID) -> Option<PathBuf> {
 }
 
 fn environment(temp: Option<&Path>, workspace: &Path) -> Vec<u16> {
-    let mut block: Vec<(String, String)> = VARIABLES.iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
+    let block: Vec<(String, String)> = VARIABLES.iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
     let temp = temp.map(|path| path.display().to_string()).or_else(|| std::env::var("TEMP").ok()).unwrap_or_default();
-    if let Some(root) = crate::bundled::root() {
-        let added = crate::bundled::environment(&root, &std::env::var("PATH").unwrap_or_default(), &temp, workspace);
+    let block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, crate::msvc::found);
+    let mut out = Vec::new();
+    for (name, value) in block {
+        out.extend(format!("{name}={value}").encode_utf16());
+        out.push(0);
+    }
+    out.push(0);
+    out
+}
+
+/// A command's environment from what it inherits. The PATH comes out as the bundled tools, then what the machine has (without a person's own Python, Node or Git), then the folders of
+/// Visual Studio's compiler when `build_tools` finds them, and last the bundled Git's Unix tools: nothing that is earlier on it can be shadowed by a later one.
+fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, temp: String, workspace: &Path, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<(String, String)> {
+    crate::msvc::add_to(&mut block, build_tools);
+    if let Some(root) = bundled {
+        let inherited = block.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH")).map(|(_, path)| path.clone()).unwrap_or_default();
+        let added = crate::bundled::environment(root, &inherited, &temp, workspace);
         block.retain(|(name, _)| !added.iter().any(|(new, _)| new.eq_ignore_ascii_case(name)));
         block.extend(added);
     }
@@ -1297,13 +1313,7 @@ fn environment(temp: Option<&Path>, workspace: &Path) -> Vec<u16> {
     block.push(("TEMP".to_string(), temp.clone()));
     block.push(("TMP".to_string(), temp));
     block.sort_by_key(|(name, _)| name.to_uppercase());
-    let mut out = Vec::new();
-    for (name, value) in block {
-        out.extend(format!("{name}={value}").encode_utf16());
-        out.push(0);
-    }
-    out.push(0);
-    out
+    block
 }
 
 struct Handle(HANDLE);
@@ -1948,5 +1958,67 @@ mod tests {
     fn a_folder_outside_the_workspace_does_not_run() {
         let folder = work_folder("cwd");
         assert!(run("echo x", Path::new("C:\\Windows"), &folder, false, Duration::from_secs(5), &AtomicBool::new(false)).is_err());
+    }
+
+    fn path_folders(block: &[(String, String)]) -> Vec<PathBuf> {
+        std::env::split_paths(&block.iter().find(|(name, _)| name == "PATH").unwrap().1).collect()
+    }
+
+    fn build_tools() -> crate::msvc::BuildTools {
+        let folders = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        crate::msvc::BuildTools { lib: folders(&["C:\\vs\\lib\\x64", "C:\\kits\\um\\x64"]), include: folders(&["C:\\vs\\include", "C:\\kits\\ucrt"]), path: folders(&["C:\\vs\\bin", "C:\\kits\\bin"]) }
+    }
+
+    #[test]
+    fn a_build_gets_its_libraries_and_its_tools_come_after_everything_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, work) = (dir.path().join("tools"), dir.path().join("work"));
+        for folder in ["python", "node", "git\\cmd"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let (own_node, other) = (dir.path().join("Program Files\\nodejs"), dir.path().join("other"));
+        std::fs::create_dir_all(&own_node).unwrap();
+        std::fs::write(own_node.join("node.exe"), "").unwrap();
+        let inherited = std::env::join_paths([&own_node, &other]).unwrap().to_string_lossy().into_owned();
+        let start = || vec![("PATH".to_string(), inherited.clone()), ("SystemRoot".to_string(), "C:\\Windows".to_string())];
+        let temp = dir.path().display().to_string();
+        let made = environment_block(start(), Some(&root), temp.clone(), &work, || Some(build_tools()));
+        assert_eq!(path_folders(&made), [root.join("python"), root.join("node"), root.join("git\\cmd"), other.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
+        let value = |name: &str| made.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
+        assert_eq!(value("LIB"), Some("C:\\vs\\lib\\x64;C:\\kits\\um\\x64"));
+        assert_eq!(value("INCLUDE"), Some("C:\\vs\\include;C:\\kits\\ucrt"));
+        // Without the bundled tools: the machine's PATH, and then the same.
+        let plain = environment_block(start(), None, temp.clone(), &work, || Some(build_tools()));
+        assert_eq!(path_folders(&plain), [own_node.clone(), other.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
+        // On a machine with none found, PATH is what it was.
+        let none = environment_block(start(), Some(&root), temp, &work, || None);
+        assert_eq!(path_folders(&none), [root.join("python"), root.join("node"), root.join("git\\cmd"), other]);
+        assert!(none.iter().all(|(name, _)| name != "LIB" && name != "INCLUDE"));
+    }
+
+    /// In the real sandbox, on a machine with Visual Studio's C++ tools: `cl` and `link` are found by PATH, and the headers and libraries by INCLUDE and LIB, with nothing set by hand.
+    #[test]
+    #[ignore = "needs Visual Studio with the C++ tools for x64, and the Windows SDK; the app must not have been started from a Developer prompt"]
+    fn a_c_program_builds_in_the_sandbox_without_a_developer_prompt() {
+        assert!(std::env::var_os("LIB").is_none(), "run this from a plain prompt");
+        let folder = work_folder("msvc");
+        std::fs::write(folder.join("hello.c"), "#include <stdio.h>\n#include <windows.h>\nint main(void) { puts(\"BUILT-IN-THE-SANDBOX\"); return 0; }\n").unwrap();
+        let done = command("cl /nologo hello.c kernel32.lib user32.lib && hello.exe", &folder, false);
+        let said = format!("{}{}", decode(&done.stdout), decode(&done.stderr));
+        assert!(done.status == Some(0) && said.contains("BUILT-IN-THE-SANDBOX"), "{said}");
+        let rc = command("rc /? | findstr /i \"Resource\"", &folder, false);
+        assert_eq!(rc.status, Some(0), "rc.exe is on PATH too: {}", decode(&rc.stderr));
+    }
+
+    #[test]
+    fn a_developer_prompts_variables_are_passed_on_and_nothing_is_looked_for() {
+        for name in ["LIB", "INCLUDE", "LIBPATH"] {
+            assert!(VARIABLES.contains(&name), "{name} is what the app was started with");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let start = vec![("PATH".to_string(), "C:\\a".to_string()), ("LIB".to_string(), "C:\\dev\\lib".to_string()), ("INCLUDE".to_string(), "C:\\dev\\include".to_string()), ("LIBPATH".to_string(), "C:\\dev\\libpath".to_string())];
+        let made = environment_block(start, None, dir.path().display().to_string(), dir.path(), || panic!("an app with a LIB of its own looks for none"));
+        let value = |name: &str| made.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
+        assert_eq!((value("PATH"), value("LIB"), value("INCLUDE"), value("LIBPATH")), (Some("C:\\a"), Some("C:\\dev\\lib"), Some("C:\\dev\\include"), Some("C:\\dev\\libpath")));
     }
 }
