@@ -1799,11 +1799,49 @@ fn only_keeps_some_lines(step: &str) -> bool {
     }
 }
 
+/// Whether the line has a cmd `set NAME=value` that is not quoted and ends in a space before a `&`, `&&`, `|` or `||`: cmd keeps the space in the value, so `set A=C:\x && cd %A%` looks for `C:\x ` (a real
+/// model's `set CARGO_TARGET_DIR=%TEMP%\sd-isolation-target && cargo build` failed on a path ending in a space). `set` is the first word of the line, or of what follows `&`, `|` or `(`; the
+/// switches (`set /a`, `set /p`) and the quoted form `set "A=b"` do not have it.
+#[cfg(windows)]
+fn set_value_ends_in_a_space(line: &str) -> bool {
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (at, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if c == '^' && !quoted {
+            escaped = true;
+        } else if !quoted && matches!(c, '&' | '|' | '(' | ')' | '\n' | '\r') {
+            if matches!(c, '&' | '|') && set_with_a_space_at_its_end(&line[start..at]) {
+                return true;
+            }
+            start = at + c.len_utf8();
+        }
+    }
+    false
+}
+
+/// A command (as `commands_of` cuts them, with its trailing space) that is `set NAME=value` with the value ending in a space.
+#[cfg(windows)]
+fn set_with_a_space_at_its_end(command: &str) -> bool {
+    let command = command.trim_start().trim_start_matches('@').trim_start();
+    if !command.get(..3).is_some_and(|word| word.eq_ignore_ascii_case("set")) || !command[3..].starts_with([' ', '\t']) {
+        return false;
+    }
+    let rest = command[3..].trim_start();
+    !rest.starts_with(['"', '/']) && rest.split_once('=').is_some_and(|(name, _)| !name.trim().is_empty()) && rest.ends_with([' ', '\t'])
+}
+
 /// One line more where a sandbox's answer reads as something else: a model believes it, and the next rounds go on that.
 #[cfg(windows)]
 fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -> String {
     let mut notes = String::new();
     let lower = line.to_ascii_lowercase();
+    // (whatever it came to: the program that is then run fails, or runs with a value that is not the one written, and the line itself shows nothing wrong)
+    if set_value_ends_in_a_space(line) {
+        notes.push_str("note: in cmd, the space before `&&` (or `&`, `||`, `|`) stays in the value of `set NAME=value && ...`. Write `set \"NAME=value\" && ...`.\n");
+    }
     if crate::bundled::root().is_some() && lower.contains("pip") && lower.contains("install") {
         // (a repository need not see them)
         if workspace.join(crate::bundled::PY_DEPS).is_dir() {
@@ -3525,6 +3563,31 @@ mod tests {
         assert!(!here.is_empty() && !here.ends_with('.') && says_access_denied(&format!("{here}.\r\n"), here), "{here}");
         for (line, status, err) in [("type C:\\work\\a.txt", Some(1), "Access is denied."), ("where python", Some(0), ""), ("python x.py", Some(1), "boom"), ("powershell -c x", Some(1), "boom")] {
             assert_eq!(sandbox_notes(line, root, status, err), "", "{line}");
+        }
+    }
+
+    /// A real model's `set CARGO_TARGET_DIR=%TEMP%\sd-isolation-target && cargo build`: cmd kept the space before `&&` in the value, and cargo failed on a path that ended in a space.
+    #[cfg(windows)]
+    #[test]
+    fn a_set_whose_value_ends_in_a_space_before_the_ampersands_is_told_to_quote_it() {
+        let root = Path::new("C:\\work");
+        let joined = on_one_line("set A=b\ncargo build").unwrap();
+        assert_eq!(joined, "set A=b & cargo build", "two lines are joined with the space");
+        for line in ["set A=b && x", "set CARGO_TARGET_DIR=%TEMP%\\sd-isolation-target && cargo build", "SET A=b &&x", "set A=b & x", "set A=b || x", "set A=b | x", "@set A=b  && x", "cd src && set A=b && x", "echo y & set A=b && x", "(set A=b && x)", "set A=\"b c\" && x", "set\tA=b && x", &*joined] {
+            // (whatever the program that follows made of it: it may well have run, with a value that is not the one written)
+            for (status, err) in [(Some(0), ""), (Some(1), "boom"), (Some(9009), ""), (None, "")] {
+                let notes = sandbox_notes(line, root, status, err);
+                assert!(notes.contains("the space before `&&`") && notes.contains("`set \"NAME=value\" && ...`"), "{line} {status:?}: {notes}");
+                assert!(notes.lines().all(|note| note.starts_with("note: ")) && notes.lines().count() == 1, "{line}: {notes}");
+            }
+        }
+        for line in [
+            "set \"A=b\" && x", "set A=b&& x", "set \"A=b\"&& x", "set \"A=b & c\" && x", "set A=b", "set A=b ", "x && y", "cargo build",
+            "echo set A=b && x", "reset A=b && x", "rem set A=b && x", "set /a n=1 && x", "set /p n=ask && x", "echo \"set A=b \" && x", "set && x", "set  && x", "xset A=b && x",
+        ] {
+            for (status, err) in [(Some(0), ""), (Some(1), "boom")] {
+                assert_eq!(sandbox_notes(line, root, status, err), "", "{line} {status:?}");
+            }
         }
     }
 
