@@ -4342,7 +4342,7 @@ impl App {
             let files = dogmind_agent::tools::workspace_files(&path, 20000);
             let branch = dogmind_agent::tools::git_branch(&path);
             let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
-            let skills = dogmind_agent::skills::discover(&path, home.as_deref());
+            let skills = dogmind_agent::skills::one_each(dogmind_agent::skills::discover(&path, home.as_deref()));
             poster.send(Note::Workspace { path, files, branch, skills });
         });
     }

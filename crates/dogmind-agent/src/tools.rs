@@ -3514,6 +3514,26 @@ mod tests {
         assert!(said.contains("- one: Does a thing") && said.contains("- two:"), "{said}");
     }
 
+    /// The project's `pdf` that only the person may start does not make the model's `skill("pdf")` say there is none: the person's own that the model may start is read.
+    #[test]
+    fn the_skill_tool_reads_the_first_of_a_name_that_the_model_may_start() {
+        let (dir, mut bench, cancel) = bench();
+        let (home, work) = (dir.path().join("me"), dir.path().join("work"));
+        let write = |folder: PathBuf, text: &str| {
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("SKILL.md"), text).unwrap();
+        };
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        write(work.join(".claude").join("skills").join("pdf"), "---\nname: pdf\ndescription: d\ndisable-model-invocation: true\n---\nthe project's, for the person");
+        write(home.join(".claude").join("skills").join("pdf"), "---\nname: pdf\ndescription: d\n---\nthe home's, for the model");
+        write(work.join(".claude").join("skills").join("manual"), "---\nname: manual\ndescription: d\ndisable-model-invocation: true\n---\nonly the person");
+        bench.skills = crate::skills::discover(&work, Some(&home));
+        let said = bench.run("skill", &json!({"name": "pdf"}), &work, &cancel).unwrap();
+        assert!(said.contains("the home's, for the model") && !said.contains("for the person"), "{said}");
+        let none = bench.run("skill", &json!({"name": "manual"}), &work, &cancel).unwrap_err();
+        assert!(none.contains("no skill is called manual"), "{none}");
+    }
+
     #[test]
     fn a_search_uses_smart_case_and_takes_bad_regex_as_text() {
         let (dir, mut bench, cancel) = bench();

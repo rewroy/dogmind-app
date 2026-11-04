@@ -3359,6 +3359,39 @@ mod tests {
         assert_eq!(prompt::typed_text(&asked), "/haiku 古池");
     }
 
+    /// Of two skills of a name, the model is offered the one it may start and `/name` starts the one the person may: neither hides the other.
+    #[test]
+    fn of_two_skills_of_a_name_each_who_asks_gets_the_one_it_may_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, work) = (dir.path().join("me"), dir.path().join("work"));
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        let write = |folder: PathBuf, text: &str| {
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("SKILL.md"), text).unwrap();
+        };
+        write(work.join(".claude").join("skills").join("pdf"), "---\nname: pdf\ndescription: the project's pdf\ndisable-model-invocation: true\n---\nproject pdf body");
+        write(home.join(".claude").join("skills").join("pdf"), "---\nname: pdf\ndescription: the person's pdf\n---\nhome pdf body");
+        write(work.join(".claude").join("skills").join("csv"), "---\nname: csv\ndescription: the project's csv\nuser-invocable: false\n---\nproject csv body");
+        write(home.join(".claude").join("skills").join("csv"), "---\nname: csv\ndescription: the person's csv\n---\nhome csv body");
+        let (client, bodies) = server(vec![call_answer("skill", serde_json::json!({"name": "pdf"})), text_answer("read it"), text_answer("started")]);
+        let (sender, events) = channel();
+        let sessions = tempfile::tempdir().unwrap();
+        let handle = start(Config { workspace: work.clone(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: Some(home), skills_off: Vec::new(), memory: None, mcp: None }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("convert it".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.contains("home pdf body")), "the model reads the person's pdf, which it may start: {log:?}");
+        assert!(!log.iter().any(|line| line.contains("no skill is called")), "{log:?}");
+        run.handle.commands.send(Command::Send("/csv now".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let bodies = bodies.lock().unwrap();
+        let listed = bodies[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(listed.contains("- pdf: the person's pdf") && listed.contains("- csv: the project's csv") && !listed.contains("the project's pdf"), "{listed}");
+        let asked = bodies[2]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap().to_string();
+        assert!(asked.contains("home csv body") && !asked.contains("project csv body"), "the person starts the csv that they may: {asked}");
+    }
+
     #[test]
     fn plan_mode_looks_and_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();

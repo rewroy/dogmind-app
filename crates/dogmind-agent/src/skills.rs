@@ -115,8 +115,9 @@ fn under(folder: &Path, place: &str) -> PathBuf {
     place.split('/').fold(folder.to_path_buf(), |path, part| path.join(part))
 }
 
-/// A project's skills, from the workspace up to its root, and then the person's. The first of a name wins: the project's over
-/// the person's, and the nearer folder's over the farther.
+/// A project's skills, from the workspace up to its root, and then the person's, all of them, in the order that decides between two of a name: the project's before the person's, and the nearer
+/// folder's before the farther. Which of two of a name is used depends on who starts it (see `the_model_may_start` and `one_each`): a project's `pdf` that only the person may start must not hide
+/// the person's own that the model may.
 pub fn discover(workspace: &Path, home: Option<&Path>) -> Vec<Skill> {
     let mut found = Vec::new();
     let root = workspace.ancestors().find(|folder| folder.join(".git").exists()).unwrap_or(workspace);
@@ -134,9 +135,26 @@ pub fn discover(workspace: &Path, home: Option<&Path>) -> Vec<Skill> {
             walk(&under(home, place), 0, "user", &mut found);
         }
     }
-    let mut names = HashSet::new();
-    found.retain(|skill| names.insert(skill.name.to_lowercase()));
     found
+}
+
+/// The first skill of each name that the model may start, in the order they were found: what its list and its `skill` tool have.
+pub fn the_model_may_start(skills: &[Skill]) -> Vec<&Skill> {
+    let mut names = HashSet::new();
+    skills.iter().filter(|skill| skill.for_the_model && names.insert(skill.name.to_lowercase())).collect()
+}
+
+/// One skill of each name, for what the person sees of them: the first that the person may start as `/name`, or of a name that they may not start, the first. A switch to each is by its name.
+pub fn one_each(skills: Vec<Skill>) -> Vec<Skill> {
+    let mut chosen: Vec<Skill> = Vec::new();
+    for skill in skills {
+        match chosen.iter_mut().find(|known| known.name.eq_ignore_ascii_case(&skill.name)) {
+            Some(known) if !known.for_the_person && skill.for_the_person => *known = skill,
+            Some(_) => {}
+            None => chosen.push(skill),
+        }
+    }
+    chosen
 }
 
 /// Without the ones the person turned off, by name in any case: the same name in a project and in the home is one skill to them.
@@ -155,7 +173,7 @@ fn for_tools_not_here(skill: &Skill, tools: &[String]) -> bool {
 /// What the model is told of them, every request: enough to know when one applies. `tools`: what this session has, by name.
 pub fn prompt_section(skills: &[Skill], tools: &[String]) -> String {
     let (mut list, mut more) = (String::new(), 0);
-    for skill in skills.iter().filter(|skill| skill.for_the_model && !for_tools_not_here(skill, tools)) {
+    for skill in the_model_may_start(skills).into_iter().filter(|skill| !for_tools_not_here(skill, tools)) {
         let about: String = skill.description.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MAX_DESCRIPTION).collect();
         let line = format!("- {}: {about}\n", skill.name);
         if list.len() + line.len() > MAX_LIST {
@@ -173,7 +191,7 @@ pub fn prompt_section(skills: &[Skill], tools: &[String]) -> String {
 
 /// All of them, for what the prompt had no room for.
 pub fn listing(skills: &[Skill]) -> String {
-    skills.iter().filter(|skill| skill.for_the_model).map(|skill| format!("- {}: {}\n", skill.name, skill.description.split_whitespace().collect::<Vec<_>>().join(" "))).collect()
+    the_model_may_start(skills).into_iter().map(|skill| format!("- {}: {}\n", skill.name, skill.description.split_whitespace().collect::<Vec<_>>().join(" "))).collect()
 }
 
 /// A skill's instructions, as the model reads them: where it is, as what it names is relative to that.
@@ -261,7 +279,10 @@ mod tests {
         assert!(!names.contains(&"review-agent"), "a tool's own, in a hidden folder, is not offered");
         let one = skills.iter().find(|skill| skill.name == "one").unwrap();
         assert_eq!((one.description.as_str(), one.scope), ("the project's own", "project"));
-        assert_eq!(names.iter().filter(|name| **name == "one").count(), 1);
+        let used = the_model_may_start(&skills);
+        assert_eq!(used.iter().filter(|skill| skill.name == "one").count(), 1);
+        assert_eq!(used.iter().find(|skill| skill.name == "one").unwrap().scope, "project", "the project's over the person's");
+        assert_eq!(one_each(skills).iter().filter(|skill| skill.name == "one").count(), 1);
     }
 
     #[test]
@@ -282,6 +303,44 @@ mod tests {
         assert!(!section.contains("manual") && section.contains("hidden"), "{section}");
         assert!(skills.iter().find(|skill| skill.name == "manual").unwrap().for_the_person);
         assert!(!skills.iter().find(|skill| skill.name == "hidden").unwrap().for_the_person);
+    }
+
+    /// Two skills of a name: the one a project has and the model may not start does not hide the person's own that it may, and the one the person may not start does not hide the other.
+    #[test]
+    fn two_skills_of_one_name_are_chosen_between_by_who_starts_the_one_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, work) = (dir.path().join("me"), dir.path().join("work"));
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        write(&work.join(".claude/skills/pdf"), "---\nname: pdf\ndescription: from the project, for the person\ndisable-model-invocation: true\n---\nb");
+        write(&home.join(".claude/skills/pdf"), "---\nname: pdf\ndescription: from the home, for the model\n---\nb");
+        write(&work.join(".claude/skills/csv"), "---\nname: csv\ndescription: from the project, for the model\nuser-invocable: false\n---\nb");
+        write(&home.join(".claude/skills/csv"), "---\nname: csv\ndescription: from the home, for the person\n---\nb");
+        write(&work.join(".claude/skills/both"), "---\nname: both\ndescription: from the project\n---\nb");
+        write(&home.join(".claude/skills/both"), "---\nname: both\ndescription: from the home\n---\nb");
+        let skills = discover(&work, Some(&home));
+        let scope_of = |chosen: &[&Skill], name: &str| chosen.iter().find(|skill| skill.name == name).unwrap().scope;
+        let model = the_model_may_start(&skills);
+        assert_eq!(model.len(), 3, "{model:?}");
+        assert_eq!((scope_of(&model, "pdf"), scope_of(&model, "csv"), scope_of(&model, "both")), ("user", "project", "project"));
+        let section = prompt_section(&skills, &[]);
+        assert!(section.contains("- pdf: from the home, for the model") && section.contains("- csv: from the project, for the model") && section.contains("- both: from the project"), "{section}");
+        assert!(!section.contains("from the project, for the person") && !section.contains("from the home, for the person") && !section.contains("from the home\n"), "{section}");
+        let listed = listing(&skills);
+        assert_eq!(listed.lines().count(), 3, "{listed}");
+        let person = one_each(skills);
+        let scope_of = |name: &str| person.iter().find(|skill| skill.name == name).unwrap().scope;
+        assert_eq!(person.len(), 3);
+        assert_eq!((scope_of("pdf"), scope_of("csv"), scope_of("both")), ("project", "user", "project"));
+        assert!(person.iter().all(|skill| skill.for_the_person));
+    }
+
+    #[test]
+    fn a_name_that_the_person_may_not_start_is_still_listed_once_for_its_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join(".claude/skills/hidden"), "---\nname: Hidden\ndescription: d\nuser-invocable: false\n---\nb");
+        let one = one_each(discover(dir.path(), None));
+        assert_eq!(one.len(), 1);
+        assert!(!one[0].for_the_person);
     }
 
     #[test]
@@ -327,6 +386,10 @@ mod tests {
         write(&dir.path().join(".claude/skills/xlsx"), "---\nname: xlsx\ndescription: d\n---\nb");
         let left = without(discover(dir.path(), None), &["pdf".to_string()]);
         assert_eq!(left.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(), ["xlsx"]);
+        // (both of a name in the project and in the home go: it is one skill to them)
+        let home = dir.path().join("me");
+        write(&home.join(".claude/skills/pdf"), "---\nname: pdf\ndescription: d\n---\nb");
+        assert!(without(discover(dir.path(), Some(&home)), &["pdf".to_string()]).iter().all(|skill| !skill.name.eq_ignore_ascii_case("pdf")));
         assert_eq!(without(discover(dir.path(), None), &[]).len(), 2);
     }
 
