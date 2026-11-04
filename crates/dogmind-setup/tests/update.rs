@@ -44,8 +44,24 @@ fn pack(scene: &Path, version: &str) -> PathBuf {
 
 fn setup(program: &Path) -> Command {
     let mut command = Command::new(program);
-    command.env("DOGMIND_SETUP_APP_NAME", APP).env("DOGMIND_SETUP_LANG", "en").env_remove("DOGMIND_SETUP_FAIL_AFTER").env_remove("DOGMIND_SETUP_SLOW_MS");
+    command.env("DOGMIND_SETUP_APP_NAME", APP).env("DOGMIND_SETUP_LANG", "en").env_remove("DOGMIND_SETUP_FAIL_AFTER").env_remove("DOGMIND_SETUP_SLOW_MS").env_remove("DOGMIND_SETUP_PRESS");
     command
+}
+
+/// Every file under a folder, by its path in it, with what it holds: what "the folder as it was" is compared with.
+fn contents(folder: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut waiting = vec![folder.to_path_buf()];
+    while let Some(current) = waiting.pop() {
+        for entry in std::fs::read_dir(&current).unwrap().flatten() {
+            if entry.path().is_dir() {
+                waiting.push(entry.path());
+            } else {
+                found.insert(entry.path().strip_prefix(folder).unwrap().to_string_lossy().into_owned(), std::fs::read(entry.path()).unwrap());
+            }
+        }
+    }
+    found
 }
 
 /// The numbers of the processes whose program is a file of this folder.
@@ -185,6 +201,54 @@ fn an_update_that_cannot_finish_leaves_the_old_version_and_starts_it_as_it_was()
     // what a person does on that page is start the app as it was: the old version, from the folder
     assert_eq!(wait_for_the_app(&folder).len(), 1, "the app is started as it was");
     assert_eq!(std::fs::read(folder.join(APP)).unwrap(), version_app("1.0.0"));
+}
+
+#[test]
+fn an_update_that_is_cancelled_starts_the_app_again_and_leaves_the_folder_as_it_was() {
+    // The app quit for the update and its person chose to update, not to close it: Cancel brings it back, whether it is pressed before the work has begun or with the first file unpacked
+    // (the second is stopped between the files, and what waited beside its place goes), and the code still says it was stopped.
+    for (press, slowly) in [("cancel-at-once", None), ("cancel-at-work", Some("1500"))] {
+        let scene = Scene::new();
+        let folder = scene.installed("1.0.0");
+        let second = pack(scene.path(), "2.0.0");
+        let before = contents(&folder);
+        let mut command = setup(&second);
+        command.env("DOGMIND_SETUP_PRESS", press);
+        if let Some(milliseconds) = slowly {
+            command.env("DOGMIND_SETUP_SLOW_MS", milliseconds);
+        }
+        let status = command.args(["--update", "--test", "--auto", "--dir"]).arg(&folder).status().unwrap();
+        assert_eq!(status.code(), Some(2), "{press}: it says it was stopped");
+        assert_eq!(wait_for_the_app(&folder).len(), 1, "{press}: the app is started as it was");
+        assert_eq!(contents(&folder), before, "{press}: the folder is as it was, with nothing left waiting beside its places");
+        assert_eq!((version_of(&folder), manifest_version(&folder)), ("1.0.0".to_string(), "1.0.0".to_string()), "{press}");
+    }
+}
+
+#[test]
+fn an_update_closed_on_the_page_that_says_it_did_not_finish_starts_the_app_again() {
+    let scene = Scene::new();
+    let folder = scene.installed("1.0.0");
+    let second = pack(scene.path(), "2.0.0");
+    let before = contents(&folder);
+    // (a failure asked for by the test, on the first file; then the window's own close, as a person's cross)
+    let status = setup(&second).env("DOGMIND_SETUP_FAIL_AFTER", "0").env("DOGMIND_SETUP_PRESS", "close-on-failure").args(["--update", "--test", "--auto", "--dir"]).arg(&folder).status().unwrap();
+    assert_eq!(status.code(), Some(1), "it says it did not finish");
+    assert_eq!(wait_for_the_app(&folder).len(), 1, "the app is started as it was");
+    assert_eq!(contents(&folder), before);
+}
+
+#[test]
+fn an_install_a_person_cancels_starts_nothing_and_leaves_nothing() {
+    // Only an update is of an app that quit for it: a first install that is cancelled is as it was.
+    let scene = Scene::new();
+    let first = pack(scene.path(), "1.0.0");
+    let folder = scene.install_folder();
+    let status = setup(&first).env("DOGMIND_SETUP_PRESS", "cancel-at-work").env("DOGMIND_SETUP_SLOW_MS", "1500").args(["--test", "--auto", "--dir"]).arg(&folder).status().unwrap();
+    assert_eq!(status.code(), Some(2));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(running_from(&folder).is_empty(), "nothing is started");
+    assert!(!folder.exists(), "and nothing of it is left");
 }
 
 #[test]
