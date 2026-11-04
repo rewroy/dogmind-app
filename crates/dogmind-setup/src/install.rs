@@ -103,11 +103,12 @@ fn write_manifest(folder: &Path, manifest: &Manifest) -> std::io::Result<()> {
     std::io::Write::write_all(&mut out, text.as_bytes())?;
     out.sync_all()?;
     drop(out);
-    std::fs::rename(&partial, folder.join(MANIFEST))
+    replace(&partial, &folder.join(MANIFEST))
 }
 
-/// A virus scanner or the search index may have a new file open for a moment.
-fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
+/// `from` renamed to `to`, over what is there. A virus scanner or the search index may have a new file open for a moment, and so for the last two things an install writes, which come after
+/// every file is in place (the manifest, and the uninstaller in `write_stub`): a lock that passes in a moment is no reason to say that an install whose files are all new did not finish.
+pub fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut tries = 0;
     loop {
         match std::fs::rename(from, to) {
@@ -743,6 +744,38 @@ mod tests {
         assert!(made.success());
         remove(&folder, &scene.shell, &mut |_| {}).unwrap();
         assert_eq!(std::fs::read(elsewhere.join("x.py")).unwrap(), b"the person's");
+    }
+
+    /// Holds `path` open for `milliseconds` on another thread, as a virus scanner or the search index does a new file: for reading, with no sharing for deleting or replacing it.
+    fn held_for(path: &Path, milliseconds: u64) -> std::thread::JoinHandle<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path).unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(milliseconds));
+            drop(held);
+        })
+    }
+
+    #[test]
+    fn the_manifests_own_rename_is_tried_again_while_something_has_it_open_for_a_moment() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = |version: &str| Manifest { version: version.to_string(), test: true, files: vec!["a.exe".to_string()] };
+        write_manifest(dir.path(), &manifest("1.0.0")).unwrap();
+        // (what a rename made once meets: the target is open, and nothing lets it be replaced)
+        std::fs::write(dir.path().join("other"), "x").unwrap();
+        let release = held_for(&dir.path().join(MANIFEST), 100);
+        let error = std::fs::rename(dir.path().join("other"), dir.path().join(MANIFEST)).unwrap_err();
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error:?}");
+        release.join().unwrap();
+        // the manifest's own, with the lock gone after 400 ms
+        let release = held_for(&dir.path().join(MANIFEST), 400);
+        let began = std::time::Instant::now();
+        write_manifest(dir.path(), &manifest("2.0.0")).unwrap();
+        assert!(began.elapsed() >= Duration::from_millis(250), "it did wait for the lock to go: {:?}", began.elapsed());
+        release.join().unwrap();
+        assert_eq!(read_manifest(dir.path()).unwrap().version, "2.0.0");
+        assert!(!dir.path().join(format!("{MANIFEST}{WAITING}")).exists(), "nothing is left waiting");
     }
 
     #[test]

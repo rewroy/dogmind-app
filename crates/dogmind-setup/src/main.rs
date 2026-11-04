@@ -170,7 +170,7 @@ pub fn write_stub(from: &Path, path: &Path) -> std::io::Result<()> {
     let mut out = std::fs::File::create(&partial)?;
     std::io::copy(&mut source.take(length), &mut out)?;
     drop(out);
-    std::fs::rename(partial, path)
+    install::replace(&partial, path)
 }
 
 /// In a window program a word to the command line goes to where the caller put its error stream, when it did.
@@ -389,6 +389,32 @@ mod tests {
         write_stub(&setup, &stub).unwrap();
         assert!(pack::Package::open(&stub).is_err(), "no package on it");
         assert_eq!(std::fs::metadata(&stub).unwrap().len(), pack::overlay_start(&mut std::fs::File::open(&stub).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn the_uninstaller_is_written_over_one_that_something_has_open_for_a_moment() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("in");
+        pack::tests::tree(&folder, &[("a", b"1")]);
+        let setup = dir.path().join("setup.exe");
+        pack::pack(&pack::tests::own_exe(), &folder, &setup, "1", 6, &mut |_| {}).unwrap();
+        let stub = dir.path().join("stub.exe");
+        write_stub(&setup, &stub).unwrap();
+        std::fs::write(&stub, "the earlier one").unwrap();
+        // (a virus scanner or the search index: open for reading, with no sharing for replacing it, and let go after 400 ms)
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&stub).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(held);
+        });
+        let began = std::time::Instant::now();
+        write_stub(&setup, &stub).unwrap();
+        assert!(began.elapsed() >= Duration::from_millis(250), "it did wait for the lock to go: {:?}", began.elapsed());
+        release.join().unwrap();
+        assert!(pack::Package::open(&stub).is_err(), "and it is the program without a package");
+        assert_ne!(std::fs::read(&stub).unwrap(), b"the earlier one");
+        assert!(!stub.with_extension("dogmind-new").exists(), "nothing is left waiting");
     }
 
     #[test]
