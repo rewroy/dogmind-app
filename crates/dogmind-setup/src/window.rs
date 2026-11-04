@@ -21,7 +21,7 @@ use crate::install::{self, Failure, Install, Progress, Stage};
 use crate::pack::Package;
 use crate::place::{self, Refusal};
 use crate::system::{self, wide, Running};
-use crate::Options;
+use crate::{Options, Press};
 
 const WM_WORKER: u32 = WM_APP + 1;
 const TIMER_POLL: usize = 1;
@@ -218,7 +218,8 @@ struct App {
     exit_code: i32,
     /// When the app's page is what removes it: nothing is left to do but leave.
     auto_tries: u32,
-    /// Started with `--update` by the app: it began on the work itself, and when that is done the app is started again, and this closes. A failure keeps the window, with a way to start the app as it was.
+    /// Started with `--update` by the app: it began on the work itself, and when that is done the app is started again, and this closes. The app quit for the update and its person did not choose
+    /// to close it, so any other end brings it back as it is in the folder (see `end_without_success`). A failure keeps the window until then, with a way to start the app as it was.
     updating: bool,
 }
 
@@ -401,7 +402,16 @@ impl App {
 
     /// `--auto` under the test switch: what a person would press, so that a script needs no pointer or keyboard, and a code says how it ended.
     unsafe fn press_by_itself(&mut self) {
+        let press = self.options.press;
         match &self.page {
+            // (a test's way out of the work: Cancel, as the button does it)
+            Page::Working { progress, stopping: false, .. } if press == Some(Press::CancelAtOnce) || (press == Some(Press::CancelAtWork) && progress.is_some()) => {
+                PostMessageW(self.window, WM_COMMAND, 2, 0);
+            }
+            // (and the window's own close on the page of an update that did not finish)
+            Page::Failed { .. } if self.updating && press == Some(Press::CloseOnFailure) => {
+                PostMessageW(self.window, WM_CLOSE, 0, 0);
+            }
             // (a folder that was refused stays refused: nothing here chooses another, so it ends)
             Page::Ready { notice: Some(Notice::Refused(_)) } => self.finish(1),
             Page::Ready { .. } | Page::CloseFirst { asked: false, .. } | Page::AppWontStart(_) => {
@@ -410,7 +420,7 @@ impl App {
             Page::CloseFirst { asked: true, .. } => {
                 self.auto_tries += 1;
                 if self.auto_tries > 2 {
-                    self.finish(3);
+                    self.end_without_success(3);
                 } else {
                     PostMessageW(self.window, WM_COMMAND, 1, 0);
                 }
@@ -428,6 +438,14 @@ impl App {
     unsafe fn finish(&mut self, code: i32) {
         self.exit_code = code;
         DestroyWindow(self.window);
+    }
+
+    /// An end that is not the work done. An update the app asked for is of an app that quit for it, and its person chose to update, not to close it: whichever page this is on and whichever way
+    /// it ends (Cancel, the window's close, a failure), the app comes back as it is in the folder, and the code still says how it ended. If it cannot be started, or this is no update, it ends as it says.
+    unsafe fn end_without_success(&mut self, code: i32) {
+        if !(self.updating && self.start_the_app_and_close(code)) {
+            self.finish(code);
+        }
     }
 
     unsafe fn place_buttons(&self) {
@@ -759,23 +777,9 @@ impl App {
             }
             Page::Removing { .. } => {}
             Page::Gone { .. } | Page::Installed { .. } => self.finish(0),
-            // (an update that failed is of an app that is not running: its button starts it as it was, and the window's own close stays what it says)
-            Page::Failed { .. } if self.updating => {
-                if !self.start_the_app_and_close(1) {
-                    self.finish(1);
-                }
-            }
-            Page::Failed { .. } | Page::RemoveFailed(_) | Page::Refused(..) => self.finish(1),
-            _ => self.finish(2),
-        }
-    }
-
-    /// The window's own close button: what the secondary button does, but it never starts the app.
-    unsafe fn on_close(&mut self) {
-        if self.updating && matches!(self.page, Page::Failed { .. }) {
-            self.finish(1);
-        } else {
-            self.on_secondary();
+            // (an update that failed is of an app that is not running: its button starts it as it was, and so does the window's own close)
+            Page::Failed { .. } | Page::RemoveFailed(_) | Page::Refused(..) => self.end_without_success(1),
+            _ => self.end_without_success(2),
         }
     }
 
@@ -811,7 +815,7 @@ impl App {
                 }
                 Message::Waited => {
                     if self.stop.load(Ordering::Relaxed) {
-                        self.finish(2);
+                        self.end_without_success(2);
                     } else {
                         self.clear_the_way(After::Install);
                     }
@@ -820,7 +824,7 @@ impl App {
                     self.page = Page::Failed { failure };
                     self.refresh();
                 }
-                Message::Stopped => self.finish(2),
+                Message::Stopped => self.end_without_success(2),
                 Message::Removed(Ok(left)) => {
                     self.page = Page::Gone { left };
                     self.refresh();
@@ -904,8 +908,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.on_timer();
             0
         }
+        // (the window's own close is what Cancel, or the secondary button of the page, does)
         WM_CLOSE => {
-            app.on_close();
+            app.on_secondary();
             0
         }
         WM_DPICHANGED => {

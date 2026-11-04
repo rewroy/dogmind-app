@@ -5,7 +5,8 @@
 //!     DogmindSetup.exe [--dir FOLDER]                                    installs, or updates what is there. It starts with FOLDER, else with the install Installed apps names if that is still
 //!                                                                        there, else with %LOCALAPPDATA%\Programs\Dogmind; a first install can be moved to another folder on its first page
 //!     DogmindSetup.exe --update --dir FOLDER [--wait-pid PID]...         what the app runs for an update it has downloaded: no question is asked. It waits for those
-//!                                                                        programs to end, updates the install in FOLDER (which must hold one), and starts the app again
+//!                                                                        programs to end, updates the install in FOLDER (which must hold one), and starts the app again. If it
+//!                                                                        does not finish (it is cancelled or closed, or fails), the app is started as it is in FOLDER all the same
 //!     dogmind-uninstall.exe --uninstall                                  what Installed apps runs: clears the way, and opens the app's own page for removing it
 //!
 //! `--test` is for trying it out: no real Start menu entry or registry key is written, what would be goes in files in the folder, `--dir` must be named, and only what runs from that
@@ -34,6 +35,30 @@ pub struct Options {
     pub slowly: Duration,
     /// What a test has the folder picker answer, so that the page after a choice can be seen without anyone choosing: the picker is not opened.
     pub pick: Option<PathBuf>,
+    /// A press `--auto` makes besides the page's main button, for a test of how an update ends when it is stopped or closed.
+    pub press: Option<Press>,
+}
+
+/// What a test asks `--auto` to press: not the button that goes on, but the way out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Press {
+    /// Cancel, the moment the work page is up, before anything is unpacked.
+    CancelAtOnce,
+    /// Cancel, once the work has begun to unpack.
+    CancelAtWork,
+    /// The window's own close, on the page that says it did not finish.
+    CloseOnFailure,
+}
+
+impl Press {
+    fn named(name: &str) -> Option<Press> {
+        match name {
+            "cancel-at-once" => Some(Press::CancelAtOnce),
+            "cancel-at-work" => Some(Press::CancelAtWork),
+            "close-on-failure" => Some(Press::CloseOnFailure),
+            _ => None,
+        }
+    }
 }
 
 /// What the command line says.
@@ -246,6 +271,7 @@ fn main() {
         fail_after: number_from("DOGMIND_SETUP_FAIL_AFTER", test).map(|count| count as usize),
         slowly: Duration::from_millis(number_from("DOGMIND_SETUP_SLOW_MS", test).unwrap_or(0)),
         pick: if test { std::env::var_os("DOGMIND_SETUP_PICK").map(PathBuf::from) } else { None },
+        press: if test { std::env::var("DOGMIND_SETUP_PRESS").ok().and_then(|name| Press::named(&name)) } else { None },
     };
     let start = if found.finish_removal {
         window::Start::FinishRemoval
