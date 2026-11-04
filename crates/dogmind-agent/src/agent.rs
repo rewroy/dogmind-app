@@ -1,6 +1,7 @@
 //! The agent loop, on its own thread: stream, run the tools, repeat. A UI sends it [`Command`]s and shows its [`Event`]s.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -492,6 +493,168 @@ fn cost_note(generated: u64) -> String {
 fn is_code_line(line: &str) -> bool {
     let line = line.trim();
     line.ends_with([';', '{', '}']) || line.ends_with("*/") || line.starts_with("#define ") || line.starts_with("</")
+}
+
+/// A line shorter than this (in bytes) is not told as a quote or as new: `}`, `});` and `break;` are in every file there is, and say nothing of where they came from.
+const QUOTE_MIN: usize = 6;
+/// What is kept of the lines it has been shown, to tell its quotes by: the longest line, and the most lines. A conversation at its window holds some 10,000.
+const SHOWN_LINE_LONGEST: usize = 400;
+const SHOWN_LINES_MOST: usize = 100_000;
+
+/// The trimmed lines of what it has been shown: the tool results of the conversation, and what the person said. A model that reads a file and thinks about it says its lines over in its
+/// reasoning, as a person points at them, and that is a quote and not a draft. The app's own notes are not the person's, and are left out. A result with the line numbers `read_file` puts
+/// before its lines, or the `path:line:` of `search_files`, is kept with and without them.
+fn lines_shown(messages: &[Message]) -> BTreeSet<String> {
+    let mut shown = BTreeSet::new();
+    for message in messages {
+        let from_a_tool = match message.role.as_str() {
+            "tool" => true,
+            "user" => false,
+            _ => continue,
+        };
+        let Some(text) = message.content.as_deref().filter(|text| !prompt::is_nudge(text)) else { continue };
+        for line in text.lines() {
+            if shown.len() >= SHOWN_LINES_MOST {
+                return shown;
+            }
+            let mut keep = |line: &str| {
+                let line = line.trim();
+                if (QUOTE_MIN..=SHOWN_LINE_LONGEST).contains(&line.len()) {
+                    shown.insert(line.to_string());
+                }
+            };
+            keep(line);
+            if from_a_tool {
+                if let Some(code) = after_the_line_number(line) {
+                    keep(code);
+                }
+            }
+        }
+    }
+    shown
+}
+
+/// The code of a result's line that has its number before it: `12|    let a = 1;` of `read_file`, `src/a.rs:12:    let a = 1;` of `search_files`.
+fn after_the_line_number(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 && line[digits..].starts_with('|') {
+        return Some(&line[digits + 1..]);
+    }
+    // (the first `:12:` in it: a drive letter's colon is not followed by digits)
+    let mut from = 0;
+    while let Some(colon) = line[from..].find(':') {
+        let start = from + colon + 1;
+        let digits = line[start..].bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && line[start + digits..].starts_with(':') {
+            return Some(&line[start + digits + 1..]);
+        }
+        from = start;
+    }
+    None
+}
+
+/// A fenced block of its reasoning, as far as it has come.
+#[derive(Default)]
+struct Block {
+    /// The lines in it that are not blank, and of those the ones long enough to tell (`QUOTE_MIN`) and the ones among them that it was shown.
+    lines: usize,
+    known: usize,
+    quoted: usize,
+}
+
+impl Block {
+    /// Whether it holds code of its own: not when all of what can be told in it, or nearly all (three in four), is quoted.
+    fn is_new(known: usize, quoted: usize) -> bool {
+        known == 0 || quoted * 4 < known * 3
+    }
+}
+
+/// Whether the reasoning, as it streams, has become a draft of what is to be written: fenced blocks of code of its own, or lines of it with no fence. What it was shown (`lines_shown`)
+/// and says again is not code of its own, in a fence or out of one.
+struct DraftWatch {
+    shown: BTreeSet<String>,
+    /// Where the line after the last whole one begins.
+    line_starts: usize,
+    /// The lines of code of its own, among the whole ones.
+    code_lines: usize,
+    /// Whether the last line that could be told was a quote: a `}` that follows it ends a quote, and one that follows a line of its own ends that.
+    after_quote: bool,
+    /// The fence marks of the blocks that are done and hold code of its own, two each.
+    marks: usize,
+    block: Option<Block>,
+}
+
+impl DraftWatch {
+    fn new(shown: BTreeSet<String>) -> DraftWatch {
+        DraftWatch { shown, line_starts: 0, code_lines: 0, after_quote: false, marks: 0, block: None }
+    }
+
+    /// Whether a line of the reasoning is one it was shown; none where it is too short to say.
+    fn quote(&self, line: &str) -> Option<bool> {
+        (line.len() >= QUOTE_MIN).then(|| self.shown.contains(line))
+    }
+
+    /// Whether some line it was shown begins as `part` does.
+    fn begins_a_quote(&self, part: &str) -> bool {
+        self.shown.range::<str, _>((Bound::Included(part), Bound::Unbounded)).next().is_some_and(|line| line.starts_with(part))
+    }
+
+    fn whole_line(&mut self, line: &str) {
+        let marks = line.matches("```").count();
+        if marks > 0 {
+            for _ in 0..marks {
+                match self.block.take() {
+                    None => self.block = Some(Block::default()),
+                    Some(done) => self.marks += if Block::is_new(done.known, done.quoted) { 2 } else { 0 },
+                }
+            }
+            return;
+        }
+        let line = line.trim();
+        let quote = self.quote(line);
+        if let (Some(block), false) = (&mut self.block, line.is_empty()) {
+            block.lines += 1;
+            if let Some(quoted) = quote {
+                block.known += 1;
+                block.quoted += quoted as usize;
+            }
+        }
+        if is_code_line(line) && !quote.unwrap_or(self.after_quote) {
+            self.code_lines += 1;
+        }
+        if let Some(quoted) = quote {
+            self.after_quote = quoted;
+        }
+    }
+
+    /// Whether the open block holds code of its own so far, its unfinished line included: a quote that is half said is a quote. Not before anything of it has come.
+    fn open_block_is_new(&self, unfinished: &str) -> bool {
+        let Some(block) = &self.block else { return false };
+        let part = if unfinished.contains("```") { "" } else { unfinished.trim() };
+        let (mut known, mut quoted) = (block.known, block.quoted);
+        if !part.is_empty() {
+            if self.begins_a_quote(part) {
+                (known, quoted) = (known + 1, quoted + 1);
+            } else if part.len() >= QUOTE_MIN {
+                known += 1;
+            }
+        }
+        (block.lines > 0 || !part.is_empty()) && Block::is_new(known, quoted)
+    }
+
+    /// Looks at the reasoning as it is now, and says whether it is a draft: the second block of code of its own begun, or `DRAFT_LINES` lines of it.
+    fn is_a_draft(&mut self, reasoned: &str) -> bool {
+        // (each whole line once, as it ends)
+        if let Some(end) = reasoned.rfind('\n').filter(|end| *end >= self.line_starts) {
+            for line in reasoned[self.line_starts..end].split('\n') {
+                self.whole_line(line);
+            }
+            self.line_starts = end + 1;
+        }
+        let marks = self.marks + usize::from(self.open_block_is_new(&reasoned[self.line_starts..]));
+        self.code_lines >= DRAFT_LINES || marks >= DRAFT_FENCES
+    }
 }
 
 /// What it had thought before the first of the code, fenced or not.
@@ -1229,8 +1392,8 @@ impl Agent {
             let mut cut = false;
             let mut drafting = false;
             let may_stop_drafting = cuts && drafts_stopped < MAX_DRAFTS_STOPPED && !wrote;
-            let (draft_fences, draft_lines) = (DRAFT_FENCES, DRAFT_LINES);
-            let (mut code_lines, mut line_starts) = (0usize, 0usize);
+            // (what it has been shown, once for the request: its code in its reasoning that is a line of that is a quote, and not a draft)
+            let mut watch = may_stop_drafting.then(|| DraftWatch::new(lines_shown(&self.messages)));
             // The app's own stops (a draft, a file cut to get it on disk) end the stream through a flag of the stream's: on the person's,
             // and taken back after, a Stop pressed as one of them fired was taken for it, and the turn went on. The person's is passed on to it.
             let halt = AtomicBool::new(self.cancelled());
@@ -1255,14 +1418,11 @@ impl Agent {
                     Delta::Reasoning(text) => {
                         meter.count(text, now);
                         reasoned.push_str(text);
-                        // (each whole line once, as it ends)
-                        if let Some(end) = reasoned.rfind('\n').filter(|end| *end >= line_starts) {
-                            code_lines += reasoned[line_starts..end].split('\n').filter(|line| is_code_line(line)).count();
-                            line_starts = end + 1;
-                        }
-                        if may_stop_drafting && !drafting && (reasoned.matches("```").count() >= draft_fences || code_lines >= draft_lines) {
-                            drafting = true;
-                            cancel.store(true, Ordering::Relaxed);
+                        if let (Some(watch), false) = (&mut watch, drafting) {
+                            if watch.is_a_draft(&reasoned) {
+                                drafting = true;
+                                cancel.store(true, Ordering::Relaxed);
+                            }
                         }
                         vec![Event::Reasoning(text.to_string())]
                     }
@@ -4261,6 +4421,137 @@ mod tests {
         let (log, cancelled) = until_end(&run, Decision::Reject);
         assert!(!cancelled, "{log:?}");
         assert_eq!(bodies.lock().unwrap().len(), 1, "{log:?}");
+    }
+
+    fn thought(text: &str) -> Value {
+        serde_json::json!({"choices": [{"delta": {"reasoning_content": text}}]})
+    }
+
+    /// `totals.rs` as `read_file` shows it: a function of fourteen lines of code.
+    fn totals_rs() -> String {
+        let lines: String = (1..=14).map(|at| format!("    let total_{at} = prices.iter().map(|price| price * {at}.0).sum::<f64>();\n")).collect();
+        format!("fn totals(prices: &[f64]) {{\n{lines}}}\n")
+    }
+
+    /// Lines `from` to `to` of that function, as a model says them over: not indented as they are.
+    fn lines_of_totals(from: usize, to: usize) -> String {
+        (from..=to).map(|at| format!("  let total_{at} = prices.iter().map(|price| price * {at}.0).sum::<f64>();\n")).collect()
+    }
+
+    /// Lines of code that are in no file it read.
+    fn lines_of_its_own(from: usize, to: usize) -> String {
+        (from..=to).map(|at| format!("  let doubled_{at} = prices.iter().map(|price| price * {at}.0 + 1.0).sum::<f64>();\n")).collect()
+    }
+
+    /// A model reads `totals.rs`, and its next answer says `thinking`, goes on a while as a model does, and ends. A third answer is there for the note if it is stopped.
+    /// Gives the number of requests it made, and the number of draft notes in the last.
+    fn after_reading_it_thinks(thinking: Vec<Value>) -> (usize, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("totals.rs"), totals_rs()).unwrap();
+        let done = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
+        let read = vec![serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "r", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"totals.rs\"}"}}]}, "finish_reason": "tool_calls"}]})];
+        let said: Vec<Value> = thinking.into_iter().chain((0..100).map(|_| thought(" more of it"))).chain([done.clone()]).collect();
+        let (client, bodies) = trickling_server(vec![read, said, vec![done]]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("what does totals do".into())).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled, "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let notes = bodies.last().unwrap()["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "user" && message["content"].as_str().is_some_and(|text| text.starts_with(prompt::DRAFT_NOTE))).count();
+        (bodies.len(), notes)
+    }
+
+    /// The real run: Dogmind read Rust, was asked to change nothing, and quoted lines of it in its reasoning. The app took that for drafting, cut it and told it to write the file.
+    #[test]
+    fn reasoning_that_says_again_lines_it_read_is_not_a_draft() {
+        let quoted = lines_of_totals(1, 14);
+        assert_eq!(after_reading_it_thinks(vec![thought("The totals are these.\n"), thought(&quoted), thought("}\nSo they add up.")]), (2, 0));
+    }
+
+    #[test]
+    fn as_many_lines_of_its_own_are_still_a_draft() {
+        let own = lines_of_its_own(1, 14);
+        assert_eq!(after_reading_it_thinks(vec![thought("A function of its own.\n"), thought(&own), thought("}\nSo they add up.")]), (3, 1));
+    }
+
+    #[test]
+    fn a_fenced_block_of_lines_it_read_is_not_counted_and_one_of_code_of_its_own_is() {
+        let block = |lines: String| format!("```\n{lines}```\n");
+        let quoted = format!("Here:\n{}And here:\n{}And here:\n{}", block(lines_of_totals(1, 3)), block(lines_of_totals(4, 6)), block(lines_of_totals(7, 9)));
+        assert_eq!(after_reading_it_thinks(vec![thought(&quoted)]), (2, 0), "three blocks of what it read");
+        // (six lines of code in all: it is the second block that makes it a draft)
+        let own = format!("Here:\n{}And here:\n{}", block(lines_of_its_own(1, 3)), block(lines_of_its_own(4, 6)));
+        assert_eq!(after_reading_it_thinks(vec![thought(&own)]), (3, 1), "two blocks of its own");
+    }
+
+    /// The text as a stream brings it, in pieces; whether the watch took it for a draft at any point.
+    fn streamed(watch: &mut DraftWatch, text: &str) -> bool {
+        let mut so_far = String::new();
+        for piece in text.as_bytes().chunks(7) {
+            so_far.push_str(std::str::from_utf8(piece).unwrap());
+            if watch.is_a_draft(&so_far) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn watching_totals() -> DraftWatch {
+        DraftWatch::new(lines_shown(&[Message::tool_result("r", totals_rs().lines().enumerate().map(|(at, line)| format!("{}|{line}\n", at + 1)).collect::<String>())]))
+    }
+
+    #[test]
+    fn what_it_was_shown_is_the_lines_of_results_and_of_the_persons_words_with_and_without_their_numbers() {
+        let messages = [
+            Message::text("user", "[Now: 2026-11-04 13:02]\nmake it return the sum;\nplease"),
+            Message::tool_result("1", "12|    let a = compute(1);\n13|\n14|}\nsrc/a.rs:20:    fn parse(&self) -> Result<Config, Error> {\nC:\\w\\a.rs:5:        let c = compute(3);\n"),
+            Message::text("assistant", "let from_the_model = compute(4);"),
+            Message::text("user", format!("{}You began writing code in your reasoning:\nlet from_a_note = compute(5);", prompt::DRAFT_NOTE)),
+        ];
+        let shown = lines_shown(&messages);
+        for line in ["make it return the sum;", "12|    let a = compute(1);", "let a = compute(1);", "fn parse(&self) -> Result<Config, Error> {", "let c = compute(3);"] {
+            assert!(shown.contains(line), "{line}: {shown:?}");
+        }
+        assert!(!shown.contains("let from_the_model = compute(4);") && !shown.contains("let from_a_note = compute(5);"), "{shown:?}");
+        assert!(shown.iter().all(|line| line.len() >= QUOTE_MIN), "a line too short to say where it came from is not kept: {shown:?}");
+        assert_eq!(after_the_line_number("  7|    x = 1;"), Some("    x = 1;"));
+        assert_eq!(after_the_line_number("C:\\a\\b.rs:12:    x = 1;"), Some("    x = 1;"));
+        assert_eq!(after_the_line_number("let x: u8 = 3;"), None);
+    }
+
+    #[test]
+    fn only_lines_of_code_of_its_own_count_toward_a_draft() {
+        // (ten lines of it, as before: the stop is the same for what it wrote)
+        assert!(streamed(&mut watching_totals(), &format!("A function of its own.\n{}", lines_of_its_own(1, 10))));
+        assert!(!streamed(&mut watching_totals(), &format!("A function of its own.\n{}", lines_of_its_own(1, 9))));
+        // (what it read, and says again, is not)
+        assert!(!streamed(&mut watching_totals(), &format!("It reads:\n{}\n", lines_of_totals(1, 14))));
+        assert!(!streamed(&mut watching_totals(), &format!("{}{}", lines_of_totals(1, 7), lines_of_its_own(1, 9))), "nine of its own among seven it read");
+        assert!(streamed(&mut watching_totals(), &format!("{}{}", lines_of_totals(1, 7), lines_of_its_own(1, 10))));
+        // (a `}` after a line it read is the end of that, and after a line of its own is the end of that)
+        let closed = |lines: String| lines.lines().map(|line| format!("{line}\n}}\n")).collect::<String>();
+        assert!(!streamed(&mut watching_totals(), &closed(lines_of_totals(1, 12))));
+        assert!(streamed(&mut watching_totals(), &closed(lines_of_its_own(1, 5))));
+        assert!(streamed(&mut watching_totals(), &"}\n".repeat(10)), "closing braces and nothing else are told from nothing");
+    }
+
+    #[test]
+    fn only_fenced_blocks_with_code_of_its_own_count_toward_a_draft() {
+        let block = |lines: String| format!("```\n{lines}```\n");
+        let mixed = |read: usize, own: usize| block(format!("{}{}", lines_of_totals(1, read), lines_of_its_own(1, own)));
+        assert!(!streamed(&mut watching_totals(), &format!("{}{}{}", block(lines_of_totals(1, 3)), block(lines_of_totals(4, 6)), block(lines_of_totals(7, 9)))));
+        // (a block of nearly all quotes is one: three in four, and one line of its own among them)
+        assert!(!streamed(&mut watching_totals(), &format!("{}{}{}", mixed(3, 1), mixed(3, 1), mixed(3, 1))));
+        assert!(streamed(&mut watching_totals(), &format!("{}{}", mixed(2, 2), mixed(2, 2))), "half of each is its own");
+        assert!(!streamed(&mut watching_totals(), &format!("{}{}", block(lines_of_totals(1, 3)), block(lines_of_its_own(1, 3)))), "one block of its own is one block");
+        assert!(streamed(&mut watching_totals(), &format!("{}{}", block(lines_of_its_own(1, 2)), block(lines_of_its_own(3, 4)))));
+        // (blocks with lines too short to tell, as `d` and `e`, are as they were: they count)
+        assert!(streamed(&mut watching_totals(), "Again.\n```\nd\n```\n```\ne\n```\n"));
+        // (a block half said that is a quote so far is not one yet: it is when it goes on in other words)
+        let begun = format!("```\n{}```\nAnd:\n```\n", lines_of_its_own(1, 2));
+        assert!(!streamed(&mut watching_totals(), &format!("{begun}  let total_1 = prices.iter().map(|pri")));
+        assert!(streamed(&mut watching_totals(), &format!("{begun}  let total_1 = prices.iter().filter(|pri")));
+        assert!(!streamed(&mut watching_totals(), &begun), "just opened, and nothing of it is said");
     }
 
     #[test]
