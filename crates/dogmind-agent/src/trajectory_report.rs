@@ -232,7 +232,7 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         if let Some((entry, how)) = joined.get(at) {
             let drafts = entry.drafts.map_or(String::new(), |(kept, tried)| format!(", drafts {kept}/{tried}"));
             // (the engine writes its line as the request ends, and the app writes its own when it has read the stream's last word)
-            let apart = line.at.zip(entry.at).map_or(String::new(), |(ours, theirs)| format!(", logged {} ms before the app's line", (ours.with_timezone(&Utc) - theirs).num_milliseconds()));
+            let apart = line.at.zip(entry.at).map_or(String::new(), |(ours, theirs)| format!(", the app's line is {:+} ms from the engine's (the two machines' clocks differ a little)", (ours.with_timezone(&Utc) - theirs).num_milliseconds()));
             let _ = writeln!(out, "        engine ({how}): prompt {}, reused {} from {}, prefilled {} in {} ms, first token {:.2} s, {} tokens at {:.1} tok/s{drafts}{apart}", entry.prompt, entry.reused, entry.from, entry.new, entry.prefill_ms, entry.first_s, entry.tokens, entry.tokens_per_second);
         } else if !engine.is_empty() && line.s("role") != "warm" {
             let _ = writeln!(out, "        engine: no line for this request");
@@ -604,7 +604,7 @@ mod tests {
         let said = report(&text(&lines), Some(&log));
         assert!(said.contains("connections\n  connect took 1.2 s, ok ending at 09:59:50.000"), "{said}");
         assert!(!said.contains("before the first turn"), "{said}");
-        assert!(said.contains("logged 12 ms before the app's line"), "{said}");
+        assert!(said.contains("the app's line is +12 ms from the engine's"), "{said}");
     }
 
     #[test]
