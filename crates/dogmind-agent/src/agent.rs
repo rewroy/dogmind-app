@@ -1262,7 +1262,7 @@ impl Agent {
         self.load_extras();
         let messages = [Message::text("system", self.frozen_prompt()), Message::text("user", ".")];
         let req_id = self.traj.request_id();
-        let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false };
+        let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id) };
         // Its first word is enough, which stops it as Stop does: Stop itself ends it at once, for what was written during it to begin.
         self.cancel.store(false, Ordering::Relaxed);
         let mut answered = false;
@@ -1525,7 +1525,7 @@ impl Agent {
             let req_id = self.traj.request_id();
             self.last_req = Some(req_id.clone());
             let folder = self.picture_folder();
-            let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters() };
+            let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
             let mut written = String::new();
             let (mut reasoned, mut calling) = (String::new(), Vec::<crate::message::ToolCall>::new());
             let cuts = provider.keeps_cut_writes();
@@ -2090,7 +2090,7 @@ impl Agent {
             // The tools are offered to the end. Not offered, a real model (DeepSeek-V4.1) went on calling one, in its own markup: that came back as
             // the answer, and the agent that asked got that and nothing of what the helper had found.
             let req_id = self.traj.request_id();
-            let request = Request { model: &self.model, messages: &messages, tools: Some(&schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false };
+            let request = Request { model: &self.model, messages: &messages, tools: Some(&schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id) };
             let mut clock = Clock::start();
             let streamed = provider.stream(&request, &self.cancel, &mut |_| clock.word());
             self.traced("helper", &req_id, &clock, &streamed);
@@ -2547,7 +2547,7 @@ impl Agent {
         messages.push(Message::text("user", prompt::CHECKPOINT_PROMPT));
         let folder = self.picture_folder();
         let req_id = self.traj.request_id();
-        let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false };
+        let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false, request_id: Some(&req_id) };
         let mut clock = Clock::start();
         let streamed = provider.stream(&request, &self.cancel, &mut |_| clock.word());
         self.traced("checkpoint", &req_id, &clock, &streamed);
@@ -5556,6 +5556,60 @@ mod tests {
         std::fs::remove_file(&session).unwrap();
         crate::checkpoint::remove_for(&session).unwrap();
         assert!(!beside.exists());
+    }
+
+    /// A server that answers each request with the next script, and keeps what each was called in its `X-Request-Id` header (none: empty).
+    fn server_hearing_names(scripts: Vec<String>) -> (Client, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let kept = names.clone();
+        std::thread::spawn(move || {
+            for script in scripts {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (mut request, mut block) = (Vec::new(), [0u8; 65536]);
+                loop {
+                    let count = stream.read(&mut block).unwrap();
+                    request.extend_from_slice(&block[..count]);
+                    let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&request[..at]).to_string();
+                    let length: usize = head.to_lowercase().lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                    if request.len() >= at + 4 + length {
+                        kept.lock().unwrap().push(head.lines().find_map(|line| line.strip_prefix("X-Request-Id: ")).unwrap_or("").to_string());
+                        break;
+                    }
+                }
+                let answer = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{script}", script.len());
+                stream.write_all(answer.as_bytes()).unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+            }
+        });
+        (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), names)
+    }
+
+    #[test]
+    fn every_request_of_a_turn_is_named_to_the_server_as_the_trajectory_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "the needle is here\n").unwrap();
+        // A step of the conversation, two of a helper's, and the last step: each one a request, whoever makes it.
+        let (client, names) = server_hearing_names(vec![
+            call_answer("explore", serde_json::json!({"task": "Where is the needle?"})),
+            call_answer("search_files", serde_json::json!({"pattern": "needle"})),
+            text_answer("The needle is at a.txt:1."),
+            text_answer("found it"),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("find the needle".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let lines = trajectory_of(&run);
+        let requests = of_kind(&lines, "request");
+        assert_eq!(requests.iter().map(|line| line["role"].as_str().unwrap()).collect::<Vec<_>>(), ["main", "helper", "helper", "main"], "{lines:?}");
+        let ids: Vec<&str> = requests.iter().map(|line| line["req"].as_str().unwrap()).collect();
+        let sent = names.lock().unwrap().clone();
+        assert_eq!(sent, ids, "the server was told the same name for each request, in the order they were made");
+        assert!(ids.iter().enumerate().all(|(at, id)| id.ends_with(&format!("/{}", at + 1))), "{ids:?}");
+        assert!(sent.iter().all(|name| name.len() <= 64 && name.bytes().all(|byte| (0x21..=0x7e).contains(&byte))));
     }
 
     #[test]

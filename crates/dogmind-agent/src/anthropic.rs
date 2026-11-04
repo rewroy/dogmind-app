@@ -337,7 +337,10 @@ impl Provider for Anthropic {
     fn stream(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
         let text = request_body(request).to_string();
         let url = self.base.join("messages");
-        let mut response = http::request("POST", &url, &self.headers(), Some(&text), Duration::from_secs(20), cancel)?;
+        // (extra headers are ignored by the API)
+        let mut headers = self.headers();
+        headers.extend(request.request_id.and_then(llm::request_id_header));
+        let mut response = http::request("POST", &url, &headers, Some(&text), Duration::from_secs(20), cancel)?;
         if response.status != 200 {
             let status = response.status;
             return Err(classify(status, &response.text()?));
@@ -400,7 +403,7 @@ mod tests {
             });
             let claude = Anthropic::new(&format!("http://127.0.0.1:{port}/v1"), "k".into()).unwrap();
             let messages = [Message::text("user", "hi")];
-            claude.stream(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false }, &AtomicBool::new(false), &mut |_| {})
+            claude.stream(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None }, &AtomicBool::new(false), &mut |_| {})
         };
         let start = [
             json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
@@ -410,6 +413,39 @@ mod tests {
         assert!(matches!(answer(&start), Err(LlmError::Transient(_))));
         let whole: Vec<Value> = start.iter().cloned().chain([json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}), json!({"type": "message_stop"})]).collect();
         assert_eq!(answer(&whole).unwrap().content, "Half of");
+    }
+
+    /// Claude's API ignores a header it does not know, so the name of a request goes to it as it goes to any server.
+    #[test]
+    fn a_request_is_named_in_a_header_here_too() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (told, heard) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (mut request, mut block) = (Vec::new(), [0u8; 65536]);
+            let head = loop {
+                let count = stream.read(&mut block).unwrap();
+                request.extend_from_slice(&block[..count]);
+                let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(&request[..at]).to_lowercase();
+                let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                if request.len() >= at + 4 + length {
+                    break head;
+                }
+            };
+            told.send(head).unwrap();
+            let body = format!("data: {}\n\ndata: {}\n\n", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}), json!({"type": "message_stop"}));
+            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+        });
+        let claude = Anthropic::new(&format!("http://127.0.0.1:{port}/v1"), "k".into()).unwrap();
+        let messages = [Message::text("user", "hi")];
+        claude.stream(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: Some("20261105-120000/4") }, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        let head = heard.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(head.lines().any(|line| line == "x-request-id: 20261105-120000/4") && head.contains("x-api-key: k"), "{head}");
     }
 
     #[test]
@@ -504,7 +540,7 @@ mod tests {
     fn a_request_is_what_the_current_api_takes() {
         let schemas = crate::tools::schemas();
         let messages = [Message::text("system", "s"), Message::text("user", "hi")];
-        let body = request_body(&Request { model: DEFAULT_MODEL, messages: &messages, tools: Some(&schemas), effort: Some("none"), images: None, japanese_letters: false });
+        let body = request_body(&Request { model: DEFAULT_MODEL, messages: &messages, tools: Some(&schemas), effort: Some("none"), images: None, japanese_letters: false, request_id: None });
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "low");
         assert_eq!(body["system"], "s");
