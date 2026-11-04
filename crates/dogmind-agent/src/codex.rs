@@ -486,7 +486,7 @@ mod tests {
     fn the_model_chosen_is_the_one_the_request_asks_for() {
         let codex = stood_in();
         let messages = [crate::message::Message::text("user", "hi")];
-        let request = Request { model: "gpt-chosen", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false };
+        let request = Request { model: "gpt-chosen", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None };
         let answer = codex.stream(&request, &AtomicBool::new(false), &mut |_| {}).unwrap();
         assert_eq!(answer.content, "thread-gpt-chosen gpt-chosen");
     }
@@ -542,7 +542,7 @@ mod tests {
     fn the_transcript_leaves_out_the_reasoning() {
         let message = crate::message::Message { role: "assistant".into(), content: Some("a".into()), reasoning_content: Some("secret".into()), ..Default::default() };
         let messages = [message];
-        let text = payload(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false });
+        let text = payload(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None });
         assert!(!text.contains("secret") && text.contains("dogmind_tools"));
     }
 
@@ -554,7 +554,7 @@ mod tests {
         let kept = crate::images::save(&session, &crate::images::attach_bytes("a", bytes.clone()).unwrap(), crate::images::ImageLimit::WIDE).unwrap();
         let messages = [crate::message::Message { images: vec![kept], ..crate::message::Message::text("user", "what") }];
         let folder = crate::images::folder_of(&session);
-        let (text, pictures) = transcript(&Request { model: "m", messages: &messages, tools: None, effort: None, images: Some(&folder), japanese_letters: false });
+        let (text, pictures) = transcript(&Request { model: "m", messages: &messages, tools: None, effort: None, images: Some(&folder), japanese_letters: false, request_id: None });
         assert_eq!(pictures, [json!({"type": "image", "url": format!("data:image/png;base64,{}", crate::images::base64(&bytes))})]);
         assert!(text.contains("\"attached_images\":[1]") && !text.contains("media_type") && !text.contains("base64"), "{text}");
     }

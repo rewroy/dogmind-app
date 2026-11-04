@@ -327,6 +327,15 @@ pub struct Request<'a> {
     pub images: Option<&'a Path>,
     /// This answer is to hold no letter Japanese is not written with, for a server that can see to that.
     pub japanese_letters: bool,
+    /// What this request is called in the trajectory, which the server is also told, as `X-Request-Id`: `<session id>/<n>`. A provider with no HTTP to carry it leaves it out.
+    pub request_id: Option<&'a str>,
+}
+
+/// The header that names a request to the server. What the server logs of it is printable ASCII with no space (0x21 to 0x7E) and at most 64 characters, so that is all that is sent of it:
+/// none when nothing is left.
+pub fn request_id_header(id: &str) -> Option<(String, String)> {
+    let kept: String = id.chars().filter(|c| ('\u{21}'..='\u{7e}').contains(c)).take(64).collect();
+    (!kept.is_empty()).then(|| ("X-Request-Id".to_string(), kept))
 }
 
 /// What the agent needs of a model. `on` hears the answer as it comes; a provider that only has it at the end says it then.
@@ -361,7 +370,7 @@ impl Provider for Client {
         if request.japanese_letters && self.suppresses_letters {
             body["suppress"] = json!(NOT_CP932_HAN);
         }
-        self.post(&body, cancel, on)
+        self.post(&body, request.request_id, cancel, on)
     }
 
     /// Straydog's API takes them, and its template shows them inside the tool's response. The services' chat completions take text there.
@@ -427,10 +436,13 @@ impl Client {
         }
     }
 
-    fn post(&self, body: &Value, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
+    fn post(&self, body: &Value, id: Option<&str>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
         let text = body.to_string();
         let url = self.base.join("chat/completions");
-        let mut response = http::request("POST", &url, &self.headers(), Some(&text), Duration::from_secs(10), cancel).map_err(|failure| self.unreached(failure))?;
+        // (OpenAI-compatible servers ignore a header they do not know; Straydog writes it in its own line for the request)
+        let mut headers = self.headers();
+        headers.extend(id.and_then(request_id_header));
+        let mut response = http::request("POST", &url, &headers, Some(&text), Duration::from_secs(10), cancel).map_err(|failure| self.unreached(failure))?;
         if response.status != 200 {
             let status = response.status;
             return Err(classify(status, &response.text()?));
@@ -572,6 +584,56 @@ mod tests {
         assert_eq!(completion.finish, "tool_calls");
         let usage = completion.usage.unwrap();
         assert_eq!((usage.prompt, usage.cached, usage.completion, usage.tokens_per_second), (7, 5, 3, Some(41.5)));
+    }
+
+    /// The head of the request a server is sent by `stream`, as the server reads it, lower-cased.
+    fn head_seen_by_a_server(request_id: Option<&str>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (told, heard) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (mut request, mut block) = (Vec::new(), [0u8; 65536]);
+            let head = loop {
+                let count = stream.read(&mut block).unwrap();
+                request.extend_from_slice(&block[..count]);
+                let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(&request[..at]).to_lowercase();
+                let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                if request.len() >= at + 4 + length {
+                    break head;
+                }
+            };
+            told.send(head).unwrap();
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+        });
+        let client = Client::new(&format!("http://127.0.0.1:{port}/v1"), Some("key".into())).unwrap();
+        let messages = [Message::text("user", "hi")];
+        let request = Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id };
+        assert_eq!(client.stream(&request, &AtomicBool::new(false), &mut |_| {}).unwrap().content, "a");
+        heard.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
+    #[test]
+    fn a_request_is_named_to_the_server_in_a_header_and_unnamed_has_none() {
+        let head = head_seen_by_a_server(Some("20261105-120000/3"));
+        assert!(head.lines().any(|line| line == "x-request-id: 20261105-120000/3"), "{head}");
+        assert!(head.contains("authorization: bearer key"), "what a request had it still has: {head}");
+        assert!(!head_seen_by_a_server(None).contains("x-request-id"));
+    }
+
+    #[test]
+    fn the_name_sent_is_printable_ascii_with_no_space_and_at_most_sixty_four_long() {
+        assert_eq!(request_id_header("20261105-120000/12"), Some(("X-Request-Id".to_string(), "20261105-120000/12".to_string())));
+        assert_eq!(request_id_header("a b\r\nc\t\u{7f}d\u{3042}e").unwrap().1, "abcde", "no space, no control, no letter outside ASCII");
+        let long = request_id_header(&format!("{}/1", "s".repeat(100))).unwrap().1;
+        assert_eq!(long.len(), 64);
+        assert!(long.bytes().all(|byte| (0x21..=0x7e).contains(&byte)));
+        assert_eq!(request_id_header(" \u{3042}"), None);
     }
 
     #[test]
@@ -800,7 +862,7 @@ mod tests {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let client = Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap();
         let cancel = AtomicBool::new(false);
-        let request = Request { model: "m", messages: &[], tools: None, effort: None, images: None, japanese_letters: false };
+        let request = Request { model: "m", messages: &[], tools: None, effort: None, images: None, japanese_letters: false, request_id: None };
         assert!(matches!(client.stream(&request, &cancel, &mut |_| {}), Err(LlmError::Down(_))));
         assert!(!client.answers());
         let said = client.describe().unwrap_err();
