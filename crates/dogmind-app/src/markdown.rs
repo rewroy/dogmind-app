@@ -156,6 +156,22 @@ fn page_address(url: &str) -> String {
     }
 }
 
+/// How deep quotations and lists nest in a page. A model's answer, or a file it wrote, is not trusted to stop: a line of a hundred thousand `>` is a hundred thousand levels, each one a
+/// call, and the process ended with its stack. No real answer is near this; what is deeper is shown as the words it is, at the level that is reached.
+const MOST_NESTING: usize = 32;
+
+/// What is left, as one paragraph of its own words.
+fn plain_rest(lines: &[&str], out: &mut String) {
+    out.push_str("<p>");
+    for (at, line) in lines.iter().enumerate() {
+        if at > 0 {
+            out.push('\n');
+        }
+        out.push_str(&escape(line));
+    }
+    out.push_str("</p>");
+}
+
 /// A line's text as HTML: emphasis, code, links, pictures.
 pub fn inline(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 16);
@@ -344,8 +360,24 @@ fn starts_block(line: &str) -> bool {
     trimmed.is_empty() || trimmed.starts_with("```") || trimmed.starts_with("~~~") || heading_level(trimmed).is_some() || is_rule(trimmed) || trimmed.starts_with('>') || item_of(line).is_some() || trimmed.starts_with('|')
 }
 
-/// A list from the line at `at`, with what is nested in it; where it ended.
-fn list(lines: &[&str], mut at: usize, out: &mut String) -> usize {
+/// A line with up to `columns` of its leading space taken off (a tab is four).
+fn without_columns(line: &str, columns: usize) -> &str {
+    let mut taken = 0;
+    for (at, byte) in line.bytes().enumerate() {
+        if taken >= columns {
+            return &line[at..];
+        }
+        match byte {
+            b' ' => taken += 1,
+            b'\t' => taken += 4,
+            _ => return &line[at..],
+        }
+    }
+    ""
+}
+
+/// A list from the line at `at`, with what is nested in it; where it ended. `depth`: how deep this list is.
+fn list(lines: &[&str], mut at: usize, out: &mut String, depth: usize) -> usize {
     let indent = indent_of(lines[at]);
     let ordered = item_of(lines[at]).is_some_and(|item| item.ordered);
     out.push_str(if ordered { "<ol>" } else { "<ul>" });
@@ -386,9 +418,9 @@ fn list(lines: &[&str], mut at: usize, out: &mut String) -> usize {
         }
         if start < at {
             let least = lines[start..at].iter().filter(|line| !line.trim().is_empty()).map(|line| indent_of(line)).min().unwrap_or(0);
-            let inner: Vec<String> = lines[start..at].iter().map(|line| line.chars().skip(least).collect()).collect();
-            let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
-            blocks(&inner, out);
+            // (slices of the lines: a list a thousand deep copied all that was inside each of them)
+            let inner: Vec<&str> = lines[start..at].iter().map(|line| without_columns(line, least)).collect();
+            blocks(&inner, out, depth + 1);
         }
         out.push_str("</li>");
     }
@@ -396,7 +428,11 @@ fn list(lines: &[&str], mut at: usize, out: &mut String) -> usize {
     at
 }
 
-fn blocks(lines: &[&str], out: &mut String) {
+fn blocks(lines: &[&str], out: &mut String, depth: usize) {
+    if depth >= MOST_NESTING {
+        plain_rest(lines, out);
+        return;
+    }
     let mut at = 0;
     while at < lines.len() {
         let line = lines[at];
@@ -430,10 +466,10 @@ fn blocks(lines: &[&str], out: &mut String) {
                 at += 1;
             }
             out.push_str("<blockquote>");
-            blocks(&inner, out);
+            blocks(&inner, out, depth + 1);
             out.push_str("</blockquote>");
         } else if item_of(line).is_some() {
-            at = list(lines, at, out);
+            at = list(lines, at, out, depth);
         } else if trimmed.starts_with('|') && lines.get(at + 1).and_then(|next| crate::rtf::table_cells(next)).is_some_and(|cells| crate::rtf::is_table_rule(&cells)) {
             let rule = crate::rtf::table_cells(lines[at + 1]).unwrap_or_default();
             let aligned = |column: usize| match rule.get(column).map(String::as_str) {
@@ -474,7 +510,7 @@ fn blocks(lines: &[&str], out: &mut String) {
 pub fn to_html(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = String::with_capacity(text.len() + text.len() / 4);
-    blocks(&lines, &mut out);
+    blocks(&lines, &mut out, 0);
     out
 }
 
@@ -592,6 +628,41 @@ mod tests {
         }
         assert_eq!(to_html("- a\nb"), "<ul><li>a</li></ul><p>b</p>");
         assert_eq!(to_html("1. a\n- b"), "<ol><li>a</li></ol><ul><li>b</li></ul>");
+    }
+
+    /// `run` on a thread with a stack of this size, which proves what the test says of it: the stack of the app's own thread is far larger than this, and an answer is no reason to use it.
+    fn on_a_small_stack<R: Send + 'static>(kilobytes: usize, run: impl FnOnce() -> R + Send + 'static) -> R {
+        std::thread::Builder::new().stack_size(kilobytes * 1024).spawn(run).unwrap().join().expect("it did not overflow its stack")
+    }
+
+    /// The real find: a line of a hundred thousand `>` is a hundred thousand levels of quotation, and the process ended with its stack.
+    #[test]
+    fn a_line_of_a_hundred_thousand_quote_marks_is_a_quotation_so_deep_and_then_its_words() {
+        let began = std::time::Instant::now();
+        let page = on_a_small_stack(256, || to_html(&">".repeat(100_000)));
+        assert_eq!(page.matches("<blockquote>").count(), MOST_NESTING, "as deep as it goes");
+        assert_eq!(page.matches("</blockquote>").count(), MOST_NESTING);
+        // (the rest is what it is: words, escaped, at the level that was reached)
+        assert!(page.contains(&format!("<p>{}</p>", "&gt;".repeat(100_000 - MOST_NESTING))), "the rest is shown as it was written");
+        assert!(began.elapsed() < std::time::Duration::from_secs(2), "{:?}", began.elapsed());
+        // Quotation marks with words in them, as an answer has them, nest as far as they go and no further.
+        let few = to_html("> > a\n> b");
+        assert_eq!(few, "<blockquote><blockquote><p>a</p></blockquote><p>b</p></blockquote>");
+    }
+
+    #[test]
+    fn lists_nested_hundreds_deep_end_at_the_same_cap() {
+        let began = std::time::Instant::now();
+        let text: String = (0..400).map(|level| format!("{}- item {level}\n", " ".repeat(level))).collect();
+        let page = on_a_small_stack(256, move || to_html(&text));
+        assert_eq!(page.matches("<ul>").count(), MOST_NESTING, "{}", &page[..200.min(page.len())]);
+        assert!(page.contains("item 31") && page.contains("- item 40"), "what is deeper is its words, with its marks");
+        assert!(began.elapsed() < std::time::Duration::from_secs(2), "{:?}", began.elapsed());
+        // The same through quotations that hold lists that hold quotations.
+        let mixed: String = (0..2000).map(|level| format!("{}> - x\n", "  ".repeat(level.min(40)))).collect();
+        let _ = on_a_small_stack(256, move || to_html(&mixed));
+        let ordinary = to_html("- a\n  - b\n    - c\n- d");
+        assert_eq!(ordinary, "<ul><li>a<ul><li>b<ul><li>c</li></ul></li></ul></li><li>d</li></ul>");
     }
 
     #[test]
