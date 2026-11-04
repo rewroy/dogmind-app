@@ -102,15 +102,38 @@ fn separates_words(c: char) -> bool {
     c.is_whitespace() || "\"'=<>|&;(),".contains(c)
 }
 
-/// The first word of a command that leads off this PC, as `reaches_out` tells it of a path: `\\server\share`, `//server/share`, `\\?\UNC\server\share`, a device or a pipe (`\\.\pipe\x`), and
-/// `\\server@8080\x` or `\\server@SSL@443\x`, which is WebDAV, through a service that runs outside the sandbox. Also one that a switch is given, as `findstr /f:\\server\list`: what follows its
-/// `:`, as long as the name before it is no drive's letter. A plain `\\?\C:\x` is only a spelling of a path on this PC. Nothing here opens one of them to find out.
+/// `host\share...`, as it follows the `\\` of a UNC path: a host of hostname or address characters (any language's letters and digits, and `.`, `-`, `_`), with `@port`, `@SSL` or `@SSL@port` after
+/// it for WebDAV, and a share that is not empty. What only starts with two slashes, as a comment does (`//TODO`), or a regex (`\\d+`, `\\\\`), has no share and is no path.
+fn is_a_host_and_share(rest: &str) -> bool {
+    let Some((host, after)) = rest.split_once('\\') else { return false };
+    let mut parts = host.split('@');
+    let name = parts.next().unwrap_or("");
+    let marks: Vec<&str> = parts.collect();
+    let name_is_one = name.starts_with(|c: char| c.is_alphanumeric() || c == '_') && name.chars().all(|c| c.is_alphanumeric() || "._-".contains(c));
+    let marks_are_ports = marks.len() <= 2 && marks.iter().all(|mark| mark.eq_ignore_ascii_case("ssl") || (!mark.is_empty() && mark.bytes().all(|b| b.is_ascii_digit())));
+    name_is_one && marks_are_ports && !after.split('\\').next().unwrap_or("").is_empty()
+}
+
+/// Whether a word has the shape of a path that leads off this PC: `\\host\share...` or `//host/share...` (with `@port` or `@SSL@port` after the host, which is WebDAV through a service that runs
+/// outside the sandbox), `\\?\UNC\host\share...`, and the device and pipe prefixes `\\.\` and `\\?\` as `reaches_out` has them, but for a drive's path, `\\?\C:\x`, which is only a spelling of one on
+/// this PC.
+fn has_the_shape_of_a_path_off_this_pc(word: &str) -> bool {
+    let spelled = word.replace('/', "\\");
+    let Some(rest) = spelled.strip_prefix("\\\\") else { return false };
+    if rest.starts_with(".\\") || rest.starts_with("?\\") {
+        return reaches_out(Path::new(word));
+    }
+    is_a_host_and_share(rest)
+}
+
+/// The first word of a command that has the shape of a path off this PC, as it is said above. Also one that a switch is given, as `findstr /f:\\server\list`: what follows its `:`, as long as the
+/// name before it is no drive's letter. Nothing here opens one of them to find out.
 fn names_a_place_off_this_pc(command: &str) -> Option<String> {
     // (cmd's escape is no part of a name)
     let command = command.replace('^', "");
     command.split(separates_words).filter(|word| !word.is_empty()).find_map(|word| {
         let given_to_a_switch = word.split_once(':').filter(|(name, value)| name.len() > 1 && value.starts_with("\\\\")).map(|(_, value)| value);
-        [Some(word), given_to_a_switch].into_iter().flatten().find(|candidate| reaches_out(Path::new(candidate))).map(str::to_string)
+        [Some(word), given_to_a_switch].into_iter().flatten().find(|candidate| has_the_shape_of_a_path_off_this_pc(candidate)).map(str::to_string)
     })
 }
 
@@ -1086,6 +1109,9 @@ mod tests {
             "dir \\\\?\\UNC\\192.0.2.10\\share", "dir //?/UNC/192.0.2.10/share", "dir \\\\.\\pipe\\x", "dir \\\\.\\PhysicalDrive0", "type \\\\?\\GLOBALROOT\\Device\\Mup\\192.0.2.10\\x",
             "dir \"\\\\192.0.2.10\\share\"", "dir /b \\\\192.0.2.10\\share", "dir /b,\\\\192.0.2.10\\share", "findstr x \\\\192.0.2.10\\share\\*", "findstr /f:\\\\192.0.2.10\\list x", "tree \\\\192.0.2.10\\share",
             "dir \\^\\192.0.2.10\\share", "copy \\\\192.0.2.10\\share\\a.txt .", "python read.py \\\\192.0.2.10\\share", "git status \\\\192.0.2.10\\share", "git log --output=\\\\192.0.2.10\\share\\x",
+            // (a host and a share, in any of the spellings)
+            "dir //host/share/x", "dir \\\\host\\share", "dir \\\\10.0.0.5\\c$\\x", "dir \\\\host@8080\\dav\\x", "dir \\\\host@SSL\\dav", "dir \\\\host@8080@SSL\\dav", "dir \\\\サーバー\\共有", "dir \\\\my-host_1.example.org\\s",
+            "findstr x //host/share/a.txt", "findstr /f:\\\\host\\list x",
         ] {
             assert!(names_a_place_off_this_pc(line).is_some(), "{line}");
             assert_eq!(gate.command_risk(line, None).unwrap(), Risk::High, "{line}");
@@ -1114,6 +1140,23 @@ mod tests {
             assert_eq!(names_a_place_off_this_pc(line), None, "{line}");
             assert!(gate.is_look(line), "{line}");
             assert_eq!(gate.check("execute_command", &json!({"command": line}), root), Verdict::Allow, "{line}");
+        }
+        // What only starts with two slashes is no path, and was no more of one before this: a comment searched for, a regex's backslashes, and a URL with a scheme in front of its slashes.
+        for line in [
+            "findstr \"//TODO\" src\\a.js", "findstr \"//TODO:\" src\\a.js", "findstr \"// x\" src\\a.js", "findstr \"//\" src\\a.js", "findstr \"\\\\\\\\\" src\\a.js", "findstr \"\\\\d+\" src\\a.js",
+            "findstr /c:\"//TODO\" src\\a.js", "findstr /c:\"\\\\d+\" src\\a.js", "findstr \"//host\" src\\a.js", "findstr \"\\\\host\" src\\a.js",
+        ] {
+            assert_eq!(names_a_place_off_this_pc(line), None, "{line}");
+            assert!(gate.is_look(line), "{line}");
+            assert_eq!(gate.check("execute_command", &json!({"command": line}), root), Verdict::Allow, "{line}");
+        }
+        for line in ["rg \"//TODO\" src", "rg \"//TODO:\" src", "rg \"// x\"", "rg \"\\\\\\\\\" src", "rg \"\\\\d+\" src", "rg -n \"//\" src\\a.js"] {
+            assert_eq!(names_a_place_off_this_pc(line), None, "{line}");
+            assert_eq!(gate.command_risk(line, None).unwrap(), Risk::Safe, "{line}");
+            assert!(matches!(gate.check("execute_command", &json!({"command": line}), root), Verdict::Ask { risk: Risk::Safe, reason: None }), "{line}");
+        }
+        for word in ["//TODO", "//TODO:", "//", "// x", "\\\\\\\\", "\\\\d+", "\\\\host", "//host", "\\\\host\\", "\\\\host\\\\x", "\\\\", "//x:y/z", "https://example.org/a", "///x/y", "\\\\-host\\x"] {
+            assert!(!has_the_shape_of_a_path_off_this_pc(word), "{word}");
         }
         // (`type \\?\C:\x` was no look, as its `?` reads as a wildcard, and is none now; it names nothing off this PC)
         assert_eq!(names_a_place_off_this_pc("type \\\\?\\C:\\work\\a.txt"), None);
