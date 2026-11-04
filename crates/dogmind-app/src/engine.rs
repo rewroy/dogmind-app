@@ -22,41 +22,104 @@ pub fn find(settings: &Settings) -> Option<PathBuf> {
     settings.straydog.clone().filter(|file| file.is_file()).or(beside.filter(|file| file.is_file())).or(on_path)
 }
 
-/// The bundles this app offers: DeepSeek's GSQ-RCO ones, by ISTA-DASLab, and Qwen3.8's (its `UD-*` by Unsloth). `straydog` itself still has the
-/// others, for who wants them. A bundle is a model's: two models may have one of the same name (each has a `UD-IQ1_M`). Straydog does not say
-/// where a bundle comes from, so a new one appears here when a line says so; `crates/straydog-engine/src/assets*.json` there name each bundle's
-/// repository.
-fn origin(model: &str, quant: &str) -> Option<String> {
-    match model {
-        "Qwen3.8-Flash-Next" if quant.starts_with("UD-") => Some("by Qwen, quantized by Unsloth".to_string()),
-        "Qwen3.8-Flash-Next" => Some("by Qwen, quantized by ISTA-DASLab".to_string()),
-        "DeepSeek-V4.1-Flash" if quant.starts_with("GSQ-RCO") => Some("by DeepSeek, quantized by ISTA-DASLab".to_string()),
-        _ => None,
+const QWEN: &str = "Qwen3.8-Flash-Next";
+const DEEPSEEK: &str = "DeepSeek-V4.1-Flash-1017";
+const ISTA_DASLAB: &str = "ISTA-DASLab";
+const UNSLOTH: &str = "Unsloth";
+
+/// A model bundle by Straydog's three labels: its model, who quantized it, and its quantization. None of the three names a bundle alone: Qwen3.8 and
+/// DeepSeek each have a `UD-IQ1_M`, and ISTA-DASLab and Unsloth may each quantize a model to a name the other has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bundle {
+    /// `model` and `provider` are `None` only for settings an older setup wrote of a bundle that `legacy_labels` does not know: such a bundle is
+    /// found, and set up, by its quantization alone.
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub quant: String,
+}
+
+impl Bundle {
+    pub fn new(model: &str, provider: &str, quant: &str) -> Bundle {
+        Bundle { model: Some(model.to_string()), provider: Some(provider.to_string()), quant: quant.to_string() }
+    }
+
+    /// The bundle the settings name, in `model_name`, `provider` and `quant`. Settings written up to 0.1.3 have no `model_name` and no `provider`, and
+    /// the quantization names of those versions: `legacy_labels` reads them.
+    pub fn from_settings(model_name: Option<&str>, provider: Option<&str>, quant: &str) -> Bundle {
+        match model_name.is_none().then(|| legacy_labels(quant)).flatten() {
+            Some((model, old_provider, quant)) => Bundle::new(model, provider.unwrap_or(old_provider), quant),
+            None => Bundle { model: model_name.map(str::to_string), provider: provider.map(str::to_string), quant: quant.to_string() },
+        }
+    }
+
+    /// Whether `set_up`, what the settings name, is this bundle. A label that one of the two lacks is not compared.
+    pub fn is(&self, set_up: &Bundle) -> bool {
+        let same = |mine: &Option<String>, theirs: &Option<String>| mine.is_none() || theirs.is_none() || mine == theirs;
+        self.quant == set_up.quant && same(&self.model, &set_up.model) && same(&self.provider, &set_up.provider)
+    }
+
+    /// What a person reads as its name: the labels it has, in order.
+    fn name(&self) -> String {
+        [self.model.as_deref(), self.provider.as_deref(), Some(self.quant.as_str())].into_iter().flatten().collect::<Vec<_>>().join(" · ")
+    }
+
+    /// What `setup` is given to choose it: each label that is known.
+    fn arguments(&self) -> Vec<String> {
+        let labels = [("--model-name", self.model.as_deref()), ("--provider", self.provider.as_deref()), ("--quant", Some(self.quant.as_str()))];
+        labels.into_iter().filter_map(|(flag, value)| Some([flag.to_string(), value?.to_string()])).flatten().collect()
     }
 }
 
-/// A model's own terms, for the person to read before the download: from the model's page, by what that page says of the weights (a quantized file inherits its base model's).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A bundle named by its quantization alone, as settings written up to 0.1.3 name it, by the three labels Straydog gives it now, with the quantization
+/// under its name now. This table is frozen at 0.1.3 and never grows: a setup after it writes all three labels, and no other bundle was named by the
+/// quantization alone.
+fn legacy_labels(quant: &str) -> Option<(&str, &str, &str)> {
+    Some(match quant {
+        "GSQ-RCO-IQ2_XS" => (DEEPSEEK, ISTA_DASLAB, "IQ2_XS"),
+        "GSQ-RCO-IQ2_XXS" => (DEEPSEEK, ISTA_DASLAB, "IQ2_XXS"),
+        // (Qwen had no UD-IQ1_M before 0.1.3: an old one is DeepSeek's)
+        "UD-IQ2_XXS" | "UD-IQ1_M" => (DEEPSEEK, UNSLOTH, quant),
+        "Q2_0" | "IQ2_XS" | "IQ3_XXS" | "IQ3_S" => (QWEN, ISTA_DASLAB, quant),
+        _ => return None,
+    })
+}
+
+/// The bundles this app offers, by model and provider: every Qwen3.8 bundle, and DeepSeek's by ISTA-DASLab. `straydog` itself still has the
+/// others (DeepSeek's by Unsloth), for who wants them.
+fn is_offered(model: &str, provider: &str) -> bool {
+    match model {
+        QWEN => true,
+        DEEPSEEK => provider == ISTA_DASLAB,
+        _ => false,
+    }
+}
+
+/// Whose model it is, and who made this file of it: its `creator` as Straydog says it (none, for a bundle that has none), and who quantized it.
+fn origin(creator: &str, provider: &str) -> String {
+    if creator.is_empty() { format!("quantized by {provider}") } else { format!("by {creator}, quantized by {provider}") }
+}
+
+/// A model's own terms, for the person to read before the download, as Straydog says them of the bundle: the licence's name, and the address of its terms
+/// (a quantized file has its base model's).
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelLicence {
-    pub name: &'static str,
-    pub terms: &'static str,
+    pub name: String,
+    pub terms: String,
 }
 
-/// When Straydog offers another model, it has no line here until its page has been read.
-fn licence_of(model: &str) -> Option<ModelLicence> {
-    match model {
-        "Qwen3.8-Flash-Next" => Some(ModelLicence { name: "Qwen Community License 1.0", terms: "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE" }),
-        "DeepSeek-V4.1-Flash" => Some(ModelLicence { name: "MIT", terms: "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE" }),
-        _ => None,
-    }
+/// The licence a bundle says it has, in `license` and `license_url`. A bundle that says neither has no line, as Straydog's own choice has none; nor has one
+/// whose address is not an `https` one, for the address is opened in the browser.
+fn licence_in(bundle: &Value) -> Option<ModelLicence> {
+    let word = |name: &str| bundle.get(name).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let (name, terms) = (word("license"), word("license_url"));
+    (!name.is_empty() && terms.starts_with("https://")).then_some(ModelLicence { name, terms })
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogEntry {
-    /// Whose bundle `quant` is; `None` with it for Straydog's own choice.
-    pub model: Option<String>,
     /// `None`: Straydog picks the best for this PC.
-    pub quant: Option<String>,
+    pub bundle: Option<Bundle>,
+    /// The bundle's labels, `model · provider · quant`.
     pub name: String,
     /// Whose model it is, and who made this file of it.
     pub origin: String,
@@ -76,15 +139,14 @@ pub struct CatalogEntry {
 }
 
 impl CatalogEntry {
-    /// Whether this is the bundle set up: the model's name and its quantization. Settings an older setup wrote have no model name, and
-    /// its bundles' names were each one model's.
-    pub fn is(&self, model: Option<&str>, quant: &str) -> bool {
-        self.quant.as_deref() == Some(quant) && model.is_none_or(|model| self.model.as_deref() == Some(model))
+    /// Whether this is the bundle set up, by what the settings name.
+    pub fn is(&self, set_up: &Bundle) -> bool {
+        self.bundle.as_ref().is_some_and(|bundle| bundle.is(set_up))
     }
 
     /// The line before a long download, as a link to the terms.
     pub fn licence_line(&self) -> Option<String> {
-        self.licence.map(|licence| tf("This model's licence: {0}. Read its terms", &[&licence.name]))
+        self.licence.as_ref().map(|licence| tf("This model's licence: {0}. Read its terms", &[&licence.name]))
     }
 }
 
@@ -137,10 +199,11 @@ pub struct Catalog {
     pub refusal: Option<Refusal>,
 }
 
-/// The bundles `straydog fetch --help` offers: `Model: QUANT (68.0 GB), QUANT (75.8 GB); Model: ...`. What it does not say
-/// is not offered, and Straydog's own choice always is.
+/// The bundles `straydog fetch --help` offers, for a Straydog without `setup --list`: `Model: QUANT (68.0 GB), QUANT (75.8 GB); Model: ...`, in the
+/// quantization names of 0.1.3 and before, which `legacy_labels` reads. What it does not say or does not read is not offered, and Straydog's own choice
+/// always is. It says no creator and no licence of a bundle.
 pub fn parse_catalog(help: &str) -> Vec<CatalogEntry> {
-    let mut entries = vec![CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, model: None, quant: None, name: t("The best for this PC").into(), origin: String::new(), detail: t("Straydog looks at this machine and chooses").into(), context: None, disk_bytes: None, licence: None, runs: true }];
+    let mut entries = vec![CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, bundle: None, name: t("The best for this PC").into(), origin: String::new(), detail: t("Straydog looks at this machine and chooses").into(), context: None, disk_bytes: None, licence: None, runs: true }];
     for line in help.lines().filter(|line| line.contains(" GB)")) {
         let line = line.split(". ").next().unwrap_or(line);
         for part in line.split(';') {
@@ -153,8 +216,11 @@ pub fn parse_catalog(help: &str) -> Vec<CatalogEntry> {
                 if quant.is_empty() || quant.contains(' ') || !size.ends_with("GB") {
                     continue;
                 }
-                if let Some(origin) = origin(model, quant) {
-                    entries.push(CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, model: Some(model.to_string()), quant: Some(quant.to_string()), name: format!("{model} {quant}"), origin, detail: size.to_string(), context: None, disk_bytes: None, licence: licence_of(model), runs: true });
+                // (the model the help names is the table's, under the name it had then: `DeepSeek-V4.1-Flash` is `DeepSeek-V4.1-Flash-1017`'s start)
+                let Some((labelled, provider, quant)) = legacy_labels(quant).filter(|(labelled, ..)| labelled.starts_with(model)) else { continue };
+                if is_offered(labelled, provider) {
+                    let bundle = Bundle::new(labelled, provider, quant);
+                    entries.push(CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, name: bundle.name(), bundle: Some(bundle), origin: origin("", provider), detail: size.to_string(), context: None, disk_bytes: None, licence: None, runs: true });
                 }
             }
         }
@@ -217,12 +283,11 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     let mut short_entries = Vec::new();
     let mut shortest: Option<(f64, String, String)> = None;
     for bundle in bundles {
-        let quant = word(bundle, "quant");
-        if quant.is_empty() {
+        let (model, provider, quant) = (word(bundle, "model"), word(bundle, "provider"), word(bundle, "quant"));
+        // (a bundle with no provider is an older Straydog's: it has no name here)
+        if quant.is_empty() || provider.is_empty() || !is_offered(&model, &provider) {
             continue;
         }
-        let model = word(bundle, "model");
-        let Some(origin) = origin(&model, &quant) else { continue };
         let runs = bundle.get("runs").and_then(Value::as_bool).unwrap_or(false);
         let short = if runs { None } else { memory_short(&word(bundle, "note")) };
         if let Some((needs, has)) = &short {
@@ -247,20 +312,20 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
             None => how_it_runs(&word(bundle, "fit")).to_string(),
         };
         let extra = |name: &str| bundle.get("extras").and_then(Value::as_array).into_iter().flatten().find(|extra| word(extra, "name") == name).and_then(|extra| extra.get("download_bytes")).and_then(Value::as_u64);
+        let named = Bundle::new(&model, &provider, &quant);
         let entry = CatalogEntry {
             download_bytes: Some(download),
             vision_bytes: extra("vision"),
             drafter_bytes: extra("mtp"),
-            name: format!("{model} {quant}"),
-            licence: licence_of(&model),
-            origin,
+            name: named.name(),
+            licence: licence_in(bundle),
+            origin: origin(&word(bundle, "creator"), &provider),
             detail: if short.is_some() {
                 format!("{how}  ·  {size}")
             } else {
                 format!("{}{size}{}{how}", if recommended { t("Recommended for this PC  ·  ") } else { "" }, if how.is_empty() { "" } else { "  ·  " })
             },
-            model: Some(model),
-            quant: Some(quant),
+            bundle: Some(named),
             context: bundle.get("context").and_then(Value::as_u64),
             disk_bytes,
             runs,
@@ -396,7 +461,7 @@ pub fn engine_arguments(settings: &Settings, folder: &Path) -> Vec<String> {
 
 /// For a model that is there and has no vision file: setup does not fetch again what it has, and checks it. The drafter stays as the settings have it, for setup rewrites them; a DeepSeek drafter that is not there is not wanted here.
 pub fn vision_arguments(installed: &crate::vision::Installed, config: &Path) -> Vec<String> {
-    let mut args = setup_arguments(installed.model_name.as_deref(), Some(&installed.quant), &installed.model, config, installed.drafter, true);
+    let mut args = setup_arguments(Some(&installed.bundle), &installed.model, config, installed.drafter, true);
     // (the model is there: without this its shards are all read again, for one small file)
     args.extend(["--no-dspark".to_string(), "--vision-only".to_string()]);
     args
@@ -410,14 +475,11 @@ pub fn setup_can_force(straydog: &Path) -> bool {
     command.output().is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("--force"))
 }
 
-/// `model` and `quant` name the bundle: a quantization is a model's. With no model (settings an older setup wrote), the quantization alone.
-pub fn setup_arguments(model: Option<&str>, quant: Option<&str>, folder: &Path, config: &Path, drafter: bool, vision: bool) -> Vec<String> {
+/// `bundle` names the bundle by all three labels, or only those it has (settings an older setup wrote); `None` leaves the choice to Straydog.
+pub fn setup_arguments(bundle: Option<&Bundle>, folder: &Path, config: &Path, drafter: bool, vision: bool) -> Vec<String> {
     let mut args: Vec<String> = vec!["setup".into(), "--yes".into(), "--dir".into(), folder.display().to_string(), "--config".into(), config.display().to_string()];
-    if let Some(quant) = quant {
-        if let Some(model) = model {
-            args.extend(["--model-name".to_string(), model.to_string()]);
-        }
-        args.extend(["--quant".to_string(), quant.to_string()]);
+    if let Some(bundle) = bundle {
+        args.extend(bundle.arguments());
     }
     if !drafter {
         args.push("--no-mtp".into());
@@ -846,13 +908,32 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The quantizations of the bundles an entry list has, and the names it shows.
+    fn quants(entries: &[CatalogEntry]) -> Vec<&str> {
+        entries.iter().filter_map(|entry| entry.bundle.as_ref()).map(|bundle| bundle.quant.as_str()).collect()
+    }
+
+    fn names(entries: &[CatalogEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.name.as_str()).collect()
+    }
+
+    /// A bundle as `setup --list` says it, with its model's creator and licence.
+    fn listed(model: &str, provider: &str, quant: &str) -> String {
+        let (creator, license, url) = if model.starts_with("DeepSeek") {
+            ("DeepSeek", "MIT", "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE")
+        } else {
+            ("Qwen", "Qwen Community License 1.0", "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE")
+        };
+        format!(r#"{{"model":"{model}","provider":"{provider}","quant":"{quant}","creator":"{creator}","license":"{license}","license_url":"{url}","download_bytes":1,"runs":true,"note":"n"}}"#)
+    }
+
     #[test]
     fn a_vision_file_alone_keeps_the_rest_as_the_settings_have_it() {
-        let installed = crate::vision::Installed { model: PathBuf::from(r"D:\models\Qwen\IQ2_XS"), model_name: None, quant: "IQ2_XS".into(), drafter: true, named: None };
+        let installed = crate::vision::Installed { model: PathBuf::from(r"D:\models\Qwen\IQ2_XS"), bundle: Bundle::from_settings(None, None, "IQ2_XS"), drafter: true, named: None };
         let args = vision_arguments(&installed, Path::new("C"));
         let joined = args.join(" ");
         assert!(joined.contains(r"--dir D:\models\Qwen\IQ2_XS"), "the bundle's own folder, which setup then does not put a level down: {joined}");
-        assert!(joined.contains("--quant IQ2_XS") && !joined.contains("--no-vision") && !joined.contains("--no-mtp") && joined.contains("--no-dspark"), "{joined}");
+        assert!(joined.contains("--model-name Qwen3.8-Flash-Next --provider ISTA-DASLab --quant IQ2_XS") && !joined.contains("--no-vision") && !joined.contains("--no-mtp") && joined.contains("--no-dspark"), "{joined}");
         let without = vision_arguments(&crate::vision::Installed { drafter: false, ..installed }, Path::new("C"));
         assert!(without.contains(&"--no-mtp".to_string()), "a drafter it has not got is not fetched now");
     }
@@ -860,14 +941,14 @@ mod tests {
     #[test]
     fn the_list_says_what_each_extra_takes() {
         let list = r#"{"machine": {"gpus": [], "ram_bytes": 0}, "bundles": [
-            {"model": "Qwen3.8-Flash-Next", "quant": "IQ2_XS", "runs": true, "recommended": true, "fit": "fits", "download_bytes": 1000, "disk_bytes": 2000,
+            {"model": "Qwen3.8-Flash-Next", "provider": "ISTA-DASLab", "creator": "Qwen", "license": "Qwen Community License 1.0", "license_url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE", "quant": "IQ2_XS", "runs": true, "recommended": true, "fit": "fits", "download_bytes": 1000, "disk_bytes": 2000,
              "extras": [{"name": "mtp", "download_bytes": 300}, {"name": "vision", "download_bytes": 100}]},
-            {"model": "DeepSeek-V4.1-Flash", "quant": "UD-IQ2_XXS", "runs": true, "fit": "fits", "download_bytes": 5000, "disk_bytes": 6000, "extras": []}]}"#;
+            {"model": "DeepSeek-V4.1-Flash-1017", "provider": "ISTA-DASLab", "creator": "DeepSeek", "license": "MIT", "license_url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE", "quant": "IQ2_XXS", "runs": true, "fit": "fits", "download_bytes": 5000, "disk_bytes": 6000, "extras": []}]}"#;
         let catalog = parse_list(list, true).unwrap();
-        let of = |quant: &str| catalog.entries.iter().find(|entry| entry.quant.as_deref() == Some(quant));
+        let of = |quant: &str| catalog.entries.iter().find(|entry| entry.bundle.as_ref().is_some_and(|bundle| bundle.quant == quant));
         let Some(first) = of("IQ2_XS") else { return };
         assert_eq!((first.download_bytes, first.vision_bytes, first.drafter_bytes), (Some(1000), Some(100), Some(300)));
-        if let Some(second) = of("UD-IQ2_XXS") {
+        if let Some(second) = of("IQ2_XXS") {
             assert_eq!(second.vision_bytes, None, "no file for it: no row for it");
         }
     }
@@ -994,16 +1075,22 @@ mod tests {
 
     #[test]
     fn a_model_says_its_licence_before_it_is_fetched() {
-        let list = r#"{"bundles":[{"model":"Qwen3.8-Flash-Next","quant":"IQ2_XS","download_bytes":1,"runs":true},{"model":"DeepSeek-V4.1-Flash","quant":"GSQ-RCO-IQ2_XS","download_bytes":1,"runs":true}]}"#;
-        let entries = parse_list(list, true).unwrap().entries;
-        let qwen = entries[0].licence.unwrap();
+        let list = format!(r#"{{"bundles":[{},{},
+            {{"model":"Qwen3.8-Flash-Next","provider":"Unsloth","quant":"UD-IQ1_M","creator":"Qwen","download_bytes":1,"runs":true}},
+            {{"model":"Qwen3.8-Flash-Next","provider":"ISTA-DASLab","quant":"IQ3_S","license":"Qwen Community License 1.0","license_url":"file:///C:/Windows/System32/calc.exe","download_bytes":1,"runs":true}}]}}"#,
+            listed("Qwen3.8-Flash-Next", "ISTA-DASLab", "IQ2_XS"), listed("DeepSeek-V4.1-Flash-1017", "ISTA-DASLab", "IQ2_XS"));
+        let entries = parse_list(&list, true).unwrap().entries;
+        assert_eq!(entries.len(), 4);
+        let qwen = entries[0].licence.clone().unwrap();
         assert_eq!(qwen.name, "Qwen Community License 1.0");
         assert!(qwen.terms.starts_with("https://huggingface.co/Qwen/"), "the base model's terms, which the quantized file inherits");
-        assert_eq!(entries[1].licence.unwrap().name, "MIT");
+        assert_eq!(entries[1].licence.clone().unwrap().name, "MIT");
         assert!(entries[0].licence_line().unwrap().contains("Qwen Community License 1.0"));
+        assert_eq!(entries[2].licence, None, "a bundle that says no licence has no line");
+        assert_eq!(entries[3].licence, None, "an address that is no web address is not one to open in a browser");
         let help = parse_catalog("      --quant <NAME>  Qwen3.8-Flash-Next: IQ2_XS (68.0 GB). x\n");
         assert_eq!(help[0].licence_line(), None, "Straydog's own choice is no model yet");
-        assert!(help[1].licence.is_some());
+        assert_eq!(help[1].licence, None, "the help of an older Straydog says none");
     }
 
     #[test]
@@ -1016,11 +1103,16 @@ mod tests {
     fn the_bundles_come_from_straydogs_own_help() {
         let help = "Download and authenticate a model bundle\n\nOptions:\n  -m, --model <DIR>  The bundle directory\n      --quant <NAME>  Qwen3.8-Flash-Next: Q2_0 (66.4 GB), IQ2_XS (68.0 GB); DeepSeek-V4.1-Flash: GSQ-RCO-IQ2_XXS (248.8 GB); Qwen3.6-35B-A3B: UD-Q8_K_XL (38.5 GB). `straydog setup` chooses for you\n";
         let entries = parse_catalog(help);
-        assert_eq!(entries[0].quant, None);
-        let quants: Vec<&str> = entries.iter().filter_map(|entry| entry.quant.as_deref()).collect();
-        assert_eq!(quants, ["Q2_0", "IQ2_XS", "GSQ-RCO-IQ2_XXS"]);
+        assert_eq!(entries[0].bundle, None);
+        // (what it names is read as the settings of 0.1.3 are: DeepSeek's GSQ-RCO-IQ2_XXS is now ISTA-DASLab's IQ2_XXS)
+        assert_eq!(quants(&entries), ["Q2_0", "IQ2_XS", "IQ2_XXS"]);
         assert_eq!(entries[2].detail, "68.0 GB");
-        assert_eq!(entries[2].name, "Qwen3.8-Flash-Next IQ2_XS");
+        assert_eq!(entries[2].name, "Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS");
+        assert_eq!(entries[3].bundle, Some(Bundle::new("DeepSeek-V4.1-Flash-1017", "ISTA-DASLab", "IQ2_XXS")));
+        assert_eq!(entries[3].origin, "quantized by ISTA-DASLab", "it says no creator");
+        // (what the table does not know, what it gives to another model, and what is not offered, are left out)
+        let left_out = parse_catalog("      --quant <NAME>  Qwen3.8-Flash-Next: Qwen-UD-IQ1_M (68.0 GB), UD-IQ1_M (68.0 GB); DeepSeek-V4.1-Flash: UD-IQ2_XXS (1.0 GB), IQ3_S (1.0 GB). x\n");
+        assert_eq!(left_out.len(), 1, "{:?}", names(&left_out));
         assert_eq!(parse_catalog("something else entirely").len(), 1, "an unknown help still offers Straydog's choice");
     }
 
@@ -1035,13 +1127,12 @@ mod tests {
     #[test]
     fn the_list_puts_the_recommended_first_and_leaves_out_what_cannot_run() {
         let list = r#"{"machine":{"backend":"cuda"},"bundles":[
-            {"model":"Qwen3.8-Flash-Next","quant":"IQ3_S","download_bytes":83600000000,"runs":true,"recommended":false,"note":"slow"},
-            {"model":"Qwen3.8-Flash-Next","quant":"IQ2_XS","download_bytes":68000000000,"runs":true,"recommended":true,"note":"fits","context":262144},
-            {"model":"DeepSeek-V4.1-Flash","quant":"UD-IQ2_XXS","download_bytes":300500000000,"runs":false,"recommended":false,"note":"too little VRAM"}]}"#;
+            {"model":"Qwen3.8-Flash-Next","provider":"ISTA-DASLab","creator":"Qwen","license":"Qwen Community License 1.0","license_url":"https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE","quant":"IQ3_S","download_bytes":83600000000,"runs":true,"recommended":false,"note":"slow"},
+            {"model":"Qwen3.8-Flash-Next","provider":"ISTA-DASLab","creator":"Qwen","license":"Qwen Community License 1.0","license_url":"https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE","quant":"IQ2_XS","download_bytes":68000000000,"runs":true,"recommended":true,"note":"fits","context":262144},
+            {"model":"DeepSeek-V4.1-Flash-1017","provider":"ISTA-DASLab","creator":"DeepSeek","license":"MIT","license_url":"https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE","quant":"IQ2_XXS","download_bytes":300500000000,"runs":false,"recommended":false,"note":"too little VRAM"}]}"#;
         let catalog = parse_list(list, true).unwrap();
         let entries = &catalog.entries;
-        let quants: Vec<&str> = entries.iter().filter_map(|entry| entry.quant.as_deref()).collect();
-        assert_eq!(quants, ["IQ2_XS", "IQ3_S"]);
+        assert_eq!(quants(entries), ["IQ2_XS", "IQ3_S"]);
         assert!(entries[0].detail.starts_with("Recommended for this PC  ·  68 GB to download") && !entries[1].detail.contains("Recommended"), "{}", entries[0].detail);
         assert_eq!(entries[0].origin, "by Qwen, quantized by ISTA-DASLab");
         assert_eq!(entries[0].context, Some(262144));
@@ -1051,46 +1142,111 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_is_its_models_and_two_models_may_name_one_alike() {
-        // Qwen3.8 and DeepSeek-V4.1 each have a UD-IQ1_M: Qwen's, by Unsloth, is offered; DeepSeek's is not, here
-        let list = r#"{"bundles":[
-            {"model":"Qwen3.8-Flash-Next","quant":"UD-IQ1_M","download_bytes":68007094938,"runs":true,"recommended":true,"fit":"ram","extras":[{"name":"mtp","download_bytes":1},{"name":"vision","download_bytes":2}]},
-            {"model":"Qwen3.8-Flash-Next","quant":"IQ2_XS","download_bytes":68000000000,"runs":true},
-            {"model":"DeepSeek-V4.1-Flash","quant":"UD-IQ1_M","download_bytes":1,"runs":true}]}"#;
-        let entries = parse_list(list, true).unwrap().entries;
-        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, ["Qwen3.8-Flash-Next UD-IQ1_M", "Qwen3.8-Flash-Next IQ2_XS"]);
+    fn the_bundle_set_up_is_found_by_all_three_labels() {
+        // Qwen3.8 and DeepSeek each have a UD-IQ1_M, and ISTA-DASLab and Unsloth each have a bundle of a name the other has
+        let list = format!(r#"{{"bundles":[{}]}}"#, [
+            listed("Qwen3.8-Flash-Next", "Unsloth", "UD-IQ1_M"), listed("Qwen3.8-Flash-Next", "ISTA-DASLab", "IQ2_XS"), listed("Qwen3.8-Flash-Next", "Unsloth", "IQ2_XS"),
+            listed("DeepSeek-V4.1-Flash-1017", "ISTA-DASLab", "IQ2_XS"),
+        ].join(","));
+        let entries = parse_list(&list, true).unwrap().entries;
+        let found = |set_up: &Bundle| -> Vec<&str> { entries.iter().filter(|entry| entry.is(set_up)).map(|entry| entry.name.as_str()).collect() };
+        assert_eq!(found(&Bundle::new("Qwen3.8-Flash-Next", "Unsloth", "UD-IQ1_M")), ["Qwen3.8-Flash-Next · Unsloth · UD-IQ1_M"]);
+        assert!(found(&Bundle::new("DeepSeek-V4.1-Flash-1017", "Unsloth", "UD-IQ1_M")).is_empty(), "DeepSeek's UD-IQ1_M is not Qwen's, and is not offered");
+        assert_eq!(found(&Bundle::new("Qwen3.8-Flash-Next", "ISTA-DASLab", "IQ2_XS")), ["Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS"]);
+        assert_eq!(found(&Bundle::new("Qwen3.8-Flash-Next", "Unsloth", "IQ2_XS")), ["Qwen3.8-Flash-Next · Unsloth · IQ2_XS"], "an ISTA-DASLab bundle is not an Unsloth one of its name");
+        assert_eq!(found(&Bundle::new("DeepSeek-V4.1-Flash-1017", "ISTA-DASLab", "IQ2_XS")), ["DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XS"], "nor is Qwen's one of DeepSeek's");
+        // a label the settings lack is not compared: a bundle of a name they do not know is found by its quantization alone, as it was
+        let odd = |model: Option<&str>, provider: Option<&str>| Bundle { model: model.map(str::to_string), provider: provider.map(str::to_string), quant: "IQ2_XS".into() };
+        assert_eq!(found(&odd(None, None)).len(), 3);
+        assert_eq!(found(&odd(Some("Qwen3.8-Flash-Next"), None)).len(), 2);
+        assert_eq!(found(&odd(None, Some("Unsloth"))), ["Qwen3.8-Flash-Next · Unsloth · IQ2_XS"]);
+        assert!(found(&Bundle::from_settings(None, None, "Q8_0")).is_empty());
+        // Straydog's own choice is no bundle yet
+        assert!(!parse_catalog("x")[0].is(&Bundle::from_settings(None, None, "IQ2_XS")));
+    }
+
+    #[test]
+    fn settings_written_up_to_0_1_3_are_read_by_the_table_frozen_there() {
+        let read = |quant: &str| Bundle::from_settings(None, None, quant);
+        let (deepseek, qwen) = ("DeepSeek-V4.1-Flash-1017", "Qwen3.8-Flash-Next");
+        assert_eq!(read("GSQ-RCO-IQ2_XS"), Bundle::new(deepseek, "ISTA-DASLab", "IQ2_XS"));
+        assert_eq!(read("GSQ-RCO-IQ2_XXS"), Bundle::new(deepseek, "ISTA-DASLab", "IQ2_XXS"));
+        assert_eq!(read("UD-IQ2_XXS"), Bundle::new(deepseek, "Unsloth", "UD-IQ2_XXS"));
+        assert_eq!(read("UD-IQ1_M"), Bundle::new(deepseek, "Unsloth", "UD-IQ1_M"), "Qwen had none before, so an old one is DeepSeek's");
+        for quant in ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S"] {
+            assert_eq!(read(quant), Bundle::new(qwen, "ISTA-DASLab", quant), "{quant}");
+        }
+        // anything else keeps its quantization, and its model and provider are unknown
+        assert_eq!(read("Qwen-UD-IQ1_M"), Bundle { model: None, provider: None, quant: "Qwen-UD-IQ1_M".into() });
+        // a setup that says its model is not read by the table: IQ2_XS of DeepSeek's is not Qwen's
+        assert_eq!(Bundle::from_settings(Some(deepseek), Some("ISTA-DASLab"), "IQ2_XS"), Bundle::new(deepseek, "ISTA-DASLab", "IQ2_XS"));
+        assert_eq!(Bundle::from_settings(Some(qwen), Some("Unsloth"), "UD-IQ1_M"), Bundle::new(qwen, "Unsloth", "UD-IQ1_M"));
+        assert_eq!(Bundle::from_settings(Some(qwen), None, "UD-IQ1_M"), Bundle { model: Some(qwen.into()), provider: None, quant: "UD-IQ1_M".into() }, "what it does not say is not guessed");
+    }
+
+    #[test]
+    fn setup_is_told_the_model_the_provider_and_the_quantization() {
+        let whole = |bundle: Option<&Bundle>| setup_arguments(bundle, Path::new("M"), Path::new("C"), true, true).join(" ");
+        let args = whole(Some(&Bundle::new("Qwen3.8-Flash-Next", "Unsloth", "UD-IQ1_M")));
+        assert!(args.contains("--model-name Qwen3.8-Flash-Next --provider Unsloth --quant UD-IQ1_M"), "{args}");
+        // only the ones known, for a bundle an older setup wrote that no table knows
+        let odd = whole(Some(&Bundle::from_settings(None, None, "Q8_0")));
+        assert!(odd.contains("--quant Q8_0") && !odd.contains("--model-name") && !odd.contains("--provider"), "{odd}");
+        // and none for Straydog's own choice
+        let own = whole(None);
+        assert!(!own.contains("--model-name") && !own.contains("--provider") && !own.contains("--quant"), "{own}");
+        // the vision file of a model set up by 0.1.3 asks for it by the labels it has now
+        let installed = crate::vision::Installed { model: PathBuf::from(r"D:\m\GSQ-RCO-IQ2_XS"), bundle: Bundle::from_settings(None, None, "GSQ-RCO-IQ2_XS"), drafter: true, named: None };
+        let vision = vision_arguments(&installed, Path::new("C")).join(" ");
+        assert!(vision.contains("--model-name DeepSeek-V4.1-Flash-1017 --provider ISTA-DASLab --quant IQ2_XS"), "{vision}");
+    }
+
+    #[test]
+    fn a_bundle_is_shown_by_its_three_labels_and_says_who_made_it_and_who_quantized_it() {
+        let list = format!(r#"{{"bundles":[{},{},
+            {{"model":"Qwen3.8-Flash-Next","provider":"ISTA-DASLab","quant":"IQ2_XS","download_bytes":1,"runs":true}}]}}"#,
+            listed("Qwen3.8-Flash-Next", "Unsloth", "UD-IQ1_M"), listed("DeepSeek-V4.1-Flash-1017", "ISTA-DASLab", "IQ2_XXS"));
+        let entries = parse_list(&list, true).unwrap().entries;
+        assert_eq!(names(&entries), ["Qwen3.8-Flash-Next · Unsloth · UD-IQ1_M", "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XXS", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS"]);
         assert_eq!(entries[0].origin, "by Qwen, quantized by Unsloth");
-        assert_eq!(entries[1].origin, "by Qwen, quantized by ISTA-DASLab");
-        assert_eq!(entries[0].licence.unwrap().name, "Qwen Community License 1.0", "a quantized file has its base model's terms");
-        assert_eq!((entries[0].drafter_bytes, entries[0].vision_bytes), (Some(1), Some(2)), "it shares Qwen3.8's drafter and vision file");
-        // setup is told whose bundle it is
-        let args = setup_arguments(entries[0].model.as_deref(), entries[0].quant.as_deref(), Path::new("M"), Path::new("C"), true, true).join(" ");
-        assert!(args.contains("--model-name Qwen3.8-Flash-Next --quant UD-IQ1_M"), "{args}");
-        // the one set up is found by both its names; settings from an older setup have no model name, and their quantization alone
-        assert!(entries[0].is(Some("Qwen3.8-Flash-Next"), "UD-IQ1_M") && !entries[0].is(Some("DeepSeek-V4.1-Flash"), "UD-IQ1_M"));
-        assert!(entries[1].is(None, "IQ2_XS") && !entries[1].is(None, "UD-IQ1_M"));
-        let installed = crate::vision::Installed { model: PathBuf::from(r"D:\m\UD-IQ1_M"), model_name: Some("Qwen3.8-Flash-Next".into()), quant: "UD-IQ1_M".into(), drafter: true, named: None };
-        assert!(vision_arguments(&installed, Path::new("C")).join(" ").contains("--model-name Qwen3.8-Flash-Next --quant UD-IQ1_M"));
-        let help = parse_catalog("      --quant <NAME>  Qwen3.8-Flash-Next: UD-IQ1_M (68.0 GB), IQ2_XS (68.0 GB); DeepSeek-V4.1-Flash: UD-IQ1_M (1.0 GB). x\n");
-        let bundles: Vec<(Option<&str>, Option<&str>)> = help.iter().map(|entry| (entry.model.as_deref(), entry.quant.as_deref())).collect();
-        assert_eq!(bundles, [(None, None), (Some("Qwen3.8-Flash-Next"), Some("UD-IQ1_M")), (Some("Qwen3.8-Flash-Next"), Some("IQ2_XS"))]);
-        assert_eq!(help[1].origin, "by Qwen, quantized by Unsloth");
+        assert_eq!(entries[1].origin, "by DeepSeek, quantized by ISTA-DASLab");
+        assert_eq!(entries[2].origin, "quantized by ISTA-DASLab", "a bundle with no creator says only who quantized it");
+        assert_eq!(origin("Qwen", "ISTA-DASLab"), "by Qwen, quantized by ISTA-DASLab");
+        assert_eq!(origin("", "Unsloth"), "quantized by Unsloth");
+    }
+
+    #[test]
+    fn every_qwen_bundle_is_offered_and_deepseeks_only_by_ista_daslab() {
+        let (qwen, deepseek) = ("Qwen3.8-Flash-Next", "DeepSeek-V4.1-Flash-1017");
+        let list = format!(r#"{{"bundles":[{}]}}"#, [
+            listed(deepseek, "ISTA-DASLab", "IQ2_XXS"), listed(deepseek, "ISTA-DASLab", "IQ2_XS"), listed(deepseek, "Unsloth", "UD-IQ2_XXS"), listed(deepseek, "Unsloth", "UD-IQ1_M"),
+            listed(qwen, "ISTA-DASLab", "IQ3_S"), listed(qwen, "ISTA-DASLab", "IQ3_XXS"), listed(qwen, "ISTA-DASLab", "IQ2_XS"), listed(qwen, "ISTA-DASLab", "Q2_0"), listed(qwen, "Unsloth", "UD-IQ1_M"),
+            listed("Qwen3.6-35B-A3B", "Unsloth", "UD-Q8_K_XL"),
+            // (a list of a Straydog that does not say who quantized)
+            format!(r#"{{"model":"{qwen}","quant":"Q2_0","download_bytes":1,"runs":true}}"#),
+        ].join(","));
+        let entries = parse_list(&list, true).unwrap().entries;
+        assert_eq!(names(&entries), [
+            "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XXS", "DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XS",
+            "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_S", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ3_XXS", "Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS", "Qwen3.8-Flash-Next · ISTA-DASLab · Q2_0",
+            "Qwen3.8-Flash-Next · Unsloth · UD-IQ1_M"]);
+        assert!(is_offered(qwen, "Unsloth") && is_offered(deepseek, "ISTA-DASLab"));
+        assert!(!is_offered(deepseek, "Unsloth") && !is_offered("Qwen3.6-35B-A3B", "ISTA-DASLab"));
     }
 
     #[test]
     fn a_pc_that_can_run_nothing_is_told_why_and_how() {
         let nothing = r#"{"machine":{"backend":"CUDA","gpus":[],"gpu_error":"CUDA driver version is insufficient for CUDA runtime version","ram_bytes":34359738368},"bundles":[
-            {"model":"Qwen3.8-Flash-Next","quant":"IQ2_XS","download_bytes":75000000000,"runs":false,"recommended":false,"fit":"no_gpu","note":"needs a GPU"}]}"#;
+            {"model":"Qwen3.8-Flash-Next","provider":"ISTA-DASLab","creator":"Qwen","license":"Qwen Community License 1.0","license_url":"https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE","quant":"IQ2_XS","download_bytes":75000000000,"runs":false,"recommended":false,"fit":"no_gpu","note":"needs a GPU"}]}"#;
         assert_eq!(parse_list(nothing, false).unwrap().refusal, Some(Refusal::NoNvidia), "an AMD or Intel PC has no driver of NVIDIA's");
         let old = parse_list(nothing, true).unwrap();
         assert!(matches!(&old.refusal, Some(Refusal::Driver(said)) if said.contains("insufficient")), "{old:?}");
         assert!(old.refusal.unwrap().words().contains("newest driver"));
         assert!(old.entries.is_empty());
         let small = r#"{"machine":{"gpus":[{"ordinal":0,"name":"RTX 2060","total_bytes":6442450944,"free_bytes":5000000000}],"gpu_error":null,"ram_bytes":34359738368},"bundles":[
-            {"model":"Qwen3.8-Flash-Next","quant":"IQ3_S","download_bytes":1,"runs":false,"note":"needs 11 GiB of VRAM; this machine has 6 GiB"},
-            {"model":"Qwen3.8-Flash-Next","quant":"Q2_0","download_bytes":1,"runs":false,"note":"needs 10 GiB of VRAM; this machine has 6 GiB"},
-            {"model":"DeepSeek-V4.1-Flash","quant":"UD-IQ2_XXS","download_bytes":1,"runs":false,"note":"needs 30 GiB of VRAM; this machine has 6 GiB"}]}"#;
+            {"model":"Qwen3.8-Flash-Next","provider":"ISTA-DASLab","creator":"Qwen","license":"Qwen Community License 1.0","license_url":"https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE","quant":"IQ3_S","download_bytes":1,"runs":false,"note":"needs 11 GiB of VRAM; this machine has 6 GiB"},
+            {"model":"Qwen3.8-Flash-Next","provider":"ISTA-DASLab","creator":"Qwen","license":"Qwen Community License 1.0","license_url":"https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE","quant":"Q2_0","download_bytes":1,"runs":false,"note":"needs 10 GiB of VRAM; this machine has 6 GiB"},
+            {"model":"DeepSeek-V4.1-Flash-1017","provider":"ISTA-DASLab","creator":"DeepSeek","license":"MIT","license_url":"https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE","quant":"IQ2_XXS","download_bytes":1,"runs":false,"note":"needs 30 GiB of VRAM; this machine has 6 GiB"}]}"#;
         let small = parse_list(small, true).unwrap();
         assert_eq!(small.refusal, Some(Refusal::TooLittleMemory { needs: "10 GiB".into(), has: "6 GiB".into() }), "the least it would take");
         assert_eq!(small.machine, "RTX 2060 (6 GB)  ·  34 GB of memory");
@@ -1102,12 +1258,12 @@ mod tests {
     fn a_model_short_of_graphics_memory_is_listed_after_the_rest_not_recommended() {
         let note = |needs: &str| format!("needs {needs} GiB of VRAM free, with what `auto` leaves for the desktop; this machine has 12.2 GiB for it");
         let list = format!(r#"{{"machine":{{"gpus":[{{"name":"RTX 5070 Ti","total_bytes":17179869184}}],"ram_bytes":66571993088}},"bundles":[
-            {{"model":"DeepSeek-V4.1-Flash","quant":"GSQ-RCO-IQ2_XXS","download_bytes":1,"runs":false,"fit":"too_little_vram","note":"{}"}},
-            {{"model":"DeepSeek-V4.1-Flash","quant":"GSQ-RCO-IQ2_XS","download_bytes":1,"runs":false,"fit":"too_little_vram","note":"{}"}},
-            {{"model":"Qwen3.8-Flash-Next","quant":"IQ2_XS","download_bytes":1,"runs":true,"fit":"ram"}}]}}"#, note("16.9"), note("14.8"));
+            {{"model":"DeepSeek-V4.1-Flash-1017","provider":"ISTA-DASLab","creator":"DeepSeek","license":"MIT","license_url":"https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE","quant":"IQ2_XXS","download_bytes":1,"runs":false,"fit":"too_little_vram","note":"{}"}},
+            {{"model":"DeepSeek-V4.1-Flash-1017","provider":"ISTA-DASLab","creator":"DeepSeek","license":"MIT","license_url":"https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE","quant":"IQ2_XS","download_bytes":1,"runs":false,"fit":"too_little_vram","note":"{}"}},
+            {{"model":"Qwen3.8-Flash-Next","provider":"ISTA-DASLab","creator":"Qwen","license":"Qwen Community License 1.0","license_url":"https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE","quant":"IQ2_XS","download_bytes":1,"runs":true,"fit":"ram"}}]}}"#, note("16.9"), note("14.8"));
         let catalog = parse_list(&list, true).unwrap();
         let names: Vec<(&str, bool)> = catalog.entries.iter().map(|entry| (entry.name.as_str(), entry.runs)).collect();
-        assert_eq!(names, [("Qwen3.8-Flash-Next IQ2_XS", true), ("DeepSeek-V4.1-Flash GSQ-RCO-IQ2_XXS", false), ("DeepSeek-V4.1-Flash GSQ-RCO-IQ2_XS", false)]);
+        assert_eq!(names, [("Qwen3.8-Flash-Next · ISTA-DASLab · IQ2_XS", true), ("DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XXS", false), ("DeepSeek-V4.1-Flash-1017 · ISTA-DASLab · IQ2_XS", false)]);
         assert_eq!(catalog.refusal, None);
         assert!(catalog.entries[1].detail.contains("16.9 GiB") && catalog.entries[1].detail.contains("12.2 GiB") && !catalog.entries[1].detail.starts_with("Recommended"), "{}", catalog.entries[1].detail);
         // (and with nothing that runs, the least of it is the refusal's, in these words too; what is short is still there to try)
@@ -1118,17 +1274,6 @@ mod tests {
         // (one that needs a GPU this PC has not is not offered at all)
         let no_gpu = list.replace(&note("16.9"), "needs a GPU");
         assert_eq!(parse_list(&no_gpu, true).unwrap().entries.len(), 2);
-    }
-
-    #[test]
-    fn only_the_gsq_rco_bundles_are_offered() {
-        let bundle = |model: &str, quant: &str| format!(r#"{{"model":"{model}","quant":"{quant}","download_bytes":1,"runs":true,"recommended":false,"note":"n"}}"#);
-        let list = format!(r#"{{"bundles":[{},{},{},{},{},{},{},{}]}}"#,
-            bundle("DeepSeek-V4.1-Flash", "GSQ-RCO-IQ2_XXS"), bundle("DeepSeek-V4.1-Flash", "GSQ-RCO-IQ2_XS"), bundle("DeepSeek-V4.1-Flash", "UD-IQ2_XXS"),
-            bundle("Qwen3.8-Flash-Next", "IQ3_S"), bundle("Qwen3.8-Flash-Next", "IQ3_XXS"), bundle("Qwen3.8-Flash-Next", "IQ2_XS"), bundle("Qwen3.8-Flash-Next", "Q2_0"),
-            bundle("Qwen3.6-35B-A3B", "UD-Q8_K_XL"));
-        let quants: Vec<String> = parse_list(&list, true).unwrap().entries.into_iter().filter_map(|entry| entry.quant).collect();
-        assert_eq!(quants, ["GSQ-RCO-IQ2_XXS", "GSQ-RCO-IQ2_XS", "IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0"]);
     }
 
     #[test]
@@ -1168,10 +1313,10 @@ mod tests {
 
     #[test]
     fn setup_asks_nothing_and_writes_this_apps_file() {
-        let args = setup_arguments(None, Some("IQ2_XS"), Path::new("M"), Path::new("C"), false, true);
+        let args = setup_arguments(Some(&Bundle::new("Qwen3.8-Flash-Next", "ISTA-DASLab", "IQ2_XS")), Path::new("M"), Path::new("C"), false, true);
         assert_eq!(&args[..2], ["setup", "--yes"]);
-        assert!(args.contains(&"--no-mtp".to_string()) && args.contains(&"IQ2_XS".to_string()) && !args.contains(&"--model-name".to_string()));
-        let chosen = setup_arguments(None, None, Path::new("M"), Path::new("C"), true, false);
+        assert!(args.contains(&"--no-mtp".to_string()) && args.contains(&"IQ2_XS".to_string()));
+        let chosen = setup_arguments(None, Path::new("M"), Path::new("C"), true, false);
         assert!(chosen.contains(&"--no-vision".to_string()), "left out when asked");
         assert!(!chosen.contains(&"--no-mtp".to_string()) && !chosen.contains(&"--quant".to_string()));
         assert!(!chosen.contains(&"--vision-only".to_string()), "only for a model already there");
