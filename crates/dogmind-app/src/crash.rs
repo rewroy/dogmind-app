@@ -9,7 +9,7 @@ use crate::settings::Settings;
 
 /// Where reports go: the public repository's issues, the only address for them the app itself knows, kept here alone. With none, a
 /// report's words would only say where the file is, for the person to send however they like.
-pub const WHERE_REPORTS_GO: Option<&str> = Some("https://github.com/rewroy/DogmindApp/issues");
+pub const WHERE_REPORTS_GO: Option<&str> = Some("https://github.com/rewroy/dogmind-app/issues");
 
 const FOLDER: &str = "crashes";
 const MOST_LOG_LINES: usize = 200;
@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn a_report_says_where_the_file_is_and_where_to_send_it() {
         let words = report_words("C:\\data\\report.txt");
-        assert!(words.contains("C:\\data\\report.txt") && words.contains("https://github.com/rewroy/DogmindApp/issues"), "{words}");
+        assert!(words.contains("C:\\data\\report.txt") && words.contains("https://github.com/rewroy/dogmind-app/issues"), "{words}");
         let without = report_words_with("f.txt", None);
         assert!(without.contains("f.txt") && without.contains("any way you like") && !without.contains("http"), "{without}");
     }

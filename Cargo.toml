@@ -6,7 +6,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/rewroy/DogmindApp"
+repository = "https://github.com/rewroy/dogmind-app"
 # (a program, not a library: nothing here goes to crates.io)
 publish = false
 

@@ -41,7 +41,7 @@ a rail at the transcript's right edge has a mark for each of your messages: the 
 
 ## Updating, removing, and when something goes wrong
 
-New versions are published at [Releases](https://github.com/rewroy/DogmindApp/releases). The app asks GitHub for the latest release
+New versions are published at [Releases](https://github.com/rewroy/dogmind-app/releases). The app asks GitHub for the latest release
 at most once a day, and says so quietly when there is a newer one, with a button that opens its page: it never downloads or installs
 anything by itself, and *Settings > About* has *Check for updates*, and a switch to turn the daily check off. The request carries
 nothing about you but the app's version. To update, run the new `DogmindSetup-VERSION.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. Every file takes its place or none does: a failure puts back what was there, so the program is as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
@@ -50,7 +50,7 @@ To remove it, *Settings > General > Remove this app from this PC* takes away the
 profile, and the model unless you keep it. In its data folder it takes only what it made there, by name: anything else stays, and it says what. Straydog's own sandbox profile stays, as the engine also runs as a server of its own. Installed apps opens the same page, and closing it then takes away the program and its entries: only the files its installer put there, and a folder only once it is empty. From a zip, delete the folder it runs from. Workspaces stay as they are.
 
 A crash leaves a text file in `%LOCALAPPDATA%\DogmindApp\crashes`, and the next start says so. `/report`, or *About > Write a problem report*, writes `report.txt` in `%LOCALAPPDATA%\DogmindApp`, with no key, server address or
-conversation in it, and says where it is: read it, and attach it to an [issue](https://github.com/rewroy/DogmindApp/issues) with what you were doing. Nothing is sent by itself. Whoever makes a release keeps its `dogmind_app.pdb` and `straydog.pdb`: the addresses in a crash are read with them.
+conversation in it, and says where it is: read it, and attach it to an [issue](https://github.com/rewroy/dogmind-app/issues) with what you were doing. Nothing is sent by itself. Whoever makes a release keeps its `dogmind_app.pdb` and `straydog.pdb`: the addresses in a crash are read with them.
 Please report a security problem privately, as [SECURITY.md](SECURITY.md) says, and not in a public issue.
 
 The app is not signed yet. Windows shows *Windows protected your PC* for it (*More info > Run anyway*), and with Smart App Control on, Windows will not run it at all.
