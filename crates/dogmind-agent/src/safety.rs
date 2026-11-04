@@ -92,6 +92,28 @@ pub(crate) fn reaches_out(path: &Path) -> bool {
     !rest.is_some_and(|rest| rest.len() >= 3 && rest[0].is_ascii_alphabetic() && rest[1] == b':' && rest[2] == b'\\')
 }
 
+/// What a person is told of a path that leads off this PC.
+fn leads_off_this_pc(what: &str) -> String {
+    format!("this leads off this PC, to another machine or a device, and opening it gives that your sign-in: {what}")
+}
+
+/// What cmd takes to end a word of a command: whitespace, and its own separators, a `,` too.
+fn separates_words(c: char) -> bool {
+    c.is_whitespace() || "\"'=<>|&;(),".contains(c)
+}
+
+/// The first word of a command that leads off this PC, as `reaches_out` tells it of a path: `\\server\share`, `//server/share`, `\\?\UNC\server\share`, a device or a pipe (`\\.\pipe\x`), and
+/// `\\server@8080\x` or `\\server@SSL@443\x`, which is WebDAV, through a service that runs outside the sandbox. Also one that a switch is given, as `findstr /f:\\server\list`: what follows its
+/// `:`, as long as the name before it is no drive's letter. A plain `\\?\C:\x` is only a spelling of a path on this PC. Nothing here opens one of them to find out.
+fn names_a_place_off_this_pc(command: &str) -> Option<String> {
+    // (cmd's escape is no part of a name)
+    let command = command.replace('^', "");
+    command.split(separates_words).filter(|word| !word.is_empty()).find_map(|word| {
+        let given_to_a_switch = word.split_once(':').filter(|(name, value)| name.len() > 1 && value.starts_with("\\\\")).map(|(_, value)| value);
+        [Some(word), given_to_a_switch].into_iter().flatten().find(|candidate| reaches_out(Path::new(candidate))).map(str::to_string)
+    })
+}
+
 pub(crate) fn inside(workspace: &Path, path: &Path) -> bool {
     let key = |p: &Path| as_opened(&p.to_string_lossy().replace('\\', "/").to_lowercase());
     let (root, target) = (key(workspace), key(path));
@@ -408,7 +430,8 @@ impl Gate {
         if self.denied.is_match(&read) {
             return Err(format!("blocked, it can destroy the system: {command}"));
         }
-        if self.high.is_match(&read) || self.names_a_secret(command) {
+        // (a word that opens another machine's share, or a device, gives it the person's sign-in: that is not a look, whatever program it is given to)
+        if self.high.is_match(&read) || self.names_a_secret(command) || names_a_place_off_this_pc(command).is_some() {
             return Ok(Risk::High);
         }
         let medium = self.medium.is_match(&without_what_a_program_is_given(command)) || names_a_new_branch(&read);
@@ -431,7 +454,7 @@ impl Gate {
         // (a word alone can be about them, in `git log --grep=credentials`, but not to a program that prints a file)
         let prints_files = ["type", "more", "findstr"].iter().any(|program| command.trim_start().get(..program.len()).is_some_and(|start| start.eq_ignore_ascii_case(program)));
         // (cmd's own separators are a `,` too. In `HEAD:.env` what follows the `:` is the path, and in `C:\x` the whole word is.)
-        command.split(|c: char| c.is_whitespace() || "\"'=<>|&;(),".contains(c)).filter(|word| !word.is_empty() && (prints_files || !word.eq_ignore_ascii_case("credentials"))).any(|word| {
+        command.split(separates_words).filter(|word| !word.is_empty() && (prints_files || !word.eq_ignore_ascii_case("credentials"))).any(|word| {
             let path = Path::new(word);
             let rooted = |path: &Path| if path.is_absolute() { path.to_path_buf() } else { Path::new("/").join(path) };
             let after_a_revision = word.rsplit_once(':').map(|(_, path)| Path::new(path));
@@ -479,7 +502,7 @@ impl Gate {
                 // The person gave the instruction, and looking changes nothing: outside the workspace is as inside it. Only keys ask.
                 let path = resolve(workspace, text("path").unwrap_or("."));
                 if reaches_out(&path) {
-                    return Verdict::Ask { risk: Risk::High, reason: Some(format!("this leads off this PC, to another machine or a device, and opening it gives that your sign-in: {}", path.display())) };
+                    return Verdict::Ask { risk: Risk::High, reason: Some(leads_off_this_pc(&path.display().to_string())) };
                 }
                 if self.is_secret(&path) {
                     Verdict::Ask { risk: Risk::High, reason: Some(format!("reads a place secrets are kept: {}", path.display())) }
@@ -518,6 +541,8 @@ impl Gate {
                 // is told to the person, and keeps a rule, "always" and a mode from answering for the call)
                 let answered = answered_here(command, &cwd);
                 let planted = self.planted_here(&answered, &cwd);
+                // (a look that names one is no look, as `command_risk` has it, and what is asked says why, as for `read_file`: the reason keeps a rule, "always" and a mode from answering for it)
+                let off_this_pc = names_a_place_off_this_pc(command).map(|word| leads_off_this_pc(&word));
                 if self.is_look(command) && !wants_network(arguments) && within(workspace, &cwd) && answered.is_empty() {
                     return Verdict::Allow;
                 }
@@ -526,7 +551,7 @@ impl Gate {
                         // (what is safe is safe by the name of a program the list knows, and a file here that answers to the name runs the project's code instead. Safe and low are what the setting for safe
                         // commands lets through, so this is more than low: it asks)
                         let risk = if risk == Risk::Safe && !answered.is_empty() { Risk::Medium } else { risk };
-                        let reasons: Vec<String> = planted.into_iter().chain(wants_network(arguments).then(|| "this command gets the network".to_string())).collect();
+                        let reasons: Vec<String> = planted.into_iter().chain(off_this_pc).chain(wants_network(arguments).then(|| "this command gets the network".to_string())).collect();
                         Verdict::Ask { risk, reason: (!reasons.is_empty()).then(|| reasons.join("; ")) }
                     }
                     Err(reason) => Verdict::Deny(reason),
@@ -1048,6 +1073,58 @@ mod tests {
         for path in ["C:\\work\\a.txt", "\\\\?\\C:\\work\\a.txt", "\\\\.\\C:\\work\\a.txt", "a.txt"] {
             assert!(!reaches_out(&resolve(root, path)), "{path}");
         }
+    }
+
+    /// A look runs with no one asked, so what its words name is what it opens, with the person's sign-in if it is another machine's: `dir \\192.0.2.10\share` is the person's sign-in handed to
+    /// 192.0.2.10 (an address kept for documentation, which nothing answers; no test opens one).
+    #[test]
+    fn a_command_that_names_a_place_off_this_pc_asks_with_its_reason_and_is_no_look() {
+        let gate = Gate::new();
+        let root = Path::new("C:\\work");
+        for line in [
+            "dir \\\\192.0.2.10\\share", "type \\\\192.0.2.10\\share\\a.txt", "dir \\\\host@8080\\x", "dir \\\\host@SSL@8443\\x", "dir \\\\host@SSL\\DavWWWRoot\\x", "dir //192.0.2.10/share", "dir //host@8080/x",
+            "dir \\\\?\\UNC\\192.0.2.10\\share", "dir //?/UNC/192.0.2.10/share", "dir \\\\.\\pipe\\x", "dir \\\\.\\PhysicalDrive0", "type \\\\?\\GLOBALROOT\\Device\\Mup\\192.0.2.10\\x",
+            "dir \"\\\\192.0.2.10\\share\"", "dir /b \\\\192.0.2.10\\share", "dir /b,\\\\192.0.2.10\\share", "findstr x \\\\192.0.2.10\\share\\*", "findstr /f:\\\\192.0.2.10\\list x", "tree \\\\192.0.2.10\\share",
+            "dir \\^\\192.0.2.10\\share", "copy \\\\192.0.2.10\\share\\a.txt .", "python read.py \\\\192.0.2.10\\share", "git status \\\\192.0.2.10\\share", "git log --output=\\\\192.0.2.10\\share\\x",
+        ] {
+            assert!(names_a_place_off_this_pc(line).is_some(), "{line}");
+            assert_eq!(gate.command_risk(line, None).unwrap(), Risk::High, "{line}");
+            assert!(!gate.is_look(line), "{line}");
+            for cwd in [None, Some("sub")] {
+                let arguments = match cwd {
+                    Some(cwd) => json!({"command": line, "cwd": cwd}),
+                    None => json!({"command": line}),
+                };
+                let Verdict::Ask { risk, reason } = gate.check("execute_command", &arguments, root) else { panic!("{line}") };
+                assert!(risk == Risk::High && reason.as_deref().is_some_and(|reason| reason.starts_with("this leads off this PC, to another machine or a device")), "{line}: {risk:?} {reason:?}");
+                for mode in [Mode::Default, Mode::AcceptEdits, Mode::Auto, Mode::Plan] {
+                    assert!(!delegated(mode, "execute_command", risk, reason.as_deref(), true), "{line}");
+                }
+            }
+            assert_eq!(gate.always_scope("execute_command", &json!({"command": line}), root), None, "{line}: no always");
+        }
+        // The word it names is said, as for `read_file`.
+        assert_eq!(names_a_place_off_this_pc("dir \"\\\\192.0.2.10\\share\" /b").as_deref(), Some("\\\\192.0.2.10\\share"));
+        assert_eq!(names_a_place_off_this_pc("findstr /f:\\\\192.0.2.10\\list x").as_deref(), Some("\\\\192.0.2.10\\list"));
+        // What is on this PC is as it was: a drive's path, a spelling of one with `\\?\` or `\\.\`, and the switches and revisions that have a `:` in them.
+        for line in [
+            "dir C:\\x", "type a.txt", "dir", "dir \\\\?\\C:\\work\\x", "dir \\\\.\\C:\\work\\x", "type \\\\.\\C:\\work\\a.txt", "dir C:\\\\x", "findstr /c:abc a.txt", "dir /b *.rs",
+            "dir \"C:\\Program Files\"", "git status", "git log --format=%h", "git show HEAD:src/a.rs", "tree src", "type src\\a.rs",
+        ] {
+            assert_eq!(names_a_place_off_this_pc(line), None, "{line}");
+            assert!(gate.is_look(line), "{line}");
+            assert_eq!(gate.check("execute_command", &json!({"command": line}), root), Verdict::Allow, "{line}");
+        }
+        // (`type \\?\C:\x` was no look, as its `?` reads as a wildcard, and is none now; it names nothing off this PC)
+        assert_eq!(names_a_place_off_this_pc("type \\\\?\\C:\\work\\a.txt"), None);
+        // `\\?\C:\x` is `C:\x`, in a look, in a risk, and in what is asked.
+        for (spelled, plain) in [("dir \\\\?\\C:\\work\\x", "dir C:\\work\\x"), ("type \\\\.\\C:\\work\\a.txt", "type C:\\work\\a.txt")] {
+            assert_eq!(gate.command_risk(spelled, None).unwrap(), gate.command_risk(plain, None).unwrap());
+            assert_eq!(gate.check("execute_command", &json!({"command": spelled}), root), gate.check("execute_command", &json!({"command": plain}), root));
+        }
+        // The same words from a place that is not a look were asked about before, and are still: the reason is added to what it was.
+        let Verdict::Ask { risk, reason } = gate.check("execute_command", &json!({"command": "python read.py \\\\192.0.2.10\\share", "risk_level": "low"}), root) else { panic!("asked") };
+        assert!(risk == Risk::High && reason.is_some());
     }
 
     #[test]
