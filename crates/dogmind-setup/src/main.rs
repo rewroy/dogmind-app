@@ -10,6 +10,7 @@
 //!
 //! `--test` is for trying it out: no real Start menu entry or registry key is written, what would be goes in files in the folder, `--dir` must be named, and only what runs from that
 //! folder is looked at. With it `--auto` presses what a person would press, and the exit code says how it ended.
+//! An update or a removal of an install that was made with it is a test as well, whoever starts it (the app does, without the switch): off the screen, taking no focus.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod install;
@@ -97,6 +98,18 @@ fn check(found: &Arguments) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A removal: from Installed apps, or the steps that follow it.
+fn is_removal(found: &Arguments) -> bool {
+    found.uninstall || found.after_remove || found.finish_removal
+}
+
+/// Whether this run is a test: one that was asked to be (`--test`), or a removal or an update of an install that was made with it, whoever starts that. The app starts both without a word of
+/// `--test`, and an install that a test made is dealt with off the person's screen, without taking its focus, as the test that made it was. Nothing else takes it from what is in the
+/// folder: an install of the person's own, or a first install, is not made a test by whatever a manifest says.
+fn is_a_test_run(found: &Arguments, install_is_a_test: bool) -> bool {
+    found.test || ((is_removal(found) || found.update) && install_is_a_test)
 }
 
 /// What an update that was started wrongly says on a window: nobody reads a command line the app started this with.
@@ -217,10 +230,10 @@ fn main() {
         std::process::exit(do_verify(file));
     }
     let exe_folder = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.to_path_buf()));
-    let removing = found.uninstall || found.after_remove || found.finish_removal;
+    let removing = is_removal(&found);
     let folder = found.dir.clone().or_else(|| if removing { exe_folder } else { place::existing_install(system::registered_folder().as_deref(), system::default_folder()) });
     let Some(folder) = folder else { std::process::exit(fail("no folder to work in: name one with --dir")) };
-    let test = found.test || (removing && install::read_manifest(&folder).is_some_and(|manifest| manifest.test));
+    let test = is_a_test_run(&found, install::read_manifest(&folder).is_some_and(|manifest| manifest.test));
     if found.after_remove {
         std::process::exit(hand_over_to_a_copy(&found, &folder, test));
     }
@@ -307,6 +320,25 @@ mod tests {
             words.extend_from_slice(other);
             assert!(check(&args(&words).unwrap()).unwrap_err().contains("--update"), "{other:?}");
         }
+    }
+
+    #[test]
+    fn an_update_or_a_removal_of_a_test_install_is_a_test_and_nothing_else_is_made_one_by_a_manifest() {
+        let run = |words: &[&str], install_is_a_test: bool| is_a_test_run(&args(words).unwrap(), install_is_a_test);
+        // the app updates an install that a test made with no word of --test: off the screen, as that test was
+        assert!(run(&["--update", "--dir", "x"], true));
+        assert!(!run(&["--update", "--dir", "x"], false), "an install of the person's own is updated where they can see it");
+        // a removal is the same
+        for removal in [&["--uninstall"][..], &["--after-remove"], &["--finish-removal"]] {
+            assert!(run(removal, true), "{removal:?}");
+            assert!(!run(removal, false), "{removal:?}");
+        }
+        // a first install, or one that runs over what is there, is a test only when it says so
+        assert!(!run(&["--dir", "x"], true));
+        assert!(!run(&[], true));
+        assert!(run(&["--test", "--dir", "x"], false));
+        assert!(run(&["--test", "--dir", "x"], true));
+        assert!(run(&["--update", "--test", "--dir", "x"], false));
     }
 
     #[test]
