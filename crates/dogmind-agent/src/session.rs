@@ -312,7 +312,7 @@ pub fn complete_tool_calls(messages: &mut Vec<Message>) {
 /// The sessions in a folder, the newest first.
 pub fn list(folder: &Path) -> Vec<Summary> {
     let mut paths: Vec<PathBuf> = fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl")).collect();
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !crate::trajectory::is_trajectory(path)).collect();
     paths.sort();
     paths.reverse();
     paths.into_iter().filter_map(|path| {

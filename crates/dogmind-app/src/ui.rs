@@ -1879,6 +1879,9 @@ struct App {
     connect_failed: bool,
     /// The timer is what is connecting, so a failure it has seen is not said again.
     connect_retrying: bool,
+    /// When the connection being made began, and when it first had something to wait for (the engine starting, or loading): for the trajectory.
+    connect_began: Option<std::time::Instant>,
+    connect_waiting_since: Option<std::time::Instant>,
     last_connect_error: String,
     /// What is in the composer is being put back: this is no one writing.
     restoring_draft: bool,
@@ -9365,6 +9368,8 @@ impl App {
             return;
         }
         self.connection = "connecting".into();
+        self.connect_began = Some(std::time::Instant::now());
+        self.connect_waiting_since = None;
         self.update_status();
         let (poster, generations) = (self.poster.clone(), self.generation.clone());
         let current = move || generations.load(Ordering::SeqCst) == generation;
@@ -10320,14 +10325,27 @@ impl App {
         self.layout();
     }
 
+    /// How the connection that has just ended went, for the trajectory: all of it, and the time it spent waiting for the server or the engine to be ready.
+    fn note_connection(&mut self, outcome: &str) {
+        let at = dogmind_agent::trajectory::now();
+        if let Some(began) = self.connect_began.take() {
+            let _ = self.agent.commands.send(Command::Connection { at: at.clone(), what: "connect".into(), ms: began.elapsed().as_millis() as u64, outcome: outcome.into() });
+        }
+        if let Some(waiting) = self.connect_waiting_since.take() {
+            let _ = self.agent.commands.send(Command::Connection { at, what: "loading_wait".into(), ms: waiting.elapsed().as_millis() as u64, outcome: outcome.into() });
+        }
+    }
+
     unsafe fn on_note(&mut self, note: Note) {
         let current = self.generation.load(Ordering::SeqCst);
         match note {
             Note::Status(generation, text) if generation == current => {
+                self.connect_waiting_since.get_or_insert_with(std::time::Instant::now);
                 self.connection = text;
                 self.update_status();
             }
             Note::Connected { generation, provider, model, window, straydog, vision } if generation == current => {
+                self.note_connection("ok");
                 self.connected = true;
                 self.connect_retrying = false;
                 self.last_connect_error.clear();
@@ -10356,6 +10374,7 @@ impl App {
             }
             Note::Models(generation, models) if generation == current => self.provider_models = models,
             Note::ConnectFailed(generation, error) if generation == current => {
+                self.note_connection(&format!("error:{}", dogmind_agent::agent::failure_kind(&error)));
                 self.connection = "not connected".into();
                 // (writing tries again)
                 self.engine_waits = self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded);
@@ -13675,6 +13694,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             stop_asked: false,
             connect_failed: false,
             connect_retrying: false,
+            connect_began: None,
+            connect_waiting_since: None,
             last_connect_error: String::new(),
             restoring_draft: false,
             composer_typed_at: None,

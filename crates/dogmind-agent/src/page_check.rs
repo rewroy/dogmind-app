@@ -1,6 +1,7 @@
 //! Opening a page of the workspace in a headless browser, inside the sandbox: what its scripts printed and threw, and what it shows. It is the same sandbox as any command's, with no
 //! network, so what a page takes from a CDN does not load; this says so plainly, as nothing else would tell: the page just sits there with no error.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -340,6 +341,33 @@ fn note_run(picture: bool, bad: bool) {
     BROWSER_RUNS[usize::from(picture) * 2].fetch_add(1, Ordering::Relaxed);
     BROWSER_RUNS[usize::from(picture) * 2 + 1].fetch_add(u64::from(bad), Ordering::Relaxed);
 }
+/// One run of the browser in a check, for the trajectory: what it was for (`page` or `picture`), how it ended (its exit code as the check says it, or `timed out`), and how long it took.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrowserRun {
+    pub of: &'static str,
+    pub end: String,
+    pub ms: u64,
+}
+
+thread_local! {
+    /// The runs of the check this thread is making or has made: the agent runs a tool on its own thread, and reads them when the call ends.
+    static RUNS_OF_THIS_CHECK: RefCell<Vec<BrowserRun>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Before a check: whatever an earlier one left is not this one's.
+pub fn forget_runs() {
+    RUNS_OF_THIS_CHECK.with(|runs| runs.borrow_mut().clear());
+}
+
+/// The runs of the check that ended on this thread, in order.
+pub fn take_runs() -> Vec<BrowserRun> {
+    RUNS_OF_THIS_CHECK.with(|runs| std::mem::take(&mut *runs.borrow_mut()))
+}
+
+fn note_browser_run(of: &'static str, end: String, started: std::time::Instant) {
+    RUNS_OF_THIS_CHECK.with(|runs| runs.borrow_mut().push(BrowserRun { of, end, ms: started.elapsed().as_millis() as u64 }));
+}
+
 const MOST_LINES: usize = 25;
 const MOST_LINE: usize = 400;
 const MOST_TEXT: usize = 400;
@@ -879,6 +907,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         }
         finished = done.status == Some(0) && !dom.trim().is_empty();
         how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
+        note_browser_run("page", how.clone(), started);
         #[cfg(test)]
         note_run(false, !finished);
         if finished || cancel.load(Ordering::Relaxed) || started.elapsed() > LIMIT / 2 || trying.elapsed() > MOST_TRYING || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension") {
@@ -962,6 +991,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             let profile = profiles.next();
             let line = shot_line(&program, &browser_flags, (window_width, window_height), wait, &profile, &shot, &plain(&frame));
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
+            note_browser_run("picture", done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32))), started);
             #[cfg(debug_assertions)]
             if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
                 if let Ok(done) = &done {
@@ -1103,6 +1133,25 @@ fn forget_old_pictures(temp: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_runs_of_a_check_are_told_in_order_once_and_not_to_the_next_check() {
+        forget_runs();
+        let began = std::time::Instant::now();
+        note_browser_run("page", "exit code 0xc0000005".to_string(), began);
+        note_browser_run("page", "exit code 0x0".to_string(), began);
+        note_browser_run("picture", "timed out".to_string(), began);
+        let runs = take_runs();
+        assert_eq!(runs.iter().map(|run| (run.of, run.end.as_str())).collect::<Vec<_>>(), [("page", "exit code 0xc0000005"), ("page", "exit code 0x0"), ("picture", "timed out")]);
+        assert!(take_runs().is_empty(), "told once");
+        note_browser_run("page", "exit code 0x0".to_string(), began);
+        forget_runs();
+        assert!(take_runs().is_empty(), "what an earlier check left is not the next one's");
+        // (and what another thread runs is that thread's own)
+        note_browser_run("page", "exit code 0x0".to_string(), began);
+        assert!(std::thread::spawn(take_runs).join().unwrap().is_empty());
+        forget_runs();
+    }
 
     #[test]
     fn a_week_old_picture_goes_and_a_new_one_and_other_files_stay() {
