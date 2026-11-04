@@ -422,7 +422,7 @@ const JA: &[(&str, &str)] = &[
     ("GitHub answered with an error ({0}). Try again later.", "GitHub がエラーを返しました ({0})。しばらくしてからもう一度お試しください。"),
     ("GitHub's answer could not be read.", "GitHub からの応答を読み取れませんでした。"),
     ("Dogmind asks GitHub for the newest release at most once a day. It sends only its name and version. When there is a newer one, it downloads the setup in the background and checks it, and restarts into it only when you press Restart to update.", "Dogmind は 1 日に 1 回まで、GitHub に最新のリリースを問い合わせます。送るのは名前とバージョンだけです。新しいリリースがあると、セットアップをバックグラウンドでダウンロードして検証し、「再起動して更新」を押したときだけ再起動して更新します。"),
-    ("Downloading the update… {0}%", "更新をダウンロードしています… {0}%"),
+    ("Downloading Dogmind {0}… {1}%", "Dogmind {0} をダウンロードしています… {1}%"),
     ("Dogmind {0} is ready to install.", "Dogmind {0} をインストールする準備ができました。"),
     ("The update download was cancelled, and its partial file deleted. The next automatic look tries again.", "更新のダウンロードを中止し、途中のファイルを削除しました。次の自動確認でもう一度試します。"),
     ("The update was not downloaded: this connection is metered. Check for updates downloads it anyway.", "更新はダウンロードしませんでした。この接続は従量制です。「更新を確認」を押すとダウンロードします。"),
