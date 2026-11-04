@@ -289,7 +289,12 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         let mut what = match kind {
             "draft_stop" => {
                 let spent = stopped.map_or(String::new(), |request| format!(" in {}", secs(request.u("ms").unwrap_or(0))));
-                format!("{} tokens thrown away{spent} ({} lines of code, {} fence marks)", line.u("tokens_before").unwrap_or(0), line.u("code_lines").unwrap_or(0), line.u("fences").unwrap_or(0))
+                // (a stop before the rule counted runs said its totals instead)
+                let shape = match line.u("run") {
+                    Some(run) => format!("a run of {run} lines of code"),
+                    None => format!("{} lines of code and {} fence marks in all", line.u("code_lines").unwrap_or(0), line.u("fences").unwrap_or(0)),
+                };
+                format!("{} tokens thrown away{spent} ({shape})", line.u("tokens_before").unwrap_or(0))
             }
             "cut_write" => format!("{} bytes of {} cut ({}), after {} tokens", line.u("bytes").unwrap_or(0), line.s("path"), line.s("why"), line.u("tokens_before").unwrap_or(0)),
             "cost_note" => format!("{} tokens generated", line.u("generated").unwrap_or(0)),
@@ -526,7 +531,7 @@ mod tests {
         let lines = [
             json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 40, "images": 0}),
             request(1, "2026-11-05T10:01:43.000+09:00", "main", 2000, 103_000, 5000, 0, 8328, "stopped_app:draft_stop"),
-            json!({"t": "2026-11-05T10:01:43.001+09:00", "ev": "intervention", "turn": 1, "req": "s/1", "kind": "draft_stop", "tokens_before": 8328, "reasoning_chars": 20000, "stops_before": 0, "code_lines": 36, "fences": 0}),
+            json!({"t": "2026-11-05T10:01:43.001+09:00", "ev": "intervention", "turn": 1, "req": "s/1", "kind": "draft_stop", "tokens_before": 8328, "reasoning_chars": 20000, "stops_before": 0, "run": 61}),
             request(2, "2026-11-05T10:02:20.000+09:00", "main", 1000, 37_000, 13_000, 4800, 2714, "tool_calls"),
             tool(2, "create_file", 40, "ok", Some("index.html"), Some("aaaaaaaaaaaa"), "h1"),
             json!({"t": "2026-11-05T10:02:21.000+09:00", "ev": "approval", "turn": 1, "req": "s/2", "tool": "execute_command", "wait_ms": 4000, "decision": "approve"}),
@@ -541,7 +546,7 @@ mod tests {
         assert!(said.contains("   /1 main") && said.contains("stopped_app:draft_stop") && said.contains("cached  36%"), "{said}");
         assert!(said.contains("index.html"), "{said}");
         // What the stop cost: the tokens thrown away and the time, and what the request after it did.
-        assert!(said.contains("draft_stop at /1: 8328 tokens thrown away in 103.0 s (36 lines of code, 0 fence marks)"), "{said}");
+        assert!(said.contains("draft_stop at /1: 8328 tokens thrown away in 103.0 s (a run of 61 lines of code)"), "{said}");
         assert!(said.contains("next: /2 wrote 2714 tokens in 37.0 s, cached 36%, ended tool_calls"), "{said}");
         assert!(said.contains("signs of going round in circles\n  none"), "{said}");
     }

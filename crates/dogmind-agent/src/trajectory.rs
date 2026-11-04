@@ -114,6 +114,8 @@ pub struct RequestNote<'a> {
     pub tokens_est: u64,
     /// The request this one repeats, why, and how long it waited: after a connection that dropped, or an answer with nothing in it.
     pub retry: Option<(String, &'static str, u64)>,
+    /// Whether the app was watching this request's reasoning for a draft: `on`, or `off:` and why (the person asked for no change, a file has been written, it has stopped one this turn).
+    pub draft_watch: Option<&'static str>,
 }
 
 pub struct Trajectory {
@@ -251,6 +253,9 @@ impl Trajectory {
             "calls": note.calls,
             "end": note.end,
         });
+        if let Some(watch) = note.draft_watch {
+            fields["draft_watch"] = json!(watch);
+        }
         if let Some((again, why, wait_ms)) = note.retry {
             fields["retry_of"] = json!(again);
             fields["retry_why"] = json!(why);
