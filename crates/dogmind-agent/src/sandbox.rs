@@ -1363,17 +1363,22 @@ pub fn run(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Dur
 
 /// As `run`, with what it prints in `live` as it prints it.
 pub fn run_live(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
-    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), live)
+    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live)
 }
 
 /// A browser under those limits falls over in most runs, whichever of them is set (0xC0000005, 12 to 19 runs in 20, against none in 20 with none set). Its own window station
 /// keeps it from the person's clipboard and session in any case.
+///
+/// Its input is a closed pipe, not the NUL device. With the NUL device Edge's crash handler (`--type=crashpad-handler`, which the browser starts) began with a standard input that
+/// was not a handle of its own process (its output and error were), and ended in the loader with STATUS_INVALID_HANDLE (0xC0000008) before it ran; with a pipe it runs, to the end
+/// of the browser's. With no handler to answer, the browser's other processes waited for it in `WaitNamedPipe` (crashpad's registration), and in about one run in three the page was
+/// never opened: no end and no output until the time was up.
 pub fn run_browser(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, cancel: &AtomicBool) -> Result<Output, String> {
-    run_limited(line, cwd, workspace, false, timeout, cancel, 0, None, None)
+    run_limited(line, cwd, workspace, false, timeout, cancel, 0, None, true, None)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
+fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, closed_stdin: bool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
     let asked_at = Instant::now();
     // (the build tools are looked for while the folder is made ready below, and the environment then usually finds them ready)
     crate::msvc::look_ahead();
@@ -1400,7 +1405,17 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let (err_read, err_write) = pipe()?;
         let nul = wide("NUL");
         let inheritable = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: std::ptr::null_mut(), bInheritHandle: 1 };
-        let input = Handle(CreateFileW(nul.as_ptr(), FILE_GENERIC_READ, FILE_SHARE_READ, &inheritable, OPEN_EXISTING, 0, std::ptr::null_mut()));
+        let input = if closed_stdin {
+            // The end of a pipe nothing writes to: reading it ends at once, as the NUL device does.
+            let (read_end, write_end) = pipe()?;
+            drop(write_end);
+            if SetHandleInformation(read_end.0, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+                return Err(last_error("a pipe for its input"));
+            }
+            read_end
+        } else {
+            Handle(CreateFileW(nul.as_ptr(), FILE_GENERIC_READ, FILE_SHARE_READ, &inheritable, OPEN_EXISTING, 0, std::ptr::null_mut()))
+        };
 
         let job = Handle(CreateJobObjectW(std::ptr::null(), std::ptr::null()));
         if job.0.is_null() {
@@ -1667,6 +1682,42 @@ mod tests {
         run(line, folder, folder, network, Duration::from_secs(60), &AtomicBool::new(false)).unwrap()
     }
 
+    /// The other half of `a_browsers_input_is_a_pipe_that_its_children_are_handed`, run in the container as a copy of this program: `parent` starts `child` with its own input handed
+    /// on, as Edge starts its crash handler, and `child` says what kind of handle its input is.
+    #[test]
+    #[ignore = "run in the container by a_browsers_input_is_a_pipe_that_its_children_are_handed"]
+    fn an_input_probe() {
+        use std::os::windows::io::AsRawHandle;
+        match std::env::args().last().unwrap_or_default().as_str() {
+            "parent" => {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child.args(["sandbox::tests::an_input_probe", "--exact", "--ignored", "--nocapture", "--test-threads=1", "child"]).stdin(std::process::Stdio::inherit()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+                let said = child.output().unwrap();
+                let out = String::from_utf8_lossy(&said.stdout).into_owned();
+                println!("PROBE-PARENT {}", out.find("PROBE-CHILD").map_or_else(|| format!("PROBE-CHILD no answer, {:?}: {out} {}", said.status, String::from_utf8_lossy(&said.stderr)), |at| out[at..].lines().next().unwrap_or("").to_string()));
+            }
+            "child" => {
+                // SAFETY: it asks the system what a handle is.
+                let kind = unsafe { GetFileType(std::io::stdin().as_raw_handle() as HANDLE) };
+                println!("PROBE-CHILD input is {}", match kind { 1 => "a file", 2 => "a device", 3 => "a pipe", _ => "no handle" });
+            }
+            _ => {}
+        }
+    }
+
+    /// What a browser runs with as its input is a pipe, and a child of its that is handed it has a pipe too: with the NUL device in its place, the crash handler Edge starts as such a
+    /// child ended before it ran (see `run_browser`). What a command is given is not looked at here.
+    #[test]
+    fn a_browsers_input_is_a_pipe_that_its_children_are_handed() {
+        let folder = work_folder("browser-input");
+        let probe = folder.join("probe.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+        let line = format!("\"{}\" sandbox::tests::an_input_probe --exact --ignored --nocapture --test-threads=1 parent", probe.display());
+        let done = run_browser(&line, &folder, &folder, Duration::from_secs(60), &AtomicBool::new(false)).unwrap();
+        let said = decode(&done.stdout);
+        assert!(said.contains("PROBE-PARENT PROBE-CHILD input is a pipe"), "{said} {}", decode(&done.stderr));
+    }
+
     /// Nothing is written: this only asks about a link to the real home, and what is made goes with the temp folder.
     fn junction(link: &Path, target: &Path) {
         let mut made = std::process::Command::new("cmd");
@@ -1927,18 +1978,18 @@ mod tests {
         std::fs::create_dir_all(&place).unwrap();
         let cap = 300u64 << 20;
         let greedy = "powershell -NoProfile -Command \"try { $a = [Runtime.InteropServices.Marshal]::AllocHGlobal(800000000); 'allocated' } catch { 'refused'; exit 7 }\"";
-        let done = run_limited(greedy, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), None).unwrap();
+        let done = run_limited(greedy, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None).unwrap();
         eprintln!("status {:?}, out_of_memory {:?}, out {} err {}", done.status, done.out_of_memory, decode(&done.stdout).trim(), decode(&done.stderr));
         assert!(decode(&done.stdout).contains("refused") && done.status == Some(7), "{}", decode(&done.stdout));
         // Bit by bit, as a leak goes: it is said to have been stopped.
         let leak = "powershell -NoProfile -Command \"try { while ($true) { $null = [Runtime.InteropServices.Marshal]::AllocHGlobal(5000000) } } catch { 'refused'; exit 7 }\"";
-        let leaked = run_limited(leak, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), None).unwrap();
+        let leaked = run_limited(leak, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None).unwrap();
         // (What a process does at the end of its memory is its own. PowerShell catches the refusal and ends with 7, or falls over in the middle of it, which it does in about
         // one run in three, and not with one code: 0xC0000005, 0xC00000FD when the stack cannot grow by a page, 0xC0000409, or the runtime's own 0xE0434352 or 0x80131523, as
         // what it has left to run its handler with is not the same twice. Which of them is no business of the sandbox. It is stopped all the same: it ended by itself, and not
         // well, and it is said to have used all it was allowed.)
         assert!(leaked.ended.is_empty() && leaked.status.is_some_and(|status| status != 0) && leaked.out_of_memory == Some(cap), "{:?} {:?} {:?}", leaked.status, leaked.ended, leaked.out_of_memory);
-        let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap), None).unwrap();
+        let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None).unwrap();
         assert!(decode(&fine.stdout).contains("fine") && fine.out_of_memory.is_none());
         drop(holder);
     }
@@ -1951,7 +2002,7 @@ mod tests {
         // Each alone fits under the cap; four together do not.
         let one = "try { $a = [Runtime.InteropServices.Marshal]::AllocHGlobal(500000000); Write-Output held; Start-Sleep 8 } catch { Write-Output refused }";
         let line = format!("powershell -NoProfile -Command \"$p = 1..4 | ForEach-Object {{ $i = New-Object Diagnostics.ProcessStartInfo 'powershell.exe', '-NoProfile -Command {}'; $i.UseShellExecute = $false; [Diagnostics.Process]::Start($i) }}; $p | ForEach-Object {{ $_.WaitForExit() }}\"", one);
-        let done = run_limited(&line, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(1200u64 << 20), None).unwrap();
+        let done = run_limited(&line, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(1200u64 << 20), false, None).unwrap();
         let said = decode(&done.stdout);
         eprintln!("status {:?} out {} err {}", done.status, said.trim(), decode(&done.stderr).trim());
         assert!(said.contains("held"), "one fits: {said}");

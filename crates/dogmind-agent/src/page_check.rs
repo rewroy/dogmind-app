@@ -14,6 +14,9 @@ use serde_json::Value;
 const LIMIT: Duration = Duration::from_secs(20);
 /// (not `--disable-breakpad` or `--disable-crash-reporter`: with those the browser crashes in about half its runs in the sandbox, against about 1 in 30 finally without. What keeps a crash
 /// from raising a dialog is the error mode and the job's limit, in `sandbox`.)
+/// `msWindowsTaskManager` is off because Edge's part that tells the Windows Task Manager of its processes (`WindowsTaskManagerHandler::DoTasksUpdated`, in msedge.dll) reads through a
+/// null when the registration it makes fails, which it does in a container: the browser ended with 0xc0000005 in about 6 runs of 10 on this machine, always there, and in none of
+/// 90 with the feature off. A browser that does not know the name (Chrome) ignores it.
 /// The flags, with what a debug build is told to add (for a look at what the browser does in the sandbox).
 fn flags() -> String {
     #[cfg(debug_assertions)]
@@ -22,7 +25,7 @@ fn flags() -> String {
     }
     FLAGS.to_string()
 }
-const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-extensions --disable-background-networking --disable-sync --disable-component-update --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
+const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-extensions --disable-background-networking --disable-sync --disable-component-update --disable-features=msWindowsTaskManager --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
 
 /// The command line of a run that dumps the page's DOM, as the sandbox's shell is given it: `%TEMP%` is the container's own folder, where the run's profile is.
 fn page_line(program: &Path, flags: &str, wait: u64, profile: &str, address: &str) -> String {
@@ -182,9 +185,10 @@ fn served_address(url: &str) -> Result<String, String> {
     }
     Ok(url.to_string())
 }
-/// Tries of the browser for the page, and again for each picture. It ends with 0xc0000005 in about 6 runs of 10 on some machines, whatever the page, however long it was left alone, and whether
-/// the run before it ended well or not, so each try is as likely to end well as the first was; a run that crashes is over in about 1.5 s. Ten tries are lost about once in a hundred
-/// (4 were lost one time in six, and a picture's 3 two in five), and cost 15 s at the most when it is crashes that they go on, with nothing between them; a run that hangs is not tried again.
+/// Tries of the browser for the page, and again for each picture: a safety net now. The browser ended with 0xc0000005 in about 6 runs of 10 here, whatever the page, however long it was left
+/// alone, and whether the run before it ended well or not (the cause is in the flags above and in `sandbox::run_browser`), and in none of the 90 runs of a page, of a page with steps and of
+/// pictures after those were set right (2 of 60 picture runs hung, with no end and no output, and a hung run is not tried again). Ten tries cost nothing when the first ends well,
+/// and 15 s at the most when it is crashes that they go on, with nothing between them, as another build of Edge or another machine may still bring; a run that hangs is not tried again.
 const TRIES: usize = 10;
 /// No new try after this long in all: runs that crash late, or hang, would otherwise go on for minutes.
 const MOST_TRYING: Duration = Duration::from_secs(45);
