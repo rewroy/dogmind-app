@@ -617,21 +617,37 @@ pub fn progress_text(progress: &Value) -> String {
     }
 }
 
+/// How many polls in a row may fail, once the engine has answered, before it is said to have stopped. A poll gives up after 20 seconds, so an engine that goes silent ends the wait in
+/// about a minute, and one that is gone (the connection refused) in the few seconds three refusals and the pauses between them take. One that is slow for a moment, loading a model on a
+/// machine that is short of memory, is waited for.
+const FAILED_POLLS_IN_A_ROW: usize = 3;
+
 /// Waits for the server. `say` hears its loading; ends when it is ready or cannot be.
 pub fn wait_ready(client: &Client, keep_going: &dyn Fn() -> bool, say: &mut dyn FnMut(String)) -> Result<(), String> {
+    wait_until_ready(&mut || client.health(), Duration::from_millis(500), keep_going, say)
+}
+
+/// `wait_ready` for any way of asking after `/health`, and any pause between two asks.
+fn wait_until_ready(ask: &mut dyn FnMut() -> Result<Health, String>, pause: Duration, keep_going: &dyn Fn() -> bool, say: &mut dyn FnMut(String)) -> Result<(), String> {
     let mut reached = false;
+    let mut failed_in_a_row = 0;
     while keep_going() {
-        match client.health() {
+        match ask() {
             Ok(Health::Ready) => return Ok(()),
             Ok(Health::Loading(progress)) => {
-                reached = true;
+                (reached, failed_in_a_row) = (true, 0);
                 say(progress_text(&progress));
             }
             Ok(Health::Failed(message)) => return Err(message),
-            Err(_) if reached => return Err(t("the engine stopped answering: /log shows why, and writing again tries once more").to_string()),
+            Err(_) if reached => {
+                failed_in_a_row += 1;
+                if failed_in_a_row >= FAILED_POLLS_IN_A_ROW {
+                    return Err(t("the engine stopped answering: /log shows why, and writing again tries once more").to_string());
+                }
+            }
             Err(_) => say(t("starting the engine").to_string()),
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(pause);
     }
     Err("stopped".into())
 }
@@ -1122,5 +1138,94 @@ mod tests {
     fn loading_reads_in_a_line() {
         assert_eq!(progress_text(&json!({"stage": "weights", "done": 1, "total": 4})), "weights 25%");
         assert_eq!(progress_text(&json!(null)), "loading");
+    }
+
+    /// An engine at a free port that answers `/health` as `script` says (its loading, then ready), one answer for each connection, each on a thread of its own so that a close it never
+    /// hears blocks no other. When the script is over it stops listening, and what comes next is refused. The connections it took are counted.
+    ///
+    /// (A failed poll is not made with this: on this machine the loopback has a filter that reads the traffic, which turns an answer that is no answer, or a connection that is dropped, into a
+    /// page of its own or into a reset that comes or does not. A poll that fails is scripted in `wait_until_ready` below, and a refused connection is a real one.)
+    fn engine_that_answers(script: Vec<Health>) -> (Client, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = taken.clone();
+        std::thread::spawn(move || {
+            for step in script {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let (mut head, mut block) = (Vec::new(), [0u8; 4096]);
+                    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut block) {
+                            Ok(0) | Err(_) => return,
+                            Ok(count) => head.extend_from_slice(&block[..count]),
+                        }
+                    }
+                    let body = match step {
+                        Health::Loading(progress) => json!({"status": "loading", "progress": progress}).to_string(),
+                        _ => json!({"status": "ok"}).to_string(),
+                    };
+                    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+                    // (the client closes first)
+                    while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+                });
+            }
+        });
+        (client(port), taken)
+    }
+
+    const STOPPED_ANSWERING: &str = "the engine stopped answering: /log shows why, and writing again tries once more";
+
+    fn loading() -> Health {
+        Health::Loading(json!({"stage": "weights", "done": 1, "total": 4}))
+    }
+
+    /// `wait_until_ready` over a list of what each ask comes to, with no pause: what it comes to, and how many asks were made.
+    fn waited_over(asks: Vec<Result<Health, String>>) -> (Result<(), String>, usize, Vec<String>) {
+        let (mut asks, mut made, mut said) = (asks.into_iter(), 0, Vec::new());
+        let result = wait_until_ready(&mut || { made += 1; asks.next().expect("asked after the list was over") }, Duration::ZERO, &|| true, &mut |line| said.push(line));
+        (result, made, said)
+    }
+
+    #[test]
+    fn once_the_engine_has_answered_one_or_two_failed_polls_in_a_row_do_not_end_the_wait_and_an_answer_clears_the_count() {
+        let failed = || Err("no answer".to_string());
+        // (four failed polls in all, but never three in a row)
+        let (result, made, _) = waited_over(vec![Ok(loading()), failed(), failed(), Ok(loading()), failed(), failed(), Ok(Health::Ready)]);
+        assert_eq!((result, made), (Ok(()), 7));
+    }
+
+    #[test]
+    fn three_failed_polls_in_a_row_after_the_engine_has_answered_end_the_wait_and_it_asks_no_more() {
+        let failed = || Err("no answer".to_string());
+        let (result, made, _) = waited_over(vec![Ok(loading()), failed(), failed(), failed()]);
+        assert_eq!((result, made), (Err(t(STOPPED_ANSWERING).to_string()), 4));
+    }
+
+    #[test]
+    fn before_the_engine_has_answered_no_number_of_failed_polls_ends_the_wait() {
+        let failed = || Err("no answer".to_string());
+        let (result, made, said) = waited_over(vec![failed(), failed(), failed(), failed(), failed(), Ok(Health::Ready)]);
+        assert_eq!((result, made), (Ok(()), 6));
+        assert_eq!(said, vec![t("starting the engine").to_string(); 5], "it says it is starting, as it did");
+    }
+
+    #[test]
+    fn an_engine_that_answers_loading_and_then_ready_is_waited_for_over_a_real_connection() {
+        let (client, taken) = engine_that_answers(vec![loading(), loading(), Health::Ready]);
+        assert_eq!(wait_ready(&client, &|| true, &mut |_| {}), Ok(()));
+        assert_eq!(taken.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn an_engine_that_has_answered_and_then_stops_listening_ends_the_wait_in_a_moment() {
+        let (client, _) = engine_that_answers(vec![loading()]);
+        let started = std::time::Instant::now();
+        assert_eq!(wait_ready(&client, &|| true, &mut |_| {}), Err(t(STOPPED_ANSWERING).to_string()));
+        // (three refused connections and the pauses between them: seconds, as a refused connection takes a couple of seconds to be said on Windows; not the minute of three silent polls)
+        assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
     }
 }
