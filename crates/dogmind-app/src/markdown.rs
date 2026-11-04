@@ -12,40 +12,47 @@ pub enum Link<'a> {
     No,
 }
 
+/// How much of a line a link, or an address, may take. Nothing past it is looked at: a line of a hundred thousand `[` was read to its end for each of them.
+const MOST: usize = 2000;
+
+/// The first `most` bytes of `text`, to a character's edge, and whether there was more.
+fn first_bytes(text: &str, most: usize) -> (&str, bool) {
+    let mut end = most.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], end < text.len())
+}
+
 /// `rest` begins at the `[`.
 pub fn parse_link(rest: &str) -> Link<'_> {
-    const MOST: usize = 2000;
-    let Some(close) = rest.find(']') else {
-        return if rest.contains('\n') || rest.len() > MOST { Link::No } else { Link::Waiting };
-    };
+    // (the limit first: each scan below is of this much at the most, so the whole of a long line is read once for all its brackets and not once for each)
+    let (rest, cut) = first_bytes(rest, MOST);
+    // What is not there to find: a line that goes on past the limit is no link, and one that ends may still be given more.
+    let missing = |inside: &str| if inside.contains('\n') || cut { Link::No } else { Link::Waiting };
+    let Some(close) = rest.find(']') else { return missing(rest) };
     if rest[..close].contains('\n') || close == 1 {
         return Link::No;
     }
     let after = &rest[close + 1..];
     if after.is_empty() {
-        return Link::Waiting;
+        return missing("");
     }
     if !after.starts_with('(') {
         return Link::No;
     }
     // `(<a path with spaces>)`, as CommonMark writes an address that has them
     if let Some(inside) = after[1..].strip_prefix('<') {
-        let Some(close_angle) = inside.find('>') else {
-            return if inside.contains('\n') || rest.len() > MOST { Link::No } else { Link::Waiting };
-        };
+        let Some(close_angle) = inside.find('>') else { return missing(inside) };
         let url = &inside[..close_angle];
         if url.is_empty() || url.contains('\n') {
             return Link::No;
         }
         let tail = &inside[close_angle + 1..];
-        let Some(end) = tail.find(')') else {
-            return if tail.contains('\n') || rest.len() > MOST { Link::No } else { Link::Waiting };
-        };
+        let Some(end) = tail.find(')') else { return missing(tail) };
         return Link::Whole { text: &rest[1..close], url, length: close + 1 + 2 + close_angle + 1 + end + 1 };
     }
-    let Some(end) = after.find(')') else {
-        return if after.contains('\n') || rest.len() > MOST { Link::No } else { Link::Waiting };
-    };
+    let Some(end) = after.find(')') else { return missing(after) };
     // (a title after the address is left out)
     let Some(url) = after[1..end].split_whitespace().next() else { return Link::No };
     Link::Whole { text: &rest[1..close], url, length: close + 1 + end + 1 }
@@ -67,14 +74,22 @@ pub fn bare_url(rest: &str) -> BareUrl {
     }
     let end = rest.find(|c: char| !c.is_ascii_graphic() || matches!(c, '<' | '>' | '"' | '`'));
     let Some(end) = end else {
-        return if rest.len() > 2000 { BareUrl::Whole(rest.len()) } else { BareUrl::Waiting };
+        return if rest.len() > MOST { BareUrl::Whole(rest.len()) } else { BareUrl::Waiting };
     };
     let mut url = &rest[..end];
-    // What ends the sentence or the bracket around it is not in the address, unless the address opened that bracket itself.
+    // What ends the sentence or the bracket around it is not in the address, unless the address opened that bracket itself. The brackets are counted once and as they go, not
+    // again for each character that is trimmed: a thousand `)` at the end of an address was a thousand counts of all of it.
+    let count = |mark: char| url.matches(mark).count() as isize;
+    let (mut parens, mut squares) = (count('(') - count(')'), count('[') - count(']'));
     loop {
         let last = url.chars().last().unwrap_or(' ');
-        let unbalanced = |open: char, close: char| last == close && url.matches(close).count() > url.matches(open).count();
-        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | '_') || unbalanced('(', ')') || unbalanced('[', ']') {
+        let unbalanced = |open_minus_close: isize, close: char| last == close && open_minus_close < 0;
+        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | '_') || unbalanced(parens, ')') || unbalanced(squares, ']') {
+            match last {
+                ')' => parens += 1,
+                ']' => squares += 1,
+                _ => {}
+            }
             url = &url[..url.len() - last.len_utf8()];
         } else {
             break;
@@ -134,15 +149,20 @@ pub fn undecided(head: &str) -> bool {
 
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    let mut before = None;
+    while let Some(c) = chars.next() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&#39;"),
+            // (what acts on the text and shows nothing is shown: as its mark, with the brackets escaped like any)
+            hidden if is_shown_as_mark(before, hidden, chars.peek().copied()) => out.push_str(&format!("&lt;U+{:04X}&gt;", hidden as u32)),
             other => out.push(other),
         }
+        before = Some(c);
     }
     out
 }
@@ -167,9 +187,108 @@ fn plain_rest(lines: &[&str], out: &mut String) {
         if at > 0 {
             out.push('\n');
         }
-        out.push_str(&escape(line));
+        out.push_str(&escape_text(line));
     }
     out.push_str("</p>");
+}
+
+/// What the person sees of the characters that act on the text and show nothing (`is_hidden`): the mark for each, as words.
+pub fn hidden_marker(c: char) -> String {
+    format!("<U+{:04X}>", c as u32)
+}
+
+/// Whether this character changes how the text around it reads while showing nothing itself: the direction controls (a right-to-left override shows the rest of a line backwards, so that
+/// what is shown is not what was written), the zero width characters and marks, the line and paragraph separators, and the byte order mark.
+pub fn is_hidden(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// Whether a character is a picture a joiner may join: the emoji blocks, the symbols many emoji are in, and the selector that asks for the picture.
+fn is_emoji_like(c: char) -> bool {
+    matches!(c, '\u{1F000}'..='\u{1FAFF}' | '\u{2190}'..='\u{21FF}' | '\u{2300}'..='\u{23FF}' | '\u{2600}'..='\u{27BF}' | '\u{2900}'..='\u{297F}' | '\u{2B00}'..='\u{2BFF}' | '\u{3030}' | '\u{303D}' | '\u{3297}' | '\u{3299}' | '\u{FE0F}' | '\u{00A9}' | '\u{00AE}' | '\u{200D}')
+}
+
+/// Whether `c` is to be shown as a mark, between these two characters: a zero width joiner that joins two emoji is what makes them one picture, and is left alone. A joiner at the very edge
+/// of what is looked at, with nothing known of what is beside it, is left alone too.
+pub fn is_shown_as_mark(before: Option<char>, c: char, after: Option<char>) -> bool {
+    if !is_hidden(c) {
+        return false;
+    }
+    !(c == '\u{200D}' && (before.is_none() || after.is_none() || (before.is_some_and(is_emoji_like) && after.is_some_and(is_emoji_like))))
+}
+
+/// Whether any character of the text is to be shown as a mark.
+pub fn has_marks(text: &str) -> bool {
+    let mut chars = text.chars().peekable();
+    let mut before = None;
+    while let Some(c) = chars.next() {
+        if is_shown_as_mark(before, c, chars.peek().copied()) {
+            return true;
+        }
+        before = Some(c);
+    }
+    false
+}
+
+/// The text cut into what is shown as it is, and the marks that stand for its hidden characters, each with whether it is one: `("a", false), ("<U+202E>", true), ("b", false)`.
+pub fn with_marks(text: &str) -> Vec<(String, bool)> {
+    let mut parts: Vec<(String, bool)> = Vec::new();
+    let mut chars = text.chars().peekable();
+    let mut before = None;
+    while let Some(c) = chars.next() {
+        if is_shown_as_mark(before, c, chars.peek().copied()) {
+            parts.push((hidden_marker(c), true));
+        } else {
+            match parts.last_mut() {
+                Some((held, false)) => held.push(c),
+                _ => parts.push((c.to_string(), false)),
+            }
+        }
+        before = Some(c);
+    }
+    parts
+}
+
+/// The text with each hidden character written as its mark (`<U+202E>`), where a person reads plain text.
+pub fn show_hidden(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(is_hidden) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut chars = text.chars().peekable();
+    let mut before = None;
+    while let Some(c) = chars.next() {
+        if is_shown_as_mark(before, c, chars.peek().copied()) {
+            out.push_str(&hidden_marker(c));
+        } else {
+            out.push(c);
+        }
+        before = Some(c);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// `escape` for words that stand between tags: a hidden character is its mark, in the muted colour of the page.
+pub fn escape_text(text: &str) -> String {
+    if !text.chars().any(is_hidden) {
+        return escape(text);
+    }
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut chars = text.chars().peekable();
+    let mut before = None;
+    let mut plain = String::new();
+    while let Some(c) = chars.next() {
+        if is_shown_as_mark(before, c, chars.peek().copied()) {
+            out.push_str(&escape(&plain));
+            plain.clear();
+            out.push_str(&format!("<span class=\"u\">{}</span>", escape(&hidden_marker(c))));
+        } else {
+            plain.push(c);
+        }
+        before = Some(c);
+    }
+    out.push_str(&escape(&plain));
+    out
 }
 
 /// A line's text as HTML: emphasis, code, links, pictures.
@@ -253,7 +372,11 @@ pub fn inline(text: &str) -> String {
             }
             _ => {}
         }
-        out.push_str(&escape(&c.to_string()));
+        if is_shown_as_mark(before, c, next) {
+            out.push_str(&format!("<span class=\"u\">{}</span>", escape(&hidden_marker(c))));
+        } else {
+            out.push_str(&escape(&c.to_string()));
+        }
         before = Some(c);
         at += c.len_utf8();
     }
@@ -278,13 +401,13 @@ fn class_of(kind: Kind) -> Option<&'static str> {
 /// One line of code, in the colours of its language when it has any. Returns whether a block comment runs on past it.
 fn code_line(line: &str, language: &str, open: bool, out: &mut String) -> bool {
     let Some((runs, still_open)) = highlight::runs(line, language, open) else {
-        out.push_str(&escape(line));
+        out.push_str(&escape_text(line));
         return false;
     };
     for (text, kind) in runs {
         match class_of(kind) {
-            Some(class) => out.push_str(&format!("<span class=\"{class}\">{}</span>", escape(&text))),
-            None => out.push_str(&escape(&text)),
+            Some(class) => out.push_str(&format!("<span class=\"{class}\">{}</span>", escape_text(&text))),
+            None => out.push_str(&escape_text(&text)),
         }
     }
     still_open
@@ -479,14 +602,14 @@ fn blocks(lines: &[&str], out: &mut String, depth: usize) {
             };
             out.push_str("<table><thead><tr>");
             for (column, cell) in crate::rtf::table_cells(line).unwrap_or_default().iter().enumerate() {
-                out.push_str(&format!("<th{}>{}</th>", aligned(column), escape(cell)));
+                out.push_str(&format!("<th{}>{}</th>", aligned(column), escape_text(cell)));
             }
             out.push_str("</tr></thead><tbody>");
             at += 2;
             while at < lines.len() && lines[at].trim_start().starts_with('|') {
                 out.push_str("<tr>");
                 for (column, cell) in crate::rtf::table_cells(lines[at]).unwrap_or_default().iter().enumerate() {
-                    out.push_str(&format!("<td{}>{}</td>", aligned(column), escape(cell)));
+                    out.push_str(&format!("<td{}>{}</td>", aligned(column), escape_text(cell)));
                 }
                 out.push_str("</tr>");
                 at += 1;
@@ -644,6 +767,7 @@ mod tests {
         assert_eq!(page.matches("</blockquote>").count(), MOST_NESTING);
         // (the rest is what it is: words, escaped, at the level that was reached)
         assert!(page.contains(&format!("<p>{}</p>", "&gt;".repeat(100_000 - MOST_NESTING))), "the rest is shown as it was written");
+        eprintln!("a hundred thousand `>` on 256 KB of stack: {:?}", began.elapsed());
         assert!(began.elapsed() < std::time::Duration::from_secs(2), "{:?}", began.elapsed());
         // Quotation marks with words in them, as an answer has them, nest as far as they go and no further.
         let few = to_html("> > a\n> b");
@@ -657,12 +781,102 @@ mod tests {
         let page = on_a_small_stack(256, move || to_html(&text));
         assert_eq!(page.matches("<ul>").count(), MOST_NESTING, "{}", &page[..200.min(page.len())]);
         assert!(page.contains("item 31") && page.contains("- item 40"), "what is deeper is its words, with its marks");
+        eprintln!("lists four hundred deep on 256 KB of stack: {:?}", began.elapsed());
         assert!(began.elapsed() < std::time::Duration::from_secs(2), "{:?}", began.elapsed());
         // The same through quotations that hold lists that hold quotations.
         let mixed: String = (0..2000).map(|level| format!("{}> - x\n", "  ".repeat(level.min(40)))).collect();
         let _ = on_a_small_stack(256, move || to_html(&mixed));
         let ordinary = to_html("- a\n  - b\n    - c\n- d");
         assert_eq!(ordinary, "<ul><li>a<ul><li>b<ul><li>c</li></ul></li></ul></li><li>d</li></ul>");
+    }
+
+    /// What a line of nothing but opening brackets, closing ones or the start of a link costs: each was scanned to the end of the line from its own place.
+    #[test]
+    fn a_long_line_of_marks_is_read_once_and_not_once_for_each() {
+        let megabyte = 1 << 20;
+        let shapes: [(&str, String); 6] = [
+            ("[", "[".repeat(megabyte)),
+            (")", ")".repeat(megabyte)),
+            ("[a](", "[a](".repeat(megabyte / 4)),
+            ("[a](<", "[a](<".repeat(megabyte / 5)),
+            ("an address and its closing brackets", format!("https://a.example/{}  and on", ")".repeat(megabyte))),
+            ("![", "![".repeat(megabyte / 2)),
+        ];
+        for (name, line) in shapes {
+            let began = std::time::Instant::now();
+            let said = inline(&line);
+            assert!(said.len() >= line.len() / 2, "{name}");
+            eprintln!("inline of a megabyte of {name}: {:?}", began.elapsed());
+            // (generous: this is a build with no optimization of its own code, and what is measured is that it is not a minute)
+            assert!(began.elapsed() < std::time::Duration::from_secs(3), "{name}: {:?}", began.elapsed());
+        }
+        // Well-formed links are as many as they are, and each is a link.
+        let links = "[a](http://b) ".repeat(50_000);
+        let began = std::time::Instant::now();
+        assert_eq!(inline(&links).matches("<a href").count(), 50_000);
+        eprintln!("inline of fifty thousand links: {:?}", began.elapsed());
+        assert!(began.elapsed() < std::time::Duration::from_secs(3), "{:?}", began.elapsed());
+    }
+
+    #[test]
+    fn a_link_longer_than_the_limit_is_not_one_and_one_inside_it_is() {
+        let long = format!("[a](http://b/{})", "x".repeat(MOST));
+        assert_eq!(parse_link(&long), Link::No);
+        let whole = format!("[a](http://b/{})", "x".repeat(MOST - 40));
+        assert!(matches!(parse_link(&whole), Link::Whole { .. }));
+        assert_eq!(parse_link(&format!("[{}", "a".repeat(MOST + 10))), Link::No);
+        assert_eq!(parse_link("[あ"), Link::Waiting);
+        // (a limit that falls in the middle of a character does not cut it)
+        let _ = parse_link(&format!("[{}", "あ".repeat(MOST)));
+    }
+
+    #[test]
+    fn the_closing_brackets_after_an_address_are_trimmed_once_and_not_counted_again_for_each() {
+        assert_eq!(bare_url("https://a.example/(b) x"), BareUrl::Whole(21));
+        assert_eq!(bare_url("https://a.example/b)) x"), BareUrl::Whole(19), "two brackets nothing opened");
+        assert_eq!(bare_url("https://a.example/(b)) x"), BareUrl::Whole(21), "one that was opened, and one that was not");
+        assert_eq!(bare_url("https://a.example/[b]] x"), BareUrl::Whole(21));
+        let began = std::time::Instant::now();
+        let line = format!("https://a.example/{} x", ")".repeat(1 << 20));
+        assert_eq!(bare_url(&line), BareUrl::Whole("https://a.example/".len()));
+        eprintln!("bare_url of an address and a million closing brackets: {:?}", began.elapsed());
+        assert!(began.elapsed() < std::time::Duration::from_secs(2), "{:?}", began.elapsed());
+    }
+
+    /// Every character that acts on text and shows nothing, each by its name.
+    fn hidden_characters() -> Vec<char> {
+        ('\u{200B}'..='\u{200F}').chain(['\u{2028}', '\u{2029}']).chain('\u{202A}'..='\u{202E}').chain('\u{2066}'..='\u{2069}').chain(['\u{FEFF}']).collect()
+    }
+
+    #[test]
+    fn what_acts_on_text_and_shows_nothing_is_shown_as_its_mark_in_every_page() {
+        for c in hidden_characters() {
+            let word = format!("a{c}b");
+            let mark = format!("<U+{:04X}>", c as u32);
+            assert_eq!(show_hidden(&word), format!("a{mark}b"), "{mark}");
+            assert_eq!(escape(&word), format!("a&lt;U+{:04X}&gt;b", c as u32));
+            assert_eq!(inline(&word), format!("a<span class=\"u\">&lt;U+{:04X}&gt;</span>b", c as u32));
+            for page in [to_html(&word), to_html(&format!("```rust\n{word}\n```")), to_html(&format!("| {word} |\n|---|\n| {word} |")), source_html(&word, "", None), source_html(&word, "rs", None)] {
+                assert!(!page.contains(c) && page.contains(&format!("U+{:04X}", c as u32)), "{mark} in {page}");
+            }
+        }
+        // The right-to-left override in a link's words, an address and an attribute: none of it reaches the page.
+        let page = to_html("[a\u{202e}b](http://x/\u{202e}y) and \u{202e}http://z.example/\u{202e}");
+        assert!(!page.contains('\u{202e}'), "{page}");
+    }
+
+    #[test]
+    fn japanese_emoji_and_combining_marks_are_left_as_they_are() {
+        // a skin tone is a modifier and no joiner; a joiner between two emoji makes the picture of them; a combining mark is part of the letter before it
+        for text in ["日本語のテキスト、「括弧」と全角！", "👍🏽 👋🏿", "👩\u{200d}💻 and 👨\u{200d}👩\u{200d}👧", "e\u{0301} が\u{3099} ❤\u{fe0f}", "ASCII only."] {
+            assert_eq!(show_hidden(text), text, "{text}");
+            assert_eq!(escape_text(text), escape(text));
+            assert!(!to_html(text).contains("U+"), "{text}");
+        }
+        // A joiner with nothing known beside it is left alone, and one between letters is not a joiner.
+        assert_eq!(show_hidden("\u{200d}"), "\u{200d}");
+        assert_eq!(show_hidden("a\u{200d}b"), "a<U+200D>b");
+        assert_eq!(show_hidden("x👩\u{200d}"), "x👩\u{200d}");
     }
 
     #[test]

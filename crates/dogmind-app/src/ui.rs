@@ -2414,6 +2414,14 @@ impl App {
         if text.is_empty() {
             return;
         }
+        // What acts on the text and shows nothing (a direction override, a zero width mark) is shown as its mark, in the muted colour, and does not reach the control: the rest of a line
+        // is not shown backwards because of something a model wrote.
+        if markdown::has_marks(text) {
+            for (part, is_mark) in markdown::with_marks(text) {
+                self.append(&part, if is_mark { Style::Quote } else { style });
+            }
+            return;
+        }
         if !self.replaying && !self.unkept {
             match self.shown.last_mut() {
                 Some(Shown::Text(held, kind, para)) if *kind == style && *para == self.para => held.push_str(text),
@@ -9729,10 +9737,10 @@ impl App {
                         // A session at work has calls still running, or still waiting for an answer: they say so when they end.
                         if let Some(result) = results.get(call.id.as_str()) {
                             let arguments = serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
-                            let summary: String = dogmind_agent::tools::summary(&call.function.name, &arguments).chars().take(160).collect();
+                            let summary: String = markdown::show_hidden(&dogmind_agent::tools::summary(&call.function.name, &arguments)).chars().take(160).collect();
                             let pictures = self.pictures_of(&result.images);
                             if self.settings.compact_tools {
-                                self.told_call(&call.function.name, &summary, result.content.as_deref().unwrap_or(""), &mut told);
+                                self.told_call(&call.function.name, &summary, &markdown::show_hidden(result.content.as_deref().unwrap_or("")), &mut told);
                                 if !pictures.is_empty() {
                                     self.flush_told_calls(&mut told);
                                     self.show_tool_pictures(&pictures);
@@ -9763,6 +9771,7 @@ impl App {
 
     /// What a session out of sight says: its state is kept for when it is opened. `true`: its turn has ended.
     unsafe fn absorb(&mut self, at: usize, event: Event) -> bool {
+        let event = hidden_shown(event);
         let parked = &mut self.parked[at];
         match event {
             Event::SessionFile(path) => {
@@ -9979,6 +9988,7 @@ impl App {
     }
 
     unsafe fn on_event(&mut self, event: Event) {
+        let event = hidden_shown(event);
         let live_report = matches!(&event, Event::Usage { usage, .. } if usage.prompt == 0 && usage.completion == 0);
         if !matches!(event, Event::Content(_) | Event::RequestStarted) && !live_report {
             self.flush_reveal();
@@ -10156,11 +10166,14 @@ impl App {
                     (Some(rule), true) => tf("Always saves: {0}", &[&t(&rule.label())]),
                     _ => String::new(),
                 };
+                // (the rule is made of the command: what hides in it is shown as its mark here too, or the line under the buttons reads in another order than the command above)
+                let always = markdown::show_hidden(&always).into_owned();
                 self.tip(self.always, if always.is_empty() { t("Always allows this exact call, for this session.") } else { &always });
                 self.always_line = always;
                 let body = approval_body(&approval.tool, &approval.summary, &approval.details);
                 // (a line at its end with nothing on it would have it scroll for nothing)
-                set_text(self.note, &format!("{reason}{body}").trim_end().replace('\n', "\r\n"));
+                // (a command is read from its first character: what hides in it is shown as its mark)
+                set_text(self.note, &markdown::show_hidden(&format!("{reason}{body}")).trim_end().replace('\n', "\r\n"));
                 // From its first word: what is being approved is read from the top, whatever its length.
                 SendMessageW(self.note, EM_SETSEL, 0, 0);
                 SendMessageW(self.note, EM_SCROLLCARET, 0, 0);
@@ -12980,6 +12993,17 @@ unsafe fn title_bar(window: HWND) {
 
 /// What a call is, as a person reads it: what it is for, then what it will do, in full, with no JSON around it. Nothing of a
 /// command is left out, as it is being approved; a file's content may be long, and its first part tells what it is.
+/// What a call says of itself, and what it brought back, is drawn as it is written: a command with a right-to-left override in it showed its end backwards, as `echo safe live world`
+/// for what ran as `echo safe <U+202E> dlrow evil`. What acts on text and shows nothing is shown as its mark before any of it is drawn.
+fn hidden_shown(event: Event) -> Event {
+    match event {
+        Event::ToolStarted { id, tool, summary } if markdown::has_marks(&summary) => Event::ToolStarted { id, tool, summary: markdown::show_hidden(&summary).into_owned() },
+        Event::ToolProgress { id, tool, summary } if markdown::has_marks(&summary) => Event::ToolProgress { id, tool, summary: markdown::show_hidden(&summary).into_owned() },
+        Event::ToolEnded { id, ok, declined, elapsed, output, images } if markdown::has_marks(&output) => Event::ToolEnded { id, ok, declined, elapsed, output: markdown::show_hidden(&output).into_owned(), images },
+        other => other,
+    }
+}
+
 fn approval_body(tool: &str, summary: &str, details: &str) -> String {
     const SHOWN: usize = 4000;
     let Ok(arguments) = serde_json::from_str::<serde_json::Value>(details) else { return format!("{summary}\n{details}") };
@@ -14600,5 +14624,19 @@ mod tests {
             }
             assert_eq!(window_of_folder(WINDOW_CLASS, one), None, "a window that is gone is not found");
         }
+    }
+
+    #[test]
+    fn what_a_call_says_and_what_it_brings_back_is_drawn_with_its_hidden_characters_as_marks() {
+        let bad = char::from_u32(0x202e).unwrap();
+        let summary = format!("echo safe {bad} dlrow evil");
+        let Event::ToolStarted { summary: shown, .. } = hidden_shown(Event::ToolStarted { id: "a".into(), tool: "execute_command".into(), summary }) else { panic!("it is the same event") };
+        assert_eq!(shown, "echo safe <U+202E> dlrow evil");
+        let Event::ToolEnded { output, .. } = hidden_shown(Event::ToolEnded { id: "a".into(), ok: true, declined: false, elapsed: std::time::Duration::ZERO, output: format!("out {bad}x"), images: Vec::new() }) else { panic!("it is the same event") };
+        assert_eq!(output, "out <U+202E>x");
+        // what has nothing hidden in it, Japanese and an emoji included, is the very same text
+        let Event::ToolStarted { summary: same, .. } = hidden_shown(Event::ToolStarted { id: "b".into(), tool: "read_file".into(), summary: "日本語.md 👍🏽".into() }) else { panic!("it is the same event") };
+        assert_eq!(same, "日本語.md 👍🏽");
+        assert_eq!(markdown::show_hidden(&format!("{bad}ls")).as_ref(), "<U+202E>ls", "an approval card's command reads in order");
     }
 }

@@ -22,25 +22,61 @@ fn channels(color: u32) -> String {
     format!("\\red{}\\green{}\\blue{}", color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF)
 }
 
-/// In RTF's own spelling: what is not plain ASCII as UTF-16 units, each a signed number with a character for old readers after it.
+/// The colour a hidden character's mark is written in: between the text's and the background's, as a quiet word of the app's.
+fn muted(color: u32, back: u32) -> u32 {
+    let mix = |shift: u32| (((color >> shift) & 0xFF) * 11 + ((back >> shift) & 0xFF) * 9) / 20 << shift;
+    mix(0) | mix(8) | mix(16)
+}
+
+/// In RTF's own spelling: what is not plain ASCII as UTF-16 units, each a signed number with a character for old readers after it. What acts on the text and shows nothing (a direction
+/// override, a zero width mark: `markdown::is_hidden`) is written as its mark, `<U+202E>`, so that what is shown is what was written and none of it reaches RichEdit.
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for unit in text.encode_utf16() {
-        match unit {
-            0x5C => out.push_str("\\\\"),
-            0x7B => out.push_str("\\{"),
-            0x7D => out.push_str("\\}"),
-            0x09 => out.push_str("\\tab "),
-            0x20..=0x7E => out.push(char::from(unit as u8)),
-            0x00..=0x1F => {}
-            _ => out.push_str(&format!("\\u{}?", unit as i16)),
+    let mut chars = text.chars().peekable();
+    let mut before = None;
+    let mut units = [0u16; 2];
+    while let Some(c) = chars.next() {
+        if crate::markdown::is_shown_as_mark(before, c, chars.peek().copied()) {
+            out.push_str(&crate::markdown::hidden_marker(c));
+        } else {
+            for unit in c.encode_utf16(&mut units).iter().copied() {
+                match unit {
+                    0x5C => out.push_str("\\\\"),
+                    0x7B => out.push_str("\\{"),
+                    0x7D => out.push_str("\\}"),
+                    0x09 => out.push_str("\\tab "),
+                    0x20..=0x7E => out.push(char::from(unit as u8)),
+                    0x00..=0x1F => {}
+                    _ => out.push_str(&format!("\\u{}?", unit as i16)),
+                }
+            }
         }
+        before = Some(c);
     }
     out
 }
 
-/// What is written in a row: what is Japanese in its own face, `\\f1` of the table every row here has, so that it does not depend on what RichEdit makes of the Latin one.
-fn words(text: &str) -> String {
+/// What is written in a row: what is Japanese in its own face, `\\f1` of the table every row here has, so that it does not depend on what RichEdit makes of the Latin one. A hidden character
+/// is its mark, in the colour of the table that has the number `muted`.
+fn words(text: &str, muted: usize) -> String {
+    let (mut out, mut plain) = (String::new(), String::new());
+    let mut chars = text.chars().peekable();
+    let mut before = None;
+    while let Some(c) = chars.next() {
+        if crate::markdown::is_shown_as_mark(before, c, chars.peek().copied()) {
+            out.push_str(&plain_words(&plain));
+            plain.clear();
+            out.push_str(&format!("{{\\cf{muted} {}}}", escape(&crate::markdown::hidden_marker(c))));
+        } else {
+            plain.push(c);
+        }
+        before = Some(c);
+    }
+    out.push_str(&plain_words(&plain));
+    out
+}
+
+fn plain_words(text: &str) -> String {
     let (mut out, mut run, mut japanese) = (String::new(), String::new(), false);
     let mut flush = |run: &mut String, japanese: bool| {
         if !run.is_empty() {
@@ -78,14 +114,15 @@ fn font_table(face: &str) -> String {
 pub fn row(row: &Row) -> String {
     let (across, down) = row.padding;
     let left = if row.right { (row.column - row.width).max(0) } else { 0 };
-    let text: Vec<String> = row.lines.iter().map(|line| words(line)).collect();
+    let text: Vec<String> = row.lines.iter().map(|line| words(line, 3)).collect();
     // A card's room round its words is its paragraph's indents and spacing: RichEdit gives a cell's own padding (trgaph, trpadd) only a few pixels, whatever it is asked.
     let (gap, padded, paragraph) = if row.right { (0, 0, format!("\\li{across}\\ri{across}\\sb{down}\\sa{down}")) } else { (across, down, "\\sa0\\sb0".to_string()) };
     format!(
-        "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{color};}}\\trowd\\trgaph{gap}\\trleft{left}\\trpaddt{padded}\\trpaddb{padded}\\trpaddft3\\trpaddfb3{span}\\clcfpat1\\clcbpat1\\clshdng10000{cell_span}\\cellx{end}\\pard\\intbl\\ql\\sl0{paragraph}\\f0\\fs{size}\\cf2 {body}\\cell\\row}}",
+        "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{color};{quiet};}}\\trowd\\trgaph{gap}\\trleft{left}\\trpaddt{padded}\\trpaddb{padded}\\trpaddft3\\trpaddfb3{span}\\clcfpat1\\clcbpat1\\clshdng10000{cell_span}\\cellx{end}\\pard\\intbl\\ql\\sl0{paragraph}\\f0\\fs{size}\\cf2 {body}\\cell\\row}}",
         fonts = font_table(row.face),
         back = channels(row.back),
         color = channels(row.color),
+        quiet = channels(muted(row.color, row.back)),
         end = left + row.width,
         // A block keeps to the column as a share of it, so that it follows the window; a card is as wide as its words.
         span = if row.right { "" } else { "\\trftsWidth2\\trwWidth5000" },
@@ -113,16 +150,20 @@ pub fn spacer_row(width: i32, column: i32, height: i32, back: u32, padding: (i32
 pub fn colored_row(runs: &[(String, u32)], face: &str, points: i32, back: u32, width: i32, padding: (i32, i32)) -> String {
     let (across, down) = padding;
     let mut colors: Vec<u32> = Vec::new();
+    for (_, color) in runs {
+        if !colors.contains(color) {
+            colors.push(*color);
+        }
+    }
+    // (the colour of a hidden character's mark follows the others in the table)
+    let quiet = colors.len() + 2;
     let mut body = String::new();
     for (text, color) in runs {
-        let at = colors.iter().position(|known| known == color).unwrap_or_else(|| {
-            colors.push(*color);
-            colors.len() - 1
-        });
+        let at = colors.iter().position(|known| known == color).unwrap_or(0);
         // In the table, 1 is the background and the rest follow it.
-        body.push_str(&format!("\\cf{} {}", at + 2, words(text)));
+        body.push_str(&format!("\\cf{} {}", at + 2, words(text, quiet)));
     }
-    let table: String = colors.iter().map(|color| format!("{};", channels(*color))).collect();
+    let table: String = colors.iter().map(|color| format!("{};", channels(*color))).chain([format!("{};", channels(muted(colors.first().copied().unwrap_or(0xCCCCCC), back)))]).collect();
     format!(
         "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{table}}}\\trowd\\trgaph{across}\\trleft0\\trpaddt{down}\\trpaddb{down}\\trpaddft3\\trpaddfb3\\trftsWidth2\\trwWidth5000\\clcfpat1\\clcbpat1\\clshdng10000\\clftsWidth2\\clwWidth5000\\cellx{width}\\pard\\intbl\\ql\\sl0\\sa0\\sb0\\f0\\fs{size} {body}\\cell\\row}}",
         fonts = font_table(face),
@@ -148,13 +189,14 @@ pub fn table_row(row: &TableRow) -> String {
     // (a line between two rows is the upper one's foot and the lower one's head: left unsaid, the head is black and wins)
     let frames: String = row.ends.iter().map(|end| format!("\\clbrdrt\\brdrs\\brdrw10\\brdrcf3\\clbrdrb\\brdrs\\brdrw10\\brdrcf3\\clcfpat1\\clcbpat1\\clshdng10000\\cellx{end}")).collect();
     let empty = String::new();
-    let cells: String = (0..row.ends.len()).map(|at| format!("\\pard\\intbl\\ql\\sl0\\sa0\\sb0\\f0\\fs{}\\cf2{} {}\\cell", half_points(row.points), if row.bold { "\\b" } else { "" }, words(row.cells.get(at).unwrap_or(&empty)))).collect();
+    let cells: String = (0..row.ends.len()).map(|at| format!("\\pard\\intbl\\ql\\sl0\\sa0\\sb0\\f0\\fs{}\\cf2{} {}\\cell", half_points(row.points), if row.bold { "\\b" } else { "" }, words(row.cells.get(at).unwrap_or(&empty), 4))).collect();
     format!(
-        "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{color};{line};}}\\trowd\\trgaph120\\trleft0\\trpaddt50\\trpaddb50\\trpaddft3\\trpaddfb3{frames}{cells}\\row}}",
+        "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{color};{line};{quiet};}}\\trowd\\trgaph120\\trleft0\\trpaddt50\\trpaddb50\\trpaddft3\\trpaddfb3{frames}{cells}\\row}}",
         fonts = font_table(row.face),
         back = channels(row.back),
         color = channels(row.color),
         line = channels(row.line),
+        quiet = channels(muted(row.color, row.back)),
     )
 }
 
@@ -179,13 +221,19 @@ pub fn table_cells(line: &str) -> Option<Vec<String>> {
 
 /// A cell has one font: the marks that would mean another go, a link keeps its words, and a line break is a space.
 fn clean_cell(cell: &str) -> String {
-    let mut text = cell.replace("**", "").replace('`', "").replace("<br>", " ").replace("<br/>", " ");
-    while let Some(open) = text.find('[') {
-        let crate::markdown::Link::Whole { text: words, length, .. } = crate::markdown::parse_link(&text[open..]) else { break };
-        let words = words.to_string();
-        text.replace_range(open..open + length, &words);
+    let text = cell.replace("**", "").replace('`', "").replace("<br>", " ").replace("<br/>", " ");
+    // The links in it, in one pass: each was taken out of a text that was then looked through again from its start, a thousand links a thousand times. As before, the first bracket that
+    // is not a link ends it, and what follows stays as it was.
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(open) = rest.find('[') {
+        let crate::markdown::Link::Whole { text: words, length, .. } = crate::markdown::parse_link(&rest[open..]) else { break };
+        out.push_str(&rest[..open]);
+        out.push_str(words);
+        rest = &rest[open + length..];
     }
-    text
+    out.push_str(rest);
+    out
 }
 
 /// Whether these cells are the line under a table's heading: `|---|:--:|`.
@@ -195,7 +243,8 @@ pub fn is_table_rule(cells: &[String]) -> bool {
 
 /// How wide a text is, in half-width characters: what is not plain ASCII takes two.
 fn columns_of(text: &str) -> i32 {
-    text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+    // (as it is shown: a hidden character is the eight characters of its mark)
+    crate::markdown::show_hidden(text).chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
 /// Where each column of these rows ends: each as wide as it needs, and all of them narrowed in step if the column they stand in is too narrow.
@@ -255,11 +304,67 @@ mod tests {
 
     #[test]
     fn what_is_japanese_has_its_own_face_and_the_rest_keeps_the_rows() {
-        assert_eq!(words("abc 日本 12"), "abc {\\f1 \\u26085?\\u26412?} 12");
-        assert_eq!(words("plain"), "plain");
-        assert_eq!(words(""), "");
+        assert_eq!(words("abc 日本 12", 3), "abc {\\f1 \\u26085?\\u26412?} 12");
+        assert_eq!(words("plain", 3), "plain");
+        assert_eq!(words("", 3), "");
         let text = row(&Row { lines: &["あ"], face: "Consolas", points: 10, color: 0, back: 0, width: 100, right: false, column: 0, padding: (0, 0) });
         assert!(text.contains(&format!("{{\\f0\\fnil Consolas;}}{{\\f1\\fnil\\fcharset128 {};}}", crate::paint::japanese_face())), "{text}");
+    }
+
+    #[test]
+    fn a_direction_override_is_shown_as_its_mark_in_the_muted_colour_and_never_reaches_the_rtf() {
+        let bad = '\u{202e}';
+        let wanted = "<U+202E>";
+        let answer = format!("normal {bad}txet desrever and 日本語");
+        let card = row(&Row { lines: &[&answer], face: "Consolas", points: 10, color: 0x0000FF, back: 0x332211, width: 9000, right: false, column: 0, padding: (0, 0) });
+        assert!(card.contains("{\\cf3 <U+202E>}") && !card.contains("\\u8238"), "{card}");
+        // The colour of the mark is the fourth in the table, between the text's and the background's.
+        assert!(card.contains("\\red17\\green34\\blue51;\\red255\\green0\\blue0;\\red"), "{card}");
+        let runs = vec![("let a = 1; ".to_string(), 0x0000FF), (format!("// {bad}"), 0x00FF00)];
+        let code = colored_row(&runs, "Consolas", 10, 0x332211, 9000, (0, 0));
+        assert!(code.contains("{\\cf4 <U+202E>}") && !code.contains("\\u8238"), "{code}");
+        let cells = vec![format!("a{bad}b"), "c".to_string()];
+        let table = table_row(&TableRow { cells: &cells, ends: &[1000, 2000], face: "F", points: 10, color: 1, back: 2, line: 3, bold: false });
+        assert!(table.contains("{\\cf4 <U+202E>}") && !table.contains("\\u8238"), "{table}");
+        assert_eq!(escape(&format!("a{bad}b")), format!("a{wanted}b"), "and where it is only escaped, it is still not let through");
+        // Every one of them, each by its code.
+        for c in ('\u{200B}'..='\u{200F}').chain(['\u{2028}', '\u{2029}']).chain('\u{202A}'..='\u{202E}').chain('\u{2066}'..='\u{2069}').chain(['\u{FEFF}']) {
+            let text = row(&Row { lines: &[&format!("a{c}b")], face: "F", points: 10, color: 1, back: 2, width: 100, right: false, column: 0, padding: (0, 0) });
+            assert!(text.contains(&format!("<U+{:04X}>", c as u32)) && !text.contains(&format!("\\u{}?", c as u32 as i16)), "{c:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn japanese_and_an_emoji_with_a_skin_tone_are_written_as_they_were() {
+        assert_eq!(escape("日本語"), "\\u26085?\\u26412?\\u-30050?");
+        assert_eq!(escape("👍🏽"), "\\u-10179?\\u-9139?\\u-10180?\\u-8195?", "both halves of both, as signed numbers");
+        assert_eq!(escape("👩\u{200d}💻"), format!("{}\\u8205?{}", escape("👩"), escape("💻")), "a joiner between two emoji is the picture");
+        assert_eq!(words("あ👍🏽", 3), "{\\f1 \\u12354?}\\u-10179?\\u-9139?\\u-10180?\\u-8195?");
+    }
+
+    #[test]
+    fn a_column_is_as_wide_as_what_is_shown_in_it_marks_included() {
+        let bad = char::from_u32(0x202e).unwrap();
+        let plain = table_ends(&[vec!["ab".to_string()]], 10, 100_000);
+        let hidden = table_ends(&[vec![format!("a{bad}b")]], 10, 100_000);
+        assert_eq!(hidden[0] - plain[0], (10 - 2) * 10 * 13, "the mark is eight characters in the place of the one it stands for");
+    }
+
+    #[test]
+    fn a_table_cell_of_a_hundred_thousand_links_is_cleaned_in_one_pass() {
+        let cell = "[a](http://b) ".repeat(100_000);
+        let began = std::time::Instant::now();
+        let cleaned = clean_cell(&cell);
+        assert_eq!(cleaned, "a ".repeat(100_000));
+        eprintln!("a table cell of a hundred thousand links: {:?}", began.elapsed());
+        assert!(began.elapsed() < std::time::Duration::from_secs(2), "{:?}", began.elapsed());
+        // The first bracket that is no link ends it, as it did; and a line of nothing but brackets is not read once for each.
+        assert_eq!(clean_cell("[x] and [a](b)"), "[x] and [a](b)");
+        let began = std::time::Instant::now();
+        let cells = table_cells(&format!("| {} |", "[".repeat(1 << 20))).unwrap();
+        assert_eq!(cells[0].len(), 1 << 20);
+        eprintln!("a table cell of a megabyte of `[`: {:?}", began.elapsed());
+        assert!(began.elapsed() < std::time::Duration::from_secs(2), "{:?}", began.elapsed());
     }
 
     #[test]
