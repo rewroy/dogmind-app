@@ -56,9 +56,11 @@ pub enum Trouble {
 }
 
 impl Outcome {
-    /// Whether GitHub was heard from. Only then has a look been made that counts against the day: with no connection, the next try is cheap and may find one.
-    pub fn was_answered(&self) -> bool {
-        !matches!(self, Outcome::Failed(Trouble::NotReached | Trouble::TooSlow))
+    /// Whether the look learned something, which is all that counts against the day: that this app is the newest, that a newer one is out, or that GitHub has no release to give.
+    /// A refusal (403 is GitHub's limit for requests that do not sign in, which a shared address or a VPN reaches early), a server's error and an answer that is no release
+    /// (a proxy's or a captive portal's page) learned nothing, and neither did a look that never heard from GitHub: the hourly timer tries again at its next tick.
+    pub fn learned_something(&self) -> bool {
+        matches!(self, Outcome::UpToDate | Outcome::Newer(_) | Outcome::NoRelease)
     }
 }
 
@@ -377,6 +379,18 @@ mod tests {
     }
 
     #[test]
+    fn only_a_look_that_learned_something_counts_against_the_day() {
+        let release = Release { version: "0.2.0".into(), page: LATEST_PAGE.into() };
+        for outcome in [Outcome::UpToDate, Outcome::Newer(release), Outcome::NoRelease] {
+            assert!(outcome.learned_something(), "{outcome:?}");
+        }
+        // a limit, an error, a page that is no release, and no way through at all: the next tick of the timer looks again
+        for trouble in [Trouble::NotReached, Trouble::TooSlow, Trouble::Refused(403), Trouble::Refused(429), Trouble::Refused(500), Trouble::Refused(502), Trouble::Refused(503), Trouble::Unreadable] {
+            assert!(!Outcome::Failed(trouble.clone()).learned_something(), "{trouble:?}");
+        }
+    }
+
+    #[test]
     fn a_version_the_person_closed_is_not_told_again_but_a_later_one_is() {
         assert!(is_to_be_told("0.2.0", None));
         assert!(!is_to_be_told("0.2.0", Some("0.2.0")));
@@ -495,7 +509,7 @@ mod tests {
         let (address, _) = answering(with_length("404 Not Found", r#"{"message":"Not Found","documentation_url":"https://docs.github.com/rest/releases/releases#get-the-latest-release","status":"404"}"#));
         let outcome = check_at(&address, "0.1.0", Duration::from_secs(10));
         assert_eq!(outcome, Outcome::NoRelease);
-        assert!(outcome.was_answered());
+        assert!(outcome.learned_something());
     }
 
     #[test]
@@ -503,9 +517,20 @@ mod tests {
         let (address, _) = answering(with_length("403 Forbidden", r#"{"message":"API rate limit exceeded"}"#));
         let outcome = check_at(&address, "0.1.0", Duration::from_secs(10));
         assert_eq!(outcome, Outcome::Failed(Trouble::Refused(403)));
-        assert!(outcome.was_answered());
+        assert!(!outcome.learned_something(), "GitHub's limit says nothing of releases, and an hour later it may be lifted");
         let (address, _) = answering(with_length("200 OK", "<html>a login page</html>"));
-        assert_eq!(check_at(&address, "0.1.0", Duration::from_secs(10)), Outcome::Failed(Trouble::Unreadable));
+        let outcome = check_at(&address, "0.1.0", Duration::from_secs(10));
+        assert_eq!(outcome, Outcome::Failed(Trouble::Unreadable));
+        assert!(!outcome.learned_something());
+        // (an answer that is JSON but names no release is a page of someone else's as well)
+        let (address, _) = answering(with_length("200 OK", r#"{"message":"hello"}"#));
+        let outcome = check_at(&address, "0.1.0", Duration::from_secs(10));
+        assert_eq!(outcome, Outcome::Failed(Trouble::Unreadable));
+        assert!(!outcome.learned_something());
+        let (address, _) = answering(with_length("503 Service Unavailable", "try later"));
+        let outcome = check_at(&address, "0.1.0", Duration::from_secs(10));
+        assert_eq!(outcome, Outcome::Failed(Trouble::Refused(503)));
+        assert!(!outcome.learned_something());
         let (half, rest) = LATEST.split_at(100);
         let chunked = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{half}\r\n{:x}\r\n{rest}\r\n0\r\n\r\n", half.len(), rest.len());
         let (address, _) = answering(chunked);
@@ -520,7 +545,7 @@ mod tests {
         std::thread::spawn(move || drop(hangs_up.accept()));
         let outcome = check_at(&closed, "0.1.0", Duration::from_secs(10));
         assert_eq!(outcome, Outcome::Failed(Trouble::NotReached));
-        assert!(!outcome.was_answered());
+        assert!(!outcome.learned_something());
         assert_eq!(check_at("not an address", "0.1.0", Duration::from_secs(10)), Outcome::Failed(Trouble::NotReached));
         // a server that takes the request and says nothing
         let silent = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -528,7 +553,7 @@ mod tests {
         let began = std::time::Instant::now();
         let outcome = check_at(&address, "0.1.0", Duration::from_millis(400));
         assert_eq!(outcome, Outcome::Failed(Trouble::TooSlow));
-        assert!(!outcome.was_answered());
+        assert!(!outcome.learned_something());
         assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
         drop(silent);
     }
