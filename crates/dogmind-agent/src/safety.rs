@@ -292,6 +292,34 @@ fn fetched_site(program: &str, words: &[&str]) -> Option<String> {
     site
 }
 
+/// A command's words as cmd parts them: at a space or a tab outside quotes. A double-quoted run is part of one word, the spaces in it kept, and the quotes are not in the word: `"a  b".txt` is
+/// the one word `a  b.txt`, and `""` is a word of no letters.
+pub(crate) fn command_words(command: &str) -> Vec<String> {
+    let (mut words, mut word, mut quoted, mut begun) = (Vec::new(), String::new(), false, false);
+    for letter in command.chars() {
+        match letter {
+            '"' => {
+                quoted = !quoted;
+                begun = true;
+            }
+            ' ' | '\t' if !quoted => {
+                if begun {
+                    words.push(std::mem::take(&mut word));
+                    begun = false;
+                }
+            }
+            _ => {
+                word.push(letter);
+                begun = true;
+            }
+        }
+    }
+    if begun {
+        words.push(word);
+    }
+    words
+}
+
 /// A command's words as cmd reads them: its escape and the quotes that only join letters are not in what runs, so that `d^el` is `del` and `"git" push` is `git push`.
 fn as_cmd_reads(command: &str) -> String {
     command.replace(['^', '"'], "")
@@ -713,6 +741,18 @@ mod tests {
         assert_eq!(gate.check("execute_command", &json!({"command": "git status", "cwd": "sub"}), &work), Verdict::Allow);
         std::fs::write(work.join("node.exe"), "").unwrap();
         assert!(matches!(gate.check("execute_command", &json!({"command": "node.exe -v"}), &work), Verdict::Ask { .. }));
+    }
+
+    /// cmd's parting of a line into words: quotes join what is in them, and are not in the word.
+    #[test]
+    fn a_command_is_parted_into_words_as_cmd_parts_it() {
+        let words = |text: &str| command_words(text);
+        assert_eq!(words("git  status\t-s"), ["git", "status", "-s"]);
+        assert_eq!(words("\"C:\\Program Files\\x.exe\" -c \"a  b\""), ["C:\\Program Files\\x.exe", "-c", "a  b"]);
+        assert_eq!(words("del \"a  b\".txt c\"d e\"f"), ["del", "a  b.txt", "cd ef"]);
+        assert_eq!(words("echo \"\" x"), ["echo", "", "x"]);
+        assert_eq!(words("echo \"never closed  here"), ["echo", "never closed  here"]);
+        assert!(words("   ").is_empty() && words("").is_empty());
     }
 
     #[test]
