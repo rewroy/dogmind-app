@@ -27,6 +27,7 @@ use crate::design as ds;
 use crate::diffview::{self, RowKind};
 use crate::settings::KeySource;
 use crate::toolrun::{self, LineKind, RunEntry, Tone, ToolRun};
+use crate::updates;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::*;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -274,6 +275,8 @@ const ID_VISION: isize = 9903;
 const ID_VISION_DELETE: isize = 9904;
 const ID_VISION_OFFER: isize = 9905;
 const ID_UPDATE_OFFER: isize = 9906;
+const ID_RELEASE_OFFER: isize = 9907;
+const ID_TOGGLE_UPDATES: isize = 9908;
 const ID_DIFF_PREVIOUS: isize = 9900;
 const ID_DIFF_NEXT: isize = 9901;
 const ID_DIFF_CLOSE: isize = 9902;
@@ -291,6 +294,10 @@ const TIMER_REFLOW: usize = 6;
 const TIMER_RECONNECT: usize = 7;
 /// Whether a new build has come in over the app or the engine it runs.
 const TIMER_UPDATE: usize = 8;
+/// Whether it is time to ask GitHub for a newer release: the first time a little after the start, then once an hour (it asks only when a day has gone by since the last answer).
+const TIMER_RELEASES: usize = 9;
+const FIRST_RELEASE_LOOK_MS: u32 = 30_000;
+const RELEASE_LOOK_MS: u32 = 60 * 60 * 1000;
 /// The conversation's width below which the panel on the right gives way, at 96 dpi.
 const RIGHT_NEEDS: i32 = 480;
 /// How often a server that cannot be reached is tried again, while something waits to be sent to it.
@@ -641,6 +648,8 @@ enum Note {
     VisionSwitched(Result<(), String>),
     /// What `straydog --version` said, if it said anything.
     EngineVersion(Option<String>, Option<u64>),
+    /// A look at GitHub's latest release is over: whether the app made it on its own, and what it came to.
+    ReleaseLooked { on_its_own: bool, outcome: updates::Outcome },
     Status(u64, String),
     /// The models the provider just connected to offers.
     Models(u64, Vec<String>),
@@ -1202,6 +1211,26 @@ impl Form {
         self.end_row(height);
     }
 
+    /// A button in the middle of the page, as wide as its words need.
+    unsafe fn button_centered(&mut self, window: HWND) {
+        let height = self.s(ds::size::CONTROL);
+        let across = (text_width(self.fonts.strong, &get_text(window)) + self.s(ds::space::XXL)).max(self.s(80)).min(self.width);
+        place(window, (self.width - across) / 2, self.y, across, height);
+        self.used.push(window);
+        self.y += height + self.s(ds::space::S);
+    }
+
+    /// A switch and its words after it, the two together in the middle of the page.
+    unsafe fn toggle_centered(&mut self, words: &str, window: HWND) {
+        let height = self.s(ds::size::CONTROL);
+        let (across, tall, gap) = (self.s(ds::size::TOGGLE_WIDTH), self.s(ds::size::TOGGLE_HEIGHT), self.s(ds::space::S));
+        let x = ((self.width - across - gap - text_width(self.fonts.body, words)) / 2).max(0);
+        place(window, x, self.y + (height - tall) / 2, across, tall);
+        self.used.push(window);
+        self.shapes.push(Shape::Text { area: rect(x + across + gap, self.y, (self.width - x - across - gap).max(0), height), text: words.to_string(), font: FontKind::Body, color: theme::soft(), flags: ONE_LINE });
+        self.end_row(height);
+    }
+
     /// A switch with what it does beside it, for rows whose label names something else.
     unsafe fn toggle_beside(&mut self, words: &str, window: HWND, beside: &str) {
         let height = self.s(ds::size::CONTROL);
@@ -1581,6 +1610,15 @@ struct App {
     update_declined: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
     /// They said yes while work was going on: it restarts when the work is done.
     restart_when_done: bool,
+    /// A newer release on GitHub than this one, found on the app's own look: a row above the input tells of it (it is never fetched), with a button for its page and a cross.
+    release_offer: Option<updates::Release>,
+    release_offer_button: HWND,
+    release_offer_close: Option<RECT>,
+    /// A look at GitHub is under way (a thread asks; the answer comes as a note), and what the last one came to, as the About page says it.
+    release_checking: bool,
+    release_outcome: Option<updates::Outcome>,
+    /// The switch on the About page for the app's own looks.
+    toggle_updates: HWND,
     read_folder_add: HWND,
     read_folder_stop: HWND,
     read_folder_remove: Vec<HWND>,
@@ -4722,6 +4760,7 @@ impl App {
             }
             show(self.vision_offer_button, false);
             show(self.update_offer_button, false);
+            show(self.release_offer_button, false);
         }
         show(self.help_button, !bare && !squeezed);
         show(self.suggest, chat && !self.suggestions.is_empty());
@@ -4908,6 +4947,26 @@ impl App {
                 let close = rect(left + column - cross - s(ds::space::XS), row.top + (tall - cross) / 2, cross, cross);
                 shapes.push(Shape::Icon { name: "x", area: close, size: s(ds::space::M), color: theme::muted() });
                 self.vision_offer_close = Some(close);
+                bottom -= tall + s(ds::space::XS);
+            }
+            // A newer release than this one is out, found by the app's own look: said quietly, and not fetched.
+            self.release_offer_close = None;
+            show(self.release_offer_button, self.release_offer.is_some());
+            if let Some(release) = &self.release_offer {
+                let tall = s(ds::size::QUEUE_STEP) + s(ds::space::XS);
+                let row = rect(left, bottom - tall, column, tall);
+                shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
+                let (words, action) = (tf("Dogmind {0} is available.", &[&release.version]), t("Open the release page"));
+                set_text_if_changed(self.release_offer_button, action);
+                let cross = s(ds::space::XL);
+                let across = (text_width(self.fonts.body, action) + s(ds::space::XL)).max(s(72));
+                let button_x = left + column - cross - s(ds::space::XS) - across;
+                place(self.release_offer_button, button_x, row.top + (tall - s(ds::size::ICON_BUTTON)) / 2, across, s(ds::size::ICON_BUTTON));
+                SetWindowPos(self.release_offer_button, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                shapes.push(Shape::Text { area: rect(left + s(ds::space::M), row.top, (button_x - left - s(ds::space::L)).max(0), tall), text: words, font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
+                let close = rect(left + column - cross - s(ds::space::XS), row.top + (tall - cross) / 2, cross, cross);
+                shapes.push(Shape::Icon { name: "x", area: close, size: s(ds::space::M), color: theme::muted() });
+                self.release_offer_close = Some(close);
                 bottom -= tall + s(ds::space::XS);
             }
             if !waiting.is_empty() {
@@ -5300,7 +5359,7 @@ impl App {
         all.push(self.vision_delete);
         all.extend(self.read_folder_remove.iter().copied());
         all.extend([self.read_folder_add, self.read_folder_stop]);
-        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_compact, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
+        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_compact, self.toggle_updates, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
         all
     }
 
@@ -5822,9 +5881,10 @@ impl App {
                 }
             }
             Panel::About => {
-                // The mark, the two versions, and what the law asks for: in the middle of the page, with nothing to read but those.
+                // The mark, the two versions, whether there is a newer one, and what the law asks for: in the middle of the page, with nothing to read but those.
                 let (dog, mark) = (s(96), s(136));
-                let block = dog + s(ds::space::XS) + title_height(mark) + s(ds::space::XL) + 2 * s(ds::size::TEXT_LINE) + s(ds::space::M) + s(ds::size::LINK);
+                let block = dog + s(ds::space::XS) + title_height(mark) + s(ds::space::XL) + 2 * s(ds::size::TEXT_LINE) + s(ds::space::M)
+                    + s(ds::size::CONTROL) + s(ds::space::S) + s(ds::size::TEXT_LINE) + s(ds::size::CONTROL) + s(ds::space::M) + s(ds::size::LINK);
                 form.y += ((view - block) * 2 / 5 - s(ds::space::XL)).max(0);
                 form.shapes.push(Shape::Logo { x: (form.width - dog) / 2, y: form.y, size: dog });
                 form.y += dog + s(ds::space::XS);
@@ -5838,6 +5898,20 @@ impl App {
                     form.y += s(ds::size::TEXT_LINE);
                 }
                 form.y += s(ds::space::M);
+                // Whether a newer release is out: asked for here, and said here.
+                form.button_centered(self.buttons[1]);
+                if let Some((words, problem)) = self.release_words() {
+                    let tall = text_height(self.fonts.small, &words, form.width);
+                    form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: words, font: FontKind::Small, color: if problem { theme::bad() } else { theme::soft() }, flags: DT_CENTER | DT_WORDBREAK });
+                    form.y += tall + s(ds::space::HAIR) + s(ds::space::S);
+                    if matches!(self.release_outcome, Some(updates::Outcome::Newer(_))) {
+                        let across = text_width(self.fonts.small, &get_text(self.buttons[2])) + s(ds::space::L);
+                        place(self.buttons[2], (form.width - across) / 2, form.y, across, s(ds::size::LINK));
+                        form.used.push(self.buttons[2]);
+                        form.y += s(ds::size::LINK) + s(ds::space::S);
+                    }
+                }
+                form.toggle_centered(t("Check for updates automatically"), self.toggle_updates);
                 let across = text_width(self.fonts.small, &get_text(self.buttons[0])) + s(ds::space::L);
                 place(self.buttons[0], (form.width - across) / 2, form.y, across, s(ds::size::LINK));
                 form.used.push(self.buttons[0]);
@@ -6680,6 +6754,8 @@ impl App {
             InvalidateRect(field, std::ptr::null(), 0);
         }
         self.panel = panel;
+        // (the About page's button waits while a look is going on, and is not to stay that way on another page)
+        EnableWindow(self.buttons[1], 1);
         self.panel_log.clear();
         self.panel_problem = false;
         self.panel_scroll = 0;
@@ -6782,7 +6858,10 @@ impl App {
                 self.panel_title = t("About").into();
                 self.read_engine_version();
                 set_text(self.buttons[0], t("Licenses"));
-                self.set_button_kinds(&[ButtonKind::Link]);
+                self.set_button_kinds(&[ButtonKind::Link, ButtonKind::Secondary, ButtonKind::Link]);
+                self.update_toggles();
+                self.show_release_controls();
+                self.tip(self.toggle_updates, t("Dogmind asks GitHub for the newest release at most once a day. It sends only its name and version, and downloads and installs nothing."));
             }
             Panel::General => {
                 self.panel_title = t("Settings").into();
@@ -7353,7 +7432,7 @@ impl App {
     }
 
     unsafe fn update_toggles(&self) {
-        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools)] {
+        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_updates, self.settings.check_for_updates)] {
             set_button_style(toggle, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         }
         for (at, (segment, (known, name))) in self.theme_segments.iter().zip(THEMES).enumerate() {
@@ -7710,6 +7789,82 @@ impl App {
             return;
         }
         DestroyWindow(self.window);
+    }
+
+    /// The app's own look at GitHub for a newer release, when the timer says it may be time. It is made only if the person has not turned it off, if a day has gone by since GitHub
+    /// last answered, and if there is anywhere to ask; and not on the first screens, where a new install has just fetched the newest there is.
+    unsafe fn look_for_release(&mut self) {
+        if !self.settings.check_for_updates || self.onboarding || !matches!(self.leaving, Leaving::No) || !updates::can_ask() {
+            return;
+        }
+        if updates::is_due(self.settings.last_update_check, updates::now()) {
+            self.start_release_look(true);
+        }
+    }
+
+    /// Asks on a thread of its own (it may take ten seconds); what it comes to arrives as a note. `on_its_own`: the app's look, and not one the person asked for.
+    unsafe fn start_release_look(&mut self, on_its_own: bool) {
+        if self.release_checking {
+            return;
+        }
+        self.release_checking = true;
+        let poster = self.poster.clone();
+        std::thread::spawn(move || poster.send(Note::ReleaseLooked { on_its_own, outcome: updates::check() }));
+        if self.panel == Panel::About {
+            self.show_release_controls();
+            self.layout();
+        }
+    }
+
+    /// The About page's button for the look: what it says, and that it waits while a look is going on.
+    unsafe fn show_release_controls(&self) {
+        set_text_if_changed(self.buttons[1], if self.release_checking { t("Checking…") } else { t("Check for updates") });
+        set_text_if_changed(self.buttons[2], t("Open the release page"));
+        EnableWindow(self.buttons[1], i32::from(!self.release_checking));
+    }
+
+    /// What the About page says of the last look, and whether that is a trouble. Nothing while one is going on, and before any.
+    fn release_words(&self) -> Option<(String, bool)> {
+        use updates::{Outcome, Trouble};
+        if self.release_checking {
+            return None;
+        }
+        Some(match self.release_outcome.as_ref()? {
+            Outcome::UpToDate => (tf("Dogmind {0} is up to date.", &[&env!("CARGO_PKG_VERSION")]), false),
+            Outcome::Newer(release) => (tf("Dogmind {0} is available.", &[&release.version]), false),
+            Outcome::NoRelease => (t("No release has been published yet.").to_string(), false),
+            Outcome::Failed(Trouble::NotReached) => (t("Could not reach GitHub.").to_string(), true),
+            Outcome::Failed(Trouble::TooSlow) => (t("GitHub did not answer in time.").to_string(), true),
+            Outcome::Failed(Trouble::Refused(status)) => (tf("GitHub answered with an error ({0}). Try again later.", &[status]), true),
+            Outcome::Failed(Trouble::Unreadable) => (t("GitHub's answer could not be read.").to_string(), true),
+        })
+    }
+
+    /// The release's page, in the browser. The person has been told of this one, and is not told of it again on the app's own.
+    unsafe fn open_release(&mut self, release: &updates::Release) {
+        open_in_browser(&release.page);
+        self.dismiss_release(&release.version);
+    }
+
+    unsafe fn dismiss_release(&mut self, version: &str) {
+        self.settings.dismissed_update = Some(version.to_string());
+        self.save();
+        if self.release_offer.as_ref().is_some_and(|offer| offer.version == version) {
+            self.release_offer = None;
+        }
+    }
+
+    /// The About page's switch for the app's own looks.
+    unsafe fn updates_switched(&mut self) {
+        self.settings.check_for_updates = !self.settings.check_for_updates;
+        if !self.settings.check_for_updates {
+            self.release_offer = None;
+        }
+        self.save();
+        self.update_toggles();
+        // (turned on, it looks at once if a day has gone by: that is what turning it on asks for)
+        self.look_for_release();
+        self.layout();
     }
 
     unsafe fn asked_to_quit(&mut self) {
@@ -10082,6 +10237,26 @@ impl App {
                     self.layout();
                 }
             }
+            Note::ReleaseLooked { on_its_own, outcome } => {
+                self.release_checking = false;
+                // Only a look that GitHub answered counts against the day: with no connection the next one is cheap, and may find one.
+                if outcome.was_answered() {
+                    self.settings.last_update_check = Some(updates::now());
+                    self.save();
+                }
+                // (a look that the person has turned off since it began tells nothing on its own)
+                if let Some(release) = updates::release_to_tell(&outcome, on_its_own, self.settings.check_for_updates, self.settings.dismissed_update.as_deref()) {
+                    self.release_offer = Some(release);
+                }
+                // (the About page says what its own button was asked for, and what the app learned on its own; that the app could not reach GitHub when no one asked is not news there)
+                if !on_its_own || !matches!(outcome, updates::Outcome::Failed(_)) {
+                    self.release_outcome = Some(outcome);
+                }
+                if self.panel == Panel::About {
+                    self.show_release_controls();
+                }
+                self.layout();
+            }
             Note::Report(result) => match result {
                 Ok(path) => {
                     let words = crate::crash::report_words(&shown_path(&path));
@@ -10449,7 +10624,13 @@ impl App {
             (Panel::ConfirmRemove, 0) => self.leave_this_pc(false),
             (Panel::ConfirmRemove, 1) if self.model_in_the_data_folder().is_some() => self.leave_this_pc(true),
             (Panel::ConfirmRemove, _) => self.set_panel(Panel::General),
-            (Panel::About, 1) => self.write_report(),
+            (Panel::About, 1) => self.start_release_look(false),
+            (Panel::About, 2) => {
+                if let Some(updates::Outcome::Newer(release)) = self.release_outcome.clone() {
+                    self.open_release(&release);
+                    self.layout();
+                }
+            }
             (Panel::About, 0) => {
                 let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|folder| folder.join("LICENSE.txt")));
                 match beside.filter(|file| file.is_file()) {
@@ -11581,6 +11762,12 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.look_for_update();
             0
         }
+        WM_TIMER if wparam == TIMER_RELEASES => {
+            // (the first look came a little after the start; from here the timer asks once an hour whether a day has gone by)
+            SetTimer(window, TIMER_RELEASES, RELEASE_LOOK_MS, None);
+            app.look_for_release();
+            0
+        }
         WM_TIMER if wparam == TIMER_RECONNECT => {
             KillTimer(window, TIMER_RECONNECT);
             if !app.connected && app.connect_failed && !app.queued.is_empty() {
@@ -11689,6 +11876,14 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             }
             if app.vision_offer_close.is_some_and(|close| within(&close)) && !app.setting_up {
                 app.vision_offer = None;
+                app.layout();
+                return 0;
+            }
+            // (not this release: a later one is told of again)
+            if app.release_offer_close.is_some_and(|close| within(&close)) {
+                if let Some(release) = app.release_offer.take() {
+                    app.dismiss_release(&release.version);
+                }
                 app.layout();
                 return 0;
             }
@@ -11869,6 +12064,13 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_UPDATE_OFFER => app.update_offer_pressed(),
+                ID_RELEASE_OFFER => {
+                    if let Some(release) = app.release_offer.clone() {
+                        app.open_release(&release);
+                        app.layout();
+                    }
+                }
+                ID_TOGGLE_UPDATES => app.updates_switched(),
                 ID_VISION_OFFER => match app.vision_offer {
                     _ if app.setting_up => app.setup_cancel.store(true, Ordering::Relaxed),
                     Some(VisionOffer::Download(_)) => app.start_vision_setup(),
@@ -12914,6 +13116,12 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             update_offer: false,
             update_offer_button: make_button(window, ID_UPDATE_OFFER, "", ButtonKind::Secondary, theme::surface()),
             update_offer_close: None,
+            release_offer: None,
+            release_offer_button: make_button(window, ID_RELEASE_OFFER, "", ButtonKind::Secondary, theme::surface()),
+            release_offer_close: None,
+            release_checking: false,
+            release_outcome: None,
+            toggle_updates: make_button(pane, ID_TOGGLE_UPDATES, "", ButtonKind::Toggle, theme::background()),
             update_declined: None,
             restart_when_done: false,
             read_folder_add: make_button(pane, ID_READ_FOLDER_ADD, "", ButtonKind::Secondary, theme::background()),
@@ -13200,6 +13408,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         // What this copy runs, to see a new build come in over it.
         app.builds = std::env::current_exe().ok().into_iter().chain(engine::find(&app.settings)).map(|path| { let now = stamp(&path); (path, now) }).collect();
         SetTimer(window, TIMER_UPDATE, 5000, None);
+        SetTimer(window, TIMER_RELEASES, FIRST_RELEASE_LOOK_MS, None);
         app.update_status();
         app.refresh_sessions();
         if !needs_folder {

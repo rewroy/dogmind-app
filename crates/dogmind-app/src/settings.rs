@@ -196,6 +196,12 @@ pub struct Settings {
     pub text_size: u32,
     /// The skills turned off, by name.
     pub skills_off: Vec<String>,
+    /// Ask GitHub, now and then, whether a newer release is out (see `updates`). Off: the app never asks on its own. Nothing is downloaded or installed either way.
+    pub check_for_updates: bool,
+    /// When GitHub last answered such a question, in seconds since 1970: it is asked again a day later, at the soonest.
+    pub last_update_check: Option<u64>,
+    /// The release whose notice the person closed (or followed to its page): they are not told of that one again.
+    pub dismissed_update: Option<String>,
 }
 
 /// The sizes offered for the conversation's words, in percent, and their names.
@@ -254,6 +260,9 @@ impl Default for Settings {
             pinned: Vec::new(),
             text_size: 100,
             skills_off: Vec::new(),
+            check_for_updates: true,
+            last_update_check: None,
+            dismissed_update: None,
         }
     }
 }
@@ -474,6 +483,23 @@ mod tests {
         assert!(!older.skill_is_on("pdf") && older.skill_is_on("xlsx"));
         older.set_skill("pdf", true);
         assert!(older.skill_is_on("PDF") && older.skills_off.is_empty());
+    }
+
+    #[test]
+    fn the_update_check_comes_from_an_older_file_as_on_and_never_made_and_is_kept() {
+        let older: Settings = serde_json::from_str(r#"{"active": "This PC", "theme": "dark"}"#).unwrap();
+        assert_eq!((older.check_for_updates, older.last_update_check, older.dismissed_update.clone()), (true, None, None));
+        let folder = tempfile::tempdir().unwrap();
+        let file = folder.path().join("settings.json");
+        let mut settings = older;
+        settings.check_for_updates = false;
+        settings.last_update_check = Some(1_793_000_000);
+        settings.dismissed_update = Some("0.2.0".into());
+        settings.save(&file).unwrap();
+        let kept = Settings::load(&file);
+        assert_eq!((kept.check_for_updates, kept.last_update_check, kept.dismissed_update.as_deref()), (false, Some(1_793_000_000), Some("0.2.0")));
+        // a new install asks, too: it is a setting the person can turn off, and it starts on
+        assert!(Settings::fresh().check_for_updates);
     }
 
     #[test]
