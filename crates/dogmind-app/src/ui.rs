@@ -1247,6 +1247,14 @@ impl Form {
         self.y += height + self.s(ds::space::S);
     }
 
+    /// A link (a button that looks like words) in the middle of the page, as wide as its words need.
+    unsafe fn link_centered(&mut self, window: HWND) {
+        let across = text_width(self.fonts.small, &get_text(window)) + self.s(ds::space::L);
+        place(window, (self.width - across) / 2, self.y, across, self.s(ds::size::LINK));
+        self.used.push(window);
+        self.y += self.s(ds::size::LINK) + self.s(ds::space::S);
+    }
+
     /// A switch and its words after it, the two together in the middle of the page.
     unsafe fn toggle_centered(&mut self, words: &str, window: HWND) {
         let height = self.s(ds::size::CONTROL);
@@ -5936,29 +5944,26 @@ impl App {
                     form.y += s(ds::size::TEXT_LINE);
                 }
                 form.y += s(ds::space::M);
-                // Whether a newer release is out: asked for here, and said here.
-                form.button_centered(self.buttons[1]);
+                // Whether a newer release is out: asked for here, and said here. Once its setup is here, there is nothing left to look for: the button that stands in the look's place restarts into it.
+                let setup_here = self.ready_setup().is_some();
+                form.button_centered(if setup_here { self.buttons[3] } else { self.buttons[1] });
                 if let Some((words, problem)) = self.release_words() {
                     let tall = text_height(self.fonts.small, &words, form.width);
                     form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: words, font: FontKind::Small, color: if problem { theme::bad() } else { theme::soft() }, flags: DT_CENTER | DT_WORDBREAK });
                     form.y += tall + s(ds::space::HAIR) + s(ds::space::S);
                     if matches!(self.release_outcome, Some(updates::Outcome::Newer(_))) {
-                        let across = text_width(self.fonts.small, &get_text(self.buttons[2])) + s(ds::space::L);
-                        place(self.buttons[2], (form.width - across) / 2, form.y, across, s(ds::size::LINK));
-                        form.used.push(self.buttons[2]);
-                        form.y += s(ds::size::LINK) + s(ds::space::S);
+                        form.link_centered(self.buttons[2]);
                     }
                 }
-                // The update to it, as far as it has come: fetching, waiting to be run, or what became of the last try.
+                // The update to it, as far as it has come: fetching, waiting to be run, or what became of the last try. With its setup here, the release's page is under it, to be read before restarting.
                 if let Some((words, problem)) = self.update_words() {
                     let tall = text_height(self.fonts.small, &words, form.width);
                     form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: words, font: FontKind::Small, color: if problem { theme::bad() } else { theme::soft() }, flags: DT_CENTER | DT_WORDBREAK });
                     form.y += tall + s(ds::space::HAIR) + s(ds::space::S);
-                    if self.update_button_words().is_some() {
-                        let across = text_width(self.fonts.small, &get_text(self.buttons[3])) + s(ds::space::L);
-                        place(self.buttons[3], (form.width - across) / 2, form.y, across, s(ds::size::LINK));
-                        form.used.push(self.buttons[3]);
-                        form.y += s(ds::size::LINK) + s(ds::space::S);
+                    if setup_here {
+                        form.link_centered(self.buttons[2]);
+                    } else if self.update_button_words().is_some() {
+                        form.link_centered(self.buttons[3]);
                     }
                 }
                 form.toggle_centered(t("Update automatically"), self.toggle_updates);
@@ -5966,10 +5971,7 @@ impl App {
                 let tall = text_height(self.fonts.small, what_it_does, form.width);
                 form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: what_it_does.to_string(), font: FontKind::Small, color: theme::muted(), flags: DT_CENTER | DT_WORDBREAK });
                 form.y += tall + s(ds::space::HAIR) + s(ds::space::S);
-                let across = text_width(self.fonts.small, &get_text(self.buttons[0])) + s(ds::space::L);
-                place(self.buttons[0], (form.width - across) / 2, form.y, across, s(ds::size::LINK));
-                form.used.push(self.buttons[0]);
-                form.y += s(ds::size::LINK) + s(ds::space::S);
+                form.link_centered(self.buttons[0]);
                 if !log.is_empty() {
                     let tall = text_height(self.fonts.small, &log, form.width);
                     form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: log, font: FontKind::Small, color: log_color, flags: DT_CENTER | DT_WORDBREAK });
@@ -7888,7 +7890,7 @@ impl App {
     /// About's line about the update to a newer release: how far its setup has come, that it waits to be run, or what became of the last try, and whether that is a trouble.
     fn update_words(&self) -> Option<(String, bool)> {
         match &self.release_update {
-            ReleaseUpdate::Fetching { done, total, .. } => Some((tf("Downloading the update… {0}%", &[&(done * 100 / (*total).max(1))]), false)),
+            ReleaseUpdate::Fetching { version, done, total, .. } => Some((tf("Downloading Dogmind {0}… {1}%", &[version, &(done * 100 / (*total).max(1))]), false)),
             ReleaseUpdate::Ready(ready) => Some((tf("Dogmind {0} is ready to install.", &[&ready.version]), false)),
             ReleaseUpdate::None => self.release_update_said.clone(),
         }
@@ -7899,6 +7901,36 @@ impl App {
         match &self.release_update {
             ReleaseUpdate::Fetching { .. } => Some(t("Cancel")),
             ReleaseUpdate::Ready(_) if self.ready_setup().is_some() => Some(if self.restart_when_done { t("Not now") } else { t("Restart to update") }),
+            _ => None,
+        }
+    }
+
+    /// How that button looks: the page's main button when it restarts into the update, a plain one to take that back, and a link to stop a download.
+    fn update_button_kind(&self) -> ButtonKind {
+        match &self.release_update {
+            ReleaseUpdate::Ready(_) if self.restart_when_done => ButtonKind::Secondary,
+            ReleaseUpdate::Ready(_) => ButtonKind::Primary,
+            _ => ButtonKind::Link,
+        }
+    }
+
+    /// An update of this install is on its way or here: About tells of it by its own lines, and not by those of the look that found the release.
+    fn updating(&self) -> bool {
+        self.install_folder.is_some() && !matches!(self.release_update, ReleaseUpdate::None)
+    }
+
+    /// The release About's link opens, with its page: the newer one the last look found; or, once its setup is here, that one, which a setup kept from before this start has had no
+    /// look to name the page of. While the setup is on its way, none: it is told of by its percent.
+    fn release_to_read(&self) -> Option<(String, String)> {
+        if !self.updating() {
+            return match self.release_outcome.as_ref() {
+                Some(updates::Outcome::Newer(release)) => Some((release.version.clone(), release.page.clone())),
+                _ => None,
+            };
+        }
+        match (&self.release_update, self.release_outcome.as_ref()) {
+            (ReleaseUpdate::Ready(ready), Some(updates::Outcome::Newer(release))) if release.version == ready.version => Some((release.version.clone(), release.page.clone())),
+            (ReleaseUpdate::Ready(ready), _) => Some((ready.version.clone(), updates::release_page_of(&ready.version))),
             _ => None,
         }
     }
@@ -8018,6 +8050,7 @@ impl App {
         set_text_if_changed(self.buttons[2], t("Open the release page"));
         if let Some(words) = self.update_button_words() {
             set_text_if_changed(self.buttons[3], words);
+            set_button_style(self.buttons[3], self.update_button_kind(), theme::background());
         }
         EnableWindow(self.buttons[1], i32::from(!self.release_checking));
     }
@@ -8030,6 +8063,8 @@ impl App {
         }
         Some(match self.release_outcome.as_ref()? {
             Outcome::UpToDate => (tf("Dogmind {0} is up to date.", &[&env!("CARGO_PKG_VERSION")]), false),
+            // (an update that is on its way or here has its own lines: the same release is not told of twice)
+            Outcome::Newer(_) if self.updating() => return None,
             Outcome::Newer(release) => (tf("Dogmind {0} is available.", &[&release.version]), false),
             Outcome::NoRelease => (t("No release has been published yet.").to_string(), false),
             Outcome::NotAsked => (t("This test build asks no one.").to_string(), false),
@@ -8041,9 +8076,9 @@ impl App {
     }
 
     /// The release's page, in the browser. The person has been told of this one, and is not told of it again on the app's own.
-    unsafe fn open_release(&mut self, release: &updates::Release) {
-        open_in_browser(&release.page);
-        self.dismiss_release(&release.version);
+    unsafe fn open_release(&mut self, version: &str, page: &str) {
+        open_in_browser(page);
+        self.dismiss_release(version);
     }
 
     unsafe fn dismiss_release(&mut self, version: &str) {
@@ -10865,8 +10900,8 @@ impl App {
                 ReleaseUpdate::None => {}
             },
             (Panel::About, 2) => {
-                if let Some(updates::Outcome::Newer(release)) = self.release_outcome.clone() {
-                    self.open_release(&release);
+                if let Some((version, page)) = self.release_to_read() {
+                    self.open_release(&version, &page);
                     self.layout();
                 }
             }
@@ -12306,7 +12341,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_UPDATE_OFFER => app.update_offer_pressed(),
                 ID_RELEASE_OFFER => {
                     if let Some(release) = app.release_offer.clone() {
-                        app.open_release(&release);
+                        app.open_release(&release.version, &release.page);
                         app.layout();
                     }
                 }
