@@ -2297,7 +2297,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
         report.push_str(&DRIVE_ROOT_NOTE.replace("{}", crate::prompt::NO_DRIVE_ROOT));
     }
     if !done.disarmed.is_empty() {
-        report.push_str(&format!("note: the app took this out of a repository a command made, as it would have run outside the sandbox the next time git is used there: {}. A hook or such a setting has to come from the user.\n", done.disarmed.join("; ")));
+        report.push_str(&format!("note: {} Git does not read what was moved, and the user can put back any of it that was theirs. A hook or such a setting has to come from the user.\n", done.disarmed.join(" ")));
     }
     if let Some(why) = &done.unguarded {
         report.push_str(&format!("note: after this command the app found what it cannot keep a command from planting something in, to run outside the sandbox: {why}. The next command will not start until the user has put that right.\n"));

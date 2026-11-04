@@ -1011,6 +1011,63 @@ fn repositories_under(root: &Path) -> Vec<PathBuf> {
 /// The repositories known of in each workspace: those there at the first command, and those made since and looked at.
 static KNOWN_REPOSITORIES: Mutex<Option<HashMap<String, HashSet<String>>>> = Mutex::new(None);
 
+/// What the app's own commands have done in each workspace: how many are at work (a background job is one for as long as it runs), and whether any has run since the last look at the
+/// repositories there. A repository that first shows up when none has is the person's: they made it themselves, as they do in their own terminal while a chat is open.
+static COMMANDS: Mutex<Option<HashMap<String, Commands>>> = Mutex::new(None);
+
+#[derive(Default)]
+struct Commands {
+    running: usize,
+    ran_since_look: bool,
+}
+
+fn commands_of_workspaces() -> std::sync::MutexGuard<'static, Option<HashMap<String, Commands>>> {
+    COMMANDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A command of the app at work in a workspace: from after it was made ready to when what it started has ended and what it made has been looked at.
+struct AtWork {
+    place: String,
+}
+
+impl AtWork {
+    fn start(root: &Path) -> AtWork {
+        let place = key(root);
+        let mut all = commands_of_workspaces();
+        let commands = all.get_or_insert_with(HashMap::new).entry(place.clone()).or_default();
+        commands.running += 1;
+        commands.ran_since_look = true;
+        AtWork { place }
+    }
+}
+
+impl Drop for AtWork {
+    fn drop(&mut self) {
+        if let Some(commands) = commands_of_workspaces().as_mut().and_then(|all| all.get_mut(&self.place)) {
+            commands.running = commands.running.saturating_sub(1);
+        }
+    }
+}
+
+/// Whether a command of the app was at work in this workspace, or ran, since the last look: what shows up in it now may be its making. Taken as a look at it: it is asked once for each.
+fn commands_since_the_last_look(root: &Path) -> bool {
+    let mut all = commands_of_workspaces();
+    let commands = all.get_or_insert_with(HashMap::new).entry(key(root)).or_default();
+    let at_work = commands.running > 0 || commands.ran_since_look;
+    commands.ran_since_look = false;
+    at_work
+}
+
+/// Which look at the repositories of a workspace this is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// As a command is made ready. A new repository here is a command's only if one was at work since the last look (a background job, or another conversation's command); otherwise the
+    /// person made it, and it is guarded like every other, and nothing is taken out of it.
+    BeforeACommand,
+    /// As a command has ended and nothing it started is left: what is new was made while it ran, by it or by something at work beside it.
+    AfterACommand,
+}
+
 /// Of these, those not known of until now, which are from then on. On a first look at a workspace nothing is new: what is there is the person's, hooks and all.
 fn newly_made(root: &Path, found: &[PathBuf]) -> Vec<PathBuf> {
     let mut known = KNOWN_REPOSITORIES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1128,66 +1185,170 @@ fn common_folder_of(folder: &Path, root: &Path) -> Result<Option<PathBuf>, Strin
     folder_in_the_workspace(&crate::safety::resolve(folder, text.trim()), root)
 }
 
+//// What was taken out of one repository that a command made, and where it was put.
+#[derive(Default)]
+struct Taken {
+    /// What it was, as a person reads it: `hooks/pre-commit`, `core.fsmonitor`.
+    names: Vec<String>,
+    /// The folders, each inside the git folder it was taken from (where git reads nothing), that hold it.
+    kept_in: Vec<PathBuf>,
+}
+
+impl Taken {
+    /// What is said of it, for the person and for the model: where it was made, and where to find what was moved.
+    fn said_of(&self, place: &str) -> String {
+        let names = self.names.join(", ");
+        if self.kept_in.is_empty() {
+            return format!("In {place}, made by a command, this was removed, as it would have run programs outside the sandbox: {names}.");
+        }
+        let folders = self.kept_in.iter().map(|folder| folder.display().to_string()).collect::<Vec<_>>().join(", ");
+        format!("In {place}, made by a command, hooks and config lines that would run programs outside the sandbox were moved to {folders}: {names}.")
+    }
+}
+
+/// What cannot be removed by itself, as a link is: the link, and never what it leads to.
+fn remove_link(path: &Path) -> bool {
+    std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path)).is_ok()
+}
+
+/// A place for what is taken out of a git folder, inside it: git reads nothing there, so none of it runs. One for each time, and never one that is already there.
+fn make_room_in(git_folder: &Path) -> Option<PathBuf> {
+    let time = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    for number in 1..=1000 {
+        let folder = git_folder.join(if number == 1 { format!("dogmind-disarmed-{time}") } else { format!("dogmind-disarmed-{time}-{number}") });
+        match std::fs::create_dir(&folder) {
+            Ok(()) => return Some(folder),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Every link under a folder taken away, each by itself and never through: what a command made is moved with the folder it is in, and not to be left as a way to somewhere else.
+fn remove_links_inside(folder: &Path) {
+    for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+        let kind = entry.file_type().ok();
+        if kind.is_some_and(|kind| kind.is_symlink()) {
+            remove_link(&entry.path());
+        } else if kind.is_some_and(|kind| kind.is_dir()) {
+            remove_links_inside(&entry.path());
+        }
+    }
+}
+
+/// Takes `from` to `to`, a file or a folder of one volume as a git folder's is. Where a move cannot be done a file is copied and then deleted.
+fn move_to(from: &Path, to: &Path) -> bool {
+    if std::fs::rename(from, to).is_ok() {
+        return true;
+    }
+    from.is_file() && std::fs::copy(from, to).is_ok() && std::fs::remove_file(from).is_ok()
+}
+
+/// Writes down where a link that is taken away led, beside what else is put aside, so that nothing the person pointed it at is lost track of.
+fn write_down_link(room: Option<&Path>, link: &Path, name: &str) {
+    use std::io::Write;
+    if let (Some(room), Ok(target)) = (room, std::fs::read_link(link)) {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(room.join("links.txt")) {
+            let _ = writeln!(file, "{name} -> {}", target.display());
+        }
+    }
+}
+
+/// What is taken out of one git folder, put aside inside it as it is: its hooks other than the samples, and its config as it was, before it is written again without what names a program.
+/// A link where a hook or the config should be is taken away, and where it led is written down beside the rest.
+fn disarm_folder(folder: &Path, taken: &mut Taken) {
+    // (made when first needed: a folder with nothing taken out of it gets none)
+    let mut room: Option<Option<PathBuf>> = None;
+    let mut room_for = |taken: &mut Taken| -> Option<PathBuf> {
+        room.get_or_insert_with(|| {
+            let made = make_room_in(folder);
+            if let Some(made) = &made {
+                taken.kept_in.push(made.clone());
+            }
+            made
+        })
+        .clone()
+    };
+    let hooks = folder.join("hooks");
+    if is_link(&hooks) {
+        write_down_link(room_for(taken).as_deref(), &hooks, "hooks");
+        if remove_link(&hooks) {
+            taken.names.push("a link in place of its hooks".to_string());
+        }
+    } else {
+        for entry in std::fs::read_dir(&hooks).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".sample") {
+                continue;
+            }
+            // (an entry's own type, which is a link's own and not what it leads to; the links in a folder are taken away before it is moved, and not gone through)
+            let (path, kind) = (entry.path(), entry.file_type().ok());
+            if kind.is_some_and(|kind| kind.is_symlink()) {
+                write_down_link(room_for(taken).as_deref(), &path, &format!("hooks/{name}"));
+                if remove_link(&path) {
+                    taken.names.push(format!("hooks/{name} (a link)"));
+                }
+                continue;
+            }
+            let is_folder = kind.is_some_and(|kind| kind.is_dir());
+            if is_folder {
+                remove_links_inside(&path);
+            }
+            let moved = room_for(taken).map(|room| room.join("hooks")).is_some_and(|aside| std::fs::create_dir_all(&aside).is_ok() && move_to(&path, &aside.join(&name)));
+            if moved {
+                taken.names.push(format!("hooks/{name}"));
+            } else if (if is_folder { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) }).is_ok() {
+                // (it could not be put aside, and a hook that runs is not left in its place)
+                taken.names.push(format!("hooks/{name} (removed: it could not be put aside)"));
+            }
+        }
+    }
+    let config = folder.join("config");
+    if is_link(&config) {
+        write_down_link(room_for(taken).as_deref(), &config, "config");
+        if remove_link(&config) {
+            taken.names.push("a link in place of its config".to_string());
+        }
+        return;
+    }
+    // (git does not ask that it be UTF-8)
+    let Ok(bytes) = std::fs::read(&config) else { return };
+    let (kept, gone) = config_without_programs(&String::from_utf8_lossy(&bytes));
+    if gone.is_empty() {
+        return;
+    }
+    // The config as it was, byte for byte, before it is written again.
+    let saved = room_for(taken).is_some_and(|room| std::fs::write(room.join("config"), &bytes).is_ok());
+    if std::fs::write(&config, kept).is_ok() {
+        if saved {
+            taken.names.extend(gone);
+        } else {
+            taken.names.extend(gone.into_iter().map(|name| format!("{name} (removed: the config could not be put aside)")));
+        }
+    }
+}
+
 /// Takes out of a repository a command made what would run as the person the next time git is used there: its hooks, and what its config names. Guarding it first would keep later commands from
 /// doing the same and leave what this one already did. `known`: repositories that were there before it, which are the person's and are not touched, whatever a worktree says of them.
 ///
+/// Nothing is destroyed: what is taken out is put aside in a folder of its own inside the git folder (`dogmind-disarmed-<time>`, with the hooks and the config as they were), where git does not
+/// read it, and `taken` names the folder.
+///
 /// This is done as the person, and nothing here goes through a link: a command can make one to what it may write, and a repository of the person's can be that. What a link is met at is refused as
-/// a whole, and not touched; what is said is in `said` as it is done, as one place can be refused after another was taken care of. Whatever the order of this and the guarding, neither follows one.
-fn disarm_repository(git: &Path, root: &Path, known: &HashSet<String>, said: &mut Vec<String>) -> Result<(), String> {
-    // What cannot be removed by itself, as a link is: the link, and never what it leads to.
-    let remove_link = |path: &Path| std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path)).is_ok();
-    let disarm_folder = |folder: &Path, said: &mut Vec<String>| {
-        let hooks = folder.join("hooks");
-        if is_link(&hooks) {
-            if remove_link(&hooks) {
-                said.push("a link in place of its hooks".to_string());
-            }
-        } else {
-            for entry in std::fs::read_dir(&hooks).into_iter().flatten().flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".sample") {
-                    continue;
-                }
-                // (an entry's own type, which is a link's own and not what it leads to; `remove_dir_all` does not go through a link inside a folder either)
-                let kind = entry.file_type().ok();
-                let gone = if kind.is_some_and(|kind| kind.is_symlink()) {
-                    remove_link(&entry.path())
-                } else if kind.is_some_and(|kind| kind.is_dir()) {
-                    std::fs::remove_dir_all(entry.path()).is_ok()
-                } else {
-                    std::fs::remove_file(entry.path()).is_ok()
-                };
-                if gone {
-                    said.push(format!("hooks/{name}"));
-                }
-            }
-        }
-        let config = folder.join("config");
-        if is_link(&config) {
-            if remove_link(&config) {
-                said.push("a link in place of its config".to_string());
-            }
-            return;
-        }
-        // (git does not ask that it be UTF-8)
-        if let Ok(bytes) = std::fs::read(&config) {
-            let (kept, gone) = config_without_programs(&String::from_utf8_lossy(&bytes));
-            if !gone.is_empty() && std::fs::write(&config, kept).is_ok() {
-                said.extend(gone);
-            }
-        }
-    };
+/// a whole, and not touched; what is said is in `taken` as it is done, as one place can be refused after another was taken care of. Whatever the order of this and the guarding, neither follows one.
+fn disarm_repository(git: &Path, root: &Path, known: &HashSet<String>, taken: &mut Taken) -> Result<(), String> {
     refuse_links(&[git])?;
     if git.is_dir() {
-        disarm_folder(git, said);
+        disarm_folder(git, taken);
         return Ok(());
     }
     // A worktree's or a submodule's: the folder it points to, and for a worktree, the repository that says it is part of.
     let Some(folder) = git_folder_of(git, root)? else { return Ok(()) };
     let common = common_folder_of(&folder, root);
-    disarm_folder(&folder, said);
+    disarm_folder(&folder, taken);
     if let Some(common) = common?.filter(|common| !known.contains(&key(common))) {
-        disarm_folder(&common, said);
+        disarm_folder(&common, taken);
     }
     Ok(())
 }
@@ -1214,27 +1375,32 @@ unsafe fn guard_with_what_it_leads_to(root: &Path, git: &Path, sid: PSID) -> Res
 
 /// What looking after the repositories of a workspace came to.
 struct Looked {
-    /// What was taken out of the repositories a command made, as it would have run outside the sandbox.
+    /// What was taken out of the repositories a command made, as it would have run outside the sandbox, and where it was put: a sentence for each repository.
     said: Vec<String>,
     /// What cannot be kept from commands, the first of it: a link met where the app writes as the person, or a list that could not be written. It stays so until a person puts it right, and it is
     /// looked for again before every command, which is not run while it is there.
     refused: Option<String>,
 }
 
-/// Before a command, and after it for what that one made: every repository in reach, each new one disarmed and all of them guarded. Says what was taken out, and what stands in the way of
-/// guarding. A refusal at one repository is not the end of the looking: the others are still taken care of, and what a command made there is not left for no one to see.
-unsafe fn look_after_repositories(root: &Path, sid: PSID) -> Looked {
+//// Before a command, and after it for what that one made: every repository in reach, each new one that a command could have made disarmed, and all of them guarded. Says what was taken out,
+/// and what stands in the way of guarding. A refusal at one repository is not the end of the looking: the others are still taken care of, and what a command made there is not left for no one to see.
+///
+/// A repository that is new at a look is a command's if this is the look after one, or if one of the workspace's was at work, or ran, since the last look: a background job, or a command of
+/// another conversation. When nothing of the app's was, the person made it, as in their own terminal while a chat is open on the workspace: it is guarded as every repository is, so that
+/// no command can change its hooks or its config, and nothing is taken out of it.
+unsafe fn look_after_repositories(root: &Path, sid: PSID, when: Look) -> Looked {
     let found = repositories_under(root);
     let new = newly_made(root, &found);
+    let by_a_command = commands_since_the_last_look(root) || when == Look::AfterACommand;
     let mut looked = Looked { said: Vec::new(), refused: None };
-    if !new.is_empty() {
+    if by_a_command && !new.is_empty() {
         let known: HashSet<String> = found.iter().filter(|git| !new.contains(git)).map(|git| key(git)).collect();
         for git in &new {
-            let mut taken = Vec::new();
+            let mut taken = Taken::default();
             let result = disarm_repository(git, root, &known, &mut taken);
-            if !taken.is_empty() {
+            if !taken.names.is_empty() {
                 let shown = git.parent().and_then(|folder| folder.strip_prefix(root).ok()).map_or(String::new(), |place| place.display().to_string());
-                looked.said.push(format!("{} in {}", taken.join(", "), if shown.is_empty() { "." } else { &shown }));
+                looked.said.push(taken.said_of(&if shown.is_empty() { "the workspace folder itself".to_string() } else { shown }));
             }
             if let Err(refusal) = result {
                 looked.refused.get_or_insert(refusal);
@@ -1303,11 +1469,11 @@ pub fn also_readable(folder: &Path) {
 unsafe fn prepare(workspace: &Path, sid: PSID, disarmed: &mut Vec<String>) -> Result<(), String> {
     grant(workspace, sid, READ_WRITE_EXECUTE, true)?;
     // Each repository in the workspace. If one cannot be guarded the command does not run, as with any other containment.
-    let looked = look_after_repositories(workspace, sid);
+    let looked = look_after_repositories(workspace, sid, Look::BeforeACommand);
     *disarmed = looked.said;
     if let Some(refusal) = looked.refused {
         // (what was taken out of a repository on the way is said too: nothing the app does as the person is done quietly)
-        return Err(if disarmed.is_empty() { refusal } else { format!("{refusal}. The app also took this out of a repository made since the last command, as it would have run outside the sandbox: {}", disarmed.join("; ")) });
+        return Err(if disarmed.is_empty() { refusal } else { format!("{refusal}. The app also did this, in a repository made since the last command: {}", disarmed.join(" ")) });
     }
     for folder in ALSO_READABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter() {
         let _ = grant(folder, sid, READ_EXECUTE, true);
@@ -1492,6 +1658,8 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
                 crate::bundled::open_to_sandbox(&tools)?;
             }
         }
+        // (from here to the look after it, a repository that shows up in the workspace may be what it makes)
+        let _at_work = AtWork::start(&root);
         let (out_read, out_write) = pipe()?;
         let (err_read, err_write) = pipe()?;
         let nul = wide("NUL");
@@ -1645,7 +1813,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         drop(job);
         // What it made, with nothing of its own left running to go on making it. (Not being able to guard this does not take back what has already run: the next command is what is refused, for what is
         // found again before it, and it is said now in what this one returns.)
-        let looked = look_after_repositories(&root, sid);
+        let looked = look_after_repositories(&root, sid, Look::AfterACommand);
         disarmed.extend(looked.said);
         Ok(Output { stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default(), status, ended, shown, disarmed, out_of_memory, unguarded: looked.refused })
     }
@@ -2014,6 +2182,13 @@ mod tests {
         let config = std::fs::read_to_string(git.join("config")).unwrap();
         assert!(!config.contains("evil") && config.contains("repositoryformatversion"), "{config}");
         assert!(planted.disarmed.join(" ").contains("hooks/pre-commit") && planted.disarmed.join(" ").contains("core.fsmonitor"), "{:?}", planted.disarmed);
+        // Nothing is destroyed: the hook and the config as the command left them are in a folder of git's own, which the note names.
+        let aside = disarmed_folders(&git);
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(std::fs::read(aside[0].join("hooks\\pre-commit")).unwrap().starts_with(b"evil"), "the hook");
+        assert!(String::from_utf8_lossy(&std::fs::read(aside[0].join("config")).unwrap()).contains("fsmonitor = evil.exe"), "the config as it was");
+        let said = planted.disarmed.join(" ");
+        assert!(said.contains(aside[0].file_name().unwrap().to_str().unwrap()) && said.contains("In a\\b\\c, made by a command"), "{said}");
         assert!(git.join("hooks").is_dir(), "the folder itself is git's");
         // From then on it is guarded as any other. Git still works there.
         let cwd = place.join("a/b/c");
@@ -2126,9 +2301,16 @@ mod tests {
         }
     }
 
+    /// The look after a command: what is new in the workspace is its making.
     fn look(place: &Path) -> Looked {
         // SAFETY: the profile's SID lives as long as the process.
-        unsafe { look_after_repositories(place, profile_sid().unwrap()) }
+        unsafe { look_after_repositories(place, profile_sid().unwrap(), Look::AfterACommand) }
+    }
+
+    /// The look as a command is made ready, when what was made since the last look may be the person's.
+    fn look_between_commands(place: &Path) -> Looked {
+        // SAFETY: the profile's SID lives as long as the process.
+        unsafe { look_after_repositories(place, profile_sid().unwrap(), Look::BeforeACommand) }
     }
 
     fn is_refused_for_a_link(looked: &Looked) -> bool {
@@ -2152,9 +2334,9 @@ mod tests {
         // As a command would make it: a repository that was not there at the last look, and a junction.
         links.junction(&place.join("sub\\.git"), &git);
         let known = HashSet::new();
-        let mut taken = Vec::new();
+        let mut taken = Taken::default();
         let by_disarming = disarm_repository(&place.join("sub\\.git"), &place, &known, &mut taken).unwrap_err();
-        assert!(by_disarming.contains("is a link") && taken.is_empty(), "{by_disarming} {taken:?}");
+        assert!(by_disarming.contains("is a link") && taken.names.is_empty(), "{by_disarming} {:?}", taken.names);
         assert_eq!(all_of(&git), before, "disarming went through it");
         let by_guarding = unsafe { guard_repository(&place, &place.join("sub\\.git"), profile_sid().unwrap()) }.unwrap_err();
         assert!(by_guarding.contains("is a link"), "{by_guarding}");
@@ -2204,9 +2386,9 @@ mod tests {
         for (folder, said) in [("a", "gitdir: jn\n".to_string()), ("b", format!("gitdir: {}\n", place.join("b\\jn").display()))] {
             links.junction(&place.join(folder).join("jn"), &git);
             std::fs::write(place.join(folder).join(".git"), said).unwrap();
-            let (mut taken, known) = (Vec::new(), HashSet::new());
+            let (mut taken, known) = (Taken::default(), HashSet::new());
             let by_disarming = disarm_repository(&place.join(folder).join(".git"), &place, &known, &mut taken).unwrap_err();
-            assert!(by_disarming.contains("link") && taken.is_empty(), "{folder}: {by_disarming} {taken:?}");
+            assert!(by_disarming.contains("link") && taken.names.is_empty(), "{folder}: {by_disarming} {:?}", taken.names);
             assert_eq!(all_of(&git), before, "{folder}: disarming went through it");
             let looked = look(&place);
             assert!(is_refused_for_a_link(&looked), "{folder}: {:?}", looked.refused);
@@ -2342,6 +2524,166 @@ mod tests {
         for name in ["core.fsmonitor", "remote.uploadpack", "alias.x", "filter.clean", "include.path"] {
             assert!(gone.iter().any(|said| said == name), "{name}: {gone:?}");
         }
+    }
+
+    /// The aside folders of a git folder: what a disarming puts what it takes out into.
+    fn disarmed_folders(git: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(git).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("dogmind-disarmed-"))).collect()
+    }
+
+    /// A repository as a person has one that they cloned: a hook as husky leaves, and a config with a credential helper, an alias, `core.hooksPath` and what Git LFS needs.
+    /// `.git` of it, with the hook's bytes and the config's.
+    fn the_persons_own_repository(folder: &Path) -> (PathBuf, Vec<u8>, Vec<u8>) {
+        let git = folder.join(".git");
+        for inside in ["hooks", "objects", "refs"] {
+            std::fs::create_dir_all(git.join(inside)).unwrap();
+        }
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let hook = b"#!/bin/sh\n. \"$(dirname \"$0\")/_/husky.sh\"\nnpx lint-staged\n".to_vec();
+        std::fs::write(git.join("hooks\\pre-commit"), &hook).unwrap();
+        let config = b"[core]\n\trepositoryformatversion = 0\n\thooksPath = .husky\n[credential]\n\thelper = manager\n[alias]\n\tco = checkout\n[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n[lfs]\n\tstorage = lfs-store\n".to_vec();
+        std::fs::write(git.join("config"), &config).unwrap();
+        (git, hook, config)
+    }
+
+    /// In real commands, in a temp folder: a repository that the person makes between two commands, with no job at work, is theirs. The next command takes nothing out of it and says nothing of
+    /// it, and it is guarded as any other: no command can write its hooks or its config.
+    #[test]
+    fn a_repository_the_person_makes_between_two_commands_is_theirs_and_is_guarded() {
+        let holder = tempfile::tempdir().unwrap();
+        let place = holder.path().join("work");
+        std::fs::create_dir_all(&place).unwrap();
+        assert_eq!(command("echo first> first.txt", &place, false).status, Some(0));
+        let (git, hook, config) = the_persons_own_repository(&place.join("clone"));
+        let next = command("echo second> second.txt", &place, false);
+        assert_eq!(next.status, Some(0), "{}", decode(&next.stderr));
+        assert!(next.disarmed.is_empty() && next.unguarded.is_none(), "{:?} {:?}", next.disarmed, next.unguarded);
+        assert_eq!(std::fs::read(git.join("hooks\\pre-commit")).unwrap(), hook, "their hook, byte for byte");
+        assert_eq!(std::fs::read(git.join("config")).unwrap(), config, "their config, byte for byte");
+        assert!(disarmed_folders(&git).is_empty(), "nothing was put aside: nothing was taken");
+        // Guarded all the same: a command cannot write its hooks, or its config.
+        for line in ["echo evil> clone\\.git\\hooks\\post-commit", "echo evil>> clone\\.git\\hooks\\pre-commit", "echo evil>> clone\\.git\\config", "del clone\\.git\\config", "ren clone\\.git\\hooks hooks.old"] {
+            let done = command(line, &place, false);
+            assert!(done.disarmed.is_empty(), "{line}: {:?}", done.disarmed);
+            assert_eq!(std::fs::read(git.join("hooks\\pre-commit")).unwrap(), hook, "{line}");
+            assert_eq!(std::fs::read(git.join("config")).unwrap(), config, "{line}");
+            assert!(!git.join("hooks\\post-commit").exists() && git.join("hooks").is_dir(), "{line}");
+        }
+        assert!(disarmed_folders(&git).is_empty());
+        drop(holder);
+    }
+
+    /// In real commands: a repository that is made while a background job of the workspace is at work may be the job's, and is disarmed as one a command made. What is taken out is put aside,
+    /// and the command's result names where.
+    #[test]
+    fn a_repository_made_while_a_background_job_runs_is_disarmed_and_what_is_taken_is_kept() {
+        let holder = tempfile::tempdir().unwrap();
+        let place = holder.path().join("work");
+        std::fs::create_dir_all(&place).unwrap();
+        assert_eq!(command("echo first> first.txt", &place, false).status, Some(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let job = {
+            let (place, stop) = (place.clone(), stop.clone());
+            std::thread::spawn(move || run("powershell -NoProfile -Command \"Start-Sleep -Seconds 60\"", &place, &place, false, Duration::from_secs(120), &stop))
+        };
+        let root = writable_root(&place, &place, std::env::var_os("USERPROFILE").map(PathBuf::from).as_deref()).unwrap();
+        let waited = Instant::now();
+        while !commands_of_workspaces().as_ref().and_then(|all| all.get(&key(&root))).is_some_and(|commands| commands.running > 0) {
+            assert!(waited.elapsed() < Duration::from_secs(60), "the job did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (git, hook, config) = the_persons_own_repository(&place.join("made"));
+        let beside = command("echo second> second.txt", &place, false);
+        stop.store(true, Ordering::Relaxed);
+        let ended = job.join().unwrap().unwrap();
+        assert_eq!(ended.ended, "cancelled");
+        assert_eq!(beside.status, Some(0), "{}", decode(&beside.stderr));
+        let said = beside.disarmed.join(" ");
+        assert!(said.contains("made") && said.contains("hooks/pre-commit") && said.contains("hooksPath"), "{said}");
+        assert!(!git.join("hooks\\pre-commit").exists(), "taken out of its place");
+        let aside = disarmed_folders(&git);
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(said.contains(aside[0].file_name().unwrap().to_str().unwrap()), "the note names the folder: {said}");
+        assert_eq!(std::fs::read(aside[0].join("hooks\\pre-commit")).unwrap(), hook);
+        assert_eq!(std::fs::read(aside[0].join("config")).unwrap(), config, "the config as it was");
+        assert!(!std::fs::read_to_string(git.join("config")).unwrap().contains("hooksPath"));
+        drop(holder);
+    }
+
+    /// Without a command: what a look takes as a command's and what it takes as the person's, by what has been at work since the last look.
+    #[test]
+    fn a_new_repository_is_a_commands_only_if_one_was_at_work_or_ran_since_the_last_look() {
+        let holder = tempfile::tempdir().unwrap();
+        let place = holder.path().join("work");
+        std::fs::create_dir_all(&place).unwrap();
+        assert!(look_between_commands(&place).said.is_empty(), "the first look takes what is there");
+        // The person's, between two looks with nothing at work: not touched, and guarded.
+        let (theirs, hook, config) = the_persons_own_repository(&place.join("theirs"));
+        let looked = look_between_commands(&place);
+        assert!(looked.said.is_empty() && looked.refused.is_none(), "{:?} {:?}", looked.said, looked.refused);
+        assert_eq!(std::fs::read(theirs.join("hooks\\pre-commit")).unwrap(), hook);
+        assert_eq!(std::fs::read(theirs.join("config")).unwrap(), config);
+        assert!(disarmed_folders(&theirs).is_empty());
+        // And it is theirs from then on, whatever is at work later.
+        let job = AtWork::start(&place);
+        assert!(look_between_commands(&place).said.is_empty() && std::fs::read(theirs.join("config")).unwrap() == config);
+        // A job at work: what appears is taken as its making.
+        let (others, other_hook, _) = the_persons_own_repository(&place.join("others"));
+        let looked = look_between_commands(&place);
+        assert!(looked.said.len() == 1 && looked.said[0].contains("others") && looked.said[0].contains("hooks/pre-commit"), "{:?}", looked.said);
+        assert!(!others.join("hooks\\pre-commit").exists());
+        let aside = disarmed_folders(&others);
+        assert_eq!(aside.len(), 1);
+        assert_eq!(std::fs::read(aside[0].join("hooks\\pre-commit")).unwrap(), other_hook);
+        drop(job);
+        // The look after a command takes what is new as the command's, whatever was or was not at work.
+        let (after, _, _) = the_persons_own_repository(&place.join("after"));
+        let looked = look(&place);
+        assert_eq!(looked.said.len(), 1, "{:?}", looked.said);
+        assert!(!after.join("hooks\\pre-commit").exists() && disarmed_folders(&after).len() == 1);
+        // A command ran since the last look and no look came after it (it was cut short): the next look takes what is new as its making.
+        drop(AtWork::start(&place));
+        let (late, _, _) = the_persons_own_repository(&place.join("late"));
+        assert_eq!(look_between_commands(&place).said.len(), 1);
+        assert!(!late.join("hooks\\pre-commit").exists());
+        // With none at work and none run, the person's again.
+        let (mine, _, config) = the_persons_own_repository(&place.join("mine"));
+        assert!(look_between_commands(&place).said.is_empty());
+        assert_eq!(std::fs::read(mine.join("config")).unwrap(), config);
+        drop(holder);
+    }
+
+    /// A worktree's folder and its repository's config are put aside too, each inside the git folder it was taken from; a link that stood in place of a hook leaves where it led in a note.
+    #[test]
+    fn what_is_taken_from_a_repository_is_put_aside_in_its_own_git_folder() {
+        let holder = tempfile::tempdir().unwrap();
+        let place = holder.path().join("work");
+        std::fs::create_dir_all(&place).unwrap();
+        assert!(look(&place).said.is_empty());
+        let mut links = Links(Vec::new());
+        let (git, _, config) = the_persons_own_repository(&place.join("a"));
+        std::fs::write(git.join("hooks\\pre-commit.sample"), "a sample\n").unwrap();
+        std::fs::create_dir_all(git.join("hooks\\folder")).unwrap();
+        std::fs::write(git.join("hooks\\folder\\inner"), "in a folder\n").unwrap();
+        let standin = stand_in_repository(&holder.path().join("standin"));
+        let before = all_of(&standin);
+        links.junction(&git.join("hooks\\pre-push"), &standin.join("hooks"));
+        let looked = look(&place);
+        assert!(looked.refused.is_none(), "{:?}", looked.refused);
+        let aside = disarmed_folders(&git);
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(std::fs::read(aside[0].join("config")).unwrap(), config);
+        assert_eq!(std::fs::read(aside[0].join("hooks\\folder\\inner")).unwrap(), b"in a folder\n");
+        assert!(git.join("hooks\\pre-commit.sample").is_file(), "a sample stays");
+        assert!(std::fs::symlink_metadata(git.join("hooks\\pre-push")).is_err(), "the link is gone");
+        assert!(std::fs::read_to_string(aside[0].join("links.txt")).unwrap().contains("hooks/pre-push"), "where it led is written down");
+        assert!(!aside[0].join("hooks\\pre-push").exists());
+        assert_eq!(all_of(&standin), before, "what the link led to is as it was");
+        let said = looked.said.join(" ");
+        assert!(said.contains("were moved to") && said.contains(aside[0].file_name().unwrap().to_str().unwrap()), "{said}");
+        assert!(said.contains("credential") || said.contains("alias.co"), "{said}");
+        drop(links);
+        drop(holder);
     }
 
     #[test]
