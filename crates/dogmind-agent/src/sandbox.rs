@@ -1316,6 +1316,22 @@ fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, t
     block
 }
 
+/// The folders on the PATH a command starts with, in order, made as `environment_block` makes it: the bundled tools, the machine's without a person's own Python, Node or Git, and then Visual
+/// Studio's. Only the PATH is made: `environment_block` goes on to ask git for a name and to write a config file, which a question about a name in a command must not do.
+fn path_of(mut block: Vec<(String, String)>, bundled: Option<&Path>, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<PathBuf> {
+    crate::msvc::add_to(&mut block, build_tools);
+    let inherited = block.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH")).map(|(_, path)| path.clone()).unwrap_or_default();
+    let path = bundled.map_or(inherited.clone(), |root| crate::bundled::path_with(root, &inherited));
+    std::env::split_paths(&path).collect()
+}
+
+/// Where a command's programs are found: its PATH, as this machine gives it to the sandbox. The gate asks, to tell a file in the folder that takes the place of an installed program from
+/// one that is the project's own.
+pub(crate) fn command_path() -> Vec<PathBuf> {
+    let block: Vec<(String, String)> = ["PATH", "LIB", "INCLUDE"].into_iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
+    path_of(block, crate::bundled::root().as_deref(), crate::msvc::found)
+}
+
 struct Handle(HANDLE);
 
 impl Drop for Handle {
@@ -1984,6 +2000,10 @@ mod tests {
         let temp = dir.path().display().to_string();
         let made = environment_block(start(), Some(&root), temp.clone(), &work, || Some(build_tools()));
         assert_eq!(path_folders(&made), [root.join("python"), root.join("node"), root.join("git\\cmd"), other.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
+        // The PATH alone, for a question about a name, is the same one.
+        assert_eq!(path_of(start(), Some(&root), || Some(build_tools())), path_folders(&made));
+        assert_eq!(path_of(start(), None, || Some(build_tools())), path_folders(&environment_block(start(), None, temp.clone(), &work, || Some(build_tools()))));
+        assert_eq!(path_of(start(), Some(&root), || None), path_folders(&environment_block(start(), Some(&root), temp.clone(), &work, || None)));
         let value = |name: &str| made.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
         assert_eq!(value("LIB"), Some("C:\\vs\\lib\\x64;C:\\kits\\um\\x64"));
         assert_eq!(value("INCLUDE"), Some("C:\\vs\\include;C:\\kits\\ucrt"));
