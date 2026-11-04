@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-wordmark-dark.png">
-    <img src="assets/logo-wordmark.png" alt="Dogmind" width="360">
+    <img src="assets/logo-wordmark.png" alt="Dogmind" width="240">
   </picture>
 </p>
 
