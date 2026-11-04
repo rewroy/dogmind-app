@@ -179,11 +179,14 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
     }
     let mut total = Spent::default();
     for (turn, in_turn) in &turns {
+        // (what comes before the first turn is the connection and the engine's warm-up, which are told below)
+        if *turn == 0 {
+            continue;
+        }
         let spent = Spent::of(in_turn);
         let began = in_turn.iter().find(|line| line.ev() == "turn_start");
         let shown = match began {
             Some(began) => format!("turn {turn}: {} characters, {} pictures", began.u("chars").unwrap_or(0), began.u("images").unwrap_or(0)),
-            None if *turn == 0 => "before the first turn".to_string(),
             None => format!("turn {turn}"),
         };
         let _ = writeln!(out, "\n{shown}");
@@ -193,6 +196,15 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
     if turns.len() > 1 {
         let _ = writeln!(out, "\nall turns");
         total.print(&mut out, "  ");
+    }
+
+    let connections: Vec<&Line> = lines.iter().filter(|line| line.ev() == "connection").collect();
+    if !connections.is_empty() {
+        let _ = writeln!(out, "\nconnections");
+        for line in connections {
+            let at = line.at.map_or(String::new(), |at| format!(" ending at {}", at.format("%H:%M:%S%.3f")));
+            let _ = writeln!(out, "  {} took {}, {}{at}", line.s("what"), secs(line.u("ms").unwrap_or(0)), line.s("outcome"));
+        }
     }
 
     let _ = writeln!(out, "\nrequests (first = time to the first word; gen = the rest; tok/s is the server's where it said, else counted)");
@@ -219,7 +231,9 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         }
         if let Some((entry, how)) = joined.get(at) {
             let drafts = entry.drafts.map_or(String::new(), |(kept, tried)| format!(", drafts {kept}/{tried}"));
-            let _ = writeln!(out, "        engine ({how}): prompt {}, reused {} from {}, prefilled {} in {} ms, first token {:.2} s, {} tokens at {:.1} tok/s{drafts}", entry.prompt, entry.reused, entry.from, entry.new, entry.prefill_ms, entry.first_s, entry.tokens, entry.tokens_per_second);
+            // (the engine writes its line as the request ends, and the app writes its own when it has read the stream's last word)
+            let apart = line.at.zip(entry.at).map_or(String::new(), |(ours, theirs)| format!(", logged {} ms before the app's line", (ours.with_timezone(&Utc) - theirs).num_milliseconds()));
+            let _ = writeln!(out, "        engine ({how}): prompt {}, reused {} from {}, prefilled {} in {} ms, first token {:.2} s, {} tokens at {:.1} tok/s{drafts}{apart}", entry.prompt, entry.reused, entry.from, entry.new, entry.prefill_ms, entry.first_s, entry.tokens, entry.tokens_per_second);
         } else if !engine.is_empty() && line.s("role") != "warm" {
             let _ = writeln!(out, "        engine: no line for this request");
         }
@@ -576,6 +590,21 @@ mod tests {
         assert!(said.contains("engine (time): prompt 7000, reused 0 from root, prefilled 7000 in 5000 ms"), "{said}");
         assert!(said.contains("engine: no line for this request"), "{said}");
         assert!(said.contains("2 of 3 requests joined to the engine's log: 1 by id, 1 by time"), "{said}");
+    }
+
+    #[test]
+    fn the_connection_before_the_first_turn_is_told_apart_from_the_turns_and_the_engines_line_says_how_far_apart() {
+        let log = json!({"lines": ["2026-11-05T01:00:10.500000Z  INFO Straydog request: id s/1, prompt 5000 tokens (reused 4000 from live), new 1000 in 900 ms, first token 0.90 s, 300 tokens at 70.0 tok/s"]}).to_string();
+        let lines = [
+            json!({"t": "2026-11-05T09:59:50.000+09:00", "ev": "connection", "turn": 0, "what": "connect", "ms": 1200, "outcome": "ok"}),
+            json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 4, "images": 0}),
+            request(1, "2026-11-05T10:00:10.512+09:00", "main", 900, 10_000, 5000, 4000, 300, "stop"),
+            json!({"t": "2026-11-05T10:00:11.000+09:00", "ev": "turn_end", "turn": 1, "cancelled": false, "requests": 1, "tools": 0, "ms": 11_000}),
+        ];
+        let said = report(&text(&lines), Some(&log));
+        assert!(said.contains("connections\n  connect took 1.2 s, ok ending at 09:59:50.000"), "{said}");
+        assert!(!said.contains("before the first turn"), "{said}");
+        assert!(said.contains("logged 12 ms before the app's line"), "{said}");
     }
 
     #[test]
