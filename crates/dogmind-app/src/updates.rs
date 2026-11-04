@@ -576,6 +576,18 @@ pub fn kept(folder: &Path, running: &str) -> Option<Ready> {
     read_record(folder).filter(|ready| is_newer(&ready.version, running) && ready.is_there())
 }
 
+/// `kept`, with the file's bytes read again, which is a second or two for a setup of this size: run off the window's thread. A file whose bytes are not those that were checked is taken away
+/// with its note, and then there is none.
+pub fn kept_and_sound(folder: &Path, running: &str) -> Option<Ready> {
+    let ready = kept(folder, running)?;
+    if ready.is_sound() {
+        return Some(ready);
+    }
+    let _ = std::fs::remove_file(&ready.path);
+    clean_up(folder, running);
+    None
+}
+
 /// The version a file of the `updates` folder is the setup of.
 fn version_of_setup_file(name: &str) -> Option<&str> {
     name.strip_prefix("DogmindSetup-")?.strip_suffix(".exe").filter(|version| is_plain_version(version))
@@ -624,8 +636,11 @@ fn obtain_from(version: &str, setup: &Setup, folder: &Path, test_server: Option<
     std::fs::create_dir_all(folder).map_err(disk)?;
     let name = setup_file_name(version);
     let (partial, path) = (folder.join(format!("{name}.partial")), folder.join(&name));
-    // (the note is of a file that is about to be replaced)
-    let _ = std::fs::remove_file(folder.join(RECORD));
+    // (a note of the file that is about to be replaced is no longer true of it. A note of another version's setup, fetched and checked before, stays with that file until the new setup is here:
+    // `write_record` replaces it then, and `remove_other_setups` takes the old file. A fetch that fails leaves that setup to be offered again.)
+    if read_record(folder).is_some_and(|ready| ready.version == version) {
+        let _ = std::fs::remove_file(folder.join(RECORD));
+    }
     if let Err(failed) = stream(&first, setup, &partial, test_server, on, stop) {
         let _ = std::fs::remove_file(&partial);
         return Err(failed);
@@ -1739,6 +1754,55 @@ mod tests {
         assert!(kept(folder.path(), "0.1.1").is_some_and(|ready| !ready.is_sound()), "the same length, other bytes");
         std::fs::write(&path, &changed[..1000]).unwrap();
         assert_eq!(kept(folder.path(), "0.1.1"), None, "a file that is shorter is not what was checked");
+    }
+
+    #[test]
+    fn a_fetch_that_fails_leaves_the_setup_checked_before_to_be_offered_again_and_one_that_succeeds_takes_its_place() {
+        let folder = tempfile::tempdir().unwrap();
+        let (old_bytes, new_bytes, other_bytes) = (file_bytes(250_000, 3), file_bytes(260_000, 4), file_bytes(260_000, 5));
+        // 0.1.3, fetched and checked by an earlier look, for the copy that runs as 0.1.2
+        let old_server = Server::start(|_| vec![("/download/DogmindSetup-0.1.3.exe".into(), file_answer(&old_bytes))]);
+        let old_setup = setup_at(&old_server, "/download/DogmindSetup-0.1.3.exe", &old_bytes);
+        let old = obtain_from("0.1.3", &old_setup, folder.path(), Some(&old_server.as_url()), &mut |_, _| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(names_in(folder.path()), ["DogmindSetup-0.1.3.exe", "ready.txt"]);
+        // a fetch of 0.1.4 that fails, three ways: GitHub answers with an error, what comes is not what was published, and the person stops it
+        let gone = Server::start(|_| Vec::new());
+        let wrong = Server::start(|_| vec![("/download/DogmindSetup-0.1.4.exe".into(), file_answer(&other_bytes))]);
+        let new_at = |server: &Server| setup_at(server, "/download/DogmindSetup-0.1.4.exe", &new_bytes);
+        for (server, stopped, expected) in [(&gone, false, Failed::Refused(404)), (&wrong, false, Failed::DidNotMatch), (&gone, true, Failed::Cancelled)] {
+            let failed = obtain_from("0.1.4", &new_at(server), folder.path(), Some(&server.as_url()), &mut |_, _| {}, &AtomicBool::new(stopped)).unwrap_err();
+            assert_eq!(failed, expected);
+            assert_eq!(names_in(folder.path()), ["DogmindSetup-0.1.3.exe", "ready.txt"], "{expected:?}: the setup checked before stays, with its note");
+            assert_eq!(kept(folder.path(), "0.1.2"), Some(old.clone()), "{expected:?}: and is found for the app to offer again");
+            assert_eq!(kept_and_sound(folder.path(), "0.1.2"), Some(old.clone()), "{expected:?}");
+        }
+        // a fetch of 0.1.4 that succeeds takes the place of 0.1.3: its file and its note go
+        let server = Server::start(|_| vec![("/download/DogmindSetup-0.1.4.exe".into(), file_answer(&new_bytes))]);
+        let new = obtain_from("0.1.4", &new_at(&server), folder.path(), Some(&server.as_url()), &mut |_, _| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(names_in(folder.path()), ["DogmindSetup-0.1.4.exe", "ready.txt"], "the one it replaces is not kept as well");
+        assert_eq!(kept(folder.path(), "0.1.2"), Some(new.clone()));
+        assert_eq!(read_record(folder.path()), Some(new.clone()), "the note is the new one's");
+        // the note of the very file that a fetch is about to replace is not true of it any more: when that fetch fails it is gone, and the file is no longer offered
+        let republished = Setup { sha256: sha_of(&other_bytes), ..new_at(&server) };
+        assert_eq!(obtain_from("0.1.4", &republished, folder.path(), Some(&server.as_url()), &mut |_, _| {}, &AtomicBool::new(true)).unwrap_err(), Failed::Cancelled);
+        assert_eq!(kept(folder.path(), "0.1.2"), None);
+        assert!(!folder.path().join("ready.txt").exists());
+    }
+
+    #[test]
+    fn a_setup_kept_whose_bytes_are_not_those_that_were_checked_is_not_offered_and_is_taken_away() {
+        let folder = tempfile::tempdir().unwrap();
+        let bytes = file_bytes(100_000, 6);
+        let server = Server::start(|_| vec![(SETUP_PATH.into(), file_answer(&bytes))]);
+        let ready = fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap();
+        assert_eq!(kept_and_sound(folder.path(), "0.1.0"), Some(ready.clone()));
+        // (the same length, other bytes)
+        let mut changed = bytes.clone();
+        changed[10] ^= 1;
+        std::fs::write(&ready.path, &changed).unwrap();
+        assert_eq!(kept(folder.path(), "0.1.0"), Some(ready), "its size is what was checked");
+        assert_eq!(kept_and_sound(folder.path(), "0.1.0"), None);
+        assert_eq!(names_in(folder.path()), Vec::<String>::new(), "neither the file nor its note is left");
     }
 
     #[test]

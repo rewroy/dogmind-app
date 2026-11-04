@@ -7985,14 +7985,20 @@ impl App {
             if !installed {
                 return;
             }
-            match updates::kept(&folder, running) {
-                Some(ready) if ready.is_sound() => poster.send(Note::ReleaseFetched(Ok(ready))),
-                // (changed since it was checked: it is not run)
-                Some(ready) => {
-                    let _ = std::fs::remove_file(&ready.path);
-                    updates::clean_up(&folder, running);
-                }
-                None => {}
+            // (one that changed since it was checked is not offered, and is taken away)
+            if let Some(ready) = updates::kept_and_sound(&folder, running) {
+                poster.send(Note::ReleaseFetched(Ok(ready)));
+            }
+        });
+    }
+
+    /// After a fetch that did not come to an end: the setup that was fetched and checked before, if `kept` still finds it, is offered again, as it is at a start. Its bytes are read again for
+    /// that, off the window's thread.
+    fn offer_the_setup_kept(&self) {
+        let (poster, folder) = (self.poster.clone(), self.folder.join(updates::FOLDER));
+        std::thread::spawn(move || {
+            if let Some(ready) = updates::kept_and_sound(&folder, env!("CARGO_PKG_VERSION")) {
+                poster.send(Note::ReleaseFetched(Ok(ready)));
             }
         });
     }
@@ -10515,12 +10521,13 @@ impl App {
                 }
                 self.release_update_changed();
             }
-            // (what is said of a try that did not come to an end; a setup that is already here stays)
+            // (what is said of a try that did not come to an end; a setup that is already here stays, and one that was checked before and is still on disk, which the fetch left, is offered again)
             Note::ReleaseFetched(Err(failed)) => {
                 if matches!(self.release_update, ReleaseUpdate::Fetching { .. }) {
                     self.release_update = ReleaseUpdate::None;
                     self.release_update_said = Some(fetch_words(&failed));
                     self.release_update_changed();
+                    self.offer_the_setup_kept();
                 }
             }
             Note::Report(result) => match result {
