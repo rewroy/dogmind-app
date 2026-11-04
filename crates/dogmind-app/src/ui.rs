@@ -13075,18 +13075,53 @@ fn uninstaller_beside() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("dogmind-uninstall.exe"))).filter(|file| file.is_file())
 }
 
+/// The class of the app's window, and the property on it that says which data folder its app has.
+const WINDOW_CLASS: &str = "DogmindApp";
+const FOLDER_PROPERTY: &str = "DogmindApp.Folder";
+
+/// What stands for a data folder, in its name's lower case: it names the mutex of the app that has the folder, and is on that app's window.
+fn folder_key(folder: &Path) -> u64 {
+    folder.display().to_string().to_lowercase().bytes().fold(0xcbf29ce484222325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
+}
+
+/// The mutex an app holds for as long as it runs on a data folder.
+fn mutex_name(key: u64) -> String {
+    format!("Local\\DogmindApp-{key:016x}")
+}
+
+/// Says on this window which data folder its app has, for a start on the same folder to find it by.
+unsafe fn mark_window_of_folder(window: HWND, key: u64) {
+    SetPropW(window, wide(FOLDER_PROPERTY).as_ptr(), key as usize as HANDLE);
+}
+
+/// The window of the app that has the data folder with this key, among the windows of this class that there are: a copy on another data folder (a test's, a development build, the person's
+/// own on theirs) is not it, and nor is a window that says nothing of a folder. None when there is none.
+unsafe fn window_of_folder(class: &str, key: u64) -> Option<HWND> {
+    let (class, property) = (wide(class), wide(FOLDER_PROPERTY));
+    let mut window: HWND = std::ptr::null_mut();
+    loop {
+        window = FindWindowExW(std::ptr::null_mut(), window, class.as_ptr(), std::ptr::null());
+        if window.is_null() {
+            return None;
+        }
+        let marked = GetPropW(window, property.as_ptr());
+        if !marked.is_null() && marked as usize as u64 == key {
+            return Some(window);
+        }
+    }
+}
+
 /// Whether this data folder has its app already, whose window then comes forward: two would write over each other's
-/// settings and start two engines. The mutex lasts as long as this process.
+/// settings and start two engines. The mutex lasts as long as this process. Only the window of the app that has this folder comes
+/// forward; where there is none to be found, no window is touched.
 unsafe fn already_running(folder: &Path) -> bool {
-    let hash = folder.display().to_string().to_lowercase().bytes().fold(0xcbf29ce484222325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
-    let name = wide(&format!("Local\\DogmindApp-{hash:016x}"));
+    let key = folder_key(folder);
+    let name = wide(&mutex_name(key));
     let mutex = windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, name.as_ptr());
     if mutex.is_null() || windows_sys::Win32::Foundation::GetLastError() != windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
         return false;
     }
-    let class_name = wide("DogmindApp");
-    let window = FindWindowW(class_name.as_ptr(), std::ptr::null());
-    if !window.is_null() {
+    if let Some(window) = window_of_folder(WINDOW_CLASS, key) {
         ShowWindow(window, SW_SHOW);
         if IsIconic(window) != 0 {
             ShowWindow(window, SW_RESTORE);
@@ -13157,7 +13192,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         LoadLibraryW(library.as_ptr());
 
         let instance = GetModuleHandleW(std::ptr::null());
-        let class_name = wide("DogmindApp");
+        let class_name = wide(WINDOW_CLASS);
         let background = CreateSolidBrush(theme::background());
         let icon = window_icon(64);
         let class = WNDCLASSW {
@@ -13173,6 +13208,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let title = wide("Dogmind");
         let window = CreateWindowExW(0, class_name.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1100, 800, std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null());
         title_bar(window);
+        // (so that a start on this data folder finds this window, and no other app's)
+        mark_window_of_folder(window, folder_key(&settings::data_folder()));
 
         let folder = settings::data_folder();
         // (what was pasted in an earlier run: a session keeps its own copy of what it sent)
@@ -14395,6 +14432,54 @@ mod tests {
         assert_eq!(list_marker("12. a"), Some(("12.".to_string(), 4)));
         for not in ["-a", "**bold**", "3.14 is pi", "2026. was", "text", ""] {
             assert_eq!(list_marker(not), None, "{not}");
+        }
+    }
+
+    /// A window of this class that is never shown, on this thread, with the key of a data folder on it if it is to say which it has.
+    unsafe fn unshown_window(class: &str, key: Option<u64>) -> HWND {
+        let (name, title, instance) = (wide(class), wide("a test's window"), GetModuleHandleW(std::ptr::null()));
+        // (a class that is there from an earlier call of this is no matter: registering it again says no)
+        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: instance, lpszClassName: name.as_ptr(), ..std::mem::zeroed() });
+        let window = CreateWindowExW(0, name.as_ptr(), title.as_ptr(), WS_OVERLAPPED, 0, 0, 100, 100, std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null());
+        assert!(!window.is_null());
+        assert_eq!(IsWindowVisible(window), 0, "never shown");
+        if let Some(key) = key {
+            mark_window_of_folder(window, key);
+        }
+        window
+    }
+
+    #[test]
+    fn a_data_folder_is_known_by_its_name_in_lower_case() {
+        let (one, two) = (folder_key(Path::new("C:/scratch/one")), folder_key(Path::new("C:/scratch/two")));
+        assert_ne!(one, two);
+        assert_eq!(folder_key(Path::new("C:/Scratch/ONE")), one);
+        // (the mutex it names is the one the app has always had, so that a copy of an older build and one of this still keep out of each other's folder)
+        assert_eq!(mutex_name(folder_key(Path::new(""))), "Local\\DogmindApp-cbf29ce484222325");
+        assert_ne!(mutex_name(one), mutex_name(two));
+    }
+
+    /// What is found of the app of a data folder is the window that says it has it, and no other of its class: a copy on another folder (a test's, a development build, the person's own
+    /// on theirs) and a window that says nothing are not it, and where there is none, none is found and none is taken instead. Only windows of this test's own, never shown.
+    #[test]
+    fn the_window_that_comes_forward_is_the_one_of_the_app_that_has_the_data_folder() {
+        let (one, two, three, four) = (folder_key(Path::new("C:/scratch/one")), folder_key(Path::new("C:/scratch/two")), folder_key(Path::new("C:/scratch/three")), folder_key(Path::new("C:/scratch/four")));
+        // SAFETY: windows of this test's own, on this thread, made here and destroyed here; none is shown.
+        unsafe {
+            let (first, second, bare) = (unshown_window(WINDOW_CLASS, Some(one)), unshown_window(WINDOW_CLASS, Some(two)), unshown_window(WINDOW_CLASS, None));
+            let of_another_class = unshown_window("DogmindTestOtherClass", Some(three));
+            assert_eq!(window_of_folder(WINDOW_CLASS, one), Some(first));
+            assert_eq!(window_of_folder(WINDOW_CLASS, two), Some(second));
+            assert_eq!(window_of_folder(WINDOW_CLASS, three), None, "a window of another class is no app's");
+            assert_eq!(window_of_folder(WINDOW_CLASS, four), None, "no app has it: no window is found, whichever others there are");
+            assert_eq!(window_of_folder(WINDOW_CLASS, 0), None, "a window that says nothing is not the app of any folder");
+            // (the same folder in other letters is the same folder)
+            assert_eq!(window_of_folder(WINDOW_CLASS, folder_key(Path::new("c:/SCRATCH/Two"))), Some(second));
+            for window in [first, second, bare, of_another_class] {
+                assert_eq!(IsWindowVisible(window), 0, "nothing was shown");
+                DestroyWindow(window);
+            }
+            assert_eq!(window_of_folder(WINDOW_CLASS, one), None, "a window that is gone is not found");
         }
     }
 }
