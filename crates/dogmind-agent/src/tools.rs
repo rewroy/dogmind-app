@@ -1694,8 +1694,31 @@ fn step_stand_in(step: &str, piped: bool) -> Option<String> {
     Some(format!("{}({text})", &step[..step.len() - step.trim_start().len()]))
 }
 
+/// The line that runs for a line a model wrote: the same, but where `dir`, `del` or `| head` is replaced by what does that in the
+/// sandbox. The gate weighs this one too, and a person who is asked is shown this one, with what was written beside it.
+/// The lines of a command are joined into one first, as `execute_command` does before it puts the stand-ins in. That alone is the same commands in the same order, so a line
+/// that only needed joining comes back as it was written.
+pub fn line_that_runs(line: &str) -> String {
+    #[cfg(windows)]
+    {
+        match on_one_line(line) {
+            Ok(one) => {
+                let runs = with_stand_ins(&one);
+                if runs == one.as_ref() { line.to_string() } else { runs }
+            }
+            // (a line it refuses is not run at all)
+            Err(_) => line.to_string(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        line.to_string()
+    }
+}
+
 /// The line that runs: `dir` and `del` read the drive's root before anything else, which a container cannot, wherever their file is. A model reaches for them by habit however it is
-/// told, and each refusal is a round of a slow model's time. What the gate and the person saw is the line as the model wrote it. A line with parentheses or more than one line of its own is left as it is.
+/// told, and each refusal is a round of a slow model's time. A line with parentheses or more than one line of its own is left as it is, and so is a line this has made: running
+/// it on its own answer changes nothing, so that what was shown is what runs.
 #[cfg(windows)]
 fn with_stand_ins(line: &str) -> String {
     if line.contains(['\n', '\r']) {
@@ -2151,14 +2174,19 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let network = crate::safety::wants_network(arguments);
     let started = Instant::now();
     let before = file_states(&cwd);
+    let runs = line_that_runs(line);
     // Spelled as `cwd` is, or a path with `..` in it would not be seen as holding it.
-    let done = crate::sandbox::run_live(&with_stand_ins(line), &cwd, &resolve(workspace, "."), network, timeout, cancel, live).map_err(|error| {
+    let done = crate::sandbox::run_live(&runs, &cwd, &resolve(workspace, "."), network, timeout, cancel, live).map_err(|error| {
         // (the app's `git init` has run by then, and what is said is what is there)
         let started = if started_with_init.is_some() { "`git init` ran, and made .git there; the rest of the line was not started" } else { "The command was not started" };
         format!("{error}. {started}; changing its spelling cannot repair this")
     })?;
     let (out, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
     let mut report = String::new();
+    // (said, and not done quietly: the model learns what its words became, and the person reads it in the result)
+    if runs != line {
+        report.push_str(&format!("note: this ran as `{runs}`: in the sandbox `dir`, `del` and `| head` are replaced by what does the same there.\n"));
+    }
     if !done.shown.is_empty() {
         report.push_str(&format!("note: it opened a window that nobody can see, as nothing from a command reaches the screen: {}. Run what prints instead of what shows.\n", done.shown.iter().map(|title| if title.is_empty() { "a dialog" } else { title.as_str() }).take(4).collect::<Vec<_>>().join(", ")));
     }
@@ -3346,6 +3374,33 @@ mod tests {
         assert!(piped.starts_with("((for /d %d in (\"vendor\\*\")") && !piped.contains("if exist") && piped.ends_with("| findstr three"), "{piped}");
         assert!(with_stand_ins("dir vendor || echo none").contains("if exist"), "a second chance is not a pipe");
         assert_eq!(with_stand_ins("del it's.txt"), "del it's.txt");
+    }
+
+    /// What a person was shown must be what runs: a line this has made is not changed by being gone over again.
+    #[cfg(windows)]
+    #[test]
+    fn a_line_with_its_stand_ins_in_is_left_as_it_is() {
+        for line in ["dir", "dir /s *.js", "del /q a.txt \"b c.txt\"", "erase *.log", "x | head -60"] {
+            let once = with_stand_ins(line);
+            assert_ne!(once, line, "{line}: something was put in");
+            assert_eq!(with_stand_ins(&once), once, "{line}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_line_that_runs_is_the_line_the_sandbox_is_given() {
+        for same in ["echo hi", "python x.py", "if exist x (del x)", "dir > out.txt", "echo a\necho b", "python -c \"print(1)\nprint(2)\""] {
+            assert_eq!(line_that_runs(same), same, "joining the lines alone is not told of: {same}");
+        }
+        assert_eq!(line_that_runs("del a.txt"), "(powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\")");
+        assert_eq!(line_that_runs("x | head -60"), "x | findstr \"^\"");
+        assert_eq!(line_that_runs("dir /s *.js"), with_stand_ins("dir /s *.js"));
+        // Lines are joined before the stand-ins go in, so that a `del` on the second one is replaced too.
+        let two = line_that_runs("echo a\ndel a.txt");
+        assert_eq!(two, "echo a & (powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\")", "{two}");
+        // A line that is refused is not run, so there is nothing else for it to be.
+        assert_eq!(line_that_runs("echo \"a\nb\"\ndel x"), "echo \"a\nb\"\ndel x");
     }
 
     #[cfg(windows)]
