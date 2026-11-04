@@ -340,6 +340,8 @@ pub struct Gate {
     high: RegexSet,
     compound: Regex,
     wide_read: Regex,
+    /// The folders a command's programs are found in besides the one it runs in. None: the PATH a command starts with.
+    pub path: Option<Vec<PathBuf>>,
 }
 
 impl Default for Gate {
@@ -390,6 +392,7 @@ impl Gate {
             compound: Regex::new(r"[|&;><`\n\r^]|\$\(|%[^%\s]*%|%[^%]*:[^%]*%").expect("the pattern is valid"),
             // Words that read many files, of which the keys are some: what names them one by one is looked at, and this is not.
             wide_read: Regex::new(r"(?i)^\s*((type|findstr)\b.*[*?]|findstr\b.*\s/[sfgd])").expect("the pattern is valid"),
+            path: None,
         }
     }
 
@@ -511,7 +514,7 @@ impl Gate {
                     return Verdict::Ask { risk: Risk::High, reason: Some(format!("this runs in a place off this PC: {}", cwd.display())) };
                 }
                 // (a reason is what keeps a rule, "always" and a mode from answering for it: what they were given leave to run is the program the line names, not a file here)
-                let planted = planted_here(command, &cwd);
+                let planted = self.planted_here(command, &cwd);
                 if self.is_look(command) && !wants_network(arguments) && within(workspace, &cwd) && planted.is_none() {
                     return Verdict::Allow;
                 }
@@ -580,31 +583,78 @@ fn names_a_new_branch(command: &str) -> bool {
     !rest.iter().any(|word| LISTING.contains(word)) && rest.iter().any(|word| !word.starts_with('-'))
 }
 
-/// What to tell the person where a file in this folder is what a part of this command would run: cmd looks in the folder a command runs in before PATH, so that a `git.cmd` the model wrote there
-/// is what `git status` starts. Every part of the line is looked at, as `cd src & git status` starts git too, and a program that is named by its path is the one the line says.
-fn planted_here(command: &str, folder: &Path) -> Option<String> {
-    const RUNS: [&str; 9] = ["", ".exe", ".com", ".bat", ".cmd", ".js", ".vbs", ".wsf", ".wsh"];
-    // (cmd drops its escape and the quotes before it looks for the program: `g^it` and `"git"` are `git`)
-    for part in command_parts(&command.replace('^', "")) {
-        let words = command_words(part);
-        let mut words = words.iter().map(|word| word.trim_start_matches('@')).filter(|word| !word.is_empty());
-        let Some(first) = words.next().map(|first| if first.eq_ignore_ascii_case("call") { words.next().unwrap_or("") } else { first }) else { continue };
-        if first.is_empty() || first.contains(['\\', '/', ':']) {
-            continue;
-        }
-        let lower = first.to_ascii_lowercase();
-        let name = lower.strip_suffix(".exe").unwrap_or(&lower);
-        if let Some(file) = RUNS.iter().map(|extension| format!("{name}{extension}")).find(|file| folder.join(file).is_file()) {
-            return Some(format!("`{first}` here is the file {file} in this folder, not the installed program"));
-        }
-    }
-    None
+/// What cmd runs itself before it looks for a file by the name: no file in the folder takes the place of these.
+const CMD_BUILT_INS: &[&str] = &[
+    "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir", "dpath", "echo", "endlocal", "erase", "exit", "for", "ftype", "goto", "if", "md", "mkdir", "mklink", "move", "path",
+    "pause", "popd", "prompt", "pushd", "rd", "rem", "ren", "rename", "rmdir", "set", "setlocal", "shift", "start", "time", "title", "type", "ver", "verify", "vol",
+];
+
+/// The extensions cmd adds to a name to find a program, as this machine has them.
+fn path_extensions() -> Vec<String> {
+    let text = std::env::var("PATHEXT").ok().filter(|text| !text.trim().is_empty()).unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC".to_string());
+    text.split(';').map(|extension| extension.trim().to_ascii_lowercase()).filter(|extension| extension.len() > 1 && extension.starts_with('.')).collect()
 }
 
-/// What to tell the person where this call of `execute_command` would run a file in its folder in place of a program on PATH, as [`planted_here`] says it.
-pub fn planted_program(arguments: &Value, workspace: &Path) -> Option<String> {
-    let command = arguments.get("command").and_then(Value::as_str)?;
-    planted_here(command, &resolve(workspace, arguments.get("cwd").and_then(Value::as_str).unwrap_or(".")))
+/// The files cmd looks for under a name, in a folder: the name itself when it ends in an extension that runs, and else with each of them added.
+fn file_names(name: &str, extensions: &[String]) -> Vec<String> {
+    if extensions.iter().any(|extension| name.len() > extension.len() && name.ends_with(extension.as_str())) {
+        vec![name.to_string()]
+    } else {
+        extensions.iter().map(|extension| format!("{name}{extension}")).collect()
+    }
+}
+
+impl Gate {
+    /// What to tell the person where a file in this folder takes the place of an installed program for a part of this command: cmd looks in the folder a command runs in before PATH, so that a `git.cmd`
+    /// the model wrote there is what `git status` starts. Every part of the line is looked at, as `cd src & git status` starts git too. Not a program named by its path, which is the one the line says;
+    /// not what cmd runs itself; and not a name that nothing on PATH answers to, as `gradlew.bat` in a project: that is the project's own, and nothing is taken the place of.
+    fn planted_here(&self, command: &str, folder: &Path) -> Option<String> {
+        let extensions = path_extensions();
+        // (cmd drops its escape and the quotes before it looks for the program: `g^it` and `"git"` are `git`)
+        for part in command_parts(&command.replace('^', "")) {
+            let words = command_words(part);
+            let mut words = words.iter().map(|word| word.trim_start_matches('@')).filter(|word| !word.is_empty());
+            let Some(first) = words.next().map(|first| if first.eq_ignore_ascii_case("call") { words.next().unwrap_or("") } else { first }) else { continue };
+            if first.is_empty() || first.contains(['\\', '/', ':']) {
+                continue;
+            }
+            let lower = first.to_ascii_lowercase();
+            if CMD_BUILT_INS.contains(&lower.as_str()) {
+                continue;
+            }
+            let names = file_names(&lower, &extensions);
+            let Some(file) = names.iter().find(|name| folder.join(name).is_file()) else { continue };
+            if self.installed(&names, folder) {
+                return Some(format!("`{first}` here is the file {file} in this folder, not the installed program"));
+            }
+        }
+        None
+    }
+
+    /// Whether a program of one of these file names is on the PATH a command starts with, in a folder other than this one (which is first on it already).
+    fn installed(&self, names: &[String], folder: &Path) -> bool {
+        let path = self.path.clone().unwrap_or_else(command_path);
+        // (a relative entry is the folder itself)
+        path.iter().filter(|entry| entry.is_absolute() && !(inside(entry, folder) && inside(folder, entry))).any(|entry| names.iter().any(|name| entry.join(name).is_file()))
+    }
+
+    /// What to tell the person where this call of `execute_command` would run a file in its folder in place of an installed program, as [`Gate::planted_here`] says it.
+    pub fn planted_program(&self, arguments: &Value, workspace: &Path) -> Option<String> {
+        let command = arguments.get("command").and_then(Value::as_str)?;
+        self.planted_here(command, &resolve(workspace, arguments.get("cwd").and_then(Value::as_str).unwrap_or(".")))
+    }
+}
+
+/// The folders a command's programs are found in.
+fn command_path() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        crate::sandbox::command_path()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect()
+    }
 }
 
 /// Inside the workspace as it is spelled and where it really leads: a link inside it to somewhere else is somewhere else.
@@ -749,13 +799,24 @@ mod tests {
         }
     }
 
+    /// A folder to stand for the PATH of a command, with these programs (empty files) in it: a test does not go by what this machine has installed.
+    fn installed(under: &Path, programs: &[&str]) -> PathBuf {
+        let folder = under.join("installed");
+        std::fs::create_dir_all(&folder).unwrap();
+        for program in programs {
+            std::fs::write(folder.join(program), "").unwrap();
+        }
+        folder
+    }
+
     #[test]
     fn a_program_planted_in_the_folder_is_not_a_look_and_a_folder_outside_is_not_either() {
         let dir = tempfile::tempdir().unwrap();
         let (work, elsewhere) = (dir.path().join("work"), dir.path().join("elsewhere"));
         std::fs::create_dir_all(work.join("sub")).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
-        let gate = Gate::new();
+        let mut gate = Gate::new();
+        gate.path = Some(vec![installed(dir.path(), &["git.exe", "node.exe"])]);
         assert_eq!(gate.check("execute_command", &json!({"command": "git status"}), &work), Verdict::Allow);
         assert_eq!(gate.check("execute_command", &json!({"command": "git status", "cwd": "sub"}), &work), Verdict::Allow);
         assert!(matches!(gate.check("execute_command", &json!({"command": "git status", "cwd": elsewhere.to_str().unwrap()}), &work), Verdict::Ask { .. }));
@@ -766,13 +827,14 @@ mod tests {
         assert!(matches!(gate.check("execute_command", &json!({"command": "node.exe -v"}), &work), Verdict::Ask { .. }));
     }
 
-    /// A file in the folder that stands in for the installed program is a reason to ask, for a look and for any other command, however the line spells the program.
+    /// A file in the folder that takes the place of an installed program is a reason to ask, for a look and for any other command, however the line spells the program.
     #[test]
     fn a_program_planted_in_the_folder_asks_with_a_reason_the_person_can_act_on() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("sub")).unwrap();
-        let gate = Gate::new();
+        let mut gate = Gate::new();
+        gate.path = Some(vec![installed(dir.path(), &["git.exe", "cargo.exe", "npm.cmd"])]);
         let reason = |command: &str, cwd: &str| match gate.check("execute_command", &json!({"command": command, "cwd": cwd}), &work) {
             Verdict::Ask { reason, .. } => reason,
             other => panic!("{command}: {other:?}"),
@@ -786,9 +848,9 @@ mod tests {
         let said = "`git` here is the file git.cmd in this folder, not the installed program";
         assert_eq!(ask("git status", "."), Verdict::Ask { risk: Risk::Safe, reason: Some(said.to_string()) });
         assert_eq!(reason("cargo build", ".").as_deref(), Some("`cargo` here is the file cargo.bat in this folder, not the installed program"));
-        assert_eq!(reason("npm test", ".").as_deref(), Some("`npm` here is the file npm.exe in this folder, not the installed program"));
+        assert_eq!(reason("npm test", ".").as_deref(), Some("`npm` here is the file npm.exe in this folder, not the installed program"), "of any extension that runs, for the installed one of another");
         // However the line spells it: in quotes, with cmd's escape, after `@` or `call`, or as the second part of a line.
-        for command in ["\"git\" status", "g^it status", "@git status", "call git status", "cd . && git status", "cd . & \"git\" log", "(cd .) & git diff", "echo x | git status", "GIT status", "git.exe status"] {
+        for command in ["\"git\" status", "g^it status", "@git status", "call git status", "cd . && git status", "cd . & \"git\" log", "(cd .) & git diff", "echo x | git status", "GIT status"] {
             assert!(reason(command, ".").is_some_and(|reason| reason.contains("here is the file git.cmd")), "{command}");
         }
         // The folder the command runs in is the one that counts, and a program named by its path is the one the line says.
@@ -796,15 +858,66 @@ mod tests {
         for command in [".\\git.cmd status", "C:\\Program Files\\Git\\cmd\\git.exe status", "\"C:\\Program Files\\Git\\cmd\\git.exe\" status", "./cargo build"] {
             assert_eq!(reason(command, "."), None, "{command}");
         }
+        // A name with its extension is that file: `git.exe` is not the `git.cmd` that is there.
+        assert_eq!(reason("git.exe status", "."), None);
         // Along with the other reason a command may have, and not instead of it.
         let both = match gate.check("execute_command", &json!({"command": "npm test", "network": true}), &work) {
             Verdict::Ask { reason, .. } => reason.unwrap(),
             other => panic!("{other:?}"),
         };
         assert!(both.contains("`npm` here is the file npm.exe") && both.ends_with("this command gets the network"), "{both}");
-        assert_eq!(planted_program(&json!({"command": "git status"}), &work).as_deref(), Some(said));
-        assert_eq!(planted_program(&json!({"command": "git status", "cwd": "sub"}), &work), None);
-        assert_eq!(planted_program(&json!({"path": "x"}), &work), None);
+        assert_eq!(gate.planted_program(&json!({"command": "git status"}), &work).as_deref(), Some(said));
+        assert_eq!(gate.planted_program(&json!({"command": "git status", "cwd": "sub"}), &work), None);
+        assert_eq!(gate.planted_program(&json!({"path": "x"}), &work), None);
+    }
+
+    /// A file in the folder is only the place of an installed program when a program of that name is on PATH: `gradlew.bat` in a project is the project's own, and `gradlew build` is a command like another.
+    #[test]
+    fn a_file_in_the_folder_that_no_installed_program_answers_to_is_the_projects_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut gate = Gate::new();
+        gate.path = Some(vec![installed(dir.path(), &["git.exe"])]);
+        for file in ["gradlew.bat", "build.bat", "deploy.cmd", "tool.exe", "lint.js"] {
+            std::fs::write(work.join(file), "@echo hi").unwrap();
+        }
+        for command in ["gradlew build", "build", "deploy --prod", "tool x", "lint src", "cd . && gradlew build", "\"gradlew\" build", "gradlew.bat build"] {
+            assert_eq!(gate.check("execute_command", &json!({"command": command}), &work), Verdict::Ask { risk: Risk::Low, reason: None }, "{command}");
+        }
+        // The same names, once an installed program has them.
+        gate.path = Some(vec![installed(dir.path(), &["git.exe", "gradlew.exe", "build.com", "lint.cmd"])]);
+        for (command, file) in [("gradlew build", "gradlew.bat"), ("build", "build.bat"), ("lint src", "lint.js")] {
+            let Verdict::Ask { reason: Some(reason), .. } = gate.check("execute_command", &json!({"command": command}), &work) else { panic!("{command}") };
+            assert!(reason.contains(&format!("is the file {file} in this folder")), "{command}: {reason}");
+        }
+        // PATH reaching this very folder is not an installed program: what is first on it is the file itself.
+        gate.path = Some(vec![work.clone(), PathBuf::from(".")]);
+        assert_eq!(gate.check("execute_command", &json!({"command": "gradlew build"}), &work), Verdict::Ask { risk: Risk::Low, reason: None });
+    }
+
+    /// What cmd runs itself is never replaced by a file in the folder: `dir.cmd` there does not make `dir` ask.
+    #[test]
+    fn what_cmd_runs_itself_is_not_taken_the_place_of_by_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut gate = Gate::new();
+        // (even with a program of the name on PATH, as `echo.exe` and `dir.exe` may be on a machine)
+        gate.path = Some(vec![installed(dir.path(), &["dir.exe", "echo.exe", "type.exe", "git.exe"])]);
+        for built_in in ["dir", "echo", "type", "copy", "del", "cd", "set", "if", "for", "call", "move", "mkdir", "ver"] {
+            std::fs::write(work.join(format!("{built_in}.cmd")), "@echo planted").unwrap();
+        }
+        std::fs::write(work.join("git.cmd"), "@echo planted").unwrap();
+        assert_eq!(gate.check("execute_command", &json!({"command": "dir"}), &work), Verdict::Allow);
+        assert_eq!(gate.check("execute_command", &json!({"command": "type a.txt"}), &work), Verdict::Allow);
+        for command in ["echo hi", "copy a b", "cd sub", "set X=1", "if exist a echo b", "for %d in (a) do @echo %d", "call dir", "mkdir x"] {
+            assert!(matches!(gate.check("execute_command", &json!({"command": command}), &work), Verdict::Ask { reason: None, .. }), "{command}");
+        }
+        assert_eq!(gate.check("execute_command", &json!({"command": "DIR /b"}), &work), Verdict::Allow);
+        // A built-in does not hide what comes after it on the line.
+        assert!(matches!(gate.check("execute_command", &json!({"command": "dir & git status"}), &work), Verdict::Ask { reason: Some(_), .. }));
+        assert_eq!(gate.planted_program(&json!({"command": "dir"}), &work), None);
     }
 
     /// cmd's parting of a line into words: quotes join what is in them, and are not in the word.
