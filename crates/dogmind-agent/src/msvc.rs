@@ -1,13 +1,19 @@
 //! What a Developer prompt for x64 gives a build, for commands that cannot find Visual Studio themselves. Rust finds MSVC through the Visual Studio setup configuration (COM and
 //! `C:\ProgramData`), which a container cannot reach, and `cl` and `link` are on no PATH of a person's unless they started from a Developer prompt. The files are readable, so only the
-//! variables are missing: found once per process, outside the sandbox, and given to a command as `LIB`, `INCLUDE` and the tool folders at the end of its PATH.
+//! variables are missing: found outside the sandbox, in the background, and given to a command as `LIB`, `INCLUDE` and the tool folders at the end of its PATH. What is found, and that
+//! there is none to find, stay for the process; a look that ran out of time does not.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// `vswhere` is a small program that reads a few files; when it takes longer than this, something is wrong and a build goes on without.
 const VSWHERE_LIMIT: Duration = Duration::from_secs(10);
+/// A look that ran out of time (a virus scan or Windows Update has `vswhere` waiting) is made again on a later call, but not sooner than this after it ended.
+const LOOK_AGAIN_AFTER: Duration = Duration::from_secs(60);
+/// How often a wait for a look asks whether the command it is for has been stopped.
+const ASK_STOP_EVERY: Duration = Duration::from_millis(25);
 /// The Visual Studio component that has `cl.exe`, `link.exe` and the libraries for x64.
 const CPP_TOOLS: &str = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64";
 
@@ -95,54 +101,185 @@ pub fn add_to(block: &mut Vec<(String, String)>, find: impl FnOnce() -> Option<B
     block.extend([("LIB".to_string(), lib), ("INCLUDE".to_string(), include), ("PATH".to_string(), path)]);
 }
 
-/// The build tools of this machine, looked for once per process. The first command waits for the lookup, which takes a moment, and none after it does.
-pub fn found() -> Option<BuildTools> {
-    static FOUND: OnceLock<Option<BuildTools>> = OnceLock::new();
-    FOUND.get_or_init(look).clone()
+/// What a look came to: an answer that stands, or none yet (the program it asks ran out of time, or could not be run).
+enum Looked<T> {
+    Settled(T),
+    Unsettled,
 }
 
-fn look() -> Option<BuildTools> {
-    let architecture = std::env::var("PROCESSOR_ARCHITECTURE").ok().filter(|architecture| is_x64(architecture))?;
-    let program_files = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from)?;
-    let install = installation(&program_files)?;
+/// What is known of the build tools, and whether a look for them is going on.
+struct Remembered {
+    /// What a look settled, for the process: the tools, or `None` for a machine that has none (no Visual Studio with the C++ tools, no `vswhere`, not x64). Not known yet: `None` out here.
+    settled: Option<Option<BuildTools>>,
+    /// A look is going on, on a thread of its own.
+    looking: bool,
+    /// When the last look ended without settling anything.
+    unsettled_at: Option<Instant>,
+}
+
+/// The build tools of this machine, found by a look that runs in the background. No one waits on it unless they say so: the gate, which weighs a command before the person is shown it,
+/// takes what is known, and a command's environment waits for a look that is going on for as long as the command has time.
+struct Finder {
+    remembered: Mutex<Remembered>,
+    /// Told when a look ends.
+    ended: Condvar,
+    /// How long after a look that settled nothing the next one may begin.
+    again_after: Duration,
+}
+
+impl Finder {
+    const fn new(again_after: Duration) -> Finder {
+        Finder { remembered: Mutex::new(Remembered { settled: None, looking: false, unsettled_at: None }), ended: Condvar::new(), again_after }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Remembered> {
+        self.remembered.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Begins a look on a thread of its own, when one is wanted: not when the answer is known, a look is going on, or the last one ended without settling less than `again_after` ago.
+    fn begin(&'static self, remembered: &mut Remembered, look: impl FnOnce() -> Looked<Option<BuildTools>> + Send + 'static) {
+        let may_try_again = remembered.unsettled_at.is_none_or(|at| at.elapsed() >= self.again_after);
+        if remembered.settled.is_some() || remembered.looking || !may_try_again {
+            return;
+        }
+        let spawned = std::thread::Builder::new().name("build tools".to_string()).spawn(move || {
+            // (a look that panics settles nothing, and does not leave the others waiting for it)
+            let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(look)).unwrap_or(Looked::Unsettled);
+            let mut remembered = self.lock();
+            remembered.looking = false;
+            match looked {
+                Looked::Settled(tools) => remembered.settled = Some(tools),
+                Looked::Unsettled => remembered.unsettled_at = Some(Instant::now()),
+            }
+            drop(remembered);
+            self.ended.notify_all();
+        });
+        // (the thread takes the lock for its end, which this call holds until it returns)
+        remembered.looking = spawned.is_ok();
+        if spawned.is_err() {
+            remembered.unsettled_at = Some(Instant::now());
+        }
+    }
+
+    fn look_ahead(&'static self, look: impl FnOnce() -> Looked<Option<BuildTools>> + Send + 'static) {
+        self.begin(&mut self.lock(), look);
+    }
+
+    /// What is known now, and never a wait: the tools when a look has found them, and otherwise none. A look that is wanted begins.
+    fn known(&'static self, look: impl FnOnce() -> Looked<Option<BuildTools>> + Send + 'static) -> Option<BuildTools> {
+        let mut remembered = self.lock();
+        self.begin(&mut remembered, look);
+        remembered.settled.clone().flatten()
+    }
+
+    /// The tools, waiting for a look that is going on (or begins here) until `deadline`, and not past the moment `stop` is set. None: the machine has none, or the look did not settle in that time.
+    fn found_before(&'static self, look: impl FnOnce() -> Looked<Option<BuildTools>> + Send + 'static, deadline: Instant, stop: &AtomicBool) -> Option<BuildTools> {
+        let mut remembered = self.lock();
+        self.begin(&mut remembered, look);
+        loop {
+            if let Some(settled) = &remembered.settled {
+                return settled.clone();
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !remembered.looking || left.is_zero() || stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            remembered = self.ended.wait_timeout(remembered, left.min(ASK_STOP_EVERY)).unwrap_or_else(PoisonError::into_inner).0;
+        }
+    }
+}
+
+static FINDER: Finder = Finder::new(LOOK_AGAIN_AFTER);
+
+/// Begins the look for the build tools in the background, if it is wanted and has not begun, and returns at once. Asked early (when an agent starts, and when a command is about to run), so that
+/// a command's environment usually finds the answer ready.
+pub fn look_ahead() {
+    FINDER.look_ahead(look);
+}
+
+/// The build tools as far as they are known, without waiting for anything: the gate weighs a command before the person is shown it, and nothing is on the screen to tell them what it waits for.
+/// Not found yet reads as none; the look begins here if it has not.
+pub fn known() -> Option<BuildTools> {
+    FINDER.known(look)
+}
+
+/// The build tools for a command's environment: waits for a look that is going on, until `deadline` (the end of the time the command has) and not past the moment `stop` is set, which is
+/// the person's Stop. A command goes on without them when the look has not come to anything by then.
+pub fn found_before(deadline: Instant, stop: &AtomicBool) -> Option<BuildTools> {
+    FINDER.found_before(look, deadline, stop)
+}
+
+fn look() -> Looked<Option<BuildTools>> {
+    let Some(architecture) = std::env::var("PROCESSOR_ARCHITECTURE").ok().filter(|architecture| is_x64(architecture)) else { return Looked::Settled(None) };
+    let Some(program_files) = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from) else { return Looked::Settled(None) };
+    let install = match installation(&program_files) {
+        Looked::Settled(Some(install)) => install,
+        Looked::Settled(None) => return Looked::Settled(None),
+        Looked::Unsettled => return Looked::Unsettled,
+    };
     // (the registry's root first; where the SDK puts itself by default, when it has none or the one it names is not what was wanted)
     let kits = kits_root().into_iter().chain([program_files.join("Windows Kits\\10")]);
-    kits.into_iter().find_map(|kits| layout(&architecture, &install, &kits))
+    Looked::Settled(kits.into_iter().find_map(|kits| layout(&architecture, &install, &kits)))
 }
 
-/// The newest Visual Studio with the C++ tools, as its own `vswhere` says.
-fn installation(program_files: &Path) -> Option<PathBuf> {
+/// The newest Visual Studio with the C++ tools, as its own `vswhere` says. Settled as none when `vswhere` is not there or has found no installation; not settled when it ran out of time or
+/// could not be run, as that says nothing of what is installed.
+fn installation(program_files: &Path) -> Looked<Option<PathBuf>> {
     let vswhere = program_files.join("Microsoft Visual Studio\\Installer\\vswhere.exe");
     if !vswhere.is_file() {
-        return None;
+        return Looked::Settled(None);
     }
     let mut command = std::process::Command::new(vswhere);
     command.args(["-latest", "-products", "*", "-requires", CPP_TOOLS, "-property", "installationPath", "-utf8"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
     crate::tools::no_window(&mut command);
-    let said = output_within(command, VSWHERE_LIMIT)?;
-    said.lines().map(str::trim).find(|line| !line.is_empty()).map(PathBuf::from).filter(|folder| folder.is_dir())
+    match output_within(command, VSWHERE_LIMIT) {
+        Ran::Said(said) => Looked::Settled(said.lines().map(str::trim).find(|line| !line.is_empty()).map(PathBuf::from).filter(|folder| folder.is_dir())),
+        Ran::Failed | Ran::TooSlow => Looked::Unsettled,
+    }
 }
 
-/// What the program prints, if it ends well within the limit. Past it, the program is ended.
-fn output_within(mut command: std::process::Command, limit: Duration) -> Option<String> {
+/// How a program that is run for what it prints came out.
+#[derive(Debug, PartialEq, Eq)]
+enum Ran {
+    /// It ended well within the limit, and this is all it printed.
+    Said(String),
+    /// It could not be run, or ended with a status that is not success.
+    Failed,
+    /// It did not end within the limit, or what it printed did not: a program it started may keep its output open.
+    TooSlow,
+}
+
+/// What the program prints, if it and its output end within the limit. Past it, the program is ended, and a reader that is still reading is left to end by itself when the output closes.
+fn output_within(mut command: std::process::Command, limit: Duration) -> Ran {
     use std::io::Read;
-    let mut child = command.spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let Ok(mut child) = command.spawn() else { return Ran::Failed };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ran::Failed;
+    };
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = stdout.read_to_end(&mut bytes);
-        bytes
+        let _ = send.send(bytes);
     });
     let deadline = Instant::now() + limit;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return reader.join().ok().filter(|_| status.success()).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            // (the output closes when the program ends, unless a program it started holds it open: that one is not waited for past the limit)
+            Ok(Some(status)) => {
+                return match receive.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(bytes) if status.success() => Ran::Said(String::from_utf8_lossy(&bytes).into_owned()),
+                    Ok(_) => Ran::Failed,
+                    Err(_) => Ran::TooSlow,
+                };
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            // (the reader ends by itself when the program's end closes its pipe)
-            _ => {
+            outcome => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return if outcome.is_err() { Ran::Failed } else { Ran::TooSlow };
             }
         }
     }
@@ -178,6 +315,8 @@ fn kits_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
 
     /// An installation and a Windows SDK as they are laid out on disk: a toolset version (the default one named in the file), and SDK versions that each have all of their parts.
     fn machine(root: &Path, toolsets: &[&str], default: &str, sdks: &[&str]) -> (PathBuf, PathBuf) {
@@ -339,7 +478,7 @@ mod tests {
     #[test]
     #[ignore = "needs Visual Studio with the C++ tools for x64, and the Windows SDK"]
     fn the_real_machines_build_tools_are_found() {
-        let found = look().expect("Visual Studio with the C++ tools, and the Windows SDK");
+        let Looked::Settled(Some(found)) = look() else { panic!("Visual Studio with the C++ tools, and the Windows SDK") };
         println!("{found:#?}");
         assert!(found.path[0].join("link.exe").is_file() && found.path[0].join("cl.exe").is_file());
         assert!(found.path[1].join("rc.exe").is_file());
@@ -353,11 +492,186 @@ mod tests {
         slow.args(["/d", "/c", "ping -n 6 127.0.0.1 >nul"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
         crate::tools::no_window(&mut slow);
         let began = Instant::now();
-        assert_eq!(output_within(slow, Duration::from_millis(300)), None);
+        assert_eq!(output_within(slow, Duration::from_millis(300)), Ran::TooSlow);
         assert!(began.elapsed() < Duration::from_secs(5));
         let mut quick = std::process::Command::new("cmd");
         quick.args(["/d", "/c", "echo", "C:\\a"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
         crate::tools::no_window(&mut quick);
-        assert_eq!(output_within(quick, Duration::from_secs(20)).as_deref().map(str::trim), Some("C:\\a"));
+        assert!(matches!(output_within(quick, Duration::from_secs(20)), Ran::Said(said) if said.trim() == "C:\\a"));
+    }
+
+    #[test]
+    fn a_program_that_fails_or_is_not_there_is_not_one_that_ran_out_of_time() {
+        let mut fails = std::process::Command::new("cmd");
+        fails.args(["/d", "/c", "echo C:\\a & exit 3"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
+        crate::tools::no_window(&mut fails);
+        assert_eq!(output_within(fails, Duration::from_secs(20)), Ran::Failed);
+        let mut missing = std::process::Command::new("C:\\no\\such\\folder\\vswhere.exe");
+        missing.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
+        assert_eq!(output_within(missing, Duration::from_secs(20)), Ran::Failed);
+    }
+
+    /// Ends what a test started, by its number, when the test ends in whatever way: `pid_file` is where the program wrote it.
+    struct EndsWhatItStarted {
+        pid_file: PathBuf,
+    }
+
+    impl Drop for EndsWhatItStarted {
+        fn drop(&mut self) {
+            if let Some(pid) = std::fs::read_to_string(&self.pid_file).ok().and_then(|text| text.trim().parse::<u32>().ok()) {
+                crate::tools::kill_tree(pid);
+            }
+        }
+    }
+
+    #[test]
+    fn a_program_whose_output_stays_open_after_it_ended_is_given_up_at_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("sleeper.pid");
+        let _ends = EndsWhatItStarted { pid_file: pid_file.clone() };
+        // The program starts a sleeper that shares its output, writes the sleeper's number and ends: the sleeper holds the output open for twenty seconds more.
+        let program = "import subprocess, sys; s = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(20)']); open(sys.argv[1], 'w').write(str(s.pid))";
+        let mut command = std::process::Command::new("python");
+        command.args(["-I", "-c", program]).arg(&pid_file).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+        crate::tools::no_window(&mut command);
+        let began = Instant::now();
+        assert_eq!(output_within(command, Duration::from_secs(3)), Ran::TooSlow);
+        // (by the limit, and not when the sleeper lets go)
+        assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+        assert!(pid_file.is_file(), "the sleeper was started, and it is what held the output");
+    }
+
+    #[test]
+    fn a_vswhere_that_is_not_there_is_a_machine_without_visual_studio_for_good() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(installation(dir.path()), Looked::Settled(None)));
+    }
+
+    /// A finder of a test's own (the process's is not for a test to count on). `begin` needs it to live as long as the process does.
+    fn finder(again_after: Duration) -> &'static Finder {
+        Box::leak(Box::new(Finder::new(again_after)))
+    }
+
+    /// A look that counts that it was made, and comes to `answer`.
+    fn counting(calls: &Arc<AtomicUsize>, answer: Looked<Option<BuildTools>>) -> impl FnOnce() -> Looked<Option<BuildTools>> + Send + 'static {
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            answer
+        }
+    }
+
+    fn within(seconds: u64) -> Instant {
+        Instant::now() + Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn a_look_that_ran_out_of_time_is_not_kept_and_a_later_call_looks_again() {
+        let (finder, calls, go_on) = (finder(Duration::ZERO), Arc::new(AtomicUsize::new(0)), AtomicBool::new(false));
+        assert_eq!(finder.found_before(counting(&calls, Looked::Unsettled), within(10), &go_on), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(finder.found_before(counting(&calls, Looked::Unsettled), within(10), &go_on), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a later call looks again");
+        // (the gate's form begins the look, and has nothing to show for it yet; a command that comes while it is going on waits for it)
+        assert_eq!(finder.known(counting(&calls, Looked::Settled(Some(tools())))), None);
+        assert_eq!(finder.found_before(counting(&calls, Looked::Unsettled), within(10), &go_on), Some(tools()));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // what was found stays: no look is made again, for any form of the question
+        for _ in 0..3 {
+            assert_eq!(finder.found_before(counting(&calls, Looked::Unsettled), within(10), &go_on), Some(tools()));
+            assert_eq!(finder.known(counting(&calls, Looked::Unsettled)), Some(tools()));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_machine_without_the_tools_is_settled_and_not_looked_at_again() {
+        let (finder, calls, go_on) = (finder(Duration::ZERO), Arc::new(AtomicUsize::new(0)), AtomicBool::new(false));
+        assert_eq!(finder.found_before(counting(&calls, Looked::Settled(None)), within(10), &go_on), None);
+        for _ in 0..3 {
+            assert_eq!(finder.found_before(counting(&calls, Looked::Settled(Some(tools()))), within(10), &go_on), None);
+            assert_eq!(finder.known(counting(&calls, Looked::Settled(Some(tools())))), None);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_look_that_ran_out_of_time_is_not_made_again_within_the_minute() {
+        let (finder, calls, go_on) = (finder(Duration::from_secs(3600)), Arc::new(AtomicUsize::new(0)), AtomicBool::new(false));
+        assert_eq!(finder.found_before(counting(&calls, Looked::Unsettled), within(10), &go_on), None);
+        let began = Instant::now();
+        for _ in 0..3 {
+            assert_eq!(finder.found_before(counting(&calls, Looked::Settled(Some(tools()))), within(10), &go_on), None);
+            assert_eq!(finder.known(counting(&calls, Looked::Settled(Some(tools())))), None);
+        }
+        // (a command goes on without, and does not wait for a look that is not to be made)
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_look_that_panics_settles_nothing_and_is_made_again() {
+        let (finder, calls, go_on) = (finder(Duration::ZERO), Arc::new(AtomicUsize::new(0)), AtomicBool::new(false));
+        let panicking = {
+            let calls = calls.clone();
+            move || -> Looked<Option<BuildTools>> {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("a look that went wrong, on purpose")
+            }
+        };
+        assert_eq!(finder.found_before(panicking, within(10), &go_on), None);
+        assert_eq!(finder.found_before(counting(&calls, Looked::Settled(Some(tools()))), within(10), &go_on), Some(tools()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_gate_takes_what_is_known_and_does_not_wait_for_a_look_that_is_open() {
+        let (finder, calls, go_on) = (finder(LOOK_AGAIN_AFTER), Arc::new(AtomicUsize::new(0)), AtomicBool::new(false));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (began, has_begun) = std::sync::mpsc::channel::<()>();
+        let open = {
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let _ = began.send(());
+                // (a vswhere that is held up: the look is not over until the test says)
+                let _ = held.recv();
+                Looked::Settled(Some(tools()))
+            }
+        };
+        let asked = Instant::now();
+        assert_eq!(finder.known(open), None);
+        assert!(asked.elapsed() < Duration::from_secs(2), "the gate waited: {:?}", asked.elapsed());
+        has_begun.recv_timeout(Duration::from_secs(10)).expect("the look began in the background");
+        // asked again with the look still open: at once, and with no second look
+        let asked = Instant::now();
+        for _ in 0..5 {
+            assert_eq!(finder.known(counting(&calls, Looked::Settled(Some(tools())))), None);
+        }
+        assert!(asked.elapsed() < Duration::from_secs(2), "the gate waited: {:?}", asked.elapsed());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // A command's environment waits for it, but only for the time the command has left.
+        let asked = Instant::now();
+        assert_eq!(finder.found_before(counting(&calls, Looked::Unsettled), Instant::now() + Duration::from_millis(300), &go_on), None);
+        assert!(asked.elapsed() >= Duration::from_millis(250) && asked.elapsed() < Duration::from_secs(5), "{:?}", asked.elapsed());
+        // And not past Stop, which is set while it waits.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let asked = Instant::now();
+        assert_eq!(finder.found_before(counting(&calls, Looked::Unsettled), within(60), &stop), None);
+        assert!(asked.elapsed() < Duration::from_secs(5), "Stop was not heard: {:?}", asked.elapsed());
+        stopper.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // When the look ends in time, the command has the tools, and the gate's form has them from then on.
+        release.send(()).unwrap();
+        assert_eq!(finder.found_before(counting(&calls, Looked::Unsettled), within(10), &go_on), Some(tools()));
+        assert_eq!(finder.known(counting(&calls, Looked::Unsettled)), Some(tools()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
