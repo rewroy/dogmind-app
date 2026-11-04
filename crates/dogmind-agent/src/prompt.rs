@@ -296,7 +296,8 @@ mod tests {
         // (5,150 until check_page took views and a wait: pictures at a phone's width and after an animation were what a real model, asked, missed most;
         // then steps, to click and type in a page as Playwright would, which the person asked for)
         // (then explore, a look by a helper in a context of its own, which saves a review far more than it costs: 197K tokens of one went on reading)
-        assert!(tools.len() < 5_800, "the tools have grown to {} characters", tools.len());
+        // (then a sentence on reloads in the steps: a check of what a page keeps across one is ordinary, and without it the steps began again at every load)
+        assert!(tools.len() < 5_900, "the tools have grown to {} characters", tools.len());
         assert!(user_message_in("x", "2026-11-02 20:01:18 +09:00", None).len() < 60, "what rides on every message");
     }
 
