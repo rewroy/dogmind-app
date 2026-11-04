@@ -528,17 +528,29 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The size of a file and the SHA-256 of all of it, read a block at a time.
 fn hash_of(path: &Path) -> std::io::Result<(u64, String)> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
+    hash_reader(std::fs::File::open(path)?)
+}
+
+/// The same, of what a reader gives from where it is to its end.
+fn hash_reader(mut reader: impl std::io::Read) -> std::io::Result<(u64, String)> {
     let (mut hasher, mut size, mut block) = (Sha256::new(), 0u64, vec![0u8; 1 << 20]);
     loop {
-        let count = file.read(&mut block)?;
+        let count = reader.read(&mut block)?;
         if count == 0 {
             return Ok((size, hex(&hasher.finalize())));
         }
         hasher.update(&block[..count]);
         size += count as u64;
     }
+}
+
+/// Why a setup that was fetched and checked is not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotRun {
+    /// The file is not there, or its bytes are not those whose hash was noted.
+    Changed,
+    /// It could not be opened, held or read: the system's words.
+    Refused(String),
 }
 
 impl Ready {
@@ -551,6 +563,30 @@ impl Ready {
     pub fn is_sound(&self) -> bool {
         hash_of(&self.path).is_ok_and(|(size, sha256)| size == self.size && sha256 == self.sha256)
     }
+
+    /// Whether the file is still what was checked, ahead of its being run, and held so until it has been: it is opened for reading, shared with readers only (not with writing, deleting
+    /// or renaming), and its bytes are hashed through that handle. The handle comes back with the file sound, and while it is open no one can change the file between the check and the
+    /// start (`run_held`). A second or two for a setup of this size: run off the window's thread.
+    pub fn hold_if_sound(&self) -> Result<std::fs::File, NotRun> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let file = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&self.path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => NotRun::Changed,
+            _ => NotRun::Refused(error.to_string()),
+        })?;
+        match hash_reader(&file) {
+            Ok((size, sha256)) if size == self.size && sha256 == self.sha256 => Ok(file),
+            Ok(_) => Err(NotRun::Changed),
+            Err(error) => Err(NotRun::Refused(error.to_string())),
+        }
+    }
+}
+
+/// The setup run with `arguments`, while the handle that checked it is still open; then that is let go of. (Windows reads the file to start it: a handle that shares reading does not stand in the way.)
+pub fn run_held(ready: &Ready, held: std::fs::File, arguments: &[std::ffi::OsString]) -> std::io::Result<std::process::Child> {
+    let started = std::process::Command::new(&ready.path).args(arguments).spawn();
+    drop(held);
+    started
 }
 
 fn write_record(folder: &Path, ready: &Ready) -> std::io::Result<()> {
@@ -1803,6 +1839,61 @@ mod tests {
         assert_eq!(kept(folder.path(), "0.1.0"), Some(ready), "its size is what was checked");
         assert_eq!(kept_and_sound(folder.path(), "0.1.0"), None);
         assert_eq!(names_in(folder.path()), Vec::<String>::new(), "neither the file nor its note is left");
+    }
+
+    /// A setup file of these bytes in a folder, and the note of what was checked of it.
+    fn checked_file(folder: &Path, bytes: &[u8]) -> Ready {
+        let path = folder.join("DogmindSetup-0.2.0.exe");
+        std::fs::write(&path, bytes).unwrap();
+        Ready { version: "0.2.0".into(), path, size: bytes.len() as u64, sha256: sha_of(bytes) }
+    }
+
+    #[test]
+    fn a_setup_is_run_only_if_its_bytes_are_those_that_were_checked_and_cannot_be_changed_while_held() {
+        let folder = tempfile::tempdir().unwrap();
+        let bytes = file_bytes(300_000, 9);
+        let ready = checked_file(folder.path(), &bytes);
+        // as it was checked: held, with every other way to it shut but reading
+        let held = ready.hold_if_sound().expect("the bytes are the ones that were checked");
+        let elsewhere = folder.path().join("elsewhere.exe");
+        assert!(std::fs::OpenOptions::new().write(true).open(&ready.path).is_err(), "no one writes to it");
+        assert!(std::fs::write(&ready.path, b"another").is_err());
+        assert!(std::fs::rename(&ready.path, &elsewhere).is_err(), "no one moves it");
+        assert!(std::fs::remove_file(&ready.path).is_err(), "no one deletes it");
+        assert_eq!(std::fs::read(&ready.path).unwrap(), bytes, "reading it is let");
+        drop(held);
+        assert!(std::fs::OpenOptions::new().write(true).open(&ready.path).is_ok(), "and it is let go of");
+        // changed after it was recorded: the same length with one byte other, shorter, longer, empty, gone
+        let mut changed = bytes.clone();
+        changed[200_000] ^= 1;
+        for (words, other) in [("one byte", changed), ("shorter", bytes[..1000].to_vec()), ("longer", [bytes.clone(), vec![0]].concat()), ("empty", Vec::new())] {
+            std::fs::write(&ready.path, &other).unwrap();
+            assert_eq!(ready.hold_if_sound().map(|_| ()), Err(NotRun::Changed), "{words}");
+        }
+        std::fs::remove_file(&ready.path).unwrap();
+        assert_eq!(ready.hold_if_sound().map(|_| ()), Err(NotRun::Changed), "gone");
+        // and what was checked, put back, is sound again
+        std::fs::write(&ready.path, &bytes).unwrap();
+        assert!(ready.hold_if_sound().is_ok());
+        // a file that someone is writing to cannot be held shut: it is refused with the system's words, and is not called changed
+        let writer = std::fs::OpenOptions::new().write(true).open(&ready.path).unwrap();
+        assert!(matches!(ready.hold_if_sound(), Err(NotRun::Refused(_))));
+        drop(writer);
+    }
+
+    #[test]
+    fn a_setup_is_started_while_the_handle_that_checked_it_is_still_open() {
+        // (a copy of the command interpreter stands in for the setup: it is a program, and it ends with the code it is told)
+        let folder = tempfile::tempdir().unwrap();
+        let program = std::fs::read(std::env::var_os("ComSpec").expect("ComSpec")).unwrap();
+        let ready = checked_file(folder.path(), &program);
+        let held = ready.hold_if_sound().unwrap();
+        assert!(std::fs::remove_file(&ready.path).is_err(), "it is held");
+        let mut child = run_held(&ready, held, &["/c".into(), "exit 7".into()]).expect("Windows starts a program whose file a handle holds shut to writers");
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+        // (the handle is let go of once the program has started; Windows lets go of the program's own file a moment after it ends)
+        let removed = (0..40).any(|_| std::fs::remove_file(&ready.path).is_ok() || { std::thread::sleep(Duration::from_millis(50)); false });
+        assert!(removed, "nothing holds the file any more");
     }
 
     #[test]
