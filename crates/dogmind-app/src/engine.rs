@@ -482,6 +482,11 @@ impl Engine {
         Ok(Engine { child, _job: job, last_said, port: settings.port })
     }
 
+    /// Its process number: an installer that is to replace its files waits for it to end.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Why it ended, if it has.
     pub fn ended(&mut self) -> Option<String> {
         let status = self.child.try_wait().ok()??;
