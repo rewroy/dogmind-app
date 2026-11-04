@@ -2,9 +2,10 @@
 
 [日本語](README.ja.md)
 
-Dogmind as a native Windows application. For a server, run `straydog`; for a terminal, run `dogmind`; this is the one with a
-window. It is a product of its own, which uses Straydog as a program: put a new `straydog.exe` beside it and that is the
-update.
+Dogmind is an AI agent on your own Windows PC, as a native application: it reads and changes the files of a folder you choose,
+and runs commands there, asking you first. Its engine is [Straydog](https://github.com/rewroy/Straydog), a separate program
+that runs a model on this PC: put a new `straydog.exe` beside the app and that is the engine's update. It can also use a model
+on another machine, a service, Codex or Claude.
 
 - **Light.** Win32, drawn with Direct2D and DirectWrite on the CPU, and RichEdit for the text: no GPU memory for drawing, so that
   the VRAM stays with the model, and a WebView2 only while a preview is open. IME input, selection and copy are the system's own.
@@ -84,21 +85,23 @@ No GPU toolkit is needed. To use the engine, copy a `straydog.exe` built by Stra
 
 A package also has `tools\` beside the exe, so that a person installs nothing and a command does the same on every machine: Python with common modules, Node.js with npm and npx, and Git, first on every sandboxed command's PATH, ahead of anything installed. `python -I scripts/fetch_tools.py` fetches them by the hashes pinned in `scripts/tools.lock.json`, into a cache outside this tree, and `python -I scripts/package.py` puts them together and adds their licenses. A development build with no `tools\` beside it uses what the machine has, or the folder `DOGMIND_TOOLS` names.
 
-## What it has of Dogmind, and what not
+## The agent
 
-The agent loop, its stop conditions and retries; the system prompt; `read_file`, `list_files`, `search_files`, `apply_patch`,
-`create_file`, `execute_command`, `show_diff` and `todo`; the approval model (*default*, *accept edits*, *auto*, the Paw Note);
-three-stage compaction; sessions, in its own files; `DOGMIND.md`.
+Its tools read, search, create and edit files (`read_file`, `list_files`, `find_files`, `search_files`, `create_file`,
+`apply_patch`), run commands (`execute_command`), show what changed (`show_diff`), keep a to-do list, check a web page in a
+browser, and search and read the web when that is turned on. Edits and commands ask first, as the mode says (*default*,
+*accept edits*, *auto*), each with a Paw Note: the explanation shown before an approval. A long session is compacted in three
+stages, and every session is kept in a file of its own. A project's `DOGMIND.md` (or its `AGENTS.md` or `CLAUDE.md`) says how it
+wants to be worked on. What the model reads is kept as small as a local model needs it: the system prompt is in
+`crates/dogmind-agent/src/prompt.rs` and the tool schemas in `tools.rs`.
 
-Not yet: Toybox, plugins, general subagents and Dog Nose Work.
+For a long look, `explore` hands a question to a helper with a context of its own and only the looking tools, and only its
+answer joins the conversation. A file of more than 800 lines read with no place in it comes as its outline, a turn is told at
+each 96 KB of files it has read, and a long command output or search result is kept whole in `%TEMP%\dogmind-output` for a week,
+its report saying where. A command left running in the background shows, at each `command_status`, what it has printed since the
+last look: a dev server's ready line among it.
 
-What it has of its own for a long look, as Deepseek Harness keeps one out of the conversation: `explore` hands a question to a
-helper with a context of its own and only the looking tools, and only its answer joins the conversation. A file of more than 800
-lines read with no place in it comes as its outline, a turn is told at each 96 KB of files it has read, and a long command
-output or search result is kept whole in `%TEMP%\dogmind-output` for a week, its report saying where. A command left running in
-the background shows, at each `command_status`, what it has printed since the last look: a dev server's ready line among it.
-
-`execute_command` runs in an AppContainer, `DogmindApp.Exec`, as in Dogmind: a command can write only in the workspace, read
+`execute_command` runs in an AppContainer, `DogmindApp.Exec`: a command can write only in the workspace, read
 that, the per-user toolchains on PATH and what every app may read, and has no network unless it was approved for it, each
 time. What it starts ends with it. What cannot be contained does not run: there is no fallback, and a workspace that is a
 whole drive or holds your user folder cannot run commands at all (it still reads and edits, and says so when it starts).
@@ -107,24 +110,8 @@ AppContainers work by ACEs, so the first command in a workspace writes one on th
 folders, and these stay. To take them away: `icacls <folder> /remove <the profile's SID> /t`. The app's own file tools run
 outside the container and pass through the approvals instead.
 
-## Following the two projects
+## Straydog
 
-Both move on their own. They are kept at a distance so that following them is mostly reading:
-
-- The app shares no code with Straydog. It starts `straydog.exe`, runs `straydog setup`, reads the bundles from `fetch --help`,
-  and speaks HTTP: all of that is in `crates/dogmind-app/src/engine.rs`.
-- What the model reads is this app's own, as small as a local model needs it: the system prompt in `crates/dogmind-agent/src/prompt.rs`
-  and the tool schemas in `tools.rs`. They began as Dogmind's, and only its checkpoint prompt and Codex policy are still taken as they are.
-  `scripts/sync_dogmind.py` generates `assets/dogmind`, which is what Dogmind says now: `--check` says when that has changed, and a change
-  is read and ported by hand if it earns its tokens.
-- `UPSTREAM.toml` says which commits were followed; `python scripts/upstream.py` lists what changed since in the files that
-  matter, and `--mark` moves it after a port.
-
-```bat
-python scripts\upstream.py
-..\Dogmind\.venv\Scripts\python.exe scripts\sync_dogmind.py
-cargo test
-python scripts\upstream.py --mark
-```
-
-Vocabulary follows Dogmind's `AGENTS.md`: Paw Note is the explanation before an approval.
+The app shares no code with Straydog, which moves on its own. It starts `straydog.exe`, runs `straydog setup`, reads the bundles
+from `fetch --help`, and speaks HTTP: all of that is in `crates/dogmind-app/src/engine.rs`, so that following Straydog is mostly
+reading.
