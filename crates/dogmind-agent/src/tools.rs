@@ -749,7 +749,7 @@ impl Workbench {
                 let start: String = old.trim().chars().take(40).collect();
                 return Err(format!("edit {} of {} (`{start}`): old_string occurs {found} times in {given}, not {count}: nothing was changed. Read the exact text; do not include line numbers{hint}", number + 1, edits.len()));
             }
-            let changed = text.replace(&old, &new);
+            let changed = replace_with_the_line_end_there(text, &old, &new);
             if changed.is_empty() && !edit.get("allow_empty_file").and_then(Value::as_bool).unwrap_or(false) {
                 return Err(format!("edit {} would leave {given} empty: nothing was changed", number + 1));
             }
@@ -807,6 +807,31 @@ impl Workbench {
         }
         Ok(self.todos.iter().map(|item| format!("[{}] {}: {}", item["status"].as_str().unwrap_or("pending"), item["id"].as_str().unwrap_or(""), item["text"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"))
     }
+}
+
+/// `new` put in place of each `old` in `text`, its lines ending as the line it is put on ends. (A model writes its lines with LF: one line
+/// replaced by three, in a file of CRLF lines, left LF lines among them. A `\n` that has a CR before it already keeps just that one.)
+fn replace_with_the_line_end_there(text: &str, old: &str, new: &str) -> String {
+    let bare_lf = new.char_indices().any(|(at, c)| c == '\n' && !new[..at].ends_with('\r'));
+    if !bare_lf {
+        return text.replace(old, new);
+    }
+    let with_crlf = new.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut out = String::with_capacity(text.len() + new.len());
+    let mut from = 0;
+    for (at, found) in text.match_indices(old) {
+        out.push_str(&text[from..at]);
+        out.push_str(if line_ends_with_crlf(text, at) { &with_crlf } else { new });
+        from = at + found.len();
+    }
+    out.push_str(&text[from..]);
+    out
+}
+
+/// Whether the line `text` has at `at` ends with CRLF; a last line with no end takes the one before it.
+fn line_ends_with_crlf(text: &str, at: usize) -> bool {
+    let end = text[at..].find('\n').map(|found| at + found).or_else(|| text[..at].rfind('\n'));
+    end.is_some_and(|end| text[..end].ends_with('\r'))
 }
 
 /// Whether `content` begins as the file does: written again from its first line, not going on from its last.
@@ -2955,6 +2980,42 @@ mod tests {
         let crlf = json!({"edits": [{"path": "shop.py", "old_string": "last = 1\nend = 2", "new_string": "last = 3\nend = 4"}]});
         bench.run("apply_patch", &crlf, dir.path(), &cancel).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "def f(code):\n    if code.upper() == 'A':\n        return 1\n    return 0\n\nlast = 3\r\nend = 4\r\n");
+    }
+
+    /// Found by the app itself in use: one line replaced by three written with LF, in a file of CRLF lines, left the three with LF.
+    #[test]
+    fn one_line_replaced_by_three_takes_the_line_end_of_the_file() {
+        let (dir, mut bench, cancel) = bench();
+        let edit = json!({"edits": [{"path": "a.rs", "old_string": "const MAX_LINKS: usize = 20;", "new_string": "const MAX_LINKS: usize = 20;\nconst MAX_IMAGES: usize = 8;\nconst MAX_DEPTH: usize = 3;"}]});
+        std::fs::write(dir.path().join("a.rs"), "use x;\r\nconst MAX_LINKS: usize = 20;\r\nfn main() {}\r\n").unwrap();
+        bench.run("read_file", &json!({"path": "a.rs"}), dir.path(), &cancel).unwrap();
+        bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "use x;\r\nconst MAX_LINKS: usize = 20;\r\nconst MAX_IMAGES: usize = 8;\r\nconst MAX_DEPTH: usize = 3;\r\nfn main() {}\r\n");
+        // (in a file of LF lines, no CR at all)
+        std::fs::write(dir.path().join("a.rs"), "use x;\nconst MAX_LINKS: usize = 20;\nfn main() {}\n").unwrap();
+        bench.run("read_file", &json!({"path": "a.rs"}), dir.path(), &cancel).unwrap();
+        bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "use x;\nconst MAX_LINKS: usize = 20;\nconst MAX_IMAGES: usize = 8;\nconst MAX_DEPTH: usize = 3;\nfn main() {}\n");
+    }
+
+    /// In a file with both line ends, the line it replaces says which one: a one-line edit of the CRLF last line gets CRLF, the LF lines are not touched,
+    /// and a CR the new text already has is not doubled.
+    #[test]
+    fn a_line_replaced_by_more_takes_the_line_end_where_it_is() {
+        let (dir, mut bench, cancel) = bench();
+        let file = dir.path().join("shop.py");
+        std::fs::write(&file, "def f(code):\n    return 0\n\nlast = 1\r\nend = 2\r\n").unwrap();
+        bench.run("read_file", &json!({"path": "shop.py"}), dir.path(), &cancel).unwrap();
+        let crlf = json!({"edits": [{"path": "shop.py", "old_string": "end = 2", "new_string": "end = 2\nmore = 3\r\nmost = 4"}]});
+        bench.run("apply_patch", &crlf, dir.path(), &cancel).unwrap();
+        let lf = json!({"edits": [{"path": "shop.py", "old_string": "    return 0", "new_string": "    if code:\n        return 1\n    return 0"}]});
+        bench.run("apply_patch", &lf, dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "def f(code):\n    if code:\n        return 1\n    return 0\n\nlast = 1\r\nend = 2\r\nmore = 3\r\nmost = 4\r\n");
+        // (a last line with no end of its own takes the one before it)
+        std::fs::write(&file, "a\r\nb").unwrap();
+        bench.run("read_file", &json!({"path": "shop.py"}), dir.path(), &cancel).unwrap();
+        bench.run("apply_patch", &json!({"edits": [{"path": "shop.py", "old_string": "b", "new_string": "b\nc"}]}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\r\nb\r\nc");
     }
 
     #[test]
