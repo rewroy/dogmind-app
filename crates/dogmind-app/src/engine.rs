@@ -22,12 +22,13 @@ pub fn find(settings: &Settings) -> Option<PathBuf> {
     settings.straydog.clone().filter(|file| file.is_file()).or(beside.filter(|file| file.is_file())).or(on_path)
 }
 
-/// The bundles this app offers: the GSQ-RCO ones, by ISTA-DASLab, and Qwen3.8's (its `Qwen-UD-*` by Unsloth). `straydog` itself still has the
-/// others, for who wants them. Straydog does not say where a bundle comes from, so a new one appears here when a line says so;
-/// `crates/straydog-engine/src/assets*.json` there name each bundle's repository.
+/// The bundles this app offers: DeepSeek's GSQ-RCO ones, by ISTA-DASLab, and Qwen3.8's (its `UD-*` by Unsloth). `straydog` itself still has the
+/// others, for who wants them. A bundle is a model's: two models may have one of the same name (each has a `UD-IQ1_M`). Straydog does not say
+/// where a bundle comes from, so a new one appears here when a line says so; `crates/straydog-engine/src/assets*.json` there name each bundle's
+/// repository.
 fn origin(model: &str, quant: &str) -> Option<String> {
     match model {
-        "Qwen3.8-Flash-Next" if quant.starts_with("Qwen-UD-") => Some("by Qwen, quantized by Unsloth".to_string()),
+        "Qwen3.8-Flash-Next" if quant.starts_with("UD-") => Some("by Qwen, quantized by Unsloth".to_string()),
         "Qwen3.8-Flash-Next" => Some("by Qwen, quantized by ISTA-DASLab".to_string()),
         "DeepSeek-V4.1-Flash" if quant.starts_with("GSQ-RCO") => Some("by DeepSeek, quantized by ISTA-DASLab".to_string()),
         _ => None,
@@ -52,6 +53,8 @@ fn licence_of(model: &str) -> Option<ModelLicence> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogEntry {
+    /// Whose bundle `quant` is; `None` with it for Straydog's own choice.
+    pub model: Option<String>,
     /// `None`: Straydog picks the best for this PC.
     pub quant: Option<String>,
     pub name: String,
@@ -73,6 +76,12 @@ pub struct CatalogEntry {
 }
 
 impl CatalogEntry {
+    /// Whether this is the bundle set up: the model's name and its quantization. Settings an older setup wrote have no model name, and
+    /// its bundles' names were each one model's.
+    pub fn is(&self, model: Option<&str>, quant: &str) -> bool {
+        self.quant.as_deref() == Some(quant) && model.is_none_or(|model| self.model.as_deref() == Some(model))
+    }
+
     /// The line before a long download, as a link to the terms.
     pub fn licence_line(&self) -> Option<String> {
         self.licence.map(|licence| tf("This model's licence: {0}. Read its terms", &[&licence.name]))
@@ -131,7 +140,7 @@ pub struct Catalog {
 /// The bundles `straydog fetch --help` offers: `Model: QUANT (68.0 GB), QUANT (75.8 GB); Model: ...`. What it does not say
 /// is not offered, and Straydog's own choice always is.
 pub fn parse_catalog(help: &str) -> Vec<CatalogEntry> {
-    let mut entries = vec![CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, quant: None, name: t("The best for this PC").into(), origin: String::new(), detail: t("Straydog looks at this machine and chooses").into(), context: None, disk_bytes: None, licence: None, runs: true }];
+    let mut entries = vec![CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, model: None, quant: None, name: t("The best for this PC").into(), origin: String::new(), detail: t("Straydog looks at this machine and chooses").into(), context: None, disk_bytes: None, licence: None, runs: true }];
     for line in help.lines().filter(|line| line.contains(" GB)")) {
         let line = line.split(". ").next().unwrap_or(line);
         for part in line.split(';') {
@@ -145,7 +154,7 @@ pub fn parse_catalog(help: &str) -> Vec<CatalogEntry> {
                     continue;
                 }
                 if let Some(origin) = origin(model, quant) {
-                    entries.push(CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, quant: Some(quant.to_string()), name: format!("{model} {quant}"), origin, detail: size.to_string(), context: None, disk_bytes: None, licence: licence_of(model), runs: true });
+                    entries.push(CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, model: Some(model.to_string()), quant: Some(quant.to_string()), name: format!("{model} {quant}"), origin, detail: size.to_string(), context: None, disk_bytes: None, licence: licence_of(model), runs: true });
                 }
             }
         }
@@ -214,9 +223,6 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
         }
         let model = word(bundle, "model");
         let Some(origin) = origin(&model, &quant) else { continue };
-        // What a person reads: Straydog's `label`, which for Qwen3.8's `Qwen-UD-IQ1_M` is `UD-IQ1_M` (an older one has none). `quant` stays the
-        // key `setup --quant` is given back.
-        let label = Some(word(bundle, "label")).filter(|label| !label.is_empty()).unwrap_or_else(|| quant.clone());
         let runs = bundle.get("runs").and_then(Value::as_bool).unwrap_or(false);
         let short = if runs { None } else { memory_short(&word(bundle, "note")) };
         if let Some((needs, has)) = &short {
@@ -245,7 +251,7 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
             download_bytes: Some(download),
             vision_bytes: extra("vision"),
             drafter_bytes: extra("mtp"),
-            name: format!("{model} {label}"),
+            name: format!("{model} {quant}"),
             licence: licence_of(&model),
             origin,
             detail: if short.is_some() {
@@ -253,6 +259,7 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
             } else {
                 format!("{}{size}{}{how}", if recommended { t("Recommended for this PC  ·  ") } else { "" }, if how.is_empty() { "" } else { "  ·  " })
             },
+            model: Some(model),
             quant: Some(quant),
             context: bundle.get("context").and_then(Value::as_u64),
             disk_bytes,
@@ -389,7 +396,7 @@ pub fn engine_arguments(settings: &Settings, folder: &Path) -> Vec<String> {
 
 /// For a model that is there and has no vision file: setup does not fetch again what it has, and checks it. The drafter stays as the settings have it, for setup rewrites them; a DeepSeek drafter that is not there is not wanted here.
 pub fn vision_arguments(installed: &crate::vision::Installed, config: &Path) -> Vec<String> {
-    let mut args = setup_arguments(Some(&installed.quant), &installed.model, config, installed.drafter, true);
+    let mut args = setup_arguments(installed.model_name.as_deref(), Some(&installed.quant), &installed.model, config, installed.drafter, true);
     // (the model is there: without this its shards are all read again, for one small file)
     args.extend(["--no-dspark".to_string(), "--vision-only".to_string()]);
     args
@@ -403,9 +410,13 @@ pub fn setup_can_force(straydog: &Path) -> bool {
     command.output().is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("--force"))
 }
 
-pub fn setup_arguments(quant: Option<&str>, folder: &Path, config: &Path, drafter: bool, vision: bool) -> Vec<String> {
+/// `model` and `quant` name the bundle: a quantization is a model's. With no model (settings an older setup wrote), the quantization alone.
+pub fn setup_arguments(model: Option<&str>, quant: Option<&str>, folder: &Path, config: &Path, drafter: bool, vision: bool) -> Vec<String> {
     let mut args: Vec<String> = vec!["setup".into(), "--yes".into(), "--dir".into(), folder.display().to_string(), "--config".into(), config.display().to_string()];
     if let Some(quant) = quant {
+        if let Some(model) = model {
+            args.extend(["--model-name".to_string(), model.to_string()]);
+        }
         args.extend(["--quant".to_string(), quant.to_string()]);
     }
     if !drafter {
@@ -837,7 +848,7 @@ mod tests {
 
     #[test]
     fn a_vision_file_alone_keeps_the_rest_as_the_settings_have_it() {
-        let installed = crate::vision::Installed { model: PathBuf::from(r"D:\models\Qwen\IQ2_XS"), quant: "IQ2_XS".into(), drafter: true, named: None };
+        let installed = crate::vision::Installed { model: PathBuf::from(r"D:\models\Qwen\IQ2_XS"), model_name: None, quant: "IQ2_XS".into(), drafter: true, named: None };
         let args = vision_arguments(&installed, Path::new("C"));
         let joined = args.join(" ");
         assert!(joined.contains(r"--dir D:\models\Qwen\IQ2_XS"), "the bundle's own folder, which setup then does not put a level down: {joined}");
@@ -1040,33 +1051,31 @@ mod tests {
     }
 
     #[test]
-    fn qwens_unsloth_bundle_is_offered_and_says_who_made_it() {
-        // Straydog names Unsloth's UD-IQ1_M of Qwen3.8 `Qwen-UD-IQ1_M`, apart from DeepSeek's UD-IQ1_M, which this app does not offer
-        // and shows it as `UD-IQ1_M`, its `label`; an older Straydog without labels is shown its `quant`
+    fn a_bundle_is_its_models_and_two_models_may_name_one_alike() {
+        // Qwen3.8 and DeepSeek-V4.1 each have a UD-IQ1_M: Qwen's, by Unsloth, is offered; DeepSeek's is not, here
         let list = r#"{"bundles":[
-            {"model":"Qwen3.8-Flash-Next","quant":"Qwen-UD-IQ1_M","label":"UD-IQ1_M","download_bytes":68007094938,"runs":true,"recommended":true,"fit":"ram","extras":[{"name":"mtp","download_bytes":1},{"name":"vision","download_bytes":2}]},
+            {"model":"Qwen3.8-Flash-Next","quant":"UD-IQ1_M","download_bytes":68007094938,"runs":true,"recommended":true,"fit":"ram","extras":[{"name":"mtp","download_bytes":1},{"name":"vision","download_bytes":2}]},
             {"model":"Qwen3.8-Flash-Next","quant":"IQ2_XS","download_bytes":68000000000,"runs":true},
-            {"model":"DeepSeek-V4.1-Flash","quant":"UD-IQ1_M","label":"UD-IQ1_M","download_bytes":1,"runs":true}]}"#;
+            {"model":"DeepSeek-V4.1-Flash","quant":"UD-IQ1_M","download_bytes":1,"runs":true}]}"#;
         let entries = parse_list(list, true).unwrap().entries;
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["Qwen3.8-Flash-Next UD-IQ1_M", "Qwen3.8-Flash-Next IQ2_XS"]);
-        assert_eq!(entries[0].quant.as_deref(), Some("Qwen-UD-IQ1_M"), "the key, which setup is given back");
         assert_eq!(entries[0].origin, "by Qwen, quantized by Unsloth");
         assert_eq!(entries[1].origin, "by Qwen, quantized by ISTA-DASLab");
         assert_eq!(entries[0].licence.unwrap().name, "Qwen Community License 1.0", "a quantized file has its base model's terms");
         assert_eq!((entries[0].drafter_bytes, entries[0].vision_bytes), (Some(1), Some(2)), "it shares Qwen3.8's drafter and vision file");
-        assert_eq!(engine_args_quant(&entries[0]), ["--quant", "Qwen-UD-IQ1_M"]);
-        let help = parse_catalog("      --quant <NAME>  Qwen3.8-Flash-Next: Qwen-UD-IQ1_M (68.0 GB), IQ2_XS (68.0 GB); DeepSeek-V4.1-Flash: UD-IQ1_M (1.0 GB). x\n");
-        let quants: Vec<&str> = help.iter().filter_map(|entry| entry.quant.as_deref()).collect();
-        assert_eq!(quants, ["Qwen-UD-IQ1_M", "IQ2_XS"]);
+        // setup is told whose bundle it is
+        let args = setup_arguments(entries[0].model.as_deref(), entries[0].quant.as_deref(), Path::new("M"), Path::new("C"), true, true).join(" ");
+        assert!(args.contains("--model-name Qwen3.8-Flash-Next --quant UD-IQ1_M"), "{args}");
+        // the one set up is found by both its names; settings from an older setup have no model name, and their quantization alone
+        assert!(entries[0].is(Some("Qwen3.8-Flash-Next"), "UD-IQ1_M") && !entries[0].is(Some("DeepSeek-V4.1-Flash"), "UD-IQ1_M"));
+        assert!(entries[1].is(None, "IQ2_XS") && !entries[1].is(None, "UD-IQ1_M"));
+        let installed = crate::vision::Installed { model: PathBuf::from(r"D:\m\UD-IQ1_M"), model_name: Some("Qwen3.8-Flash-Next".into()), quant: "UD-IQ1_M".into(), drafter: true, named: None };
+        assert!(vision_arguments(&installed, Path::new("C")).join(" ").contains("--model-name Qwen3.8-Flash-Next --quant UD-IQ1_M"));
+        let help = parse_catalog("      --quant <NAME>  Qwen3.8-Flash-Next: UD-IQ1_M (68.0 GB), IQ2_XS (68.0 GB); DeepSeek-V4.1-Flash: UD-IQ1_M (1.0 GB). x\n");
+        let bundles: Vec<(Option<&str>, Option<&str>)> = help.iter().map(|entry| (entry.model.as_deref(), entry.quant.as_deref())).collect();
+        assert_eq!(bundles, [(None, None), (Some("Qwen3.8-Flash-Next"), Some("UD-IQ1_M")), (Some("Qwen3.8-Flash-Next"), Some("IQ2_XS"))]);
         assert_eq!(help[1].origin, "by Qwen, quantized by Unsloth");
-    }
-
-    /// What `setup` is told of the bundle chosen.
-    fn engine_args_quant(entry: &CatalogEntry) -> Vec<String> {
-        let args = setup_arguments(entry.quant.as_deref(), Path::new("M"), Path::new("C"), true, true);
-        let at = args.iter().position(|arg| arg == "--quant").unwrap();
-        args[at..at + 2].to_vec()
     }
 
     #[test]
@@ -1159,10 +1168,10 @@ mod tests {
 
     #[test]
     fn setup_asks_nothing_and_writes_this_apps_file() {
-        let args = setup_arguments(Some("IQ2_XS"), Path::new("M"), Path::new("C"), false, true);
+        let args = setup_arguments(None, Some("IQ2_XS"), Path::new("M"), Path::new("C"), false, true);
         assert_eq!(&args[..2], ["setup", "--yes"]);
-        assert!(args.contains(&"--no-mtp".to_string()) && args.contains(&"IQ2_XS".to_string()));
-        let chosen = setup_arguments(None, Path::new("M"), Path::new("C"), true, false);
+        assert!(args.contains(&"--no-mtp".to_string()) && args.contains(&"IQ2_XS".to_string()) && !args.contains(&"--model-name".to_string()));
+        let chosen = setup_arguments(None, None, Path::new("M"), Path::new("C"), true, false);
         assert!(chosen.contains(&"--no-vision".to_string()), "left out when asked");
         assert!(!chosen.contains(&"--no-mtp".to_string()) && !chosen.contains(&"--quant".to_string()));
         assert!(!chosen.contains(&"--vision-only".to_string()), "only for a model already there");
