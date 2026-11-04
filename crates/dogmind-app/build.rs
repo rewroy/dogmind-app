@@ -48,7 +48,7 @@ fn build_id() -> String {
     let built = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
     format!("{commit}{}, built at {built}", if changes { " with changes" } else { "" })
 }
-
+
 /// The version resource: what Explorer's Details, Task Manager and Installed apps call the program, and its version. Without it they
 /// call it by its file's name.
 fn version_resource(description: &str, internal: &str, original: &str) -> Vec<u8> {
@@ -109,6 +109,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=../dogmind-agent/src");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // (a commit moves the branch, not HEAD, which only names it: the build kept the commit before. HEAD's log has a line for each)
+    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../assets/app.ico");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
