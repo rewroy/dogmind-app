@@ -510,11 +510,16 @@ impl Gate {
                 if reaches_out(&cwd) {
                     return Verdict::Ask { risk: Risk::High, reason: Some(format!("this runs in a place off this PC: {}", cwd.display())) };
                 }
-                if self.is_look(command) && !wants_network(arguments) && within(workspace, &cwd) && !planted_here(command, &cwd) {
+                // (a reason is what keeps a rule, "always" and a mode from answering for it: what they were given leave to run is the program the line names, not a file here)
+                let planted = planted_here(command, &cwd);
+                if self.is_look(command) && !wants_network(arguments) && within(workspace, &cwd) && planted.is_none() {
                     return Verdict::Allow;
                 }
                 match self.command_risk(command, stated) {
-                    Ok(risk) => Verdict::Ask { risk, reason: wants_network(arguments).then(|| "this command gets the network".to_string()) },
+                    Ok(risk) => {
+                        let reasons: Vec<String> = planted.into_iter().chain(wants_network(arguments).then(|| "this command gets the network".to_string())).collect();
+                        Verdict::Ask { risk, reason: (!reasons.is_empty()).then(|| reasons.join("; ")) }
+                    }
                     Err(reason) => Verdict::Deny(reason),
                 }
             }
@@ -575,13 +580,31 @@ fn names_a_new_branch(command: &str) -> bool {
     !rest.iter().any(|word| LISTING.contains(word)) && rest.iter().any(|word| !word.starts_with('-'))
 }
 
-/// Whether a file in this folder is what the first word of this command would run: cmd looks in the folder a command runs in before PATH, so that a `git.cmd` the model wrote there is what
-/// `git status` starts.
-fn planted_here(command: &str, folder: &Path) -> bool {
+/// What to tell the person where a file in this folder is what a part of this command would run: cmd looks in the folder a command runs in before PATH, so that a `git.cmd` the model wrote there
+/// is what `git status` starts. Every part of the line is looked at, as `cd src & git status` starts git too, and a program that is named by its path is the one the line says.
+fn planted_here(command: &str, folder: &Path) -> Option<String> {
     const RUNS: [&str; 9] = ["", ".exe", ".com", ".bat", ".cmd", ".js", ".vbs", ".wsf", ".wsh"];
-    let Some(first) = command.split_whitespace().next() else { return false };
-    let name = first.strip_suffix(".exe").unwrap_or(first);
-    RUNS.iter().any(|extension| folder.join(format!("{name}{extension}")).is_file())
+    // (cmd drops its escape and the quotes before it looks for the program: `g^it` and `"git"` are `git`)
+    for part in command_parts(&command.replace('^', "")) {
+        let words = command_words(part);
+        let mut words = words.iter().map(|word| word.trim_start_matches('@')).filter(|word| !word.is_empty());
+        let Some(first) = words.next().map(|first| if first.eq_ignore_ascii_case("call") { words.next().unwrap_or("") } else { first }) else { continue };
+        if first.is_empty() || first.contains(['\\', '/', ':']) {
+            continue;
+        }
+        let lower = first.to_ascii_lowercase();
+        let name = lower.strip_suffix(".exe").unwrap_or(&lower);
+        if let Some(file) = RUNS.iter().map(|extension| format!("{name}{extension}")).find(|file| folder.join(file).is_file()) {
+            return Some(format!("`{first}` here is the file {file} in this folder, not the installed program"));
+        }
+    }
+    None
+}
+
+/// What to tell the person where this call of `execute_command` would run a file in its folder in place of a program on PATH, as [`planted_here`] says it.
+pub fn planted_program(arguments: &Value, workspace: &Path) -> Option<String> {
+    let command = arguments.get("command").and_then(Value::as_str)?;
+    planted_here(command, &resolve(workspace, arguments.get("cwd").and_then(Value::as_str).unwrap_or(".")))
 }
 
 /// Inside the workspace as it is spelled and where it really leads: a link inside it to somewhere else is somewhere else.
@@ -741,6 +764,47 @@ mod tests {
         assert_eq!(gate.check("execute_command", &json!({"command": "git status", "cwd": "sub"}), &work), Verdict::Allow);
         std::fs::write(work.join("node.exe"), "").unwrap();
         assert!(matches!(gate.check("execute_command", &json!({"command": "node.exe -v"}), &work), Verdict::Ask { .. }));
+    }
+
+    /// A file in the folder that stands in for the installed program is a reason to ask, for a look and for any other command, however the line spells the program.
+    #[test]
+    fn a_program_planted_in_the_folder_asks_with_a_reason_the_person_can_act_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        let gate = Gate::new();
+        let reason = |command: &str, cwd: &str| match gate.check("execute_command", &json!({"command": command, "cwd": cwd}), &work) {
+            Verdict::Ask { reason, .. } => reason,
+            other => panic!("{command}: {other:?}"),
+        };
+        let ask = |command: &str, cwd: &str| gate.check("execute_command", &json!({"command": command, "cwd": cwd}), &work);
+        assert_eq!(ask("git status", "."), Verdict::Allow);
+        assert_eq!(reason("cargo build", "."), None, "nothing there, nothing to say");
+        std::fs::write(work.join("git.cmd"), "@echo planted").unwrap();
+        std::fs::write(work.join("cargo.bat"), "@echo planted").unwrap();
+        std::fs::write(work.join("npm.exe"), "").unwrap();
+        let said = "`git` here is the file git.cmd in this folder, not the installed program";
+        assert_eq!(ask("git status", "."), Verdict::Ask { risk: Risk::Safe, reason: Some(said.to_string()) });
+        assert_eq!(reason("cargo build", ".").as_deref(), Some("`cargo` here is the file cargo.bat in this folder, not the installed program"));
+        assert_eq!(reason("npm test", ".").as_deref(), Some("`npm` here is the file npm.exe in this folder, not the installed program"));
+        // However the line spells it: in quotes, with cmd's escape, after `@` or `call`, or as the second part of a line.
+        for command in ["\"git\" status", "g^it status", "@git status", "call git status", "cd . && git status", "cd . & \"git\" log", "(cd .) & git diff", "echo x | git status", "GIT status", "git.exe status"] {
+            assert!(reason(command, ".").is_some_and(|reason| reason.contains("here is the file git.cmd")), "{command}");
+        }
+        // The folder the command runs in is the one that counts, and a program named by its path is the one the line says.
+        assert_eq!(ask("git status", "sub"), Verdict::Allow);
+        for command in [".\\git.cmd status", "C:\\Program Files\\Git\\cmd\\git.exe status", "\"C:\\Program Files\\Git\\cmd\\git.exe\" status", "./cargo build"] {
+            assert_eq!(reason(command, "."), None, "{command}");
+        }
+        // Along with the other reason a command may have, and not instead of it.
+        let both = match gate.check("execute_command", &json!({"command": "npm test", "network": true}), &work) {
+            Verdict::Ask { reason, .. } => reason.unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert!(both.contains("`npm` here is the file npm.exe") && both.ends_with("this command gets the network"), "{both}");
+        assert_eq!(planted_program(&json!({"command": "git status"}), &work).as_deref(), Some(said));
+        assert_eq!(planted_program(&json!({"command": "git status", "cwd": "sub"}), &work), None);
+        assert_eq!(planted_program(&json!({"path": "x"}), &work), None);
     }
 
     /// cmd's parting of a line into words: quotes join what is in them, and are not in the word.
