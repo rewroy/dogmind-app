@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::safety::{Gate, Risk};
+use crate::safety::{command_words, Gate, Risk};
 
 /// Programs whose second word can be any code at all: a rule for them would allow anything.
 const INTERPRETERS: &[&str] = &["python", "python3", "py", "node", "deno", "bun", "ruby", "perl", "php", "lua", "cmd", "powershell", "pwsh", "bash", "sh", "wsl", "npx", "uvx", "cscript", "wscript", "mshta", "rundll32", "regsvr32"];
@@ -54,8 +54,19 @@ fn family(tool: &str) -> Option<&'static str> {
     }
 }
 
-fn words(command: &str) -> String {
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
+/// A word as a rule keeps it: one that holds a space is quoted again, so that `del "a  b.txt"` is not `del "a b.txt"`, another file. The words of `"python" -c x` and `python -c x` are the same.
+fn written(word: &str) -> String {
+    if word.is_empty() || word.contains([' ', '\t']) { format!("\"{word}\"") } else { word.to_string() }
+}
+
+fn joined(words: &[String]) -> String {
+    words.iter().map(|word| written(word)).collect::<Vec<_>>().join(" ")
+}
+
+/// The program a command's first word names: its folder taken off, in lower case, and without the extension that cmd would add.
+fn program_of(first: &str) -> String {
+    let name = first.rsplit(['\\', '/']).next().unwrap_or(first).to_lowercase();
+    [".exe", ".cmd", ".bat", ".com"].iter().find_map(|extension| name.strip_suffix(extension)).unwrap_or(&name).to_string()
 }
 
 /// A second line, or cmd's escape, makes a command more than its first words say.
@@ -73,19 +84,17 @@ pub fn proposed(gate: &Gate, workspace: &Path, tool: &str, arguments: &Value, ri
     if !plain(gate, command) {
         return None;
     }
-    let all = words(command);
-    let mut parts = all.split(' ');
+    let all = command_words(command);
+    let mut parts = all.iter();
     let first = parts.next().filter(|first| !first.is_empty())?;
-    let program = first.rsplit(['\\', '/']).next().unwrap_or(first).to_lowercase();
-    let program = program.strip_suffix(".exe").unwrap_or(&program);
     // What deletes, moves or stops things, and what runs code it was handed, is allowed to the letter or not at all.
-    let exact = risk >= Risk::Medium || INTERPRETERS.contains(&program);
+    let exact = risk >= Risk::Medium || INTERPRETERS.contains(&program_of(first).as_str());
     let prefix = if exact {
-        all.clone()
+        joined(&all)
     } else {
         match parts.next().filter(|second| !second.starts_with(['-', '/'])) {
-            Some(second) => format!("{first} {second}"),
-            None => first.to_string(),
+            Some(second) => joined(&[first.clone(), second.clone()]),
+            None => joined(std::slice::from_ref(first)),
         }
     };
     Some(Rule { workspace: workspace.to_path_buf(), tool: COMMAND.to_string(), prefix, exact })
@@ -102,7 +111,7 @@ fn matches(rule: &Rule, gate: &Gate, workspace: &Path, tool: &str, arguments: &V
     if !plain(gate, command) {
         return false;
     }
-    let all = words(command);
+    let all = joined(&command_words(command));
     all == rule.prefix || (!rule.exact && all.starts_with(&format!("{} ", rule.prefix)))
 }
 
@@ -187,6 +196,52 @@ mod tests {
         let aside: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.starts_with("permissions.unreadable-")).collect();
         assert_eq!(aside.len(), 1, "{aside:?}");
         assert!(std::fs::read(dir.path().join(&aside[0])).unwrap().starts_with(b"[{\"workspace\""), "what was there is kept");
+    }
+
+    /// A quoted program is the program, a quoted path with spaces in it is one word, and spaces inside quotes are not taken for gaps.
+    #[test]
+    fn what_is_quoted_is_read_as_cmd_reads_it() {
+        let gate = Gate::new();
+        let root = Path::new("C:\\w");
+        for (text, prefix) in [
+            ("\"python\" -c \"import os\"", "python -c \"import os\""),
+            ("\"C:\\Program Files\\Python312\\python.exe\" -c x", "\"C:\\Program Files\\Python312\\python.exe\" -c x"),
+            ("\"PYTHON.EXE\" x.py", "PYTHON.EXE x.py"),
+            ("C:\\tools\\node.cmd x.js", "C:\\tools\\node.cmd x.js"),
+        ] {
+            let rule = proposed(&gate, root, COMMAND, &command(text), Risk::Low).unwrap();
+            assert!(rule.exact, "{text}");
+            assert_eq!(rule.prefix, prefix, "{text}");
+            assert!(matches(&rule, &gate, root, COMMAND, &command(text)), "{text}");
+            assert!(!matches(&rule, &gate, root, COMMAND, &command(&format!("{text} more"))), "{text}: to the letter");
+        }
+        let python = proposed(&gate, root, COMMAND, &command("\"python\" -c x"), Risk::Low).unwrap();
+        assert!(!matches(&python, &gate, root, COMMAND, &command("\"python\" -c \"import shutil\"")));
+        // A program in quotes is the program for a rule that is not to the letter as well.
+        let cargo = proposed(&gate, root, COMMAND, &command("\"cargo\" build"), Risk::Low).unwrap();
+        assert_eq!((cargo.prefix.as_str(), cargo.exact), ("cargo build", false));
+        assert!(matches(&cargo, &gate, root, COMMAND, &command("cargo build --release")));
+        assert!(!matches(&cargo, &gate, root, COMMAND, &command("cargo buildx")));
+        // A rule saved in the form this read quotes in before asks again, and allows no more than it did.
+        let old = Rule { workspace: root.to_path_buf(), tool: COMMAND.to_string(), prefix: "\"python\"".into(), exact: false };
+        for text in ["python -c x", "\"python\" -c x"] {
+            assert!(!matches(&old, &gate, root, COMMAND, &command(text)), "{text}");
+        }
+    }
+
+    #[test]
+    fn spaces_inside_quotes_are_kept_and_two_files_are_two_rules() {
+        let gate = Gate::new();
+        let root = Path::new("C:\\w");
+        let rule = proposed(&gate, root, COMMAND, &command("del \"a  b.txt\""), Risk::Medium).unwrap();
+        assert_eq!(rule.prefix, "del \"a  b.txt\"");
+        assert!(matches(&rule, &gate, root, COMMAND, &command("del   \"a  b.txt\"")), "the gaps between words are not words");
+        assert!(!matches(&rule, &gate, root, COMMAND, &command("del \"a b.txt\"")), "another file");
+        assert!(!matches(&rule, &gate, root, COMMAND, &command("del a b.txt")), "two files");
+        let two = proposed(&gate, root, COMMAND, &command("del a b.txt"), Risk::Medium).unwrap();
+        assert!(!matches(&two, &gate, root, COMMAND, &command("del \"a b.txt\"")));
+        assert_eq!(proposed(&gate, root, COMMAND, &command("del \"\""), Risk::Medium).unwrap().prefix, "del \"\"");
+        assert!(proposed(&gate, root, COMMAND, &command("\"\" x"), Risk::Low).is_none(), "no program, no rule");
     }
 
     #[test]
