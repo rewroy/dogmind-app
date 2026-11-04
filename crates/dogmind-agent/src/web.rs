@@ -384,17 +384,49 @@ fn target_of(url: &str, settings: &WebSettings) -> Result<Url, String> {
 }
 
 /// Where it will connect: every address the name gives is looked at, as one bad answer among good ones is the whole attack.
-fn pin(target: &Url, settings: &WebSettings) -> Result<Vec<SocketAddr>, String> {
-    let addresses: Vec<SocketAddr> = (target.host.as_str(), target.port).to_socket_addrs().map_err(|error| format!("{}: {error}", target.host))?.collect();
+fn pin(target: &Url, settings: &WebSettings, stop: &AtomicBool, until: Instant) -> Result<Vec<SocketAddr>, Failure> {
+    pin_with(target, settings, stop, until, |host, port| (host.as_str(), port).to_socket_addrs().map(Iterator::collect))
+}
+
+/// `pin`, with the lookup given (a test gives one that hangs).
+fn pin_with(target: &Url, settings: &WebSettings, stop: &AtomicBool, until: Instant, lookup: impl FnOnce(String, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static) -> Result<Vec<SocketAddr>, Failure> {
+    let addresses = look_up(target, stop, until, lookup)?;
     if !settings.allow_local {
         if let Some(bad) = addresses.iter().find(|address| blocked_address(address.ip())) {
-            return Err(format!("{} is at {}: this machine and its network are not read from the web tools", target.host, bad.ip()));
+            return Err(Failure::Connect(format!("{} is at {}: this machine and its network are not read from the web tools", target.host, bad.ip())));
         }
     }
     if addresses.is_empty() {
-        return Err(format!("{}: no address", target.host));
+        return Err(Failure::Connect(format!("{}: no address", target.host)));
     }
     Ok(addresses)
+}
+
+/// A name looked up on a thread of its own, and waited for with an ear for the stop and the time: a lookup that hangs (one can, for as long as the
+/// resolver likes) would otherwise hold both the person's Stop and the limit. When the wait ends first, the thread is left to finish by itself; it
+/// holds nothing but its own result, which no one reads then.
+fn look_up(target: &Url, stop: &AtomicBool, until: Instant, lookup: impl FnOnce(String, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static) -> Result<Vec<SocketAddr>, Failure> {
+    if stop.load(Ordering::Relaxed) {
+        return Err(Failure::Cancelled);
+    }
+    let (host, port) = (target.host.clone(), target.port);
+    let (send, receive) = std::sync::mpsc::channel();
+    let name = host.clone();
+    std::thread::Builder::new().spawn(move || {
+        let _ = send.send(lookup(name, port));
+    }).map_err(|error| Failure::Connect(format!("{host}: {error}")))?;
+    loop {
+        match receive.recv_timeout(Duration::from_millis(20)) {
+            Ok(answer) => return answer.map_err(|error| Failure::Connect(format!("{host}: {error}"))),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::Relaxed) || Instant::now() >= until {
+                    return Err(Failure::Cancelled);
+                }
+            }
+            // (the thread ended without an answer)
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(Failure::Connect(format!("{host}: the name lookup gave no answer"))),
+        }
+    }
 }
 
 fn get(url: &str, headers: &[(String, String)], settings: &WebSettings, cancel: &AtomicBool) -> Result<Answer, String> {
@@ -425,9 +457,11 @@ fn follow(url: &str, headers: &[(String, String)], settings: &WebSettings, stop:
     let mut current = url.trim().to_string();
     let mut all = vec![("User-Agent".to_string(), USER_AGENT.to_string()), ("Accept-Encoding".to_string(), "gzip".to_string())];
     all.extend_from_slice(headers);
+    // (the time `get` allows the whole of it, as far as a name lookup waits)
+    let until = Instant::now() + FETCH_LIMIT;
     for _ in 0..=MAX_REDIRECTS {
         let target = target_of(&current, settings).map_err(Failure::Connect)?;
-        let addresses = pin(&target, settings).map_err(Failure::Connect)?;
+        let addresses = pin(&target, settings, stop, until)?;
         let mut response = http::request_at(&addresses, "GET", &target, &all, None, CONNECT, stop)?;
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             if let Some(next) = response.header("location").and_then(|location| join_address(&current, location)) {
@@ -1033,7 +1067,7 @@ mod tests {
         }
         let settings = WebSettings::default();
         for url in ["http://127.0.0.1/", "http://localhost/", "http://2130706433/", "http://0x7f.0.0.1/", "http://127.1/"] {
-            let answer = target_of(url, &settings).and_then(|target| pin(&target, &settings));
+            let answer = target_of(url, &settings).and_then(|target| pinned(&target, &settings));
             assert!(answer.is_err(), "{url}: {answer:?}");
         }
         for url in ["ftp://example.com/", "file:///c:/a", "http://user:pw@example.com/", "https://[::1]/", "https://example.com:8443/", "https://exa mple.com/", "javascript:alert(1)"] {
@@ -1051,6 +1085,68 @@ mod tests {
         for ip in ["2002:0808:0808::1", "2002:0101:0101::", "::8.8.8.8", "2001:4860:4860::8888"] {
             assert!(!blocked_address(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    /// `pin` as most tests want it: no stop, and all the time there is.
+    fn pinned(target: &Url, settings: &WebSettings) -> Result<Vec<SocketAddr>, String> {
+        pin(target, settings, &AtomicBool::new(false), Instant::now() + FETCH_LIMIT).map_err(|failure| failure.to_string())
+    }
+
+    /// A name lookup that hangs holds neither the person's Stop nor the time limit: the wait for it ends with either, at once, and the lookup is left to end by itself.
+    #[test]
+    fn a_name_lookup_that_hangs_holds_neither_a_stop_nor_the_time_limit() {
+        let settings = WebSettings::default();
+        let target = target_of("http://hangs.example/", &settings).unwrap();
+        let hangs = |_: String, _: u16| {
+            std::thread::sleep(Duration::from_secs(20));
+            Ok(Vec::new())
+        };
+        let stop = AtomicBool::new(false);
+        let began = Instant::now();
+        let answer = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                stop.store(true, Ordering::Relaxed);
+            });
+            pin_with(&target, &settings, &stop, Instant::now() + Duration::from_secs(60), hangs)
+        });
+        assert!(matches!(answer, Err(Failure::Cancelled)), "a stop set during the wait: {answer:?}");
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        let began = Instant::now();
+        let answer = pin_with(&target, &settings, &AtomicBool::new(false), Instant::now() + Duration::from_millis(150), hangs);
+        assert!(matches!(answer, Err(Failure::Cancelled)), "the time up: {answer:?}");
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        // (a stop set before it begins starts no lookup)
+        let looked = std::sync::Arc::new(AtomicBool::new(false));
+        let seen = looked.clone();
+        let answer = pin_with(&target, &settings, &AtomicBool::new(true), Instant::now() + FETCH_LIMIT, move |_, _| {
+            seen.store(true, Ordering::Relaxed);
+            Ok(Vec::new())
+        });
+        assert!(matches!(answer, Err(Failure::Cancelled)), "{answer:?}");
+        assert!(!looked.load(Ordering::Relaxed));
+    }
+
+    /// What a lookup gives is looked at as before: a public address is let through, a local one refused, and a lookup that fails is said with the name.
+    #[test]
+    fn a_name_lookup_on_its_own_thread_gives_the_same_answers() {
+        let settings = WebSettings::default();
+        let target = target_of("http://gives.example/", &settings).unwrap();
+        let (stop, until) = (AtomicBool::new(false), Instant::now() + FETCH_LIMIT);
+        let public: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        assert_eq!(pin_with(&target, &settings, &stop, until, move |_, _| Ok(vec![public])).unwrap(), [public]);
+        let local: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let refused = pin_with(&target, &settings, &stop, until, move |_, _| Ok(vec![public, local])).unwrap_err().to_string();
+        assert!(refused.contains("gives.example is at 127.0.0.1"), "{refused}");
+        let failed = pin_with(&target, &settings, &stop, until, |_, _| Err(std::io::Error::other("no such host"))).unwrap_err().to_string();
+        assert_eq!(failed, "gives.example: no such host");
+        let (host, port) = std::sync::mpsc::channel();
+        pin_with(&target, &settings, &stop, until, move |name, number| {
+            host.send((name, number)).unwrap();
+            Ok(vec![public])
+        }).unwrap();
+        assert_eq!(port.recv().unwrap(), ("gives.example".to_string(), 80));
+        assert!(pin_with(&target, &settings, &stop, until, |_, _| Ok(Vec::new())).unwrap_err().to_string().contains("no address"));
     }
 
     fn serve(pages: Vec<&'static str>) -> String {
@@ -1123,11 +1219,11 @@ mod tests {
         // Only the first hop is let through, as a public site would be.
         let target = target_of(&base, &WebSettings { allow_local: true, ..WebSettings::default() }).unwrap();
         let cancel = AtomicBool::new(false);
-        let mut response = http::request_at(&pin(&target, &WebSettings { allow_local: true, ..WebSettings::default() }).unwrap(), "GET", &target, &[], None, CONNECT, &cancel).unwrap();
+        let mut response = http::request_at(&pinned(&target, &WebSettings { allow_local: true, ..WebSettings::default() }).unwrap(), "GET", &target, &[], None, CONNECT, &cancel).unwrap();
         let next = join_address(&base, response.header("location").unwrap()).unwrap();
         let _ = response.next();
         let settings = WebSettings::default();
-        assert!(target_of(&next, &settings).and_then(|target| pin(&target, &settings)).is_err());
+        assert!(target_of(&next, &settings).and_then(|target| pinned(&target, &settings)).is_err());
     }
 
     #[test]
