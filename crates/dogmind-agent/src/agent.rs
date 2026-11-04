@@ -379,9 +379,30 @@ fn always_key(tool: &str, arguments: &Value) -> String {
     }
 }
 
-/// Counts this response's calls against those since the last edit, marks in `repeated` those that have come round too often,
-/// and returns the highest count. Asking how a job is doing is meant to be repeated.
-fn note_repeats(calls: &[crate::message::ToolCall], repeats: &mut HashMap<String, u32>, repeated: &mut HashSet<String>) -> u32 {
+/// What a call that reads a file also depends on, beyond its arguments: the file as it is now, by its size and when it was last written. The same call after the file was rewritten, by whoever
+/// did it, is not the same call: its answer is not the one it had. Empty for a call that reads no file, and for one whose arguments do not say which.
+fn file_stamp(call: &crate::message::ToolCall, workspace: &Path) -> String {
+    if call.function.name != "read_file" {
+        return String::new();
+    }
+    let Some(path) = serde_json::from_str::<Value>(&call.function.arguments).ok().and_then(|arguments| arguments.get("path").and_then(Value::as_str).map(str::to_string)) else { return String::new() };
+    match std::fs::metadata(resolve(workspace, &path)) {
+        Ok(data) => {
+            let written = data.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |since| since.as_nanos());
+            format!("{} bytes, written {written}", data.len())
+        }
+        Err(_) => "absent".to_string(),
+    }
+}
+
+/// Whether this call's result says that a command wrote in the workspace: a command's own, or a background job's end as `command_status` tells it. A file that reads the same words says nothing.
+fn command_wrote(tool: &str, result: &Result<String, String>) -> bool {
+    matches!(tool, "execute_command" | "command_status") && result.as_ref().is_ok_and(|output| output.contains(tools::CHANGED_BY_COMMAND))
+}
+
+/// Counts this response's calls against those since the last edit (or since a command that wrote files in the workspace), marks in `repeated` those that have come round too often,
+/// and returns the highest count. Asking how a job is doing is meant to be repeated. A read of a file counts only against reads of it as it is now.
+fn note_repeats(calls: &[crate::message::ToolCall], workspace: &Path, repeats: &mut HashMap<String, u32>, repeated: &mut HashSet<String>) -> u32 {
     let mut most = 0;
     for call in calls {
         let name = call.function.name.as_str();
@@ -389,8 +410,7 @@ fn note_repeats(calls: &[crate::message::ToolCall], repeats: &mut HashMap<String
         if matches!(name, "command_status" | "todo") {
             continue;
         }
-        let times = repeats.entry(format!("{name}
-{}", call.function.arguments)).or_insert(0);
+        let times = repeats.entry(format!("{name}\n{}\n{}", call.function.arguments, file_stamp(call, workspace))).or_insert(0);
         *times += 1;
         most = most.max(*times);
         if *times >= REPEATS_NOTED {
@@ -801,6 +821,8 @@ struct Agent {
     counted: usize,
     /// An edit has gone through since this was last looked at.
     edited: bool,
+    /// A command, or a background job looked at, has reported files it created, changed or deleted in the workspace since this was last looked at.
+    changed_by_commands: bool,
     /// When the person's message came: what has changed since is this turn's own work.
     turn_began: std::time::SystemTime,
     /// The web was turned on during this conversation: its next message brings the rules its system prompt does not have.
@@ -957,6 +979,7 @@ impl Agent {
             used: 0,
             counted: 0,
             edited: false,
+            changed_by_commands: false,
             turn_began: std::time::SystemTime::now(),
             web_rules_due: false,
             events,
@@ -1766,12 +1789,16 @@ impl Agent {
             if has_calls && completion.finish != "length" {
                 cut_off = 0;
                 let calls = one_shape_for_edits(&completion.tool_calls);
-                let most = note_repeats(&calls, &mut repeats, &mut self.repeated);
+                let most = note_repeats(&calls, &self.workspace, &mut repeats, &mut self.repeated);
                 let failures = self.run_tools(&calls);
                 failed_calls = if failures == calls.len() { failed_calls + failures } else { 0 };
                 let edited = std::mem::take(&mut self.edited);
-                if edited {
+                // What a command wrote counts as an edit for the calls that look: what they would answer now is not what they did. (Not for what the model wrote: the draft watch is for that.)
+                let changed = std::mem::take(&mut self.changed_by_commands);
+                if edited || changed {
                     repeats.clear();
+                }
+                if edited {
                     wrote = true;
                 }
                 if self.cancelled() {
@@ -1780,7 +1807,7 @@ impl Agent {
                 if failed_calls >= MAX_FAILED_CALLS {
                     return Ended::Failed(format!("{failed_calls} tool calls in a row failed: stopped so that you can look"));
                 }
-                if most >= REPEATS_STOPPED && !edited {
+                if most >= REPEATS_STOPPED && !edited && !changed {
                     return Ended::Failed(format!("the model made the same call {most} times with nothing edited in between: stopped so that you can look"));
                 }
                 unchecked = still_unchecked(unchecked, &calls);
@@ -2063,6 +2090,12 @@ impl Agent {
         }
         if matches!(name, "create_file" | "apply_patch") && result.is_ok() {
             self.edited = true;
+        }
+        // A command (or a job's end, as `command_status` tells it) that wrote in the workspace is no call whose answer will not change, and the calls after it in this response are not
+        // "with nothing edited in between" either.
+        if command_wrote(name, &result) {
+            self.changed_by_commands = true;
+            self.repeated.clear();
         }
         // (a command that ran and failed is a failure too: a model can spend an hour on those with nothing being wrong with a call)
         let failed = usize::from(result.as_ref().map_or(true, |output| name == "execute_command" && command_failed(output)));
@@ -4129,12 +4162,12 @@ mod tests {
         let call = |id: &str, name: &str, arguments: &str| crate::message::ToolCall { id: id.into(), kind: "function".into(), function: crate::message::FunctionCall { name: name.into(), arguments: arguments.into() } };
         let (mut repeats, mut repeated) = (HashMap::new(), HashSet::new());
         for (id, expected) in [("a", 1), ("b", 2), ("c", 3)] {
-            assert_eq!(note_repeats(&[call(id, "read_file", "{}")], &mut repeats, &mut repeated), expected);
+            assert_eq!(note_repeats(&[call(id, "read_file", "{}")], Path::new("."), &mut repeats, &mut repeated), expected);
         }
         assert!(repeated.contains("b") && !repeated.contains("a"), "a slow model is told at the second");
-        assert_eq!(note_repeats(&[call("e", "apply_patch", "{}")], &mut repeats, &mut repeated), 1, "an edit is counted too, until one goes through");
+        assert_eq!(note_repeats(&[call("e", "apply_patch", "{}")], Path::new("."), &mut repeats, &mut repeated), 1, "an edit is counted too, until one goes through");
         for id in ["g", "h", "i", "j"] {
-            assert_eq!(note_repeats(&[call(id, "command_status", "{}")], &mut repeats, &mut repeated), 0);
+            assert_eq!(note_repeats(&[call(id, "command_status", "{}")], Path::new("."), &mut repeats, &mut repeated), 0);
         }
     }
 
@@ -4580,6 +4613,73 @@ mod tests {
         let (failed, _) = turn_said(&run);
         assert!(failed[0].contains("the same call"), "{failed:?}");
         assert_eq!(provider.requests(), REPEATS_STOPPED as usize);
+    }
+
+    /// What each tool call came back with, in order, from a turn's log.
+    fn tool_results(log: &[String]) -> Vec<&str> {
+        log.iter().filter_map(|line| line.strip_prefix("tool:")).collect()
+    }
+
+    const REPEAT_WORDS: &str = "has run before with nothing edited in between";
+
+    /// A command that writes the file the model then reads, and again the same command and the same read: the second read is of a file that is not what the first was, and it is not told
+    /// that its answer will not change. (The incident: a chart drawn, read, drawn again, read again.)
+    #[test]
+    fn a_read_of_a_file_a_command_rewrote_is_no_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = || calls(&[("execute_command", serde_json::json!({"command": "echo %TIME% %RANDOM%> out.txt"}))]);
+        let read = || calls(&[("read_file", serde_json::json!({"path": "out.txt"}))]);
+        let (run, _) = scripted(dir.path(), vec![write(), read(), write(), read(), says("done")], Mode::Auto);
+        run.handle.commands.send(Command::Send("draw it".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        let results = tool_results(&log);
+        assert_eq!(results.len(), 4, "{log:?}");
+        assert!(results[2].contains(tools::CHANGED_BY_COMMAND), "the second command says what it wrote, which is what the app goes by: {}", results[2]);
+        assert!(results.iter().all(|result| !result.contains(REPEAT_WORDS)), "{results:?}");
+        assert!(of_kind(&trajectory_of(&run), "intervention").iter().all(|line| line["kind"] != "repeat_note"), "and the trajectory has none");
+    }
+
+    /// Two reads of a file with nothing between them: the note, as before. A file written between them by anyone else is another file.
+    #[test]
+    fn the_same_read_is_noted_but_not_of_a_file_that_was_written_since() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+        let read = || calls(&[("read_file", serde_json::json!({"path": "a.txt"}))]);
+        let path = dir.path().join("a.txt");
+        let rewrites: Step = Box::new(move |_: &AtomicBool| {
+            std::fs::write(&path, "now there is more in it").unwrap();
+            Ok(llm::Completion { tool_calls: vec![crate::message::ToolCall { id: "c0".into(), kind: "function".into(), function: crate::message::FunctionCall { name: "read_file".into(), arguments: serde_json::json!({"path": "a.txt"}).to_string() } }], finish: "tool_calls".into(), ..llm::Completion::default() })
+        });
+        let (run, _) = scripted(dir.path(), vec![read(), read(), rewrites, read(), says("done")], Mode::Default);
+        run.handle.commands.send(Command::Send("look".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        let results = tool_results(&log);
+        assert_eq!(results.len(), 4, "{log:?}");
+        assert!(!results[0].contains(REPEAT_WORDS) && results[1].contains(REPEAT_WORDS), "read and read again, with nothing in between: {results:?}");
+        assert!(!results[2].contains(REPEAT_WORDS) && results[2].contains("now there is more in it"), "the file was written since: {results:?}");
+        assert!(results[3].contains(REPEAT_WORDS), "and read again as it is now: {results:?}");
+    }
+
+    /// The same command again with nothing written is the loop that is stopped, as it was.
+    #[test]
+    fn the_same_command_with_nothing_written_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, provider) = scripted(dir.path(), (0..40).map(|_| calls(&[("execute_command", serde_json::json!({"command": "echo same"}))])).collect(), Mode::Auto);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert!(log.iter().any(|line| line.starts_with("failed:") && line.contains("the same call")), "{log:?}");
+        assert_eq!(provider.requests(), REPEATS_STOPPED as usize);
+        assert!(tool_results(&log)[1].contains(REPEAT_WORDS), "told at the second");
+    }
+
+    /// A background job's end, as `command_status` tells it, counts as a write when it lists files; a file that happens to say the same words does not.
+    #[test]
+    fn what_a_command_or_a_jobs_end_lists_as_written_counts_and_nothing_else_does() {
+        let lists = format!("job1 has ended: make\n{}- changed report.png (12 bytes)\nstdout:\nok\n", tools::CHANGED_BY_COMMAND);
+        assert!(command_wrote("command_status", &Ok(lists.clone())) && command_wrote("execute_command", &Ok(lists.clone())));
+        assert!(!command_wrote("command_status", &Ok("job1 is running, for 4 s: make\nit has printed nothing yet".into())));
+        assert!(!command_wrote("execute_command", &Err("not run".into())));
+        assert!(!command_wrote("read_file", &Ok(lists)), "a file that says it is not a command");
     }
 
     #[test]
