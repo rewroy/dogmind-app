@@ -523,6 +523,9 @@ impl Gate {
                 }
                 match self.command_risk(command, stated) {
                     Ok(risk) => {
+                        // (what is safe is safe by the name of a program the list knows, and a file here that answers to the name runs the project's code instead. Safe and low are what the setting for safe
+                        // commands lets through, so this is more than low: it asks)
+                        let risk = if risk == Risk::Safe && !answered.is_empty() { Risk::Medium } else { risk };
                         let reasons: Vec<String> = planted.into_iter().chain(wants_network(arguments).then(|| "this command gets the network".to_string())).collect();
                         Verdict::Ask { risk, reason: (!reasons.is_empty()).then(|| reasons.join("; ")) }
                     }
@@ -863,7 +866,7 @@ mod tests {
         std::fs::write(work.join("cargo.bat"), "@echo planted").unwrap();
         std::fs::write(work.join("npm.exe"), "").unwrap();
         let said = "`git` here is the file git.cmd in this folder, not the installed program";
-        assert_eq!(ask("git status", "."), Verdict::Ask { risk: Risk::Safe, reason: Some(said.to_string()) });
+        assert_eq!(ask("git status", "."), Verdict::Ask { risk: Risk::Medium, reason: Some(said.to_string()) });
         assert_eq!(reason("cargo build", ".").as_deref(), Some("`cargo` here is the file cargo.bat in this folder, not the installed program"));
         assert_eq!(reason("npm test", ".").as_deref(), Some("`npm` here is the file npm.exe in this folder, not the installed program"), "of any extension that runs, for the installed one of another");
         // However the line spells it: in quotes, with cmd's escape, after `@` or `call`, or as the second part of a line.
@@ -928,20 +931,48 @@ mod tests {
         // `rg` is not installed, and the repository holds `rg.cmd`: what was a look asks, as any command does, with no reason to give.
         assert_eq!(ask("rg --version"), Verdict::Allow);
         std::fs::write(work.join("rg.cmd"), "@echo hi").unwrap();
-        assert_eq!(ask("rg --version"), Verdict::Ask { risk: Risk::Safe, reason: None });
-        assert_eq!(ask("rg pattern"), Verdict::Ask { risk: Risk::Safe, reason: None });
+        assert_eq!(ask("rg --version"), Verdict::Ask { risk: Risk::Medium, reason: None });
+        assert_eq!(ask("rg pattern"), Verdict::Ask { risk: Risk::Medium, reason: None });
         // `git status` with `git.cmd` there asks, installed or not; installed, it is the file taking its place, and the person is told.
         assert_eq!(ask("git status"), Verdict::Allow);
         std::fs::write(work.join("git.cmd"), "@echo hi").unwrap();
-        assert_eq!(ask("git status"), Verdict::Ask { risk: Risk::Safe, reason: None });
+        assert_eq!(ask("git status"), Verdict::Ask { risk: Risk::Medium, reason: None });
         assert_eq!(gate.planted_program(&json!({"command": "git status"}), &work), None, "nothing is taken the place of, so nothing to tell");
         let mut installed_git = Gate::new();
         installed_git.path = Some(vec![installed(dir.path(), &["tool.exe", "git.exe"])]);
         let said = "`git` here is the file git.cmd in this folder, not the installed program";
-        assert_eq!(installed_git.check("execute_command", &json!({"command": "git status"}), &work), Verdict::Ask { risk: Risk::Safe, reason: Some(said.to_string()) });
+        assert_eq!(installed_git.check("execute_command", &json!({"command": "git status"}), &work), Verdict::Ask { risk: Risk::Medium, reason: Some(said.to_string()) });
         // A look in another folder is a look still.
         std::fs::create_dir_all(work.join("sub")).unwrap();
         assert_eq!(gate.check("execute_command", &json!({"command": "git status", "cwd": "sub"}), &work), Verdict::Allow);
+    }
+
+    /// What the list calls safe is safe by the name of a program it knows. With a file in the folder that answers to the name it is the project's code that runs, and more than safe: safe and low are what the
+    /// setting for safe commands lets through, so such a call is medium, and asks. A higher risk stays, and a command the list does not know stays low, as `make` is.
+    #[test]
+    fn a_file_in_the_folder_that_answers_to_a_safe_program_makes_the_call_more_than_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut gate = Gate::new();
+        gate.path = Some(vec![installed(dir.path(), &["tool.exe"])]);
+        let ask = |command: &str| gate.check("execute_command", &json!({"command": command}), &work);
+        let safe = ["rg pattern", "rg --version", "cargo test", "pytest -q", "git log", "findstr x a.txt"];
+        for command in safe {
+            assert!(matches!(ask(command), Verdict::Allow | Verdict::Ask { risk: Risk::Safe, reason: None }), "{command}: as it was");
+        }
+        assert!(delegated(Mode::Default, "execute_command", Risk::Safe, None, true) && delegated(Mode::Default, "execute_command", Risk::Low, None, true), "safe and low are let through with the setting");
+        for file in ["rg.cmd", "cargo.bat", "pytest.exe", "git.cmd", "findstr.cmd", "make.cmd"] {
+            std::fs::write(work.join(file), "@echo hi").unwrap();
+        }
+        for command in safe {
+            assert_eq!(ask(command), Verdict::Ask { risk: Risk::Medium, reason: None }, "{command}");
+        }
+        let Verdict::Ask { risk, reason } = ask("rg pattern") else { panic!() };
+        assert!(!delegated(Mode::Default, "execute_command", risk, reason.as_deref(), true), "so the setting does not let it through");
+        assert_eq!(ask("make"), Verdict::Ask { risk: Risk::Low, reason: None });
+        assert!(matches!(ask("git push"), Verdict::Ask { risk: Risk::Medium, .. }));
+        assert!(matches!(ask("git reset --hard"), Verdict::Ask { risk: Risk::High, .. }));
     }
 
     /// What cmd runs itself is never replaced by a file in the folder: `dir.cmd` there does not make `dir` ask.
