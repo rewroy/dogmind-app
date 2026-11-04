@@ -1584,6 +1584,38 @@ mod tests {
         assert_eq!(names_in(folder.path()), Vec::<String>::new());
     }
 
+    /// A download from a server of the test's that closes its end at once, tried until something is heard of it. On this machine a connection that its server closes at once is now and then
+    /// lost whole: no byte, no close and no reset ever reach the client (plain sockets, with nothing of this code, 3 of 600), and a client waits for a silent server as long as it waits for
+    /// any, which is not what is tried here. So an attempt has a few seconds to hear something, ended as Stop ends a download (the watch ends at once when the attempt is over, on a channel),
+    /// and one that heard nothing is made again on a server of its own; three of them in a row is a client that is not answered. `start` makes the server and what it published.
+    fn fetched_from_one_that_closes(what: &str, start: impl Fn() -> (Server, Setup)) -> (Server, tempfile::TempDir, Result<Ready, Failed>) {
+        let mut lost = 0;
+        loop {
+            let (server, setup) = start();
+            let folder = tempfile::tempdir().unwrap();
+            let stop = AtomicBool::new(false);
+            let (over, watching) = mpsc::channel::<()>();
+            let result = std::thread::scope(|scope| {
+                let cancel = &stop;
+                scope.spawn(move || {
+                    if watching.recv_timeout(Duration::from_secs(5)) == Err(RecvTimeoutError::Timeout) {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                });
+                let result = obtain_from("0.2.0", &setup, folder.path(), Some(&server.as_url()), &mut |_, _| {}, &stop);
+                let _ = over.send(());
+                result
+            });
+            match result {
+                Err(Failed::Cancelled) => {
+                    lost += 1;
+                    assert!(lost < 3, "{what}: nothing came, three times");
+                }
+                result => return (server, folder, result),
+            }
+        }
+    }
+
     /// What GitHub's storage, a proxy or a small server of someone's may be: it answers HTTP/1.0, or HTTP/1.1 with `Connection: close`, and closes its end the moment it has answered. The first
     /// connection for each address is closed at once, which on Windows can reset it with the answer unread; the app asks again, and what it asks for is followed and checked all the same.
     #[test]
@@ -1591,29 +1623,37 @@ mod tests {
         let bytes = file_bytes(60_000, 12);
         for (version, closing) in [("1.0", ""), ("1.1", "Connection: close\r\n")] {
             for round in 0..20 {
-                let server = Server::start(|port| {
-                    let redirect = format!("HTTP/{version} 302 Found\r\n{closing}Location: http://127.0.0.1:{port}/storage/DogmindSetup-0.2.0.exe\r\nContent-Length: 0\r\n\r\n");
-                    let mut file = format!("HTTP/{version} 200 OK\r\n{closing}Content-Length: {}\r\n\r\n", bytes.len()).into_bytes();
-                    file.extend_from_slice(&bytes);
-                    vec![(SETUP_PATH.to_string(), Answer::Closes(redirect.into_bytes())), ("/storage/DogmindSetup-0.2.0.exe".to_string(), Answer::ClosesAfter(file, 20))]
+                let what = format!("HTTP/{version} {closing:?}, round {round}");
+                let (server, folder, result) = fetched_from_one_that_closes(&what, || {
+                    let server = Server::start(|port| {
+                        let redirect = format!("HTTP/{version} 302 Found\r\n{closing}Location: http://127.0.0.1:{port}/storage/DogmindSetup-0.2.0.exe\r\nContent-Length: 0\r\n\r\n");
+                        let mut file = format!("HTTP/{version} 200 OK\r\n{closing}Content-Length: {}\r\n\r\n", bytes.len()).into_bytes();
+                        file.extend_from_slice(&bytes);
+                        vec![(SETUP_PATH.to_string(), Answer::Closes(redirect.into_bytes())), ("/storage/DogmindSetup-0.2.0.exe".to_string(), Answer::ClosesAfter(file, 20))]
+                    });
+                    let setup = setup_at(&server, SETUP_PATH, &bytes);
+                    (server, setup)
                 });
-                let folder = tempfile::tempdir().unwrap();
-                let ready = fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_or_else(|failed| panic!("HTTP/{version} {closing:?}, round {round}: {failed:?}"));
+                let ready = result.unwrap_or_else(|failed| panic!("{what}: {failed:?}"));
                 assert_eq!(std::fs::read(&ready.path).unwrap(), bytes);
                 assert!(ready.is_sound());
                 let asked = server.requests();
                 assert!(asked.iter().any(|line| line.contains(SETUP_PATH)) && asked.iter().any(|line| line.contains("/storage/")), "{asked:?}");
+                drop(folder);
             }
         }
         // and what comes is still checked: the bytes of another file, under the right address and size, are refused
-        let server = Server::start(|port| {
-            let redirect = format!("HTTP/1.0 302 Found\r\nLocation: http://127.0.0.1:{port}/storage/DogmindSetup-0.2.0.exe\r\nContent-Length: 0\r\n\r\n");
-            let mut file = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len()).into_bytes();
-            file.extend_from_slice(&file_bytes(bytes.len(), 13));
-            vec![(SETUP_PATH.to_string(), Answer::Closes(redirect.into_bytes())), ("/storage/DogmindSetup-0.2.0.exe".to_string(), Answer::ClosesAfter(file, 20))]
+        let (_server, folder, result) = fetched_from_one_that_closes("the bytes of another file", || {
+            let server = Server::start(|port| {
+                let redirect = format!("HTTP/1.0 302 Found\r\nLocation: http://127.0.0.1:{port}/storage/DogmindSetup-0.2.0.exe\r\nContent-Length: 0\r\n\r\n");
+                let mut file = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len()).into_bytes();
+                file.extend_from_slice(&file_bytes(bytes.len(), 13));
+                vec![(SETUP_PATH.to_string(), Answer::Closes(redirect.into_bytes())), ("/storage/DogmindSetup-0.2.0.exe".to_string(), Answer::ClosesAfter(file, 20))]
+            });
+            let setup = setup_at(&server, SETUP_PATH, &bytes);
+            (server, setup)
         });
-        let folder = tempfile::tempdir().unwrap();
-        assert_eq!(fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).err(), Some(Failed::DidNotMatch));
+        assert_eq!(result.err(), Some(Failed::DidNotMatch));
         assert_eq!(names_in(folder.path()), Vec::<String>::new());
     }
 
