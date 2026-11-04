@@ -1,6 +1,13 @@
-# Dogmind
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img src="assets/logo.png" alt="Dogmind" width="160">
+  </picture>
+</p>
 
-[日本語](README.ja.md)
+<h1 align="center">Dogmind</h1>
+
+<p align="center"><a href="README.ja.md">日本語</a></p>
 
 Dogmind is an AI agent on your own Windows PC, as a native application: it reads and changes the files of a folder you choose,
 and runs commands there, asking you first. Its engine is [Straydog](https://github.com/rewroy/Straydog), a separate program
