@@ -78,7 +78,10 @@ fn file_url(path: &Path) -> String {
     out
 }
 
-/// What a model's steps are run with, in the page: Playwright's way of saying them, done with the page's own DOM. A browser that stays open
+/// What a model's steps are run with, in the page: Playwright's way of saying them, done with the page's own DOM. The helpers `click`, `fill`, `press`, `check`, `select`, `wait`, `text`,
+/// `count` and `visible` are the names here; what models write of Playwright itself (`page.evaluate(fn)`, `evaluate(fn)`, `page.click(sel)`, `page.fill(sel, v)`, `page.press(sel, key)`,
+/// `page.waitForTimeout(ms)`, `page.locator(sel).click()`, `page.$eval`, `page.$$eval`) is mapped onto them, a few forms and no more, and any other name is the error it is, with the
+/// helpers there are in it. A browser that stays open
 /// to be driven cannot run in the sandbox (node there cannot make the pipes Playwright speaks over, and a headless Edge that is kept open falls
 /// over within a second, where one that loads a page and ends does not), so the steps go in the page and run in the one load that is read.
 const STEPS_PRELUDE: &str = r#"<script>
@@ -102,6 +105,17 @@ const STEPS_PRELUDE: &str = r#"<script>
   const text = (selector) => find(selector).textContent.trim();
   const count = (selector) => document.querySelectorAll(selector).length;
   const visible = (selector) => { const found = document.querySelector(selector); if (!found) return false; const box = found.getBoundingClientRect(); return box.width > 0 && box.height > 0 && getComputedStyle(found).visibility !== 'hidden'; };
+  // (what a model writes of Playwright, on the helpers above; `evaluate` runs the function in this page itself, as the steps are, and gives what it gives)
+  const evaluate = async (fn, ...args) => { const made = typeof fn === 'string' ? (0, eval)(fn) : fn; return typeof made === 'function' ? made(...args) : made; };
+  const locator = (selector) => ({ click: () => click(selector), fill: (value) => fill(selector, value), press: (key) => press(selector, key), check: () => check(selector), textContent: async () => find(selector).textContent, isVisible: async () => visible(selector), count: async () => count(selector) });
+  const page = {
+    evaluate, locator,
+    click: (selector) => click(selector), fill: (selector, value) => fill(selector, value), press: (selector, key) => press(selector, key), check: (selector) => check(selector), selectOption: (selector, value) => select(selector, value),
+    waitForTimeout: (ms) => wait(ms),
+    textContent: async (selector) => find(selector).textContent, isVisible: async (selector) => visible(selector),
+    $eval: (selector, fn, ...args) => evaluate(fn, find(selector), ...args),
+    $$eval: (selector, fn, ...args) => evaluate(fn, [...document.querySelectorAll(selector)], ...args),
+  };
   await new Promise((done) => document.readyState === 'complete' ? done() : addEventListener('load', done));
   try {
     await (async () => {
@@ -110,7 +124,9 @@ const STEPS_END: &str = r#"
     })();
     console.log('DOGMIND-STEPS-DONE');
   } catch (error) {
-    console.error('DOGMIND-STEPS-FAILED: ' + error.message);
+    // (a name that is not here: the ones that are, once, as the model has no other place to read them)
+    const hint = error instanceof ReferenceError || /is not a function/.test(String(error && error.message)) ? ' (here: click, fill, press, check, select, wait, text, count, visible, evaluate, and page.click/fill/press/check/selectOption/waitForTimeout/textContent/isVisible/evaluate/$eval/$$eval/locator(sel); the rest is plain JavaScript in the page)' : '';
+    console.error('DOGMIND-STEPS-FAILED: ' + error.message + hint);
   }
 })();
 </script>"#;
@@ -1064,6 +1080,35 @@ mod tests {
         assert_eq!(based.matches("<base").count(), 1, "a page's own base stays");
     }
 
+    #[test]
+    fn what_models_write_of_playwright_is_mapped_onto_the_helpers_and_the_rest_says_what_there_is() {
+        let page = with_steps("<body><p>x</p></body>", "file:///C:/w/", "await page.evaluate(() => 1)");
+        // each form, as a name the steps can use
+        for form in [
+            "const evaluate = async (fn, ...args)",
+            "evaluate, locator,",
+            "click: (selector) => click(selector)",
+            "fill: (selector, value) => fill(selector, value)",
+            "press: (selector, key) => press(selector, key)",
+            "waitForTimeout: (ms) => wait(ms)",
+            "locator = (selector) => ({ click: () => click(selector)",
+            "$eval: (selector, fn, ...args) => evaluate(fn, find(selector), ...args)",
+            "$$eval: (selector, fn, ...args) => evaluate(fn, [...document.querySelectorAll(selector)], ...args)",
+            "textContent: async (selector) => find(selector).textContent",
+            "isVisible: async (selector) => visible(selector)",
+        ] {
+            assert!(page.contains(form), "{form}");
+        }
+        // the page and the helpers are made before the steps, which can then use them, and the steps' own words are after
+        assert!(page.find("const page = {").unwrap() < page.find("await page.evaluate(() => 1)").unwrap());
+        // a name that is not here is said with the ones that are
+        let hint = STEPS_END;
+        for helper in ["click", "fill", "press", "check", "select", "wait", "text", "count", "visible", "evaluate", "waitForTimeout", "locator(sel)", "$eval", "$$eval"] {
+            assert!(hint.contains(helper), "{helper}");
+        }
+        assert!(hint.contains("ReferenceError") && hint.contains("is not a function"));
+    }
+
     /// With the real browser, in the real sandbox: the steps type and click as a person would, and the page is read after them.
     #[test]
     #[ignore = "starts Edge in the sandbox"]
@@ -1094,6 +1139,44 @@ mod tests {
         let steps = "await fill('#t', 'a'); await press('#t', 'Enter'); await fill('#t', 'b'); await press('Enter'); await fill('#t', 'c'); await press('Enter', '#t'); console.log('items ' + count('li'));";
         let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps}), dir.path(), &AtomicBool::new(false)).unwrap();
         assert!(said.contains("Steps: all ran") && said.contains("items 3"), "{said}");
+    }
+
+    /// With the real browser, in the real sandbox: the Playwright forms a real model wrote (`page.evaluate`, `evaluate`, `page.click`, `page.fill`, `page.press`,
+    /// `page.waitForTimeout`, `page.locator(..).click()`, `page.$eval`) run, and a name that is not here fails saying which are.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn playwrights_forms_run_as_the_helpers_do() {
+        let (dir, _) = page(&[(
+            "index.html",
+            "<!DOCTYPE html><title>todo</title><form id=f><input id=t><button id=add type=button>add</button></form><input type=checkbox id=c><select id=s><option value=a>a<option value=b>b</select><ul id=l></ul><script>document.getElementById('add').onclick=()=>{const li=document.createElement('li');li.textContent=document.getElementById('t').value;document.getElementById('l').append(li)};document.getElementById('f').onsubmit=(e)=>{e.preventDefault();document.getElementById('add').click()};</script>",
+        )]);
+        let steps = r#"
+            await page.fill('#t', 'milk');
+            await page.click('#add');
+            console.log('r1 ' + await page.evaluate(() => document.querySelectorAll('li').length));
+            console.log('r2 ' + await evaluate((a, b) => a + b, 2, 3));
+            console.log('r3 ' + await page.evaluate('document.title'));
+            console.log('r4 ' + await page.$eval('li', (el, tail) => el.textContent + tail, '!'));
+            console.log('r5 ' + await page.$$eval('li', (els) => els.map((el) => el.textContent).join(',')));
+            console.log('r6 ' + await page.textContent('li') + ' ' + await page.isVisible('li') + ' ' + await page.isVisible('#nope'));
+            await page.waitForTimeout(100);
+            await page.locator('#t').fill('eggs');
+            await page.locator('#add').click();
+            await page.press('#t', 'Enter');
+            console.log('r7 ' + await page.locator('li').count() + ' ' + await page.locator('li').textContent() + ' ' + await page.locator('li').isVisible());
+            await page.check('#c');
+            await page.selectOption('#s', 'b');
+            console.log('r8 ' + document.getElementById('c').checked + ' ' + document.getElementById('s').value + ' ' + await evaluate(async () => 'async'));
+        "#;
+        let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps, "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        for wanted in ["Steps: all ran", "r1 1", "r2 5", "r3 todo", "r4 milk!", "r5 milk", "r6 milk true false", "r7 3 milk true", "r8 true b async"] {
+            assert!(said.contains(wanted), "{wanted}: {said}");
+        }
+        for (steps, wanted) in [("await page.goto('x')", "page.goto is not a function (here: click, fill, press, check, select, wait, text, count, visible, evaluate"), ("await foo(1)", "foo is not defined (here: click, fill")] {
+            let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps}), dir.path(), &AtomicBool::new(false)).unwrap();
+            assert!(said.contains(&format!("STEPS FAILED: {wanted}")), "{wanted}: {said}");
+        }
     }
 
     /// What a batch of plain checks came to: the checks that said NOT CHECKED, the pictures not taken, and the browser's own runs behind them
