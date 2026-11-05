@@ -333,6 +333,26 @@ fn served_address(url: &str) -> Result<String, String> {
 const TRIES: usize = 10;
 /// No new try after this long in all: runs that crash late, or hang, would otherwise go on for minutes.
 const MOST_TRYING: Duration = Duration::from_secs(45);
+/// What a normal run of the browser takes, with some to spare for a slow start: a run took 2 to 3 s here (1.9 s for the page's DOM, 2.6 s for a picture), so this is about three times that.
+/// The page's own wait is added to it (`run_limit`).
+const RUN_BASE: Duration = Duration::from_secs(8);
+
+/// How long one run of the browser may take, from the wait it was given: a run that has not ended by then has hung (the GPU process of the browser waits for a registration of its crash handler
+/// in the container, and nothing ends it), and it is ended early, to be tried once more, and not left for the whole of [`LIMIT`]. Never more than that.
+fn run_limit(wait: u64) -> Duration {
+    (RUN_BASE + Duration::from_millis(wait)).min(LIMIT)
+}
+
+/// Whether a run that did not give what was wanted is tried again, when it hung: once. A hang is the browser's and not the page's when the page's other run went well (a picture) or when it
+/// printed nothing at all (a page's own console would have been heard), and the browser that hangs once does not hang the next time, as far as 60 runs here say.
+fn tries_again_after_a_hang(hangs: usize) -> bool {
+    hangs <= 1
+}
+
+/// Whether a run was ended by the time it was given, and not by itself.
+fn hung(done: &crate::sandbox::Output) -> bool {
+    done.status.is_none() && done.ended == "timed out"
+}
 /// How the browser's runs went, for the test that measures it: the page's runs and those that did not end well, the pictures' and those that left none.
 #[cfg(test)]
 static BROWSER_RUNS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -934,12 +954,15 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
     let mut ended_as = EndOfRun::Stopped;
+    let mut hangs = 0;
+    // (a page with steps may take as long as its steps do; one without has a limit of its own, and a run that hangs is ended early)
+    let limit = if steps.is_some() { LIMIT } else { run_limit(wait) };
     let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
     for _ in 0..TRIES {
         let started = std::time::Instant::now();
         let profile = profiles.next();
         let line = page_line(&program, &browser_flags, wait, &profile, &address);
-        let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel)?;
+        let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel)?;
         (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
         #[cfg(debug_assertions)]
         if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
@@ -951,7 +974,11 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         note_browser_run("page", how.clone(), started);
         #[cfg(test)]
         note_run(false, !finished);
-        if finished || cancel.load(Ordering::Relaxed) || started.elapsed() > LIMIT / 2 || trying.elapsed() > MOST_TRYING || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension") {
+        // (a run that hung and printed nothing, not so much as a console line of the page's, is the browser's: it is tried once more)
+        let silent_hang = hung(&done) && !err.contains("INFO:CONSOLE");
+        hangs += usize::from(silent_hang);
+        let again = silent_hang && tries_again_after_a_hang(hangs);
+        if finished || cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING || (!again && (started.elapsed() > LIMIT / 2 || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension"))) {
             break;
         }
     }
@@ -1026,7 +1053,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         }
         // (a window larger than the frame by what the browser takes of it, and at least its least width)
         let (window_width, window_height) = (view.width.max(600) + 64, view.height + 160);
-        let (mut taken, mut said_there) = (false, Vec::new());
+        let (mut taken, mut said_there, mut picture_hangs) = (false, Vec::new(), 0);
         let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
         for _ in 0..TRIES {
             if cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING {
@@ -1036,7 +1063,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             let started = std::time::Instant::now();
             let profile = profiles.next();
             let line = shot_line(&program, &browser_flags, (window_width, window_height), wait, &profile, &shot, &plain(&frame));
-            let done = crate::sandbox::run_browser(&line, &cwd, workspace, LIMIT, cancel);
+            let done = crate::sandbox::run_browser(&line, &cwd, workspace, run_limit(wait), cancel);
             note_browser_run("picture", done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32))), started);
             #[cfg(debug_assertions)]
             if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
@@ -1055,8 +1082,10 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
                     break;
                 }
             }
-            // (a sandbox that could not run it, or a run that hung and was ended, will not do better the next time)
-            if done.is_err() || started.elapsed() > LIMIT / 2 {
+            // (a sandbox that could not run it will not do better the next time; a run that hung is the browser's, as the page's own run went well, and is tried once more)
+            let hung_now = done.as_ref().is_ok_and(hung);
+            picture_hangs += usize::from(hung_now);
+            if done.is_err() || (hung_now && !tries_again_after_a_hang(picture_hangs)) || (!hung_now && started.elapsed() > LIMIT / 2) {
                 break;
             }
         }
@@ -1476,6 +1505,21 @@ mod tests {
         assert!(said.contains("How it looks at desktop"), "{said}");
     }
 
+    /// A run has a limit of its own from the wait it was given, a hang is tried once more and no more, and only a run that was ended by its time is a hang.
+    #[test]
+    fn a_run_that_hangs_is_ended_early_and_tried_once_more() {
+        assert_eq!(run_limit(WAIT_MS), Duration::from_millis(9500), "about 10 s at the usual wait: three or four times a run");
+        assert!(run_limit(0) < run_limit(WAIT_MS) && run_limit(WAIT_MS) < run_limit(5_000), "it follows the wait");
+        assert_eq!(run_limit(MOST_WAIT_MS), Duration::from_secs(18), "at the longest wait a page may ask for");
+        assert_eq!(run_limit(60_000), LIMIT, "and never more than the longest a run may take");
+        assert!(tries_again_after_a_hang(1), "the first hang is tried again");
+        assert!(!tries_again_after_a_hang(2), "and the second is not: the page's own bound is MOST_TRYING, and a browser that hangs twice will not do better");
+        let ended = |status: Option<i32>, ended: &'static str| crate::sandbox::Output { status, ended, ..crate::sandbox::Output::default() };
+        assert!(hung(&ended(None, "timed out")));
+        assert!(!hung(&ended(None, "cancelled")), "a Stop of the person's is not a hang");
+        assert!(!hung(&ended(Some(0), "")) && !hung(&ended(Some(0xC000_0005u32 as i32), "")));
+    }
+
     /// What the run gives tells the cases apart: ended well with the page, ended well with nothing (the page did not load), crashed, stopped.
     #[test]
     fn a_page_that_did_not_load_is_told_from_a_browser_that_crashed_or_was_stopped() {
@@ -1861,6 +1905,7 @@ mod tests {
         std::fs::write(&frame, frame_page(&file_url(&index), &View { label: "desktop".into(), width: 1280, height: 800 })).unwrap();
         let mut profiles = Profiles::new(dir.path(), dir.path());
         let (mut ends, mut bad, mut seconds) = (std::collections::BTreeMap::<String, usize>::new(), 0usize, 0f64);
+        let (mut hung_first, mut saved) = (0usize, 0usize);
         for at in 0..runs {
             let _ = std::fs::remove_file(&shot);
             let profile = profiles.next();
@@ -1870,7 +1915,16 @@ mod tests {
                 _ => page_line(&program, &flags, wait, &profile, &index.display().to_string()),
             };
             let started = std::time::Instant::now();
-            let done = crate::sandbox::run_browser(&line, dir.path(), dir.path(), LIMIT, &AtomicBool::new(false));
+            // (as the check runs it, when asked to with DOGMIND_PROBE_LIKE_THE_CHECK: with the limit its wait gives, and a run that hung tried once more)
+            let like_the_check = std::env::var_os("DOGMIND_PROBE_LIKE_THE_CHECK").is_some();
+            let limit = if like_the_check { run_limit(if mode == "steps" { 2 * wait } else { wait }) } else { LIMIT };
+            let mut done = crate::sandbox::run_browser(&line, dir.path(), dir.path(), limit, &AtomicBool::new(false));
+            if like_the_check && done.as_ref().is_ok_and(hung) {
+                hung_first += 1;
+                let again = crate::sandbox::run_browser(&line, dir.path(), dir.path(), limit, &AtomicBool::new(false));
+                saved += usize::from(again.as_ref().is_ok_and(|again| again.status == Some(0)));
+                done = again;
+            }
             seconds += started.elapsed().as_secs_f64();
             let (end, well) = match &done {
                 Ok(done) => {
@@ -1889,7 +1943,7 @@ mod tests {
             }
         }
         profiles.clear();
-        println!("PROBE mode={mode} runs={runs} bad={bad} ends={ends:?} seconds_each={:.2} flags={flags}", seconds / runs.max(1) as f64);
+        println!("PROBE mode={mode} runs={runs} bad={bad} hung_first={hung_first} saved_by_a_second_try={saved} ends={ends:?} seconds_each={:.2} flags={flags}", seconds / runs.max(1) as f64);
     }
 
     /// What a batch of plain checks came to: the checks that said NOT CHECKED, the pictures not taken, and the browser's own runs behind them
