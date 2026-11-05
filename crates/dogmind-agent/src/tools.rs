@@ -1386,6 +1386,11 @@ impl FileChange {
         FileChange::counted(path.to_string(), diff)
     }
 
+    /// A file that changed, and of which no text is shown: it is binary, or too large to be read for it.
+    pub fn without_diff(path: &str) -> FileChange {
+        FileChange { path: path.to_string(), added: 0, removed: 0, diff: String::new() }
+    }
+
     fn counted(path: String, diff: String) -> FileChange {
         let changed = |mark: char, header: &str| diff.lines().filter(|line| line.starts_with(mark) && !line.starts_with(header)).count();
         FileChange { added: changed('+', "+++"), removed: changed('-', "---"), path, diff }

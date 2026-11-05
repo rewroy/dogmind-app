@@ -19,7 +19,7 @@ const MOST_FILES: usize = 20_000;
 const MOST_COPIED: u64 = 256 * 1024;
 const MOST_KEPT: u64 = 32 << 20;
 /// What is read to compare it with what was there.
-const MOST_READ: u64 = 64 << 20;
+pub(crate) const MOST_READ: u64 = 64 << 20;
 const MOST_SHOWN_OF_A_FILE: usize = 6000;
 /// Files shown in full in an answer: past these, a line each.
 const MOST_SHOWN: usize = 100;
@@ -196,7 +196,8 @@ impl Baseline {
         let edited = std::cell::OnceCell::new();
         let edited_diff = |name: &str| -> Option<String> {
             let changes = edited.get_or_init(|| crate::checkpoint::Checkpoints::open(&self.session).session_changes(workspace));
-            changes.iter().find(|change| change.path.replace('\\', "/") == name).map(|change| change.diff.clone())
+            // (a change with no diff is one of a binary or of a file too large to read: nothing is shown of it, as of any other)
+            changes.iter().find(|change| change.path.replace('\\', "/") == name).map(|change| change.diff.clone()).filter(|diff| !diff.is_empty())
         };
         for name in names.iter().filter(|name| wanted(name)) {
             let path = workspace.join(name);
