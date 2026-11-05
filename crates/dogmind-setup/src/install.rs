@@ -369,7 +369,7 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     let folder = job.folder;
     let entries = package.entries.clone();
     // A folder of the install that has been made a link leads out of it: a file written there, moved aside there and deleted there would be another place's. Nothing is written before this is known.
-    if let Some(link) = entries.iter().find_map(|entry| link_on_the_way(folder, &entry.path)) {
+    if let Some(link) = first_link(folder, entries.iter().map(|entry| entry.path.as_str()), &mut is_a_link) {
         return Err(Failure::Said(format!("{}: this folder of the install is a link to somewhere else, so nothing has been changed. Install in another folder, or take the link away.", link.display())));
     }
     std::fs::create_dir_all(folder).map_err(|error| say(folder, &error))?;
@@ -696,21 +696,39 @@ fn aside_of(target: &Path, stamp: u64) -> PathBuf {
     (stamp..).map(|time| target.with_file_name(format!("{stem}.previous-{time}{extension}"))).find(|path| std::fs::symlink_metadata(path).is_err()).unwrap_or_default()
 }
 
-/// The first folder on the way to this file from the folder that is a link (a symbolic link, or a junction, which Rust takes for one). What it leads to is not in the folder, whatever the path
-/// says, and is not this program's to write in or take.
-fn link_on_the_way(folder: &Path, file: &str) -> Option<PathBuf> {
-    let mut place = folder.to_path_buf();
-    let mut parts = file.split('\\').peekable();
-    while let Some(part) = parts.next() {
-        if parts.peek().is_none() {
-            return None;
+/// Whether this place is a link (a symbolic link, or a junction, which Rust takes for one).
+fn is_a_link(place: &Path) -> bool {
+    std::fs::symlink_metadata(place).is_ok_and(|what| what.file_type().is_symlink())
+}
+
+/// The first folder on the way to any of these files from the folder that is a link, in the order of the files. What a link leads to is not in the folder, whatever the path says, and is not this
+/// program's to write in or take. Each folder is looked at once, by `is_link`: one found not to be a link is kept, and a file whose deepest folder is kept has none above it to look at; the first
+/// link found ends it. (A package has thousands of files in a thousand folders.)
+fn first_link<'a>(folder: &Path, files: impl Iterator<Item = &'a str>, is_link: &mut dyn FnMut(&Path) -> bool) -> Option<PathBuf> {
+    let mut clear: HashSet<&str> = HashSet::new();
+    for file in files {
+        let Some(deepest) = file.rfind('\\') else { continue };
+        if clear.contains(&file[..deepest]) {
+            continue;
         }
-        place.push(part);
-        if std::fs::symlink_metadata(&place).is_ok_and(|what| what.file_type().is_symlink()) {
-            return Some(place);
+        for (at, _) in file.match_indices('\\') {
+            let above = &file[..at];
+            if clear.contains(above) {
+                continue;
+            }
+            let place = folder.join(above);
+            if is_link(&place) {
+                return Some(place);
+            }
+            clear.insert(above);
         }
     }
     None
+}
+
+/// The first folder on the way to this file from the folder that is a link.
+fn link_on_the_way(folder: &Path, file: &str) -> Option<PathBuf> {
+    first_link(folder, std::iter::once(file), &mut is_a_link)
 }
 
 /// Whether the way to this file from the folder goes through a link.
@@ -1834,5 +1852,24 @@ mod tests {
         let mut third = scene.package("3.0.0", &[("a", &changed), ("b", &b), ("c", &same_size)]);
         assert!(scene.run(&mut third, Some(ROOM_TO_SPARE), None).is_ok());
         assert_eq!(std::fs::read(folder.join("a")).unwrap(), changed, "the changed file is unpacked all the same");
+    }
+
+    #[test]
+    fn the_check_for_links_looks_at_each_folder_once_and_stops_at_the_first_link() {
+        let files = ["a.exe", "tools\\x.py", "tools\\python\\python.exe", "tools\\python\\lib\\a.py", "tools\\python\\lib\\b.py", "tools\\python\\DLLs\\c.pyd", "fonts\\f.ttf", "fonts\\g.ttf", "docs\\deep\\er\\r.txt"];
+        let root = Path::new("C:\\not\\a\\folder");
+        let mut looked: Vec<PathBuf> = Vec::new();
+        assert_eq!(first_link(root, files.iter().copied(), &mut |place| { looked.push(place.to_path_buf()); false }), None);
+        let mut once = looked.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!((looked.len(), once.len()), (8, 8), "tools, tools\\python, its lib and DLLs, fonts, docs, docs\\deep, docs\\deep\\er, each once: {looked:?}");
+        // a link ends it, and nothing after it is looked at
+        looked.clear();
+        let link = root.join("tools\\python");
+        assert_eq!(first_link(root, files.iter().copied(), &mut |place| { looked.push(place.to_path_buf()); place == link }), Some(link.clone()));
+        assert_eq!(looked, [root.join("tools"), link]);
+        // a file at the top of the folder has no folder to look at
+        assert_eq!(first_link(root, ["a.exe"].into_iter(), &mut |_| panic!("looked")), None);
     }
 }
