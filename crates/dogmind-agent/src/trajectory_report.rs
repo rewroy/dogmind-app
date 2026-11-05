@@ -223,6 +223,13 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
             completion.or(line.u("tokens_est")).map_or("-".to_string(), |tokens| tokens.to_string()), rate, line.s("end"), if calls.is_empty() { String::new() } else { format!(" [{}]", calls.join(", ")) },
             match line.v["retry_of"].as_str() { Some(of) => format!("  (repeats {} after {}, {})", short(of), secs(line.u("wait_ms").unwrap_or(0)), line.s("retry_why")), None => String::new() });
         if let Some(server) = line.v.get("server").filter(|server| server.is_object()) {
+            // The app's first word minus the server's own time to its first token is a wait before the server began: the request was behind another's.
+            if let (Some(first_ms), Some(ttft)) = (first.map(|first| first as f64), server.get("ttft_seconds").and_then(Value::as_f64)) {
+                let queued = (first_ms - ttft * 1000.0) / 1000.0;
+                if queued >= 1.0 {
+                    let _ = writeln!(out, "        queued at the server: {queued:.1} s (the app's first word came after {:.1} s, the server's own first token {ttft:.2} s after it began)", first_ms / 1000.0);
+                }
+            }
             let pick = |key: &str| server.get(key).and_then(Value::as_f64).map(|value| format!("{key} {value:.2}"));
             let said: Vec<String> = ["prefill_seconds", "ttft_seconds", "request_seconds", "decode_tokens_per_second"].iter().filter_map(|key| pick(key)).chain(server.get("resumed_from").and_then(Value::as_str).map(|from| format!("resumed_from {from}"))).collect();
             if !said.is_empty() {
@@ -265,6 +272,12 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         if let Some(wait) = line.u("wait_ms") {
             more.push(format!("{} waiting for the person", secs(wait)));
         }
+        // (a command's time apart from the program's: what the app does before it starts and after it ends)
+        if let Some(prepare) = line.u("prepare_ms") {
+            let part = |key: &str, name: &str| line.u(key).filter(|ms| *ms > 0).map(|ms| format!("{name} {}", secs(ms)));
+            let parts: Vec<String> = [part("grant_ms", "grants"), part("repos_ms", "repositories"), part("toolchains_ms", "toolchains"), part("env_ms", "environment")].into_iter().flatten().collect();
+            more.push(format!("prepared in {}{}, ran {}, looked after in {}", secs(prepare), if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) }, secs(line.u("run_ms").unwrap_or(0)), secs(line.u("after_ms").unwrap_or(0))));
+        }
         if let Some(runs) = line.v["browser_runs"].as_array() {
             let ended: Vec<String> = runs.iter().map(|run| format!("{} {} in {}", run["of"].as_str().unwrap_or("?"), run["end"].as_str().unwrap_or("?"), secs(run["ms"].as_u64().unwrap_or(0)))).collect();
             more.push(format!("{} browser runs: {}", runs.len(), ended.join("; ")));
@@ -281,7 +294,8 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         let line = &lines[at];
         let next = lines[at + 1..].iter().find(|later| later.ev() == "request" && later.s("role") == "main");
         if line.ev() == "compaction" {
-            let _ = writeln!(out, "  compaction ({}): {} tokens to {} in {}", line.s("stage"), line.u("before_tokens").unwrap_or(0), line.u("after_tokens").unwrap_or(0), secs(line.u("ms").unwrap_or(0)));
+            let window = line.u("window").map_or(String::new(), |window| format!(", of a window of {window}"));
+            let _ = writeln!(out, "  compaction ({}): {} tokens to {} in {}{window}", line.s("stage"), line.u("before_tokens").unwrap_or(0), line.u("after_tokens").unwrap_or(0), secs(line.u("ms").unwrap_or(0)));
             continue;
         }
         let kind = line.s("kind");
@@ -610,6 +624,26 @@ mod tests {
         assert!(said.contains("connections\n  connect took 1.2 s, ok ending at 09:59:50.000"), "{said}");
         assert!(!said.contains("before the first turn"), "{said}");
         assert!(said.contains("the app's line is +12 ms from the engine's"), "{said}");
+    }
+
+    /// A command's time besides the program's is on its line, and a request that waited behind another at the server says so.
+    #[test]
+    fn a_commands_own_parts_and_a_wait_at_the_server_are_told() {
+        let mut command = tool(2, "execute_command", 900, "ok", None, None, "h");
+        for (key, ms) in [("prepare_ms", 320u64), ("grant_ms", 10), ("repos_ms", 250), ("toolchains_ms", 0), ("env_ms", 40), ("run_ms", 560), ("after_ms", 90)] {
+            command[key] = json!(ms);
+        }
+        let mut queued = request(1, "2026-11-05T10:00:30.000+09:00", "main", 24_500, 30_000, 5000, 0, 100, "stop");
+        queued["server"] = json!({"ttft_seconds": 1.17});
+        let mut prompt = request(2, "2026-11-05T10:00:50.000+09:00", "main", 1500, 5000, 5000, 0, 100, "stop");
+        prompt["server"] = json!({"ttft_seconds": 1.2});
+        let lines = [json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 4, "images": 0}), queued, prompt, command];
+        let said = report(&text(&lines), None);
+        assert!(said.contains("queued at the server: 23.3 s (the app's first word came after 24.5 s, the server's own first token 1.17 s after it began)"), "{said}");
+        assert_eq!(said.matches("queued at the server").count(), 1, "a first word that is the server's own is not a queue: {said}");
+        assert!(said.contains("prepared in 0.3 s (grants 0.0 s, repositories 0.2 s, environment 0.0 s), ran 0.6 s, looked after in 0.1 s") || said.contains("prepared in 0.3 s (grants 0.0 s, repositories 0.3 s, environment 0.0 s), ran 0.6 s, looked after in 0.1 s"), "{said}");
+        let compaction = json!({"t": "2026-11-05T10:01:00.000+09:00", "ev": "compaction", "turn": 1, "stage": "checkpoint", "before_tokens": 24962, "after_tokens": 18137, "window": 32768, "ms": 41341, "outcome": "ok"});
+        assert!(report(&text(&[json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 4, "images": 0}), compaction]), None).contains("compaction (checkpoint): 24962 tokens to 18137 in 41.3 s, of a window of 32768"));
     }
 
     #[test]
