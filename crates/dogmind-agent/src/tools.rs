@@ -140,6 +140,8 @@ struct Job {
     started: Instant,
     cancel: Arc<AtomicBool>,
     result: Arc<Mutex<Option<Result<String, String>>>>,
+    /// It was started to run in the session's scratch folder, and not in the workspace.
+    in_scratch: bool,
     /// Its output has been in a report of all of them: the next such report says so in a line.
     told: AtomicBool,
     /// What it has printed while it runs, and how far a look at it has got.
@@ -267,6 +269,8 @@ pub struct Workbench {
     pub read_told: usize,
     /// What holds keys besides what reads as such: the app's own folder, and the files its settings name.
     pub secrets: Vec<PathBuf>,
+    /// While the person has asked for no changes to the files: the folder outside the workspace where a command may run, and where the write tools may write.
+    pub scratch: Option<PathBuf>,
 }
 
 fn sha16(bytes: &[u8]) -> String {
@@ -451,8 +455,15 @@ impl Workbench {
         match tool {
             "apply_patch" => self.apply_patch(arguments, workspace),
             "create_file" => self.create_file(arguments, workspace),
-            "execute_command" if arguments.get("background").and_then(Value::as_bool) == Some(true) => self.start_job(arguments, workspace),
-            "execute_command" => self.run_command(arguments, workspace, cancel),
+            "execute_command" => {
+                // A command whose folder is the scratch folder runs there as it would in a workspace: that folder is the only one it may write in.
+                let place = self.scratch_for(arguments).unwrap_or_else(|| workspace.to_path_buf());
+                if arguments.get("background").and_then(Value::as_bool) == Some(true) {
+                    self.start_job(arguments, &place)
+                } else {
+                    self.run_command(arguments, &place, cancel)
+                }
+            }
             #[cfg(windows)]
             "check_page" => crate::page_check::check_page(arguments, workspace, cancel),
             "command_status" => self.job_status(arguments),
@@ -481,6 +492,26 @@ impl Workbench {
         }
     }
 
+    /// The scratch folder when this command is to run in it, and not in the workspace.
+    pub fn scratch_for(&self, arguments: &Value) -> Option<PathBuf> {
+        let scratch = self.scratch.as_ref()?;
+        let cwd = resolve(Path::new(""), arguments.get("cwd").and_then(Value::as_str)?);
+        (cwd.is_absolute() && crate::safety::within(scratch, &cwd)).then(|| scratch.clone())
+    }
+
+    /// Whether this call's files are the scratch folder's: a command that ran in it, or a look at jobs that all did. What such a call changed is no change to the workspace.
+    pub fn in_scratch(&self, tool: &str, arguments: &Value) -> bool {
+        match tool {
+            "execute_command" => self.scratch_for(arguments).is_some(),
+            "command_status" => {
+                let wanted = arguments.get("id").and_then(Value::as_str);
+                let mut jobs = self.jobs.0.iter().filter(|job| wanted.is_none_or(|id| job.id == id)).peekable();
+                jobs.peek().is_some() && jobs.all(|job| job.in_scratch)
+            }
+            _ => false,
+        }
+    }
+
     fn read_skill(&mut self, arguments: &Value) -> Result<String, String> {
         let name = text_arg(arguments, "name")?;
         if name.eq_ignore_ascii_case("list") && !self.skills.iter().any(|skill| skill.name.eq_ignore_ascii_case("list")) {
@@ -502,7 +533,8 @@ impl Workbench {
     fn add_job(&mut self, arguments: &Value, cancel: Arc<AtomicBool>, result: CommandResult, live: Arc<Live>) -> Result<String, String> {
         let id = format!("job{}", self.jobs.0.len() + 1);
         let command = text_arg(arguments, "command")?.to_string();
-        self.jobs.0.push(Job { id: id.clone(), command, started: Instant::now(), cancel, result, told: AtomicBool::new(false), live, looked: AtomicU64::new(0) });
+        let in_scratch = self.scratch_for(arguments).is_some();
+        self.jobs.0.push(Job { id: id.clone(), command, started: Instant::now(), cancel, result, in_scratch, told: AtomicBool::new(false), live, looked: AtomicU64::new(0) });
         Ok(id)
     }
 
