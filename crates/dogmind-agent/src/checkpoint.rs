@@ -90,11 +90,39 @@ pub fn remove_for(session: &Path) -> Result<(), String> {
     }
 }
 
+/// One more than the largest `N` of the `N.bin` copies in a folder: where the numbering goes on when the index that held it is not there to say.
+fn after_the_last_copy(folder: &Path) -> u64 {
+    std::fs::read_dir(folder).into_iter().flatten().flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.strip_suffix(".bin")?.parse::<u64>().ok())
+        .max().map_or(0, |last| last + 1)
+}
+
+/// `from` as a new file at `to`, streamed, and never over one that is there: a copy that was kept is the only one there is of what it held.
+fn copy_new(from: &Path, to: &Path) -> std::io::Result<u64> {
+    let mut source = std::fs::File::open(from)?;
+    let mut copy = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+    let written = std::io::copy(&mut source, &mut copy);
+    if written.is_err() {
+        drop(copy);
+        let _ = std::fs::remove_file(to);
+    }
+    written
+}
+
 impl Checkpoints {
-    /// A session's, as far as it got. A damaged index means nothing can be undone, not that the session cannot go on.
+    /// A session's, as far as it got. A damaged index means nothing can be undone, not that the session cannot go on: it is put aside under another name, so that the copies it
+    /// named can still be found, and none of them is written over by what comes next.
     pub fn open(session: &Path) -> Checkpoints {
         let folder = folder_of(session);
-        let index = std::fs::read_to_string(folder.join(INDEX)).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+        let text = std::fs::read_to_string(folder.join(INDEX));
+        let parsed = text.as_ref().ok().and_then(|text| serde_json::from_str::<Index>(text).ok());
+        if parsed.is_none() && folder.join(INDEX).exists() {
+            let aside = folder.join(format!("index.damaged-{}.json", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+            let _ = std::fs::rename(folder.join(INDEX), aside);
+        }
+        let mut index = parsed.unwrap_or_default();
+        // (what the index said it had come to may be less than what is there: the numbering goes on past every copy in the folder)
+        index.next_copy = index.next_copy.max(after_the_last_copy(&folder));
         Checkpoints { folder, index }
     }
 
@@ -121,11 +149,16 @@ impl Checkpoints {
             return Ok(Saved::of(path, None));
         }
         std::fs::create_dir_all(&self.folder).map_err(|error| format!("{}: {error}", self.folder.display()))?;
-        let name = format!("{}.bin", self.index.next_copy);
-        self.index.next_copy += 1;
-        // A copy, not a read: the file may be larger than this machine's memory.
-        std::fs::copy(path, self.folder.join(&name)).map_err(|error| format!("{}: {error}", path.display()))?;
-        Ok(Saved::of(path, Some(name)))
+        // A copy, not a read: the file may be larger than this machine's memory. Never over one that is there: the next name that is free.
+        loop {
+            let name = format!("{}.bin", self.index.next_copy);
+            self.index.next_copy += 1;
+            match copy_new(path, &self.folder.join(&name)) {
+                Ok(_) => return Ok(Saved::of(path, Some(name))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            }
+        }
     }
 
     /// Before an edit: what the files hold now, unless this turn already has them. The first copy is the one that counts.
@@ -290,6 +323,53 @@ mod tests {
         assert_eq!(read(&plain), "before", "the rest is rewound");
         assert_eq!(restored.failed.len(), 2, "{:?}", restored.failed);
         std::fs::remove_dir(work.join("sub")).unwrap();
+    }
+
+    /// The index is gone bad (a cut, a bad disk): it is kept aside and not written over, and none of the copies it named is overwritten by the next one.
+    #[test]
+    fn a_damaged_index_keeps_the_copies_it_named_and_is_put_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session.jsonl");
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        std::fs::write(&a, "first").unwrap();
+        std::fs::write(&b, "second").unwrap();
+        let mut marks = Checkpoints::open(&session);
+        marks.begin("one", "t", Some(1)).unwrap();
+        marks.before_edit(&[a.clone(), b.clone()]).unwrap();
+        let folder = folder_of(&session);
+        assert_eq!((read(&folder.join("0.bin")), read(&folder.join("1.bin"))), ("first".to_string(), "second".to_string()));
+        // (what a cut leaves)
+        std::fs::write(folder.join(INDEX), "{\"next_copy\": 2, \"tur").unwrap();
+        let mut again = Checkpoints::open(&session);
+        assert!(again.turns().is_empty(), "nothing to go back to, and the session goes on");
+        let aside: Vec<String> = std::fs::read_dir(&folder).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.starts_with("index.damaged-")).collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(!folder.join(INDEX).exists() || serde_json::from_str::<serde_json::Value>(&read(&folder.join(INDEX))).is_ok());
+        let c = dir.path().join("c.txt");
+        std::fs::write(&c, "third").unwrap();
+        again.begin("two", "t", Some(2)).unwrap();
+        again.before_edit(&[c.clone()]).unwrap();
+        assert_eq!((read(&folder.join("0.bin")), read(&folder.join("1.bin"))), ("first".to_string(), "second".to_string()), "the copies of the history before it are still there");
+        assert_eq!(read(&folder.join("2.bin")), "third", "and the new one has a name of its own");
+        assert_eq!(read(&folder.join(&aside[0])), "{\"next_copy\": 2, \"tur", "the damaged index is kept as it was");
+    }
+
+    /// A copy never goes over a file that is there, whatever the numbering says.
+    #[test]
+    fn a_copy_takes_the_next_name_that_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session.jsonl");
+        let folder = folder_of(&session);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("0.bin"), "old zero").unwrap();
+        std::fs::write(folder.join("1.bin"), "old one").unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "now").unwrap();
+        // (an index that says nothing of them)
+        let mut marks = Checkpoints { folder: folder.clone(), index: Index::default() };
+        marks.begin("one", "t", Some(1)).unwrap();
+        marks.before_edit(&[file]).unwrap();
+        assert_eq!((read(&folder.join("0.bin")), read(&folder.join("1.bin")), read(&folder.join("2.bin"))), ("old zero".to_string(), "old one".to_string(), "now".to_string()));
     }
 
     /// A file that cannot take what a rewind puts back is as it was, with nothing left beside it, and the rewind says so.
