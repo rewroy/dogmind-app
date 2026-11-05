@@ -279,7 +279,10 @@ pub(crate) fn openai_content(message: &Message, folder: Option<&Path>) -> Value 
         return Value::String(text);
     }
     let mut parts: Vec<Value> = pictures.iter().map(|picture| json!({"type": "image_url", "image_url": {"url": picture.data_url()}})).collect();
-    parts.push(json!({"type": "text", "text": text}));
+    // (a message that is only pictures has no text part: some servers refuse an empty one, and anthropic.rs leaves it out as well)
+    if !text.is_empty() {
+        parts.push(json!({"type": "text", "text": text}));
+    }
     Value::Array(parts)
 }
 
@@ -402,6 +405,20 @@ pub(crate) mod tests {
         assert!(decode_picture(&encoded(30, 20, ImageFormat::Png)).is_ok());
         assert_eq!(decode_picture(&vec![0u8; MOST_BYTES + 1]).unwrap_err(), TOO_LARGE, "past the size, before any look at it");
         assert_eq!(decode_picture(b"not a picture at all").unwrap_err(), NOT_A_PICTURE);
+    }
+
+    #[test]
+    fn a_message_of_only_pictures_has_no_empty_text_part() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), encoded(4, 4, ImageFormat::Png)).unwrap();
+        let image = ImageRef { file: "a.png".into(), media_type: "image/png".into(), width: 4, height: 4 };
+        let only = Message { images: vec![image.clone()], ..Message::text("user", "") };
+        let parts = openai_content(&only, Some(dir.path()));
+        let kinds: Vec<&str> = parts.as_array().unwrap().iter().map(|part| part["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["image_url"], "{parts}");
+        let with_words = Message { images: vec![image], ..Message::text("user", "what is this") };
+        let kinds: Vec<String> = openai_content(&with_words, Some(dir.path())).as_array().unwrap().iter().map(|part| part["type"].as_str().unwrap().to_string()).collect();
+        assert_eq!(kinds, ["image_url", "text"], "the words still follow the pictures");
     }
 
     #[test]

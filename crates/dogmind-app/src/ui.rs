@@ -668,7 +668,7 @@ enum Note {
     /// What fetching a vision file for this model would take; `None`: there is no such file for it.
     VisionSize(Option<u64>),
     /// A vision file set aside or brought back, or why not.
-    VisionSwitched(Result<(), String>),
+    VisionSwitched(Result<bool, String>),
     /// What `straydog --version` said, if it said anything.
     EngineVersion(Option<String>, Option<u64>),
     /// A look at GitHub's latest release is over: whether the app made it on its own, and what it came to.
@@ -10695,8 +10695,16 @@ impl App {
                 None => self.warn(t("This model can't read pictures.")),
             },
             Note::VisionSwitched(result) => {
-                if let Err(error) = result {
-                    if self.panel == Panel::Chat { self.say(&error) } else { self.problem_in_panel(&error) }
+                match result {
+                    Err(error) => {
+                        if self.panel == Panel::Chat { self.say(&error) } else { self.problem_in_panel(&error) }
+                    }
+                    // (the file had gone, or been moved by hand, since the button was drawn: nothing was done, and the person is told so rather than that it was)
+                    Ok(false) => {
+                        let words = t("There was no vision file to turn on or off any more: nothing was changed.");
+                        if self.panel == Panel::Chat { self.say(words) } else { self.problem_in_panel(words) }
+                    }
+                    Ok(true) => {}
                 }
                 self.vision_offer = None;
                 self.vision_told = false;

@@ -602,6 +602,7 @@ const JA: &[(&str, &str)] = &[
     ("Web content is here: commands ask", "Web の内容を含むため、コマンドは毎回確認します"),
     // The preview.
     ("{0}: starting...", "{0}: 起動中..."),
+    ("There was no vision file to turn on or off any more: nothing was changed.", "切り替える画像用ファイルがもうありません。何も変更していません。"),
     ("Shown as {0}.", "{0} として表示しています。"),
     ("an encoding it does not know", "不明な文字コード"),
     ("{0} is gone. Nothing is shown until it is written again.", "{0} がなくなりました。もう一度書かれるまで何も表示しません。"),
