@@ -1985,6 +1985,22 @@ fn set_with_a_space_at_its_end(command: &str) -> bool {
     !rest.starts_with(['"', '/']) && rest.split_once('=').is_some_and(|(name, _)| !name.trim().is_empty()) && rest.ends_with([' ', '\t'])
 }
 
+/// The C++ build tool a command said it could not find, if it did: in the words of cmd, English or Japanese (`'cl' は、内部コマンドまたは外部コマンド...として認識されていません`).
+fn build_tool_not_found(err: &str) -> Option<&'static str> {
+    let not_found = err.contains("is not recognized") || err.contains("認識されていません");
+    not_found.then(|| ["cl", "link", "nmake"].into_iter().find(|program| err.contains(&format!("'{program}'")))).flatten()
+}
+
+/// What a model is told when `cl`, `link` or `nmake` was not found: why the app did not give the build tools, and what the person can install. `known`: the app has found some.
+fn build_tools_note(program: &str, why: Option<crate::msvc::Why>, known: bool) -> String {
+    match (why, known) {
+        (Some(why), _) => format!("note: `{program}` was not found because the build tools were not given to this command: {}. Tell the person that; building needs them.\n", why.words()),
+        // (they are found: the command was not run with them for another reason, or the look had just ended)
+        (None, true) => String::new(),
+        (None, false) => format!("note: `{program}` was not found, and the search for Visual Studio's build tools had not come to an answer when this command began (it runs in the background). Running the command again may find them; if not, the person has to install the \"Desktop development with C++\" workload of Visual Studio or its Build Tools.\n"),
+    }
+}
+
 /// One line more where a sandbox's answer reads as something else: a model believes it, and the next rounds go on that.
 #[cfg(windows)]
 fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -> String {
@@ -2032,6 +2048,10 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
         } else if err.contains("failed to stat") {
             notes.push_str("note: git cannot look above the workspace from the sandbox, so this says only that the workspace is not a git repository. `git init` at the start of a line works.\n");
         }
+    }
+    // (cl, link and nmake are in no PATH of a person's unless they started from a Developer prompt; the app gives a command their folders when it finds them, and says here why it did not)
+    if let Some(program) = build_tool_not_found(err) {
+        notes.push_str(&build_tools_note(program, crate::msvc::why_not(), crate::msvc::known().is_some()));
     }
     let denied = says_access_denied(err, system_access_denied());
     let lower_err = err.to_ascii_lowercase();
@@ -3858,6 +3878,33 @@ mod tests {
         let alone = tempfile::tempdir().unwrap();
         assert!(sandbox_notes("git status", alone.path(), Some(128), "fatal: failed to stat 'C:/Users': Permission denied").contains("not a git repository. `git init`"));
         assert_eq!(sandbox_notes("git status", alone.path(), Some(128), "fatal: not a git repository (or any of the parent directories): .git"), "");
+    }
+
+    /// A command that did not find `cl`, `link` or `nmake` is told why the build tools were not given, for each reason, and what the person can install.
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_compiler_is_told_with_the_reason_the_build_tools_were_not_given() {
+        use crate::msvc::Why;
+        let root = Path::new("C:\\work");
+        let english = "'cl' is not recognized as an internal or external command,\noperable program or batch file.";
+        let japanese = "'link' \u{306f}\u{3001}\u{5185}\u{90e8}\u{30b3}\u{30de}\u{30f3}\u{30c9}\u{307e}\u{305f}\u{306f}\u{5916}\u{90e8}\u{30b3}\u{30de}\u{30f3}\u{30c9}\u{3001}\u{64cd}\u{4f5c}\u{53ef}\u{80fd}\u{306a}\u{30d7}\u{30ed}\u{30b0}\u{30e9}\u{30e0}\u{307e}\u{305f}\u{306f}\u{30d0}\u{30c3}\u{30c1} \u{30d5}\u{30a1}\u{30a4}\u{30eb}\u{3068}\u{3057}\u{3066}\u{8a8d}\u{8b58}\u{3055}\u{308c}\u{3066}\u{3044}\u{307e}\u{305b}\u{3093}\u{3002}";
+        for (why, wanted) in [(Why::NotX64, "not an x64 one"), (Why::NoInstaller, "installer was not found"), (Why::NoCppTools, "without the C++ tools"), (Why::NoToolset, "not all there"), (Why::NoSdk, "no complete Windows SDK")] {
+            crate::msvc::set_test_why(Some(Some(why)));
+            for (line, err, program) in [("cl main.c", english, "cl"), ("link /?", japanese, "link"), ("nmake", "'nmake' is not recognized as an internal or external command", "nmake")] {
+                let note = sandbox_notes(line, root, Some(1), err);
+                assert!(note.contains(&format!("`{program}` was not found because the build tools were not given")) && note.contains(wanted), "{why:?} {program}: {note}");
+                if why != Why::NotX64 {
+                    assert!(note.contains("Desktop development with C++"), "{why:?}: {note}");
+                }
+            }
+        }
+        // no answer yet, and not found: the look may not have ended; nothing for another word not found, or for a command that was fine
+        crate::msvc::set_test_why(Some(None));
+        // (whether the look has found some by now is the process's, and not for a test to count on: the words are told by the function)
+        assert!(build_tools_note("cl", None, false).contains("had not come to an answer") && build_tools_note("cl", None, true).is_empty());
+        assert!(!sandbox_notes("foo", root, Some(1), "'foo' is not recognized as an internal or external command").contains("build tools"));
+        assert!(!sandbox_notes("cl main.c", root, Some(0), "").contains("build tools"));
+        crate::msvc::set_test_why(None);
     }
 
     #[cfg(windows)]
