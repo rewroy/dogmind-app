@@ -63,6 +63,47 @@ fn fill(words: &str, values: &[&dyn Display]) -> String {
     text
 }
 
+/// A reason on an approval card, which the gate gives in English as a template with what varies in it (a path, a word, a number), joined by "; " where there are several. The same
+/// words in the person's language where the app has them (`dogmind_agent::safety::REASONS`), with what varies put back in.
+pub fn reason(text: &str) -> String {
+    reason_in(text, is_japanese())
+}
+
+fn reason_in(text: &str, japanese: bool) -> String {
+    if !japanese {
+        return text.to_string();
+    }
+    text.split("; ").map(reason_part).collect::<Vec<String>>().join("; ")
+}
+
+fn reason_part(part: &str) -> String {
+    for template in dogmind_agent::safety::REASONS {
+        let Some(found) = fill_of(template, part) else { continue };
+        if let Some(words) = japanese().get(template) {
+            return found.iter().enumerate().fold((*words).to_string(), |text, (at, value)| text.replace(&format!("{{{at}}}"), value));
+        }
+    }
+    part.to_string()
+}
+
+/// What stands in the places of `{0}`, `{1}`... of a template in a text that is made from it; none if it is not.
+fn fill_of(template: &str, text: &str) -> Option<Vec<String>> {
+    let mut found: Vec<String> = Vec::new();
+    let (mut rest, mut left) = (text, template);
+    while let Some(at) = left.find('{') {
+        let literal = &left[..at];
+        rest = rest.strip_prefix(literal)?;
+        let close = left[at..].find('}')? + at;
+        left = &left[close + 1..];
+        // (what stands there runs up to the literal that follows it, and to the end if none does)
+        let next = left.find('{').map_or(left, |next| &left[..next]);
+        let value = if next.is_empty() { rest } else { &rest[..rest.find(next)?] };
+        found.push(value.to_string());
+        rest = &rest[value.len()..];
+    }
+    (rest == left).then_some(found)
+}
+
 /// What the agent says of itself comes as English, some of it with a detail after the words that are always the same.
 pub fn notice(text: &str) -> String {
     if !is_japanese() {
@@ -204,6 +245,17 @@ const JA: &[(&str, &str)] = &[
     ("The settings could not be saved: {0}\n", "設定を保存できませんでした: {0}\n"),
     ("Thinking…", "考え中…"),
     ("Compacting the session…", "セッションを圧縮しています…"),
+    (dogmind_agent::safety::REASON_OFF_THIS_PC, "このパスは、このPCの外にある別のマシンやデバイスにつながっています。開くと、あなたのサインイン情報をそこに渡すことになります: {0}"),
+    (dogmind_agent::safety::REASON_SECRET_READ, "秘密が置かれた場所を読みます: {0}"),
+    (dogmind_agent::safety::REASON_RUNS_OFF_THIS_PC, "このPCの外の場所で実行します: {0}"),
+    (dogmind_agent::safety::REASON_PLANTED, "このフォルダーの {1} が、インストール済みのプログラムではなく `{0}` として実行されます"),
+    (dogmind_agent::safety::REASON_NETWORK, "このコマンドはネットワークを使います"),
+    (dogmind_agent::safety::REASON_OUTSIDE_AND_OFF_THIS_PC, "ワークスペースの外で、このPCの外でもあります: {0}"),
+    (dogmind_agent::safety::REASON_OUTSIDE, "ワークスペースの外です: {0}"),
+    (dogmind_agent::safety::REASON_GIT_FOLDER, "Git 自身のフォルダーの中です: {0}"),
+    (dogmind_agent::safety::REASON_LONG_QUERY, "検索語が長すぎます（{0} 文字）。このPCのテキストが外に出てしまいます"),
+    (dogmind_agent::safety::REASON_WEB_NOTE, "この会話にはウェブの内容が含まれていて、メモはこの先のすべてのセッションに残ります"),
+    (dogmind_agent::safety::REASON_WEB_ASKED, "この会話にはウェブの内容が含まれていて、これはそこから求められたことかもしれません"),
     ("Needs tools this app does not have: mcp__{0}__…", "このアプリにないツールが必要です: mcp__{0}__…"),
     ("Needs something of another app that this app does not have: {0}", "このアプリにない、別のアプリの機能が必要です: {0}"),
     ("a connector of another app", "別のアプリのコネクター"),
@@ -914,6 +966,36 @@ mod tests {
         assert!(missing.is_empty(), "no Japanese for {missing:#?}");
     }
 
+    /// Every reason the gate gives, made from its template with something in each place, is in Japanese with those things put back, and in English as it was.
+    #[test]
+    fn every_reason_the_gate_gives_has_its_japanese_with_what_varies_put_back() {
+        for template in dogmind_agent::safety::REASONS {
+            let places = (0..4).filter(|at| template.contains(&format!("{{{at}}}"))).count();
+            let values: Vec<String> = (0..places).map(|at| format!("v{at}-C:/x/y")).collect();
+            let parts: Vec<&str> = values.iter().map(String::as_str).collect();
+            let english = dogmind_agent::safety::reason_of(template, &parts);
+            let japanese = reason_in(&english, true);
+            assert_ne!(japanese, english, "{template}");
+            assert!(values.iter().all(|value| japanese.contains(value)) && !japanese.contains('{'), "{template}: {japanese}");
+            assert_eq!(reason_in(&english, false), english);
+        }
+        // (several reasons of a command, joined as the gate joins them)
+        let both = format!("{}; {}", dogmind_agent::safety::reason_of(dogmind_agent::safety::REASON_PLANTED, &["npm", "npm.exe"]), dogmind_agent::safety::REASON_NETWORK);
+        let said = reason_in(&both, true);
+        assert!(said.contains("npm.exe") && said.contains("ネットワーク") && !said.contains("this "), "{said}");
+    }
+
+    /// The reason the gate gives for a command that gets the network, as the card for a Japanese window shows it.
+    #[test]
+    fn the_network_reason_shows_in_japanese_on_a_card_for_a_japanese_window() {
+        use dogmind_agent::safety::{Gate, Verdict};
+        let gate = Gate::new();
+        let Verdict::Ask { reason: Some(reason), .. } = gate.check("execute_command", &serde_json::json!({"command": "curl https://example.com", "network": true}), std::path::Path::new("C:/work")) else { panic!("asked, with a reason") };
+        assert_eq!(reason, "this command gets the network");
+        assert_eq!(reason_in(&reason, true), "このコマンドはネットワークを使います");
+        assert_eq!(reason_in(&reason, false), reason);
+    }
+
     #[test]
     fn what_a_person_reads_when_a_provider_fails_is_all_in_japanese() {
         let table: HashMap<&str, &str> = JA.iter().copied().collect();
@@ -921,6 +1003,9 @@ mod tests {
             assert!(table.contains_key(words), "{words}");
         }
         assert!(table.contains_key(crate::settings::VARIABLE_NAME_ONLY));
+        for template in dogmind_agent::safety::REASONS {
+            assert!(table.contains_key(template), "no Japanese for the reason: {template}");
+        }
         assert!(table.contains_key(crate::settings::NAME_HOLDS_A_KEY) && table.contains_key(crate::settings::ADDRESS_HOLDS_A_KEY));
         assert!(table.contains_key("Connecting…"), "said by a word kept elsewhere");
         for opening in llm::OPENINGS {
