@@ -40,7 +40,12 @@ struct Journal {
     grants: Vec<Grant>,
 }
 
-/// The folders in use, by key, and how many things use each.
+/// Where a path really leads, through links, junctions, short names and substituted drives: a folder is one folder whatever it was opened by, and an ACE lands on what a path leads to.
+fn real(path: &Path) -> PathBuf {
+    crate::safety::real_path(path).unwrap_or_else(|| path.to_path_buf())
+}
+
+/// The folders in use, by key (of the real path), and how many things use each.
 static USERS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
 /// One change to a tree at a time, and no command being made ready during one.
 static WORK: Mutex<()> = Mutex::new(());
@@ -109,9 +114,11 @@ pub struct Use {
 
 impl Use {
     pub fn new(path: &Path) -> Use {
-        let place = sandbox::key(path);
+        // (the chat gives the folder as the person opened it, and a command gives the real one `writable_root` works out: either is the same folder, or the grant went when the command ended)
+        let path = real(path);
+        let place = sandbox::key(&path);
         *users().get_or_insert_with(HashMap::new).entry(place.clone()).or_insert(0) += 1;
-        Use { place, path: path.to_path_buf(), file: the_file() }
+        Use { place, path, file: the_file() }
     }
 
     /// What this leaves behind is not taken back, as in a test's own temp folder or a command's process ending with the app.
@@ -177,14 +184,17 @@ pub(crate) fn in_the_background() {
 
 /// Whether anything uses this folder, or one inside it, or one it is inside: a command's folder can be a project in a chat's wider workspace, and either holds the other's files.
 pub(crate) fn is_in_use(path: &Path) -> bool {
-    let place = sandbox::key(path);
-    users().as_ref().is_some_and(|all| all.keys().any(|known| sandbox::under(known, &place) || sandbox::under(&place, known)))
+    in_use_key(&sandbox::key(&real(path)))
+}
+
+fn in_use_key(place: &str) -> bool {
+    users().as_ref().is_some_and(|all| all.keys().any(|known| sandbox::under(known, place) || sandbox::under(place, known)))
 }
 
 fn recorded_at(file: &Path, path: &Path) -> bool {
-    let place = sandbox::key(path);
+    let place = sandbox::key(&real(path));
     read(file).grants.iter().any(|grant| {
-        let root = sandbox::key(&grant.root);
+        let root = sandbox::key(&real(&grant.root));
         sandbox::under(&root, &place) || sandbox::under(&place, &root)
     })
 }
@@ -195,9 +205,10 @@ pub(crate) fn before_grant(root: &Path) -> Result<MutexGuard<'static, ()>, Strin
     let one = WORK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(file) = the_file() {
         let mut journal = read(&file);
-        let place = sandbox::key(root);
-        if !journal.grants.iter().any(|grant| sandbox::key(&grant.root) == place) {
-            journal.grants.push(Grant { root: root.to_path_buf(), guarded: Vec::new(), id: sandbox::file_id(root) });
+        let root = real(root);
+        let place = sandbox::key(&root);
+        if !journal.grants.iter().any(|grant| sandbox::key(&real(&grant.root)) == place) {
+            journal.grants.push(Grant { root: root.clone(), guarded: Vec::new(), id: sandbox::file_id(&root) });
             write(&file, &journal)?;
         }
     }
@@ -223,6 +234,7 @@ pub(crate) fn before_guarding(root: &Path, path: &Path, sddl: String, protected:
 /// `None` if something began to use the folder meanwhile: then it stops, and the command that wants it makes it whole again. Otherwise how many things could not be read or written: the ACE may
 /// still be on them, and that is not something to write down as done. (What is gone by the time it is looked at is not one.)
 unsafe fn strip_tree(root: &Path, watch: &Path, sid: PSID, masks: &[u32]) -> Option<u32> {
+    let watch = sandbox::key(&real(watch));
     let gone = |path: &Path| std::fs::symlink_metadata(path).is_err();
     let mut waiting = vec![root.to_path_buf()];
     let (mut looked, mut failed) = (0u32, 0u32);
@@ -236,7 +248,7 @@ unsafe fn strip_tree(root: &Path, watch: &Path, sid: PSID, masks: &[u32]) -> Opt
         };
         for item in items.flatten() {
             looked += 1;
-            if looked % 64 == 0 && is_in_use(watch) {
+            if looked % 64 == 0 && in_use_key(&watch) {
                 return None;
             }
             let Ok(kind) = item.file_type() else {
@@ -808,5 +820,32 @@ mod tests {
         assert!(outcome.done && outcome.failed.is_empty(), "{:?}", outcome.failed);
         assert!(read(&stand.file).grants.iter().all(|grant| sandbox::key(&grant.root) != sandbox::key(&first)));
         assert!(!holds_grant(&first) && !holds_grant(&first.join("made.txt")) && !holds_grant(&first.join("sub").join("b.txt")));
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let done = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
+        assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stdout));
+    }
+
+    /// A workspace opened through a junction is the folder the junction leads to: the chat that has it open keeps the grant a command in it made, whichever way the two are spelled.
+    #[test]
+    fn a_workspace_opened_through_a_junction_keeps_its_grant_while_the_chat_is_open() {
+        let stand = stand();
+        let first = folder(&stand, "first");
+        let link = stand.base.join("through");
+        junction(&link, &first);
+        let chat = Use::new(&link);
+        assert!(is_in_use(&first) && is_in_use(&link), "one folder, whichever way it is named");
+        // A command gives the real folder, as `writable_root` works it out; it begins and ends.
+        assert_eq!(command(&first, "echo made> made.txt").0, Some(0));
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(holds_grant(&first) && holds_grant(&first.join("made.txt")), "the chat is still open, so the grant stays");
+        assert!(read(&stand.file).grants.iter().any(|grant| sandbox::key(&grant.root) == sandbox::key(&first)));
+        // And a second command does not walk the tree again: the grant is there already.
+        assert_eq!(command(&first, "echo again> again.txt").0, Some(0));
+        drop(chat);
+        wait_for("the grant to go once nothing uses it", || !holds_grant(&first) && !holds_grant(&first.join("again.txt")));
+        std::fs::remove_dir(&link).unwrap();
+        assert!(first.join("a.txt").is_file(), "the folder itself is there");
     }
 }
