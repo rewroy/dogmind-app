@@ -2411,6 +2411,10 @@ impl Agent {
         if name == "check_page" {
             crate::page_check::forget_runs();
         }
+        #[cfg(windows)]
+        if name == "execute_command" {
+            crate::sandbox::forget_timings();
+        }
         self.approval_wait = None;
         self.refusal = None;
         self.running.insert(id.to_string(), ToolMeta { name: name.to_string(), at: chrono::Local::now(), path, cmd0, args_bytes: raw.len(), args_hash: trajectory::short_hash(raw.as_bytes()), edited, parallel, req: self.last_req.clone() });
@@ -2463,6 +2467,20 @@ impl Agent {
             }
             if edited.len() > 1 {
                 line["edited"] = Value::Array(edited);
+            }
+        }
+        // Where a command's time went besides the program's own, in milliseconds (one command; a batch run side by side says the last that ended).
+        #[cfg(windows)]
+        if meta.name == "execute_command" {
+            if let Some(times) = crate::sandbox::take_timings().last() {
+                let ms = |time: Duration| json!(time.as_millis() as u64);
+                line["prepare_ms"] = ms(times.prepare);
+                line["grant_ms"] = ms(times.grant);
+                line["repos_ms"] = ms(times.repos);
+                line["toolchains_ms"] = ms(times.toolchains);
+                line["env_ms"] = ms(times.env);
+                line["run_ms"] = ms(times.run);
+                line["after_ms"] = ms(times.after);
             }
         }
         #[cfg(windows)]

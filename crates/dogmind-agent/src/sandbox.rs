@@ -1491,15 +1491,51 @@ pub fn also_readable(folder: &Path) {
     }
 }
 
-unsafe fn prepare(workspace: &Path, sid: PSID, disarmed: &mut Vec<String>) -> Result<(), String> {
+/// Where the time of a command went apart from the program's own: what the app does before the process starts (`prepare`, in the parts of it that take time), the program from its start to its
+/// end, and the look after it. A command's one duration says none of this, and a data job's seven Python commands took 30% of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Timings {
+    /// From the call to just before the process is started: all of the below, and the work of the folder, the lists and the bundled tools.
+    pub prepare: Duration,
+    /// The grants on the workspace, on what a skill may read, and on the folders above.
+    pub grant: Duration,
+    /// The look through the workspace for repositories to guard.
+    pub repos: Duration,
+    /// The toolchains' folders, and what in them is held out.
+    pub toolchains: Duration,
+    /// The environment block, which may wait for the build tools.
+    pub env: Duration,
+    /// The process, from its start to its end.
+    pub run: Duration,
+    /// The look through the workspace for repositories after it.
+    pub after: Duration,
+}
+
+/// The timings of the commands run since `forget_timings`, for the trajectory's line of the call.
+static TIMINGS: Mutex<Vec<Timings>> = Mutex::new(Vec::new());
+
+pub fn forget_timings() {
+    TIMINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+}
+
+pub fn take_timings() -> Vec<Timings> {
+    std::mem::take(&mut *TIMINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+}
+
+unsafe fn prepare(workspace: &Path, sid: PSID, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
+    let began = Instant::now();
     grant(workspace, sid, READ_WRITE_EXECUTE, true)?;
+    times.grant += began.elapsed();
     // Each repository in the workspace. If one cannot be guarded the command does not run, as with any other containment.
+    let began = Instant::now();
     let looked = look_after_repositories(workspace, sid, Look::BeforeACommand);
+    times.repos += began.elapsed();
     *disarmed = looked.said;
     if let Some(refusal) = looked.refused {
         // (what was taken out of a repository on the way is said too: nothing the app does as the person is done quietly)
         return Err(if disarmed.is_empty() { refusal } else { format!("{refusal}. The app also did this, in a repository made since the last command: {}", disarmed.join(" ")) });
     }
+    let began = Instant::now();
     for folder in ALSO_READABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter() {
         let _ = grant(folder, sid, READ_EXECUTE, true);
         for ancestor in folder.ancestors().skip(1).filter(|above| above.parent().is_some()) {
@@ -1510,10 +1546,13 @@ unsafe fn prepare(workspace: &Path, sid: PSID, disarmed: &mut Vec<String>) -> Re
     for ancestor in workspace.ancestors().skip(1).filter(|folder| folder.parent().is_some()) {
         let _ = grant(ancestor, sid, FILE_GENERIC_EXECUTE, false);
     }
+    times.grant += began.elapsed();
     // (never a test's: these are the real home's folders, with real lists)
     #[cfg(not(test))]
     if let (Some(path), Some(home)) = (std::env::var_os("PATH"), std::env::var_os("USERPROFILE")) {
+        let began = Instant::now();
         open_toolchains(&path.to_string_lossy(), Path::new(&home), crate::bundled::root().map(|root| crate::bundled::Present::of(&root)), sid);
+        times.toolchains += began.elapsed();
     }
     Ok(())
 }
@@ -1681,9 +1720,10 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
     unsafe {
         let sid = profile_sid()?;
         let mut disarmed = Vec::new();
+        let mut times = Timings::default();
         {
             let _one = crate::workspace_grants::before_grant(&root)?;
-            prepare(&root, sid, &mut disarmed)?;
+            prepare(&root, sid, &mut disarmed, &mut times)?;
             // (a file held out of a folder commands can read, saved anew since by an editor, inherited what the folder gives: it is held out again before this command can read it)
             if let Some(folder) = crate::workspace_grants::data_folder() {
                 crate::read_folders::hold_out_again(&crate::read_folders::file_in(&folder));
@@ -1777,9 +1817,12 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         // The code page first, so that a tool's output arrives as UTF-8 on a Japanese Windows.
         let mut command_line = wide(&format!("\"{shell}\" /d /s /c \"chcp 65001 >nul & {line}\""));
         // (the look for the build tools may still be going on: the command's start waits for it no longer than the command has time, and not past Stop)
+        let env_began = Instant::now();
         let block = environment(profile_folder(sid).as_deref(), &root, || crate::msvc::found_before(asked_at.checked_add(timeout).unwrap_or(asked_at + Duration::from_secs(3600)), cancel));
+        times.env = env_began.elapsed();
         let place = wide_path(cwd);
         let mut process: PROCESS_INFORMATION = std::mem::zeroed();
+        times.prepare = asked_at.elapsed();
         let started = CreateProcessW(
             std::ptr::null(), command_line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
@@ -1834,6 +1877,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
                 }
             }
         };
+        times.run = began.elapsed();
         let seen = desktop.windows();
         let shown = (if seen.is_empty() { last_seen } else { seen }).into_iter().filter(|(class, title)| class == "#32770" || !title.is_empty()).map(|(_, title)| title).collect();
         let mut code = 0u32;
@@ -1847,7 +1891,10 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         drop(job);
         // What it made, with nothing of its own left running to go on making it. (Not being able to guard this does not take back what has already run: the next command is what is refused, for what is
         // found again before it, and it is said now in what this one returns.)
+        let after_began = Instant::now();
         let looked = look_after_repositories(&root, sid, Look::AfterACommand);
+        times.after = after_began.elapsed();
+        TIMINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(times);
         disarmed.extend(looked.said);
         Ok(Output { stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default(), status, ended, shown, disarmed, out_of_memory, unguarded: looked.refused })
     }
@@ -2811,6 +2858,117 @@ mod tests {
             assert!(crate::tools::powershell_lost_at_a_root(&decode(&lost.stderr), &folder), "{}", decode(&lost.stderr));
         }
         drop(holder);
+    }
+
+    /// A command's parts are timed: before the process, the process, and after it.
+    #[test]
+    fn a_command_has_its_own_parts_timed() {
+        let folder = work_folder("timings");
+        forget_timings();
+        let done = run("echo hi", &folder, &folder, false, Duration::from_secs(60), &AtomicBool::new(false)).unwrap();
+        assert_eq!(done.status, Some(0));
+        // (the list is the process's: a test run beside this one may have put its own commands in it)
+        let times = take_timings();
+        assert!(!times.is_empty());
+        for one in times {
+            assert!(one.run > Duration::ZERO && one.prepare > Duration::ZERO, "{one:?}");
+            // (the parts of the preparation are within it)
+            assert!(one.grant + one.repos + one.toolchains + one.env <= one.prepare + Duration::from_millis(5), "{one:?}");
+        }
+    }
+
+    /// What the app's own work costs before and after a command, on three workspaces: a few files, a copy of this repository's sources, and a tree of 3,000 folders six deep with a
+    /// repository in it. `echo hi` and a Python line, ten each. Prints the median and the worst of each part. `DOGMIND_TOOLS` names the bundled tools (for the Python), `DOGMIND_MEASURE_SOURCES`
+    /// the folder whose crates, assets and scripts are copied.
+    #[test]
+    #[ignore = "a measurement: needs DOGMIND_TOOLS and DOGMIND_MEASURE_SOURCES, and prints"]
+    fn what_a_command_costs_before_and_after_on_three_workspaces() {
+        let tools = PathBuf::from(std::env::var_os("DOGMIND_TOOLS").expect("DOGMIND_TOOLS"));
+        crate::bundled::set_test_root(Some(&tools));
+        let sources = PathBuf::from(std::env::var_os("DOGMIND_MEASURE_SOURCES").expect("DOGMIND_MEASURE_SOURCES"));
+        let holder = tempfile::tempdir().unwrap();
+        let (small, copy, deep) = (holder.path().join("small"), holder.path().join("sources"), holder.path().join("deep"));
+        std::fs::create_dir_all(&small).unwrap();
+        for at in 0..5 {
+            std::fs::write(small.join(format!("f{at}.txt")), "x").unwrap();
+        }
+        fn copy_tree(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for item in std::fs::read_dir(from).unwrap().flatten() {
+                let name = item.file_name().to_string_lossy().to_string();
+                if name.starts_with("target") || name == "dist" || name == ".git" || name == "node_modules" {
+                    continue;
+                }
+                let kind = item.file_type().unwrap();
+                if kind.is_dir() {
+                    copy_tree(&item.path(), &to.join(&name));
+                } else if kind.is_file() {
+                    let _ = std::fs::copy(item.path(), to.join(&name));
+                }
+            }
+        }
+        for part in ["crates", "assets", "scripts"] {
+            if sources.join(part).is_dir() {
+                copy_tree(&sources.join(part), &copy.join(part));
+            }
+        }
+        // 3,000 folders, six levels (7 x 7 x 7 x 3 x 3 x 3 is 9,261: this is the first 3,000 of them), a file in each, and a repository
+        let mut made = 0;
+        'all: for a in 0..7 {
+            for b in 0..7 {
+                for c in 0..7 {
+                    for d in 0..3 {
+                        for e in 0..3 {
+                            for f in 0..3 {
+                                let folder = deep.join(format!("a{a}")).join(format!("b{b}")).join(format!("c{c}")).join(format!("d{d}")).join(format!("e{e}")).join(format!("f{f}"));
+                                std::fs::create_dir_all(&folder).unwrap();
+                                std::fs::write(folder.join("x.js"), "1").unwrap();
+                                made += 1;
+                                if made >= 3000 {
+                                    break 'all;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let nested = deep.join("a0").join("b0").join("nested-repo");
+        std::fs::create_dir_all(&nested).unwrap();
+        crate::tools::git(&nested, &["init", "-q"]).unwrap();
+        std::fs::write(nested.join("a.txt"), "a").unwrap();
+        let count = |folder: &Path| walkdir_count(folder);
+        fn walkdir_count(folder: &Path) -> usize {
+            std::fs::read_dir(folder).map_or(0, |items| items.flatten().map(|item| 1 + if item.file_type().is_ok_and(|kind| kind.is_dir()) { walkdir_count(&item.path()) } else { 0 }).sum())
+        }
+        println!("MEASURE sizes: small {} items, sources {} items, deep {} items", count(&small), count(&copy), count(&deep));
+        let median = |mut values: Vec<f64>| {
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            values[values.len() / 2]
+        };
+        let ms = |time: Duration| time.as_secs_f64() * 1000.0;
+        for (name, folder) in [("small", &small), ("sources", &copy), ("deep", &deep)] {
+            for line in ["echo hi", "python -c \"print(1)\""] {
+                let mut all: Vec<Timings> = Vec::new();
+                let mut totals = Vec::new();
+                for _ in 0..11 {
+                    forget_timings();
+                    let began = Instant::now();
+                    let done = run(line, folder, folder, false, Duration::from_secs(120), &AtomicBool::new(false)).unwrap();
+                    totals.push(ms(began.elapsed()));
+                    assert_eq!(done.status, Some(0), "{line}: {}", decode(&done.stderr));
+                    all.extend(take_timings());
+                }
+                // (the first of the eleven grants the folder, and is not the cost of a command in a folder that has it: it is told apart)
+                let first = all[0];
+                let rest = &all[1..];
+                let part = |pick: fn(&Timings) -> Duration| (median(rest.iter().map(|times| ms(pick(times))).collect()), rest.iter().map(|times| ms(pick(times))).fold(0.0, f64::max));
+                let (prepare, grant, repos, toolchains, env, run_ms, after) = (part(|t| t.prepare), part(|t| t.grant), part(|t| t.repos), part(|t| t.toolchains), part(|t| t.env), part(|t| t.run), part(|t| t.after));
+                println!("MEASURE {name:8} {line:24} first: prepare {:.0} (grant {:.0}, repos {:.0})  |  median/worst of 10: prepare {:.0}/{:.0} (grants {:.0}/{:.0}, repos {:.0}/{:.0}, toolchains {:.0}/{:.0}, env {:.0}/{:.0}) run {:.0}/{:.0} after {:.0}/{:.0}  total median {:.0}",
+                    ms(first.prepare), ms(first.grant), ms(first.repos), prepare.0, prepare.1, grant.0, grant.1, repos.0, repos.1, toolchains.0, toolchains.1, env.0, env.1, run_ms.0, run_ms.1, after.0, after.1, median(totals));
+            }
+        }
+        crate::bundled::set_test_root(None);
     }
 
     #[test]
