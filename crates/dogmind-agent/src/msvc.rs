@@ -197,6 +197,7 @@ struct Finder {
 }
 
 impl Finder {
+    #[cfg(test)]
     const fn new(again_after: Duration) -> Finder {
         Finder::looking_again_at_none(again_after, Duration::MAX, || false)
     }
