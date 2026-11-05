@@ -141,11 +141,32 @@ impl Drop for Use {
         if !is_in_use(&path) && recorded_at(&file, &path) {
             std::thread::spawn(move || {
                 in_the_background();
-                release(&file, &path);
+                let _ = release(&file, &path);
             });
         }
     }
 }
+
+/// What a take-back came to.
+enum Taken {
+    /// All of it.
+    Whole,
+    /// Something began to use the folder while it went on: it stops, and the command that wants it makes it whole again.
+    InUse,
+    /// Some things could not be read or written, and are as they were: the container's ACE may still be on them.
+    Partly,
+}
+
+/// What a release came to: whether the folders it was asked about are all clear of the grant, and the roots whose take-back left something behind.
+struct Released {
+    done: bool,
+    failed: Vec<PathBuf>,
+}
+
+/// What the person is told of a folder whose take-back left something behind (see `sweep`).
+pub const NOT_TAKEN_BACK: &str = "Some of what commands were allowed to write here could not be taken back, as Windows would not let it be changed. It stays on the list, and that is tried again each time the app starts.";
+/// Every whole message here, for the test that each has its Japanese.
+pub const WORDS: [&str; 1] = [NOT_TAKEN_BACK];
 
 /// What goes through a whole tree gives way to everything else on the machine, the disk included.
 pub(crate) fn in_the_background() {
@@ -199,22 +220,41 @@ pub(crate) fn before_guarding(root: &Path, path: &Path, sddl: String, protected:
 }
 
 /// One inherited ACE off everything under a folder, with these masks. What keeps its own list is passed by, and a workspace of its own inside it, and links are not gone through.
-/// False if something began to use the folder meanwhile: then it stops, and the command that wants it makes it whole again.
-unsafe fn strip_tree(root: &Path, watch: &Path, sid: PSID, masks: &[u32]) -> bool {
+/// `None` if something began to use the folder meanwhile: then it stops, and the command that wants it makes it whole again. Otherwise how many things could not be read or written: the ACE may
+/// still be on them, and that is not something to write down as done. (What is gone by the time it is looked at is not one.)
+unsafe fn strip_tree(root: &Path, watch: &Path, sid: PSID, masks: &[u32]) -> Option<u32> {
+    let gone = |path: &Path| std::fs::symlink_metadata(path).is_err();
     let mut waiting = vec![root.to_path_buf()];
-    let mut looked = 0u32;
+    let (mut looked, mut failed) = (0u32, 0u32);
     while let Some(folder) = waiting.pop() {
-        for item in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+        let items = match std::fs::read_dir(&folder) {
+            Ok(items) => items,
+            Err(_) => {
+                failed += u32::from(!gone(&folder));
+                continue;
+            }
+        };
+        for item in items.flatten() {
             looked += 1;
             if looked % 64 == 0 && is_in_use(watch) {
-                return false;
+                return None;
             }
-            let Ok(kind) = item.file_type() else { continue };
+            let Ok(kind) = item.file_type() else {
+                failed += u32::from(!gone(&item.path()));
+                continue;
+            };
             if kind.is_symlink() {
                 continue;
             }
             let path = item.path();
-            let Ok(mut dacl) = Dacl::read(&path) else { continue };
+            let Ok(mut dacl) = Dacl::read(&path) else {
+                // (its list cannot be read, so it is not known to be clear of the ACE; what is under it is still looked at)
+                failed += u32::from(!gone(&path));
+                if kind.is_dir() {
+                    waiting.push(path);
+                }
+                continue;
+            };
             if dacl.protected() || (kind.is_dir() && dacl.has_exact(sid, READ_WRITE_EXECUTE, TO_ALL)) {
                 continue;
             }
@@ -225,23 +265,25 @@ unsafe fn strip_tree(root: &Path, watch: &Path, sid: PSID, masks: &[u32]) -> boo
                     changed = true;
                 }
             }
-            if changed {
-                let _ = dacl.write_alone(&path);
+            if changed && dacl.write_alone(&path).is_err() {
+                failed += u32::from(!gone(&path));
             }
             if kind.is_dir() {
                 waiting.push(path);
             }
         }
     }
-    true
+    Some(failed)
 }
 
-/// Takes back all that the list says of this folder, if nothing uses it by the time this can begin. True if it did.
-fn release(file: &Path, path: &Path) -> bool {
+/// Takes back all that the list says of this folder, if nothing uses it by the time this can begin. `done` if it did. A grant whose take-back left something behind stays on the list, and its
+/// root is in `failed`: the next start tries again.
+fn release(file: &Path, path: &Path) -> Released {
     let _one = WORK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut failed = Vec::new();
     // SAFETY: what each call below is given lives until it returns.
     unsafe {
-        let Ok(sid) = sandbox::profile_sid() else { return false };
+        let Ok(sid) = sandbox::profile_sid() else { return Released { done: false, failed } };
         let mut journal = read(file);
         let place = sandbox::key(path);
         let roots: Vec<Grant> = journal.grants.iter().filter(|grant| {
@@ -263,9 +305,22 @@ fn release(file: &Path, path: &Path) -> bool {
                 sandbox::Located::At(place) => {
                     // Where it has gone, its guarded paths with it; if something uses it there, it stays.
                     let moved = Grant { guarded: grant.guarded.iter().map(|item| Guarded { path: item.path.strip_prefix(&grant.root).map_or_else(|_| item.path.clone(), |inside| place.join(inside)), sddl: item.sddl.clone() }).collect(), root: place, id: grant.id.clone() };
-                    if is_in_use(&moved.root) || !take_back(&moved, sid) {
+                    if is_in_use(&moved.root) {
                         all_done = false;
                         continue;
+                    }
+                    match take_back(&moved, sid) {
+                        Taken::Whole => {}
+                        Taken::InUse => {
+                            all_done = false;
+                            continue;
+                        }
+                        // (some of it is still on the list's folder: it is not let go of as if done)
+                        Taken::Partly => {
+                            all_done = false;
+                            failed.push(grant.root.clone());
+                            continue;
+                        }
                     }
                 }
                 sandbox::Located::Gone => {}
@@ -280,45 +335,50 @@ fn release(file: &Path, path: &Path) -> bool {
             let _ = write(file, &journal);
         }
         sandbox::forget_grants();
-        all_done
+        Released { done: all_done, failed }
     }
 }
 
-unsafe fn take_back(grant: &Grant, sid: PSID) -> bool {
+unsafe fn take_back(grant: &Grant, sid: PSID) -> Taken {
     // What was made to keep its own list goes back to what it was, as long as it still does: if a person's git has written it anew, it inherits and is dealt with below.
     for item in &grant.guarded {
         // (one that could not be put back stays on the list, as does the rest of this grant, for the next start)
         if Dacl::read(&item.path).is_ok_and(|dacl| dacl.protected()) && sandbox::restore_dacl_text(&item.path, &item.sddl).is_err() {
-            return false;
+            return Taken::Partly;
         }
     }
-    let Ok(dacl) = Dacl::read(&grant.root) else { return true };
+    // (a root whose list cannot be read is not known to be clear of the ACE)
+    let Ok(dacl) = Dacl::read(&grant.root) else { return Taken::Partly };
     if dacl.has_exact(sid, READ_WRITE_EXECUTE, TO_ALL) && dacl.without_exact(sid, READ_WRITE_EXECUTE, TO_ALL).write_alone(&grant.root).is_err() {
-        return false;
+        return Taken::Partly;
     }
-    if !strip_tree(&grant.root, &grant.root, sid, &[READ_WRITE_EXECUTE]) {
-        return false;
-    }
+    let Some(mut failed) = strip_tree(&grant.root, &grant.root, sid, &[READ_WRITE_EXECUTE]) else { return Taken::InUse };
     // Under a guarded folder what inherited was made read-only, and with what it inherited from put back that is left over.
     for item in &grant.guarded {
-        if item.path.is_dir() && !strip_tree(&item.path, &grant.root, sid, &[READ_EXECUTE]) {
-            return false;
+        if item.path.is_dir() {
+            let Some(more) = strip_tree(&item.path, &grant.root, sid, &[READ_EXECUTE]) else { return Taken::InUse };
+            failed += more;
         }
     }
-    true
+    if failed == 0 {
+        Taken::Whole
+    } else {
+        Taken::Partly
+    }
 }
 
 /// When the app starts, off the window's thread: what earlier runs left. All that the list has, and what an earlier version left on a folder this app's sessions name, if its exact
-/// write ACE is there to prove it. A folder in use is left. Says how many went.
-pub fn sweep(folder: &Path, named_by_sessions: &[PathBuf]) -> usize {
+/// write ACE is there to prove it. A folder in use is left. Says the folders whose take-back left something behind: they stay on the list, and the person is told ([`NOT_TAKEN_BACK`]).
+pub fn sweep(folder: &Path, named_by_sessions: &[PathBuf]) -> Vec<PathBuf> {
     in_the_background();
     let file = folder.join(FILE_NAME);
-    sweep_file(&file, named_by_sessions)
+    sweep_file(&file, named_by_sessions).1
 }
 
-fn sweep_file(file: &Path, named_by_sessions: &[PathBuf]) -> usize {
+/// How many were let go of, and which are left with something behind.
+fn sweep_file(file: &Path, named_by_sessions: &[PathBuf]) -> (usize, Vec<PathBuf>) {
     // SAFETY: the SID lives as long as the process.
-    let Ok(sid) = (unsafe { sandbox::profile_sid() }) else { return 0 };
+    let Ok(sid) = (unsafe { sandbox::profile_sid() }) else { return (0, Vec::new()) };
     {
         let _one = WORK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut journal = read(file);
@@ -338,7 +398,15 @@ fn sweep_file(file: &Path, named_by_sessions: &[PathBuf]) -> usize {
         }
     }
     let roots: Vec<PathBuf> = read(file).grants.into_iter().map(|grant| grant.root).collect();
-    roots.iter().filter(|root| !is_in_use(root) && release(file, root)).count()
+    let (mut released, mut failed) = (0, Vec::new());
+    for root in roots.iter().filter(|root| !is_in_use(root)) {
+        let outcome = release(file, root);
+        released += usize::from(outcome.done);
+        failed.extend(outcome.failed);
+    }
+    failed.sort();
+    failed.dedup();
+    (released, failed)
 }
 
 #[cfg(test)]
@@ -559,7 +627,7 @@ mod tests {
         let (other_before, plain_before, not_named_before) = (lists(&other_shape), lists(&plain), lists(&not_named));
         let held = Use::new(&in_use);
         let gone = stand.base.join("gone-now");
-        let swept = sweep_file(&stand.file, &[old.clone(), other_shape.clone(), in_use.clone(), plain.clone(), gone]);
+        let swept = sweep_file(&stand.file, &[old.clone(), other_shape.clone(), in_use.clone(), plain.clone(), gone]).0;
         assert_eq!(swept, 1);
         assert!(!holds_grant(&old) && !holds_grant(&old.join("a.txt")) && !holds_grant(&old.join("sub").join("b.txt")), "proved, and nothing uses it");
         assert_eq!(lists(&other_shape), other_before, "not the shape of a write grant: not provably one of these");
@@ -619,7 +687,7 @@ mod tests {
         assert!(holds_grant(&git), "guarded");
         // Guarded again, as before each command: the list it had before stays what is written down.
         unsafe { sandbox::guard_repository(&place, &git, sid).unwrap() };
-        assert!(release(&stand.file, &place));
+        assert!(release(&stand.file, &place).done);
         assert_eq!(sandbox::dacl_text(&git).unwrap(), before, "and nothing of the container's stays on it");
     }
 
@@ -658,7 +726,7 @@ mod tests {
         unsafe { sandbox::guard_repository(&place, &git, sid).unwrap() };
         assert!(!git.join("commondir").exists());
         assert!(git.join("worktrees").join("w").join("commondir").exists(), "a real worktree's");
-        assert!(release(&stand.file, &place));
+        assert!(release(&stand.file, &place).done);
     }
 
     #[test]
@@ -673,7 +741,7 @@ mod tests {
         unsafe { sandbox::guard_repository(&place, &git, sid).unwrap() };
         let guarded = sandbox::dacl_text(&git).unwrap();
         assert!(guarded.starts_with("D:P") && guarded.contains(&sandbox::profile_sid_text()), "{guarded}");
-        assert!(release(&stand.file, &place));
+        assert!(release(&stand.file, &place).done);
         assert_eq!(sandbox::dacl_text(&git).unwrap(), before);
     }
 
@@ -710,5 +778,35 @@ mod tests {
         sandbox::forget_grants();
         unsafe { sandbox::open_toolchains("", &home, false, sid) };
         assert!(!sandbox::dacl_text(&cargo.join("credentials.toml")).unwrap().contains(&id));
+    }
+
+    /// An item under the grant that refuses to have its list changed leaves the grant on the list, and the take-back is done when it can be.
+    #[test]
+    fn a_take_back_that_could_not_change_everything_stays_on_the_list_and_is_tried_again() {
+        let stand = stand();
+        let first = folder(&stand, "first");
+        let chat = Use::new(&first);
+        assert_eq!(command(&first, "echo made> made.txt").0, Some(0));
+        let a = first.join("a.txt");
+        let text = sandbox::dacl_text(&a).unwrap();
+        assert!(text.contains(&sandbox::profile_sid_text()), "it was granted: {text}");
+        // The stand-in: nobody may write its list (Everyone is denied WRITE_DAC, and an OWNER RIGHTS entry takes from its owner the right the owner has without one), though it can be read. It
+        // is in a temp folder, which can still be emptied: the folder lets its owner delete what is in it.
+        let at = text.find('(').unwrap();
+        sandbox::restore_dacl_text(&a, &format!("{}(D;;WD;;;WD)(A;;RC;;;OW){}", &text[..at], &text[at..])).unwrap();
+        assert!(unsafe { Dacl::read(&a).unwrap().write_alone(&a) }.is_err(), "its list cannot be written now");
+        drop(chat);
+        let outcome = release(&stand.file, &first);
+        assert!(!outcome.done && outcome.failed.len() == 1 && sandbox::key(&outcome.failed[0]) == sandbox::key(&first), "{:?}", outcome.failed);
+        assert!(read(&stand.file).grants.iter().any(|grant| sandbox::key(&grant.root) == sandbox::key(&first)), "it stays on the list");
+        assert!(holds_grant(&a), "and the ACE is still where it could not be taken off");
+        // (the person is told through what the start of the app does with it)
+        assert_eq!(sweep_file(&stand.file, &[]).1.len(), 1);
+        // Once what refused is gone, the next try takes back the rest and lets the grant go.
+        std::fs::remove_file(&a).unwrap();
+        let outcome = release(&stand.file, &first);
+        assert!(outcome.done && outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert!(read(&stand.file).grants.iter().all(|grant| sandbox::key(&grant.root) != sandbox::key(&first)));
+        assert!(!holds_grant(&first) && !holds_grant(&first.join("made.txt")) && !holds_grant(&first.join("sub").join("b.txt")));
     }
 }
