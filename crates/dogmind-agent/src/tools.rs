@@ -167,23 +167,85 @@ impl Live {
         kept.0.drain(..over);
     }
 
-    /// What came after its first `from` bytes, at most the last `most` of it, and where the next look starts.
+    /// What came after its first `from` bytes, at most the last `most` of it, and where the next look starts: not past a character that has come only in part, which is kept for the next look
+    /// and shown whole then.
     fn since(&self, from: u64, most: usize) -> (String, u64) {
         let kept = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (buffer, total) = (&kept.0, kept.1);
         let new = total.saturating_sub(from);
         let shown = (new.min(buffer.len() as u64) as usize).min(most);
         let mut bytes: Vec<u8> = buffer.iter().skip(buffer.len() - shown).copied().collect();
-        // (a look may start in the middle of a character)
+        // (a look may start in the middle of a character: of UTF-8 it is dropped. Of the console's code page it is not told from a character of one byte, and what is there is read as it is)
+        let begins_inside = new > shown as u64;
         let cut = bytes.iter().take_while(|byte| (0x80..0xC0).contains(*byte)).count();
-        bytes.drain(..cut);
+        if begins_inside && cut > 0 && utf8_so_far(&bytes[cut..]) {
+            bytes.drain(..cut);
+        }
+        let (decoded, used) = decode_so_far(&bytes);
         let mut text = String::new();
-        if new > shown as u64 {
+        if begins_inside {
             text.push_str(&format!("({} bytes before this are not shown)\n", new - shown as u64));
         }
-        text.push_str(&String::from_utf8_lossy(&bytes));
-        (text, total)
+        text.push_str(&decoded);
+        (text, total - (bytes.len() - used) as u64)
     }
+}
+
+/// Whether these bytes are UTF-8, or UTF-8 that ends in the middle of a character.
+fn utf8_so_far(bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        Err(error) => error.error_len().is_none(),
+    }
+}
+
+/// A command's output as far as it has come, as the final output is read (`sandbox::decode`: UTF-8, as asked for, or for what ignored that the console's code page), and how many of its bytes
+/// that is. A character that has come in part, at the end, is left out and left for the next time: UTF-8 that ends in one, or a double-byte character of the code page whose second byte has
+/// not come.
+fn decode_so_far(bytes: &[u8]) -> (String, usize) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => return (text.to_string(), bytes.len()),
+        Err(error) if error.error_len().is_none() => {
+            let upto = error.valid_up_to();
+            return (String::from_utf8_lossy(&bytes[..upto]).into_owned(), upto);
+        }
+        Err(_) => {}
+    }
+    let whole = whole_characters(bytes);
+    (decode_text(&bytes[..whole]), whole)
+}
+
+/// The length of these bytes without a lead byte of the console's code page at its end, which a second byte has still to follow.
+#[cfg(windows)]
+fn whole_characters(bytes: &[u8]) -> usize {
+    use windows_sys::Win32::Globalization::{GetOEMCP, IsDBCSLeadByteEx};
+    // SAFETY: both take numbers.
+    let code_page = unsafe { GetOEMCP() };
+    let mut at = 0;
+    while at < bytes.len() {
+        // SAFETY: as above.
+        let lead = unsafe { IsDBCSLeadByteEx(code_page, bytes[at]) } != 0;
+        if lead && at + 1 >= bytes.len() {
+            return at;
+        }
+        at += if lead { 2 } else { 1 };
+    }
+    bytes.len()
+}
+
+#[cfg(not(windows))]
+fn whole_characters(bytes: &[u8]) -> usize {
+    bytes.len()
+}
+
+#[cfg(windows)]
+fn decode_text(bytes: &[u8]) -> String {
+    crate::sandbox::decode(bytes)
+}
+
+#[cfg(not(windows))]
+fn decode_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Commands going on in the background. They do not outlive the session that started them.
@@ -403,9 +465,24 @@ fn keep_whole_as(kind: &str, whole: &str) -> Option<PathBuf> {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-    let file = folder.join(format!("{kind}-{}.txt", chrono::Local::now().format("%Y%m%d-%H%M%S%3f")));
-    std::fs::write(&file, whole).ok()?;
-    Some(file)
+    keep_whole_in(&folder, kind, &chrono::Local::now().format("%Y%m%d-%H%M%S%3f").to_string(), whole)
+}
+
+/// The file for one output, named by the time to the millisecond and made so that it cannot replace another: commands end on threads of their own, and two that end in the same
+/// millisecond had one file between them, and both reports pointed at the one that was written last. On a clash the name has a number added.
+fn keep_whole_in(folder: &Path, kind: &str, stamp: &str, whole: &str) -> Option<PathBuf> {
+    for again in 0..1000 {
+        let name = if again == 0 { format!("{kind}-{stamp}.txt") } else { format!("{kind}-{stamp}-{again}.txt") };
+        let file = folder.join(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&file) {
+            Ok(mut out) => {
+                return std::io::Write::write_all(&mut out, whole.as_bytes()).is_ok().then_some(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// The head and the tail of a long output, and where all of it is when it was kept.
@@ -525,16 +602,18 @@ impl Workbench {
     }
 
     fn start_job(&mut self, arguments: &Value, workspace: &Path) -> Result<String, String> {
+        let started = Instant::now();
         let (cancel, result, live) = spawn_command(&background_arguments(arguments), workspace);
-        let id = self.add_job(arguments, cancel, result, live)?;
+        let id = self.add_job(arguments, started, cancel, result, live)?;
         Ok(format!("started as {id}. Go on with other work, and use command_status for it; do not wait in a loop."))
     }
 
-    fn add_job(&mut self, arguments: &Value, cancel: Arc<AtomicBool>, result: CommandResult, live: Arc<Live>) -> Result<String, String> {
+    /// `started`: when it began, which for a command that was waited for and went on in the background is when it was started and not when it was left.
+    fn add_job(&mut self, arguments: &Value, started: Instant, cancel: Arc<AtomicBool>, result: CommandResult, live: Arc<Live>) -> Result<String, String> {
         let id = format!("job{}", self.jobs.0.len() + 1);
         let command = text_arg(arguments, "command")?.to_string();
         let in_scratch = self.scratch_for(arguments).is_some();
-        self.jobs.0.push(Job { id: id.clone(), command, started: Instant::now(), cancel, result, in_scratch, told: AtomicBool::new(false), live, looked: AtomicU64::new(0) });
+        self.jobs.0.push(Job { id: id.clone(), command, started, cancel, result, in_scratch, told: AtomicBool::new(false), live, looked: AtomicU64::new(0) });
         Ok(id)
     }
 
@@ -548,20 +627,20 @@ impl Workbench {
         if let Some(fields) = given.as_object_mut() {
             fields.remove("timeout_seconds");
         }
+        let started = Instant::now();
         let (stop, result, live) = spawn_command(&given, workspace);
         if let Some(outcome) = wait_for_command(&result, &stop, cancel, wait) {
             return outcome;
         }
-        let id = self.add_job(arguments, stop, result, live)?;
+        let id = self.add_job(arguments, started, stop, result, live)?;
         Ok(format!("still running after {} s, so it goes on in the background as {id}. Go on with other work and use command_status for it: do not run it again, and do not wait in a loop.", wait.as_secs()))
     }
 
-    fn job_status(&self, arguments: &Value) -> Result<String, String> {
-        let wanted = arguments.get("id").and_then(Value::as_str);
-        // (asked for all of them, an ended one whose output was in such a report already is a line: all of them again each time pushed the
-        // middle ones out of the report, and the model was not told)
-        let report = |job: &Job| match &*job.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
-            Some(_) if wanted.is_none() && job.told.load(Ordering::Relaxed) => format!("{} has ended, as reported before (command_status with its id says it again): {}", job.id, job.command),
+    /// How one job stands, for `command_status`. Asked for all of them (`all`), an ended one whose output was in such a report already is a line: all of them again each time pushed the
+    /// middle ones out of the report, and the model was not told.
+    fn job_report(job: &Job, all: bool) -> String {
+        match &*job.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+            Some(_) if all && job.told.load(Ordering::Relaxed) => format!("{} has ended, as reported before (command_status with its id says it again): {}", job.id, job.command),
             Some(Ok(output)) => {
                 job.told.store(true, Ordering::Relaxed);
                 format!("{} has ended: {}\n{output}", job.id, job.command)
@@ -581,8 +660,12 @@ impl Workbench {
                 };
                 format!("{} is running, for {} s: {}\n{said}", job.id, job.started.elapsed().as_secs(), job.command)
             }
-        };
-        let lines: Vec<String> = self.jobs.0.iter().filter(|job| wanted.is_none_or(|id| job.id == id)).map(report).collect();
+        }
+    }
+
+    fn job_status(&self, arguments: &Value) -> Result<String, String> {
+        let wanted = arguments.get("id").and_then(Value::as_str);
+        let lines: Vec<String> = self.jobs.0.iter().filter(|job| wanted.is_none_or(|id| job.id == id)).map(|job| Workbench::job_report(job, wanted.is_none())).collect();
         if lines.is_empty() {
             return Ok(wanted.map_or("no command has been started in the background".to_string(), |id| format!("there is no {id}")));
         }
@@ -592,6 +675,10 @@ impl Workbench {
     fn job_stop(&self, arguments: &Value) -> Result<String, String> {
         let id = text_arg(arguments, "id")?;
         let job = self.jobs.0.iter().find(|job| job.id == id).ok_or_else(|| format!("there is no {id}"))?;
+        // One that has ended is not being ended: nothing was stopped, and what it came to is what `command_status` says of it.
+        if job.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some() {
+            return Ok(format!("{id} had already ended, so nothing was stopped. As command_status gives it:\n{}", Workbench::job_report(job, false)));
+        }
         job.cancel.store(true, Ordering::Relaxed);
         Ok(format!("{id} is being ended"))
     }
@@ -2495,7 +2582,7 @@ mod power_tests {
     fn an_ended_jobs_output_is_reported_once_among_all_and_its_timeout_is_not_its_life() {
         let mut bench = Workbench::default();
         let done: CommandResult = Arc::new(Mutex::new(Some(Ok("BUILD OUTPUT".to_string()))));
-        bench.add_job(&json!({"command": "cargo build"}), Arc::new(AtomicBool::new(false)), done, Arc::default()).unwrap();
+        bench.add_job(&json!({"command": "cargo build"}), Instant::now(), Arc::new(AtomicBool::new(false)), done, Arc::default()).unwrap();
         let first = bench.job_status(&json!({})).unwrap();
         let second = bench.job_status(&json!({})).unwrap();
         let by_id = bench.job_status(&json!({"id": "job1"})).unwrap();
@@ -2509,7 +2596,7 @@ mod power_tests {
     fn a_running_job_shows_what_it_printed_since_the_last_look() {
         let mut bench = Workbench::default();
         let live: Arc<Live> = Arc::default();
-        bench.add_job(&json!({"command": "npm run dev"}), Arc::new(AtomicBool::new(false)), Arc::default(), live.clone()).unwrap();
+        bench.add_job(&json!({"command": "npm run dev"}), Instant::now(), Arc::new(AtomicBool::new(false)), Arc::default(), live.clone()).unwrap();
         assert!(bench.job_status(&json!({})).unwrap().ends_with("it has printed nothing yet"));
         live.push("compiling\nlistening on http://localhost:5173\n".as_bytes());
         let first = bench.job_status(&json!({"id": "job1"})).unwrap();
@@ -3487,6 +3574,96 @@ mod tests {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         bytes
+    }
+
+    /// What a command has printed so far is read as the final output is: a double-byte character of the console's code page that has come in part is left for the next look and shown
+    /// whole then, and what came before it is not garbled.
+    #[cfg(windows)]
+    #[test]
+    fn what_a_running_command_has_printed_is_read_as_what_it_printed_when_it_ends() {
+        use windows_sys::Win32::Globalization::GetOEMCP;
+        // (the console's code page on a Japanese Windows: this is what is looked at, and on another it would be another)
+        if unsafe { GetOEMCP() } != 932 {
+            return;
+        }
+        // "日本語" and then "です" in Shift_JIS, the first chunk cut in the middle of the third character
+        let all: Vec<u8> = vec![0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA, 0x82, 0xC5, 0x82, 0xB7];
+        let live = Live::default();
+        live.push(&all[..5]);
+        let (first, next) = live.since(0, LIVE_SHOWN);
+        assert_eq!(first, "日本", "the character that has come in part waits");
+        assert_eq!(next, 4);
+        live.push(&all[5..]);
+        let (rest, after) = live.since(next, LIVE_SHOWN);
+        assert_eq!(rest, "語です", "and is whole in the next look");
+        assert_eq!(after, all.len() as u64);
+        // (all at once, it reads as the final output does)
+        let once = Live::default();
+        once.push(&all);
+        assert_eq!(once.since(0, LIVE_SHOWN).0, crate::sandbox::decode(&all));
+        // (UTF-8 as asked for, cut in the middle of a character, waits the same way)
+        let utf8 = "ありがとう".as_bytes();
+        let split = Live::default();
+        split.push(&utf8[..4]);
+        let (first, next) = split.since(0, LIVE_SHOWN);
+        assert_eq!((first.as_str(), next), ("あ", 3));
+        split.push(&utf8[4..]);
+        assert_eq!(split.since(next, LIVE_SHOWN).0, "りがとう");
+        // (a look that nothing new has come to is empty, and does not move)
+        assert_eq!(split.since(utf8.len() as u64, LIVE_SHOWN), (String::new(), utf8.len() as u64));
+    }
+
+    /// Plain text and UTF-8 are read as they were, whatever the code page.
+    #[test]
+    fn what_a_running_command_has_printed_in_plain_text_is_unchanged() {
+        let live = Live::default();
+        live.push(b"line one\r\nline two\r\n");
+        assert_eq!(live.since(0, LIVE_SHOWN), ("line one\r\nline two\r\n".to_string(), 20));
+        live.push("日本語\n".as_bytes());
+        assert_eq!(live.since(20, LIVE_SHOWN).0, "日本語\n");
+    }
+
+    /// Two outputs kept in the same millisecond are two files, each with its own words.
+    #[test]
+    fn two_outputs_kept_in_one_millisecond_take_two_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = keep_whole_in(dir.path(), "command", "20261105-120000000", "first output").unwrap();
+        let second = keep_whole_in(dir.path(), "command", "20261105-120000000", "second output").unwrap();
+        let third = keep_whole_in(dir.path(), "command", "20261105-120000000", "third output").unwrap();
+        assert!(first != second && second != third && first != third);
+        assert_eq!((std::fs::read_to_string(&first).unwrap(), std::fs::read_to_string(&second).unwrap(), std::fs::read_to_string(&third).unwrap()), ("first output".to_string(), "second output".to_string(), "third output".to_string()));
+        assert!(second.file_name().unwrap().to_string_lossy().ends_with("-1.txt"), "{second:?}");
+        // (on threads of their own, as commands end)
+        let place = dir.path().to_path_buf();
+        let kept: Vec<PathBuf> = (0..8).map(|at| { let place = place.clone(); std::thread::spawn(move || keep_whole_in(&place, "search", "same", &format!("output {at}")).unwrap()) }).collect::<Vec<_>>().into_iter().map(|thread| thread.join().unwrap()).collect();
+        let mut names: Vec<_> = kept.iter().collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 8, "{kept:?}");
+        let mut written: Vec<String> = kept.iter().map(|file| std::fs::read_to_string(file).unwrap()).collect();
+        written.sort();
+        assert_eq!(written, (0..8).map(|at| format!("output {at}")).collect::<Vec<_>>());
+    }
+
+    /// A job that has ended is said to have, with what it came to; one still at work is being ended. A command that went on in the background after it was waited for began when it began.
+    #[test]
+    fn command_stop_of_a_job_that_has_ended_says_so_and_a_job_counts_from_its_real_start() {
+        let mut bench = Workbench::default();
+        let (done, running): (CommandResult, CommandResult) = (Arc::new(Mutex::new(Some(Ok("stdout:\nfinished\n\nexit_code: 0".to_string())))), Arc::new(Mutex::new(None)));
+        let arguments = json!({"command": "make"});
+        let ended = bench.add_job(&arguments, Instant::now(), Arc::new(AtomicBool::new(false)), done, Arc::new(Live::default())).unwrap();
+        let said = bench.job_stop(&json!({"id": ended})).unwrap();
+        assert!(said.contains("had already ended") && said.contains("nothing was stopped") && said.contains("finished") && !said.contains("is being ended"), "{said}");
+        assert!(!bench.jobs.0[0].cancel.load(Ordering::Relaxed), "nothing was told to stop");
+        // (a job that is running, which began a while before it was left in the background)
+        let began = Instant::now().checked_sub(Duration::from_secs(42)).unwrap();
+        let at_work = bench.add_job(&json!({"command": "build"}), began, Arc::new(AtomicBool::new(false)), running, Arc::new(Live::default())).unwrap();
+        let status = bench.job_status(&json!({"id": at_work})).unwrap();
+        let seconds: u64 = status.split("for ").nth(1).and_then(|rest| rest.split(" s").next()).and_then(|number| number.parse().ok()).unwrap();
+        assert!((42..50).contains(&seconds), "counted from its real start, not from when it was left: {status}");
+        assert_eq!(bench.job_stop(&json!({"id": at_work})).unwrap(), format!("{at_work} is being ended"));
+        assert!(bench.jobs.0[1].cancel.load(Ordering::Relaxed));
+        assert_eq!(bench.job_stop(&json!({"id": "job9"})).unwrap_err(), "there is no job9");
     }
 
     #[test]
