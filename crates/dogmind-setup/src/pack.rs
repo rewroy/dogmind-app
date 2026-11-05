@@ -21,6 +21,23 @@ fn invalid(words: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, words.into())
 }
 
+/// A hash in lower case hex.
+pub fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A hash from its hex, in either case; none for anything that is not exactly 64 hex digits.
+pub fn unhex(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (at, pair) in text.as_bytes().chunks(2).enumerate() {
+        out[at] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Where what follows an executable's sections begins, or where its file ends when nothing does. By its own header, and not from the end: a signature may come after.
 pub fn overlay_start(file: &mut (impl Read + Seek)) -> io::Result<u64> {
     fn read_at(file: &mut (impl Read + Seek), at: u64, buffer: &mut [u8]) -> io::Result<()> {
