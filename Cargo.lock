@@ -210,6 +210,7 @@ name = "dogmind-app"
 version = "0.1.4"
 dependencies = [
  "dogmind-agent",
+ "flate2",
  "image",
  "serde",
  "serde_json",
