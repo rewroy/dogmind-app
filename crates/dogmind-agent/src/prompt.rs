@@ -137,8 +137,22 @@ fn environment() -> String {
 pub fn workspace_state(cwd: &Path) -> String {
     // (no answer from git is not the same as no repository)
     let none = if cwd.join(".git").exists() { "This folder has a `.git`, and the app could not run git on it." } else { "This folder is not a git repository." };
-    let git = crate::tools::git_info(cwd).map_or(none.to_string(), |info| {
-        format!("A git repository, on {}, with {} changed, {} staged and {} new files.", info.branch, info.changed, info.staged, info.untracked)
+    // (a folder of a larger repository: git, run outside the sandbox, finds that repository, and a command in the sandbox cannot reach it, so the model is told both)
+    let above = crate::tools::repository_above(cwd);
+    let git = crate::tools::git_info(cwd).map_or(none.to_string(), |info| match &above {
+        Some(top) => {
+            let last = info.last_commit.as_ref().map_or(String::new(), |last| format!(" Its last commit: {last}."));
+            format!(
+                "This folder is inside the git repository at `{}`, on {}, with {} changed, {} staged and {} new files in this folder.{last} {}",
+                top.display(),
+                info.branch,
+                info.changed,
+                info.staged,
+                info.untracked,
+                crate::tools::git_above_words(top)
+            )
+        }
+        None => format!("A git repository, on {}, with {} changed, {} staged and {} new files.", info.branch, info.changed, info.staged, info.untracked),
     });
     format!("## The Workspace\n- Root, which relative paths start at: `{}`\n- {}\n- {git}", cwd.display(), folder_contents(cwd))
 }
@@ -387,6 +401,30 @@ mod tests {
         assert!(state.contains("a.txt, src/.") && !state.contains("The workspace is empty") && !state.contains(".git/"), "{state}");
         std::fs::write(folder.path().join("big.log"), vec![b'x'; 300 * 1024]).unwrap();
         assert!(workspace_state(folder.path()).contains("a.txt, big.log (0.3 MB), src/."), "a big file says how big");
+    }
+
+    /// A folder of a larger repository: the first message names the repository and says that git cannot reach it from the sandbox; the top of a repository keeps the sentence it had.
+    #[test]
+    fn a_folder_of_a_larger_repository_is_told_so_and_the_top_of_one_is_not() {
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            crate::tools::git(repo.path(), args).unwrap();
+        };
+        run(&["init", "-q"]);
+        std::fs::create_dir(repo.path().join("pkg")).unwrap();
+        std::fs::write(repo.path().join("pkg").join("a.txt"), "a\n").unwrap();
+        run(&["add", "."]);
+        run(&["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "first commit"]);
+        std::fs::write(repo.path().join("pkg").join("a.txt"), "b\n").unwrap();
+        std::fs::write(repo.path().join("top.txt"), "x").unwrap();
+        let top = crate::tools::repository_above(&repo.path().join("pkg")).unwrap();
+        let state = workspace_state(&repo.path().join("pkg"));
+        println!("{state}");
+        assert!(state.contains(&format!("This folder is inside the git repository at `{}`", top.display())) && state.contains("with 1 changed, 0 staged and 0 new files in this folder"), "{state}");
+        assert!(state.contains("Its last commit: first commit") && state.contains("cannot reach that repository's `.git` from the sandbox") && state.contains("`show_diff`") && state.contains("`git -C"), "{state}");
+        assert!(!state.contains("A git repository, on"), "{state}");
+        let at_top = workspace_state(repo.path());
+        assert!(at_top.contains("- A git repository, on ") && at_top.contains("with 1 changed, 0 staged and 1 new files.") && !at_top.contains("cannot reach"), "{at_top}");
     }
 
     #[test]
