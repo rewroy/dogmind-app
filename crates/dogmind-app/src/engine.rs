@@ -527,12 +527,55 @@ impl Drop for Job {
     }
 }
 
+/// The last lines an engine wrote to its error stream.
+type Said = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+/// How many of those lines are kept: a panic is three lines, and what an engine says after it is little.
+const LINES_KEPT: usize = 20;
+
+/// Reads an engine's error stream, all the time and to its end: a pipe nobody reads fills up, and the engine, its worker with it, then stops at its next line. Keeps the last lines.
+fn listen(stderr: std::process::ChildStderr) -> Said {
+    let said = Said::default();
+    let kept = said.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = Vec::new();
+        while matches!(reader.read_until(b'\n', &mut line), Ok(count) if count > 0) {
+            let text = String::from_utf8_lossy(&line);
+            if !text.trim().is_empty() {
+                let mut lines = kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                lines.push_back(text.trim_end().to_string());
+                while lines.len() > LINES_KEPT {
+                    lines.pop_front();
+                }
+            }
+            line.clear();
+        }
+    });
+    said
+}
+
+/// Why an engine that ended did, from the last lines it wrote. A panic is its place and its message: Rust writes `thread 'main' (4412) panicked at src\main.rs:3:5:` and then the message (older
+/// Rust, `thread 'main' panicked at ...:` and the message, and older still, the message on that line), and after them `note: run with `RUST_BACKTRACE=1` ...`, which says nothing of what went
+/// wrong and was all that was shown. Anything else is the last line, as an error that `main` returns is written in one; the note is not taken for that either.
+fn why_it_said(lines: &[String]) -> Option<String> {
+    if let Some(at) = lines.iter().rposition(|line| line.trim_start().starts_with("thread '") && line.contains(" panicked at ")) {
+        let message = lines[at + 1..].iter().map(|line| line.trim()).take_while(|line| !is_backtrace_note(line) && !line.starts_with("stack backtrace")).take(3);
+        return Some(std::iter::once(lines[at].trim()).chain(message).collect::<Vec<_>>().join(" "));
+    }
+    lines.iter().rev().map(|line| line.trim()).find(|line| !line.is_empty() && !is_backtrace_note(line)).map(str::to_string)
+}
+
+fn is_backtrace_note(line: &str) -> bool {
+    line.starts_with("note: run with `RUST_BACKTRACE")
+}
+
 pub struct Engine {
     child: Child,
     _job: Option<Job>,
-    /// The last line it wrote to its error stream. The stream is read all the time: a pipe nobody reads fills up, and the
-    /// engine, its worker with it, then stops at its next line.
-    last_said: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The last lines it wrote to its error stream (see `listen`).
+    said: Said,
     /// Where it listens: not always the port asked for.
     pub port: u16,
 }
@@ -545,23 +588,8 @@ impl Engine {
         hidden(&mut command);
         let mut child = command.spawn().map_err(|error| start_failure(straydog, &error))?;
         let job = Job::holding(&child).ok();
-        let last_said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        if let Some(stderr) = child.stderr.take() {
-            let last_said = last_said.clone();
-            std::thread::spawn(move || {
-                use std::io::BufRead;
-                let mut reader = std::io::BufReader::new(stderr);
-                let mut line = Vec::new();
-                while matches!(reader.read_until(b'\n', &mut line), Ok(count) if count > 0) {
-                    let text = String::from_utf8_lossy(&line);
-                    if !text.trim().is_empty() {
-                        *last_said.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = text.trim_end().to_string();
-                    }
-                    line.clear();
-                }
-            });
-        }
-        Ok(Engine { child, _job: job, last_said, port: settings.port })
+        let said = child.stderr.take().map_or_else(Said::default, listen);
+        Ok(Engine { child, _job: job, said, port: settings.port })
     }
 
     /// Its process number: an installer that is to replace its files waits for it to end.
@@ -574,8 +602,8 @@ impl Engine {
         let status = self.child.try_wait().ok()??;
         // (its last words may still be on their way to the reader)
         std::thread::sleep(Duration::from_millis(100));
-        let last = self.last_said.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-        Some(if let Some(why) = why_it_did_not_begin(status.code()) { why } else if last.is_empty() { format!("the engine ended ({status})") } else { last })
+        let lines: Vec<String> = self.said.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().cloned().collect();
+        Some(why_it_did_not_begin(status.code()).or_else(|| why_it_said(&lines)).unwrap_or_else(|| format!("the engine ended ({status})")))
     }
 }
 
@@ -1267,6 +1295,67 @@ mod tests {
         // (a Straydog that measures what is free says so too)
         let free = r#"{"machine":{"gpus":[{"ordinal":0,"name":"RTX 5070 Ti","total_bytes":17066033152}],"ram_bytes":66126708736,"free_ram_bytes":30064771072},"bundles":[]}"#;
         assert_eq!(parse_list(free, true).unwrap().machine, "RTX 5070 Ti (16 GB)  ·  62 GB of memory, 28 GB free now");
+    }
+
+    /// An engine stand-in: a program that writes `lines` to its error stream and exits with `code`, listened to as the engine is.
+    fn stand_in(lines: &[&str], code: i32) -> Engine {
+        let mut steps: Vec<String> = lines.iter().map(|line| format!("echo {line} 1>&2")).collect();
+        steps.push(format!("exit /b {code}"));
+        let mut command = Command::new("cmd.exe");
+        command.args(["/c", &steps.join(" & ")]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        hidden(&mut command);
+        let mut child = command.spawn().unwrap();
+        let said = child.stderr.take().map_or_else(Said::default, listen);
+        Engine { child, _job: None, said, port: 0 }
+    }
+
+    fn why_it_ended(lines: &[&str], code: i32) -> String {
+        let mut engine = stand_in(lines, code);
+        for _ in 0..100 {
+            if let Some(why) = engine.ended() {
+                return why;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the stand-in did not end");
+    }
+
+    /// An engine that panics is shown the panic and its message, and not the note about a backtrace that comes last; one that writes an error and ends is shown that, as before.
+    #[test]
+    fn an_engine_that_panicked_is_shown_why_and_not_the_note_that_follows() {
+        let note = "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace";
+        let now = why_it_ended(&["thread 'main' (4412) panicked at src\\main.rs:3:5:", "index out of bounds: the len is 3 but the index is 7", note], 101);
+        assert_eq!(now, "thread 'main' (4412) panicked at src\\main.rs:3:5: index out of bounds: the len is 3 but the index is 7");
+        let before = why_it_ended(&["Straydog loading", "thread 'main' panicked at src\\main.rs:3:5:", "no such expert", note], 101);
+        assert_eq!(before, "thread 'main' panicked at src\\main.rs:3:5: no such expert");
+        // a worker's panic, the engine going on after it
+        let worker = why_it_ended(&["thread 'worker-1' (77) panicked at gpu.rs:9:1:", "CUDA out of memory", note, "worker 1 exited with code 101"], 1);
+        assert!(worker.contains("CUDA out of memory") && !worker.contains("RUST_BACKTRACE"), "{worker}");
+        // an error that main returns is one line, and is the reason as it was
+        assert_eq!(why_it_ended(&["Straydog loading", "Error: no model in D:\\m"], 1), "Error: no model in D:\\m");
+        assert_eq!(why_it_ended(&[], 3).starts_with("the engine ended ("), true, "nothing said");
+    }
+
+    #[test]
+    fn only_the_last_lines_are_kept_and_the_note_is_never_the_reason() {
+        let note = "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace".to_string();
+        // the panic scrolled out, and its note alone is left: the line before it
+        assert_eq!(why_it_said(&["the last thing it said".to_string(), note.clone()]).as_deref(), Some("the last thing it said"));
+        assert_eq!(why_it_said(&[note.clone()]), None);
+        assert_eq!(why_it_said(&[]), None);
+        // the last panic of several, and a backtrace that is not cut by the note
+        let two: Vec<String> = ["thread 'a' panicked at x.rs:1:1:", "first", "thread 'b' (2) panicked at y.rs:2:2:", "second", "stack backtrace:", "   0: frame"].map(String::from).to_vec();
+        assert_eq!(why_it_said(&two).as_deref(), Some("thread 'b' (2) panicked at y.rs:2:2: second"));
+        // the oldest form has its message on the line
+        assert_eq!(why_it_said(&["thread 'main' panicked at 'boom', src/main.rs:3:5".to_string(), note]).as_deref(), Some("thread 'main' panicked at 'boom', src/main.rs:3:5"));
+        // twenty lines are kept of thirty
+        let many: Vec<String> = (1..=30).map(|at| format!("line {at}")).collect();
+        let mut engine = stand_in(&many.iter().map(String::as_str).collect::<Vec<_>>(), 1);
+        while engine.ended().is_none() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let kept: Vec<String> = engine.said.lock().unwrap().iter().cloned().collect();
+        assert_eq!((kept.len(), kept.first().map(String::as_str), kept.last().map(String::as_str)), (LINES_KEPT, Some("line 11"), Some("line 30")));
     }
 
     /// Memory is shown as Windows shows it (units of 2^30, written GB), and the sizes of downloads as Straydog writes them (10^9).
