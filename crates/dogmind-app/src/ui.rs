@@ -3579,7 +3579,10 @@ impl App {
     }
 
     /// A call on a row of its own: the row of the run going on if that has nothing else in it, so that nothing moves.
-    unsafe fn own_row(&mut self, entry: RunEntry, tone: Tone, note: String) {
+    unsafe fn own_row(&mut self, mut entry: RunEntry, tone: Tone, note: String) {
+        if tone != Tone::Done {
+            entry.failure = Some(note.clone());
+        }
         let at = match self.run_open {
             Some(at) if self.runs[at].entries.is_empty() => {
                 self.run_open = None;
