@@ -362,8 +362,12 @@ fn holds(path: &Path, entry: &Entry, record: Option<&Record>, hashed: &mut usize
 /// The package in the folder, from nothing or over an earlier install, going on from where another run stopped.
 pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress)) -> Result<Installed, Failure> {
     let folder = job.folder;
-    std::fs::create_dir_all(folder).map_err(|error| say(folder, &error))?;
     let entries = package.entries.clone();
+    // A folder of the install that has been made a link leads out of it: a file written there, moved aside there and deleted there would be another place's. Nothing is written before this is known.
+    if let Some(link) = entries.iter().find_map(|entry| link_on_the_way(folder, &entry.path)) {
+        return Err(Failure::Said(format!("{}: this folder of the install is a link to somewhere else, so nothing has been changed. Install in another folder, or take the link away.", link.display())));
+    }
+    std::fs::create_dir_all(folder).map_err(|error| say(folder, &error))?;
     let total = package.total_bytes().max(1);
     // (how long each stage took, for the manifest)
     let (mut checking, mut unpacking, mut placing) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
@@ -670,20 +674,26 @@ fn aside_of(target: &Path, stamp: u64) -> PathBuf {
     (stamp..).map(|time| target.with_file_name(format!("{stem}.previous-{time}{extension}"))).find(|path| std::fs::symlink_metadata(path).is_err()).unwrap_or_default()
 }
 
-/// Whether the way to this file from the folder goes through a link. What it leads to is not in the folder, whatever the path says, and is not this program's to take.
-fn through_a_link(folder: &Path, file: &str) -> bool {
+/// The first folder on the way to this file from the folder that is a link (a symbolic link, or a junction, which Rust takes for one). What it leads to is not in the folder, whatever the path
+/// says, and is not this program's to write in or take.
+fn link_on_the_way(folder: &Path, file: &str) -> Option<PathBuf> {
     let mut place = folder.to_path_buf();
     let mut parts = file.split('\\').peekable();
     while let Some(part) = parts.next() {
         if parts.peek().is_none() {
-            return false;
+            return None;
         }
         place.push(part);
         if std::fs::symlink_metadata(&place).is_ok_and(|what| what.file_type().is_symlink()) {
-            return true;
+            return Some(place);
         }
     }
-    false
+    None
+}
+
+/// Whether the way to this file from the folder goes through a link.
+fn through_a_link(folder: &Path, file: &str) -> bool {
+    link_on_the_way(folder, file).is_some()
 }
 
 /// The file a copy moved aside stood for: `NAME.previous-TIME.EXT` stood for `NAME.EXT`, TIME being digits. None for any other name.
@@ -1704,5 +1714,46 @@ mod tests {
         assert!(read_manifest(&folder).is_none());
         letting.join().unwrap();
         other.join().unwrap();
+    }
+
+    /// A junction at `link` to `target`, as `mklink /J` makes it.
+    fn make_junction(link: &Path, target: &Path) {
+        use std::os::windows::process::CommandExt;
+        let made = std::process::Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(link).arg(target).creation_flags(0x0800_0000).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
+        assert!(made.success());
+    }
+
+    #[test]
+    fn an_update_whose_folder_has_been_made_a_link_stops_before_anything_changes_and_names_it() {
+        let scene = Scene::new();
+        let mut first = scene.package("1.0.0", &[("a.exe", b"1"), ("tools\\x.py", b"2"), ("tools\\deep\\y.py", b"3")]);
+        scene.run(&mut first, None, None).unwrap();
+        let folder = scene.folder();
+        // the folder `tools` is now a junction to a folder outside the install, which holds files of the same names
+        let elsewhere = scene.dir.path().join("elsewhere");
+        tree(&elsewhere, &[("x.py", b"the person's x"), ("deep\\y.py", b"the person's y"), ("z.py", b"the person's z")]);
+        std::fs::remove_dir_all(folder.join("tools")).unwrap();
+        make_junction(&folder.join("tools"), &elsewhere);
+        let mut second = scene.package("2.0.0", &[("a.exe", b"11"), ("tools\\x.py", b"22"), ("tools\\deep\\y.py", b"33")]);
+        let (inside, outside) = (walk(&folder), walk(&elsewhere));
+        let manifest_before = std::fs::read(folder.join(MANIFEST)).unwrap();
+        for by_hand in [false, true] {
+            let failed = if by_hand { scene.run_by_hand(&mut second) } else { scene.run(&mut second, None, None) };
+            let Err(Failure::Said(words)) = failed else { panic!("{failed:?}") };
+            assert!(words.contains(&folder.join("tools").display().to_string()) && words.contains("nothing has been changed"), "{words}");
+            assert!(!words.contains('\n'), "one line: {words}");
+            assert_eq!(walk(&folder), inside, "not a file made or moved in the install");
+            assert_eq!(walk(&elsewhere), outside, "not a file made, moved aside or deleted outside it");
+            assert_eq!(std::fs::read(elsewhere.join("x.py")).unwrap(), b"the person's x");
+            assert_eq!(std::fs::read(elsewhere.join("deep\\y.py")).unwrap(), b"the person's y");
+            assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"1");
+            assert_eq!(std::fs::read(folder.join(MANIFEST)).unwrap(), manifest_before);
+        }
+        assert_eq!(scene.shell.said.borrow().len(), 1, "nothing was registered again");
+        // and with the link taken away, the same update goes through
+        std::fs::remove_dir(folder.join("tools")).unwrap();
+        assert!(scene.run(&mut second, None, None).is_ok());
+        assert_eq!(std::fs::read(folder.join("tools\\x.py")).unwrap(), b"22");
+        assert_eq!(std::fs::read(elsewhere.join("x.py")).unwrap(), b"the person's x");
     }
 }
