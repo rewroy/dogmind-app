@@ -13549,12 +13549,16 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let _ = handle.commands.send(Command::SetSafeCommands(saved.safe_commands));
         // What earlier runs left writable, now that what this one uses is counted.
         {
-            let (data, mut named) = (folder.clone(), saved.workspaces.clone());
+            let (data, mut named, poster) = (folder.clone(), saved.workspaces.clone(), poster.clone());
             std::thread::spawn(move || {
                 named.extend(session::list(&data.join("sessions")).into_iter().map(|summary| summary.workspace));
                 named.sort();
                 named.dedup();
-                dogmind_agent::workspace_grants::sweep(&data, &named);
+                // (a folder whose take-back left something behind stays on the list and is tried again at each start; the person is told, as they are of a folder they named for commands)
+                let left: Vec<String> = dogmind_agent::workspace_grants::sweep(&data, &named).iter().map(|folder| format!("{}: {}", folder.display(), t(dogmind_agent::workspace_grants::NOT_TAKEN_BACK))).collect();
+                if !left.is_empty() {
+                    poster.send(Note::ReadFolderDone(left.join("\n"), true));
+                }
             });
         }
 
