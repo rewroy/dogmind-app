@@ -28,6 +28,62 @@ pub struct BuildTools {
     pub path: Vec<PathBuf>,
 }
 
+/// Why the build tools were not found, when they were not: what a command that then fails to find `cl` can be told, and the person with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// Not an x64 PC: on arm64 the folders would be another set.
+    NotX64,
+    /// Visual Studio's installer (`vswhere`) is not here: no Visual Studio, or no Build Tools.
+    NoInstaller,
+    /// The installer is here, and no installation of it has the C++ tools for x64.
+    NoCppTools,
+    /// An installation with the C++ tools, whose default toolset is not all there.
+    NoToolset,
+    /// No complete Windows SDK.
+    NoSdk,
+}
+
+impl Why {
+    /// For a model that ran `cl`, `link` or `nmake` and did not find it, to tell the person.
+    pub fn words(self) -> &'static str {
+        match self {
+            Why::NotX64 => "this PC is not an x64 one, and the build tools are given to x64 builds only",
+            Why::NoInstaller => "Visual Studio's installer was not found on this PC, so there are no build tools to give. The person can install Visual Studio or the Build Tools for Visual Studio, with the \"Desktop development with C++\" workload",
+            Why::NoCppTools => "Visual Studio is here, but without the C++ tools for x64. The person can add the \"Desktop development with C++\" workload in the Visual Studio Installer",
+            Why::NoToolset => "the C++ toolset of the Visual Studio here is not all there (its default version, or its folders). The person can repair it, or modify it to include the \"Desktop development with C++\" workload, in the Visual Studio Installer",
+            Why::NoSdk => "no complete Windows SDK was found beside the C++ tools. The person can add a Windows SDK in the Visual Studio Installer (under the \"Desktop development with C++\" workload)",
+        }
+    }
+
+    /// Whether something the person installs while the app runs could change it.
+    fn may_change(self) -> bool {
+        self != Why::NotX64
+    }
+}
+
+/// Why the last look settled on none, for the process; none when it found them, or has not settled.
+static WHY: Mutex<Option<Why>> = Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_WHY: std::cell::Cell<Option<Option<Why>>> = const { std::cell::Cell::new(None) };
+}
+
+/// A test's own answer to [`why_not`].
+#[cfg(test)]
+pub(crate) fn set_test_why(why: Option<Option<Why>>) {
+    TEST_WHY.with(|known| known.set(why));
+}
+
+/// Why the build tools were not found, if the look settled on none. (A look that has not come to an answer says nothing: `None`, as when they were found.)
+pub fn why_not() -> Option<Why> {
+    #[cfg(test)]
+    if let Some(told) = TEST_WHY.with(std::cell::Cell::get) {
+        return told;
+    }
+    *WHY.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Only x64 hosts: on arm64 the folders would be another set, and no build is better than one that links the wrong thing.
 fn is_x64(architecture: &str) -> bool {
     architecture.eq_ignore_ascii_case("AMD64")
@@ -41,21 +97,26 @@ fn version_numbers(name: &str) -> Option<Vec<u64>> {
 /// The folders of one Visual Studio installation and one Windows SDK root, when all of them are there. Takes the toolset the installation names as its default, and the newest SDK
 /// that has everything: a half-installed newer one is passed over, and what is taken is all of one version.
 pub fn layout(architecture: &str, install: &Path, kits: &Path) -> Option<BuildTools> {
+    layout_or_why(architecture, install, kits).ok()
+}
+
+/// [`layout`], and why not when it is none.
+fn layout_or_why(architecture: &str, install: &Path, kits: &Path) -> Result<BuildTools, Why> {
     if !is_x64(architecture) {
-        return None;
+        return Err(Why::NotX64);
     }
-    let named = std::fs::read_to_string(install.join("VC\\Auxiliary\\Build\\Microsoft.VCToolsVersion.default.txt")).ok()?;
+    let named = std::fs::read_to_string(install.join("VC\\Auxiliary\\Build\\Microsoft.VCToolsVersion.default.txt")).map_err(|_| Why::NoToolset)?;
     let version = named.trim();
     // (a name from a file, joined to a path: a version, not a way out of the folder)
     if version_numbers(version).is_none() {
-        return None;
+        return Err(Why::NoToolset);
     }
     let toolset = install.join("VC\\Tools\\MSVC").join(version);
     let (bin, lib, include) = (toolset.join("bin\\Hostx64\\x64"), toolset.join("lib\\x64"), toolset.join("include"));
     if ![&bin, &lib, &include].iter().all(|folder| folder.is_dir()) {
-        return None;
+        return Err(Why::NoToolset);
     }
-    let mut versions: Vec<(Vec<u64>, String)> = std::fs::read_dir(kits.join("Lib")).ok()?.flatten().filter_map(|entry| {
+    let mut versions: Vec<(Vec<u64>, String)> = std::fs::read_dir(kits.join("Lib")).map_err(|_| Why::NoSdk)?.flatten().filter_map(|entry| {
         let name = entry.file_name().to_string_lossy().into_owned();
         Some((version_numbers(&name)?, name))
     }).collect();
@@ -70,7 +131,7 @@ pub fn layout(architecture: &str, install: &Path, kits: &Path) -> Option<BuildTo
             include: [vec![include.clone()], includes].concat(),
             path: vec![bin.clone(), sdk_bin],
         })
-    })
+    }).ok_or(Why::NoSdk)
 }
 
 /// A list of folders as a variable holds it. None when one cannot be written in one (a quote), which no folder of an install has.
@@ -107,10 +168,15 @@ enum Looked<T> {
     Unsettled,
 }
 
+/// How long an answer of none stands before the next ask looks again, when what the person installs could change it: Build Tools put on while the app runs are found without a restart.
+const NONE_STANDS: Duration = Duration::from_secs(5 * 60);
+
 /// What is known of the build tools, and whether a look for them is going on.
 struct Remembered {
     /// What a look settled, for the process: the tools, or `None` for a machine that has none (no Visual Studio with the C++ tools, no `vswhere`, not x64). Not known yet: `None` out here.
     settled: Option<Option<BuildTools>>,
+    /// When it settled.
+    settled_at: Option<Instant>,
     /// A look is going on, on a thread of its own.
     looking: bool,
     /// When the last look ended without settling anything.
@@ -125,11 +191,18 @@ struct Finder {
     ended: Condvar,
     /// How long after a look that settled nothing the next one may begin.
     again_after: Duration,
+    /// How long an answer of none stands, and whether it could be otherwise now (an install can change it; an arm64 PC cannot).
+    none_stands: Duration,
+    none_may_change: fn() -> bool,
 }
 
 impl Finder {
     const fn new(again_after: Duration) -> Finder {
-        Finder { remembered: Mutex::new(Remembered { settled: None, looking: false, unsettled_at: None }), ended: Condvar::new(), again_after }
+        Finder::looking_again_at_none(again_after, Duration::MAX, || false)
+    }
+
+    const fn looking_again_at_none(again_after: Duration, none_stands: Duration, none_may_change: fn() -> bool) -> Finder {
+        Finder { remembered: Mutex::new(Remembered { settled: None, settled_at: None, looking: false, unsettled_at: None }), ended: Condvar::new(), again_after, none_stands, none_may_change }
     }
 
     fn lock(&self) -> MutexGuard<'_, Remembered> {
@@ -139,7 +212,9 @@ impl Finder {
     /// Begins a look on a thread of its own, when one is wanted: not when the answer is known, a look is going on, or the last one ended without settling less than `again_after` ago.
     fn begin(&'static self, remembered: &mut Remembered, look: impl FnOnce() -> Looked<Option<BuildTools>> + Send + 'static) {
         let may_try_again = remembered.unsettled_at.is_none_or(|at| at.elapsed() >= self.again_after);
-        if remembered.settled.is_some() || remembered.looking || !may_try_again {
+        // (an answer of none that has stood for a while is looked into again in the background, and stands meanwhile: nothing waits for it)
+        let none_is_stale = matches!(remembered.settled, Some(None)) && remembered.settled_at.is_some_and(|at| at.elapsed() >= self.none_stands) && (self.none_may_change)();
+        if (remembered.settled.is_some() && !none_is_stale) || remembered.looking || !may_try_again {
             return;
         }
         let spawned = std::thread::Builder::new().name("build tools".to_string()).spawn(move || {
@@ -148,7 +223,10 @@ impl Finder {
             let mut remembered = self.lock();
             remembered.looking = false;
             match looked {
-                Looked::Settled(tools) => remembered.settled = Some(tools),
+                Looked::Settled(tools) => {
+                    remembered.settled = Some(tools);
+                    remembered.settled_at = Some(Instant::now());
+                }
                 Looked::Unsettled => remembered.unsettled_at = Some(Instant::now()),
             }
             drop(remembered);
@@ -189,7 +267,7 @@ impl Finder {
     }
 }
 
-static FINDER: Finder = Finder::new(LOOK_AGAIN_AFTER);
+static FINDER: Finder = Finder::looking_again_at_none(LOOK_AGAIN_AFTER, NONE_STANDS, || WHY.lock().unwrap_or_else(PoisonError::into_inner).is_some_and(Why::may_change));
 
 /// Begins the look for the build tools in the background, if it is wanted and has not begun, and returns at once. Asked early (when an agent starts, and when a command is about to run), so that
 /// a command's environment usually finds the answer ready.
@@ -210,30 +288,45 @@ pub fn found_before(deadline: Instant, stop: &AtomicBool) -> Option<BuildTools> 
 }
 
 fn look() -> Looked<Option<BuildTools>> {
-    let Some(architecture) = std::env::var("PROCESSOR_ARCHITECTURE").ok().filter(|architecture| is_x64(architecture)) else { return Looked::Settled(None) };
-    let Some(program_files) = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from) else { return Looked::Settled(None) };
+    let settled = |why: Why| {
+        *WHY.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+        Looked::Settled(None)
+    };
+    let Some(architecture) = std::env::var("PROCESSOR_ARCHITECTURE").ok().filter(|architecture| is_x64(architecture)) else { return settled(Why::NotX64) };
+    let Some(program_files) = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from) else { return settled(Why::NoInstaller) };
     let install = match installation(&program_files) {
-        Looked::Settled(Some(install)) => install,
-        Looked::Settled(None) => return Looked::Settled(None),
+        Looked::Settled(Ok(install)) => install,
+        Looked::Settled(Err(why)) => return settled(why),
         Looked::Unsettled => return Looked::Unsettled,
     };
     // (the registry's root first; where the SDK puts itself by default, when it has none or the one it names is not what was wanted)
     let kits = kits_root().into_iter().chain([program_files.join("Windows Kits\\10")]);
-    Looked::Settled(kits.into_iter().find_map(|kits| layout(&architecture, &install, &kits)))
+    let mut why = Why::NoSdk;
+    for kits in kits {
+        match layout_or_why(&architecture, &install, &kits) {
+            Ok(tools) => {
+                *WHY.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                return Looked::Settled(Some(tools));
+            }
+            Err(Why::NoToolset) => why = Why::NoToolset,
+            Err(other) => why = if why == Why::NoToolset { why } else { other },
+        }
+    }
+    settled(why)
 }
 
 /// The newest Visual Studio with the C++ tools, as its own `vswhere` says. Settled as none when `vswhere` is not there or has found no installation; not settled when it ran out of time or
 /// could not be run, as that says nothing of what is installed.
-fn installation(program_files: &Path) -> Looked<Option<PathBuf>> {
+fn installation(program_files: &Path) -> Looked<Result<PathBuf, Why>> {
     let vswhere = program_files.join("Microsoft Visual Studio\\Installer\\vswhere.exe");
     if !vswhere.is_file() {
-        return Looked::Settled(None);
+        return Looked::Settled(Err(Why::NoInstaller));
     }
     let mut command = std::process::Command::new(vswhere);
     command.args(["-latest", "-products", "*", "-requires", CPP_TOOLS, "-property", "installationPath", "-utf8"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
     crate::tools::no_window(&mut command);
     match output_within(command, VSWHERE_LIMIT) {
-        Ran::Said(said) => Looked::Settled(said.lines().map(str::trim).find(|line| !line.is_empty()).map(PathBuf::from).filter(|folder| folder.is_dir())),
+        Ran::Said(said) => Looked::Settled(said.lines().map(str::trim).find(|line| !line.is_empty()).map(PathBuf::from).filter(|folder| folder.is_dir()).ok_or(Why::NoCppTools)),
         Ran::Failed | Ran::TooSlow => Looked::Unsettled,
     }
 }
@@ -544,7 +637,7 @@ mod tests {
     #[test]
     fn a_vswhere_that_is_not_there_is_a_machine_without_visual_studio_for_good() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(installation(dir.path()), Looked::Settled(None)));
+        assert!(matches!(installation(dir.path()), Looked::Settled(Err(Why::NoInstaller))));
     }
 
     /// A finder of a test's own (the process's is not for a test to count on). `begin` needs it to live as long as the process does.
@@ -581,6 +674,57 @@ mod tests {
             assert_eq!(finder.found_before(counting(&calls, Looked::Unsettled), within(10), &go_on), Some(tools()));
             assert_eq!(finder.known(counting(&calls, Looked::Unsettled)), Some(tools()));
         }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Each way the layout can fail says which it was.
+    #[test]
+    fn a_layout_that_fails_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (install, kits) = machine(dir.path(), &["14.38.33130"], "14.38.33130", &["10.0.22621.0"]);
+        assert!(layout_or_why("AMD64", &install, &kits).is_ok());
+        assert_eq!(layout_or_why("ARM64", &install, &kits), Err(Why::NotX64));
+        assert_eq!(layout_or_why("AMD64", Path::new("C:\\no\\such\\install"), &kits), Err(Why::NoToolset));
+        let (install, kits) = machine(&dir.path().join("two"), &["14.38.33130"], "14.99.1", &["10.0.22621.0"]);
+        assert_eq!(layout_or_why("AMD64", &install, &kits), Err(Why::NoToolset), "its default toolset is not there");
+        let (install, kits) = machine(&dir.path().join("three"), &["14.38.33130"], "14.38.33130", &[]);
+        assert_eq!(layout_or_why("AMD64", &install, &kits), Err(Why::NoSdk), "no SDK");
+        let (install, kits) = machine(&dir.path().join("four"), &["14.38.33130"], "14.38.33130", &["10.0.22621.0"]);
+        std::fs::remove_file(kits.join("Lib\\10.0.22621.0\\um\\x64\\kernel32.lib")).unwrap();
+        assert_eq!(layout_or_why("AMD64", &install, &kits), Err(Why::NoSdk), "an SDK that is not complete");
+        for why in [Why::NotX64, Why::NoInstaller, Why::NoCppTools, Why::NoToolset, Why::NoSdk] {
+            assert!(!why.words().is_empty());
+            assert_eq!(why.may_change(), why != Why::NotX64);
+        }
+    }
+
+    /// A machine that had none when the app started and has them after the person installs them is looked at again after a while, in the background; it is not looked at again where
+    /// nothing the person installs could change it, and nothing waits for the new look.
+    #[test]
+    fn a_machine_with_none_is_looked_at_again_after_a_while_when_an_install_could_change_it() {
+        let (calls, go_on) = (Arc::new(AtomicUsize::new(0)), AtomicBool::new(false));
+        let again: &'static Finder = Box::leak(Box::new(Finder::looking_again_at_none(Duration::ZERO, Duration::from_millis(60), || true)));
+        assert_eq!(again.found_before(counting(&calls, Looked::Settled(None)), within(10), &go_on), None);
+        assert_eq!(again.known(counting(&calls, Looked::Settled(Some(tools())))), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "within the while, the answer stands");
+        std::thread::sleep(Duration::from_millis(100));
+        // the ask that comes after it begins the look, and is answered with what was known: it does not wait
+        assert_eq!(again.known(counting(&calls, Looked::Settled(Some(tools())))), None);
+        let until = Instant::now() + Duration::from_secs(10);
+        while again.known(counting(&calls, Looked::Unsettled)) != Some(tools()) {
+            assert!(Instant::now() < until, "the new look was never answered");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // what was found stays
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(again.known(counting(&calls, Looked::Settled(None))), Some(tools()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // where nothing could change it, none stands
+        let fixed: &'static Finder = Box::leak(Box::new(Finder::looking_again_at_none(Duration::ZERO, Duration::from_millis(10), || false)));
+        assert_eq!(fixed.found_before(counting(&calls, Looked::Settled(None)), within(10), &go_on), None);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(fixed.known(counting(&calls, Looked::Settled(Some(tools())))), None);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
