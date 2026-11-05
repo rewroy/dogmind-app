@@ -10065,8 +10065,13 @@ impl App {
             }
             // (what a long session is waiting for, which is not the model thinking: it is asked to sum the session up, and nothing of that shows)
             Event::Compacting => self.set_activity(t("Compacting the session…").into()),
+            // (the request is kept for a server that is restarting: what it says of its loading, as the connection screen says it)
+            Event::ServerRestarting(progress) => {
+                let waiting = if progress.is_null() { t("Waiting for the server to restart…").to_string() } else { tf("Waiting for the server: {0}", &[&engine::progress_text(&progress)]) };
+                self.set_activity(waiting);
+            }
             Event::RequestStarted => {
-                if self.activity == t("Compacting the session…") {
+                if self.activity == t("Compacting the session…") || self.activity == t("Waiting for the server to restart…") || self.activity.starts_with(&tf("Waiting for the server: {0}", &[&""])) {
                     self.set_activity(t("Thinking…").into());
                 }
                 // (the next answer does not start at the speed the last one ended)

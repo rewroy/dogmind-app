@@ -42,6 +42,7 @@ pub const NOT_READY: &str = "the engine is not ready yet";
 pub const UNFINISHED: &str = "the server ended the answer without finishing it";
 pub const UNREADABLE: &str = "the server sent something that could not be read";
 pub const BROKE_OFF: &str = "The answer broke off: asking for the rest.";
+pub const SERVER_RESTARTING: &str = "The server is restarting. The request is kept and goes when it is ready, for up to 10 minutes; Stop ends the wait.";
 pub const NO_CHECKPOINT: &str = "The model could not write a checkpoint, so the oldest turns go.";
 pub const START_FAILED: &str = "the engine stopped while loading: /log shows why, and writing again tries once more";
 pub const START_OUT_OF_MEMORY: &str = "the engine ran out of memory while loading: close other apps and write again";
@@ -50,7 +51,7 @@ pub const SERVER_ERROR: &str = "The server reported an error. Your conversation 
 pub const REFUSED: &str = "The server refused this request. Your conversation is kept. It said: ";
 pub const NO_ANSWER: &str = "no answer from the server: check that it is running and that its address is right: ";
 /// Every whole message above, for the test that each has its Japanese.
-pub const WORDS: [&str; 17] = [NO_VISION, SERVER_GONE, SERVER_OUT_OF_MEMORY, ENGINE_GONE, ENGINE_OUT_OF_MEMORY, SERVER_BUSY, KEY_REFUSED, NOT_FOUND, CONTEXT_FULL, MEMORY_FULL, NOT_READY, UNFINISHED, UNREADABLE, BROKE_OFF, NO_CHECKPOINT, START_FAILED, START_OUT_OF_MEMORY];
+pub const WORDS: [&str; 18] = [NO_VISION, SERVER_GONE, SERVER_OUT_OF_MEMORY, ENGINE_GONE, ENGINE_OUT_OF_MEMORY, SERVER_BUSY, KEY_REFUSED, NOT_FOUND, CONTEXT_FULL, MEMORY_FULL, NOT_READY, UNFINISHED, UNREADABLE, BROKE_OFF, SERVER_RESTARTING, NO_CHECKPOINT, START_FAILED, START_OUT_OF_MEMORY];
 /// Every message above that begins one.
 pub const OPENINGS: [&str; 3] = [SERVER_ERROR, REFUSED, NO_ANSWER];
 
@@ -357,6 +358,24 @@ pub trait Provider: Send + Sync {
     fn keeps_cut_writes(&self) -> bool {
         false
     }
+    /// Asked after a request was refused or broke off: whether the server is being restarted, and so is worth waiting for. A provider with no such thing to ask says it does not know.
+    fn restart(&self, _cancel: &AtomicBool) -> Restart {
+        Restart::Unknown
+    }
+}
+
+/// What a server that refused a request says, when asked, of whether it is on its way back.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Restart {
+    /// `/health` says it is loading, with its progress; or the front of it answers 502, 503 or 504 with no health of its own, as a proxy does while the server behind it is replaced
+    /// (the progress is then null).
+    Coming(Value),
+    /// `/health` says it is ready.
+    Ready,
+    /// Nothing answers `/health` at all: a server in the gap of a restart looks so, and so does one that is gone.
+    Silent,
+    /// It answers, and says nothing to go by (no `/health`, an error of its own): the usual retries go.
+    Unknown,
 }
 
 impl Provider for Client {
@@ -385,7 +404,23 @@ impl Provider for Client {
     fn keeps_cut_writes(&self) -> bool {
         true
     }
+
+    fn restart(&self, cancel: &AtomicBool) -> Restart {
+        match self.get_json(&self.root("/health"), cancel, RESTART_ASK_WITHIN) {
+            Err(_) => Restart::Silent,
+            Ok((status, body)) => match body.get("status").and_then(Value::as_str) {
+                Some("ok") => Restart::Ready,
+                Some("loading") => Restart::Coming(body.get("progress").cloned().unwrap_or(Value::Null)),
+                Some(_) => Restart::Unknown,
+                None if matches!(status, 502 | 503 | 504) => Restart::Coming(Value::Null),
+                None => Restart::Unknown,
+            },
+        }
+    }
 }
+
+/// How long one question about a server's health is waited for while it is being waited for: the wait asks again soon after.
+const RESTART_ASK_WITHIN: Duration = Duration::from_secs(8);
 
 /// What a Straydog request names to have Han letters with no CP932 form refused.
 const NOT_CP932_HAN: &str = "not_cp932_han";
