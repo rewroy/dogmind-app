@@ -823,6 +823,8 @@ struct Agent {
     edited: bool,
     /// A command, or a background job looked at, has reported files it created, changed or deleted in the workspace since this was last looked at.
     changed_by_commands: bool,
+    /// The scratch folder this session has made, for when the person asks for no changes to the files: it goes when the session's agent does.
+    scratch_made: Option<PathBuf>,
     /// When the person's message came: what has changed since is this turn's own work.
     turn_began: std::time::SystemTime,
     /// The web was turned on during this conversation: its next message brings the rules its system prompt does not have.
@@ -841,6 +843,36 @@ struct Agent {
     refusal: Option<&'static str>,
     /// Why a compaction went as it did, for its line.
     compaction_stage: &'static str,
+}
+
+/// A session's scratch folder: outside the workspace, in the sandbox's own temp area, which is the one place besides a workspace where a command may write. Named for the session's file.
+fn scratch_folder_of(session: Option<&Path>) -> PathBuf {
+    #[cfg(windows)]
+    let base = crate::sandbox::temp_folder();
+    #[cfg(not(windows))]
+    let base: Option<PathBuf> = None;
+    // (the session's file name is only one in its own folder: another app's data folder may have the same, begun in the same second)
+    let name = session.map_or_else(|| "session".to_string(), |path| format!("{}-{}", path.file_stem().map_or(String::new(), |stem| stem.to_string_lossy().into_owned()), &trajectory::short_hash(path.to_string_lossy().to_lowercase().as_bytes())[..6]));
+    base.unwrap_or_else(|| std::env::temp_dir().join("dogmind")).join("scratch").join(name)
+}
+
+/// The scratch folders of sessions that ended without the agent's own cleanup (the app was ended from outside) are taken away, a day after they were last used.
+fn forget_old_scratch_folders(folder: &Path) {
+    const LEFT: Duration = Duration::from_secs(24 * 3600);
+    for entry in folder.parent().and_then(|parent| std::fs::read_dir(parent).ok()).into_iter().flatten().flatten() {
+        let old = entry.metadata().ok().and_then(|meta| meta.modified().ok()).and_then(|at| at.elapsed().ok()).is_some_and(|age| age > LEFT);
+        if old && entry.path() != folder && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        if let Some(folder) = self.scratch_made.take() {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+    }
 }
 
 /// What a call's line in the trajectory needs from its beginning.
@@ -980,6 +1012,7 @@ impl Agent {
             counted: 0,
             edited: false,
             changed_by_commands: false,
+            scratch_made: None,
             turn_began: std::time::SystemTime::now(),
             web_rules_due: false,
             events,
@@ -1356,6 +1389,18 @@ impl Agent {
         }
         if let Some(note) = self.asked_skill(text) {
             message = prompt::with_note(&message, &note);
+        }
+        // While the latest request asks for no changes to the files, the workspace is closed to the write tools and a folder outside it is open for experiments.
+        if prompt::forbids_changes(text) {
+            let folder = self.scratch_folder();
+            forget_old_scratch_folders(&folder);
+            if std::fs::create_dir_all(&folder).is_ok() {
+                self.scratch_made = Some(folder.clone());
+                message = prompt::with_note(&message, &prompt::no_change_note(&folder));
+                self.bench.scratch = Some(folder);
+            }
+        } else {
+            self.bench.scratch = None;
         }
         if self.mode == Mode::Plan {
             message = prompt::with_note(&message, "## Plan Mode\nThe user wants a plan first. Look as much as you need with the read-only tools, then set out what you would change and why, and stop there. Nothing can be changed in this mode: the user leaves it when they accept the plan.");
@@ -1879,6 +1924,40 @@ impl Agent {
         self.messages.iter().rev().find(|message| Self::of_the_person(message)).and_then(|message| message.content.as_deref()).is_some_and(|text| prompt::forbids_changes(prompt::typed_text(text)))
     }
 
+    /// Where the model may experiment while the person has asked for no changes to the files.
+    fn scratch_folder(&self) -> PathBuf {
+        scratch_folder_of(self.session.as_ref().map(|session| session.path.as_path()))
+    }
+
+    /// While the person's latest request forbids changes, the workspace is read-only to the write tools: such a call is not run, and says where the scratch folder is. A write into the
+    /// scratch folder is run with no one asked, as it is outside the workspace and goes with the session. None: this is no concern of the guard's.
+    fn no_change_guard(&mut self, tool: &str, arguments: &Value) -> Option<Permission> {
+        if !matches!(tool, "create_file" | "apply_patch") || !self.person_forbids_changes() {
+            return None;
+        }
+        let scratch = self.scratch_folder();
+        let targets = edited_paths(tool, arguments, &self.workspace);
+        let in_workspace: Vec<String> = targets.iter().filter(|path| safety::within(&self.workspace, path)).map(|path| path_for_trajectory(&path.to_string_lossy(), &self.workspace)).collect();
+        if !in_workspace.is_empty() {
+            self.intervened("no_change_guard", json!({"what": "write_refused", "tool": tool, "paths": in_workspace}));
+            return Some(Permission::Refused(prompt::no_change_refusal(&scratch), "refused_no_change"));
+        }
+        (!targets.is_empty() && targets.iter().all(|path| safety::within(&scratch, path))).then_some(Permission::Run)
+    }
+
+    /// While the person's latest request forbids changes, a command that reports files it changed in the workspace is not undone: its result says that the person asked for none, and
+    /// the trajectory has the count. What a command did in the scratch folder is none of this.
+    fn with_changes_noted(&mut self, tool: &str, arguments: &Value, result: Result<String, String>) -> Result<String, String> {
+        if !command_wrote(tool, &result) || !self.person_forbids_changes() || self.bench.in_scratch(tool, arguments) {
+            return result;
+        }
+        let Ok(mut output) = result else { return result };
+        let files = output.split(tools::CHANGED_BY_COMMAND).nth(1).map_or(0, |listed| listed.lines().take_while(|line| line.starts_with("- ")).count());
+        output.push_str(&prompt::no_change_made(&self.scratch_folder()));
+        self.intervened("no_change_guard", json!({"what": "command_changed", "tool": tool, "files": files}));
+        Ok(output)
+    }
+
     fn of_the_person(message: &Message) -> bool {
         message.role == "user" && !message.content.as_deref().is_some_and(prompt::is_nudge)
     }
@@ -1965,10 +2044,11 @@ impl Agent {
 
     /// Whether this call would run with no one asked.
     fn runs_unasked(&self, tool: &str, arguments: &Value) -> bool {
-        match weigh(&self.gate, tool, arguments, &self.workspace).0 {
+        let place = self.bench.scratch_for(arguments).filter(|_| tool == "execute_command").unwrap_or_else(|| self.workspace.clone());
+        match weigh(&self.gate, tool, arguments, &place).0 {
             Verdict::Allow => true,
             Verdict::Deny(_) => false,
-            Verdict::Ask { risk, reason } => self.mode != Mode::Plan && (delegated(self.mode, tool, risk, reason.as_deref(), self.safe_commands) || (risk < Risk::High && reason.is_none() && rules::allows(&self.rules, &self.gate, &self.workspace, tool, arguments))),
+            Verdict::Ask { risk, reason } => self.mode != Mode::Plan && (delegated(self.mode, tool, risk, reason.as_deref(), self.safe_commands) || (risk < Risk::High && reason.is_none() && rules::allows(&self.rules, &self.gate, &place, tool, arguments))),
         }
     }
 
@@ -2097,6 +2177,7 @@ impl Agent {
             self.changed_by_commands = true;
             self.repeated.clear();
         }
+        let result = self.with_changes_noted(name, &arguments, result);
         // (a command that ran and failed is a failure too: a model can spend an hour on those with nothing being wrong with a call)
         let failed = usize::from(result.as_ref().map_or(true, |output| name == "execute_command" && command_failed(output)));
         self.finish_call(&call.id, result, false, started.elapsed());
@@ -2290,9 +2371,14 @@ impl Agent {
     }
 
     fn permission(&mut self, tool: &str, arguments: &Value) -> Permission {
+        if let Some(guarded) = self.no_change_guard(tool, arguments) {
+            return guarded;
+        }
+        // A command in the scratch folder is weighed as it would be in a workspace of its own.
+        let place = self.bench.scratch_for(arguments).filter(|_| tool == "execute_command").unwrap_or_else(|| self.workspace.clone());
         // What a page said may be why this is being done: keys are asked for each time then, and so is what a page could have planted.
         let from_web = self.web_seen && (tool == "execute_command" || tool == "remember" || tool.starts_with("mcp__"));
-        let (verdict, runs_as) = weigh(&self.gate, tool, arguments, &self.workspace);
+        let (verdict, runs_as) = weigh(&self.gate, tool, arguments, &place);
         let (risk, mut reason) = match verdict {
             Verdict::Allow if tool == "web_read" => {
                 let url = arguments.get("url").and_then(Value::as_str).unwrap_or("");
@@ -2337,9 +2423,9 @@ impl Agent {
         }
         let key = always_key(tool, arguments);
         let free = risk < Risk::High && reason.is_none();
-        let scope = self.gate.always_scope(tool, arguments, &self.workspace);
+        let scope = self.gate.always_scope(tool, arguments, &place);
         // A file in the folder that runs in place of the installed program: "always" was said of the program the line names, and that is not what this runs. (in the line that runs as well as the one as written)
-        let planted = tool == "execute_command" && [Some(arguments), runs_as.as_ref()].into_iter().flatten().any(|call| self.gate.planted_program(call, &self.workspace).is_some());
+        let planted = tool == "execute_command" && [Some(arguments), runs_as.as_ref()].into_iter().flatten().any(|call| self.gate.planted_program(call, &place).is_some());
         // Something to say "always" to wherever that is not the same as saying it to anything: never of a high-risk command, nor of what a page may have asked for.
         let offered = !planted && match &scope {
             Some(AlwaysScope::Folders(_)) => true,
@@ -2350,10 +2436,10 @@ impl Agent {
             if safety::covered(scope, &self.always_files, &self.always_folders, &self.always_networks) {
                 return Permission::Run;
             }
-        } else if (offered && self.always.contains(&key)) || (free && rules::allows(&self.rules, &self.gate, &self.workspace, tool, arguments)) {
+        } else if (offered && self.always.contains(&key)) || (free && rules::allows(&self.rules, &self.gate, &place, tool, arguments)) {
             return Permission::Run;
         }
-        let rule = if free { rules::proposed(&self.gate, &self.workspace, tool, arguments, risk) } else { None };
+        let rule = if free { rules::proposed(&self.gate, &place, tool, arguments, risk) } else { None };
         let (answer, answered) = channel();
         let (asked_at, asked) = (chrono::Local::now(), Instant::now());
         let risk_name = risk.name();
@@ -4359,8 +4445,12 @@ mod tests {
     }
 
     fn scripted_as(workspace: &Path, provider: Scripted, mode: Mode) -> (Run, Arc<Scripted>) {
+        scripted_with(workspace, tempfile::tempdir().unwrap(), provider, mode)
+    }
+
+    /// The same, with the folder of the sessions made by the test: a step that must know where the session's own files are can then look.
+    fn scripted_with(workspace: &Path, sessions: tempfile::TempDir, provider: Scripted, mode: Mode) -> (Run, Arc<Scripted>) {
         let (sender, events) = channel();
-        let sessions = tempfile::tempdir().unwrap();
         let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None }, sender, Box::new(|| {}));
         let provider = Arc::new(provider);
         handle.commands.send(Command::Provider(provider.clone(), "model".into(), 100_000)).unwrap();
@@ -4680,6 +4770,136 @@ mod tests {
         assert!(!command_wrote("command_status", &Ok("job1 is running, for 4 s: make\nit has printed nothing yet".into())));
         assert!(!command_wrote("execute_command", &Err("not run".into())));
         assert!(!command_wrote("read_file", &Ok(lists)), "a file that says it is not a command");
+    }
+
+    /// The scratch folder of the session whose files are in `sessions`, as a step of a script finds it when it runs.
+    fn scratch_of(sessions: &Path) -> PathBuf {
+        let session = std::fs::read_dir(sessions).unwrap().flatten().map(|entry| entry.path()).find(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !trajectory::is_trajectory(path)).expect("the session's file");
+        scratch_folder_of(Some(&session))
+    }
+
+    /// A step whose calls are made when it runs, with the session's scratch folder.
+    fn calls_in_scratch(sessions: &Path, make: impl FnOnce(&Path) -> Vec<(&'static str, Value)> + Send + 'static) -> Step {
+        let sessions = sessions.to_path_buf();
+        Box::new(move |_: &AtomicBool| {
+            let list: Vec<crate::message::ToolCall> = make(&scratch_of(&sessions)).into_iter().enumerate().map(|(at, (name, arguments))| crate::message::ToolCall {
+                id: format!("s{at}"), kind: "function".into(), function: crate::message::FunctionCall { name: name.to_string(), arguments: arguments.to_string() },
+            }).collect();
+            Ok(llm::Completion { tool_calls: list, finish: "tool_calls".into(), ..llm::Completion::default() })
+        })
+    }
+
+    const NO_CHANGES: &str = "このコードを読んで、重要な問題を報告してください。ファイルは変更しないでください。";
+
+    /// The incident: asked to change no file, the model wrote files in the workspace, compiled and ran them there. Now a write to the workspace is not run and says where to experiment; the same
+    /// writes in the scratch folder, and a command run there, go through with no one asked; a command that writes in the workspace is run, and its result says that the person asked for none.
+    #[test]
+    fn when_the_person_asks_for_no_changes_the_workspace_is_closed_to_writes_and_the_scratch_folder_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let steps: Vec<Step> = vec![
+            calls(&[("create_file", serde_json::json!({"path": "_scratch/deep.rs", "content": "fn main() {}\n"})), ("apply_patch", serde_json::json!({"edits": [{"path": "a.txt", "old_string": "before", "new_string": "after"}], "expected_files": ["a.txt"]}))]),
+            calls_in_scratch(sessions.path(), |scratch| vec![("create_file", serde_json::json!({"path": scratch.join("deep.rs"), "content": "fn main() {}\n"}))]),
+            calls_in_scratch(sessions.path(), |scratch| vec![("execute_command", serde_json::json!({"command": "echo made> there.txt", "cwd": scratch}))]),
+            calls(&[("execute_command", serde_json::json!({"command": "echo made> in_workspace.txt"}))]),
+            says("done"),
+        ];
+        let (run, _) = scripted_with(dir.path(), sessions, Scripted { steps: Mutex::new(steps.into()), ..Scripted::default() }, Mode::Auto);
+        run.handle.commands.send(Command::Send(NO_CHANGES.into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        let results = tool_results(&log);
+        assert_eq!(results.len(), 5, "{log:?}");
+        let scratch = scratch_of(run._sessions.path());
+        for refused in &results[..2] {
+            assert!(refused.starts_with("false:true:") && refused.contains("asked for no changes") && refused.contains(&scratch.display().to_string()), "{refused}");
+        }
+        assert!(!dir.path().join("_scratch").exists() && std::fs::read_to_string(dir.path().join("a.txt")).unwrap() == "before\n", "nothing was written in the workspace");
+        assert!(results[2].starts_with("true:false:"), "the scratch folder is written in: {}", results[2]);
+        assert_eq!(std::fs::read_to_string(scratch.join("deep.rs")).unwrap(), "fn main() {}\n");
+        assert!(results[3].starts_with("true:false:") && results[3].contains("exit_code: 0") && scratch.join("there.txt").is_file(), "and a command runs in it: {}", results[3]);
+        assert!(!dir.path().join("there.txt").exists() && !results[3].contains("asked for no changes"), "and says nothing of the workspace");
+        assert!(results[4].contains(tools::CHANGED_BY_COMMAND) && results[4].contains("asked for no changes to the files") && results[4].contains("in_workspace.txt"), "{}", results[4]);
+        assert!(dir.path().join("in_workspace.txt").is_file(), "the app does not undo it");
+        assert!(!log.iter().any(|line| line.starts_with("approval:") && (line.contains("create_file") || line.contains("apply_patch"))), "no one was asked about a write: {log:?}");
+        let lines = trajectory_of(&run);
+        let guard: Vec<&Value> = of_kind(&lines, "intervention").into_iter().filter(|line| line["kind"] == "no_change_guard").collect();
+        let whats: Vec<&str> = guard.iter().map(|line| line["what"].as_str().unwrap()).collect();
+        assert_eq!(whats, ["write_refused", "write_refused", "command_changed"], "{guard:?}");
+        assert!(guard[2]["files"].as_u64().unwrap() >= 1);
+        let tools_run = of_kind(&lines, "tool");
+        assert_eq!(tools_run.iter().filter(|line| line["outcome"] == "refused_no_change").count(), 2, "{tools_run:?}");
+    }
+
+    /// With no such request nothing is different: a write is asked about or run as the mode says, and a command's changes are not noted.
+    #[test]
+    fn when_the_person_does_not_ask_for_no_changes_nothing_is_guarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, _) = scripted(dir.path(), vec![calls(&[("create_file", serde_json::json!({"path": "_scratch/deep.rs", "content": "x\n"})), ("execute_command", serde_json::json!({"command": "echo made> in_workspace.txt"}))]), says("done")], Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("write the file, and one more".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        let results = tool_results(&log);
+        assert!(results[0].starts_with("true:false:") && dir.path().join("_scratch").join("deep.rs").is_file(), "{log:?}");
+        assert!(results[1].contains(tools::CHANGED_BY_COMMAND) && !results[1].contains("asked for no changes"), "{}", results[1]);
+        assert!(of_kind(&trajectory_of(&run), "intervention").iter().all(|line| line["kind"] != "no_change_guard"));
+    }
+
+    /// The guard follows the latest request: asked again for a change in a later turn, the person has lifted it.
+    #[test]
+    fn a_later_request_for_a_change_lifts_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = || calls(&[("create_file", serde_json::json!({"path": "report.md", "content": "found nothing\n"}))]);
+        let (run, _) = scripted(dir.path(), vec![write(), says("not written"), write(), says("written")], Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send(NO_CHANGES.into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert!(tool_results(&log)[0].starts_with("false:true:") && !dir.path().join("report.md").exists(), "{log:?}");
+        run.handle.commands.send(Command::Send("では、報告を report.md に書いてください。".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert!(tool_results(&log)[0].starts_with("true:false:") && dir.path().join("report.md").is_file(), "{log:?}");
+    }
+
+    /// A session whose app was ended from outside leaves its scratch folder: the next one takes it away after a day, and no one's newer one.
+    #[test]
+    #[cfg(windows)]
+    fn scratch_folders_left_behind_are_taken_after_a_day_and_not_before() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let (old, fresh, mine) = (base.path().join("old"), base.path().join("fresh"), base.path().join("mine"));
+        for folder in [&old, &fresh, &mine] {
+            std::fs::create_dir(folder).unwrap();
+            std::fs::write(folder.join("x.txt"), "x").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
+        // (FILE_FLAG_BACKUP_SEMANTICS: how a folder is opened to set its time)
+        for folder in [&old, &mine] {
+            std::fs::OpenOptions::new().write(true).custom_flags(0x0200_0000).open(folder).unwrap().set_modified(long_ago).unwrap();
+        }
+        forget_old_scratch_folders(&mine);
+        assert!(!old.exists() && fresh.exists() && mine.exists(), "an old one goes, a new one stays, and the session's own stays whatever its age");
+    }
+
+    /// The turn's note names the scratch folder, and only for a request that asks for no changes. The folder is made, and is gone when the session's agent is.
+    #[test]
+    fn the_note_of_a_turn_with_no_changes_names_the_scratch_folder_and_it_goes_with_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, provider) = scripted(dir.path(), vec![says("a"), says("b")], Mode::Default);
+        run.handle.commands.send(Command::Send(NO_CHANGES.into())).unwrap();
+        until_end(&run, Decision::Reject);
+        run.handle.commands.send(Command::Send("次は何を見ますか".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let (first, second) = (provider.messages(0), provider.messages(1));
+        let scratch = scratch_of(run._sessions.path());
+        let noted = user_text(&first[1]);
+        assert!(noted.contains("## No Changes") && noted.contains(&scratch.display().to_string()), "{noted}");
+        assert!(scratch.is_dir(), "made for the turn");
+        assert_eq!(second.iter().filter(|message| user_text(message).contains("## No Changes")).count(), 1, "only the turn that asked has it");
+        drop(run);
+        // (the agent's thread ends when its commands do)
+        let waited = Instant::now();
+        while scratch.exists() && waited.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!scratch.exists(), "and gone with the session");
     }
 
     #[test]

@@ -726,7 +726,7 @@ fn command_path() -> Vec<PathBuf> {
 }
 
 /// Inside the workspace as it is spelled and where it really leads: a link inside it to somewhere else is somewhere else.
-fn within(workspace: &Path, path: &Path) -> bool {
+pub(crate) fn within(workspace: &Path, path: &Path) -> bool {
     inside(workspace, path) && match (real_path(workspace), real_path(path)) {
         (Some(root), Some(real)) => inside(&root, &real),
         _ => true,

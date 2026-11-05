@@ -254,6 +254,23 @@ pub fn forbids_changes(text: &str) -> bool {
     WORDS.iter().any(|word| lower.contains(word))
 }
 
+/// The turn's note while the person has asked for no changes to the files: what is closed, and the folder that is open for experiments.
+pub fn no_change_note(scratch: &std::path::Path) -> String {
+    format!("## No Changes
+The user asked for no changes to the files. create_file and apply_patch are refused in the workspace, and a command that changes files there is reported to you. For an experiment use the scratch folder `{}`: it is outside the workspace and goes when the session ends. create_file and apply_patch write there, and execute_command runs there with cwd set to it.", scratch.display())
+}
+
+/// The error of a write to the workspace while the person has asked for no changes to the files.
+pub fn no_change_refusal(scratch: &std::path::Path) -> String {
+    format!("not run: the user asked for no changes to the files, so nothing is written in the workspace. A scratch folder is there for experiments: `{}`. create_file and apply_patch write there, and execute_command runs there with cwd set to it. Say what you tried in your answer.", scratch.display())
+}
+
+/// What is added to a command's result when it changed files in the workspace while the person had asked for no changes.
+pub fn no_change_made(scratch: &std::path::Path) -> String {
+    format!("note: the user asked for no changes to the files, and this command changed files in the workspace (listed above). The app has not undone them. Say so in your answer, and keep any further experiment in the scratch folder `{}`.
+", scratch.display())
+}
+
 /// A fact for this turn only, on a message built by [`user_message`], before what was typed and what it is to be answered in.
 pub fn with_note(message: &str, note: &str) -> String {
     match message.split_once('\n') {
@@ -285,6 +302,9 @@ pub fn typed_text(message: &str) -> &str {
 mod tests {
     #[test]
     fn a_person_who_says_no_file_is_to_change_is_told_from_one_who_does_not() {
+        // (the request of a review in which a model wrote and ran files in the workspace: it ends with the words)
+        const REVIEW: &str = "crates/dogmind-app/src/rtf.rs は、モデルの回答（Markdown）を会話欄の RichEdit に表示するための RTF に変換する部分、markdown.rs は Markdown の読み取り、highlight.rs はコードの色分けです。モデルの出力は信用できない入力として扱うべきものです。実際に起きうる不具合を、重要なものから最大 3 つ、根拠のファイルと行つきで報告してください。コードを読んで確かめたものだけを挙げ、推測は推測と書いてください。ファイルは変更しないでください。";
+        assert!(super::forbids_changes(REVIEW));
         for no in ["ファイルは変更しないでください。", "コードは読むだけで、書き換えないで", "do not change files", "Don't modify anything, just report", "read-only please", "without changing the code"] {
             assert!(super::forbids_changes(no), "{no}");
         }
