@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
-use webview2_com::{AddScriptToExecuteOnDocumentCreatedCompletedHandler, CallDevToolsProtocolMethodCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, DownloadStartingEventHandler, ExecuteScriptCompletedHandler, LaunchingExternalUriSchemeEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler, PermissionRequestedEventHandler, WebResourceRequestedEventHandler};
+use webview2_com::{AddScriptToExecuteOnDocumentCreatedCompletedHandler, CallDevToolsProtocolMethodCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, DevToolsProtocolEventReceivedEventHandler, DownloadStartingEventHandler, ExecuteScriptCompletedHandler, LaunchingExternalUriSchemeEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler, PermissionRequestedEventHandler, WebResourceRequestedEventHandler};
 use windows::core::{Interface, HSTRING, PWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -74,8 +74,99 @@ pub unsafe fn choose_images(owner: isize, title: &str, kind_name: &str) -> Vec<P
     chosen().unwrap_or_default()
 }
 
+/// How many files a page's requests are kept for, to look at their times.
+const MOST_WATCHED: usize = 500;
+
+/// The workspace files the page being shown has asked for, as the browser's requests say it: what a change to would show in the page.
+#[derive(Default)]
+struct Requested {
+    root: Option<PathBuf>,
+    files: Vec<PathBuf>,
+}
+
+impl Requested {
+    fn note(&mut self, address: &str) {
+        let Some(file) = self.root.as_deref().and_then(|root| path_of(root, address)) else { return };
+        if self.files.len() < MOST_WATCHED && !self.files.contains(&file) {
+            self.files.push(file);
+        }
+    }
+}
+
+/// A device name Windows opens in place of a file of that name, with or without an extension.
+fn is_a_device(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit())
+}
+
+/// The file a request of the made-up host is for, under `root`: the reverse of [`address_of`]. None for another host, and for any address that does not name a file below `root` by plain
+/// names (a part that is `..`, holds a separator or a drive, ends in a dot or a space, or is a device).
+pub fn path_of(root: &Path, address: &str) -> Option<PathBuf> {
+    let rest = address.get(..8).filter(|scheme| scheme.eq_ignore_ascii_case("https://")).map(|_| &address[8..])?;
+    let (host, path) = rest.split_once('/')?;
+    if !host.eq_ignore_ascii_case(HOST) {
+        return None;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let mut file = root.to_path_buf();
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        let mut bytes = Vec::with_capacity(part.len());
+        let mut at = part.bytes();
+        while let Some(byte) = at.next() {
+            if byte == b'%' {
+                let (high, low) = (at.next()?, at.next()?);
+                bytes.push(u8::from_str_radix(std::str::from_utf8(&[high, low]).ok()?, 16).ok()?);
+            } else {
+                bytes.push(byte);
+            }
+        }
+        let name = String::from_utf8(bytes).ok()?;
+        if name == "." || name == ".." || name.contains(['/', '\\', ':', '\0', '*', '?', '"', '<', '>', '|']) || name.ends_with(['.', ' ']) || is_a_device(&name) {
+            return None;
+        }
+        file.push(name);
+    }
+    (file != root).then_some(file)
+}
+
+/// The address a `Network.requestWillBeSent` event of the browser is for.
+fn requested_address(parameters: &str) -> Option<String> {
+    let event: serde_json::Value = serde_json::from_str(parameters).ok()?;
+    event.pointer("/request/url")?.as_str().map(str::to_string)
+}
+
+/// When what a page loaded last changed: the file itself and the files it asked for. None when the file is gone.
+pub fn newest_of(file: &Path, loaded: &[PathBuf]) -> Option<std::time::SystemTime> {
+    let mut newest = std::fs::metadata(file).and_then(|data| data.modified()).ok()?;
+    for other in loaded {
+        if let Ok(written) = std::fs::metadata(other).and_then(|data| data.modified()) {
+            newest = newest.max(written);
+        }
+    }
+    Some(newest)
+}
+
+/// What the look at the shown file found, against what it found before.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Seen {
+    Same,
+    /// Written again: shown again.
+    Changed,
+    /// The file is not there any more: the old page does not stay.
+    Gone,
+}
+
+pub fn seen_since(before: Option<std::time::SystemTime>, now: Option<std::time::SystemTime>) -> Seen {
+    match (before, now) {
+        (_, None) => Seen::Gone,
+        (before, Some(now)) if before != Some(now) => Seen::Changed,
+        _ => Seen::Same,
+    }
+}
+
 /// What the preview can show. Anything else is not for this panel.
-/// When anything a page can use last changed: the file, what lies beside it and one folder down (its styles, scripts and pictures).
+/// When anything a page can use last changed: the file, what lies beside it and one folder down (its styles, scripts and pictures). What a page that has loaded is watched by is what it asked for
+/// ([`newest_of`]); this is for one that has asked for nothing yet.
 pub fn newest_beside(file: &Path) -> Option<std::time::SystemTime> {
     const MOST: usize = 2000;
     let own = std::fs::metadata(file).and_then(|data| data.modified()).ok()?;
@@ -250,6 +341,10 @@ pub struct Preview {
     root: RefCell<Option<PathBuf>>,
     /// The folder and the file shown now, and the lines a link named in it.
     shown: RefCell<Option<(PathBuf, PathBuf, Option<(usize, usize)>)>>,
+    /// What the page asked for, from the made-up host.
+    requested: Rc<RefCell<Requested>>,
+    /// The page was taken away because its file was gone: what is in the browser is nothing, and a reload opens the file again.
+    cleared: Cell<bool>,
     /// The page coming has lines a link named: once it has loaded, the view goes to them.
     to_lines: Rc<Cell<bool>>,
     environment: Rc<RefCell<Option<ICoreWebView2Environment>>>,
@@ -406,6 +501,7 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
     // Held here and let go on closing: a handler that kept it would keep the browser's processes alive.
     let environment = Rc::new(RefCell::new(Some(environment.clone())));
     let (count, responses) = (blocked.clone(), environment.clone());
+    let requested = Rc::new(RefCell::new(Requested::default()));
     webview.add_WebResourceRequested(&WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
         if let Some(args) = args {
             let request = args.Request()?;
@@ -449,6 +545,21 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
     // What was just written is what is shown, not what the cache has.
     let answered = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_, _| Ok(())));
     webview.CallDevToolsProtocolMethod(&HSTRING::from("Network.setCacheDisabled"), &HSTRING::from(r#"{"cacheDisabled":true}"#), &answered)?;
+    // What the page asks for, to know what a change would show in it. The handler of resource requests is never asked about the workspace's own host (it is served inside the browser), so
+    // this comes from the browser's network events, which see every request of the page and its frames.
+    let asked = requested.clone();
+    let receiver = webview.GetDevToolsProtocolEventReceiver(&HSTRING::from("Network.requestWillBeSent"))?;
+    receiver.add_DevToolsProtocolEventReceived(&DevToolsProtocolEventReceivedEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args {
+            let parameters = text_of(|text| args.ParameterObjectAsJson(text));
+            if let Some(address) = requested_address(&parameters) {
+                asked.borrow_mut().note(&address);
+            }
+        }
+        Ok(())
+    })), &mut token)?;
+    webview.CallDevToolsProtocolMethod(&HSTRING::from("Network.enable"), &HSTRING::from("{}"), &CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_, _| Ok(()))))?;
+    guards.push("watches_requests");
     // A source file opened at a link's lines is shown at them: the page has no script of its own, so this comes from here once it has loaded.
     let to_lines = Rc::new(Cell::new(false));
     let wanted = to_lines.clone();
@@ -461,7 +572,7 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
         }
         Ok(())
     })), &mut token)?;
-    Ok(Preview { controller, webview, blocked, guards, root: RefCell::new(None), shown: RefCell::new(None), to_lines, environment })
+    Ok(Preview { controller, webview, blocked, guards, root: RefCell::new(None), shown: RefCell::new(None), requested, cleared: Cell::new(false), to_lines, environment })
 }
 
 impl Preview {
@@ -477,6 +588,8 @@ impl Preview {
             *self.root.borrow_mut() = Some(root.to_path_buf());
         }
         self.blocked.set(0);
+        self.cleared.set(false);
+        *self.requested.borrow_mut() = Requested { root: Some(root.to_path_buf()), files: Vec::new() };
         *self.shown.borrow_mut() = Some((root.to_path_buf(), file.to_path_buf(), lines));
         match written(file) {
             Some(kind) => {
@@ -493,6 +606,24 @@ impl Preview {
         }
     }
 
+    /// When what the page shown now loaded last changed: the file and what the page asked for, wherever in the workspace it lies. Before it has asked for anything, the folder's look.
+    pub fn newest_loaded(&self, file: &Path) -> Option<std::time::SystemTime> {
+        let loaded = self.requested.borrow().files.clone();
+        if loaded.is_empty() { newest_beside(file) } else { newest_of(file, &loaded) }
+    }
+
+    /// How many files the page shown now has asked for.
+    pub fn loaded_count(&self) -> usize {
+        self.requested.borrow().files.len()
+    }
+
+    /// The file is gone: the old page does not stay, and the panel says so.
+    pub unsafe fn clear(&self) {
+        self.cleared.set(true);
+        *self.requested.borrow_mut() = Requested { root: self.root.borrow().clone(), files: Vec::new() };
+        let _ = self.webview.Navigate(&HSTRING::from("about:blank"));
+    }
+
     /// What shows behind a page, before it comes too.
     unsafe fn background(&self, color: u32) {
         if let Ok(controller) = self.controller.cast::<ICoreWebView2Controller2>() {
@@ -503,7 +634,7 @@ impl Preview {
     pub unsafe fn reload(&self) {
         self.blocked.set(0);
         // (a page written here is written again: the browser has only a string of it)
-        let written_now = self.shown.borrow().clone().filter(|(_, file, _)| written(file).is_some());
+        let written_now = self.shown.borrow().clone().filter(|(_, file, _)| self.cleared.get() || written(file).is_some());
         match written_now {
             Some((root, file, lines)) => {
                 let _ = self.open(&root, &file, lines);
@@ -628,6 +759,101 @@ mod tests {
     fn the_script_that_turns_printing_off_leaves_it_nothing_to_write_over() {
         assert!(NO_PRINT.contains("Object.defineProperty(window,'print'") && NO_PRINT.contains("writable:false") && NO_PRINT.contains("configurable:false"));
         assert!(!NO_PRINT.contains("window.print()"), "it does not call it");
+    }
+
+    #[test]
+    fn a_request_names_a_file_below_the_root_and_never_one_outside_it() {
+        let root = Path::new("C:\\work");
+        // (the reverse of address_of)
+        let file = Path::new("C:\\work\\a b\\デモ.html");
+        assert_eq!(path_of(root, &address_of(root, file).unwrap()).as_deref(), Some(file));
+        assert_eq!(path_of(root, "https://dogmind-preview.example/css/site.css?v=3#top").as_deref(), Some(Path::new("C:\\work\\css\\site.css")));
+        assert_eq!(path_of(root, "HTTPS://Dogmind-Preview.example/Img/x.PNG").as_deref(), Some(Path::new("C:\\work\\Img\\x.PNG")));
+        for not in [
+            "https://dogmind-preview.example/", "https://dogmind-preview.example", "https://dogmind-preview.example/../secret.txt", "https://dogmind-preview.example/a/%2e%2e/b.txt",
+            "https://dogmind-preview.example/a%2F..%2Fb", "https://dogmind-preview.example/a%5Cb", "https://dogmind-preview.example/C:/Windows/win.ini", "https://dogmind-preview.example/C%3A/x",
+            "https://dogmind-preview.example/a/CON", "https://dogmind-preview.example/nul.txt", "https://dogmind-preview.example/x./y", "https://dogmind-preview.example/x%20/y",
+            "https://dogmind-preview.example/%ff%fe", "https://dogmind-preview.example/%zz", "https://dogmind-preview.example/%4", "https://other.example/a.css", "http://dogmind-preview.example/a.css",
+            "https://dogmind-preview.example.evil.com/a.css", "https://dogmind-fonts.example/BIZUDGothic-Regular.ttf", "data:text/css,x",
+        ] {
+            assert_eq!(path_of(root, not), None, "{not}");
+        }
+        // (and whatever a request is, what comes out is inside the root)
+        for odd in ["https://dogmind-preview.example/a/./b", "https://dogmind-preview.example//a//b", "https://dogmind-preview.example/a%00b"] {
+            if let Some(found) = path_of(root, odd) {
+                assert!(found.starts_with(root) && !found.components().any(|part| matches!(part, std::path::Component::ParentDir)), "{odd}: {found:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn what_a_page_loaded_from_a_folder_up_or_two_down_is_what_it_is_watched_by() {
+        let dir = tempfile::tempdir().unwrap();
+        let (page, style, picture) = (dir.path().join("pages").join("a.html"), dir.path().join("style.css"), dir.path().join("assets").join("img").join("x.png"));
+        std::fs::create_dir_all(picture.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+        for file in [&page, &style, &picture] {
+            std::fs::write(file, "x").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for file in [&page, &style, &picture] {
+            std::fs::File::options().write(true).open(file).unwrap().set_modified(long_ago).unwrap();
+        }
+        let loaded = [style.clone(), picture.clone()];
+        let before = newest_of(&page, &loaded);
+        assert_eq!(before, Some(long_ago));
+        assert_eq!(newest_beside(&page), Some(long_ago));
+        std::fs::write(&picture, "changed").unwrap();
+        assert_eq!(newest_beside(&page), Some(long_ago), "the folder's look does not see it");
+        assert_eq!(seen_since(before, newest_of(&page, &loaded)), Seen::Changed, "a picture two levels down");
+        let after = newest_of(&page, &loaded);
+        std::fs::File::options().write(true).open(&style).unwrap().set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(seen_since(after, newest_of(&page, &loaded)), Seen::Changed, "a style one level up");
+        let kept = newest_of(&page, &loaded);
+        assert_eq!(seen_since(kept, newest_of(&page, &loaded)), Seen::Same);
+        // (a file it asked for that is gone is not a reason to fail: the page shows what it can)
+        std::fs::remove_file(&picture).unwrap();
+        assert!(newest_of(&page, &loaded).is_some());
+    }
+
+    #[test]
+    fn a_file_that_is_deleted_is_gone_and_one_that_comes_back_is_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("a.html");
+        std::fs::write(&page, "x").unwrap();
+        let shown = newest_of(&page, &[]);
+        assert!(shown.is_some());
+        std::fs::remove_file(&page).unwrap();
+        assert_eq!(seen_since(shown, newest_of(&page, &[])), Seen::Gone);
+        assert_eq!(seen_since(None, newest_of(&page, &[])), Seen::Gone, "and stays gone");
+        std::fs::write(&page, "back").unwrap();
+        assert_eq!(seen_since(None, newest_of(&page, &[])), Seen::Changed, "written again, it is shown again");
+    }
+
+    #[test]
+    fn the_address_of_a_network_event_is_read_from_its_request() {
+        let event = r#"{"requestId":"1","loaderId":"2","request":{"url":"https://dogmind-preview.example/style.css?v=1","method":"GET"},"type":"Stylesheet"}"#;
+        assert_eq!(requested_address(event).as_deref(), Some("https://dogmind-preview.example/style.css?v=1"));
+        for not in ["", "not json", "{}", r#"{"request":{}}"#, r#"{"request":{"url":3}}"#] {
+            assert_eq!(requested_address(not), None, "{not}");
+        }
+    }
+
+    #[test]
+    fn a_page_is_watched_by_its_requests_and_the_cap_holds() {
+        let mut asked = Requested { root: Some(PathBuf::from("C:\\work")), files: Vec::new() };
+        asked.note("https://dogmind-preview.example/a.css");
+        asked.note("https://dogmind-preview.example/a.css");
+        asked.note("https://example.com/b.css");
+        asked.note("https://dogmind-preview.example/../c.css");
+        assert_eq!(asked.files, [PathBuf::from("C:\\work\\a.css")]);
+        for at in 0..MOST_WATCHED + 20 {
+            asked.note(&format!("https://dogmind-preview.example/f{at}.png"));
+        }
+        assert_eq!(asked.files.len(), MOST_WATCHED);
+        let mut none = Requested::default();
+        none.note("https://dogmind-preview.example/a.css");
+        assert!(none.files.is_empty(), "with no root there is nothing to map to");
     }
 
     #[test]

@@ -1745,6 +1745,10 @@ struct App {
     /// The lines of it a link named, to be shown at: for a browser that is still starting too.
     preview_lines: Option<(usize, usize)>,
     preview_written: Option<std::time::SystemTime>,
+    /// How many files the page had asked for when `preview_written` was taken: a page that asks for more has not changed, it has shown what it holds.
+    preview_loaded: usize,
+    /// The file shown is not there any more, and the panel says so.
+    preview_gone: bool,
     preview_making: bool,
     preview_blocked: u32,
     preview_hits: Vec<(RECT, PathBuf)>,
@@ -6117,9 +6121,13 @@ impl App {
         let name = self.preview_file.as_deref().and_then(Path::file_name).map_or(String::new(), |name| name.to_string_lossy().into_owned());
         let name = if self.preview.is_some() { name } else { tf("{0}: starting...", &[&name]) };
         shapes.push(Shape::Text { area: rect(x, 0, at - x - s(ds::space::S), bar), text: name, font: FontKind::Strong, color: theme::text(), flags: ONE_LINE });
-        let note = if self.preview_blocked > 0 { s(26) } else { 0 };
+        let note = if self.preview_blocked > 0 || self.preview_gone { s(26) } else { 0 };
         if note > 0 {
-            let words = tf("{0} requests to outside were blocked here. Open in browser to let them through.", &[&self.preview_blocked]);
+            let words = if self.preview_gone {
+                tf("{0} is gone. Nothing is shown until it is written again.", &[&self.preview_file.as_deref().and_then(Path::file_name).map_or(String::new(), |name| name.to_string_lossy().into_owned())])
+            } else {
+                tf("{0} requests to outside were blocked here. Open in browser to let them through.", &[&self.preview_blocked])
+            };
             shapes.push(Shape::Text { area: rect(x, height - note, width, note), text: words, font: FontKind::Small, color: theme::warn(), flags: ONE_LINE });
         }
         if let Some(shown) = &self.preview {
@@ -6152,6 +6160,8 @@ impl App {
             return;
         };
         self.preview_written = preview::newest_beside(&file);
+        self.preview_loaded = 0;
+        self.preview_gone = false;
         self.preview_file = Some(file.clone());
         self.preview_root = Some(root.clone());
         self.preview_blocked = 0;
@@ -6214,6 +6224,8 @@ impl App {
         self.preview = None;
         self.preview_file = None;
         self.preview_written = None;
+        self.preview_loaded = 0;
+        self.preview_gone = false;
         self.preview_blocked = 0;
         self.layout();
         InvalidateRect(self.window, std::ptr::null(), 0);
@@ -6230,13 +6242,32 @@ impl App {
     unsafe fn watch_preview(&mut self) {
         let Some(file) = &self.preview_file else { return };
         let Some(shown) = &self.preview else { return };
-        let written = preview::newest_beside(file);
-        if written.is_some() && written != self.preview_written {
-            self.preview_written = written;
-            shown.reload();
+        // What the page asked for is what it is watched by, and not only what lies near it.
+        let written = shown.newest_loaded(file);
+        let loaded = shown.loaded_count();
+        let mut relayout = false;
+        match preview::seen_since(self.preview_written, written) {
+            preview::Seen::Gone if !self.preview_gone => {
+                // (the old page does not stay: it would show what is no more)
+                self.preview_gone = true;
+                self.preview_written = None;
+                shown.clear();
+                relayout = true;
+            }
+            preview::Seen::Gone => {}
+            _ if loaded != self.preview_loaded && !self.preview_gone => {
+                (self.preview_loaded, self.preview_written) = (loaded, written);
+            }
+            preview::Seen::Changed => {
+                self.preview_written = written;
+                self.preview_loaded = loaded;
+                relayout = std::mem::take(&mut self.preview_gone);
+                shown.reload();
+            }
+            preview::Seen::Same => {}
         }
         let blocked = shown.blocked.get();
-        if blocked != self.preview_blocked {
+        if blocked != self.preview_blocked || relayout {
             self.preview_blocked = blocked;
             self.layout();
             InvalidateRect(self.window, std::ptr::null(), 0);
@@ -13629,6 +13660,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             preview_file: None,
             preview_lines: None,
             preview_written: None,
+            preview_loaded: 0,
+            preview_gone: false,
             preview_making: false,
             preview_blocked: 0,
             preview_hits: Vec::new(),
