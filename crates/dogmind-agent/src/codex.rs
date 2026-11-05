@@ -60,8 +60,12 @@ fn toml_key(name: &str) -> String {
     }
 }
 
+/// The setting that keeps the app-server from searching the web by itself. What it found would be read by the model and never pass `web_read`, so the session would not be marked as having
+/// read the web, and the approvals would stay as loose as before untrusted text came in.
+const WEB_SEARCH_OFF: &str = "web_search=\"disabled\"";
+
 pub fn arguments(config: &str) -> Vec<String> {
-    let mut args: Vec<String> = ["app-server", "--stdio", "-c", "mcp_servers={}"].iter().map(|text| text.to_string()).collect();
+    let mut args: Vec<String> = ["app-server", "--stdio", "-c", "mcp_servers={}", "-c", WEB_SEARCH_OFF].iter().map(|text| text.to_string()).collect();
     for server in mcp_servers(config) {
         args.extend(["-c".to_string(), format!("mcp_servers.{}.enabled=false", toml_key(&server))]);
     }
@@ -187,6 +191,25 @@ impl Server {
     }
 }
 
+/// The kinds of item (`params.item.type`) a turn of this transport has: what it was given, what the model said and thought, and a plan. Anything else is Codex doing something of its own (a command,
+/// a file change, a tool of a server, a search of the web), which is not what this transport is for. Compared with case and underscores left out, as an app-server words them either way.
+const EXPECTED_ITEM_KINDS: [&str; 5] = ["usermessage", "agentmessage", "reasoning", "plan", "contextcompaction"];
+
+fn plain_kind(kind: &str) -> String {
+    kind.chars().filter(|c| *c != '_' && *c != '-').flat_map(char::to_lowercase).collect()
+}
+
+/// The kinds of the items a message names: the one it is about, and those a finished turn lists. An item says its kind as `type`, or as `kind`.
+fn item_kinds(message: &Value) -> Vec<String> {
+    let kind_of = |item: &Value| item.get("type").or_else(|| item.get("kind")).and_then(Value::as_str).map(str::to_string);
+    let Some(params) = message.get("params") else { return Vec::new() };
+    let mut kinds: Vec<String> = params.get("item").and_then(kind_of).into_iter().collect();
+    for list in [params.get("items"), params.pointer("/turn/items")] {
+        kinds.extend(list.and_then(Value::as_array).into_iter().flatten().filter_map(kind_of));
+    }
+    kinds
+}
+
 /// Why this message may not be accepted, if so.
 fn refusal(message: &Value) -> Option<String> {
     let method = message.get("method")?.as_str()?;
@@ -194,8 +217,20 @@ fn refusal(message: &Value) -> Option<String> {
         return Some(format!("the Codex app-server asked for something this transport does not allow: {method}"));
     }
     let lower = method.to_lowercase();
-    strings(&policy()["forbidden_method_parts"]).iter().any(|part| lower.contains(part.as_str()))
-        .then(|| format!("the Codex app-server tried to use a tool of its own: {method}"))
+    if strings(&policy()["forbidden_method_parts"]).iter().any(|part| lower.contains(part.as_str())) {
+        return Some(format!("the Codex app-server tried to use a tool of its own: {method}"));
+    }
+    // (by what the item is, as the methods for items are the same for all: `item/started`, `item/completed`)
+    for kind in item_kinds(message) {
+        let plain = plain_kind(&kind);
+        if plain.contains("websearch") {
+            return Some(format!("the Codex app-server searched the web on its own ({kind}): what it finds would not pass the web tools' checks"));
+        }
+        if !EXPECTED_ITEM_KINDS.contains(&plain.as_str()) {
+            return Some(format!("the Codex app-server used an item of its own: {kind}"));
+        }
+    }
+    None
 }
 
 fn output_schema() -> Value {
@@ -458,6 +493,14 @@ mod tests {
             };
             writeln!(out, "{}", json!({"jsonrpc": "2.0", "id": id, "result": answer})).unwrap();
             if method == "turn/start" {
+                // What the conversation asks for is what it does: a search of the web of its own, or an ordinary message of the model's.
+                let asked = message["params"]["input"][0]["text"].as_str().unwrap_or("");
+                for (marker, kind) in [("search the web", "webSearch"), ("say it plainly", "agentMessage")] {
+                    if asked.contains(marker) {
+                        let item = json!({"type": kind, "id": "item-1"});
+                        writeln!(out, "{}", json!({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": message["params"]["threadId"], "item": item}})).unwrap();
+                    }
+                }
                 // What it answers is the model it was asked for, by the thread and by the turn.
                 let said = format!("{} {}", message["params"]["threadId"].as_str().unwrap_or(""), message["params"]["model"].as_str().unwrap_or(""));
                 let final_text = json!({"kind": "final", "content": said, "tool_calls": []}).to_string();
@@ -494,13 +537,48 @@ mod tests {
     #[test]
     fn its_own_tools_and_every_mcp_server_are_off() {
         let args = arguments("model = \"x\"\n[mcp_servers.alpha]\ncommand = \"a\"\n[mcp_servers.alpha.env]\nA = \"1\"\n[mcp_servers.\"b c\"]\ncommand = \"b\"\n");
-        assert_eq!(&args[..4], ["app-server", "--stdio", "-c", "mcp_servers={}"]);
+        assert_eq!(&args[..6], ["app-server", "--stdio", "-c", "mcp_servers={}", "-c", "web_search=\"disabled\""]);
         assert!(args.contains(&"mcp_servers.alpha.enabled=false".to_string()));
         assert!(args.contains(&"mcp_servers.\"b c\".enabled=false".to_string()));
         assert_eq!(args.iter().filter(|arg| arg.contains("alpha")).count(), 1);
         for feature in ["shell_tool", "unified_exec", "plugins"] {
             assert!(args.windows(2).any(|pair| pair[0] == "--disable" && pair[1] == feature), "{feature}");
         }
+    }
+
+    /// A turn whose conversation says `asked`, through the stand-in, which answers it with an item of the kind the words name.
+    fn answer_to(asked: &str) -> Result<Completion, LlmError> {
+        let messages = [crate::message::Message::text("user", asked)];
+        let request = Request { model: "gpt-chosen", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None };
+        stood_in().stream(&request, &AtomicBool::new(false), &mut |_| {})
+    }
+
+    #[test]
+    fn a_search_of_the_web_by_the_app_server_ends_the_turn_and_an_ordinary_message_does_not() {
+        let LlmError::Rejected(why) = answer_to("please search the web for it").unwrap_err() else { panic!("a refusal") };
+        assert!(why.contains("searched the web") && why.contains("webSearch"), "{why}");
+        assert!(answer_to("say it plainly").is_ok());
+        assert!(answer_to("hello").is_ok());
+    }
+
+    #[test]
+    fn items_are_refused_by_their_kind_whatever_the_method_and_the_spelling() {
+        let item = |method: &str, item: Value| json!({"method": method, "params": {"threadId": "t", "item": item}});
+        for web in [json!({"type": "webSearch"}), json!({"type": "web_search_call"}), json!({"kind": "WebSearch"}), json!({"type": "web-search"})] {
+            let why = refusal(&item("item/started", web.clone())).unwrap_or_default();
+            assert!(why.contains("searched the web"), "{web}: {why}");
+            assert!(refusal(&item("item/completed", web)).is_some());
+        }
+        for other in [json!({"type": "commandExecution"}), json!({"type": "mcpToolCall"}), json!({"type": "imageGeneration"}), json!({"kind": "somethingNew"})] {
+            assert!(refusal(&item("item/started", other.clone())).is_some_and(|why| why.contains("an item of its own")), "{other}");
+        }
+        for fine in [json!({"type": "agentMessage"}), json!({"type": "reasoning"}), json!({"type": "userMessage"}), json!({"type": "plan"}), json!({"kind": "agent_message"}), json!({"id": "no kind"})] {
+            assert!(refusal(&item("item/started", fine.clone())).is_none(), "{fine}");
+        }
+        // (a finished turn lists its items too)
+        let turn = |items: Value| json!({"method": "turn/completed", "params": {"threadId": "t", "turn": {"status": "completed", "items": items}}});
+        assert!(refusal(&turn(json!([{"type": "agentMessage", "phase": "final_answer", "text": "{}"}, {"type": "reasoning"}]))).is_none());
+        assert!(refusal(&turn(json!([{"type": "agentMessage", "text": "{}"}, {"type": "webSearch"}]))).is_some());
     }
 
     #[test]
