@@ -298,3 +298,41 @@ fn an_update_goes_by_the_installs_records_and_a_setup_a_person_runs_reads_every_
     assert_eq!(version_of(&folder), "1.0.0");
     assert!(running_from(&folder).is_empty(), "a setup that is run does not start the app");
 }
+
+#[test]
+fn an_update_waits_while_another_install_of_the_folder_holds_its_mutex_and_goes_on_when_it_is_let_go() {
+    use sha2::{Digest, Sha256};
+    use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
+    let scene = Scene::new();
+    let folder = scene.installed("1.0.0");
+    let second = pack(scene.path(), "2.0.0");
+    // Another install of the folder, as far as the mutex goes: `Local\DogmindSetup-` and the hash of the folder's path in lower case. A mutex is let go by the thread that took it.
+    let digest = Sha256::digest(folder.to_string_lossy().to_lowercase().as_bytes());
+    let name: Vec<u16> = format!("Local\\DogmindSetup-{}", digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()).encode_utf16().chain(std::iter::once(0)).collect();
+    let (taken, ready) = std::sync::mpsc::channel::<()>();
+    let (release, waiting) = std::sync::mpsc::channel::<()>();
+    let other = std::thread::spawn(move || {
+        // SAFETY: the name ends in a zero, and the handle is this thread's own, taken and let go here.
+        unsafe {
+            let mutex = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            assert!(!mutex.is_null() && WaitForSingleObject(mutex, 5000) == 0);
+            taken.send(()).unwrap();
+            let _ = waiting.recv();
+            ReleaseMutex(mutex);
+            CloseHandle(mutex);
+        }
+    });
+    ready.recv().unwrap();
+    let mut child = setup(&second).args(["--update", "--test", "--auto", "--dir"]).arg(&folder).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    let still_waiting = child.try_wait().unwrap().is_none();
+    let unchanged = (version_of(&folder), manifest_version(&folder)) == ("1.0.0".to_string(), "1.0.0".to_string());
+    release.send(()).unwrap();
+    other.join().unwrap();
+    let status = child.wait().unwrap();
+    assert!(still_waiting, "it waited, and did not go on over the other install");
+    assert!(unchanged, "and changed nothing while it waited");
+    assert_eq!(status.code(), Some(0));
+    assert_eq!((version_of(&folder), manifest_version(&folder)), ("2.0.0".to_string(), "2.0.0".to_string()), "let go, it went on");
+    assert_eq!(wait_for_the_app(&folder).len(), 1, "and started the app again");
+}
