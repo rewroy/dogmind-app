@@ -4342,9 +4342,9 @@ impl App {
             // (whether this model has such a file at all, and how large, is Straydog's to say)
             crate::vision::State::Absent => match engine::find(&self.settings) {
                 Some(straydog) => {
-                    let (poster, quant) = (self.poster.clone(), installed.quant);
+                    let poster = self.poster.clone();
                     std::thread::spawn(move || {
-                        let size = engine::load_catalog(&straydog).ok().and_then(|catalog| catalog.entries.into_iter().find(|entry| entry.quant.as_deref() == Some(&quant))).and_then(|entry| entry.vision_bytes);
+                        let size = engine::load_catalog(&straydog).ok().and_then(|catalog| catalog.entries.into_iter().find(|entry| entry.is(&installed.bundle))).and_then(|entry| entry.vision_bytes);
                         poster.send(Note::VisionSize(size));
                     });
                 }
@@ -8339,8 +8339,8 @@ impl App {
     /// The model the Models page is about is the one set up: its files say what the row says. Another one chosen is still only a choice.
     fn vision_for_installed(&self) -> Option<crate::vision::Installed> {
         let installed = self.vision_installed()?;
-        match unsafe { self.list_selection() }.and_then(|at| self.catalog.get(at)).and_then(|entry| entry.quant.clone()) {
-            Some(quant) if quant != installed.quant => None,
+        match unsafe { self.list_selection() }.and_then(|at| self.catalog.get(at)) {
+            Some(entry) if entry.bundle.is_some() && !entry.is(&installed.bundle) => None,
             _ => Some(installed),
         }
     }
@@ -10768,7 +10768,7 @@ impl App {
             }
         }
         let vision = if self.vision_for_installed().is_some() { self.vision_is_on() } else { self.vision_wanted };
-        let mut args = engine::setup_arguments(entry.quant.as_deref(), &folder, &engine::config_path(&self.folder), self.drafter, vision);
+        let mut args = engine::setup_arguments(entry.bundle.as_ref(), &folder, &engine::config_path(&self.folder), self.drafter, vision);
         // One short of graphics memory is set up only when chosen, and by a Straydog that is told so: it refuses otherwise.
         if !entry.runs {
             if !engine::setup_can_force(&straydog) {
@@ -12557,8 +12557,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 ID_REMOVE_ALL => app.set_panel(Panel::ConfirmRemove),
                 ID_MODEL_LICENCE => {
-                    if let Some(licence) = app.list_selection().and_then(|at| app.catalog.get(at)).and_then(|entry| entry.licence) {
-                        open_in_browser(licence.terms);
+                    if let Some(licence) = app.list_selection().and_then(|at| app.catalog.get(at)).and_then(|entry| entry.licence.clone()) {
+                        open_in_browser(&licence.terms);
                     }
                 }
                 ID_HELP => app.set_panel(Panel::Help),
