@@ -45,6 +45,7 @@ const DEVELOPER_TOOLS: [&str; 24] = ["node", "npm", "python", "py", "git", "go",
 /// In a folder as wide as the home or a drive, what a command may not be given to write in, however it asks.
 const NOT_A_PROJECT: [&str; 18] = ["appdata", "desktop", "documents", "downloads", "pictures", "music", "videos", "onedrive", "windows", "program files", "program files (x86)", "programdata", "users", "$recycle.bin", "system volume information", "contacts", "favorites", "searches"];
 
+#[derive(Default)]
 pub struct Output {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
