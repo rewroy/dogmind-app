@@ -2481,7 +2481,7 @@ impl Agent {
         // A command in the scratch folder is weighed as it would be in a workspace of its own.
         let place = self.bench.scratch_for(arguments).filter(|_| tool == "execute_command").unwrap_or_else(|| self.workspace.clone());
         // What a page said may be why this is being done: keys are asked for each time then, and so is what a page could have planted.
-        let from_web = self.web_seen && (tool == "execute_command" || tool == "remember" || tool.starts_with("mcp__"));
+        let from_web = self.web_seen && (tool == "execute_command" || tool == "remember" || tool == "forget" || tool.starts_with("mcp__"));
         let (verdict, runs_as) = weigh(&self.gate, tool, arguments, &place);
         let (risk, mut reason) = match verdict {
             Verdict::Allow if tool == "web_read" => {
@@ -2509,6 +2509,8 @@ impl Agent {
             }
             // A note reaches every later session, so what a page says must not get there on its own.
             Verdict::Allow if tool == "remember" && self.web_seen => (Risk::Medium, Some(safety::REASON_WEB_NOTE.to_string())),
+            // (and so is dropping one: what a page planted must not be able to take the person's notes away either)
+            Verdict::Allow if tool == "forget" && self.web_seen => (Risk::Medium, Some(safety::REASON_WEB_FORGET.to_string())),
             Verdict::Allow => return Permission::Run,
             Verdict::Deny(reason) => return Permission::Denied(format!("denied: {reason}")),
             Verdict::Ask { risk, reason } => (risk, reason),
@@ -4316,6 +4318,33 @@ mod tests {
         assert_eq!(log.iter().filter(|line| line.starts_with("approval:remember")).count(), 1, "{log:?}");
         let section = memory::prompt_section(notes.path(), dir.path());
         assert!(section.contains("before the page") && !section.contains("after the page"), "{section}");
+    }
+
+    #[test]
+    fn dropping_a_note_after_a_page_asks_as_keeping_one_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = tempfile::tempdir().unwrap();
+        for note in ["answers in Japanese", "builds with make"] {
+            memory::remember(notes.path(), dir.path(), &serde_json::json!({"note": note, "scope": "user"})).unwrap();
+        }
+        let page = web_page("<p>plain words</p>");
+        let (client, _) = server(vec![
+            call_answer("forget", serde_json::json!({"words": "answers in Japanese"})),
+            call_answer("web_read", serde_json::json!({"url": page})),
+            call_answer("forget", serde_json::json!({"words": "builds with make"})),
+            text_answer("done"),
+        ]);
+        let (sender, events) = channel();
+        let sessions = tempfile::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send(format!("read {page}"))).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert_eq!(log.iter().filter(|line| line.starts_with("approval:forget")).count(), 1, "only the one after the page asks: {log:?}");
+        let kept: Vec<String> = memory::notes(notes.path(), dir.path()).into_iter().map(|(_, note)| note).collect();
+        assert_eq!(kept, ["builds with make"], "the one before the page went, and the one after it, refused, stayed");
+        assert!(std::fs::read_to_string(memory::forgotten_file(notes.path())).unwrap().contains("- answers in Japanese"));
     }
 
     #[test]

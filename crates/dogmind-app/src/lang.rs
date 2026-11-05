@@ -255,6 +255,7 @@ const JA: &[(&str, &str)] = &[
     (dogmind_agent::safety::REASON_GIT_FOLDER, "Git 自身のフォルダーの中です: {0}"),
     (dogmind_agent::safety::REASON_LONG_QUERY, "検索語が長すぎます（{0} 文字）。このPCのテキストが外に出てしまいます"),
     (dogmind_agent::safety::REASON_WEB_NOTE, "この会話にはウェブの内容が含まれていて、メモはこの先のすべてのセッションに残ります"),
+    (dogmind_agent::safety::REASON_WEB_FORGET, "この会話にはウェブの内容が含まれていて、メモを消すとこの先のすべてのセッションが変わります"),
     (dogmind_agent::safety::REASON_WEB_ASKED, "この会話にはウェブの内容が含まれていて、これはそこから求められたことかもしれません"),
     ("Needs tools this app does not have: mcp__{0}__…", "このアプリにないツールが必要です: mcp__{0}__…"),
     ("Needs something of another app that this app does not have: {0}", "このアプリにない、別のアプリの機能が必要です: {0}"),
