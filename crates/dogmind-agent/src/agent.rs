@@ -2707,23 +2707,7 @@ impl Agent {
         let kept = compaction::truncate(&self.messages, goal);
         if kept == self.messages {
             if compaction::needed(self.expected_use(), self.window) {
-                // Last, every tool output, the newest round's too: a first turn of big reads in a small window is all head, and the
-                // session could otherwise send nothing ever again. The model reads the starts of them, and that they were cut.
-                // (what the server has counted goes down by what went of that; what it has not is counted afresh as it is)
-                let counted = |messages: &[Message], upto: usize| messages.iter().take(upto).map(Message::chars).sum::<usize>();
-                let before = counted(&self.messages, self.counted);
-                let more = compaction::trim_tool_outputs(&mut self.messages, usize::MAX, true, true);
-                self.used = self.used.saturating_sub((before.saturating_sub(counted(&self.messages, self.counted)) / CHARS_A_TOKEN) as u64);
-                if more == 0 || compaction::needed(self.expected_use(), self.window) {
-                    // Sent here by a refusal, or by a count that was too full: nothing went, so nothing will fit.
-                    self.messages = found;
-                    return Err(llm::CONTEXT_FULL.into());
-                }
-                compaction::strip_thinking(&mut self.messages);
-                self.compaction_stage = "trim_all";
-                self.emit(Event::Notice(format!("Session compacted: every tool output, the newest too, shortened by {} KB, as nothing else would fit", (saved + more) / 1024)));
-                self.save_snapshot();
-                return Ok(());
+                return self.trim_every_output(found, saved);
             }
             // (what stage 0 did stays, and a reopened session must send it too)
             if self.messages != found {
@@ -2739,11 +2723,11 @@ impl Agent {
             self.messages = found;
             return Err(if answers.is_none() { llm::NOT_READY } else { llm::SERVER_GONE }.into());
         }
-        // (turns gone and still too long would be a loss for nothing)
+        // (turns gone and still too long would be a loss for nothing: the head and the newest round cannot go, and when they are all big reads a first turn in a small window has nothing else to
+        // give up. Shortening every tool output loses no turn, and is what is done then: a real review in a window of 32,768 tokens ended in "context full" here with 33,077 in it.)
         let left = (kept.iter().map(Message::chars).sum::<usize>() / CHARS_A_TOKEN) as u64;
         if self.window > 0 && left + compaction::reserve(self.window) >= self.window {
-            self.messages = found;
-            return Err(llm::CONTEXT_FULL.into());
+            return self.trim_every_output(found, saved);
         }
         if no_checkpoint {
             self.emit(Event::Notice(llm::NO_CHECKPOINT.into()));
@@ -2758,6 +2742,26 @@ impl Agent {
         self.emit(Event::Notice("Session compacted: the oldest turns were dropped".into()));
         self.save_snapshot();
         self.report_usage(None);
+        Ok(())
+    }
+
+    /// Last, every tool output, the newest round's too: a first turn of big reads in a small window is all head, and the session could otherwise send nothing ever again. The model reads the starts
+    /// of them, and that they were cut. `found`: the conversation as it was, which an error leaves; `saved`: what stage 0 saved before.
+    fn trim_every_output(&mut self, found: Vec<Message>, saved: usize) -> Result<(), String> {
+        // (what the server has counted goes down by what went of that; what it has not is counted afresh as it is)
+        let counted = |messages: &[Message], upto: usize| messages.iter().take(upto).map(Message::chars).sum::<usize>();
+        let before = counted(&self.messages, self.counted);
+        let more = compaction::trim_tool_outputs(&mut self.messages, usize::MAX, true, true);
+        self.used = self.used.saturating_sub((before.saturating_sub(counted(&self.messages, self.counted)) / CHARS_A_TOKEN) as u64);
+        if more == 0 || compaction::needed(self.expected_use(), self.window) {
+            // Sent here by a refusal, or by a count that was too full: nothing went, so nothing will fit.
+            self.messages = found;
+            return Err(llm::CONTEXT_FULL.into());
+        }
+        compaction::strip_thinking(&mut self.messages);
+        self.compaction_stage = "trim_all";
+        self.emit(Event::Notice(format!("Session compacted: every tool output, the newest too, shortened by {} KB, as nothing else would fit", (saved + more) / 1024)));
+        self.save_snapshot();
         Ok(())
     }
 
@@ -4829,6 +4833,42 @@ mod tests {
         assert_eq!(window_with(262_144, Some(0)), (262_144, "the provider"));
         // (a release build reads no variable at all)
         assert_eq!(window_in_use(262_144).0 <= 262_144, true);
+    }
+
+    /// The first turn of a review in a small window, as a real job showed it: one user message, and rounds of two large reads each, 33,077 tokens in a window of 32,768. Nothing is old enough to
+    /// drop and the head holds the first rounds, so shortening the tool outputs is all there is, and it must be done and not given up on.
+    #[test]
+    fn a_first_turn_of_large_reads_in_a_small_window_is_shortened_and_not_given_up_on() {
+        let call = |id: &str, names: usize| Message {
+            role: "assistant".into(),
+            tool_calls: Some((0..names).map(|at| crate::message::ToolCall { id: format!("{id}-{at}"), kind: "function".into(), function: crate::message::FunctionCall { name: "read_file".into(), arguments: "{\"path\":\"a.rs\"}".into() } }).collect()),
+            ..Message::default()
+        };
+        let mut messages = vec![Message::text("system", "s".repeat(6150)), Message::text("user", "u".repeat(1200)), call("a", 1), Message::tool_result("a-0", "x".repeat(11_326))];
+        for (round, sizes) in [[16_651usize, 7_713], [9_985, 12_986], [10_223, 8_863]].iter().enumerate() {
+            messages.push(call(&format!("r{round}"), 2));
+            for (at, size) in sizes.iter().enumerate() {
+                messages.push(Message::tool_result(&format!("r{round}-{at}"), "x".repeat(*size)));
+            }
+        }
+        // (the thinking of the rounds goes back with every request, and counts: 96, 4,901 and 12,020 characters of it)
+        let mut thinking = [96usize, 4_901, 12_020].into_iter();
+        for message in messages.iter_mut().filter(|message| message.role == "assistant" && message.tool_calls.as_ref().is_some_and(|calls| calls.len() == 2)) {
+            message.reasoning_content = Some("t".repeat(thinking.next().unwrap()));
+        }
+        let turns = messages.len();
+        let (mut agent, provider, _events, _kept) = agent_holding(messages, 32_768, vec![says("a summary")]);
+        agent.used = 33_077;
+        agent.counted = agent.messages.len();
+        assert!(compaction::needed(agent.expected_use(), agent.window), "the scenario is a full window");
+        let result = agent.compact(false, false);
+        println!("RESULT {result:?} stage {} used {} requests {}", agent.compaction_stage, agent.expected_use(), provider.requests());
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!compaction::needed(agent.expected_use(), agent.window), "it fits now: {} of {}", agent.expected_use(), agent.window);
+        assert_eq!(agent.compaction_stage, "trim_all");
+        assert_eq!(agent.messages.len(), turns, "no turn went: shortening what was read was enough");
+        assert_eq!(provider.requests(), 0, "and nothing was asked of the model");
+        assert!(agent.messages.iter().filter(|message| message.role == "tool").any(|message| user_text(message).contains("trimmed by compaction")));
     }
 
     #[test]
