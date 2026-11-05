@@ -19,6 +19,8 @@ pub struct RunEntry {
     pub output: Vec<String>,
     /// The model is still writing this call: it has not begun to run.
     pub writing: Option<Writing>,
+    /// Why this call failed, when it did: the run's row names it, and says how many there were.
+    pub failure: Option<String>,
 }
 
 /// A call as far as the model has written it.
@@ -32,7 +34,7 @@ pub struct Writing {
 
 impl RunEntry {
     pub fn running(id: String, tool: String, summary: String) -> RunEntry {
-        RunEntry { id, tool, summary, elapsed: None, done: false, output: Vec::new(), writing: None }
+        RunEntry { id, tool, summary, elapsed: None, done: false, output: Vec::new(), writing: None, failure: None }
     }
 
     pub fn being_written(index: usize, tool: String) -> RunEntry {
@@ -61,7 +63,7 @@ impl RunEntry {
     }
 
     pub fn ended(tool: String, summary: String, output: Vec<String>) -> RunEntry {
-        RunEntry { id: String::new(), tool, summary, elapsed: None, done: true, output, writing: None }
+        RunEntry { id: String::new(), tool, summary, elapsed: None, done: true, output, writing: None, failure: None }
     }
 }
 
@@ -116,7 +118,8 @@ impl ToolRun {
         if self.open {
             return self.entries.iter().any(|entry| entry.writing.is_some());
         }
-        self.tone == Tone::Done && (self.entries.len() > 1 || self.entries.iter().any(|entry| !entry.output.is_empty()))
+        // (a run that has a failure opens like any other: its calls are what a person wants to see then, and the failed one's kept output)
+        self.entries.len() > 1 || self.entries.iter().any(|entry| !entry.output.is_empty())
     }
 
     /// The call the row is about while the run goes on: the one the model is writing, or else the first still running, or else the last.
@@ -148,12 +151,16 @@ impl ToolRun {
             }
             format!("{mark}  {}{after}", being_done(entry, workspace, units.saturating_sub(width(&after) + 3)))
         } else if self.tone != Tone::Done {
-            let entry = self.entries.first();
+            // The call that failed: the last of those that say so, or, where none does, the last that ended.
+            let failed = self.entries.iter().filter(|entry| entry.failure.is_some()).count();
+            let entry = self.entries.iter().rev().find(|entry| entry.failure.is_some()).or_else(|| self.entries.last());
             let what = entry.map_or(String::new(), |entry| named(entry, workspace, (units / 2).max(20)));
             let mark = '✗';
-            let reason = bare_reason(&without_workspace(&self.note, workspace), &what);
+            let why = entry.and_then(|entry| entry.failure.as_deref()).unwrap_or(&self.note);
+            let reason = bare_reason(&without_workspace(why, workspace), &what);
+            let many = if failed > 1 { format!("  ·  {}", tf("{0} failed", &[&failed])) } else { String::new() };
             // (one row like its neighbours: the pointer on it has the whole of a long reason)
-            if reason.is_empty() { format!("{mark}  {what}") } else { clip(&format!("{mark}  {what}  —  {reason}"), units) }
+            if reason.is_empty() { clip(&format!("{mark}  {what}{many}"), units) } else { clip(&format!("{mark}  {what}  —  {reason}{many}"), units) }
         } else if let [entry] = self.entries.as_slice() {
             let after = time_text(entry.elapsed.or(self.took));
             format!("✓  {}{after}", named(entry, workspace, units.saturating_sub(width(&after) + 3)))
@@ -618,6 +625,36 @@ mod tests {
         assert_eq!(above, 5);
         assert_eq!(lines.last().map(String::as_str), Some("warned"));
         assert_eq!(lines.len(), 6);
+    }
+
+    /// A run with a failure opens, and its row names the call that failed and how many did.
+    #[test]
+    fn a_run_with_a_failure_opens_and_its_row_names_the_call_that_failed() {
+        let mut run = ToolRun::new();
+        run.tone = Tone::Bad;
+        run.note = "exit code 3".to_string();
+        let mut failed = call("execute_command", "pytest -q", 2.0);
+        failed.failure = Some("exit code 3".to_string());
+        failed.output = vec!["stdout line".to_string(), "FAILED test_a.py::test_one".to_string(), "AssertionError: 1 != 2".to_string()];
+        run.entries = vec![call("read_file", "a.rs", 0.1), call("search_files", "x in .", 0.2), failed];
+        let head = run.head(&work(), 100, 5.0);
+        assert!(head.starts_with('✗') && head.contains("pytest -q") && head.contains("exit code 3") && !head.contains("a.rs"), "the third call, and not the first: {head}");
+        assert!(!head.contains("failed"), "one failure: no count: {head}");
+        assert!(run.expandable(), "a run with a failure opens");
+        run.expanded = true;
+        let lines = run.lines(&work(), 100, 5.0);
+        assert_eq!(lines.len(), 1 + 3 + 3, "every call, and the failed one's kept output");
+        assert!(lines.iter().any(|(line, _)| line.contains("AssertionError: 1 != 2")));
+        // two failed: the last, and how many
+        run.entries[0].failure = Some("no such file".to_string());
+        let head = run.head(&work(), 100, 5.0);
+        assert!(head.contains("pytest -q") && head.contains("2") && head.contains(&tf("{0} failed", &[&2])), "{head}");
+        // one call that failed alone is as it was, and does not open
+        let mut alone = ToolRun::new();
+        alone.tone = Tone::Bad;
+        alone.note = "exit code 1".to_string();
+        alone.entries = vec![call("execute_command", "make", 1.0)];
+        assert!(!alone.expandable() && alone.head(&work(), 100, 1.0).contains("make"));
     }
 
     #[test]

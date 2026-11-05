@@ -572,6 +572,7 @@ const JA: &[(&str, &str)] = &[
     ("plus|New session", "plus|新しいセッション"),
     ("settings|Settings", "settings|設定"),
     ("Rejected", "却下しました"),
+    ("{0} failed", "{0} 件が失敗"),
     ("{0}  ·  {1} risk", "{0}  ·  リスク: {1}"),
     ("safe", "安全"),
     ("low", "低"),
