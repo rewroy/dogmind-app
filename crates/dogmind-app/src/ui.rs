@@ -453,7 +453,7 @@ const COMMANDS: [(&str, &str); 43] = [
     ("/usage", "Tokens and speed of this session"),
     ("/init", "Have the model write this project's DOGMIND.md"),
     ("/model", "Change how the model runs: /model Claude"),
-    ("/effort", "How hard to think: none low medium high xhigh default"),
+    ("/effort", "How hard to think: none low medium high xhigh/max default"),
     ("/mode", "When to ask: ask edits auto plan"),
     ("/plan", "Look and plan first, and change nothing until you say"),
     ("/skills", "The skills of this folder, from Claude's and Codex's folders too"),
@@ -524,6 +524,8 @@ Your instructions (Settings) go for every session; a DOGMIND.md for its project.
 const INIT_PROMPT: &str = "Look through this project and write a DOGMIND.md at its root for agents who work here: what the project is, how to build and test it, its layout and its conventions. Keep it short, and only what you have checked.";
 
 const EFFORTS: [(Option<&str>, &str); 6] = [(None, "Default"), (Some("none"), "None"), (Some("low"), "Low"), (Some("medium"), "Medium"), (Some("high"), "High"), (Some("xhigh"), "Extra high")];
+/// What the highest effort is called for a DeepSeek model: its template names that level max. What is sent stays xhigh.
+const DEEPSEEK_HIGHEST: &str = "Max";
 const MODES: [(Mode, &str); 4] = [(Mode::Default, "Ask first"), (Mode::AcceptEdits, "Accept edits"), (Mode::Auto, "Auto"), (Mode::Plan, "Plan first")];
 
 /// Work going on through a folder's tree.
@@ -620,6 +622,36 @@ fn always_places(scope: &Option<AlwaysScope>) -> String {
 fn key_files(settings: &Settings) -> Vec<PathBuf> {
     settings.providers.iter().map(|provider| provider.api_key.trim()).chain([settings.search_key.trim()])
         .filter(|key| matches!(KeySource::of(key), KeySource::File(_))).map(PathBuf::from).collect()
+}
+
+/// Whether a model is one of DeepSeek's, told by its name.
+fn is_deepseek(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("deepseek")
+}
+
+/// The efforts as a model's own words name them: for DeepSeek the highest is Max, for the rest Extra high.
+fn efforts_for(model: &str) -> [(Option<&'static str>, &'static str); 6] {
+    let mut efforts = EFFORTS;
+    if is_deepseek(model) {
+        for (known, name) in efforts.iter_mut() {
+            if *known == Some("xhigh") {
+                *name = DEEPSEEK_HIGHEST;
+            }
+        }
+    }
+    efforts
+}
+
+/// The model the efforts are named for: the active provider's setting, or, where that is empty, the one the connection settled on.
+fn model_of_effort<'a>(settings: &'a Settings, connected: &'a str) -> &'a str {
+    settings.active_provider().map(|provider| provider.model.as_str()).filter(|model| !model.is_empty()).unwrap_or(connected)
+}
+
+/// Which effort a word asks for: the one the engine takes, its English name, or Max / 最大, which are xhigh for any model.
+fn effort_asked_for(word: &str) -> Option<usize> {
+    let wanted = word.trim().to_lowercase();
+    let wanted = if wanted == "max" || wanted == "最大" { "xhigh" } else { wanted.as_str() };
+    EFFORTS.iter().position(|(known, name)| known.map_or(wanted == "default", |known| known == wanted) || name.eq_ignore_ascii_case(wanted))
 }
 
 /// The model chip's menu: the providers, then the models the active one offers, if it says, then the way to the settings.
@@ -4540,7 +4572,8 @@ impl App {
                 let provider = self.settings.active_provider().map_or(String::new(), |provider| format!("{}  ·  {}", provider.name, t(provider.kind.label())));
                 let mode = self.current_mode();
                 let mode = t(MODES.iter().find(|(known, _)| *known == mode).map_or("", |(_, name)| name));
-                let effort = t(EFFORTS.iter().find(|(known, _)| *known == self.settings.effort.as_deref()).map_or("Default", |(_, name)| name));
+                let efforts = self.efforts();
+                let effort = t(efforts.iter().find(|(known, _)| *known == self.settings.effort.as_deref()).map_or("Default", |(_, name)| name));
                 let lines = [
                     format!("Dogmind  {}", env!("CARGO_PKG_VERSION")),
                     format!("Build        {}", readable_build(env!("DOGMIND_APP_BUILD"))),
@@ -4670,8 +4703,7 @@ impl App {
                 }
             }
             "effort" => {
-                let wanted = argument.to_lowercase();
-                match EFFORTS.iter().position(|(known, name)| known.map_or(wanted == "default", |known| known == wanted) || name.eq_ignore_ascii_case(&wanted)) {
+                match effort_asked_for(argument) {
                     Some(at) => self.on_menu(M_EFFORT + at),
                     None => self.on_chip(ID_EFFORT_CHIP),
                 }
@@ -4763,7 +4795,8 @@ impl App {
         let mode = self.current_mode();
         let name = MODES.iter().find(|(known, _)| *known == mode).map_or("", |(_, name)| name);
         set_text(self.mode_chip, t(name));
-        let effort = EFFORTS.iter().find(|(known, _)| *known == self.settings.effort.as_deref()).map_or("Default", |(_, name)| name);
+        let efforts = self.efforts();
+        let effort = efforts.iter().find(|(known, _)| *known == self.settings.effort.as_deref()).map_or("Default", |(_, name)| name);
         set_text(self.effort_chip, &tf("Effort: {0}", &[&t(effort)]));
     }
 
@@ -6893,6 +6926,10 @@ impl App {
     fn effort_to_send(&self) -> Option<String> {
         let local = self.settings.providers.iter().any(|provider| provider.name == self.settings.active && provider.kind == Kind::Embedded);
         self.settings.effort.clone().or_else(|| local.then(|| "low".to_string()))
+    }
+
+    fn efforts(&self) -> [(Option<&'static str>, &'static str); 6] {
+        efforts_for(model_of_effort(&self.settings, &self.model))
     }
 
     unsafe fn send_effort(&self) {
@@ -11493,7 +11530,7 @@ impl App {
                 self.popup(self.mode_chip, &items);
             }
             ID_EFFORT_CHIP => {
-                let mut items: Vec<(usize, String, bool)> = EFFORTS.iter().enumerate().map(|(at, (known, name))| (M_EFFORT + at, t(name).to_string(), *known == self.settings.effort.as_deref())).collect();
+                let mut items: Vec<(usize, String, bool)> = self.efforts().iter().enumerate().map(|(at, (known, name))| (M_EFFORT + at, t(name).to_string(), *known == self.settings.effort.as_deref())).collect();
                 items.push((0, String::new(), false));
                 items.push((M_THINKING, t("Show the thinking").into(), self.settings.show_thinking));
                 self.popup(self.effort_chip, &items);
@@ -14194,6 +14231,46 @@ mod tests {
     }
 
     #[test]
+    fn the_highest_effort_is_max_for_a_deepseek_model_and_extra_high_for_another() {
+        let names = |model: &str| efforts_for(model).map(|(_, name)| name);
+        for model in ["DeepSeek-V4.1", "deepseek-v4.1-iq2_xs", "unsloth/DEEPSEEK-V4", "my-deepseek"] {
+            assert_eq!(names(model), ["Default", "None", "Low", "Medium", "High", "Max"], "{model}");
+        }
+        for model in ["", "gpt-5", "Qwen3.8-35B", "claude-sonnet"] {
+            assert_eq!(names(model), ["Default", "None", "Low", "Medium", "High", "Extra high"], "{model}");
+        }
+        // What is sent does not change with the name.
+        assert_eq!(efforts_for("deepseek-v4.1").map(|(known, _)| known), EFFORTS.map(|(known, _)| known));
+        assert_eq!(efforts_for("deepseek-v4.1")[5].0, Some("xhigh"));
+    }
+
+    #[test]
+    fn the_efforts_are_named_for_the_model_the_provider_is_set_to_or_else_the_one_connected() {
+        let provider = |name: &str, model: &str| ProviderConfig { name: name.into(), kind: Kind::Server, base_url: String::new(), model: model.into(), api_key: String::new() };
+        let mut settings = Settings::default();
+        settings.providers = vec![provider("a", "deepseek-v4.1"), provider("b", ""), provider("c", "gpt-5")];
+        settings.active = "a".into();
+        assert_eq!(model_of_effort(&settings, "gpt-5"), "deepseek-v4.1", "what the provider is set to");
+        settings.active = "b".into();
+        assert_eq!(model_of_effort(&settings, "DeepSeek-V4.1"), "DeepSeek-V4.1", "set to none: what the connection settled on");
+        assert_eq!(efforts_for(model_of_effort(&settings, "DeepSeek-V4.1"))[5].1, "Max");
+        settings.active = "c".into();
+        assert_eq!(efforts_for(model_of_effort(&settings, "DeepSeek-V4.1"))[5].1, "Extra high");
+    }
+
+    #[test]
+    fn max_asks_for_xhigh_for_any_model() {
+        let xhigh = EFFORTS.iter().position(|(known, _)| *known == Some("xhigh"));
+        assert!(xhigh.is_some());
+        for word in ["max", "Max", "MAX", " max ", "最大", "xhigh", "extra high", "Extra High"] {
+            assert_eq!(effort_asked_for(word), xhigh, "{word}");
+        }
+        assert_eq!(effort_asked_for("default"), Some(0));
+        assert_eq!(effort_asked_for("low"), Some(2));
+        assert_eq!(effort_asked_for("maximum"), None);
+    }
+
+    #[test]
     fn the_files_that_hold_keys_are_named_and_a_variable_is_not_a_file() {
         let mut settings = Settings::default();
         settings.providers = vec![ProviderConfig { name: "a".into(), kind: Kind::Server, base_url: String::new(), model: String::new(), api_key: "D:\\keys\\a.txt".into() }, ProviderConfig { name: "b".into(), kind: Kind::Server, base_url: String::new(), model: String::new(), api_key: "env:KEY".into() }];
@@ -14212,6 +14289,7 @@ mod tests {
         let mut words: Vec<&str> = COMMANDS.iter().map(|(_, about)| *about).collect();
         words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page", "explore"].map(tool_name));
         words.extend(EFFORTS.iter().map(|(_, name)| *name));
+        words.extend(efforts_for("DeepSeek-V4.1").iter().map(|(_, name)| *name));
         words.extend(MODES.iter().map(|(_, name)| *name));
         words.extend(THEMES.iter().map(|(_, name)| *name));
         words.extend(TEXT_SIZES.iter().map(|(_, name)| *name));
