@@ -28,6 +28,8 @@ use std::time::Duration;
 pub struct Options {
     pub folder: PathBuf,
     pub test: bool,
+    /// `--update`: the app's own update of an install, which goes by what the install wrote down of its files. A setup that a person runs reads each of them.
+    pub update: bool,
     pub auto: bool,
     pub wait_pids: Vec<u32>,
     pub app_name: String,
@@ -280,6 +282,7 @@ fn main() {
     let options = Options {
         folder: folder.clone(),
         test,
+        update: found.update,
         auto: found.auto,
         wait_pids: found.wait_pids.clone(),
         app_name: if test { std::env::var("DOGMIND_SETUP_APP_NAME").unwrap_or_else(|_| "dogmind-app.exe".to_string()) } else { "dogmind-app.exe".to_string() },
