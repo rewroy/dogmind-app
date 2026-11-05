@@ -18,7 +18,8 @@ dogmind-agent = { path = "../dogmind-agent" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-# An update is fetched, and what comes is checked by the SHA-256 GitHub published for it: as dogmind-agent has it.
+# An update is fetched, and what comes is checked by the SHA-256 GitHub published for it: as dogmind-agent has it. The files of a setup that is put together from parts are inflated to be checked.
+flate2 = "1"
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]

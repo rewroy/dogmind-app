@@ -8,6 +8,10 @@
 //! name that ends in `.partial` until its size and its hash are those GitHub published, and then under its own, with a note of what was checked, which stays for the next start.
 //! Anything else is deleted. Only github.com is asked, and where it sends the download on: `*.githubusercontent.com`, five times at most. A debug build pointed at a test server
 //! (`DOGMIND_TEST_RELEASES_URL`) may fetch from that same server as well; a build for release cannot.
+//!
+//! A release also has, beside its setup, a `.parts` file that says where each file of the setup is in it. With that, and the record that the installer keeps in the manifest of what it
+//! installed, the app fetches by ranges only the files of the setup that are new or have changed, and puts a setup together of those and the program (`ranges`). It checks all of it as
+//! it checks a setup fetched whole, and if anything is not as it should be it fetches the setup whole, as it did before.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,6 +22,8 @@ use std::time::Duration;
 
 use dogmind_agent::http::{self, Failure, Url};
 use sha2::{Digest, Sha256};
+
+mod ranges;
 
 /// The twenty newest releases, pre-releases included (`releases/latest` leaves them out, and answers 404 while every release of the project is one). A request that does not
 /// sign in is not given drafts. 404: the repository is not public yet.
@@ -54,7 +60,7 @@ pub const FOLDER: &str = "updates";
 /// What is written beside a setup that has been checked, so that the next start has it and does not fetch it again.
 const RECORD: &str = "ready.txt";
 
-/// The setup of a release, as GitHub lists it among the release's files, with what it published of it to check it by.
+/// A file of a release, as GitHub lists it among the release's files, with what it published of it to check it by: its setup, and the `.parts` file beside that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Setup {
     /// Where it is fetched from (`browser_download_url`), already an address a setup may be fetched from.
@@ -62,6 +68,9 @@ pub struct Setup {
     pub size: u64,
     /// Its SHA-256, in lower case, as the `digest` GitHub publishes for the file says.
     pub sha256: String,
+    /// For a setup: the `DogmindSetup-VERSION.parts` beside it, when the release has that with a SHA-256 digest too. With it an install that keeps a record of its files can be updated by
+    /// fetching only what changed. None: the setup is fetched whole.
+    pub parts: Option<Box<Setup>>,
 }
 
 /// The release that is newest, as the person is told of it.
@@ -78,6 +87,11 @@ pub struct Release {
 /// The name a release's setup has on GitHub and in the `updates` folder.
 pub fn setup_file_name(version: &str) -> String {
     format!("DogmindSetup-{version}.exe")
+}
+
+/// The name the `.parts` file beside a release's setup has on GitHub.
+fn parts_file_name(version: &str) -> String {
+    format!("DogmindSetup-{version}.parts")
 }
 
 /// A version fit to be in a file name: what a tag is made of, and no more.
@@ -295,13 +309,28 @@ fn setup_of(entry: &serde_json::Value, version: &str, test_server: Option<&Url>)
     if !is_plain_version(version) {
         return None;
     }
-    let name = setup_file_name(version);
-    let asset = entry.get("assets")?.as_array()?.iter().find(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some(name.as_str()))?;
-    let size = asset.get("size")?.as_u64().filter(|size| (1..=MOST_OF_A_SETUP).contains(size))?;
+    let mut setup = file_of(entry, &setup_file_name(version), MOST_OF_A_SETUP, test_server)?;
+    setup.parts = parts_of(entry, version, test_server).map(Box::new);
+    Some(setup)
+}
+
+/// The `.parts` file beside the setup among the files of this release, with a size and a SHA-256 digest GitHub published for it and an address it may be fetched from. A release that
+/// lacks any of these has none, and its setup is fetched whole.
+fn parts_of(entry: &serde_json::Value, version: &str, test_server: Option<&Url>) -> Option<Setup> {
+    if !is_plain_version(version) {
+        return None;
+    }
+    file_of(entry, &parts_file_name(version), ranges::MOST_OF_PARTS, test_server)
+}
+
+/// The file of this name among the files of a release, when it has a size of at most `most`, a SHA-256 digest and an address a download may be fetched from.
+fn file_of(entry: &serde_json::Value, name: &str, most: u64, test_server: Option<&Url>) -> Option<Setup> {
+    let asset = entry.get("assets")?.as_array()?.iter().find(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some(name))?;
+    let size = asset.get("size")?.as_u64().filter(|size| (1..=most).contains(size))?;
     let sha256 = digest_hex(asset.get("digest")?.as_str()?)?;
     let url = asset.get("browser_download_url")?.as_str()?;
     first_hop(url, test_server)?;
-    Some(Setup { url: url.to_string(), size, sha256 })
+    Some(Setup { url: url.to_string(), size, sha256, parts: None })
 }
 
 /// The hash in a `sha256:HEX` digest, in lower case. Another kind of digest, or a hash of another length, is none.
@@ -589,11 +618,28 @@ pub fn run_held(ready: &Ready, held: std::fs::File, arguments: &[std::ffi::OsStr
     started
 }
 
+#[cfg(test)]
 fn write_record(folder: &Path, ready: &Ready) -> std::io::Result<()> {
-    let text = format!("version {}\nsize {}\nsha256 {}\n", ready.version, ready.size, ready.sha256);
+    write_record_of(folder, ready, None)
+}
+
+/// The note of a setup that was checked. A setup that was put together here is not the file that GitHub published, and its note says which that was, so that a look that finds the same
+/// release does not fetch it again.
+fn write_record_of(folder: &Path, ready: &Ready, published: Option<&Setup>) -> std::io::Result<()> {
+    let mut text = format!("version {}\nsize {}\nsha256 {}\n", ready.version, ready.size, ready.sha256);
+    if let Some(published) = published {
+        text.push_str(&format!("published_size {}\npublished_sha256 {}\n", published.size, published.sha256));
+    }
     let partial = folder.join(format!("{RECORD}.partial"));
     std::fs::write(&partial, text)?;
     std::fs::rename(&partial, folder.join(RECORD))
+}
+
+/// The size and the hash of the setup that GitHub published, which the setup in the folder was put together in place of, if its note says so.
+fn read_published(folder: &Path) -> Option<(u64, String)> {
+    let text = std::fs::read_to_string(folder.join(RECORD)).ok()?;
+    let value = |name: &str| text.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')).map(str::trim);
+    Some((value("published_size")?.parse().ok()?, digest_hex(&format!("sha256:{}", value("published_sha256")?))?))
 }
 
 /// What the note beside a checked setup says, as a setup that is there to be run, whether or not the file is. A note that is not in order is none.
@@ -654,18 +700,27 @@ fn remove_other_setups(folder: &Path, keep: &str) {
     }
 }
 
-/// The setup of a release in `folder`, checked: fetched from GitHub, or found there from an earlier try that was checked. `on` is told how many bytes of how many have come; `stop` ends it,
-/// and then, as after any failure, nothing of it is left. Run off the window's thread.
+/// The setup of a release in `folder`, checked: fetched from GitHub, or found there from an earlier try that was checked. With the release's `parts` file, and when this copy runs from an
+/// install that kept a record of its files, only the files of the setup that are new or changed are fetched, and a setup is put together of them (see `ranges`); when that cannot be done
+/// the setup is fetched whole. `on` is told how many bytes of how many have come; `stop` ends it, and then, as after any failure, nothing of it is left. Run off the window's thread.
 pub fn obtain(version: &str, setup: &Setup, folder: &Path, on: &mut dyn FnMut(u64, u64), stop: &AtomicBool) -> Result<Ready, Failed> {
-    obtain_from(version, setup, folder, test_server().as_ref(), on, stop)
+    obtain_within(version, setup, install_folder().as_deref(), folder, test_server().as_ref(), on, stop)
 }
 
+/// `obtain_within`, for the whole setup alone.
+#[cfg(test)]
 fn obtain_from(version: &str, setup: &Setup, folder: &Path, test_server: Option<&Url>, on: &mut dyn FnMut(u64, u64), stop: &AtomicBool) -> Result<Ready, Failed> {
+    obtain_within(version, setup, None, folder, test_server, on, stop)
+}
+
+/// The setup in `folder`; `install` is the install folder that it is for, when there is one: with that, and the `.parts` file of the release, it is put together of parts.
+fn obtain_within(version: &str, setup: &Setup, install: Option<&Path>, folder: &Path, test_server: Option<&Url>, on: &mut dyn FnMut(u64, u64), stop: &AtomicBool) -> Result<Ready, Failed> {
     if !is_plain_version(version) {
         return Err(Failed::NotAllowed);
     }
-    // (checked already, and kept: it is not fetched again)
-    if let Some(ready) = read_record(folder).filter(|ready| ready.version == version && ready.size == setup.size && ready.sha256 == setup.sha256 && ready.is_there()) {
+    // (checked already, and kept: it is not fetched again. One that was put together here stands for the setup that GitHub published, and its note says so.)
+    let of_this_release = |ready: &Ready| (ready.size == setup.size && ready.sha256 == setup.sha256) || read_published(folder) == Some((setup.size, setup.sha256.clone()));
+    if let Some(ready) = read_record(folder).filter(|ready| ready.version == version && of_this_release(ready) && ready.is_there()) {
         return Ok(ready);
     }
     let first = first_hop(&setup.url, test_server).ok_or(Failed::NotAllowed)?;
@@ -677,16 +732,36 @@ fn obtain_from(version: &str, setup: &Setup, folder: &Path, test_server: Option<
     if read_record(folder).is_some_and(|ready| ready.version == version) {
         let _ = std::fs::remove_file(folder.join(RECORD));
     }
-    if let Err(failed) = stream(&first, setup, &partial, test_server, on, stop) {
-        let _ = std::fs::remove_file(&partial);
-        return Err(failed);
+    // The files that changed, by ranges, when that can be done. Whatever goes wrong with it (but the person's stop), the setup is fetched whole, and no more is said of it.
+    let mut put_together = None;
+    if let (Some(parts), Some(install)) = (setup.parts.as_deref(), install) {
+        match ranges::assemble(&ranges::Job { version, setup, parts, install, test_server }, &partial, on, stop) {
+            Ok(assembled) => put_together = Some(assembled),
+            Err(ranges::Not::Stopped) => {
+                let _ = std::fs::remove_file(&partial);
+                return Err(Failed::Cancelled);
+            }
+            Err(ranges::Not::Because(_why)) => {
+                let _ = std::fs::remove_file(&partial);
+            }
+        }
+    }
+    if put_together.is_none() {
+        if let Err(failed) = stream(&first, setup, &partial, test_server, on, stop) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(failed);
+        }
     }
     if let Err(error) = std::fs::rename(&partial, &path) {
         let _ = std::fs::remove_file(&partial);
         return Err(disk(error));
     }
-    let ready = Ready { version: version.to_string(), path, size: setup.size, sha256: setup.sha256.clone() };
-    if let Err(error) = write_record(folder, &ready) {
+    // (what is hashed is what was written, as it is for a setup fetched whole)
+    let ready = match &put_together {
+        Some(assembled) => Ready { version: version.to_string(), path, size: assembled.size, sha256: assembled.sha256.clone() },
+        None => Ready { version: version.to_string(), path, size: setup.size, sha256: setup.sha256.clone() },
+    };
+    if let Err(error) = write_record_of(folder, &ready, put_together.as_ref().map(|_| setup)) {
         let _ = std::fs::remove_file(&ready.path);
         return Err(disk(error));
     }
@@ -694,19 +769,17 @@ fn obtain_from(version: &str, setup: &Setup, folder: &Path, test_server: Option<
     Ok(ready)
 }
 
-/// The setup into `partial`, hashed as it comes. It is sent on at most five times, and only to github.com and GitHub's storage; its size is the one published, in its head if it says and
-/// in what arrives; and what arrives has the hash that was published. Anything else is an error, and the caller deletes the file.
-fn stream(first: &Url, setup: &Setup, partial: &Path, test_server: Option<&Url>, on: &mut dyn FnMut(u64, u64), stop: &AtomicBool) -> Result<(), Failed> {
-    // (what goes out says what program asks and that it wants the file: no sign-in, nothing of whoever is at the keyboard)
-    let headers = [("User-Agent".to_string(), format!("Dogmind/{}", env!("CARGO_PKG_VERSION"))), ("Accept".to_string(), "application/octet-stream".to_string())];
+/// The answer to a GET of `first` that has this status, with the address that gave it. It is sent on at most five times, and only to github.com and GitHub's storage; any other answer is an
+/// error. What is asked for goes to each address it is sent on to as it went to the first.
+fn follow<'a>(first: &Url, headers: &[(String, String)], accepted: u16, test_server: Option<&Url>, stop: &'a AtomicBool) -> Result<(http::Response<'a>, Url), Failed> {
     let (mut url, mut sent_on) = (first.clone(), 0);
-    let mut response = loop {
+    loop {
         if stop.load(Ordering::Relaxed) {
             return Err(Failed::Cancelled);
         }
-        let response = http::request("GET", &url, &headers, None, CONNECT, stop).map_err(failed_of)?;
+        let response = http::request("GET", &url, headers, None, CONNECT, stop).map_err(failed_of)?;
         match response.status {
-            200 => break response,
+            status if status == accepted => return Ok((response, url)),
             301 | 302 | 303 | 307 | 308 => {
                 sent_on += 1;
                 url = match response.header("location").and_then(|location| next_hop(location, test_server)) {
@@ -716,7 +789,15 @@ fn stream(first: &Url, setup: &Setup, partial: &Path, test_server: Option<&Url>,
             }
             status => return Err(Failed::Refused(status)),
         }
-    };
+    }
+}
+
+/// The setup into `partial`, hashed as it comes. It is sent on at most five times, and only to github.com and GitHub's storage; its size is the one published, in its head if it says and
+/// in what arrives; and what arrives has the hash that was published. Anything else is an error, and the caller deletes the file.
+fn stream(first: &Url, setup: &Setup, partial: &Path, test_server: Option<&Url>, on: &mut dyn FnMut(u64, u64), stop: &AtomicBool) -> Result<(), Failed> {
+    // (what goes out says what program asks and that it wants the file: no sign-in, nothing of whoever is at the keyboard)
+    let headers = [("User-Agent".to_string(), format!("Dogmind/{}", env!("CARGO_PKG_VERSION"))), ("Accept".to_string(), "application/octet-stream".to_string())];
+    let (mut response, _) = follow(first, &headers, 200, test_server, stop)?;
     if response.header("content-length").is_some_and(|length| length.trim().parse::<u64>().ok() != Some(setup.size)) {
         return Err(Failed::DidNotMatch);
     }
@@ -1246,7 +1327,7 @@ mod tests {
     fn a_release_with_its_setup_gives_its_address_size_and_digest() {
         let body = listing_with("v0.2.0", &[asset("DogmindApp-0.2.0.zip", "30408704", "\"sha256:ffff\"", "https://github.com/x"), github_asset()]);
         let Some(Outcome::Newer(release)) = read_releases(&body, "0.1.0") else { panic!("a newer release") };
-        assert_eq!(release.setup, Some(Setup { url: GITHUB_SETUP.into(), size: 563_000_000, sha256: HASH.into() }));
+        assert_eq!(release.setup, Some(Setup { url: GITHUB_SETUP.into(), size: 563_000_000, sha256: HASH.into(), parts: None }));
         assert_eq!(release.page, "https://github.com/rewroy/dogmind-app/releases/tag/v0.2.0");
         // the hash is kept as lower case, whichever way GitHub writes it
         let upper = listing_with("v0.2.0", &[asset("DogmindSetup-0.2.0.exe", "5", &format!("\"sha256:{}\"", HASH.to_uppercase()), GITHUB_SETUP)]);
@@ -1372,6 +1453,111 @@ mod tests {
         Closes(Vec<u8>),
         /// The same, this many milliseconds after, every time.
         ClosesAfter(Vec<u8>, u64),
+        /// What a server that keeps files answers: the whole of the body to a request that does not ask for a range of it, and 206 and the range to one that does. What it serves is counted.
+        Ranged(Body, Fault),
+        /// The first to a request that asks for a range, the second to one that does not.
+        ByRange(Box<Answer>, Box<Answer>),
+        /// The first to the first request for the path, the second to the second, and the last to each after: a path that changes.
+        Turns(Vec<Answer>),
+        /// An address that has gone stale.
+        Forbidden,
+    }
+
+    /// What a ranged answer is of.
+    enum Body {
+        Bytes(Vec<u8>),
+        File(PathBuf),
+    }
+
+    impl Body {
+        fn len(&self) -> u64 {
+            match self {
+                Body::Bytes(bytes) => bytes.len() as u64,
+                Body::File(path) => std::fs::metadata(path).unwrap().len(),
+            }
+        }
+
+        /// The bytes from `from` to one before `to`, written to the client a block at a time.
+        fn write(&self, stream: &mut std::net::TcpStream, from: u64, to: u64) {
+            match self {
+                Body::Bytes(bytes) => {
+                    let _ = stream.write_all(&bytes[from as usize..to as usize]);
+                }
+                Body::File(path) => {
+                    use std::io::Seek;
+                    let mut file = std::fs::File::open(path).unwrap();
+                    file.seek(std::io::SeekFrom::Start(from)).unwrap();
+                    let mut left = to - from;
+                    let mut block = vec![0u8; 1 << 20];
+                    while left > 0 {
+                        let count = file.read(&mut block[..left.min(1 << 20) as usize]).unwrap();
+                        if count == 0 || stream.write_all(&block[..count]).is_err() {
+                            return;
+                        }
+                        left -= count as u64;
+                    }
+                }
+            }
+        }
+    }
+
+    /// What goes wrong in a ranged answer.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fault {
+        None,
+        /// It says the bytes are those after the ones asked for.
+        WrongRange,
+        /// It stops half way, and closes.
+        Short,
+    }
+
+    impl Answer {
+        /// The answer that stands for this one to a request: `ByRange` and `Turns` are decided by the request, and what they decide on may be one of them again.
+        fn settle(&self, head: &str, earlier: usize) -> &Answer {
+            match self {
+                Answer::ByRange(ranged, whole) => {
+                    if head.lines().any(|line| line.to_ascii_lowercase().starts_with("range:")) { ranged.settle(head, earlier) } else { whole.settle(head, earlier) }
+                }
+                Answer::Turns(answers) => answers[earlier.min(answers.len() - 1)].settle(head, earlier),
+                other => other,
+            }
+        }
+    }
+
+    /// A ranged answer, written to the client; the bytes of the body are added to `sent`.
+    fn serve_ranged(stream: &mut std::net::TcpStream, head: &str, body: &Body, fault: Fault, sent: &std::sync::atomic::AtomicU64) {
+        let total = body.len();
+        let asked = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("range").then(|| value.trim().to_string())
+            })
+            .and_then(|value| {
+                let (from, to) = value.strip_prefix("bytes=")?.split_once('-')?;
+                Some((from.parse::<u64>().ok()?, to.parse::<u64>().ok()))
+            });
+        match asked {
+            None => {
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\n\r\n").as_bytes());
+                body.write(stream, 0, total);
+                sent.fetch_add(total, Ordering::Relaxed);
+            }
+            Some((from, to)) if from < total => {
+                let to = to.map_or(total - 1, |to| to.min(total - 1));
+                let said = if fault == Fault::WrongRange { (from + 1, to + 1) } else { (from, to) };
+                let _ = stream.write_all(format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{total}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n\r\n", said.0, said.1, to - from + 1).as_bytes());
+                let until = if fault == Fault::Short { from + (to - from + 1) / 2 } else { to + 1 };
+                body.write(stream, from, until);
+                sent.fetch_add(until - from, Ordering::Relaxed);
+                if fault == Fault::Short {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            Some(_) => {
+                let _ = stream.write_all(format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\n\r\n").as_bytes());
+            }
+        }
     }
 
     /// A server on this machine for as many requests as come, each on a thread of its own: the paths it answers (the path is what the request asks for, its query too) and what each request said.
@@ -1379,6 +1565,8 @@ mod tests {
         port: u16,
         heard: Arc<std::sync::Mutex<Vec<String>>>,
         done: Arc<AtomicBool>,
+        /// The bytes of the bodies it has served: of a ranged answer what was asked for, of any other all that was written.
+        sent: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl Drop for Server {
@@ -1395,14 +1583,15 @@ mod tests {
             let port = listener.local_addr().unwrap().port();
             let routes = Arc::new(routes(port));
             let (heard, done) = (Arc::new(std::sync::Mutex::new(Vec::<String>::new())), Arc::new(AtomicBool::new(false)));
-            let (heard_by, done_by) = (heard.clone(), done.clone());
+            let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (heard_by, done_by, sent_by) = (heard.clone(), done.clone(), sent.clone());
             std::thread::spawn(move || {
                 while !done_by.load(Ordering::Relaxed) {
                     let Ok((mut stream, _)) = listener.accept() else {
                         std::thread::sleep(Duration::from_millis(5));
                         continue;
                     };
-                    let (routes, heard, done) = (routes.clone(), heard_by.clone(), done_by.clone());
+                    let (routes, heard, done, sent) = (routes.clone(), heard_by.clone(), done_by.clone(), sent_by.clone());
                     std::thread::spawn(move || {
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
@@ -1420,15 +1609,24 @@ mod tests {
                         let head = String::from_utf8_lossy(&head).into_owned();
                         let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
                         let earlier = heard.lock().unwrap().iter().filter(|known| known.split_whitespace().nth(1) == Some(path.as_str())).count();
-                        heard.lock().unwrap().push(head);
-                        let found = routes.iter().find(|(known, _)| *known == path).map(|(_, answer)| answer);
+                        heard.lock().unwrap().push(head.clone());
+                        let found = routes.iter().find(|(known, _)| *known == path).map(|(_, answer)| answer.settle(&head, earlier));
                         let (bytes, stalls, closes_after) = match found {
                             Some(Answer::Whole(bytes)) => (bytes.clone(), false, None),
                             Some(Answer::Stalls(bytes)) => (bytes.clone(), true, None),
                             Some(Answer::Closes(bytes)) => (bytes.clone(), false, Some(if earlier == 0 { 0u64 } else { 5 })),
                             Some(Answer::ClosesAfter(bytes, milliseconds)) => (bytes.clone(), false, Some(*milliseconds)),
+                            Some(Answer::Forbidden) => (with_length("403 Forbidden", "gone stale").into_bytes(), false, None),
+                            Some(Answer::Ranged(..)) => (Vec::new(), false, None),
+                            Some(Answer::ByRange(..) | Answer::Turns(_)) => unreachable!("settled above"),
                             None => (with_length("404 Not Found", "not here").into_bytes(), false, None),
                         };
+                        if let Some(Answer::Ranged(body, fault)) = found {
+                            serve_ranged(&mut stream, &head, body, *fault, &sent);
+                        } else {
+                            // (the body of what is written: what follows the head)
+                            sent.fetch_add(bytes.windows(4).position(|window| window == b"\r\n\r\n").map_or(0, |at| (bytes.len() - at - 4) as u64), Ordering::Relaxed);
+                        }
                         let _ = stream.write_all(&bytes);
                         let _ = stream.flush();
                         if let Some(milliseconds) = closes_after {
@@ -1450,7 +1648,25 @@ mod tests {
                     });
                 }
             });
-            Server { port, heard, done }
+            Server { port, heard, done, sent }
+        }
+
+        /// The bytes of bodies it has served.
+        fn sent(&self) -> u64 {
+            self.sent.load(Ordering::Relaxed)
+        }
+
+        /// The request lines of the requests that asked for a range, with the range.
+        fn ranged_requests(&self) -> Vec<String> {
+            self.heard
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|head| {
+                    let range = head.lines().find(|line| line.to_ascii_lowercase().starts_with("range:"))?;
+                    Some(format!("{} {}", head.lines().next().unwrap_or(""), range.trim()))
+                })
+                .collect()
         }
 
         fn url(&self, path: &str) -> String {
@@ -1497,7 +1713,7 @@ mod tests {
 
     /// The setup of 0.2.0 as a server of the test's has it: its bytes, and what GitHub would have published of them.
     fn setup_at(server: &Server, path: &str, bytes: &[u8]) -> Setup {
-        Setup { url: server.url(path), size: bytes.len() as u64, sha256: sha_of(bytes) }
+        Setup { url: server.url(path), size: bytes.len() as u64, sha256: sha_of(bytes), parts: None }
     }
 
     fn fetched(server: &Server, setup: &Setup, folder: &Path) -> Result<Ready, Failed> {
@@ -1542,7 +1758,7 @@ mod tests {
     #[test]
     fn a_download_of_another_size_is_refused_whichever_way_it_says_so_and_leaves_no_file() {
         let bytes = file_bytes(100_000, 3);
-        let published = Setup { url: String::new(), size: bytes.len() as u64, sha256: sha_of(&bytes) };
+        let published = Setup { url: String::new(), size: bytes.len() as u64, sha256: sha_of(&bytes), parts: None };
         let chunked = |body: &[u8]| {
             let mut answer = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", body.len()).into_bytes();
             answer.extend_from_slice(body);
@@ -1744,7 +1960,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let bytes = file_bytes(10, 0);
         // (in a build for release nothing but GitHub's own is: the test server is the debug build's)
-        let setup = Setup { url: server.url(SETUP_PATH), size: 10, sha256: sha_of(&bytes) };
+        let setup = Setup { url: server.url(SETUP_PATH), size: 10, sha256: sha_of(&bytes), parts: None };
         assert_eq!(obtain_from("0.2.0", &setup, folder.path(), None, &mut |_, _| {}, &AtomicBool::new(false)).unwrap_err(), Failed::NotAllowed);
         assert!(server.requests().is_empty());
         for url in ["https://evil.example/x.exe", "http://github.com/rewroy/dogmind-app/releases/download/v0.2.0/a.exe"] {
@@ -1989,5 +2205,412 @@ mod tests {
         assert!(!is_install(other.path()));
         // the name is the one the installer writes, which this cannot link to
         assert!(include_str!("../../dogmind-setup/src/install.rs").contains(&format!("pub const MANIFEST: &str = \"{INSTALL_MANIFEST}\";")));
+    }
+
+    // ---- a setup put together of parts: only what changed is fetched, by ranges ----
+
+    use super::ranges::{self, setup_pack, support::*};
+
+    const PARTS_PATH: &str = "/download/DogmindSetup-0.2.0.parts";
+
+    fn old_files() -> Vec<(&'static str, Vec<u8>)> {
+        vec![("LICENSE.txt", b"license text. ".repeat(1500)), ("big-a.dll", noisy(3 << 20, 1)), ("big-b.dll", noisy(3 << 20, 2)), ("dogmind-app.exe", noisy(200_000, 3)), ("tools\\z.py", noisy(3 << 20, 4))]
+    }
+
+    /// The release after: one file is other, and one is new.
+    fn new_files() -> Vec<(&'static str, Vec<u8>)> {
+        let mut files = old_files();
+        files[3].1 = noisy(200_000, 5);
+        files.push(("new.txt", b"fresh file, ".repeat(3000)));
+        files
+    }
+
+    fn borrowed<'a>(files: &'a [(&'static str, Vec<u8>)]) -> Vec<(&'static str, &'a [u8])> {
+        files.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect()
+    }
+
+    /// A release of 0.2.0 and the install it is for: the setup and its parts file as `dogmind-setup --pack` made them, and the install folder of 0.1.9 that the installer left.
+    struct Scene {
+        dir: tempfile::TempDir,
+        exe: PathBuf,
+        exe_bytes: Vec<u8>,
+        parts_bytes: Vec<u8>,
+        install: PathBuf,
+        folder: PathBuf,
+    }
+
+    impl Scene {
+        fn new(with_sums: bool) -> Scene {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = make_setup(dir.path(), "0.2.0", &borrowed(&new_files()));
+            let (exe_bytes, parts_bytes) = (std::fs::read(&exe).unwrap(), std::fs::read(setup_pack::parts_path(&exe)).unwrap());
+            let install = dir.path().join("install");
+            make_install(&install, &borrowed(&old_files()), with_sums);
+            let folder = dir.path().join("updates");
+            Scene { dir, exe, exe_bytes, parts_bytes, install, folder }
+        }
+
+        /// The setup as GitHub lists it, at this server: its size and hash, and its parts file's.
+        fn setup(&self, server: &Server) -> Setup {
+            let parts = Setup { url: server.url(PARTS_PATH), size: self.parts_bytes.len() as u64, sha256: sha_of(&self.parts_bytes), parts: None };
+            Setup { parts: Some(Box::new(parts)), ..setup_at(server, SETUP_PATH, &self.exe_bytes) }
+        }
+
+        fn server(&self, exe: Answer, parts: Answer) -> Server {
+            Server::start(move |port| {
+                vec![
+                    (SETUP_PATH.to_string(), redirect_to(&format!("http://127.0.0.1:{port}/storage/setup?sig=1"))),
+                    ("/storage/setup?sig=1".to_string(), exe),
+                    (PARTS_PATH.to_string(), redirect_to(&format!("http://127.0.0.1:{port}/storage/parts?sig=1"))),
+                    ("/storage/parts?sig=1".to_string(), parts),
+                ]
+            })
+        }
+
+        /// A server that has the release as GitHub's storage has it: ranges are answered.
+        fn good_server(&self) -> Server {
+            self.server(Answer::Ranged(Body::Bytes(self.exe_bytes.clone()), Fault::None), Answer::Ranged(Body::Bytes(self.parts_bytes.clone()), Fault::None))
+        }
+
+        fn obtain(&self, server: &Server, setup: &Setup) -> Result<Ready, Failed> {
+            obtain_within("0.2.0", setup, Some(&self.install), &self.folder, Some(&server.as_url()), &mut |_, _| {}, &AtomicBool::new(false))
+        }
+
+        /// What putting the setup together comes to by itself, which says why it did not when it did not.
+        fn assembled(&self, server: &Server, setup: &Setup) -> Result<ranges::Assembled, ranges::Not> {
+            let job = ranges::Job { version: "0.2.0", setup, parts: setup.parts.as_deref().unwrap(), install: &self.install, test_server: Some(&server.as_url()) };
+            let partial = self.dir.path().join("assembled.partial");
+            let result = ranges::assemble(&job, &partial, &mut |_, _| {}, &AtomicBool::new(false));
+            let _ = std::fs::remove_file(&partial);
+            result
+        }
+
+        /// The whole setup is what the folder has after: the bytes GitHub published.
+        fn assert_fetched_whole(&self, ready: Result<Ready, Failed>) {
+            let ready = ready.expect("the setup is fetched whole when the parts are no way to it");
+            assert_eq!((ready.size, ready.sha256.as_str()), (self.exe_bytes.len() as u64, sha_of(&self.exe_bytes).as_str()));
+            assert_eq!(std::fs::read(&ready.path).unwrap(), self.exe_bytes);
+            assert_eq!(names_in(&self.folder), ["DogmindSetup-0.2.0.exe", "ready.txt"], "no `.partial` is left");
+            assert_eq!(read_published(&self.folder), None, "and it is the setup that was published");
+        }
+    }
+
+    /// Every file of a setup of the installer's making, opened and laid out as an install of 0.2.0 has to have it: kept from the folder, or in the package.
+    fn tree_of(path: &Path, install: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut package = setup_pack::Package::open(path).unwrap();
+        let mut tree = std::collections::BTreeMap::new();
+        for entry in package.entries.clone() {
+            let bytes = if entry.method == setup_pack::KEPT {
+                let bytes = std::fs::read(install.join(&entry.path)).unwrap();
+                assert_eq!(Sha256::digest(&bytes).as_slice(), entry.sha256, "{}: kept from the install, and it is the one", entry.path);
+                bytes
+            } else {
+                let mut bytes = Vec::new();
+                package.extract(&entry, &mut bytes, &mut |_| {}).unwrap();
+                bytes
+            };
+            tree.insert(entry.path.clone(), bytes);
+        }
+        tree
+    }
+
+    #[test]
+    fn a_range_update_fetches_the_program_and_the_files_that_changed_and_nothing_else() {
+        let scene = Scene::new(true);
+        let server = scene.good_server();
+        let setup = scene.setup(&server);
+        let mut told = Vec::new();
+        let ready = obtain_within("0.2.0", &setup, Some(&scene.install), &scene.folder, Some(&server.as_url()), &mut |done, total| told.push((done, total)), &AtomicBool::new(false)).unwrap();
+
+        // the bytes served: the parts file, the program, and the stored bytes of the file that changed and the one that is new, which are next to each other in the setup
+        let package = setup_pack::Package::open(&scene.exe).unwrap();
+        let stored = |name: &str| package.entries.iter().find(|entry| entry.path == name).unwrap().stored;
+        let fetched = package.base + stored("dogmind-app.exe") + stored("new.txt");
+        assert_eq!(server.sent(), scene.parts_bytes.len() as u64 + fetched);
+        assert!(fetched * 20 < scene.exe_bytes.len() as u64, "{fetched} of {}", scene.exe_bytes.len());
+        // by two requests, to the storage the setup was sent on to; the setup's own address was asked once
+        let storage: Vec<String> = server.ranged_requests().into_iter().filter(|line| line.contains("/storage/setup")).collect();
+        assert_eq!(storage.len(), 2, "{:?}", server.requests());
+        assert!(storage[0].ends_with(&format!("bytes=0-{}", package.base - 1)));
+        assert_eq!(server.requests().iter().filter(|line| line.contains(SETUP_PATH)).count(), 1, "the redirect is followed once: {:?}", server.requests());
+        // the progress is of those bytes
+        assert_eq!(told.first(), Some(&(0, fetched)));
+        assert_eq!(told.last(), Some(&(fetched, fetched)));
+        assert!(told.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+
+        // the setup that was put together is a setup: it opens, it says what the release's does, and the files it holds and keeps are the release's, file for file
+        assert!(ready.is_there() && ready.is_sound());
+        assert_eq!(ready.size, std::fs::metadata(&ready.path).unwrap().len());
+        assert!(ready.size * 20 < scene.exe_bytes.len() as u64);
+        let made = setup_pack::Package::open(&ready.path).unwrap();
+        assert_eq!(made.version, "0.2.0");
+        assert_eq!(made.base, package.base);
+        let kept: Vec<&str> = made.entries.iter().filter(|entry| entry.method == setup_pack::KEPT).map(|entry| entry.path.as_str()).collect();
+        assert_eq!(kept, ["LICENSE.txt", "big-a.dll", "big-b.dll", "tools\\z.py"]);
+        for (made, whole) in made.entries.iter().zip(&package.entries) {
+            assert_eq!((&made.path, made.size, made.sha256), (&whole.path, whole.size, whole.sha256));
+            if made.method != setup_pack::KEPT {
+                assert_eq!((made.method, made.stored), (whole.method, whole.stored));
+            }
+        }
+        let wanted: std::collections::BTreeMap<String, Vec<u8>> = new_files().into_iter().map(|(name, bytes)| (name.to_string(), bytes)).collect();
+        assert_eq!(tree_of(&ready.path, &scene.install), wanted);
+        // and it is kept like any other, with a note that says which release's it stands for: a look that finds the same release does not fetch it again
+        assert_eq!(names_in(&scene.folder), ["DogmindSetup-0.2.0.exe", "ready.txt"]);
+        assert_eq!(read_published(&scene.folder), Some((setup.size, setup.sha256.clone())));
+        assert_eq!(kept_and_sound(&scene.folder, "0.1.9"), Some(ready.clone()));
+        let asked = server.requests().len();
+        assert_eq!(scene.obtain(&server, &setup).unwrap(), ready);
+        assert_eq!(server.requests().len(), asked, "nothing was asked");
+    }
+
+    #[test]
+    fn a_file_next_to_the_program_joins_its_request_and_one_far_from_it_has_its_own() {
+        let scene = Scene::new(true);
+        // the license is the first file of the setup, a header after the program; the others that are wanted are 6 MB on, after two that are not
+        std::fs::remove_file(scene.install.join("LICENSE.txt")).unwrap();
+        let server = scene.good_server();
+        let setup = scene.setup(&server);
+        scene.obtain(&server, &setup).unwrap();
+        let package = setup_pack::Package::open(&scene.exe).unwrap();
+        let entry = |name: &str| package.entries.iter().find(|entry| entry.path == name).unwrap().clone();
+        let (license, app, new) = (entry("LICENSE.txt"), entry("dogmind-app.exe"), entry("new.txt"));
+        let storage: Vec<String> = server.ranged_requests().into_iter().filter(|line| line.contains("/storage/setup")).collect();
+        let first_end = package.base + license.offset + license.stored;
+        let second = (package.base + app.offset, package.base + new.offset + new.stored);
+        assert_eq!(storage.len(), 2, "{storage:?}");
+        assert!(storage[0].ends_with(&format!("bytes=0-{}", first_end - 1)), "the program and the license in one: {storage:?}");
+        assert!(storage[1].ends_with(&format!("bytes={}-{}", second.0, second.1 - 1)), "{storage:?}");
+        assert_eq!(server.sent(), scene.parts_bytes.len() as u64 + first_end + (second.1 - second.0));
+    }
+
+    #[test]
+    fn when_most_of_the_setup_is_wanted_it_is_fetched_whole() {
+        let scene = Scene::new(true);
+        // three of the four files that cannot be made smaller are not in the install any more
+        for name in ["big-a.dll", "big-b.dll", "tools\\z.py"] {
+            std::fs::remove_file(scene.install.join(name)).unwrap();
+        }
+        let server = scene.good_server();
+        let setup = scene.setup(&server);
+        assert_eq!(scene.assembled(&server, &setup), Err(ranges::Not::Because(ranges::NOT_WORTH_IT)));
+        scene.assert_fetched_whole(scene.obtain(&server, &setup));
+        assert!(server.ranged_requests().is_empty(), "no range was asked for: {:?}", server.requests());
+    }
+
+    #[test]
+    fn a_server_that_ignores_range_has_the_setup_fetched_whole() {
+        let scene = Scene::new(true);
+        let server = scene.server(file_answer(&scene.exe_bytes), Answer::Ranged(Body::Bytes(scene.parts_bytes.clone()), Fault::None));
+        let setup = scene.setup(&server);
+        assert_eq!(scene.assembled(&server, &setup), Err(ranges::Not::Because(ranges::WHOLE_FILE)));
+        scene.assert_fetched_whole(scene.obtain(&server, &setup));
+        // it asked for a range first, and was answered with all of it; then it asked for the file
+        assert!(!server.ranged_requests().is_empty());
+        let last = server.heard.lock().unwrap().last().unwrap().clone();
+        assert!(last.starts_with("GET /storage/setup") && !last.to_ascii_lowercase().contains("range:"), "{last}");
+    }
+
+    #[test]
+    fn a_range_that_comes_damaged_has_the_setup_fetched_whole() {
+        let scene = Scene::new(true);
+        let package = setup_pack::Package::open(&scene.exe).unwrap();
+        let place = |name: &str| {
+            let entry = package.entries.iter().find(|entry| entry.path == name).unwrap();
+            (package.base + entry.offset + entry.stored / 2) as usize
+        };
+        // the program, a file that is stored as it is (dogmind-app.exe), and one that is deflated (new.txt): a byte of each is another
+        for (what, at) in [("the program", 100), ("a stored file", place("dogmind-app.exe")), ("a deflated file", place("new.txt"))] {
+            let mut damaged = scene.exe_bytes.clone();
+            damaged[at] ^= 0x55;
+            let answer = || Answer::ByRange(Box::new(Answer::Ranged(Body::Bytes(damaged.clone()), Fault::None)), Box::new(file_answer(&scene.exe_bytes)));
+            let server = scene.server(answer(), Answer::Ranged(Body::Bytes(scene.parts_bytes.clone()), Fault::None));
+            let setup = scene.setup(&server);
+            assert_eq!(scene.assembled(&server, &setup), Err(ranges::Not::Because(ranges::DAMAGED)), "{what}");
+            let _ = std::fs::remove_dir_all(&scene.folder);
+            scene.assert_fetched_whole(scene.obtain(&server, &setup));
+        }
+    }
+
+    #[test]
+    fn a_missing_or_wrong_parts_file_has_the_setup_fetched_whole() {
+        let scene = Scene::new(true);
+        // not there
+        let server = Server::start(|port| {
+            vec![
+                (SETUP_PATH.to_string(), redirect_to(&format!("http://127.0.0.1:{port}/storage/setup?sig=1"))),
+                ("/storage/setup?sig=1".to_string(), Answer::Ranged(Body::Bytes(scene.exe_bytes.clone()), Fault::None)),
+            ]
+        });
+        let setup = scene.setup(&server);
+        assert_eq!(scene.assembled(&server, &setup), Err(ranges::Not::Because(ranges::PARTS_NOT_FETCHED)));
+        scene.assert_fetched_whole(scene.obtain(&server, &setup));
+        assert!(server.ranged_requests().is_empty(), "no range was asked for: {:?}", server.requests());
+        // there, and not the size and the hash that GitHub published of it
+        let mut other = scene.parts_bytes.clone();
+        let middle = other.len() / 2;
+        other[middle] ^= 1;
+        let cases = [
+            ("a byte other", Answer::Ranged(Body::Bytes(other), Fault::None), 0),
+            ("a size other", Answer::Ranged(Body::Bytes(scene.parts_bytes.clone()), Fault::None), 1),
+            ("a file that is no parts file", Answer::Ranged(Body::Bytes(b"{}".to_vec()), Fault::None), 2),
+        ];
+        for (what, parts, published) in cases {
+            let server = scene.server(Answer::Ranged(Body::Bytes(scene.exe_bytes.clone()), Fault::None), parts);
+            let mut setup = scene.setup(&server);
+            match published {
+                1 => setup.parts.as_mut().unwrap().size += 1,
+                2 => {
+                    let nothing = b"{}";
+                    let parts = setup.parts.as_mut().unwrap();
+                    (parts.size, parts.sha256) = (nothing.len() as u64, sha_of(nothing));
+                }
+                _ => {}
+            }
+            let reason = if published == 2 { ranges::PARTS_UNREADABLE } else { ranges::PARTS_DIFFER };
+            assert_eq!(scene.assembled(&server, &setup), Err(ranges::Not::Because(reason)), "{what}");
+            let _ = std::fs::remove_dir_all(&scene.folder);
+            scene.assert_fetched_whole(scene.obtain(&server, &setup));
+        }
+        // a release that has none among its files has none to fetch
+        let server = scene.good_server();
+        let mut setup = scene.setup(&server);
+        setup.parts = None;
+        scene.assert_fetched_whole(scene.obtain(&server, &setup));
+        assert!(server.requests().iter().all(|line| !line.contains("parts")), "{:?}", server.requests());
+    }
+
+    #[test]
+    fn an_install_that_has_no_record_of_its_files_has_the_setup_fetched_whole() {
+        // the install of 0.1.4: `file` lines, and no `sum` line of any
+        let scene = Scene::new(false);
+        let server = scene.good_server();
+        let setup = scene.setup(&server);
+        assert_eq!(scene.assembled(&server, &setup), Err(ranges::Not::Because(ranges::NO_RECORDS)));
+        scene.assert_fetched_whole(scene.obtain(&server, &setup));
+        assert!(server.requests().iter().all(|line| !line.contains("parts")) && server.ranged_requests().is_empty(), "nothing but the setup was asked for: {:?}", server.requests());
+        // and a copy that is no install at all
+        let _ = std::fs::remove_dir_all(&scene.folder);
+        let ready = obtain_within("0.2.0", &setup, None, &scene.folder, Some(&server.as_url()), &mut |_, _| {}, &AtomicBool::new(false));
+        scene.assert_fetched_whole(ready);
+    }
+
+    #[test]
+    fn an_address_that_has_gone_stale_is_resolved_again_once() {
+        let scene = Scene::new(true);
+        let ranged = || Answer::Ranged(Body::Bytes(scene.exe_bytes.clone()), Fault::None);
+        let parts = || Answer::Ranged(Body::Bytes(scene.parts_bytes.clone()), Fault::None);
+        // the first storage address answers the first range and then goes stale; the setup's own address then sends the request on to another
+        let server = Server::start(|port| {
+            vec![
+                (SETUP_PATH.to_string(), Answer::Turns(vec![redirect_to(&format!("http://127.0.0.1:{port}/storage/one")), redirect_to(&format!("http://127.0.0.1:{port}/storage/two"))])),
+                ("/storage/one".to_string(), Answer::Turns(vec![ranged(), Answer::Forbidden])),
+                ("/storage/two".to_string(), ranged()),
+                (PARTS_PATH.to_string(), redirect_to(&format!("http://127.0.0.1:{port}/storage/parts"))),
+                ("/storage/parts".to_string(), parts()),
+            ]
+        });
+        let setup = scene.setup(&server);
+        let ready = scene.obtain(&server, &setup).unwrap();
+        let wanted: std::collections::BTreeMap<String, Vec<u8>> = new_files().into_iter().map(|(name, bytes)| (name.to_string(), bytes)).collect();
+        assert_eq!(tree_of(&ready.path, &scene.install), wanted);
+        let asked = server.requests();
+        let at = |what: &str| asked.iter().position(|line| line.contains(what)).unwrap_or(usize::MAX);
+        assert_eq!(asked.iter().filter(|line| line.contains(SETUP_PATH)).count(), 2, "{asked:?}");
+        assert!(at("/storage/one") < at("/storage/two"), "{asked:?}");
+        // a second address that goes stale as well is not resolved a third time: the range way is given up, and so is the whole fetch here, which meets the same address
+        let server = Server::start(|port| {
+            vec![
+                (SETUP_PATH.to_string(), redirect_to(&format!("http://127.0.0.1:{port}/storage/one"))),
+                ("/storage/one".to_string(), Answer::Turns(vec![ranged(), Answer::Forbidden])),
+                (PARTS_PATH.to_string(), redirect_to(&format!("http://127.0.0.1:{port}/storage/parts"))),
+                ("/storage/parts".to_string(), parts()),
+            ]
+        });
+        let setup = scene.setup(&server);
+        assert_eq!(scene.assembled(&server, &setup), Err(ranges::Not::Because(ranges::NOT_FETCHED)));
+        assert_eq!(server.requests().iter().filter(|line| line.contains(SETUP_PATH)).count(), 2, "{:?}", server.requests());
+    }
+
+    #[test]
+    fn an_answer_that_is_not_the_range_asked_for_has_the_setup_fetched_whole() {
+        let scene = Scene::new(true);
+        for (what, fault, reason) in [("other bytes than those asked for", Fault::WrongRange, ranges::NOT_A_RANGE), ("fewer bytes than the length said", Fault::Short, ranges::NOT_FETCHED)] {
+            let answer = || Answer::ByRange(Box::new(Answer::Ranged(Body::Bytes(scene.exe_bytes.clone()), fault)), Box::new(file_answer(&scene.exe_bytes)));
+            let server = scene.server(answer(), Answer::Ranged(Body::Bytes(scene.parts_bytes.clone()), Fault::None));
+            let setup = scene.setup(&server);
+            assert_eq!(scene.assembled(&server, &setup), Err(ranges::Not::Because(reason)), "{what}");
+            let _ = std::fs::remove_dir_all(&scene.folder);
+            scene.assert_fetched_whole(scene.obtain(&server, &setup));
+        }
+        // a server that has no such range to give
+        let server = scene.server(Answer::Whole(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n".to_vec()), Answer::Ranged(Body::Bytes(scene.parts_bytes.clone()), Fault::None));
+        let setup = scene.setup(&server);
+        assert_eq!(scene.assembled(&server, &setup), Err(ranges::Not::Because(ranges::NOT_FETCHED)));
+    }
+
+    #[test]
+    fn a_range_update_that_the_person_stops_leaves_no_file_and_does_not_go_on_to_the_whole_setup() {
+        let scene = Scene::new(true);
+        let server = scene.good_server();
+        let setup = scene.setup(&server);
+        let stop = AtomicBool::new(false);
+        let failed = obtain_within("0.2.0", &setup, Some(&scene.install), &scene.folder, Some(&server.as_url()), &mut |done, _| if done > 0 { stop.store(true, Ordering::Relaxed) }, &stop).unwrap_err();
+        assert_eq!(failed, Failed::Cancelled);
+        assert_eq!(names_in(&scene.folder), Vec::<String>::new(), "no setup, no `.partial`, no note");
+        let big = scene.exe_bytes.len() as u64;
+        assert!(server.sent() < big / 20, "the whole setup was not fetched after it: {} of {big}", server.sent());
+    }
+
+    #[test]
+    fn a_release_lists_its_parts_file_beside_its_setup_and_only_with_a_size_a_digest_and_an_address_that_are_fit() {
+        let digest = format!("\"sha256:{HASH}\"");
+        let parts_url = "https://github.com/rewroy/dogmind-app/releases/download/v0.2.0/DogmindSetup-0.2.0.parts";
+        let setup = github_asset();
+        let parts = asset("DogmindSetup-0.2.0.parts", "150000", &digest, parts_url);
+        let read = |assets: &[String]| setup_read_from(&listing_with("v0.2.0", assets));
+        let found = read(&[setup.clone(), parts.clone()]).unwrap();
+        assert_eq!(found.parts.as_deref(), Some(&Setup { url: parts_url.into(), size: 150_000, sha256: HASH.into(), parts: None }));
+        assert_eq!(read(&[parts.clone(), setup.clone()]).unwrap(), found, "in whatever order");
+        assert_eq!(read(&[setup.clone()]).unwrap().parts, None);
+        for (what, bad) in [
+            ("no digest", asset("DogmindSetup-0.2.0.parts", "150000", "null", parts_url)),
+            ("a size of nothing", asset("DogmindSetup-0.2.0.parts", "0", &digest, parts_url)),
+            ("a size no parts file has", asset("DogmindSetup-0.2.0.parts", "99999999", &digest, parts_url)),
+            ("the parts of another version", asset("DogmindSetup-0.1.9.parts", "150000", &digest, parts_url)),
+            ("an address on another host", asset("DogmindSetup-0.2.0.parts", "150000", &digest, "https://example.com/rewroy/dogmind-app/releases/download/v0.2.0/DogmindSetup-0.2.0.parts")),
+            ("an address of another project", asset("DogmindSetup-0.2.0.parts", "150000", &digest, "https://github.com/someone/else/releases/download/v0.2.0/DogmindSetup-0.2.0.parts")),
+        ] {
+            let found = read(&[setup.clone(), bad]).unwrap();
+            assert_eq!((found.parts, found.url.as_str()), (None, GITHUB_SETUP), "{what}: the setup is still there, and is fetched whole");
+        }
+        // a parts file of a release with no setup is no way to anything
+        let Some(Outcome::Newer(release)) = read_releases(&listing_with("v0.2.0", &[parts]), "0.1.0") else { panic!("a newer release") };
+        assert_eq!(release.setup, None);
+    }
+
+    /// A real setup, put together from a real install by the app's own code and then installed by the installer: driven by a script (`DOGMIND_RANGE_*` name the files), and not run otherwise.
+    /// It serves the second setup from a server of this test's that answers ranges, puts the setup together for the install, and tells what it fetched; the script then runs the result.
+    #[test]
+    #[ignore = "driven by a script with real files"]
+    fn a_real_setup_is_put_together_for_a_real_install_for_a_script() {
+        let var = |name: &str| PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} names a file")));
+        let (exe, install, out) = (var("DOGMIND_RANGE_SETUP"), var("DOGMIND_RANGE_INSTALL"), var("DOGMIND_RANGE_OUT"));
+        let parts_bytes = std::fs::read(setup_pack::parts_path(&exe)).unwrap();
+        let (size, sha256) = hash_of(&exe).unwrap();
+        let server = Server::start(|port| {
+            vec![
+                (SETUP_PATH.to_string(), redirect_to(&format!("http://127.0.0.1:{port}/storage/setup?sig=1"))),
+                ("/storage/setup?sig=1".to_string(), Answer::Ranged(Body::File(exe.clone()), Fault::None)),
+                (PARTS_PATH.to_string(), redirect_to(&format!("http://127.0.0.1:{port}/storage/parts?sig=1"))),
+                ("/storage/parts?sig=1".to_string(), Answer::Ranged(Body::Bytes(parts_bytes.clone()), Fault::None)),
+            ]
+        });
+        let parts = Setup { url: server.url(PARTS_PATH), size: parts_bytes.len() as u64, sha256: sha_of(&parts_bytes), parts: None };
+        let setup = Setup { url: server.url(SETUP_PATH), size, sha256, parts: Some(Box::new(parts)) };
+        let began = std::time::Instant::now();
+        let ready = obtain_within("0.2.0", &setup, Some(&install), &out, Some(&server.as_url()), &mut |_, _| {}, &AtomicBool::new(false)).unwrap();
+        println!("range path: {} bytes of bodies served, {} of {} for the setup, {} requests, {:?}; made {}", server.sent(), server.sent() - parts_bytes.len() as u64, size, server.requests().len(), began.elapsed(), ready.path.display());
+        println!("range path: made setup is {} bytes, sha256 {}", ready.size, ready.sha256);
     }
 }
