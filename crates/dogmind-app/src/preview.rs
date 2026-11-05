@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
-use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, DownloadStartingEventHandler, ExecuteScriptCompletedHandler, LaunchingExternalUriSchemeEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler, PermissionRequestedEventHandler, WebResourceRequestedEventHandler};
+use webview2_com::{AddScriptToExecuteOnDocumentCreatedCompletedHandler, CallDevToolsProtocolMethodCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, DownloadStartingEventHandler, ExecuteScriptCompletedHandler, LaunchingExternalUriSchemeEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler, PermissionRequestedEventHandler, WebResourceRequestedEventHandler};
 use windows::core::{Interface, HSTRING, PWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -29,6 +29,9 @@ const FONT_HOST: &str = "dogmind-fonts.example";
 /// Every connection of the browser goes to a proxy that is not there, WebSockets and addresses by number too, which a filter on
 /// requests would not see. The workspace's host is served inside the browser and does not go that way.
 const CUT_OFF: &str = "--proxy-server=http://127.0.0.1:9 --proxy-bypass-list=<-loopback> --force-webrtc-ip-handling-policy=disable_non_proxied_udp --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-first-run --blink-settings=defaultTextEncodingName=UTF-8";
+
+/// Run in every document before its own scripts: `window.print` is a function that does nothing, and cannot be written over or redefined by the page.
+const NO_PRINT: &str = "(function(){var none=function print(){};try{Object.defineProperty(window,'print',{value:none,writable:false,configurable:false,enumerable:true});}catch(e){}})();";
 
 /// The folder the person picks, in the Explorer's own window; none when they cancel.
 pub unsafe fn choose_folder(owner: isize, title: &str) -> Option<PathBuf> {
@@ -339,6 +342,12 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
         more.SetIsPasswordAutosaveEnabled(false)?;
         more.SetIsGeneralAutofillEnabled(false)?;
     }
+    // The browser's own keys (print, save the page, find, reload, zoom) are the page's to ask for and not the person's by accident: the print dialog's "Save as PDF" writes wherever it is pointed.
+    let mut keys_off = false;
+    if let Ok(more) = settings.cast::<ICoreWebView2Settings3>() {
+        more.SetAreBrowserAcceleratorKeysEnabled(false)?;
+        keys_off = true;
+    }
     let blocked = Rc::new(Cell::new(0u32));
     let mut token = 0i64;
     // What is held against the page, by name, for the log line of a debug build and for the tests.
@@ -368,6 +377,9 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
         Ok(())
     })), &mut token)?;
     guards.push("frame_navigation");
+    if keys_off {
+        guards.push("browser_keys_off");
+    }
     // A scheme the system hands to another program (mailto:, ms-settings:, a custom one): never launched, whatever the person might have answered the runtime's own question. (A runtime too old for
     // the interface has no such event, and the other checks are what there is.)
     if let Ok(more) = webview.cast::<ICoreWebView2_18>() {
@@ -431,6 +443,9 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
             Ok(())
         })), &mut token)?;
     }
+    // A page's own call to print is the same door as the key: it does nothing, in every document and every frame, before any script of the page runs.
+    webview.AddScriptToExecuteOnDocumentCreated(&HSTRING::from(NO_PRINT), &AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| Ok(()))))?;
+    guards.push("print_off");
     // What was just written is what is shown, not what the cache has.
     let answered = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_, _| Ok(())));
     webview.CallDevToolsProtocolMethod(&HSTRING::from("Network.setCacheDisabled"), &HSTRING::from(r#"{"cacheDisabled":true}"#), &answered)?;
@@ -606,6 +621,13 @@ mod tests {
         for inside in ["https://dogmind-preview.example/frame.html", "about:blank", "about:srcdoc", "data:text/html,x"] {
             assert!(stays_inside(inside), "{inside}");
         }
+    }
+
+    /// The script that takes `window.print` away is a function that ends at once and a property the page cannot change.
+    #[test]
+    fn the_script_that_turns_printing_off_leaves_it_nothing_to_write_over() {
+        assert!(NO_PRINT.contains("Object.defineProperty(window,'print'") && NO_PRINT.contains("writable:false") && NO_PRINT.contains("configurable:false"));
+        assert!(!NO_PRINT.contains("window.print()"), "it does not call it");
     }
 
     #[test]
