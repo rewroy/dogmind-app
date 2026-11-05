@@ -288,6 +288,7 @@ const JA: &[(&str, &str)] = &[
     ("These models need {0} of graphics memory, and this PC's GPU has {1}. You can still use a model on another computer, an online service, Codex or Claude.", "これらのモデルには {0} のグラフィックスメモリが必要ですが、この PC の GPU は {1} です。別のコンピューターやオンラインサービス、Codex、Claude のモデルなら使えます。"),
     ("it finds no GPU", "GPU が見つかりません"),
     ("{0} of memory", "メモリ {0}"),
+    ("{0} of memory, {1} free now", "メモリ {0} (いまの空き {1})"),
     ("{0} to download, {1} on the drive", "ダウンロード {0} / 保存 {1}"),
     ("{0} to download", "ダウンロード {0}"),
     ("{0} GB free on that drive", "そのドライブの空き {0} GB"),
