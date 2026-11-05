@@ -784,7 +784,7 @@ mod tests {
         std::fs::write(cargo.join("credentials.toml"), "token = \"secret\"").unwrap();
         std::fs::write(cargo.join("config.toml"), "").unwrap();
         let sid = unsafe { sandbox::profile_sid().unwrap() };
-        unsafe { sandbox::open_toolchains("", &home, false, sid) };
+        unsafe { sandbox::open_toolchains("", &home, None, sid) };
         let id = sandbox::profile_sid_text();
         assert!(sandbox::dacl_text(&cargo).unwrap().contains(&id) && sandbox::dacl_text(&cargo.join("config.toml")).unwrap().contains(&id), "the toolchain");
         let held = sandbox::dacl_text(&cargo.join("credentials.toml")).unwrap();
@@ -794,7 +794,7 @@ mod tests {
         std::fs::write(cargo.join("credentials.toml"), "token = \"secret\"").unwrap();
         assert!(sandbox::dacl_text(&cargo.join("credentials.toml")).unwrap().contains(&id));
         sandbox::forget_grants();
-        unsafe { sandbox::open_toolchains("", &home, false, sid) };
+        unsafe { sandbox::open_toolchains("", &home, None, sid) };
         assert!(!sandbox::dacl_text(&cargo.join("credentials.toml")).unwrap().contains(&id));
     }
 

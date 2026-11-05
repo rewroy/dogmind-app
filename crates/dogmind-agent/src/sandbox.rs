@@ -431,7 +431,6 @@ pub fn closed_tool_folders() -> Vec<PathBuf> {
     let Some(path) = std::env::var_os("PATH") else { return Vec::new() };
     let home = std::env::var_os("USERPROFILE").map_or(String::new(), |home| key(Path::new(&home)));
     let system = std::env::var_os("SystemRoot").map_or(String::new(), |root| key(Path::new(&root)));
-    let bundled = crate::bundled::root().is_some();
     // SAFETY: the SID lives as long as the process, and each call below gets the sizes it is given.
     unsafe {
         let Ok(sid) = profile_sid() else { return Vec::new() };
@@ -442,7 +441,7 @@ pub fn closed_tool_folders() -> Vec<PathBuf> {
             // What a project's commands would want; an unrelated program's folder stays as it is.
             .filter(|folder| DEVELOPER_TOOLS.iter().any(|tool| ["exe", "cmd"].iter().any(|ext| folder.join(format!("{tool}.{ext}")).is_file())))
             // (a person's own Node or Python is not what a command runs when these are beside the app)
-            .filter(|folder| !bundled || !crate::bundled::NAMES.iter().any(|name| folder.join(name).is_file()))
+            .filter(|folder| !crate::bundled::replaces(folder))
             .filter(|folder| !open_to_container(folder, sid))
             .collect()
     }
@@ -1514,15 +1513,20 @@ unsafe fn prepare(workspace: &Path, sid: PSID, disarmed: &mut Vec<String>) -> Re
     // (never a test's: these are the real home's folders, with real lists)
     #[cfg(not(test))]
     if let (Some(path), Some(home)) = (std::env::var_os("PATH"), std::env::var_os("USERPROFILE")) {
-        open_toolchains(&path.to_string_lossy(), Path::new(&home), crate::bundled::root().is_some(), sid);
+        open_toolchains(&path.to_string_lossy(), Path::new(&home), crate::bundled::root().map(|root| crate::bundled::Present::of(&root)), sid);
     }
     Ok(())
 }
 
-pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: bool, sid: PSID) {
+pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: Option<crate::bundled::Present>, sid: PSID) {
     for folder in toolchain_folders(path_variable, home) {
-        // (a person's own Python or Node is not what runs, so nothing is opened for it)
-        let replaced = bundled && (crate::bundled::NAMES.iter().any(|name| folder.join(name).is_file()) || ["python", "npm", "nvm"].iter().any(|word| key(&folder).contains(word)));
+        // (a person's own Python or Node is not what runs when the bundle has its own, so nothing is opened for it; where the bundle lacks one, theirs is)
+        let replaced = bundled.is_some_and(|present| {
+            let folder_key = key(&folder);
+            crate::bundled::NAMES.iter().any(|name| present.covers(name.trim_end_matches(".exe")) && folder.join(name).is_file())
+                || (present.python && folder_key.contains("python"))
+                || (present.node && (folder_key.contains("npm") || folder_key.contains("nvm")))
+        });
         if folder.exists() && !replaced {
             let _ = grant(&folder, sid, READ_EXECUTE, true);
             hold_out_secrets(&folder, sid);
@@ -2828,8 +2832,9 @@ mod tests {
     fn a_build_gets_its_libraries_and_its_tools_come_after_everything_on_path() {
         let dir = tempfile::tempdir().unwrap();
         let (root, work) = (dir.path().join("tools"), dir.path().join("work"));
-        for folder in ["python", "node", "git\\cmd"] {
+        for (folder, program) in [("python", "python.exe"), ("node", "node.exe"), ("git\\cmd", "git.exe")] {
             std::fs::create_dir_all(root.join(folder)).unwrap();
+            std::fs::write(root.join(folder).join(program), "").unwrap();
         }
         let (own_node, other) = (dir.path().join("Program Files\\nodejs"), dir.path().join("other"));
         std::fs::create_dir_all(&own_node).unwrap();
@@ -2838,11 +2843,14 @@ mod tests {
         let start = || vec![("PATH".to_string(), inherited.clone()), ("SystemRoot".to_string(), "C:\\Windows".to_string())];
         let temp = dir.path().display().to_string();
         let made = environment_block(start(), Some(&root), temp.clone(), &work, || Some(build_tools()));
-        assert_eq!(path_folders(&made), [root.join("python"), root.join("node"), root.join("git\\cmd"), other.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
-        // The PATH alone, for a question about a name, is the same one.
-        assert_eq!(path_of(start(), Some(&root), || Some(build_tools())), path_folders(&made));
+        // (and where `npm install -g` puts its commands, in the sandbox's folder, after the bundled tools)
+        let global = PathBuf::from(&temp).join("npm-global");
+        assert_eq!(path_folders(&made), [root.join("python"), root.join("node"), root.join("git\\cmd"), global.clone(), other.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
+        // The PATH alone, for a question about a name, is the same one (without the folder of the commands that were installed, which no question about a name of the project's own is about).
+        let without_global: Vec<PathBuf> = path_folders(&made).into_iter().filter(|folder| *folder != global).collect();
+        assert_eq!(path_of(start(), Some(&root), || Some(build_tools())), without_global);
         assert_eq!(path_of(start(), None, || Some(build_tools())), path_folders(&environment_block(start(), None, temp.clone(), &work, || Some(build_tools()))));
-        assert_eq!(path_of(start(), Some(&root), || None), path_folders(&environment_block(start(), Some(&root), temp.clone(), &work, || None)));
+        assert_eq!(path_of(start(), Some(&root), || None), path_folders(&environment_block(start(), Some(&root), temp.clone(), &work, || None)).into_iter().filter(|folder| *folder != global).collect::<Vec<_>>());
         let value = |name: &str| made.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
         assert_eq!(value("LIB"), Some("C:\\vs\\lib\\x64;C:\\kits\\um\\x64"));
         assert_eq!(value("INCLUDE"), Some("C:\\vs\\include;C:\\kits\\ucrt"));
@@ -2851,7 +2859,7 @@ mod tests {
         assert_eq!(path_folders(&plain), [own_node.clone(), other.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
         // On a machine with none found, PATH is what it was.
         let none = environment_block(start(), Some(&root), temp, &work, || None);
-        assert_eq!(path_folders(&none), [root.join("python"), root.join("node"), root.join("git\\cmd"), other]);
+        assert_eq!(path_folders(&none), [root.join("python"), root.join("node"), root.join("git\\cmd"), global, other]);
         assert!(none.iter().all(|(name, _)| name != "LIB" && name != "INCLUDE"));
     }
 
