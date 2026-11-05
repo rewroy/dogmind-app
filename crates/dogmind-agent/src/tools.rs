@@ -952,6 +952,16 @@ pub(crate) fn file_text(bytes: &[u8]) -> (String, &'static str) {
     }
 }
 
+/// A file's bytes as text to be shown, as the agent reads files (`file_text`): UTF-16 with its mark, else UTF-8, else code page 932, with the name of what it was. None for a binary, which is
+/// a NUL in the first 8 KB of what is not UTF-16.
+pub fn text_of_file(bytes: &[u8]) -> Option<(String, &'static str)> {
+    let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+    if !utf16 && bytes.iter().take(8192).any(|&byte| byte == 0) {
+        return None;
+    }
+    Some(file_text(bytes))
+}
+
 fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, String)), String> {
     let path = resolve(workspace, text_arg(arguments, "path")?);
     if crate::images::is_picture(&path) {
@@ -963,12 +973,10 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
         return Err(format!("{} is too large to read here, at {} MB: use search_files for what is in it, or a command that prints a part of it", path.display(), size / 1_048_576));
     }
     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
-    if !utf16 && bytes.iter().take(8192).any(|&byte| byte == 0) {
+    let Some((text, encoding)) = text_of_file(&bytes) else {
         return Err(format!("{} is binary: unsupported binaries are refused", path.display()));
-    }
+    };
     let hash = sha16(&bytes);
-    let (text, encoding) = file_text(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     // A large file asked for with no place in it: where its parts begin, to read the one wanted, and not its first 500 lines, which stay
     // in the context for the rest of the conversation whether they were the part or not.
@@ -3455,6 +3463,25 @@ mod tests {
         // An edit still has what it needs after an answer of no lines.
         assert_eq!(read(&mut bench, json!({"path": "a.txt"})), UNCHANGED_READ);
         bench.run("apply_patch", &json!({"edits": [{"path": "a.txt", "old_string": "two", "new_string": "TWO"}]}), dir.path(), &cancel).unwrap();
+    }
+
+    #[test]
+    fn a_file_is_shown_as_the_agent_reads_it_and_a_binary_is_not_shown() {
+        let utf16 = utf16_with_its_mark();
+        assert_eq!(text_of_file(&utf16), Some(("日本語 ok\r\n".to_string(), "utf-16")), "what PowerShell's > writes has NULs all through it");
+        assert_eq!(text_of_file("plain 見出し".as_bytes()), Some(("plain 見出し".to_string(), "utf-8")));
+        assert_eq!(text_of_file(&[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA]), Some(("日本語".to_string(), "shift_jis")));
+        assert_eq!(text_of_file(b"MZ\0\0 binary"), None);
+        assert_eq!(text_of_file(b""), Some((String::new(), "utf-8")));
+    }
+
+    /// "日本語 ok\r\n" as UTF-16 little-endian with its mark, which is what a Japanese PowerShell's `>` writes.
+    fn utf16_with_its_mark() -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "日本語 ok\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
     }
 
     #[test]

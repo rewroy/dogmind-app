@@ -283,10 +283,10 @@ fn written_page(root: &Path, file: &Path, kind: &Written, marked: Option<(usize,
     const MOST_TEXT: usize = 256 * 1024;
     const MOST_PAGE: usize = 1800 * 1024;
     let bytes = std::fs::read(file).map_err(|error| format!("{}: {error}", file.display()))?;
-    if bytes.iter().take(8192).any(|byte| *byte == 0) {
+    // (as the agent reads a file: what PowerShell's > writes is UTF-16, and a Japanese Windows keeps much of its text in Shift_JIS)
+    let Some((whole, encoding)) = dogmind_agent::tools::text_of_file(&bytes) else {
         return Err(t("This file is not text, so it has no preview.").to_string());
-    }
-    let whole = String::from_utf8_lossy(&bytes);
+    };
     let mut end = whole.len().min(MOST_TEXT);
     while !whole.is_char_boundary(end) {
         end -= 1;
@@ -302,6 +302,15 @@ fn written_page(root: &Path, file: &Path, kind: &Written, marked: Option<(usize,
     }
     if end < whole.len() {
         body.push_str(&format!("<p class=\"cut\">{}</p>", markdown::escape(&tf("Only the first {0} KB are shown.", &[&(MOST_TEXT / 1024)]))));
+    }
+    // (what is not UTF-8 says what it was read as: a Shift_JIS file that is shown right is not seen to be one otherwise)
+    if encoding != "utf-8" {
+        let name = match encoding {
+            "utf-16" => "UTF-16".to_string(),
+            "shift_jis" => "Shift_JIS".to_string(),
+            _ => t("an encoding it does not know").to_string(),
+        };
+        body.push_str(&format!("<p class=\"cut\">{}</p>", markdown::escape(&tf("Shown as {0}.", &[&name]))));
     }
     let base = file.parent().and_then(|folder| address_of(root, folder)).unwrap_or_else(|| format!("https://{HOST}"));
     Ok(page_of(&body, &format!("{base}/")))
@@ -720,6 +729,30 @@ mod tests {
         assert!(page.contains("<base href=\"https://dogmind-preview.example/doc/\">"), "{page}");
         assert!(page.contains("default-src 'none'") && page.contains("<img src=\"p.png\""), "{page}");
         assert!(!page.contains("BACK") && !page.contains("SCHEME"), "every colour is filled in");
+    }
+
+    /// A text file that PowerShell's `>` wrote (UTF-16 LE with its mark) and one that Excel or an older editor wrote in Shift_JIS are shown with their characters, and say what they were read as.
+    #[test]
+    fn a_utf16_file_and_a_shift_jis_file_are_shown_with_their_own_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "# 見出し\r\n\r\n本文です\r\n".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        let wide = dir.path().join("wide.md");
+        std::fs::write(&wide, &utf16).unwrap();
+        let page = written_page(dir.path(), &wide, &Written::Markdown, None).unwrap();
+        assert!(page.contains("見出し") && page.contains("本文です") && page.contains("UTF-16"), "{page}");
+        // ("日本語,売上" and its row, as Excel writes a CSV on a Japanese Windows)
+        let sjis = dir.path().join("sales.csv");
+        std::fs::write(&sjis, [0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA, b',', 0x94, 0x84, 0x8F, 0xE3, b'\r', b'\n', b'1', b',', b'2', b'\r', b'\n']).unwrap();
+        let page = written_page(dir.path(), &sjis, &Written::Source("csv".to_string()), None).unwrap();
+        assert!(page.contains("日本語") && page.contains("売上") && page.contains("Shift_JIS") && !page.contains('\u{FFFD}'), "{page}");
+        // (plain UTF-8 says nothing of it)
+        let plain = dir.path().join("a.txt");
+        std::fs::write(&plain, "見出し\n").unwrap();
+        let page = written_page(dir.path(), &plain, &Written::Source("txt".to_string()), None).unwrap();
+        assert!(page.contains("見出し") && !page.contains("Shown as") && !page.contains("UTF-16"), "{page}");
     }
 
     #[test]
