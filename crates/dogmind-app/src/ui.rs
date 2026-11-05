@@ -7138,7 +7138,8 @@ impl App {
             }
             Panel::Memory => {
                 self.panel_title = t("Memory").into();
-                self.memory_notes = dogmind_agent::memory::notes(&self.folder.join("memory"), &self.workspace);
+                let memory_folder = self.folder.join("memory");
+                self.memory_notes = dogmind_agent::memory::notes(&memory_folder, &self.workspace);
                 while self.memory_remove.len() < self.memory_notes.len() {
                     let id = ID_MEMORY_REMOVE + self.memory_remove.len() as isize;
                     self.memory_remove.push(make_button(self.pane, id, "", ButtonKind::Secondary, theme::background()));
@@ -7146,7 +7147,16 @@ impl App {
                 for button in &self.memory_remove {
                     set_text(*button, t("Remove"));
                 }
-                self.panel_log = if self.memory_notes.is_empty() { t("Nothing is kept yet. The model keeps what later sessions would want, and you can ask it to.").into() } else { String::new() };
+                // (a file of notes that cannot be read is said so, and is not shown as none; and where what the model forgot is kept)
+                let mut said: Vec<String> = dogmind_agent::memory::unreadable(&memory_folder, &self.workspace).into_iter().map(|(file, error)| tf("The notes in {0} could not be read ({1}). The file is left as it is.", &[&file.display(), &error])).collect();
+                if self.memory_notes.is_empty() && said.is_empty() {
+                    said.push(t("Nothing is kept yet. The model keeps what later sessions would want, and you can ask it to.").into());
+                }
+                let forgotten = dogmind_agent::memory::forgotten_file(&memory_folder);
+                if forgotten.is_file() {
+                    said.push(tf("Notes the model forgot are kept in {0}, so that you can get one back.", &[&forgotten.display()]));
+                }
+                self.panel_log = said.join("\n");
             }
             Panel::Skills => {
                 self.panel_title = t("Skills").into();
