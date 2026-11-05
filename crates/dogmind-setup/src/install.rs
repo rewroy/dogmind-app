@@ -6,7 +6,9 @@
 //! Running it again after any failure goes on: what is in place, or waiting beside its place, with the right hash, is not unpacked again.
 //!
 //! To find that a file in place has the right hash, all of an install would be read each time, and it is all but a few files that are found so. So each install writes down, in its manifest, the
-//! hash of each file of the package with the size and time the file had when it was written down; a file that still has them is the same file, and is not read. Anything else is read and hashed.
+//! hash of each file of the package with the size and time the file had when it was written down; an update (the app's own, `--update`, which runs often and has to be quick) takes a file that
+//! still has them for the same file, and does not read it. Anything else is read and hashed. A setup that a person runs reads every file whose size is right, and so is the way to repair an
+//! install: a size and a time can be put back by anyone who can write the folder, and a file that was changed that way is found by its bytes.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -61,7 +63,7 @@ pub struct Installed {
     pub unpacked: usize,
     pub already_there: usize,
     pub removed: usize,
-    /// The files that were read whole to be hashed, which the install's own record of a file spares.
+    /// The files that were read whole to be hashed, which the install's own record of a file spares an update.
     pub hashed: usize,
 }
 
@@ -236,6 +238,9 @@ pub struct Install<'a> {
     pub test: bool,
     /// Writes the program that takes it all away, as `dogmind-uninstall.exe`.
     pub write_uninstaller: &'a dyn Fn(&Path) -> std::io::Result<()>,
+    /// This is the app's own update (`--update`): the install's record of a file, its hash with the size and time it had, then stands for reading the file while the file still has that size and
+    /// time. Otherwise (a setup that a person runs, which is how an install is repaired) every file of the size an entry says is hashed, and the records are written down all the same.
+    pub update: bool,
     /// A test's failure, after this many files have been unpacked.
     pub fail_after: Option<usize>,
     /// A test's slowness, for a capture of it at work, after each file.
@@ -249,8 +254,8 @@ enum Holds {
     Yes(Option<Stamp>),
 }
 
-/// Whether the file at `path` is `entry`'s. `record`: what the last install wrote down of this very file, which stands for reading it while the file still has the size and time it was
-/// written down with. Otherwise it is read whole and hashed, and counted in `hashed`. `announce` is told of a file that is looked at.
+/// Whether the file at `path` is `entry`'s. `record`: what the last install wrote down of this very file, when this run goes by that, which stands for reading it while the file still has the
+/// size and time it was written down with. Otherwise it is read whole and hashed, and counted in `hashed`. `announce` is told of a file that is looked at.
 fn holds(path: &Path, entry: &Entry, record: Option<&Record>, hashed: &mut usize, announce: &mut dyn FnMut()) -> Holds {
     let Ok(before) = std::fs::metadata(path) else { return Holds::No };
     if before.len() != entry.size {
@@ -284,8 +289,10 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     let ours: HashSet<String> = previous.iter().flat_map(|manifest| manifest.files.iter()).map(|file| file.to_lowercase()).collect();
     // What the last install wrote down of its files, by lower case path.
     let records: HashMap<String, &Record> = previous.iter().flat_map(|manifest| manifest.records.iter()).map(|(path, record)| (path.to_lowercase(), record)).collect();
+    // What is taken for a file that has the size and time it was written down with: in an update, and no other run (see `Install::update`).
+    let trusted = |path: &str| if job.update { records.get(&path.to_lowercase()).copied() } else { None };
     // The files this package leaves out (KEPT) are in the folder already, as the app saw them when it put the package together, or nothing is changed and the person is told what to do: such a
-    // setup can be no more than an update of the install it was made for.
+    // setup can be no more than an update of the install it was made for, which only the app makes and only `--update` runs, so these go by their records whoever asks.
     let mut found: HashMap<usize, Option<Stamp>> = HashMap::new();
     for (at, entry) in entries.iter().enumerate().filter(|(_, entry)| entry.method == KEPT) {
         let mut announce = || on(Progress { stage: Stage::Checking, fraction: 0.0, file: entry.path.clone() });
@@ -341,7 +348,7 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
         let looked = Instant::now();
         let mut announce = || on(Progress { stage: Stage::Checking, fraction: parts, file: entry.path.clone() });
         let in_waiting = matches!(holds(&waiting, entry, None, &mut hashed, &mut announce), Holds::Yes(_));
-        let in_place = if in_waiting { Holds::No } else { holds(&target, entry, records.get(&entry.path.to_lowercase()).copied(), &mut hashed, &mut announce) };
+        let in_place = if in_waiting { Holds::No } else { holds(&target, entry, trusted(&entry.path), &mut hashed, &mut announce) };
         checking += looked.elapsed();
         if in_waiting {
             to_place.push(entry);
@@ -740,9 +747,17 @@ mod tests {
             pack(&own_exe(), &source, &out, version, 6, &mut |_| {}).unwrap();
             Package::open(&out).unwrap()
         }
+        /// The app's own update (`--update`): the install's records stand for reading its files.
         fn run(&self, package: &mut Package, free: Option<u64>, fail_after: Option<usize>) -> Result<Installed, Failure> {
+            self.run_as(true, package, free, fail_after)
+        }
+        /// A setup that a person runs: every file of the size an entry says is read.
+        fn run_by_hand(&self, package: &mut Package) -> Result<Installed, Failure> {
+            self.run_as(false, package, None, None)
+        }
+        fn run_as(&self, update: bool, package: &mut Package, free: Option<u64>, fail_after: Option<usize>) -> Result<Installed, Failure> {
             let folder = self.folder();
-            let job = Install { folder: &folder, shell: &self.shell, free, stop: &self.stop, test: true, write_uninstaller: &|path| std::fs::write(path, "uninstaller"), fail_after, slowly: Duration::ZERO };
+            let job = Install { folder: &folder, shell: &self.shell, free, stop: &self.stop, test: true, write_uninstaller: &|path| std::fs::write(path, "uninstaller"), update, fail_after, slowly: Duration::ZERO };
             install(package, &job, &mut |_| {})
         }
     }
@@ -914,7 +929,8 @@ mod tests {
             assert_eq!(moved_aside(&folder).len(), 1, "the old b.dll is where it was moved to: {:?}", walk(&folder));
             assert_eq!(beside(&folder.join("b.dll")).exists(), !new_one_stays, "{:?}", walk(&folder));
             assert_eq!(read_manifest(&folder).unwrap().version, "1.0.0", "not done until it is all done");
-            let done = scene.run(&mut second, None, None).unwrap();
+            // (the app's update in the one state, and a setup run by hand in the other: it finishes either way)
+            let done = if new_one_stays { scene.run(&mut second, None, None) } else { scene.run_by_hand(&mut second) }.unwrap();
             assert_eq!(done.unpacked + done.already_there, 4, "{done:?}");
             for (file, bytes) in new {
                 assert_eq!(hash_file(&folder.join(file), &mut |_| {}).unwrap(), hash_of(bytes), "{file}");
@@ -1274,6 +1290,43 @@ mod tests {
         assert_eq!(scene.run(&mut fifth, None, None).unwrap().hashed, 0);
     }
 
+    /// The update goes by the install's own records, as it must to be quick, and a size and a time can be put back by whoever can write the folder: a file changed that way stays through an
+    /// update. The setup a person runs is how an install is repaired, and reads every file of the size it should be.
+    #[test]
+    fn a_file_changed_with_its_size_and_time_put_back_stays_through_an_update_and_a_setup_run_by_hand_replaces_it() {
+        let scene = Scene::new();
+        let files: [(&str, &[u8]); 3] = [("a.exe", b"one a"), ("b.dll", b"one b"), ("c.dll", b"one c")];
+        let mut first = scene.package("1.0.0", &files);
+        scene.run(&mut first, None, None).unwrap();
+        let folder = scene.folder();
+        let written = stamp_on_disk(&folder.join("a.exe"));
+        // other bytes of the same size, and the last-write time it had
+        let time = std::fs::metadata(folder.join("a.exe")).unwrap().modified().unwrap();
+        std::fs::write(folder.join("a.exe"), b"one X").unwrap();
+        std::fs::OpenOptions::new().write(true).open(folder.join("a.exe")).unwrap().set_modified(time).unwrap();
+        assert_eq!(stamp_on_disk(&folder.join("a.exe")), written, "its size and its time say nothing of the change");
+        // an update goes by what was written down: nothing is read, and the file stays
+        let mut second = scene.package("1.0.1", &files);
+        assert_eq!(scene.run(&mut second, None, None).unwrap(), Installed { unpacked: 0, already_there: 3, removed: 0, hashed: 0 });
+        assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"one X");
+        // the same package, run by hand, reads each file of that size, finds this one other, and puts the right one there
+        let mut third = scene.package("1.0.2", &files);
+        assert_eq!(scene.run_by_hand(&mut third).unwrap(), Installed { unpacked: 1, already_there: 2, removed: 0, hashed: 3 });
+        assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"one a");
+        // the records are written down after it as they are after any run, for the update that comes next
+        assert_eq!(read_manifest(&folder).unwrap().records.len(), 3);
+        let mut fourth = scene.package("1.0.3", &files);
+        assert_eq!(scene.run(&mut fourth, None, None).unwrap(), Installed { unpacked: 0, already_there: 3, removed: 0, hashed: 0 });
+        // and a run by hand over files that are all as they should be reads every one of them, and changes none
+        let mut fifth = scene.package("1.0.4", &files);
+        assert_eq!(scene.run_by_hand(&mut fifth).unwrap(), Installed { unpacked: 0, already_there: 3, removed: 0, hashed: 3 });
+        let manifest = read_manifest(&folder).unwrap();
+        assert_eq!(manifest.version, "1.0.4");
+        for (path, record) in &manifest.records {
+            assert_eq!(Stamp { size: record.size, modified: record.modified }, stamp_on_disk(&folder.join(path)), "{path}");
+        }
+    }
+
     impl Scene {
         /// The package of these files with the files named left out of it (KEPT), as the app puts one together.
         fn package_without(&self, version: &str, files: &[(&str, &[u8])], kept: &[&str]) -> Package {
@@ -1311,6 +1364,20 @@ mod tests {
         // what is left is what a whole setup of that version leaves, and one finds everything in place at once
         let mut whole = scene.package("2.0.1", &files);
         assert_eq!(scene.run(&mut whole, None, None).unwrap(), Installed { unpacked: 0, already_there: 5, removed: 0, hashed: 0 });
+    }
+
+    /// Only the app makes a package that leaves files out, and only `--update` runs it: the files it leaves out go by their records, whoever it is run by.
+    #[test]
+    fn a_package_that_leaves_files_out_goes_by_the_records_when_it_is_run_by_hand_too() {
+        let scene = Scene::new();
+        let big = noise(50_000);
+        let mut first = scene.package("1.0.0", &[("dogmind-app.exe", b"app one"), ("big.dll", &big), ("same.txt", b"unchanged")]);
+        scene.run(&mut first, None, None).unwrap();
+        let files: [(&str, &[u8]); 3] = [("dogmind-app.exe", b"app two!"), ("big.dll", &big), ("same.txt", b"unchanged")];
+        let mut second = scene.package_without("2.0.0", &files, &["big.dll", "same.txt"]);
+        let done = scene.run_by_hand(&mut second).unwrap();
+        assert_eq!(done, Installed { unpacked: 1, already_there: 2, removed: 0, hashed: 0 });
+        assert_eq!(std::fs::read(scene.folder().join("dogmind-app.exe")).unwrap(), b"app two!");
     }
 
     #[test]

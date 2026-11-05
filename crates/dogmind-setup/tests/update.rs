@@ -274,3 +274,27 @@ fn an_update_without_its_folder_is_refused_before_anything_starts() {
     let status = setup(&second).args(["--update", "--test", "--auto"]).status().unwrap();
     assert_eq!(status.code(), Some(1));
 }
+
+#[test]
+fn an_update_goes_by_the_installs_records_and_a_setup_a_person_runs_reads_every_file() {
+    // A file changed so that its size and its last-write time are as the install wrote them down: what an update, which must be quick, cannot see, and what running the setup is for.
+    let scene = Scene::new();
+    let folder = scene.installed("1.0.0");
+    let version_file = folder.join("data").join("version.txt");
+    let time = std::fs::metadata(&version_file).unwrap().modified().unwrap();
+    std::fs::write(&version_file, "9.9.9").unwrap();
+    std::fs::OpenOptions::new().write(true).open(&version_file).unwrap().set_modified(time).unwrap();
+    let same_setup = scene.path().join("DogmindSetup-1.0.0.exe");
+    // the app's own update: the record says the file is the one that was written, and it stays
+    let status = setup(&same_setup).args(["--update", "--test", "--auto", "--dir"]).arg(&folder).status().unwrap();
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(version_of(&folder), "9.9.9");
+    // (the update started the app again, and a setup asks for it to be closed)
+    assert_eq!(wait_for_the_app(&folder).len(), 1);
+    end_what_runs_from(&folder);
+    // the setup a person runs, on the same package: every file is read, and this one is found other
+    let status = setup(&same_setup).args(["--test", "--auto", "--dir"]).arg(&folder).status().unwrap();
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(version_of(&folder), "1.0.0");
+    assert!(running_from(&folder).is_empty(), "a setup that is run does not start the app");
+}

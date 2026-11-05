@@ -624,6 +624,7 @@ impl App {
                 stop: &stop,
                 test: options.test,
                 write_uninstaller: &write_uninstaller,
+                update: options.update,
                 fail_after: options.fail_after,
                 slowly: options.slowly,
             };
