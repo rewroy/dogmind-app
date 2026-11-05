@@ -97,6 +97,26 @@ fn after_the_last_copy(folder: &Path) -> u64 {
         .max().map_or(0, |last| last + 1)
 }
 
+/// Whether two files hold the same bytes: their sizes first, then block by block, so that two files that differ early are told apart by reading no more than that, and no file is read whole.
+fn same_bytes(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let (mut one, mut other) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if one.metadata()?.len() != other.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut first, mut second) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let count = one.read(&mut first)?;
+        if count == 0 {
+            return Ok(true);
+        }
+        other.read_exact(&mut second[..count])?;
+        if first[..count] != second[..count] {
+            return Ok(false);
+        }
+    }
+}
+
 /// `from` as a new file at `to`, streamed, and never over one that is there: a copy that was kept is the only one there is of what it held.
 fn copy_new(from: &Path, to: &Path) -> std::io::Result<u64> {
     let mut source = std::fs::File::open(from)?;
@@ -201,14 +221,47 @@ impl Checkpoints {
         self.plan(id).into_iter().map(|saved| saved.path).collect()
     }
 
-    /// What the agent changed in this session, where git cannot say: each file against its first copy.
+    /// What the agent changed in this session, where git cannot say: each file against its first copy. Whether a file changed is told by its bytes, sizes first and then block by block, with
+    /// no whole-file read; what is shown of the change is the text as the agent reads files (UTF-16, UTF-8, Shift_JIS). A file over what is read for a comparison (as `baseline` has it) or a binary
+    /// one is said to have changed, with no diff.
     pub fn session_changes(&self, workspace: &Path) -> Vec<FileChange> {
-        let read = |path: &Path| std::fs::read(path).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        self.session_changes_within(workspace, crate::baseline::MOST_READ)
+    }
+
+    fn session_changes_within(&self, workspace: &Path, most_read: u64) -> Vec<FileChange> {
         self.plan(0).into_iter().filter_map(|saved| {
-            let before = saved.copy.as_ref().and_then(|copy| read(&self.folder.join(copy)));
-            let after = read(&saved.path);
+            let before = saved.copy.as_ref().map(|copy| self.folder.join(copy));
+            let now = std::fs::metadata(&saved.path).ok().filter(std::fs::Metadata::is_file).map(|data| data.len());
+            let changed = match (&before, now) {
+                (None, None) => false,
+                (None, Some(_)) | (Some(_), None) => true,
+                // (a copy that cannot be read to compare is not one that proves it the same)
+                (Some(before), Some(_)) => !same_bytes(before, &saved.path).unwrap_or(false),
+            };
+            if !changed {
+                return None;
+            }
             let name = saved.path.strip_prefix(workspace).unwrap_or(&saved.path).display().to_string();
-            (before != after).then(|| FileChange::between(&name, before.as_deref(), after.as_deref()))
+            let before_size = before.as_ref().and_then(|copy| std::fs::metadata(copy).ok()).map(|data| data.len());
+            if before_size.is_some_and(|size| size > most_read) || now.is_some_and(|size| size > most_read) {
+                return Some(FileChange::without_diff(&name));
+            }
+            let read = |path: &Path| std::fs::read(path).ok();
+            let (before_bytes, after_bytes) = (before.as_ref().and_then(|copy| read(copy)), now.and_then(|_| read(&saved.path)));
+            // (a file that is there and cannot be read now is a change whose words are not known)
+            if (before.is_some() && before_bytes.is_none()) || (now.is_some() && after_bytes.is_none()) {
+                return Some(FileChange::without_diff(&name));
+            }
+            let text = |bytes: &Option<Vec<u8>>| -> Result<Option<String>, ()> {
+                match bytes {
+                    None => Ok(None),
+                    Some(bytes) => crate::tools::text_of_file(bytes).map(|(text, _)| Some(text)).ok_or(()),
+                }
+            };
+            Some(match (text(&before_bytes), text(&after_bytes)) {
+                (Ok(before), Ok(after)) => FileChange::between(&name, before.as_deref(), after.as_deref()),
+                _ => FileChange::without_diff(&name),
+            })
         }).collect()
     }
 
@@ -370,6 +423,62 @@ mod tests {
         marks.begin("one", "t", Some(1)).unwrap();
         marks.before_edit(&[file]).unwrap();
         assert_eq!((read(&folder.join("0.bin")), read(&folder.join("1.bin")), read(&folder.join("2.bin"))), ("old zero".to_string(), "old one".to_string(), "now".to_string()));
+    }
+
+    /// Two Shift_JIS files that differ, and that the lossy text of both is the same for (every byte of both is a bad UTF-8 byte), are told apart, and shown as they read.
+    #[test]
+    fn two_shift_jis_versions_that_differ_are_told_apart() {
+        let mut f = fixture();
+        // ("日語" and "旅上": four bytes each, none of them a character of UTF-8)
+        std::fs::write(&f.file, [0x93, 0xFA, 0x8C, 0xEA]).unwrap();
+        f.marks.begin("one", "t", Some(1)).unwrap();
+        f.marks.before_edit(&[f.file.clone()]).unwrap();
+        std::fs::write(&f.file, [0x97, 0xB7, 0x8F, 0xE3]).unwrap();
+        let changes = f.marks.session_changes(f.file.parent().unwrap());
+        assert_eq!(changes.len(), 1, "a changed file is not called unchanged");
+        assert!(changes[0].diff.contains("-日語") && changes[0].diff.contains("+旅上"), "{}", changes[0].diff);
+        // (the same bytes written again are no change)
+        std::fs::write(&f.file, [0x93, 0xFA, 0x8C, 0xEA]).unwrap();
+        assert!(f.marks.session_changes(f.file.parent().unwrap()).is_empty());
+    }
+
+    /// A file larger than what is read for a comparison is reported changed with no diff, found changed by its bytes and not by reading it; a binary one too.
+    #[test]
+    fn a_large_file_and_a_binary_one_are_reported_changed_with_no_diff() {
+        let mut f = fixture();
+        let big = f.file.clone();
+        std::fs::write(&big, "line\n".repeat(20_000)).unwrap();
+        std::fs::write(&f.other, [b'M', b'Z', 0, 0, 1, 2, 3]).unwrap();
+        f.marks.begin("one", "t", Some(1)).unwrap();
+        f.marks.before_edit(&[big.clone(), f.other.clone()]).unwrap();
+        std::fs::write(&big, format!("{}last\n", "line\n".repeat(19_999))).unwrap();
+        std::fs::write(&f.other, [b'M', b'Z', 0, 0, 1, 2, 4]).unwrap();
+        let root = big.parent().unwrap();
+        let small_cap = f.marks.session_changes_within(root, 1024);
+        assert_eq!(small_cap.len(), 2, "both are changed");
+        assert!(small_cap.iter().all(|change| change.diff.is_empty() && change.added == 0), "{small_cap:?}");
+        let whole = f.marks.session_changes(root);
+        let (text, binary) = (whole.iter().find(|change| change.path == "a.txt").unwrap(), whole.iter().find(|change| change.path == "b.txt").unwrap());
+        assert!(text.diff.contains("+last") && text.added == 1, "within the cap it is shown");
+        assert!(binary.diff.is_empty(), "a binary is not");
+    }
+
+    /// Two files are told apart by their size, or by the first block that differs, and the same bytes are the same.
+    #[test]
+    fn two_files_are_compared_by_size_and_then_by_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        let body = vec![7u8; 200_000];
+        std::fs::write(&a, &body).unwrap();
+        std::fs::write(&b, &body).unwrap();
+        assert!(same_bytes(&a, &b).unwrap());
+        let mut later = body.clone();
+        later[150_000] = 8;
+        std::fs::write(&b, &later).unwrap();
+        assert!(!same_bytes(&a, &b).unwrap(), "a difference in a later block");
+        std::fs::write(&b, &body[..199_999]).unwrap();
+        assert!(!same_bytes(&a, &b).unwrap(), "a different size");
+        assert!(same_bytes(&a, &dir.path().join("none")).is_err());
     }
 
     /// A file that cannot take what a rewind puts back is as it was, with nothing left beside it, and the rewind says so.
