@@ -59,6 +59,12 @@ thread_local! {
     static TEST_FILE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
+/// For a test of another module that runs commands: the folder of the app's data is this one's, as it is for the commands that module's test runs.
+#[cfg(test)]
+pub(crate) fn use_test_folder(folder: &Path) {
+    TEST_FILE.with(|known| *known.borrow_mut() = Some(folder.join(FILE_NAME)));
+}
+
 fn users() -> MutexGuard<'static, Option<HashMap<String, u32>>> {
     USERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
