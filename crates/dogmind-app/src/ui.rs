@@ -10533,6 +10533,10 @@ impl App {
                     self.settings.port = started.port;
                     self.save();
                 }
+                // (an engine that is not held by a job stays when this app is killed, with its card's memory: the trajectory says that it was started so)
+                if let Some(why) = &started.not_held {
+                    let _ = self.agent.commands.send(Command::Connection { at: dogmind_agent::trajectory::now(), what: "engine_job".into(), ms: 0, outcome: format!("not held by a job, so it does not end with the app if the app is killed: {why}") });
+                }
                 self.engine = Some(started);
             }
             // Dropped, it stops: the person moved on while it started.

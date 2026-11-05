@@ -511,11 +511,17 @@ impl Job {
             if job.is_null() {
                 return Err("no Job Object".into());
             }
+            // (held at once, so that every way out below closes it)
+            let held = Job(job);
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(job, JobObjectExtendedLimitInformation, std::ptr::addr_of!(limits).cast(), std::mem::size_of_val(&limits) as u32);
-            AssignProcessToJobObject(job, child.as_raw_handle() as _);
-            Ok(Job(job))
+            if SetInformationJobObject(job, JobObjectExtendedLimitInformation, std::ptr::addr_of!(limits).cast(), std::mem::size_of_val(&limits) as u32) == 0 {
+                return Err(format!("the job's limit could not be set: {}", std::io::Error::last_os_error()));
+            }
+            if AssignProcessToJobObject(job, child.as_raw_handle() as _) == 0 {
+                return Err(format!("the process could not be put in the job: {}", std::io::Error::last_os_error()));
+            }
+            Ok(held)
         }
     }
 }
@@ -574,6 +580,8 @@ fn is_backtrace_note(line: &str) -> bool {
 pub struct Engine {
     child: Child,
     _job: Option<Job>,
+    /// Why it is not held by a job, when it is not: it then does not end with this app if the app is killed, and the trajectory says so.
+    pub not_held: Option<String>,
     /// The last lines it wrote to its error stream (see `listen`).
     said: Said,
     /// Where it listens: not always the port asked for.
@@ -587,9 +595,12 @@ impl Engine {
         command.args(engine_arguments(settings, folder)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         hidden(&mut command);
         let mut child = command.spawn().map_err(|error| start_failure(straydog, &error))?;
-        let job = Job::holding(&child).ok();
+        let (job, not_held) = match Job::holding(&child) {
+            Ok(job) => (Some(job), None),
+            Err(why) => (None, Some(why)),
+        };
         let said = child.stderr.take().map_or_else(Said::default, listen);
-        Ok(Engine { child, _job: job, said, port: settings.port })
+        Ok(Engine { child, _job: job, not_held, said, port: settings.port })
     }
 
     /// Its process number: an installer that is to replace its files waits for it to end.
@@ -1306,7 +1317,7 @@ mod tests {
         hidden(&mut command);
         let mut child = command.spawn().unwrap();
         let said = child.stderr.take().map_or_else(Said::default, listen);
-        Engine { child, _job: None, said, port: 0 }
+        Engine { child, _job: None, not_held: None, said, port: 0 }
     }
 
     fn why_it_ended(lines: &[&str], code: i32) -> String {
