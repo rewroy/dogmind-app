@@ -426,7 +426,8 @@ fn is_absolute(path: &str) -> bool {
     path.starts_with('/') || path.as_bytes().get(1) == Some(&b':')
 }
 
-/// A path as it is worth reading: from the workspace if it is in it, and its name if it is not.
+/// A path as it is worth reading: from the workspace if it is in it. What is outside it is shown as outside, with its name: the drive and an ellipsis, `D:\…\notes.txt`, or the machine for a
+/// share, `\\server\…\x.txt`, so that a write there does not read like one in the workspace, which is all a conversation has to say where it went when nothing asked.
 pub fn short_path(path: &str, workspace: &Path) -> String {
     let clean = path.trim().replace('\\', "/");
     if clean.is_empty() || clean == "." {
@@ -448,8 +449,30 @@ pub fn short_path(path: &str, workspace: &Path) -> String {
             return rest.to_string();
         }
     }
-    let name = clean.trim_end_matches('/');
-    name.rsplit('/').next().unwrap_or(name).to_string()
+    outside(clean)
+}
+
+/// A path that is not in the workspace: where it is, in few words, and its name.
+fn outside(clean: &str) -> String {
+    let clean = clean.trim_end_matches('/');
+    // (`\\?\UNC\server\share\x` is a share like `\\server\share\x`)
+    let unc = clean.strip_prefix("UNC/").map(|rest| format!("//{rest}"));
+    let clean = unc.as_deref().unwrap_or(clean);
+    let name = clean.rsplit('/').next().unwrap_or(clean);
+    if let Some(share) = clean.strip_prefix("//") {
+        let parts: Vec<&str> = share.split('/').filter(|part| !part.is_empty()).collect();
+        return match parts.as_slice() {
+            [server, .., _] if parts.len() > 2 => format!("\\\\{server}\\…\\{name}"),
+            [server, _] => format!("\\\\{server}\\{name}"),
+            _ => clean.replace('/', "\\"),
+        };
+    }
+    let (root, rest) = match clean.as_bytes() {
+        [letter, b':', ..] if letter.is_ascii_alphabetic() => (format!("{}:", *letter as char), &clean[2..]),
+        _ => (String::new(), clean),
+    };
+    let folders = rest.split('/').filter(|part| !part.is_empty()).count();
+    if folders > 1 { format!("{root}\\…\\{name}") } else { format!("{root}\\{name}") }
 }
 
 /// A path whole.
@@ -582,11 +605,17 @@ mod tests {
         assert_eq!(short_path(r"c:\projects\app\src\tools.rs", &w), "src/tools.rs", "the case of a Windows path");
         assert_eq!(short_path("C:/Projects/App/README.md", &w), "README.md");
         assert_eq!(short_path(r"C:\Projects\App", &w), ".");
-        assert_eq!(short_path(r"C:\Projects\Application\x.rs", &w), "x.rs", "a folder whose name only begins the same");
-        assert_eq!(short_path(r"D:\elsewhere\notes.txt", &w), "notes.txt");
+        assert_eq!(short_path(r"C:\Projects\Application\x.rs", &w), r"C:\…\x.rs", "a folder whose name only begins the same");
+        assert_eq!(short_path(r"D:\elsewhere\notes.txt", &w), r"D:\…\notes.txt", "outside is shown as outside");
+        assert_eq!(short_path(r"D:\notes.txt", &w), r"D:\notes.txt");
+        assert_eq!(short_path(r"d:\a\b\c\notes.txt", &w), r"d:\…\notes.txt");
+        assert_eq!(short_path(r"\\server\share\dir\x.txt", &w), r"\\server\…\x.txt", "a share on another machine");
+        assert_eq!(short_path(r"\\server\x.txt", &w), r"\\server\x.txt");
+        assert_eq!(short_path(r"\\?\UNC\server\share\x.txt", &w), r"\\server\…\x.txt");
         assert_eq!(short_path("./src/lib.rs", &w), "src/lib.rs");
         assert_eq!(short_path(r"src\lib.rs", &w), "src/lib.rs");
-        assert_eq!(short_path("/etc/hosts", &w), "hosts");
+        assert_eq!(short_path("/etc/hosts", &w), r"\…\hosts");
+        assert_eq!(short_path("/hosts", &w), r"\hosts");
         assert_eq!(short_path(r"\\?\C:\Projects\App\a.rs", &PathBuf::from(r"\\?\C:\Projects\App")), "a.rs");
     }
 
