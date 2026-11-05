@@ -238,6 +238,8 @@ pub struct Settings {
     pub text_size: u32,
     /// The skills turned off, by name.
     pub skills_off: Vec<String>,
+    /// The skills the person turned on that are off until they do (written for another app's features).
+    pub skills_on: Vec<String>,
     /// Ask GitHub, now and then, whether a newer release is out, and fetch its setup in the background when it is (see `updates`). Off: the app neither asks nor fetches on its own. Either way
     /// nothing is installed unless the person presses Restart to update.
     pub check_for_updates: bool,
@@ -256,16 +258,35 @@ impl Settings {
         TEXT_SIZES.iter().map(|(percent, _)| *percent).find(|percent| *percent == self.text_size).unwrap_or(100)
     }
 
-    pub fn skill_is_on(&self, name: &str) -> bool {
-        !self.skills_off.iter().any(|off| off.eq_ignore_ascii_case(name))
+    /// Whether a skill is on: what the person chose, turned off or on, and with no choice made, on, unless it is written for another app's features (`foreign`), which are not here.
+    pub fn skill_is_on(&self, name: &str, foreign: bool) -> bool {
+        let named = |list: &[String]| list.iter().any(|known| known.eq_ignore_ascii_case(name));
+        if named(&self.skills_off) {
+            return false;
+        }
+        named(&self.skills_on) || !foreign
     }
 
-    /// Turns one skill on or off; its name is kept as found.
+    /// The person turns one skill on or off; their choice is kept as made, over the default, and its name as found.
     pub fn set_skill(&mut self, name: &str, on: bool) {
         self.skills_off.retain(|off| !off.eq_ignore_ascii_case(name));
-        if !on {
+        self.skills_on.retain(|known| !known.eq_ignore_ascii_case(name));
+        if on {
+            self.skills_on.push(name.to_string());
+        } else {
             self.skills_off.push(name.to_string());
         }
+    }
+
+    /// The names the agent is told to leave out: what the person turned off, and what is written for another app's features (`foreign`) that they have not turned on.
+    pub fn skills_off_for(&self, foreign: &[String]) -> Vec<String> {
+        let mut off = self.skills_off.clone();
+        for name in foreign {
+            if !self.skill_is_on(name, true) && !off.iter().any(|known| known.eq_ignore_ascii_case(name)) {
+                off.push(name.clone());
+            }
+        }
+        off
     }
 }
 
@@ -303,6 +324,7 @@ impl Default for Settings {
             pinned: Vec::new(),
             text_size: 100,
             skills_off: Vec::new(),
+            skills_on: Vec::new(),
             check_for_updates: true,
             last_update_check: None,
             dismissed_update: None,
@@ -557,15 +579,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn skills_written_for_another_app_are_off_until_the_person_turns_them_on_and_their_choice_wins() {
+        let mut settings = Settings::default();
+        // (no choice made: a general skill is on, and one for another app's features is off)
+        assert!(settings.skill_is_on("pdf", false) && !settings.skill_is_on("chrome-browser", true));
+        assert_eq!(settings.skills_off_for(&["chrome-browser".to_string(), "morning".to_string()]), ["chrome-browser", "morning"]);
+        // (turned on by the person, and it stays on, whatever the default and whatever a later start finds)
+        settings.set_skill("Chrome-Browser", true);
+        assert!(settings.skill_is_on("chrome-browser", true));
+        assert_eq!(settings.skills_off_for(&["chrome-browser".to_string(), "morning".to_string()]), ["morning"]);
+        // (the same file, read again: the choice is in it)
+        let again: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(again.skill_is_on("chrome-browser", true));
+        // (turned off again, it is the person's choice off, and a general one they turn off is off too)
+        settings.set_skill("chrome-browser", false);
+        settings.set_skill("pdf", false);
+        assert!(!settings.skill_is_on("chrome-browser", true) && !settings.skill_is_on("pdf", false));
+        assert_eq!(settings.skills_off_for(&[]), ["chrome-browser", "pdf"]);
+        assert!(settings.skills_on.is_empty());
+        // (and a settings file from before has no list of what was turned on)
+        let older: Settings = serde_json::from_str(r#"{"skills_off": ["pdf"]}"#).unwrap();
+        assert!(!older.skill_is_on("pdf", false) && older.skills_on.is_empty());
+    }
+
+    #[test]
     fn text_size_and_skills_off_come_from_an_older_file_as_standard_and_none() {
         let mut older: Settings = serde_json::from_str(r#"{"active": "This PC", "theme": "dark"}"#).unwrap();
         assert_eq!((older.text_percent(), older.skills_off.len()), (100, 0));
         older.text_size = 97;
         assert_eq!(older.text_percent(), 100, "a size no version offered");
         older.set_skill("PDF", false);
-        assert!(!older.skill_is_on("pdf") && older.skill_is_on("xlsx"));
+        assert!(!older.skill_is_on("pdf", false) && older.skill_is_on("xlsx", false));
         older.set_skill("pdf", true);
-        assert!(older.skill_is_on("PDF") && older.skills_off.is_empty());
+        assert!(older.skill_is_on("PDF", false) && older.skills_off.is_empty());
     }
 
     #[test]

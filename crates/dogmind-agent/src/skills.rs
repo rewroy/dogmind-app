@@ -17,7 +17,7 @@ const MAX_DESCRIPTION: usize = 60;
 /// Under a project and under the home alike. Claude's and the shared form come first, then Codex's, then Dogmind's own.
 const FOLDERS: [&str; 4] = [".claude/skills", ".agents/skills", ".codex/skills", ".dogmind/skills"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Skill {
     pub name: String,
     pub description: String,
@@ -28,6 +28,58 @@ pub struct Skill {
     pub for_the_model: bool,
     /// `user-invocable: false`: only the model starts it.
     pub for_the_person: bool,
+    /// The servers whose tools its text names (`mcp__<server>__...`): as Dogmind names a tool, the first `__` after `mcp__` ends the server's part.
+    pub mcp_servers: Vec<String>,
+    /// Which of [`OTHER_APP`] it carries: it needs something of another app that this one has no counterpart for.
+    pub other_app: Option<&'static str>,
+}
+
+/// What a skill that is written for another app's own features has in it. Calibrated on the fourteen skills a Claude account synced to a machine: the six general ones (documents, sheets,
+/// slides, drawing, writing skills) carry none, and the eight that cannot work here carry at least one, or name tools of a server this app has not. Each is looked for where it is meant: in the
+/// description, which is where a skill says what it needs before it is read, or in the whole text. `(in the description, the words, what they mean)`.
+const OTHER_APP: [(bool, &str, &str); 4] = [
+    // (the host's connector, which a call is made through)
+    (true, "connector call", "a connector of another app"),
+    (true, "-connector", "a connector of another app"),
+    // (a skill that says it works by spawning agents of its own, and is for use only where there is a tool to spawn them)
+    (true, "subagent", "subagents that it spawns"),
+    // (the host's own scheduler: a morning brief that is set up as a recurring task)
+    (false, "scheduled task", "another app's scheduled tasks"),
+];
+
+/// What a skill needs that is not here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Missing {
+    /// The tools of a server this app has not configured, by the server's part of their names.
+    Tools(String),
+    /// Something of another app, in these words.
+    Something(&'static str),
+}
+
+/// The servers a text names tools of: `mcp__<server>__<tool>`, where the server's part ends at the first `__` (a server called `Claude_Browser` has one single `_`). `mcp__` with no name after
+/// it (a skill saying how such names are written) is no server.
+fn servers_named(text: &str) -> Vec<String> {
+    let mut servers: Vec<String> = Vec::new();
+    for (at, _) in text.match_indices("mcp__") {
+        let rest = &text[at + 5..];
+        let run: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+        let server = run.split("__").next().unwrap_or("").trim_matches('_');
+        if !server.is_empty() && !servers.iter().any(|known| known.eq_ignore_ascii_case(server)) {
+            servers.push(server.to_string());
+        }
+    }
+    servers
+}
+
+impl Skill {
+    /// What it needs that this app does not have, if anything: tools of a server that is not configured (`servers`: the part of each configured server's tools' names), or a feature of the app it was
+    /// written for. A skill that is turned on by the person anyway is theirs to run; this is for what is off until they say.
+    pub fn needs_what_is_not_here(&self, servers: &[String]) -> Option<Missing> {
+        if let Some(server) = self.mcp_servers.iter().find(|server| !servers.iter().any(|known| known.eq_ignore_ascii_case(server))) {
+            return Some(Missing::Tools(server.clone()));
+        }
+        self.other_app.map(|what| Missing::Something(OTHER_APP.iter().find(|(_, _, meaning)| *meaning == what).map_or(what, |(_, _, meaning)| meaning)))
+    }
 }
 
 /// The frontmatter's top-level words: plain, quoted, or a block (`>` or `|`). Nothing else of YAML is needed here, and anything
@@ -89,7 +141,9 @@ fn read_skill(file: &Path, scope: &'static str) -> Option<Skill> {
     let name = field("name").map(str::trim).filter(|name| !name.is_empty()).map(str::to_string)
         .or_else(|| folder.file_name().map(|name| name.to_string_lossy().into_owned()))?;
     let yes = |name: &str, default: bool| field(name).map_or(default, |value| value.trim().eq_ignore_ascii_case("true"));
-    Some(Skill { name, description, folder, scope, for_the_model: !yes("disable-model-invocation", false), for_the_person: yes("user-invocable", true) })
+    let (lower, lower_description) = (text.to_lowercase(), description.to_lowercase());
+    let other_app = OTHER_APP.iter().find(|(in_description, words, _)| if *in_description { lower_description.contains(words) } else { lower.contains(words) }).map(|(_, _, meaning)| *meaning);
+    Some(Skill { name, description, folder, scope, for_the_model: !yes("disable-model-invocation", false), for_the_person: yes("user-invocable", true), mcp_servers: servers_named(&text), other_app })
 }
 
 fn walk(folder: &Path, depth: usize, scope: &'static str, found: &mut Vec<Skill>) {
@@ -239,6 +293,45 @@ mod tests {
         std::fs::write(folder.join("SKILL.md"), text).unwrap();
     }
 
+    fn found_as(text: &str) -> Skill {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a"), text);
+        read_skill(&dir.path().join("a").join("SKILL.md"), "user").unwrap()
+    }
+
+    /// Skills written for another app's own tools are told from the general ones, by what they name and by what they say they need: stand-ins written for this test, one of each kind.
+    #[test]
+    fn a_skill_for_another_apps_features_is_told_from_a_general_one() {
+        let general = found_as("---\nname: pdf\ndescription: Read, merge and split PDF files with the bundled Python.\n---\nUse pypdf. Write to out.pdf.\n");
+        assert_eq!((general.mcp_servers.len(), general.other_app), (0, None));
+        assert_eq!(general.needs_what_is_not_here(&[]), None);
+        // a general skill that mentions the other app only in passing, or says how such names are written, is general
+        let passing = found_as("---\nname: docx\ndescription: Makes Word files. If a page or doc skill or connector is offered, use that instead.\n---\nTools are named `mcp__<server>__<tool>`. A task may use an artifact. Subagents are optional here.\n");
+        assert_eq!(passing.needs_what_is_not_here(&[]), None, "{passing:?}");
+        // names the tools of a server this app has not
+        let browser = found_as("---\nname: browser\ndescription: Drives a browser through mcp__Claude_Browser__tabs and mcp__remote-devices__x.\n---\nCall mcp__Claude_Browser__navigate.\n");
+        assert_eq!(browser.mcp_servers, ["Claude_Browser", "remote-devices"]);
+        assert_eq!(browser.needs_what_is_not_here(&["srv".to_string()]), Some(Missing::Tools("Claude_Browser".into())));
+        // (a server this app has configured is no lack: the part of the tools' names is the server's)
+        let wanted = vec!["Claude_Browser".to_string(), "remote-devices".to_string()];
+        assert_eq!(browser.needs_what_is_not_here(&wanted), None);
+        // in the body only
+        let memory = found_as("---\nname: memory\ndescription: Imports notes.\n---\nUse mcp__memory__write to keep them.\n");
+        assert_eq!(memory.needs_what_is_not_here(&[]), Some(Missing::Tools("memory".into())));
+        // markers: a connector call and a spawned subagent in the description, a scheduled task in the text
+        let connector = found_as("---\nname: sheets\ndescription: Read this before the first Drive or Sheets connector call.\n---\nText.\n");
+        assert_eq!(connector.needs_what_is_not_here(&[]), Some(Missing::Something("a connector of another app")));
+        let docs = found_as("---\nname: docs\ndescription: Making one - if no docs-connector instructions are in context, call its guide.\n---\nText.\n");
+        assert!(docs.other_app.is_some());
+        let research = found_as("---\nname: research\ndescription: This skill coordinates research subagents, so use it only with a tool for spawning them.\n---\nText.\n");
+        assert_eq!(research.needs_what_is_not_here(&[]), Some(Missing::Something("subagents that it spawns")));
+        let morning = found_as("---\nname: morning\ndescription: Render a brief.\n---\nWhen asked to set this up as a Scheduled Task, infer the time.\n");
+        assert_eq!(morning.needs_what_is_not_here(&[]), Some(Missing::Something("another app's scheduled tasks")));
+        // (a body that says subagents is not a skill that needs them: only what it says of itself first counts)
+        let creator = found_as("---\nname: creator\ndescription: Create and test skills.\n---\nIf you can spawn subagents, run the checks in them; else do it yourself.\n");
+        assert_eq!(creator.needs_what_is_not_here(&[]), None);
+    }
+
     #[test]
     fn the_frontmatter_of_either_tool_is_read() {
         let claude = "---\nname: pdf\ndescription: \"Reads \\\"PDF\\\" files: all of them\"\nlicense: Proprietary. LICENSE.txt has complete terms\nallowed-tools: Read, Write\n---\n\n# PDF\n\nBody here.\n";
@@ -359,14 +452,14 @@ mod tests {
 
     #[test]
     fn the_list_stays_within_what_a_prompt_can_carry() {
-        let skills: Vec<Skill> = (0..150).map(|at| Skill { name: format!("s{at}"), description: "word ".repeat(200), folder: PathBuf::new(), scope: "user", for_the_model: true, for_the_person: true }).collect();
+        let skills: Vec<Skill> = (0..150).map(|at| Skill { name: format!("s{at}"), description: "word ".repeat(200), folder: PathBuf::new(), scope: "user", for_the_model: true, for_the_person: true, ..Skill::default() }).collect();
         assert!(prompt_section(&skills, &[]).len() < MAX_LIST + 1000);
         assert_eq!(prompt_section(&[], &[]), "");
     }
 
     #[test]
     fn a_skill_for_tools_this_session_has_not_got_is_not_offered() {
-        let skill = |name: &str, description: &str| Skill { name: name.into(), description: description.into(), folder: PathBuf::new(), scope: "user", for_the_model: true, for_the_person: true };
+        let skill = |name: &str, description: &str| Skill { name: name.into(), description: description.into(), folder: PathBuf::new(), scope: "user", for_the_model: true, for_the_person: true, ..Skill::default() };
         let skills = [
             skill("built-in-browser", "Read this skill before the first step that uses the pane, whose tools are named mcp__Claude_Browser__* in the app and mcp__remote-devices__Claude_Browser__* when linked."),
             skill("chrome-browser", "Before Claude in Chrome, whose tools are named mcp__claude-in-chrome__*."),
@@ -395,13 +488,13 @@ mod tests {
 
     #[test]
     fn the_list_says_it_is_no_word_about_this_conversation() {
-        let skill = Skill { name: "imagegen".into(), description: "Edits images".into(), folder: PathBuf::new(), scope: "user", for_the_model: true, for_the_person: true };
+        let skill = Skill { name: "imagegen".into(), description: "Edits images".into(), folder: PathBuf::new(), scope: "user", for_the_model: true, for_the_person: true, ..Skill::default() };
         assert!(prompt_section(&[skill], &[]).contains("says nothing about this conversation"));
     }
 
     #[test]
     fn a_long_list_stays_short_in_the_prompt_and_says_how_to_read_it_all() {
-        let skill = |at: usize| Skill { name: format!("skill-{at}"), description: "Does something at great length, ".repeat(10), folder: PathBuf::new(), scope: "user", for_the_model: true, for_the_person: true };
+        let skill = |at: usize| Skill { name: format!("skill-{at}"), description: "Does something at great length, ".repeat(10), folder: PathBuf::new(), scope: "user", for_the_model: true, for_the_person: true, ..Skill::default() };
         let all: Vec<Skill> = (0..40).map(skill).collect();
         let section = prompt_section(&all, &[]);
         assert!(section.len() < MAX_LIST + 500, "{}", section.len());

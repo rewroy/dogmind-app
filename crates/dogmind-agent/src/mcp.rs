@@ -574,6 +574,12 @@ impl Hub {
         format!("{error}. It is being started again: make the call again in a moment if it is still needed")
     }
 
+    /// What each configured server's tools are called after (`mcp__<this>__tool`), in the order of the configuration.
+    pub fn server_parts(&self) -> Vec<String> {
+        let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        name_parts(slots.iter().map(|slot| &slot.name))
+    }
+
     /// Each server's name, and whether the person trusts what it returns.
     pub fn trust(&self) -> Vec<(String, bool)> {
         self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().map(|slot| (slot.name.clone(), slot.trusted)).collect()
