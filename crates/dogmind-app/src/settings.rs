@@ -119,6 +119,13 @@ impl ProviderConfig {
         if self.name.trim().is_empty() {
             return Some(t("A connection needs a name.").into());
         }
+        // (a name goes to the settings file, to error messages and to the name of the key in Credential Manager)
+        if holds_a_key_itself(&self.name) {
+            return Some(t(NAME_HOLDS_A_KEY).into());
+        }
+        if address_holds_a_key(&self.base_url) {
+            return Some(t(ADDRESS_HOLDS_A_KEY).into());
+        }
         if self.kind == Kind::Server && dogmind_agent::http::Url::parse(self.base_url.trim()).is_err() {
             return Some(t("An address looks like http://192.168.0.100:8080/v1").into());
         }
@@ -135,6 +142,30 @@ impl ProviderConfig {
         }
         None
     }
+}
+
+/// What to do with a key pasted in a connection's name.
+pub const NAME_HOLDS_A_KEY: &str = "That looks like a key, and a name is written in the settings file and in messages. Give the connection a name of your own, and paste the key in the API key field.";
+
+/// What to do with a key put in an address.
+pub const ADDRESS_HOLDS_A_KEY: &str = "An address may not hold a key (user:password@ or ?key=): it is written in the settings file and in messages. Paste the key in the API key field, and leave it out of the address.";
+
+/// Whether an address carries a key in it: as user information (`user:password@host`, which is a key as much as a password is), or in a query parameter that is named as keys are
+/// (`?key=`, `?api_key=`, `?token=`...) or whose value looks like one. Google's own examples put the key in `?key=`. An ordinary query (`?v=2`) is not one.
+pub fn address_holds_a_key(address: &str) -> bool {
+    let address = address.trim();
+    let rest = address.split_once("://").map_or(address, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return true;
+    }
+    let Some((_, query)) = rest.split_once('?') else { return false };
+    let query = query.split('#').next().unwrap_or("");
+    const NAMES: [&str; 9] = ["key", "api_key", "apikey", "api-key", "token", "access_token", "auth", "secret", "password"];
+    query.split(['&', ';']).filter(|pair| !pair.is_empty()).any(|pair| {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        NAMES.contains(&name.trim().to_ascii_lowercase().as_str()) && !value.is_empty() || holds_a_key_itself(value)
+    })
 }
 
 /// What to do with a key where the name of a variable is asked for.
@@ -316,6 +347,16 @@ impl Settings {
             if holds_a_key_itself(&provider.api_key) {
                 provider.api_key.clear();
             }
+            // (the last guard, if one is ever in memory: what is in the address or the name is not written)
+            if address_holds_a_key(&provider.base_url) {
+                provider.base_url.clear();
+            }
+            if holds_a_key_itself(&provider.name) {
+                provider.name.clear();
+            }
+        }
+        if holds_a_key_itself(&clean.active) {
+            clean.active.clear();
         }
         if holds_a_key_itself(&clean.search_key) {
             clean.search_key.clear();
@@ -686,6 +727,62 @@ mod tests {
         for place in ["", "env:OPENAI_API_KEY", "credential:Claude", "C:\\keys\\openai.txt", "keys/openai.txt", "openai.key", "key", "a-long-file-name-of-a-key-for-this.txt"] {
             assert!(!holds_a_key_itself(place), "{place}");
         }
+    }
+
+    fn server(name: &str, address: &str) -> ProviderConfig {
+        ProviderConfig { name: name.into(), kind: Kind::Server, base_url: address.into(), model: String::new(), api_key: String::new() }
+    }
+
+    /// A key put in the address (as user information, or in a parameter named for one, or whose value is one) is refused, and an ordinary address, with an ordinary query too, is not.
+    #[test]
+    fn an_address_that_holds_a_key_is_refused() {
+        for address in [
+            "https://user:sk-0123456789abcdefghij@host.example/v1", "https://someone@host.example/v1", "http://:secret@host/v1",
+            "https://host.example/v1?key=AIzaSyA0123456789", "https://host.example/v1?api_key=abc", "https://host.example/v1?apikey=abc", "https://host.example/v1?API-KEY=abc",
+            "https://host.example/v1?v=2&token=abc", "https://host.example/v1?access_token=abc#x", "https://host.example/v1?auth=abc", "https://host.example/v1?x=sk-0123456789abcdefghij",
+            "https://host.example/v1?a=1&b=abcdefghijklmnopqrstuvwxyz0123456",
+        ] {
+            let problem = server("Homelab", address).problem();
+            assert!(problem.is_some_and(|words| words.contains("API key field")), "{address}");
+            assert!(address_holds_a_key(address), "{address}");
+        }
+        for address in ["http://192.168.0.100:8080/v1", "https://host.example/v1?v=2", "https://host.example/v1?api-version=2024-02-01", "https://host.example:8443/v1/", "https://host.example/v1?key=", "http://localhost:8080/v1#key=none"] {
+            assert!(server("Homelab", address).problem().is_none(), "{address}");
+            assert!(!address_holds_a_key(address), "{address}");
+        }
+        // (and Claude's own address, or none, as before)
+        let claude = ProviderConfig { name: "Claude".into(), kind: Kind::Anthropic, base_url: String::new(), model: String::new(), api_key: "env:ANTHROPIC_API_KEY".into() };
+        assert!(claude.problem().is_none());
+        assert!(ProviderConfig { base_url: "https://api.anthropic.com/v1?key=abc".into(), ..claude }.problem().is_some());
+    }
+
+    /// A key pasted where the connection's name goes is refused, as it is where a variable's name goes.
+    #[test]
+    fn a_name_that_holds_a_key_is_refused() {
+        for name in ["sk-0123456789abcdefghij", "AIzaSyA0123456789", "abcdefghijklmnopqrstuvwxyz012345"] {
+            let problem = server(name, "http://host/v1").problem();
+            assert!(problem.is_some_and(|words| words.contains("API key field") && !words.contains(name)), "{name}");
+        }
+        for name in ["Homelab", "This PC", "Claude (work)", "サーバー 1"] {
+            assert!(server(name, "http://host/v1").problem().is_none(), "{name}");
+        }
+    }
+
+    /// The last guard: if an address or a name with a key in it is ever in memory, the file does not get it.
+    #[test]
+    fn a_key_in_an_address_or_a_name_is_not_written_whatever_checked_it() {
+        const KEY: &str = "sk-very-secret-0123456789";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.providers.push(server(KEY, &format!("https://host.example/v1?key={KEY}")));
+        settings.providers.push(server("Homelab", &format!("https://user:{KEY}@host.example/v1")));
+        settings.providers.push(server("Ordinary", "https://host.example/v1?v=2"));
+        settings.active = KEY.into();
+        settings.save(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains(KEY) && !written.contains("sk-"), "{written}");
+        assert!(written.contains("https://host.example/v1?v=2") && written.contains("Ordinary") && written.contains("Homelab"), "what is ordinary stays: {written}");
     }
 
     #[test]

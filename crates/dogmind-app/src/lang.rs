@@ -221,6 +221,8 @@ const JA: &[(&str, &str)] = &[
     ("An address looks like http://192.168.0.100:8080/v1", "アドレスは http://192.168.0.100:8080/v1 のような形です"),
     ("An address looks like https://api.anthropic.com/v1, or leave it empty.", "アドレスは https://api.anthropic.com/v1 のような形です。空欄でもかまいません。"),
     ("Claude needs an API key: paste it here.", "Claude には API キーが必要です。ここに貼り付けてください。"),
+    ("That looks like a key, and a name is written in the settings file and in messages. Give the connection a name of your own, and paste the key in the API key field.", "キーのように見えます。名前は設定ファイルやメッセージに書かれます。接続には別の名前を付けて、キーは API キーの欄に貼り付けてください。"),
+    ("An address may not hold a key (user:password@ or ?key=): it is written in the settings file and in messages. Paste the key in the API key field, and leave it out of the address.", "アドレスにキーを含めることはできません（user:password@ や ?key= など）。アドレスは設定ファイルやメッセージに書かれます。キーは API キーの欄に貼り付け、アドレスからは外してください。"),
     ("That is not the name of an environment variable. A key itself goes in the API key field above.", "環境変数の名前ではないようです。キーそのものは上の API キーの欄に貼り付けてください。"),
     ("{0}: the saved API key is gone. Paste it again in Settings.", "{0}: 保存した API キーが見つかりません。設定でもう一度貼り付けてください。"),
     ("The graphics memory limit is a number of GB, or leave it empty.", "グラフィックメモリの上限は GB の数字で入力するか、空欄にしてください。"),
@@ -911,6 +913,7 @@ mod tests {
             assert!(table.contains_key(words), "{words}");
         }
         assert!(table.contains_key(crate::settings::VARIABLE_NAME_ONLY));
+        assert!(table.contains_key(crate::settings::NAME_HOLDS_A_KEY) && table.contains_key(crate::settings::ADDRESS_HOLDS_A_KEY));
         assert!(table.contains_key("Connecting…"), "said by a word kept elsewhere");
         for opening in llm::OPENINGS {
             assert!(NOTICES.iter().any(|(english, _)| *english == opening), "{opening}");
