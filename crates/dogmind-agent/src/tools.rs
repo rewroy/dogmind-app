@@ -1457,6 +1457,23 @@ pub fn git_info(workspace: &Path) -> Option<GitInfo> {
     Some(info)
 }
 
+/// The top of the git repository that the workspace is a folder of, when that is above the workspace. The app's git runs outside the sandbox and finds it; a command in the sandbox cannot reach that
+/// repository's `.git` (the person chose the folder, and what is above it stays closed), and fails. None when the workspace is the top itself, or is in no repository.
+pub fn repository_above(workspace: &Path) -> Option<PathBuf> {
+    let top = git(workspace, &["rev-parse", "--show-toplevel"]).ok()?;
+    let (top, here) = (std::fs::canonicalize(top.trim()).ok()?, std::fs::canonicalize(workspace).ok()?);
+    (top != here && here.starts_with(&top)).then(|| PathBuf::from(top.display().to_string().trim_start_matches("\\\\?\\")))
+}
+
+/// What a model is told, after where the repository is, when the workspace is a folder of one above it: what fails, what works and what to do about the rest.
+pub(crate) fn git_above_words(top: &Path) -> String {
+    format!(
+        "git commands in `execute_command` cannot reach that repository's `.git` from the sandbox, so they fail (\"not a git repository\", \"error reading '.../.git'\") whatever is tried: `cd ..` and `git -C` fail the same, so do not try them. \
+         `show_diff` with scope `workspace`, `staged` or `unstaged` works here, and shows this folder's changes. For the history, a commit or anything else of git, give the user the command to run themselves, as `git -C \"{}\" log -5`.",
+        top.display()
+    )
+}
+
 /// One file's changes, as the diff panel shows them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChange {
@@ -2008,8 +2025,13 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     if (lower.contains("powershell") || lower.contains("pwsh")) && powershell_lost_at_a_root(err, workspace) {
         notes.push_str("note: PowerShell starts at the root of a drive in the sandbox and cannot move from there, whatever `cwd` says: give it absolute paths, and `Start-Process` a `-WorkingDirectory`. `[IO.File]` methods do take paths relative to `cwd`.\n");
     }
-    if lower.contains("git") && err.contains("failed to stat") {
-        notes.push_str("note: git cannot look above the workspace from the sandbox, so this says only that the workspace is not a git repository. `git init` at the start of a line works.\n");
+    if lower.contains("git") && (err.contains("failed to stat") || err.contains("not a git repository") || (err.contains("error reading") && err.contains(".git"))) {
+        // (the workspace may be a folder of a repository above it, which the sandbox cannot reach: then it is that, and not that the folder is no repository)
+        if let Some(top) = repository_above(workspace) {
+            notes.push_str(&format!("note: this folder is part of the git repository at `{}`, and the sandbox cannot reach its `.git`. {}\n", top.display(), git_above_words(&top)));
+        } else if err.contains("failed to stat") {
+            notes.push_str("note: git cannot look above the workspace from the sandbox, so this says only that the workspace is not a git repository. `git init` at the start of a line works.\n");
+        }
     }
     let denied = says_access_denied(err, system_access_denied());
     let lower_err = err.to_ascii_lowercase();
@@ -3770,6 +3792,72 @@ mod tests {
         assert_eq!(two, "echo a & (powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\")", "{two}");
         // A line that is refused is not run, so there is nothing else for it to be.
         assert_eq!(line_that_runs("echo \"a\nb\"\ndel x"), "echo \"a\nb\"\ndel x");
+    }
+
+    /// A repository with `pkg` and `other` folders, each with a file committed, and a change to each: the workspace is `pkg`.
+    fn repository_with_a_folder() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.com"];
+            all.extend(args);
+            git(dir.path(), &all).unwrap();
+        };
+        run(&["init", "-q"]);
+        for folder in ["pkg", "other"] {
+            std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+            std::fs::write(dir.path().join(folder).join("a.txt"), "a\n").unwrap();
+        }
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.path().join("pkg").join("a.txt"), "b\n").unwrap();
+        std::fs::write(dir.path().join("other").join("a.txt"), "OTHER-CHANGE\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_repository_above_a_folder_is_told_from_one_that_is_the_folder() {
+        let dir = repository_with_a_folder();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let top = repository_above(&dir.path().join("pkg")).expect("pkg is a folder of the repository");
+        assert_eq!(std::fs::canonicalize(&top).unwrap(), real);
+        assert!(!top.display().to_string().starts_with("\\\\?"), "{}", top.display());
+        assert_eq!(repository_above(dir.path()), None, "the top itself");
+        let alone = tempfile::tempdir().unwrap();
+        assert_eq!(repository_above(alone.path()), None, "no repository");
+        assert_eq!(repository_above(&alone.path().join("not-there")), None);
+    }
+
+    /// In a folder of a larger repository, the scopes that run git for the app work and show this folder's changes and not the repository's other ones.
+    #[test]
+    fn show_diff_in_a_folder_of_a_repository_shows_that_folders_changes() {
+        let dir = repository_with_a_folder();
+        let pkg = dir.path().join("pkg");
+        for scope in ["workspace", "unstaged"] {
+            let said = show_diff(&json!({"scope": scope}), &pkg, None).unwrap();
+            assert!(said.contains("+b") && !said.contains("OTHER-CHANGE"), "{scope}: {said}");
+        }
+        git(&pkg, &["add", "a.txt"]).unwrap();
+        let staged = show_diff(&json!({"scope": "staged"}), &pkg, None).unwrap();
+        assert!(staged.contains("+b") && !staged.contains("OTHER-CHANGE"), "{staged}");
+        assert!(show_diff(&json!({"scope": "unstaged"}), &pkg, None).unwrap().starts_with("no differences"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_failing_in_a_folder_of_a_repository_says_whose_repository_it_is() {
+        let dir = repository_with_a_folder();
+        let pkg = dir.path().join("pkg");
+        let top = repository_above(&pkg).unwrap();
+        for err in ["fatal: error reading 'C:/Projects/DogmindApp/.git'", "fatal: not a git repository (or any of the parent directories): .git", "fatal: failed to stat '        C:/Users': Permission denied"] {
+            let note = sandbox_notes("git status --short", &pkg, Some(128), err);
+            assert!(note.contains(&format!("part of the git repository at `{}`", top.display())) && note.contains("cannot reach its `.git`") && note.contains("`show_diff`") && note.contains("command to run themselves"), "{err}: {note}");
+            assert!(!note.contains("not a git repository. `git init`"), "{err}: {note}");
+        }
+        // not a command of git's, and a folder that is no repository's: as before
+        assert!(!sandbox_notes("dir", &pkg, Some(1), "fatal: not a git repository").contains("part of the git repository"));
+        let alone = tempfile::tempdir().unwrap();
+        assert!(sandbox_notes("git status", alone.path(), Some(128), "fatal: failed to stat 'C:/Users': Permission denied").contains("not a git repository. `git init`"));
+        assert_eq!(sandbox_notes("git status", alone.path(), Some(128), "fatal: not a git repository (or any of the parent directories): .git"), "");
     }
 
     #[cfg(windows)]
