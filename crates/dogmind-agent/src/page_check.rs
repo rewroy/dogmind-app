@@ -167,6 +167,18 @@ const STEPS_END: &str = r#"  ];
   console.log('DOGMIND-STEPS-TEXT:' + encodeURIComponent(seen()));
 })();
 </script>"#;
+/// How much more of its own time the browser is given for a plain page than the page is read at: the script that says its words waits for the page's time, and the browser must still be going.
+const READ_MARGIN_MS: u64 = 400;
+
+/// What a plain page of HTML is opened with, in a copy, so that the words it shows are the browser's own account of them (its style sheets, its media queries and its window applied), and
+/// not a guess from the DOM, which knows none of them: a script that waits for the page's time and says them on the console line the steps' run uses (`DOGMIND-STEPS-TEXT`, percent-encoded,
+/// cut where a character is whole). It does not touch the page.
+fn reading_script(wait: u64) -> String {
+    format!(
+        "<script>\n(async () => {{\n  await new Promise((done) => document.readyState === 'complete' ? done() : addEventListener('load', done));\n  await new Promise((done) => setTimeout(done, {wait}));\n  let text = '';\n  try {{ text = Array.from(document.body.innerText || '').slice(0, 2000).join(''); }} catch (error) {{}}\n  console.log('DOGMIND-STEPS-TEXT:' + encodeURIComponent(text));\n}})();\n</script>"
+    )
+}
+
 /// The most parts the steps are cut into by reloads. A page that reloads more often than that is not what a check is made of.
 const MOST_PARTS: usize = 5;
 
@@ -282,9 +294,8 @@ fn parts_begun(err: &str) -> Vec<usize> {
     err.lines().filter_map(|line| line.split_once("DOGMIND-STEPS-PART ").and_then(|(_, rest)| rest.split('/').next()?.trim().parse().ok())).collect()
 }
 
-/// The page with the steps at its end and its folder as its base, so that what it names by a relative path is what it would have had. `key`: the name under which the page keeps, in
-/// the tab's storage, which part of the steps is next.
-fn with_steps(html: &str, base: &str, steps: &str, key: &str) -> String {
+/// The page with a script of ours at its end and its folder as its base, so that what it names by a relative path is what it would have had.
+fn with_script(html: &str, base: &str, script: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = html.to_string();
     // (one with a base of its own keeps it)
@@ -293,15 +304,19 @@ fn with_steps(html: &str, base: &str, steps: &str, key: &str) -> String {
         let at = lower.find("<head").and_then(|head| lower[head..].find('>').map(|end| head + end + 1)).or_else(|| lower.find("<html").and_then(|html| lower[html..].find('>').map(|end| html + end + 1))).unwrap_or(0);
         out.insert_str(at, &tag);
     }
+    match out.to_ascii_lowercase().rfind("</body>") {
+        Some(at) => out.insert_str(at, script),
+        None => out.push_str(script),
+    }
+    out
+}
+
+/// The page with the steps at its end. `key`: the name under which the page keeps, in the tab's storage, which part of the steps is next.
+fn with_steps(html: &str, base: &str, steps: &str, key: &str) -> String {
     // (what the steps say cannot end the script they are in)
     let (parts, _) = step_parts(steps);
     let parts: String = parts.iter().map(|part| format!("    async () => {{\n{}\n    }},\n", part.replace("</script", "<\\/script").replace("</SCRIPT", "<\\/SCRIPT"))).collect();
-    let script = format!("{STEPS_PRELUDE}  const key = '{key}';\n  const parts = [\n{parts}{STEPS_END}");
-    match out.to_ascii_lowercase().rfind("</body>") {
-        Some(at) => out.insert_str(at, &script),
-        None => out.push_str(&script),
-    }
-    out
+    with_script(html, base, &format!("{STEPS_PRELUDE}  const key = '{key}';\n  const parts = [\n{parts}{STEPS_END}"))
 }
 
 /// The page in a frame of exactly this size: the browser's window has a least width of about 500 pixels whatever it is asked, and
@@ -572,6 +587,11 @@ fn needs_of(page: &Path) -> Needs {
     needs
 }
 
+/// Whether the page itself wrote to the console, or threw: a line of the browser's log that is a console line, not a browser extension's and not one of our own scripts' (`DOGMIND-STEPS-`).
+fn page_wrote_to_console(err: &str) -> bool {
+    err.lines().any(|line| line.contains("INFO:CONSOLE") && !line.contains("chrome-extension") && !line.contains("DOGMIND-STEPS-"))
+}
+
 /// What the page printed and threw, from all the browser says of itself. Long paths to the workspace go, and every line a browser's own extension or service prints.
 fn console_lines(err: &str, folder_url: &str) -> Vec<String> {
     let start = Regex::new(r#"INFO:CONSOLE:\d+\] "(.*)"#).expect("the pattern is valid");
@@ -673,23 +693,24 @@ fn tag_of(dom: &str, at: usize) -> (String, Vec<(String, Option<String>)>, usize
 }
 
 /// Whether an element is not seen as the page's DOM itself says: it has the `hidden` attribute, or `aria-hidden="true"`, or a `style` of `display:none` or `visibility:hidden`, or it is
-/// a `dialog` that is not open, or what a browser does not show of a page whatever it says (a script, a style, a template, the head, what `noscript` holds when scripts run, an svg).
+/// a `dialog` that is not open, or what a browser does not show of a page whatever it says (a script, a style, a template, the head, what `noscript` holds when scripts run, and what an svg holds
+/// that is not drawn: its title, its description and its definitions; its `text` is drawn, and is a chart's axis).
 fn is_unseen(name: &str, attributes: &[(String, Option<String>)]) -> bool {
     static STYLE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let style = STYLE.get_or_init(|| Regex::new(r"(?i)(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)\b").expect("the pattern is valid"));
     let has = |wanted: &str| attributes.iter().any(|(attribute, _)| attribute == wanted);
     let value = |wanted: &str| attributes.iter().find(|(attribute, _)| attribute == wanted).and_then(|(_, value)| value.as_deref());
-    matches!(name, "script" | "style" | "template" | "head" | "noscript" | "svg" | "title")
+    matches!(name, "script" | "style" | "template" | "head" | "noscript" | "title" | "desc" | "defs" | "metadata")
         || has("hidden")
         || value("aria-hidden").is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
         || value("style").is_some_and(|text| style.is_match(text))
         || (name == "dialog" && !has("open"))
 }
 
-/// The words of a page's DOM that are not in an element it says is not seen (see `is_unseen`), in one line. Without steps there is no script of ours in the page to ask the browser
-/// what it shows (`document.body.innerText`, which the steps' run does say, and which is used when it is there), and a copy of the page with one in it is not the page: another
-/// address, and none at all for a page a server gives. So this reads the DOM, which gives away only what the DOM says: an element a style sheet hides by its class is read here, and
-/// not in a check with steps.
+/// The words of a page's DOM that are not in an element it says is not seen (see `is_unseen`), in one line. The browser's own account of what it shows (`document.body.innerText`, which a
+/// script of ours in the page says, in the copy of a page that has steps and in the copy that a plain page of HTML is opened in) is used when there is one. This is what is left where
+/// there is none (a page a server gives, which is not copied; a page that is not HTML; a copy that could not be made or did not get to say it), and it gives away only what the DOM
+/// says: an element that a style sheet hides by its class, a media query's rule for another width, and what a framework's `hidden` class does are read here as shown, and the report says so.
 fn visible_text(dom: &str) -> String {
     // (the same bytes in lower case, to look for the end tag of what is not seen)
     let (bytes, lower, mut text, mut at) = (dom.as_bytes(), dom.to_ascii_lowercase(), String::new(), 0);
@@ -815,9 +836,9 @@ struct Reading {
     not_loaded: Option<String>,
     /// Said in place of the browser's crash when it was the steps that did not end (they began, and the browser was stopped with them still going).
     steps_lost: Option<String>,
-    /// What heads the console, if not `Console`: the console is that of the run that reads the page, at 1280x800, whatever views were asked for.
+    /// What heads the console, if not `Console`: the console is that of the run that reads the page, at 1280x800, whatever views were asked for. (The words it shows are read there too.)
     console_head: Option<String>,
-    /// The words the page said it shows, at the end of the steps, where they ended.
+    /// The words the page said it shows, at the end of the steps or of its time, where they ended; none where the browser was not asked to say them.
     seen: Option<String>,
 }
 
@@ -872,8 +893,17 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
     }
     if finished {
         let (title, from_dom) = shown(dom);
-        let text = reading.seen.clone().unwrap_or(from_dom);
-        out.push_str(&format!("Shows: title \"{title}\"; text: {}\n", if text.is_empty() { "none" } else { &text }));
+        let text = reading.seen.clone().unwrap_or_else(|| from_dom);
+        // (where the words were read, when that is not what a person looking at the page would have: the window that was not asked for, and the DOM, which no style sheet is applied to)
+        let mut notes = Vec::new();
+        if reading.console_head.is_some() {
+            notes.push("read at 1280x800");
+        }
+        if reading.seen.is_none() {
+            notes.push("from the page's DOM, with no style sheet applied: what a class or a media query hides is counted as shown");
+        }
+        let label = if notes.is_empty() { "Shows".to_string() } else { format!("Shows ({})", notes.join("; ")) };
+        out.push_str(&format!("{label}: title \"{title}\"; text: {}\n", if text.is_empty() { "none" } else { &text }));
     }
     out
 }
@@ -932,8 +962,9 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     }
     // (what this check makes in that folder goes when it ends, whichever way)
     let mut made = Removing(Vec::new());
-    // With steps, what is opened is a copy of the page with them in it, in the sandbox's own folder, that reads the page's own files from where they are.
-    let (mut steps_copy, mut opened) = (None, page.clone());
+    // With steps, what is opened is a copy of the page with them in it, in the sandbox's own folder, that reads the page's own files from where they are. A plain page of HTML is opened in a
+    // copy too, with a script that says the words the browser shows of it (the DOM a dump gives does not know a rule of a style sheet); a page that cannot be copied is opened as it is.
+    let (mut copy_name, mut opened) = (None, page.clone());
     if let (Some(page), Some(steps)) = (&page, steps) {
         let temp = temp.as_ref().ok_or("the sandbox's folder could not be found, so the steps could not be run")?;
         let html = std::fs::read_to_string(page).map_err(|error| format!("{name}: {error}"))?;
@@ -943,25 +974,38 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let copy = temp.join(&file_name);
         made.0.push(copy.clone());
         std::fs::write(&copy, with_steps(&html, &base, steps, &format!("dogmind-steps-{run}"))).map_err(|error| format!("{}: {error}", copy.display()))?;
-        (steps_copy, opened) = (Some(file_name), Some(copy));
+        (copy_name, opened) = (Some(file_name), Some(copy));
+    } else if let (Some(page), Some(temp), None) = (&page, &temp, steps) {
+        let html_page = page.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm"));
+        if let (true, Ok(html)) = (html_page, std::fs::read_to_string(page)) {
+            let base = file_url(page.parent().unwrap_or(workspace)) + "/";
+            let file_name = steps_page_of(&next_run());
+            let copy = temp.join(&file_name);
+            made.0.push(copy.clone());
+            if std::fs::write(&copy, with_script(&html, &base, &reading_script(wait))).is_ok() {
+                (copy_name, opened) = (Some(file_name), Some(copy));
+            }
+        }
     }
-    // What the browser is given, on its command line and in the pictures' frame.
+    // What the browser is given, on its command line and in the pictures' frame (the pictures of a plain page are of the page itself, not of its copy).
     let (address, src) = match &opened {
-        Some(file) => (plain(file), file_url(file)),
+        Some(file) => (plain(file), file_url(if steps.is_some() { file } else { page.as_deref().unwrap_or(file) })),
         None => (name.clone(), name.clone()),
     };
+    // (the script that reads a plain page's words waits for the page's time to be up, so the browser is given a little more of it than that)
+    let run_wait = if steps.is_none() && copy_name.is_some() { wait + READ_MARGIN_MS } else { wait };
     let browser_flags = flags();
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
     let mut ended_as = EndOfRun::Stopped;
     let mut hangs = 0;
     // (a page with steps may take as long as its steps do; one without has a limit of its own, and a run that hangs is ended early)
-    let limit = if steps.is_some() { LIMIT } else { run_limit(wait) };
+    let limit = if steps.is_some() { LIMIT } else { run_limit(run_wait) };
     let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
     for _ in 0..TRIES {
         let started = std::time::Instant::now();
         let profile = profiles.next();
-        let line = page_line(&program, &browser_flags, wait, &profile, &address);
+        let line = page_line(&program, &browser_flags, run_wait, &profile, &address);
         let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel)?;
         (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
         #[cfg(debug_assertions)]
@@ -975,10 +1019,10 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         #[cfg(test)]
         note_run(false, !finished);
         // (a run that hung and printed nothing, not so much as a console line of the page's, is the browser's: it is tried once more)
-        let silent_hang = hung(&done) && !err.contains("INFO:CONSOLE");
+        let silent_hang = hung(&done) && !page_wrote_to_console(&err);
         hangs += usize::from(silent_hang);
         let again = silent_hang && tries_again_after_a_hang(hangs);
-        if finished || cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING || (!again && (started.elapsed() > LIMIT / 2 || err.contains("INFO:CONSOLE") && !err.contains("chrome-extension"))) {
+        if finished || cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING || (!again && (started.elapsed() > LIMIT / 2 || page_wrote_to_console(&err))) {
             break;
         }
     }
@@ -990,7 +1034,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     };
     let mut console = console_lines(&err, &base_url);
     let (mut steps_said, mut steps_lost) = (String::new(), None);
-    if let (Some(page), Some(copy)) = (&page, &steps_copy) {
+    if let (Some(page), Some(copy)) = (&page, &copy_name) {
         // (the copy's lines are the page's own; and whether the steps got to their end is said apart)
         let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
         let done = console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE"));
@@ -1000,25 +1044,27 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let again = began.iter().find(|part| began.iter().filter(|other| other == part).count() > 1).copied();
         console.retain(|line| !line.contains("DOGMIND-STEPS-"));
         console.iter_mut().for_each(|line| *line = line.replace(copy.as_str(), &file_name));
-        let in_parts = if parts.len() > 1 { format!(" (in {} parts, one after each reload they make)", parts.len()) } else { String::new() };
-        steps_said = match (done, failed, again) {
-            (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
-            (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
-            (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
-            (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms.\n"),
-        };
-        let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
-        steps_said.push_str(&more_note);
-        // (stopped with them going on: that says what the steps and the page did, and nothing of a crash)
-        if !finished && (again.is_some() || how == "timed out") {
-            if again.is_none() {
-                steps_said = more_note;
+        if steps.is_some() {
+            let in_parts = if parts.len() > 1 { format!(" (in {} parts, one after each reload they make)", parts.len()) } else { String::new() };
+            steps_said = match (done, failed, again) {
+                (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
+                (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
+                (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
+                (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms.\n"),
+            };
+            let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
+            steps_said.push_str(&more_note);
+            // (stopped with them going on: that says what the steps and the page did, and nothing of a crash)
+            if !finished && (again.is_some() || how == "timed out") {
+                if again.is_none() {
+                    steps_said = more_note;
+                }
+                steps_lost = Some(match (again, began.is_empty()) {
+                    (Some(_), _) => "NOT CHECKED: the steps began again and again until the browser was stopped, which is not the browser crashing: see the steps below. Running this check again changes nothing until that is changed.\n".to_string(),
+                    (None, true) => format!("NOT CHECKED: the browser was stopped after {} s and the steps had not begun: the page had not finished loading, with its own scripts and anything it waits for (or it loads itself again and again). This is not the browser crashing.\n", LIMIT.as_secs()),
+                    (None, false) => format!("NOT CHECKED: the browser was stopped after {} s with the steps still going: the page or the steps are slow or do not end (a wait, a loop, a load that waits for the network). This is not the browser crashing. Shorter steps, or a page that settles, will be read.\n", LIMIT.as_secs()),
+                });
             }
-            steps_lost = Some(match (again, began.is_empty()) {
-                (Some(_), _) => "NOT CHECKED: the steps began again and again until the browser was stopped, which is not the browser crashing: see the steps below. Running this check again changes nothing until that is changed.\n".to_string(),
-                (None, true) => format!("NOT CHECKED: the browser was stopped after {} s and the steps had not begun: the page had not finished loading, with its own scripts and anything it waits for (or it loads itself again and again). This is not the browser crashing.\n", LIMIT.as_secs()),
-                (None, false) => format!("NOT CHECKED: the browser was stopped after {} s with the steps still going: the page or the steps are slow or do not end (a wait, a loop, a load that waits for the network). This is not the browser crashing. Shorter steps, or a page that settles, will be read.\n", LIMIT.as_secs()),
-            });
         }
     }
     // (a run that ended well with nothing to read is a page that did not load, and not a crash: unless the steps say what the page did)
@@ -1026,7 +1072,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         EndOfRun::NotLoaded(reason) if steps_lost.is_none() => Some(not_loaded_words(reason.as_deref())),
         _ => None,
     };
-    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen: steps_copy.as_ref().and_then(|_| steps_text(&err)) };
+    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen: copy_name.as_ref().and_then(|_| steps_text(&err)) };
     let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
@@ -1078,7 +1124,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             if let Ok(whole) = shot_image {
                 if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
                     taken = true;
-                    said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref().zip(steps_copy.as_deref()))).unwrap_or_default();
+                    said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref().zip(copy_name.as_deref()))).unwrap_or_default();
                     break;
                 }
             }
@@ -1420,15 +1466,49 @@ mod tests {
             <img src="a.png" hidden><input type="hidden" value="v"><br hidden>
             <!-- COMMENT <p hidden> -->
             <ul><li>milk</li><li style="display:none">gone</li><li>eggs &amp; bread</li></ul>
-            <svg><text>SVG</text></svg>
+            <svg><title>SVG-TITLE</title><desc>SVG-DESC</desc><defs><text>SVG-DEF</text></defs><text>SVG-AXIS</text><text>SVG-AXIS-2</text></svg>
             <button disabled>Add</button> 1 &lt; 2
         </body></html>"#;
         let (title, text) = shown(dom);
         assert_eq!(title, "T");
-        for gone in ["EMPTY-MESSAGE", "NONE-A", "NONE-B", "INVISIBLE", "INNER", "ARIA ", "NESTED", "MORE-NESTED", "TEMPLATE", "NOSCRIPT", "SCRIPT", "CLOSED-DIALOG", "COMMENT", "gone", "SVG"] {
+        for gone in ["EMPTY-MESSAGE", "NONE-A", "NONE-B", "INVISIBLE", "INNER", "ARIA ", "NESTED", "MORE-NESTED", "TEMPLATE", "NOSCRIPT", "SCRIPT", "CLOSED-DIALOG", "COMMENT", "gone", "SVG-TITLE", "SVG-DESC", "SVG-DEF"] {
             assert!(!text.contains(gone), "{gone} is not seen: {text}");
         }
-        assert_eq!(text, "ARIA-FALSE-SEEN CLASS-NAME-ONLY-SEEN after-the-nest OPEN-DIALOG milk eggs & bread Add 1 < 2", "{text}");
+        assert_eq!(text, "ARIA-FALSE-SEEN CLASS-NAME-ONLY-SEEN after-the-nest OPEN-DIALOG milk eggs & bread SVG-AXIS SVG-AXIS-2 Add 1 < 2", "{text}");
+    }
+
+    /// The report says where the words were read when that is not what a person looking at the page would have: at the desktop's size when it was not asked for, and from the DOM.
+    #[test]
+    fn the_words_a_page_shows_say_where_they_were_read() {
+        let needs = Needs::default();
+        let dom = "<html><head><title>T</title></head><body><p>from the dom</p><p class=\"hidden\">CLASS</p></body></html>";
+        let says = |reading: &Reading| report("index.html", "Edge", true, Some(&needs), &[], dom, reading).lines().find(|line| line.starts_with("Shows")).unwrap().to_string();
+        assert_eq!(says(&Reading { seen: Some("from the browser".to_string()), ..Reading::default() }), "Shows: title \"T\"; text: from the browser", "the browser's own account needs no note");
+        let from_dom = says(&Reading::default());
+        assert!(from_dom.starts_with("Shows (from the page's DOM, with no style sheet applied") && from_dom.ends_with("text: from the dom CLASS"), "{from_dom}");
+        let phone = says(&Reading { console_head: Some("Console (as read at 1280x800)".to_string()), seen: Some("x".to_string()), ..Reading::default() });
+        assert_eq!(phone, "Shows (read at 1280x800): title \"T\"; text: x");
+        let both = says(&Reading { console_head: Some("Console (as read at 1280x800)".to_string()), ..Reading::default() });
+        assert!(both.starts_with("Shows (read at 1280x800; from the page's DOM"), "{both}");
+    }
+
+    #[test]
+    fn a_plain_page_is_given_a_script_that_says_its_words_and_nothing_else() {
+        let page = with_script("<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>", "file:///C:/w/", &reading_script(1500));
+        assert!(page.contains("<head><base href=\"file:///C:/w/\"><title>"), "{page}");
+        let (script_at, body_end) = (page.find("setTimeout(done, 1500)").unwrap(), page.rfind("</body>").unwrap());
+        assert!(page.find("<p>x</p>").unwrap() < script_at && script_at < body_end, "{page}");
+        assert!(page.contains("DOGMIND-STEPS-TEXT:") && page.contains("document.body.innerText") && page.matches("<script>").count() == 1, "{page}");
+        // the steps' page is made of the same
+        assert!(with_steps("<body></body>", "file:///C:/w/", "await click('#a')", "k").contains("<base href=\"file:///C:/w/\">"));
+    }
+
+    #[test]
+    fn a_line_of_the_page_is_told_from_one_of_ours_and_from_a_browsers_extension() {
+        let ours = "[1:2:3/4:INFO:CONSOLE:5] \"DOGMIND-STEPS-TEXT:abc\", source: file:///x (5)\n";
+        let theirs = "[1:2:3/4:INFO:CONSOLE:5] \"hello\", source: file:///x (5)\n";
+        assert!(!page_wrote_to_console(ours) && !page_wrote_to_console("nothing at all") && page_wrote_to_console(&format!("{ours}{theirs}")));
+        assert!(!page_wrote_to_console("[1:2:3/4:INFO:CONSOLE:5] \"x\", source: chrome-extension://abc/x.js (5)\n"));
     }
 
     #[test]
@@ -1588,8 +1668,8 @@ mod tests {
         assert_eq!(desktop.get_pixel(1260, 20).0, [0xcc, 0x33, 0x33]);
     }
 
-    /// With the real browser, in the real sandbox: what a page hides is not in what it shows, with steps and without them. (A style sheet that hides by class is known to the page's own
-    /// text, which the steps have, and not to the DOM, which is all there is without them.)
+    /// With the real browser, in the real sandbox: what a page hides is not in what it shows, with steps and without them. (A style sheet that hides by class is known to the browser, which says
+    /// the words in both; the DOM alone does not know it.)
     #[test]
     #[ignore = "starts Edge in the sandbox"]
     fn what_a_page_hides_is_not_in_the_words_it_shows() {
@@ -1599,13 +1679,38 @@ mod tests {
         )]);
         let without = check_page(&serde_json::json!({"path": "index.html", "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
         println!("{without}");
-        let shows = |said: &str| said.lines().find(|line| line.starts_with("Shows: ")).map(str::to_string).unwrap_or_default();
-        assert!(shows(&without).contains("milk visible words") || shows(&without).contains("milk"), "{without}");
-        assert!(!shows(&without).contains("HIDDEN-ATTRIBUTE") && !shows(&without).contains("HIDDEN-STYLE"), "{without}");
+        let shows = |said: &str| said.lines().find(|line| line.starts_with("Shows")).map(str::to_string).unwrap_or_default();
+        assert!(shows(&without).contains("milk visible words"), "{without}");
+        assert!(!shows(&without).contains("HIDDEN-ATTRIBUTE") && !shows(&without).contains("HIDDEN-STYLE") && !shows(&without).contains("HIDDEN-BY-CLASS"), "{without}");
         let with = check_page(&serde_json::json!({"path": "index.html", "steps": "await wait(10);", "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
         println!("{with}");
         assert!(shows(&with).contains("milk visible words"), "{with}");
         assert!(!shows(&with).contains("HIDDEN-ATTRIBUTE") && !shows(&with).contains("HIDDEN-STYLE") && !shows(&with).contains("HIDDEN-BY-CLASS"), "{with}");
+    }
+
+    /// With the real browser, in the real sandbox: the words are the browser's own with the page's styles (a class that hides, a media query), a chart's axis in svg is among them and its title
+    /// is not, and asked only for a phone's width they are said to be read at the desktop's.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn the_words_are_the_browsers_own_and_say_the_size_they_were_read_at() {
+        let (dir, _) = page(&[(
+            "index.html",
+            "<!DOCTYPE html><title>r</title><style>.hidden{display:none}.wide{display:block}@media(max-width:600px){.wide{display:none}}</style><p class=hidden>TAILWIND-HIDDEN</p><p class=wide>WIDE-ONLY</p><p>always</p><svg width=100 height=40><title>CHART-TITLE</title><text x=0 y=20>AXIS-LABEL</text></svg>",
+        )]);
+        let shows = |said: &str| said.lines().find(|line| line.starts_with("Shows")).map(str::to_string).unwrap_or_default();
+        let desktop = check_page(&serde_json::json!({"path": "index.html", "views": ["desktop"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{desktop}");
+        assert!(shows(&desktop).starts_with("Shows: title \"r\"; text: "), "{desktop}");
+        for wanted in ["WIDE-ONLY", "always", "AXIS-LABEL"] {
+            assert!(shows(&desktop).contains(wanted), "{wanted}: {desktop}");
+        }
+        for gone in ["TAILWIND-HIDDEN", "CHART-TITLE"] {
+            assert!(!shows(&desktop).contains(gone), "{gone}: {desktop}");
+        }
+        let phone = check_page(&serde_json::json!({"path": "index.html", "views": ["mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{phone}");
+        assert!(shows(&phone).starts_with("Shows (read at 1280x800): "), "{phone}");
+        assert!(shows(&phone).contains("WIDE-ONLY"), "read at the desktop's width, where it is shown: {phone}");
     }
 
     /// With the real browser, in the real sandbox: asked only for a phone's width, the first console is labelled as the desktop's size, and the phone's own is under its name.
@@ -1883,7 +1988,7 @@ mod tests {
     }
 
     /// How the browser's own runs end, counted by their exit codes, on the command lines `check_page` runs (`page_line` and `shot_line`) and nothing between: a page that does
-    /// nothing, for `DOGMIND_PROBE_RUNS` runs (30), as `DOGMIND_PROBE_MODE` says: `dump` (the page's DOM), `shot` (a picture of it) or `steps` (the page with steps in it).
+    /// nothing, for `DOGMIND_PROBE_RUNS` runs (30), as `DOGMIND_PROBE_MODE` says: `dump` (the page's DOM), `read` (the page in the copy that says its words), `shot` (a picture of it) or `steps` (the page with steps in it).
     /// `DOGMIND_PAGE_FLAGS` adds flags to the browser's. `DOGMIND_PROBE_KEEP=FOLDER` keeps what the browser said in each run.
     /// `DOGMIND_PROBE_RUNS=30 DOGMIND_PROBE_MODE=shot cargo test -p dogmind-agent --target-dir target-ui the_browsers_runs_are_counted_by_how_they_end -- --ignored --nocapture`.
     #[test]
@@ -1902,6 +2007,9 @@ mod tests {
         made.0.extend([steps_copy.clone(), frame.clone(), shot.clone()]);
         let html = std::fs::read_to_string(&index).unwrap();
         std::fs::write(&steps_copy, with_steps(&html, &(file_url(dir.path()) + "/"), "await click('p'); console.log('steps done');", "dogmind-steps-probe")).unwrap();
+        let read_copy = temp.join(steps_page_of(&format!("{own}-read")));
+        made.0.push(read_copy.clone());
+        std::fs::write(&read_copy, with_script(&html, &(file_url(dir.path()) + "/"), &reading_script(wait))).unwrap();
         std::fs::write(&frame, frame_page(&file_url(&index), &View { label: "desktop".into(), width: 1280, height: 800 })).unwrap();
         let mut profiles = Profiles::new(dir.path(), dir.path());
         let (mut ends, mut bad, mut seconds) = (std::collections::BTreeMap::<String, usize>::new(), 0usize, 0f64);
@@ -1912,6 +2020,7 @@ mod tests {
             let line = match mode.as_str() {
                 "shot" => shot_line(&program, &flags, (1344, 960), wait, &profile, &shot, &frame.display().to_string()),
                 "steps" => page_line(&program, &flags, 2 * wait, &profile, &steps_copy.display().to_string()),
+                "read" => page_line(&program, &flags, wait + READ_MARGIN_MS, &profile, &read_copy.display().to_string()),
                 _ => page_line(&program, &flags, wait, &profile, &index.display().to_string()),
             };
             let started = std::time::Instant::now();
