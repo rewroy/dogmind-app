@@ -340,6 +340,11 @@ enum Holds {
     Yes(Option<Stamp>),
 }
 
+/// Whether a file with this size and time is `entry`'s by `record`, which says so without the file being read: the record has the entry's hash, and the size and time the file has now.
+fn is_by_record(stamp: Stamp, entry: &Entry, record: Option<&Record>) -> bool {
+    stamp.size == entry.size && record.is_some_and(|record| record.sha256 == entry.sha256 && record.size == stamp.size && record.modified == stamp.modified)
+}
+
 /// Whether the file at `path` is `entry`'s. `record`: what the last install wrote down of this very file, when this run goes by that, which stands for reading it while the file still has the
 /// size and time it was written down with. Otherwise it is read whole and hashed, and counted in `hashed`. `announce` is told of a file that is looked at.
 fn holds(path: &Path, entry: &Entry, record: Option<&Record>, hashed: &mut usize, announce: &mut dyn FnMut()) -> Holds {
@@ -349,7 +354,7 @@ fn holds(path: &Path, entry: &Entry, record: Option<&Record>, hashed: &mut usize
     }
     announce();
     let stamp = Stamp::of(&before);
-    if record.is_some_and(|record| record.sha256 == entry.sha256 && record.size == stamp.size && record.modified == stamp.modified) {
+    if is_by_record(stamp, entry, record) {
         return Holds::Yes(Some(stamp));
     }
     *hashed += 1;
@@ -372,13 +377,23 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     // (how long each stage took, for the manifest)
     let (mut checking, mut unpacking, mut placing) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let looked = Instant::now();
-    // What will not fit is said before anything is written. What is there already at this size will most likely stay as it is, and a file the package leaves out (KEPT) needs no room.
-    let needed: u64 = entries.iter().filter(|entry| entry.method != KEPT && std::fs::metadata(folder.join(&entry.path)).map_or(true, |data| data.len() != entry.size) && std::fs::metadata(beside(&folder.join(&entry.path))).map_or(true, |data| data.len() != entry.size)).map(|entry| entry.size).sum();
     let mut hashed = 0usize;
     let previous = read_manifest(folder);
     let ours: HashSet<String> = previous.iter().flat_map(|manifest| manifest.files.iter()).map(|file| file.to_lowercase()).collect();
     // What the last install wrote down of its files, by lower case path.
     let records: HashMap<String, &Record> = previous.iter().flat_map(|manifest| manifest.records.iter()).map(|(path, record)| (path.to_lowercase(), record)).collect();
+    // What will not fit is said before anything is written, and no file is read to know. A file the package leaves out (KEPT) needs no room; nor does one that waits beside its place at the entry's
+    // size (an earlier run unpacked it, and its room is taken); nor one in place that the install's record of it says is the entry's, by hash, size and time, which an update takes without reading
+    // it. Any other counts whole, one in place at the entry's size too: if it is not the entry's it is unpacked beside its place in full.
+    let needed: u64 = entries
+        .iter()
+        .filter(|entry| {
+            entry.method != KEPT
+                && std::fs::metadata(beside(&folder.join(&entry.path))).map_or(true, |data| data.len() != entry.size)
+                && !std::fs::metadata(folder.join(&entry.path)).is_ok_and(|data| is_by_record(Stamp::of(&data), entry, records.get(&entry.path.to_lowercase()).copied()))
+        })
+        .map(|entry| entry.size)
+        .sum();
     // What is taken for a file that has the size and time it was written down with: in an update, and no other run (see `Install::update`).
     let trusted = |path: &str| if job.update { records.get(&path.to_lowercase()).copied() } else { None };
     // The files this package leaves out (KEPT) are in the folder already, as the app saw them when it put the package together, or nothing is changed and the person is told what to do: such a
@@ -1755,5 +1770,34 @@ mod tests {
         assert!(scene.run(&mut second, None, None).is_ok());
         assert_eq!(std::fs::read(folder.join("tools\\x.py")).unwrap(), b"22");
         assert_eq!(std::fs::read(elsewhere.join("x.py")).unwrap(), b"the person's x");
+    }
+
+    #[test]
+    fn a_changed_file_of_the_size_it_had_is_counted_in_the_room_an_update_asks_for() {
+        let scene = Scene::new();
+        let (a, b) = (noise(200_000), noise(150_000));
+        let mut first = scene.package("1.0.0", &[("a", &a), ("b", &b)]);
+        scene.run(&mut first, None, None).unwrap();
+        // the new `a` is another file of the same size, and `b` is the same: the install's record of `b` says so, and it is not read to know
+        let mut changed = a.clone();
+        changed[1000] ^= 1;
+        let mut second = scene.package("2.0.0", &[("a", &changed), ("b", &b)]);
+        let folder = scene.folder();
+        let before = walk(&folder);
+        let size = a.len() as u64;
+        let failed = scene.run(&mut second, Some(ROOM_TO_SPARE + size - 1), None).unwrap_err();
+        assert_eq!(failed, Failure::TooLittleRoom { needed: ROOM_TO_SPARE + size, free: ROOM_TO_SPARE + size - 1 }, "the bytes of the changed file are asked for, and not those of `b`");
+        assert_eq!(walk(&folder), before, "nothing was written");
+        let done = scene.run(&mut second, Some(ROOM_TO_SPARE + size), None).unwrap();
+        assert_eq!((done.unpacked, done.already_there), (1, 1));
+        assert_eq!(std::fs::read(folder.join("a")).unwrap(), changed);
+        // a file whose time is not the one written down is counted too, as it is read to find out
+        let file = std::fs::OpenOptions::new().write(true).open(folder.join("b")).unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(3600)).unwrap();
+        drop(file);
+        let mut third = scene.package("3.0.0", &[("a", &changed), ("b", &b)]);
+        let failed = scene.run(&mut third, Some(ROOM_TO_SPARE + b.len() as u64 - 1), None).unwrap_err();
+        assert_eq!(failed, Failure::TooLittleRoom { needed: ROOM_TO_SPARE + b.len() as u64, free: ROOM_TO_SPARE + b.len() as u64 - 1 });
+        assert!(scene.run(&mut third, Some(ROOM_TO_SPARE + b.len() as u64), None).is_ok());
     }
 }
