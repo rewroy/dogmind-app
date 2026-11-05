@@ -2,6 +2,7 @@
 //! The window that draws them is in `ui`; what is here can be told without one.
 
 use crate::highlight::{self, Kind};
+use crate::lang::t;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
@@ -33,10 +34,95 @@ pub fn language_of(path: &str) -> String {
     path.rsplit(['/', '\\']).next().and_then(|name| name.rsplit_once('.')).map_or(String::new(), |(_, extension)| extension.to_lowercase())
 }
 
-/// A line as it is drawn: tabs at four columns, and no end to it that would have to be measured for nothing.
-fn drawn(line: &str) -> String {
-    const LONGEST: usize = 2000;
-    line.trim_end_matches('\r').replace('\t', "    ").chars().take(LONGEST).collect()
+/// The most of a line that is drawn: no end to it that would have to be measured for nothing.
+const LONGEST: usize = 2000;
+/// How much of two long lines is shown on each side of where they first differ.
+const AROUND: usize = 60;
+
+/// A line as it is drawn: tabs at four columns (an arrow and spaces, where it is a tab that is all there is to a change), and a mark where it is cut.
+fn drawn(line: &str, show_tabs: bool) -> String {
+    let text = line.trim_end_matches('\r').replace('\t', if show_tabs { "→   " } else { "    " });
+    if text.chars().count() > LONGEST {
+        format!("{}…", text.chars().take(LONGEST).collect::<String>())
+    } else {
+        text
+    }
+}
+
+/// The lines of a diff, each without its newline and with its carriage return, if it has one: `str::lines` takes that away, and with it the difference this is about.
+fn diff_lines(diff: &str) -> impl Iterator<Item = &str> {
+    diff.split_inclusive('\n').map(|line| line.strip_suffix('\n').unwrap_or(line))
+}
+
+/// A line of the diff, and what is told of it by the one it is set against.
+struct Prepared {
+    text: String,
+    /// It and the line it is paired with differ in tabs and spaces alone: the tabs are shown.
+    whitespace_only: bool,
+}
+
+/// The lines of a diff, with each removed line set against the added line in its place (the n-th of a block of removals against the n-th of the additions after it): two long lines that
+/// are the same as far as a line is drawn are cut where they differ and not at the end, and two that differ in tabs and spaces alone are marked.
+fn prepared(diff: &str) -> Vec<Prepared> {
+    let mut lines: Vec<Prepared> = diff_lines(diff).map(|line| Prepared { text: line.to_string(), whitespace_only: false }).collect();
+    let is = |line: &Prepared, mark: char| line.text.starts_with(mark) && !line.text.starts_with("--- ") && !line.text.starts_with("+++ ");
+    let mut at = 0;
+    while at < lines.len() {
+        let start = at;
+        while at < lines.len() && is(&lines[at], '-') {
+            at += 1;
+        }
+        let middle = at;
+        while at < lines.len() && is(&lines[at], '+') {
+            at += 1;
+        }
+        if middle == start || at == middle {
+            at = at.max(start + 1);
+            continue;
+        }
+        for k in 0..(middle - start).min(at - middle) {
+            let (old, new) = (start + k, middle + k);
+            let (a, b) = (lines[old].text[1..].trim_end_matches('\r').to_string(), lines[new].text[1..].trim_end_matches('\r').to_string());
+            if a == b {
+                continue;
+            }
+            if a.replace('\t', "    ") == b.replace('\t', "    ") {
+                lines[old].whitespace_only = true;
+                lines[new].whitespace_only = true;
+            } else if a.chars().count() > LONGEST && b.chars().count() > LONGEST && a.chars().take(LONGEST).eq(b.chars().take(LONGEST)) {
+                // (a change past the cut would not show at all: where they differ is shown instead)
+                let first = a.chars().zip(b.chars()).position(|(x, y)| x != y).unwrap_or_else(|| a.chars().count().min(b.chars().count()));
+                let window = |text: &str| format!("…{}…", text.chars().skip(first.saturating_sub(AROUND)).take(2 * AROUND).collect::<String>());
+                lines[old].text = format!("-{}", window(&a));
+                lines[new].text = format!("+{}", window(&b));
+            }
+        }
+    }
+    lines
+}
+
+/// Whether the diff changes nothing but line endings: every removed line is an added line with a carriage return more or less. Which way, if so.
+fn only_line_endings(diff: &str) -> Option<&'static str> {
+    let (mut removed, mut added): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    for line in diff_lines(diff) {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
+        match line.chars().next() {
+            Some('-') => removed.push(&line[1..]),
+            Some('+') => added.push(&line[1..]),
+            _ => {}
+        }
+    }
+    if removed.is_empty() || removed.len() != added.len() || !removed.iter().zip(&added).all(|(a, b)| a.trim_end_matches('\r') == b.trim_end_matches('\r')) {
+        return None;
+    }
+    let (with, without) = (removed.iter().filter(|line| line.ends_with('\r')).count(), added.iter().filter(|line| line.ends_with('\r')).count());
+    match (with, without) {
+        (0, 0) => None,
+        (more, fewer) if more >= fewer => Some("line endings only (CRLF → LF)"),
+        _ => Some("line endings only (LF → CRLF)"),
+    }
 }
 
 /// `@@ -a,b +c,d @@ what it is in`: where the two sides begin, and the words.
@@ -50,6 +136,10 @@ fn hunk_head(line: &str) -> Option<(u32, u32, &str)> {
 
 /// The rows of a diff. Past `most` it stops, saying so: a file of a hundred thousand changed lines is not read here.
 pub fn rows(diff: &str, path: &str, most: usize) -> Vec<Row> {
+    // A file whose every line changed by its ending alone would be a wall of lines that read the same: said once.
+    if let Some(words) = only_line_endings(diff) {
+        return vec![Row { kind: RowKind::Note, old: None, new: None, runs: vec![(t(words).to_string(), Kind::Comment)] }];
+    }
     let language = language_of(path);
     let mut found = Vec::new();
     let (mut old, mut new) = (0, 0);
@@ -64,7 +154,8 @@ pub fn rows(diff: &str, path: &str, most: usize) -> Vec<Row> {
             None => vec![(text, Kind::Plain)],
         }
     };
-    for line in diff.lines() {
+    for prepared_line in prepared(diff) {
+        let (line, tabs) = (prepared_line.text.as_str(), prepared_line.whitespace_only);
         if found.len() >= most {
             found.push(Row { kind: RowKind::Note, old: None, new: None, runs: vec![("…".to_string(), Kind::Plain)] });
             break;
@@ -73,7 +164,7 @@ pub fn rows(diff: &str, path: &str, most: usize) -> Vec<Row> {
             (old, new) = (from, to);
             // (a new file, or a change at the very top: nothing has been passed over to mark)
             if !(found.is_empty() && from <= 1 && to <= 1) {
-                found.push(Row { kind: RowKind::Hunk, old: None, new: None, runs: vec![(drawn(words), Kind::Comment)] });
+                found.push(Row { kind: RowKind::Hunk, old: None, new: None, runs: vec![(drawn(words, false), Kind::Comment)] });
             }
             continue;
         }
@@ -84,15 +175,19 @@ pub fn rows(diff: &str, path: &str, most: usize) -> Vec<Row> {
         }
         match line.chars().next() {
             Some('+') => {
-                found.push(Row { kind: RowKind::Added, old: None, new: Some(new), runs: colored(drawn(&line[1..]), &mut open_new) });
+                let mut runs = colored(drawn(&line[1..], tabs), &mut open_new);
+                if tabs {
+                    runs.push((format!("   ← {}", t("tabs and spaces only")), Kind::Comment));
+                }
+                found.push(Row { kind: RowKind::Added, old: None, new: Some(new), runs });
                 new += 1;
             }
             Some('-') => {
-                found.push(Row { kind: RowKind::Removed, old: Some(old), new: None, runs: colored(drawn(&line[1..]), &mut open_old) });
+                found.push(Row { kind: RowKind::Removed, old: Some(old), new: None, runs: colored(drawn(&line[1..], tabs), &mut open_old) });
                 old += 1;
             }
             Some(' ') => {
-                let runs = colored(drawn(&line[1..]), &mut open_new);
+                let runs = colored(drawn(&line[1..], false), &mut open_new);
                 open_old = open_new;
                 found.push(Row { kind: RowKind::Same, old: Some(old), new: Some(new), runs });
                 old += 1;
@@ -104,7 +199,7 @@ pub fn rows(diff: &str, path: &str, most: usize) -> Vec<Row> {
                 new += 1;
             }
             None => {}
-            _ => found.push(Row { kind: RowKind::Note, old: None, new: None, runs: vec![(drawn(line.trim_start_matches("\\ ")), Kind::Comment)] }),
+            _ => found.push(Row { kind: RowKind::Note, old: None, new: None, runs: vec![(drawn(line.trim_start_matches("\\ "), false), Kind::Comment)] }),
         }
     }
     found
@@ -209,6 +304,49 @@ mod tests {
     #[test]
     fn the_longest_line_counts_wide_characters_twice() {
         assert_eq!(longest(&rows("@@ -1,2 +1,2 @@\n abc\n 日本語\n", "x", 100)), 6);
+    }
+
+    /// A change past where a long line is cut still shows: the lines are cut where they differ, and a cut has a mark.
+    #[test]
+    fn a_change_past_the_cut_of_a_long_line_is_shown_where_it_is() {
+        let long = |tail: &str| format!("{}{tail}", "x".repeat(LONGEST + 500));
+        let diff = format!("@@ -1,1 +1,1 @@\n-{}\n+{}\n", long("OLD-END"), long("NEW-END"));
+        let rows = rows(&diff, "min.js", 100);
+        let (old, new) = (rows[0].text(), rows[1].text());
+        assert!(old.contains("OLD-END") && new.contains("NEW-END"), "where they differ: {old} / {new}");
+        assert!(old.starts_with('…') && old.ends_with('…') && old.chars().count() <= 2 * AROUND + 2, "{old}");
+        // lines that differ before the cut are cut at the end, with a mark
+        let diff = format!("@@ -1,1 +1,1 @@\n-a{}\n+b{}\n", "y".repeat(LONGEST + 10), "y".repeat(LONGEST + 10));
+        let rows = super::rows(&diff, "min.js", 100);
+        assert!(rows[0].text().ends_with('…') && rows[0].text().chars().count() == LONGEST + 1, "{}", rows[0].text().chars().count());
+        // and a short one is not marked
+        assert!(!super::rows("@@ -1,1 +1,1 @@\n-short\n+shorter\n", "a.txt", 100)[0].text().contains('…'));
+    }
+
+    /// Tabs changed to spaces read as two lines the same: the tabs are shown, and the pair says so.
+    #[test]
+    fn a_change_of_tabs_to_spaces_is_shown_as_one() {
+        let rows = rows("@@ -1,2 +1,2 @@\n-\tindented\n-\tsecond\n+    indented\n+    second changed\n", "a.txt", 100);
+        assert_eq!(rows[0].text(), "→   indented");
+        assert!(rows[2].text().starts_with("    indented") && rows[2].text().contains("tabs and spaces only"), "{}", rows[2].text());
+        assert_eq!(rows[1].text(), "    second", "a pair that is more than whitespace is not marked: its tab is drawn as it was");
+        assert!(!rows[3].text().contains("tabs and spaces"), "{}", rows[3].text());
+    }
+
+    /// A file whose every line changed by its ending alone is said once.
+    #[test]
+    fn a_change_of_line_endings_alone_is_said_once() {
+        let crlf_to_lf = "@@ -1,3 +1,3 @@\n-one\r\n-two\r\n-three\r\n+one\n+two\n+three\n";
+        let rows = rows(crlf_to_lf, "a.txt", 100);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].kind, rows[0].text().as_str()), (RowKind::Note, "line endings only (CRLF → LF)"));
+        let lf_to_crlf = "@@ -1,2 +1,2 @@\n-one\n-two\n+one\r\n+two\r\n";
+        assert_eq!(super::rows(lf_to_crlf, "a.txt", 100)[0].text(), "line endings only (LF → CRLF)");
+        // one real change among them, and it is a diff
+        let with_change = "@@ -1,2 +1,2 @@\n-one\r\n-two\r\n+one\n+TWO\n";
+        assert!(super::rows(with_change, "a.txt", 100).len() > 1);
+        assert_eq!(only_line_endings("@@ -1,1 +1,1 @@\n-a\n+a\n"), None, "nothing differs at all: not a change of endings");
+        assert_eq!(only_line_endings("@@ -1,1 +1,1 @@\n context\n"), None);
     }
 
     #[test]
