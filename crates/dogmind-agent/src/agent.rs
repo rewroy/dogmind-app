@@ -71,6 +71,21 @@ const EMPTY_RETRIES: u32 = 2;
 const CHARS_A_TOKEN: usize = 3;
 /// What a forced compaction leaves after its checkpoint: it is asked for, so a short conversation is worth it too.
 const FORCED_KEEP: usize = 4;
+
+/// The window an agent works with, and where it comes from: the provider's, or, in a debug build and when `DOGMIND_TEST_WINDOW` (tokens) is set, the smaller of that and the provider's. It is how
+/// a real job is made to compact when the server's window is far larger than any test job; a release build ignores it, as it does `DOGMIND_TEST_KEYS`.
+fn window_in_use(provided: u64) -> (u64, &'static str) {
+    let asked = if cfg!(debug_assertions) { std::env::var("DOGMIND_TEST_WINDOW").ok().and_then(|text| text.trim().parse::<u64>().ok()) } else { None };
+    window_with(provided, asked)
+}
+
+fn window_with(provided: u64, asked: Option<u64>) -> (u64, &'static str) {
+    match asked.filter(|asked| *asked > 0) {
+        // (a provider that does not say its window, 0, has the one that was asked for)
+        Some(asked) if provided == 0 || asked < provided => (asked, "DOGMIND_TEST_WINDOW"),
+        _ => (provided, "the provider"),
+    }
+}
 /// The same call again with nothing edited: at the first its answer says it will not change, at the second the turn stops.
 const REPEATS_NOTED: u32 = 2;
 const REPEATS_STOPPED: u32 = 5;
@@ -1076,10 +1091,15 @@ impl Agent {
             self.read_live();
             match command {
                 Command::Quit => return,
-                Command::Provider(provider, model, window) => {
+                Command::Provider(provider, model, provided) => {
+                    let (window, from) = window_in_use(provided);
                     self.provider = Some(provider);
                     self.model = model;
                     self.window = window;
+                    // (a window that is not the provider's is said, for a run that compacts is read against it; the compaction lines carry the one in use)
+                    if window != provided {
+                        self.traj.write("connection", None, json!({"what": "window", "ms": 0, "outcome": format!("{window} tokens, from {from} (the provider says {provided})"), "at": trajectory::now()}));
+                    }
                     self.report_usage(None);
                 }
                 Command::Connection { at, what, ms, outcome } => {
@@ -2632,7 +2652,7 @@ impl Agent {
         self.compaction_stage = "none";
         let result = self.compact_conversation(forced, refused);
         let (after, req) = (self.expected_use(), self.last_req.clone());
-        self.traj.write("compaction", req.as_deref(), json!({"forced": forced, "refused": refused, "stage": self.compaction_stage, "before_tokens": before, "after_tokens": after, "ms": began.elapsed().as_millis() as u64, "outcome": if result.is_ok() { "ok" } else { "error" }}));
+        self.traj.write("compaction", req.as_deref(), json!({"forced": forced, "refused": refused, "stage": self.compaction_stage, "before_tokens": before, "after_tokens": after, "window": self.window, "ms": began.elapsed().as_millis() as u64, "outcome": if result.is_ok() { "ok" } else { "error" }}));
         result
     }
 
@@ -4798,6 +4818,17 @@ mod tests {
         assert!(agent.compact(false, false).is_ok());
         assert_eq!((provider.requests(), agent.compaction_stage), (1, "checkpoint"));
         assert!(!agent.messages.iter().any(|message| user_text(message).contains("trimmed by compaction")));
+    }
+
+    #[test]
+    fn a_test_window_is_the_smaller_of_it_and_the_providers_and_says_where_it_came_from() {
+        assert_eq!(window_with(262_144, Some(32_768)), (32_768, "DOGMIND_TEST_WINDOW"));
+        assert_eq!(window_with(16_384, Some(32_768)), (16_384, "the provider"), "never larger than the provider's");
+        assert_eq!(window_with(0, Some(32_768)), (32_768, "DOGMIND_TEST_WINDOW"), "a provider that does not say");
+        assert_eq!(window_with(262_144, None), (262_144, "the provider"));
+        assert_eq!(window_with(262_144, Some(0)), (262_144, "the provider"));
+        // (a release build reads no variable at all)
+        assert_eq!(window_in_use(262_144).0 <= 262_144, true);
     }
 
     #[test]
