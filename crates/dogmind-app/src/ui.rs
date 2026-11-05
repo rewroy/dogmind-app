@@ -278,6 +278,7 @@ const ID_VISION_OFFER: isize = 9905;
 const ID_UPDATE_OFFER: isize = 9906;
 const ID_RELEASE_OFFER: isize = 9907;
 const ID_TOGGLE_UPDATES: isize = 9908;
+const ID_SPEED_FIRST: isize = 9909;
 const ID_DIFF_PREVIOUS: isize = 9900;
 const ID_DIFF_NEXT: isize = 9901;
 const ID_DIFF_CLOSE: isize = 9902;
@@ -1804,6 +1805,8 @@ struct App {
     buttons: [HWND; 5],
     kind_chip: HWND,
     drafter_chip: HWND,
+    /// Speed first for a PC short of memory: the engine's next start leaves the CPU's low-weight routes out.
+    speed_chip: HWND,
     /// Whether the model reads pictures: a switch in a dialog, a choice on the first screens.
     vision_chip: HWND,
     vision_delete: HWND,
@@ -5285,6 +5288,7 @@ impl App {
         // (a PC that cannot run a model is not asked where to keep one)
         let refused = self.panel == Panel::Models && self.refusal.is_some();
         show(self.drafter_chip, self.panel == Panel::Models && !refused);
+        show(self.speed_chip, self.panel == Panel::Models && !refused);
         show(self.vision_chip, self.panel == Panel::Models && !refused && self.vision_row().is_some());
         show(self.vision_delete, false);
         show(self.licence_link, self.panel == Panel::Models && !refused && !get_text(self.licence_link).is_empty());
@@ -5406,6 +5410,10 @@ impl App {
                 top += label_row;
                 place(self.drafter_chip, field_left, top + s(ds::space::XS), s(380).min(field_width), s(30));
                 top += row + s(ds::space::XS);
+                shapes.push(Shape::Text { area: rect(left, top, label_width, if stacked { label_row } else { row }), text: t("Speed first (for a PC short of memory)").into(), font: FontKind::Body, color: theme::muted(), flags: ONE_LINE });
+                top += label_row;
+                place(self.speed_chip, field_left, top + s(ds::space::XS), s(380).min(field_width), s(30));
+                top += row + s(ds::space::XS);
                 if let Some(words) = self.vision_row() {
                     shapes.push(Shape::Text { area: rect(left, top, label_width, if stacked { label_row } else { row }), text: words, font: FontKind::Body, color: theme::muted(), flags: ONE_LINE });
                     top += label_row;
@@ -5468,7 +5476,7 @@ impl App {
 
     /// The controls that move between the window and a dialog as they are needed, and those that only a dialog has.
     fn shared_controls(&self) -> Vec<HWND> {
-        let mut all = vec![self.list, self.doc, self.kind_chip, self.drafter_chip, self.vision_chip, self.licence_link, self.toggle_display, self.provider_up, self.provider_down];
+        let mut all = vec![self.list, self.doc, self.kind_chip, self.drafter_chip, self.speed_chip, self.vision_chip, self.licence_link, self.toggle_display, self.provider_up, self.provider_down];
         all.extend(self.fields);
         all.extend(self.buttons);
         all
@@ -5832,6 +5840,7 @@ impl App {
                 form.field(t("Graphics memory limit (GB)"), self.fields[1]);
                 form.field(t("Longest conversation (tokens)"), self.fields[2]);
                 form.toggle(t("Faster-writing data (5 GB)"), self.drafter_chip);
+                form.toggle(t("Speed first (for a PC short of memory)"), self.speed_chip);
                 if let Some(words) = self.vision_row() {
                     form.toggle(&words, self.vision_chip);
                 }
@@ -7218,6 +7227,7 @@ impl App {
                 set_text(self.fields[1], &settings::show_vram(self.settings.vram));
                 set_text(self.fields[2], &self.settings.context.map_or(String::new(), |context| context.to_string()));
                 self.update_drafter_chip();
+                self.update_speed_chip();
                 self.update_vision_chip();
                 set_text(self.vision_delete, t("Delete"));
                 set_text(self.buttons[1], t("Browse..."));
@@ -8586,6 +8596,17 @@ impl App {
         self.update_vision_chip();
         if self.panel == Panel::Chat {
             self.layout();
+        }
+    }
+
+    /// Speed first: on, the engine's next start skips the CPU's low-weight routes (faster where memory is short, answers change a little).
+    unsafe fn update_speed_chip(&self) {
+        let on = self.settings.speed_first;
+        if self.modal_open {
+            set_button_style(self.speed_chip, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
+        } else {
+            set_button_style(self.speed_chip, ButtonKind::Select, theme::background());
+            set_text(self.speed_chip, if on { t("On: faster, answers change a little") } else { t("Off") });
         }
     }
 
@@ -11340,6 +11361,7 @@ impl App {
         self.update_chips();
         self.update_toggles();
         self.update_drafter_chip();
+        self.update_speed_chip();
         // (with an empty box from the start, not lit until the first thing is typed and taken back)
         self.update_send_enabled();
         self.refresh_sessions();
@@ -12560,6 +12582,13 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_DRAFTER => {
                     app.drafter = !app.drafter;
                     app.update_drafter_chip();
+                    app.layout();
+                }
+                ID_SPEED_FIRST => {
+                    app.settings.speed_first = !app.settings.speed_first;
+                    app.save();
+                    app.update_speed_chip();
+                    app.tip(app.speed_chip, t("Takes effect when the engine starts again"));
                     app.layout();
                 }
                 ID_VISION => app.vision_clicked(),
@@ -13830,6 +13859,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             buttons: std::array::from_fn(|at| make_button(window, ID_BUTTONS + at as isize, "", ButtonKind::Secondary, theme::background())),
             kind_chip: make_button(window, ID_KIND_CHIP, "", ButtonKind::Select, theme::background()),
             drafter_chip: make_button(window, ID_DRAFTER, "", ButtonKind::Chip, theme::background()),
+            speed_chip: make_button(window, ID_SPEED_FIRST, "", ButtonKind::Chip, theme::background()),
             vision_chip: make_button(window, ID_VISION, "", ButtonKind::Chip, theme::background()),
             vision_delete: make_button(pane, ID_VISION_DELETE, "", ButtonKind::Secondary, theme::background()),
             vision_offer_button: make_button(window, ID_VISION_OFFER, "", ButtonKind::Secondary, theme::surface()),

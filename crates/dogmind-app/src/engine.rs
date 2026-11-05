@@ -461,8 +461,15 @@ pub fn engine_arguments(settings: &Settings, folder: &Path) -> Vec<String> {
     if let Some(context) = settings.context {
         args.extend(["--ctx-size".to_string(), context.to_string()]);
     }
+    if settings.speed_first {
+        args.extend(["--expert-floor".to_string(), SPEED_FIRST_FLOOR.to_string()]);
+    }
     args
 }
+
+/// The expert floor speed first starts the engine with: Straydog's measure (Qwen3.8, a partially resident model) put the loss at 0.04 about
+/// that of a smaller engram table (mean KL 0.0020), and found it five times as large at 0.06.
+const SPEED_FIRST_FLOOR: &str = "0.04";
 
 /// For a model that is there and has no vision file: setup does not fetch again what it has, and checks it. The drafter stays as the settings have it, for setup rewrites them; a DeepSeek drafter that is not there is not wanted here.
 pub fn vision_arguments(installed: &crate::vision::Installed, config: &Path) -> Vec<String> {
@@ -1441,7 +1448,9 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--ctx-size", "262144"]), "{args:?}");
         assert!(args.windows(2).any(|pair| pair[0] == "--host" && pair[1] == "127.0.0.1"), "only this machine reaches it: {args:?}");
         let plain = engine_arguments(&Settings::default(), Path::new("D"));
-        assert!(!plain.iter().any(|arg| arg == "--vram" || arg == "--ctx-size"));
+        assert!(!plain.iter().any(|arg| arg == "--vram" || arg == "--ctx-size" || arg == "--expert-floor"), "speed first is off unless chosen");
+        let fast = engine_arguments(&Settings { speed_first: true, ..Settings::default() }, Path::new("D"));
+        assert!(fast.windows(2).any(|pair| pair == ["--expert-floor", "0.04"]), "{fast:?}");
     }
 
     #[test]
