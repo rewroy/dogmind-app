@@ -288,9 +288,9 @@ pub fn query_problem(arguments: &Value) -> Option<String> {
     ]).expect("the patterns are valid");
     queries_of(arguments).iter().find_map(|query| {
         if query.chars().count() > MAX_QUERY {
-            Some(format!("this query is long ({} characters): text from this machine would leave it", query.chars().count()))
+            Some(crate::safety::reason_of(crate::safety::REASON_LONG_QUERY, &[&query.chars().count().to_string()]))
         } else {
-            looks_private.is_match(query).then(|| "this query looks like it holds a secret or a private path, and it would go to a search index".to_string())
+            looks_private.is_match(query).then(|| crate::safety::REASON_PRIVATE_QUERY.to_string())
         }
     })
 }

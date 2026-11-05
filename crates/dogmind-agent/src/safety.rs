@@ -94,7 +94,35 @@ pub(crate) fn reaches_out(path: &Path) -> bool {
 
 /// What a person is told of a path that leads off this PC.
 fn leads_off_this_pc(what: &str) -> String {
-    format!("this leads off this PC, to another machine or a device, and opening it gives that your sign-in: {what}")
+    reason_of(REASON_OFF_THIS_PC, &[what])
+}
+
+// The reasons the gate gives for asking, as templates with `{0}` and `{1}` for what varies: the model reads them as they are written, and the app has each of them in the person's
+// language (see `REASONS`, and the test there that each has its Japanese). A new reason is a new constant here, and in that list.
+pub const REASON_OFF_THIS_PC: &str = "this leads off this PC, to another machine or a device, and opening it gives that your sign-in: {0}";
+pub const REASON_SECRET_READ: &str = "reads a place secrets are kept: {0}";
+pub const REASON_RUNS_OFF_THIS_PC: &str = "this runs in a place off this PC: {0}";
+pub const REASON_PLANTED: &str = "`{0}` here is the file {1} in this folder, not the installed program";
+pub const REASON_NETWORK: &str = "this command gets the network";
+pub const REASON_OUTSIDE_AND_OFF_THIS_PC: &str = "outside the workspace, and off this PC: {0}";
+pub const REASON_OUTSIDE: &str = "outside the workspace: {0}";
+pub const REASON_GIT_FOLDER: &str = "inside git's own folder: {0}";
+pub const REASON_LONG_QUERY: &str = "this query is long ({0} characters): text from this machine would leave it";
+pub const REASON_PRIVATE_QUERY: &str = "this query looks like it holds a secret or a private path, and it would go to a search index";
+pub const REASON_WEB_ADDRESS_PATH: &str = "web content is in this conversation, and an address can carry data out in its path";
+pub const REASON_WEB_UNKNOWN_ADDRESS: &str = "this address is not from your messages, a search or a page, and an address can carry data out";
+pub const REASON_WEB_NOTE: &str = "web content is in this conversation, and a note reaches every later session";
+pub const REASON_WEB_ASKED: &str = "web content is in this conversation, and it may have asked for this";
+
+/// Every reason a card can give, for the test that each has its Japanese in the app.
+pub const REASONS: [&str; 14] = [
+    REASON_OFF_THIS_PC, REASON_SECRET_READ, REASON_RUNS_OFF_THIS_PC, REASON_PLANTED, REASON_NETWORK, REASON_OUTSIDE_AND_OFF_THIS_PC, REASON_OUTSIDE, REASON_GIT_FOLDER, REASON_LONG_QUERY,
+    REASON_PRIVATE_QUERY, REASON_WEB_ADDRESS_PATH, REASON_WEB_UNKNOWN_ADDRESS, REASON_WEB_NOTE, REASON_WEB_ASKED,
+];
+
+/// A reason from its template: `{0}` and `{1}` are what the call adds.
+pub fn reason_of(template: &str, parts: &[&str]) -> String {
+    parts.iter().enumerate().fold(template.to_string(), |text, (at, part)| text.replace(&format!("{{{at}}}"), part))
 }
 
 /// What cmd takes to end a word of a command: whitespace, and its own separators, a `,` too.
@@ -528,7 +556,7 @@ impl Gate {
                     return Verdict::Ask { risk: Risk::High, reason: Some(leads_off_this_pc(&path.display().to_string())) };
                 }
                 if self.is_secret(&path) {
-                    Verdict::Ask { risk: Risk::High, reason: Some(format!("reads a place secrets are kept: {}", path.display())) }
+                    Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_SECRET_READ, &[&path.display().to_string()])) }
                 } else {
                     Verdict::Allow
                 }
@@ -557,7 +585,7 @@ impl Gate {
                 let command = text("command").unwrap_or("");
                 let cwd = resolve(workspace, text("cwd").unwrap_or("."));
                 if reaches_out(&cwd) {
-                    return Verdict::Ask { risk: Risk::High, reason: Some(format!("this runs in a place off this PC: {}", cwd.display())) };
+                    return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_RUNS_OFF_THIS_PC, &[&cwd.display().to_string()])) };
                 }
                 // (a reason is what keeps a rule, "always" and a mode from answering for it: what they were given leave to run is the program the line names, not a file here)
                 // (a look runs with no one asked, so it runs no file of the folder at all: any that answers to a name in it makes it a command like another. Only a file that takes the place of an installed program
@@ -574,7 +602,7 @@ impl Gate {
                         // (what is safe is safe by the name of a program the list knows, and a file here that answers to the name runs the project's code instead. Safe and low are what the setting for safe
                         // commands lets through, so this is more than low: it asks)
                         let risk = if risk == Risk::Safe && !answered.is_empty() { Risk::Medium } else { risk };
-                        let reasons: Vec<String> = planted.into_iter().chain(off_this_pc).chain(wants_network(arguments).then(|| "this command gets the network".to_string())).collect();
+                        let reasons: Vec<String> = planted.into_iter().chain(off_this_pc).chain(wants_network(arguments).then(|| REASON_NETWORK.to_string())).collect();
                         Verdict::Ask { risk, reason: (!reasons.is_empty()).then(|| reasons.join("; ")) }
                     }
                     Err(reason) => Verdict::Deny(reason),
@@ -590,17 +618,17 @@ impl Gate {
         for path in paths {
             let full = resolve(workspace, path);
             if reaches_out(&full) {
-                return Verdict::Ask { risk: Risk::High, reason: Some(format!("outside the workspace, and off this PC: {}", full.display())) };
+                return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_OUTSIDE_AND_OFF_THIS_PC, &[&full.display().to_string()])) };
             }
             if self.is_secret(&full) {
                 return Verdict::Deny(format!("writes to a place secrets are kept: {}", full.display()));
             }
             if !within(workspace, &full) {
-                return Verdict::Ask { risk: Risk::High, reason: Some(format!("outside the workspace: {}", full.display())) };
+                return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_OUTSIDE, &[&full.display().to_string()])) };
             }
             // A hook or a line of config there runs outside the sandbox, the next time a person uses git here.
             if full.components().any(|part| part.as_os_str().eq_ignore_ascii_case(".git")) {
-                return Verdict::Ask { risk: Risk::High, reason: Some(format!("inside git's own folder: {}", full.display())) };
+                return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_GIT_FOLDER, &[&full.display().to_string()])) };
             }
         }
         Verdict::Ask { risk: Risk::Low, reason: None }
@@ -695,7 +723,7 @@ impl Gate {
     /// nothing on PATH answers to, as `gradlew.bat` in a project, is the project's own file and nothing is taken the place of.
     fn planted_here(&self, answered: &[Answered], folder: &Path) -> Option<String> {
         let taken = answered.iter().find(|one| self.installed(&one.names, folder))?;
-        Some(format!("`{}` here is the file {} in this folder, not the installed program", taken.word, taken.file))
+        Some(reason_of(REASON_PLANTED, &[&taken.word, &taken.file]))
     }
 
     /// Whether a program of one of these file names is on the PATH a command starts with, in a folder other than this one (which is first on it already).

@@ -10249,7 +10249,7 @@ impl App {
             }
             Event::Approval(approval) => {
                 self.run_asks();
-                let reason = approval.reason.as_ref().map_or(String::new(), |reason| format!("{}\n\n", lang::notice(reason)));
+                let reason = approval.reason.as_ref().map_or(String::new(), |reason| format!("{}\n\n", lang::reason(reason)));
                 // What Always means here, for whoever is about to use it, with the pointer or the key. That it covers this very call needs no line of its own.
                 let always = match (&approval.rule, approval.always_allowed) {
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::File(_))) => tf("Always allows this file, for this session: {0}", &[&always_places(&approval.scope)]),

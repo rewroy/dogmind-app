@@ -2501,14 +2501,14 @@ impl Agent {
                 }
                 // Asked for, not refused: an address the person knows is fine. Never delegated, as it has a reason.
                 let reason = if plain {
-                    "web content is in this conversation, and an address can carry data out in its path"
+                    safety::REASON_WEB_ADDRESS_PATH
                 } else {
-                    "this address is not from your messages, a search or a page, and an address can carry data out"
+                    safety::REASON_WEB_UNKNOWN_ADDRESS
                 };
                 (Risk::Medium, Some(reason.to_string()))
             }
             // A note reaches every later session, so what a page says must not get there on its own.
-            Verdict::Allow if tool == "remember" && self.web_seen => (Risk::Medium, Some("web content is in this conversation, and a note reaches every later session".to_string())),
+            Verdict::Allow if tool == "remember" && self.web_seen => (Risk::Medium, Some(safety::REASON_WEB_NOTE.to_string())),
             Verdict::Allow => return Permission::Run,
             Verdict::Deny(reason) => return Permission::Denied(format!("denied: {reason}")),
             Verdict::Ask { risk, reason } => (risk, reason),
@@ -2520,7 +2520,7 @@ impl Agent {
         // a command can do anything the sandbox lets it, so a person looks, whatever the mode and the saved rules. That goes
         // for what the gate calls safe too: `cargo test` runs what an edit may have just planted.
         if self.web_seen && (tool == "execute_command" || tool.starts_with("mcp__")) && reason.is_none() {
-            reason = Some("web content is in this conversation, and it may have asked for this".to_string());
+            reason = Some(safety::REASON_WEB_ASKED.to_string());
         }
         if delegated(self.mode, tool, risk, reason.as_deref(), self.safe_commands) {
             return Permission::Run;
