@@ -448,17 +448,32 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
 /// Every file waiting beside its place put in it, or none: half of two versions would run as neither. First what is there now is moved
 /// aside, each under a name of its own (Windows lets a program's file be renamed while it runs, and it runs on from there); then each new
 /// one comes into its place. Anything that fails on the way puts back what was moved, and what came goes back to waiting beside its
-/// place: the program is as it was, and running again goes on. What was moved aside, by where it stood, for the caller to take away.
+/// place: the program is as it was, and running again goes on. If something cannot be put back either (a virus scanner or a library that
+/// is loaded has the file), that is the failure that is returned, with the files it is of: the folder is then not as it was, and what is
+/// left is still where running again finds it, a new file by its hash in its place or waiting beside it, and an old one under its own name.
+/// What was moved aside, by where it stood, for the caller to take away.
 fn place_all(folder: &Path, to_place: &[&Entry], on: &mut dyn FnMut(Progress)) -> Result<Vec<(PathBuf, PathBuf)>, Failure> {
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
     let steps = (to_place.len() * 2).max(1) as f64;
     let (mut moved, mut placed): (Vec<(PathBuf, PathBuf)>, Vec<PathBuf>) = (Vec::new(), Vec::new());
     let failed = |moved: &[(PathBuf, PathBuf)], placed: &[PathBuf], file: &str, target: &Path, error: std::io::Error| {
+        // What stays as this left it, by its place: an old file that is not back, or a new one that is still where it came and has no old one to go over it.
+        let mut stuck: Vec<&Path> = Vec::new();
+        let mut still_there: Vec<&Path> = Vec::new();
         for done in placed.iter().rev() {
-            let _ = replace(done, &beside(done));
+            if put_back(Back::WhatCame, folder, done, done, &beside(done)).is_err() {
+                still_there.push(done);
+            }
         }
         for (target, aside) in moved.iter().rev() {
-            let _ = replace(aside, target);
+            if put_back(Back::WhatWas, folder, target, aside, target).is_err() {
+                stuck.push(target);
+            }
+        }
+        // (a new file that stays where it came is put over by the old one when that goes back, and then the folder is as it was)
+        stuck.extend(still_there.into_iter().filter(|done| !moved.iter().any(|(target, _)| target == done)));
+        if !stuck.is_empty() {
+            return not_put_back(folder, &stuck);
         }
         if matches!(error.raw_os_error(), Some(5 | 32)) { Failure::InUse(file.to_string()) } else { say(target, &error) }
     };
@@ -488,6 +503,48 @@ fn place_all(folder: &Path, to_place: &[&Entry], on: &mut dyn FnMut(Progress)) -
         placed.push(target);
     }
     Ok(moved)
+}
+
+/// Which way a file goes when a failed placing is undone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Back {
+    /// What came into its place goes to waiting beside it again.
+    WhatCame,
+    /// What was moved aside goes back into its place.
+    WhatWas,
+}
+
+/// One step of undoing a failed placing: `from` renamed to `to`, for the file that stands at `target`.
+fn put_back(back: Back, folder: &Path, target: &Path, from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    let refused = tests::REFUSE_PUTTING_BACK.with(|refused| refused.borrow().iter().any(|(file, which)| *which == back && folder.join(file) == target));
+    #[cfg(not(test))]
+    let refused = {
+        let _ = (back, folder, target);
+        false
+    };
+    if refused {
+        return Err(std::io::Error::from_raw_os_error(32));
+    }
+    replace(from, to)
+}
+
+/// How many files the failure names before it says how many more there are.
+const NAMED: usize = 3;
+
+/// The failure of a placing that could not be undone: in one line, which files are not as they were, and that running the setup again finishes it. That is true of any such state: the new
+/// files are in their places or waiting beside them, which the next run finds by their hashes, and a file that is not in its place is put there by the next run.
+fn not_put_back(folder: &Path, stuck: &[&Path]) -> Failure {
+    let mut names: Vec<String> = stuck.iter().map(|path| path.strip_prefix(folder).unwrap_or(path).display().to_string()).collect();
+    names.sort();
+    names.dedup();
+    let more = names.len().saturating_sub(NAMED);
+    let mut shown = names[..names.len() - more].join(", ");
+    if more > 0 {
+        shown.push_str(&format!(" and {more} more"));
+    }
+    let was = if names.len() == 1 { "it was" } else { "they were" };
+    Failure::Said(format!("This did not finish: {shown} could not be put back as {was}, so the folder is not as it was. Running the setup again finishes it."))
 }
 
 /// The name a file is moved aside under: `NAME.previous-TIME.EXT`, as the app's own new builds do, and one no file has yet.
@@ -618,6 +675,8 @@ mod tests {
     thread_local! {
         /// The file whose coming into its place fails, as if something had opened its place in the moment between: for this thread's install.
         pub static REFUSE_PLACING: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// The put-backs of a failed placing that fail, as if something had the file open: the file, and which of its two put-backs.
+        pub static REFUSE_PUTTING_BACK: RefCell<Vec<(String, Back)>> = const { RefCell::new(Vec::new()) };
     }
 
     /// The names in a folder that something was moved aside under.
@@ -822,6 +881,95 @@ mod tests {
         assert_eq!(std::fs::read(folder.join("tools\\d.py")).unwrap(), b"new d");
         assert_eq!(read_manifest(&folder).unwrap().version, "2.0.0");
         assert!(moved_aside(&folder).is_empty() && walk(&folder).iter().all(|name| !name.ends_with(WAITING)), "{:?}", walk(&folder));
+    }
+
+    /// A file whose coming into its place fails, and one that cannot be put back after that: the failure says which, and running the setup again, with nothing refused, ends with every file
+    /// of the new version, by its hash. Both ways a put-back can fail: the new file stays in its place with the old one beside it, or the old one is not back and the new one waits.
+    #[test]
+    fn a_failed_placing_that_cannot_put_a_file_back_says_which_and_running_again_finishes() {
+        use sha2::{Digest, Sha256};
+        let hash_of = |bytes: &[u8]| -> [u8; 32] { Sha256::digest(bytes).into() };
+        let new: [(&str, &[u8]); 4] = [("a.exe", b"two a"), ("b.dll", b"two b"), ("tools\\c.py", b"two c"), ("tools\\d.py", b"new d")];
+        // (b.dll is held in its place, which neither takes the new file out of it nor puts the old one over it; then only the old one's way back is held)
+        for (refused, new_one_stays) in [(vec![("b.dll", Back::WhatCame), ("b.dll", Back::WhatWas)], true), (vec![("b.dll", Back::WhatWas)], false)] {
+            let scene = Scene::new();
+            let mut first = scene.package("1.0.0", &[("a.exe", b"one a"), ("b.dll", b"one b"), ("tools\\c.py", b"one c")]);
+            scene.run(&mut first, None, None).unwrap();
+            let folder = scene.folder();
+            let mut second = scene.package("2.0.0", &new);
+            REFUSE_PLACING.with(|refusing| *refusing.borrow_mut() = Some("tools\\c.py".into()));
+            REFUSE_PUTTING_BACK.with(|refusing| *refusing.borrow_mut() = refused.iter().map(|(file, back)| (file.to_string(), *back)).collect());
+            let failed = scene.run(&mut second, None, None).unwrap_err();
+            REFUSE_PLACING.with(|refusing| *refusing.borrow_mut() = None);
+            REFUSE_PUTTING_BACK.with(|refusing| refusing.borrow_mut().clear());
+            assert_eq!(
+                failed,
+                Failure::Said("This did not finish: b.dll could not be put back as it was, so the folder is not as it was. Running the setup again finishes it.".to_string()),
+                "{new_one_stays}"
+            );
+            // what could be put back is as it was; the file that could not is where it is said to be
+            assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"one a");
+            assert_eq!(std::fs::read(folder.join("tools\\c.py")).unwrap(), b"one c");
+            assert_eq!(folder.join("b.dll").exists(), new_one_stays);
+            assert_eq!(moved_aside(&folder).len(), 1, "the old b.dll is where it was moved to: {:?}", walk(&folder));
+            assert_eq!(beside(&folder.join("b.dll")).exists(), !new_one_stays, "{:?}", walk(&folder));
+            assert_eq!(read_manifest(&folder).unwrap().version, "1.0.0", "not done until it is all done");
+            let done = scene.run(&mut second, None, None).unwrap();
+            assert_eq!(done.unpacked + done.already_there, 4, "{done:?}");
+            for (file, bytes) in new {
+                assert_eq!(hash_file(&folder.join(file), &mut |_| {}).unwrap(), hash_of(bytes), "{file}");
+            }
+            assert_eq!(read_manifest(&folder).unwrap().version, "2.0.0");
+            assert!(moved_aside(&folder).is_empty() && walk(&folder).iter().all(|name| !name.ends_with(WAITING)), "{:?}", walk(&folder));
+            // and what it wrote down is of what is there: the next run reads nothing
+            let mut third = scene.package("2.0.1", &new);
+            assert_eq!(scene.run(&mut third, None, None).unwrap(), Installed { unpacked: 0, already_there: 4, removed: 0, hashed: 0 });
+        }
+    }
+
+    /// A new file that has no old one to go over it, and cannot be put back to waiting, stays in its place: that is named too. A file that was put back by the old one going over it is not.
+    #[test]
+    fn a_new_file_that_stays_in_its_place_is_named_and_one_the_old_file_went_over_is_not() {
+        let scene = Scene::new();
+        let mut first = scene.package("1.0.0", &[("a.exe", b"one a"), ("b.dll", b"one b")]);
+        scene.run(&mut first, None, None).unwrap();
+        let folder = scene.folder();
+        // a.exe: the new file will not go back to waiting, but the old one goes over it, and the folder is as it was
+        let mut second = scene.package("2.0.0", &[("a.exe", b"two a"), ("b.dll", b"two b"), ("z.dll", b"new z")]);
+        REFUSE_PLACING.with(|refusing| *refusing.borrow_mut() = Some("z.dll".into()));
+        REFUSE_PUTTING_BACK.with(|refusing| *refusing.borrow_mut() = vec![("a.exe".to_string(), Back::WhatCame)]);
+        let failed = scene.run(&mut second, None, None).unwrap_err();
+        assert_eq!(failed, Failure::InUse("z.dll".to_string()), "nothing is left that the person has to know of");
+        assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"one a");
+        assert!(moved_aside(&folder).is_empty(), "{:?}", walk(&folder));
+        // m.dll is new, and has no old file to go over it
+        let mut third = scene.package("3.0.0", &[("a.exe", b"two a"), ("b.dll", b"two b"), ("m.dll", b"new m"), ("z.dll", b"new z")]);
+        REFUSE_PUTTING_BACK.with(|refusing| *refusing.borrow_mut() = vec![("m.dll".to_string(), Back::WhatCame)]);
+        let failed = scene.run(&mut third, None, None).unwrap_err();
+        REFUSE_PLACING.with(|refusing| *refusing.borrow_mut() = None);
+        REFUSE_PUTTING_BACK.with(|refusing| refusing.borrow_mut().clear());
+        assert_eq!(failed, Failure::Said("This did not finish: m.dll could not be put back as it was, so the folder is not as it was. Running the setup again finishes it.".to_string()));
+        assert_eq!(std::fs::read(folder.join("m.dll")).unwrap(), b"new m");
+        let done = scene.run(&mut third, None, None).unwrap();
+        assert_eq!(done.unpacked + done.already_there, 4, "{done:?}");
+        assert_eq!(read_manifest(&folder).unwrap().version, "3.0.0");
+        assert_eq!(std::fs::read(folder.join("z.dll")).unwrap(), b"new z");
+        assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"two a");
+    }
+
+    #[test]
+    fn the_files_not_put_back_are_named_a_few_at_a_time_and_counted_after() {
+        let folder = Path::new("C:\\x");
+        let paths: Vec<PathBuf> = ["e.dll", "tools\\d.py", "a.exe", "c.dll", "b.dll"].iter().map(|name| folder.join(name)).collect();
+        let stuck: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        let said = |failure: Failure| match failure {
+            Failure::Said(words) => words,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(said(not_put_back(folder, &stuck)), "This did not finish: a.exe, b.dll, c.dll and 2 more could not be put back as they were, so the folder is not as it was. Running the setup again finishes it.");
+        assert_eq!(said(not_put_back(folder, &stuck[..3])), "This did not finish: a.exe, e.dll, tools\\d.py could not be put back as they were, so the folder is not as it was. Running the setup again finishes it.");
+        assert!(said(not_put_back(folder, &stuck[2..3])).contains(": a.exe could not be put back as it was,"));
+        assert!(said(not_put_back(folder, &[stuck[0], stuck[0]])).contains(": e.dll could not be put back as it was,"), "a file named twice is named once");
     }
 
     #[test]
