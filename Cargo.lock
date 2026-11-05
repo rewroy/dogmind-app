@@ -227,6 +227,7 @@ name = "dogmind-setup"
 version = "0.1.4"
 dependencies = [
  "flate2",
+ "serde_json",
  "sha2",
  "tempfile",
  "windows",

@@ -4,6 +4,9 @@
 //!     MAGIC, the index's place, length and hash
 //!     each file's bytes
 //!     the index
+//!
+//! Beside each setup that is packed goes its `.parts` file: JSON that says what is where in the setup, so that the app can fetch the part of it that has changed and put together a setup
+//! of its own, with a method of KEPT for each file whose bytes it did not fetch (the file is in the install folder already, with that hash).
 
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -11,11 +14,20 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-const MAGIC: &[u8; 16] = b"DogmindSetup\x1a\x01\0\0";
-const HEADER: u64 = 16 + 8 + 8 + 32;
+pub const MAGIC: &[u8; 16] = b"DogmindSetup\x1a\x01\0\0";
+pub const HEADER: u64 = 16 + 8 + 8 + 32;
 const BLOCK: usize = 1 << 20;
-const STORED: u8 = 0;
-const DEFLATED: u8 = 1;
+pub const STORED: u8 = 0;
+pub const DEFLATED: u8 = 1;
+/// No bytes in the package: the file is in the install folder already, and the install checks it has the hash.
+pub const KEPT: u8 = 2;
+/// What the `.parts` file's JSON calls itself, for a reader to say that it is not one that it knows.
+pub const PARTS_FORMAT: u64 = 1;
+
+/// The `.parts` file of the setup at `exe`: `DogmindSetup-X.exe` has `DogmindSetup-X.parts`.
+pub fn parts_path(exe: &Path) -> PathBuf {
+    exe.with_extension("parts")
+}
 
 fn invalid(words: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, words.into())
@@ -99,7 +111,8 @@ pub struct Entry {
 /// What a package says of itself.
 pub struct Package {
     file: File,
-    base: u64,
+    /// Where the package begins in the file: the length of the program before it.
+    pub base: u64,
     pub version: String,
     pub entries: Vec<Entry>,
 }
@@ -206,6 +219,7 @@ impl Package {
         match entry.method {
             STORED => pump(&mut std::io::BufReader::with_capacity(BLOCK, raw))?,
             DEFLATED => pump(&mut flate2::read::DeflateDecoder::new(std::io::BufReader::with_capacity(BLOCK, raw)))?,
+            KEPT => return Err(invalid(format!("{}: this setup does not hold its bytes: the file is kept from the install", entry.path))),
             other => return Err(invalid(format!("{}: a way of packing this program does not know ({other})", entry.path))),
         }
         if written != entry.size || digest.finalize().as_slice() != entry.sha256 {
@@ -263,14 +277,72 @@ pub struct PackedSize {
     pub stored: u64,
 }
 
-/// `stub`, then `folder` as a package: one file, written beside `out` until it is whole. `level`: of deflate, 0 to 9.
+/// What a setup says of itself, as the `.parts` file has it, read from the file itself: the program's length and hash, the package's header, and each entry. The same reading is what the file
+/// is written from and what it is checked by, so that it describes the setup byte for byte.
+pub fn describe(exe: &Path) -> io::Result<serde_json::Value> {
+    let package = Package::open(exe)?;
+    let mut file = File::open(exe)?;
+    let length = file.metadata()?.len();
+    let mut header = [0u8; HEADER as usize];
+    file.seek(SeekFrom::Start(package.base))?;
+    file.read_exact(&mut header)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; BLOCK];
+    let mut left = package.base;
+    while left > 0 {
+        let count = file.read(&mut buffer[..left.min(BLOCK as u64) as usize])?;
+        if count == 0 {
+            return Err(invalid("the program before the package ends early"));
+        }
+        digest.update(&buffer[..count]);
+        left -= count as u64;
+    }
+    let stub_sha256: [u8; 32] = digest.finalize().into();
+    let word = |from: usize| u64::from_le_bytes(header[from..from + 8].try_into().expect("eight bytes"));
+    let entries: Vec<serde_json::Value> = package
+        .entries
+        .iter()
+        .map(|entry| serde_json::json!({ "path": entry.path, "size": entry.size, "offset": entry.offset, "stored": entry.stored, "method": entry.method, "sha256": hex(&entry.sha256) }))
+        .collect();
+    Ok(serde_json::json!({
+        "format": PARTS_FORMAT,
+        "version": package.version,
+        "length": length,
+        "base": package.base,
+        "stub_sha256": hex(&stub_sha256),
+        "header": { "index_at": word(16), "index_length": word(24), "index_sha256": hex(header[32..64].try_into().expect("thirty-two bytes")) },
+        "entries": entries,
+    }))
+}
+
+/// Whether the `.parts` file beside the setup at `exe` describes that setup, byte for byte.
+pub fn check_parts(exe: &Path) -> io::Result<usize> {
+    let written: serde_json::Value = serde_json::from_slice(&std::fs::read(parts_path(exe))?).map_err(|error| invalid(format!("{}: {error}", parts_path(exe).display())))?;
+    if written != describe(exe)? {
+        return Err(invalid(format!("{} does not describe {}", parts_path(exe).display(), exe.display())));
+    }
+    Ok(written["entries"].as_array().map_or(0, Vec::len))
+}
+
+/// `stub`, then `folder` as a package: one file, written beside `out` until it is whole, and beside it its `.parts` file. `level`: of deflate, 0 to 9.
 pub fn pack(stub: &Path, folder: &Path, out: &Path, version: &str, level: u32, on_file: &mut dyn FnMut(&str)) -> io::Result<PackedSize> {
     let mut source = File::open(stub)?;
     let stub_length = overlay_start(&mut source)?;
     source.seek(SeekFrom::Start(0))?;
     let partial = out.with_extension("packing");
     let mut target = File::create(&partial)?;
-    std::io::copy(&mut (&mut source).take(stub_length), &mut target)?;
+    let mut block = vec![0u8; BLOCK];
+    let mut left = stub_length;
+    while left > 0 {
+        let count = source.read(&mut block[..left.min(BLOCK as u64) as usize])?;
+        if count == 0 {
+            return Err(invalid("the program ends before its own sections do"));
+        }
+        target.write_all(&block[..count])?;
+        left -= count as u64;
+    }
+    drop(block);
     target.write_all(&[0u8; HEADER as usize])?;
     let mut entries = Vec::new();
     let mut packed = PackedSize::default();
@@ -318,7 +390,13 @@ pub fn pack(stub: &Path, folder: &Path, out: &Path, version: &str, level: u32, o
     target.write_all(&Sha256::digest(&index))?;
     target.sync_all()?;
     drop(target);
+    // What goes in the `.parts` file is read back from the file just written, and it goes beside it only once that is whole: one from an earlier run is gone first.
+    let parts = parts_path(out);
+    let waiting = parts.with_extension("parts-packing");
+    std::fs::write(&waiting, serde_json::to_vec(&describe(&partial)?).map_err(|error| invalid(error.to_string()))?)?;
+    let _ = std::fs::remove_file(&parts);
     std::fs::rename(&partial, out)?;
+    std::fs::rename(&waiting, &parts)?;
     Ok(packed)
 }
 
@@ -447,5 +525,114 @@ pub mod tests {
         }
         assert!(is_shipped("a.exe") && !is_shipped("x\\A.PDB") && !is_shipped("tools\\.open-to-sandbox") && !is_shipped("dogmind-app.previous-002327.exe") && !is_shipped("x.dll.dogmind-new"));
         assert!(!is_shipped("straydog.previous-163000.exe") && !is_shipped("cublasLt64_13.previous-163000.dll") && !is_shipped("fonts\\BIZUDGothic-Regular.previous-163000.ttf"));
+    }
+
+    /// `setup` with the files named left out of it: its index says KEPT of each, and none of their bytes are in it. What the app puts together from the parts of a setup it fetched.
+    pub fn leave_out(setup: &Path, out: &Path, kept: &[&str]) {
+        let package = Package::open(setup).unwrap();
+        let mut input = File::open(setup).unwrap();
+        let mut file = vec![0u8; package.base as usize];
+        input.read_exact(&mut file).unwrap();
+        let (mut body, mut entries) = (Vec::new(), Vec::new());
+        for entry in package.entries.clone() {
+            if kept.contains(&entry.path.as_str()) {
+                entries.push(Entry { offset: 0, stored: 0, method: KEPT, ..entry });
+            } else {
+                input.seek(SeekFrom::Start(package.base + entry.offset)).unwrap();
+                let mut bytes = vec![0u8; entry.stored as usize];
+                input.read_exact(&mut bytes).unwrap();
+                entries.push(Entry { offset: HEADER + body.len() as u64, ..entry });
+                body.extend_from_slice(&bytes);
+            }
+        }
+        let index = index_bytes(&package.version, &entries);
+        file.extend_from_slice(MAGIC);
+        file.extend_from_slice(&(HEADER + body.len() as u64).to_le_bytes());
+        file.extend_from_slice(&(index.len() as u64).to_le_bytes());
+        file.extend_from_slice(&Sha256::digest(&index));
+        file.extend_from_slice(&body);
+        file.extend_from_slice(&index);
+        std::fs::write(out, file).unwrap();
+    }
+
+    #[test]
+    fn the_parts_file_describes_the_setup_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("in");
+        let big = vec![7u8; 2 << 20];
+        let random = noise(300_000);
+        tree(&folder, &[("a.txt", b"hello"), ("deep\\er\\b.bin", &big), ("deep\\noise", &random), ("\u{65e5}\u{672c}\\c d", b"x"), ("empty", b"")]);
+        let out = dir.path().join("Setup.exe");
+        pack(&own_exe(), &folder, &out, "1.2.3", 6, &mut |_| {}).unwrap();
+        assert_eq!(parts_path(&out), dir.path().join("Setup.parts"));
+        let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name != "in").collect();
+        assert_eq!(names.len(), 2, "the setup and its parts file, and nothing left packing: {names:?}");
+
+        let parts: serde_json::Value = serde_json::from_slice(&std::fs::read(parts_path(&out)).unwrap()).unwrap();
+        let package = Package::open(&out).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(parts["format"], PARTS_FORMAT);
+        assert_eq!(parts["version"], "1.2.3");
+        assert_eq!(parts["length"], bytes.len() as u64);
+        assert_eq!(parts["base"], package.base);
+        assert_eq!(parts["stub_sha256"], hex(&Sha256::digest(&bytes[..package.base as usize]).into()));
+        let header = &bytes[package.base as usize..][..HEADER as usize];
+        assert_eq!(&header[..16], MAGIC);
+        assert_eq!(parts["header"]["index_at"], u64::from_le_bytes(header[16..24].try_into().unwrap()));
+        assert_eq!(parts["header"]["index_length"], u64::from_le_bytes(header[24..32].try_into().unwrap()));
+        assert_eq!(parts["header"]["index_sha256"], hex(header[32..64].try_into().unwrap()));
+        let listed = parts["entries"].as_array().unwrap();
+        assert_eq!(listed.len(), package.entries.len());
+        for (listed, entry) in listed.iter().zip(&package.entries) {
+            assert_eq!(listed["path"], entry.path.as_str());
+            assert_eq!((listed["size"].as_u64(), listed["offset"].as_u64(), listed["stored"].as_u64(), listed["method"].as_u64()), (Some(entry.size), Some(entry.offset), Some(entry.stored), Some(u64::from(entry.method))));
+            assert_eq!(listed["sha256"], hex(&entry.sha256));
+        }
+        assert_eq!(check_parts(&out).unwrap(), 5);
+
+        // A setup that is not the one it was made with is not described by it: a byte of the program, a signature on the end, or another setup altogether.
+        let changed = |name: &str, bytes: Vec<u8>| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::copy(parts_path(&out), parts_path(&path)).unwrap();
+            path
+        };
+        let mut other = bytes.clone();
+        other[100] ^= 1;
+        assert!(check_parts(&changed("program.exe", other)).unwrap_err().to_string().contains("does not describe"));
+        assert!(check_parts(&changed("signed.exe", [bytes.clone(), vec![9u8; 100]].concat())).is_err());
+        tree(&folder, &[("a.txt", b"hullo")]);
+        let again = dir.path().join("Again.exe");
+        pack(&own_exe(), &folder, &again, "1.2.3", 6, &mut |_| {}).unwrap();
+        std::fs::copy(parts_path(&out), parts_path(&again)).unwrap();
+        assert!(check_parts(&again).is_err());
+        // and a file that is not there is not a description of anything
+        assert!(check_parts(&dir.path().join("nothing.exe")).is_err());
+    }
+
+    #[test]
+    fn a_package_that_leaves_files_out_opens_and_will_not_unpack_what_it_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("in");
+        let random = noise(200_000);
+        tree(&folder, &[("a.txt", b"hello"), ("b.bin", &random), ("c.txt", &vec![3u8; 100_000])]);
+        let whole = dir.path().join("Whole.exe");
+        pack(&own_exe(), &folder, &whole, "2.0.0", 6, &mut |_| {}).unwrap();
+        let part = dir.path().join("Part.exe");
+        leave_out(&whole, &part, &["b.bin"]);
+        let mut package = Package::open(&part).unwrap();
+        assert_eq!(package.version, "2.0.0");
+        assert_eq!(package.entries.iter().map(|entry| (entry.path.as_str(), entry.method)).collect::<Vec<_>>(), [("a.txt", STORED), ("b.bin", KEPT), ("c.txt", DEFLATED)]);
+        let kept = package.entries[1].clone();
+        assert_eq!((kept.size, kept.stored, kept.sha256), (200_000, 0, Sha256::digest(&random).into()), "it is known by its size and its hash, and has no bytes");
+        let error = package.extract(&kept, &mut Vec::new(), &mut |_| {}).unwrap_err().to_string();
+        assert!(error.contains("b.bin") && error.contains("kept from the install"), "{error}");
+        for (name, wanted) in [("a.txt", &b"hello"[..]), ("c.txt", &[3u8; 100_000][..])] {
+            let entry = package.entries.iter().find(|entry| entry.path == name).unwrap().clone();
+            let mut back = Vec::new();
+            package.extract(&entry, &mut back, &mut |_| {}).unwrap();
+            assert_eq!(back, wanted, "{name}");
+        }
+        assert!(std::fs::metadata(&part).unwrap().len() < std::fs::metadata(&whole).unwrap().len() - 190_000);
     }
 }
