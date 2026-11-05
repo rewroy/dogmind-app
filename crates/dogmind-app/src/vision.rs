@@ -59,6 +59,15 @@ fn places(installed: &Installed) -> Vec<PathBuf> {
     std::iter::once(installed.model.clone()).chain(installed.model.parent().map(Path::to_path_buf)).collect()
 }
 
+/// Every file the engine would find, or every one set aside: not the first only.
+fn all_found(installed: &Installed, wanted: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = places(installed).into_iter().flat_map(|place| std::fs::read_dir(place).into_iter().flatten().flatten().map(|entry| entry.path()).collect::<Vec<_>>())
+        .filter(|path| path.is_file() && path.file_name().and_then(|name| name.to_str()).is_some_and(&wanted)).collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
 fn found(installed: &Installed, wanted: impl Fn(&str) -> bool) -> Option<PathBuf> {
     places(installed).into_iter().find_map(|place| {
         let mut files: Vec<PathBuf> = std::fs::read_dir(place).into_iter().flatten().flatten().map(|entry| entry.path())
@@ -93,27 +102,39 @@ fn with_key(config: &str, on: bool) -> String {
     }).collect::<Vec<_>>().join("\n") + "\n"
 }
 
-/// For the engine's next start, which is not this one: a running engine has the file open.
-pub fn switch(config_file: &Path, on: bool) -> Result<(), String> {
+/// For the engine's next start, which is not this one: a running engine has the file open. Whether anything was changed: false when there was no vision file to move and no setting to
+/// turn, which is not an error, but is not the same as having done it.
+pub fn switch(config_file: &Path, on: bool) -> Result<bool, String> {
     let config = std::fs::read_to_string(config_file).map_err(|error| format!("{}: {error}", config_file.display()))?;
+    let mut changed = false;
     if config.lines().any(|line| line.trim_start().trim_start_matches('#').trim_start().split_once('=').is_some_and(|(name, _)| name.trim() == "model_vision")) {
-        std::fs::write(config_file, with_key(&config, on)).map_err(|error| format!("{}: {error}", config_file.display()))?;
+        let written = with_key(&config, on);
+        if written.trim_end() != config.trim_end() {
+            std::fs::write(config_file, written).map_err(|error| format!("{}: {error}", config_file.display()))?;
+            changed = true;
+        }
     }
     let config = std::fs::read_to_string(config_file).map_err(|error| format!("{}: {error}", config_file.display()))?;
-    let Some(installed) = installed(&config) else { return Ok(()) };
+    let Some(installed) = installed(&config) else { return Ok(changed) };
     if on {
-        if let Some(off) = found(&installed, |name| name.strip_suffix(SET_ASIDE).is_some_and(is_vision_file)) {
+        // (every one that was set aside, as turning it off sets aside every one the engine would find)
+        for off in all_found(&installed, |name| name.strip_suffix(SET_ASIDE).is_some_and(is_vision_file)) {
             let name = off.to_string_lossy().strip_suffix(SET_ASIDE).map(PathBuf::from).unwrap_or_else(|| off.clone());
+            // (one by that name is there already: it is the one in use, and the one set aside is not put over it)
+            if name.exists() {
+                continue;
+            }
             std::fs::rename(&off, &name).map_err(|error| format!("{}: {error}", off.display()))?;
+            changed = true;
         }
     } else {
-        // (every one the engine would find)
-        while let Some(file) = found(&installed, is_vision_file) {
+        for file in all_found(&installed, is_vision_file) {
             let aside = format!("{}{SET_ASIDE}", file.display());
             std::fs::rename(&file, &aside).map_err(|error| format!("{}: {error}", file.display()))?;
+            changed = true;
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -183,6 +204,29 @@ mod tests {
         assert!(aside.is_file());
         switch(&config, true).unwrap();
         assert_eq!(state(&read), State::On(beside));
+    }
+
+    /// More than one file may be set aside (the model's folder and the one beside it): turning it on puts every one back, as turning it off set every one aside. And a switch that finds
+    /// nothing to move says so.
+    #[test]
+    fn turning_it_on_puts_back_every_file_and_says_when_there_was_nothing_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, read) = setup(dir.path(), "");
+        let (beside, inside) = (dir.path().join("Qwen").join("mmproj-a.gguf"), read.model.join("mmproj-b.gguf"));
+        file(&beside);
+        file(&inside);
+        assert_eq!(switch(&config, true).unwrap(), false, "both are on: nothing to change");
+        assert_eq!(switch(&config, false).unwrap(), true);
+        assert!(!beside.exists() && !inside.exists() && dir.path().join("Qwen").join("mmproj-a.gguf.off").is_file() && read.model.join("mmproj-b.gguf.off").is_file());
+        assert_eq!(switch(&config, false).unwrap(), false, "both are off: nothing to change");
+        assert_eq!(switch(&config, true).unwrap(), true);
+        assert!(beside.is_file() && inside.is_file(), "every one is put back, not the first only");
+        assert!(!dir.path().join("Qwen").join("mmproj-a.gguf.off").exists() && !read.model.join("mmproj-b.gguf.off").exists());
+        assert!(matches!(state(&read), State::On(_)));
+        // (one that is there already is the one in use, and what was set aside under its name is not put over it)
+        std::fs::write(dir.path().join("Qwen").join("mmproj-a.gguf.off"), b"older").unwrap();
+        assert_eq!(switch(&config, true).unwrap(), false);
+        assert_eq!(std::fs::read(&beside).unwrap(), b"x");
     }
 
     #[test]
