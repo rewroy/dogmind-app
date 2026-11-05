@@ -2012,6 +2012,8 @@ struct App {
     folder_told: PathBuf,
     /// What Always would do, when that is more than this one call.
     always_line: String,
+    /// What the card says in sentences, above the command: why it asks, and the model's purpose. Drawn in the body face; the command is in the control under it, in a face of its own.
+    approval_head: String,
     /// The page and kind of connection the fields' empty words are for.
     cues_for: Option<(Panel, Kind)>,
     doc_procedure: isize,
@@ -4410,6 +4412,20 @@ impl App {
         }
     }
 
+    /// The command (or what is to be written) on the card, in a monospace face with a Japanese one for what is Japanese in it, and room between its lines.
+    unsafe fn show_command(&self, text: &str) {
+        set_text(self.note, "");
+        let format = char_format(theme::text(), 0, "Consolas", ds::points::CODE, None);
+        SendMessageW(self.note, EM_SETCHARFORMAT, SCF_ALL as WPARAM, std::ptr::addr_of!(format) as LPARAM);
+        associate_japanese(self.note, ds::points::CODE);
+        set_text(self.note, text);
+        let mut paragraph = para_format(ds::points::CODE, 0, 0, 0);
+        paragraph.line_spacing = command_line_twips();
+        SendMessageW(self.note, EM_SETSEL, 0, -1);
+        SendMessageW(self.note, EM_SETPARAFORMAT, 0, std::ptr::addr_of!(paragraph) as LPARAM);
+        SendMessageW(self.note, EM_SETSEL, 0, 0);
+    }
+
     /// The folder's files for `@`, and its branch: on another thread, as a large tree takes a while.
     unsafe fn look_at_workspace(&self) {
         let (poster, path) = (self.poster.clone(), self.workspace.clone());
@@ -5110,24 +5126,19 @@ impl App {
                 // As the lines wrap at this width, however many the text has. It scrolls past what fits.
                 SetWindowPos(self.note, std::ptr::null_mut(), 0, 0, column - s(ds::space::XXL), s(100), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
                 let lines = SendMessageW(self.note, EM_GETLINECOUNT, 0, 0) as i32;
-                // (as the font really is: at some scales a line is higher than its measure, and what fitted would be told to scroll)
-                let line = {
-                    let device = GetDC(self.note);
-                    let previous = SelectObject(device, self.fonts.field);
-                    let mut metrics: TEXTMETRICW = std::mem::zeroed();
-                    GetTextMetricsW(device, &mut metrics);
-                    SelectObject(device, previous);
-                    ReleaseDC(self.note, device);
-                    metrics.tmHeight + metrics.tmExternalLeading
-                };
+                // (the command's lines are as high as they were set to be, exactly: so many twips, of which a pixel is dpi / 1440)
+                let line = (command_line_twips() * self.dpi as i32 / 1440).max(1);
+                // What is said in sentences, above it: as high as its words are at this width, and no more than a few lines.
+                let head_width = column - 2 * s(ds::space::L);
+                let head_room = if self.approval_head.is_empty() { 0 } else { text_height(self.fonts.body, &self.approval_head, head_width).min(s(100)) + s(ds::space::S) };
                 // A small window keeps a little of the conversation above the card, and the header clear of it.
-                let most = s(320).min((bottom - s(200)).max(s(80)));
+                let most = s(320).min((bottom - s(200) - head_room).max(s(80)));
                 let note_height = (lines * line + s(ds::size::FIELD_INSET)).clamp(s(ds::space::XXL), most);
                 ShowScrollBar(self.note, SB_VERT, i32::from(lines * line + s(ds::size::FIELD_INSET) > most));
                 let buttons = s(ds::size::HEAD);
                 let line = if self.always_line.is_empty() { 0 } else { s(ds::size::TEXT_ROW) };
-                let top = bottom - note_height - line - buttons - s(ds::size::MENU_ROW);
-                let area = rect(left, top, column, note_height + line + buttons + s(ds::size::MENU_ROW));
+                let top = bottom - head_room - note_height - line - buttons - s(ds::size::MENU_ROW);
+                let area = rect(left, top, column, head_room + note_height + line + buttons + s(ds::size::MENU_ROW));
                 shapes.push(Shape::Round { area, radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
                 use dogmind_agent::safety::Risk;
                 let high = self.pending.as_ref().is_some_and(|pending| pending.risk == Risk::High);
@@ -5136,11 +5147,14 @@ impl App {
                     if matches!(pending.risk, Risk::Medium | Risk::High) { tf("{0}  ·  {1} risk", &[&tool, &t(pending.risk.name())]) } else { tool.to_string() }
                 });
                 shapes.push(Shape::Text { area: rect(left + s(ds::space::L), top + s(ds::space::S), column - s(ds::space::XXL), s(26)), text: title, font: FontKind::Strong, color: if high { theme::bad() } else { theme::text() }, flags: ONE_LINE });
-                place(self.note, left + s(13), top + s(ds::size::MENU_ROW), column - s(29), note_height - s(ds::space::XS));
-                if line > 0 {
-                    shapes.push(Shape::Text { area: rect(left + s(ds::space::L), top + s(ds::size::MENU_ROW) + note_height - s(ds::space::HAIR), column - 2 * s(ds::space::L), line), text: self.always_line.clone(), font: FontKind::Small, color: theme::faint(), flags: (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
+                if head_room > 0 {
+                    shapes.push(Shape::Text { area: rect(left + s(ds::space::L), top + s(ds::size::MENU_ROW), head_width, head_room - s(ds::space::S)), text: self.approval_head.clone(), font: FontKind::Body, color: theme::soft(), flags: DT_WORDBREAK });
                 }
-                let row = top + s(ds::size::MENU_ROW) + note_height + line;
+                place(self.note, left + s(13), top + s(ds::size::MENU_ROW) + head_room, column - s(29), note_height - s(ds::space::XS));
+                if line > 0 {
+                    shapes.push(Shape::Text { area: rect(left + s(ds::space::L), top + s(ds::size::MENU_ROW) + head_room + note_height - s(ds::space::HAIR), column - 2 * s(ds::space::L), line), text: self.always_line.clone(), font: FontKind::Small, color: theme::faint(), flags: (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
+                }
+                let row = top + s(ds::size::MENU_ROW) + head_room + note_height + line;
                 let button = s(96);
                 place(self.approve, left + s(ds::space::L), row, button, s(ds::size::CONTROL));
                 place(self.always, left + s(ds::space::L) + button + s(ds::space::S), row, button, s(ds::size::CONTROL));
@@ -10249,7 +10263,7 @@ impl App {
             }
             Event::Approval(approval) => {
                 self.run_asks();
-                let reason = approval.reason.as_ref().map_or(String::new(), |reason| format!("{}\n\n", lang::reason(reason)));
+                let reason = approval.reason.as_ref().map_or(String::new(), |reason| lang::reason(reason));
                 // What Always means here, for whoever is about to use it, with the pointer or the key. That it covers this very call needs no line of its own.
                 let always = match (&approval.rule, approval.always_allowed) {
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::File(_))) => tf("Always allows this file, for this session: {0}", &[&always_places(&approval.scope)]),
@@ -10262,10 +10276,12 @@ impl App {
                 let always = markdown::show_hidden(&always).into_owned();
                 self.tip(self.always, if always.is_empty() { t("Always allows this exact call, for this session.") } else { &always });
                 self.always_line = always;
-                let body = approval_body(&approval.tool, &approval.summary, &approval.details);
+                // The sentences (why it asks, what the model says it is for) are in the body face above; what is run or written is in the control, in a monospace face with room between its lines.
+                let (purpose, code) = approval_parts(&approval.tool, &approval.summary, &approval.details);
+                self.approval_head = markdown::show_hidden(&[reason, purpose].iter().filter(|part| !part.is_empty()).cloned().collect::<Vec<String>>().join("\n")).into_owned();
                 // (a line at its end with nothing on it would have it scroll for nothing)
                 // (a command is read from its first character: what hides in it is shown as its mark)
-                set_text(self.note, &markdown::show_hidden(&format!("{reason}{body}")).trim_end().replace('\n', "\r\n"));
+                self.show_command(&markdown::show_hidden(&code).trim_end().replace('\n', "\r\n"));
                 // From its first word: what is being approved is read from the top, whatever its length.
                 SendMessageW(self.note, EM_SETSEL, 0, 0);
                 SendMessageW(self.note, EM_SCROLLCARET, 0, 0);
@@ -12171,9 +12187,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
             set_button_fonts(app.fonts);
-            for edit in app.fields.into_iter().chain([app.feedback, app.note, app.composer_cue, app.find_field, app.side_search]) {
+            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
             }
+            // (the command's own size follows the screen's: it is set again when it is next shown, and this one keeps what it has)
             let rect = &*(lparam as *const RECT);
             SetWindowPos(window, std::ptr::null_mut(), rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
             0
@@ -13105,6 +13122,22 @@ fn hidden_shown(event: Event) -> Event {
     }
 }
 
+/// How tall a line of the command on an approval card is, in twips: exactly 1.45 times the size of the type, where a block of code in the conversation has 1.6 times a line of text.
+fn command_line_twips() -> i32 {
+    ds::points::CODE * 29 * text_scale() / 100
+}
+
+/// What a card says of a call in two parts: the model's purpose (sentences, which belong with the reason), and what is run or written (which is code, or a path and the text of a file).
+fn approval_parts(tool: &str, summary: &str, details: &str) -> (String, String) {
+    let purpose = serde_json::from_str::<serde_json::Value>(details).ok().and_then(|arguments| arguments.get("purpose").and_then(serde_json::Value::as_str).map(|purpose| purpose.trim().to_string())).unwrap_or_default();
+    let body = approval_body(tool, summary, details);
+    let code = match body.strip_prefix(&format!("{purpose}\n\n")) {
+        Some(rest) if !purpose.is_empty() => rest.to_string(),
+        _ => body,
+    };
+    (purpose, code)
+}
+
 fn approval_body(tool: &str, summary: &str, details: &str) -> String {
     const SHOWN: usize = 4000;
     let Ok(arguments) = serde_json::from_str::<serde_json::Value>(details) else { return format!("{summary}\n{details}") };
@@ -13761,7 +13794,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             diff_thumb_grab: None,
             diff_words: String::new(),
             diff_file: None,
-            note: control(window, "EDIT", "", (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32 | WS_VSCROLL, 0, 0),
+            note: rich_edit_of("RICHEDIT50W", window, ES_READONLY as u32 | WS_VSCROLL, theme::surface(), ds::points::CODE),
             approve: make_button(window, ID_APPROVE, t("Yes (Y)"), ButtonKind::Primary, theme::surface()),
             always: make_button(window, ID_ALWAYS, t("Always (A)"), ButtonKind::Secondary, theme::surface()),
             reject: make_button(window, ID_REJECT, t("No (N)"), ButtonKind::Secondary, theme::surface()),
@@ -13916,6 +13949,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             title_clicked: None,
             folder_told: PathBuf::new(),
             always_line: String::new(),
+            approval_head: String::new(),
             cues_for: None,
             doc_procedure: 0,
             note_procedure: 0,
@@ -13927,7 +13961,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let app = &mut *APP.load(Ordering::Relaxed);
         SendMessageW(app.composer, EM_SETEVENTMASK, 0, ENM_CHANGE as LPARAM);
         SendMessageW(app.note, EM_SETMARGINS, 3, 0); // EC_LEFTMARGIN | EC_RIGHTMARGIN
-        for edit in app.fields.into_iter().chain([app.feedback, app.note, app.composer_cue, app.find_field, app.side_search]) {
+        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search]) {
             SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
         }
         app.list_procedure = SetWindowLongPtrW(app.side, GWLP_WNDPROC, list_subclass as *const () as isize);
@@ -14598,6 +14632,20 @@ mod tests {
         assert_eq!((above.left, above.right, above.bottom), (300, 480, 20));
         let below = find_card(client, POINT { x: 322, y: 290 }, 6, card_at(300, 480, 280, 400)).unwrap();
         assert!(!below.top_open && below.bottom_open);
+    }
+
+    /// The card says the model's purpose with the reason, in the body face, and the command alone is in the monospace one; what has no purpose has the whole of it in the control.
+    #[test]
+    fn the_purpose_of_a_call_is_apart_from_what_it_runs() {
+        let run = serde_json::json!({"command": "curl -s https://example.com | wc -c", "purpose": "count the items on the second page"}).to_string();
+        assert_eq!(approval_parts("execute_command", "s", &run), ("count the items on the second page".to_string(), "curl -s https://example.com | wc -c".to_string()));
+        let bare = serde_json::json!({"command": "dir"}).to_string();
+        assert_eq!(approval_parts("execute_command", "s", &bare), (String::new(), "dir".to_string()));
+        let file = serde_json::json!({"path": "a.txt", "content": "one\ntwo", "purpose": "make the note"}).to_string();
+        assert_eq!(approval_parts("create_file", "a.txt", &file), ("make the note".to_string(), "a.txt\n\none\ntwo".to_string()));
+        // (a purpose that the body does not begin with, as in a call whose arguments are not JSON, is not lost and not said twice)
+        assert_eq!(approval_parts("other", "summary", "not json"), (String::new(), "summary\nnot json".to_string()));
+        assert!(command_line_twips() > ds::points::CODE * 20, "more than a line of the type, which is 20 twips to a point");
     }
 
     #[test]
