@@ -26,6 +26,7 @@ const MOST_SHOWN: usize = 100;
 const MANIFEST: &str = "manifest.json";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 struct Entry {
     size: u64,
     modified: Option<u128>,
@@ -36,7 +37,9 @@ struct Entry {
     gone: bool,
 }
 
+/// A manifest of an older or a newer build may lack a field, or have one more: what it has is read, and what it lacks is empty, and it is no reason to take the starting point anew.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Baseline {
     /// HEAD when the session began; none outside a repository, or in one with no commit yet.
     pub head: Option<String>,
@@ -44,8 +47,26 @@ pub struct Baseline {
     files: BTreeMap<String, Entry>,
     /// Whether every file was looked at.
     whole: bool,
+    /// When the starting point was taken anew because the record of the first could not be read: what changed before then is not known, and `changes` says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved: Option<String>,
     #[serde(skip)]
     session: PathBuf,
+}
+
+/// A file's whole new content, written beside it and then in its place: a crash in the middle leaves the old file or none, and never a cut one that the next look takes for whole.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let partial = path.with_extension(format!("partial-{}", std::process::id()));
+    let done = std::fs::File::create(&partial)
+        .and_then(|mut out| {
+            std::io::Write::write_all(&mut out, bytes)?;
+            out.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&partial, path));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    done
 }
 
 pub fn folder_of(session: &Path) -> PathBuf {
@@ -77,7 +98,9 @@ fn entry_of(folder: &Path, name: &str, path: &Path, data: &std::fs::Metadata, ke
         if let Ok(bytes) = std::fs::read(path) {
             if !binary(&bytes) && std::fs::create_dir_all(folder).is_ok() {
                 let copy: String = Sha256::digest(&bytes).iter().take(16).map(|byte| format!("{byte:02x}")).collect();
-                if folder.join(&copy).exists() || std::fs::write(folder.join(&copy), &bytes).is_ok() {
+                // (named by what it holds, so one that is there is the same, unless a crash cut it: it is used only at the size of the file it is a copy of)
+                let there = std::fs::metadata(folder.join(&copy)).is_ok_and(|data| data.len() == entry.size && data.len() == bytes.len() as u64);
+                if there || write_atomically(&folder.join(&copy), &bytes).is_ok() {
                     *kept += entry.size;
                     entry.copy = Some(copy);
                 }
@@ -99,12 +122,22 @@ impl Baseline {
     /// A session's, as it was first taken; taken now if it has none.
     pub fn for_session(session: &Path, workspace: &Path) -> Baseline {
         let folder = folder_of(session);
-        let kept = std::fs::read_to_string(folder.join(MANIFEST)).ok().and_then(|text| serde_json::from_str::<Baseline>(&text).ok());
+        let text = std::fs::read_to_string(folder.join(MANIFEST));
+        let kept = text.as_ref().ok().and_then(|text| serde_json::from_str::<Baseline>(text).ok());
+        // A record that is there and cannot be read is not written over: it is kept aside, and the starting point, taken now, says that it moved.
+        let damaged = kept.is_none() && folder.join(MANIFEST).exists();
+        if damaged {
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let _ = std::fs::rename(folder.join(MANIFEST), folder.join(format!("manifest.damaged-{stamp}")));
+        }
         let mut baseline = kept.unwrap_or_else(|| {
-            let taken = Baseline::take(&folder, workspace);
+            let mut taken = Baseline::take(&folder, workspace);
+            if damaged {
+                taken.moved = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+            }
             if std::fs::create_dir_all(&folder).is_ok() {
                 if let Ok(text) = serde_json::to_string(&taken) {
-                    let _ = std::fs::write(folder.join(MANIFEST), text);
+                    let _ = write_atomically(&folder.join(MANIFEST), text.as_bytes());
                 }
             }
             taken
@@ -158,7 +191,7 @@ impl Baseline {
                 }
             }
         }
-        Baseline { head, files, whole, session: PathBuf::new() }
+        Baseline { head, files, whole, moved: None, session: PathBuf::new() }
     }
 
     /// The files that may differ from the beginning, and whether that is all of them.
@@ -268,10 +301,12 @@ impl Baseline {
             }
         }
         let partly = if whole { "" } else { "--- too much to look through completely, so this may not be everything ---\n" };
+        // (said every time: what changed before the starting point moved is not in this, and a model that reads "nothing changed" would take it for the whole session)
+        let moved = self.moved.as_ref().map_or(String::new(), |time| format!("note: the record of where this session began could not be read, so it began again at {time}: what the session changed before then is not shown here, and the files themselves are the way to see it.\n"));
         if lines.is_empty() {
-            return partly.to_string();
+            return format!("{partly}{moved}");
         }
-        format!("{partly}{}\n\n{}", lines.join("\n"), shown.join("\n"))
+        format!("{partly}{moved}{}\n\n{}", lines.join("\n"), shown.join("\n"))
     }
 }
 
@@ -297,6 +332,74 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "committed\n").unwrap();
         run_git(dir, &["add", "."]);
         run_git(dir, &["commit", "-q", "-m", "first"]);
+    }
+
+    /// A manifest cut by a crash is not written over: it is kept aside, the starting point is taken now, and what `show_diff` says tells the model it moved.
+    #[test]
+    fn a_manifest_that_cannot_be_read_is_kept_aside_and_the_start_is_said_to_have_moved() {
+        let (work, _keep, session) = fixture();
+        std::fs::write(work.path().join("a.txt"), "first\n").unwrap();
+        Baseline::for_session(&session, work.path());
+        let folder = folder_of(&session);
+        std::fs::write(work.path().join("a.txt"), "second\n").unwrap();
+        let whole = std::fs::read_to_string(folder.join(MANIFEST)).unwrap();
+        std::fs::write(folder.join(MANIFEST), &whole[..whole.len() / 2]).unwrap();
+        let baseline = Baseline::for_session(&session, work.path());
+        let aside: Vec<String> = std::fs::read_dir(&folder).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.starts_with("manifest.damaged-")).collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(std::fs::read_to_string(folder.join(&aside[0])).unwrap(), whole[..whole.len() / 2], "kept as it was");
+        let said = baseline.changes(work.path(), &[]);
+        assert!(said.contains("began again at") && !said.contains("+second"), "the work before the move is not shown, and it says so: {said}");
+        std::fs::write(work.path().join("a.txt"), "third\n").unwrap();
+        let said = baseline.changes(work.path(), &[]);
+        assert!(said.contains("began again at") && said.contains("-second") && said.contains("+third"), "{said}");
+        // (and it is said again by the next look at the session, which reads the new record)
+        let again = Baseline::for_session(&session, work.path()).changes(work.path(), &[]);
+        assert!(again.contains("began again at"), "{again}");
+        // (a manifest that was never there is no loss)
+        let (other, _keep2, other_session) = fixture();
+        assert_eq!(Baseline::for_session(&other_session, other.path()).changes(other.path(), &[]), "");
+    }
+
+    /// A manifest of another build, with a field fewer or more, is read, and is no reason to begin again.
+    #[test]
+    fn a_manifest_with_other_fields_is_read_as_far_as_it_goes() {
+        let (work, _keep, session) = fixture();
+        std::fs::write(work.path().join("a.txt"), "first\n").unwrap();
+        let first = Baseline::for_session(&session, work.path());
+        let folder = folder_of(&session);
+        let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(folder.join(MANIFEST)).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("whole");
+        value["from_a_later_build"] = serde_json::json!(true);
+        value["files"]["a.txt"].as_object_mut().unwrap().remove("modified");
+        std::fs::write(folder.join(MANIFEST), value.to_string()).unwrap();
+        std::fs::write(work.path().join("a.txt"), "second\n").unwrap();
+        let said = Baseline::for_session(&session, work.path()).changes(work.path(), &[]);
+        assert!(said.contains("-first") && said.contains("+second") && !said.contains("began again"), "{said}");
+        assert_eq!(first.files.len(), 1);
+    }
+
+    /// A copy that a crash cut is not the "before": one of the wrong size is written again.
+    #[test]
+    fn a_copy_of_the_wrong_size_is_not_used() {
+        let (work, _keep, session) = fixture();
+        let folder = folder_of(&session);
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = work.path().join("a.txt");
+        std::fs::write(&file, "the whole file\n").unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        let name: String = Sha256::digest(&bytes).iter().take(16).map(|byte| format!("{byte:02x}")).collect();
+        std::fs::write(folder.join(&name), "the who").unwrap();
+        let data = std::fs::metadata(&file).unwrap();
+        let entry = entry_of(&folder, "a.txt", &file, &data, &mut 0);
+        assert_eq!(entry.copy.as_deref(), Some(name.as_str()));
+        assert_eq!(std::fs::read(folder.join(&name)).unwrap(), bytes, "the cut copy was written again");
+        // (and one that is whole is the one used, and left as it is)
+        let before = std::fs::metadata(folder.join(&name)).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        entry_of(&folder, "a.txt", &file, &data, &mut 0);
+        assert_eq!(std::fs::metadata(folder.join(&name)).unwrap().modified().unwrap(), before);
+        assert!(std::fs::read_dir(&folder).unwrap().flatten().all(|entry| !entry.file_name().to_string_lossy().contains("partial")), "nothing left beside");
     }
 
     #[test]
