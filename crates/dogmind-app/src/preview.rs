@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
-use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, DownloadStartingEventHandler, ExecuteScriptCompletedHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler, PermissionRequestedEventHandler, WebResourceRequestedEventHandler};
+use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, DownloadStartingEventHandler, ExecuteScriptCompletedHandler, LaunchingExternalUriSchemeEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler, PermissionRequestedEventHandler, WebResourceRequestedEventHandler};
 use windows::core::{Interface, HSTRING, PWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -234,7 +234,7 @@ pub fn address_of(root: &Path, file: &Path) -> Option<String> {
 pub fn stays_inside(address: &str) -> bool {
     let lower = address.to_ascii_lowercase();
     let inside = format!("https://{HOST}/");
-    lower.starts_with(&inside) || lower == inside.trim_end_matches('/') || lower.starts_with("data:") || lower.starts_with("blob:") || lower == "about:blank"
+    lower.starts_with(&inside) || lower == inside.trim_end_matches('/') || lower.starts_with("data:") || lower.starts_with("blob:") || lower == "about:blank" || lower == "about:srcdoc"
 }
 
 pub struct Preview {
@@ -242,6 +242,8 @@ pub struct Preview {
     webview: ICoreWebView2,
     /// Requests that were turned away since the page was opened.
     pub blocked: Rc<Cell<u32>>,
+    /// What is held against the page, by name.
+    pub guards: Vec<&'static str>,
     root: RefCell<Option<PathBuf>>,
     /// The folder and the file shown now, and the lines a link named in it.
     shown: RefCell<Option<(PathBuf, PathBuf, Option<(usize, usize)>)>>,
@@ -279,6 +281,7 @@ pub fn make(parent: isize, data: &Path, done: impl Fn() + Clone + 'static) -> Re
     // SAFETY: the options live until the call below has taken them.
     unsafe { options.set_additional_browser_arguments(CUT_OFF.to_string()) };
     let folder = HSTRING::from(data.as_os_str());
+    let guards_file = data.join("guards.txt");
     let failed = {
         let done = done.clone();
         move |error: String| {
@@ -303,6 +306,10 @@ pub fn make(parent: isize, data: &Path, done: impl Fn() + Clone + 'static) -> Re
             // SAFETY: on the thread that made it, as everything here is.
             match unsafe { set_up(controller, &held) } {
                 Ok(preview) => {
+                    // (a debug build says what it holds against the page, for whoever looks in it from outside)
+                    if cfg!(debug_assertions) {
+                        let _ = std::fs::write(guards_file.as_path(), preview.guards.join("\n"));
+                    }
                     MADE.with(|made| *made.borrow_mut() = Some(Ok(preview)));
                     done();
                 }
@@ -334,8 +341,10 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
     }
     let blocked = Rc::new(Cell::new(0u32));
     let mut token = 0i64;
+    // What is held against the page, by name, for the log line of a debug build and for the tests.
+    let mut guards: Vec<&'static str> = vec!["navigation", "new_window", "resources", "permissions", "downloads"];
 
-    // A page does not leave its host, whether the link is its own idea or a click.
+    // A page does not leave its host, whether the link is its own idea or a click. A frame's navigation is not a top-level one, and is another event.
     let count = blocked.clone();
     webview.add_NavigationStarting(&NavigationStartingEventHandler::create(Box::new(move |_, args| {
         if let Some(args) = args {
@@ -347,6 +356,31 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
         }
         Ok(())
     })), &mut token)?;
+    let count = blocked.clone();
+    webview.add_FrameNavigationStarting(&NavigationStartingEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args {
+            let address = text_of(|text| args.Uri(text));
+            if !stays_inside(&address) {
+                args.SetCancel(true)?;
+                count.set(count.get() + 1);
+            }
+        }
+        Ok(())
+    })), &mut token)?;
+    guards.push("frame_navigation");
+    // A scheme the system hands to another program (mailto:, ms-settings:, a custom one): never launched, whatever the person might have answered the runtime's own question. (A runtime too old for
+    // the interface has no such event, and the other checks are what there is.)
+    if let Ok(more) = webview.cast::<ICoreWebView2_18>() {
+        let count = blocked.clone();
+        more.add_LaunchingExternalUriScheme(&LaunchingExternalUriSchemeEventHandler::create(Box::new(move |_, args| {
+            if let Some(args) = args {
+                args.SetCancel(true)?;
+                count.set(count.get() + 1);
+            }
+            Ok(())
+        })), &mut token)?;
+        guards.push("external_scheme");
+    }
     let count = blocked.clone();
     webview.add_NewWindowRequested(&NewWindowRequestedEventHandler::create(Box::new(move |_, args| {
         if let Some(args) = args {
@@ -412,7 +446,7 @@ unsafe fn set_up(controller: ICoreWebView2Controller, environment: &ICoreWebView
         }
         Ok(())
     })), &mut token)?;
-    Ok(Preview { controller, webview, blocked, root: RefCell::new(None), shown: RefCell::new(None), to_lines, environment })
+    Ok(Preview { controller, webview, blocked, guards, root: RefCell::new(None), shown: RefCell::new(None), to_lines, environment })
 }
 
 impl Preview {
@@ -561,6 +595,17 @@ mod tests {
         assert_eq!(address_of(root, Path::new("C:\\work\\a b\\デモ.html")).unwrap(), "https://dogmind-preview.example/a%20b/%E3%83%87%E3%83%A2.html");
         assert!(address_of(root, Path::new("C:\\other\\a.html")).is_none());
         assert!(address_of(root, Path::new("C:\\work\\..\\secret.html")).is_none(), "out through a dot-dot");
+    }
+
+    /// A frame's address is judged as a top-level one is: the page's own host stays, whatever leaves it does not, and neither does a scheme another program is started by.
+    #[test]
+    fn a_frame_or_a_scheme_that_leaves_the_host_is_not_inside() {
+        for outside in ["https://example.com/", "mailto:someone@example.com", "ms-settings:privacy", "ms-msdt:/id", "tel:+81", "slack://open", "javascript:alert(1)", "ftp://dogmind-preview.example/", "file:///C:/Windows/win.ini", "https://dogmind-preview.example@evil.example/", "https://dogmind-preview.example:444@evil.example/"] {
+            assert!(!stays_inside(outside), "{outside}");
+        }
+        for inside in ["https://dogmind-preview.example/frame.html", "about:blank", "about:srcdoc", "data:text/html,x"] {
+            assert!(stays_inside(inside), "{inside}");
+        }
     }
 
     #[test]
