@@ -1680,6 +1680,10 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         {
             let _one = crate::workspace_grants::before_grant(&root)?;
             prepare(&root, sid, &mut disarmed)?;
+            // (a file held out of a folder commands can read, saved anew since by an editor, inherited what the folder gives: it is held out again before this command can read it)
+            if let Some(folder) = crate::workspace_grants::data_folder() {
+                crate::read_folders::hold_out_again(&crate::read_folders::file_in(&folder));
+            }
             if let Some(tools) = crate::bundled::root() {
                 crate::bundled::open_to_sandbox(&tools)?;
             }

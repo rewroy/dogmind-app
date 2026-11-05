@@ -44,6 +44,10 @@ pub enum State {
 struct Held {
     path: PathBuf,
     sddl: String,
+    /// The list this app gave it, as text: when the folder goes, what is put back is put back over that and over nothing else. A file whose list is not that now has been changed by someone, or
+    /// is a file made anew in its place, and is left as it is. (An entry from before this was kept has none, and is taken to be as it was if it still keeps its own list.)
+    #[serde(default)]
+    set: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -336,10 +340,14 @@ unsafe fn open(file: &Path, journal: &mut Journal, folder: &Path, secrets: &[Pat
             continue;
         }
         let Ok(sddl) = sandbox::dacl_text(&path) else { continue };
-        let held = Held { path: path.clone(), sddl };
+        let held = Held { path: path.clone(), sddl, set: None };
         entry(journal, folder).ok_or(NOT_ALLOWED)?.held.push(held);
         write(file, journal)?;
         dacl.as_explicit_and_protected(sid).write_alone(&path).map_err(|_| NOT_ALLOWED.to_string())?;
+        // (written down with the rest, below: a crash before then leaves it without, which is put back only while it keeps its own list)
+        if let (Ok(now), Some(last)) = (sandbox::dacl_text(&path), entry(journal, folder).and_then(|found| found.held.last_mut())) {
+            last.set = Some(now);
+        }
     }
     let dacl = Dacl::read(folder).map_err(|_| NOT_ALLOWED.to_string())?;
     let already = dacl.has_exact(sid, READ_EXECUTE, FLAGS_INHERITED_BY_ALL);
@@ -407,7 +415,12 @@ unsafe fn take_back(file: &Path, journal: &mut Journal, folder: &Path, on: &mut 
             (Some(place), Ok(inside)) => place.join(inside),
             _ => item.path.clone(),
         };
-        if path.exists() {
+        // Only a file that still has the list the app gave it: one whose list was changed since, or that was made anew in its place, is not written over with the old file's.
+        let as_set = match &item.set {
+            Some(set) => sandbox::dacl_text(&path).is_ok_and(|now| now == *set),
+            None => Dacl::read(&path).is_ok_and(|dacl| dacl.protected()),
+        };
+        if path.exists() && as_set {
             sandbox::restore_dacl_text(&path, &item.sddl).map_err(|_| NOT_ALLOWED.to_string())?;
         }
     }
@@ -428,6 +441,43 @@ unsafe fn take_back(file: &Path, journal: &mut Journal, folder: &Path, on: &mut 
     sandbox::forget_grants();
     write(file, journal)?;
     Ok(now_at.map_or(Removed::NotFound, Removed::From))
+}
+
+/// Before a command: a file held out of a named folder that has been written anew since is held out again. Many editors save by writing a new file and renaming it over the old one (JetBrains'
+/// safe write, vim with some settings, many tools that write a config), and the new one inherits the folder's ACE for the container: `.env` and the like would be readable by commands, though
+/// the person was told they are held out. It is the held list that is looked at, a few files and not the tree. What was not held is not looked for: the person is told that what is made
+/// later can be read, and a walk through the tree before every command would take minutes in a large one. If an adding or a removing is going on it does its own, and this does not wait for it.
+pub fn hold_out_again(file: &Path) {
+    // (in a test, the work of the others going on at the same time is waited for, so that what a test asks of this is what it gets)
+    #[cfg(test)]
+    let one = WORK.lock().map_err(|_| ());
+    #[cfg(not(test))]
+    let one = WORK.try_lock().map_err(|_| ());
+    let Ok(_one) = one else { return };
+    let mut journal = read(file);
+    if journal.folders.iter().all(|folder| folder.held.is_empty()) {
+        return;
+    }
+    // SAFETY: the SID lives as long as the process; what each call below is given lives until it returns.
+    let Ok(sid) = (unsafe { sandbox::profile_sid() }) else { return };
+    let mut changed = false;
+    for folder in journal.folders.iter_mut().filter(|folder| folder.state == State::Open) {
+        for item in &mut folder.held {
+            // SAFETY: as above.
+            unsafe {
+                let Ok(dacl) = Dacl::read(&item.path) else { continue };
+                // (one that keeps its own list takes nothing from the folder)
+                if dacl.protected() || dacl.as_explicit_and_protected(sid).write_alone(&item.path).is_err() {
+                    continue;
+                }
+            }
+            item.set = sandbox::dacl_text(&item.path).ok();
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = write(file, &journal);
+    }
 }
 
 /// What a crash left half done: an adding is undone and a removing finished. For when the app starts, off the window's thread. Says what could not be.
@@ -567,6 +617,82 @@ mod tests {
         assert_eq!(lists(&[&stand.named, &stand.outside]), before, "to the byte");
         assert_eq!(plain_text(&parent), above_before, "the way to it too");
         drop(stand.holder);
+    }
+
+    /// What the person changed in a held file's list since the folder was named survives the folder going.
+    #[test]
+    fn a_held_file_whose_list_was_changed_since_keeps_the_change_when_the_folder_goes() {
+        let stand = stand();
+        let before = lists(&[&stand.named]);
+        let added = add(&stand.journal, &stand.named, &[], &mut no_word, &AtomicBool::new(false)).unwrap();
+        assert!(matches!(added, Added::Open { held_out: 2, .. }), "{added:?}");
+        let (env, key) = (stand.named.join(".env"), stand.named.join(".ssh\\id_rsa"));
+        let held = plain_text(&env);
+        assert!(held.starts_with("D:P") && !held.contains(&sandbox::profile_sid_text()), "{held}");
+        // The person gives the container's own SID a plain ACE on it (any change will do for a test), and leaves the other alone.
+        unsafe { Dacl::read(&env).unwrap().with_exact(sandbox::profile_sid().unwrap(), READ_EXECUTE, 0).write_alone(&env).unwrap() };
+        let changed = plain_text(&env);
+        assert_ne!(changed, held);
+        remove(&stand.journal, &stand.named, &mut no_word).unwrap();
+        assert_eq!(plain_text(&env), changed, "their change is not written over with the list from before");
+        // The one nobody touched is put back as it was.
+        let key_before = before.iter().find(|(path, _)| *path == key).unwrap().1.clone();
+        assert_eq!(plain_text(&key), key_before);
+        // (and what the test changed goes with its folder)
+        unsafe { Dacl::read(&env).unwrap().without_exact(sandbox::profile_sid().unwrap(), READ_EXECUTE, 0).write_alone(&env).unwrap() };
+    }
+
+    /// A held file saved anew by an editor (written new, renamed over the old) inherits the folder's ACE for the container; it is held out again before the next command runs.
+    #[test]
+    fn a_held_file_saved_anew_by_an_editor_is_held_out_again_before_the_next_command() {
+        let stand = stand();
+        // (the commands of this test find the app's folder where the list is)
+        crate::workspace_grants::use_test_folder(stand.journal.parent().unwrap());
+        add(&stand.journal, &stand.named, &[], &mut no_word, &AtomicBool::new(false)).unwrap();
+        let (env, key) = (stand.named.join(".env"), stand.named.join(".ssh\\id_rsa"));
+        let id = sandbox::profile_sid_text();
+        assert!(!reads(&stand, &env, "PLANTED-ENV"));
+        // An editor's safe write.
+        let new = stand.named.join(".env.new");
+        std::fs::write(&new, "REPLACED-ENV").unwrap();
+        std::fs::rename(&new, &env).unwrap();
+        // (confirmed: the new file has what the folder gives the container, and keeps no list of its own)
+        let after = plain_text(&env);
+        assert!(after.contains(&id) && !after.starts_with("D:P"), "{after}");
+        unsafe { assert!(!Dacl::read(&env).unwrap().protected()) };
+        // The next command holds it out again, and then runs.
+        assert!(!reads(&stand, &env, "REPLACED-ENV"), "it is held out again before the command runs");
+        let held = plain_text(&env);
+        assert!(held.starts_with("D:P") && !held.contains(&id), "{held}");
+        assert!(!reads(&stand, &key, "PLANTED-KEY"));
+        // What was not held is as the person was told: a file made since is readable.
+        std::fs::write(stand.named.join("later.txt"), "IN-LATER").unwrap();
+        assert!(reads(&stand, &stand.named.join("later.txt"), "IN-LATER"));
+        // Taken back, the folder goes and the new file is not given the old one's list: it is as any file of the folder is.
+        remove(&stand.journal, &stand.named, &mut no_word).unwrap();
+        assert!(!reads(&stand, &env, "REPLACED-ENV") && !reads(&stand, &stand.named.join("later.txt"), "IN-LATER"));
+        assert!(!plain_text(&env).contains(&id), "nothing of the container is left on it");
+    }
+
+    /// What looking at the held list before a command costs, with one held file and with twenty (nothing to hold out again: the common case).
+    #[test]
+    fn looking_at_the_held_list_costs_little_before_a_command() {
+        for held in [1usize, 20] {
+            let stand = stand();
+            for at in 0..held {
+                std::fs::write(stand.named.join(format!(".env.{at}")), "PLANTED").unwrap();
+            }
+            add(&stand.journal, &stand.named, &[], &mut no_word, &AtomicBool::new(false)).unwrap();
+            let count = list(&stand.journal)[0].held.len();
+            let started = std::time::Instant::now();
+            for _ in 0..20 {
+                hold_out_again(&stand.journal);
+            }
+            let each = started.elapsed() / 20;
+            println!("HELD {count} files: {each:?} a look");
+            assert!(count >= held && each < Duration::from_millis(250), "{count} held: {each:?}");
+            remove(&stand.journal, &stand.named, &mut no_word).unwrap();
+        }
     }
 
     #[test]
