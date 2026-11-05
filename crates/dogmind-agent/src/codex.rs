@@ -293,10 +293,23 @@ pub fn completion_of(text: &str, usage: Option<Usage>) -> Result<Completion, Llm
             completion.content = value.get("content").and_then(Value::as_str).unwrap_or("").to_string();
             let calls = value.get("tool_calls").and_then(Value::as_array).filter(|calls| !calls.is_empty())
                 .ok_or_else(|| LlmError::Transient("Codex returned tool_calls with no call".into()))?;
+            // The model's own ids, kept: two calls of one answer with the same id would have results that cannot be told apart, so the second is given another, and so is one with none.
+            let given: Vec<&str> = calls.iter().filter_map(|call| call.get("id").and_then(Value::as_str)).filter(|id| !id.is_empty()).collect();
+            let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (index, call) in calls.iter().enumerate() {
                 let name = call.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()).ok_or_else(|| LlmError::Transient("Codex returned a tool call with no name".into()))?;
-                let id = call.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map_or_else(|| format!("codex-{index}"), str::to_string);
-                let arguments = call.get("arguments").and_then(Value::as_str).unwrap_or("{}").to_string();
+                let kept = call.get("id").and_then(Value::as_str).filter(|id| !id.is_empty() && !used.contains(*id));
+                let id = match kept {
+                    Some(id) => id.to_string(),
+                    None => (1..).map(|again| if again == 1 { format!("codex-{index}") } else { format!("codex-{index}-{again}") }).find(|made| !used.contains(made) && !given.contains(&made.as_str())).unwrap_or_default(),
+                };
+                used.insert(id.clone());
+                // A JSON object is the arguments' text as it is; a string is what the schema asks for. Anything else is not arguments, and made into none a call would run with nothing asked.
+                let arguments = match call.get("arguments") {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(object @ Value::Object(_)) => object.to_string(),
+                    _ => return Err(LlmError::Transient(format!("Codex returned the call to {name} with arguments that are not a JSON object"))),
+                };
                 completion.tool_calls.push(ToolCall { id, kind: "function".into(), function: FunctionCall { name: name.to_string(), arguments } });
             }
         }
@@ -599,6 +612,46 @@ mod tests {
         assert_eq!(calls.tool_calls[0].function.arguments, "{\"path\":\"a\"}");
         assert!(completion_of("not json", None).is_err());
         assert!(completion_of(r#"{"kind":"tool_calls","content":"","tool_calls":[]}"#, None).is_err());
+    }
+
+    fn ids_and_arguments_of(text: &str) -> Vec<(String, String)> {
+        completion_of(text, None).unwrap().tool_calls.into_iter().map(|call| (call.id, call.function.arguments)).collect()
+    }
+
+    #[test]
+    fn two_calls_of_one_answer_never_share_an_id() {
+        let answer = |ids: &[&str]| {
+            let calls: Vec<Value> = ids.iter().map(|id| json!({"id": id, "name": "read_file", "arguments": "{}"})).collect();
+            json!({"kind": "tool_calls", "content": "", "tool_calls": calls}).to_string()
+        };
+        // (the model's own ids are kept as they are)
+        let ids = |list: &[&str]| ids_and_arguments_of(&answer(list)).into_iter().map(|(id, _)| id).collect::<Vec<String>>();
+        assert_eq!(ids(&["a", "b"]), ["a", "b"]);
+        // (the second of two the same is given another, and so is one with none)
+        assert_eq!(ids(&["a", "a"]), ["a", "codex-1"]);
+        assert_eq!(ids(&["", ""]), ["codex-0", "codex-1"]);
+        assert_eq!(ids(&["", "codex-0"]), ["codex-0-2", "codex-0"], "an id the model gave is kept, and a made-up one does not take it");
+        assert_eq!(ids(&["a", "a", "a", "codex-1"]), ["a", "codex-1-2", "codex-2", "codex-1"], "and the same for a later call's own");
+        let all = ids(&["x", "x", "", "x", "codex-3"]);
+        let mut unique = all.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len(), "{all:?}");
+    }
+
+    #[test]
+    fn arguments_that_are_an_object_are_its_text_and_anything_else_that_is_not_a_string_is_refused() {
+        let with = |arguments: Value| json!({"kind": "tool_calls", "content": "", "tool_calls": [{"id": "a", "name": "read_file", "arguments": arguments}]}).to_string();
+        assert_eq!(ids_and_arguments_of(&with(json!("{\"path\":\"a\"}"))), [("a".to_string(), "{\"path\":\"a\"}".to_string())]);
+        let object = ids_and_arguments_of(&with(json!({"path": "a", "limit": 3})));
+        assert_eq!(serde_json::from_str::<Value>(&object[0].1).unwrap(), json!({"path": "a", "limit": 3}), "a model that sent an object gets a call with its arguments");
+        for not_arguments in [json!(3), json!([1]), json!(null), json!(true)] {
+            let Err(LlmError::Transient(why)) = completion_of(&with(not_arguments.clone()), None) else { panic!("{not_arguments} is refused") };
+            assert!(why.contains("read_file") && why.contains("not a JSON object"), "{why}");
+        }
+        // (and none at all)
+        let none = json!({"kind": "tool_calls", "content": "", "tool_calls": [{"id": "a", "name": "list_files"}]}).to_string();
+        assert!(matches!(completion_of(&none, None), Err(LlmError::Transient(_))));
     }
 
     #[test]
