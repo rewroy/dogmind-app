@@ -108,9 +108,18 @@ pub enum Undecoded {
     Unreadable,
 }
 
-/// A small copy of a file, for a room this large.
+/// A small copy of a file, for a room this large. A file larger than the agent takes of a picture is not read, and one that declares more pixels than it takes is not decoded: it is
+/// one that cannot be shown, as is any that is damaged.
 pub fn decode(path: &Path, room_width: i32, room_height: i32) -> Result<Decoded, Undecoded> {
-    let bytes = std::fs::read(path).map_err(|_| Undecoded::Gone)?;
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|_| Undecoded::Gone)?;
+    let most = dogmind_agent::images::MOST_BYTES as u64;
+    if file.metadata().map_err(|_| Undecoded::Gone)?.len() > most {
+        return Err(Undecoded::Unreadable);
+    }
+    // (and no more than that is read of a file that grows meanwhile: what is one byte past is refused by `decode_picture`)
+    let mut bytes = Vec::new();
+    file.take(most + 1).read_to_end(&mut bytes).map_err(|_| Undecoded::Gone)?;
     decode_bytes(&bytes, room_width, room_height)
 }
 
@@ -182,6 +191,53 @@ mod tests {
         assert_eq!(paste_kind(false, true, true), Paste::Text, "a table copied from a spreadsheet");
         assert_eq!(paste_kind(false, false, true), Paste::Bitmap, "a screenshot");
         assert_eq!(paste_kind(false, false, false), Paste::Nothing);
+    }
+
+    /// A few hundred bytes that declare 30000 by 30000 pixels, and a file larger than the agent takes, are cards that cannot be shown, and neither is decoded or read.
+    #[test]
+    fn a_picture_past_what_the_agent_takes_is_not_decoded_for_the_card() {
+        fn crc(bytes: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+                }
+            }
+            !crc
+        }
+        let chunk = |kind: &[u8; 4], data: &[u8]| {
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            let mut out = (data.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc(&body).to_be_bytes());
+            out
+        };
+        let mut header = 30_000u32.to_be_bytes().to_vec();
+        header.extend_from_slice(&30_000u32.to_be_bytes());
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend(chunk(b"IHDR", &header));
+        png.extend(chunk(b"IDAT", &[0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01]));
+        png.extend(chunk(b"IEND", &[]));
+        assert!(png.len() < 1000);
+        assert_eq!(decode_bytes(&png, 280, 200).err(), Some(Undecoded::Unreadable), "refused from its header");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("huge.png");
+        std::fs::write(&file, &png).unwrap();
+        assert_eq!(decode(&file, 280, 200).err(), Some(Undecoded::Unreadable));
+        // (a file over the size, which is not read at all: it is a hole in the disk of that size)
+        let large = dir.path().join("large.png");
+        std::fs::File::create(&large).unwrap().set_len(dogmind_agent::images::MOST_BYTES as u64 + 1).unwrap();
+        assert_eq!(decode(&large, 280, 200).err(), Some(Undecoded::Unreadable));
+        assert_eq!(decode(&dir.path().join("none.png"), 280, 200).err(), Some(Undecoded::Gone));
+        // (and a picture within the limits is shown as ever)
+        let small = image::RgbImage::from_pixel(30, 20, image::Rgb([1, 2, 3]));
+        let mut ok = Vec::new();
+        small.write_to(&mut std::io::Cursor::new(&mut ok), image::ImageFormat::Png).unwrap();
+        std::fs::write(dir.path().join("ok.png"), &ok).unwrap();
+        assert_eq!(decode(&dir.path().join("ok.png"), 280, 200).map(|shown| (shown.width, shown.height)).ok(), Some((30, 20)));
     }
 
     /// A wide JPEG with Orientation 6 is shown tall: the card's copy is turned.
