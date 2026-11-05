@@ -311,6 +311,36 @@ fn parts_begun(err: &str) -> Vec<usize> {
     err.lines().filter_map(|line| line.split_once("DOGMIND-STEPS-PART ").and_then(|(_, rest)| rest.split('/').next()?.trim().parse().ok())).collect()
 }
 
+/// A page's text, and what it was in, read as the agent reads files (`tools::file_text`): UTF-16 with its mark, UTF-8, or Shift_JIS, which pages on a Japanese machine are in as often as not.
+fn page_text(page: &Path) -> Result<(String, &'static str), String> {
+    let bytes = std::fs::read(page).map_err(|error| error.to_string())?;
+    Ok(crate::tools::file_text(&bytes))
+}
+
+/// The page's text, to be written as a UTF-8 file that is opened in its place: when it was not UTF-8, the copy says that it is (see `utf8_declared`).
+fn page_html(page: &Path) -> Result<String, String> {
+    let (text, kind) = page_text(page)?;
+    Ok(if kind == "utf-8" { text } else { utf8_declared(&text) })
+}
+
+/// The page with its character set said to be UTF-8: the `<meta charset>` it has, or its `Content-Type` one, is made so, and one is added as the first thing in its head if it has neither
+/// (a page in UTF-16 has no need of one, and a browser that is given its text as UTF-8 reads it as a Windows code page without).
+fn utf8_declared(html: &str) -> String {
+    static CHARSET: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static CONTENT_TYPE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let charset = CHARSET.get_or_init(|| Regex::new(r#"(?i)<meta\s+charset\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>/]+)\s*/?>"#).expect("the pattern is valid"));
+    let content_type = CONTENT_TYPE.get_or_init(|| Regex::new(r#"(?i)(<meta\s[^>]*http-equiv\s*=\s*["']?content-type["']?[^>]*content\s*=\s*["'][^"']*?)charset\s*=\s*[^"';\s>]+"#).expect("the pattern is valid"));
+    if charset.is_match(html) {
+        return charset.replace(html, "<meta charset=\"utf-8\">").into_owned();
+    }
+    if content_type.is_match(html) {
+        return content_type.replace(html, "${1}charset=utf-8").into_owned();
+    }
+    let place = |pattern: &str| Regex::new(pattern).ok().and_then(|pattern| pattern.find(html).map(|found| found.end()));
+    let at = place(r"(?i)<head(?:\s[^>]*)?>").or_else(|| place(r"(?i)<html(?:\s[^>]*)?>")).or_else(|| place(r"(?i)^\s*<!doctype[^>]*>")).unwrap_or(0);
+    format!("{}<meta charset=\"utf-8\">{}", &html[..at], &html[at..])
+}
+
 /// The page with a script of ours at its end and its folder as its base, so that what it names by a relative path is what it would have had.
 fn with_script(html: &str, base: &str, script: &str) -> String {
     let lower = html.to_ascii_lowercase();
@@ -330,9 +360,11 @@ fn with_script(html: &str, base: &str, script: &str) -> String {
 
 /// The page with the steps at its end. `key`: the name under which the page keeps, in the tab's storage, which part of the steps is next.
 fn with_steps(html: &str, base: &str, steps: &str, key: &str) -> String {
-    // (what the steps say cannot end the script they are in)
+    // (what the steps say cannot end the script they are in, however `</script` is written)
+    static END_TAG: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let end_tag = END_TAG.get_or_init(|| Regex::new(r"(?i)</(script)").expect("the pattern is valid"));
     let (parts, _) = step_parts(steps);
-    let parts: String = parts.iter().map(|part| format!("    async () => {{\n{}\n    }},\n", part.replace("</script", "<\\/script").replace("</SCRIPT", "<\\/SCRIPT"))).collect();
+    let parts: String = parts.iter().map(|part| format!("    async () => {{\n{}\n    }},\n", end_tag.replace_all(part, "<\\/$1"))).collect();
     with_script(html, base, &format!("{STEPS_PRELUDE}  const key = '{key}';\n  const parts = [\n{parts}{STEPS_END}"))
 }
 
@@ -490,9 +522,9 @@ fn is_remote(address: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://") || bare.starts_with("//") || bare.starts_with("/\\") || bare.trim_start_matches('/').starts_with("?/unc")
 }
 
-/// A page's address of a file of its own, without what only a server would read: `app.js?v=2` is `app.js`.
-fn file_part(address: &str) -> &str {
-    address.split(['?', '#']).next().unwrap_or(address)
+/// A page's address of a file of its own, as the file's name: without what only a server would read (`app.js?v=2` is `app.js`) and with the percent signs read (`my%20style.css` is `my style.css`).
+fn file_part(address: &str) -> String {
+    percent_decoded(address.split(['?', '#']).next().unwrap_or(address))
 }
 
 /// Through the page's import map, the longest name that fits first.
@@ -535,7 +567,7 @@ fn imports_of(text: &str, folder: &Path, map: &[(String, String)], seen: &mut Ha
 
 fn needs_of(page: &Path) -> Needs {
     let mut needs = Needs::default();
-    let Ok(text) = std::fs::read_to_string(page) else { return needs };
+    let Ok((text, _)) = page_text(page) else { return needs };
     let root = page.parent().unwrap_or(Path::new("."));
     let scripts = Regex::new(r"(?is)<script\b([^>]*)>(.*?)</script\s*>").expect("the pattern is valid");
     let mut map = Vec::new();
@@ -607,6 +639,16 @@ fn needs_of(page: &Path) -> Needs {
 /// Whether the page itself wrote to the console, or threw: a line of the browser's log that is a console line, not a browser extension's and not one of our own scripts' (`DOGMIND-STEPS-`).
 fn page_wrote_to_console(err: &str) -> bool {
     err.lines().any(|line| line.contains("INFO:CONSOLE") && !line.contains("chrome-extension") && !line.contains("DOGMIND-STEPS-"))
+}
+
+/// Whether a run that failed said on the console what the run before it said, which is kept in `before` for the next. A page that brings the browser down in the same place, with the same words,
+/// each time is the page's doing, and another try will not change it. A crash with other words, or with none, may be the browser's own, which falls over now and then in the sandbox whatever
+/// the page (and the more a page logs, the more of its crashes this once passed off as the page's); that is tried again.
+fn crash_repeats(before: &mut Option<Vec<String>>, err: &str) -> bool {
+    let said: Vec<String> = console_lines(err, "").into_iter().filter(|line| !line.contains("DOGMIND-STEPS-")).collect();
+    let repeats = !said.is_empty() && before.as_ref() == Some(&said);
+    *before = Some(said);
+    repeats
 }
 
 /// What the page printed and threw, from all the browser says of itself. Long paths to the workspace go, and every line a browser's own extension or service prints.
@@ -776,7 +818,8 @@ fn visible_text(dom: &str) -> String {
             at = open + 1;
         }
     }
-    let text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">");
+    // (`&amp;` last: `&amp;lt;` is the text `&lt;`, and not a `<`)
+    let text = text.replace("&nbsp;", " ").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
     text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MOST_TEXT).collect()
 }
 
@@ -1018,7 +1061,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     let (mut copy_name, mut opened) = (None, page.clone());
     if let (Some(page), Some(steps)) = (&page, steps) {
         let temp = temp.as_ref().ok_or("the sandbox's folder could not be found, so the steps could not be run")?;
-        let html = std::fs::read_to_string(page).map_err(|error| format!("{name}: {error}"))?;
+        let html = page_html(page).map_err(|error| format!("{name}: {error}"))?;
         let base = file_url(page.parent().unwrap_or(workspace)) + "/";
         let run = next_run();
         let file_name = steps_page_of(&run);
@@ -1028,7 +1071,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         (copy_name, opened) = (Some(file_name), Some(copy));
     } else if let (Some(page), Some(temp), None) = (&page, &temp, steps) {
         let html_page = page.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm"));
-        if let (true, Ok(html)) = (html_page, std::fs::read_to_string(page)) {
+        if let (true, Ok(html)) = (html_page, page_html(page)) {
             let base = file_url(page.parent().unwrap_or(workspace)) + "/";
             let file_name = steps_page_of(&next_run());
             let copy = temp.join(&file_name);
@@ -1053,6 +1096,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     // (a page with steps may take as long as its steps do; one without has a limit of its own, and a run that hangs is ended early)
     let limit = if steps.is_some() { LIMIT } else { run_limit(run_wait) };
     let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
+    let mut before = None;
     for _ in 0..TRIES {
         let started = std::time::Instant::now();
         let profile = profiles.next();
@@ -1073,7 +1117,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let silent_hang = hung(&done) && !page_wrote_to_console(&err);
         hangs += usize::from(silent_hang);
         let again = silent_hang && tries_again_after_a_hang(hangs);
-        if finished || cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING || (!again && (started.elapsed() > LIMIT / 2 || page_wrote_to_console(&err))) {
+        if finished || cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING || (!again && (started.elapsed() > LIMIT / 2 || crash_repeats(&mut before, &err))) {
             break;
         }
     }
@@ -1566,6 +1610,84 @@ mod tests {
         assert!(page.find("let underway = true").unwrap() < page.find("await parts[index]()").unwrap() && page.find("await parts[index]()").unwrap() < page.find("underway = false;\n    if (index + 1").unwrap(), "{page}");
     }
 
+    /// `&amp;lt;` is the text `&lt;`, and is not decoded twice.
+    #[test]
+    fn an_entity_is_decoded_once() {
+        let (_, text) = shown("<html><body><p>&amp;lt;b&amp;gt; &amp;amp; &lt;b&gt; &amp;nbsp; a&nbsp;b</p></body></html>");
+        assert_eq!(text, "&lt;b&gt; &amp; <b> &nbsp; a b");
+    }
+
+    #[test]
+    fn a_file_named_with_percent_signs_is_found_by_its_name() {
+        assert_eq!(file_part("my%20style.css?v=1#x"), "my style.css");
+        assert_eq!(file_part("%E3%81%82.js"), "あ.js");
+        assert_eq!(file_part("plain.js"), "plain.js");
+        let (_dir, index) = page(&[
+            ("index.html", "<link rel=\"stylesheet\" href=\"my%20style.css\"><script src=\"a%20b.js\"></script><script src=\"gone%20too.js\"></script>"),
+            ("my style.css", ""),
+            ("a b.js", ""),
+        ]);
+        let needs = needs_of(&index);
+        assert_eq!(needs.missing, ["gone%20too.js"], "only the one that is not there, named as the page names it");
+        assert_eq!(needs.run, ["a%20b.js"]);
+    }
+
+    #[test]
+    fn steps_cannot_end_their_script_whatever_the_case_of_the_end_tag() {
+        let page = with_steps("<body></body>", "file:///C:/w/", "console.log('</script>', '</SCRIPT>', '</Script >', '</sCrIpT'); await wait(1)", "k");
+        let ends = Regex::new(r"(?i)</script").unwrap().find_iter(&page).count();
+        assert_eq!(ends, 1, "only the script's own end: {page}");
+        assert!(page.contains("<\\/Script >") && page.contains("<\\/sCrIpT'") && page.contains("<\\/script>"), "{page}");
+    }
+
+    /// A crash that says the same on the console each time is the page's; any other may be the browser's own and is tried again.
+    #[test]
+    fn a_crash_is_the_pages_only_when_it_says_the_same_again() {
+        let line = |text: &str| format!("[1:2:3/4:INFO:CONSOLE:5] \"{text}\", source: file:///x (5)\n");
+        let mut before = None;
+        assert!(!crash_repeats(&mut before, &line("a")), "the first has nothing before it");
+        assert!(crash_repeats(&mut before, &line("a")), "the same again");
+        assert!(!crash_repeats(&mut before, &line("b")), "other words");
+        assert!(!crash_repeats(&mut before, &line("a")), "and what came two runs ago is not the run before");
+        assert!(!crash_repeats(&mut before, "") && !crash_repeats(&mut before, ""), "a crash that said nothing is never taken for the page's");
+        let steps = "[1:2:3/4:INFO:CONSOLE:5] \"DOGMIND-STEPS-PART 1/1\", source: file:///x (5)\n";
+        assert!(!crash_repeats(&mut before, steps) && !crash_repeats(&mut before, steps), "our own lines say nothing of the page");
+    }
+
+    #[test]
+    fn a_page_in_shift_jis_or_utf_16_is_read_and_says_it_is_utf_8() {
+        let dir = tempfile::tempdir().unwrap();
+        let sjis = dir.path().join("sjis.html");
+        let mut bytes = b"<!DOCTYPE html><html><head><meta charset=\"Shift_JIS\"><title>".to_vec();
+        bytes.extend_from_slice(&[0x94, 0x84, 0x8F, 0xE3]);
+        bytes.extend_from_slice(b"</title></head><body><p>x</p></body></html>");
+        std::fs::write(&sjis, &bytes).unwrap();
+        let html = page_html(&sjis).unwrap();
+        assert!(html.contains("<title>売上</title>") && html.contains("<meta charset=\"utf-8\">") && !html.to_ascii_lowercase().contains("shift_jis"), "{html}");
+        let wide = dir.path().join("wide.html");
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend("<html><body><p>売上</p></body></html>".encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(&wide, &bytes).unwrap();
+        let html = page_html(&wide).unwrap();
+        assert!(html.contains("<p>売上</p>") && html.starts_with("<html><meta charset=\"utf-8\">"), "{html}");
+        // a page that is UTF-8 is left as it is, and so is the text of one that cannot be read
+        let plain = dir.path().join("plain.html");
+        std::fs::write(&plain, "<meta charset=\"windows-1252\"><p>x</p>").unwrap();
+        assert_eq!(page_html(&plain).unwrap(), "<meta charset=\"windows-1252\"><p>x</p>");
+        assert!(page_html(&dir.path().join("none.html")).is_err());
+    }
+
+    #[test]
+    fn the_character_set_a_page_says_is_made_utf_8_where_it_is_said_or_added_where_it_is_not() {
+        assert_eq!(utf8_declared("<head><meta charset=shift_jis><title>t</title></head>"), "<head><meta charset=\"utf-8\"><title>t</title></head>");
+        assert_eq!(utf8_declared("<head><META CHARSET='EUC-JP' /></head>"), "<head><meta charset=\"utf-8\"></head>");
+        assert_eq!(utf8_declared("<head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=Shift_JIS\"></head>"), "<head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head>");
+        assert_eq!(utf8_declared("<!DOCTYPE html><html lang=ja><head class=x><title>t</title></head>"), "<!DOCTYPE html><html lang=ja><head class=x><meta charset=\"utf-8\"><title>t</title></head>");
+        assert_eq!(utf8_declared("<html><body>x</body></html>"), "<html><meta charset=\"utf-8\"><body>x</body></html>");
+        assert_eq!(utf8_declared("<!DOCTYPE html><p>x</p>"), "<!DOCTYPE html><meta charset=\"utf-8\"><p>x</p>");
+        assert_eq!(utf8_declared("<p>x</p>"), "<meta charset=\"utf-8\"><p>x</p>");
+    }
+
     #[test]
     fn the_words_a_page_shows_say_where_they_were_read() {
         let needs = Needs::default();
@@ -1827,6 +1949,25 @@ mod tests {
         // and steps that stay are as they were
         let stays = check("await fill('#q', 'milk'); await wait(10);");
         assert!(stays.contains("Steps: all ran") && !stays.contains("LEFT THE PAGE"), "{stays}");
+    }
+
+    /// With the real browser, in the real sandbox: a page in Shift_JIS is checked with steps, and without, and is read as the browser reads it.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn a_page_in_shift_jis_is_checked_with_steps_and_without() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = b"<!DOCTYPE html><html><head><meta charset=\"Shift_JIS\"><title>".to_vec();
+        bytes.extend_from_slice(&[0x94, 0x84, 0x8F, 0xE3]);
+        bytes.extend_from_slice(b"</title></head><body><p id=t>");
+        bytes.extend_from_slice(&[0x94, 0x84, 0x8F, 0xE3]);
+        bytes.extend_from_slice(b"</p><button id=b onclick=\"document.getElementById('t').textContent += '!'\">go</button></body></html>");
+        std::fs::write(dir.path().join("index.html"), &bytes).unwrap();
+        let plain = check_page(&serde_json::json!({"path": "index.html", "views": ["desktop"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{plain}");
+        assert!(plain.contains("Shows: title \"売上\"; text: 売上 go"), "{plain}");
+        let with = check_page(&serde_json::json!({"path": "index.html", "steps": "await click('#b');", "views": ["desktop"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{with}");
+        assert!(with.contains("Steps: all ran") && with.contains("Shows: title \"売上\"; text: 売上! go"), "{with}");
     }
 
     /// With the real browser, in the real sandbox: asked only for a phone's width, the first console is labelled as the desktop's size, and the phone's own is under its name.
