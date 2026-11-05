@@ -27,10 +27,14 @@ impl Saved {
         Saved { path: path.to_path_buf(), copy, real: crate::safety::real_path(path) }
     }
 
-    /// Whether the path leads somewhere else than when it was saved. One saved before this was kept is taken as it is.
+    /// Whether the path leads somewhere else than when it was saved. One saved before that was kept has no "then" to compare with: a link or a junction on its way now is taken to lead
+    /// elsewhere, as nothing says it did not.
     fn leads_elsewhere(&self) -> bool {
         let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
-        self.real.as_ref().is_some_and(|then| crate::safety::real_path(&self.path).is_none_or(|now| key(&now) != key(then)))
+        match &self.real {
+            Some(then) => crate::safety::real_path(&self.path).is_none_or(|now| key(&now) != key(then)),
+            None => has_a_link_on_its_way(&self.path),
+        }
     }
 }
 
@@ -60,6 +64,11 @@ struct Index {
 pub struct Checkpoints {
     folder: PathBuf,
     index: Index,
+}
+
+/// Whether the path, or any folder on the way to it, is a link or a junction (`is_symlink` is true of a junction on Windows too), looked at and not gone through.
+fn has_a_link_on_its_way(path: &Path) -> bool {
+    path.ancestors().any(|place| std::fs::symlink_metadata(place).is_ok_and(|what| what.file_type().is_symlink()))
 }
 
 fn folder_of(session: &Path) -> PathBuf {
@@ -267,6 +276,19 @@ impl Checkpoints {
 
     /// Back to a turn's beginning. What is there now is saved first: a rewind can itself be rewound.
     pub fn restore(&mut self, id: u64, at: &str) -> Restored {
+        self.restore_with(id, at, &mut || {})
+    }
+
+    /// Whether a file is still as the rewind saw it when it kept a copy of what it held: absent if it was, else the same bytes as that copy.
+    fn as_kept(&self, seen: &Saved) -> bool {
+        match &seen.copy {
+            None => std::fs::symlink_metadata(&seen.path).is_err(),
+            Some(copy) => same_bytes(&self.folder.join(copy), &seen.path).unwrap_or(false),
+        }
+    }
+
+    /// `between` is called when the copies are kept and before any file is written: a test's way to make the person, or a command, write in between.
+    fn restore_with(&mut self, id: u64, at: &str, between: &mut dyn FnMut()) -> Restored {
         let plan = self.plan(id);
         let mut restored = Restored::default();
         if plan.is_empty() {
@@ -276,7 +298,7 @@ impl Checkpoints {
         let mut keep = Vec::new();
         for saved in &plan {
             if saved.leads_elsewhere() {
-                restored.failed.push(format!("{}: a link on its way leads somewhere else than when it was saved, so nothing was put there", saved.path.display()));
+                restored.failed.push(Checkpoints::leads_elsewhere_words(saved));
                 continue;
             }
             match self.copy_of(&saved.path) {
@@ -288,13 +310,25 @@ impl Checkpoints {
             }
         }
         let kept: HashSet<PathBuf> = keep.iter().map(|saved| saved.path.clone()).collect();
+        let keep_seen = keep.clone();
         let next = self.index.turns.last().map_or(1, |turn| turn.id + 1);
         self.index.turns.push(Turn { id: next, title: format!("Before the rewind to: {title}"), at: at.to_string(), message: None, files: keep });
         if let Err(error) = self.save() {
             restored.failed.push(error);
             return restored;
         }
+        between();
         for saved in plan.iter().filter(|saved| kept.contains(&saved.path)) {
+            // Nothing is written over what came after the copy was kept, and nothing is taken away that was not there to take: it is left, and said.
+            let seen = keep_seen.iter().find(|seen| seen.path == saved.path).expect("every file that is written was kept");
+            if saved.leads_elsewhere() {
+                restored.failed.push(Checkpoints::leads_elsewhere_words(saved));
+                continue;
+            }
+            if !self.as_kept(seen) {
+                restored.failed.push(format!("{}: it changed while the rewind was under way, so it was left as it is", saved.path.display()));
+                continue;
+            }
             match &saved.copy {
                 Some(copy) => {
                     if let Some(parent) = saved.path.parent() {
@@ -313,6 +347,14 @@ impl Checkpoints {
             }
         }
         restored
+    }
+
+    fn leads_elsewhere_words(saved: &Saved) -> String {
+        if saved.real.is_some() {
+            format!("{}: a link on its way leads somewhere else than when it was saved, so nothing was put there", saved.path.display())
+        } else {
+            format!("{}: a link or junction is on its way, and this record, from before they were looked at, does not say where the path led when it was saved, so nothing was put there", saved.path.display())
+        }
     }
 
     /// The conversation before `from` is all that remains: later turns can go back in their files only.
@@ -479,6 +521,75 @@ mod tests {
         std::fs::write(&b, &body[..199_999]).unwrap();
         assert!(!same_bytes(&a, &b).unwrap(), "a different size");
         assert!(same_bytes(&a, &dir.path().join("none")).is_err());
+    }
+
+    /// What is written between the rewind's two looks is not written over, nor taken away: the file is left as the person made it, and the rewind says so. The rest goes on.
+    #[test]
+    fn a_file_changed_between_the_rewinds_passes_is_left_and_said() {
+        let mut f = fixture();
+        let created = f.file.with_file_name("created.txt");
+        std::fs::write(&f.file, "before").unwrap();
+        std::fs::write(&f.other, "other before").unwrap();
+        f.marks.begin("one", "t", Some(1)).unwrap();
+        // (a.txt is edited, b.txt too, and created.txt did not exist when the turn began and is not made by it)
+        f.marks.before_edit(&[f.file.clone(), f.other.clone(), created.clone()]).unwrap();
+        std::fs::write(&f.file, "the agent's").unwrap();
+        std::fs::write(&f.other, "the agent's too").unwrap();
+        let (file, created_now) = (f.file.clone(), created.clone());
+        let restored = f.marks.restore_with(1, "t", &mut || {
+            std::fs::write(&file, "the person's own, a moment ago").unwrap();
+            std::fs::write(&created_now, "theirs").unwrap();
+        });
+        assert_eq!(read(&f.file), "the person's own, a moment ago", "not written over");
+        assert_eq!(read(&created), "theirs", "not removed, as it was not there when the copies were kept");
+        assert_eq!(read(&f.other), "other before", "the rest of the rewind goes on");
+        assert_eq!(restored.failed.len(), 2, "{:?}", restored.failed);
+        assert!(restored.failed.iter().all(|why| why.contains("changed while the rewind was under way")), "{:?}", restored.failed);
+        assert_eq!(restored.written, [f.other.clone()]);
+        // (and what the rewind left is what a later rewind can bring back: the copies were kept before the person's own were written)
+        assert!(restored.removed.is_empty());
+    }
+
+    /// A record from before the link guard has no place to compare with: a junction on its way now is not written through.
+    #[cfg(windows)]
+    #[test]
+    fn an_older_record_is_not_written_through_a_junction_that_is_there_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let (work, elsewhere) = (dir.path().join("work"), dir.path().join("elsewhere"));
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let (planted, plain) = (work.join("sub").join("run.bat"), work.join("a.txt"));
+        std::fs::write(&planted, "payload").unwrap();
+        std::fs::write(&plain, "before").unwrap();
+        let mut marks = Checkpoints::open(&dir.path().join("session.jsonl"));
+        marks.begin("one", "t", Some(1)).unwrap();
+        marks.before_edit(&[planted.clone(), plain.clone()]).unwrap();
+        std::fs::write(&plain, "after").unwrap();
+        // (a record as it was written before `real` was kept)
+        for turn in &mut marks.index.turns {
+            for saved in &mut turn.files {
+                saved.real = None;
+            }
+        }
+        std::fs::remove_dir_all(work.join("sub")).unwrap();
+        let status = std::process::Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(work.join("sub")).arg(&elsewhere).stdout(std::process::Stdio::null()).status().unwrap();
+        assert!(status.success());
+        let restored = marks.restore(1, "t");
+        assert!(!elsewhere.join("run.bat").exists(), "nothing written through the junction");
+        assert_eq!(read(&plain), "before", "the rest is rewound");
+        assert_eq!(restored.failed.len(), 1, "{:?}", restored.failed);
+        assert!(restored.failed[0].contains("this record"), "{:?}", restored.failed);
+        std::fs::remove_dir(work.join("sub")).unwrap();
+    }
+
+    /// A path with no link on its way is no concern of the guard's, whether its record says where it led or not.
+    #[test]
+    fn a_plain_path_has_no_link_on_its_way() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a").join("b")).unwrap();
+        assert!(!has_a_link_on_its_way(&dir.path().join("a").join("b").join("c.txt")));
+        let record = Saved { path: dir.path().join("a").join("b").join("c.txt"), copy: None, real: None };
+        assert!(!record.leads_elsewhere());
     }
 
     /// A file that cannot take what a rewind puts back is as it was, with nothing left beside it, and the rewind says so.
