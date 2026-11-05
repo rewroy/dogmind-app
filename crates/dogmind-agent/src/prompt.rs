@@ -108,16 +108,19 @@ fn environment() -> String {
     #[cfg(not(windows))]
     let closed: Vec<PathBuf> = Vec::new();
     let (mut found, mut shut): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    // What of the bundle is there, each of its three on its own: only that is offered, and what is not is the machine's, if it has it.
     #[cfg(windows)]
-    let bundled = crate::bundled::root().is_some();
+    let bundle = crate::bundled::root().map(|root| crate::bundled::Present::of(&root));
     #[cfg(not(windows))]
-    let bundled = false;
-    #[cfg(windows)]
-    if bundled {
-        found.push(crate::bundled::OFFERED);
+    let bundle: Option<crate::bundled::Present> = None;
+    let offered = bundle.map(|present| present.offered()).unwrap_or_default();
+    if !offered.is_empty() {
+        found.push(&offered);
     }
+    let lacking = bundle.map(|present| present.missing()).unwrap_or_default();
+    let lacking = if lacking.is_empty() { String::new() } else { format!(" This build lacks its own {}: those are only what the machine has installed, if it has them.", lacking.join(", ")) };
     for tool in TOOLS {
-        if bundled && matches!(tool, "git" | "python" | "node" | "npm" | "npx") {
+        if bundle.is_some_and(|present| present.covers(tool)) {
             continue;
         }
         match folders.iter().find(|folder| ["exe", "cmd", "bat"].iter().any(|ext| folder.join(format!("{tool}.{ext}")).is_file())) {
@@ -128,7 +131,7 @@ fn environment() -> String {
     }
     let shut = if shut.is_empty() { String::new() } else { format!(" Closed to the sandbox until the user runs /tools, by any path: {}: work without them, and say what /tools would add.", shut.join(", ")) };
     format!(
-        "## Environment\n- Windows. `execute_command` runs cmd.exe in a sandbox, so write cmd syntax. It can write only in the workspace (when that is a whole user folder or drive, only in the project folder its `cwd` names), it cannot read the user's other files except folders the first message names, and it has no network. curl, package installs and remote git ask the user by themselves; anything else that needs it sets `network: true`, which asks too.\n- A server a command starts in the background on localhost can be reached from other commands and by `check_page`'s `url`. `check_page` shows how a page looks, and its `steps` click and type in it as a person would. A page using a CDN library cannot run here, and that is fine: write it once as one file, never download or build a library to check it, and say in your answer that it has not been run.\n- PowerShell starts at C:\\ in the sandbox and cannot move from there, so give it absolute paths, and `Start-Process` a `-WorkingDirectory`.\n- Stay in the workspace unless the user asks otherwise. What the sandbox refuses it refuses by every route, so say what you could not do instead of trying others.\n- On PATH, with no need to check: {}.{shut}\n\n",
+        "## Environment\n- Windows. `execute_command` runs cmd.exe in a sandbox, so write cmd syntax. It can write only in the workspace (when that is a whole user folder or drive, only in the project folder its `cwd` names), it cannot read the user's other files except folders the first message names, and it has no network. curl, package installs and remote git ask the user by themselves; anything else that needs it sets `network: true`, which asks too.\n- A server a command starts in the background on localhost can be reached from other commands and by `check_page`'s `url`. `check_page` shows how a page looks, and its `steps` click and type in it as a person would. A page using a CDN library cannot run here, and that is fine: write it once as one file, never download or build a library to check it, and say in your answer that it has not been run.\n- PowerShell starts at C:\\ in the sandbox and cannot move from there, so give it absolute paths, and `Start-Process` a `-WorkingDirectory`.\n- Stay in the workspace unless the user asks otherwise. What the sandbox refuses it refuses by every route, so say what you could not do instead of trying others.\n- On PATH, with no need to check: {}.{shut}{lacking}\n\n",
         found.join(", ")
     )
 }
@@ -385,6 +388,32 @@ mod tests {
         assert!(system_prompt(&inner, false, "  語尾はにゃん  ", "").contains("語尾はにゃん\n"));
         assert!(prompt.find("top").unwrap() < prompt.find("inner\n").unwrap());
         assert!(!prompt.contains("not this"));
+    }
+
+    /// Only what of the bundle is there is offered, and what is not is said so.
+    #[cfg(windows)]
+    #[test]
+    fn a_bundle_in_part_offers_what_is_there_and_says_what_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tools");
+        std::fs::create_dir_all(root.join("git\\cmd")).unwrap();
+        std::fs::write(root.join("git\\cmd\\git.exe"), "").unwrap();
+        crate::bundled::set_test_root(Some(&root));
+        let text = environment();
+        crate::bundled::set_test_root(None);
+        assert!(text.contains("On PATH, with no need to check: git"), "{text}");
+        // (what the machine itself has on PATH comes after, by name: this PC's own Python and Node are among it)
+        assert!(!text.contains("numpy") && !text.contains("pip, node, npm, npx, git"), "{text}");
+        assert!(text.contains("This build lacks its own python, node"), "{text}");
+        // the whole of it is as it was, with nothing said to be missing
+        for (folder, program) in [("python", "python.exe"), ("node", "node.exe")] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            std::fs::write(root.join(folder).join(program), "").unwrap();
+        }
+        crate::bundled::set_test_root(Some(&root));
+        let text = environment();
+        crate::bundled::set_test_root(None);
+        assert!(text.contains("python (numpy, pandas") && text.contains("pip, node, npm, npx, git") && !text.contains("lacks"), "{text}");
     }
 
     #[test]
