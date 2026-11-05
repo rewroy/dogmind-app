@@ -31,6 +31,36 @@ const HELPER_PAST_ENOUGH: usize = 2;
 /// review's answer of ten findings lost four from its middle.)
 const HELPER_ANSWER: usize = 16 * 1024;
 const TRANSIENT_RETRIES: u32 = 3;
+/// How long in all a turn keeps its request for a server that says it is restarting (a model's load is minutes, and so is a proxy's answer of 502 while one is replaced behind it).
+const RESTART_WAIT: Duration = Duration::from_secs(600);
+/// How long the server may say nothing at all, once it has been seen coming back: the gap between one process ending and the next opening its port.
+const RESTART_SILENCE: Duration = Duration::from_secs(90);
+/// How often it is asked.
+const RESTART_ASK_EVERY: Duration = Duration::from_secs(1);
+
+/// `(how often, how long in all, how long it may be silent)`; a test shortens them.
+fn restart_limits() -> (Duration, Duration, Duration) {
+    #[cfg(test)]
+    if let Some(limits) = *TEST_RESTART_LIMITS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+        return limits;
+    }
+    (RESTART_ASK_EVERY, RESTART_WAIT, RESTART_SILENCE)
+}
+
+#[cfg(test)]
+static TEST_RESTART_LIMITS: Mutex<Option<(Duration, Duration, Duration)>> = Mutex::new(None);
+
+/// How a wait for a restarting server ended.
+enum Restarted {
+    /// The server did not say it was restarting, or had no more to wait for: the usual retries.
+    Not,
+    /// It is back: the request goes again, and this was no retry. The wait in ms.
+    Back(u64),
+    /// The person's Stop ended the wait.
+    Stopped,
+    /// It did not come back in the time there is.
+    GaveUp,
+}
 const OVERFLOW_RETRIES: u32 = 2;
 /// In a row: a long job meets failures along the way, and a model that gets nowhere meets nothing else.
 const MAX_FAILED_CALLS: usize = 12;
@@ -132,6 +162,8 @@ pub enum Event {
     Turns(Vec<Turn>),
     /// A rewind is done; `prompt` is what was typed, when the conversation went back to before it.
     Rewound { restored: Restored, prompt: Option<String> },
+    /// The request waits for a server that is being restarted: its loading progress as `/health` gave it, or null when only a proxy in front of it answers. Till the next request.
+    ServerRestarting(Value),
     Notice(String),
     Failed(String),
     TurnEnded { cancelled: bool },
@@ -1565,6 +1597,53 @@ impl Agent {
         self.cancel.load(Ordering::Relaxed)
     }
 
+    /// A request the server refused or lost: asks `/health` whether it is being restarted, and if it is keeps the request and waits while it says so (loading, or a proxy's 502, 503 or 504 with no
+    /// health of its own), up to the time this turn has for it. A server that is ready, or has no health to ask, is none of this: the usual retries go. The person's Stop ends it at once.
+    /// `spent`: what this turn has waited in all.
+    fn wait_for_restart(&mut self, provider: &dyn Provider, spent: &mut Duration) -> Restarted {
+        let (every, bound, silence) = restart_limits();
+        let began = Instant::now();
+        let (mut coming, mut silent_since, mut shown) = (false, None::<Instant>, None::<Value>);
+        let ended = loop {
+            if self.cancelled() {
+                break Restarted::Stopped;
+            }
+            if *spent + began.elapsed() >= bound {
+                break if coming { Restarted::GaveUp } else { Restarted::Not };
+            }
+            match provider.restart(&self.cancel) {
+                llm::Restart::Coming(progress) => {
+                    silent_since = None;
+                    if !coming {
+                        coming = true;
+                        self.emit(Event::Notice(llm::SERVER_RESTARTING.into()));
+                    }
+                    if shown.as_ref() != Some(&progress) {
+                        self.emit(Event::ServerRestarting(progress.clone()));
+                        shown = Some(progress);
+                    }
+                }
+                llm::Restart::Ready => break if coming { Restarted::Back(0) } else { Restarted::Not },
+                llm::Restart::Silent if coming => {
+                    if silent_since.get_or_insert_with(Instant::now).elapsed() > silence {
+                        break Restarted::GaveUp;
+                    }
+                }
+                llm::Restart::Silent => break Restarted::Not,
+                // (it answers, and no longer as a server that is loading: it is for the request to find out)
+                llm::Restart::Unknown => break if coming { Restarted::Back(0) } else { Restarted::Not },
+            }
+            self.wait_to_retry(every);
+        };
+        if coming {
+            *spent += began.elapsed();
+        }
+        match ended {
+            Restarted::Back(_) => Restarted::Back(began.elapsed().as_millis() as u64),
+            other => other,
+        }
+    }
+
     fn iterate(&mut self) -> Ended {
         let Some(provider) = self.provider.clone() else { return Ended::Failed(llm::NOT_READY.into()) };
         let (mut transient, mut overflow, mut failed_calls) = (0u32, 0u32, 0usize);
@@ -1576,6 +1655,8 @@ impl Agent {
         let (mut said, mut asked_about_slips) = (String::new(), false);
         // The request this one repeats, why, and how long it waited, for the trajectory.
         let mut retry: Option<(String, &'static str, u64)> = None;
+        // What this turn has waited for a server being restarted, in all.
+        let mut restart_spent = Duration::ZERO;
         for _ in 0..MAX_ITERATIONS {
             if self.cancelled() {
                 return Ended::Cancelled;
@@ -1749,7 +1830,25 @@ impl Agent {
                     answer
                 }
                 Err(LlmError::Transient(message)) => {
-                    transient += 1;
+                    // A server being restarted is waited for, with the request kept, and that is no retry of the three.
+                    let waited_for_restart = match self.wait_for_restart(provider.as_ref(), &mut restart_spent) {
+                        Restarted::Back(ms) => Some(ms),
+                        Restarted::Stopped => {
+                            self.restart_wait_ended("stopped", restart_spent);
+                            if !saved.is_some_and(|saved| self.keep_cut_write(saved.0)) {
+                                self.keep_written(&written);
+                            }
+                            return Ended::Cancelled;
+                        }
+                        Restarted::GaveUp => {
+                            self.restart_wait_ended("gave_up", restart_spent);
+                            None
+                        }
+                        Restarted::Not => None,
+                    };
+                    if waited_for_restart.is_none() {
+                        transient += 1;
+                    }
                     if transient > TRANSIENT_RETRIES && saved.is_some() {
                         if !saved.is_some_and(|saved| self.keep_cut_write(saved.0)) {
                             self.keep_written(&written);
@@ -1772,8 +1871,8 @@ impl Agent {
                         }
                         self.push(Message::text("user", if begun.is_empty() { prompt::CONTINUE_NUDGE.to_string() } else { prompt::calls_broken_off(&begun) }));
                     }
-                    let waited = self.wait_to_retry(retry_pause(transient, &message));
-                    retry = Some((req_id.clone(), "transient", waited));
+                    let waited = waited_for_restart.unwrap_or_else(|| self.wait_to_retry(retry_pause(transient, &message)));
+                    retry = Some((req_id.clone(), if waited_for_restart.is_some() { "server_restart" } else { "transient" }, waited));
                     continue;
                 }
                 // Nothing to wait for and nothing to shorten: what came stays, and the conversation with it.
@@ -1991,6 +2090,11 @@ impl Agent {
     fn intervened(&mut self, kind: &str, fields: Value) {
         let req = self.last_req.clone();
         self.traj.intervention(kind, req.as_deref(), fields);
+    }
+
+    /// A wait for a restarting server that did not end in the request going again: how it ended, and how long in all this turn has waited.
+    fn restart_wait_ended(&mut self, how: &str, spent: Duration) {
+        self.intervened("server_restart_wait", json!({"outcome": how, "waited_ms": spent.as_millis() as u64}));
     }
 
     /// A `create_file` kept where it was cut off, to be gone on with: its size, and why it was cut.
@@ -2730,18 +2834,28 @@ mod tests {
         let kept = bodies.clone();
         std::thread::spawn(move || {
             for script in scripts {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
                 let mut block = [0u8; 65536];
-                let body = loop {
-                    let count = stream.read(&mut block).unwrap();
-                    request.extend_from_slice(&block[..count]);
-                    let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
-                    let head = String::from_utf8_lossy(&request[..at]).to_lowercase();
-                    let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
-                    if request.len() >= at + 4 + length {
-                        break String::from_utf8_lossy(&request[at + 4..at + 4 + length]).into_owned();
+                let (mut stream, body) = loop {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = Vec::new();
+                    let (head, body) = loop {
+                        let count = stream.read(&mut block).unwrap();
+                        request.extend_from_slice(&block[..count]);
+                        let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&request[..at]).to_lowercase();
+                        let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                        if request.len() >= at + 4 + length {
+                            break (head, String::from_utf8_lossy(&request[at + 4..at + 4 + length]).into_owned());
+                        }
+                    };
+                    // (a server with no `/health`, which the agent asks after a request it could not have answered: it is no request of the script's)
+                    if head.starts_with("get /health") {
+                        stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+                        continue;
                     }
+                    break (stream, body);
                 };
                 kept.lock().unwrap().push(serde_json::from_str::<Value>(&body).unwrap());
                 let answer = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{script}", script.len());
@@ -4770,6 +4884,245 @@ mod tests {
         assert!(!command_wrote("command_status", &Ok("job1 is running, for 4 s: make\nit has printed nothing yet".into())));
         assert!(!command_wrote("execute_command", &Err("not run".into())));
         assert!(!command_wrote("read_file", &Ok(lists)), "a file that says it is not a command");
+    }
+
+    /// A server of routes, for what a server being restarted does: `answer(method, path, n)` is the status, content type and body for the n-th request (from 0) of that method and path.
+    fn routed(answer: impl Fn(&str, &str, usize) -> (u16, &'static str, String) + Send + Sync + 'static) -> (Client, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (answer, seen) = (Arc::new(answer), Arc::new(Mutex::new(Vec::<String>::new())));
+        let kept = seen.clone();
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut stream) = connection else { return };
+                let (answer, kept) = (answer.clone(), kept.clone());
+                std::thread::spawn(move || {
+                    let (mut request, mut block) = (Vec::new(), [0u8; 65536]);
+                    let head = loop {
+                        let Ok(count @ 1..) = stream.read(&mut block) else { return };
+                        request.extend_from_slice(&block[..count]);
+                        let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&request[..at]).to_string();
+                        let length: usize = head.to_lowercase().lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                        if request.len() >= at + 4 + length {
+                            break head;
+                        }
+                    };
+                    let mut first = head.lines().next().unwrap_or("").split_whitespace();
+                    let (method, path) = (first.next().unwrap_or("").to_string(), first.next().unwrap_or("").to_string());
+                    let n = {
+                        let mut kept = kept.lock().unwrap();
+                        let n = kept.iter().filter(|line| **line == format!("{method} {path}")).count();
+                        kept.push(format!("{method} {path}"));
+                        n
+                    };
+                    let (status, kind, body) = answer(&method, &path, n);
+                    let reason = match status { 200 => "OK", 404 => "Not Found", 502 => "Bad Gateway", _ => "Service Unavailable" };
+                    let said = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(said.as_bytes());
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+                });
+            }
+        });
+        (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), seen)
+    }
+
+    /// The waits for a restarting server, shortened for as long as this is held: the tests that wait are one at a time, as the limits are one for all.
+    struct ShortRestartLimits<'a> {
+        _one_at_a_time: std::sync::MutexGuard<'a, ()>,
+    }
+
+    static RESTART_TESTS: Mutex<()> = Mutex::new(());
+
+    impl ShortRestartLimits<'_> {
+        fn of(bound: Duration) -> ShortRestartLimits<'static> {
+            let one_at_a_time = RESTART_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *TEST_RESTART_LIMITS.lock().unwrap() = Some((Duration::from_millis(20), bound, Duration::from_millis(300)));
+            ShortRestartLimits { _one_at_a_time: one_at_a_time }
+        }
+    }
+
+    impl Drop for ShortRestartLimits<'_> {
+        fn drop(&mut self) {
+            *TEST_RESTART_LIMITS.lock().unwrap() = None;
+        }
+    }
+
+    const LOADING: &str = r#"{"status": "loading", "progress": {"stage": "load", "done": 1, "total": 4}}"#;
+
+    /// The Homelab at 23:46: the engine restarted while a run went on, and the next request failed in 35 s of retries, less than a load. Now the request is kept while `/health` says loading, goes
+    /// when it says ready, and the three retries are not used for it: four refusals in a row, each in a restart, and the answer comes.
+    #[test]
+    fn a_request_refused_while_the_server_loads_waits_for_it_and_goes_again() {
+        let _short = ShortRestartLimits::of(Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = routed(|method, path, n| match (method, path) {
+            ("POST", _) if n < 4 => (503, "application/json", r#"{"error": {"message": "Loading model"}}"#.to_string()),
+            ("POST", _) => (200, "text/event-stream", text_answer("back")),
+            // (loading, then ready, in each of the four restarts)
+            ("GET", "/health") if n % 2 == 0 => (503, "application/json", LOADING.to_string()),
+            ("GET", "/health") => (200, "application/json", r#"{"status": "ok"}"#.to_string()),
+            _ => (404, "application/json", "{}".to_string()),
+        });
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("hello".into())).unwrap();
+        let mut told: Vec<String> = Vec::new();
+        let mut loading = Vec::new();
+        let mut content = String::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(30)).expect("the turn ended") {
+                Event::Notice(text) => told.push(text),
+                Event::ServerRestarting(progress) => loading.push(progress),
+                Event::Content(text) => content.push_str(&text),
+                Event::Failed(text) => panic!("the turn failed: {text}"),
+                Event::TurnEnded { cancelled } => {
+                    assert!(!cancelled);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(content, "back");
+        assert_eq!(told.iter().filter(|text| *text == llm::SERVER_RESTARTING).count(), 4, "{told:?}");
+        assert!(loading.iter().all(|progress| progress["stage"] == "load"), "the progress is passed on as it was: {loading:?}");
+        assert_eq!(seen.lock().unwrap().iter().filter(|line| line.starts_with("POST")).count(), 5);
+        let lines = trajectory_of(&run);
+        let requests = of_kind(&lines, "request");
+        let waits: Vec<&&Value> = requests.iter().filter(|line| line["retry_why"] == "server_restart").collect();
+        assert_eq!(waits.len(), 4, "each wait is on the request that came after it, with its length: {requests:?}");
+        assert!(waits.iter().all(|line| line["wait_ms"].as_u64().is_some() && line["retry_of"].is_string()));
+    }
+
+    /// The same, as a proxy in front of the server does it: its 502 while the server behind it is replaced, for `/health` too, and then the server's own answer.
+    #[test]
+    fn a_502_from_a_proxy_in_front_of_a_restarting_server_is_waited_for_too() {
+        let _short = ShortRestartLimits::of(Duration::from_secs(60));
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _) = routed(|method, path, n| match (method, path) {
+            ("POST", _) if n == 0 => (502, "text/html", "<html><body><h1>502 Bad Gateway</h1></body></html>".to_string()),
+            ("POST", _) => (200, "text/event-stream", text_answer("back")),
+            ("GET", "/health") if n < 3 => (502, "text/html", "<html><body><h1>502 Bad Gateway</h1></body></html>".to_string()),
+            ("GET", "/health") => (200, "application/json", r#"{"status": "ok"}"#.to_string()),
+            _ => (404, "application/json", "{}".to_string()),
+        });
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("hello".into())).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled && log.iter().any(|line| line == "content:back") && !log.iter().any(|line| line.starts_with("failed:")), "{log:?}");
+        let progress: Vec<Value> = of_kind(&trajectory_of(&run), "request").into_iter().filter(|line| line["retry_why"] == "server_restart").cloned().collect();
+        assert_eq!(progress.len(), 1);
+    }
+
+    /// The person's Stop ends the wait at once, and the turn with it.
+    #[test]
+    fn stop_ends_the_wait_for_a_restarting_server_at_once() {
+        let _short = ShortRestartLimits::of(Duration::from_secs(600));
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _) = routed(|method, path, _| match (method, path) {
+            ("POST", _) => (503, "application/json", r#"{"error": {"message": "Loading model"}}"#.to_string()),
+            ("GET", "/health") => (503, "application/json", LOADING.to_string()),
+            _ => (404, "application/json", "{}".to_string()),
+        });
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("hello".into())).unwrap();
+        loop {
+            if let Event::ServerRestarting(_) = run.events.recv_timeout(Duration::from_secs(20)).expect("the wait began") {
+                break;
+            }
+        }
+        let stopped = Instant::now();
+        run.handle.cancel.store(true, Ordering::Relaxed);
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(10)).expect("the turn ended") {
+                Event::TurnEnded { cancelled } => {
+                    assert!(cancelled);
+                    break;
+                }
+                Event::Failed(text) => panic!("a Stop is no failure: {text}"),
+                _ => {}
+            }
+        }
+        assert!(stopped.elapsed() < Duration::from_secs(3), "{:?}", stopped.elapsed());
+        let lines = trajectory_of(&run);
+        assert!(of_kind(&lines, "intervention").iter().any(|line| line["kind"] == "server_restart_wait" && line["outcome"] == "stopped"));
+    }
+
+    /// A server that does not come back in the time there is is given up on: the wait is over, and the usual retries are what is left (the turn is stopped here, as they take half a minute).
+    #[test]
+    fn a_server_that_stays_loading_past_the_time_there_is_is_given_up_on() {
+        let _short = ShortRestartLimits::of(Duration::from_millis(400));
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _) = routed(|method, path, _| match (method, path) {
+            ("POST", _) => (503, "application/json", r#"{"error": {"message": "Loading model"}}"#.to_string()),
+            ("GET", "/health") => (503, "application/json", LOADING.to_string()),
+            _ => (404, "application/json", "{}".to_string()),
+        });
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("hello".into())).unwrap();
+        let waited = Instant::now();
+        let gave_up = loop {
+            let given_up = std::fs::read_dir(run._sessions.path()).unwrap().flatten().map(|entry| entry.path()).filter(|path| trajectory::is_trajectory(path))
+                .any(|file| std::fs::read_to_string(file).unwrap_or_default().contains("\"outcome\":\"gave_up\""));
+            if given_up || waited.elapsed() > Duration::from_secs(20) {
+                break given_up;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(gave_up, "the wait is over when the time is");
+        run.handle.cancel.store(true, Ordering::Relaxed);
+        until_end(&run, Decision::Reject);
+    }
+
+    /// A 503 from a server whose health has nothing to say of a restart is not one: the usual retries, five seconds for the first.
+    #[test]
+    fn a_503_with_no_loading_health_keeps_the_usual_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = routed(|method, path, n| match (method, path) {
+            ("POST", _) if n == 0 => (503, "application/json", r#"{"error": {"message": "busy with another request"}}"#.to_string()),
+            ("POST", _) => (200, "text/event-stream", text_answer("again")),
+            _ => (404, "application/json", "{}".to_string()),
+        });
+        let run = run_agent(dir.path(), client, Mode::Default);
+        let began = Instant::now();
+        run.handle.commands.send(Command::Send("hello".into())).unwrap();
+        let (mut notices, mut content) = (Vec::new(), String::new());
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(30)).expect("the turn ended") {
+                Event::Notice(text) => notices.push(text),
+                Event::Content(text) => content.push_str(&text),
+                Event::Failed(text) => panic!("the turn failed: {text}"),
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(content, "again");
+        assert!(!notices.iter().any(|text| text == llm::SERVER_RESTARTING), "no word of a restart: {notices:?}");
+        assert!(began.elapsed() >= Duration::from_secs(5), "the first retry waits five seconds for a server that is busy: {:?}", began.elapsed());
+        assert_eq!(seen.lock().unwrap().iter().filter(|line| line.starts_with("POST")).count(), 2);
+        assert!(of_kind(&trajectory_of(&run), "request").iter().any(|line| line["retry_why"] == "transient"));
+    }
+
+    /// What `/health` and the front of a server can say, as the client reads it.
+    #[test]
+    fn what_a_server_says_of_its_restart_is_read_as_it_is() {
+        let ask = |status: u16, kind: &'static str, body: &'static str| {
+            let (client, _) = routed(move |_, _, _| (status, kind, body.to_string()));
+            llm::Provider::restart(&client, &AtomicBool::new(false))
+        };
+        assert_eq!(ask(200, "application/json", r#"{"status": "ok"}"#), llm::Restart::Ready);
+        assert_eq!(ask(503, "application/json", LOADING), llm::Restart::Coming(serde_json::json!({"stage": "load", "done": 1, "total": 4})));
+        assert_eq!(ask(200, "application/json", r#"{"status": "loading"}"#), llm::Restart::Coming(Value::Null));
+        for status in [502, 503, 504] {
+            assert_eq!(ask(status, "text/html", "<h1>Bad Gateway</h1>"), llm::Restart::Coming(Value::Null), "{status}");
+        }
+        assert_eq!(ask(404, "application/json", "{}"), llm::Restart::Unknown);
+        assert_eq!(ask(500, "text/plain", "oops"), llm::Restart::Unknown);
+        assert_eq!(ask(200, "application/json", r#"{"status": "error"}"#), llm::Restart::Unknown);
+        // (nothing listens)
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let gone = Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap();
+        assert_eq!(llm::Provider::restart(&gone, &AtomicBool::new(false)), llm::Restart::Silent);
     }
 
     /// The scratch folder of the session whose files are in `sessions`, as a step of a script finds it when it runs.
