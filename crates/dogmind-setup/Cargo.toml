@@ -13,8 +13,9 @@ name = "dogmind-setup"
 path = "src/main.rs"
 
 [dependencies]
-# Nothing that is not already in this workspace: the package is deflated, file by file, and each file is checked by its hash.
+# Nothing that is not already in this workspace: the package is deflated, file by file, and each file is checked by its hash. The `.parts` file beside a setup is JSON, as the app reads it.
 flate2 = "1"
+serde_json = "1"
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]

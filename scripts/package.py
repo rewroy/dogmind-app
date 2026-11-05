@@ -8,7 +8,8 @@
     python -I scripts/package.py --tools-only FOLDER     tools\\ alone, in FOLDER, for a test
     python -I scripts/package.py --setup-only FOLDER OUT.exe   an installer of FOLDER alone, for a test, from the release build of dogmind-setup or %DOGMIND_SETUP_STUB%
 
-What comes out: the folder dist/DogmindApp, its zip, and the installer DogmindSetup-VERSION.exe, one file with that folder on its end.
+What comes out: the folder dist/DogmindApp, its zip, and the installer DogmindSetup-VERSION.exe, one file with that folder on its end, and beside it DogmindSetup-VERSION.parts: what is where
+in the installer, which the app reads to fetch only the part of it that an update changes. It is a file of the release, to be uploaded with the installer, and no part of what is installed.
 
 DOGMIND_DIST names the folder that takes the place of dist/ for all of it (DogmindApp, symbols-VERSION, the zip and the installer). A release made while the app runs from dist/DogmindApp
 sets it, as this replaces tools\\ whole and puts a new exe over the running one.
@@ -340,8 +341,12 @@ def make_setup(folder, out, version):
     if not stub.is_file():
         sys.exit(f"{stub} is missing: run cargo build --release -p dogmind-setup")
     subprocess.run([str(stub), "--pack", str(folder), str(out), "--version", version], check=True)
+    # (it reads the `.parts` file beside it as well, and says if that is not a description of this very file)
     subprocess.run([str(stub), "--verify", str(out)], check=True)
-    print(f"{out}: {out.stat().st_size / 1048576:.0f} MB")
+    parts = out.with_suffix(".parts")
+    if not parts.is_file():
+        sys.exit(f"{parts} is missing: dogmind-setup --pack writes it beside the installer")
+    print(f"{out}: {out.stat().st_size / 1048576:.0f} MB, and {parts.name}: {parts.stat().st_size / 1024:.0f} KB")
 
 
 def main():

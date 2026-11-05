@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::pack::{hash_file, hex, unhex, Entry, Package};
+use crate::pack::{hash_file, hex, unhex, Entry, Package, KEPT};
 
 /// What says what an install put in a folder, and of which version.
 pub const MANIFEST: &str = "dogmind-install.txt";
@@ -277,19 +277,36 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     // (how long each stage took, for the manifest)
     let (mut checking, mut unpacking, mut placing) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let looked = Instant::now();
-    // What will not fit is said before anything is written. What is there already at this size will most likely stay as it is.
-    let needed: u64 = entries.iter().filter(|entry| std::fs::metadata(folder.join(&entry.path)).map_or(true, |data| data.len() != entry.size) && std::fs::metadata(beside(&folder.join(&entry.path))).map_or(true, |data| data.len() != entry.size)).map(|entry| entry.size).sum();
+    // What will not fit is said before anything is written. What is there already at this size will most likely stay as it is, and a file the package leaves out (KEPT) needs no room.
+    let needed: u64 = entries.iter().filter(|entry| entry.method != KEPT && std::fs::metadata(folder.join(&entry.path)).map_or(true, |data| data.len() != entry.size) && std::fs::metadata(beside(&folder.join(&entry.path))).map_or(true, |data| data.len() != entry.size)).map(|entry| entry.size).sum();
+    let mut hashed = 0usize;
+    let previous = read_manifest(folder);
+    let ours: HashSet<String> = previous.iter().flat_map(|manifest| manifest.files.iter()).map(|file| file.to_lowercase()).collect();
+    // What the last install wrote down of its files, by lower case path.
+    let records: HashMap<String, &Record> = previous.iter().flat_map(|manifest| manifest.records.iter()).map(|(path, record)| (path.to_lowercase(), record)).collect();
+    // The files this package leaves out (KEPT) are in the folder already, as the app saw them when it put the package together, or nothing is changed and the person is told what to do: such a
+    // setup can be no more than an update of the install it was made for.
+    let mut found: HashMap<usize, Option<Stamp>> = HashMap::new();
+    for (at, entry) in entries.iter().enumerate().filter(|(_, entry)| entry.method == KEPT) {
+        let mut announce = || on(Progress { stage: Stage::Checking, fraction: 0.0, file: entry.path.clone() });
+        match holds(&folder.join(&entry.path), entry, records.get(&entry.path.to_lowercase()).copied(), &mut hashed, &mut announce) {
+            Holds::Yes(stamp) => {
+                found.insert(at, stamp);
+            }
+            Holds::No => {
+                return Err(Failure::Said(format!(
+                    "{}: this update leaves out the files that were in this folder when it was fetched, and this one is not as it was, so nothing has been changed. Download the full setup from the release page, and run that.",
+                    folder.join(&entry.path).display()
+                )));
+            }
+        }
+    }
     if let Some(free) = job.free {
         if needed + ROOM_TO_SPARE > free {
             return Err(Failure::TooLittleRoom { needed: needed + ROOM_TO_SPARE, free });
         }
     }
-    let mut hashed = 0usize;
     // What is in the way and is no install's. The folder can be any the person names, and what this is about to do is put its own file in that place and, one day, take it away.
-    let previous = read_manifest(folder);
-    let ours: HashSet<String> = previous.iter().flat_map(|manifest| manifest.files.iter()).map(|file| file.to_lowercase()).collect();
-    // What the last install wrote down of its files, by lower case path.
-    let records: HashMap<String, &Record> = previous.iter().flat_map(|manifest| manifest.records.iter()).map(|(path, record)| (path.to_lowercase(), record)).collect();
     for entry in &entries {
         let target = folder.join(&entry.path);
         if !ours.contains(&entry.path.to_lowercase()) && target.exists() {
@@ -303,8 +320,7 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     let mut done = 0u64;
     let mut outcome = Installed::default();
     let mut unpacked_now = 0;
-    // The files that were found in place, by their place in the package, with the size and time they had when they were looked at.
-    let mut found: HashMap<usize, Option<Stamp>> = HashMap::new();
+    // (`found`, from above, has the files that were found in place, by their place in the package, with the size and time they had when they were looked at.)
     // Unpack, or find it there.
     let mut to_place: Vec<&Entry> = Vec::new();
     for (at, entry) in entries.iter().enumerate() {
@@ -314,6 +330,14 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
         let target = folder.join(&entry.path);
         let waiting = beside(&target);
         let parts = done as f64 / total as f64;
+        if entry.method == KEPT {
+            // (found above; a file waiting for it is of a run that was for another package)
+            let _ = std::fs::remove_file(&waiting);
+            outcome.already_there += 1;
+            done += entry.size;
+            on(Progress { stage: Stage::Unpacking, fraction: done as f64 / total as f64, file: entry.path.clone() });
+            continue;
+        }
         let looked = Instant::now();
         let mut announce = || on(Progress { stage: Stage::Checking, fraction: parts, file: entry.path.clone() });
         let in_waiting = matches!(holds(&waiting, entry, None, &mut hashed, &mut announce), Holds::Yes(_));
@@ -1100,5 +1124,102 @@ mod tests {
         assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"one a");
         let mut fifth = scene.package("1.0.4", &files);
         assert_eq!(scene.run(&mut fifth, None, None).unwrap().hashed, 0);
+    }
+
+    impl Scene {
+        /// The package of these files with the files named left out of it (KEPT), as the app puts one together.
+        fn package_without(&self, version: &str, files: &[(&str, &[u8])], kept: &[&str]) -> Package {
+            drop(self.package(version, files));
+            let part = self.dir.path().join(format!("setup-{version}-part.exe"));
+            crate::pack::tests::leave_out(&self.dir.path().join(format!("setup-{version}.exe")), &part, kept);
+            Package::open(&part).unwrap()
+        }
+    }
+
+    #[test]
+    fn a_package_that_leaves_files_out_goes_over_the_install_it_was_made_for_and_reads_none_of_them() {
+        let scene = Scene::new();
+        let big = noise(200_000);
+        let mut first = scene.package("1.0.0", &[("dogmind-app.exe", b"app one"), ("big.dll", &big), ("same.txt", b"unchanged"), ("tools\\keep.py", b"keep")]);
+        scene.run(&mut first, None, None).unwrap();
+        let folder = scene.folder();
+        let files: [(&str, &[u8]); 5] = [("dogmind-app.exe", b"app two!"), ("big.dll", &big), ("same.txt", b"unchanged"), ("tools\\keep.py", b"keep"), ("new.txt", b"new")];
+        let mut second = scene.package_without("2.0.0", &files, &["big.dll", "same.txt", "tools\\keep.py"]);
+        // (room for what is in the package and no more: what it leaves out needs none)
+        let done = scene.run(&mut second, Some(ROOM_TO_SPARE + 100), None).unwrap();
+        assert_eq!(done, Installed { unpacked: 2, already_there: 3, removed: 0, hashed: 0 }, "the files left out count as in place, and none of them is read");
+        for (name, bytes) in files {
+            assert_eq!(std::fs::read(folder.join(name)).unwrap(), bytes, "{name}");
+        }
+        let manifest = read_manifest(&folder).unwrap();
+        assert_eq!(manifest.version, "2.0.0");
+        for (name, _) in files {
+            assert!(manifest.files.contains(&name.to_string()), "{name}");
+        }
+        assert_eq!(manifest.records.len(), 5, "the files that were left out are written down as the others are");
+        for (path, record) in &manifest.records {
+            assert_eq!(Stamp { size: record.size, modified: record.modified }, stamp_on_disk(&folder.join(path)), "{path}");
+        }
+        // what is left is what a whole setup of that version leaves, and one finds everything in place at once
+        let mut whole = scene.package("2.0.1", &files);
+        assert_eq!(scene.run(&mut whole, None, None).unwrap(), Installed { unpacked: 0, already_there: 5, removed: 0, hashed: 0 });
+    }
+
+    #[test]
+    fn a_file_left_out_is_found_by_its_hash_when_the_install_has_no_record_of_it() {
+        let scene = Scene::new();
+        let big = noise(50_000);
+        let mut first = scene.package("1.0.0", &[("dogmind-app.exe", b"app one"), ("big.dll", &big), ("same.txt", b"unchanged")]);
+        scene.run(&mut first, None, None).unwrap();
+        let folder = scene.folder();
+        // an install of 0.1.4: `file` lines, and no record of any file
+        std::fs::write(folder.join(MANIFEST), format!("version 1.0.0\ntest\nfile dogmind-app.exe\nfile big.dll\nfile same.txt\nfile {UNINSTALLER}\n")).unwrap();
+        let files: [(&str, &[u8]); 3] = [("dogmind-app.exe", b"app two!"), ("big.dll", &big), ("same.txt", b"unchanged")];
+        let mut second = scene.package_without("2.0.0", &files, &["big.dll", "same.txt"]);
+        let done = scene.run(&mut second, None, None).unwrap();
+        assert_eq!(done, Installed { unpacked: 1, already_there: 2, removed: 0, hashed: 2 });
+        assert_eq!(read_manifest(&folder).unwrap().records.len(), 3, "and now it has them");
+    }
+
+    #[test]
+    fn a_file_left_out_that_is_not_as_it_was_stops_it_before_anything_changes_and_says_what_to_do() {
+        let scene = Scene::new();
+        let big = noise(50_000);
+        let mut first = scene.package("1.0.0", &[("dogmind-app.exe", b"app one"), ("big.dll", &big), ("same.txt", b"unchanged")]);
+        scene.run(&mut first, None, None).unwrap();
+        let folder = scene.folder();
+        let files: [(&str, &[u8]); 3] = [("dogmind-app.exe", b"app two!"), ("big.dll", &big), ("same.txt", b"unchanged")];
+        let mut second = scene.package_without("2.0.0", &files, &["big.dll", "same.txt"]);
+        let said = |failed: Failure| match failed {
+            Failure::Said(words) => words,
+            other => panic!("{other:?}"),
+        };
+        let manifest_before = std::fs::read(folder.join(MANIFEST)).unwrap();
+        // gone
+        std::fs::remove_file(folder.join("same.txt")).unwrap();
+        let before = walk(&folder);
+        let words = said(scene.run(&mut second, None, None).unwrap_err());
+        assert!(words.contains("same.txt") && words.contains("full setup") && words.contains("release page") && words.contains("nothing has been changed"), "{words}");
+        assert_eq!(walk(&folder), before, "not a file made, not one moved");
+        assert_eq!(std::fs::read(folder.join("dogmind-app.exe")).unwrap(), b"app one");
+        assert_eq!(std::fs::read(folder.join(MANIFEST)).unwrap(), manifest_before);
+        // there, with other bytes of the same size, and another time
+        std::fs::write(folder.join("same.txt"), b"unchangeX").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(folder.join("same.txt")).unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(3600)).unwrap();
+        drop(file);
+        let before = walk(&folder);
+        assert!(said(scene.run(&mut second, None, None).unwrap_err()).contains("full setup"));
+        assert_eq!(walk(&folder), before);
+        // with no install at all there is nothing for it to leave out
+        let fresh = Scene::new();
+        let mut alone = fresh.package_without("2.0.0", &files, &["big.dll", "same.txt"]);
+        assert!(said(fresh.run(&mut alone, None, None).unwrap_err()).contains("full setup"));
+        assert!(walk(&fresh.folder()).is_empty() && read_manifest(&fresh.folder()).is_none());
+        // the file as it was, put back, is read, found to be the one, and the update goes through
+        std::fs::write(folder.join("same.txt"), b"unchanged").unwrap();
+        let done = scene.run(&mut second, None, None).unwrap();
+        assert_eq!(done, Installed { unpacked: 1, already_there: 2, removed: 0, hashed: 1 });
+        assert_eq!(std::fs::read(folder.join("dogmind-app.exe")).unwrap(), b"app two!");
     }
 }

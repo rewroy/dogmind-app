@@ -1,7 +1,8 @@
 //! Dogmind's installer: one executable with the package on its end, no administrator and nothing to install it with.
 //!
-//!     dogmind-setup --pack FOLDER OUT.exe [--version V] [--level 0-9]    makes DogmindSetup.exe from this program and FOLDER (scripts/package.py does)
-//!     dogmind-setup --verify FILE.exe                                    unpacks all of it to nowhere, and says if every file is sound
+//!     dogmind-setup --pack FOLDER OUT.exe [--version V] [--level 0-9]    makes DogmindSetup.exe from this program and FOLDER (scripts/package.py does), and OUT.parts beside it:
+//!                                                                        what is where in it, for the app to fetch only what an update changes
+//!     dogmind-setup --verify FILE.exe                                    unpacks all of it to nowhere, and says if every file is sound; and if FILE.parts is beside it, that it describes it
 //!     DogmindSetup.exe [--dir FOLDER]                                    installs, or updates what is there. It starts with FOLDER, else with the install Installed apps names if that is still
 //!                                                                        there, else with %LOCALAPPDATA%\Programs\Dogmind; a first install can be moved to another folder on its first page
 //!     DogmindSetup.exe --update --dir FOLDER [--wait-pid PID]...         what the app runs for an update it has downloaded: no question is asked. It waits for those
@@ -188,6 +189,8 @@ fn do_pack(folder: &Path, out: &Path, version: &str, level: u32) -> i32 {
         Ok(size) => {
             let length = std::fs::metadata(out).map_or(0, |data| data.len());
             println!("{}: {} files, {:.0} MB in them, {:.0} MB packed, {:.0} MB in all", out.display(), size.files, size.bytes as f64 / 1e6, size.stored as f64 / 1e6, length as f64 / 1e6);
+            let parts = pack::parts_path(out);
+            println!("{}: {:.0} KB", parts.display(), std::fs::metadata(&parts).map_or(0, |data| data.len()) as f64 / 1e3);
             0
         }
         Err(error) => fail(&format!("{}: {error}", out.display())),
@@ -199,12 +202,24 @@ fn do_verify(file: &Path) -> i32 {
         Ok(package) => package,
         Err(error) => return fail(&format!("{}: {error}", file.display())),
     };
+    // (a setup the app put together holds no bytes of the files that are KEPT from the install: there is nothing of them to check here)
+    let mut kept = 0;
     for entry in package.entries.clone() {
-        if let Err(error) = package.extract(&entry, &mut std::io::sink(), &mut |_| {}) {
+        if entry.method == pack::KEPT {
+            kept += 1;
+        } else if let Err(error) = package.extract(&entry, &mut std::io::sink(), &mut |_| {}) {
             return fail(&error.to_string());
         }
     }
-    println!("{}: version {}, {} files, all as they were packed", file.display(), package.version, package.entries.len());
+    let words = if kept > 0 { format!(", {kept} of them kept from the install and not in it") } else { String::new() };
+    println!("{}: version {}, {} files{words}, all as they were packed", file.display(), package.version, package.entries.len());
+    // The `.parts` file that was made with it says what is where in it, and the app fetches by that: it has to be what the file is.
+    if pack::parts_path(file).is_file() {
+        match pack::check_parts(file) {
+            Ok(count) => println!("{}: describes it, {count} files", pack::parts_path(file).display()),
+            Err(error) => return fail(&error.to_string()),
+        }
+    }
     0
 }
 
@@ -435,5 +450,22 @@ mod tests {
         let setup = dir.path().join("setup.exe");
         pack::pack(&pack::tests::own_exe(), &folder, &setup, "1", 1, &mut |_| {}).unwrap();
         assert_eq!(do_verify(&setup), 0);
+    }
+
+    #[test]
+    fn a_setup_is_verified_with_its_parts_file_and_one_that_leaves_files_out_with_what_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("in");
+        pack::tests::tree(&folder, &[("a", b"1"), ("b", &pack::tests::noise(100_000))]);
+        let setup = dir.path().join("setup.exe");
+        pack::pack(&pack::tests::own_exe(), &folder, &setup, "1", 6, &mut |_| {}).unwrap();
+        assert!(pack::parts_path(&setup).is_file());
+        assert_eq!(do_verify(&setup), 0);
+        let part = dir.path().join("part.exe");
+        pack::tests::leave_out(&setup, &part, &["b"]);
+        assert_eq!(do_verify(&part), 0, "what it left out is not in it to be checked");
+        // a parts file that is not the setup's is said
+        std::fs::write(pack::parts_path(&setup), b"{}").unwrap();
+        assert_eq!(do_verify(&setup), 1);
     }
 }
