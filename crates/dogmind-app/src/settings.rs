@@ -102,6 +102,17 @@ pub fn new_key_target(owner: &str, in_use: &[&str]) -> String {
     (2..).map(|at| format!("{clean}-{at}")).find(|name| !taken(name)).unwrap_or(clean)
 }
 
+/// What a person is told when a key could not be taken out of Credential Manager: it is still kept there. The same words wherever a key is removed.
+pub fn key_not_removed(error: &str) -> String {
+    tf("The key could not be removed from Windows Credential Manager, so it is still kept there: {0}", &[&error])
+}
+
+/// Takes away the key that a setting names, when it names one in Credential Manager. None: it is done, or there was nothing to do. Some: what to tell the person.
+pub fn remove_key(store: &dyn KeyStore, setting: &str) -> Option<String> {
+    let KeySource::Stored(target) = KeySource::of(setting) else { return None };
+    store.remove(&target).err().map(|error| key_not_removed(&error))
+}
+
 /// Whether this can be the name of a variable of the environment; a key pasted there cannot.
 pub fn is_variable_name(name: &str) -> bool {
     let mut letters = name.chars();
@@ -364,24 +375,33 @@ impl Settings {
         clean
     }
 
-    /// A key an older version let into the file goes to the store, and the file says where it is now. `true`: something moved, and it is to be saved.
-    pub fn move_keys_to(&mut self, store: &dyn KeyStore) -> bool {
-        let mut moved = false;
+    /// A key an older version let into the file goes to the store, and the file says where it is now. What could not be kept is in the answer: the file is not to hold a key itself, so
+    /// that is saved as well (the next save would drop it from the file in any case, and without a word), and the person is told.
+    pub fn move_keys_to(&mut self, store: &dyn KeyStore) -> KeysMoved {
+        let mut done = KeysMoved::default();
         for at in 0..self.providers.len() {
             if holds_a_key_itself(&self.providers[at].api_key) {
                 let settings: Vec<&str> = self.providers.iter().map(|provider| provider.api_key.as_str()).chain([self.search_key.as_str()]).collect();
                 let target = new_key_target(&self.providers[at].name, &settings);
-                if store.write(&target, self.providers[at].api_key.trim()).is_ok() {
-                    self.providers[at].api_key = format!("{CREDENTIAL}{target}");
-                    moved = true;
+                match store.write(&target, self.providers[at].api_key.trim()) {
+                    Ok(()) => {
+                        self.providers[at].api_key = format!("{CREDENTIAL}{target}");
+                        done.moved = true;
+                    }
+                    Err(error) => done.not_kept.push((self.providers[at].name.clone(), error)),
                 }
             }
         }
-        if holds_a_key_itself(&self.search_key) && store.write(SEARCH_KEY_TARGET, self.search_key.trim()).is_ok() {
-            self.search_key = format!("{CREDENTIAL}{SEARCH_KEY_TARGET}");
-            moved = true;
+        if holds_a_key_itself(&self.search_key) {
+            match store.write(SEARCH_KEY_TARGET, self.search_key.trim()) {
+                Ok(()) => {
+                    self.search_key = format!("{CREDENTIAL}{SEARCH_KEY_TARGET}");
+                    done.moved = true;
+                }
+                Err(error) => done.not_kept.push((t("the web search").to_string(), error)),
+            }
         }
-        moved
+        done
     }
 
     /// Whether the window is to be light now.
@@ -427,6 +447,27 @@ impl Settings {
 
     pub fn active_provider(&self) -> Option<&ProviderConfig> {
         self.providers.iter().find(|provider| provider.name == self.active).or_else(|| self.providers.first())
+    }
+}
+
+/// What came of moving the keys an older version left in the file.
+#[derive(Debug, Default, PartialEq)]
+pub struct KeysMoved {
+    /// Something went to the store: the file says where it is, and is to be saved.
+    pub moved: bool,
+    /// Whose key the store refused, and why. The key is not in the file any more once it is saved, and is in memory only until the app ends.
+    pub not_kept: Vec<(String, String)>,
+}
+
+impl KeysMoved {
+    /// Whether the settings are to be saved: a key that went to the store is a change, and a key that did not is not left in the file.
+    pub fn to_save(&self) -> bool {
+        self.moved || !self.not_kept.is_empty()
+    }
+
+    /// What to tell the person, once: which key could not be kept, why, and that it is to be pasted again.
+    pub fn words(&self) -> Vec<String> {
+        self.not_kept.iter().map(|(owner, error)| tf("The API key of {0} could not be kept in Windows Credential Manager ({1}), and it is no longer in the settings file. Paste it again in Settings, under its connection.", &[&owner, &error])).collect()
     }
 }
 
@@ -729,6 +770,72 @@ mod tests {
         }
     }
 
+    /// A store that refuses, as Credential Manager does when it is locked or full.
+    struct Refusing;
+
+    impl KeyStore for Refusing {
+        fn read(&self, _: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn write(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("access denied".into())
+        }
+        fn remove(&self, _: &str) -> Result<(), String> {
+            Err("access denied".into())
+        }
+        fn remove_all(&self) -> Result<(), String> {
+            Err("access denied".into())
+        }
+    }
+
+    /// A key that could not be taken away is said, in the same words wherever one is removed; one that was, or that is no store's, says nothing.
+    #[test]
+    fn a_key_that_could_not_be_removed_is_said_and_one_that_was_is_not() {
+        let said = remove_key(&Refusing, "credential:Claude").unwrap();
+        assert!(said.contains("still kept there") && said.contains("access denied"), "{said}");
+        assert_eq!(said, key_not_removed("access denied"), "the words are one function's");
+        assert_eq!(remove_key(&Refusing, "env:ANTHROPIC_API_KEY"), None, "a variable is not in the store");
+        assert_eq!(remove_key(&Refusing, ""), None);
+        assert_eq!(remove_key(&Refusing, "C:\\keys\\a.txt"), None);
+        let store = keys::MemoryKeys::default();
+        store.write("Claude", "made-up").unwrap();
+        assert_eq!(remove_key(&store, "credential:Claude"), None);
+        assert_eq!(store.read("Claude").unwrap(), None, "and it is gone");
+        assert_eq!(remove_key(&store, "credential:Claude"), None, "a key that is not there has been removed already");
+    }
+
+    /// An older version's key that the store refuses is said once, is not written to the file, and the keys that do go are moved as before.
+    #[test]
+    fn a_key_the_store_refuses_is_said_and_never_written_back_to_the_file() {
+        const KEY: &str = "sk-very-secret-0123456789";
+        const OTHER: &str = "sk-another-0123456789abcdef";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.providers.push(server("Homelab", "http://host/v1"));
+        settings.providers.last_mut().unwrap().api_key = KEY.into();
+        settings.search_key = OTHER.into();
+        let done = settings.move_keys_to(&Refusing);
+        assert!(!done.moved && done.to_save());
+        assert_eq!(done.not_kept.iter().map(|(owner, _)| owner.as_str()).collect::<Vec<_>>(), ["Homelab", "the web search"], "{done:?}");
+        let words = done.words();
+        assert_eq!(words.len(), 2);
+        assert!(words[0].contains("Homelab") && words[0].contains("access denied") && words[0].contains("Paste it again"), "{words:?}");
+        assert!(words.iter().all(|said| !said.contains(KEY) && !said.contains(OTHER)), "the key is not in what is said");
+        settings.save(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains(KEY) && !written.contains(OTHER), "{written}");
+        // (and one the store takes goes, with the others still said)
+        let mut settings = Settings::default();
+        settings.providers.push(server("Homelab", "http://host/v1"));
+        settings.providers.last_mut().unwrap().api_key = KEY.into();
+        let store = keys::MemoryKeys::default();
+        let done = settings.move_keys_to(&store);
+        assert!(done.moved && done.not_kept.is_empty() && done.words().is_empty());
+        assert!(settings.providers.last().unwrap().api_key.starts_with(CREDENTIAL));
+        assert_eq!(store.read(&settings.providers.last().unwrap().api_key[CREDENTIAL.len()..]).unwrap().as_deref(), Some(KEY), "it is in the store, where the file now says");
+    }
+
     fn server(name: &str, address: &str) -> ProviderConfig {
         ProviderConfig { name: name.into(), kind: Kind::Server, base_url: address.into(), model: String::new(), api_key: String::new() }
     }
@@ -817,11 +924,11 @@ mod tests {
         let mut settings = Settings::default();
         settings.providers[2].api_key = KEY.into();
         settings.search_key = "BSAabcdefghijklmnopqrstuvwxyz0123".into();
-        assert!(settings.move_keys_to(&store));
+        assert!(settings.move_keys_to(&store).moved);
         assert_eq!(settings.providers[2].api_key, "credential:Claude");
         assert_eq!(store.read("Claude").unwrap().as_deref(), Some(KEY));
         assert_eq!(settings.search_key, format!("{CREDENTIAL}{SEARCH_KEY_TARGET}"));
-        assert!(!settings.move_keys_to(&store), "nothing left to move");
+        assert!(!settings.move_keys_to(&store).to_save(), "nothing left to move");
     }
 
     #[test]

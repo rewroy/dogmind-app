@@ -670,6 +670,8 @@ enum Note {
     VisionSize(Option<u64>),
     /// A vision file set aside or brought back, or why not.
     VisionSwitched(Result<bool, String>),
+    /// A key an older version left in the file, which Credential Manager would not keep: said once, at the start.
+    KeyNotKept(String),
     /// What `straydog --version` said, if it said anything.
     EngineVersion(Option<String>, Option<u64>),
     /// A look at GitHub's latest release is over: whether the app made it on its own, and what it came to.
@@ -6101,16 +6103,20 @@ impl App {
     /// The setting for the key of what this page is about, and where it goes when it changes.
     unsafe fn forget_key(&mut self) {
         let setting = match self.panel {
-            Panel::Tools => std::mem::take(&mut self.settings.search_key),
-            _ => match self.selected_provider.and_then(|at| self.settings.providers.get_mut(at)) {
-                Some(provider) => std::mem::take(&mut provider.api_key),
-                None => String::new(),
-            },
+            Panel::Tools => self.settings.search_key.clone(),
+            _ => self.selected_provider.and_then(|at| self.settings.providers.get(at)).map_or(String::new(), |provider| provider.api_key.clone()),
         };
-        if let KeySource::Stored(target) = KeySource::of(&setting) {
-            if let Err(error) = crate::keys::store().remove(&target) {
-                self.problem_in_panel(&error);
-                return;
+        // (the setting stays as it is while the key is still kept: said "removed" with the key there, it would have no way left to be found)
+        if let Some(words) = settings::remove_key(crate::keys::store(), &setting) {
+            self.problem_in_panel(&words);
+            return;
+        }
+        match self.panel {
+            Panel::Tools => self.settings.search_key.clear(),
+            _ => {
+                if let Some(provider) = self.selected_provider.and_then(|at| self.settings.providers.get_mut(at)) {
+                    provider.api_key.clear();
+                }
             }
         }
         self.save();
@@ -9363,13 +9369,9 @@ impl App {
             }
             set_text(self.fields[KEY_FIELD], "");
         }
-        // One that went from the store to a variable leaves nothing behind.
-        let before = self.selected_provider.and_then(|at| self.settings.providers.get(at)).map(|known| KeySource::of(&known.api_key));
-        if let Some(KeySource::Stored(target)) = before {
-            if !matches!(KeySource::of(&provider.api_key), KeySource::Stored(_)) {
-                let _ = crate::keys::store().remove(&target);
-            }
-        }
+        // One that went from the store to a variable leaves nothing behind. (If it could not be taken away, that is said, once the page says it is saved.)
+        let before = self.selected_provider.and_then(|at| self.settings.providers.get(at)).map(|known| known.api_key.clone());
+        let left_behind = before.filter(|_| !matches!(KeySource::of(&provider.api_key), KeySource::Stored(_))).and_then(|setting| settings::remove_key(crate::keys::store(), &setting));
         match self.selected_provider.filter(|&at| at < self.settings.providers.len()) {
             Some(at) => {
                 if self.settings.active == self.settings.providers[at].name {
@@ -9384,7 +9386,10 @@ impl App {
         }
         self.save();
         self.fill_providers();
-        self.say_in_panel(t("Saved."));
+        match left_behind {
+            Some(words) => self.problem_in_panel(&words),
+            None => self.say_in_panel(t("Saved.")),
+        }
         true
     }
 
@@ -10711,6 +10716,7 @@ impl App {
                 }
                 None => self.warn(t("This model can't read pictures.")),
             },
+            Note::KeyNotKept(words) => self.say(&words),
             Note::VisionSwitched(result) => {
                 match result {
                     Err(error) => {
@@ -11012,9 +11018,7 @@ impl App {
             (Panel::Providers, 3) => {
                 if let Some(at) = self.selected_provider.filter(|&at| at < self.settings.providers.len() && self.settings.providers.len() > 1) {
                     let gone = self.settings.providers.remove(at);
-                    if let KeySource::Stored(target) = KeySource::of(&gone.api_key) {
-                        let _ = crate::keys::store().remove(&target);
-                    }
+                    let left_behind = settings::remove_key(crate::keys::store(), &gone.api_key);
                     let was_active = gone.name == self.settings.active;
                     if was_active {
                         self.settings.active = self.settings.providers[0].name.clone();
@@ -11025,6 +11029,10 @@ impl App {
                     self.layout();
                     if was_active {
                         self.connect();
+                    }
+                    // (the connection is gone either way: what could not go with it is told, where a person looks)
+                    if let Some(words) = left_behind {
+                        if self.panel == Panel::Chat { self.say(&words) } else { self.problem_in_panel(&words) }
                     }
                 }
             }
@@ -13416,9 +13424,11 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         // (what was pasted in an earlier run: a session keeps its own copy of what it sent)
         let _ = std::fs::remove_dir_all(folder.join("attachments"));
         let mut saved = Settings::load(&folder.join("settings.json"));
-        if saved.move_keys_to(crate::keys::store()) {
+        let moved = saved.move_keys_to(crate::keys::store());
+        if moved.to_save() {
             let _ = saved.save(&folder.join("settings.json"));
         }
+        let keys_not_kept = moved.words();
         lang::set(&saved.display_language);
         // (before the transcript and the composer are made, whose first format takes it)
         TEXT_SCALE.store(saved.text_percent(), Ordering::Relaxed);
@@ -13431,6 +13441,10 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let (event_sender, events) = channel();
         let (notes_sender, notes) = channel();
         let poster = Poster { notes: notes_sender, window: window as isize };
+        // (a key that Credential Manager would not keep: said once, when the window has begun, and never again, as the file no longer has it)
+        for words in keys_not_kept {
+            poster.send(Note::KeyNotKept(words));
+        }
         // What a crash left half done on a folder commands can read: put right before anything else asks.
         {
             let (file, poster) = (read_folders::file_in(&folder), poster.clone());
