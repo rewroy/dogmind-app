@@ -116,7 +116,8 @@ pub fn decode(path: &Path, room_width: i32, room_height: i32) -> Result<Decoded,
 
 /// (a GIF's first frame)
 pub fn decode_bytes(bytes: &[u8], room_width: i32, room_height: i32) -> Result<Decoded, Undecoded> {
-    let picture = image::load_from_memory(bytes).map_err(|_| Undecoded::Unreadable)?;
+    // (turned as its orientation says, as the model is sent it: a phone's photo shows on its side in the card otherwise)
+    let picture = dogmind_agent::images::decode_picture(bytes).map_err(|_| Undecoded::Unreadable)?;
     let (width, height) = fit(picture.width() as i32, picture.height() as i32, room_width, room_height);
     let shown = if (width as u32, height as u32) == (picture.width(), picture.height()) { picture } else { picture.thumbnail_exact(width as u32, height as u32) };
     let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
@@ -181,6 +182,29 @@ mod tests {
         assert_eq!(paste_kind(false, true, true), Paste::Text, "a table copied from a spreadsheet");
         assert_eq!(paste_kind(false, false, true), Paste::Bitmap, "a screenshot");
         assert_eq!(paste_kind(false, false, false), Paste::Nothing);
+    }
+
+    /// A wide JPEG with Orientation 6 is shown tall: the card's copy is turned.
+    #[test]
+    fn a_photos_orientation_is_applied_to_the_card() {
+        let picture = image::RgbImage::from_fn(40, 20, |x, _| if x < 20 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) });
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95).encode_image(&picture).unwrap();
+        // (an EXIF segment with one entry, Orientation 6, after the SOI)
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0".to_vec();
+        exif.extend_from_slice(&[1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0]);
+        let mut turned = jpeg[..2].to_vec();
+        turned.extend_from_slice(&[0xFF, 0xE1]);
+        turned.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        turned.extend_from_slice(&exif);
+        turned.extend_from_slice(&jpeg[2..]);
+        let plain = decode_bytes(&jpeg, 200, 200).unwrap();
+        assert_eq!((plain.width, plain.height), (40, 20));
+        let upright = decode_bytes(&turned, 200, 200).unwrap();
+        assert_eq!((upright.width, upright.height), (20, 40), "width and height swapped");
+        // (blue, green, red, alpha: the top of what is shown is red, its bottom blue)
+        let at = |x: usize, y: usize| { let place = (y * upright.width as usize + x) * 4; [upright.pixels[place], upright.pixels[place + 1], upright.pixels[place + 2]] };
+        assert!(at(10, 3)[2] > 200 && at(10, 3)[0] < 60 && at(10, 36)[0] > 200 && at(10, 36)[2] < 60, "{:?} {:?}", at(10, 3), at(10, 36));
     }
 
     #[test]
