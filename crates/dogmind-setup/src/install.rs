@@ -231,6 +231,87 @@ fn say(what: &Path, error: &std::io::Error) -> Failure {
     Failure::Said(format!("{}: {error}", what.display()))
 }
 
+/// How long an install that no one watches (the app's own update, a test's `--auto`) waits for another install of its folder to end, before it fails.
+pub const WAIT_FOR_ANOTHER: Duration = Duration::from_secs(10 * 60);
+
+/// What an install or a removal says when another one of the folder is still at work and it has waited as long as it may.
+const ANOTHER_IS_RUNNING: &str = "Another install of this folder is still running, so nothing has been changed.";
+
+/// The name of the mutex of a folder: the hash of its full path in lower case, as Windows takes two spellings of a path for one folder. Nothing of the folder is looked at, so that a first
+/// install, whose folder is not made yet, has one.
+fn lock_name(folder: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let full = std::path::absolute(folder).unwrap_or_else(|_| folder.to_path_buf());
+    // (the components leave out a slash at the end and a `.`)
+    let text = full.components().collect::<PathBuf>().to_string_lossy().to_lowercase();
+    let text = match text.strip_prefix("\\\\?\\unc\\") {
+        Some(rest) => format!("\\\\{rest}"),
+        None => text.strip_prefix("\\\\?\\").map_or(text.clone(), str::to_string),
+    };
+    format!("Local\\DogmindSetup-{}", hex(&Sha256::digest(text.as_bytes()).into()))
+}
+
+/// The mutex of a folder, held by the one install, update or removal that works on it. A mutex belongs to the thread that took it, and is let go by that thread (or by the system, when the
+/// process ends): it is taken and dropped on the thread that does the work.
+pub struct FolderLock(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for FolderLock {
+    fn drop(&mut self) {
+        // SAFETY: the handle is the mutex this took, which this thread owns.
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// The mutex of `folder`, taken. When another install, update or removal of the folder has it, `held(true)` says so once, and this waits for it: as long as it takes, or, with `at_most`, that
+/// long and then fails with a line. `held(false)` says the wait is over. `stop` ends the wait (`Failure::Stopped`), and nothing has been written by then.
+pub fn lock_folder(folder: &Path, at_most: Option<Duration>, stop: &AtomicBool, held: &mut dyn FnMut(bool)) -> Result<FolderLock, Failure> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+    let name = crate::system::wide(&lock_name(folder));
+    // SAFETY: the name ends in a zero; the mutex has the default security and is not owned at first.
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(Failure::Said(format!("{}: the folder's lock could not be made: {}", folder.display(), std::io::Error::last_os_error())));
+    }
+    let (began, mut said) = (Instant::now(), false);
+    loop {
+        // (the first look does not wait; after it, the wait ends the moment the mutex is let go, and is cut short to hear a stop)
+        // SAFETY: the handle is the mutex made above.
+        let got = unsafe { WaitForSingleObject(handle, if said { 200 } else { 0 }) };
+        // (a mutex that was abandoned was held by a program that ended with it: this has it all the same)
+        if got == WAIT_OBJECT_0 || got == WAIT_ABANDONED {
+            if said {
+                held(false);
+            }
+            return Ok(FolderLock(handle));
+        }
+        let failure = if got != WAIT_TIMEOUT {
+            Some(Failure::Said(format!("{}: the folder's lock could not be waited for: {}", folder.display(), std::io::Error::last_os_error())))
+        } else if stop.load(Ordering::Relaxed) {
+            Some(Failure::Stopped)
+        } else if at_most.is_some_and(|most| began.elapsed() >= most) {
+            Some(Failure::Said(ANOTHER_IS_RUNNING.to_string()))
+        } else {
+            None
+        };
+        if let Some(failure) = failure {
+            if said {
+                held(false);
+            }
+            // SAFETY: the handle is the mutex made above, which this does not own.
+            unsafe { CloseHandle(handle) };
+            return Err(failure);
+        }
+        if !said {
+            said = true;
+            held(true);
+        }
+    }
+}
+
 /// Everything an install asks of a machine, for tests to hold back.
 pub struct Install<'a> {
     pub folder: &'a Path,
@@ -248,6 +329,8 @@ pub struct Install<'a> {
     pub fail_after: Option<usize>,
     /// A test's slowness, for a capture of it at work, after each file.
     pub slowly: Duration,
+    /// How long to wait for another install, update or removal of the folder to end (see `install_alone`): as long as it takes, or this long and then fail.
+    pub wait: Option<Duration>,
 }
 
 /// Whether a file holds what an entry says, and the size and time it had when that was found out. The time is kept only for a file that was the same all through the look: one that
@@ -453,6 +536,18 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     write_manifest(folder, &Manifest { version: package.version.clone(), test: job.test, files, records: written_down, last_run: Some(last_run) }).map_err(|error| say(&folder.join(MANIFEST), &error))?;
     job.shell.add_entries(folder, &package.version, package.total_bytes() / 1024).map_err(Failure::Said)?;
     Ok(outcome)
+}
+
+/// `install`, when no other install, update or removal of the folder is at work: with the folder's mutex taken, for the whole of it. `held` is told when it has to wait for another (`true`) and when
+/// that is over (`false`). A stop that comes while it waits changes nothing; one that comes after takes away what was left waiting beside the places, while the mutex is still held, as another
+/// install of the folder could be unpacking there as soon as it is let go.
+pub fn install_alone(package: &mut Package, job: &Install, held: &mut dyn FnMut(bool), on: &mut dyn FnMut(Progress)) -> Result<Installed, Failure> {
+    let _alone = lock_folder(job.folder, job.wait, job.stop, held)?;
+    let result = install(package, job, on);
+    if result == Err(Failure::Stopped) {
+        clean_up_waiting(package, job.folder);
+    }
+    result
 }
 
 /// Every file waiting beside its place put in it, or none: half of two versions would run as neither. First what is there now is moved
@@ -686,6 +781,16 @@ pub fn remove(folder: &Path, shell: &dyn Shell, on: &mut dyn FnMut(f64)) -> Resu
     Ok(Removed { left })
 }
 
+/// `remove`, when no other install, update or removal of the folder is at work (see `install_alone`). A removal has no stop: `wait` is as long as it waits, or none for as long as it takes.
+pub fn remove_alone(folder: &Path, shell: &dyn Shell, wait: Option<Duration>, held: &mut dyn FnMut(bool), on: &mut dyn FnMut(f64)) -> Result<Removed, String> {
+    let _alone = match lock_folder(folder, wait, &AtomicBool::new(false), held) {
+        Ok(lock) => lock,
+        Err(Failure::Said(words)) => return Err(words),
+        Err(_) => return Err("The removal was stopped.".to_string()),
+    };
+    remove(folder, shell, on)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,7 +876,7 @@ mod tests {
         }
         fn run_as(&self, update: bool, package: &mut Package, free: Option<u64>, fail_after: Option<usize>) -> Result<Installed, Failure> {
             let folder = self.folder();
-            let job = Install { folder: &folder, shell: &self.shell, free, stop: &self.stop, test: true, write_uninstaller: &|path| std::fs::write(path, "uninstaller"), update, fail_after, slowly: Duration::ZERO };
+            let job = Install { folder: &folder, shell: &self.shell, free, stop: &self.stop, test: true, write_uninstaller: &|path| std::fs::write(path, "uninstaller"), update, fail_after, slowly: Duration::ZERO, wait: None };
             install(package, &job, &mut |_| {})
         }
     }
@@ -1452,5 +1557,152 @@ mod tests {
         let done = scene.run(&mut second, None, None).unwrap();
         assert_eq!(done, Installed { unpacked: 1, already_there: 2, removed: 0, hashed: 1 });
         assert_eq!(std::fs::read(folder.join("dogmind-app.exe")).unwrap(), b"app two!");
+    }
+
+    /// Another install of `folder`, as far as the mutex goes: it holds it on a thread of its own until the sender is used, and is holding it when this returns.
+    fn holding(folder: &Path) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (release, waiting) = std::sync::mpsc::channel::<()>();
+        let (taken, ready) = std::sync::mpsc::channel::<()>();
+        let folder = folder.to_path_buf();
+        let thread = std::thread::spawn(move || {
+            let lock = lock_folder(&folder, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
+            taken.send(()).unwrap();
+            let _ = waiting.recv();
+            drop(lock);
+        });
+        ready.recv().unwrap();
+        (release, thread)
+    }
+
+    /// Lets go of what `holding` holds after `milliseconds`, on a thread of its own; `released` is set just before.
+    fn let_go_after(release: std::sync::mpsc::Sender<()>, milliseconds: u64, released: std::sync::Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(milliseconds));
+            released.store(true, Ordering::Relaxed);
+            release.send(()).unwrap();
+        })
+    }
+
+    impl Scene {
+        fn job<'a>(&'a self, folder: &'a Path, stop: &'a AtomicBool, wait: Option<Duration>) -> Install<'a> {
+            Install { folder, shell: &self.shell, free: None, stop, test: true, write_uninstaller: &|path| std::fs::write(path, "uninstaller"), update: true, fail_after: None, slowly: Duration::ZERO, wait }
+        }
+    }
+
+    #[test]
+    fn the_mutex_of_a_folder_is_named_by_its_path_in_lower_case_and_two_folders_do_not_share_one() {
+        let name = lock_name(Path::new("C:\\Users\\Someone\\Programs\\Dogmind"));
+        assert!(name.starts_with("Local\\DogmindSetup-") && name.len() == "Local\\DogmindSetup-".len() + 64, "{name}");
+        assert_eq!(name, lock_name(Path::new("c:\\users\\someone\\PROGRAMS\\dogmind")));
+        assert_eq!(name, lock_name(Path::new("C:\\Users\\Someone\\Programs\\Dogmind\\")));
+        assert_eq!(name, lock_name(Path::new("\\\\?\\C:\\Users\\Someone\\Programs\\Dogmind")));
+        assert_ne!(name, lock_name(Path::new("C:\\Users\\Someone\\Programs\\Dogmind2")));
+        // two folders are held at once, and a folder is held by one at a time
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let stop = AtomicBool::new(false);
+        let (release, other) = holding(a.path());
+        let _second = lock_folder(b.path(), None, &stop, &mut |_| {}).unwrap();
+        let upper = PathBuf::from(a.path().to_string_lossy().to_uppercase());
+        let failed = lock_folder(&upper, Some(Duration::from_millis(100)), &stop, &mut |_| {}).err();
+        assert_eq!(failed, Some(Failure::Said(ANOTHER_IS_RUNNING.to_string())), "the same folder, spelled another way, is held");
+        release.send(()).unwrap();
+        other.join().unwrap();
+    }
+
+    #[test]
+    fn a_second_install_of_a_folder_waits_while_the_first_holds_it_and_goes_on_when_it_is_let_go() {
+        let scene = Scene::new();
+        let mut package = scene.package("1.0.0", &[("a", b"1"), ("tools\\b", b"2")]);
+        let folder = scene.folder();
+        let (release, other) = holding(&folder);
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let letting = let_go_after(release, 400, released.clone());
+        let (mut told, mut early) = (Vec::new(), false);
+        let began = Instant::now();
+        let stop = AtomicBool::new(false);
+        let done = install_alone(&mut package, &scene.job(&folder, &stop, None), &mut |held| told.push(held), &mut |_| early |= !released.load(Ordering::Relaxed)).unwrap();
+        assert!(!early, "nothing was done before the first was let go");
+        assert!(began.elapsed() >= Duration::from_millis(350), "{:?}", began.elapsed());
+        assert_eq!(told, [true, false], "it said that it waited, once, and when that was over");
+        assert_eq!(done.unpacked, 2);
+        assert_eq!(read_manifest(&folder).unwrap().version, "1.0.0");
+        letting.join().unwrap();
+        other.join().unwrap();
+        // with nothing holding the folder it does not wait, nor say so
+        told.clear();
+        let again = install_alone(&mut package, &scene.job(&folder, &stop, None), &mut |held| told.push(held), &mut |_| {}).unwrap();
+        assert!(told.is_empty() && again.unpacked == 0);
+    }
+
+    #[test]
+    fn an_install_that_may_wait_only_so_long_fails_with_one_line_and_has_changed_nothing() {
+        let scene = Scene::new();
+        let mut package = scene.package("1.0.0", &[("a", b"1")]);
+        let folder = scene.folder();
+        let (release, other) = holding(&folder);
+        let (mut told, began, stop) = (Vec::new(), Instant::now(), AtomicBool::new(false));
+        let failed = install_alone(&mut package, &scene.job(&folder, &stop, Some(Duration::from_millis(300))), &mut |held| told.push(held), &mut |_| {}).unwrap_err();
+        assert_eq!(failed, Failure::Said("Another install of this folder is still running, so nothing has been changed.".to_string()));
+        assert!(began.elapsed() >= Duration::from_millis(300) && began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+        assert_eq!(told, [true, false]);
+        assert!(!folder.exists(), "not a folder made, not a file written");
+        assert_eq!(scene.shell.said.borrow().len(), 0);
+        // and a removal, the same
+        let failed = remove_alone(&folder, &scene.shell, Some(Duration::from_millis(200)), &mut |_| {}, &mut |_| {}).unwrap_err();
+        assert_eq!(failed, "Another install of this folder is still running, so nothing has been changed.");
+        release.send(()).unwrap();
+        other.join().unwrap();
+        assert!(install_alone(&mut package, &scene.job(&folder, &stop, Some(Duration::from_millis(300))), &mut |_| {}, &mut |_| {}).is_ok(), "let go, it is taken");
+    }
+
+    #[test]
+    fn a_stop_while_it_waits_for_another_install_ends_it_and_leaves_what_the_other_has_there() {
+        let scene = Scene::new();
+        let mut package = scene.package("1.0.0", &[("a", b"1")]);
+        let folder = scene.folder();
+        // (what the other install has unpacked and not yet placed)
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(beside(&folder.join("a")), b"1").unwrap();
+        let (release, other) = holding(&folder);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let pressing = stop.clone();
+        let presser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            pressing.store(true, Ordering::Relaxed);
+        });
+        let began = Instant::now();
+        let mut told = Vec::new();
+        let failed = install_alone(&mut package, &scene.job(&folder, &stop, None), &mut |held| told.push(held), &mut |_| {}).unwrap_err();
+        assert_eq!(failed, Failure::Stopped);
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        assert_eq!(told, [true, false]);
+        assert!(beside(&folder.join("a")).exists() && folder.exists(), "what the other has there is not taken away");
+        presser.join().unwrap();
+        release.send(()).unwrap();
+        other.join().unwrap();
+        // a stop that comes after the mutex is taken takes away what this left waiting, as before
+        let stop = AtomicBool::new(true);
+        std::fs::remove_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(beside(&folder.join("a")), b"1").unwrap();
+        assert_eq!(install_alone(&mut package, &scene.job(&folder, &stop, None), &mut |_| {}, &mut |_| {}).unwrap_err(), Failure::Stopped);
+        assert!(!folder.exists(), "nothing of it is left");
+    }
+
+    #[test]
+    fn a_removal_waits_while_another_install_of_the_folder_holds_it_and_goes_on_when_it_is_let_go() {
+        let scene = Scene::new();
+        let mut package = scene.package("1.0.0", &[("a.exe", b"1")]);
+        scene.run(&mut package, None, None).unwrap();
+        let folder = scene.folder();
+        let (release, other) = holding(&folder);
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let letting = let_go_after(release, 300, released.clone());
+        let (mut told, mut early) = (Vec::new(), false);
+        remove_alone(&folder, &scene.shell, None, &mut |held| told.push(held), &mut |_| early |= !released.load(Ordering::Relaxed)).unwrap();
+        assert!(!early && told == [true, false]);
+        assert!(read_manifest(&folder).is_none());
+        letting.join().unwrap();
+        other.join().unwrap();
     }
 }

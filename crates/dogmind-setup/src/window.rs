@@ -173,6 +173,8 @@ enum Message {
     Removed(Result<Vec<String>, String>),
     /// What an update waited for has ended, or been waited for as long as it will be.
     Waited,
+    /// Another install, update or removal of the folder is at work and this waits for it (`true`), or that is over (`false`).
+    Held(bool),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -218,6 +220,8 @@ struct App {
     exit_code: i32,
     /// When the app's page is what removes it: nothing is left to do but leave.
     auto_tries: u32,
+    /// The work waits for another install of the folder to end, and the page says so.
+    held: bool,
     /// Started with `--update` by the app: it began on the work itself, and when that is done the app is started again, and this closes. The app quit for the update and its person did not choose
     /// to close it, so any other end brings it back as it is in the folder (see `end_without_success`). A failure keeps the window until then, with a way to start the app as it was, unless the folder
     /// is not as it was (see `failed_view`).
@@ -299,6 +303,11 @@ impl App {
         &self.options.folder
     }
 
+    /// What is said while another install of the folder is at work.
+    fn waiting_words(&self) -> String {
+        self.w("Another install of this folder is running. Waiting for it to finish...", "このフォルダーの別のインストールが実行中です。終わるのを待っています...")
+    }
+
     fn notice_words(&self, notice: &Notice) -> String {
         match notice {
             Notice::InSubfolder => self.w("That folder is not empty, so it goes in a Dogmind folder inside it.", "選んだフォルダーは空ではないため、その中の Dogmind フォルダーにインストールします。"),
@@ -367,12 +376,12 @@ impl App {
             Page::Closing { .. } => View { heading: self.w("Waiting for it to close...", "閉じるのを待っています..."), secondary: Some(self.w("Cancel", "キャンセル")), ..View::default() },
             Page::Working { progress, stopping, update } => {
                 let stage = progress.as_ref().map(|progress| progress.stage.clone());
-                let small = progress.as_ref().map_or(String::new(), |progress| match progress.stage {
+                let small = if self.held { self.waiting_words() } else { progress.as_ref().map_or(String::new(), |progress| match progress.stage {
                     Stage::Checking => format!("{}: {}", self.w("Checking", "確認中"), progress.file),
                     Stage::Unpacking => format!("{}: {}", self.w("Unpacking", "展開中"), progress.file),
                     Stage::Placing => format!("{}: {}", self.w("Putting in place", "配置中"), progress.file),
                     Stage::Finishing => self.w("Finishing", "仕上げ中"),
-                });
+                }) };
                 let can_stop = !matches!(stage, Some(Stage::Placing | Stage::Finishing)) && !stopping;
                 View {
                     heading: if *stopping { self.w("Stopping...", "中止しています...") } else if *update { self.w("Updating Dogmind...", "Dogmind を更新しています...") } else { self.w("Installing...", "インストールしています...") },
@@ -398,7 +407,7 @@ impl App {
                 problem: true,
                 ..View::default()
             },
-            Page::Removing { fraction } => View { heading: self.w("Removing the program...", "プログラムを削除しています..."), fraction: Some(*fraction), ..View::default() },
+            Page::Removing { fraction } => View { heading: self.w("Removing the program...", "プログラムを削除しています..."), small: if self.held { self.waiting_words() } else { String::new() }, fraction: Some(*fraction), ..View::default() },
             Page::Gone { left } => View {
                 heading: self.w("Dogmind is removed", "Dogmind を削除しました"),
                 detail: if left.is_empty() { String::new() } else if self.japanese { format!("{folder} には、これがインストールしたのではないものが残っています: {}", left.join(", ")) } else { format!("What it did not put there stays in {folder}: {}", left.join(", ")) },
@@ -659,9 +668,11 @@ impl App {
                 update: options.update,
                 fail_after: options.fail_after,
                 slowly: options.slowly,
+                // (with no one at the window, an update or a test's run does not wait for ever)
+                wait: (options.update || options.auto).then_some(install::WAIT_FOR_ANOTHER),
             };
             let mut last = Instant::now() - Duration::from_secs(1);
-            let result = install::install(&mut package, &job, &mut |progress| {
+            let result = install::install_alone(&mut package, &job, &mut |held| send(Message::Held(held)), &mut |progress| {
                 if last.elapsed() >= Duration::from_millis(50) || progress.stage == Stage::Finishing {
                     last = Instant::now();
                     send(Message::Progress(progress));
@@ -669,10 +680,7 @@ impl App {
             });
             match result {
                 Ok(_) => send(Message::Installed(update)),
-                Err(Failure::Stopped) => {
-                    install::clean_up_waiting(&package, &folder);
-                    send(Message::Stopped);
-                }
+                Err(Failure::Stopped) => send(Message::Stopped),
                 Err(failure) => send(Message::Failed(failure)),
             }
         });
@@ -692,7 +700,8 @@ impl App {
             system::wait_for_end(&options.wait_pids, 30_000);
             let folder = options.folder.clone();
             let shell = crate::shell_for(&options, &folder);
-            let result = install::remove(&folder, shell.as_ref(), &mut |_| {}).map(|removed| removed.left);
+            let wait = options.auto.then_some(install::WAIT_FOR_ANOTHER);
+            let result = install::remove_alone(&folder, shell.as_ref(), wait, &mut |held| send(Message::Held(held)), &mut |_| {}).map(|removed| removed.left);
             send(Message::Removed(result));
         });
     }
@@ -856,6 +865,10 @@ impl App {
                 }
                 Message::Failed(failure) => {
                     self.page = Page::Failed { failure };
+                    self.refresh();
+                }
+                Message::Held(held) => {
+                    self.held = held;
                     self.refresh();
                 }
                 Message::Stopped => self.end_without_success(2),
@@ -1037,7 +1050,7 @@ pub fn run(options: Options, start: Start) -> i32 {
             Start::Uninstall | Start::FinishRemoval => Page::Removing { fraction: 0.0 },
         };
         let fixed = previous.is_some();
-        let app = Box::into_raw(Box::new(App { options, japanese, version, previous, window, primary, secondary, change, fixed, dpi, colours, fonts: [std::ptr::null_mut(); 3], page, view: View::default(), sender, messages, stop: Arc::new(AtomicBool::new(false)), exit_code: 0, auto_tries: 0, updating }));
+        let app = Box::into_raw(Box::new(App { options, japanese, version, previous, window, primary, secondary, change, fixed, dpi, colours, fonts: [std::ptr::null_mut(); 3], page, view: View::default(), sender, messages, stop: Arc::new(AtomicBool::new(false)), exit_code: 0, auto_tries: 0, held: false, updating }));
         APP.store(app as isize, Ordering::Relaxed);
         let app = &mut *app;
         app.make_fonts();
