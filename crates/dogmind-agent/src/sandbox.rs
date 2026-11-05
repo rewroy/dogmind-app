@@ -318,15 +318,40 @@ pub fn refusal(workspace: &Path, home: Option<&Path>) -> Option<String> {
     refusal_with(workspace, home, &own_folders())
 }
 
+/// How a workspace is closed to commands, which decides what a model is told to do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    /// Too wide to give away (a whole drive, the whole user folder): a project folder inside it can still be run in.
+    Wide,
+    /// A place keys are kept, and so is anything inside it.
+    Keys,
+    /// This app's own files, or a folder among them: what a command could write there runs outside the sandbox, and a folder made inside it is as closed.
+    Own,
+}
+
 fn refusal_with(workspace: &Path, home: Option<&Path>, own: &[PathBuf]) -> Option<String> {
+    closed_with(workspace, home, own).map(|(reason, _)| reason)
+}
+
+/// What a model is told, after why the workspace is closed: what can be done about it, and what only looks like it. A folder is made only when the person asked for something new; to look at
+/// files nothing is made, since `read_file`, `list_files` and `search_files` are not refused.
+fn advice(reason: &str, kind: Closed) -> String {
+    match kind {
+        Closed::Wide => format!("{reason}. Set cwd to a project folder that is already inside it: that folder alone can then be written in. To look at files, `read_file`, `list_files` and `search_files` are not refused. Make a new folder with create_file only when the user asked for something new to be made"),
+        Closed::Keys => format!("{reason}, and no folder inside it is one to run in either. `read_file`, `list_files` and `search_files` can look there"),
+        Closed::Own => format!("{reason}. A folder made inside it does not help, as a command there cannot read the rest of it: `read_file`, `list_files` and `search_files` can look at its files"),
+    }
+}
+
+fn closed_with(workspace: &Path, home: Option<&Path>, own: &[PathBuf]) -> Option<(String, Closed)> {
     let really = real(workspace);
     for folder in [workspace, really.as_path()] {
         let place = key(folder);
         if folder.parent().is_none() || place.ends_with(':') {
-            return Some(format!("{} is a whole drive, so a command runs only in a project folder inside it", workspace.display()));
+            return Some((format!("{} is a whole drive, so a command runs only in a project folder inside it", workspace.display()), Closed::Wide));
         }
         if crate::safety::keys_folder(folder) {
-            return Some(format!("{} is a place keys are kept, so a command does not run in it", workspace.display()));
+            return Some((format!("{} is a place keys are kept, so a command does not run in it", workspace.display()), Closed::Keys));
         }
         // (a folder of the app's own stays closed whatever: what a command could write over in it, or rename away from under it with its
         // parent's leave, runs the next time with none of the sandbox. Writing a Deny on it would not hold against that.)
@@ -336,11 +361,11 @@ fn refusal_with(workspace: &Path, home: Option<&Path>, own: &[PathBuf]) -> Optio
         }) {
             // (the first is what the app runs from: a copy run from elsewhere leaves this folder free; the rest are what it keeps)
             let way = if at == 0 { ". To work on a folder that holds a build of this app, run a copy of the app from another folder, as the one Dogmind's installer puts in %LOCALAPPDATA%\\Programs\\Dogmind" } else { "" };
-            return Some(format!("{} holds this app's own files ({}), or lies among them, and what a command wrote there would run outside its sandbox: a command runs only in a folder of its own{way}", workspace.display(), own[at].display()));
+            return Some((format!("{} holds this app's own files ({}), or lies among them, and what a command wrote there would run outside its sandbox: a command does not run in it{way}", workspace.display(), own[at].display()), Closed::Own));
         }
         if let Some(home) = home {
             if under(&key(home), &place) || under(&key(&real(home)), &place) {
-                return Some(format!("{} holds your whole user folder, so a command runs only in a project folder inside it", workspace.display()));
+                return Some((format!("{} holds your whole user folder, so a command runs only in a project folder inside it", workspace.display()), Closed::Wide));
             }
         }
     }
@@ -353,13 +378,13 @@ fn refusal_with(workspace: &Path, home: Option<&Path>, own: &[PathBuf]) -> Optio
 pub fn writable_root(cwd: &Path, workspace: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
     let (cwd, workspace, home) = (real(cwd), real(workspace), home.map(real));
     let (cwd, workspace, home) = (cwd.as_path(), workspace.as_path(), home.as_deref());
-    let Some(reason) = refusal(workspace, home) else {
+    let Some((reason, kind)) = closed_with(workspace, home, &own_folders()) else {
         if !under(&key(cwd), &key(workspace)) {
             return Err(format!("{} is outside the workspace: a command runs inside it. `read_file`, `list_files` and `search_files` can look there; running something there takes the user opening it as the workspace", cwd.display()));
         }
         return Ok(workspace.to_path_buf());
     };
-    let advice = format!("{reason}. Set cwd to that project's folder, creating it first with create_file if there is none; that folder alone can then be written in");
+    let advice = advice(&reason, kind);
     let (place, wide) = (key(cwd), key(workspace));
     if place == wide || !under(&place, &wide) {
         return Err(advice);
@@ -374,7 +399,7 @@ pub fn writable_root(cwd: &Path, workspace: &Path, home: Option<&Path>) -> Resul
     }
     // Directly under one of the usual places would not be caught above when the workspace is itself one level higher.
     if !cwd.is_dir() {
-        return Err(format!("{} does not exist yet: create it first with create_file", cwd.display()));
+        return Err(format!("{} does not exist yet. Set cwd to a folder that exists; make it with create_file only when the user asked for something new to be made", cwd.display()));
     }
     Ok(cwd.to_path_buf())
 }
@@ -1912,12 +1937,15 @@ mod tests {
         assert_eq!(root, project.join("src"));
         assert_eq!(writable_root(&project, &home, Some(&home)).unwrap(), project);
         let refused = writable_root(&home, &home, Some(&home)).unwrap_err();
-        assert!(refused.contains("Set cwd"), "{refused}");
+        assert!(refused.contains("whole user folder") && refused.contains("Set cwd to a project folder that is already inside it"), "{refused}");
+        assert!(refused.contains("`read_file`, `list_files` and `search_files` are not refused") && refused.contains("only when the user asked for something new"), "{refused}");
+        assert!(!refused.contains("creating it first"), "a folder is not made only to have somewhere to run: {refused}");
         for place in [".ssh", ".aws", "AppData\\Local", "Documents", "Desktop", "Downloads\\x"] {
             std::fs::create_dir_all(home.join(place)).unwrap();
             assert!(writable_root(&home.join(place), &home, Some(&home)).is_err(), "{place}");
         }
-        assert!(writable_root(&home.join("not-made-yet"), &home, Some(&home)).unwrap_err().contains("does not exist"));
+        let missing = writable_root(&home.join("not-made-yet"), &home, Some(&home)).unwrap_err();
+        assert!(missing.contains("does not exist") && missing.contains("only when the user asked for something new"), "{missing}");
         assert!(writable_root(dir.path(), &home, Some(&home)).is_err(), "outside it");
     }
 
@@ -2023,6 +2051,27 @@ mod tests {
         std::fs::remove_dir(&link).unwrap();
     }
 
+    /// Each way a workspace is closed has the advice that is true for it: a wide one has project folders to run in, and a folder made in what holds keys or this app's own files is as closed.
+    #[test]
+    fn the_advice_for_a_closed_workspace_is_the_one_that_is_true_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("me");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let keys = writable_root(&ssh, &ssh, Some(&home)).unwrap_err();
+        assert!(keys.contains("a place keys are kept") && keys.contains("no folder inside it is one to run in") && keys.contains("can look there"), "{keys}");
+        assert!(!keys.contains("Set cwd") && !keys.contains("create_file"), "{keys}");
+        let app = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let own = writable_root(&app, &app, Some(&home)).unwrap_err();
+        assert!(own.contains("holds this app's own files") && own.contains("a command does not run in it") && own.contains("run a copy of the app from another folder"), "{own}");
+        assert!(own.contains("A folder made inside it does not help, as a command there cannot read the rest of it"), "{own}");
+        assert!(!own.contains("Set cwd") && !own.contains("create_file") && !own.contains("folder of its own"), "{own}");
+        // a folder inside it is as closed, and the person's notice (the reason alone) says nothing of making one
+        let inside = writable_root(&app.join("sub"), &app, Some(&home)).unwrap_err();
+        assert!(inside.contains("does not help"), "{inside}");
+        assert!(!refusal(&app, Some(&home)).unwrap().contains("create_file"));
+    }
+
     #[test]
     fn what_holds_this_app_or_keys_is_no_workspace() {
         let dir = tempfile::tempdir().unwrap();
@@ -2030,6 +2079,7 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         let own = [data.clone()];
         assert!(refusal_with(&tools, Some(&home), &own).unwrap().contains("this app's own"), "it holds it");
+        assert!(!refusal_with(&tools, Some(&home), &own).unwrap().contains("folder of its own"), "it does not point at one");
         assert!(refusal_with(&data, Some(&home), &own).is_some());
         assert!(refusal_with(&data.join("tools"), Some(&home), &own).is_some(), "it lies among them");
         assert_eq!(refusal_with(&dir.path().join("Tools2"), Some(&home), &own), None);
