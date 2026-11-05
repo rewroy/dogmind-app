@@ -210,6 +210,9 @@ pub struct Settings {
     /// The engine inside the app: its VRAM budget in GiB, its context in tokens and its port.
     pub vram: Option<f64>,
     pub context: Option<u32>,
+    /// Speed first, for a PC short of memory: the engine leaves a partially resident model's low-weight routes on the CPU out
+    /// (`--expert-floor`). Off by default; it changes answers a little.
+    pub speed_first: bool,
     pub port: u16,
     pub models_folder: Option<PathBuf>,
     /// `straydog.exe`, when it is not beside this app.
@@ -308,6 +311,7 @@ impl Default for Settings {
             compact_tools: true,
             vram: None,
             context: None,
+            speed_first: false,
             port: 18480,
             models_folder: None,
             straydog: None,
