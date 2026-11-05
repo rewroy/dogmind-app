@@ -18,6 +18,13 @@ pub const DEFAULT_CONTEXT: u64 = 1_000_000;
 const API_VERSION: &str = "2026-10-21";
 /// A declined request is tried again by the server on a model it picks.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// The models the API documents the `"default"` form of server-side fallbacks for (Haiku 5.5 has none). An id is one of these, or one of these with a date after it.
+const FALLBACK_MODELS: [&str; 5] = ["claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"];
+
+/// Whether the field and the beta header of server-side fallbacks go with this model: for any other the API has no such thing to take.
+fn takes_fallbacks(model: &str) -> bool {
+    FALLBACK_MODELS.iter().any(|known| model == *known || model.strip_prefix(known).is_some_and(|rest| rest.starts_with('-')))
+}
 const MAX_TOKENS: u64 = 64000;
 
 pub struct Anthropic {
@@ -126,8 +133,10 @@ pub fn request_body(request: &Request) -> Value {
         "thinking": {"type": "adaptive", "display": "summarized"},
         "output_config": {"effort": effort_level(request.effort)},
         "cache_control": {"type": "ephemeral"},
-        "fallbacks": "default",
     });
+    if takes_fallbacks(request.model) {
+        body["fallbacks"] = json!("default");
+    }
     if !system.is_empty() {
         body["system"] = json!(system);
     }
@@ -156,7 +165,9 @@ fn classify_error(status: u16, kind: &str, message: &str) -> LlmError {
     if matches!(kind, "api_error" | "timeout_error") || matches!(status, 408 | 409) || status >= 500 {
         return LlmError::Transient(text);
     }
-    if matches!(kind, "authentication_error" | "permission_error") || matches!(status, 401 | 403) {
+    // A key the API does not know is a refused key. A key that is good and not allowed something (a model the organisation may not use, a beta it is not in) is the API's own reason, which
+    // is what the person has to look at.
+    if kind == "authentication_error" || status == 401 {
         return LlmError::Rejected(llm::KEY_REFUSED.to_string());
     }
     LlmError::Rejected(text)
@@ -301,19 +312,20 @@ impl Anthropic {
         Ok(Anthropic { base: Url::parse(base_url)?, key })
     }
 
-    fn headers(&self) -> Vec<(String, String)> {
-        vec![
-            ("x-api-key".to_string(), self.key.clone()),
-            ("anthropic-version".to_string(), API_VERSION.to_string()),
-            ("anthropic-beta".to_string(), FALLBACK_BETA.to_string()),
-        ]
+    /// `model`: the beta of fallbacks goes with the models that take them.
+    fn headers(&self, model: &str) -> Vec<(String, String)> {
+        let mut headers = vec![("x-api-key".to_string(), self.key.clone()), ("anthropic-version".to_string(), API_VERSION.to_string())];
+        if takes_fallbacks(model) {
+            headers.push(("anthropic-beta".to_string(), FALLBACK_BETA.to_string()));
+        }
+        headers
     }
 
     /// The model's context, from the Models API.
     pub fn context_of(&self, model: &str) -> Result<u64, String> {
         let cancel = AtomicBool::new(false);
         let url = self.base.join(&format!("models/{model}"));
-        let mut response = http::request("GET", &url, &self.headers(), None, Duration::from_secs(10), &cancel).map_err(|failure| LlmError::from(failure).to_string())?;
+        let mut response = http::request("GET", &url, &self.headers(model), None, Duration::from_secs(10), &cancel).map_err(|failure| LlmError::from(failure).to_string())?;
         let status = response.status;
         let text = response.text().map_err(|failure| LlmError::from(failure).to_string())?;
         if status != 200 {
@@ -338,7 +350,7 @@ impl Provider for Anthropic {
         let text = request_body(request).to_string();
         let url = self.base.join("messages");
         // (extra headers are ignored by the API)
-        let mut headers = self.headers();
+        let mut headers = self.headers(request.model);
         headers.extend(request.request_id.and_then(llm::request_id_header));
         let mut response = http::request("POST", &url, &headers, Some(&text), Duration::from_secs(20), cancel)?;
         if response.status != 200 {
@@ -550,6 +562,42 @@ mod tests {
         for field in ["temperature", "top_p", "top_k", "tool_choice"] {
             assert!(body.get(field).is_none(), "{field}");
         }
+    }
+
+    /// Server-side fallbacks go with the models that take them, by id (with or without a date), and with no other.
+    #[test]
+    fn fallbacks_go_with_the_models_that_take_them_and_with_no_other() {
+        let messages = [Message::text("user", "hi")];
+        let body = |model: &str| request_body(&Request { model, messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None });
+        let key = || Anthropic::new(DEFAULT_URL, "k".to_string()).unwrap();
+        for model in ["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5-5-20261001"] {
+            assert_eq!(body(model)["fallbacks"], "default", "{model}");
+            assert!(key().headers(model).contains(&("anthropic-beta".to_string(), FALLBACK_BETA.to_string())), "{model}");
+        }
+        for model in ["claude-haiku-5-5", "claude-haiku-5-5-20261001", "claude-opus-4-1", "claude-sonnet-5", "claude-opus-50", "claude-opus-5x", ""] {
+            assert!(body(model).get("fallbacks").is_none(), "{model}");
+            let headers = key().headers(model);
+            assert!(!headers.iter().any(|(name, _)| name == "anthropic-beta") && headers.iter().any(|(name, _)| name == "x-api-key") && headers.iter().any(|(name, _)| name == "anthropic-version"), "{model}");
+        }
+        // the rest of the body is the same for them all
+        assert_eq!(body("claude-haiku-5-5")["thinking"], body("claude-opus-5-5")["thinking"]);
+    }
+
+    /// A key the API does not know is a refused key; a good key that is not allowed something is the API's own reason.
+    #[test]
+    fn a_403_keeps_the_apis_reason_and_a_401_is_a_refused_key() {
+        let reason = |status: u16, body: &str| match classify(status, body) {
+            LlmError::Rejected(text) => text,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(reason(401, r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#), llm::KEY_REFUSED);
+        assert_eq!(reason(403, r#"{"error":{"type":"permission_error","message":"Your organization may not use claude-opus-5-5"}}"#), "Claude: Your organization may not use claude-opus-5-5");
+        assert_eq!(reason(403, r#"{"error":{"type":"permission_error","message":"This beta is not enabled for your organization"}}"#), "Claude: This beta is not enabled for your organization");
+        // (a status with no type in the body, and a type with no status)
+        assert_eq!(reason(401, "denied"), llm::KEY_REFUSED);
+        assert_eq!(reason(403, "forbidden"), "Claude: forbidden");
+        assert_eq!(reason(400, r#"{"error":{"type":"authentication_error","message":"bad"}}"#), llm::KEY_REFUSED);
+        assert_eq!(reason(400, r#"{"error":{"type":"permission_error","message":"nope"}}"#), "Claude: nope");
     }
 
     #[test]
