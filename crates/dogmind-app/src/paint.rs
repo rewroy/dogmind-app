@@ -1384,7 +1384,7 @@ mod path_tests {
         assert_eq!(compact_path_with("plain words that are long", &within(10)), "plain wor…");
         assert_eq!(compact_path_with("C:\\x", &within(2)), "C…");
         assert_eq!(compact_path_with("/home/someone/projects/app", &within(20)), "/home/…/projects/app", "a path with slashes keeps them");
-        assert_eq!(compact_path_with("日本語のフォルダ名", &within(4)), "日本語…");
+        assert_eq!(compact_path_with("日本語のフォルダー名", &within(4)), "日本語…");
     }
 
     #[test]

@@ -244,14 +244,14 @@ impl App {
 
     fn notice_words(&self, notice: &Notice) -> String {
         match notice {
-            Notice::InSubfolder => self.w("That folder is not empty, so it goes in a Dogmind folder inside it.", "選んだフォルダは空ではないため、その中の Dogmind フォルダにインストールします。"),
+            Notice::InSubfolder => self.w("That folder is not empty, so it goes in a Dogmind folder inside it.", "選んだフォルダーは空ではないため、その中の Dogmind フォルダーにインストールします。"),
             Notice::Refused(Refusal::SettingsFolder) => self.w(
                 "That is where the app keeps your settings and sessions (%LOCALAPPDATA%\\DogmindApp). Choose another folder.",
-                "そこはアプリの設定とセッションの保存先 (%LOCALAPPDATA%\\DogmindApp) です。別のフォルダを選んでください。",
+                "そこはアプリの設定とセッションの保存先 (%LOCALAPPDATA%\\DogmindApp) です。別のフォルダーを選んでください。",
             ),
             Notice::Refused(Refusal::NotWritable(why)) => {
                 if self.japanese {
-                    format!("管理者権限なしでは、そこにファイルを作れません ({why})。ドキュメントや別のドライブなど、ご自分のフォルダを選んでください。")
+                    format!("管理者権限なしでは、そこにファイルを作れません ({why})。ドキュメントや別のドライブなど、ご自分のフォルダーを選んでください。")
                 } else {
                     format!("No file can be made there without an administrator ({why}). Choose a folder of your own, in Documents or on another drive.")
                 }
@@ -267,14 +267,14 @@ impl App {
                 let page = match &self.previous {
                     Some(previous) => View {
                         heading: if self.japanese { format!("Dogmind {previous} を {} に更新", self.version) } else { format!("Update Dogmind {previous} to {}", self.version) },
-                        detail: self.w("This replaces the program in the folder below. Your settings, sessions and models are kept.", "下のフォルダのプログラムを置き換えます。設定、セッション、モデルはそのまま残ります。"),
+                        detail: self.w("This replaces the program in the folder below. Your settings, sessions and models are kept.", "下のフォルダーのプログラムを置き換えます。設定、セッション、モデルはそのまま残ります。"),
                         primary: Some(self.w("Update", "更新")),
                         secondary: Some(self.w("Cancel", "キャンセル")),
                         ..View::default()
                     },
                     None => View {
                         heading: if self.japanese { format!("Dogmind {} をインストール", self.version) } else { format!("Install Dogmind {}", self.version) },
-                        detail: self.w("It goes in the folder below, for you alone: no administrator is needed. It gets a place in the Start menu and in Installed apps.", "下のフォルダに、あなた専用としてインストールします。管理者権限は不要です。スタート メニューと「インストールされているアプリ」に登録します。"),
+                        detail: self.w("It goes in the folder below, for you alone: no administrator is needed. It gets a place in the Start menu and in Installed apps.", "下のフォルダーに、あなた専用としてインストールします。管理者権限は不要です。スタート メニューと「インストールされているアプリ」に登録します。"),
                         primary: Some(self.w("Install", "インストール")),
                         secondary: Some(self.w("Cancel", "キャンセル")),
                         ..View::default()
@@ -727,7 +727,7 @@ impl App {
             return;
         }
         // (the picker runs its own message loop, in which this window's timer and painting go on: nothing is held of `self` through it)
-        let (window, start, title) = (self.window, self.folder().to_path_buf(), self.w("Choose the folder for Dogmind", "Dogmind のインストール先のフォルダを選択"));
+        let (window, start, title) = (self.window, self.folder().to_path_buf(), self.w("Choose the folder for Dogmind", "Dogmind のインストール先のフォルダーを選択"));
         let Some(picked) = self.options.pick.clone().or_else(|| system::pick_folder(window, &start, &title)) else { return };
         let chosen = place::choose(&picked);
         let notice = match place::check(&chosen, &place::settings_folders()) {

@@ -142,7 +142,7 @@ fn refuse_the_update(found: &Arguments, words: &str) -> i32 {
     let options = Options { folder: found.dir.clone().unwrap_or_default(), test: found.test, ..Options::default() };
     let japanese = window::japanese(&options);
     let detail = match (found.dir.is_none(), japanese) {
-        (true, true) => "更新するインストール先のフォルダが指定されていません。".to_string(),
+        (true, true) => "更新するインストール先のフォルダーが指定されていません。".to_string(),
         (true, false) => "No folder was named for the install to update.".to_string(),
         (false, true) => "この更新は、使えない引数で起動されました。".to_string(),
         (false, false) => format!("This update was started with arguments that cannot go together ({words})."),
