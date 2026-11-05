@@ -103,13 +103,18 @@ fn file_url(path: &Path) -> String {
 const STEPS_PRELUDE: &str = r#"<script>
 (async () => {
   const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+  // (which call of the helpers was made last, and what it was: if the steps take the page to another document, that is where they were)
+  let calls = 0, last = null;
+  const said = (value) => { try { const text = JSON.stringify(value); return text.length > 40 ? text.slice(0, 37) + '...' : text; } catch (error) { return '?'; } };
+  const note = (name, ...args) => { calls += 1; last = { n: calls, call: name + '(' + args.filter((arg) => arg !== undefined).map(said).join(', ') + ')' }; };
   const find = (selector) => { const found = document.querySelector(selector); if (!found) throw new Error('nothing matches ' + selector); return found; };
-  const click = async (selector) => { find(selector).click(); await wait(50); };
-  const fill = async (selector, value) => { const field = find(selector); field.focus(); field.value = value; field.dispatchEvent(new Event('input', { bubbles: true })); field.dispatchEvent(new Event('change', { bubbles: true })); await wait(50); };
-  const check = async (selector, on = true) => { const box = find(selector); if (box.checked !== on) box.click(); await wait(50); };
-  const select = async (selector, value) => { const list = find(selector); list.value = value; list.dispatchEvent(new Event('change', { bubbles: true })); await wait(50); };
+  const click = async (selector) => { note('click', selector); find(selector).click(); await wait(50); };
+  const fill = async (selector, value) => { note('fill', selector, value); const field = find(selector); field.focus(); field.value = value; field.dispatchEvent(new Event('input', { bubbles: true })); field.dispatchEvent(new Event('change', { bubbles: true })); await wait(50); };
+  const check = async (selector, on = true) => { note('check', selector); const box = find(selector); if (box.checked !== on) box.click(); await wait(50); };
+  const select = async (selector, value) => { note('select', selector, value); const list = find(selector); list.value = value; list.dispatchEvent(new Event('change', { bubbles: true })); await wait(50); };
   const KEY = /^((Control|Shift|Alt|Meta)\+)*(Enter|Tab|Escape|Backspace|Delete|Space|Home|End|PageUp|PageDown|Arrow(Up|Down|Left|Right)|F\d{1,2}|.)$/;
   const press = async (first, second) => {
+    note('press', first, second);
     // (as Playwright: press(selector, key), or press(key) on what has the focus; a key named first is taken as one)
     let [selector, key] = second === undefined ? [null, first] : [first, second];
     if (second !== undefined && KEY.test(first) && !KEY.test(second)) [selector, key] = [second, first];
@@ -149,8 +154,19 @@ const STEPS_END: &str = r#"  ];
   const keep = (value) => { try { sessionStorage.setItem(key, value); } catch (error) {} };
   keep('ran:' + index);
   console.log('DOGMIND-STEPS-PART ' + (index + 1) + '/' + parts.length);
+  // A step can take the page to another document (a form it submits, a link it follows, `location.href = ...`): the new document has none of the steps, so these end there, and neither DONE nor
+  // FAILED is said. Which call was the last, and where the page went, is said before it goes. (A reload is not that: the parts are cut at the ones the steps make, and the rest is the page's own.)
+  let underway = true;
+  if (window.navigation) {
+    navigation.addEventListener('navigate', (event) => {
+      if (!underway || event.navigationType === 'reload' || event.destination.sameDocument) return;
+      underway = false;
+      console.log('DOGMIND-STEPS-LEFT:' + encodeURIComponent(JSON.stringify({ step: last, to: event.destination.url })));
+    });
+  }
   try {
     await parts[index]();
+    underway = false;
     if (index + 1 < parts.length) {
       keep('due:' + (index + 1));
       location.reload();
@@ -159,6 +175,7 @@ const STEPS_END: &str = r#"  ];
     keep('done');
     console.log('DOGMIND-STEPS-DONE');
   } catch (error) {
+    underway = false;
     keep('done');
     // (a name that is not here: the ones that are, once, as the model has no other place to read them)
     const hint = error instanceof ReferenceError || /is not a function/.test(String(error && error.message)) ? ' (here: click, fill, press, check, select, wait, reload, text, count, visible, evaluate, and page.click/fill/press/check/selectOption/waitForTimeout/reload/textContent/isVisible/evaluate/$eval/$$eval/locator(sel); the rest is plain JavaScript in the page)' : '';
@@ -768,10 +785,16 @@ fn visible_text(dom: &str) -> String {
 fn steps_text(err: &str) -> Option<String> {
     let line = err.lines().rev().find(|line| line.contains("DOGMIND-STEPS-TEXT:"))?;
     let encoded = line.split_once("DOGMIND-STEPS-TEXT:")?.1.split(['"', ' ']).next().unwrap_or("");
-    let (mut bytes, raw) = (Vec::new(), encoded.as_bytes());
+    let text = percent_decoded(encoded);
+    Some(text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MOST_TEXT).collect())
+}
+
+/// `text` with its `%XX` bytes read as such, as a UTF-8 text (a `%` that is not followed by two hex digits stays as it is).
+fn percent_decoded(text: &str) -> String {
+    let (mut bytes, raw) = (Vec::new(), text.as_bytes());
     let mut i = 0;
     while i < raw.len() {
-        let hex = if raw[i] == b'%' { encoded.get(i + 1..i + 3).and_then(|pair| u8::from_str_radix(pair, 16).ok()) } else { None };
+        let hex = if raw[i] == b'%' { text.get(i + 1..i + 3).and_then(|pair| u8::from_str_radix(pair, 16).ok()) } else { None };
         match hex {
             Some(byte) => {
                 bytes.push(byte);
@@ -783,8 +806,36 @@ fn steps_text(err: &str) -> Option<String> {
             }
         }
     }
-    let text = String::from_utf8_lossy(&bytes);
-    Some(text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MOST_TEXT).collect())
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Where the steps took the page, when they did: the call they had made last (its number and what it was), if they had made one, and the address the page went to.
+#[derive(Debug, PartialEq, Eq)]
+struct Left {
+    step: Option<(u64, String)>,
+    to: String,
+}
+
+/// What the page said when the steps took it to another document, from the browser's log: a line `DOGMIND-STEPS-LEFT:` with a JSON text, percent-encoded.
+fn steps_left(err: &str) -> Option<Left> {
+    let line = err.lines().find(|line| line.contains("DOGMIND-STEPS-LEFT:"))?;
+    let encoded = line.split_once("DOGMIND-STEPS-LEFT:")?.1.split(['"', ' ']).next().unwrap_or("");
+    let said: Value = serde_json::from_str(&percent_decoded(encoded)).ok()?;
+    let step = said.get("step").and_then(|step| Some((step.get("n")?.as_u64()?, step.get("call")?.as_str()?.to_string())));
+    Some(Left { step, to: said.get("to")?.as_str()?.to_string() })
+}
+
+/// What is said of steps that took the page to another document. The address is told as the model would name it: a file of the workspace by its path, and the copy the steps ran in (a form
+/// that submits to its own address comes back to it) as the page.
+/// `base_url`: the workspace as the browser names it; `copy`: the file name of the copy; `page_name`: the page's name.
+fn left_words(left: &Left, base_url: &str, copy: &str, page_name: &str) -> String {
+    let (path, rest) = left.to.split_at(left.to.find(['?', '#']).unwrap_or(left.to.len()));
+    let place = if path.ends_with(copy) { format!("{page_name}{rest}") } else { format!("{}{rest}", path.strip_prefix(base_url).map_or_else(|| path.to_string(), percent_decoded)) };
+    let at = match &left.step {
+        Some((n, call)) => format!("at step {n} (`{call}`, the last call they had made)"),
+        None => "before any call of theirs was made (a `location` they set)".to_string(),
+    };
+    format!("STEPS LEFT THE PAGE: they went to {place} {at}. The steps after it did not run, as that page has none of them: what it shows, and its pictures, are that page. Giving a larger wait_ms changes nothing.\n")
 }
 
 /// The title and the words a person would read, from the page as its scripts left it.
@@ -1040,6 +1091,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let done = console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE"));
         let failed = console.iter().find_map(|line| line.split_once("DOGMIND-STEPS-FAILED: ").map(|(_, why)| why.to_string()));
         let began = parts_begun(&err);
+        let left = if steps.is_some() { steps_left(&err) } else { None };
         // (a part that began more than once is the page loading itself again, and with it the steps, from where it was: not the browser's doing, and not a crash)
         let again = began.iter().find(|part| began.iter().filter(|other| other == part).count() > 1).copied();
         console.retain(|line| !line.contains("DOGMIND-STEPS-"));
@@ -1047,6 +1099,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         if steps.is_some() {
             let in_parts = if parts.len() > 1 { format!(" (in {} parts, one after each reload they make)", parts.len()) } else { String::new() };
             steps_said = match (done, failed, again) {
+                // (the steps that went on in the page they left, until it was gone, may have failed on what the new page does not have, or have ended: the page they left is what happened)
+                _ if left.is_some() => left.as_ref().map_or(String::new(), |left| left_words(left, &base_url, copy, &name)),
                 (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
                 (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
                 (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
@@ -1072,7 +1126,9 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         EndOfRun::NotLoaded(reason) if steps_lost.is_none() => Some(not_loaded_words(reason.as_deref())),
         _ => None,
     };
-    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen: copy_name.as_ref().and_then(|_| steps_text(&err)) };
+    // (the words that the page the steps left said at their end are not of the page that is shown)
+    let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
+    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen };
     let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
@@ -1478,6 +1534,38 @@ mod tests {
     }
 
     /// The report says where the words were read when that is not what a person looking at the page would have: at the desktop's size when it was not asked for, and from the DOM.
+    /// The steps that take the page to another document are told from the line the page said before it went.
+    #[test]
+    fn steps_that_left_the_page_are_told_with_the_call_and_where_they_went() {
+        let said = |value: &str| format!("[1:2:3/4:INFO:CONSOLE:5] \"DOGMIND-STEPS-LEFT:{}\", source: file:///x (5)\n", value.replace('%', "%25").replace('"', "%22").replace('{', "%7B").replace('}', "%7D").replace(' ', "%20"));
+        let err = said(r##"{"step":{"n":2,"call":"press(\"#q\", \"Enter\")"},"to":"file:///C:/work/results.html?q=milk%20tea"}"##);
+        let left = steps_left(&err).expect("a line");
+        assert_eq!(left, Left { step: Some((2, "press(\"#q\", \"Enter\")".to_string())), to: "file:///C:/work/results.html?q=milk%20tea".to_string() });
+        let words = left_words(&left, "file:///C:/work/", "dogmind-steps-7.html", "index.html");
+        assert!(words.starts_with("STEPS LEFT THE PAGE: they went to results.html?q=milk%20tea at step 2 (`press(\"#q\", \"Enter\")`"), "{words}");
+        assert!(words.contains("did not run") && words.contains("that page") && words.contains("larger wait_ms changes nothing"), "{words}");
+        // a call before none: a location they set; a form that comes back to its own copy is the page
+        let bare = steps_left(&said(r##"{"step":null,"to":"file:///C:/Users/x/dogmind-steps-7.html#top"}"##)).expect("a line");
+        let words = left_words(&bare, "file:///C:/work/", "dogmind-steps-7.html", "index.html");
+        assert!(words.contains("went to index.html#top before any call of theirs was made"), "{words}");
+        // an address outside the workspace is told whole; a line that is not that is none
+        let outside = steps_left(&said(r##"{"step":{"n":1,"call":"click(\"#a\")"},"to":"file:///C:/other/b.html"}"##)).unwrap();
+        assert!(left_words(&outside, "file:///C:/work/", "c.html", "index.html").contains("went to file:///C:/other/b.html at step 1"));
+        assert_eq!(steps_left("nothing of that here"), None);
+        assert_eq!(steps_left("INFO:CONSOLE \"DOGMIND-STEPS-LEFT:not%20json\", source: x (1)"), None);
+        assert_eq!(percent_decoded("a%20b%E3%81%82%zz%4"), "a bあ%zz%4");
+    }
+
+    #[test]
+    fn the_steps_note_their_calls_and_say_when_they_leave_the_page() {
+        let page = with_steps("<body></body>", "file:///C:/w/", "await press('#q', 'Enter')", "k");
+        for wanted in ["note('press', first, second)", "note('click', selector)", "navigation.addEventListener('navigate'", "event.navigationType === 'reload'", "DOGMIND-STEPS-LEFT:", "underway = false;"] {
+            assert!(page.contains(wanted), "{wanted}: {page}");
+        }
+        // they say it only while a part is going, and the reload that cuts them is not leaving
+        assert!(page.find("let underway = true").unwrap() < page.find("await parts[index]()").unwrap() && page.find("await parts[index]()").unwrap() < page.find("underway = false;\n    if (index + 1").unwrap(), "{page}");
+    }
+
     #[test]
     fn the_words_a_page_shows_say_where_they_were_read() {
         let needs = Needs::default();
@@ -1711,6 +1799,34 @@ mod tests {
         println!("{phone}");
         assert!(shows(&phone).starts_with("Shows (read at 1280x800): "), "{phone}");
         assert!(shows(&phone).contains("WIDE-ONLY"), "read at the desktop's width, where it is shown: {phone}");
+    }
+
+    /// With the real browser, in the real sandbox: steps that take the page to another document (a form submitted by Enter, a link followed, a location set) are told so, with the call and
+    /// the address, and what is shown is the page they went to, whatever the later steps tried on the page they left.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn steps_that_leave_the_page_say_so_and_the_page_shown_is_the_one_they_went_to() {
+        let (dir, _) = page(&[
+            ("index.html", "<!DOCTYPE html><title>search</title><form action=\"results.html\" method=\"get\"><input id=q name=q><button>Go</button></form><a id=go href=\"other.html\">go on</a>"),
+            ("results.html", "<!DOCTYPE html><title>results</title><p>RESULTS-PAGE-WORDS</p>"),
+            ("other.html", "<!DOCTYPE html><title>other</title><p>OTHER-PAGE-WORDS</p>"),
+        ]);
+        let check = |steps: &str| {
+            let said = check_page(&serde_json::json!({"path": "index.html", "steps": steps, "views": ["desktop"]}), dir.path(), &AtomicBool::new(false)).unwrap();
+            println!("{said}");
+            said
+        };
+        let form = check("await fill('#q', 'milk'); await press('#q', 'Enter'); await click('#result-in-the-old-page'); console.log('later');");
+        assert!(form.contains("STEPS LEFT THE PAGE: they went to results.html?q=milk at step 2 (`press(\"#q\", \"Enter\")`"), "{form}");
+        assert!(form.contains("RESULTS-PAGE-WORDS") && !form.contains("give a larger wait_ms") && !form.contains("STEPS FAILED") && !form.contains("Steps: all ran"), "{form}");
+        let link = check("await click('#go');");
+        assert!(link.contains("STEPS LEFT THE PAGE: they went to other.html at step 1 (`click(\"#go\")`"), "{link}");
+        assert!(link.contains("OTHER-PAGE-WORDS"), "{link}");
+        let set = check("location.href = 'other.html'; await wait(500);");
+        assert!(set.contains("STEPS LEFT THE PAGE: they went to other.html before any call of theirs was made"), "{set}");
+        // and steps that stay are as they were
+        let stays = check("await fill('#q', 'milk'); await wait(10);");
+        assert!(stays.contains("Steps: all ran") && !stays.contains("LEFT THE PAGE"), "{stays}");
     }
 
     /// With the real browser, in the real sandbox: asked only for a phone's width, the first console is labelled as the desktop's size, and the phone's own is under its name.
