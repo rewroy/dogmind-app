@@ -112,12 +112,13 @@ pub const REASON_PRIVATE_QUERY: &str = "this query looks like it holds a secret 
 pub const REASON_WEB_ADDRESS_PATH: &str = "web content is in this conversation, and an address can carry data out in its path";
 pub const REASON_WEB_UNKNOWN_ADDRESS: &str = "this address is not from your messages, a search or a page, and an address can carry data out";
 pub const REASON_WEB_NOTE: &str = "web content is in this conversation, and a note reaches every later session";
+pub const REASON_WEB_FORGET: &str = "web content is in this conversation, and forgetting a note changes every later session";
 pub const REASON_WEB_ASKED: &str = "web content is in this conversation, and it may have asked for this";
 
 /// Every reason a card can give, for the test that each has its Japanese in the app.
-pub const REASONS: [&str; 14] = [
+pub const REASONS: [&str; 15] = [
     REASON_OFF_THIS_PC, REASON_SECRET_READ, REASON_RUNS_OFF_THIS_PC, REASON_PLANTED, REASON_NETWORK, REASON_OUTSIDE_AND_OFF_THIS_PC, REASON_OUTSIDE, REASON_GIT_FOLDER, REASON_LONG_QUERY,
-    REASON_PRIVATE_QUERY, REASON_WEB_ADDRESS_PATH, REASON_WEB_UNKNOWN_ADDRESS, REASON_WEB_NOTE, REASON_WEB_ASKED,
+    REASON_PRIVATE_QUERY, REASON_WEB_ADDRESS_PATH, REASON_WEB_UNKNOWN_ADDRESS, REASON_WEB_NOTE, REASON_WEB_FORGET, REASON_WEB_ASKED,
 ];
 
 /// A reason from its template: `{0}` and `{1}` are what the call adds.
@@ -204,6 +205,45 @@ pub(crate) fn sensitive(path: &Path) -> bool {
         || named
         || SECRET_FILES.iter().any(|mark| text.ends_with(mark))
         || SECRET_EXTENSIONS.iter().any(|mark| text.ends_with(mark))
+}
+
+/// What in a text reads as a secret, said as what it is, or None. It is what a note must not hold (a note is kept in plain text and goes into every later session's prompt, to whatever provider
+/// that session uses): a key by how it opens (`sk-`, `ghp_`, `AKIA`, `AIza`, `xox`, `-----BEGIN`), a name for one with a value after it (`password: hunter2`, `token=...`, `api key is ...`), a
+/// long run of letters and digits as a key is written, and the path of a place keys are kept (`sensitive`). A word like "token" or "password" alone is not one: notes are about code.
+pub(crate) fn secret_in(text: &str) -> Option<String> {
+    use regex::Regex;
+    static PATTERNS: std::sync::OnceLock<(Vec<(Regex, &'static str)>, Regex, Regex)> = std::sync::OnceLock::new();
+    let (openings, named, run) = PATTERNS.get_or_init(|| {
+        let openings = [
+            (r"(?i)\b(sk|pk|rk)-[a-z0-9_-]{16,}", "an API key"),
+            (r"\b(xai|gsk)[-_][A-Za-z0-9]{16,}", "an API key"),
+            (r"\bgh[pousr]_[A-Za-z0-9]{20,}", "a GitHub token"),
+            (r"\bAKIA[0-9A-Z]{12,}", "an AWS access key"),
+            (r"\bAIza[0-9A-Za-z_-]{30,}", "a Google API key"),
+            (r"\bxox[abprs]-[A-Za-z0-9-]{10,}", "a chat service token"),
+            (r"-----BEGIN [A-Z ]*(KEY|CERTIFICATE|BLOCK)", "a private key"),
+        ];
+        let named = r#"(?i)\b(?:api[_ -]?key|access[_ -]?key|secret[_ -]?key|private[_ -]?key|key|password|passwd|passcode|secret|token|credentials?)\b\s*(?:[:=]|\bis\b)\s*["']?([^\s"',;]+)"#;
+        (openings.map(|(pattern, what)| (Regex::new(pattern).expect("the pattern is valid"), what)).to_vec(), Regex::new(named).expect("the pattern is valid"), Regex::new(r"[A-Za-z0-9+_=-]{40,}").expect("the pattern is valid"))
+    });
+    if let Some((_, what)) = openings.iter().find(|(pattern, _)| pattern.is_match(text)) {
+        return Some((*what).to_string());
+    }
+    // (a value that is a word is not one: it has a digit in it, or it is long)
+    if named.captures_iter(text).any(|found| found.get(1).is_some_and(|value| value.as_str().chars().count() >= 6 && (value.as_str().chars().any(|c| c.is_ascii_digit()) || value.as_str().chars().count() >= 20))) {
+        return Some("a password, a key or a token with its value".to_string());
+    }
+    if run.find_iter(text).any(|found| {
+        let run = found.as_str();
+        run.chars().any(|c| c.is_ascii_uppercase()) && run.chars().any(|c| c.is_ascii_lowercase()) && run.chars().any(|c| c.is_ascii_digit())
+    }) {
+        return Some("a long run of letters and digits, as a key is written".to_string());
+    }
+    // (a path: a word with a separator in it, or one that begins as a hidden file or the home does)
+    let path = text.split_whitespace().map(|word| word.trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';' | '`'))).find(|word| {
+        (word.contains(['/', '\\']) || word.starts_with(['.', '~'])) && (sensitive(Path::new(word)) || (word.starts_with('.') && sensitive(Path::new(&format!("/{word}")))))
+    });
+    path.map(|word| format!("the path of a place keys are kept ({word})"))
 }
 
 /// One of those folders, or something in one. Not what is only named like a key, as a project called `credentials-api` is.
@@ -1360,6 +1400,44 @@ mod tests {
             // (a project named after one of those apps is not their store)
             "C:\\Projects\\slack\\bot.py", "C:\\Projects\\discord-bot\\index.js", "C:\\Projects\\rclone\\README.md", "docs\\history.md"] {
             assert_eq!(read_verdict(&gate, path, root), Verdict::Allow, "{path}");
+        }
+    }
+
+    #[test]
+    fn what_reads_as_a_secret_is_told_from_what_is_only_about_one() {
+        for text in [
+            "use sk-abcdefghijklmnopqrstuv for the API",
+            "the token: ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "login is admin and the password: hunter2",
+            "aws AKIAIOSFODNN7EXAMPLE",
+            "api_key=3f2a9c1b5d7e4a8f9b0c1d2e3f4a5b6c",
+            "the api key is Zq81xKd0",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "gemini AIzaSyA-1234567890abcdefghijklmnopqrstuv",
+            "chat xoxb-123456789012-abcdefghij",
+            "Authorization AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf",
+            "the key is in C:/Users/me/.ssh/id_rsa",
+            "credentials at ~/.aws/credentials",
+            "see .env for it",
+        ] {
+            assert!(secret_in(text).is_some(), "{text}");
+        }
+        for text in [
+            "prefers short answers, in Japanese",
+            "builds with make, not cargo",
+            "the token budget is 4000 per request",
+            "see src/tokens.rs and src/lexer.py for the lexer",
+            "commit abc1234 fixed it",
+            "token: refresh daily",
+            "the password is stored in the vault",
+            "key: ctrl+s saves",
+            "an api key is required, set in the settings",
+            "uses the .env.example as the template",
+            "project credentials-api",
+            "https://example.com/docs/some-long-page-name-that-is-lowercase-and-has-no-digits",
+            "メモ: 回答は日本語で、短く",
+        ] {
+            assert_eq!(secret_in(text), None, "{text}");
         }
     }
 
