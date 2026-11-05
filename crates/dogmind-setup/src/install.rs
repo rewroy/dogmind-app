@@ -4,13 +4,16 @@
 //! Every file is unpacked beside its place, under a name of its own, and checked by its hash. Only when all of them are there do they take their places, so that a failure before that
 //! leaves the program as it was. A file made there has what its folder gives new files, which matters: the sandbox's entries on `tools\` are on each thing in it and inherited by what comes.
 //! Running it again after any failure goes on: what is in place, or waiting beside its place, with the right hash, is not unpacked again.
+//!
+//! To find that a file in place has the right hash, all of an install would be read each time, and it is all but a few files that are found so. So each install writes down, in its manifest, the
+//! hash of each file of the package with the size and time the file had when it was written down; a file that still has them is the same file, and is not read. Anything else is read and hashed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::pack::{hash_file, Entry, Package};
+use crate::pack::{hash_file, hex, unhex, Entry, Package};
 
 /// What says what an install put in a folder, and of which version.
 pub const MANIFEST: &str = "dogmind-install.txt";
@@ -58,6 +61,8 @@ pub struct Installed {
     pub unpacked: usize,
     pub already_there: usize,
     pub removed: usize,
+    /// The files that were read whole to be hashed, which the install's own record of a file spares.
+    pub hashed: usize,
 }
 
 fn beside(target: &Path) -> PathBuf {
@@ -66,13 +71,76 @@ fn beside(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
-/// What a folder holds of an install.
+/// What an install wrote down of a file it placed or found in place: the hash its bytes have, and the size and last-write time the file had after that. A file that still has that size
+/// and that time is the file that was written down, and the next install does not read it again to know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub sha256: [u8; 32],
+    pub size: u64,
+    /// As Windows keeps it, in steps of 100 ns (`Metadata::modified` is made from the same count).
+    pub modified: u64,
+}
+
+/// A file's size and last-write time, as they are on the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    size: u64,
+    modified: u64,
+}
+
+impl Stamp {
+    fn of(data: &std::fs::Metadata) -> Stamp {
+        use std::os::windows::fs::MetadataExt;
+        Stamp { size: data.len(), modified: data.last_write_time() }
+    }
+}
+
+/// What the last install of a folder did, and how long each of its parts took, in milliseconds: written into the manifest so that an update can be read afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LastRun {
+    pub counts: Installed,
+    pub checking: u64,
+    pub unpacking: u64,
+    pub placing: u64,
+    pub finishing: u64,
+}
+
+/// What a folder holds of an install. The manifest is lines of a word and what it says; a reader goes by the words it knows and passes over the rest, so that a line added later (`sum`,
+/// `took` and `count` were) is nothing to a program that is older than it:
+///
+///     version 0.1.5
+///     test                                                           (only when it was made with the test switch)
+///     file PATH                                                      each file the install put there, and the uninstaller
+///     sum SHA256 SIZE MODIFIED PATH                                  what was written down of a file of the package (see `Record`)
+///     took checking=MS unpacking=MS placing=MS finishing=MS          the last run's time in each stage
+///     count unpacked=N already_there=N hashed=N removed=N            and what it did
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Manifest {
     pub version: String,
     /// Made with the test switch: nothing real was registered for it, and nothing real is taken away for it.
     pub test: bool,
     pub files: Vec<String>,
+    /// By path, as the package spells it. An install made before these were written has none, and is read whole once.
+    pub records: Vec<(String, Record)>,
+    pub last_run: Option<LastRun>,
+}
+
+/// `HASH SIZE MODIFIED PATH` of a `sum` line. The path is the rest of the line, spaces and all.
+fn read_record(rest: &str) -> Option<(String, Record)> {
+    let mut parts = rest.splitn(4, ' ');
+    let sha256 = unhex(parts.next()?)?;
+    let size = parts.next()?.parse().ok()?;
+    let modified = parts.next()?.parse().ok()?;
+    let path = parts.next().filter(|path| crate::pack::is_safe(path))?;
+    Some((path.to_string(), Record { sha256, size, modified }))
+}
+
+/// The `NAME=NUMBER` words of a `took` or `count` line.
+fn numbers(rest: &str) -> impl Iterator<Item = (&str, u64)> {
+    rest.split(' ').filter_map(|word| {
+        let (name, number) = word.split_once('=')?;
+        Some((name, number.parse().ok()?))
+    })
 }
 
 pub fn read_manifest(folder: &Path) -> Option<Manifest> {
@@ -82,6 +150,31 @@ pub fn read_manifest(folder: &Path) -> Option<Manifest> {
         match line.split_once(' ') {
             Some(("version", version)) => manifest.version = version.to_string(),
             Some(("file", file)) if crate::pack::is_safe(file) => manifest.files.push(file.to_string()),
+            Some(("sum", rest)) => manifest.records.extend(read_record(rest)),
+            Some(("took", rest)) => {
+                let run = manifest.last_run.get_or_insert_with(LastRun::default);
+                for (name, milliseconds) in numbers(rest) {
+                    match name {
+                        "checking" => run.checking = milliseconds,
+                        "unpacking" => run.unpacking = milliseconds,
+                        "placing" => run.placing = milliseconds,
+                        "finishing" => run.finishing = milliseconds,
+                        _ => {}
+                    }
+                }
+            }
+            Some(("count", rest)) => {
+                let run = manifest.last_run.get_or_insert_with(LastRun::default);
+                for (name, count) in numbers(rest) {
+                    match name {
+                        "unpacked" => run.counts.unpacked = count as usize,
+                        "already_there" => run.counts.already_there = count as usize,
+                        "hashed" => run.counts.hashed = count as usize,
+                        "removed" => run.counts.removed = count as usize,
+                        _ => {}
+                    }
+                }
+            }
             _ if line == "test" => manifest.test = true,
             _ => {}
         }
@@ -96,6 +189,14 @@ fn write_manifest(folder: &Path, manifest: &Manifest) -> std::io::Result<()> {
     }
     for file in &manifest.files {
         text.push_str(&format!("file {file}\n"));
+    }
+    for (path, record) in &manifest.records {
+        text.push_str(&format!("sum {} {} {} {path}\n", hex(&record.sha256), record.size, record.modified));
+    }
+    if let Some(run) = &manifest.last_run {
+        text.push_str(&format!("took checking={} unpacking={} placing={} finishing={}\n", run.checking, run.unpacking, run.placing, run.finishing));
+        let counts = &run.counts;
+        text.push_str(&format!("count unpacked={} already_there={} hashed={} removed={}\n", counts.unpacked, counts.already_there, counts.hashed, counts.removed));
     }
     let partial = folder.join(format!("{MANIFEST}{WAITING}"));
     // (on the disk before its name changes: after a power cut a rename can stand on nothing, and then no file here is known to be this program's)
@@ -141,12 +242,41 @@ pub struct Install<'a> {
     pub slowly: Duration,
 }
 
+/// Whether a file holds what an entry says, and the size and time it had when that was found out. The time is kept only for a file that was the same all through the look: one that
+/// changed while it was read is the entry's by its hash, and there is nothing to write down of it.
+enum Holds {
+    No,
+    Yes(Option<Stamp>),
+}
+
+/// Whether the file at `path` is `entry`'s. `record`: what the last install wrote down of this very file, which stands for reading it while the file still has the size and time it was
+/// written down with. Otherwise it is read whole and hashed, and counted in `hashed`. `announce` is told of a file that is looked at.
+fn holds(path: &Path, entry: &Entry, record: Option<&Record>, hashed: &mut usize, announce: &mut dyn FnMut()) -> Holds {
+    let Ok(before) = std::fs::metadata(path) else { return Holds::No };
+    if before.len() != entry.size {
+        return Holds::No;
+    }
+    announce();
+    let stamp = Stamp::of(&before);
+    if record.is_some_and(|record| record.sha256 == entry.sha256 && record.size == stamp.size && record.modified == stamp.modified) {
+        return Holds::Yes(Some(stamp));
+    }
+    *hashed += 1;
+    if !hash_file(path, &mut |_| {}).is_ok_and(|hash| hash == entry.sha256) {
+        return Holds::No;
+    }
+    Holds::Yes(std::fs::metadata(path).ok().map(|after| Stamp::of(&after)).filter(|after| *after == stamp))
+}
+
 /// The package in the folder, from nothing or over an earlier install, going on from where another run stopped.
 pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress)) -> Result<Installed, Failure> {
     let folder = job.folder;
     std::fs::create_dir_all(folder).map_err(|error| say(folder, &error))?;
     let entries = package.entries.clone();
     let total = package.total_bytes().max(1);
+    // (how long each stage took, for the manifest)
+    let (mut checking, mut unpacking, mut placing) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let looked = Instant::now();
     // What will not fit is said before anything is written. What is there already at this size will most likely stay as it is.
     let needed: u64 = entries.iter().filter(|entry| std::fs::metadata(folder.join(&entry.path)).map_or(true, |data| data.len() != entry.size) && std::fs::metadata(beside(&folder.join(&entry.path))).map_or(true, |data| data.len() != entry.size)).map(|entry| entry.size).sum();
     if let Some(free) = job.free {
@@ -154,44 +284,53 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
             return Err(Failure::TooLittleRoom { needed: needed + ROOM_TO_SPARE, free });
         }
     }
+    let mut hashed = 0usize;
     // What is in the way and is no install's. The folder can be any the person names, and what this is about to do is put its own file in that place and, one day, take it away.
     let previous = read_manifest(folder);
     let ours: HashSet<String> = previous.iter().flat_map(|manifest| manifest.files.iter()).map(|file| file.to_lowercase()).collect();
+    // What the last install wrote down of its files, by lower case path.
+    let records: HashMap<String, &Record> = previous.iter().flat_map(|manifest| manifest.records.iter()).map(|(path, record)| (path.to_lowercase(), record)).collect();
     for entry in &entries {
         let target = folder.join(&entry.path);
-        if !ours.contains(&entry.path.to_lowercase()) && target.exists() && !hash_file(&target, &mut |_| {}).is_ok_and(|hash| hash == entry.sha256) {
-            return Err(Failure::Said(format!("{}: there is a file of that name in this folder already, which no install put there, so nothing has been changed. Move it, or install in another folder.", target.display())));
+        if !ours.contains(&entry.path.to_lowercase()) && target.exists() {
+            hashed += 1;
+            if !hash_file(&target, &mut |_| {}).is_ok_and(|hash| hash == entry.sha256) {
+                return Err(Failure::Said(format!("{}: there is a file of that name in this folder already, which no install put there, so nothing has been changed. Move it, or install in another folder.", target.display())));
+            }
         }
     }
+    checking += looked.elapsed();
     let mut done = 0u64;
     let mut outcome = Installed::default();
     let mut unpacked_now = 0;
+    // The files that were found in place, by their place in the package, with the size and time they had when they were looked at.
+    let mut found: HashMap<usize, Option<Stamp>> = HashMap::new();
     // Unpack, or find it there.
     let mut to_place: Vec<&Entry> = Vec::new();
-    for entry in &entries {
+    for (at, entry) in entries.iter().enumerate() {
         if job.stop.load(Ordering::Relaxed) {
             return Err(Failure::Stopped);
         }
         let target = folder.join(&entry.path);
         let waiting = beside(&target);
         let parts = done as f64 / total as f64;
-        let same = |path: &Path, on: &mut dyn FnMut(Progress)| -> bool {
-            if std::fs::metadata(path).map_or(true, |data| data.len() != entry.size) {
-                return false;
-            }
-            on(Progress { stage: Stage::Checking, fraction: parts, file: entry.path.clone() });
-            hash_file(path, &mut |_| {}).is_ok_and(|hash| hash == entry.sha256)
-        };
-        if same(&waiting, on) {
+        let looked = Instant::now();
+        let mut announce = || on(Progress { stage: Stage::Checking, fraction: parts, file: entry.path.clone() });
+        let in_waiting = matches!(holds(&waiting, entry, None, &mut hashed, &mut announce), Holds::Yes(_));
+        let in_place = if in_waiting { Holds::No } else { holds(&target, entry, records.get(&entry.path.to_lowercase()).copied(), &mut hashed, &mut announce) };
+        checking += looked.elapsed();
+        if in_waiting {
             to_place.push(entry);
             outcome.unpacked += 1;
-        } else if same(&target, on) {
+        } else if let Holds::Yes(stamp) = in_place {
             let _ = std::fs::remove_file(&waiting);
             outcome.already_there += 1;
+            found.insert(at, stamp);
         } else {
             if job.fail_after.is_some_and(|after| unpacked_now >= after) {
                 return Err(Failure::Said(format!("{}: a failure asked for by a test", entry.path)));
             }
+            let began = Instant::now();
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|error| say(parent, &error))?;
             }
@@ -212,6 +351,7 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
             if stop.load(Ordering::Relaxed) {
                 return Err(Failure::Stopped);
             }
+            unpacking += began.elapsed();
             to_place.push(entry);
             outcome.unpacked += 1;
             unpacked_now += 1;
@@ -223,16 +363,27 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
         on(Progress { stage: Stage::Unpacking, fraction: done as f64 / total as f64, file: entry.path.clone() });
     }
     // All are here and sound. From now on nothing is stopped half way by the person: what is left would be half of two versions.
-    // What is about to be here is written down first, under the version that is here: from a failure from now on, a removal takes what came of this too.
+    // What is about to be here is written down first, under the version that is here: from a failure from now on, a removal takes what came of this too. (What was written down of the files
+    // that are there now is true of them until they are replaced, and a file that is replaced has another time.)
     let mut going_on: Vec<String> = previous.iter().flat_map(|manifest| manifest.files.iter().cloned()).collect();
     going_on.extend(entries.iter().filter(|entry| !ours.contains(&entry.path.to_lowercase())).map(|entry| entry.path.clone()));
     let version_here = previous.as_ref().map_or_else(|| package.version.clone(), |manifest| manifest.version.clone());
-    write_manifest(folder, &Manifest { version: version_here, test: previous.as_ref().map_or(job.test, |manifest| manifest.test), files: going_on }).map_err(|error| say(&folder.join(MANIFEST), &error))?;
+    write_manifest(folder, &Manifest {
+        version: version_here,
+        test: previous.as_ref().map_or(job.test, |manifest| manifest.test),
+        files: going_on,
+        records: previous.iter().flat_map(|manifest| manifest.records.iter().cloned()).collect(),
+        last_run: previous.as_ref().and_then(|manifest| manifest.last_run.clone()),
+    })
+    .map_err(|error| say(&folder.join(MANIFEST), &error))?;
+    let placing_began = Instant::now();
     let moved = place_all(folder, &to_place, on)?;
     // (one a program still runs from cannot go: it stays, and goes with the next install)
     for (_, aside) in moved {
         let _ = std::fs::remove_file(aside);
     }
+    placing += placing_began.elapsed();
+    let finishing_began = Instant::now();
     on(Progress { stage: Stage::Finishing, fraction: 1.0, file: String::new() });
     // What the last version had and this one has not: nothing else in the folder is this program's to take.
     let mut new_files: HashSet<String> = entries.iter().map(|entry| entry.path.to_lowercase()).collect();
@@ -251,7 +402,21 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     (job.write_uninstaller)(&folder.join(UNINSTALLER)).map_err(|error| say(&folder.join(UNINSTALLER), &error))?;
     let mut files: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
     files.push(UNINSTALLER.to_string());
-    write_manifest(folder, &Manifest { version: package.version.clone(), test: job.test, files }).map_err(|error| say(&folder.join(MANIFEST), &error))?;
+    // What is written down of each file is its size and time as the disk has them now, after the last write of it: a file placed by this run has the time it was unpacked with, which the
+    // rename keeps. A file that was found in place is written down only if it still has what it had when it was looked at.
+    let mut written_down = Vec::with_capacity(entries.len());
+    for (at, entry) in entries.iter().enumerate() {
+        let Ok(data) = std::fs::metadata(folder.join(&entry.path)) else { continue };
+        let now = Stamp::of(&data);
+        if now.size != entry.size || found.get(&at).is_some_and(|seen| *seen != Some(now)) {
+            continue;
+        }
+        written_down.push((entry.path.clone(), Record { sha256: entry.sha256, size: now.size, modified: now.modified }));
+    }
+    outcome.hashed = hashed;
+    let millis = |time: Duration| time.as_millis() as u64;
+    let last_run = LastRun { counts: outcome.clone(), checking: millis(checking), unpacking: millis(unpacking), placing: millis(placing), finishing: millis(finishing_began.elapsed()) };
+    write_manifest(folder, &Manifest { version: package.version.clone(), test: job.test, files, records: written_down, last_run: Some(last_run) }).map_err(|error| say(&folder.join(MANIFEST), &error))?;
     job.shell.add_entries(folder, &package.version, package.total_bytes() / 1024).map_err(Failure::Said)?;
     Ok(outcome)
 }
@@ -504,7 +669,7 @@ mod tests {
         let scene = Scene::new();
         let mut package = scene.package("1.0.0", &[("dogmind-app.exe", b"app"), ("tools\\python\\python.exe", b"py"), ("\u{65e5}\u{672c}\\x", b"j")]);
         let done = scene.run(&mut package, None, None).unwrap();
-        assert_eq!(done, Installed { unpacked: 3, already_there: 0, removed: 0 });
+        assert_eq!(done, Installed { unpacked: 3, already_there: 0, removed: 0, hashed: 0 });
         let folder = scene.folder();
         assert_eq!(std::fs::read(folder.join("tools\\python\\python.exe")).unwrap(), b"py");
         assert_eq!(std::fs::read(folder.join(UNINSTALLER)).unwrap(), b"uninstaller");
@@ -546,7 +711,7 @@ mod tests {
 
         let mut second = scene.package("2.0.0", &[("dogmind-app.exe", b"app two"), ("same.dll", b"unchanged"), ("tools\\keep.py", b"keep"), ("tools\\new\\added.py", b"new")]);
         let done = scene.run(&mut second, None, None).unwrap();
-        assert_eq!(done, Installed { unpacked: 2, already_there: 2, removed: 1 });
+        assert_eq!(done, Installed { unpacked: 2, already_there: 2, removed: 1, hashed: 1 });
         assert_eq!(std::fs::read(folder.join("dogmind-app.exe")).unwrap(), b"app two");
         assert_eq!(std::fs::read(folder.join("tools\\new\\added.py")).unwrap(), b"new");
         assert!(!folder.join("tools\\old").exists(), "what is gone from the package goes, with its folder");
@@ -573,7 +738,7 @@ mod tests {
         // A half-written file from a power cut: its hash says so, and it is done again.
         std::fs::write(beside(&folder.join("b.dll")), "two").unwrap();
         let done = scene.run(&mut second, None, None).unwrap();
-        assert_eq!(done, Installed { unpacked: 3, already_there: 0, removed: 0 });
+        assert_eq!(done, Installed { unpacked: 3, already_there: 0, removed: 0, hashed: 3 });
         assert_eq!(std::fs::read(folder.join("b.dll")).unwrap(), b"two b");
         assert_eq!(read_manifest(&folder).unwrap().version, "2.0.0");
         assert!(walk(&folder).iter().all(|name| !name.ends_with(WAITING)));
@@ -622,6 +787,12 @@ mod tests {
         assert!(!folder.join("tools\\d.py").exists(), "a new file is not there either");
         assert!(moved_aside(&folder).is_empty(), "{:?}", walk(&folder));
         assert_eq!(read_manifest(&folder).unwrap().version, "1.0.0");
+        // what was written down is still true of each file: a rename keeps its time, and so what was moved aside and put back has the one it had
+        let records = read_manifest(&folder).unwrap().records;
+        assert_eq!(records.len(), 3);
+        for (path, record) in &records {
+            assert_eq!(Stamp::of(&std::fs::metadata(folder.join(path)).unwrap()), Stamp { size: record.size, modified: record.modified }, "{path}");
+        }
         let done = scene.run(&mut second, None, None).unwrap();
         assert_eq!(done.unpacked, 4, "all were waiting: {done:?}");
         assert_eq!(std::fs::read(folder.join("tools\\d.py")).unwrap(), b"new d");
@@ -760,7 +931,7 @@ mod tests {
     #[test]
     fn the_manifests_own_rename_is_tried_again_while_something_has_it_open_for_a_moment() {
         let dir = tempfile::tempdir().unwrap();
-        let manifest = |version: &str| Manifest { version: version.to_string(), test: true, files: vec!["a.exe".to_string()] };
+        let manifest = |version: &str| Manifest { version: version.to_string(), test: true, files: vec!["a.exe".to_string()], ..Manifest::default() };
         write_manifest(dir.path(), &manifest("1.0.0")).unwrap();
         // (what a rename made once meets: the target is open, and nothing lets it be replaced)
         std::fs::write(dir.path().join("other"), "x").unwrap();
@@ -792,5 +963,142 @@ mod tests {
         drop(held);
         remove(&folder, &scene.shell, &mut |_| {}).unwrap();
         assert!(!folder.exists());
+    }
+
+    /// `read_manifest` as 0.1.4 had it: what an older setup or uninstaller reads a newer manifest with.
+    fn read_manifest_as_0_1_4(text: &str) -> Manifest {
+        let mut manifest = Manifest::default();
+        for line in text.lines() {
+            match line.split_once(' ') {
+                Some(("version", version)) => manifest.version = version.to_string(),
+                Some(("file", file)) if crate::pack::is_safe(file) => manifest.files.push(file.to_string()),
+                _ if line == "test" => manifest.test = true,
+                _ => {}
+            }
+        }
+        manifest
+    }
+
+    fn stamp_on_disk(path: &Path) -> Stamp {
+        Stamp::of(&std::fs::metadata(path).unwrap())
+    }
+
+    #[test]
+    fn the_manifest_holds_a_record_of_each_file_and_the_last_runs_numbers_and_an_older_reader_passes_over_them() {
+        let scene = Scene::new();
+        let mut package = scene.package("1.0.0", &[("dogmind-app.exe", b"app"), ("tools\\py thon\\python.exe", b"py"), ("\u{65e5}\u{672c}\\x", b"j")]);
+        let done = scene.run(&mut package, None, None).unwrap();
+        let folder = scene.folder();
+        let manifest = read_manifest(&folder).unwrap();
+        // one for each file of the package, and none for the uninstaller, which no package holds
+        let mut written: Vec<&str> = manifest.records.iter().map(|(path, _)| path.as_str()).collect();
+        written.sort();
+        assert_eq!(written, ["dogmind-app.exe", "tools\\py thon\\python.exe", "\u{65e5}\u{672c}\\x"]);
+        assert!(manifest.files.contains(&UNINSTALLER.to_string()));
+        for (path, record) in &manifest.records {
+            let place = folder.join(path);
+            assert_eq!(record.sha256, hash_file(&place, &mut |_| {}).unwrap(), "{path}");
+            assert_eq!(Stamp { size: record.size, modified: record.modified }, stamp_on_disk(&place), "read back from the disk after it was placed: {path}");
+        }
+        let run = manifest.last_run.clone().unwrap();
+        assert_eq!(run.counts, done);
+        let text = std::fs::read_to_string(folder.join(MANIFEST)).unwrap();
+        assert!(text.starts_with("version 1.0.0\ntest\nfile "), "{text}");
+        assert_eq!(text.lines().filter(|line| line.starts_with("sum ")).count(), 3);
+        assert!(text.contains("\nsum ") && text.contains(" tools\\py thon\\python.exe\n"), "a path is the rest of its line, spaces and all");
+        assert!(text.contains("\ntook checking=") && text.contains(" finishing=") && text.contains("\ncount unpacked=3 already_there=0 hashed=0 removed=0\n"), "{text}");
+        // an older setup or uninstaller reads what it knows of it, and the same as before
+        let old = read_manifest_as_0_1_4(&text);
+        assert_eq!((old.version.as_str(), old.test, &old.files), ("1.0.0", true, &manifest.files));
+        // and a second run replaces the numbers of the first, and does not add to them
+        let mut again = scene.package("1.0.1", &[("dogmind-app.exe", b"app"), ("tools\\py thon\\python.exe", b"py"), ("\u{65e5}\u{672c}\\x", b"j")]);
+        scene.run(&mut again, None, None).unwrap();
+        let text = std::fs::read_to_string(folder.join(MANIFEST)).unwrap();
+        assert_eq!((text.matches("\ntook ").count(), text.matches("\ncount ").count(), text.matches("\nsum ").count()), (1, 1, 3));
+        assert!(text.contains("\ncount unpacked=0 already_there=3 hashed=0 removed=0\n"), "{text}");
+    }
+
+    #[test]
+    fn lines_a_reader_does_not_understand_are_passed_over_and_a_record_that_is_not_in_order_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let text = format!(
+            "version 2\nfile a.exe\nsum {hash} 5 123 a.exe\nsum {hash} 5 123\nsum nothing 5 123 b.exe\nsum {hash} five 123 c.exe\nsum {hash} 5 123 ..\\d.exe\nsum {hash} 5 123 e f\\g h.exe\ntook checking=7 other=1 bad\ncount hashed=3 unpacked=x\nsomething else\n"
+        );
+        std::fs::write(dir.path().join(MANIFEST), text).unwrap();
+        let manifest = read_manifest(dir.path()).unwrap();
+        let paths: Vec<&str> = manifest.records.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, ["a.exe", "e f\\g h.exe"]);
+        assert_eq!(manifest.records[0].1, Record { sha256: unhex(hash).unwrap(), size: 5, modified: 123 });
+        let run = manifest.last_run.unwrap();
+        assert_eq!((run.checking, run.counts.hashed, run.counts.unpacked), (7, 3, 0));
+    }
+
+    #[test]
+    fn an_update_reads_only_the_files_it_has_no_record_of_or_whose_record_no_longer_fits() {
+        let scene = Scene::new();
+        let big = noise(300_000);
+        let mut first = scene.package("1.0.0", &[("a.exe", b"one a"), ("b.dll", &big), ("c.dll", b"one c")]);
+        scene.run(&mut first, None, None).unwrap();
+        // a.exe is of the same size as it was and another file: it is read, and found other. b.dll and c.dll are not read at all.
+        let mut second = scene.package("2.0.0", &[("a.exe", b"two a"), ("b.dll", &big), ("c.dll", b"one c")]);
+        let done = scene.run(&mut second, None, None).unwrap();
+        assert_eq!(done, Installed { unpacked: 1, already_there: 2, removed: 0, hashed: 1 });
+        let mut third = scene.package("3.0.0", &[("a.exe", b"two a"), ("b.dll", &big), ("c.dll", b"one c")]);
+        let done = scene.run(&mut third, None, None).unwrap();
+        assert_eq!(done, Installed { unpacked: 0, already_there: 3, removed: 0, hashed: 0 }, "all three have a record that fits");
+        let run = read_manifest(&scene.folder()).unwrap().last_run.unwrap();
+        assert_eq!(run.counts, done);
+    }
+
+    /// An install of 0.1.4 has `file` lines and nothing else: it is updated as it always was, every file of the size it should be read once, and written down for the next update.
+    #[test]
+    fn an_install_with_file_lines_only_is_updated_and_has_its_records_after() {
+        let scene = Scene::new();
+        let mut first = scene.package("1.0.0", &[("a.exe", b"one a"), ("b.dll", b"same b"), ("gone.py", b"old")]);
+        scene.run(&mut first, None, None).unwrap();
+        let folder = scene.folder();
+        std::fs::write(folder.join(MANIFEST), format!("version 1.0.0\ntest\nfile a.exe\nfile b.dll\nfile gone.py\nfile {UNINSTALLER}\n")).unwrap();
+        let before = read_manifest(&folder).unwrap();
+        assert!(before.records.is_empty() && before.last_run.is_none() && before.files.len() == 4);
+        let mut second = scene.package("2.0.0", &[("a.exe", b"two a"), ("b.dll", b"same b"), ("new.py", b"new")]);
+        let done = scene.run(&mut second, None, None).unwrap();
+        assert_eq!(done, Installed { unpacked: 2, already_there: 1, removed: 1, hashed: 2 }, "a.exe and b.dll are read; new.py is not there to be");
+        assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"two a");
+        assert!(!folder.join("gone.py").exists());
+        let after = read_manifest(&folder).unwrap();
+        assert_eq!((after.version.as_str(), after.records.len()), ("2.0.0", 3));
+        let mut third = scene.package("3.0.0", &[("a.exe", b"two a"), ("b.dll", b"same b"), ("new.py", b"new")]);
+        assert_eq!(scene.run(&mut third, None, None).unwrap(), Installed { unpacked: 0, already_there: 3, removed: 0, hashed: 0 });
+    }
+
+    #[test]
+    fn a_file_with_another_time_than_the_one_written_down_is_read_again_and_written_down_anew() {
+        let scene = Scene::new();
+        let files: [(&str, &[u8]); 2] = [("a.exe", b"one a"), ("b.dll", b"one b")];
+        let mut first = scene.package("1.0.0", &files);
+        scene.run(&mut first, None, None).unwrap();
+        let folder = scene.folder();
+        let set_time = |name: &str, ahead: u64| {
+            let file = std::fs::OpenOptions::new().write(true).open(folder.join(name)).unwrap();
+            file.set_modified(std::time::SystemTime::now() + Duration::from_secs(ahead)).unwrap();
+        };
+        // touched: the same bytes, another time
+        set_time("b.dll", 3600);
+        let mut second = scene.package("1.0.1", &files);
+        assert_eq!(scene.run(&mut second, None, None).unwrap(), Installed { unpacked: 0, already_there: 2, removed: 0, hashed: 1 });
+        let records = read_manifest(&folder).unwrap().records;
+        let of = |name: &str| records.iter().find(|(path, _)| path == name).unwrap().1.clone();
+        assert_eq!(Stamp { size: 5, modified: of("b.dll").modified }, stamp_on_disk(&folder.join("b.dll")), "it is written down as it is now");
+        let mut third = scene.package("1.0.2", &files);
+        assert_eq!(scene.run(&mut third, None, None).unwrap(), Installed { unpacked: 0, already_there: 2, removed: 0, hashed: 0 });
+        // changed by someone: other bytes of the same size, and another time. It is read, found not to be the package's, and replaced.
+        std::fs::write(folder.join("a.exe"), b"edit!").unwrap();
+        set_time("a.exe", 7200);
+        let mut fourth = scene.package("1.0.3", &files);
+        assert_eq!(scene.run(&mut fourth, None, None).unwrap(), Installed { unpacked: 1, already_there: 1, removed: 0, hashed: 1 });
+        assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"one a");
+        let mut fifth = scene.package("1.0.4", &files);
+        assert_eq!(scene.run(&mut fifth, None, None).unwrap().hashed, 0);
     }
 }
