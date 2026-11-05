@@ -221,7 +221,8 @@ fn hidden(command: &mut Command) {
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 }
 
-/// Bytes as a person reads a size on a drive, as Straydog gives sizes.
+/// The size of a download or of what is on a drive, in the units Straydog gives sizes in (10^9 bytes, which it writes "GB": its help, its progress and its words of the disk), so that the list of
+/// models, the progress and Straydog's own words agree on one number. (Explorer counts a file in 2^30, and shows the same file as a smaller number.)
 pub fn gb(bytes: u64) -> String {
     format!("{:.0} GB", bytes as f64 / 1e9)
 }
@@ -229,6 +230,12 @@ pub fn gb(bytes: u64) -> String {
 /// The size of a file of about a gigabyte, which `gb` would call nothing or one.
 pub fn gb_file(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
+/// The memory of the PC and of its graphics card as Windows counts it: in units of 2^30, which it writes "GB" (Task Manager, the box of the card): a card of 8 GiB reads 8 GB, and a PC of 32 GiB
+/// 32 GB. (Straydog's words of memory, on the same line, are in GiB.)
+pub fn memory_gb(bytes: u64) -> String {
+    format!("{:.0} GB", bytes as f64 / (1u64 << 30) as f64)
 }
 
 /// What the verdict of `setup --list` means for the person choosing, in words of theirs: Straydog's own speak of its experts.
@@ -335,7 +342,7 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     entries.extend(short_entries);
     let machine = value.get("machine");
     let gpus: Vec<String> = machine.and_then(|machine| machine.get("gpus")).and_then(Value::as_array).into_iter().flatten().map(|gpu| {
-        format!("{} ({})", word(gpu, "name"), gb(gpu.get("total_bytes").and_then(Value::as_u64).unwrap_or(0)))
+        format!("{} ({})", word(gpu, "name"), memory_gb(gpu.get("total_bytes").and_then(Value::as_u64).unwrap_or(0)))
     }).collect();
     let ram = machine.and_then(|machine| machine.get("ram_bytes")).and_then(Value::as_u64).unwrap_or(0);
     // (what is free now, when Straydog says: what other programs hold decides whether a model's experts stay in memory)
@@ -343,8 +350,8 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     let mut parts = gpus.clone();
     if ram > 0 {
         parts.push(match free_ram {
-            Some(free) => tf("{0} of memory, {1} free now", &[&gb(ram), &gb(free)]),
-            None => tf("{0} of memory", &[&gb(ram)]),
+            Some(free) => tf("{0} of memory, {1} free now", &[&memory_gb(ram), &memory_gb(free)]),
+            None => tf("{0} of memory", &[&memory_gb(ram)]),
         });
     }
     // (said whether or not the list has some that are short: they are there to try, and not what this PC runs)
@@ -1256,10 +1263,26 @@ mod tests {
             {"model":"DeepSeek-V4.1-Flash-1017","provider":"ISTA-DASLab","creator":"DeepSeek","license":"MIT","license_url":"https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE","quant":"IQ2_XXS","download_bytes":1,"runs":false,"note":"needs 30 GiB of VRAM; this machine has 6 GiB"}]}"#;
         let small = parse_list(small, true).unwrap();
         assert_eq!(small.refusal, Some(Refusal::TooLittleMemory { needs: "10 GiB".into(), has: "6 GiB".into() }), "the least it would take");
-        assert_eq!(small.machine, "RTX 2060 (6 GB)  ·  34 GB of memory");
+        assert_eq!(small.machine, "RTX 2060 (6 GB)  ·  32 GB of memory");
         // (a Straydog that measures what is free says so too)
         let free = r#"{"machine":{"gpus":[{"ordinal":0,"name":"RTX 5070 Ti","total_bytes":17066033152}],"ram_bytes":66126708736,"free_ram_bytes":30064771072},"bundles":[]}"#;
-        assert_eq!(parse_list(free, true).unwrap().machine, "RTX 5070 Ti (17 GB)  ·  66 GB of memory, 30 GB free now");
+        assert_eq!(parse_list(free, true).unwrap().machine, "RTX 5070 Ti (16 GB)  ·  62 GB of memory, 28 GB free now");
+    }
+
+    /// Memory is shown as Windows shows it (units of 2^30, written GB), and the sizes of downloads as Straydog writes them (10^9).
+    #[test]
+    fn memory_is_counted_as_windows_counts_it() {
+        let machine = |card: u64, ram: u64| parse_list(&format!(r#"{{"machine":{{"gpus":[{{"ordinal":0,"name":"Card","total_bytes":{card}}}],"ram_bytes":{ram}}},"bundles":[]}}"#), true).unwrap().machine;
+        // as CUDA gives them: an 8 GiB card reads 8 GB (9 when divided by 10^9), and so on up
+        assert_eq!(machine(8_585_216_000, 34_359_738_368), "Card (8 GB)  ·  32 GB of memory");
+        for (card, wanted) in [(4_294_967_296u64, "4 GB"), (6_442_450_944, "6 GB"), (8_589_934_592, "8 GB"), (12_884_901_888, "12 GB"), (17_171_480_576, "16 GB"), (25_757_220_864, "24 GB")] {
+            assert_eq!(machine(card, 1 << 34), format!("Card ({wanted})  ·  16 GB of memory"));
+        }
+        assert_eq!(memory_gb(34_359_738_368), "32 GB");
+        assert_eq!(memory_gb(0), "0 GB");
+        // a download is as Straydog says it: 75 GB is 75, and not 70
+        assert_eq!(gb(75_000_000_000), "75 GB");
+        assert_eq!(gb_file(1_800_000_000), "1.8 GB");
     }
 
     /// What Straydog 0.1.1 says on a 16 GB card: DeepSeek does not run. It is in the list after the rest, greyed and not recommended, with why,
