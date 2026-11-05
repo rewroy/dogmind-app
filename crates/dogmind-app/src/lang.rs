@@ -602,6 +602,7 @@ const JA: &[(&str, &str)] = &[
     ("Web content is here: commands ask", "Web の内容を含むため、コマンドは毎回確認します"),
     // The preview.
     ("{0}: starting...", "{0}: 起動中..."),
+    ("{0} is gone. Nothing is shown until it is written again.", "{0} がなくなりました。もう一度書かれるまで何も表示しません。"),
     ("{0} requests to outside were blocked here. Open in browser to let them through.", "外部への通信を {0} 件ブロックしました。通すにはブラウザーで開いてください。"),
     ("There is no {0} in this folder.", "このフォルダに {0} はありません。"),
     ("The preview shows web pages, pictures, PDFs, Markdown and source files.", "プレビューできるのは Web ページ、画像、PDF、Markdown、ソースファイルです。"),
