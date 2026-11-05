@@ -11,9 +11,9 @@ use sha2::{Digest, Sha256};
 
 use crate::message::{ImageRef, Message};
 
-/// What the local engine takes, in bytes and in pixels: nothing past this is read by anyone, so nothing past it is decoded.
-const MOST_BYTES: usize = 32 << 20;
-const MOST_PIXELS: u64 = 64 << 20;
+/// What the local engine takes, in bytes and in pixels: nothing past this is read by anyone, so nothing past it is decoded. The card in the window holds to the same.
+pub const MOST_BYTES: usize = 32 << 20;
+pub const MOST_PIXELS: u64 = 64 << 20;
 /// How many times a picture still too heavy is made smaller, by three quarters.
 const SHRINKS: u32 = 6;
 const JPEG_QUALITY: u8 = 85;
@@ -77,6 +77,11 @@ fn decode(bytes: &[u8], format: ImageFormat) -> Result<DynamicImage, String> {
     let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(limits);
     let mut decoder = reader.into_decoder().map_err(|_| DAMAGED.to_string())?;
+    // (what a header says, before any of it is decoded: a few kilobytes can declare a picture that takes gigabytes)
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > MOST_PIXELS {
+        return Err(TOO_LARGE.to_string());
+    }
     let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut picture = DynamicImage::from_decoder(decoder).map_err(|_| DAMAGED.to_string())?;
     picture.apply_orientation(orientation);
@@ -354,6 +359,49 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         DynamicImage::ImageRgb8(picture).write_to(&mut Cursor::new(&mut out), format).unwrap();
         out
+    }
+
+    /// A PNG that is its header and the start of its data and declares this size: a few hundred bytes.
+    pub(crate) fn png_declaring(width: u32, height: u32) -> Vec<u8> {
+        fn crc(bytes: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+                }
+            }
+            !crc
+        }
+        fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            let mut out = (data.len() as u32).to_be_bytes().to_vec();
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc(&body).to_be_bytes());
+            out
+        }
+        let mut header = width.to_be_bytes().to_vec();
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        out.extend(chunk(b"IHDR", &header));
+        out.extend(chunk(b"IDAT", &[0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01]));
+        out.extend(chunk(b"IEND", &[]));
+        out
+    }
+
+    /// The size a header declares is looked at before anything is decoded: a picture of 30000 by 30000 is a few hundred bytes in the file and gigabytes decoded.
+    #[test]
+    fn a_picture_that_declares_more_pixels_than_are_taken_is_refused_from_its_header() {
+        let huge = png_declaring(30_000, 30_000);
+        assert!(huge.len() < 1000, "{}", huge.len());
+        assert_eq!(decode_picture(&huge).unwrap_err(), TOO_LARGE);
+        assert_eq!(attach_bytes("h.png", huge).unwrap_err(), TOO_LARGE);
+        // (and what is within the limit is read as ever)
+        assert!(decode_picture(&encoded(30, 20, ImageFormat::Png)).is_ok());
+        assert_eq!(decode_picture(&vec![0u8; MOST_BYTES + 1]).unwrap_err(), TOO_LARGE, "past the size, before any look at it");
+        assert_eq!(decode_picture(b"not a picture at all").unwrap_err(), NOT_A_PICTURE);
     }
 
     #[test]
