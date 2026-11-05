@@ -5,7 +5,7 @@
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use image::{DynamicImage, ImageFormat, ImageReader};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -69,13 +69,27 @@ fn extension_of(media_type: &str) -> &'static str {
     }
 }
 
-/// The whole picture, as a check that it is one: a GIF's first frame.
+/// The whole picture, as a check that it is one: a GIF's first frame. Turned as its EXIF orientation says (a phone's photo is stored as the sensor saw it, and shown upright by
+/// the orientation it carries, which a copy made here would lose).
 fn decode(bytes: &[u8], format: ImageFormat) -> Result<DynamicImage, String> {
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MOST_PIXELS * 8);
     let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(limits);
-    reader.decode().map_err(|_| DAMAGED.to_string())
+    let mut decoder = reader.into_decoder().map_err(|_| DAMAGED.to_string())?;
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut picture = DynamicImage::from_decoder(decoder).map_err(|_| DAMAGED.to_string())?;
+    picture.apply_orientation(orientation);
+    Ok(picture)
+}
+
+/// A picture decoded to be looked at, by anyone who does (the card in the window too): turned as its orientation says, and within what is read of any picture.
+pub fn decode_picture(bytes: &[u8]) -> Result<DynamicImage, String> {
+    if bytes.len() > MOST_BYTES {
+        return Err(TOO_LARGE.to_string());
+    }
+    let format = image::guess_format(bytes).map_err(|_| NOT_A_PICTURE.to_string())?;
+    decode(bytes, format)
 }
 
 /// A picture from what was pasted or dropped. A plain message when it cannot be one.
@@ -268,6 +282,60 @@ pub(crate) fn openai_content(message: &Message, folder: Option<&Path>) -> Value 
 pub(crate) mod tests {
     use super::*;
     use image::RgbImage;
+
+    /// A JPEG with an EXIF segment that says its orientation (1 to 8), as a phone's photo has: after its SOI, an APP1 with a little-endian TIFF header and one entry.
+    pub(crate) fn with_orientation(jpeg: &[u8], orientation: u16) -> Vec<u8> {
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0".to_vec();
+        exif.extend_from_slice(&1u16.to_le_bytes());
+        exif.extend_from_slice(&0x0112u16.to_le_bytes());
+        exif.extend_from_slice(&3u16.to_le_bytes());
+        exif.extend_from_slice(&1u32.to_le_bytes());
+        exif.extend_from_slice(&orientation.to_le_bytes());
+        exif.extend_from_slice(&[0, 0]);
+        exif.extend_from_slice(&0u32.to_le_bytes());
+        let mut out = jpeg[..2].to_vec();
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&exif);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    /// A wide picture, red on its left half and blue on its right, as a JPEG.
+    fn red_then_blue(width: u32, height: u32) -> Vec<u8> {
+        let picture = RgbImage::from_fn(width, height, |x, _| if x < width / 2 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) });
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95).encode_image(&picture).unwrap();
+        out
+    }
+
+    /// A photo taken upright is stored on its side with Orientation 6: it is attached as it is shown, and what is shrunk for the model is upright too.
+    #[test]
+    fn a_photos_orientation_is_applied_to_what_is_attached_and_to_the_shrunk_copy() {
+        let plain = attach_bytes("p.jpg", red_then_blue(40, 20)).unwrap();
+        assert_eq!((plain.width, plain.height), (40, 20));
+        let upright = attach_bytes("u.jpg", with_orientation(&red_then_blue(40, 20), 6)).unwrap();
+        assert_eq!((upright.width, upright.height), (20, 40), "width and height are swapped for a quarter turn");
+        // (the bytes are the original ones, EXIF and all, when they fit)
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("s.jsonl");
+        let kept = save(&session, &upright, ImageLimit::WIDE).unwrap();
+        assert_eq!((kept.width, kept.height), (20, 40));
+        assert!(std::fs::read(file_of(&session, &kept)).unwrap().windows(4).any(|part| part == b"Exif"), "sent as it is");
+        // (made smaller, it is turned: a copy has no EXIF to say it)
+        let small = ImageLimit { side: 30, bytes: 20 << 20 };
+        let shrunk = save(&session, &upright, small).unwrap();
+        assert_eq!((shrunk.width, shrunk.height), (15, 30), "the longest side is 30, of the turned picture");
+        let copy = image::load_from_memory(&std::fs::read(file_of(&session, &shrunk)).unwrap()).unwrap().to_rgb8();
+        assert_eq!((copy.width(), copy.height()), (15, 30));
+        // (Orientation 6 turns it a quarter clockwise: what was its left, red, is now its top)
+        let (top, bottom) = (copy.get_pixel(7, 3).0, copy.get_pixel(7, 26).0);
+        assert!(top[0] > 200 && top[2] < 60, "red at the top: {top:?}");
+        assert!(bottom[2] > 200 && bottom[0] < 60, "blue at the bottom: {bottom:?}");
+        // (and a picture with no orientation, or an unreadable one, is as it was)
+        let not_turned = save(&session, &plain, small).unwrap();
+        assert_eq!((not_turned.width, not_turned.height), (30, 15));
+    }
 
     #[test]
     fn attached_pictures_are_copied_as_they_were_under_names_a_command_takes() {
