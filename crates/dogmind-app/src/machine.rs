@@ -287,9 +287,43 @@ fn counts_by_the_amount(kind: windows::Networking::Connectivity::NetworkCostType
     matches!(kind, NetworkCostType::Fixed | NetworkCostType::Variable) || roaming || over_limit || near_limit
 }
 
+/// The day a build was made, as `2026-11-04`, from what `build.rs` gives: its text ends in the seconds since 1970.
+pub fn build_day(build: &str) -> Option<String> {
+    let seconds = build.rsplit(' ').next().and_then(|last| last.parse::<i64>().ok())?;
+    // Days to a date in the proleptic Gregorian calendar, counted from 0000-03-01.
+    let z = seconds.div_euclid(86400) + 719468;
+    let era = z.div_euclid(146097);
+    let day_of_era = z.rem_euclid(146097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 { shifted_month + 3 } else { shifted_month - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    Some(format!("{year}-{month:02}-{day:02}"))
+}
+
+/// The build as `/status` says it: which commit, and the day. What `build.rs` gives ends in the seconds since 1970.
+pub fn readable_build(build: &str) -> String {
+    let commit = build.split_whitespace().next().unwrap_or("").trim_end_matches(',');
+    match build_day(build) {
+        Some(day) => format!("{commit} ({day})"),
+        None => commit.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_build_is_told_by_its_commit_and_the_day() {
+        assert_eq!(build_day("b41c461656, built at 1793796827").as_deref(), Some("2026-11-04"));
+        assert_eq!(build_day("abc built at 0").as_deref(), Some("1970-01-01"));
+        assert_eq!(build_day("abc"), None);
+        assert_eq!(readable_build("056bbaaa1a with changes, built at 1793616313"), "056bbaaa1a (2026-11-02)");
+        assert_eq!(readable_build("abc"), "abc");
+    }
 
     #[test]
     fn a_connection_that_is_paid_by_the_amount_or_at_its_limit_is_metered() {
