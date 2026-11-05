@@ -4422,6 +4422,32 @@ impl App {
         });
     }
 
+    /// What a skill needs that this app has not, if anything: tools of a server that is not configured, or a feature of the app it was written for.
+    fn skill_missing(&self, skill: &dogmind_agent::skills::Skill) -> Option<dogmind_agent::skills::Missing> {
+        skill.needs_what_is_not_here(&self.mcp.server_parts())
+    }
+
+    /// Whether a skill is on: as the person chose, and with no choice, as its kind says (off when it is written for another app's features).
+    fn skill_enabled(&self, name: &str) -> bool {
+        let foreign = self.skills.iter().find(|skill| skill.name.eq_ignore_ascii_case(name)).is_some_and(|skill| self.skill_missing(skill).is_some());
+        self.settings.skill_is_on(name, foreign)
+    }
+
+    /// What the agents are told to leave out.
+    fn skills_off_now(&self) -> Vec<String> {
+        let foreign: Vec<String> = self.skills.iter().filter(|skill| self.skill_missing(skill).is_some()).map(|skill| skill.name.clone()).collect();
+        self.settings.skills_off_for(&foreign)
+    }
+
+    /// The agents are told what is off, for a session begun from now on (and one under way keeps its list).
+    fn send_skills_off(&self) {
+        let off = self.skills_off_now();
+        let _ = self.agent.commands.send(Command::SetSkillsOff(off.clone()));
+        for parked in &self.parked {
+            let _ = parked.agent.commands.send(Command::SetSkillsOff(off.clone()));
+        }
+    }
+
     /// What is offered above the composer for the word being typed: commands after `/`, files after `@`.
     unsafe fn update_suggestions(&mut self) {
         let text = get_text(self.composer);
@@ -4432,7 +4458,7 @@ impl App {
                     found.push(Suggestion { title: name.to_string(), detail: t(about).to_string(), insert: format!("{name} ") });
                 }
             }
-            for skill in self.skills.iter().filter(|skill| skill.for_the_person && self.settings.skill_is_on(&skill.name) && format!("/{}", skill.name).to_lowercase().starts_with(&text.to_lowercase())) {
+            for skill in self.skills.iter().filter(|skill| skill.for_the_person && self.skill_enabled(&skill.name) && format!("/{}", skill.name).to_lowercase().starts_with(&text.to_lowercase())) {
                 let about: String = skill.description.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(90).collect();
                 found.push(Suggestion { title: format!("/{}", skill.name), detail: about, insert: format!("/{} ", skill.name) });
             }
@@ -4696,7 +4722,7 @@ impl App {
                 DestroyWindow(self.window);
             }
             known if self.skills.iter().any(|skill| skill.for_the_person && skill.name.eq_ignore_ascii_case(known)) => {
-                if self.settings.skill_is_on(known) {
+                if self.skill_enabled(known) {
                     self.send_or_wait(Outgoing::words(line.to_string()), false);
                 } else {
                     self.say(t("That skill is turned off. Settings > Skills turns it on."));
@@ -5902,7 +5928,15 @@ impl App {
                     form.note(t("A skill turned off is neither offered to the model nor started with /name. A session already under way keeps its list, but cannot read one that is off."), theme::muted());
                 }
                 for (skill, toggle) in self.skills.iter().zip(&self.skill_toggles) {
-                    form.toggle_at_end(&skill.name, *toggle, if self.settings.skill_is_on(&skill.name) { t("Enabled") } else { t("Disabled") });
+                    form.toggle_at_end(&skill.name, *toggle, if self.skill_enabled(&skill.name) { t("Enabled") } else { t("Disabled") });
+                    // (why one is off before the person has said: what it needs is not here)
+                    if let Some(missing) = self.skill_missing(skill) {
+                        let words = match missing {
+                            dogmind_agent::skills::Missing::Tools(server) => tf("Needs tools this app does not have: mcp__{0}__…", &[&server]),
+                            dogmind_agent::skills::Missing::Something(what) => tf("Needs something of another app that this app does not have: {0}", &[&t(what)]),
+                        };
+                        form.note(&words, theme::warn());
+                    }
                     // (about two lines: some are written for a model, a page long)
                     let about = skill.description.split_whitespace().collect::<Vec<_>>().join(" ");
                     let short: String = about.chars().take(160).collect();
@@ -7575,7 +7609,7 @@ impl App {
             set_button_style(*toggle, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         }
         for (toggle, skill) in self.skill_toggles.iter().zip(&self.skills) {
-            set_button_style(*toggle, if self.settings.skill_is_on(&skill.name) { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
+            set_button_style(*toggle, if self.skill_enabled(&skill.name) { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         }
         let mode = self.current_mode();
         set_text(self.mode_select, t(MODES.iter().find(|(known, _)| *known == mode).map_or("", |(_, name)| name)));
@@ -10504,6 +10538,8 @@ impl App {
                     self.skills = skills;
                     self.files = files;
                     self.branch = branch;
+                    // (what is written for another app's features is off, which is known now that they have been found)
+                    self.send_skills_off();
                     if self.panel == Panel::Skills {
                         // (another folder's skills: a switch for each, set as the settings say)
                         self.set_panel(Panel::Skills);
@@ -12547,14 +12583,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 _ if (ID_SKILL_TOGGLE..ID_SKILL_TOGGLE + app.skill_toggles.len() as isize).contains(&id) => {
                     if let Some(name) = app.skills.get((id - ID_SKILL_TOGGLE) as usize).map(|skill| skill.name.clone()) {
-                        let on = app.settings.skill_is_on(&name);
+                        let on = app.skill_enabled(&name);
                         app.settings.set_skill(&name, !on);
                         app.save();
-                        let off = app.settings.skills_off.clone();
-                        let _ = app.agent.commands.send(Command::SetSkillsOff(off.clone()));
-                        for parked in &app.parked {
-                            let _ = parked.agent.commands.send(Command::SetSkillsOff(off.clone()));
-                        }
+                        app.send_skills_off();
                         app.update_toggles();
                         // (the words beside the switch say which it is now)
                         app.layout();

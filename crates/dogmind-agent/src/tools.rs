@@ -3696,7 +3696,7 @@ mod tests {
     #[test]
     fn a_skill_named_as_the_list_itself_is_read_and_otherwise_the_list_comes() {
         let (dir, mut bench, cancel) = bench();
-        let skill = |name: &str| crate::skills::Skill { name: name.into(), description: "Does a thing".into(), folder: dir.path().to_path_buf(), scope: "user", for_the_model: true, for_the_person: true };
+        let skill = |name: &str| crate::skills::Skill { name: name.into(), description: "Does a thing".into(), folder: dir.path().to_path_buf(), scope: "user", for_the_model: true, for_the_person: true, ..Default::default() };
         bench.skills = vec![skill("one"), skill("two")];
         let said = bench.run("skill", &json!({"name": "list"}), dir.path(), &cancel).unwrap();
         assert!(said.contains("- one: Does a thing") && said.contains("- two:"), "{said}");
