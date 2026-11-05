@@ -383,14 +383,21 @@ pub fn install(package: &mut Package, job: &Install, on: &mut dyn FnMut(Progress
     // What the last install wrote down of its files, by lower case path.
     let records: HashMap<String, &Record> = previous.iter().flat_map(|manifest| manifest.records.iter()).map(|(path, record)| (path.to_lowercase(), record)).collect();
     // What will not fit is said before anything is written, and no file is read to know. A file the package leaves out (KEPT) needs no room; nor does one that waits beside its place at the entry's
-    // size (an earlier run unpacked it, and its room is taken); nor one in place that the install's record of it says is the entry's, by hash, size and time, which an update takes without reading
-    // it. Any other counts whole, one in place at the entry's size too: if it is not the entry's it is unpacked beside its place in full.
+    // size (an earlier run unpacked it, and its room is taken). A file the install has a record of goes by the record: in place and the entry's by hash, size and time, which an update takes
+    // without reading it, it needs none; any other counts whole, one at the entry's size too, as it is unpacked beside its place in full if it is not the entry's. A file it has no record of (every
+    // install of 0.1.4 and before has none) goes by its size, as it did: at the entry's size it will most likely stay as it is. That is short by a same-size file that has changed, once, for
+    // the install writes its records down this time.
     let needed: u64 = entries
         .iter()
         .filter(|entry| {
-            entry.method != KEPT
-                && std::fs::metadata(beside(&folder.join(&entry.path))).map_or(true, |data| data.len() != entry.size)
-                && !std::fs::metadata(folder.join(&entry.path)).is_ok_and(|data| is_by_record(Stamp::of(&data), entry, records.get(&entry.path.to_lowercase()).copied()))
+            if entry.method == KEPT || std::fs::metadata(beside(&folder.join(&entry.path))).is_ok_and(|data| data.len() == entry.size) {
+                return false;
+            }
+            let in_place = std::fs::metadata(folder.join(&entry.path));
+            match records.get(&entry.path.to_lowercase()) {
+                Some(record) => !in_place.is_ok_and(|data| is_by_record(Stamp::of(&data), entry, Some(record))),
+                None => !in_place.is_ok_and(|data| data.len() == entry.size),
+            }
         })
         .map(|entry| entry.size)
         .sum();
@@ -1799,5 +1806,33 @@ mod tests {
         let failed = scene.run(&mut third, Some(ROOM_TO_SPARE + b.len() as u64 - 1), None).unwrap_err();
         assert_eq!(failed, Failure::TooLittleRoom { needed: ROOM_TO_SPARE + b.len() as u64, free: ROOM_TO_SPARE + b.len() as u64 - 1 });
         assert!(scene.run(&mut third, Some(ROOM_TO_SPARE + b.len() as u64), None).is_ok());
+    }
+
+    #[test]
+    fn an_install_with_no_records_is_asked_for_by_the_size_of_its_files_as_before() {
+        let scene = Scene::new();
+        let (a, b, c) = (noise(200_000), noise(150_000), noise(1000));
+        let mut first = scene.package("1.0.0", &[("a", &a), ("b", &b), ("c", &c)]);
+        scene.run(&mut first, None, None).unwrap();
+        // an install of 0.1.4 or before wrote down no hash, size or time of its files
+        let folder = scene.folder();
+        let text = std::fs::read_to_string(folder.join(MANIFEST)).unwrap();
+        let without: Vec<&str> = text.lines().filter(|line| !line.starts_with("sum ")).collect();
+        std::fs::write(folder.join(MANIFEST), format!("{}\n", without.join("\n"))).unwrap();
+        assert!(read_manifest(&folder).unwrap().records.is_empty());
+        // `a` has changed and is the size it was, `b` is the same, and `c` has grown: only the file of another size is asked for
+        let mut changed = a.clone();
+        changed[1000] ^= 1;
+        let grown = noise(3000);
+        let mut second = scene.package("2.0.0", &[("a", &changed), ("b", &b), ("c", &grown)]);
+        let before = walk(&folder);
+        let failed = scene.run(&mut second, Some(ROOM_TO_SPARE + 2999), None).unwrap_err();
+        assert_eq!(failed, Failure::TooLittleRoom { needed: ROOM_TO_SPARE + 3000, free: ROOM_TO_SPARE + 2999 });
+        assert_eq!(walk(&folder), before, "nothing was written");
+        // and a package whose files are all the size of those in place asks for nothing but the spare
+        let same_size = noise(1000);
+        let mut third = scene.package("3.0.0", &[("a", &changed), ("b", &b), ("c", &same_size)]);
+        assert!(scene.run(&mut third, Some(ROOM_TO_SPARE), None).is_ok());
+        assert_eq!(std::fs::read(folder.join("a")).unwrap(), changed, "the changed file is unpacked all the same");
     }
 }
