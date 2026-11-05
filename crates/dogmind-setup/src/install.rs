@@ -54,6 +54,9 @@ pub enum Failure {
     Said(String),
     /// A file could not be replaced, as something has it open.
     InUse(String),
+    /// A placing failed, and these files (sorted, each once) could not be put back as they were: the folder holds files of both versions, or lacks one. The program is not to be started from it
+    /// until the setup has been run again, which finishes it. `not_put_back_words` says it in a line.
+    NotPutBack(Vec<String>),
     TooLittleRoom { needed: u64, free: u64 },
 }
 
@@ -539,19 +542,30 @@ fn put_back(back: Back, folder: &Path, target: &Path, from: &Path, to: &Path) ->
 /// How many files the failure names before it says how many more there are.
 const NAMED: usize = 3;
 
-/// The failure of a placing that could not be undone: in one line, which files are not as they were, and that running the setup again finishes it. That is true of any such state: the new
-/// files are in their places or waiting beside them, which the next run finds by their hashes, and a file that is not in its place is put there by the next run.
+/// The files a line names of these, and how many more there are.
+pub fn named(names: &[String]) -> (&[String], usize) {
+    let shown = names.len().min(NAMED);
+    (&names[..shown], names.len() - shown)
+}
+
+/// The failure of a placing that could not be undone, for the files that are not as they were. That running the setup again finishes it is true of any such state: the new files are in their
+/// places or waiting beside them, which the next run finds by their hashes, and a file that is not in its place is put there by the next run.
 fn not_put_back(folder: &Path, stuck: &[&Path]) -> Failure {
     let mut names: Vec<String> = stuck.iter().map(|path| path.strip_prefix(folder).unwrap_or(path).display().to_string()).collect();
     names.sort();
     names.dedup();
-    let more = names.len().saturating_sub(NAMED);
-    let mut shown = names[..names.len() - more].join(", ");
+    Failure::NotPutBack(names)
+}
+
+/// What is said of `Failure::NotPutBack`, in one line for the person: which files are not as they were (three at most, then how many more), and that running the setup again finishes it.
+pub fn not_put_back_words(names: &[String]) -> String {
+    let (shown, more) = named(names);
+    let mut shown = shown.join(", ");
     if more > 0 {
         shown.push_str(&format!(" and {more} more"));
     }
     let was = if names.len() == 1 { "it was" } else { "they were" };
-    Failure::Said(format!("This did not finish: {shown} could not be put back as {was}, so the folder is not as it was. Running the setup again finishes it."))
+    format!("This did not finish: {shown} could not be put back as {was}, so the folder is not as it was. Running the setup again finishes it.")
 }
 
 /// The name a file is moved aside under: `NAME.previous-TIME.EXT`, as the app's own new builds do, and one no file has yet.
@@ -917,11 +931,8 @@ mod tests {
             let failed = scene.run(&mut second, None, None).unwrap_err();
             REFUSE_PLACING.with(|refusing| *refusing.borrow_mut() = None);
             REFUSE_PUTTING_BACK.with(|refusing| refusing.borrow_mut().clear());
-            assert_eq!(
-                failed,
-                Failure::Said("This did not finish: b.dll could not be put back as it was, so the folder is not as it was. Running the setup again finishes it.".to_string()),
-                "{new_one_stays}"
-            );
+            assert_eq!(failed, Failure::NotPutBack(vec!["b.dll".to_string()]), "{new_one_stays}");
+            assert_eq!(not_put_back_words(&["b.dll".to_string()]), "This did not finish: b.dll could not be put back as it was, so the folder is not as it was. Running the setup again finishes it.");
             // what could be put back is as it was; the file that could not is where it is said to be
             assert_eq!(std::fs::read(folder.join("a.exe")).unwrap(), b"one a");
             assert_eq!(std::fs::read(folder.join("tools\\c.py")).unwrap(), b"one c");
@@ -964,7 +975,7 @@ mod tests {
         let failed = scene.run(&mut third, None, None).unwrap_err();
         REFUSE_PLACING.with(|refusing| *refusing.borrow_mut() = None);
         REFUSE_PUTTING_BACK.with(|refusing| refusing.borrow_mut().clear());
-        assert_eq!(failed, Failure::Said("This did not finish: m.dll could not be put back as it was, so the folder is not as it was. Running the setup again finishes it.".to_string()));
+        assert_eq!(failed, Failure::NotPutBack(vec!["m.dll".to_string()]));
         assert_eq!(std::fs::read(folder.join("m.dll")).unwrap(), b"new m");
         let done = scene.run(&mut third, None, None).unwrap();
         assert_eq!(done.unpacked + done.already_there, 4, "{done:?}");
@@ -978,14 +989,19 @@ mod tests {
         let folder = Path::new("C:\\x");
         let paths: Vec<PathBuf> = ["e.dll", "tools\\d.py", "a.exe", "c.dll", "b.dll"].iter().map(|name| folder.join(name)).collect();
         let stuck: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-        let said = |failure: Failure| match failure {
-            Failure::Said(words) => words,
+        let words = |stuck: &[&Path]| match not_put_back(folder, stuck) {
+            Failure::NotPutBack(names) => not_put_back_words(&names),
             other => panic!("{other:?}"),
         };
-        assert_eq!(said(not_put_back(folder, &stuck)), "This did not finish: a.exe, b.dll, c.dll and 2 more could not be put back as they were, so the folder is not as it was. Running the setup again finishes it.");
-        assert_eq!(said(not_put_back(folder, &stuck[..3])), "This did not finish: a.exe, e.dll, tools\\d.py could not be put back as they were, so the folder is not as it was. Running the setup again finishes it.");
-        assert!(said(not_put_back(folder, &stuck[2..3])).contains(": a.exe could not be put back as it was,"));
-        assert!(said(not_put_back(folder, &[stuck[0], stuck[0]])).contains(": e.dll could not be put back as it was,"), "a file named twice is named once");
+        assert_eq!(words(&stuck), "This did not finish: a.exe, b.dll, c.dll and 2 more could not be put back as they were, so the folder is not as it was. Running the setup again finishes it.");
+        assert_eq!(words(&stuck[..3]), "This did not finish: a.exe, e.dll, tools\\d.py could not be put back as they were, so the folder is not as it was. Running the setup again finishes it.");
+        assert!(words(&stuck[2..3]).contains(": a.exe could not be put back as it was,"));
+        assert!(words(&[stuck[0], stuck[0]]).contains(": e.dll could not be put back as it was,"), "a file named twice is named once");
+        // what carries the names has all of them, and a line says three
+        assert_eq!(not_put_back(folder, &stuck), Failure::NotPutBack(["a.exe", "b.dll", "c.dll", "e.dll", "tools\\d.py"].map(String::from).to_vec()));
+        let all = ["a", "b", "c", "d"].map(String::from);
+        assert_eq!(named(&all), (&all[..3], 1));
+        assert_eq!(named(&all[..2]), (&all[..2], 0));
     }
 
     #[test]

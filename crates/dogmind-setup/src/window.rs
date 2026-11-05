@@ -219,7 +219,8 @@ struct App {
     /// When the app's page is what removes it: nothing is left to do but leave.
     auto_tries: u32,
     /// Started with `--update` by the app: it began on the work itself, and when that is done the app is started again, and this closes. The app quit for the update and its person did not choose
-    /// to close it, so any other end brings it back as it is in the folder (see `end_without_success`). A failure keeps the window until then, with a way to start the app as it was.
+    /// to close it, so any other end brings it back as it is in the folder (see `end_without_success`). A failure keeps the window until then, with a way to start the app as it was, unless the folder
+    /// is not as it was (see `failed_view`).
     updating: bool,
 }
 
@@ -233,9 +234,65 @@ fn gigabytes(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
 }
 
+fn words(japanese: bool, english: &str, in_japanese: &str) -> String {
+    (if japanese { in_japanese } else { english }).to_string()
+}
+
+/// What the page of a failure says and offers. An update that fails is of an app that is not running, and the page lets its person start it as it was; but a placing that could not put every
+/// file back leaves the folder part of one version and part of the other (`Failure::NotPutBack`), and nothing on its page starts the program: only the update again, which finishes it, or a way out.
+fn failed_view(failure: &Failure, updating: bool, japanese: bool) -> View {
+    let w = |english: &str, in_japanese: &str| words(japanese, english, in_japanese);
+    if let Failure::NotPutBack(names) = failure {
+        let detail = if japanese {
+            let (shown, more) = install::named(names);
+            let more = if more > 0 { format!(" ほか {more} 件") } else { String::new() };
+            format!("完了できませんでした: {}{more} を元に戻せなかったため、フォルダーは元の状態ではありません。セットアップをもう一度実行すれば完了します。", shown.join("、"))
+        } else {
+            install::not_put_back_words(names)
+        };
+        return View {
+            heading: if updating { w("The update did not finish", "更新を完了できませんでした") } else { w("It did not finish", "完了できませんでした") },
+            detail,
+            primary: Some(if updating { w("Try the update again", "もう一度更新を試す") } else { w("Try again", "もう一度試す") }),
+            secondary: Some(w("Close", "閉じる")),
+            problem: true,
+            ..View::default()
+        };
+    }
+    let why = match failure {
+        Failure::InUse(file) => if japanese { format!("{file} が別のプログラムで使用中です。そのプログラムを閉じてください。") } else { format!("{file} is in use by another program. Close it.") },
+        Failure::TooLittleRoom { needed, free } => if japanese { format!("このドライブには {} の空きが必要で、{} しかありません。空きを作ってください。", gigabytes(*needed), gigabytes(*free)) } else { format!("This needs {} free on that drive, which has {}. Make room.", gigabytes(*needed), gigabytes(*free)) },
+        Failure::Said(words) => words.clone(),
+        Failure::Stopped | Failure::NotPutBack(_) => String::new(),
+    };
+    if updating {
+        return View {
+            heading: w("The update did not finish", "更新を完了できませんでした"),
+            detail: format!("{why} {}", w("Start Dogmind as it is, or try the update again.", "Dogmind をそのまま起動するか、もう一度更新を試してください。")),
+            primary: Some(w("Try again", "もう一度試す")),
+            secondary: Some(w("Start Dogmind", "Dogmind を起動")),
+            problem: true,
+            ..View::default()
+        };
+    }
+    View {
+        heading: w("It did not finish", "完了できませんでした"),
+        detail: format!("{why} {}", w("What was done stays: trying again, or running this again, goes on from there.", "ここまでの作業は残っています。もう一度試すか、これをもう一度実行すれば続きから進みます。")),
+        primary: Some(w("Try again", "もう一度試す")),
+        secondary: Some(w("Close", "閉じる")),
+        problem: true,
+        ..View::default()
+    }
+}
+
+/// Whether the app comes back when this failure's page ends without another try. Not after a placing that left the folder as it is not: that folder is not one to start the program from.
+fn app_comes_back_after(failure: &Failure) -> bool {
+    !matches!(failure, Failure::NotPutBack(_))
+}
+
 impl App {
     fn w(&self, english: &str, japanese: &str) -> String {
-        (if self.japanese { japanese } else { english }).to_string()
+        words(self.japanese, english, japanese)
     }
 
     fn folder(&self) -> &Path {
@@ -325,32 +382,7 @@ impl App {
                     ..View::default()
                 }
             }
-            Page::Failed { failure } => {
-                let why = match failure {
-                    Failure::InUse(file) => if self.japanese { format!("{file} が別のプログラムで使用中です。そのプログラムを閉じてください。") } else { format!("{file} is in use by another program. Close it.") },
-                    Failure::TooLittleRoom { needed, free } => if self.japanese { format!("このドライブには {} の空きが必要で、{} しかありません。空きを作ってください。", gigabytes(*needed), gigabytes(*free)) } else { format!("This needs {} free on that drive, which has {}. Make room.", gigabytes(*needed), gigabytes(*free)) },
-                    Failure::Said(words) => words.clone(),
-                    Failure::Stopped => String::new(),
-                };
-                if self.updating {
-                    return View {
-                        heading: self.w("The update did not finish", "更新を完了できませんでした"),
-                        detail: format!("{why} {}", self.w("Start Dogmind as it is, or try the update again.", "Dogmind をそのまま起動するか、もう一度更新を試してください。")),
-                        primary: Some(self.w("Try again", "もう一度試す")),
-                        secondary: Some(self.w("Start Dogmind", "Dogmind を起動")),
-                        problem: true,
-                        ..View::default()
-                    };
-                }
-                View {
-                    heading: self.w("It did not finish", "完了できませんでした"),
-                    detail: format!("{why} {}", self.w("What was done stays: trying again, or running this again, goes on from there.", "ここまでの作業は残っています。もう一度試すか、これをもう一度実行すれば続きから進みます。")),
-                    primary: Some(self.w("Try again", "もう一度試す")),
-                    secondary: Some(self.w("Close", "閉じる")),
-                    problem: true,
-                    ..View::default()
-                }
-            }
+            Page::Failed { failure } => failed_view(failure, self.updating, self.japanese),
             Page::Installed { update } => View {
                 heading: if *update { self.w("Dogmind is updated", "Dogmind を更新しました") } else { self.w("Dogmind is ready", "Dogmind の準備ができました") },
                 detail: self.w("You can start it from the Start menu. To remove it: Settings > Apps > Installed apps, or Settings > General in the app.", "スタート メニューから起動できます。削除するには: Windows の設定 > アプリ > インストールされているアプリ、またはアプリの 設定 > 一般。"),
@@ -778,7 +810,8 @@ impl App {
             }
             Page::Removing { .. } => {}
             Page::Gone { .. } | Page::Installed { .. } => self.finish(0),
-            // (an update that failed is of an app that is not running: its button starts it as it was, and so does the window's own close)
+            // (an update that failed is of an app that is not running: its button starts it as it was, and so does the window's own close; but not of a folder that is part of two versions)
+            Page::Failed { failure } if !app_comes_back_after(failure) => self.finish(1),
             Page::Failed { .. } | Page::RemoveFailed(_) | Page::Refused(..) => self.end_without_success(1),
             _ => self.end_without_success(2),
         }
@@ -1027,5 +1060,74 @@ pub fn run(options: Options, start: Start) -> i32 {
             }
         }
         app.exit_code
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn not_put_back(names: &[&str]) -> Failure {
+        Failure::NotPutBack(names.iter().map(|name| name.to_string()).collect())
+    }
+
+    /// Everything a page says and puts on its buttons, as one string to look for words in.
+    fn all_of(view: &View) -> String {
+        [view.heading.as_str(), view.detail.as_str(), view.primary.as_deref().unwrap_or(""), view.secondary.as_deref().unwrap_or("")].join("\n")
+    }
+
+    #[test]
+    fn the_page_of_a_folder_that_is_not_as_it_was_offers_no_start_and_only_the_update_again() {
+        for japanese in [false, true] {
+            let start = if japanese { "起動" } else { "Start" };
+            for updating in [true, false] {
+                let view = failed_view(&not_put_back(&["b.dll"]), updating, japanese);
+                let page = all_of(&view);
+                assert!(!page.contains(start) && !page.contains("as it is") && !page.contains("そのまま"), "nothing on it starts the program (updating {updating}, japanese {japanese}): {page}");
+                assert!(view.problem && page.contains("b.dll"), "{page}");
+                assert_eq!(view.secondary.as_deref(), Some(if japanese { "閉じる" } else { "Close" }), "a way out that starts nothing");
+                let again = view.primary.unwrap();
+                assert_eq!(again, match (updating, japanese) {
+                    (true, false) => "Try the update again",
+                    (true, true) => "もう一度更新を試す",
+                    (false, false) => "Try again",
+                    (false, true) => "もう一度試す",
+                });
+            }
+        }
+        // the words of the page are the one line, and it says that the folder is not as it was
+        let update = failed_view(&not_put_back(&["b.dll"]), true, false);
+        assert_eq!(update.heading, "The update did not finish");
+        assert_eq!(update.detail, "This did not finish: b.dll could not be put back as it was, so the folder is not as it was. Running the setup again finishes it.");
+        let plain = failed_view(&not_put_back(&["b.dll"]), false, false);
+        assert_eq!((plain.heading.as_str(), plain.detail.as_str()), ("It did not finish", update.detail.as_str()));
+        // three files are named and the rest counted, in both languages
+        let many = not_put_back(&["a", "b", "c", "d", "e"]);
+        assert!(failed_view(&many, true, false).detail.contains("a, b, c and 2 more could not be put back as they were"));
+        let japanese = failed_view(&many, true, true).detail;
+        assert!(japanese.contains("a、b、c ほか 2 件 を元に戻せなかったため") && japanese.contains("フォルダーは元の状態ではありません"), "{japanese}");
+    }
+
+    #[test]
+    fn the_page_of_any_other_failure_of_an_update_still_offers_to_start_the_app_as_it_was() {
+        // (so that the test above is of something: this is what the page of an update offers when the folder is as it was)
+        for failure in [Failure::Said("a failure".to_string()), Failure::InUse("b.dll".to_string()), Failure::TooLittleRoom { needed: 2_000_000_000, free: 1_000_000_000 }] {
+            let view = failed_view(&failure, true, false);
+            assert_eq!(view.secondary.as_deref(), Some("Start Dogmind"), "{failure:?}");
+            assert!(view.detail.ends_with("Start Dogmind as it is, or try the update again."), "{failure:?}");
+            assert_eq!(view.primary.as_deref(), Some("Try again"));
+            // and the page of a setup run by hand has not changed either
+            let plain = failed_view(&failure, false, false);
+            assert_eq!((plain.primary.as_deref(), plain.secondary.as_deref()), (Some("Try again"), Some("Close")));
+        }
+    }
+
+    /// What decides that the page's own button and the window's close start the app again, or do not: it is the `Close` of the page above that does not.
+    #[test]
+    fn the_app_comes_back_after_every_failure_but_the_one_that_leaves_the_folder_as_it_is_not() {
+        assert!(!app_comes_back_after(&not_put_back(&["b.dll"])));
+        for failure in [Failure::Said("a failure".to_string()), Failure::InUse("b.dll".to_string()), Failure::TooLittleRoom { needed: 2, free: 1 }, Failure::Stopped] {
+            assert!(app_comes_back_after(&failure), "{failure:?}");
+        }
     }
 }
