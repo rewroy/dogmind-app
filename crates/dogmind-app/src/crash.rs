@@ -28,8 +28,16 @@ fn report_words_with(file: &str, address: Option<&str>) -> String {
     }
 }
 
+/// The report's first line: the version, which source it was built from (with a mark if the tree differed from it) and on which day, and the Windows build. The day is read from the
+/// build's seconds by the one function About and the window use (`machine::build_day`).
+fn version_line_of(version: &str, build: &str, windows: Option<u32>) -> String {
+    let commit = build.split_once(", built at ").map_or(build, |(commit, _)| commit);
+    let built = crate::machine::build_day(build).map_or(String::new(), |day| format!(", built {day}"));
+    format!("Dogmind {version} ({commit}{built}), Windows build {}", windows.map_or("unknown".to_string(), |build| build.to_string()))
+}
+
 fn version_line() -> String {
-    format!("Dogmind {} ({}), Windows build {}", env!("CARGO_PKG_VERSION"), env!("DOGMIND_APP_BUILD"), crate::machine::windows_build().map_or("unknown".to_string(), |build| build.to_string()))
+    version_line_of(env!("CARGO_PKG_VERSION"), env!("DOGMIND_APP_BUILD"), crate::machine::windows_build())
 }
 
 fn seconds_now() -> u64 {
@@ -138,6 +146,15 @@ pub fn write_report(data: &Path, settings: &Settings, about_this_pc: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report's first line says the day the build was made, as About does, and not the seconds since 1970 that `build.rs` writes.
+    #[test]
+    fn the_first_line_of_a_report_says_the_day_of_the_build_and_not_its_seconds() {
+        assert_eq!(version_line_of("0.1.2", "b41c461656, built at 1793796827", Some(26300)), "Dogmind 0.1.2 (b41c461656, built 2026-11-04), Windows build 26300");
+        assert_eq!(version_line_of("0.1.2", "b41c461656 with changes, built at 1793796827", None), "Dogmind 0.1.2 (b41c461656 with changes, built 2026-11-04), Windows build unknown", "a tree that differed says so");
+        assert_eq!(version_line_of("0.1.2", "unknown", Some(1)), "Dogmind 0.1.2 (unknown), Windows build 1", "no time in it: none made up");
+        assert!(!version_line().contains("179"), "{}", version_line());
+    }
 
     #[test]
     fn a_crash_is_told_once() {

@@ -24,6 +24,7 @@ use dogmind_agent::tools::{FileChange, GitInfo};
 use dogmind_agent::web::{WebSettings, WARNING_MARK};
 
 use crate::design as ds;
+use crate::machine::readable_build;
 use crate::diffview::{self, RowKind};
 use crate::settings::KeySource;
 use crate::toolrun::{self, LineKind, RunEntry, Tone, ToolRun};
@@ -905,24 +906,6 @@ fn next_greeting(last: usize, seed: u64) -> usize {
     (last + 1 + (seed % (GREETINGS.len() as u64 - 1)) as usize) % GREETINGS.len()
 }
 
-/// The build as `/status` says it: which commit, and the day. What `build.rs` gives ends in the seconds since 1970.
-fn readable_build(build: &str) -> String {
-    let commit = build.split_whitespace().next().unwrap_or("").trim_end_matches(',');
-    let seconds = build.rsplit(' ').next().and_then(|last| last.parse::<i64>().ok());
-    let Some(seconds) = seconds else { return commit.to_string() };
-    // Days to a date in the proleptic Gregorian calendar, counted from 0000-03-01.
-    let z = seconds.div_euclid(86400) + 719468;
-    let era = z.div_euclid(146097);
-    let day_of_era = z.rem_euclid(146097);
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 { shifted_month + 3 } else { shifted_month - 9 };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!("{commit} ({year}-{month:02}-{day:02})")
-}
-
 /// Why a connection failed, shortly: the agent's words are for wherever they are shown, and these have a window around them.
 fn connect_failure(error: &str) -> String {
     if error == llm::KEY_REFUSED {
@@ -1172,13 +1155,15 @@ struct Form {
     fonts: Fonts,
     dpi: u32,
     first_section: bool,
+    /// What the row being laid out needs beyond its control's height, for a label of several lines: `end_row` adds it.
+    extra: i32,
 }
 
 impl Form {
     fn new(width: i32, top: i32, fonts: Fonts, dpi: u32) -> Form {
         let stacked = width < scale(dpi, ds::size::STACK_BELOW);
         let label = scale(dpi, ds::size::LABEL_WIDTH).min(width * 42 / 100);
-        Form { shapes: Vec::new(), used: Vec::new(), y: top, width, stacked, label, fonts, dpi, first_section: true }
+        Form { shapes: Vec::new(), used: Vec::new(), y: top, width, stacked, label, fonts, dpi, first_section: true, extra: 0 }
     }
 
     fn s(&self, value: i32) -> i32 {
@@ -1203,18 +1188,33 @@ impl Form {
         self.y += self.s(ds::space::XL) + self.s(ds::space::S);
     }
 
-    /// The label, on the row or over it, and where the row's value goes.
+    /// The label, on the row or over it, and where the row's value goes. A label that does not fit on a line goes on to as many as it needs, and the row is as tall as they are:
+    /// its control stays level with the first line, where it was.
     unsafe fn label(&mut self, words: &str, height: i32) {
+        let room = if self.stacked { self.width } else { self.label };
+        let one = text_height(self.fonts.body, "A", 100_000);
+        let tall = text_height(self.fonts.body, words, room.max(1));
+        let wrapped = tall > one + 1;
         if self.stacked {
-            self.shapes.push(Shape::Text { area: rect(0, self.y, self.width, self.s(ds::size::TEXT_LINE)), text: words.to_string(), font: FontKind::Body, color: theme::soft(), flags: ONE_LINE });
-            self.y += self.s(ds::space::XL);
+            if wrapped {
+                self.shapes.push(Shape::Text { area: rect(0, self.y, self.width, tall), text: words.to_string(), font: FontKind::Body, color: theme::soft(), flags: DT_WORDBREAK });
+                self.y += tall + self.s(ds::space::XL) - self.s(ds::size::TEXT_LINE);
+            } else {
+                self.shapes.push(Shape::Text { area: rect(0, self.y, self.width, self.s(ds::size::TEXT_LINE)), text: words.to_string(), font: FontKind::Body, color: theme::soft(), flags: ONE_LINE });
+                self.y += self.s(ds::space::XL);
+            }
+        } else if wrapped {
+            // (the first line is level with the middle of the control, as a label of one line is)
+            let top = ((height - one) / 2).max(0);
+            self.shapes.push(Shape::Text { area: rect(0, self.y + top, self.label, tall), text: words.to_string(), font: FontKind::Body, color: theme::soft(), flags: DT_WORDBREAK });
+            self.extra = (top + tall - height).max(0);
         } else {
             self.shapes.push(Shape::Text { area: rect(0, self.y, self.label, height), text: words.to_string(), font: FontKind::Body, color: theme::soft(), flags: ONE_LINE });
         }
     }
 
     unsafe fn end_row(&mut self, height: i32) {
-        self.y += height + self.s(ds::space::M);
+        self.y += height + std::mem::take(&mut self.extra) + self.s(ds::space::M);
     }
 
     /// A control this wide, in the value's place.
@@ -1326,11 +1326,12 @@ impl Form {
         self.used.push(edit);
     }
 
-    /// Words in the value's place.
+    /// Words in the value's place. A path that does not fit is shortened in the middle: its start and its last name show.
     unsafe fn value(&mut self, words: &str, value: &str) {
         let height = self.s(ds::size::CONTROL);
         self.label(words, height);
-        self.shapes.push(Shape::Text { area: rect(self.value_x(), self.y, self.width - self.value_x(), height), text: value.to_string(), font: FontKind::Small, color: theme::muted(), flags: (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
+        let room = self.width - self.value_x();
+        self.shapes.push(Shape::Text { area: rect(self.value_x(), self.y, room, height), text: compact_path(self.fonts.small, value, room), font: FontKind::Small, color: theme::muted(), flags: ONE_LINE });
         self.end_row(height);
     }
 
@@ -1342,7 +1343,8 @@ impl Form {
         place(button, self.value_x(), self.y, across, height);
         self.used.push(button);
         let x = self.value_x() + across + self.s(ds::space::S);
-        self.shapes.push(Shape::Text { area: rect(x, self.y, (self.width - x).max(0), height), text: beside.to_string(), font: FontKind::Small, color: theme::muted(), flags: (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
+        let room = (self.width - x).max(0);
+        self.shapes.push(Shape::Text { area: rect(x, self.y, room, height), text: compact_path(self.fonts.small, beside, room), font: FontKind::Small, color: theme::muted(), flags: ONE_LINE });
         self.end_row(height);
     }
 
@@ -4170,6 +4172,16 @@ impl App {
         }
     }
 
+    /// No words for a control any more.
+    unsafe fn untip(&self, window: HWND) {
+        let mut tool: TTTOOLINFOW = std::mem::zeroed();
+        tool.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        tool.hwnd = GetParent(window);
+        tool.uId = window as usize;
+        SendMessageW(self.tooltip, TTM_DELTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
+    }
+
     /// Words for a control when the pointer rests on it.
     unsafe fn tip(&self, window: HWND, words: &str) {
         let text = wide(words);
@@ -5657,7 +5669,7 @@ impl App {
             form.shapes.push(Shape::Text { area: rect(x + form.s(ds::space::M), form.y, dots - form.s(ds::space::L), height), text: "••••••••".into(), font: FontKind::Body, color: theme::muted(), flags: ONE_LINE });
             let saved_y = form.y;
             form.buttons(x + dots + form.s(ds::space::S), &[self.key_replace, self.key_remove]);
-            form.y = form.y.max(saved_y + height + form.s(ds::space::M));
+            form.y = form.y.max(saved_y + height + std::mem::take(&mut form.extra) + form.s(ds::space::M));
         } else if let KeySource::File(path) = &source {
             form.value(label, &tf("Read from this file: {0}", &[path]));
             form.buttons(form.value_x(), &[self.key_remove]);
@@ -5678,11 +5690,16 @@ impl App {
         let s = |value: i32| scale(self.dpi, value);
         let log = self.panel_log.clone();
         let log_color = if self.panel_problem { theme::bad() } else { theme::muted() };
+        // (this button is every page's first: what its tip said on one page is not said on the next)
+        self.untip(self.buttons[0]);
         match self.panel {
             Panel::General => {
                 form.select(t("Display language"), self.toggle_display);
                 form.select(t("Language of answers"), self.toggle_language);
-                form.button_row(t("Data folder"), self.buttons[0], &self.folder.display().to_string());
+                // (shortened to what fits, so the whole of it is on the row's tip)
+                let folder = self.folder.display().to_string();
+                self.tip(self.buttons[0], &folder);
+                form.button_row(t("Data folder"), self.buttons[0], &folder);
                 form.button_row(t("First setup"), self.setup_again, "");
                 form.button_row(t("Remove this app from this PC"), self.remove_all, "");
             }

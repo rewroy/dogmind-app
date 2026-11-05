@@ -358,6 +358,51 @@ pub unsafe fn width_on(device: HDC, font: HFONT, text: &str) -> i32 {
     size.cx
 }
 
+/// A path shortened in the middle to what `fits`, so that its start and its last name both show, with an ellipsis between: `C:\\Users\\…\\Local\\Temp`. What fits is shown whole. A path with
+/// too few parts to shorten, or that cannot keep its start and its last name, is cut at the end with an ellipsis, as any text is.
+pub fn compact_path_with(path: &str, fits: &dyn Fn(&str) -> bool) -> String {
+    if fits(path) {
+        return path.to_string();
+    }
+    let end_cut = |text: &str| -> String {
+        let mut kept: Vec<char> = text.chars().collect();
+        while !kept.is_empty() && !fits(&format!("{}…", kept.iter().collect::<String>())) {
+            kept.pop();
+        }
+        format!("{}…", kept.iter().collect::<String>())
+    };
+    let separator = if path.contains('\\') || !path.contains('/') { '\\' } else { '/' };
+    let parts: Vec<&str> = path.split(separator).collect();
+    let join = |head: usize, tail: usize| -> String {
+        format!("{}{separator}…{separator}{}", parts[..head].join(&separator.to_string()), parts[parts.len() - tail..].join(&separator.to_string()))
+    };
+    if parts.len() < 3 || !fits(&join(1, 1)) {
+        return end_cut(path);
+    }
+    let (mut head, mut tail) = (1, 1);
+    // (the last name and the start grow in turn while there is room: what says where this is, and what says which drive and folder)
+    loop {
+        let mut grew = false;
+        if head + tail + 1 < parts.len() && fits(&join(head, tail + 1)) {
+            tail += 1;
+            grew = true;
+        }
+        if head + tail + 1 < parts.len() && fits(&join(head + 1, tail)) {
+            head += 1;
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    join(head, tail)
+}
+
+/// A path as it is shown in this width: shortened in the middle where it does not fit.
+pub unsafe fn compact_path(font: HFONT, path: &str, width: i32) -> String {
+    compact_path_with(path, &|text| text_width(font, text) <= width)
+}
+
 /// How tall this text is, wrapped to this width, as the window draws it.
 pub unsafe fn text_height(font: HFONT, text: &str, width: i32) -> i32 {
     if let Some((_, height)) = crate::render::measure(font, text, Some(width)) {
@@ -1309,6 +1354,48 @@ pub unsafe fn tab_stops(parent: HWND, sidebar_right: i32) -> Vec<HWND> {
     }
     stops.sort_by_key(|(top, left, _)| (*top, *left));
     stops.into_iter().map(|(_, _, window)| window).collect()
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// A width counted in characters: every character is one wide, as the test needs.
+    fn within(width: usize) -> impl Fn(&str) -> bool {
+        move |text| text.chars().count() <= width
+    }
+
+    #[test]
+    fn a_path_is_shortened_in_the_middle_so_that_its_start_and_its_last_name_show() {
+        let path = "C:\\Users\\someone\\AppData\\Local\\Temp\\claude\\data";
+        assert_eq!(compact_path_with(path, &within(100)), path, "what fits is whole");
+        for width in [14usize, 20, 28, 36, 46] {
+            let shown = compact_path_with(path, &within(width));
+            assert!(shown.chars().count() <= width, "{shown} at {width}");
+            assert!(shown.starts_with("C:\\") && shown.ends_with("data") && shown.contains("\\…\\"), "{shown} at {width}");
+        }
+        assert_eq!(compact_path_with(path, &within(30)), "C:\\Users\\…\\Temp\\claude\\data");
+        assert_eq!(compact_path_with(path, &within(41)), "C:\\Users\\someone\\…\\Local\\Temp\\claude\\data", "as much of the start as there is room for, after the last name");
+    }
+
+    #[test]
+    fn what_cannot_keep_its_start_and_its_name_is_cut_at_the_end_with_an_ellipsis() {
+        assert_eq!(compact_path_with("C:\\VeryLongFolderName\\AnotherVeryLongName", &within(12)), "C:\\VeryLong…");
+        assert_eq!(compact_path_with("plain words that are long", &within(10)), "plain wor…");
+        assert_eq!(compact_path_with("C:\\x", &within(2)), "C…");
+        assert_eq!(compact_path_with("/home/someone/projects/app", &within(20)), "/home/…/projects/app", "a path with slashes keeps them");
+        assert_eq!(compact_path_with("日本語のフォルダ名", &within(4)), "日本語…");
+    }
+
+    #[test]
+    fn the_path_that_ends_a_row_is_whole_in_a_wide_row_and_never_cut_across_a_character() {
+        let path = "C:\\Users\\ユーザー\\AppData\\Local\\DogmindApp";
+        for width in 6..path.chars().count() + 2 {
+            let shown = compact_path_with(path, &within(width));
+            assert!(shown.chars().count() <= width.max(2), "{shown} at {width}");
+            assert!(shown.chars().all(|c| c != '\u{FFFD}'));
+        }
+    }
 }
 
 #[cfg(test)]
