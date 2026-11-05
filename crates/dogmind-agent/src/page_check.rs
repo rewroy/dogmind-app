@@ -752,10 +752,47 @@ fn shown(dom: &str) -> (String, String) {
     (title, visible_text(dom))
 }
 
+/// How a run of the browser ended, from what it gives: its exit code (none when it was stopped), the dump of the page and the browser's own log lines.
+#[derive(Debug, PartialEq, Eq)]
+enum EndOfRun {
+    /// Ended well, with the page.
+    Read,
+    /// Ended well, and had nothing to read: it could not load the page. The browser's own reason, when its log has one (`net::ERR_CONNECTION_REFUSED`).
+    NotLoaded(Option<String>),
+    /// Ended with an exception code or another that is not zero: it crashed.
+    Crashed,
+    /// Stopped, by the time limit or by the person.
+    Stopped,
+}
+
+/// The browser's own reason for a page it could not load, as its log says it: a net error, or a file error.
+fn load_failure(log: &str) -> Option<String> {
+    let found = Regex::new(r"(?:net::)?ERR_[A-Z0-9_]{4,}").expect("the pattern is valid").find(log)?;
+    Some(found.as_str().to_string())
+}
+
+fn end_of_run(status: Option<i32>, dump: &str, log: &str) -> EndOfRun {
+    match status {
+        Some(0) if !dump.trim().is_empty() => EndOfRun::Read,
+        Some(0) => EndOfRun::NotLoaded(load_failure(log)),
+        Some(_) => EndOfRun::Crashed,
+        None => EndOfRun::Stopped,
+    }
+}
+
+/// What is said when the browser ended well and the page did not load. A `url` that the sandbox refuses is one case (a server outside it, or a port it may not reach), and a path that is not
+/// a page the browser can open is another; neither is the browser crashing, and the model was sent off to look for that.
+fn not_loaded_words(reason: Option<&str>) -> String {
+    let why = reason.map_or(String::new(), |reason| format!(" ({reason})"));
+    format!("THE PAGE COULD NOT BE LOADED: the browser ran and ended normally, and had nothing to read{why}. For a `url`, the server has to be inside what the sandbox may reach: one that a command of this session started is, and another program's, on this machine or another, is not. Running this check again changes nothing until the address or the page is changed, and do not install anything to check it another way: say in your answer that the page was not checked.\n")
+}
+
 /// `needs`: what a file page was read to need; a page a local server gives has none of that known.
 /// What reading a run adds to what the browser printed.
 #[derive(Default)]
 struct Reading {
+    /// Said in place of the browser's crash when it ended well and could not load the page.
+    not_loaded: Option<String>,
     /// Said in place of the browser's crash when it was the steps that did not end (they began, and the browser was stopped with them still going).
     steps_lost: Option<String>,
     /// What heads the console, if not `Console`: the console is that of the run that reads the page, at 1280x800, whatever views were asked for.
@@ -777,6 +814,8 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
     let mut out = if served { format!("{page_name} in headless {browser_name}, with no network but this machine's own servers.\n") } else { format!("{page_name} in headless {browser_name}, with no network.\n") };
     if let (false, Some(lost)) = (finished, &reading.steps_lost) {
         out.push_str(lost);
+    } else if let (false, Some(words)) = (finished, &reading.not_loaded) {
+        out.push_str(words);
     } else if !finished {
         out.push_str("NOT CHECKED: the browser crashed or was stopped each time it was tried. This browser sometimes crashes in the sandbox, whatever the page, and a big WebGL drawing stops it too, so this says nothing about the page. What it had said by then is below. Running this check again changes nothing, and do not install anything to check it another way: say in your answer that the page was not checked.\n");
     }
@@ -894,6 +933,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     let browser_flags = flags();
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
+    let mut ended_as = EndOfRun::Stopped;
     let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
     for _ in 0..TRIES {
         let started = std::time::Instant::now();
@@ -905,7 +945,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
             eprintln!("--- browser, {:?} {:?}:\n{err}\n--- dom: {} bytes", done.status, done.ended, dom.len());
         }
-        finished = done.status == Some(0) && !dom.trim().is_empty();
+        ended_as = end_of_run(done.status, &dom, &err);
+        finished = ended_as == EndOfRun::Read;
         how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
         note_browser_run("page", how.clone(), started);
         #[cfg(test)]
@@ -953,7 +994,12 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             });
         }
     }
-    let reading = Reading { steps_lost, console_head: console_head(&views), seen: steps_copy.as_ref().and_then(|_| steps_text(&err)) };
+    // (a run that ended well with nothing to read is a page that did not load, and not a crash: unless the steps say what the page did)
+    let not_loaded = match &ended_as {
+        EndOfRun::NotLoaded(reason) if steps_lost.is_none() => Some(not_loaded_words(reason.as_deref())),
+        _ => None,
+    };
+    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen: steps_copy.as_ref().and_then(|_| steps_text(&err)) };
     let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
@@ -1428,6 +1474,26 @@ mod tests {
         assert!(said.contains("module ran: http://127.0.0.1:8765") && said.contains("text: from a module"), "{said}");
         assert!(!said.contains("Permissions-Policy"), "the browser's own words are not the page's: {said}");
         assert!(said.contains("How it looks at desktop"), "{said}");
+    }
+
+    /// What the run gives tells the cases apart: ended well with the page, ended well with nothing (the page did not load), crashed, stopped.
+    #[test]
+    fn a_page_that_did_not_load_is_told_from_a_browser_that_crashed_or_was_stopped() {
+        assert_eq!(end_of_run(Some(0), "<html>x</html>", ""), EndOfRun::Read);
+        let refused = "[1105/133001.123:ERROR:chrome\\browser\\net.cc(1)] Failed to load http://127.0.0.1:9/: net::ERR_CONNECTION_REFUSED\n";
+        assert_eq!(end_of_run(Some(0), "  \n", refused), EndOfRun::NotLoaded(Some("net::ERR_CONNECTION_REFUSED".to_string())));
+        assert_eq!(end_of_run(Some(0), "", "nothing it says of why"), EndOfRun::NotLoaded(None));
+        assert_eq!(end_of_run(Some(0), "", "ERR_FILE_NOT_FOUND"), EndOfRun::NotLoaded(Some("ERR_FILE_NOT_FOUND".to_string())));
+        assert_eq!(end_of_run(Some(0xC000_0005u32 as i32), "", refused), EndOfRun::Crashed, "an exception code, whatever its log says");
+        assert_eq!(end_of_run(Some(1), "", ""), EndOfRun::Crashed);
+        assert_eq!(end_of_run(None, "", refused), EndOfRun::Stopped, "stopped by the time limit or the person");
+        // the words: the reason when the log has one, and not the crash's
+        let said = report("http://127.0.0.1:9/", "Edge", false, None, &[], "", &Reading { not_loaded: Some(not_loaded_words(Some("net::ERR_CONNECTION_REFUSED"))), ..Reading::default() });
+        assert!(said.contains("COULD NOT BE LOADED") && said.contains("net::ERR_CONNECTION_REFUSED") && said.contains("inside what the sandbox may reach"), "{said}");
+        assert!(!said.contains("crashed") && !said.contains("NOT CHECKED"), "{said}");
+        // a crash and a stop keep their words
+        let crash = report("p", "Edge", false, None, &[], "", &Reading::default());
+        assert!(crash.contains("NOT CHECKED: the browser crashed or was stopped"), "{crash}");
     }
 
     /// With the real browser, in the real sandbox: a server on this machine that no command started (this test's own, outside the sandbox)
