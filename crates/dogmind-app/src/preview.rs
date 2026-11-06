@@ -211,6 +211,8 @@ pub enum Written {
     Source(String),
     /// A CSV (`,`) or TSV (`\t`) file as a table (`table`).
     Table(char),
+    /// An Excel workbook's first sheet as a table (`office`).
+    Workbook,
 }
 
 pub fn written(path: &Path) -> Option<Written> {
@@ -224,6 +226,7 @@ pub fn written(path: &Path) -> Option<Written> {
         "md" | "markdown" => Some(Written::Markdown),
         "csv" => Some(Written::Table(',')),
         "tsv" => Some(Written::Table('\t')),
+        "xlsx" | "xlsm" => Some(Written::Workbook),
         known if SOURCE.contains(&known) => Some(Written::Source(extension)),
         _ => None,
     }
@@ -238,7 +241,7 @@ pub fn can_show(path: &str) -> bool {
 /// What is there to be looked at and not only read as code, and has a place of its own in the panel on the right.
 pub fn is_page(path: &str) -> bool {
     let path = Path::new(path);
-    shows_as_it_is(path) || matches!(written(path), Some(Written::Markdown | Written::Table(_)))
+    shows_as_it_is(path) || matches!(written(path), Some(Written::Markdown | Written::Table(_) | Written::Workbook))
 }
 
 /// A colour as a page writes it.
@@ -287,6 +290,21 @@ fn written_page(root: &Path, file: &Path, kind: &Written, marked: Option<(usize,
     const MOST_TEXT: usize = 256 * 1024;
     const MOST_PAGE: usize = 1800 * 1024;
     let bytes = std::fs::read(file).map_err(|error| format!("{}: {error}", file.display()))?;
+    // A workbook is a zip of XML, not text: its first sheet as a table, and the names of all its sheets.
+    if *kind == Written::Workbook {
+        let (rows, sheets, total) = crate::office::first_sheet(&bytes, crate::table::MOST_ROWS, crate::table::MOST_COLUMNS)
+            .map_err(|error| tf("This workbook cannot be shown: {0}", &[&error]))?;
+        let mut body = String::new();
+        if sheets.len() > 1 {
+            body.push_str(&format!("<p class=\"cut\">{}</p>", markdown::escape(&tf("Sheets: {0} (the first is shown)", &[&sheets.join(", ")]))));
+        }
+        body.push_str(&crate::table::html_of(&rows, total, &|rows, columns| {
+            tf("{0} rows and {1} columns: the first {2} rows and {3} columns are shown.", &[&rows.to_string(), &columns.to_string(),
+                &crate::table::MOST_ROWS.min(rows).to_string(), &crate::table::MOST_COLUMNS.min(columns).to_string()])
+        }));
+        let base = file.parent().and_then(|folder| address_of(root, folder)).unwrap_or_else(|| format!("https://{HOST}"));
+        return Ok(page_of(&body, &format!("{base}/")));
+    }
     // (as the agent reads a file: what PowerShell's > writes is UTF-16, and a Japanese Windows keeps much of its text in Shift_JIS)
     let Some((whole, encoding)) = dogmind_agent::tools::text_of_file(&bytes) else {
         return Err(t("This file is not text, so it has no preview.").to_string());
@@ -299,6 +317,7 @@ fn written_page(root: &Path, file: &Path, kind: &Written, marked: Option<(usize,
     let mut body = match kind {
         Written::Markdown => markdown::to_html(text),
         Written::Source(language) => markdown::source_html(text, language, marked),
+        Written::Workbook => String::new(),
         Written::Table(separator) => crate::table::html(text, *separator, &|rows, columns| {
             tf("{0} rows and {1} columns: the first {2} rows and {3} columns are shown.", &[&rows.to_string(), &columns.to_string(),
                 &crate::table::MOST_ROWS.min(rows).to_string(), &crate::table::MOST_COLUMNS.min(columns).to_string()])

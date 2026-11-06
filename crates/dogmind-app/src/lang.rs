@@ -605,6 +605,8 @@ const JA: &[(&str, &str)] = &[
     ("No such command: {0}. /help lists them.", "{0} というコマンドはありません。/help で一覧を見られます。"),
     ("There is nothing to find in yet.", "検索できる内容がまだありません。"),
     ("This session has nothing to go back to yet.", "このセッションにはまだ戻れる地点がありません。"),
+    ("This workbook cannot be shown: {0}", "このブックは表示できません: {0}"),
+    ("Sheets: {0} (the first is shown)", "シート: {0}(最初のシートを表示しています)"),
     ("{0} rows and {1} columns: the first {2} rows and {3} columns are shown.", "{0} 行 {1} 列あります。最初の {2} 行 {3} 列を表示しています。"),
     ("Files changed in this answer:", "この回答で変わったファイル:"),
     ("The agent asks:", "エージェントからの質問:"),

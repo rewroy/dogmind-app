@@ -14,6 +14,7 @@ mod lang;
 mod machine;
 mod markdown;
 mod mask;
+mod office;
 mod highlight;
 mod notice;
 mod paint;
