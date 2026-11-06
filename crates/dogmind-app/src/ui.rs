@@ -2226,6 +2226,22 @@ fn update_button_kind_of(update: &ReleaseUpdate, restart_when_done: bool) -> But
     }
 }
 
+/// The transcript's pixels have just been moved by `dy` (its host calls this from the call that moves them): the copy, branch, code and run buttons over the text are moved by the same, here and now,
+/// where the text itself has been moved, and not only after the band it uncovered has been drawn, which was when `place_copy_buttons` got to them (3 ms or more on the answers it had to ask
+/// about, with the text at its new place and the buttons at the old). It asks for exactly where each belongs once the view is drawn, and finds these there.
+pub(crate) unsafe fn overlays_follow(dy: i32) {
+    let Some(app) = app() else { return };
+    if app.panel != Panel::Chat {
+        return;
+    }
+    for button in app.copy_buttons.iter().chain(&app.fork_buttons).chain(&app.block_buttons).chain(&app.run_buttons) {
+        if IsWindowVisible(*button) != 0 {
+            let (x, y, ..) = child_area(*button, app.window);
+            SetWindowPos(*button, std::ptr::null_mut(), x, y + dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+}
+
 /// What the notice says, and the words on its button.
 fn notice_text(shown: &notice::Notice) -> (String, String) {
     use notice::Notice;
@@ -3033,6 +3049,9 @@ impl App {
             let showing = IsWindowVisible(button) != 0;
             if !showing || child_area(button, self.window) != (x, top, size, size) {
                 SetWindowPos(button, HWND_TOP, x, top, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
+                if showing {
+                    UpdateWindow(button);
+                }
             }
             if !showing {
                 show(button, true);
@@ -3489,7 +3508,13 @@ impl App {
     unsafe fn place_copy_buttons(&mut self) {
         let mut position = POINT { x: 0, y: 0 };
         SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
+        let moved = position.y != self.placed_at;
         self.placed_at = position.y;
+        // The text first. A scroll's own message used to move these over the text before the window had painted it, and the old text showed under them until it did, for 5 to 25 ms: now the
+        // view is drawn where it has moved to (all of it, at once), and only then is anything that lies over it moved.
+        if moved && self.panel == Panel::Chat && self.has_messages {
+            UpdateWindow(self.transcript);
+        }
         self.place_pictures();
         self.place_block_buttons();
         self.place_run_buttons();
@@ -3529,6 +3554,10 @@ impl App {
                 if !showing || child_area(button, self.window) != (x, area.top + point.y, size, size) {
                     // (it stays above the transcript once it is there, and to say so again costs more than the move)
                     SetWindowPos(button, HWND_TOP, x, area.top + point.y, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
+                    // (drawn where it is now, not when the window gets to it: the text under it was drawn already)
+                    if showing {
+                        UpdateWindow(button);
+                    }
                 }
                 if !showing {
                     show(button, true);
@@ -3540,6 +3569,10 @@ impl App {
             if IsWindowVisible(*button) != 0 {
                 show(*button, false);
             }
+        }
+        // (and the text where they stood: it was under them, and is asked for now that they have gone)
+        if moved && visible {
+            UpdateWindow(self.transcript);
         }
     }
 
@@ -3979,6 +4012,9 @@ impl App {
             let showing = IsWindowVisible(button) != 0;
             if !showing || child_area(button, self.window) != (x, top, size, size) {
                 SetWindowPos(button, HWND_TOP, x, top, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
+                if showing {
+                    UpdateWindow(button);
+                }
             }
             if !showing {
                 show(button, true);

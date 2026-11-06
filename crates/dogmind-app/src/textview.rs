@@ -661,7 +661,9 @@ unsafe extern "system" fn scroll_window_ex(this: *mut Host, dx: i32, dy: i32, sc
         host.missing(host.client());
     }
     ScrollWindowEx(host.window, dx, dy, scroll, clip, region, update, flags as _);
+    // The buttons that stand over the text move with it at this moment, before the band it uncovered is drawn: they are asked for exactly where they belong when the view has been drawn.
     if dy != 0 {
+        crate::ui::overlays_follow(dy);
         host.bands_again(dy.abs());
     }
 }
