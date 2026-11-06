@@ -133,6 +133,34 @@ pub fn place_of_turn(slots: &[(usize, usize)], end: usize, message: usize) -> Op
     slots.iter().any(|(at, _)| *at == message).then(|| slots.iter().find(|(at, _)| *at > message).map_or(end, |(_, place)| *place))
 }
 
+/// Where in what was written the card of turn `turn`, whose place was `slot` when none of the cards was in, goes now that those of `came` (each its own `(slot, turn)`) are in: after the
+/// cards that stood at an earlier place or, at its own place, are of an earlier turn, and before the others. So that the replies can come in any order and the cards are in theirs.
+pub fn card_position(came: &[(usize, u64)], slot: usize, turn: u64) -> usize {
+    slot + came.iter().filter(|other| **other < (slot, turn)).count()
+}
+
+/// What `/goal` with this word after it does, the session having this goal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GoalAction {
+    /// Make this the goal.
+    Set(String),
+    /// There is a goal: it goes.
+    Clear,
+    /// Said alone with a goal set: the goal, in full, in the composer after `/goal`, to read or to change and send.
+    Edit(String),
+    /// Nothing to show or to clear: the way to set one is said.
+    None,
+}
+
+pub fn goal_action(word: &str, goal: Option<&str>) -> GoalAction {
+    let goal = goal.map(str::trim).filter(|goal| !goal.is_empty());
+    match word.trim() {
+        "" => goal.map_or(GoalAction::None, |goal| GoalAction::Edit(goal.to_string())),
+        "clear" | "off" | "none" | "なし" | "消す" => if goal.is_some() { GoalAction::Clear } else { GoalAction::None },
+        set => GoalAction::Set(set.to_string()),
+    }
+}
+
 /// How many parts a file's bar has: as many as its length in whole, however many lines it changed.
 pub const BAR_PARTS: usize = 8;
 
@@ -348,6 +376,50 @@ second")), Some("first line".to_string()));
         assert_eq!(goal_bar(Some("  
  ")), None);
         assert_eq!(goal_bar(None), None);
+    }
+
+    #[test]
+    fn a_card_goes_where_its_answer_ended_whatever_order_the_replies_come_in() {
+        // (answers 1, 2 and 3 ended at places 2, 2 and 5 of what was written, and answer 4 at 0: a card each)
+        let wanted = [(2usize, 1u64), (2, 2), (5, 3), (0, 4)];
+        let mut orders = vec![vec![0usize, 1, 2, 3]];
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = vec![a, b, c, d];
+                        if (0..4).all(|n| order.contains(&n)) {
+                            orders.push(order);
+                        }
+                    }
+                }
+            }
+        }
+        for order in orders {
+            let mut written: Vec<String> = (0..7).map(|n| format!("w{n}")).collect();
+            let mut came: Vec<(usize, u64)> = Vec::new();
+            for which in order.iter().copied() {
+                let (slot, turn) = wanted[which];
+                let at = card_position(&came, slot, turn);
+                written.insert(at, format!("card{turn}"));
+                came.push((slot, turn));
+            }
+            let text = written.join(" ");
+            assert_eq!(text, "card4 w0 w1 card1 card2 w2 w3 w4 card3 w5 w6", "{order:?}");
+        }
+    }
+
+    #[test]
+    fn goal_with_a_word_after_it_sets_it_clears_it_or_shows_it_in_one_way_each() {
+        assert_eq!(goal_action("ship the page", None), GoalAction::Set("ship the page".to_string()));
+        assert_eq!(goal_action("ship the page", Some("old")), GoalAction::Set("ship the page".to_string()));
+        assert_eq!(goal_action("clear", Some("old")), GoalAction::Clear);
+        assert_eq!(goal_action("消す", Some("old")), GoalAction::Clear);
+        // (nothing to clear, nothing to show: the way to set one is said, and nothing is sent)
+        assert_eq!(goal_action("clear", None), GoalAction::None);
+        assert_eq!(goal_action("", None), GoalAction::None);
+        assert_eq!(goal_action("", Some("  ")), GoalAction::None);
+        assert_eq!(goal_action("", Some("ship the page")), GoalAction::Edit("ship the page".to_string()));
     }
 
     #[test]
