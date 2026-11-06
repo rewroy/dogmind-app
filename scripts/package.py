@@ -266,7 +266,12 @@ def assemble_tools(target):
     with rc.open("w", encoding="utf-8", newline="") as settings:
         settings.write(text)
     # So that the first import of a large module is not its compiling, each time, in a folder a command cannot write in.
-    subprocess.run([str(python / "python.exe"), "-I", "-m", "compileall", "-q", "-j", "2", "--invalidation-mode", "unchecked-hash", str(site)], check=True, cwd=python)
+    # -d: a .pyc records the path of its source, and this folder's path holds the build folder (dist-X.Y.Z\DogmindApp\tools.new\...), so without it every release's .pyc files differ in
+    # those bytes alone, and an update by parts would fetch all of them again. The path recorded is the one inside the install instead, the same in every build. It is not what
+    # tracebacks show: importing a module with its source beside it sets the code's file name to the real path of the .py (importlib's _imp._fix_co_filename).
+    # -B: this python imports sitecustomize.py from the folder as it starts, and would write its .pyc itself (with the date of the file and the full build path in it), which compileall then
+    # takes as done; compileall alone writes every .pyc here.
+    subprocess.run([str(python / "python.exe"), "-I", "-B", "-m", "compileall", "-q", "-j", "2", "--invalidation-mode", "unchecked-hash", "-d", r"tools\python\Lib\site-packages", str(site)], check=True, cwd=python)
     for name, files in module_files.items():
         total = 0
         for file in files:
