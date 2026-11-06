@@ -254,10 +254,10 @@ const M_EDIT_COPY: usize = 9302;
 const M_EDIT_PASTE: usize = 9303;
 const M_EDIT_ALL: usize = 9304;
 const ID_PROVIDER_DOWN: isize = 9051;
-const ID_COPY_POOL: isize = 300; // ..300 + COPY_POOL
-const COPY_POOL: usize = 24;
-const ID_BLOCK_POOL: isize = 340; // ..340 + BLOCK_POOL
-const BLOCK_POOL: usize = 12;
+/// Hidden controls of no size, one for each icon over the transcript that is in view: they are what Tab reaches and what a screen reader names, and an icon is pressed through them
+/// with Enter or Space as it is with the pointer. The icons themselves are drawn in the transcript's own paint (`paint_overlays`).
+const ID_PROXY_POOL: isize = 300; // ..300 + PROXY_POOL
+const PROXY_POOL: usize = 16;
 const ID_MODAL_CLOSE: isize = 9600;
 const ID_NAV: isize = 9601; // ..+ NAV_POOL
 const NAV_POOL: usize = 10;
@@ -290,14 +290,16 @@ const ID_DIFF_CLOSE: isize = 9902;
 const ID_READ_FOLDER_ADD: isize = 9650;
 const ID_READ_FOLDER_STOP: isize = 9651;
 const ID_READ_FOLDER_REMOVE: isize = 9800; // ..+ as many folders as there are
-const ID_RUN_POOL: isize = 380; // ..380 + RUN_POOL
-/// Beside each copy button of an answer, one that branches the conversation from it.
-const ID_FORK_POOL: isize = 400; // ..400 + COPY_POOL
-const RUN_POOL: usize = 12;
 /// What the cards of the transcript put over it as windows of their own (a choice, a file, the button of a field): a pool that goes round, as the pictures' does.
 const ID_CARD_POOL: isize = 12000; // ..+ CARD_POOL
 const CARD_POOL: usize = 40;
 const TIMER_COPIED: usize = 3;
+/// The hidden controls are made to say what is in view once the view has stood still a moment.
+const TIMER_PROXIES: usize = 21;
+/// Posted by a hidden control that gains or loses the focus: the icon it stands for shows the ring, or does not.
+pub(crate) const WM_PROXY_FOCUS: u32 = WM_APP + 9;
+/// The id of the one tip that follows the icon the pointer is on.
+const OVERLAY_TIP: usize = usize::MAX - 200;
 const TIMER_SEARCH: usize = 4;
 const TIMER_CHANGES: usize = 5;
 const TIMER_REFLOW: usize = 6;
@@ -875,6 +877,37 @@ struct CodeBlock {
     at: i32,
     found: bool,
     text: String,
+}
+
+/// The icon at a point of the transcript, among those drawn in its last paint; the first drawn where two overlap.
+fn icon_under(hits: &[OverlayHit], x: i32, y: i32) -> Option<OverlayKey> {
+    hits.iter().find(|hit| x >= hit.area.left && x < hit.area.right && y >= hit.area.top && y < hit.area.bottom).map(|hit| hit.key)
+}
+
+/// The order Tab goes to the icons in, which the hidden controls are put in: top to bottom and left to right, as the page's controls are, and no more than the controls there are.
+fn proxy_order(hits: &[OverlayHit]) -> Vec<OverlayKey> {
+    let mut order: Vec<(i32, i32, OverlayKey)> = hits.iter().map(|hit| (hit.area.top, hit.area.left, hit.key)).collect();
+    order.sort_by_key(|(top, left, _)| (*top, *left));
+    order.into_iter().take(PROXY_POOL).map(|(_, _, key)| key).collect()
+}
+
+/// An icon drawn in the transcript's paint, over its text: which answer, block or run it is of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OverlayKey {
+    /// Copies the answer.
+    Copy(usize),
+    /// Branches the conversation from the answer.
+    Fork(usize),
+    /// Copies the block of code.
+    Block(usize),
+    /// Opens or closes the row of calls.
+    Run(usize),
+}
+
+/// Where an icon was drawn the last time the transcript was painted, in the transcript's own pixels.
+struct OverlayHit {
+    area: RECT,
+    key: OverlayKey,
 }
 
 /// What a control that a card puts over the transcript does when it is pressed.
@@ -1730,9 +1763,15 @@ struct App {
     effort_chip: HWND,
     help_button: HWND,
     doc: HWND,
-    copy_buttons: Vec<HWND>,
-    /// Beside each copy button, its answer's branch button: the conversation through that answer, as a session of its own.
-    fork_buttons: Vec<HWND>,
+    /// The icons over the transcript, drawn in its own paint where each stood in that frame: for hit-testing, which is the pointer's, and for the hidden controls. Which of them
+    /// the pointer is over, which is pressed, and which has just copied (shown as a check mark till the timer).
+    overlay_hits: Vec<OverlayHit>,
+    overlay_hover: Option<OverlayKey>,
+    overlay_press: Option<OverlayKey>,
+    overlay_copied: Option<OverlayKey>,
+    overlay_tip_for: Option<(OverlayKey, RECT)>,
+    proxies: Vec<HWND>,
+    proxy_keys: Vec<Option<OverlayKey>>,
     /// Where each answer ends in the transcript, and its text.
     answers: Vec<(i32, String)>,
     /// Each card of what the person wrote, in order: its corners are drawn over.
@@ -1752,8 +1791,6 @@ struct App {
     rail_tips: Vec<(RECT, usize)>,
     /// Where the text column ends at the right, in the window.
     column_right: i32,
-    /// Which answer each visible copy button stands for.
-    copy_targets: Vec<Option<usize>>,
     transcript_area: RECT,
     /// The transcript's scrollbar as this window draws it: the control's own is cut off by its region, a wide dark band in the page.
     thumb: Option<RECT>,
@@ -2048,12 +2085,8 @@ struct App {
     queue_hits: Vec<(RECT, usize, QueueAct)>,
     /// Those buttons as their tips stand now.
     queue_tips: Vec<(RECT, QueueAct)>,
-    /// The blocks of code in the transcript, each with a copy button while in view, and which it stands for.
+    /// The blocks of code in the transcript, each with a copy icon over it while in view.
     blocks: Vec<CodeBlock>,
-    block_buttons: Vec<HWND>,
-    /// The chevrons of the runs in view, and which each stands for.
-    run_buttons: Vec<HWND>,
-    run_targets: Vec<Option<usize>>,
     /// Tool calls in the transcript, one row to each run.
     runs: Vec<ToolRun>,
     /// The run still going on, at the end of the transcript.
@@ -2070,7 +2103,6 @@ struct App {
     plain_writing: Option<RunEntry>,
     /// When a request under way last said how it was going.
     request_live: Option<std::time::Instant>,
-    block_targets: Vec<Option<usize>>,
     /// Where the block being written is kept in `shown`.
     open_block: Option<usize>,
     /// A block has begun and its first row is still to come: that row is where its card is found.
@@ -2340,19 +2372,52 @@ fn update_button_kind_of(update: &ReleaseUpdate, restart_when_done: bool) -> But
     }
 }
 
-/// The transcript's pixels have just been moved by `dy` (its host calls this from the call that moves them): the copy, branch, code and run buttons over the text are moved by the same, here and now,
-/// where the text itself has been moved, and not only after the band it uncovered has been drawn, which was when `place_copy_buttons` got to them (3 ms or more on the answers it had to ask
-/// about, with the text at its new place and the buttons at the old). It asks for exactly where each belongs once the view is drawn, and finds these there.
+/// The transcript's pixels have just been moved by `dy` (its host calls this from the call that moves them): the controls of the cards that lie over the text as windows are moved by the same, here
+/// and now. (The copy, branch, code and run icons are not windows: they are drawn in the text's own paint, and move with its pixels.)
 pub(crate) unsafe fn overlays_follow(dy: i32) {
     let Some(app) = app() else { return };
     if app.panel != Panel::Chat {
         return;
     }
-    for button in app.copy_buttons.iter().chain(&app.fork_buttons).chain(&app.block_buttons).chain(&app.run_buttons).chain(&app.card_buttons).chain([&app.card_field]) {
+    for button in app.card_buttons.iter().chain([&app.card_field]) {
         if IsWindowVisible(*button) != 0 {
             let (x, y, ..) = child_area(*button, app.window);
             SetWindowPos(*button, std::ptr::null_mut(), x, y + dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
+    }
+}
+
+/// A debug build with `DOGMIND_TEST_ICONLOG` set to a file writes there, a line each and with the time in microseconds, what the transcript's host does to its pixels (moves them,
+/// asks for a part of them again, draws a part) and where the icons stood in each frame it drew: what a test reads to say whether any frame had an icon away from its answer.
+static TEST_LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+
+pub(crate) fn test_log_on() -> bool {
+    cfg!(debug_assertions) && TEST_LOG.get_or_init(|| std::env::var_os("DOGMIND_TEST_ICONLOG").and_then(|path| std::fs::File::create(path).ok()).map(std::sync::Mutex::new)).is_some()
+}
+
+pub(crate) fn test_log(line: &str) {
+    use std::io::Write;
+    if !test_log_on() {
+        return;
+    }
+    if let Some(Some(file)) = TEST_LOG.get() {
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_micros());
+        let _ = writeln!(file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()), "{at} {line}");
+    }
+}
+
+/// Whether the icons are drawn in a colour that nothing else of the window has, for a test to find them by: a debug build with `DOGMIND_TEST_ICONCOLOR` set.
+fn icons_marked() -> bool {
+    static MARKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(debug_assertions) && *MARKED.get_or_init(|| std::env::var_os("DOGMIND_TEST_ICONCOLOR").is_some())
+}
+
+/// The transcript's host has drawn its text (and its fades) on `device`: the icons over the text are drawn on the same device now, at the places the text has in this frame.
+pub(crate) unsafe fn paint_overlays(window: HWND, device: HDC, dx: i32, dy: i32) {
+    let Some(app) = app() else { return };
+    // (the composer and the side page are hosts of the same kind: the icons are over the transcript's text and no other's)
+    if window == app.transcript {
+        app.paint_overlay_icons(device, dx, dy);
     }
 }
 
@@ -3058,7 +3123,7 @@ impl App {
         }
         redraw(edit, true);
         InvalidateRect(edit, std::ptr::null(), 0);
-        self.place_copy_buttons();
+        self.place_overlays();
     }
 
     /// The lines of a Markdown table have ended: as a table if they are one, and as they were written if they are not.
@@ -3134,63 +3199,11 @@ impl App {
         }
     }
 
-    /// The top right of each block in view has a copy button of the pool. As with the answers' buttons: for every frame the view moves, and only what moved.
-    unsafe fn place_block_buttons(&mut self) {
-        let dpi = self.dpi;
-        let size = scale(dpi, 24);
-        let area = self.transcript_area;
-        let height = area.bottom - area.top;
-        self.block_targets.iter_mut().for_each(|target| *target = None);
-        let mut in_view: Vec<(usize, POINT)> = Vec::new();
-        if self.panel == Panel::Chat && self.has_messages {
-            for at in (0..self.blocks.len()).rev() {
-                let block = &mut self.blocks[at];
-                if !block.found {
-                    block.at = text_start(self.transcript, block.at);
-                    block.found = true;
-                }
-                let mut point = POINT { x: 0, y: 0 };
-                SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, block.at as LPARAM);
-                if point.y < -size {
-                    break;
-                }
-                // (half out of the view it would stand over what is above the transcript)
-                if point.y >= 0 && point.y <= height - size && !block.text.is_empty() {
-                    in_view.push((at, point));
-                }
-            }
-        }
-        let used = in_view.len().min(self.block_buttons.len());
-        let x = area.left + self.transcript_rect.1 - GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) * 3 / 5 - size - scale(dpi, 4);
-        for (slot, (at, point)) in in_view.into_iter().rev().take(used).enumerate() {
-            let button = self.block_buttons[slot];
-            // (its first line, whose top is near the block's, with the button inside the block)
-            let top = area.top + point.y + scale(dpi, 1);
-            let showing = IsWindowVisible(button) != 0;
-            if !showing || child_area(button, self.window) != (x, top, size, size) {
-                SetWindowPos(button, HWND_TOP, x, top, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
-                if showing {
-                    UpdateWindow(button);
-                }
-            }
-            if !showing {
-                show(button, true);
-            }
-            self.block_targets[slot] = Some(at);
-        }
-        for button in &self.block_buttons[used..] {
-            if IsWindowVisible(*button) != 0 {
-                show(*button, false);
-            }
-        }
-    }
-
-    unsafe fn copy_block(&mut self, slot: usize) {
-        let Some(at) = self.block_targets.get(slot).copied().flatten() else { return };
-        let text = self.blocks[at].text.clone();
+    unsafe fn copy_block(&mut self, at: usize) {
+        let Some(block) = self.blocks.get(at) else { return };
+        let text = block.text.clone();
         self.copy_to_clipboard(text.trim_end_matches('\n'));
-        set_text(self.block_buttons[slot], "check");
-        SetTimer(self.window, TIMER_COPIED, 1400, None);
+        self.copied(OverlayKey::Block(at));
     }
 
     /// What opens and closes a block: a little space, and what the code is in if it says.
@@ -3608,7 +3621,7 @@ impl App {
         self.append("\n", Style::CopyRow);
         self.unkept = false;
         self.line_start = true;
-        self.place_copy_buttons();
+        self.place_overlays();
     }
 
     /// The view has moved, by whatever moved it: what lies over the text follows. The wheel's scroll is the control's own, carried out over
@@ -3618,90 +3631,32 @@ impl App {
         let mut position = POINT { x: 0, y: 0 };
         SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
         if position.y != self.placed_at {
-            self.place_copy_buttons();
+            self.place_overlays();
             self.place_thumb();
         }
     }
 
-    /// Each answer on screen gets a button of the pool at its row, wherever the transcript has scrolled to. This runs for every frame the view
-    /// moves: only the answers from the last one up to the first above the view are asked about, and only a button whose place changed is moved.
-    unsafe fn place_copy_buttons(&mut self) {
+    /// What lies over the transcript as windows of their own (a message's pictures, the controls of the cards) goes where the text has come to, after the text is drawn: for every frame the view
+    /// moves. The copy, branch, code and run icons are not among them: they are drawn in the text's paint, at the places of that frame.
+    unsafe fn place_overlays(&mut self) {
         let mut position = POINT { x: 0, y: 0 };
         SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
         let moved = position.y != self.placed_at;
         self.placed_at = position.y;
-        // The text first. A scroll's own message used to move these over the text before the window had painted it, and the old text showed under them until it did, for 5 to 25 ms: now the
-        // view is drawn where it has moved to (all of it, at once), and only then is anything that lies over it moved.
+        // The text first: the view is drawn where it has moved to, and only then is anything that lies over it moved.
         if moved && self.panel == Panel::Chat && self.has_messages {
             UpdateWindow(self.transcript);
         }
         self.place_pictures();
-        self.place_block_buttons();
-        self.place_run_buttons();
         self.place_card_controls();
-        let dpi = self.dpi;
-        let (size, area) = (scale(dpi, ds::size::ICON_BUTTON), self.transcript_area);
-        let visible = self.panel == Panel::Chat && self.has_messages;
-        let height = area.bottom - area.top;
-        self.copy_targets.iter_mut().for_each(|target| *target = None);
-        let mut in_view: Vec<(usize, POINT)> = Vec::new();
-        if visible {
-            for at in (0..self.answers.len()).rev() {
-                let mut point = POINT { x: 0, y: 0 };
-                SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, self.answers[at].0 as LPARAM);
-                if point.y < -size {
-                    break;
-                }
-                // (half out of the view it would stand over what is above the transcript)
-                if point.y >= 0 && point.y <= height - size {
-                    in_view.push((at, point));
-                }
-            }
-        }
-        // (every answer's, not only the last one's and the one under the pointer: shown only there, they were not found)
-        let used = in_view.len().min(self.copy_buttons.len());
-        // (a branch is of a saved session, and not of an answer still coming)
-        let forks = self.current_session.is_some();
-        for (slot, (at, point)) in in_view.into_iter().rev().take(used).enumerate() {
-            let left = area.left + point.x - scale(dpi, 2);
-            for (button, x, wanted) in [(self.copy_buttons[slot], left, true), (self.fork_buttons[slot], left + size, forks)] {
-                let showing = IsWindowVisible(button) != 0;
-                if !wanted {
-                    if showing {
-                        show(button, false);
-                    }
-                    continue;
-                }
-                if !showing || child_area(button, self.window) != (x, area.top + point.y, size, size) {
-                    // (it stays above the transcript once it is there, and to say so again costs more than the move)
-                    SetWindowPos(button, HWND_TOP, x, area.top + point.y, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
-                    // (drawn where it is now, not when the window gets to it: the text under it was drawn already)
-                    if showing {
-                        UpdateWindow(button);
-                    }
-                }
-                if !showing {
-                    show(button, true);
-                }
-            }
-            self.copy_targets[slot] = Some(at);
-        }
-        for button in self.copy_buttons[used..].iter().chain(&self.fork_buttons[used..]) {
-            if IsWindowVisible(*button) != 0 {
-                show(*button, false);
-            }
-        }
-        // (and the text where they stood: it was under them, and is asked for now that they have gone)
-        if moved && visible {
-            UpdateWindow(self.transcript);
-        }
     }
-
 
     /// A new session with the conversation through this answer, opened: to go on from there another way. The answer is found in the saved
     /// session by its words, and by how many answers before it have the same.
-    unsafe fn fork_from_answer(&mut self, slot: usize) {
-        let Some(at) = self.copy_targets.get(slot).copied().flatten() else { return };
+    unsafe fn fork_from_answer(&mut self, at: usize) {
+        if at >= self.answers.len() {
+            return;
+        }
         let Some(path) = self.current_session.clone() else { return };
         let words = self.answers[at].1.clone();
         let same_before = self.answers[..at].iter().filter(|(_, other)| *other == words).count();
@@ -3722,12 +3677,25 @@ impl App {
         }
     }
 
-    unsafe fn copy_answer(&mut self, slot: usize) {
-        let Some(at) = self.copy_targets.get(slot).copied().flatten() else { return };
-        let text = self.answers[at].1.clone();
+    unsafe fn copy_answer(&mut self, at: usize) {
+        let Some((_, text)) = self.answers.get(at) else { return };
+        let text = text.clone();
         self.copy_to_clipboard(&text);
-        set_text(self.copy_buttons[slot], "check");
+        self.copied(OverlayKey::Copy(at));
+    }
+
+    /// An icon has copied: it shows a check mark for a moment.
+    unsafe fn copied(&mut self, key: OverlayKey) {
+        self.overlay_copied = Some(key);
+        self.invalidate_overlay(key);
         SetTimer(self.window, TIMER_COPIED, 1400, None);
+    }
+
+    /// The icon of `key`, as it was last drawn, drawn again.
+    unsafe fn invalidate_overlay(&self, key: OverlayKey) {
+        if let Some(hit) = self.overlay_hits.iter().find(|hit| hit.key == key) {
+            InvalidateRect(self.transcript, &hit.area, 0);
+        }
     }
 
     unsafe fn end_line(&mut self) {
@@ -3789,10 +3757,6 @@ impl App {
         (run.first, run.head_end, run.last) = written;
         run.written = lines.into_iter().next().map_or(String::new(), |(line, _)| line);
         run.written_at = Some(std::time::Instant::now());
-        // (its button stands at the end of its words, wherever they now end, and goes when there is nothing more to see)
-        if !self.replaying && !self.opening {
-            self.place_run_buttons();
-        }
     }
 
     /// The run going on, or a new one with whatever was left running from the last.
@@ -3826,7 +3790,6 @@ impl App {
             self.write_run(at);
         }
         self.line_start = true;
-        self.place_run_buttons();
     }
 
     /// A row with nothing in it goes. It is the last thing in the transcript but for what is on its way in.
@@ -3923,7 +3886,6 @@ impl App {
                 self.set_activity(String::new());
             }
             self.write_run(at);
-            self.place_run_buttons();
         }
     }
 
@@ -4019,9 +3981,6 @@ impl App {
         GetScrollInfo(self.transcript, SB_VERT, &mut bar);
         if bar.nPage == 0 || bar.nPos + 2 * bar.nPage as i32 >= bar.nMax {
             self.write_run(at);
-            if self.runs[at].expandable() {
-                self.place_run_buttons();
-            }
         }
     }
 
@@ -4093,61 +4052,8 @@ impl App {
             self.follow_end = true;
             self.want_frames();
         }
-        self.place_copy_buttons();
+        self.place_overlays();
         self.place_thumb();
-    }
-
-    /// The chevron of each run in view with more to show, at the end of its words. As with the copy buttons: for every frame the view moves, and only what moved.
-    unsafe fn place_run_buttons(&mut self) {
-        let dpi = self.dpi;
-        let size = scale(dpi, 20);
-        let area = self.transcript_area;
-        let height = area.bottom - area.top;
-        self.run_targets.iter_mut().for_each(|target| *target = None);
-        let mut in_view: Vec<(usize, POINT)> = Vec::new();
-        if self.panel == Panel::Chat && self.has_messages {
-            for at in (0..self.runs.len()).rev() {
-                let run = &self.runs[at];
-                if run.first < 0 {
-                    continue;
-                }
-                let mut point = POINT { x: 0, y: 0 };
-                SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, run.head_end as LPARAM);
-                if point.y < -size {
-                    break;
-                }
-                // (half out of the view it would stand over what is above the transcript)
-                if run.expandable() && point.y >= 0 && point.y <= height - size {
-                    in_view.push((at, point));
-                }
-            }
-        }
-        let used = in_view.len().min(self.run_buttons.len());
-        for (slot, (at, point)) in in_view.into_iter().rev().take(used).enumerate() {
-            let button = self.run_buttons[slot];
-            // (level with its words, whose line is lower in the row than the button's middle would be)
-            let (x, top) = (area.left + point.x + scale(dpi, 4), area.top + point.y + scale(dpi, 4));
-            let name = if self.runs[at].expanded { "chevron-down" } else { "chevron-right" };
-            if get_text(button) != name {
-                set_text(button, name);
-            }
-            let showing = IsWindowVisible(button) != 0;
-            if !showing || child_area(button, self.window) != (x, top, size, size) {
-                SetWindowPos(button, HWND_TOP, x, top, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
-                if showing {
-                    UpdateWindow(button);
-                }
-            }
-            if !showing {
-                show(button, true);
-            }
-            self.run_targets[slot] = Some(at);
-        }
-        for button in &self.run_buttons[used..] {
-            if IsWindowVisible(*button) != 0 {
-                show(*button, false);
-            }
-        }
     }
 
     /// The calls of a session's file that went well, as one row.
@@ -4261,7 +4167,7 @@ impl App {
             if self.text_twips != before {
                 KillTimer(self.window, TIMER_REFLOW);
                 self.reflow();
-                self.place_copy_buttons();
+                self.place_overlays();
                 self.place_thumb();
             }
         }
@@ -4590,7 +4496,7 @@ impl App {
                 self.scrolled_up_at = None;
                 self.want_frames();
             }
-            self.place_copy_buttons();
+            self.place_overlays();
             self.place_thumb();
         }
     }
@@ -4869,6 +4775,227 @@ impl App {
             None => {
                 if IsWindowVisible(self.card_field) != 0 {
                     show(self.card_field, false);
+                }
+            }
+        }
+    }
+
+    /// What an icon does.
+    unsafe fn overlay_act(&mut self, key: OverlayKey) {
+        match key {
+            OverlayKey::Copy(at) => self.copy_answer(at),
+            OverlayKey::Fork(at) => self.fork_from_answer(at),
+            OverlayKey::Block(at) => self.copy_block(at),
+            OverlayKey::Run(at) => self.toggle_run(at),
+        }
+    }
+
+    /// What an icon says of itself: in a tip, and to a screen reader.
+    fn overlay_words(&self, key: OverlayKey) -> &'static str {
+        match key {
+            OverlayKey::Copy(_) => t("Copy this answer"),
+            OverlayKey::Fork(_) => t("Branch from here: a new session with the conversation up to this answer"),
+            OverlayKey::Block(_) => t("Copy this code"),
+            OverlayKey::Run(_) => t("Show or hide these calls"),
+        }
+    }
+
+    /// The icons of the answers, code blocks and rows of calls in view, each where it stands now: the places come from the text, asked for from the last one up to the first above the view.
+    /// What is in view is the same set whatever has moved it, which is the point of asking at the moment of drawing.
+    unsafe fn overlays_in_view(&mut self) -> Vec<OverlayHit> {
+        let mut found = Vec::new();
+        if self.panel != Panel::Chat || !self.has_messages {
+            return found;
+        }
+        let dpi = self.dpi;
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(self.transcript, &mut client);
+        let height = client.bottom;
+        let ask = |char_at: i32| {
+            let mut point = POINT { x: 0, y: 0 };
+            SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, char_at as LPARAM);
+            point
+        };
+        // The answers: a copy icon at the row's start, and the branch icon beside it.
+        let size = scale(dpi, ds::size::ICON_BUTTON);
+        let forks = self.current_session.is_some();
+        for at in (0..self.answers.len()).rev() {
+            let point = ask(self.answers[at].0);
+            if point.y < -size {
+                break;
+            }
+            if point.y < height {
+                let left = point.x - scale(dpi, 2);
+                found.push(OverlayHit { area: rect(left, point.y, size, size), key: OverlayKey::Copy(at) });
+                if forks {
+                    found.push(OverlayHit { area: rect(left + size, point.y, size, size), key: OverlayKey::Fork(at) });
+                }
+            }
+        }
+        // The blocks of code: at the top right of each, inside it.
+        let size = scale(dpi, 24);
+        let x = self.transcript_rect.1 - GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) * 3 / 5 - size - scale(dpi, 4);
+        for at in (0..self.blocks.len()).rev() {
+            if !self.blocks[at].found {
+                self.blocks[at].at = text_start(self.transcript, self.blocks[at].at);
+                self.blocks[at].found = true;
+            }
+            let point = ask(self.blocks[at].at);
+            if point.y < -size {
+                break;
+            }
+            if point.y < height && !self.blocks[at].text.is_empty() {
+                found.push(OverlayHit { area: rect(x, point.y + scale(dpi, 1), size, size), key: OverlayKey::Block(at) });
+            }
+        }
+        // The rows of calls that have more to show: at the end of their words.
+        let size = scale(dpi, 20);
+        for at in (0..self.runs.len()).rev() {
+            if self.runs[at].first < 0 {
+                continue;
+            }
+            let point = ask(self.runs[at].head_end);
+            if point.y < -size {
+                break;
+            }
+            if self.runs[at].expandable() && point.y < height {
+                found.push(OverlayHit { area: rect(point.x + scale(dpi, 4), point.y + scale(dpi, 4), size, size), key: OverlayKey::Run(at) });
+            }
+        }
+        found
+    }
+
+    /// The icons, in the transcript's paint: after the text, in the same device context, each where the text has put its place in this very frame. They are part of the pixels the host
+    /// moves when it scrolls them, and the band that comes into view is drawn with its own. Whatever the pointer or the keys have done to one shows in its colour.
+    /// `dx`, `dy`: where the transcript's own pixels are in `device` (the bitmap of the area drawn, or the window itself).
+    unsafe fn paint_overlay_icons(&mut self, device: HDC, dx: i32, dy: i32) {
+        self.overlay_hits = self.overlays_in_view();
+        let dpi = self.dpi;
+        let focused = {
+            let focus = GetFocus();
+            self.proxies.iter().position(|proxy| *proxy == focus).and_then(|at| self.proxy_keys[at])
+        };
+        let ring = focused.is_some() && keys_are_in_use();
+        for hit in &self.overlay_hits {
+            let key = hit.key;
+            let area = RECT { left: hit.area.left + dx, top: hit.area.top + dy, right: hit.area.right + dx, bottom: hit.area.bottom + dy };
+            let pressed = self.overlay_press == Some(key) && self.overlay_hover == Some(key);
+            let lit = self.overlay_hover == Some(key);
+            let copied = self.overlay_copied == Some(key);
+            let name = match key {
+                OverlayKey::Copy(_) | OverlayKey::Block(_) if copied => "check",
+                OverlayKey::Copy(_) | OverlayKey::Block(_) => "copy",
+                OverlayKey::Fork(_) => "git-branch",
+                OverlayKey::Run(at) if self.runs[at].expanded => "chevron-down",
+                OverlayKey::Run(_) => "chevron-right",
+            };
+            // As an icon button of the window draws: a shade under it when the pointer is on it, one up on a card of a block of code.
+            if lit || pressed {
+                rounded(device, area, scale(dpi, ds::radius::SMALL), Some(if pressed { theme::raised() } else { theme::surface() }), None);
+            }
+            let color = if icons_marked() { 0x00FF_00FF } else if name == "check" { theme::good() } else if lit || pressed { theme::text() } else { theme::faint() };
+            icon::draw(device, name, area, scale(dpi, ds::size::ICON), color);
+            if ring && focused == Some(key) {
+                rounded(device, RECT { left: area.left + 1, top: area.top + 1, right: area.right - 1, bottom: area.bottom - 1 }, scale(dpi, ds::radius::SMALL), None, Some(theme::accent()));
+            }
+        }
+        if test_log_on() {
+            let mut position = POINT { x: 0, y: 0 };
+            SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
+            let drawn: Vec<String> = self.overlay_hits.iter().map(|hit| format!("{:?}@{},{}", hit.key, hit.area.left, hit.area.top)).collect();
+            test_log(&format!("icons scroll_y={} dpi={} area={},{},{} {} [hover {:?} press {:?}]", position.y, dpi, self.transcript_area.left, self.transcript_area.top, self.transcript_area.bottom, drawn.join(" "), self.overlay_hover, self.overlay_press));
+        }
+        // (what stands over the transcript is told of a moment after the view has come to rest)
+        SetTimer(self.window, TIMER_PROXIES, 150, None);
+        self.keep_overlay_tip();
+    }
+
+    /// The icon under a point of the transcript, as it was drawn.
+    fn overlay_at(&self, x: i32, y: i32) -> Option<OverlayKey> {
+        icon_under(&self.overlay_hits, x, y)
+    }
+
+    /// The pointer is at a point of the transcript: the icon under it is lit, and the one it left is not.
+    unsafe fn overlay_pointer(&mut self, x: i32, y: i32) {
+        let over = self.overlay_at(x, y);
+        if over == self.overlay_hover {
+            return;
+        }
+        let was = std::mem::replace(&mut self.overlay_hover, over);
+        if test_log_on() {
+            test_log(&format!("hover {was:?} -> {over:?} at {x},{y}"));
+        }
+        for key in [was, over].into_iter().flatten() {
+            self.invalidate_overlay(key);
+        }
+        self.keep_overlay_tip();
+    }
+
+    /// The pointer's place again, from where it is, after the view has moved under it.
+    unsafe fn overlay_pointer_again(&mut self) {
+        let mut point = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut point);
+        ScreenToClient(self.transcript, &mut point);
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(self.transcript, &mut client);
+        let inside = point.x >= 0 && point.y >= 0 && point.x < client.right && point.y < client.bottom;
+        if inside {
+            self.overlay_pointer(point.x, point.y);
+        }
+    }
+
+    /// The one tip of the icons stands over the icon the pointer is on, with its words; none where it is on none.
+    unsafe fn keep_overlay_tip(&mut self) {
+        let wanted = self.overlay_hover.and_then(|key| self.overlay_hits.iter().find(|hit| hit.key == key).map(|hit| (key, hit.area)));
+        let same = |a: &Option<(OverlayKey, RECT)>, b: &Option<(OverlayKey, RECT)>| match (a, b) {
+            (Some((key, area)), Some((other, place))) => key == other && same_rect(area, place),
+            (None, None) => true,
+            _ => false,
+        };
+        if same(&wanted, &self.overlay_tip_for) {
+            return;
+        }
+        let mut tool: TTTOOLINFOW = std::mem::zeroed();
+        tool.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        tool.hwnd = self.transcript;
+        tool.uId = OVERLAY_TIP;
+        if self.overlay_tip_for.is_some() {
+            SendMessageW(self.tooltip, TTM_DELTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
+        }
+        if let Some((key, area)) = wanted {
+            let words = wide(self.overlay_words(key));
+            tool.uFlags = TTF_SUBCLASS;
+            tool.rect = area;
+            tool.lpszText = words.as_ptr() as *mut u16;
+            SendMessageW(self.tooltip, TTM_ADDTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
+        }
+        self.overlay_tip_for = wanted;
+    }
+
+    /// The hidden controls say what the icons in view are, top to bottom: Tab goes to each, a screen reader reads its words, and Enter or Space does what the icon does.
+    unsafe fn sync_proxies(&mut self) {
+        let keys = proxy_order(&self.overlay_hits);
+        let (left, top) = (self.transcript_area.left + 1, self.transcript_area.top);
+        for slot in 0..PROXY_POOL {
+            let proxy = self.proxies[slot];
+            match keys.get(slot) {
+                Some(key) => {
+                    let words = self.overlay_words(*key);
+                    if get_text(proxy) != words {
+                        set_text(proxy, words);
+                    }
+                    // (a place in the order of the page's controls, and no size)
+                    SetWindowPos(proxy, std::ptr::null_mut(), left, top + slot as i32, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE);
+                    self.proxy_keys[slot] = Some(*key);
+                    if IsWindowVisible(proxy) == 0 {
+                        show(proxy, true);
+                    }
+                }
+                None => {
+                    self.proxy_keys[slot] = None;
+                    if IsWindowVisible(proxy) != 0 && GetFocus() != proxy {
+                        show(proxy, false);
+                    }
                 }
             }
         }
@@ -5919,7 +6046,7 @@ impl App {
         if self.modal_open {
             self.layout_modal(width, height);
             self.shapes = shapes;
-            self.place_copy_buttons();
+            self.place_overlays();
             InvalidateRect(self.window, std::ptr::null(), 0);
             return;
         }
@@ -5956,7 +6083,7 @@ impl App {
             self.clamp_diff();
             InvalidateRect(self.diff_view, std::ptr::null(), 0);
             self.shapes = shapes;
-            self.place_copy_buttons();
+            self.place_overlays();
             InvalidateRect(self.window, std::ptr::null(), 0);
             return;
         }
@@ -6154,7 +6281,7 @@ impl App {
             }
         }
         self.shapes = shapes;
-        self.place_copy_buttons();
+        self.place_overlays();
         InvalidateRect(self.window, std::ptr::null(), 0);
     }
 
@@ -7460,7 +7587,7 @@ impl App {
             self.scrolled_up_at = Some(std::time::Instant::now());
         }
         SendMessageW(edit, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
-        self.place_copy_buttons();
+        self.place_overlays();
         self.place_thumb();
     }
 
@@ -7526,7 +7653,7 @@ impl App {
         // (the end gives the following view back, as scrolling to it does)
         self.follow_end = at == room;
         SendMessageW(self.transcript, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
-        self.place_copy_buttons();
+        self.place_overlays();
         self.place_thumb();
     }
 
@@ -9890,7 +10017,7 @@ impl App {
             let range = CharRange { first, last };
             SendMessageW(self.transcript, EM_EXSETSEL, 0, std::ptr::addr_of!(range) as LPARAM);
             SendMessageW(self.transcript, EM_SCROLLCARET, 0, 0);
-            self.place_copy_buttons();
+            self.place_overlays();
         }
         self.layout();
     }
@@ -10875,7 +11002,7 @@ impl App {
         if self.has_messages {
             SendMessageW(self.transcript, WM_VSCROLL, SB_BOTTOM as WPARAM, 0);
             InvalidateRect(self.transcript, std::ptr::null(), 0);
-            self.place_copy_buttons();
+            self.place_overlays();
             self.place_thumb();
         }
     }
@@ -11110,7 +11237,7 @@ impl App {
             return true;
         }
         if !self.answers.is_empty() || !self.picture_blocks.is_empty() || !self.blocks.is_empty() {
-            self.place_copy_buttons();
+            self.place_overlays();
         }
         self.place_thumb();
         false
@@ -12467,15 +12594,6 @@ impl App {
         ] {
             self.tip(window, words);
         }
-        for button in self.copy_buttons.iter().chain(&self.block_buttons) {
-            self.tip(*button, t("Copy"));
-        }
-        for button in &self.fork_buttons {
-            self.tip(*button, t("Branch from here: a new session with the conversation up to this answer"));
-        }
-        for button in &self.run_buttons {
-            self.tip(*button, t("Show or hide these calls"));
-        }
         self.tip(self.modal_close, t("Close"));
         self.tip(self.diff_previous, t("Previous change (P)"));
         self.tip(self.diff_next, t("Next change (N)"));
@@ -12781,6 +12899,32 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
     if message == WM_MOUSEMOVE && !(app.links.is_empty() && app.runs.is_empty()) {
         app.track_link(lparam);
     }
+    // The icons over the text are drawn in its paint: the pointer is theirs when it is over one, and a press on one is not a press on the text.
+    if message == WM_MOUSEMOVE {
+        let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
+        app.overlay_pointer(x, y);
+    }
+    if matches!(message, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
+        let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
+        if let Some(key) = app.overlay_at(x, y) {
+            app.overlay_press = Some(key);
+            SetCapture(window);
+            app.invalidate_overlay(key);
+            return 0;
+        }
+    }
+    if message == WM_LBUTTONUP && app.overlay_press.is_some() {
+        let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
+        let pressed = app.overlay_press.take();
+        ReleaseCapture();
+        if let Some(key) = pressed {
+            app.invalidate_overlay(key);
+            if app.overlay_at(x, y) == Some(key) {
+                app.overlay_act(key);
+            }
+        }
+        return 0;
+    }
     if message == WM_MOUSEMOVE && !app.pointer_tracked && !forced_hover() {
         app.pointer_tracked = true;
         let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: window, dwHoverTime: 0 };
@@ -12789,9 +12933,18 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
     if message == WM_MOUSELEAVE {
         app.pointer_tracked = false;
         app.run_hover = None;
+        // (a test that has no pointer of its own: the leave the system sends when the capture changes is not the pointer leaving)
+        if let Some(key) = if forced_hover() { None } else { app.overlay_hover.take() } {
+            app.invalidate_overlay(key);
+            app.keep_overlay_tip();
+        }
         if app.link_hover.take().is_some() {
             InvalidateRect(app.window, &app.status_area, 0);
         }
+    }
+    if message == WM_SETCURSOR && app.overlay_hover.is_some() {
+        SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
+        return 1;
     }
     // (a row that has nothing more to show only says its whole path)
     if message == WM_SETCURSOR && app.link_hover.is_some() && app.run_hover.map_or(true, |run| app.runs[run].expandable()) {
@@ -12862,8 +13015,12 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
         CallWindowProcW(base, window, message, wparam, lparam)
     };
     if matches!(message, WM_VSCROLL | WM_MOUSEWHEEL | WM_KEYDOWN | WM_LBUTTONUP | WM_SIZE) {
-        app.place_copy_buttons();
+        app.place_overlays();
         app.place_thumb();
+        // (what moved under the pointer is what it is on now)
+        if matches!(message, WM_VSCROLL | WM_MOUSEWHEEL | WM_KEYDOWN) {
+            app.overlay_pointer_again();
+        }
     }
     if matches!(message, WM_PAINT | WM_TIMER) && app.panel == Panel::Chat {
         app.follow_the_view();
@@ -13420,9 +13577,18 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         }
         WM_TIMER if wparam == TIMER_COPIED => {
             KillTimer(window, TIMER_COPIED);
-            for button in app.copy_buttons.iter().chain(&app.block_buttons) {
-                set_text(*button, "copy");
+            if let Some(key) = app.overlay_copied.take() {
+                app.invalidate_overlay(key);
             }
+            0
+        }
+        WM_TIMER if wparam == TIMER_PROXIES => {
+            KillTimer(window, TIMER_PROXIES);
+            app.sync_proxies();
+            0
+        }
+        WM_PROXY_FOCUS => {
+            InvalidateRect(app.transcript, std::ptr::null(), 0);
             0
         }
         WM_TIMER if wparam == TIMER_UPDATE => {
@@ -13473,7 +13639,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     } else {
                         app.follow_end = false;
                         SendMessageW(app.transcript, WM_VSCROLL, if y < thumb.top { SB_PAGEUP } else { SB_PAGEDOWN } as WPARAM, 0);
-                        app.place_copy_buttons();
+                        app.place_overlays();
                         app.place_thumb();
                     }
                 }
@@ -13847,9 +14013,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_GOAL_CLEAR => {
                     let _ = app.agent.commands.send(Command::SetGoal(None));
                 }
-                _ if (ID_COPY_POOL..ID_COPY_POOL + COPY_POOL as isize).contains(&id) => app.copy_answer((id - ID_COPY_POOL) as usize),
-                _ if (ID_FORK_POOL..ID_FORK_POOL + COPY_POOL as isize).contains(&id) => app.fork_from_answer((id - ID_FORK_POOL) as usize),
-                _ if (ID_BLOCK_POOL..ID_BLOCK_POOL + BLOCK_POOL as isize).contains(&id) => app.copy_block((id - ID_BLOCK_POOL) as usize),
+                _ if (ID_PROXY_POOL..ID_PROXY_POOL + PROXY_POOL as isize).contains(&id) => {
+                    if let Some(key) = app.proxy_keys[(id - ID_PROXY_POOL) as usize] {
+                        app.overlay_act(key);
+                    }
+                }
                 _ if (ID_CARD_POOL..ID_CARD_POOL + CARD_POOL as isize).contains(&id) => app.card_pressed((id - ID_CARD_POOL) as usize),
                 CARD_FIELD_ID if code == EN_SETFOCUS as usize || code == EN_KILLFOCUS as usize => {
                     // (its frame shows that the field has the focus)
@@ -13857,11 +14025,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                         if IsWindowVisible(button) != 0 {
                             InvalidateRect(button, std::ptr::null(), 0);
                         }
-                    }
-                }
-                _ if (ID_RUN_POOL..ID_RUN_POOL + RUN_POOL as isize).contains(&id) => {
-                    if let Some(run) = app.run_targets[(id - ID_RUN_POOL) as usize] {
-                        app.toggle_run(run);
                     }
                 }
                 ID_TOGGLE_THINKING => app.on_menu(M_THINKING),
@@ -14828,8 +14991,13 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             effort_chip: chip(ID_EFFORT_CHIP, theme::surface()),
             help_button: make_button(window, ID_HELP, "circle-question-mark", ButtonKind::Icon, theme::sidebar()),
             doc,
-            copy_buttons: (0..COPY_POOL).map(|at| make_button(window, ID_COPY_POOL + at as isize, "copy", ButtonKind::Icon, theme::background())).collect(),
-            fork_buttons: (0..COPY_POOL).map(|at| make_button(window, ID_FORK_POOL + at as isize, "git-branch", ButtonKind::Icon, theme::background())).collect(),
+            overlay_hits: Vec::new(),
+            overlay_hover: None,
+            overlay_press: None,
+            overlay_copied: None,
+            overlay_tip_for: None,
+            proxies: (0..PROXY_POOL).map(|at| make_button(window, ID_PROXY_POOL + at as isize, "", ButtonKind::Hidden, theme::background())).collect(),
+            proxy_keys: vec![None; PROXY_POOL],
             answers: Vec::new(),
             user_cards: Vec::new(),
             rail_turns: Vec::new(),
@@ -14840,7 +15008,6 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             rail_hits: Vec::new(),
             rail_tips: Vec::new(),
             column_right: 0,
-            copy_targets: vec![None; COPY_POOL],
             transcript_area: rect(0, 0, 0, 0),
             thumb: None,
             thumb_grab: None,
@@ -15055,9 +15222,6 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             queue_hits: Vec::new(),
             queue_tips: Vec::new(),
             blocks: Vec::new(),
-            block_buttons: (0..BLOCK_POOL).map(|at| make_button(window, ID_BLOCK_POOL + at as isize, "copy", ButtonKind::Icon, theme::code_back())).collect(),
-            run_buttons: (0..RUN_POOL).map(|at| make_button(window, ID_RUN_POOL + at as isize, "chevron-right", ButtonKind::Icon, theme::background())).collect(),
-            run_targets: vec![None; RUN_POOL],
             runs: Vec::new(),
             run_open: None,
             run_writing: false,
@@ -15066,7 +15230,6 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             run_hover: None,
             plain_writing: None,
             request_live: None,
-            block_targets: vec![None; BLOCK_POOL],
             open_block: None,
             block_card_due: false,
             last_inserted: (0, 0),
@@ -15990,6 +16153,22 @@ mod tests {
 
     fn card_at(left: i32, right: i32, top: i32, bottom: i32) -> impl Fn(i32, i32) -> bool {
         move |x, y| (left..=right).contains(&x) && (top..=bottom).contains(&y)
+    }
+
+    #[test]
+    fn the_pointer_is_over_the_icon_drawn_under_it_and_tab_goes_down_the_page() {
+        let hit = |left: i32, top: i32, key: OverlayKey| OverlayHit { area: RECT { left, top, right: left + 28, bottom: top + 28 }, key };
+        let hits = vec![hit(60, 300, OverlayKey::Fork(1)), hit(30, 300, OverlayKey::Copy(1)), hit(30, 100, OverlayKey::Copy(0)), hit(500, 120, OverlayKey::Block(0))];
+        assert_eq!(icon_under(&hits, 40, 310), Some(OverlayKey::Copy(1)));
+        assert_eq!(icon_under(&hits, 70, 310), Some(OverlayKey::Fork(1)));
+        assert_eq!(icon_under(&hits, 58, 310), None, "between the two icons of a row: the first is 28 wide, and the second begins at 60");
+        assert_eq!(icon_under(&hits, 40, 128), None, "the icon's edge is not in it");
+        assert_eq!(icon_under(&hits, 10, 10), None);
+        // top to bottom, and left to right on a row
+        assert_eq!(proxy_order(&hits), vec![OverlayKey::Copy(0), OverlayKey::Block(0), OverlayKey::Copy(1), OverlayKey::Fork(1)]);
+        let many: Vec<OverlayHit> = (0..PROXY_POOL as i32 + 5).map(|at| hit(0, at * 30, OverlayKey::Run(at as usize))).collect();
+        assert_eq!(proxy_order(&many).len(), PROXY_POOL, "no more than there are controls");
+        assert_eq!(proxy_order(&[]), Vec::<OverlayKey>::new());
     }
 
     #[test]
