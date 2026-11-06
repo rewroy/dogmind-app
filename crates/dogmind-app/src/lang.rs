@@ -629,7 +629,8 @@ const JA: &[(&str, &str)] = &[
     ("It has a plan for you.", "計画を提案しています。"),
     ("What this session works toward, kept across turns: /goal text, /goal clear", "このセッションの目標。ターンをまたいで保つ: /goal 目標、/goal clear"),
     ("Goal: {0}", "目標: {0}"),
-    ("The goal is cleared.", "目標を消しました。"),
+    ("Goal", "目標"),
+    ("Clear the goal", "目標を消す"),
     ("No goal is set: /goal text sets one.", "目標はありません。/goal で設定できます。"),
     ("That session is at work: stop it first.", "そのセッションは作業中です。先に止めてください。"),
     // The window.
