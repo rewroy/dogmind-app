@@ -161,6 +161,37 @@ pub struct Question {
     pub answer: Sender<String>,
 }
 
+/// What a call of `ask_user` returns to the model, with the person's answer after it: the session keeps it, and a window that opens the session again reads the answer back from it.
+pub const ANSWERED: &str = "the person answered: ";
+/// What `submit_plan` returns to the model when the plan is approved, and (with the change asked for after it) when it is not.
+pub const PLAN_APPROVED: &str = "the person approved the plan, and plan mode is over: carry the plan out now, in this turn";
+pub const PLAN_CHANGE: &str = "the person wants the plan changed, and plan mode goes on: ";
+
+/// The answer in the result of an `ask_user` call that the session kept; none when the call failed, or was stopped before it was answered.
+pub fn answer_in(result: &str) -> Option<&str> {
+    result.strip_prefix(ANSWERED)
+}
+
+/// How a plan put to the person came out, as the session kept the result of its `submit_plan` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanOutcome {
+    Approved,
+    /// What the person asked to be changed.
+    Changes(String),
+    /// Stopped, or closed, before it was decided.
+    Undecided,
+}
+
+pub fn plan_outcome(result: &str) -> PlanOutcome {
+    if result == PLAN_APPROVED {
+        PlanOutcome::Approved
+    } else if let Some(change) = result.strip_prefix(PLAN_CHANGE) {
+        PlanOutcome::Changes(change.to_string())
+    } else {
+        PlanOutcome::Undecided
+    }
+}
+
 /// The plan the model put to the person in plan mode (`submit_plan`): carried out once approved, in the same turn, or changed as the person says.
 pub struct PlanReview {
     pub plan: String,
@@ -2326,7 +2357,7 @@ impl Agent {
         self.emit(Event::Question(Question { question, options, answer }));
         loop {
             match answered.recv_timeout(Duration::from_millis(200)) {
-                Ok(text) => return Ok(format!("the person answered: {}", text.trim())),
+                Ok(text) => return Ok(format!("{ANSWERED}{}", text.trim())),
                 Err(_) if self.cancelled() => return Err("the user stopped the turn before answering".into()),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err("the question was closed without an answer: decide by yourself, and say what you chose".into()),
@@ -2350,9 +2381,9 @@ impl Agent {
                     self.mode = Mode::Default;
                     self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode = Mode::Default;
                     self.emit(Event::ModeChanged(Mode::Default));
-                    return Ok("the person approved the plan, and plan mode is over: carry the plan out now, in this turn".into());
+                    return Ok(PLAN_APPROVED.into());
                 }
-                Ok(Err(change)) => return Ok(format!("the person wants the plan changed, and plan mode goes on: {}", change.trim())),
+                Ok(Err(change)) => return Ok(format!("{PLAN_CHANGE}{}", change.trim())),
                 Err(_) if self.cancelled() => return Err("the user stopped the turn before deciding on the plan".into()),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err("the plan was closed without an answer: stop here, in plan mode".into()),
@@ -3171,6 +3202,16 @@ mod tests {
         let (log, _) = until_end(&run, Decision::Reject);
         assert!(log.iter().any(|line| line.starts_with("tool:false") && line.contains("two to four options")), "{log:?}");
         drop(bodies);
+    }
+
+    /// What a session keeps of the two calls is what a window that opens it again reads the answer and the outcome from.
+    #[test]
+    fn what_a_session_keeps_of_a_question_and_a_plan_reads_back() {
+        assert_eq!(answer_in(&format!("{ANSWERED}Postgres")), Some("Postgres"));
+        assert_eq!(answer_in("error: the user stopped the turn before answering"), None);
+        assert_eq!(plan_outcome(PLAN_APPROVED), PlanOutcome::Approved);
+        assert_eq!(plan_outcome(&format!("{PLAN_CHANGE}use a modal")), PlanOutcome::Changes("use a modal".into()));
+        assert_eq!(plan_outcome("error: the user stopped the turn before deciding on the plan"), PlanOutcome::Undecided);
     }
 
     /// In plan mode the model puts its plan to the person (submit_plan): the window is told the plan, and approved, plan mode ends (the window is
