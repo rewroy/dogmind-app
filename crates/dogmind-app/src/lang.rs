@@ -325,6 +325,10 @@ const JA: &[(&str, &str)] = &[
     ("Get it too", "一緒に取得する"),
     ("That can be done once the work under way has ended.", "今の作業が終わるとできるようになります。"),
     ("Setting up the vision file...", "画像用ファイルを準備しています..."),
+    ("Getting the faster-writing data...", "高速化データを取得しています..."),
+    ("The faster-writing data is off. Its file stays in {0}, and turning it on again needs no download.", "高速化データをオフにしました。ファイルは {0} に残っているので、もう一度オンにしてもダウンロードは要りません。"),
+    ("The faster-writing data is not in {0}.", "高速化データが {0} にありません。"),
+    ("No model is set up here.", "ここにはモデルが設定されていません。"),
     ("This model can't read pictures.", "このモデルは画像を読めません。"),
     ("This model's vision file did not load. Its log says why: /log", "このモデルの画像用ファイルを読み込めませんでした。理由はログにあります: /log"),
     ("Fetching the vision file.", "画像用ファイルを取得しています。"),
@@ -996,7 +1000,7 @@ mod tests {
     fn everything_the_code_asks_for_has_its_japanese() {
         let table: HashMap<&str, &str> = JA.iter().copied().collect();
         let mut missing = Vec::new();
-        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs")] {
+        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("drafter.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs")] {
             for words in words_in(source) {
                 if !table.contains_key(words.as_str()) {
                     missing.push(words);

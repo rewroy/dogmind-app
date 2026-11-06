@@ -45,6 +45,7 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::attach;
+use crate::drafter;
 use crate::engine::{self, Catalog, CatalogEntry, Engine, Refusal, SetupLine};
 use crate::preview::{self, Preview};
 use crate::icon;
@@ -1867,7 +1868,10 @@ struct App {
     panel_log: String,
     progress: Option<f64>,
     kind: Kind,
+    /// For a model not yet there: whether to fetch its drafter with it. Of the model that is there, the settings say.
     drafter: bool,
+    /// The folder of a drafter being fetched on its own for the model that is there: this download is for it and no more.
+    drafter_fetch: Option<PathBuf>,
     // State.
     pending: Option<Approval>,
     tools_running: HashMap<String, (String, String)>,
@@ -8660,12 +8664,97 @@ impl App {
         }
     }
 
+    /// A file alone is being fetched for the model that is there: its progress has a bar of its own, not one nearly full with the model.
+    fn fetching_alone(&self) -> bool {
+        self.vision_fetch || self.drafter_fetch.is_some()
+    }
+
+    /// The model set up, when the Models page is about it and it has a drafter: its settings say what the row says. Another one chosen is still only a choice, and only the list says
+    /// which models have a drafter.
+    fn drafter_for_installed(&self) -> Option<crate::vision::Installed> {
+        let installed = self.vision_for_installed()?;
+        self.catalog.iter().find(|entry| entry.is(&installed.bundle)).filter(|entry| entry.drafter_bytes.is_some()).map(|_| installed)
+    }
+
+    /// Whether the row stands on: as the settings of the model set up say, or the choice made.
+    fn drafter_is_on(&self) -> bool {
+        if self.drafter_fetch.is_some() {
+            return true;
+        }
+        match self.drafter_for_installed() {
+            Some(installed) => installed.drafter,
+            None => self.drafter,
+        }
+    }
+
     unsafe fn update_drafter_chip(&self) {
+        let on = self.drafter_is_on();
         if self.modal_open {
-            set_button_style(self.drafter_chip, if self.drafter { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
+            set_button_style(self.drafter_chip, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         } else {
             set_button_style(self.drafter_chip, ButtonKind::Select, theme::background());
-            set_text(self.drafter_chip, if self.drafter { t("Build it too (about 5 GB more to download)") } else { t("Leave it out") });
+            set_text(self.drafter_chip, if on { t("Build it too (about 5 GB more to download)") } else { t("Leave it out") });
+        }
+    }
+
+    /// The row used: on the settings of the model set up, or only as a choice for one to come.
+    unsafe fn drafter_clicked(&mut self) {
+        let Some(installed) = self.drafter_for_installed() else {
+            self.drafter = !self.drafter;
+            self.update_drafter_chip();
+            self.layout();
+            return;
+        };
+        if self.setting_up {
+            return;
+        }
+        if self.engine_is_busy() {
+            let words = t("That can be done once the work under way has ended.");
+            if self.panel == Panel::Chat { self.say(words) } else { self.problem_in_panel(words) }
+            return;
+        }
+        if installed.drafter {
+            self.start_drafter_off(&installed);
+        } else {
+            self.start_drafter_setup(&installed);
+        }
+    }
+
+    /// The drafter alone for the model that is there, with the progress, the cancel and the going on from where it stopped of the model's own download: its shards are not read again. The
+    /// settings take it in when it is built (`Note::SetupDone`), and the engine starts again with it.
+    unsafe fn start_drafter_setup(&mut self, installed: &crate::vision::Installed) {
+        let Some(straydog) = engine::find(&self.settings) else {
+            let words = engine::not_found_words();
+            if self.panel == Panel::Chat { self.say(words) } else { self.problem_in_panel(words) }
+            return;
+        };
+        let folder = drafter::directory(installed);
+        let args = drafter::fetch_arguments(&folder);
+        self.drafter_fetch = Some(folder);
+        self.run_setup(straydog, args, t("Getting the faster-writing data...").to_string());
+        self.update_drafter_chip();
+        if self.panel == Panel::Chat {
+            self.layout();
+        }
+    }
+
+    /// The engine's next start has no drafter, and it starts again now. Its file stays where it is: setup never takes one away, and turning the row on again needs no download.
+    unsafe fn start_drafter_off(&mut self, installed: &crate::vision::Installed) {
+        match drafter::turn_off(&engine::config_path(&self.folder)) {
+            Ok(_) => {
+                let words = tf("The faster-writing data is off. Its file stays in {0}, and turning it on again needs no download.", &[&shown_path(&drafter::directory(installed))]);
+                if self.panel == Panel::Chat { self.say(&words) } else { self.say_in_panel(&words) }
+            }
+            Err(error) => {
+                if self.panel == Panel::Chat { self.say(&error) } else { self.problem_in_panel(&error) }
+                return;
+            }
+        }
+        self.update_drafter_chip();
+        self.layout();
+        if self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded) {
+            self.engine = None;
+            self.connect();
         }
     }
 
@@ -10758,6 +10847,7 @@ impl App {
                         self.offer_context(Some(0));
                         self.update_licence_link();
                         self.update_vision_chip();
+                        self.update_drafter_chip();
                     }
                     Err(error) => {
                         self.catalog.clear();
@@ -10853,13 +10943,13 @@ impl App {
                 SetupLine::Progress { stage, done, total } => {
                     self.setup_tally.hear(&SetupLine::Progress { stage: stage.clone(), done, total });
                     // (a file alone has a bar of its own: not one nearly full with the model that was there)
-                    let (place, words) = if self.vision_fetch { engine::setup_progress(&stage, done, total, &Default::default()) } else { engine::setup_progress(&stage, done, total, &self.setup_tally) };
+                    let (place, words) = if self.fetching_alone() { engine::setup_progress(&stage, done, total, &Default::default()) } else { engine::setup_progress(&stage, done, total, &self.setup_tally) };
                     self.progress = Some(place);
                     self.show_setup_status(words);
                 }
                 SetupLine::Text(text) => {
                     self.setup_tally.hear(&SetupLine::Text(text.clone()));
-                    if let Some((here, whole)) = self.setup_tally.overall().filter(|_| !self.vision_fetch) {
+                    if let Some((here, whole)) = self.setup_tally.overall().filter(|_| !self.fetching_alone()) {
                         self.progress = Some(here / whole);
                     }
                     if !text.is_empty() {
@@ -10901,12 +10991,19 @@ impl App {
                 let cancelled = self.setup_cancel.swap(false, Ordering::Relaxed);
                 self.setting_up = false;
                 let was_vision = std::mem::take(&mut self.vision_fetch);
+                let drafter_folder = self.drafter_fetch.take();
                 if was_vision && result.is_ok() {
                     self.vision_offer = None;
                     self.vision_told = false;
                 }
+                // The drafter that has been built goes into the settings, as setup would have put it, before the engine starts again.
+                let result = match (result, drafter_folder) {
+                    (Ok(()), Some(folder)) => drafter::turn_on(&engine::config_path(&self.folder), &folder).map(|_| ()),
+                    (result, _) => result,
+                };
                 if self.panel == Panel::Models {
                     self.update_vision_chip();
+                    self.update_drafter_chip();
                 }
                 if self.panel == Panel::Chat {
                     self.layout();
@@ -10993,7 +11090,7 @@ impl App {
             }
         }
         let vision = if self.vision_for_installed().is_some() { self.vision_is_on() } else { self.vision_wanted };
-        let mut args = engine::setup_arguments(entry.bundle.as_ref(), &folder, &engine::config_path(&self.folder), self.drafter, vision);
+        let mut args = engine::setup_arguments(entry.bundle.as_ref(), &folder, &engine::config_path(&self.folder), self.drafter_is_on(), vision);
         // One short of graphics memory is set up only when chosen, and by a Straydog that is told so: it refuses otherwise.
         if !entry.runs {
             if !engine::setup_can_force(&straydog) {
@@ -11026,6 +11123,8 @@ impl App {
             // A PC left alone for a download of hours does not sleep through it. It ends with this thread.
             windows_sys::Win32::System::Power::SetThreadExecutionState(windows_sys::Win32::System::Power::ES_CONTINUOUS | windows_sys::Win32::System::Power::ES_SYSTEM_REQUIRED);
             let waker = poster.clone();
+            // (a Straydog older than the app does not know every option: asked of its help, here and not on the window's thread)
+            let args = engine::for_this_straydog(&straydog, args);
             let mut tries = 0;
             let result = loop {
                 let waker = waker.clone();
@@ -12653,11 +12752,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_ALWAYS => app.answer_approval(Decision::Always),
                 ID_REJECT => app.answer_approval(Decision::Reject),
                 ID_NEW_SESSION => app.new_session(),
-                ID_DRAFTER => {
-                    app.drafter = !app.drafter;
-                    app.update_drafter_chip();
-                    app.layout();
-                }
+                ID_DRAFTER => app.drafter_clicked(),
                 ID_SPEED_FIRST => {
                     app.settings.speed_first = !app.settings.speed_first;
                     app.save();
@@ -12838,6 +12933,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     app.offer_context(selected);
                     app.update_licence_link();
                     app.update_vision_chip();
+                    app.update_drafter_chip();
                     app.layout();
                 }
                 ID_LIST if code == LBN_DBLCLK as usize && app.panel == Panel::Sessions => app.on_button(0),
@@ -13948,6 +14044,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             progress: None,
             kind: Kind::Server,
             drafter: true,
+            drafter_fetch: None,
             pending: None,
             tools_running: HashMap::new(),
             running: false,

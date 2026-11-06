@@ -5,6 +5,7 @@ mod attach;
 mod crash;
 mod design;
 mod diffview;
+mod drafter;
 mod engine;
 mod frametrace;
 mod icon;

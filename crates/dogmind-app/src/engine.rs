@@ -487,15 +487,36 @@ pub fn setup_can_force(straydog: &Path) -> bool {
     command.output().is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("--force"))
 }
 
-/// `bundle` names the bundle by all three labels, or only those it has (settings an older setup wrote); `None` leaves the choice to Straydog.
+/// Whether this Straydog's setup takes `option`, by the words of its help: `--mtp` is newer than the `straydog.exe` of 0.1.6, and an option setup does not know is refused.
+pub fn setup_takes(straydog: &Path, option: &str) -> bool {
+    let mut command = Command::new(straydog);
+    command.args(["setup", "--help"]).stdin(Stdio::null());
+    hidden(&mut command);
+    command.output().is_ok_and(|output| help_has(&String::from_utf8_lossy(&output.stdout), option))
+}
+
+/// Whether a help text lists `option` as an option of its own, at the start of a line (after a short form, if it has one): `--no-mtp` is not `--mtp`, and a sentence that names it is not its line.
+fn help_has(help: &str, option: &str) -> bool {
+    help.lines().any(|line| line.split_whitespace().take(2).any(|word| word.trim_end_matches(',') == option))
+}
+
+/// The arguments of a setup as this Straydog takes them: `--mtp` is left out for one that does not know it, which then decides the drafter by its own rule, as every Straydog
+/// did before. Anything else is as it was given.
+pub fn for_this_straydog(straydog: &Path, args: Vec<String>) -> Vec<String> {
+    if args.first().is_some_and(|first| first == "setup") && args.iter().any(|arg| arg == "--mtp") && !setup_takes(straydog, "--mtp") {
+        return args.into_iter().filter(|arg| arg != "--mtp").collect();
+    }
+    args
+}
+
+/// `bundle` names the bundle by all three labels, or only those it has (settings an older setup wrote); `None` leaves the choice to Straydog. With `drafter` the drafter is asked for
+/// whatever the graphics memory (setup's own rule would leave it out on a small card, and the person has said they want it), and without, left out.
 pub fn setup_arguments(bundle: Option<&Bundle>, folder: &Path, config: &Path, drafter: bool, vision: bool) -> Vec<String> {
     let mut args: Vec<String> = vec!["setup".into(), "--yes".into(), "--dir".into(), folder.display().to_string(), "--config".into(), config.display().to_string()];
     if let Some(bundle) = bundle {
         args.extend(bundle.arguments());
     }
-    if !drafter {
-        args.push("--no-mtp".into());
-    }
+    args.push(if drafter { "--mtp" } else { "--no-mtp" }.into());
     if !vision {
         args.push("--no-vision".into());
     }
@@ -985,8 +1006,9 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains(r"--dir D:\models\Qwen\IQ2_XS"), "the bundle's own folder, which setup then does not put a level down: {joined}");
         assert!(joined.contains("--model-name Qwen3.8-Flash-Next --provider ISTA-DASLab --quant IQ2_XS") && !joined.contains("--no-vision") && !joined.contains("--no-mtp") && joined.contains("--no-dspark"), "{joined}");
+        assert!(args.contains(&"--vision-only".to_string()) && args.contains(&"--mtp".to_string()), "the drafter it has is kept whatever the graphics memory: {joined}");
         let without = vision_arguments(&crate::vision::Installed { drafter: false, ..installed }, Path::new("C"));
-        assert!(without.contains(&"--no-mtp".to_string()), "a drafter it has not got is not fetched now");
+        assert!(without.contains(&"--no-mtp".to_string()) && !without.contains(&"--mtp".to_string()), "a drafter it has not got is not fetched now");
     }
 
     #[test]
@@ -1458,10 +1480,59 @@ mod tests {
         let args = setup_arguments(Some(&Bundle::new("Qwen3.8-Flash-Next", "ISTA-DASLab", "IQ2_XS")), Path::new("M"), Path::new("C"), false, true);
         assert_eq!(&args[..2], ["setup", "--yes"]);
         assert!(args.contains(&"--no-mtp".to_string()) && args.contains(&"IQ2_XS".to_string()));
+        assert!(!args.contains(&"--mtp".to_string()), "left out: setup refuses both");
         let chosen = setup_arguments(None, Path::new("M"), Path::new("C"), true, false);
         assert!(chosen.contains(&"--no-vision".to_string()), "left out when asked");
         assert!(!chosen.contains(&"--no-mtp".to_string()) && !chosen.contains(&"--quant".to_string()));
         assert!(!chosen.contains(&"--vision-only".to_string()), "only for a model already there");
+    }
+
+    /// The row on asks for the drafter whatever the graphics memory, with a bundle named and with Straydog's own choice; off, it is left out.
+    #[test]
+    fn the_drafter_is_asked_for_when_it_is_wanted_and_left_out_when_it_is_not() {
+        let count = |args: &[String], option: &str| args.iter().filter(|arg| *arg == option).count();
+        for bundle in [Some(Bundle::new("Qwen3.8-Flash-Next", "Unsloth", "UD-IQ1_S")), None] {
+            let on = setup_arguments(bundle.as_ref(), Path::new("M"), Path::new("C"), true, true);
+            assert_eq!((count(&on, "--mtp"), count(&on, "--no-mtp")), (1, 0), "{on:?}");
+            let off = setup_arguments(bundle.as_ref(), Path::new("M"), Path::new("C"), false, true);
+            assert_eq!((count(&off, "--mtp"), count(&off, "--no-mtp")), (0, 1), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn an_option_is_in_a_help_when_it_has_a_line_of_its_own() {
+        let old = "Options:\n      --no-vision           Leave out the vision encoder\n      --vision-only         Fetch only the vision encoder, for a model already set up: its shards are not\n                            read again\n      --no-mtp              Leave out the MTP drafter (Qwen3.8)\n  -y, --yes                 Ask nothing\n";
+        assert!(!help_has(old, "--mtp"), "--no-mtp is another option");
+        assert!(help_has(old, "--no-mtp") && help_has(old, "--yes"), "after a short form too");
+        let new = format!("{old}      --mtp                 Get the MTP drafter (Qwen3.8) even where this machine's VRAM would leave it out\n");
+        assert!(help_has(&new, "--mtp"));
+        // a sentence that names an option is not the option
+        assert!(!help_has("      --force  Set up; with --mtp or not\n", "--mtp"));
+    }
+
+    /// A Straydog is asked what its setup takes: a program that prints a help, here a batch file. `--mtp` stays for one that lists it, and goes for one that does not, which decides the
+    /// drafter itself, as it always did; every other argument stays, and so do the arguments of a program that is not setup.
+    #[test]
+    fn an_option_an_older_straydog_does_not_know_is_not_passed_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = |name: &str, lines: &[&str]| {
+            let file = dir.path().join(format!("{name}.cmd"));
+            std::fs::write(&file, format!("@echo off\r\n{}\r\n", lines.iter().map(|line| format!("echo {line}")).collect::<Vec<_>>().join("\r\n"))).unwrap();
+            file
+        };
+        let old = program("old", &["Options:", "      --no-mtp    Leave out the MTP drafter", "      --force     With --quant"]);
+        let new = program("new", &["Options:", "      --no-mtp    Leave out the MTP drafter", "      --mtp       Get the MTP drafter"]);
+        let args = |drafter| setup_arguments(Some(&Bundle::new("Qwen3.8-Flash-Next", "Unsloth", "UD-IQ1_S")), Path::new("M"), Path::new("C"), drafter, true);
+        assert!(!setup_takes(&old, "--mtp") && setup_takes(&new, "--mtp") && setup_takes(&old, "--force"));
+        let (for_old, for_new) = (for_this_straydog(&old, args(true)), for_this_straydog(&new, args(true)));
+        assert!(!for_old.contains(&"--mtp".to_string()) && !for_old.contains(&"--no-mtp".to_string()), "setup's own rule: {for_old:?}");
+        assert_eq!(for_old.len() + 1, for_new.len(), "only that one is gone");
+        assert!(for_new.contains(&"--mtp".to_string()));
+        assert_eq!(for_this_straydog(&old, args(false)), args(false), "--no-mtp is old enough for any Straydog");
+        let alone = vec!["fetch-mtp".to_string(), "--model-draft".to_string(), "M".to_string()];
+        assert_eq!(for_this_straydog(&old, alone.clone()), alone, "not a setup: nothing to ask");
+        // a program that cannot be run takes nothing
+        assert!(!setup_takes(&dir.path().join("none.exe"), "--mtp"));
     }
 
     #[test]
