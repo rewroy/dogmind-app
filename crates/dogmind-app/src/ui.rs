@@ -1802,6 +1802,8 @@ struct App {
     turn_failed: bool,
     /// The session's turns, the rows of the rewind panel, and the rows of the rules panel.
     turns: Vec<dogmind_agent::checkpoint::Turn>,
+    /// What each turn's edits changed (Event::TurnChanges), by the turn: the data of the card under its answer.
+    turn_changes: std::collections::BTreeMap<u64, Vec<dogmind_agent::tools::FileChange>>,
     rewind_rows: Vec<u64>,
     shown_rules: Vec<rules::Rule>,
     changes: Vec<FileChange>,
@@ -10598,6 +10600,17 @@ impl App {
                     self.append(&format!("{}\n", lines.join("\n")), Style::Tool);
                 }
             }
+            Event::TurnChanges { turn, files } => {
+                // (said under the answer, a line a file, till the card draws it: the files, and their lines added and removed)
+                if !files.is_empty() && !self.turn_changes.contains_key(&turn) {
+                    let shown: Vec<String> = files.iter().take(8).map(|file| if file.diff.is_empty() { format!("  {}", file.path) } else {
+                        format!("  {}  +{} -{}", file.path, file.added, file.removed)
+                    }).collect();
+                    let more = if files.len() > 8 { format!("\n  {}", tf("and {0} more", &[&(files.len() - 8).to_string()])) } else { String::new() };
+                    self.append(&format!("{}\n{}{more}\n", t("Files changed in this answer:"), shown.join("\n")), Style::Tool);
+                }
+                self.turn_changes.insert(turn, files);
+            }
             Event::Turns(turns) => {
                 self.turns = turns;
                 if self.turns.is_empty() {
@@ -14065,6 +14078,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             failed_sessions: HashSet::new(),
             turn_failed: false,
             turns: Vec::new(),
+            turn_changes: std::collections::BTreeMap::new(),
             rewind_rows: Vec::new(),
             shown_rules: Vec::new(),
             changes: Vec::new(),
