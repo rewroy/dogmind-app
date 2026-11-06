@@ -888,6 +888,12 @@ enum CardAct {
     Carry,
     /// The plan is to be changed: what is written next says how.
     Change,
+    /// The changes of this file of an answer (the turn, and the file's place in its card), on the Changes page.
+    OpenDiff(u64, usize),
+    /// The file itself, in its own app, or shown in Explorer.
+    OpenFile(u64, usize),
+    /// All the files of an answer, on the Changes page.
+    MoreFiles(u64),
 }
 
 /// One control of a card, on a row of its room.
@@ -1902,6 +1908,8 @@ struct App {
     changes: Vec<FileChange>,
     /// The file to show first when the changes come, chosen in the panel on the right.
     change_wanted: Option<usize>,
+    /// The files of one answer, which the Changes page lists in place of the workspace's, when it was opened from the card under that answer.
+    turn_view: Option<Vec<FileChange>>,
     // The panel on the right.
     right_width: i32,
     right_toggle: HWND,
@@ -4473,6 +4481,9 @@ impl App {
     /// transcript is written from, so that the transcript written again, at another width or in another theme, writes it as it stands then.
     unsafe fn write_card(&mut self, card: &Card) {
         let recording = !self.replaying;
+        // (a question or a plan is for the person, and is seen: the view goes to it. The files an answer changed come under it, and the view goes there only if it was at the end)
+        let attention = !matches!(card, Card::Files { .. });
+        let at_the_end = recording && !self.opening && self.transcript_at_end();
         if recording {
             self.close_run();
             self.end_line();
@@ -4529,15 +4540,38 @@ impl App {
                 }
                 self.card_row(&[" "], 6, theme::muted(), 80, false);
             }
+            Card::Files { turn, rows, more, added, removed } => {
+                let count = rows.len() + more;
+                let files = if count == 1 { t("1 file").to_string() } else { tf("{0} files", &[&count]) };
+                let words = format!("{}  ·  {files}  ·  +{added}  \u{2212}{removed}", t("Changed in this answer"));
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                self.card_row(&[&words], 8, theme::muted(), 26, false);
+                self.card_room(s(4), Vec::new(), false);
+                let widest = cards::most_changed(rows);
+                for (at, row) in rows.iter().enumerate() {
+                    let (green, red) = cards::bar(row.added, row.removed, widest);
+                    // (a file that is gone, or that is a program, is shown in Explorer and not opened)
+                    let (icon, tip) = if cards::opens_in_app(&row.path) && self.workspace.join(&row.path).is_file() { ("external-link", t("Open in its app")) } else { ("folder", t("Show in Explorer")) };
+                    let file = CardPart { text: file_row_text(row.added, row.removed, green, red, &row.path), kind: ButtonKind::FileRow, act: CardAct::OpenDiff(*turn, at), width: 0, tip: String::new() };
+                    let open = CardPart { text: icon.to_string(), kind: ButtonKind::Icon, act: CardAct::OpenFile(*turn, at), width: s(ds::size::ICON_BUTTON), tip: tip.to_string() };
+                    self.card_room(s(30), vec![file, open], false);
+                }
+                if *more > 0 {
+                    let rest = CardPart { text: tf("and {0} more", &[more]), kind: ButtonKind::Ghost, act: CardAct::MoreFiles(*turn), width: 0, tip: String::new() };
+                    self.card_room(s(28), vec![rest], false);
+                }
+                self.card_row(&[" "], 6, theme::muted(), 80, false);
+            }
         }
         self.replaying = held;
         self.line_start = true;
         self.para_next = Some(Para::AfterBlock);
         if recording && !self.opening {
-            // (what is asked is seen: the view goes to the end of it)
-            self.follow_end = true;
-            self.scrolled_up_at = None;
-            self.want_frames();
+            if attention || at_the_end {
+                self.follow_end = true;
+                self.scrolled_up_at = None;
+                self.want_frames();
+            }
             self.place_copy_buttons();
             self.place_thumb();
         }
@@ -4643,6 +4677,39 @@ impl App {
         }
     }
 
+    /// Whether the view is at the end of the transcript, or there is nothing to scroll.
+    unsafe fn transcript_at_end(&self) -> bool {
+        let mut bar: SCROLLINFO = std::mem::zeroed();
+        bar.cbSize = std::mem::size_of::<SCROLLINFO>() as u32;
+        bar.fMask = SIF_ALL;
+        GetScrollInfo(self.transcript, SB_VERT, &mut bar);
+        bar.nPage == 0 || bar.nPos + bar.nPage as i32 + 4 >= bar.nMax
+    }
+
+    /// The files an answer changed, on the Changes page: with the diff of file `at` of its card in view, or from the first.
+    unsafe fn open_turn_diff(&mut self, turn: u64, at: usize) {
+        let Some(files) = self.turn_changes.get(&turn).cloned() else { return };
+        self.turn_view = Some(files);
+        self.change_wanted = Some(at);
+        self.set_panel(Panel::Diff);
+    }
+
+    /// A file of an answer's card, in its own app, or shown in Explorer when it is a program (which the app does not run), or no longer there.
+    unsafe fn open_turn_file(&mut self, turn: u64, at: usize) {
+        let Some(path) = self.turn_changes.get(&turn).and_then(|files| files.get(at)).map(|file| file.path.clone()) else { return };
+        let file = self.workspace.join(&path);
+        let (verb, target, arguments) = if file.is_file() && cards::opens_in_app(&path) {
+            ("open", file.to_string_lossy().replace('/', "\\"), String::new())
+        } else if file.is_file() {
+            ("open", "explorer.exe".to_string(), format!("/select,\"{}\"", file.to_string_lossy().replace('/', "\\")))
+        } else {
+            // (gone: the folder it was in)
+            ("open", "explorer.exe".to_string(), format!("\"{}\"", file.parent().unwrap_or(&self.workspace).to_string_lossy().replace('/', "\\")))
+        };
+        let (verb, target, arguments) = (wide(verb), wide(&target), wide(&arguments));
+        ShellExecuteW(self.window, verb.as_ptr(), target.as_ptr(), if arguments.len() > 1 { arguments.as_ptr() } else { std::ptr::null() }, std::ptr::null(), SW_SHOWNORMAL);
+    }
+
     unsafe fn card_pressed(&mut self, slot: usize) {
         let Some(act) = self.card_targets.get(slot).cloned().flatten() else { return };
         match act {
@@ -4657,6 +4724,9 @@ impl App {
                 self.decide_plan(Ok(()));
             }
             CardAct::Change => self.plan_change_asked(),
+            CardAct::OpenDiff(turn, at) => self.open_turn_diff(turn, at),
+            CardAct::OpenFile(turn, at) => self.open_turn_file(turn, at),
+            CardAct::MoreFiles(turn) => self.open_turn_diff(turn, 0),
         }
     }
 
@@ -7515,6 +7585,10 @@ impl App {
             InvalidateRect(field, std::ptr::null(), 0);
         }
         self.panel = panel;
+        // (the files of one answer are listed on the Changes page that its card opened, and are not what the next opening of it lists)
+        if panel != Panel::Diff && self.turn_view.take().is_some() {
+            self.refresh_changes();
+        }
         // (the About page's button waits while a look is going on, and is not to stay that way on another page)
         EnableWindow(self.buttons[1], 1);
         self.panel_log.clear();
@@ -11236,13 +11310,9 @@ impl App {
                 }
             }
             Event::TurnChanges { turn, files } => {
-                // (said under the answer, a line a file, till the card draws it: the files, and their lines added and removed)
+                // (a card under the answer: the files, and their lines added and removed)
                 if !files.is_empty() && !self.turn_changes.contains_key(&turn) {
-                    let shown: Vec<String> = files.iter().take(8).map(|file| if file.diff.is_empty() { format!("  {}", file.path) } else {
-                        format!("  {}  +{} -{}", file.path, file.added, file.removed)
-                    }).collect();
-                    let more = if files.len() > 8 { format!("\n  {}", tf("and {0} more", &[&(files.len() - 8).to_string()])) } else { String::new() };
-                    self.append(&format!("{}\n{}{more}\n", t("Files changed in this answer:"), shown.join("\n")), Style::Tool);
+                    self.write_card(&Card::files(turn, &files));
                 }
                 self.turn_changes.insert(turn, files);
             }
@@ -11553,6 +11623,11 @@ impl App {
                 if path != self.workspace {
                     return;
                 }
+                // (opened from the card under an answer: that answer's files, with their diffs, and nothing the workspace has besides)
+                let found = match (&self.turn_view, self.panel == Panel::Diff) {
+                    (Some(files), true) => Ok(files.clone()),
+                    _ => found,
+                };
                 if self.panel != Panel::Diff {
                     self.changes = found.unwrap_or_default();
                     self.layout();
@@ -14784,6 +14859,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             shown_rules: Vec::new(),
             changes: Vec::new(),
             change_wanted: None,
+            turn_view: None,
             right_width: 0,
             right_toggle: make_button(window, ID_PANEL_TOGGLE, "panel-right", ButtonKind::Icon, theme::background()),
             right_hits: Vec::new(),

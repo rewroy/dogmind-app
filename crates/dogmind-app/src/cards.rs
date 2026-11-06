@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use dogmind_agent::agent::{self, PlanOutcome};
 use dogmind_agent::message::Message;
+use dogmind_agent::tools::FileChange;
 use serde_json::Value;
 
 /// Where a question stands.
@@ -30,19 +31,42 @@ pub enum PlanState {
     Undecided,
 }
 
+/// One file of the card of an answer's changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRow {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
+    /// Whether there is a diff to show: a file that is binary, or too large to be read, has none.
+    pub has_diff: bool,
+}
+
 /// What a card of the transcript is: it is kept with the rest of what the transcript is written from, and written again, in whatever state it has come to, as the window changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Card {
     Question { id: u64, question: String, options: Vec<(String, String)>, state: AnswerState },
     Plan { id: u64, plan: String, state: PlanState },
+    /// The files turn `turn`'s edits changed: as many as the card lists, how many more there are, and the lines added and removed in all of them.
+    Files { turn: u64, rows: Vec<FileRow>, more: usize, added: usize, removed: usize },
 }
+
+/// How many files a card lists: the rest are counted, and the Changes page has all of them.
+pub const MOST_FILES: usize = 8;
 
 impl Card {
     /// The number a card has, which says which it is among those of the transcript.
     pub fn id(&self) -> Option<u64> {
         match self {
             Card::Question { id, .. } | Card::Plan { id, .. } => Some(*id),
+            Card::Files { .. } => None,
         }
+    }
+
+    /// The card of the files turn `turn`'s edits changed.
+    pub fn files(turn: u64, changes: &[FileChange]) -> Card {
+        let rows = changes.iter().take(MOST_FILES).map(|change| FileRow { path: change.path.clone(), added: change.added, removed: change.removed, has_diff: !change.diff.is_empty() }).collect();
+        let (added, removed) = changes.iter().fold((0, 0), |(added, removed), change| (added + change.added, removed + change.removed));
+        Card::Files { turn, rows, more: changes.len().saturating_sub(MOST_FILES), added, removed }
     }
 
     /// The card of a call of `ask_user` or `submit_plan` that a session kept. `result` is what the call returned: none for a call that has no result, which is one still waiting (the window is told of it as it
@@ -101,6 +125,42 @@ pub fn is_asking(tool: &str) -> bool {
 /// Whether what was typed while a plan waits approves it. Anything else is what to change.
 pub fn approves(typed: &str) -> bool {
     matches!(typed.trim().trim_end_matches(['.', '!', '。', '！']).to_lowercase().as_str(), "yes" | "y" | "ok" | "go" | "はい" | "うん" | "承認" | "実行" | "お願い")
+}
+
+/// How many parts a file's bar has: as many as its length in whole, however many lines it changed.
+pub const BAR_PARTS: usize = 8;
+
+/// A file's bar: how many of its parts are added lines (green) and how many removed (red), against the file of the card that changed most. A file that changed at all has a part, and
+/// one that changed a tenth of the most has no more than that.
+pub fn bar(added: usize, removed: usize, most: usize) -> (usize, usize) {
+    let total = added + removed;
+    if total == 0 || most == 0 {
+        return (0, 0);
+    }
+    let parts = (total * BAR_PARTS).div_ceil(most).clamp(1, BAR_PARTS);
+    let green = if parts == 1 {
+        usize::from(added >= removed)
+    } else if added > 0 && removed > 0 {
+        // (lines of both kinds show both)
+        ((added * parts + total / 2) / total).clamp(1, parts - 1)
+    } else {
+        (added * parts) / total
+    };
+    (green, parts - green)
+}
+
+/// The most lines one file of the rows changed.
+pub fn most_changed(rows: &[FileRow]) -> usize {
+    rows.iter().map(|row| row.added + row.removed).max().unwrap_or(0)
+}
+
+/// Whether a file of the card is opened with its own app. What is a program or a script is not: opened, it would run, and what the agent wrote is not for that. These are shown in Explorer.
+pub fn opens_in_app(path: &str) -> bool {
+    const RUNS: [&str; 30] = [
+        "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp", "scr", "lnk", "url", "reg", "hta", "cpl", "jar", "pif", "appx", "msix", "dll", "sys", "py", "pyw", "sh", "gadget",
+    ];
+    let extension = path.rsplit(['/', '\\']).next().and_then(|name| name.rsplit_once('.')).map_or(String::new(), |(_, extension)| extension.to_lowercase());
+    !RUNS.contains(&extension.as_str())
 }
 
 /// What goes back to the model for what was typed while a question waits: a choice's number stands for the choice, anything else is the answer as it was written.
@@ -199,6 +259,51 @@ mod tests {
         }
         for change in ["use a modal", "no", "yes but smaller", ""] {
             assert!(!approves(change), "{change}");
+        }
+    }
+
+    #[test]
+    fn the_card_of_an_answers_files_lists_a_few_and_counts_the_rest() {
+        let change = |path: &str, added: usize, removed: usize| FileChange { path: path.into(), added, removed, diff: if added + removed == 0 { String::new() } else { "@@\n+x\n".into() } };
+        let few = Card::files(3, &[change("a.rs", 4, 1), change("logo.png", 0, 0)]);
+        assert_eq!(few, Card::Files { turn: 3, rows: vec![FileRow { path: "a.rs".into(), added: 4, removed: 1, has_diff: true }, FileRow { path: "logo.png".into(), added: 0, removed: 0, has_diff: false }], more: 0, added: 4, removed: 1 });
+        let many: Vec<FileChange> = (0..MOST_FILES + 5).map(|at| change(&format!("f{at}.txt"), 2, 1)).collect();
+        match Card::files(4, &many) {
+            Card::Files { rows, more, added, removed, .. } => assert_eq!((rows.len(), more, added, removed), (MOST_FILES, 5, 2 * (MOST_FILES + 5), MOST_FILES + 5)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(few.id(), None, "a card of files is told by its turn");
+    }
+
+    #[test]
+    fn a_file_bar_says_how_much_changed_and_of_what_kind() {
+        assert_eq!(bar(0, 0, 10), (0, 0), "nothing changed, no bar");
+        assert_eq!(bar(1, 0, 1), (BAR_PARTS, 0), "the file that changed most has the whole bar");
+        assert_eq!(bar(5, 5, 10), (BAR_PARTS / 2, BAR_PARTS / 2));
+        assert_eq!(bar(0, 40, 40), (0, BAR_PARTS), "only removed lines: all red");
+        assert_eq!(bar(1, 0, 100), (1, 0), "a little change still shows");
+        let (green, red) = bar(2, 1, 100);
+        assert_eq!(green + red, 1, "a part is all a tenth of the most has");
+        // (lines of both kinds show both when there is room for both)
+        let (green, red) = bar(99, 1, 100);
+        assert!(green >= 1 && red >= 1 && green + red == BAR_PARTS, "{green} {red}");
+        assert_eq!(bar(3, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn the_file_that_changed_most_sets_the_bars_scale() {
+        let row = |added: usize, removed: usize| FileRow { path: "x".into(), added, removed, has_diff: true };
+        assert_eq!(most_changed(&[row(2, 1), row(10, 4), row(1, 0)]), 14);
+        assert_eq!(most_changed(&[]), 0);
+    }
+
+    #[test]
+    fn a_program_the_agent_wrote_is_shown_in_explorer_and_not_run() {
+        for safe in ["notes.md", "src/app.rs", "logo.PNG", "data.csv", "README", "dir\\report.pdf"] {
+            assert!(opens_in_app(safe), "{safe}");
+        }
+        for risky in ["setup.exe", "run.BAT", "tools\\x.ps1", "a.vbs", "a.js", "a.lnk", "build.cmd", "pkg.msi", "x.dll", "run.py", "go.sh"] {
+            assert!(!opens_in_app(risky), "{risky}");
         }
     }
 

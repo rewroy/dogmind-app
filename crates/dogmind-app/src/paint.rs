@@ -891,6 +891,8 @@ pub enum ButtonKind {
     Danger = 17,
     /// One of the choices a card puts to the person: its number, its label, what it means, and a mark on the one the model suggests (`choice_text`).
     Choice = 18,
+    /// A file of the card of an answer's changes: its name, its lines added and removed and a small bar of them (`file_row_text`).
+    FileRow = 19,
     /// The frame a field of a card stands in; the field itself is a control of its own over it.
     Frame = 20,
 }
@@ -901,6 +903,11 @@ pub const PART: char = '\u{1F}';
 /// The text of a `Choice` button.
 pub fn choice_text(number: usize, suggested: &str, label: &str, meaning: &str) -> String {
     format!("{number}{PART}{suggested}{PART}{label}{PART}{meaning}")
+}
+
+/// The text of a `FileRow` button: lines added and removed, the parts of its bar that are green and red, and the file's name.
+pub fn file_row_text(added: usize, removed: usize, green: usize, red: usize, path: &str) -> String {
+    format!("{added}{PART}{removed}{PART}{green}{PART}{red}{PART}{path}")
 }
 
 /// The id of the field of a card, which a `Frame` button looks for the focus of.
@@ -1256,6 +1263,34 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
                 draw_text(device, name, RECT { left: area.left, right: area.right, top: s(7), bottom: height / 2 + s(2) }, fonts.strong, theme::text(), ONE_LINE);
                 draw_text(device, meaning, RECT { left: area.left, right: area.right, top: height / 2, bottom: height - s(7) }, fonts.small, theme::muted(), ONE_LINE);
             }
+        }
+        19 => {
+            let mut parts = label.split(PART);
+            let mut number = || parts.next().and_then(|part| part.parse::<usize>().ok()).unwrap_or(0);
+            let (added, removed, green, red) = (number(), number(), number(), number());
+            let path = parts.next().unwrap_or("");
+            if lit {
+                rounded(device, client, s(radius::SMALL), Some(theme::raised()), None);
+            }
+            let right = client.right - s(design::space::M);
+            let mut left_of_numbers = right;
+            // The bar: all its parts, the lines added green, the lines removed red, and what is left of it the card's line.
+            if added + removed > 0 {
+                let (cell, gap, tall) = (s(5), s(1), s(10));
+                let across = crate::cards::BAR_PARTS as i32 * (cell + gap) - gap;
+                let top = (height - tall) / 2;
+                for part in 0..crate::cards::BAR_PARTS {
+                    let color = if part < green { theme::good() } else if part < green + red { theme::bad() } else { theme::line() };
+                    rounded(device, rect(right - across + part as i32 * (cell + gap), top, cell, tall), s(1), Some(color), None);
+                }
+                left_of_numbers = right - across - s(design::space::M);
+                let (minus, plus) = (format!("\u{2212}{removed}"), format!("+{added}"));
+                let (minus_width, plus_width) = (text_width(fonts.small, &minus), text_width(fonts.small, &plus));
+                draw_text(device, &minus, RECT { left: left_of_numbers - minus_width, right: left_of_numbers, top: 0, bottom: height }, fonts.small, theme::bad(), DT_RIGHT | ONE_LINE);
+                draw_text(device, &plus, RECT { left: left_of_numbers - minus_width - s(design::space::S) - plus_width, right: left_of_numbers - minus_width - s(design::space::S), top: 0, bottom: height }, fonts.small, theme::good(), DT_RIGHT | ONE_LINE);
+                left_of_numbers -= minus_width + plus_width + s(design::space::S) + s(design::space::M);
+            }
+            draw_text(device, path, RECT { left: client.left + s(design::space::M), right: left_of_numbers, top: 0, bottom: height }, fonts.body, if lit { theme::text() } else { theme::soft() }, (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS);
         }
         20 => {
             let focused = {
