@@ -90,6 +90,9 @@ pub fn schemas() -> Value {
             "question": {"type": "string", "description": "One question, complete on its own: the person may see only it."},
             "options": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "description": {"type": "string", "description": "What choosing it means."}}, "required": ["label"]}}
         }), &["question", "options"]),
+        function("submit_plan", "In plan mode, when the plan is ready: put it to the person to approve. Approved, plan mode ends and you carry it out in the same turn; otherwise you are told what to change.", json!({
+            "plan": {"type": "string", "description": "The plan in Markdown: what changes, where, and why, in steps."}
+        }), &["plan"]),
         function("todo", "A checklist, only for work with several separate deliverables. Send only what changed.", json!({
             "todos": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "doing", "done", "blocked"]}}, "required": ["id"]}},
             "merge": {"type": "boolean", "description": "false: replace the whole list."}
@@ -2908,7 +2911,7 @@ mod tests {
     fn every_generated_schema_has_a_tool() {
         let schemas = schemas();
         let names: Vec<&str> = schemas.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "ask_user", "todo", "find_files", "check_page", "command_status", "command_stop", "explore"]);
+        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "ask_user", "submit_plan", "todo", "find_files", "check_page", "command_status", "command_stop", "explore"]);
     }
 
     #[test]

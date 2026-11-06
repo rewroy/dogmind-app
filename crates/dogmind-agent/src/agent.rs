@@ -158,6 +158,13 @@ pub struct Question {
     pub answer: Sender<String>,
 }
 
+/// The plan the model put to the person in plan mode (`submit_plan`): carried out once approved, in the same turn, or changed as the person says.
+pub struct PlanReview {
+    pub plan: String,
+    /// Ok: approved, and plan mode ends. Err: what to change; the model goes on planning.
+    pub answer: Sender<Result<(), String>>,
+}
+
 pub enum Event {
     SessionStarted { path: PathBuf, workspace: PathBuf, transcript: Vec<Message> },
     /// A new session's first message has given it a file.
@@ -182,6 +189,10 @@ pub enum Event {
     Approval(Approval),
     /// The model asks the person (ask_user); the turn waits for the answer, or for the turn to be stopped.
     Question(Question),
+    /// A plan waits for the person's approval (submit_plan): the turn waits.
+    PlanReview(PlanReview),
+    /// The agent changed the mode (a plan approved ends plan mode): the window shows and keeps it.
+    ModeChanged(Mode),
     Usage { used: u64, window: u64, usage: Usage },
     Todos(Vec<Value>),
     /// Whether web content is in this conversation, so that commands ask.
@@ -1483,7 +1494,7 @@ impl Agent {
             self.bench.scratch = None;
         }
         if self.mode == Mode::Plan {
-            message = prompt::with_note(&message, "## Plan Mode\nThe user wants a plan first. Look as much as you need with the read-only tools, then set out what you would change and why, and stop there. Nothing can be changed in this mode: the user leaves it when they accept the plan.");
+            message = prompt::with_note(&message, "## Plan Mode\nThe user wants a plan first. Look as much as you need with the read-only tools, then set out what you would change and why, and put it to the user with submit_plan. Nothing can be changed in this mode: once the user approves the plan, plan mode ends and you carry it out.");
         }
         // What was attached, as files: the model sees the pictures, but a page that shows one needs it in the workspace.
         #[cfg(windows)]
@@ -2291,6 +2302,32 @@ impl Agent {
         }
     }
 
+    /// The plan put to the person in plan mode (submit_plan). Approved, plan mode ends (to asking for edits, as the default mode does) and the
+    /// model carries the plan out in the same turn; otherwise it is told what to change and goes on planning. Outside plan mode there is nothing
+    /// to approve. Stopped, or with the window gone, the call fails.
+    fn submit_plan(&mut self, arguments: &Value) -> Result<String, String> {
+        if self.mode != Mode::Plan {
+            return Err("not in plan mode: there is no plan to approve, carry out the work".into());
+        }
+        let plan = arguments.get("plan").and_then(Value::as_str).map(str::trim).filter(|plan| !plan.is_empty()).ok_or("plan is required")?.to_string();
+        let (answer, answered) = channel();
+        self.emit(Event::PlanReview(PlanReview { plan, answer }));
+        loop {
+            match answered.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(())) => {
+                    self.mode = Mode::Default;
+                    self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mode = Mode::Default;
+                    self.emit(Event::ModeChanged(Mode::Default));
+                    return Ok("the person approved the plan, and plan mode is over: carry the plan out now, in this turn".into());
+                }
+                Ok(Err(change)) => return Ok(format!("the person wants the plan changed, and plan mode goes on: {}", change.trim())),
+                Err(_) if self.cancelled() => return Err("the user stopped the turn before deciding on the plan".into()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err("the plan was closed without an answer: stop here, in plan mode".into()),
+            }
+        }
+    }
+
     fn run_one(&mut self, call: &crate::message::ToolCall) -> usize {
         let name = call.function.name.as_str();
         let started = Instant::now();
@@ -2324,6 +2361,12 @@ impl Agent {
                 self.finish_call_with(&call.id, result, false, started.elapsed(), pictures);
                 return failed;
             }
+        }
+        if name == "submit_plan" {
+            let result = self.submit_plan(&arguments);
+            let failed = usize::from(result.is_err());
+            self.finish_call(&call.id, result, false, started.elapsed());
+            return failed;
         }
         if name == "ask_user" {
             let result = self.ask_user(&arguments);
@@ -3094,6 +3137,46 @@ mod tests {
         let (log, _) = until_end(&run, Decision::Reject);
         assert!(log.iter().any(|line| line.starts_with("tool:false") && line.contains("two to four options")), "{log:?}");
         drop(bodies);
+    }
+
+    /// In plan mode the model puts its plan to the person (submit_plan): the window is told the plan, and approved, plan mode ends (the window is
+    /// told the new mode) and the next request has the approval. A change asked for keeps plan mode and goes back as words.
+    #[test]
+    fn an_approved_plan_ends_plan_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = serde_json::json!({"plan": "1. Add a page\n2. Link it"});
+        let (client, bodies) = server(vec![call_answer("submit_plan", plan.clone()), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Plan);
+        run.handle.commands.send(Command::Send("add a page".into())).unwrap();
+        let (mut shown, mut changed) = (None, None);
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::PlanReview(review) => {
+                    shown = Some(review.plan.clone());
+                    review.answer.send(Ok(())).unwrap();
+                }
+                Event::ModeChanged(mode) => changed = Some(mode),
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(shown.as_deref(), Some("1. Add a page\n2. Link it"));
+        assert_eq!(changed, Some(Mode::Default));
+        assert_eq!(run.handle.live.lock().unwrap().mode, Mode::Default);
+        assert!(bodies.lock().unwrap()[1].to_string().contains("approved the plan"));
+
+        let (client, bodies) = server(vec![call_answer("submit_plan", plan), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Plan);
+        run.handle.commands.send(Command::Send("add a page".into())).unwrap();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::PlanReview(review) => review.answer.send(Err("use a modal instead".into())).unwrap(),
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(run.handle.live.lock().unwrap().mode, Mode::Plan);
+        assert!(bodies.lock().unwrap()[1].to_string().contains("use a modal instead"));
     }
 
     #[test]
