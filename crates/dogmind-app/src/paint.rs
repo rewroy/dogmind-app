@@ -856,7 +856,7 @@ pub const ONE_LINE: u32 = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
 
 // ---- Buttons.
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ButtonKind {
     /// The one thing to do here: filled with the accent.
     Primary = 0,
@@ -1254,8 +1254,14 @@ pub unsafe fn make_button(parent: HWND, id: isize, text: &str, kind: ButtonKind,
     window
 }
 
+/// The kind and backdrop a button is drawn with. One that has them already is left as it is, not drawn again: a layout that runs for every note of progress would have each of its buttons
+/// drawn at the rate the notes come.
 pub unsafe fn set_button_style(window: HWND, kind: ButtonKind, backdrop: u32) {
-    SetWindowLongPtrW(window, GWLP_USERDATA, kind as isize | ((backdrop as isize) << BACKDROP_SHIFT));
+    let wanted = kind as isize | ((backdrop as isize) << BACKDROP_SHIFT);
+    if GetWindowLongPtrW(window, GWLP_USERDATA) & !(FLAG_HOVER | FLAG_PRESSED) == wanted {
+        return;
+    }
+    SetWindowLongPtrW(window, GWLP_USERDATA, wanted);
     InvalidateRect(window, std::ptr::null(), 0);
 }
 
@@ -1475,6 +1481,47 @@ mod bundled_face {
             DeleteDC(device);
             DeleteObject(font);
             assert!(full.contains("Bold"), "{full}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod button_style_tests {
+    use super::*;
+
+    /// A button that has the style it is asked for is not drawn again, however often the layout asks; one that is given another is.
+    #[test]
+    fn a_button_is_drawn_again_only_when_its_style_changes() {
+        // SAFETY: a window of this test's own, off every screen and never activated, made and ended on this thread.
+        unsafe {
+            register_button_class();
+            let class = wide("DogButton");
+            let window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, class.as_ptr(), wide("Cancel").as_ptr(), WS_POPUP | WS_VISIBLE, -20000, -20000, 120, 40, std::ptr::null_mut(), std::ptr::null_mut(), GetModuleHandleW(std::ptr::null()), std::ptr::null());
+            assert!(!window.is_null());
+            let wanted_again = |window: HWND| {
+                let mut area: RECT = std::mem::zeroed();
+                GetUpdateRect(window, &mut area, 0) != 0
+            };
+            let settle = |window: HWND| {
+                UpdateWindow(window);
+            };
+            set_button_style(window, ButtonKind::Link, 0x202020);
+            settle(window);
+            assert!(!wanted_again(window), "drawn, and nothing asks for more");
+            for _ in 0..5 {
+                set_button_style(window, ButtonKind::Link, 0x202020);
+                assert!(!wanted_again(window), "the same style is no reason to draw it again");
+            }
+            // (the pointer on it is not undone by the layout that says what it is)
+            SetWindowLongPtrW(window, GWLP_USERDATA, GetWindowLongPtrW(window, GWLP_USERDATA) | FLAG_HOVER);
+            set_button_style(window, ButtonKind::Link, 0x202020);
+            assert!(GetWindowLongPtrW(window, GWLP_USERDATA) & FLAG_HOVER != 0);
+            set_button_style(window, ButtonKind::Secondary, 0x202020);
+            assert!(wanted_again(window), "another kind is drawn");
+            settle(window);
+            set_button_style(window, ButtonKind::Secondary, 0x303030);
+            assert!(wanted_again(window), "and another backdrop");
+            DestroyWindow(window);
         }
     }
 }
