@@ -941,8 +941,17 @@ fn next_greeting(last: usize, seed: u64) -> usize {
     (last + 1 + (seed % (GREETINGS.len() as u64 - 1)) as usize) % GREETINGS.len()
 }
 
+/// The line the engine or a server said of a failure, under the app's sentence in `text`, goes to the report (`/report`). Not while the app is taking itself off this PC: nothing is written then.
+fn keep_server_line(folder: &Path, leaving: &Leaving, text: &str) {
+    if let (Leaving::No, Some(line)) = (leaving, llm::line_under(text)) {
+        crate::crash::note_engine_error(folder, line);
+    }
+}
+
 /// Why a connection failed, shortly: the agent's words are for wherever they are shown, and these have a window around them.
 fn connect_failure(error: &str) -> String {
+    // (the line a server said under the sentence is shown apart from it)
+    let error = llm::sentence_of(error);
     if error == llm::KEY_REFUSED {
         return t("The server refused the API key. Check it in Settings.").to_string();
     }
@@ -1096,7 +1105,7 @@ struct Parked {
     rate: Option<f64>,
     totals: (u64, u64, u64, u32),
     /// What it said that no file keeps, for when it is opened.
-    notices: Vec<String>,
+    notices: Vec<(String, Style)>,
     /// Its turn ended in a failure.
     failed: bool,
     todos: Vec<serde_json::Value>,
@@ -1481,6 +1490,8 @@ enum Style {
     Output,
     Warn,
     Bad,
+    /// The line the engine or a server said, under the app's own sentence about a failure: smaller, in the muted colour.
+    Said,
 }
 
 /// Where an answer's time begins in its row, in twips: past its copy and branch buttons, each an icon button wide at 100%, and a little room.
@@ -1754,7 +1765,7 @@ struct App {
     /// What a session opened beside a working one will connect with.
     provider: Option<(Arc<dyn Provider>, String, u64)>,
     /// What sessions said after they stopped being on screen, until they are opened.
-    held_notices: HashMap<PathBuf, Vec<String>>,
+    held_notices: HashMap<PathBuf, Vec<(String, Style)>>,
     /// Chats out of sight whose last turn failed, until they are opened.
     failed_sessions: HashSet<PathBuf>,
     /// The turn on screen failed.
@@ -2493,6 +2504,7 @@ impl App {
             Style::Output => char_format(theme::faint(), 0, mono, 9, None),
             Style::Warn => char_format(theme::warn(), 0, ui, 10, None),
             Style::Bad => char_format(theme::bad(), 0, ui, 10, None),
+            Style::Said => char_format(theme::muted(), 0, ui, 9, None),
         };
         let paragraph = match style {
             Style::Output => para_format(9, 240, 0, 0),
@@ -2517,6 +2529,7 @@ impl App {
             Style::Heading => para_format(13, 0, 240, 80),
             Style::Subheading => para_format(12, 0, 180, 60),
             Style::Thinking | Style::Warn | Style::Bad => para_format(10, 0, 0, 100),
+            Style::Said => para_format(9, 0, 0, 100),
             _ => match self.para {
                 Para::Normal => para_format(11, 0, 0, 120),
                 Para::AfterList => para_format(11, 0, 80, 120),
@@ -8861,8 +8874,8 @@ impl App {
         let messages = self.current_session.as_deref().map_or(Ok(Vec::new()), session::read).unwrap_or_default();
         self.set_panel(Panel::Chat);
         self.show_transcript(&messages);
-        for notice in parked.notices {
-            self.append(&format!("{notice}\n"), Style::Warn);
+        for (notice, style) in parked.notices {
+            self.append(&format!("{notice}\n"), style);
         }
         self.answer = parked.partial;
         if messages.last().and_then(|last| last.content.as_deref()) == Some(self.answer.as_str()) {
@@ -9992,11 +10005,14 @@ impl App {
                     parked.interjected.remove(place);
                 }
             }
-            Event::Notice(text) => parked.notices.push(lang::notice(&text)),
+            Event::Notice(text) => parked.notices.push((lang::notice(&text), Style::Warn)),
             Event::Failed(text) => {
                 parked.failed = true;
                 let embedded = self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded);
-                parked.notices.push(lang::failure(&text, embedded));
+                let (words, said) = lang::failure_parts(&text, embedded);
+                parked.notices.push((words, Style::Warn));
+                parked.notices.extend(said.map(|said| (said, Style::Said)));
+                keep_server_line(&self.folder, &self.leaving, &text);
             }
             Event::Todos(items) => parked.todos = items,
             Event::WebSeen(on) => parked.web_seen = on,
@@ -10179,8 +10195,8 @@ impl App {
                 self.changes.clear();
                 self.refresh_changes();
                 self.show_transcript(&transcript);
-                for notice in notices {
-                    self.append(&format!("{notice}\n"), Style::Warn);
+                for (notice, style) in notices {
+                    self.append(&format!("{notice}\n"), style);
                 }
                 if self.find_after_open.is_some() {
                     self.find_opened();
@@ -10459,10 +10475,16 @@ impl App {
                 }
                 if !(stopped && self.engine_stop_told) {
                     self.end_line();
-                    self.append(&format!("{}\n", lang::failure(&text, embedded)), Style::Bad);
+                    // The app's sentence, and under it, smaller, what the engine or server said.
+                    let (words, said) = lang::failure_parts(&text, embedded);
+                    self.append(&format!("{words}\n"), Style::Bad);
+                    if let Some(said) = said {
+                        self.append(&format!("{said}\n"), Style::Said);
+                    }
                 }
+                keep_server_line(&self.folder, &self.leaving, &text);
                 self.engine_stop_told |= stopped;
-                if text == llm::NO_VISION {
+                if llm::sentence_of(&text) == llm::NO_VISION {
                     self.vision = Some(false);
                     self.tell_about_vision();
                 }
@@ -10579,14 +10601,23 @@ impl App {
                 let again = std::mem::take(&mut self.connect_retrying) && error == self.last_connect_error;
                 // (nor when these very words are the last thing on the page: a second try with the same key has nothing new to say)
                 let words = format!("{}\n", connect_failure(&error));
-                let said_last = matches!(self.shown.last(), Some(Shown::Text(held, Style::Bad, _)) if held.ends_with(&words));
+                // (what the engine or the server said under the sentence, if it said anything, smaller)
+                let said = llm::line_under(&error).map(|line| format!("{}\n", lang::said_by(self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded), line)));
+                let said_last = match &said {
+                    Some(said) => matches!(self.shown.last(), Some(Shown::Text(held, Style::Said, _)) if held.ends_with(said)),
+                    None => matches!(self.shown.last(), Some(Shown::Text(held, Style::Bad, _)) if held.ends_with(&words)),
+                };
                 if !again && !said_last {
                     self.last_connect_error = error.clone();
                     self.end_line();
                     self.append(&words, Style::Bad);
+                    if let Some(said) = &said {
+                        self.append(said, Style::Said);
+                    }
                 }
+                keep_server_line(&self.folder, &self.leaving, &error);
                 // (a key refused or an address that is not one will not put itself right: what was written goes back, to be sent when the settings have been seen to)
-                if self.connect_failed && !self.queued.is_empty() && error != llm::KEY_REFUSED && error != llm::NOT_FOUND {
+                if self.connect_failed && !self.queued.is_empty() && llm::sentence_of(&error) != llm::KEY_REFUSED && llm::sentence_of(&error) != llm::NOT_FOUND {
                     // Said to be sent when connected, and it is: a server comes back by itself, and the square stops this.
                     self.set_activity(t(self.waiting_words()).into());
                     SetTimer(self.window, TIMER_RECONNECT, RECONNECT_MS, None);
@@ -12301,13 +12332,19 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     app.set_activity(String::new());
                     app.update_buttons();
                 }
+                // (the engine's last word before it ended, as its own line under the app's sentence)
+                let told = llm::gone_with_line(&reason);
                 if !app.engine_stop_told {
                     app.engine_stop_told = true;
                     app.end_line();
                     // (never ready, what it said is all a person has to go on: a driver, a folder it could not open)
-                    let words = if never_ready && llm::gone_words(&reason) == llm::SERVER_GONE { tf("the engine did not start: {0}", &[&engine::in_plain_words(&reason)]) } else { lang::failure(llm::gone_words(&reason), true) };
+                    let (words, said) = if never_ready && llm::gone_words(&reason) == llm::SERVER_GONE { (tf("the engine did not start: {0}", &[&engine::in_plain_words(&reason)]), None) } else { lang::failure_parts(&told, true) };
                     app.append(&format!("{words}\n"), Style::Bad);
+                    if let Some(said) = said {
+                        app.append(&format!("{said}\n"), Style::Said);
+                    }
                 }
+                keep_server_line(&app.folder, &app.leaving, &told);
                 app.update_status();
             }
             0
@@ -14376,6 +14413,32 @@ mod tests {
         // Closed at once, with the client still on its way, Windows may reset the connection and take back what it has not read yet.
         let _ = stream.shutdown(std::net::Shutdown::Write);
         while stream.read(&mut piece).is_ok_and(|count| count > 0) {}
+    }
+
+    /// A connection that failed is told by the app's sentence alone; what the engine said under it is shown apart, in smaller text.
+    #[test]
+    fn a_connection_that_failed_is_told_by_the_sentence_and_the_engines_line_is_apart() {
+        let with_line = llm::with_line(llm::START_OUT_OF_MEMORY, "Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory)");
+        assert_eq!(connect_failure(&with_line), connect_failure(llm::START_OUT_OF_MEMORY));
+        assert!(!connect_failure(&with_line).contains("Straydog"), "{}", connect_failure(&with_line));
+        assert_eq!(llm::line_under(&with_line), Some("Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory)"));
+        let refused = llm::with_line(llm::KEY_REFUSED, "Incorrect API key provided");
+        assert_eq!(connect_failure(&refused), connect_failure(llm::KEY_REFUSED), "a refused key keeps its short words");
+    }
+
+    /// The line goes to the report, once, and not while the app is taking itself off this PC.
+    #[test]
+    fn the_line_a_server_said_goes_to_the_report_and_nothing_is_written_while_the_app_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = llm::with_line(llm::SERVER_GONE, "GPU fault");
+        keep_server_line(dir.path(), &Leaving::Going, &text);
+        keep_server_line(dir.path(), &Leaving::Gone("done".into()), &text);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "nothing written while leaving");
+        keep_server_line(dir.path(), &Leaving::No, llm::SERVER_GONE);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "no line, nothing to keep");
+        keep_server_line(dir.path(), &Leaving::No, &text);
+        let report = std::fs::read_to_string(crate::crash::write_report(dir.path(), &Settings::default(), "RTX").unwrap()).unwrap();
+        assert!(report.contains("--- the last engine error ---\n") && report.contains("  GPU fault\n"), "{report}");
     }
 
     #[test]

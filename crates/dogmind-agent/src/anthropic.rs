@@ -153,22 +153,23 @@ fn classify(status: u16, body: &str) -> LlmError {
 
 fn classify_error(status: u16, kind: &str, message: &str) -> LlmError {
     if message.contains("prompt is too long") {
-        return LlmError::Overflow(llm::CONTEXT_FULL.to_string());
+        return LlmError::Overflow(llm::with_line(llm::CONTEXT_FULL, message));
     }
     if llm::refuses_images(&message.to_lowercase()) {
-        return LlmError::NoVision(llm::NO_VISION.to_string());
+        return LlmError::NoVision(llm::with_line(llm::NO_VISION, message));
     }
     if matches!(kind, "rate_limit_error" | "overloaded_error") || status == 429 {
-        return LlmError::Transient(llm::SERVER_BUSY.to_string());
+        return LlmError::Transient(llm::with_line(llm::SERVER_BUSY, message));
     }
-    let text = format!("Claude: {message}");
+    // (a web page says nothing of the API's)
+    let text = format!("Claude: {}", if message.trim_start().starts_with('<') { "(no details)".to_string() } else { crate::safety::hide_secrets(message) });
     if matches!(kind, "api_error" | "timeout_error") || matches!(status, 408 | 409) || status >= 500 {
         return LlmError::Transient(text);
     }
     // A key the API does not know is a refused key. A key that is good and not allowed something (a model the organisation may not use, a beta it is not in) is the API's own reason, which
     // is what the person has to look at.
     if kind == "authentication_error" || status == 401 {
-        return LlmError::Rejected(llm::KEY_REFUSED.to_string());
+        return LlmError::Rejected(llm::with_line(llm::KEY_REFUSED, message));
     }
     LlmError::Rejected(text)
 }
@@ -329,7 +330,7 @@ impl Anthropic {
         let status = response.status;
         let text = response.text().map_err(|failure| LlmError::from(failure).to_string())?;
         if status != 200 {
-            return Err(classify(status, &text).to_string());
+            return Err(classify(status, &text).without(&self.key).to_string());
         }
         let value: Value = serde_json::from_str(&text).map_err(|_| llm::UNREADABLE.to_string())?;
         Ok(value.get("max_input_tokens").and_then(Value::as_u64).unwrap_or(DEFAULT_CONTEXT))
@@ -355,7 +356,7 @@ impl Provider for Anthropic {
         let mut response = http::request("POST", &url, &headers, Some(&text), Duration::from_secs(20), cancel)?;
         if response.status != 200 {
             let status = response.status;
-            return Err(classify(status, &response.text()?));
+            return Err(classify(status, &response.text()?).without(&self.key));
         }
         let mut assembly = Assembly::default();
         let mut pending = Vec::new();
@@ -365,7 +366,7 @@ impl Provider for Anthropic {
                 let line: Vec<u8> = pending.drain(..=at).collect();
                 let line = String::from_utf8_lossy(&line);
                 let Some(data) = line.trim_end().strip_prefix("data:") else { continue };
-                assembly.event(data.trim_start(), on)?;
+                assembly.event(data.trim_start(), on).map_err(|error| error.without(&self.key))?;
             }
         }
         // No word of why it stopped: the connection went in the middle of the answer, which is not an answer to keep as said.
@@ -590,16 +591,44 @@ mod tests {
             LlmError::Rejected(text) => text,
             other => panic!("{other:?}"),
         };
-        assert_eq!(reason(401, r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#), llm::KEY_REFUSED);
+        // (the sentence is the app's, and the API's own line is under it)
+        let refused = |line: &str| format!("{}\n{line}", llm::KEY_REFUSED);
+        assert_eq!(reason(401, r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#), refused("invalid x-api-key"));
         assert_eq!(reason(403, r#"{"error":{"type":"permission_error","message":"Your organization may not use claude-opus-5-5"}}"#), "Claude: Your organization may not use claude-opus-5-5");
         assert_eq!(reason(403, r#"{"error":{"type":"permission_error","message":"This beta is not enabled for your organization"}}"#), "Claude: This beta is not enabled for your organization");
         // (a status with no type in the body, and a type with no status)
-        assert_eq!(reason(401, "denied"), llm::KEY_REFUSED);
+        assert_eq!(reason(401, "denied"), refused("denied"));
         assert_eq!(reason(403, "forbidden"), "Claude: forbidden");
-        assert_eq!(reason(400, r#"{"error":{"type":"authentication_error","message":"bad"}}"#), llm::KEY_REFUSED);
+        assert_eq!(reason(400, r#"{"error":{"type":"authentication_error","message":"bad"}}"#), refused("bad"));
         assert_eq!(reason(400, r#"{"error":{"type":"permission_error","message":"nope"}}"#), "Claude: nope");
     }
 
+
+    /// The API's own line goes under the app's sentence, as a server's does, with no key or header in it.
+    #[test]
+    fn what_the_api_said_goes_under_the_apps_sentence_with_no_key_in_it() {
+        let under = |error: LlmError, sentence: &str, line: &str| {
+            let text = error.to_string();
+            assert_eq!((llm::sentence_of(&text), llm::line_under(&text)), (sentence, Some(line)), "{text}");
+        };
+        under(classify(429, r#"{"error":{"type":"rate_limit_error","message":"This request would exceed your rate limit"}}"#), llm::SERVER_BUSY, "This request would exceed your rate limit");
+        under(classify(529, r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#), llm::SERVER_BUSY, "Overloaded");
+        under(classify(400, r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 2000000 tokens > 1000000 maximum"}}"#), llm::CONTEXT_FULL, "prompt is too long: 2000000 tokens > 1000000 maximum");
+        under(classify(400, r#"{"error":{"type":"invalid_request_error","message":"image input is not supported by this model"}}"#), llm::NO_VISION, "image input is not supported by this model");
+        // A web page is not the API's.
+        assert_eq!(classify(429, "<html>overloaded</html>").to_string(), llm::SERVER_BUSY);
+        assert_eq!(classify(403, "<html>forbidden</html>").to_string(), "Claude: (no details)");
+        assert_eq!(classify(401, "<html>denied</html>").to_string(), llm::KEY_REFUSED);
+        // The key is not in what is shown: not as the API quotes it, not as the key this request was sent with.
+        let key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456";
+        let said = classify(401, &json!({"error": {"type": "authentication_error", "message": format!("invalid x-api-key: {key}")}}).to_string()).to_string();
+        assert!(!said.contains(key) && llm::sentence_of(&said) == llm::KEY_REFUSED, "{said}");
+        let said = classify(403, &json!({"error": {"type": "permission_error", "message": format!("Authorization: Bearer {key}")}}).to_string()).to_string();
+        assert!(!said.contains(key) && said.starts_with("Claude: "), "{said}");
+        let own = Anthropic::new("http://127.0.0.1:1", "a plain key of mine".to_string()).unwrap();
+        let said = classify(401, r#"{"error":{"type":"authentication_error","message":"no such key: a plain key of mine"}}"#).without(&own.key).to_string();
+        assert_eq!(llm::line_under(&said), Some("no such key: [hidden]"));
+    }
     #[test]
     fn errors_are_told_apart() {
         assert!(matches!(classify(429, r#"{"error":{"type":"rate_limit_error","message":"slow"}}"#), LlmError::Transient(_)));
