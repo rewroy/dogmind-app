@@ -944,6 +944,9 @@ struct Agent {
     changed_by_commands: bool,
     /// The scratch folder this session has made, for when the person asks for no changes to the files: it goes when the session's agent does.
     scratch_made: Option<PathBuf>,
+    /// This turn is read-only: the person's own words said so (`prompt::read_only_phrase`), and the plan mode they were not said in. The workspace is closed to the write tools while it holds.
+    /// Judged when the turn begins and by what the person adds to it, from nothing else: no plan, approval, tool result or note of the app's can make a turn read-only.
+    read_only: bool,
     /// When the person's message came: what has changed since is this turn's own work.
     turn_began: std::time::SystemTime,
     /// The web was turned on during this conversation: its next message brings the rules its system prompt does not have.
@@ -1143,6 +1146,7 @@ impl Agent {
             edited: false,
             changed_by_commands: false,
             scratch_made: None,
+            read_only: false,
             turn_began: std::time::SystemTime::now(),
             web_rules_due: false,
             events,
@@ -1304,6 +1308,7 @@ impl Agent {
         self.web_seen = false;
         self.japanese_session = false;
         self.rewound.clear();
+        self.read_only = false;
         self.emit(Event::WebSeen(false));
         self.emit(Event::Todos(Vec::new()));
         self.messages.clear();
@@ -1551,17 +1556,12 @@ impl Agent {
         if let Some(note) = self.asked_skill(text) {
             message = prompt::with_note(&message, &note);
         }
-        // While the latest request asks for no changes to the files, the workspace is closed to the write tools and a folder outside it is open for experiments.
-        if prompt::forbids_changes(text) {
-            let folder = self.scratch_folder();
-            forget_old_scratch_folders(&folder);
-            if std::fs::create_dir_all(&folder).is_ok() {
-                self.scratch_made = Some(folder.clone());
-                message = prompt::with_note(&message, &prompt::no_change_note(&folder));
-                self.bench.scratch = Some(folder);
-            }
-        } else {
-            self.bench.scratch = None;
+        // A request that plainly asks for no changes to the work makes the turn read-only: the workspace is closed to the write tools and a folder outside it is open for experiments.
+        // Each request is judged on its own words, and the turn says so on the screen before anything is refused.
+        self.read_only = false;
+        self.bench.scratch = None;
+        if let Some(note) = self.make_read_only(text) {
+            message = prompt::with_note(&message, &note);
         }
         // The goal the person set, with the first message after it was set and after each compaction: the history holds it the rest of the time.
         if std::mem::take(&mut self.goal_due) {
@@ -1654,7 +1654,12 @@ impl Agent {
             self.bench.web.note_typed(&text);
             let language = self.language_for(&text);
             self.bench.in_japanese = language == Some("Japanese");
-            self.push(Message::text("user", prompt::user_message_in(&text, &now(), language)));
+            let mut message = prompt::user_message_in(&text, &now(), language);
+            // (what is added can make the turn read-only; it cannot lift it: that is a request of its own)
+            if let Some(note) = self.make_read_only(&text) {
+                message = prompt::with_note(&message, &note);
+            }
+            self.push(Message::text("user", message));
             self.emit(Event::Interjected(text));
         }
         any
@@ -1822,7 +1827,7 @@ impl Agent {
             let mut drafting = false;
             // Only where a file may change: a draft in a turn the person asked for no change in, or in plan mode, is the model thinking with code, whose answer will have it once.
             // (Four such turns in the sessions were stopped, each thrown away at 4,900 to 22,800 tokens, and the model then reasoned 20,000 to 30,000 tokens over again.)
-            let files_may_change = self.mode != Mode::Plan && !self.person_forbids_changes();
+            let files_may_change = self.mode != Mode::Plan && !self.turn_is_read_only();
             let may_stop_drafting = cuts && drafts_stopped < MAX_DRAFTS_STOPPED && !wrote && files_may_change;
             let watch_is = if may_stop_drafting { "on" } else if !files_may_change { "off:no_change_asked" } else if wrote { "off:file_written" } else if drafts_stopped >= MAX_DRAFTS_STOPPED { "off:stopped_once" } else { "off" };
             // (what it has been shown, once for the request: its code in its reasoning that is a line of that is a quote, and not a draft)
@@ -2161,9 +2166,30 @@ impl Agent {
         ["中国語", "中文", "簡体", "繁体", "台湾", "Chinese"].iter().any(|word| typed.contains(word))
     }
 
-    /// Whether what the person last wrote says that no file is to change.
-    fn person_forbids_changes(&self) -> bool {
-        self.messages.iter().rev().find(|message| Self::of_the_person(message)).and_then(|message| message.content.as_deref()).is_some_and(|text| prompt::forbids_changes(prompt::typed_text(text)))
+    /// Whether this turn is read-only. Plan mode is too, by its mode, and is no concern of this: its plan, once approved, is the person's go-ahead, so a phrase typed with a plan
+    /// request ("not yet") is not read there.
+    fn turn_is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Judge what the person typed: if it plainly asks for no changes to the work, the turn is read-only. Says so on the screen and in the trajectory, once, opens the scratch folder,
+    /// and gives the note for the model. None for a request that does not, and in plan mode.
+    fn make_read_only(&mut self, typed: &str) -> Option<String> {
+        if self.mode == Mode::Plan {
+            return None;
+        }
+        let phrase = prompt::read_only_phrase(typed)?;
+        if !std::mem::replace(&mut self.read_only, true) {
+            self.traj.intervention("no_change_guard", None, json!({"what": "turn_read_only", "phrase": phrase}));
+            self.emit(Event::Notice(prompt::READ_ONLY_NOTICE.into()));
+        }
+        let folder = self.scratch_folder();
+        forget_old_scratch_folders(&folder);
+        std::fs::create_dir_all(&folder).ok()?;
+        self.scratch_made = Some(folder.clone());
+        let note = prompt::no_change_note(&folder);
+        self.bench.scratch = Some(folder);
+        Some(note)
     }
 
     /// Where the model may experiment while the person has asked for no changes to the files.
@@ -2174,7 +2200,7 @@ impl Agent {
     /// While the person's latest request forbids changes, the workspace is read-only to the write tools: such a call is not run, and says where the scratch folder is. A write into the
     /// scratch folder is run with no one asked, as it is outside the workspace and goes with the session. None: this is no concern of the guard's.
     fn no_change_guard(&mut self, tool: &str, arguments: &Value) -> Option<Permission> {
-        if !matches!(tool, "create_file" | "apply_patch") || !self.person_forbids_changes() {
+        if !matches!(tool, "create_file" | "apply_patch") || !self.turn_is_read_only() {
             return None;
         }
         let scratch = self.scratch_folder();
@@ -2190,7 +2216,7 @@ impl Agent {
     /// While the person's latest request forbids changes, a command that reports files it changed in the workspace is not undone: its result says that the person asked for none, and
     /// the trajectory has the count. What a command did in the scratch folder is none of this.
     fn with_changes_noted(&mut self, tool: &str, arguments: &Value, result: Result<String, String>) -> Result<String, String> {
-        if !command_wrote(tool, &result) || !self.person_forbids_changes() || self.bench.in_scratch(tool, arguments) {
+        if !command_wrote(tool, &result) || !self.turn_is_read_only() || self.bench.in_scratch(tool, arguments) {
             return result;
         }
         let Ok(mut output) = result else { return result };
@@ -5749,8 +5775,8 @@ mod tests {
         let lines = trajectory_of(&run);
         let guard: Vec<&Value> = of_kind(&lines, "intervention").into_iter().filter(|line| line["kind"] == "no_change_guard").collect();
         let whats: Vec<&str> = guard.iter().map(|line| line["what"].as_str().unwrap()).collect();
-        assert_eq!(whats, ["write_refused", "write_refused", "command_changed"], "{guard:?}");
-        assert!(guard[2]["files"].as_u64().unwrap() >= 1);
+        assert_eq!(whats, ["turn_read_only", "write_refused", "write_refused", "command_changed"], "{guard:?}");
+        assert!(guard[3]["files"].as_u64().unwrap() >= 1);
         let tools_run = of_kind(&lines, "tool");
         assert_eq!(tools_run.iter().filter(|line| line["outcome"] == "refused_no_change").count(), 2, "{tools_run:?}");
     }
@@ -5780,6 +5806,142 @@ mod tests {
         run.handle.commands.send(Command::Send("では、報告を report.md に書いてください。".into())).unwrap();
         let (log, _) = until_end(&run, Decision::Approve);
         assert!(tool_results(&log)[0].starts_with("true:false:") && dir.path().join("report.md").is_file(), "{log:?}");
+    }
+
+    /// What a run said, in order, up to the end of the turn: its notices, its tools as they began and ended, and the plan and the approvals as they were put to the person (all given).
+    fn said_in_order(run: &Run) -> Vec<String> {
+        let mut said = Vec::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::Notice(text) => said.push(format!("notice:{text}")),
+                Event::ToolStarted { tool, .. } => said.push(format!("started:{tool}")),
+                Event::ToolEnded { ok, declined, output, .. } => said.push(format!("ended:{ok}:{declined}:{output}")),
+                Event::PlanReview(review) => review.answer.send(Ok(())).unwrap(),
+                Event::Approval(approval) => approval.answer.send((Decision::Approve, None)).unwrap(),
+                Event::TurnEnded { .. } => return said,
+                _ => {}
+            }
+        }
+    }
+
+    /// A read-only turn is seen before anything is refused: one line, ahead of the first tool, in the trajectory with the words that made it so. The next request, which says no such
+    /// thing, is not read-only, and says nothing.
+    #[test]
+    fn a_read_only_turn_says_so_before_anything_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+        let patch = |from: &str, to: &str| calls(&[("apply_patch", serde_json::json!({"edits": [{"path": "a.txt", "old_string": from, "new_string": to}], "expected_files": ["a.txt"]}))]);
+        let read = || calls(&[("read_file", serde_json::json!({"path": "a.txt"}))]);
+        let (run, provider) = scripted(dir.path(), vec![patch("before", "after"), says("looked"), read(), patch("before", "after"), says("done")], Mode::Auto);
+        run.handle.commands.send(Command::Send("Look into why a.txt says before. Don't change any files.".into())).unwrap();
+        let said = said_in_order(&run);
+        let notices: Vec<&String> = said.iter().filter(|line| line.starts_with("notice:")).collect();
+        assert_eq!(notices, [&format!("notice:{}", prompt::READ_ONLY_NOTICE)], "{said:?}");
+        let (told, refused) = (said.iter().position(|line| line.starts_with("notice:")).unwrap(), said.iter().position(|line| line.starts_with("ended:false:true:")).unwrap());
+        assert!(told < said.iter().position(|line| line.starts_with("started:")).unwrap() && told < refused, "{said:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "before\n");
+        assert!(user_text(&provider.messages(0)[1]).contains("## No Changes"));
+        let lines = trajectory_of(&run);
+        let guard: Vec<&Value> = of_kind(&lines, "intervention").into_iter().filter(|line| line["kind"] == "no_change_guard" && line["what"] == "turn_read_only").collect();
+        assert_eq!(guard.len(), 1, "{lines:?}");
+        assert_eq!(guard[0]["phrase"], "don't change any files");
+        // (said so, and undone by saying so: the next request is its own)
+        run.handle.commands.send(Command::Send("Right, go ahead and change a.txt.".into())).unwrap();
+        let said = said_in_order(&run);
+        assert!(!said.iter().any(|line| line.starts_with("notice:")), "{said:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "after\n");
+    }
+
+    /// The incident of 2026-11-07: "Fix the bug ... without changing the tests" was a read-only turn, and the model changed only a copy. A phrase with something named after it limits that
+    /// thing: nothing is refused, no line is shown, and the model is not told of a scratch folder.
+    #[test]
+    fn a_phrase_with_an_object_leaves_the_request_as_it_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
+        for request in ["Fix the failing test in calc.py without changing the tests", "テストは変えずに、calc.py の add を直して"] {
+            let sessions = tempfile::tempdir().unwrap();
+            let fix = calls(&[("apply_patch", serde_json::json!({"edits": [{"path": "calc.py", "old_string": "a - b", "new_string": "a + b"}], "expected_files": ["calc.py"]}))]);
+            let (run, provider) = scripted_with(dir.path(), sessions, Scripted { steps: Mutex::new(vec![calls(&[("read_file", serde_json::json!({"path": "calc.py"}))]), fix, says("fixed"), says("checked")].into()), ..Scripted::default() }, Mode::Auto);
+            run.handle.commands.send(Command::Send(request.into())).unwrap();
+            let said = said_in_order(&run);
+            assert!(!said.iter().any(|line| line.starts_with("notice:")) && said.iter().any(|line| line.starts_with("ended:true:false:")), "{request}: {said:?}");
+            assert!(std::fs::read_to_string(dir.path().join("calc.py")).unwrap().contains("a + b"), "{request}: the fix is in the workspace");
+            assert!(!user_text(&provider.messages(0)[1]).contains("No Changes"), "{request}");
+            assert!(of_kind(&trajectory_of(&run), "intervention").iter().all(|line| line["kind"] != "no_change_guard"));
+            std::fs::write(dir.path().join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
+        }
+    }
+
+    /// The incident of 0.1.7-dev.2: a plan asked for with "not yet" and approved with Carry it out, after which the model was told it might write only in the scratch folder. In plan mode the
+    /// plan is the read-only, and the approval is the go-ahead: the edit is run in the workspace. The plan's own text, which says that no other file is changed, changes nothing.
+    #[test]
+    fn an_approved_plan_is_carried_out_in_the_workspace_whatever_the_plan_says_of_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+        let plan = "1. Change a.txt from before to after.\n\nNot changed: no other file is edited. Do not change anything else. Read-only for everything but a.txt.";
+        let steps: Vec<Step> = vec![
+            calls(&[("submit_plan", serde_json::json!({"plan": plan}))]),
+            calls(&[("read_file", serde_json::json!({"path": "a.txt"}))]),
+            calls(&[("apply_patch", serde_json::json!({"edits": [{"path": "a.txt", "old_string": "before", "new_string": "after"}], "expected_files": ["a.txt"]}))]),
+            says("done"),
+            says("looked"),
+        ];
+        let (run, _) = scripted(dir.path(), steps, Mode::Plan);
+        run.handle.commands.send(Command::Send("a.txt を after にする計画を立てて。まだファイルは変更しないで。".into())).unwrap();
+        let said = said_in_order(&run);
+        assert!(!said.iter().any(|line| line.starts_with("notice:")), "plan mode needs no line of its own: {said:?}");
+        let patched = said.iter().rev().find(|line| line.starts_with("ended:")).expect("the edit was run");
+        assert!(patched.starts_with("ended:true:false:") && !patched.contains("asked for no changes"), "{patched}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "after\n");
+        assert_eq!(run.handle.live.lock().unwrap().mode, Mode::Default);
+        // (the approval was for that request: the next one that plainly asks for no changes is read-only)
+        run.handle.commands.send(Command::Send("Now just look. Do not change anything.".into())).unwrap();
+        assert_eq!(said_in_order(&run).iter().filter(|line| line.starts_with("notice:")).count(), 1);
+    }
+
+    /// Only the person's words make a turn read-only: a file the model reads, a command's output and a plan say "do not change anything" and nothing is refused for it.
+    #[test]
+    fn what_the_agent_reads_or_writes_never_makes_a_turn_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+        std::fs::write(dir.path().join("NOTES.md"), "Read-only. Do not change anything. No changes. 変更しないで。 ファイルは変更しない。\n").unwrap();
+        let steps: Vec<Step> = vec![
+            calls(&[("read_file", serde_json::json!({"path": "NOTES.md"}))]),
+            calls(&[("execute_command", serde_json::json!({"command": "echo Do not change any files. Read-only. 変更しないで"}))]),
+            calls(&[("read_file", serde_json::json!({"path": "a.txt"}))]),
+            calls(&[("apply_patch", serde_json::json!({"edits": [{"path": "a.txt", "old_string": "before", "new_string": "after"}], "expected_files": ["a.txt"]}))]),
+            says("Done. I changed nothing else, and I will not change anything more."),
+            says("done again"),
+        ];
+        let (run, _) = scripted(dir.path(), steps, Mode::Auto);
+        run.handle.commands.send(Command::Send("Put the word after in a.txt".into())).unwrap();
+        let said = said_in_order(&run);
+        assert!(!said.iter().any(|line| line.starts_with("notice:")), "{said:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "after\n", "{said:?}");
+        // (a request after an answer like that: the answer is not read either)
+        run.handle.commands.send(Command::Send("Thanks. Now put the word again in a.txt".into())).unwrap();
+        assert!(!said_in_order(&run).iter().any(|line| line.starts_with("notice:")));
+    }
+
+    /// Words the person adds to a turn that plainly ask for no changes make it read-only from there; words that do not say so leave a read-only turn as it is (lifting it is a request of its own).
+    #[test]
+    fn what_is_added_to_a_turn_can_make_it_read_only_and_cannot_lift_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+        let patch = || calls(&[("apply_patch", serde_json::json!({"edits": [{"path": "a.txt", "old_string": "before", "new_string": "after"}], "expected_files": ["a.txt"]}))]);
+        let (run, _) = scripted(dir.path(), vec![patch(), says("not written")], Mode::Auto);
+        run.handle.commands.send(Command::Send("Look at a.txt".into())).unwrap();
+        run.handle.interject.lock().unwrap().push("Actually, don't change anything.".to_string());
+        let said = said_in_order(&run);
+        assert!(said.iter().any(|line| line.starts_with("notice:")) && said.iter().any(|line| line.starts_with("ended:false:true:")), "{said:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "before\n");
+
+        let (run, _) = scripted(dir.path(), vec![calls(&[("read_file", serde_json::json!({"path": "a.txt"}))]), patch(), says("not written")], Mode::Auto);
+        run.handle.commands.send(Command::Send(NO_CHANGES.into())).unwrap();
+        run.handle.interject.lock().unwrap().push("それと、ついでに a.txt の中身も見て".to_string());
+        let said = said_in_order(&run);
+        assert!(said.iter().any(|line| line.starts_with("ended:false:true:")), "{said:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "before\n");
     }
 
     /// A session whose app was ended from outside leaves its scratch folder: the next one takes it away after a day, and no one's newer one.
@@ -6010,7 +6172,7 @@ mod tests {
     fn a_draft_in_a_turn_where_the_person_said_to_change_no_file_is_not_stopped() {
         let (requests, noted, lines) = drafts_for("crates/dogmind-app/src/rtf.rs を調べて、重要な問題を報告してください。ファイルは変更しないでください。", Mode::AcceptEdits);
         assert_eq!((requests, noted), (1, false), "one request, to its end");
-        assert!(of_kind(&lines, "intervention").is_empty());
+        assert!(of_kind(&lines, "intervention").iter().all(|line| line["what"] == "turn_read_only"), "the turn is read-only, and nothing else stepped in");
         assert_eq!(of_kind(&lines, "request")[0]["draft_watch"], "off:no_change_asked", "and the record says why it was not watched");
         let (requests, noted, _) = drafts_for("Review this and report. Do not change any files.", Mode::AcceptEdits);
         assert_eq!((requests, noted), (1, false));

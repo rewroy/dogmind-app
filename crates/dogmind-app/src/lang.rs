@@ -917,6 +917,7 @@ const JA: &[(&str, &str)] = &[
     ("Session compacted: the earlier conversation is now a summary", "セッションを圧縮しました: これまでの会話を要約に置き換えました"),
     ("There is nothing to compact yet: the conversation is short.", "会話がまだ短いので、圧縮するものはありません。"),
     ("Session compacted: the oldest turns were dropped", "セッションを圧縮しました: いちばん古いターンを削除しました"),
+    ("Read-only: no files will be changed in this turn. Say so if that is not what you meant.", "読み取り専用: このターンではファイルを変更しません。意図と違う場合は、そう伝えてください。"),
     ("the engine stopped answering: /log shows why, and writing again tries once more", "エンジンの応答が止まりました。原因は /log で確認できます。もう一度入力すると再試行します。"),
     ("another Straydog is running on this PC (process {0}). Two on one GPU fight over its memory and the machine's, so this one was not started. Close it and restart the engine, or reach it as an OpenAI-compatible provider.", "この PC で別の Straydog が動いています (プロセス {0})。1 つの GPU で 2 つ動かすとメモリを奪い合うため、起動しませんでした。それを閉じてからエンジンを起動し直すか、OpenAI 互換の接続先として接続してください。"),
     ("port {0} on this PC is taken. Choose another port for the engine in settings.json, or close what holds it.", "この PC のポート {0} は使用中です。settings.json でエンジンの別のポートを選ぶか、使っているものを閉じてください。"),
@@ -1152,6 +1153,15 @@ mod tests {
         assert_eq!(shown, "セッションを保存できませんでした: C:\\a.jsonl: アクセスが拒否されました。");
         assert_eq!(without_system_code("a (os error 1) b (os error 2)"), "a b");
         assert_eq!(without_system_code("no such thing (os error"), "no such thing (os error");
+    }
+
+    /// The line a read-only turn shows is the agent's English, and a window in Japanese shows its Japanese.
+    #[test]
+    fn the_line_of_a_read_only_turn_is_in_japanese_for_a_japanese_window() {
+        let words = dogmind_agent::prompt::READ_ONLY_NOTICE;
+        assert_eq!(notice_in(words, false), words);
+        let shown = notice_in(words, true);
+        assert!(shown.starts_with("読み取り専用") && shown.contains("ファイルを変更しません") && !shown.contains("Read-only"), "{shown}");
     }
 
     #[test]

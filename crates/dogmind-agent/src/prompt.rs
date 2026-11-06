@@ -2,6 +2,9 @@
 //! prompt's prefix stays what Straydog has cached.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 /// What every session begins with. A local model reads all of it, and the tools, before a new session's first word, at some 200 tokens a second, so each sentence has to change
 /// what a model does. `assets/dogmind/system_prompt.md` is what Dogmind itself says, to read when it changes; this keeps what its rules do for a slow model, and leaves out what
@@ -260,15 +263,181 @@ pub fn is_nudge(text: &str) -> bool {
     text == CONTINUE_NUDGE || text.starts_with(DRAFT_NOTE) || Some(text) == CHECK_NUDGE.strip_prefix(DRAFT_NOTE)
 }
 
-/// Whether the person has said that no file is to change (「ファイルは変更しないでください」, "do not change any files", read-only): the turn is a look, and the code that is in its
-/// reasoning is for its answer, which is typed once. Only what says so plainly: a request that does not say it may change files.
+/// What the app says on the screen when a request has made its turn read-only, before anything is refused. The second sentence is the way out: a request that does not say it is followed
+/// as it is written.
+pub const READ_ONLY_NOTICE: &str = "Read-only: no files will be changed in this turn. Say so if that is not what you meant.";
+
+/// Whether the person's request makes its turn read-only: see [`read_only_phrase`].
 pub fn forbids_changes(text: &str) -> bool {
-    const WORDS: [&str; 33] = [
-        "変更しない", "変更はしない", "変更せず", "編集しない", "編集せず", "書き換えない", "書き換えず", "修正しない", "修正せず", "書き込まない", "触らない", "変えないで", "読むだけ", "見るだけ", "読み取り専用", "読み取りだけ", "ファイルを作らない",
-        "do not change", "don't change", "do not modify", "don't modify", "do not edit", "don't edit", "do not write", "don't write", "do not touch", "don't touch", "without changing", "without modifying", "without editing", "read-only", "read only", "no changes",
+    read_only_phrase(text).is_some()
+}
+
+/// The words of a request that make its turn read-only, as the person wrote them; none when it does not say so plainly. A read-only turn closes the workspace to `create_file` and
+/// `apply_patch`, opens a scratch folder, and says so on the screen. A request is followed as written unless it is one of these, so a guess never refuses a write.
+///
+/// Only the person's own typed words are read: a plan's body, an approval, a tool's output or the app's notes never come here, and neither does code the person quoted (fenced, or in
+/// backticks or quotation marks), which is a paste or a mention and not a request. What makes a turn read-only, and why:
+/// - A refusal that covers the whole work: "don't change anything", "do not modify any files", "without changing the project", "make no changes", "no changes, please". Nothing is named that
+///   the rest of the request could still be about.
+/// - A look and nothing else: "just look", "read-only review", "Read-only.".
+/// - In Japanese the same two: a refusal with no object ("変更しないで", "何も変更しない", "調べて、変更はしないで") or with the files or the project as its object ("ファイルは
+///   変更しない"), and 「読むだけ」「見るだけ」「読み取り専用」. 「コードは」 and 「フォルダーは」 are not enough: a request names them beside what it asks for.
+///
+/// What does not, because a thing is named after it and the refusal is about that thing: "without changing the tests", "don't touch the config", "no changes to the layout", "don't change
+/// anything except the tests", "don't modify files in src/", 「テストは変えずに」, 「設定ファイルは触らないで」, 「既存のコードは変更せず」, 「calc.py 以外は変更しないで」. Plan mode
+/// is read-only by its mode, and a phrase there is not read (the person's approval of the plan is their go-ahead).
+pub fn read_only_phrase(text: &str) -> Option<String> {
+    let typed = without_quoted_code(text);
+    english_phrase(&typed).or_else(|| japanese_phrase(&typed))
+}
+
+/// The request without what was pasted or quoted in it: a fenced block, and what is between backticks or quotation marks on one line (an error message, the label of a button).
+fn without_quoted_code(text: &str) -> String {
+    static RULES: OnceLock<(Regex, Regex)> = OnceLock::new();
+    let (fenced, inline) = RULES.get_or_init(|| (Regex::new(r"(?s)```.*?(?:```|$)").unwrap(), Regex::new(r#"`[^`\n]*`|「[^」\n]*」|『[^』\n]*』|“[^”\n]*”|"[^"\n]*""#).unwrap()));
+    inline.replace_all(&fenced.replace_all(text, " "), " ").into_owned()
+}
+
+/// What a refusal of changes may be about for it to cover the whole work: not "the code" or "the folder", which a request may name beside the thing it asks for.
+const WHOLE: &str = r"(?:anything|everything|(?:any|every|each)\s+files?|(?:(?:all|the|my|our|your|these|those|any\s+of\s+(?:the|my|our|your)|all\s+of\s+(?:the|my|our|your))\s+)?files|(?:(?:the|this|my|our|your)\s+)?(?:code\s?base|project|repo(?:sitory)?|workspace))";
+/// Words that may follow it without limiting it.
+const TAIL: &str = r"(?:\s+(?:please|thanks|thank\s+you|yet|for\s+now|at\s+all|now|right\s+now|here|whatsoever|anywhere|this\s+time|in\s+any\s+way|in\s+this\s+(?:turn|session|task|request|run)|(?:until|unless)\s+i\s+(?:say|tell|ask|approve)(?:\s+(?:so|you|it))?|until\s+further\s+notice))*";
+/// Where the phrase must end: the clause is over, or what follows is another clause. Not "except", "but", "in", "under", "other": those name what it is about.
+const END: &str = r"(?:\s*$|\s*[.,;:!?)]+(?:\s|$)|\s*\n|\s+[-–—]+\s|\s+(?:and|then|just|so|while|because|since)\b)";
+
+fn english_rules() -> &'static [Regex] {
+    static RULES: OnceLock<Vec<Regex>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        let negation = r"(?:do\s+not|don't|dont|never|must\s+not|mustn't|should\s+not|shouldn't|cannot|can't|may\s+not)(?:\s+ever)?(?:\s+(?:want|need|wish|like)(?:\s+you)?\s+to)?";
+        let verb = r"(?:change|modify|edit|alter|touch|write(?:\s+(?:to|into|over))?|overwrite|rewrite|update)";
+        let verbs = format!(r"{verb}(?:(?:\s*,\s*|\s+or\s+|\s+and\s+|\s*/\s*){verb})*");
+        let changes = r"(?:any\s+|the\s+)?(?:file\s+)?(?:changes?|edits?|modifications?|updates?)";
+        let of_whole = format!(r"(?:\s+(?:to|in|on|of)\s+{WHOLE})?");
+        // (a sentence begins; a clause begins, which a comma also ends)
+        let sentence_start = r"(?:^|[.!?\n]\s*)";
+        let clause_start = r"(?:^|[.!?;:,\n]\s*)";
+        [
+            // "don't change anything", "do not modify any files", "I don't want you to touch the code"
+            format!(r"\b{negation}\s+{verbs}\s+{WHOLE}{TAIL}{END}"),
+            // "don't make any changes (to the files)"
+            format!(r"\b{negation}\s+make\s+{changes}{of_whole}{TAIL}{END}"),
+            // "without changing anything", "without modifying the code"
+            format!(r"\bwithout\s+(?:changing|modifying|editing|altering|touching|writing(?:\s+(?:to|into|over))?|overwriting|rewriting|updating)\s+{WHOLE}{TAIL}{END}"),
+            // "without making any changes (to the files)"
+            format!(r"\bwithout\s+making\s+{changes}{of_whole}{TAIL}{END}"),
+            // "make no changes", "No changes, please.", "no edits to any files"
+            format!(r"(?:{clause_start}|\bmake\s+)(?:please\s+)?no\s+(?:file\s+)?(?:changes?|edits?|modifications?|writes?){of_whole}{TAIL}{END}"),
+            // "Read-only.", "read only please", "this is read-only:", "keep it read-only"
+            format!(r"{sentence_start}(?:please\s+)?(?:this\s+is\s+|keep\s+it\s+|stay\s+)?(?:a\s+)?read[- ]?only{TAIL}{END}"),
+            // "a read-only review", "read-only audit"
+            r"\bread[- ]?only\s+(?:review|look|check|audit|analysis|inspection|investigation|survey|pass|task|request|session|turn|job|question)\b".to_string(),
+            // "this task is read-only"
+            format!(r"\b(?:the|this)\s+(?:task|request|session|turn)\s+(?:is|should\s+be|must\s+be|has\s+to\s+be|needs\s+to\s+be|stays|remains)\s+(?:a\s+)?read[- ]?only{TAIL}{END}"),
+            // "just look.", "Just look, don't touch.", "and only review."
+            format!(r"(?:{clause_start}|\band\s+)(?:please\s+)?(?:just|only)\s+(?:look|read|review|inspect|report|explain){TAIL}{END}"),
+            // "Look only.", "analysis only"
+            format!(r"{sentence_start}(?:look|read|view|review|report|analysis|inspect)[- ]only{TAIL}{END}"),
+        ]
+        .iter()
+        .map(|source| Regex::new(source).unwrap_or_else(|error| panic!("{source}: {error}")))
+        .collect()
+    })
+}
+
+fn english_phrase(text: &str) -> Option<String> {
+    let lower = text.to_lowercase().replace('\u{2019}', "'");
+    english_rules().iter().find_map(|rule| rule.find(&lower)).map(|found| found.as_str().trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+}
+
+/// A refusal in Japanese: the verb of it. What stands before it decides whether it covers the whole work (`japanese_covers_everything`).
+const JAPANESE_REFUSAL: &str = r"(?:(?:変更|編集|修正|更新|上書き)(?:は|も)?(?:しない|せず|しません)|(?:書き換え|書き込ま|変え|触ら|触れ|いじら|直さ|書か)(?:ない|ず|ません))";
+/// A request for a look and nothing else.
+const JAPANESE_LOOK: &str = r"(?:(?:読む|見る|読み取る|眺める|調べる)(?:だけ|のみ)|(?:読み取り|閲覧|参照)(?:だけ|のみ)|読み取り専用)";
+
+fn japanese_phrase(text: &str) -> Option<String> {
+    static RULES: OnceLock<(Regex, Regex)> = OnceLock::new();
+    let (refusal, look) = RULES.get_or_init(|| (Regex::new(JAPANESE_REFUSAL).unwrap(), Regex::new(JAPANESE_LOOK).unwrap()));
+    for found in look.find_iter(text) {
+        if japanese_look_alone(found.as_str(), &text[found.end()..]) {
+            return Some(found.as_str().to_string());
+        }
+    }
+    for found in refusal.find_iter(text) {
+        if japanese_covers_everything(&text[..found.start()]) {
+            return Some(found.as_str().to_string());
+        }
+    }
+    None
+}
+
+/// Whether a look-only phrase stands for a request for a look: not "調べるだけでなく直して" (more than that), "調べるだけ調べて" (as far as it goes), nor "読み取り専用にして" (a setting to make).
+fn japanese_look_alone(phrase: &str, rest: &str) -> bool {
+    const MORE: [&str; 7] = ["でなく", "ではなく", "じゃなく", "では", "にとどまらず", "に留まらず", "に止まらず"];
+    if phrase == "読み取り専用" {
+        const FOR: [&str; 11] = ["レビュー", "調査", "確認", "見て", "調べて", "お願い", "読んで", "分析", "確かめて", "チェック", "点検"];
+        return rest.chars().next().is_none_or(|c| c.is_whitespace() || "。、，．！？!?.,)）」』".contains(c)) || rest.starts_with("です") || rest.strip_prefix('で').is_some_and(|after| FOR.iter().any(|word| after.starts_with(word)));
+    }
+    // ("見るだけ見て": the same verb again, as far as it goes)
+    let again = phrase.chars().next().is_some_and(|first| rest.starts_with(first));
+    !MORE.iter().any(|more| rest.starts_with(more)) && !again
+}
+
+/// Whether a refusal in Japanese covers the whole work, from what stands before its verb: nothing (「変更しないで」), a word for "anything" (「何も」「一切」), a clause that ends there
+/// (「調べて、変更はしないで」), or the files, the code or the project as its object (「ファイルは」「プロジェクトのコードを」). Anything else is an object that limits it:
+/// 「テストは」「設定ファイルは」「既存のコードは」「calc.py 以外は」, and what is not understood is one too.
+fn japanese_covers_everything(before: &str) -> bool {
+    const ADVERBS: [&str; 24] = [
+        "一切", "いっさい", "絶対に", "絶対", "決して", "必ず", "今回は", "今は", "いまは", "今のところ", "まだ", "ひとまず", "とりあえず", "くれぐれも", "どうか", "なるべく", "できるだけ", "基本的に", "ここでは", "当面", "とにかく", "全く", "まったく", "勝手に",
     ];
-    let lower = text.to_lowercase();
-    WORDS.iter().any(|word| lower.contains(word))
+    const NOTHING: [&str; 4] = ["何も", "なにも", "何一つ", "何ひとつ"];
+    const CLAUSE_ENDS: [&str; 6] = ["て", "ため", "ので", "から", "上で", "うえで"];
+    const PARTICLES: [&str; 9] = ["には", "では", "からは", "とは", "は", "を", "も", "に", "が"];
+    // (the sentence it is in: a dot is a full stop only before a space, as in a file's name it is not)
+    let chars: Vec<(usize, char)> = before.char_indices().collect();
+    let mut start = 0;
+    for (at, &(index, c)) in chars.iter().enumerate() {
+        if matches!(c, '。' | '．' | '！' | '？' | '!' | '?' | '\n') || (c == '.' && chars.get(at + 1).is_none_or(|(_, next)| next.is_whitespace())) {
+            start = index + c.len_utf8();
+        }
+    }
+    let sentence = before[start..].trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '、' | '，' | ','));
+    let mut last = sentence.rsplit(['、', '，', ',', ';', '；']).next().unwrap_or("").trim();
+    // (an adverb in front of the object: 「まだファイルは」)
+    while let Some(rest) = ADVERBS.iter().find_map(|adverb| last.strip_prefix(adverb)) {
+        last = rest.trim_start();
+    }
+    loop {
+        last = last.trim_end();
+        if NOTHING.iter().any(|word| last.ends_with(word)) {
+            return true;
+        }
+        match ADVERBS.iter().find_map(|adverb| last.strip_suffix(adverb)) {
+            Some(rest) => last = rest,
+            None => break,
+        }
+    }
+    if last.is_empty() || CLAUSE_ENDS.iter().any(|end| last.ends_with(end)) {
+        return true;
+    }
+    PARTICLES.iter().find_map(|particle| last.strip_suffix(particle)).is_some_and(|object| names_the_whole_work(object.trim_end()))
+}
+
+/// Whether a noun phrase in Japanese is the files, the code or the project as a whole, and not a kind of them: 「ファイル」「全てのファイル」「プロジェクトのコード」, not 「設定ファイル」
+/// (a word is joined to it), 「既存のコード」 or 「他のファイル」 (another word qualifies it).
+fn names_the_whole_work(object: &str) -> bool {
+    const WORK: [&str; 7] = ["ファイル類", "コードベース", "ファイル", "プロジェクト", "リポジトリー", "リポジトリ", "ワークスペース"];
+    const ALL: [&str; 6] = ["全ての", "すべての", "全部の", "どの", "あらゆる", "いかなる"];
+    WORK.iter().filter_map(|word| object.strip_suffix(word)).any(|left| {
+        let Some(last) = left.chars().last() else { return true };
+        if !last.is_alphanumeric() && !"ー々".contains(last) {
+            return true;
+        }
+        if ALL.iter().any(|all| left.ends_with(all)) {
+            return true;
+        }
+        // (the project's files: a place in front of them, and not a qualifier)
+        left.strip_suffix("内の").or_else(|| left.strip_suffix('の')).is_some_and(|place| names_the_whole_work(place) && !place.ends_with("ファイル"))
+    })
 }
 
 /// The turn's note while the person has asked for no changes to the files: what is closed, and the folder that is open for experiments.
@@ -317,17 +486,168 @@ pub fn typed_text(message: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_person_who_says_no_file_is_to_change_is_told_from_one_who_does_not() {
+    /// What a person says that makes a turn read-only: nothing in the work is to change, or only a look is wanted. In English and Japanese, as it is written in real requests.
+    const READ_ONLY: &[&str] = &[
         // (the request of a review in which a model wrote and ran files in the workspace: it ends with the words)
-        const REVIEW: &str = "crates/dogmind-app/src/rtf.rs は、モデルの回答（Markdown）を会話欄の RichEdit に表示するための RTF に変換する部分、markdown.rs は Markdown の読み取り、highlight.rs はコードの色分けです。モデルの出力は信用できない入力として扱うべきものです。実際に起きうる不具合を、重要なものから最大 3 つ、根拠のファイルと行つきで報告してください。コードを読んで確かめたものだけを挙げ、推測は推測と書いてください。ファイルは変更しないでください。";
-        assert!(super::forbids_changes(REVIEW));
-        for no in ["ファイルは変更しないでください。", "コードは読むだけで、書き換えないで", "do not change files", "Don't modify anything, just report", "read-only please", "without changing the code"] {
-            assert!(super::forbids_changes(no), "{no}");
-        }
-        for yes in ["ToDo のページを index.html に作って", "ボタンの色を青系に変えて", "fix the bug in shop.py", "この問題点を調べて、重要なものを報告して", ""] {
-            assert!(!super::forbids_changes(yes), "{yes}");
-        }
+        "crates/dogmind-app/src/rtf.rs は、モデルの回答（Markdown）を会話欄の RichEdit に表示するための RTF に変換する部分、markdown.rs は Markdown の読み取り、highlight.rs はコードの色分けです。モデルの出力は信用できない入力として扱うべきものです。実際に起きうる不具合を、重要なものから最大 3 つ、根拠のファイルと行つきで報告してください。コードを読んで確かめたものだけを挙げ、推測は推測と書いてください。ファイルは変更しないでください。",
+        "このコードを読んで、重要な問題を報告してください。ファイルは変更しないでください。",
+        "ファイルは変更しないでください。",
+        "コードは読むだけで、書き換えないで",
+        "読むだけでお願いします",
+        "見るだけでいいです",
+        "何も変更しないでください",
+        "変更はしないでください。",
+        "まだ何も変更しないで、計画だけ立てて",
+        "a.txt を after にする計画を立てて。まだファイルは変更しないで。",
+        "ファイルを書き換えずに原因を調べて",
+        "ファイルには触らないで、どこが遅いか教えて",
+        "原因を調べて、変更はしないで",
+        "一切変更しないで",
+        "読み取り専用でレビューして",
+        "ファイルには一切触れずに、仕組みを説明して",
+        "ファイルは編集しないでください",
+        "リポジトリは変更しないで",
+        "ファイルはいじらないで",
+        "今回は変更せず、調査だけお願いします",
+        "ファイルを変更せずに、どこが問題か教えて",
+        "何も書き換えないで",
+        "全てのファイルを変更しないで",
+        "プロジェクトのファイルは変更しないでください。",
+        "このプロジェクトは見るだけ。",
+        "読み取りだけでお願い",
+        "just look",
+        "Just look, don't touch.",
+        "Take a look at the scheduler and tell me what you think. Read-only please.",
+        "read-only review of crates/agent/src/lib.rs",
+        "Don't change anything.",
+        "Do not change any files.",
+        "do not change files",
+        "Don't modify anything, just report what you find",
+        "I don't want you to change anything, only tell me what is wrong.",
+        "Review parser.rs. Do not edit any files.",
+        "Explain how the scheduler works without changing anything.",
+        "Tell me why the build fails, without modifying any files.",
+        "No changes, please. Just explain.",
+        "Make no changes to any files.",
+        "Read-only.",
+        "read only. what does this function do?",
+        "Without changing anything, tell me why the build fails.",
+        "Please don't touch any files yet - I want to read the plan first.",
+        "Do not modify the repository.",
+        "Never write to any file. Only report.",
+        "Investigate the crash; do not make any changes.",
+        "This task is read-only: find where the memory goes.",
+        "Look at the logs and say what went wrong. Don't change any files.",
+        "Do not change or overwrite any files.",
+        "Please review this PR. No edits.",
+        "I just want an analysis of the module. Don't touch anything.",
+        "Analysis only, no changes.",
+        "Do not change any files until I say so.",
+        "without changing the codebase",
+        "Do not touch the project, only read it",
+    ];
+
+    /// What a person says that does not: a thing is named, or there is no refusal, or it is a setting to make. The request is followed as written.
+    const NOT_READ_ONLY: &[&str] = &[
+        // (the two requests of 2026-11-07: the phrase limits the tests, not the task)
+        "Fix the failing test in calc.py without changing the tests",
+        "Fix the bug in parser.rs without changing the tests.",
+        "テストは変えずに、calc.py のバグを直して",
+        "calc.py のテストを変更しないで、実装だけ直して",
+        "設定ファイルは触らないでください",
+        "既存のコードは変更せず、新しい関数を追加して",
+        "README.md は変更しないで",
+        "calc.py 以外は変更しないで",
+        "テストファイルは編集しないでください",
+        "他のファイルは変更しないで、calc.py だけ直して",
+        "package.json は触らないで",
+        "ログを書き換えないで、新しいログを追加して",
+        "原因を調べるだけでなく、直してください",
+        "調べるだけ調べて、直してください",
+        "ファイルを読み取り専用にして",
+        "バグを直して。ただしテストは変更しないこと",
+        "calc.py を修正して",
+        "変更点をまとめて",
+        "テストを書き換えずに、実装を直して",
+        "データベースのスキーマは変更しないで",
+        "UI は変えないで、ロジックだけ直して",
+        "この関数をそのまま変更しないで、呼び出し側を直して",
+        "関数の名前は変えずに中身を直して",
+        "テストコードは変更せずに、実装を直して",
+        "このコードを読んで、バグを直して",
+        "コードは変更しないで、設定だけ直して",
+        "コードを変更せずに、設定で解決して",
+        "フォルダーは触らないで、中のファイル名だけ直して",
+        "ボタンの色を青系に変えて",
+        "ToDo のページを index.html に作って",
+        "この問題点を調べて、重要なものを報告して",
+        "ボタンのラベルを「変更しない」にして、色も直して",
+        "```\n変更しない\n```\nこのエラーを直して",
+        "Refactor foo() without changing its behavior",
+        "Don't touch the config, just fix the parser",
+        "Do not change the public API",
+        "Update the README, but don't modify any other files",
+        "Don't change files in the tests folder",
+        "Fix the typo. No changes to the layout please",
+        "Add a read-only flag to the config",
+        "Make the file read-only",
+        "Rename the function without modifying the call sites",
+        "Never edit generated files",
+        "Fix it without changing anything else",
+        "Don't change anything except the tests",
+        "Don't change anything but the tests.",
+        "Please don't modify any files outside src/",
+        "Make the change in calc.py; no other changes",
+        "Build the feature with no changes to the existing tests",
+        "Add a button; don't change the layout of the page",
+        "This is a read-only database; fix the query",
+        "I don't want you to touch the database schema",
+        "The build says no changes to commit, so why does CI fail? Fix it.",
+        "Write the tests first, then don't change them",
+        "Don't change the existing code, add a new module",
+        "Add tests for the parser. Don't change the code.",
+        "Fix the docs without changing the code",
+        "Do not modify the folder layout",
+        "Don't touch that file",
+        "Do not change any files unless the tests need it",
+        "Just fix the typo in the README",
+        "Create a read-only mode for the editor",
+        "Rename the button to \"No changes\" and fix the typo",
+        "```\nERROR: do not change anything\n```\nFix the failing build",
+        "Make the config file read-only after writing it.",
+        "Fix the bug in shop.py",
+        "Carry it out",
+        "Please go ahead.",
+        "Not changed: no other file is edited",
+        "",
+    ];
+
+    #[test]
+    fn a_turn_is_read_only_only_when_the_person_plainly_asks_for_no_changes_to_the_work_or_for_a_look() {
+        assert!(READ_ONLY.len() >= 20 && NOT_READ_ONLY.len() >= 20);
+        let mut wrong: Vec<String> = READ_ONLY.iter().filter(|request| !super::forbids_changes(request)).map(|request| format!("should be read-only: {request}")).collect();
+        wrong.extend(NOT_READ_ONLY.iter().filter(|request| super::forbids_changes(request)).map(|request| format!("should not be: {request} (read as {:?})", super::read_only_phrase(request))));
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The phrase is told as the person wrote it, for the trajectory and for a bug report.
+    #[test]
+    fn the_phrase_that_made_a_turn_read_only_is_told() {
+        assert_eq!(super::read_only_phrase("Review it. Don't change anything, please.").as_deref(), Some("don't change anything"));
+        assert_eq!(super::read_only_phrase("原因を調べて、ファイルは変更しないでください").as_deref(), Some("変更しない"));
+        assert_eq!(super::read_only_phrase("Fix it without changing the tests"), None);
+    }
+
+    /// Only what the person typed is read: the message the model gets has the app's notes before it, and a note that says no change is made to the files (the app's own, or a skill's) is
+    /// not the request.
+    #[test]
+    fn the_apps_notes_before_what_was_typed_are_not_read_for_it() {
+        let note = "## Plan Mode\nNothing can be changed in this mode. Do not change anything.\n";
+        let message = with_note(&user_message_in("Add a line to a.txt", "2026-11-07 06:00:00 +09:00", None), note);
+        assert!(forbids_changes(&message), "read whole, the note says it");
+        assert!(!forbids_changes(typed_text(&message)), "what was typed does not");
+        let message = with_note(&user_message_in("Do not change anything", "2026-11-07 06:00:00 +09:00", None), "## Skill\nAdd lines to files.\n");
+        assert!(forbids_changes(typed_text(&message)));
     }
 
     use super::*;
