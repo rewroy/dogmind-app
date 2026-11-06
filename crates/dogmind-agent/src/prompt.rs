@@ -355,7 +355,9 @@ mod tests {
         // then steps, to click and type in a page as Playwright would, which the person asked for)
         // (then explore, a look by a helper in a context of its own, which saves a review far more than it costs: 197K tokens of one went on reading)
         // (then a sentence on reloads in the steps: a check of what a page keeps across one is ordinary, and without it the steps began again at every load)
-        assert!(tools.len() < 5_900, "the tools have grown to {} characters", tools.len());
+        // (then ask_user and submit_plan, 786 characters as short as they say what they do, about 200 tokens: once a session, as the prefix is kept
+        // after its first request; 0.1 s at DeepSeek-V4.1's 2,000 tokens a second of a cold prompt on two R9700s, 1 s at the 200 above)
+        assert!(tools.len() < 6_700, "the tools have grown to {} characters", tools.len());
         assert!(user_message_in("x", "2026-11-02 20:01:18 +09:00", None).len() < 60, "what rides on every message");
     }
 

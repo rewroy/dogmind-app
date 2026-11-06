@@ -3196,7 +3196,7 @@ mod tests {
         assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "so are the tools");
         assert_eq!(second[2]["reasoning_content"], "thinking");
         assert!(bodies[0].get("tool_choice").is_none() && bodies[0].get("max_tokens").is_none());
-        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 13, "Dogmind's eight and the app's five");
+        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 15, "Dogmind's ten and the app's five");
     }
 
     #[test]
