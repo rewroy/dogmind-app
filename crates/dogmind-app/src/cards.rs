@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use dogmind_agent::agent;
+use dogmind_agent::agent::{self, PlanOutcome};
 use dogmind_agent::message::Message;
 use serde_json::Value;
 
@@ -18,21 +18,34 @@ pub enum AnswerState {
     Unanswered,
 }
 
+/// Where a plan stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanState {
+    /// It waits for the person: it can be carried out, or changed.
+    Waiting,
+    Approved,
+    /// What the person asked to be changed.
+    Changes(String),
+    /// Stopped, or closed, before it was decided.
+    Undecided,
+}
+
 /// What a card of the transcript is: it is kept with the rest of what the transcript is written from, and written again, in whatever state it has come to, as the window changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Card {
     Question { id: u64, question: String, options: Vec<(String, String)>, state: AnswerState },
+    Plan { id: u64, plan: String, state: PlanState },
 }
 
 impl Card {
     /// The number a card has, which says which it is among those of the transcript.
     pub fn id(&self) -> Option<u64> {
         match self {
-            Card::Question { id, .. } => Some(*id),
+            Card::Question { id, .. } | Card::Plan { id, .. } => Some(*id),
         }
     }
 
-    /// The card of a call of `ask_user` that a session kept. `result` is what the call returned: none for a call that has no result, which is one still waiting (the window is told of it as it
+    /// The card of a call of `ask_user` or `submit_plan` that a session kept. `result` is what the call returned: none for a call that has no result, which is one still waiting (the window is told of it as it
     /// happens) and is no card here. None for any other call.
     pub fn of_call(id: u64, name: &str, arguments: &Value, result: Option<&str>) -> Option<Card> {
         match name {
@@ -45,12 +58,21 @@ impl Card {
                 };
                 Some(Card::Question { id, question, options, state })
             }
+            "submit_plan" => {
+                let plan = arguments.get("plan").and_then(Value::as_str).map(str::trim).filter(|plan| !plan.is_empty())?.to_string();
+                let state = match agent::plan_outcome(result?) {
+                    PlanOutcome::Approved => PlanState::Approved,
+                    PlanOutcome::Changes(change) => PlanState::Changes(change),
+                    PlanOutcome::Undecided => PlanState::Undecided,
+                };
+                Some(Card::Plan { id, plan, state })
+            }
             _ => None,
         }
     }
 }
 
-/// The cards a session's messages hold: one for each call of `ask_user` that has a result, in order, with its call's id and the number its card has (from `first_id`).
+/// The cards a session's messages hold: one for each call of `ask_user` or `submit_plan` that has a result, in order, with its call's id and the number its card has (from `first_id`).
 pub fn of_messages(messages: &[Message], first_id: u64) -> Vec<(String, Card)> {
     let results: HashMap<&str, &str> = messages.iter().filter_map(|message| Some((message.tool_call_id.as_deref()?, message.content.as_deref().unwrap_or("")))).collect();
     let mut found = Vec::new();
@@ -73,7 +95,12 @@ fn options_of(arguments: &Value) -> Vec<(String, String)> {
 
 /// Whether a tool is one whose call is a card of its own, and so has no row among the calls.
 pub fn is_asking(tool: &str) -> bool {
-    matches!(tool, "ask_user")
+    matches!(tool, "ask_user" | "submit_plan")
+}
+
+/// Whether what was typed while a plan waits approves it. Anything else is what to change.
+pub fn approves(typed: &str) -> bool {
+    matches!(typed.trim().trim_end_matches(['.', '!', '。', '！']).to_lowercase().as_str(), "yes" | "y" | "ok" | "go" | "はい" | "うん" | "承認" | "実行" | "お願い")
 }
 
 /// What goes back to the model for what was typed while a question waits: a choice's number stands for the choice, anything else is the answer as it was written.
@@ -133,6 +160,49 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_a_session_kept_comes_back_with_how_it_came_out() {
+        let plan = json!({"plan": "1. Add a page\n2. Link it"});
+        let kept = |result: &str| call("submit_plan", plan.clone(), Some(result)).unwrap();
+        let state = |card: Card| match card {
+            Card::Plan { state, plan, .. } => {
+                assert_eq!(plan, "1. Add a page\n2. Link it");
+                state
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(state(kept(agent::PLAN_APPROVED)), PlanState::Approved);
+        assert_eq!(state(kept(&format!("{}use a modal", agent::PLAN_CHANGE))), PlanState::Changes("use a modal".into()));
+        assert_eq!(state(kept("error: the user stopped the turn before deciding on the plan")), PlanState::Undecided);
+        assert_eq!(call("submit_plan", plan.clone(), None), None, "a plan still waiting is told as it happens");
+        assert_eq!(call("submit_plan", json!({"plan": "  "}), Some(agent::PLAN_APPROVED)), None, "no plan, no card");
+    }
+
+    #[test]
+    fn a_session_opened_again_shows_its_plan_beside_its_questions_in_order() {
+        let messages = vec![
+            Message::text("user", "add a page"),
+            asking("p1", "submit_plan", json!({"plan": "1. Write it"})),
+            Message::tool_result("p1", &format!("{}add a title", agent::PLAN_CHANGE)),
+            asking("p2", "submit_plan", json!({"plan": "1. Write it, with a title"})),
+            Message::tool_result("p2", agent::PLAN_APPROVED),
+        ];
+        let found = of_messages(&messages, 1);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0], ("p1".to_string(), Card::Plan { id: 1, plan: "1. Write it".into(), state: PlanState::Changes("add a title".into()) }));
+        assert_eq!(found[1], ("p2".to_string(), Card::Plan { id: 2, plan: "1. Write it, with a title".into(), state: PlanState::Approved }));
+    }
+
+    #[test]
+    fn a_plan_is_approved_by_a_yes_and_anything_else_asks_for_a_change() {
+        for yes in ["yes", "Yes.", " OK ", "はい", "実行！", "go"] {
+            assert!(approves(yes), "{yes}");
+        }
+        for change in ["use a modal", "no", "yes but smaller", ""] {
+            assert!(!approves(change), "{change}");
+        }
+    }
+
+    #[test]
     fn a_number_typed_for_a_question_picks_its_choice() {
         let labels: Vec<String> = ["hello", "hi"].iter().map(|label| label.to_string()).collect();
         assert_eq!(answer_text(&labels, "2"), "hi");
@@ -143,8 +213,8 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_that_asks_is_a_card_and_no_other_is() {
-        assert!(is_asking("ask_user"));
+    fn the_two_tools_that_ask_are_cards_and_no_other_is() {
+        assert!(is_asking("ask_user") && is_asking("submit_plan"));
         assert!(!is_asking("read_file") && !is_asking("todo"));
     }
 }
