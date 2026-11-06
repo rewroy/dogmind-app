@@ -598,6 +598,9 @@ const JA: &[(&str, &str)] = &[
     ("There is nothing to find in yet.", "検索できる内容がまだありません。"),
     ("This session has nothing to go back to yet.", "このセッションにはまだ戻れる地点がありません。"),
     ("Files changed in this answer:", "この回答で変わったファイル:"),
+    ("The agent asks:", "エージェントからの質問:"),
+    ("Type the number of a choice, or your own answer.", "選択肢の番号か、自分の答えを入力してください。"),
+    ("Your answer: {0}", "あなたの答え: {0}"),
     ("That session is at work: stop it first.", "そのセッションは作業中です。先に止めてください。"),
     // The window.
     ("New session", "新しいセッション"),
