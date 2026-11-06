@@ -652,7 +652,7 @@ impl Gate {
                 }
             }
             // (it runs a page's scripts in the sandbox with no network, where they can read and print and little else: it stays in the workspace itself)
-            "show_diff" | "todo" | "skill" | "remember" | "forget" | "command_status" | "command_stop" | "check_page" => Verdict::Allow,
+            "show_diff" | "todo" | "skill" | "remember" | "forget" | "command_status" | "command_stop" | "check_page" | "ask_user" => Verdict::Allow,
             // (its own calls are each through this gate, and it has only the looking ones)
             "explore" => Verdict::Allow,
             "web_read" => Verdict::Allow,

@@ -148,6 +148,14 @@ pub struct Approval {
     pub answer: Sender<(Decision, Option<String>)>,
 }
 
+/// What the model asks the person (the `ask_user` tool): a question with its choices, the first the model's own pick, each with what it means.
+/// The person answers with one of them or with words of their own, which go back as the call's result.
+pub struct Question {
+    pub question: String,
+    pub options: Vec<(String, String)>,
+    pub answer: Sender<String>,
+}
+
 pub enum Event {
     SessionStarted { path: PathBuf, workspace: PathBuf, transcript: Vec<Message> },
     /// A new session's first message has given it a file.
@@ -170,6 +178,8 @@ pub enum Event {
     /// Words written during the turn have reached it, between two of its steps.
     Interjected(String),
     Approval(Approval),
+    /// The model asks the person (ask_user); the turn waits for the answer, or for the turn to be stopped.
+    Question(Question),
     Usage { used: u64, window: u64, usage: Usage },
     Todos(Vec<Value>),
     /// Whether web content is in this conversation, so that commands ask.
@@ -2241,6 +2251,30 @@ impl Agent {
         failures
     }
 
+    /// The model's question to the person, with its choices (ask_user): two to six, the first the model's pick. The turn waits for the answer;
+    /// stopped, or with the window gone, the call fails and the model is told.
+    fn ask_user(&mut self, arguments: &Value) -> Result<String, String> {
+        let question = arguments.get("question").and_then(Value::as_str).map(str::trim).filter(|question| !question.is_empty())
+            .ok_or("question is required")?.to_string();
+        let options: Vec<(String, String)> = arguments.get("options").and_then(Value::as_array).into_iter().flatten().filter_map(|option| {
+            let label = option.get("label").and_then(Value::as_str).or_else(|| option.as_str())?.trim();
+            (!label.is_empty()).then(|| (label.to_string(), option.get("description").and_then(Value::as_str).unwrap_or("").trim().to_string()))
+        }).take(6).collect();
+        if options.len() < 2 {
+            return Err("give two to four options, your pick first: the person chooses one or writes their own answer".into());
+        }
+        let (answer, answered) = channel();
+        self.emit(Event::Question(Question { question, options, answer }));
+        loop {
+            match answered.recv_timeout(Duration::from_millis(200)) {
+                Ok(text) => return Ok(format!("the person answered: {}", text.trim())),
+                Err(_) if self.cancelled() => return Err("the user stopped the turn before answering".into()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err("the question was closed without an answer: decide by yourself, and say what you chose".into()),
+            }
+        }
+    }
+
     fn run_one(&mut self, call: &crate::message::ToolCall) -> usize {
         let name = call.function.name.as_str();
         let started = Instant::now();
@@ -2274,6 +2308,12 @@ impl Agent {
                 self.finish_call_with(&call.id, result, false, started.elapsed(), pictures);
                 return failed;
             }
+        }
+        if name == "ask_user" {
+            let result = self.ask_user(&arguments);
+            let failed = usize::from(result.is_err());
+            self.finish_call(&call.id, result, false, started.elapsed());
+            return failed;
         }
         if name == "explore" {
             let result = self.explore(&call.id, &arguments);
@@ -3004,6 +3044,40 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// The model asks with choices (ask_user): the window is told the question and its choices, and what the person answers is the call's result in
+    /// the next request. With fewer than two choices nothing is asked, and the model is told how to ask.
+    #[test]
+    fn a_question_waits_for_the_persons_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let ask = serde_json::json!({"question": "Which database?", "options": [{"label": "SQLite (recommended)", "description": "one file"}, {"label": "Postgres"}]});
+        let (client, bodies) = server(vec![call_answer("ask_user", ask), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("set up storage".into())).unwrap();
+        let mut asked = None;
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::Question(question) => {
+                    asked = Some((question.question.clone(), question.options.clone()));
+                    question.answer.send("Postgres".into()).unwrap();
+                }
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        let (question, options) = asked.expect("the question was asked");
+        assert_eq!(question, "Which database?");
+        assert_eq!(options, [("SQLite (recommended)".to_string(), "one file".to_string()), ("Postgres".to_string(), String::new())]);
+        let bodies = bodies.lock().unwrap();
+        assert!(bodies[1].to_string().contains("the person answered: Postgres"), "{}", bodies[1]);
+
+        let (client, bodies) = server(vec![call_answer("ask_user", serde_json::json!({"question": "Go?", "options": ["yes"]})), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.starts_with("tool:false") && line.contains("two to four options")), "{log:?}");
+        drop(bodies);
     }
 
     #[test]

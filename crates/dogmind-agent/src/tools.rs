@@ -86,6 +86,10 @@ pub fn schemas() -> Value {
             "scope": {"type": "string", "enum": ["session", "workspace", "staged", "unstaged"], "description": "session: since this session began. workspace: against HEAD, or outside git as session. staged, unstaged: git's index."},
             "paths": {"type": "array", "items": {"type": "string"}}
         }), &["scope"]),
+        function("ask_user", "Ask the person one question with choices, only when their answer decides what you do next and neither the request, the code nor a sensible default settles it. Two to four short options, your pick first with \"(recommended)\" in its label; the person may write their own answer instead. The turn waits for the answer.", json!({
+            "question": {"type": "string", "description": "One question, complete on its own: the person may see only it."},
+            "options": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "description": {"type": "string", "description": "What choosing it means."}}, "required": ["label"]}}
+        }), &["question", "options"]),
         function("todo", "A checklist, only for work with several separate deliverables. Send only what changed.", json!({
             "todos": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "doing", "done", "blocked"]}}, "required": ["id"]}},
             "merge": {"type": "boolean", "description": "false: replace the whole list."}
@@ -2888,7 +2892,7 @@ mod tests {
     fn every_generated_schema_has_a_tool() {
         let schemas = schemas();
         let names: Vec<&str> = schemas.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "todo", "find_files", "check_page", "command_status", "command_stop", "explore"]);
+        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "ask_user", "todo", "find_files", "check_page", "command_status", "command_stop", "explore"]);
     }
 
     #[test]
