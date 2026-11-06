@@ -2350,7 +2350,7 @@ impl Agent {
             let completion = streamed.map_err(|error| format!("the helper's request failed: {error}"))?;
             let answer = without_call_markup(&completion.content).trim().to_string();
             if completion.tool_calls.is_empty() || (last && !answer.is_empty()) {
-                return if answer.is_empty() { Err("the helper ended with nothing to say".into()) } else { Ok(tools::cap(&answer, HELPER_ANSWER)) };
+                return if answer.is_empty() { Err("the helper ended with nothing to say".into()) } else { Ok(tools::spill("helper", &answer, HELPER_ANSWER)) };
             }
             messages.push(completion.message());
             for call in &completion.tool_calls {

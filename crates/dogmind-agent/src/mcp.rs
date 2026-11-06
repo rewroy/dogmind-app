@@ -222,7 +222,7 @@ fn result_text(result: &Value) -> String {
         None => part.to_string(),
     }).collect();
     let text = if parts.is_empty() { result.get("structuredContent").map_or(String::new(), Value::to_string) } else { parts.join("\n") };
-    crate::tools::cap(&text, MAX_RESULT)
+    crate::tools::spill("mcp", &text, MAX_RESULT)
 }
 
 /// A name the model's API takes: letters, digits, `_` and `-`, 64 at most.
