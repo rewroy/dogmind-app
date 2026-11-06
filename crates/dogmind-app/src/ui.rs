@@ -431,7 +431,7 @@ const M_PROVIDER: usize = 200; // and on
 const M_MODEL_CHOICE: usize = 9500; // and on
 
 /// What `/` offers, in this order.
-const COMMANDS: [(&str, &str); 44] = [
+const COMMANDS: [(&str, &str); 45] = [
     ("/setup", "Go through the first setup again"),
     ("/report", "Write what can be sent about a problem"),
     ("/help", "How to use this app"),
@@ -453,6 +453,7 @@ const COMMANDS: [(&str, &str); 44] = [
     ("/diff", "What changed in the folder, file by file"),
     ("/usage", "Tokens and speed of this session"),
     ("/trajectory", "Where this session's time went: each turn's requests and tools"),
+    ("/goal", "What this session works toward, kept across turns: /goal text, /goal clear"),
     ("/init", "Have the model write this project's DOGMIND.md"),
     ("/model", "Change how the model runs: /model Claude"),
     ("/effort", "How hard to think: none low medium high xhigh/max default"),
@@ -1922,6 +1923,8 @@ struct App {
     question: Option<(std::sync::mpsc::Sender<String>, Vec<String>)>,
     /// The plan that waits for the person's approval (Event::PlanReview): where the answer goes.
     plan_review: Option<std::sync::mpsc::Sender<Result<(), String>>>,
+    /// What this session works toward, as the agent last told it (Event::Goal).
+    goal: Option<String>,
     /// The buttons on what waits above the input: where, which message, and what each does.
     queue_hits: Vec<(RECT, usize, QueueAct)>,
     /// Those buttons as their tips stand now.
@@ -4733,6 +4736,15 @@ impl App {
                 }
             }
             "diff" => self.set_panel(Panel::Diff),
+            "goal" => match argument {
+                "" => self.say(&self.goal.as_ref().map_or(t("No goal is set: /goal text sets one.").to_string(), |goal| tf("Goal: {0}", &[goal]))),
+                "clear" | "off" | "none" | "なし" | "消す" => {
+                    let _ = self.agent.commands.send(Command::SetGoal(None));
+                }
+                goal => {
+                    let _ = self.agent.commands.send(Command::SetGoal(Some(goal.to_string())));
+                }
+            },
             // (the report `dogmind-app --trajectory` prints, of this session, in the conversation: till a panel shows it as a table)
             "trajectory" => match self.current_session.as_deref().map(dogmind_agent::trajectory::file_of) {
                 Some(file) if file.exists() => match dogmind_agent::trajectory_report::report_files(&file, None) {
@@ -10652,6 +10664,17 @@ impl App {
                 self.question = Some((question.answer, question.options.into_iter().map(|(label, _)| label).collect()));
                 SetFocus(self.composer);
             }
+            Event::Goal(goal) => {
+                // (said when it changes, till a bar shows it: set, cleared, or that of a session opened)
+                if goal != self.goal {
+                    match &goal {
+                        Some(goal) => self.say(&tf("Goal: {0}", &[goal])),
+                        None if self.goal.is_some() => self.say(t("The goal is cleared.")),
+                        None => {}
+                    }
+                }
+                self.goal = goal;
+            }
             Event::PlanReview(review) => {
                 // (said in the transcript till a card shows it: the next thing typed approves it, or says what to change)
                 self.append(&format!("{}\n{}\n{}\n", t("The plan:"), review.plan.trim_end(), t("Type yes to carry it out, or say what to change.")), Style::Tool);
@@ -14227,6 +14250,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             interjected: Vec::new(),
             question: None,
             plan_review: None,
+            goal: None,
             queue_hits: Vec::new(),
             queue_tips: Vec::new(),
             blocks: Vec::new(),
