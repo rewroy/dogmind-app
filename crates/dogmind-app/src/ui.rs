@@ -1954,8 +1954,6 @@ struct App {
     turn_end_slot: usize,
     turn_cards_waiting: HashMap<u64, usize>,
     turn_cards_came: Vec<(usize, u64)>,
-    /// The turns asked for are those of the session just opened, and are not for the Rewind page.
-    listing_for_cards: bool,
     /// The bar under the title with the session's goal: its button, which clears it.
     goal_clear: HWND,
     // The panel on the right.
@@ -4640,18 +4638,17 @@ impl App {
         }
     }
 
-    /// The cards of what the turns of a session opened again changed, each where its answer ended: put in what the transcript is written from, which is then written again.
-    unsafe fn put_turn_cards(&mut self) {
-        let mut came = std::mem::take(&mut self.turn_cards_came);
-        // (the last place first: those before it keep theirs)
-        came.sort_by(|a, b| b.cmp(a));
-        for (slot, turn) in came {
-            if let Some(files) = self.turn_changes.get(&turn) {
-                let at = slot.min(self.shown.len());
-                self.shown.insert(at, Shown::Card(Card::files(turn, files)));
-            }
+    /// The card of what a turn of a session opened again changed, where its answer ended: put in what the transcript is written from, one reply at a time as they come (the places of
+    /// the others are not moved by it: `cards::card_position`), and the transcript written again a moment after the last that came together.
+    unsafe fn put_turn_card(&mut self, slot: usize, turn: u64, files: &[dogmind_agent::tools::FileChange]) {
+        let at = cards::card_position(&self.turn_cards_came, slot, turn).min(self.shown.len());
+        self.turn_cards_came.push((slot, turn));
+        self.shown.insert(at, Shown::Card(Card::files(turn, files)));
+        // (a block being written is a place in the list too)
+        if let Some(open) = self.open_block.as_mut().filter(|open| **open >= at) {
+            *open += 1;
         }
-        self.reflow();
+        SetTimer(self.window, TIMER_REFLOW, 60, None);
     }
 
     /// Whether the view is at the end of the transcript, or there is nothing to scroll.
@@ -5492,14 +5489,21 @@ impl App {
                 }
             }
             "diff" => self.set_panel(Panel::Diff),
-            "goal" => match argument {
-                "" => self.say(&self.goal.as_ref().map_or(t("No goal is set: /goal text sets one.").to_string(), |goal| tf("Goal: {0}", &[goal]))),
-                "clear" | "off" | "none" | "なし" | "消す" => {
+            // (the bar under the title is where the goal is seen: none of the three writes a line in the conversation, but where there is no goal to show or to clear, which says how to set one)
+            "goal" => match cards::goal_action(argument, self.goal.as_deref()) {
+                cards::GoalAction::Set(goal) => {
+                    let _ = self.agent.commands.send(Command::SetGoal(Some(goal)));
+                }
+                cards::GoalAction::Clear => {
                     let _ = self.agent.commands.send(Command::SetGoal(None));
                 }
-                goal => {
-                    let _ = self.agent.commands.send(Command::SetGoal(Some(goal.to_string())));
+                // (the goal in the composer, as it was set, to read in full or to change and send)
+                cards::GoalAction::Edit(goal) => {
+                    set_text(self.composer, &format!("/goal {goal}"));
+                    SendMessageW(self.composer, EM_SETSEL, usize::MAX, -1);
+                    self.focus_composer();
                 }
+                cards::GoalAction::None => self.say(t("No goal is set: /goal text sets one.")),
             },
             // (the report `dogmind-app --trajectory` prints, of this session, in the conversation: till a panel shows it as a table)
             "trajectory" => match self.current_session.as_deref().map(dogmind_agent::trajectory::file_of) {
@@ -10941,7 +10945,6 @@ impl App {
         self.turn_end_slot = 0;
         self.turn_cards_waiting.clear();
         self.turn_cards_came.clear();
-        self.listing_for_cards = false;
         // (a file that had gone may be back: it is looked for again)
         self.thumbs.retain(|_, kept| !matches!(kept.thumb, Thumb::Missing(_)));
         self.has_messages = false;
@@ -10971,10 +10974,13 @@ impl App {
         for (index, message) in messages.iter().enumerate() {
             match message.role.as_str() {
                 "user" => {
-                    if let Some(text) = message.content.as_deref().filter(|text| !dogmind_agent::prompt::is_nudge(text)) {
+                    if let Some(text) = message.content.as_deref() {
                         self.flush_told_calls(&mut told);
-                        // (what the turn before it changed has its card here)
+                        // (what the turn before it changed has its card here; a turn may begin with what the app said and not the person, which is not shown but is a place)
                         self.turn_slots.push((index, self.shown.len()));
+                        if dogmind_agent::prompt::is_nudge(text) {
+                            continue;
+                        }
                         let pictures: Vec<(PathBuf, (i32, i32))> = self.current_session.as_deref().map_or(Vec::new(), |session| message.images.iter().map(|image| (dogmind_agent::images::file_of(session, image), (image.width as i32, image.height as i32))).collect());
                         self.show_user(typed_text(text), &pictures, &written_words(message));
                     }
@@ -11292,8 +11298,7 @@ impl App {
                 self.show_transcript(&transcript);
                 // (what each answer of it changed: the cards come when the agent has said)
                 if !transcript.is_empty() && self.current_session.is_some() {
-                    self.listing_for_cards = true;
-                    let _ = self.agent.commands.send(Command::ListTurns);
+                    let _ = self.agent.commands.send(Command::TurnsForCards);
                 }
                 for (notice, style) in notices {
                     self.append(&format!("{notice}\n"), style);
@@ -11538,17 +11543,15 @@ impl App {
             }
             // (one of another session, asked for before that one was left: not for the answers shown now)
             Event::TurnChanges { session, .. } if session.is_some() && self.current_session.is_some() && session != self.current_session => {}
-            Event::CardTurns { .. } => {}
+            Event::CardTurns { session, .. } if session.is_some() && self.current_session.is_some() && session != self.current_session => {}
+            Event::CardTurns { turns, .. } => self.turns_for_cards(&turns),
             Event::TurnChanges { turn, files, .. } => {
                 if let Some(slot) = self.turn_cards_waiting.remove(&turn) {
-                    // (a session opened again: the card goes where the answer ended, when all that were asked for have come)
+                    // (a session opened again: the card goes where the answer ended, as soon as its reply has come, whatever came before and whatever does not)
                     if !files.is_empty() {
-                        self.turn_cards_came.push((slot, turn));
+                        self.put_turn_card(slot, turn, &files);
                     }
                     self.turn_changes.insert(turn, files);
-                    if self.turn_cards_waiting.is_empty() {
-                        self.put_turn_cards();
-                    }
                 } else {
                     // (a card under the answer: the files, and their lines added and removed)
                     if !files.is_empty() && !self.turn_changes.contains_key(&turn) {
@@ -11595,7 +11598,6 @@ impl App {
                 self.save();
                 self.update_status();
             }
-            Event::Turns(turns) if std::mem::take(&mut self.listing_for_cards) => self.turns_for_cards(&turns),
             Event::Turns(turns) => {
                 self.turns = turns;
                 if self.turns.is_empty() {
@@ -15182,7 +15184,6 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             turn_end_slot: 0,
             turn_cards_waiting: HashMap::new(),
             turn_cards_came: Vec::new(),
-            listing_for_cards: false,
             goal_clear: make_button(window, ID_GOAL_CLEAR, "x", ButtonKind::Icon, theme::surface()),
             right_width: 0,
             right_toggle: make_button(window, ID_PANEL_TOGGLE, "panel-right", ButtonKind::Icon, theme::background()),
