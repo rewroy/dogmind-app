@@ -86,12 +86,12 @@ pub fn schemas() -> Value {
             "scope": {"type": "string", "enum": ["session", "workspace", "staged", "unstaged"], "description": "session: since this session began. workspace: against HEAD, or outside git as session. staged, unstaged: git's index."},
             "paths": {"type": "array", "items": {"type": "string"}}
         }), &["scope"]),
-        function("ask_user", "Ask the person one question with choices, only when their answer decides what you do next and neither the request, the code nor a sensible default settles it. Two to four short options, your pick first with \"(recommended)\" in its label; the person may write their own answer instead. The turn waits for the answer.", json!({
-            "question": {"type": "string", "description": "One question, complete on its own: the person may see only it."},
-            "options": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "description": {"type": "string", "description": "What choosing it means."}}, "required": ["label"]}}
+        function("ask_user", "Ask the person one question with 2-4 choices, your pick first, only when their answer alone settles what to do. They may answer in their own words. Waits for it.", json!({
+            "question": {"type": "string"},
+            "options": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "description": {"type": "string"}}, "required": ["label"]}}
         }), &["question", "options"]),
-        function("submit_plan", "In plan mode, when the plan is ready: put it to the person to approve. Approved, plan mode ends and you carry it out in the same turn; otherwise you are told what to change.", json!({
-            "plan": {"type": "string", "description": "The plan in Markdown: what changes, where, and why, in steps."}
+        function("submit_plan", "Plan mode: put the finished plan (Markdown) to the person. Approved, plan mode ends and you carry it out now; if not, you get what to change.", json!({
+            "plan": {"type": "string"}
         }), &["plan"]),
         function("todo", "A checklist, only for work with several separate deliverables. Send only what changed.", json!({
             "todos": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "doing", "done", "blocked"]}}, "required": ["id"]}},
