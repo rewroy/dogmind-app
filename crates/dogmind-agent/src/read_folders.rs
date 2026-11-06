@@ -485,7 +485,14 @@ pub fn recover(file: &Path, on: &mut dyn FnMut(u64)) -> Vec<String> {
     let _one = WORK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut journal = read(file);
     let unfinished: Vec<PathBuf> = journal.folders.iter().filter(|folder| folder.state != State::Open).map(|folder| folder.path.clone()).collect();
-    let mut failures: Vec<String> = std::mem::take(&mut *DAMAGED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())).into_iter().filter(|kept| kept.parent() == file.parent()).map(|kept| format!("{}: {LIST_DAMAGED}", kept.display())).collect();
+    // (this list's notes only: another list's stay for its own recover, which took them all and dropped the rest before, and in a run of
+    // tests side by side one test's recover took another's note before that test could say it)
+    let mut failures: Vec<String> = {
+        let mut damaged = DAMAGED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mine, others): (Vec<PathBuf>, Vec<PathBuf>) = std::mem::take(&mut *damaged).into_iter().partition(|kept| kept.parent() == file.parent());
+        *damaged = others;
+        mine.into_iter().map(|kept| format!("{}: {LIST_DAMAGED}", kept.display())).collect()
+    };
     for folder in unfinished {
         // SAFETY: what each call below is given lives until it returns.
         if let Err(error) = unsafe { take_back(file, &mut journal, &folder, on) } {
