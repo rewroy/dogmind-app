@@ -127,6 +127,12 @@ pub fn approves(typed: &str) -> bool {
     matches!(typed.trim().trim_end_matches(['.', '!', '。', '！']).to_lowercase().as_str(), "yes" | "y" | "ok" | "go" | "はい" | "うん" | "承認" | "実行" | "お願い")
 }
 
+/// Where the card of a turn's files goes in what a session opened again was written as. `slots`: for each of the person's messages that was shown, its place in the message list and the
+/// place in what was written before it. The card goes before the words that come after the turn's own, or at `end`. None for a turn whose words are not in what was shown.
+pub fn place_of_turn(slots: &[(usize, usize)], end: usize, message: usize) -> Option<usize> {
+    slots.iter().any(|(at, _)| *at == message).then(|| slots.iter().find(|(at, _)| *at > message).map_or(end, |(_, place)| *place))
+}
+
 /// How many parts a file's bar has: as many as its length in whole, however many lines it changed.
 pub const BAR_PARTS: usize = 8;
 
@@ -161,6 +167,11 @@ pub fn opens_in_app(path: &str) -> bool {
     ];
     let extension = path.rsplit(['/', '\\']).next().and_then(|name| name.rsplit_once('.')).map_or(String::new(), |(_, extension)| extension.to_lowercase());
     !RUNS.contains(&extension.as_str())
+}
+
+/// The words of the bar under the session's title: its goal's first line. None when there is no goal, and no bar.
+pub fn goal_bar(goal: Option<&str>) -> Option<String> {
+    goal.and_then(|goal| goal.lines().map(str::trim).find(|line| !line.is_empty())).map(str::to_string)
 }
 
 /// What goes back to the model for what was typed while a question waits: a choice's number stands for the choice, anything else is the answer as it was written.
@@ -276,6 +287,17 @@ mod tests {
     }
 
     #[test]
+    fn the_card_of_a_turns_files_goes_where_its_answer_ended_in_a_session_opened_again() {
+        // the person's words at message 1, 5 and 9, written at places 0, 10 and 20 of what was shown, which ends at 30
+        let slots = [(1, 0), (5, 10), (9, 20)];
+        assert_eq!(place_of_turn(&slots, 30, 1), Some(10), "before the next person's words");
+        assert_eq!(place_of_turn(&slots, 30, 5), Some(20));
+        assert_eq!(place_of_turn(&slots, 30, 9), Some(30), "the last turn's goes at the end");
+        assert_eq!(place_of_turn(&slots, 30, 3), None, "its words are not in what was shown: a compaction took them");
+        assert_eq!(place_of_turn(&[], 0, 1), None);
+    }
+
+    #[test]
     fn a_file_bar_says_how_much_changed_and_of_what_kind() {
         assert_eq!(bar(0, 0, 10), (0, 0), "nothing changed, no bar");
         assert_eq!(bar(1, 0, 1), (BAR_PARTS, 0), "the file that changed most has the whole bar");
@@ -315,6 +337,17 @@ mod tests {
         assert_eq!(answer_text(&labels, "3"), "3", "past the choices it is a word like any other");
         assert_eq!(answer_text(&labels, "0"), "0");
         assert_eq!(answer_text(&labels, "neither, hey"), "neither, hey");
+    }
+
+    #[test]
+    fn the_goal_bar_has_the_first_line_of_the_goal_and_is_not_there_without_one() {
+        assert_eq!(goal_bar(Some("keep the folder to what I asked for")), Some("keep the folder to what I asked for".to_string()));
+        assert_eq!(goal_bar(Some("
+  first line  
+second")), Some("first line".to_string()));
+        assert_eq!(goal_bar(Some("  
+ ")), None);
+        assert_eq!(goal_bar(None), None);
     }
 
     #[test]

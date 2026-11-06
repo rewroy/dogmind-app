@@ -283,6 +283,7 @@ const ID_RELEASE_OFFER: isize = 9907;
 const ID_TOGGLE_UPDATES: isize = 9908;
 const ID_SPEED_FIRST: isize = 9909;
 const ID_NOTICE_LATER: isize = 9910;
+const ID_GOAL_CLEAR: isize = 9911;
 const ID_DIFF_PREVIOUS: isize = 9900;
 const ID_DIFF_NEXT: isize = 9901;
 const ID_DIFF_CLOSE: isize = 9902;
@@ -1910,6 +1911,16 @@ struct App {
     change_wanted: Option<usize>,
     /// The files of one answer, which the Changes page lists in place of the workspace's, when it was opened from the card under that answer.
     turn_view: Option<Vec<FileChange>>,
+    /// A session opened again: where each person's words begin in the message list and in what was written (`shown`), and where the end is: the places the cards of the files each
+    /// answer changed go to. The turns whose changes were asked for and have not come, each with its place, and the cards that have come.
+    turn_slots: Vec<(usize, usize)>,
+    turn_end_slot: usize,
+    turn_cards_waiting: HashMap<u64, usize>,
+    turn_cards_came: Vec<(usize, u64)>,
+    /// The turns asked for are those of the session just opened, and are not for the Rewind page.
+    listing_for_cards: bool,
+    /// The bar under the title with the session's goal: its button, which clears it.
+    goal_clear: HWND,
     // The panel on the right.
     right_width: i32,
     right_toggle: HWND,
@@ -2909,6 +2920,10 @@ impl App {
                             let mut scrolled = POINT { x: 0, y: 0 };
                             SendMessageW(edit, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(scrolled) as LPARAM);
                             card.top_open = card.top_open && scrolled.y > 0;
+                            // (what goes on below where the card was found to end, or above where it begins, in a colour that is not the page's, is the card in the fade at an edge of the view: it is
+                            // not rounded there, as its end is not in sight)
+                            card.bottom_open |= card.bottom + 1 < client.bottom && view.at(card.left + radius, card.bottom + 1) != page;
+                            card.top_open |= card.top > client.top && view.at(card.left + radius, card.top - 1) != page;
                             if !card.top_open && !card.bottom_open {
                                 user_card.shape = Some(CardShape::around(&card, point, page));
                             }
@@ -4201,8 +4216,8 @@ impl App {
         if self.shown.is_empty() {
             self.append("\n", Style::Gap);
         }
-        // (said in the middle of a run, it stands clear of the run's row)
-        if matches!(self.shown.last(), Some(Shown::Run(_))) {
+        // (said in the middle of a run, it stands clear of the run's row; and of a card)
+        if matches!(self.shown.last(), Some(Shown::Run(_) | Shown::Card(_))) {
             self.append("\n", Style::Gap);
         }
         let lines: Vec<&str> = text.trim().lines().collect();
@@ -4518,7 +4533,7 @@ impl App {
                     AnswerState::Answered(words) => self.card_row(&[&tf("Your answer: {0}", &[words])], 10, theme::accent(), 60, false),
                     AnswerState::Unanswered => self.card_row(&[t("Not answered")], 10, theme::muted(), 60, false),
                 }
-                self.card_row(&[" "], 6, theme::muted(), 80, false);
+                self.card_room(s(12), Vec::new(), false);
             }
             Card::Plan { plan, state, .. } => {
                 // The plan as the transcript writes an answer, Markdown and all, under a word that says what it is; and under it a card with what can be done with it, or what was.
@@ -4538,7 +4553,7 @@ impl App {
                     PlanState::Changes(change) => self.card_row(&[&tf("Change requested: {0}", &[change])], 10, theme::warn(), 60, false),
                     PlanState::Undecided => self.card_row(&[t("Not decided")], 10, theme::muted(), 60, false),
                 }
-                self.card_row(&[" "], 6, theme::muted(), 80, false);
+                self.card_room(s(12), Vec::new(), false);
             }
             Card::Files { turn, rows, more, added, removed } => {
                 let count = rows.len() + more;
@@ -4560,9 +4575,12 @@ impl App {
                     let rest = CardPart { text: tf("and {0} more", &[more]), kind: ButtonKind::Ghost, act: CardAct::MoreFiles(*turn), width: 0, tip: String::new() };
                     self.card_room(s(28), vec![rest], false);
                 }
-                self.card_row(&[" "], 6, theme::muted(), 80, false);
+                self.card_room(s(12), Vec::new(), false);
             }
         }
+        // (a table that ends the document has its last row drawn apart from the rest: a line after it, which is the room under a card anyway)
+        self.append("
+", Style::Gap);
         self.replaying = held;
         self.line_start = true;
         self.para_next = Some(Para::AfterBlock);
@@ -4675,6 +4693,32 @@ impl App {
         } else {
             self.answer_question(&words);
         }
+    }
+
+    /// The turns of the session just opened: for each that saved files, what it changed is asked for, and its card goes where its answer ended, before the next person's words or at the end.
+    unsafe fn turns_for_cards(&mut self, turns: &[dogmind_agent::checkpoint::Turn]) {
+        self.turn_cards_waiting.clear();
+        self.turn_cards_came.clear();
+        for turn in turns.iter().filter(|turn| !turn.files.is_empty()) {
+            // (one whose words are no longer in the conversation, as a compaction took them, has no place in it)
+            let Some(slot) = turn.message.and_then(|message| cards::place_of_turn(&self.turn_slots, self.turn_end_slot, message)) else { continue };
+            self.turn_cards_waiting.insert(turn.id, slot);
+            let _ = self.agent.commands.send(Command::TurnChanges(turn.id));
+        }
+    }
+
+    /// The cards of what the turns of a session opened again changed, each where its answer ended: put in what the transcript is written from, which is then written again.
+    unsafe fn put_turn_cards(&mut self) {
+        let mut came = std::mem::take(&mut self.turn_cards_came);
+        // (the last place first: those before it keep theirs)
+        came.sort_by(|a, b| b.cmp(a));
+        for (slot, turn) in came {
+            if let Some(files) = self.turn_changes.get(&turn) {
+                let at = slot.min(self.shown.len());
+                self.shown.insert(at, Shown::Card(Card::files(turn, files)));
+            }
+        }
+        self.reflow();
     }
 
     /// Whether the view is at the end of the transcript, or there is nothing to scroll.
@@ -5557,6 +5601,7 @@ impl App {
                 show(*window, false);
             }
             show(self.vision_offer_button, false);
+            show(self.goal_clear, false);
         }
         show(self.help_button, !bare && !squeezed);
         show(self.suggest, chat && !self.suggestions.is_empty());
@@ -5812,6 +5857,21 @@ impl App {
                 }
             }
             let mut top = strip;
+            // The session's goal, as a thin bar under its name, with a cross that clears it.
+            show(self.goal_clear, cards::goal_bar(self.goal.as_deref()).is_some());
+            if let Some(goal) = cards::goal_bar(self.goal.as_deref()) {
+                let bar = s(ds::size::TEXT_ROW);
+                top += s(ds::space::XS);
+                shapes.push(Shape::Round { area: rect(left, top, column, bar), radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
+                let label = t("Goal");
+                let label_width = text_width(self.fonts.small, label);
+                shapes.push(Shape::Text { area: rect(left + s(ds::space::M), top, label_width, bar), text: label.to_string(), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
+                let cross = s(ds::size::ICON_BUTTON) - s(ds::space::XS);
+                let words_left = left + s(ds::space::M) + label_width + s(ds::space::S);
+                shapes.push(Shape::Text { area: rect(words_left, top, (left + column - cross - words_left).max(0), bar), text: goal, font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
+                place(self.goal_clear, left + column - cross - s(ds::space::XS), top + (bar - cross) / 2, cross, cross);
+                top += bar + s(ds::space::XS);
+            }
             if let Some(notice) = &notice {
                 top += s(ds::space::XS);
                 top += self.place_notice(&mut shapes, notice, left, column, top);
@@ -10723,6 +10783,11 @@ impl App {
         self.question = None;
         self.plan_review = None;
         set_text(self.card_field, "");
+        self.turn_slots.clear();
+        self.turn_end_slot = 0;
+        self.turn_cards_waiting.clear();
+        self.turn_cards_came.clear();
+        self.listing_for_cards = false;
         // (a file that had gone may be back: it is looked for again)
         self.thumbs.retain(|_, kept| !matches!(kept.thumb, Thumb::Missing(_)));
         self.has_messages = false;
@@ -10749,11 +10814,13 @@ impl App {
         // (the questions and plans it holds, as cards, each with what came of it)
         let kept_cards = cards::of_messages(messages, self.card_next + 1);
         self.card_next += kept_cards.len() as u64;
-        for message in messages {
+        for (index, message) in messages.iter().enumerate() {
             match message.role.as_str() {
                 "user" => {
                     if let Some(text) = message.content.as_deref().filter(|text| !dogmind_agent::prompt::is_nudge(text)) {
                         self.flush_told_calls(&mut told);
+                        // (what the turn before it changed has its card here)
+                        self.turn_slots.push((index, self.shown.len()));
                         let pictures: Vec<(PathBuf, (i32, i32))> = self.current_session.as_deref().map_or(Vec::new(), |session| message.images.iter().map(|image| (dogmind_agent::images::file_of(session, image), (image.width as i32, image.height as i32))).collect());
                         self.show_user(typed_text(text), &pictures, &written_words(message));
                     }
@@ -10800,6 +10867,7 @@ impl App {
             }
         }
         self.flush_told_calls(&mut told);
+        self.turn_end_slot = self.shown.len();
         self.opening = false;
         hold_layout(self.transcript_document, false);
         SendMessageW(self.transcript, WM_SETREDRAW, 1, 0);
@@ -11068,6 +11136,11 @@ impl App {
                 self.changes.clear();
                 self.refresh_changes();
                 self.show_transcript(&transcript);
+                // (what each answer of it changed: the cards come when the agent has said)
+                if !transcript.is_empty() && self.current_session.is_some() {
+                    self.listing_for_cards = true;
+                    let _ = self.agent.commands.send(Command::ListTurns);
+                }
                 for (notice, style) in notices {
                     self.append(&format!("{notice}\n"), style);
                 }
@@ -11310,11 +11383,22 @@ impl App {
                 }
             }
             Event::TurnChanges { turn, files } => {
-                // (a card under the answer: the files, and their lines added and removed)
-                if !files.is_empty() && !self.turn_changes.contains_key(&turn) {
-                    self.write_card(&Card::files(turn, &files));
+                if let Some(slot) = self.turn_cards_waiting.remove(&turn) {
+                    // (a session opened again: the card goes where the answer ended, when all that were asked for have come)
+                    if !files.is_empty() {
+                        self.turn_cards_came.push((slot, turn));
+                    }
+                    self.turn_changes.insert(turn, files);
+                    if self.turn_cards_waiting.is_empty() {
+                        self.put_turn_cards();
+                    }
+                } else {
+                    // (a card under the answer: the files, and their lines added and removed)
+                    if !files.is_empty() && !self.turn_changes.contains_key(&turn) {
+                        self.write_card(&Card::files(turn, &files));
+                    }
+                    self.turn_changes.insert(turn, files);
                 }
-                self.turn_changes.insert(turn, files);
             }
             Event::Question(question) => {
                 self.card_next += 1;
@@ -11330,15 +11414,11 @@ impl App {
                 self.focus_composer();
             }
             Event::Goal(goal) => {
-                // (said when it changes, till a bar shows it: set, cleared, or that of a session opened)
+                // (the bar under the title shows it, while there is one: set, or that of a session opened)
                 if goal != self.goal {
-                    match &goal {
-                        Some(goal) => self.say(&tf("Goal: {0}", &[goal])),
-                        None if self.goal.is_some() => self.say(t("The goal is cleared.")),
-                        None => {}
-                    }
+                    self.goal = goal;
+                    self.layout();
                 }
-                self.goal = goal;
             }
             Event::PlanReview(review) => {
                 self.card_next += 1;
@@ -11358,6 +11438,7 @@ impl App {
                 self.save();
                 self.update_status();
             }
+            Event::Turns(turns) if std::mem::take(&mut self.listing_for_cards) => self.turns_for_cards(&turns),
             Event::Turns(turns) => {
                 self.turns = turns;
                 if self.turns.is_empty() {
@@ -12372,6 +12453,7 @@ impl App {
         // What has only an icon says what it is when the pointer rests on it.
         for (window, words) in [
             (self.help_button, t("Help")),
+            (self.goal_clear, t("Clear the goal")),
             (self.right_toggle, t("Show or hide the panel on the right")),
             (self.attach_button, t("Attach a picture")),
             (self.preview_reload, t("Reload")),
@@ -12971,13 +13053,18 @@ fn find_card(client: RECT, text: POINT, radius: i32, is_card: impl Fn(i32, i32) 
     if !is_card(x, from) {
         return None;
     }
-    let (mut top, mut bottom) = (from, from);
-    while top > client.top && is_card(x, top - 1) {
-        top -= 1;
-    }
-    while bottom + 1 < client.bottom && is_card(x, bottom + 1) {
-        bottom += 1;
-    }
+    // A card that is rows of a table has a seam between two of them, a line or two of another colour, where the control draws their edges at fractions of a pixel: it is walked over.
+    let reach = |from: i32, step: i32, limit: i32| -> i32 {
+        let mut y = from;
+        loop {
+            let found = (1..=3).map(|gap| y + step * gap).take_while(|at| if step > 0 { *at < limit } else { *at > limit }).find(|at| is_card(x, *at));
+            match found {
+                Some(at) => y = at,
+                None => return y,
+            }
+        }
+    };
+    let (top, bottom) = (reach(from, -1, client.top - 1), reach(from, 1, client.bottom));
     let (top_open, bottom_open) = (top == client.top, bottom + 1 == client.bottom);
     if top_open && bottom_open || bottom - top < 2 * radius {
         return None;
@@ -12995,7 +13082,7 @@ fn find_card(client: RECT, text: POINT, radius: i32, is_card: impl Fn(i32, i32) 
     }
     let height = bottom - top;
     let whole = left > client.left && right - left >= 2 * radius && height >= 2 * radius
-        && (top + radius..=bottom - radius).all(|y| is_card(left, y) && is_card(right, y) && !is_card(left - 1, y) && (right + 1 == client.right || !is_card(right + 1, y)));
+        && (top + radius..=bottom - radius).all(|y| !is_card(x, y) || (is_card(left, y) && is_card(right, y) && !is_card(left - 1, y) && (right + 1 == client.right || !is_card(right + 1, y))));
     whole.then_some(CardArea { left, right, top, bottom, top_open, bottom_open })
 }
 
@@ -13757,6 +13844,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_HELP => app.set_panel(Panel::Help),
+                ID_GOAL_CLEAR => {
+                    let _ = app.agent.commands.send(Command::SetGoal(None));
+                }
                 _ if (ID_COPY_POOL..ID_COPY_POOL + COPY_POOL as isize).contains(&id) => app.copy_answer((id - ID_COPY_POOL) as usize),
                 _ if (ID_FORK_POOL..ID_FORK_POOL + COPY_POOL as isize).contains(&id) => app.fork_from_answer((id - ID_FORK_POOL) as usize),
                 _ if (ID_BLOCK_POOL..ID_BLOCK_POOL + BLOCK_POOL as isize).contains(&id) => app.copy_block((id - ID_BLOCK_POOL) as usize),
@@ -14860,6 +14950,12 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             changes: Vec::new(),
             change_wanted: None,
             turn_view: None,
+            turn_slots: Vec::new(),
+            turn_end_slot: 0,
+            turn_cards_waiting: HashMap::new(),
+            turn_cards_came: Vec::new(),
+            listing_for_cards: false,
+            goal_clear: make_button(window, ID_GOAL_CLEAR, "x", ButtonKind::Icon, theme::surface()),
             right_width: 0,
             right_toggle: make_button(window, ID_PANEL_TOGGLE, "panel-right", ButtonKind::Icon, theme::background()),
             right_hits: Vec::new(),
@@ -15894,6 +15990,24 @@ mod tests {
 
     fn card_at(left: i32, right: i32, top: i32, bottom: i32) -> impl Fn(i32, i32) -> bool {
         move |x, y| (left..=right).contains(&x) && (top..=bottom).contains(&y)
+    }
+
+    #[test]
+    fn a_seam_of_a_line_or_two_between_the_rows_of_a_card_does_not_end_it() {
+        let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
+        let text = POINT { x: 322, y: 110 };
+        let seamed = |seam: std::ops::RangeInclusive<i32>| {
+            let card = card_at(300, 480, 100, 160);
+            move |x: i32, y: i32| card(x, y) && !seam.contains(&y)
+        };
+        // (one line, or two, at the foot of the last row: the card is all of it)
+        for seam in [150..=150, 150..=151, 120..=121] {
+            let found = find_card(client, text, 6, seamed(seam.clone())).unwrap_or_else(|| panic!("{seam:?}"));
+            assert_eq!((found.top, found.bottom), (100, 160), "{seam:?}");
+        }
+        // (three lines are a gap between two cards)
+        let found = find_card(client, text, 6, seamed(150..=152)).unwrap();
+        assert_eq!(found.bottom, 149);
     }
 
     #[test]
