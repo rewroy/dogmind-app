@@ -13522,11 +13522,26 @@ unsafe fn title_bar(window: HWND) {
 /// command is left out, as it is being approved; a file's content may be long, and its first part tells what it is.
 /// What a call says of itself, and what it brought back, is drawn as it is written: a command with a right-to-left override in it showed its end backwards, as `echo safe live world`
 /// for what ran as `echo safe <U+202E> dlrow evil`. What acts on text and shows nothing is shown as its mark before any of it is drawn.
+/// So are keys and tokens a tool brought back or a call names: hidden but their beginning (mask::hide_keys), where they are shown.
 fn hidden_shown(event: Event) -> Event {
+    let event = keys_hidden(event);
     match event {
         Event::ToolStarted { id, tool, summary } if markdown::has_marks(&summary) => Event::ToolStarted { id, tool, summary: markdown::show_hidden(&summary).into_owned() },
         Event::ToolProgress { id, tool, summary } if markdown::has_marks(&summary) => Event::ToolProgress { id, tool, summary: markdown::show_hidden(&summary).into_owned() },
         Event::ToolEnded { id, ok, declined, elapsed, output, images } if markdown::has_marks(&output) => Event::ToolEnded { id, ok, declined, elapsed, output: markdown::show_hidden(&output).into_owned(), images },
+        other => other,
+    }
+}
+
+fn keys_hidden(event: Event) -> Event {
+    let hide = |text: String| match crate::mask::hide_keys(&text) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(hidden) => hidden,
+    };
+    match event {
+        Event::ToolStarted { id, tool, summary } => Event::ToolStarted { id, tool, summary: hide(summary) },
+        Event::ToolProgress { id, tool, summary } => Event::ToolProgress { id, tool, summary: hide(summary) },
+        Event::ToolEnded { id, ok, declined, elapsed, output, images } => Event::ToolEnded { id, ok, declined, elapsed, output: hide(output), images },
         other => other,
     }
 }

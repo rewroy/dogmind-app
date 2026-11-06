@@ -13,6 +13,7 @@ mod keys;
 mod lang;
 mod machine;
 mod markdown;
+mod mask;
 mod highlight;
 mod paint;
 mod preview;
