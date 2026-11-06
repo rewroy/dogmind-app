@@ -302,6 +302,15 @@ fn written_page(root: &Path, file: &Path, kind: &Written, marked: Option<(usize,
             tf("{0} rows and {1} columns: the first {2} rows and {3} columns are shown.", &[&rows.to_string(), &columns.to_string(),
                 &crate::table::MOST_ROWS.min(rows).to_string(), &crate::table::MOST_COLUMNS.min(columns).to_string()])
         }));
+        // (as a text's page: what NavigateToString takes; the cells were bounded, so this is a last guard)
+        if body.len() > MOST_PAGE {
+            let mut cut = MOST_PAGE;
+            while !body.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            body.truncate(cut);
+            body.push_str(&format!("</table><p class=\"cut\">{}</p>", markdown::escape(&tf("Only the first {0} KB are shown.", &[&(MOST_PAGE / 1024)]))));
+        }
         let base = file.parent().and_then(|folder| address_of(root, folder)).unwrap_or_else(|| format!("https://{HOST}"));
         return Ok(page_of(&body, &format!("{base}/")));
     }
