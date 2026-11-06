@@ -928,6 +928,16 @@ struct OverlayHit {
     key: OverlayKey,
 }
 
+/// The widths of the three chips in the foot of the composer, in pixels. The mode's and the effort's are their words' (`mode`, `effort`: what their words need), whatever room there is: the
+/// mode's "Plan first" was cut to "Plan..." in a narrow window by a share of the room. The model's is its own words (`model`) up to `most`, and what the others leave, down to `least`
+/// (or its own words, if they are fewer): its long name is what gives way first, then the effort's words (the mode's are never cut).
+fn chip_widths(room: i32, mode: i32, effort: i32, model: i32, most: i32, least: i32) -> (i32, i32, i32) {
+    let floor = least.min(model);
+    // (the effort's words are cut before the mode's, and after the model's name has given what it can)
+    let effort = effort.min((room - mode - floor).max(0));
+    (mode, effort, model.min(most).min(room - mode - effort).max(floor))
+}
+
 /// What a control that a card puts over the transcript does when it is pressed.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum CardAct {
@@ -5789,11 +5799,10 @@ impl App {
             let chip = s(ds::size::ICON_BUTTON);
             // They give way to the send button in a narrow window.
             let room = column - s(100);
-            let fit = |chip: HWND, most: i32| (text_width(self.fonts.small, &get_text(chip)) + s(ds::size::BUTTON_PADDING)).min(most);
-            // The short ones keep their words as long as they can: the long name of a model is what gives way.
-            let mode_width = fit(self.mode_chip, s(140).min(room * 30 / 100));
-            let effort_width = fit(self.effort_chip, s(150).min(room * 30 / 100));
-            let model_width = fit(self.model_chip, s(300).min(room - mode_width - effort_width));
+            let want = |chip: HWND| text_width(self.fonts.small, &get_text(chip)) + s(ds::size::BUTTON_PADDING);
+            // The short ones keep their words (the mode's is never cut: "Plan first"): the long name of a model is what gives way.
+            // (less the gaps between the chips and a little to the send button)
+            let (mode_width, effort_width, model_width) = chip_widths(room - s(ds::space::HAIR) - s(ds::space::XS) - s(ds::space::M), want(self.mode_chip), want(self.effort_chip).min(s(260)), want(self.model_chip), s(300), s(60));
             place(self.attach_button, left + s(ds::space::S), row_top + s(ds::size::CHIP_INSET), chip, chip);
             let chips = left + s(ds::space::S) + chip + s(ds::space::HAIR);
             place(self.model_chip, chips, row_top + s(ds::size::CHIP_INSET), model_width, chip);
@@ -16315,6 +16324,19 @@ mod tests {
         assert_eq!(card_part_words(&part("external-link".to_string(), ButtonKind::Icon, "Open in its app")), "Open in its app");
         assert_eq!(card_part_words(&part("Send".to_string(), ButtonKind::Primary, "")), "Send");
         assert_eq!(card_part_words(&part("check|Carry it out".to_string(), ButtonKind::Primary, "")), "Carry it out");
+    }
+
+    #[test]
+    fn the_mode_chip_has_its_words_whatever_the_room_and_the_models_name_gives_way() {
+        // (a wide window: all three have their words, the model's up to its most)
+        assert_eq!(chip_widths(900, 96, 130, 260, 300, 60), (96, 130, 260));
+        assert_eq!(chip_widths(900, 96, 130, 500, 300, 60), (96, 130, 300));
+        // (a narrow one: the share of the room a chip was held to cut "Plan first"; now it does not, and the model's name takes what is left)
+        assert_eq!(chip_widths(320, 96, 130, 260, 300, 60), (96, 130, 94));
+        // (narrower: the model's name is down to its least, and the effort's words give way next; the mode's stay)
+        assert_eq!(chip_widths(200, 96, 130, 260, 300, 60), (96, 44, 60));
+        assert_eq!(chip_widths(200, 96, 130, 40, 300, 60), (96, 64, 40));
+        assert_eq!(chip_widths(100, 96, 130, 260, 300, 60), (96, 0, 60));
     }
 
     #[test]
