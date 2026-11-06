@@ -688,9 +688,8 @@ unsafe extern "system" fn scroll_window_ex(this: *mut Host, dx: i32, dy: i32, sc
     if crate::ui::test_log_on() {
         crate::ui::test_log(&format!("blit dx={dx} dy={dy}"));
     }
-    // The buttons that stand over the text move with it at this moment, before the band it uncovered is drawn: they are asked for exactly where they belong when the view has been drawn.
+    // (what is drawn over the text, the icons and the controls of the cards, is drawn in its paint and moves with its pixels: the band it uncovers is drawn with its own)
     if dy != 0 {
-        crate::ui::overlays_follow(dy);
         host.bands_again(dy.abs());
     }
 }
