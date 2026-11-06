@@ -20,6 +20,7 @@ mod paint;
 mod preview;
 mod render;
 mod rtf;
+mod table;
 mod settings;
 mod textview;
 mod toolrun;
