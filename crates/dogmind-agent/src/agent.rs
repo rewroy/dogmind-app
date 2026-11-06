@@ -103,6 +103,8 @@ pub enum Command {
     Retry,
     /// Send the session's turns as [`Event::Turns`].
     ListTurns,
+    /// Send what a turn's edits changed as [`Event::TurnChanges`]: the card under an answer of a session reopened.
+    TurnChanges(u64),
     /// Back to a turn's beginning: in the files, in the conversation, or both.
     Rewind { turn: u64, files: bool, conversation: bool },
     NewSession(PathBuf),
@@ -175,6 +177,9 @@ pub enum Event {
     /// Whether web content is in this conversation, so that commands ask.
     WebSeen(bool),
     Turns(Vec<Turn>),
+    /// What a turn's edits changed, file by file with its lines added and removed and its diff (`Checkpoints::turn_changes`): told when a turn that
+    /// changed files ends, before [`Event::TurnEnded`], and when asked (`Command::TurnChanges`). What a command changed is not in it.
+    TurnChanges { turn: u64, files: Vec<crate::tools::FileChange> },
     /// A rewind is done; `prompt` is what was typed, when the conversation went back to before it.
     Rewound { restored: Restored, prompt: Option<String> },
     /// The request waits for a server that is being restarted: its loading progress as `/health` gave it, or null when only a proxy in front of it answers. Till the next request.
@@ -1154,6 +1159,10 @@ impl Agent {
                     let turns = self.marks.as_ref().map_or(Vec::new(), |marks| marks.turns().to_vec());
                     self.emit(Event::Turns(turns));
                 }
+                Command::TurnChanges(turn) => {
+                    let files = self.marks.as_ref().map_or(Vec::new(), |marks| marks.turn_changes(turn, &self.workspace));
+                    self.emit(Event::TurnChanges { turn, files });
+                }
                 Command::Rewind { turn, files, conversation } => self.rewind(turn, files, conversation),
             }
         }
@@ -1511,6 +1520,13 @@ impl Agent {
             self.traj.write("failed", req.as_deref(), failed_fields(error));
         }
         self.traj.write("turn_end", None, json!({"cancelled": cancelled, "ended": how, "requests": requests, "tools": tools, "ms": turn_began.elapsed().as_millis() as u64}));
+        // (the files this turn's edits changed, for the card under its answer)
+        if let Some(turn) = self.marks.as_ref().and_then(|marks| marks.turns().last()).map(|turn| turn.id) {
+            let files = self.marks.as_ref().map_or(Vec::new(), |marks| marks.turn_changes(turn, &self.workspace));
+            if !files.is_empty() {
+                self.emit(Event::TurnChanges { turn, files });
+            }
+        }
         match ended {
             Ended::Done => self.emit(Event::TurnEnded { cancelled: false }),
             Ended::Cancelled => self.emit(Event::TurnEnded { cancelled: true }),
