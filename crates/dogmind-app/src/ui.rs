@@ -297,7 +297,8 @@ const TIMER_REFLOW: usize = 6;
 const TIMER_RECONNECT: usize = 7;
 /// Whether a new build has come in over the app or the engine it runs.
 const TIMER_UPDATE: usize = 8;
-/// Whether it is time to ask GitHub for a newer release: the first time a little after the start, then once an hour (it asks only when a day has gone by since the last answer).
+/// Whether it is time to ask GitHub for a newer release: the first time a little after the start, then once an hour (it asks only when six hours have gone by since the last
+/// answer; and when the window comes back from the tray, an hour: Self::tray_open).
 const TIMER_RELEASES: usize = 9;
 const FIRST_RELEASE_LOOK_MS: u32 = 30_000;
 const RELEASE_LOOK_MS: u32 = 60 * 60 * 1000;
@@ -7190,7 +7191,7 @@ impl App {
                 self.set_button_kinds(&[ButtonKind::Link, ButtonKind::Secondary, ButtonKind::Link, ButtonKind::Link]);
                 self.update_toggles();
                 self.show_release_controls();
-                self.tip(self.toggle_updates, t("Dogmind asks GitHub for the newest release at most once a day. It sends only its name and version. When there is a newer one, it downloads the setup in the background and checks it, and restarts into it only when you press Restart to update."));
+                self.tip(self.toggle_updates, t("Dogmind asks GitHub for the newest release every six hours, and when you bring the window back from the tray after an hour. It sends only its name and version. When there is a newer one, it says so on the main screen, downloads the setup in the background and checks it, and restarts into it only when you press Restart to update."));
             }
             Panel::General => {
                 self.panel_title = t("Settings").into();
@@ -7928,14 +7929,16 @@ impl App {
         Shell_NotifyIconW(NIM_MODIFY, &data);
     }
 
-    /// Back from the tray.
-    unsafe fn tray_open(&self) {
+    /// Back from the tray. A look at GitHub an hour old is made again, so that a release that came out while the window was hidden shows on the main
+    /// screen as it comes back, and not only on the About page.
+    unsafe fn tray_open(&mut self) {
         ShowWindow(self.window, SW_SHOW);
         if IsIconic(self.window) != 0 {
             ShowWindow(self.window, SW_RESTORE);
         }
         SetForegroundWindow(self.window);
         SetFocus(if self.panel == Panel::Chat && self.pending.is_none() { self.composer } else { self.window });
+        self.look_for_release_after(updates::ON_RETURN);
     }
 
     unsafe fn tray_menu(&mut self) {
@@ -8350,13 +8353,18 @@ impl App {
         DestroyWindow(self.window);
     }
 
-    /// The app's own look at GitHub for a newer release, when the timer says it may be time. It is made only if the person has not turned it off, if a day has gone by since GitHub
+    /// The app's own look at GitHub for a newer release, when the timer says it may be time. It is made only if the person has not turned it off, if six hours have gone by since GitHub
     /// last answered, and if there is anywhere to ask; and not on the first screens, where a new install has just fetched the newest there is.
     unsafe fn look_for_release(&mut self) {
+        self.look_for_release_after(updates::EVERY);
+    }
+
+    /// The same, when `every` seconds have gone by since GitHub last answered.
+    unsafe fn look_for_release_after(&mut self, every: u64) {
         if !self.settings.check_for_updates || self.onboarding || !matches!(self.leaving, Leaving::No) || !updates::can_ask() {
             return;
         }
-        if updates::is_due(self.settings.last_update_check, updates::now()) {
+        if updates::is_due_after(self.settings.last_update_check, updates::now(), every) {
             self.start_release_look(true);
         }
     }
@@ -8429,7 +8437,7 @@ impl App {
         }
         self.save();
         self.update_toggles();
-        // (turned on, it looks at once if a day has gone by: that is what turning it on asks for)
+        // (turned on, it looks at once if six hours have gone by: that is what turning it on asks for)
         self.look_for_release();
         self.layout();
     }
@@ -12669,7 +12677,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_TIMER if wparam == TIMER_RELEASES => {
-            // (the first look came a little after the start; from here the timer asks once an hour whether a day has gone by)
+            // (the first look came a little after the start; from here the timer asks once an hour whether six hours have gone by)
             SetTimer(window, TIMER_RELEASES, RELEASE_LOOK_MS, None);
             app.look_for_release();
             0
