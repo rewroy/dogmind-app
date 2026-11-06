@@ -967,6 +967,13 @@ struct CardSlot {
     tall: i32,
 }
 
+/// What the trajectory page shows: the session's turns, which of them are open, and the rows of the table as that makes them.
+struct TrajectoryPage {
+    summary: dogmind_agent::trajectory_report::Summary,
+    open: std::collections::BTreeSet<u64>,
+    rows: Vec<crate::trajectory::Row>,
+}
+
 /// The model's question that waits for the person: where the answer goes, the question as it was asked, and the card that shows it.
 struct AskedQuestion {
     answer: std::sync::mpsc::Sender<String>,
@@ -2014,6 +2021,8 @@ struct App {
     sidebar_width: i32,
     /// The Changes page: its window, the file shown as rows, where the view is, and what the pointer has chosen.
     diff_view: HWND,
+    /// The trajectory page, when the Changes page's window shows it: the table's rows and which turns are open.
+    trajectory: Option<TrajectoryPage>,
     diff_previous: HWND,
     diff_next: HWND,
     diff_close: HWND,
@@ -5426,7 +5435,10 @@ impl App {
                     self.say(t("Copied the last answer."));
                 }
             }
-            "diff" => self.set_panel(Panel::Diff),
+            "diff" => {
+                self.trajectory = None;
+                self.set_panel(Panel::Diff);
+            }
             // (the bar under the title is where the goal is seen: none of the three writes a line in the conversation, but where there is no goal to show or to clear, which says how to set one)
             "goal" => match cards::goal_action(argument, self.goal.as_deref()) {
                 cards::GoalAction::Set(goal) => {
@@ -5443,10 +5455,10 @@ impl App {
                 }
                 cards::GoalAction::None => self.say(t("No goal is set: /goal text sets one.")),
             },
-            // (the report `dogmind-app --trajectory` prints, of this session, in the conversation: till a panel shows it as a table)
+            // (the trajectory of this session as a table: a page of its own, with the turns that open into their requests and tools)
             "trajectory" => match self.current_session.as_deref().map(dogmind_agent::trajectory::file_of) {
-                Some(file) if file.exists() => match dogmind_agent::trajectory_report::report_files(&file, None) {
-                    Ok(report) => self.append(&format!("{}\n", report.trim_end()), Style::Tool),
+                Some(file) if file.exists() => match dogmind_agent::trajectory_report::summary_file(&file) {
+                    Ok(summary) => self.show_trajectory(summary),
                     Err(error) => self.say(&tf("The trajectory cannot be read: {0}", &[&error])),
                 },
                 _ => self.say(t("This session has no trajectory yet: it is written as the session runs.")),
@@ -5620,7 +5632,8 @@ impl App {
         let looking_at_changes = self.panel == Panel::Diff;
         let squeezed = looking_at_changes || (chat && !bare && self.preview_file.is_some() && width - s(ds::size::SIDEBAR_SMALL) < s(760));
         let sidebar = if bare || (squeezed && !looking_at_changes) { 0 } else if width < s(960) { s(ds::size::SIDEBAR_SMALL) } else { s(ds::size::SIDEBAR) };
-        self.sidebar_width = sidebar;
+        // (the trajectory's table has the whole window: there is no sidebar to fill)
+        self.sidebar_width = if looking_at_changes && self.trajectory.is_some() { 0 } else { sidebar };
         let inset = s(ds::space::S);
         let side_row = s(ds::size::SIDE_ROW);
         let side_width = sidebar - 2 * inset;
@@ -6029,13 +6042,14 @@ impl App {
             for window in self.shared_controls() {
                 show(window, false);
             }
-            show(self.list, !self.list_rows.is_empty());
+            let table = self.trajectory.is_some();
+            show(self.list, !table && !self.list_rows.is_empty());
             // (nothing to go between)
             for window in [self.diff_previous, self.diff_next] {
-                show(window, !self.diff_starts.is_empty());
+                show(window, !table && !self.diff_starts.is_empty());
             }
             let head = s(ds::size::DIFF_HEAD);
-            shapes.push(Shape::Text { area: rect(inset + s(ds::space::M), 0, sidebar - 2 * inset - s(ds::space::M), head), text: self.panel_title.clone(), font: FontKind::Strong, color: theme::text(), flags: ONE_LINE });
+            shapes.push(Shape::Text { area: rect(inset + s(ds::space::M), 0, if table { text_width(self.fonts.strong, &self.panel_title) + s(ds::space::XS) } else { sidebar - 2 * inset - s(ds::space::M) }, head), text: self.panel_title.clone(), font: FontKind::Strong, color: theme::text(), flags: ONE_LINE });
             // (under the head, across the window; the files and the diff stand under it)
             let under = head + notice.as_ref().map_or(0, |notice| self.place_notice(&mut shapes, notice, inset, width - 2 * inset, head));
             place(self.list, inset, under, side_width, height - under - s(ds::space::S));
@@ -6046,9 +6060,11 @@ impl App {
                 place(window, x, middle, button, button);
                 x -= button + s(ds::space::XS);
             }
-            let file = self.diff_file.and_then(|at| self.changes.get(at)).map_or(String::new(), |change| change.path.clone());
-            shapes.push(Shape::Text { area: rect(sidebar + s(ds::space::L), 0, (x + button - sidebar - s(ds::space::XL)).max(0), head), text: file, font: FontKind::Body, color: theme::soft(), flags: (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
-            place(self.diff_view, sidebar, under, width - sidebar, height - under);
+            let file = if table { self.session_title.clone() } else { self.diff_file.and_then(|at| self.changes.get(at)).map_or(String::new(), |change| change.path.clone()) };
+            let from = if table { inset + s(ds::space::M) + text_width(self.fonts.strong, &self.panel_title) + s(ds::space::XL) } else { sidebar + s(ds::space::L) };
+            shapes.push(Shape::Text { area: rect(from, 0, (x + button - from - s(ds::space::XL)).max(0), head), text: file, font: FontKind::Body, color: theme::soft(), flags: (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
+            let across = if table { 0 } else { sidebar };
+            place(self.diff_view, across, under, width - across, height - under);
             self.clamp_diff();
             InvalidateRect(self.diff_view, std::ptr::null(), 0);
             self.shapes = shapes;
@@ -7745,6 +7761,10 @@ impl App {
         if panel != Panel::Diff && self.turn_view.take().is_some() {
             self.refresh_changes();
         }
+        // (and the trajectory page is gone with the page that held it)
+        if panel != Panel::Diff {
+            self.trajectory = None;
+        }
         // (the About page's button waits while a look is going on, and is not to stay that way on another page)
         EnableWindow(self.buttons[1], 1);
         self.panel_log.clear();
@@ -7991,6 +8011,13 @@ impl App {
                 set_text(self.buttons[0], t("Save"));
                 self.set_button_kinds(&[ButtonKind::Primary]);
             }
+            Panel::Diff if self.trajectory.is_some() => {
+                self.panel_title = t("Trajectory").into();
+                self.diff_rows.clear();
+                self.diff_starts.clear();
+                self.diff_file = None;
+                self.diff_words = String::new();
+            }
             Panel::Diff => {
                 self.panel_title = t("Changes").into();
                 self.diff_rows.clear();
@@ -8194,11 +8221,36 @@ impl App {
         self.layout();
     }
 
+    /// The trajectory page, on the Changes page's window, with every turn shut.
+    unsafe fn show_trajectory(&mut self, summary: dogmind_agent::trajectory_report::Summary) {
+        let open = std::collections::BTreeSet::new();
+        let rows = crate::trajectory::rows(&summary, &open);
+        self.trajectory = Some(TrajectoryPage { summary, open, rows });
+        self.diff_scroll = 0;
+        self.set_panel(Panel::Diff);
+    }
+
+    /// A turn's row opened or shut: the rows are made again.
+    unsafe fn toggle_trajectory_turn(&mut self, turn: u64) {
+        let Some(page) = &mut self.trajectory else { return };
+        if !page.open.remove(&turn) {
+            page.open.insert(turn);
+        }
+        page.rows = crate::trajectory::rows(&page.summary, &page.open);
+        self.clamp_diff();
+        InvalidateRect(self.diff_view, std::ptr::null(), 0);
+    }
+
+    /// How many rows the Changes page's window has: those of the diff, or of the trajectory's table.
+    fn diff_len(&self) -> usize {
+        self.trajectory.as_ref().map_or(self.diff_rows.len(), |page| page.rows.len())
+    }
+
     /// How far the view can go, as the window and the file are now.
     unsafe fn diff_room(&self) -> i32 {
         let mut client: RECT = std::mem::zeroed();
         GetClientRect(self.diff_view, &mut client);
-        (self.diff_rows.len() as i32 * scale(self.dpi, ds::size::DIFF_ROW) - client.bottom).max(0)
+        (self.diff_len() as i32 * scale(self.dpi, ds::size::DIFF_ROW) - client.bottom).max(0)
     }
 
     unsafe fn clamp_diff(&mut self) {
@@ -8266,6 +8318,82 @@ impl App {
         }
     }
 
+    /// The trajectory's table: each column at its own place across, in the characters of the monospace face, the header kept at the top, the rows in view under it.
+    unsafe fn paint_trajectory(&self, device: HDC, client: RECT) {
+        use crate::trajectory::{column_starts, RowKind, COLUMNS};
+        let Some(page) = &self.trajectory else { return };
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let row = s(ds::size::DIFF_ROW);
+        let face = self.fonts.code;
+        let character = text_width(face, "0").max(1);
+        let (starts, notes) = column_starts();
+        let bar = s(ds::space::M);
+        let width = client.right - bar;
+        SetBkMode(device, TRANSPARENT as _);
+        let cell = |device: HDC, text: &str, column: usize, y: i32, color: u32| {
+            let (left, room) = (starts[column] as i32 * character, COLUMNS[column].chars as i32 * character);
+            let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | if COLUMNS[column].right { DT_RIGHT } else { 0 };
+            draw_text(device, text, RECT { left, right: left + room, top: y, bottom: y + row }, face, color, flags);
+        };
+        // (the header's row is the first, and stays where it is)
+        let first = ((self.diff_scroll / row) as usize).max(1);
+        let mut y = first as i32 * row - self.diff_scroll;
+        for (at, line) in page.rows.iter().enumerate().skip(first) {
+            if y >= client.bottom {
+                break;
+            }
+            {
+                let band = rect(0, y, width, row);
+                let back = match line.kind {
+                    RowKind::Turn { .. } if at % 2 == 1 => Some(theme::surface()),
+                    RowKind::Total => Some(theme::raised()),
+                    _ => None,
+                };
+                if let Some(color) = back {
+                    let brush = CreateSolidBrush(color);
+                    FillRect(device, &band, brush);
+                    DeleteObject(brush);
+                }
+                let color = match line.kind {
+                    RowKind::Turn { .. } | RowKind::Total => theme::text(),
+                    _ => theme::muted(),
+                };
+                if let RowKind::Turn { open, .. } = line.kind {
+                    icon::draw(device, if open { "chevron-down" } else { "chevron-right" }, rect(0, y, s(ds::size::ICON), row), s(ds::size::ICON_SMALL), theme::muted());
+                }
+                for (column, text) in line.cells.iter().enumerate() {
+                    cell(device, text, column, y, color);
+                }
+                if !line.note.is_empty() {
+                    draw_text(device, &line.note, RECT { left: notes as i32 * character, right: width, top: y, bottom: y + row }, face, theme::faint(), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                }
+            }
+            y += row;
+        }
+        // The header, over whatever has scrolled under it, with the line under it.
+        let head = rect(0, 0, client.right, row);
+        let brush = CreateSolidBrush(theme::background());
+        FillRect(device, &head, brush);
+        DeleteObject(brush);
+        if let Some(line) = page.rows.first() {
+            for (column, text) in line.cells.iter().enumerate() {
+                cell(device, text, column, 0, theme::faint());
+            }
+        }
+        let rule = rect(0, row - 1, client.right, 1);
+        let brush = CreateSolidBrush(theme::line());
+        FillRect(device, &rule, brush);
+        DeleteObject(brush);
+        // Where the view is in the whole of the table.
+        let total = page.rows.len() as i32 * row;
+        if total > client.bottom {
+            let tall = thumb_height(client.bottom, client.bottom, total, s(ds::space::XXL));
+            let at = thumb_offset(client.bottom - tall, self.diff_scroll, total - client.bottom);
+            rounded(device, rect(client.right - s(ds::size::THUMB) - s(ds::size::THUMB) / 2, at, s(ds::size::THUMB), tall), s(ds::size::THUMB) / 2, Some(if self.diff_thumb_grab.is_some() { theme::muted() } else { theme::line() }), None);
+        }
+    }
+
     /// The window of the Changes page: only the rows in view are drawn, as long as a file may be.
     unsafe fn paint_diff(&self, device: HDC, client: RECT) {
         use crate::highlight::Kind;
@@ -8274,6 +8402,9 @@ impl App {
         let brush = CreateSolidBrush(theme::background());
         FillRect(device, &client, brush);
         DeleteObject(brush);
+        if self.trajectory.is_some() {
+            return self.paint_trajectory(device, client);
+        }
         if self.diff_rows.is_empty() {
             draw_text(device, &self.diff_words, RECT { left: s(ds::space::L), right: client.right - s(ds::space::L), top: 0, bottom: s(ds::size::DIFF_HEAD) }, self.fonts.body, theme::muted(), ONE_LINE);
             return;
@@ -11803,6 +11934,9 @@ impl App {
                 if path != self.workspace {
                     return;
                 }
+                if self.panel == Panel::Diff && self.trajectory.is_some() {
+                    return;
+                }
                 // (opened from the card under an answer: that answer's files, with their diffs, and nothing the workspace has besides)
                 let found = match (&self.turn_view, self.panel == Panel::Diff) {
                     (Some(files), true) => Ok(files.clone()),
@@ -13349,7 +13483,7 @@ unsafe extern "system" fn diff_procedure(window: HWND, message: u32, wparam: WPA
         WM_LBUTTONDOWN => {
             SetCapture(window);
             if on_strip {
-                let total = app.diff_rows.len() as i32 * row;
+                let total = app.diff_len() as i32 * row;
                 if total > client.bottom {
                     let tall = thumb_height(client.bottom, client.bottom, total, scale(app.dpi, ds::space::XXL));
                     let at = thumb_offset(client.bottom - tall, app.diff_scroll, total - client.bottom);
@@ -13359,7 +13493,16 @@ unsafe extern "system" fn diff_procedure(window: HWND, message: u32, wparam: WPA
                     app.diff_to((i64::from(y - grab) * i64::from(total - client.bottom) / i64::from((client.bottom - tall).max(1))) as i32);
                 }
             } else {
-                let at = row_at(app, y).min(app.diff_rows.len().saturating_sub(1));
+                let at = row_at(app, y).min(app.diff_len().saturating_sub(1));
+                // (on the trajectory page a press on a turn's row opens it or shuts it)
+                if app.trajectory.is_some() {
+                    // (not the header, which stays over the rows that scroll under it)
+                    let hit = if y < row { None } else { app.trajectory.as_ref().and_then(|page| page.rows.get(row_at(app, y)).map(|line| line.kind)) };
+                    if let Some(crate::trajectory::RowKind::Turn { turn, .. }) = hit {
+                        app.toggle_trajectory_turn(turn);
+                    }
+                    return 0;
+                }
                 app.diff_chosen = Some((at, at));
                 InvalidateRect(window, std::ptr::null(), 0);
             }
@@ -13367,11 +13510,11 @@ unsafe extern "system" fn diff_procedure(window: HWND, message: u32, wparam: WPA
         }
         WM_MOUSEMOVE if wparam & 1 != 0 => { // MK_LBUTTON
             if let Some(grab) = app.diff_thumb_grab {
-                let total = app.diff_rows.len() as i32 * row;
+                let total = app.diff_len() as i32 * row;
                 let tall = thumb_height(client.bottom, client.bottom, total, scale(app.dpi, ds::space::XXL));
                 app.diff_to((i64::from(y - grab) * i64::from((total - client.bottom).max(0)) / i64::from((client.bottom - tall).max(1))) as i32);
             } else if let Some((from, _)) = app.diff_chosen {
-                let at = row_at(app, y).min(app.diff_rows.len().saturating_sub(1));
+                let at = row_at(app, y).min(app.diff_len().saturating_sub(1));
                 app.diff_chosen = Some((from, at));
                 // (past an edge, the view goes along)
                 if y < 0 {
@@ -15154,6 +15297,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             setup_kind: Kind::Embedded,
             sidebar_width: 0,
             diff_view,
+            trajectory: None,
             diff_previous: make_button(window, ID_DIFF_PREVIOUS, "chevron-up", ButtonKind::Icon, theme::background()),
             diff_next: make_button(window, ID_DIFF_NEXT, "chevron-down", ButtonKind::Icon, theme::background()),
             diff_close: make_button(window, ID_DIFF_CLOSE, "x", ButtonKind::Icon, theme::background()),

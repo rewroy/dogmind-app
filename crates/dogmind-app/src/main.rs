@@ -3,6 +3,7 @@
 
 mod attach;
 mod cards;
+mod trajectory;
 mod crash;
 mod design;
 mod diffview;
