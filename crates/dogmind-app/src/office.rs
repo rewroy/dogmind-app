@@ -8,6 +8,11 @@ use std::io::Read;
 /// The most a part may inflate to, and the most entries a workbook's zip may have.
 const MOST_PART: usize = 64 << 20;
 const MOST_ENTRIES: usize = 10_000;
+/// What a cell shows at most, what all the cells shown come to at most, and what the shared strings kept come to at most (one cell's
+/// string can stand in many cells: the page is bounded by what is shown, not by the parts).
+const MOST_CELL: usize = 2048;
+const MOST_SHOWN: usize = 1 << 20;
+const MOST_STRINGS: usize = 16 << 20;
 
 /// A zip's entries by name: where each one's data begins, its sizes and how it is stored.
 struct Entry {
@@ -95,7 +100,12 @@ fn unescape(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let Some(end) = rest.find(';') else { break };
+        // (an entity is a few characters: looking further for its `;` would read the rest of the text again at every `&`)
+        let Some(end) = rest.as_bytes().iter().take(12).position(|byte| *byte == b';') else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
         let entity = &rest[1..end];
         let c = match entity {
             "amp" => Some('&'),
@@ -126,44 +136,61 @@ fn local(name: &str) -> &str {
     name.rsplit_once(':').map_or(name, |(_, local)| local)
 }
 
-/// The items of an XML text, in order (enough of XML for a workbook's parts: no DTD, no CDATA in them).
-fn items(xml: &str) -> Vec<Item<'_>> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while !rest.is_empty() {
-        let Some(open) = rest.find('<') else {
-            out.push(Item::Text(unescape(rest)));
-            break;
-        };
-        if open > 0 {
-            out.push(Item::Text(unescape(&rest[..open])));
+/// The items of an XML text, in order, one at a time (enough of XML for a workbook's parts: no DTD, no CDATA in them): a reader that has
+/// what it wants stops, and a part's items are never all held at once.
+fn items(xml: &str) -> Items<'_> {
+    Items { rest: xml }
+}
+
+struct Items<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Iterator for Items<'a> {
+    type Item = Item<'a>;
+
+    fn next(&mut self) -> Option<Item<'a>> {
+        loop {
+            if self.rest.is_empty() {
+                return None;
+            }
+            let Some(open) = self.rest.find('<') else {
+                let text = unescape(self.rest);
+                self.rest = "";
+                return Some(Item::Text(text));
+            };
+            if open > 0 {
+                let text = unescape(&self.rest[..open]);
+                self.rest = &self.rest[open..];
+                return Some(Item::Text(text));
+            }
+            let Some(close) = self.rest.find('>') else {
+                self.rest = "";
+                return None;
+            };
+            let tag = &self.rest[1..close];
+            self.rest = &self.rest[close + 1..];
+            if tag.starts_with('?') || tag.starts_with('!') {
+                continue;
+            }
+            if let Some(name) = tag.strip_prefix('/') {
+                return Some(Item::Close(local(name.trim())));
+            }
+            let empty = tag.ends_with('/');
+            let tag = tag.trim_end_matches('/');
+            let (name, mut attributes_text) = tag.split_once(char::is_whitespace).unwrap_or((tag, ""));
+            let mut attributes = Vec::new();
+            while let Some(equals) = attributes_text.find('=') {
+                let key = attributes_text[..equals].trim();
+                let after = attributes_text[equals + 1..].trim_start();
+                let Some(quote) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else { break };
+                let Some(end) = after[1..].find(quote) else { break };
+                attributes.push((local(key), unescape(&after[1..1 + end])));
+                attributes_text = &after[end + 2..];
+            }
+            return Some(Item::Open(local(name), attributes, empty));
         }
-        rest = &rest[open..];
-        let Some(close) = rest.find('>') else { break };
-        let tag = &rest[1..close];
-        rest = &rest[close + 1..];
-        if tag.starts_with('?') || tag.starts_with('!') {
-            continue;
-        }
-        if let Some(name) = tag.strip_prefix('/') {
-            out.push(Item::Close(local(name.trim())));
-            continue;
-        }
-        let empty = tag.ends_with('/');
-        let tag = tag.trim_end_matches('/');
-        let (name, mut attributes_text) = tag.split_once(char::is_whitespace).unwrap_or((tag, ""));
-        let mut attributes = Vec::new();
-        while let Some(equals) = attributes_text.find('=') {
-            let key = attributes_text[..equals].trim();
-            let after = attributes_text[equals + 1..].trim_start();
-            let Some(quote) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else { break };
-            let Some(end) = after[1..].find(quote) else { break };
-            attributes.push((local(key), unescape(&after[1..1 + end])));
-            attributes_text = &after[end + 2..];
-        }
-        out.push(Item::Open(local(name), attributes, empty));
     }
-    out
 }
 
 fn attribute<'a>(attributes: &'a [(&str, String)], name: &str) -> Option<&'a str> {
@@ -173,6 +200,7 @@ fn attribute<'a>(attributes: &'a [(&str, String)], name: &str) -> Option<&'a str
 /// The shared strings: each `si`'s text, its runs joined.
 fn shared_strings(xml: &str) -> Vec<String> {
     let (mut strings, mut current, mut inside, mut in_text, mut phonetic) = (Vec::new(), String::new(), false, false, false);
+    let mut kept = 0usize;
     for item in items(xml) {
         match item {
             Item::Open("rPh", _, empty) => phonetic = !empty,
@@ -186,13 +214,16 @@ fn shared_strings(xml: &str) -> Vec<String> {
                 }
             }
             Item::Close("si") => {
-                strings.push(std::mem::take(&mut current));
+                // (past what is kept, a string is kept empty: the cells that name it still find their place)
+                kept += current.len();
+                strings.push(if kept > MOST_STRINGS { String::new() } else { std::mem::take(&mut current) });
+                current.clear();
                 inside = false;
             }
             // (phonetic runs, a Japanese reading of the text, are not the text)
             Item::Open("t", _, false) if inside && !phonetic => in_text = true,
             Item::Close("t") => in_text = false,
-            Item::Text(text) if inside && in_text => current.push_str(&text),
+            Item::Text(text) if inside && in_text && current.len() < MOST_CELL => current.push_str(&text),
             _ => {}
         }
     }
@@ -208,7 +239,15 @@ fn column_of(reference: &str) -> usize {
 fn sheet_rows(xml: &str, strings: &[String], most_rows: usize, most_columns: usize) -> (Vec<Vec<String>>, usize) {
     let (mut rows, mut row, mut total): (Vec<Vec<String>>, Vec<String>, usize) = (Vec::new(), Vec::new(), 0);
     let (mut column, mut kind, mut value, mut in_value) = (0usize, String::new(), String::new(), false);
+    let mut shown_bytes = 0usize;
     for item in items(xml) {
+        // (what will be shown is all read: the rest of the sheet is only counted, by its rows)
+        if rows.len() >= most_rows || shown_bytes >= MOST_SHOWN {
+            if let Item::Close("row") = item {
+                total += 1;
+            }
+            continue;
+        }
         match item {
             Item::Open("row", _, empty) => {
                 row.clear();
@@ -237,14 +276,23 @@ fn sheet_rows(xml: &str, strings: &[String], most_rows: usize, most_columns: usi
             }
             Item::Open("v" | "t", _, false) => in_value = true,
             Item::Close("v" | "t") => in_value = false,
-            Item::Text(text) if in_value => value.push_str(&text),
+            Item::Text(text) if in_value && value.len() < MOST_CELL => value.push_str(&text),
             Item::Close("c") => {
                 if column < most_columns {
-                    let shown = match kind.as_str() {
+                    let mut shown = match kind.as_str() {
                         "s" => value.trim().parse::<usize>().ok().and_then(|at| strings.get(at)).cloned().unwrap_or_default(),
                         "b" => if value.trim() == "1" { "TRUE".to_string() } else { "FALSE".to_string() },
                         _ => std::mem::take(&mut value),
                     };
+                    if shown.len() > MOST_CELL {
+                        let mut cut = MOST_CELL;
+                        while !shown.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        shown.truncate(cut);
+                        shown.push('…');
+                    }
+                    shown_bytes += shown.len();
                     while row.len() < column {
                         row.push(String::new());
                     }
@@ -341,6 +389,21 @@ mod tests {
         assert_eq!(names, ["売上", "Notes"]);
         assert_eq!(total, 3);
         assert_eq!(rows, [vec!["Name", "", "Total"], vec!["A & B", "TRUE", "12.5"], vec!["inline"]]);
+    }
+
+    /// One shared string named by every cell shows a cell's worth in each, and the rows past those wanted are only counted; an `&` that is
+    /// no entity stays as it is, and is not looked past.
+    #[test]
+    fn what_is_shown_is_bounded_whatever_the_parts_hold() {
+        let long = "x".repeat(MOST_CELL * 3);
+        let strings = format!("<sst><si><t>{long}</t></si></sst>");
+        let cells: String = (0..50).map(|row| format!("<row><c r=\"A{}\" t=\"s\"><v>0</v></c></row>", row + 1)).collect();
+        let sheet = format!("<worksheet><sheetData>{cells}</sheetData></worksheet>");
+        let (rows, total) = sheet_rows(&sheet, &shared_strings(&strings), 10, 5);
+        assert_eq!((rows.len(), total), (10, 50));
+        assert!(rows.iter().all(|row| row[0].len() <= MOST_CELL + '…'.len_utf8()));
+        assert_eq!(unescape("a & b &amp; c &#x41;"), "a & b & c A");
+        assert_eq!(unescape(&format!("&{}", "y".repeat(100))), format!("&{}", "y".repeat(100)));
     }
 
     #[test]
