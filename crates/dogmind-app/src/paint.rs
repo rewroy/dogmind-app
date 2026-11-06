@@ -895,6 +895,8 @@ pub enum ButtonKind {
     FileRow = 19,
     /// The frame a field of a card stands in; the field itself is a control of its own over it.
     Frame = 20,
+    /// A control of no size and nothing drawn: what Tab reaches and a screen reader names for something that is drawn elsewhere (the icons in the transcript).
+    Hidden = 21,
 }
 
 /// The parts of the text of a button that has more than one are told apart by this.
@@ -976,6 +978,11 @@ pub fn forced_hover() -> bool {
     false
 }
 
+/// Whether the keys are what is being used.
+pub fn keys_are_in_use() -> bool {
+    KEYS_IN_USE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// From a key that moves the focus, or a press of the pointer. What has the focus now shows it or stops showing it.
 pub unsafe fn keys_in_use(used: bool) {
     if KEYS_IN_USE.swap(used, std::sync::atomic::Ordering::Relaxed) != used {
@@ -1055,6 +1062,10 @@ unsafe extern "system" fn button_procedure(window: HWND, message: u32, wparam: W
         // Reached with Tab: it shows, and Enter or Space presses it.
         WM_SETFOCUS | WM_KILLFOCUS => {
             InvalidateRect(window, std::ptr::null(), 0);
+            // (what it stands for is drawn elsewhere, and shows the focus there)
+            if state & 0xFF == ButtonKind::Hidden as isize {
+                PostMessageW(GetParent(window), crate::ui::WM_PROXY_FOCUS, 0, 0);
+            }
             0
         }
         WM_KEYDOWN if matches!(wparam as u16, VK_RETURN | VK_SPACE) && IsWindowEnabled(window) != 0 => {
@@ -1292,6 +1303,7 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
             }
             draw_text(device, path, RECT { left: client.left + s(design::space::M), right: left_of_numbers, top: 0, bottom: height }, fonts.body, if lit { theme::text() } else { theme::soft() }, (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS);
         }
+        21 => {}
         20 => {
             let focused = {
                 let focus = GetFocus();

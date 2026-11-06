@@ -677,6 +677,8 @@ const JA: &[(&str, &str)] = &[
     // Text menus.
     ("Cut", "切り取り"),
     ("Copy", "コピー"),
+    ("Copy this answer", "この回答をコピー"),
+    ("Copy this code", "このコードをコピー"),
     ("Paste", "貼り付け"),
     ("Select all", "すべて選択"),
     // The tray.
