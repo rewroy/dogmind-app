@@ -50,8 +50,11 @@ const MOST_REDIRECTS: usize = 5;
 /// How long the first byte of a download is waited for.
 const CONNECT: Duration = Duration::from_secs(15);
 
-/// How long a look stands for: the app asks on its own at most once in this many seconds.
-pub const EVERY: u64 = 24 * 60 * 60;
+/// How long a look stands for: the app asks on its own at most once in this many seconds (a release can come out on any day, and a day's wait
+/// left a person who had the window open all day without the news).
+pub const EVERY: u64 = 6 * 60 * 60;
+/// How long a look stands for when the window comes back from the tray: the person sees a release that came out since they last had it open.
+pub const ON_RETURN: u64 = 60 * 60;
 
 /// What the installer puts in the folder it installs to, and what says that a copy runs from an install: as `install::MANIFEST` of `dogmind-setup`, which this cannot link to.
 pub const INSTALL_MANIFEST: &str = "dogmind-install.txt";
@@ -133,9 +136,10 @@ impl Outcome {
     }
 }
 
-/// Whether a day has gone by since the last answer. A time ahead of now is a clock that was set back: nothing says when the next look is due, so it is.
-pub fn is_due(last: Option<u64>, now: u64) -> bool {
-    last.is_none_or(|last| last > now || now - last >= EVERY)
+/// Whether `every` seconds ([`EVERY`], or [`ON_RETURN`] when the window comes back from the tray) have gone by since the last answer. A time ahead of
+/// now is a clock that was set back: nothing says when the next look is due, so it is.
+pub fn is_due_after(last: Option<u64>, now: u64, every: u64) -> bool {
+    last.is_none_or(|last| last > now || now - last >= every)
 }
 
 /// Now, in seconds since 1970.
@@ -1023,16 +1027,26 @@ mod tests {
     }
 
     #[test]
-    fn a_day_must_go_by_before_it_asks_again() {
-        let day = 24 * 60 * 60;
-        assert!(is_due(None, 1_000_000));
-        assert!(!is_due(Some(1_000_000), 1_000_000));
-        assert!(!is_due(Some(1_000_000), 1_000_000 + day - 1));
-        assert!(is_due(Some(1_000_000), 1_000_000 + day));
-        assert!(is_due(Some(1_000_000), 1_000_000 + 40 * day));
+    fn six_hours_must_go_by_before_it_asks_again() {
+        let (hours, day) = (6 * 60 * 60, 24 * 60 * 60);
+        assert!(is_due_after(None, 1_000_000, EVERY));
+        assert!(!is_due_after(Some(1_000_000), 1_000_000, EVERY));
+        assert!(!is_due_after(Some(1_000_000), 1_000_000 + hours - 1, EVERY));
+        assert!(is_due_after(Some(1_000_000), 1_000_000 + hours, EVERY));
+        assert!(is_due_after(Some(1_000_000), 1_000_000 + 40 * day, EVERY));
         // a clock that went back: the last look is in the future, and waiting for it would be for ever
-        assert!(is_due(Some(1_000_000 + day), 1_000_000));
-        assert!(is_due(Some(u64::MAX), 5));
+        assert!(is_due_after(Some(1_000_000 + day), 1_000_000, EVERY));
+        assert!(is_due_after(Some(u64::MAX), 5, EVERY));
+    }
+
+    /// Back from the tray, a look an hour old is made again: a release that came out while the window was hidden is said when it comes back.
+    #[test]
+    fn coming_back_from_the_tray_asks_after_an_hour() {
+        let hour = 60 * 60;
+        assert!(!is_due_after(Some(1_000_000), 1_000_000 + hour - 1, ON_RETURN));
+        assert!(is_due_after(Some(1_000_000), 1_000_000 + hour, ON_RETURN));
+        assert!(is_due_after(None, 1_000_000, ON_RETURN));
+        assert!(!is_due_after(Some(1_000_000), 1_000_000 + hour, EVERY));
     }
 
     #[test]

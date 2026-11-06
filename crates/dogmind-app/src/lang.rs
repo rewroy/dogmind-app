@@ -521,7 +521,7 @@ const JA: &[(&str, &str)] = &[
     ("GitHub did not answer in time.", "GitHub からの応答が時間内にありませんでした。"),
     ("GitHub answered with an error ({0}). Try again later.", "GitHub がエラーを返しました ({0})。しばらくしてからもう一度お試しください。"),
     ("GitHub's answer could not be read.", "GitHub からの応答を読み取れませんでした。"),
-    ("Dogmind asks GitHub for the newest release at most once a day. It sends only its name and version. When there is a newer one, it downloads the setup in the background and checks it, and restarts into it only when you press Restart to update.", "Dogmind は 1 日に 1 回まで、GitHub に最新のリリースを問い合わせます。送るのは名前とバージョンだけです。新しいリリースがあると、セットアップをバックグラウンドでダウンロードして検証し、「再起動して更新」を押したときだけ再起動して更新します。"),
+    ("Dogmind asks GitHub for the newest release every six hours, and when you bring the window back from the tray after an hour. It sends only its name and version. When there is a newer one, it says so on the main screen, downloads the setup in the background and checks it, and restarts into it only when you press Restart to update.", "Dogmind は 6 時間ごとと、タスクトレイから 1 時間ぶりに開いたときに、GitHub に最新のリリースを問い合わせます。送るのは名前とバージョンだけです。新しいリリースがあるとメイン画面でお知らせし、セットアップをバックグラウンドでダウンロードして検証し、「再起動して更新」を押したときだけ再起動して更新します。"),
     ("Downloading Dogmind {0}… {1}%", "Dogmind {0} をダウンロードしています… {1}%"),
     ("Dogmind {0} is ready to install.", "Dogmind {0} をインストールする準備ができました。"),
     ("The update download was cancelled, and its partial file deleted. The next automatic look tries again.", "更新のダウンロードを中止し、途中のファイルを削除しました。次の自動確認でもう一度試します。"),
