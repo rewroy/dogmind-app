@@ -211,9 +211,31 @@ pub(crate) fn sensitive(path: &Path) -> bool {
 /// that session uses): a key by how it opens (`sk-`, `ghp_`, `AKIA`, `AIza`, `xox`, `-----BEGIN`), a name for one with a value after it (`password: hunter2`, `token=...`, `api key is ...`), a
 /// long run of letters and digits as a key is written, and the path of a place keys are kept (`sensitive`). A word like "token" or "password" alone is not one: notes are about code.
 pub(crate) fn secret_in(text: &str) -> Option<String> {
+    let (openings, named, run) = secret_patterns();
+    if let Some((_, what)) = openings.iter().find(|(pattern, _)| pattern.is_match(text)) {
+        return Some((*what).to_string());
+    }
+    // (a value that is a word is not one: it has a digit in it, or it is long)
+    if named.captures_iter(text).any(|found| found.get(1).is_some_and(|value| reads_as_a_value(value.as_str()))) {
+        return Some("a password, a key or a token with its value".to_string());
+    }
+    if run.find_iter(text).any(|found| reads_as_a_key(found.as_str())) {
+        return Some("a long run of letters and digits, as a key is written".to_string());
+    }
+    // (a path: a word with a separator in it, or one that begins as a hidden file or the home does)
+    let path = text.split_whitespace().map(|word| word.trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';' | '`'))).find(|word| {
+        (word.contains(['/', '\\']) || word.starts_with(['.', '~'])) && (sensitive(Path::new(word)) || (word.starts_with('.') && sensitive(Path::new(&format!("/{word}")))))
+    });
+    path.map(|word| format!("the path of a place keys are kept ({word})"))
+}
+
+/// What a secret's kinds look like, built once: keys by how they open, the name of a secret with its value after it, and a long run of letters and digits.
+type SecretPatterns = (Vec<(regex::Regex, &'static str)>, regex::Regex, regex::Regex);
+
+fn secret_patterns() -> &'static SecretPatterns {
     use regex::Regex;
-    static PATTERNS: std::sync::OnceLock<(Vec<(Regex, &'static str)>, Regex, Regex)> = std::sync::OnceLock::new();
-    let (openings, named, run) = PATTERNS.get_or_init(|| {
+    static PATTERNS: std::sync::OnceLock<SecretPatterns> = std::sync::OnceLock::new();
+    PATTERNS.get_or_init(|| {
         let openings = [
             (r"(?i)\b(sk|pk|rk)-[a-z0-9_-]{16,}", "an API key"),
             (r"\b(xai|gsk)[-_][A-Za-z0-9]{16,}", "an API key"),
@@ -225,25 +247,53 @@ pub(crate) fn secret_in(text: &str) -> Option<String> {
         ];
         let named = r#"(?i)\b(?:api[_ -]?key|access[_ -]?key|secret[_ -]?key|private[_ -]?key|key|password|passwd|passcode|secret|token|credentials?)\b\s*(?:[:=]|\bis\b)\s*["']?([^\s"',;]+)"#;
         (openings.map(|(pattern, what)| (Regex::new(pattern).expect("the pattern is valid"), what)).to_vec(), Regex::new(named).expect("the pattern is valid"), Regex::new(r"[A-Za-z0-9+_=-]{40,}").expect("the pattern is valid"))
+    })
+}
+
+/// Whether what follows the name of a secret reads as one: a word does not, as it is short and has no digit in it.
+fn reads_as_a_value(value: &str) -> bool {
+    let length = value.chars().count();
+    length >= 6 && (value.chars().any(|c| c.is_ascii_digit()) || length >= 20)
+}
+
+/// Whether a long run of letters and digits is written as a key is: in both cases, and with a digit.
+fn reads_as_a_key(run: &str) -> bool {
+    run.chars().any(|c| c.is_ascii_uppercase()) && run.chars().any(|c| c.is_ascii_lowercase()) && run.chars().any(|c| c.is_ascii_digit())
+}
+
+/// What stands where a secret was in words that are shown.
+pub const HIDDEN: &str = "[hidden]";
+
+/// Words a server said, with what reads as a secret in them hidden, for a place that shows or keeps them: what [`secret_in`] finds in a note, and a little more, as a server may say back what it
+/// was sent. A key by how it opens, also as a server shows one it has half hidden (`sk-proj-****abcd`); a header (`Authorization: ...`, `Bearer ...`); the name of a secret with its value after
+/// it; a long run of letters and digits as a key is written. What is around them stays.
+pub fn hide_secrets(text: &str) -> String {
+    use regex::{Captures, Regex};
+    static MORE: std::sync::OnceLock<[Regex; 4]> = std::sync::OnceLock::new();
+    let [header, bearer, half_hidden, private_key] = MORE.get_or_init(|| {
+        [
+            Regex::new(r#"(?i)\b(authorization|proxy-authorization|x-api-key|api-key|x-auth-token|set-cookie|cookie)\b["']?\s*[:=]\s*["']?[^\r\n"']*"#),
+            Regex::new(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=*-]{6,})"),
+            Regex::new(r"(?i)\b(?:sk|pk|rk)-[a-z0-9_*\-]{4,}"),
+            Regex::new(r"-----BEGIN[^\r\n]*"),
+        ]
+        .map(|pattern| pattern.expect("the pattern is valid"))
     });
-    if let Some((_, what)) = openings.iter().find(|(pattern, _)| pattern.is_match(text)) {
-        return Some((*what).to_string());
+    let (openings, named, run) = secret_patterns();
+    let mut text = header.replace_all(text, format!("$1: {HIDDEN}").as_str()).into_owned();
+    // (a word after "basic" is not a credential: "basic authentication")
+    text = bearer.replace_all(&text, |found: &Captures| if reads_as_a_value(&found[2]) { format!("{} {HIDDEN}", &found[1]) } else { found[0].to_string() }).into_owned();
+    // (a private key's opening takes the rest of its line, which is the key)
+    text = private_key.replace_all(&text, HIDDEN).into_owned();
+    for (pattern, _) in openings {
+        text = pattern.replace_all(&text, HIDDEN).into_owned();
     }
-    // (a value that is a word is not one: it has a digit in it, or it is long)
-    if named.captures_iter(text).any(|found| found.get(1).is_some_and(|value| value.as_str().chars().count() >= 6 && (value.as_str().chars().any(|c| c.is_ascii_digit()) || value.as_str().chars().count() >= 20))) {
-        return Some("a password, a key or a token with its value".to_string());
-    }
-    if run.find_iter(text).any(|found| {
-        let run = found.as_str();
-        run.chars().any(|c| c.is_ascii_uppercase()) && run.chars().any(|c| c.is_ascii_lowercase()) && run.chars().any(|c| c.is_ascii_digit())
-    }) {
-        return Some("a long run of letters and digits, as a key is written".to_string());
-    }
-    // (a path: a word with a separator in it, or one that begins as a hidden file or the home does)
-    let path = text.split_whitespace().map(|word| word.trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';' | '`'))).find(|word| {
-        (word.contains(['/', '\\']) || word.starts_with(['.', '~'])) && (sensitive(Path::new(word)) || (word.starts_with('.') && sensitive(Path::new(&format!("/{word}")))))
-    });
-    path.map(|word| format!("the path of a place keys are kept ({word})"))
+    text = half_hidden.replace_all(&text, HIDDEN).into_owned();
+    text = named.replace_all(&text, |found: &Captures| {
+        let (whole, value) = (found.get(0).expect("the whole match"), found.get(1).expect("the value"));
+        if reads_as_a_value(value.as_str()) { format!("{}{HIDDEN}", &whole.as_str()[..value.start() - whole.start()]) } else { whole.as_str().to_string() }
+    }).into_owned();
+    run.replace_all(&text, |found: &Captures| if reads_as_a_key(&found[0]) { HIDDEN.to_string() } else { found[0].to_string() }).into_owned()
 }
 
 /// One of those folders, or something in one. Not what is only named like a key, as a project called `credentials-api` is.
@@ -1400,6 +1450,36 @@ mod tests {
             // (a project named after one of those apps is not their store)
             "C:\\Projects\\slack\\bot.py", "C:\\Projects\\discord-bot\\index.js", "C:\\Projects\\rclone\\README.md", "docs\\history.md"] {
             assert_eq!(read_verdict(&gate, path, root), Verdict::Allow, "{path}");
+        }
+    }
+
+    #[test]
+    fn what_a_server_said_has_its_keys_and_headers_hidden_and_its_words_left() {
+        for (said, shown) in [
+            ("Incorrect API key provided: sk-abcdefghijklmnopqrstuvwxyz123456. Check the dashboard.", "Incorrect API key provided: [hidden]. Check the dashboard."),
+            ("Incorrect API key provided: sk-proj-********abcd.", "Incorrect API key provided: [hidden]."),
+            ("Authorization: Bearer abcdefgh12345678", "Authorization: [hidden]"),
+            ("sent the header Bearer abcdefgh12345678 and was refused", "sent the header Bearer [hidden] and was refused"),
+            ("x-api-key: abc", "x-api-key: [hidden]"),
+            ("the api key is Zq81xKd0Lm, try another", "the api key is [hidden], try another"),
+            ("-----BEGIN PRIVATE KEY----- MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "[hidden]"),
+            ("token: ghp_abcdefghijklmnopqrstuvwxyz0123456789 expired", "token: [hidden] expired"),
+        ] {
+            assert_eq!(hide_secrets(said), shown, "{said}");
+        }
+        // What is only about a key, or only reads like words, is left as it is.
+        for said in [
+            "Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory); its last lines: memory allocation of 1073741824 bytes failed; restart the server",
+            "worker.rs:579 model.generate: not enough host memory for the K/V of this sequence",
+            "model 'Qwen3.8-Flash-Next' not found",
+            "an api key is required",
+            "token: refresh daily",
+            "Basic authentication is required for this route",
+            "the prompt exceeds the context of 1024",
+            "C:\\Users\\me\\AppData\\Local\\DogmindApp\\engine.log could not be opened",
+            "メモリ不足で停止しました",
+        ] {
+            assert_eq!(hide_secrets(said), said);
         }
     }
 

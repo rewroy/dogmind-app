@@ -323,6 +323,16 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         }
     }
 
+    // How the turns that failed ended, with the one line the server said of it where it said any.
+    let failures: Vec<&Line> = lines.iter().filter(|line| line.ev() == "failed").collect();
+    if !failures.is_empty() {
+        let _ = writeln!(out, "\nfailures");
+        for line in failures {
+            let said = line.s("server_said");
+            let _ = writeln!(out, "  turn {} at {}: {}{}", line.turn(), short(line.req()), line.s("kind"), if said.is_empty() { String::new() } else { format!(", the server said: {said}") });
+        }
+    }
+
     circles(&mut out, &lines);
     out
 }
@@ -563,6 +573,20 @@ mod tests {
         assert!(said.contains("draft_stop at /1: 8328 tokens thrown away in 103.0 s (a run of 61 lines of code)"), "{said}");
         assert!(said.contains("next: /2 wrote 2714 tokens in 37.0 s, cached 36%, ended tool_calls"), "{said}");
         assert!(said.contains("signs of going round in circles\n  none"), "{said}");
+    }
+
+    #[test]
+    fn a_failed_turn_is_told_with_the_line_the_server_said() {
+        let lines = [
+            json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 4, "images": 0}),
+            request(1, "2026-11-05T10:00:05.000+09:00", "main", 100, 5000, 5000, 0, 10, "error:down"),
+            json!({"t": "2026-11-05T10:00:05.001+09:00", "ev": "failed", "turn": 1, "req": "s/1", "kind": "server_gone", "server_said": "Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory)"}),
+            json!({"t": "2026-11-05T10:00:06.000+09:00", "ev": "failed", "turn": 1, "req": "s/1", "kind": "unfinished"}),
+        ];
+        let said = report(&text(&lines), None);
+        assert!(said.contains("\nfailures\n  turn 1 at /1: server_gone, the server said: Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory)\n  turn 1 at /1: unfinished\n"), "{said}");
+        // A run that did not fail has no such section.
+        assert!(!report(&text(&lines[..2]), None).contains("failures"));
     }
 
     #[test]

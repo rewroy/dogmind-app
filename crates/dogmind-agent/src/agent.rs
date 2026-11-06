@@ -375,7 +375,7 @@ fn with_the_persons_stop<R>(person: &AtomicBool, halt: &AtomicBool, run: impl Fn
 
 /// How long before asking again. A server that says it is busy or loading needs longer than one that dropped a connection.
 fn retry_pause(attempt: u32, said: &str) -> Duration {
-    let first = if said == llm::SERVER_BUSY { 5.0 } else { 1.5 };
+    let first = if llm::sentence_of(said) == llm::SERVER_BUSY { 5.0 } else { 1.5 };
     Duration::from_secs_f64(first * f64::from(2u32.pow(attempt.saturating_sub(1))))
 }
 
@@ -965,8 +965,9 @@ fn bytes_left_out(output: &str) -> u64 {
     }).sum()
 }
 
-/// How a failure reads in `failed`: a class, never its text.
+/// How a failure reads in `failed`: a class, never its text. The server's line under one of the app's sentences does not change the class.
 pub fn failure_kind(text: &str) -> &'static str {
+    let (text, _) = llm::split(text);
     if text.contains("tool calls in a row failed") {
         "failed_calls"
     } else if text.contains("made the same call") {
@@ -995,6 +996,14 @@ pub fn failure_kind(text: &str) -> &'static str {
         "server_error"
     } else {
         "other"
+    }
+}
+
+/// What the trajectory says of a failure: its class, and the one line the server said under the app's sentence, where it said any (cut, and with its secrets hidden, as it is shown).
+fn failed_fields(error: &str) -> Value {
+    match llm::line_under(error) {
+        Some(line) => json!({"kind": failure_kind(error), "server_said": line}),
+        None => json!({"kind": failure_kind(error)}),
     }
 }
 
@@ -1082,7 +1091,7 @@ impl Agent {
     /// A failure the person is told of, and its class in the trajectory.
     fn failed(&mut self, error: String) {
         let req = self.last_req.clone();
-        self.traj.write("failed", req.as_deref(), json!({"kind": failure_kind(&error)}));
+        self.traj.write("failed", req.as_deref(), failed_fields(&error));
         self.emit(Event::Failed(error));
     }
 
@@ -1499,7 +1508,7 @@ impl Agent {
         let (requests, tools) = (self.traj.turn_requests, self.traj.turn_tools);
         if let Ended::Failed(error) = &ended {
             let req = self.last_req.clone();
-            self.traj.write("failed", req.as_deref(), json!({"kind": failure_kind(error)}));
+            self.traj.write("failed", req.as_deref(), failed_fields(error));
         }
         self.traj.write("turn_end", None, json!({"cancelled": cancelled, "ended": how, "requests": requests, "tools": tools, "ms": turn_began.elapsed().as_millis() as u64}));
         match ended {
@@ -1828,7 +1837,7 @@ impl Agent {
                     self.used = self.window;
                     if let Err(error) = self.compact(true, true) {
                         // (what the refusal said is more to the point than that nothing more could go)
-                        return if self.cancelled() { Ended::Cancelled } else { Ended::Failed(if error == llm::CONTEXT_FULL { message } else { error }) };
+                        return if self.cancelled() { Ended::Cancelled } else { Ended::Failed(if llm::sentence_of(&error) == llm::CONTEXT_FULL { message } else { error }) };
                     }
                     if kept {
                         self.intervened("continue_nudge", json!({"why": "overflow"}));
@@ -3331,7 +3340,12 @@ mod tests {
         until_end(&run, Decision::Reject);
         run.handle.commands.send(Command::Send("second".into())).unwrap();
         let (failed, notices) = turn_said(&run);
-        assert_eq!(failed, [llm::SERVER_GONE]);
+        assert_eq!(failed.iter().map(|text| llm::sentence_of(text)).collect::<Vec<_>>(), [llm::SERVER_GONE]);
+        assert_eq!(llm::line_under(&failed[0]), Some("worker.rs:579 model.generate: the sequence exceeds the allocated context"), "the server's line is under the sentence");
+        // The session's record of the failure holds the class, and the same line.
+        let lines = trajectory_of(&run);
+        let record = of_kind(&lines, "failed");
+        assert_eq!((record.len(), record[0]["kind"].as_str(), record[0]["server_said"].as_str()), (1, Some("server_gone"), Some("worker.rs:579 model.generate: the sequence exceeds the allocated context")));
         assert!(notices.is_empty(), "{notices:?}");
         assert_eq!(bodies.lock().unwrap().len(), 2, "no checkpoint was asked for, and no retry");
         assert_eq!(typed_on_disk(&path), ["first", "second"]);
@@ -3424,6 +3438,27 @@ mod tests {
         assert!(!messages.last().unwrap().content.as_deref().is_some_and(prompt::is_nudge), "{messages:?}");
     }
 
+    /// What a server says back of the key it was sent is not in the failure the person reads, nor in the session's record of it.
+    #[test]
+    fn the_key_a_server_says_back_is_not_in_the_failure_or_in_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "my-local-key-0123";
+        let said = format!("Incorrect API key provided: {key}. Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz123456");
+        let (mut client, _) = server(vec![format!("data: {}\n\n", serde_json::json!({"error": {"code": 401, "message": said, "type": "authentication_error"}}))]);
+        client.key = Some(key.to_string());
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("hello".into())).unwrap();
+        let (failed, _) = turn_said(&run);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(llm::sentence_of(&failed[0]), llm::KEY_REFUSED);
+        let lines = trajectory_of(&run);
+        let record = of_kind(&lines, "failed")[0]["server_said"].as_str().unwrap().to_string();
+        for shown in [failed[0].as_str(), record.as_str()] {
+            assert!(!shown.contains(key) && !shown.contains("sk-abc") && shown.contains("[hidden]"), "{shown}");
+        }
+        assert_eq!(llm::line_under(&failed[0]), Some(record.as_str()), "the same line in both");
+    }
+
     #[test]
     fn a_key_refused_during_a_compaction_drops_no_turn() {
         let dir = tempfile::tempdir().unwrap();
@@ -3434,7 +3469,8 @@ mod tests {
         let path = asked(&run, 9);
         run.handle.commands.send(Command::Send("question 9".into())).unwrap();
         let (failed, notices) = turn_said(&run);
-        assert_eq!(failed, [llm::KEY_REFUSED], "{notices:?}");
+        assert_eq!(failed.iter().map(|text| llm::sentence_of(text)).collect::<Vec<_>>(), [llm::KEY_REFUSED], "{notices:?}");
+        assert_eq!(llm::line_under(&failed[0]), Some("bad key"));
         assert!(notices.is_empty(), "{notices:?}");
         assert_eq!(typed_on_disk(&path).len(), 10);
     }
@@ -5973,7 +6009,8 @@ mod tests {
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
         run.handle.commands.send(Command::Send("make a page".into())).unwrap();
         let (failed, _) = turn_said(&run);
-        assert_eq!(failed, [llm::SERVER_GONE]);
+        assert_eq!(failed.iter().map(|text| llm::sentence_of(text)).collect::<Vec<_>>(), [llm::SERVER_GONE]);
+        assert_eq!(llm::line_under(&failed[0]), Some("worker.rs model.generate"));
         assert!(std::fs::read_to_string(dir.path().join("web/index.html")).unwrap().ends_with("to something\n"));
     }
 

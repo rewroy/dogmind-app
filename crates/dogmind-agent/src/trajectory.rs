@@ -5,7 +5,8 @@
 //! event ends, whole and in one write, so a run that is killed loses at most the event in flight. Nothing is buffered across events.
 //!
 //! It holds names, sizes, counts, times, ids, outcomes and short hashes, and never what was said: no message, no reasoning, no file content, no command. The session file has those, and
-//! a request id (`<session id>/<n>`) says which of its messages a line is about.
+//! a request id (`<session id>/<n>`) says which of its messages a line is about. The one exception is a `failed` line, which holds the one line a server said of its failure (cut, and with its
+//! keys and headers hidden): it is the server's own error, and what a person who sends the trajectory is asked for.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;

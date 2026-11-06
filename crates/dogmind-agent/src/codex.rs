@@ -182,7 +182,7 @@ impl Server {
             let message = self.next(cancel, RPC_TIMEOUT)?;
             if message.get("id").and_then(Value::as_u64) == Some(id) && message.get("method").is_none() {
                 if let Some(error) = message.get("error") {
-                    return Err(LlmError::Rejected(format!("codex {method}: {}", error.get("message").unwrap_or(error))));
+                    return Err(LlmError::Rejected(format!("codex {method}: {}", crate::safety::hide_secrets(&error.get("message").unwrap_or(error).to_string()))));
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
@@ -426,7 +426,7 @@ impl Codex {
         let turn: Value = ended.unwrap_or(Value::Null);
         if turn.get("status").and_then(Value::as_str) != Some("completed") {
             let reason = turn.pointer("/error/message").and_then(Value::as_str).unwrap_or("the Codex turn did not complete");
-            return Err(LlmError::Rejected(reason.chars().take(500).collect()));
+            return Err(LlmError::Rejected(crate::safety::hide_secrets(reason).chars().take(500).collect()));
         }
         let text = final_text(&turn).ok_or_else(|| LlmError::Transient("the Codex turn ended with no answer".into()))?;
         let mut completion = completion_of(&text, usage)?;

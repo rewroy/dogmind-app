@@ -104,17 +104,42 @@ fn fill_of(template: &str, text: &str) -> Option<Vec<String>> {
     (rest == left).then_some(found)
 }
 
-/// What the agent says of itself comes as English, some of it with a detail after the words that are always the same.
+/// What the agent says of itself comes as English, some of it with a detail after the words that are always the same. Under one of its sentences there may be a line the server said: that
+/// stays as it came, in English, on a line of its own.
 pub fn notice(text: &str) -> String {
-    if !is_japanese() {
-        return without_system_code(text);
-    }
-    without_system_code(&in_japanese(text))
+    notice_in(text, is_japanese())
 }
 
-/// The same for why a turn failed: `embedded`, it was the engine this app starts, and writing brings it back.
-pub fn failure(text: &str, embedded: bool) -> String {
-    notice(if embedded { llm::for_the_engine(text) } else { text })
+fn notice_in(text: &str, japanese: bool) -> String {
+    let (sentence, said) = llm::split(text);
+    let words = if japanese { without_system_code(&in_japanese(sentence)) } else { without_system_code(sentence) };
+    match said {
+        Some(said) => format!("{words}\n{said}"),
+        None => words,
+    }
+}
+
+/// Why a turn failed, in two parts: the app's sentence in the person's language, and where the server said anything, its line (in English as it came) with the words that tell whose it is.
+/// `embedded`: it was the engine this app starts, and writing brings it back.
+pub fn failure_parts(text: &str, embedded: bool) -> (String, Option<String>) {
+    failure_parts_in(text, embedded, is_japanese())
+}
+
+fn failure_parts_in(text: &str, embedded: bool, japanese: bool) -> (String, Option<String>) {
+    let text = if embedded { llm::for_the_engine(text) } else { text.to_string() };
+    let (sentence, said) = llm::split(&text);
+    (notice_in(sentence, japanese), said.map(|said| said_by_in(embedded, said, japanese)))
+}
+
+/// A line a server said, with the words in front of it that tell whose it is: the engine this app starts, or a server.
+pub fn said_by(embedded: bool, said: &str) -> String {
+    said_by_in(embedded, said, is_japanese())
+}
+
+fn said_by_in(embedded: bool, said: &str, japanese: bool) -> String {
+    let label = if embedded { "The engine said: " } else { "The server said: " };
+    let label = if japanese { self::japanese().get(label).copied().unwrap_or(label) } else { label };
+    format!("{label}{said}")
 }
 
 fn in_japanese(text: &str) -> String {
@@ -811,6 +836,9 @@ const JA: &[(&str, &str)] = &[
     (llm::NO_CHECKPOINT, "要約を作れなかったため、いちばん古いターンを削除して圧縮します。"),
     (llm::START_FAILED, "エンジンが読み込み中に停止しました。原因は /log で確認できます。もう一度入力すると再試行します。"),
     (llm::START_OUT_OF_MEMORY, "エンジンが読み込み中にメモリ不足になりました。他のアプリを閉じてから、もう一度入力してください。"),
+    // In front of the line the engine or a server said under one of these: the line itself is English, as it came.
+    ("The engine said: ", "エンジンからの内容: "),
+    ("The server said: ", "サーバーからの内容: "),
     ("the Codex CLI was not found: install it, then sign in with ChatGPT", "Codex CLI が見つかりません。インストールしてから ChatGPT でサインインしてください。"),
     ("codex has no stdin", "Codex を起動できませんでした。もう一度送ってください。"),
     ("codex has no stdout", "Codex を起動できませんでした。もう一度送ってください。"),
@@ -1023,11 +1051,40 @@ mod tests {
         for opening in llm::OPENINGS {
             assert!(NOTICES.iter().any(|(english, _)| *english == opening), "{opening}");
         }
-        let shown = in_japanese(llm::for_the_engine(llm::SERVER_GONE));
+        let shown = in_japanese(&llm::for_the_engine(llm::SERVER_GONE));
         assert!(shown.contains("再起動") && shown.contains("会話はそのまま残っています"), "{shown}");
-        let shown = in_japanese(llm::for_the_engine(llm::SERVER_OUT_OF_MEMORY));
+        let shown = in_japanese(&llm::for_the_engine(llm::SERVER_OUT_OF_MEMORY));
         assert!(shown.contains("メモリ不足") && shown.contains("再起動"), "{shown}");
         assert!(!in_japanese(llm::SERVER_GONE).contains("再起動"), "another machine's server is not this app's to start");
+    }
+
+    /// The server's own line is the server's English, under the app's sentence in the person's language, with the words that say whose it is.
+    #[test]
+    fn a_line_the_server_said_stays_english_under_the_sentence_in_the_persons_language() {
+        let said = "Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory)";
+        let text = llm::with_line(llm::SERVER_OUT_OF_MEMORY, said);
+        let (words, line) = failure_parts_in(&text, true, true);
+        assert!(words.contains("メモリ不足") && words.contains("再起動") && !words.contains("Straydog") && !words.contains('\n'), "{words}");
+        assert_eq!(line, Some(format!("エンジンからの内容: {said}")));
+        let (words, line) = failure_parts_in(&text, true, false);
+        assert_eq!((words.as_str(), line), (llm::ENGINE_OUT_OF_MEMORY, Some(format!("The engine said: {said}"))));
+        // (a server on another machine: its words, not the engine's)
+        let (words, line) = failure_parts_in(&text, false, true);
+        assert!(words.contains("サーバーがメモリ不足") && !words.contains("再起動"), "{words}");
+        assert_eq!(line, Some(format!("サーバーからの内容: {said}")));
+        let (words, line) = failure_parts_in(&text, false, false);
+        assert_eq!((words.as_str(), line), (llm::SERVER_OUT_OF_MEMORY, Some(format!("The server said: {said}"))));
+        // With nothing the server said, only the sentence.
+        assert_eq!(failure_parts_in(llm::SERVER_GONE, true, false), (llm::ENGINE_GONE.to_string(), None));
+        assert_eq!(failure_parts_in(llm::SERVER_GONE, true, true).1, None);
+        // Every sentence that can have a line keeps its Japanese with one.
+        for words in llm::WORDS {
+            let (japanese, line) = failure_parts_in(&format!("{words}\nline"), false, true);
+            assert_eq!((japanese, line), (in_japanese(words), Some("サーバーからの内容: line".to_string())), "{words}");
+        }
+        // The sentence and the line in one text, for what shows them as one.
+        assert_eq!(notice_in(&text, false), format!("{}\n{said}", llm::SERVER_OUT_OF_MEMORY));
+        assert_eq!(notice_in(&text, true), format!("{}\n{said}", in_japanese(llm::SERVER_OUT_OF_MEMORY)));
     }
 
     #[test]

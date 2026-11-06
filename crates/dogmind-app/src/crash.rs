@@ -13,6 +13,8 @@ pub const WHERE_REPORTS_GO: Option<&str> = Some("https://github.com/rewroy/dogmi
 
 const FOLDER: &str = "crashes";
 const MOST_LOG_LINES: usize = 200;
+/// The last line an engine or a server said of a failure, with the time: the first line of this file is the time, the second the line.
+const ENGINE_ERROR_FILE: &str = "engine-error.txt";
 
 static CRASHES: OnceLock<PathBuf> = OnceLock::new();
 
@@ -99,6 +101,24 @@ pub fn untold(data: &Path) -> Option<PathBuf> {
     Some(latest)
 }
 
+/// Keeps the line an engine or a server said of the failure just told, for the report: it is cut, with its keys and headers hidden, once more here, and only the latest is kept. Written
+/// beside the report and not held in memory, as the app may be started again before the report is.
+pub fn note_engine_error(data: &Path, line: &str) {
+    let Some(line) = dogmind_agent::llm::line_of(line) else { return };
+    let _ = std::fs::create_dir_all(data);
+    let _ = std::fs::write(data.join(ENGINE_ERROR_FILE), format!("{}\n{line}\n", dogmind_agent::trajectory::now()));
+}
+
+/// The report's section for the last engine error: when, and the line, or that none was told.
+fn last_engine_error(data: &Path) -> String {
+    let text = std::fs::read_to_string(data.join(ENGINE_ERROR_FILE)).unwrap_or_default();
+    let mut lines = text.lines();
+    match (lines.next(), lines.next().and_then(dogmind_agent::llm::line_of)) {
+        (Some(time), Some(line)) => format!("{time}  {line}"),
+        _ => "(none recorded)".to_string(),
+    }
+}
+
 /// The person's name is not what a report is for.
 fn without_the_person(text: &str, home: Option<&str>, user: Option<&str>) -> String {
     let mut text = text.to_string();
@@ -135,6 +155,7 @@ pub fn write_report(data: &Path, settings: &Settings, about_this_pc: &str) -> Re
     for crash in crashes.iter().rev().take(3).rev() {
         text.push_str(&format!("\n--- {} ---\n{}\n", crash.file_name().map_or(String::new(), |name| name.to_string_lossy().into_owned()), std::fs::read_to_string(crash).unwrap_or_default()));
     }
+    text.push_str(&format!("\n--- the last engine error ---\n{}\n", last_engine_error(data)));
     let log = std::fs::read(crate::engine::log_path(data)).map_or(String::new(), |bytes| String::from_utf8_lossy(&bytes).into_owned());
     text.push_str(&format!("\n--- the last of the engine's log ---\n{}\n", last_lines(&log, MOST_LOG_LINES)));
     let text = without_the_person(&text, std::env::var("USERPROFILE").ok().as_deref(), std::env::var("USERNAME").ok().as_deref());
@@ -176,6 +197,50 @@ mod tests {
         assert!(words.contains("C:\\data\\report.txt") && words.contains("https://github.com/rewroy/dogmind-app/issues"), "{words}");
         let without = report_words_with("f.txt", None);
         assert!(without.contains("f.txt") && without.contains("any way you like") && !without.contains("http"), "{without}");
+    }
+
+    /// The report has a section for the last line an engine or a server said of a failure, with the time: the latest one, cut, and with no key or header in it.
+    #[test]
+    fn a_report_has_the_last_engine_error_with_its_time_and_no_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = |text: &str| -> String {
+            let (_, after) = text.split_once("\n--- the last engine error ---\n").expect("the section is there");
+            after.split_once("\n--- the last of the engine's log ---").expect("and before the engine's log").0.trim_end().to_string()
+        };
+        let report = || std::fs::read_to_string(write_report(dir.path(), &Settings::default(), "RTX (6 GB)").unwrap()).unwrap();
+        assert_eq!(section(&report()), "(none recorded)", "nothing was told");
+
+        note_engine_error(dir.path(), "an earlier line");
+        let worker = "Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory); its last lines: memory allocation of 1073741824 bytes failed; restart the server";
+        note_engine_error(dir.path(), worker);
+        let said = section(&report());
+        let (time, line) = said.split_once("  ").expect("the time, then the line");
+        assert_eq!(line, worker, "the latest, whole");
+        assert!(time.len() >= 20 && time.as_bytes()[4] == b'-' && time.contains('T') && time.contains(':'), "a time: {time}");
+        assert_eq!(report().matches("--- the last engine error ---").count(), 1);
+
+        // Too long: cut as it is shown. A key or a header: hidden, even where the line was kept as it came.
+        note_engine_error(dir.path(), &format!("{} Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz123456 {}", "a".repeat(300), "b".repeat(300)));
+        let said = section(&report());
+        assert!(said.chars().count() < 260 && !said.contains("sk-abc") && !said.contains("Bearer"), "{said}");
+        std::fs::write(dir.path().join(ENGINE_ERROR_FILE), "2026-11-06T10:00:00.000+09:00\nIncorrect API key provided: sk-abcdefghijklmnopqrstuvwxyz123456.\n").unwrap();
+        let said = section(&report());
+        assert_eq!(said, "2026-11-06T10:00:00.000+09:00  Incorrect API key provided: [hidden].");
+
+        // A web page is not the engine's; and a file with no line in it is none.
+        note_engine_error(dir.path(), "<html>502 Bad Gateway</html>");
+        assert_eq!(section(&report()), "2026-11-06T10:00:00.000+09:00  Incorrect API key provided: [hidden].", "the page did not replace it");
+        std::fs::write(dir.path().join(ENGINE_ERROR_FILE), "2026-11-06T10:00:00.000+09:00\n").unwrap();
+        assert_eq!(section(&report()), "(none recorded)");
+
+        // The person is not in it.
+        if let Ok(home) = std::env::var("USERPROFILE").map(|home| home.trim().to_string()) {
+            if !home.is_empty() {
+                note_engine_error(dir.path(), &format!("could not open {home}\\models\\x.gguf"));
+                let said = section(&report());
+                assert!(said.contains("%USERPROFILE%\\models\\x.gguf") && !said.contains(&home), "{said}");
+            }
+        }
     }
 
     #[test]
