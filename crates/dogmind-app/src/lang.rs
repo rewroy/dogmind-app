@@ -609,8 +609,11 @@ const JA: &[(&str, &str)] = &[
     ("Sheets: {0} (the first is shown)", "シート: {0}(最初のシートを表示しています)"),
     ("{0} rows and {1} columns: the first {2} rows and {3} columns are shown.", "{0} 行 {1} 列あります。最初の {2} 行 {3} 列を表示しています。"),
     ("Files changed in this answer:", "この回答で変わったファイル:"),
-    ("The agent asks:", "エージェントからの質問:"),
-    ("Type the number of a choice, or your own answer.", "選択肢の番号か、自分の答えを入力してください。"),
+    ("Question", "質問"),
+    ("Send", "送信"),
+    ("Suggested", "おすすめ"),
+    ("Write your own answer…", "自分の言葉で答える…"),
+    ("Not answered", "回答なし"),
     ("Your answer: {0}", "あなたの答え: {0}"),
     ("The plan:", "計画:"),
     ("What this session works toward, kept across turns: /goal text, /goal clear", "このセッションの目標。ターンをまたいで保つ: /goal 目標、/goal clear"),
@@ -1024,7 +1027,7 @@ mod tests {
     fn everything_the_code_asks_for_has_its_japanese() {
         let table: HashMap<&str, &str> = JA.iter().copied().collect();
         let mut missing = Vec::new();
-        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("drafter.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs")] {
+        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("drafter.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs"), include_str!("cards.rs")] {
             for words in words_in(source) {
                 if !table.contains_key(words.as_str()) {
                     missing.push(words);

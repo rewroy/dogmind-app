@@ -889,7 +889,22 @@ pub enum ButtonKind {
     Link = 15,
     /// What cannot be undone.
     Danger = 17,
+    /// One of the choices a card puts to the person: its number, its label, what it means, and a mark on the one the model suggests (`choice_text`).
+    Choice = 18,
+    /// The frame a field of a card stands in; the field itself is a control of its own over it.
+    Frame = 20,
 }
+
+/// The parts of the text of a button that has more than one are told apart by this.
+pub const PART: char = '\u{1F}';
+
+/// The text of a `Choice` button.
+pub fn choice_text(number: usize, suggested: &str, label: &str, meaning: &str) -> String {
+    format!("{number}{PART}{suggested}{PART}{label}{PART}{meaning}")
+}
+
+/// The id of the field of a card, which a `Frame` button looks for the focus of.
+pub const CARD_FIELD_ID: isize = 9930;
 
 /// What a picture's button shows.
 #[derive(Clone)]
@@ -1066,10 +1081,11 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
     let brush = CreateSolidBrush(backdrop);
     FillRect(device, &client, brush);
     DeleteObject(brush);
-    let mut buffer = [0u16; 256];
-    let length = GetWindowTextW(window, buffer.as_mut_ptr(), 256);
+    let mut buffer = [0u16; 640];
+    let length = GetWindowTextW(window, buffer.as_mut_ptr(), 640);
     let text = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
-    let (glyph, label) = text.split_once('|').map_or((None, text.as_str()), |(glyph, label)| (Some(glyph), label));
+    // (a text of several parts has its own marks, and is not an icon before a label)
+    let (glyph, label) = if text.contains(PART) { (None, text.as_str()) } else { text.split_once('|').map_or((None, text.as_str()), |(glyph, label)| (Some(glyph), label)) };
     let height = client.bottom;
     let Some(fonts) = BUTTON_FONTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().map(|fonts| fonts.0) else { return };
     let s = |value: i32| scale(fonts.dpi, value);
@@ -1213,6 +1229,39 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
                 FillRect(device, &line, brush);
                 DeleteObject(brush);
             }
+        }
+        18 => {
+            let mut parts = label.split(PART);
+            let (number, suggested, name, meaning) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            // On a card, a well a shade off it; the pointer on it, lit in the accent's frame.
+            rounded(device, client, s(radius::CONTROL), Some(if lit { theme::raised() } else { theme::surface() }), Some(if lit { theme::accent() } else { theme::line() }));
+            let mut area = client;
+            area.left += s(design::space::M);
+            area.right -= s(design::space::M);
+            // (the number is what picks it from the composer too)
+            let badge = s(design::space::L);
+            draw_text(device, number, RECT { left: area.left, right: area.left + badge, ..client }, fonts.small, theme::faint(), DT_CENTER | ONE_LINE);
+            area.left += badge + s(design::space::S);
+            if !suggested.is_empty() {
+                let across = text_width(fonts.small, suggested) + 2 * s(design::space::S);
+                let pill = rect(area.right - across, (height - s(20)) / 2, across, s(20));
+                rounded(device, pill, s(10), None, Some(theme::accent()));
+                draw_text(device, suggested, pill, fonts.small, theme::accent(), DT_CENTER | ONE_LINE);
+                area.right -= across + s(design::space::S);
+            }
+            if meaning.is_empty() {
+                draw_text(device, name, RECT { left: area.left, right: area.right, top: 0, bottom: height }, fonts.strong, theme::text(), ONE_LINE);
+            } else {
+                draw_text(device, name, RECT { left: area.left, right: area.right, top: s(7), bottom: height / 2 + s(2) }, fonts.strong, theme::text(), ONE_LINE);
+                draw_text(device, meaning, RECT { left: area.left, right: area.right, top: height / 2, bottom: height - s(7) }, fonts.small, theme::muted(), ONE_LINE);
+            }
+        }
+        20 => {
+            let focused = {
+                let focus = GetFocus();
+                !focus.is_null() && GetWindowLongPtrW(focus, GWLP_ID) == CARD_FIELD_ID
+            };
+            rounded(device, client, s(radius::CONTROL), Some(theme::surface()), Some(if focused { theme::accent() } else { theme::line() }));
         }
         selected => {
             if selected == 6 || lit {

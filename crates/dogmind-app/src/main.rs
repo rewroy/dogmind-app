@@ -2,6 +2,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod attach;
+mod cards;
 mod crash;
 mod design;
 mod diffview;

@@ -28,6 +28,7 @@ use crate::machine::readable_build;
 use crate::diffview::{self, RowKind};
 use crate::settings::KeySource;
 use crate::toolrun::{self, LineKind, RunEntry, Tone, ToolRun};
+use crate::cards::{self, AnswerState, Card};
 use crate::notice;
 use crate::updates;
 use windows_sys::Win32::Foundation::*;
@@ -292,6 +293,9 @@ const ID_RUN_POOL: isize = 380; // ..380 + RUN_POOL
 /// Beside each copy button of an answer, one that branches the conversation from it.
 const ID_FORK_POOL: isize = 400; // ..400 + COPY_POOL
 const RUN_POOL: usize = 12;
+/// What the cards of the transcript put over it as windows of their own (a choice, a file, the button of a field): a pool that goes round, as the pictures' does.
+const ID_CARD_POOL: isize = 12000; // ..+ CARD_POOL
+const CARD_POOL: usize = 40;
 const TIMER_COPIED: usize = 3;
 const TIMER_SEARCH: usize = 4;
 const TIMER_CHANGES: usize = 5;
@@ -872,6 +876,44 @@ struct CodeBlock {
     text: String,
 }
 
+/// What a control that a card puts over the transcript does when it is pressed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum CardAct {
+    /// One of the model's choices: this label is the answer.
+    Choose(String),
+    /// What is in the card's field is the answer.
+    SendOwn,
+    FocusField,
+}
+
+/// One control of a card, on a row of its room.
+#[derive(Clone)]
+struct CardPart {
+    text: String,
+    kind: ButtonKind,
+    act: CardAct,
+    /// In pixels: nothing, the rest of the row's width.
+    width: i32,
+    tip: String,
+}
+
+/// The room a card keeps over the transcript for controls, a row of an exact height: where it begins, and what lies over it, from the left. `field`: the first control is the frame of the
+/// card's field, which has the field in it.
+struct CardSlot {
+    start: i32,
+    parts: Vec<CardPart>,
+    field: bool,
+    tall: i32,
+}
+
+/// The model's question that waits for the person: where the answer goes, the question as it was asked, and the card that shows it.
+struct AskedQuestion {
+    answer: std::sync::mpsc::Sender<String>,
+    question: String,
+    options: Vec<(String, String)>,
+    card: u64,
+}
+
 /// A message's pictures in the transcript: where their room in its card begins.
 struct PictureBlock {
     start: i32,
@@ -883,6 +925,32 @@ struct PictureBlock {
 struct KeptThumb {
     thumb: Thumb,
     used: u64,
+}
+
+/// How a session stands in the sidebar, in a word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SideState {
+    /// The model waits for the person: to approve something, to answer its question, to decide on its plan.
+    Waiting,
+    Working,
+    Error,
+}
+
+/// What the sidebar says of a session. `parked`: it is at work out of sight, and whether it waits for the person. Else it is the one on screen (`current`), which `waits` and `running` speak for.
+fn side_state(parked: Option<bool>, current: bool, waits: bool, running: bool, failed: bool) -> Option<SideState> {
+    match parked {
+        Some(true) => Some(SideState::Waiting),
+        Some(false) => Some(SideState::Working),
+        None if current && waits => Some(SideState::Waiting),
+        None if current && running => Some(SideState::Working),
+        None if failed => Some(SideState::Error),
+        None => None,
+    }
+}
+
+/// Whether the send button is a stop button: the model is at work. Not while it waits for words from the person (a question, a plan), when what is typed is its answer and the button sends it.
+fn is_stoppable(running: bool, asking: bool, connecting: bool) -> bool {
+    (running && !asking) || connecting
 }
 
 /// What Esc means now.
@@ -1128,6 +1196,8 @@ struct Parked {
     agent: Handle,
     events: Receiver<Event>,
     pending: Option<Approval>,
+    /// The model's question that waits for the person.
+    question: Option<agent::Question>,
     /// What has streamed since the last whole message, which the session file holds.
     partial: String,
     tools_running: HashMap<String, (String, String)>,
@@ -1496,6 +1566,8 @@ enum Shown {
     Pictures { pictures: Vec<(PathBuf, (i32, i32))>, width: i32, alone: bool, right: bool },
     /// Tool calls as one row: which of `runs`.
     Run(usize),
+    /// A card that asks something of the person or shows something of the work, in the state it is in now.
+    Card(Card),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1924,8 +1996,17 @@ struct App {
     transcript_region: ((i32, i32), Option<(i32, i32, i32, i32)>),
     /// Words sent to the turn under way that have not reached it yet.
     interjected: Vec<String>,
-    /// The model's question that waits for the person (Event::Question): where the answer goes, and the choices' labels, which a number picks.
-    question: Option<(std::sync::mpsc::Sender<String>, Vec<String>)>,
+    /// The model's question that waits for the person (Event::Question).
+    question: Option<AskedQuestion>,
+    /// What the cards of the transcript put over it: the buttons of a pool, what each does, how much of each is cut off at an edge of the view, and the words of its tip; the field of the
+    /// question's card; where each card keeps its room; and the number the next card has.
+    card_buttons: Vec<HWND>,
+    card_targets: Vec<Option<CardAct>>,
+    card_cut: Vec<(i32, i32)>,
+    card_tips: Vec<String>,
+    card_field: HWND,
+    card_slots: Vec<CardSlot>,
+    card_next: u64,
     /// The plan that waits for the person's approval (Event::PlanReview): where the answer goes.
     plan_review: Option<std::sync::mpsc::Sender<Result<(), String>>>,
     /// What this session works toward, as the agent last told it (Event::Goal).
@@ -2234,7 +2315,7 @@ pub(crate) unsafe fn overlays_follow(dy: i32) {
     if app.panel != Panel::Chat {
         return;
     }
-    for button in app.copy_buttons.iter().chain(&app.fork_buttons).chain(&app.block_buttons).chain(&app.run_buttons) {
+    for button in app.copy_buttons.iter().chain(&app.fork_buttons).chain(&app.block_buttons).chain(&app.run_buttons).chain(&app.card_buttons).chain([&app.card_field]) {
         if IsWindowVisible(*button) != 0 {
             let (x, y, ..) = child_area(*button, app.window);
             SetWindowPos(*button, std::ptr::null_mut(), x, y + dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2891,6 +2972,7 @@ impl App {
         self.turn_words_due = false;
         self.picture_blocks.clear();
         self.blocks.clear();
+        self.card_slots.clear();
         self.links.clear();
         self.link_hover = None;
         self.runs.iter_mut().for_each(|run| run.first = -1);
@@ -2917,6 +2999,7 @@ impl App {
                 }
                 Shown::Pictures { pictures, width, alone, right } => self.append_pictures(pictures, (*width).min((self.text_twips * 4 / 5).max(800)), *alone, *right),
                 Shown::Run(at) => self.write_run(*at),
+                Shown::Card(card) => self.write_card(card),
                 Shown::Block(code) => {
                     self.begin_block();
                     if let Some(block) = self.blocks.last_mut() {
@@ -3518,6 +3601,7 @@ impl App {
         self.place_pictures();
         self.place_block_buttons();
         self.place_run_buttons();
+        self.place_card_controls();
         let dpi = self.dpi;
         let (size, area) = (scale(dpi, ds::size::ICON_BUTTON), self.transcript_area);
         let visible = self.panel == Panel::Chat && self.has_messages;
@@ -3946,6 +4030,7 @@ impl App {
         self.rail_turns.iter_mut().for_each(|turn| moved(&mut turn.start));
         self.picture_blocks.iter_mut().for_each(|block| moved(&mut block.start));
         self.blocks.iter_mut().for_each(|block| moved(&mut block.at));
+        self.card_slots.iter_mut().for_each(|slot| moved(&mut slot.start));
         for (from, to, _) in &mut self.links {
             moved(from);
             moved(to);
@@ -4339,6 +4424,257 @@ impl App {
             }
             if !showing {
                 show(window, true);
+            }
+        }
+    }
+
+    /// Whether the model waits for the person: for an approval, an answer to its question, or a decision on its plan.
+    fn waits_for_person(&self) -> bool {
+        self.pending.is_some() || self.asking()
+    }
+
+    /// Whether the model waits for the person's words, as for a question or a plan, and not for a press on a card of approval.
+    fn asking(&self) -> bool {
+        self.question.is_some() || self.plan_review.is_some()
+    }
+
+    /// A row of a card's own, in its colour: as a block of code is written, but kept by the card and not by itself. `first`: the card's first row, from which its corners are rounded.
+    unsafe fn card_row(&mut self, lines: &[&str], points: i32, color: u32, down: i32, first: bool) {
+        self.block_card_due = first;
+        let shown: Vec<&str> = if lines.is_empty() { vec![" "] } else { lines.to_vec() };
+        self.append_row(&rtf::Row { lines: &shown, face: UI_FACE, points, color, back: theme::code_back(), width: self.text_twips, right: false, column: 0, padding: (260, down) });
+    }
+
+    /// Room for controls that lie over the card: a row of an exact height, with what goes on it. Without any, it is only room between two rows.
+    unsafe fn card_room(&mut self, tall: i32, parts: Vec<CardPart>, field: bool) {
+        let twips = (i64::from(tall) * 1440 / i64::from(self.dpi)) as i32;
+        let first = self.insert_rtf(rtf::spacer_row(self.text_twips, self.text_twips, twips, theme::code_back(), (260, 0), false), None);
+        if !parts.is_empty() {
+            let start = text_start(self.transcript, first);
+            self.card_slots.push(CardSlot { start, parts, field, tall });
+        }
+    }
+
+    /// A card, in the state it is in, at the end of the transcript: shaded as a block of code is, with its controls as windows over rows of room of an exact height. It is kept with what the
+    /// transcript is written from, so that the transcript written again, at another width or in another theme, writes it as it stands then.
+    unsafe fn write_card(&mut self, card: &Card) {
+        let recording = !self.replaying;
+        if recording {
+            self.close_run();
+            self.end_line();
+            self.room_over_a_block();
+            self.shown.push(Shown::Card(card.clone()));
+        }
+        // (what goes in is the card's own: none of it is a part of the transcript's record)
+        let held = std::mem::replace(&mut self.replaying, true);
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        match card {
+            Card::Question { question, options, state, .. } => {
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                self.card_row(&[t("Question")], 8, theme::muted(), 26, false);
+                let lines: Vec<&str> = question.lines().collect();
+                self.card_row(&lines, 11, theme::text(), 40, false);
+                match state {
+                    AnswerState::Waiting => {
+                        self.card_room(s(8), Vec::new(), false);
+                        for (at, (label, meaning)) in options.iter().enumerate() {
+                            let suggested = if at == 0 { t("Suggested") } else { "" };
+                            let part = CardPart { text: choice_text(at + 1, suggested, label, meaning), kind: ButtonKind::Choice, act: CardAct::Choose(label.clone()), width: 0, tip: String::new() };
+                            self.card_room(s(if meaning.is_empty() { 36 } else { 52 }), vec![part], false);
+                            self.card_room(s(5), Vec::new(), false);
+                        }
+                        let send = t("Send");
+                        let width = text_width(self.fonts.strong, send) + s(ds::size::BUTTON_PADDING);
+                        let frame = CardPart { text: String::new(), kind: ButtonKind::Frame, act: CardAct::FocusField, width: 0, tip: String::new() };
+                        let button = CardPart { text: send.to_string(), kind: ButtonKind::Primary, act: CardAct::SendOwn, width, tip: String::new() };
+                        self.card_room(s(ds::size::CONTROL + 2), vec![frame, button], true);
+                    }
+                    AnswerState::Answered(words) => self.card_row(&[&tf("Your answer: {0}", &[words])], 10, theme::accent(), 60, false),
+                    AnswerState::Unanswered => self.card_row(&[t("Not answered")], 10, theme::muted(), 60, false),
+                }
+                self.card_row(&[" "], 6, theme::muted(), 80, false);
+            }
+        }
+        self.replaying = held;
+        self.line_start = true;
+        self.para_next = Some(Para::AfterBlock);
+        if recording && !self.opening {
+            // (what is asked is seen: the view goes to the end of it)
+            self.follow_end = true;
+            self.scrolled_up_at = None;
+            self.want_frames();
+            self.place_copy_buttons();
+            self.place_thumb();
+        }
+    }
+
+    /// The card with this number in the state `settle` leaves it in: the transcript is written again with it.
+    unsafe fn settle_card(&mut self, id: u64, settle: impl FnOnce(&mut Card)) {
+        let found = self.shown.iter_mut().find_map(|item| match item {
+            Shown::Card(card) if card.id() == Some(id) => Some(card),
+            _ => None,
+        });
+        if let Some(card) = found {
+            settle(card);
+            self.reflow();
+        }
+    }
+
+    /// Cards that still wait, when the turn that asked has ended: unanswered.
+    unsafe fn settle_waiting_cards(&mut self) {
+        let mut changed = false;
+        for item in &mut self.shown {
+            if let Shown::Card(Card::Question { state, .. }) = item {
+                if *state == AnswerState::Waiting {
+                    *state = AnswerState::Unanswered;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            set_text(self.card_field, "");
+            self.reflow();
+        }
+    }
+
+    /// The answer to the model's question: by a press on a choice, by what was written in the card's field, or by what was typed in the composer. `false`: nothing asks.
+    unsafe fn answer_question(&mut self, words: &str) -> bool {
+        let Some(asked) = self.question.take() else { return false };
+        let words = words.trim().to_string();
+        set_text(self.card_field, "");
+        let said = words.clone();
+        self.settle_card(asked.card, |card| {
+            let Card::Question { state, .. } = card;
+            *state = AnswerState::Answered(said);
+        });
+        let sent = asked.answer.send(words).is_ok();
+        self.set_activity(t("Thinking…").into());
+        self.update_buttons();
+        InvalidateRect(self.side, std::ptr::null(), 0);
+        self.focus_composer();
+        sent
+    }
+
+    /// What was written in the card's field, as the answer; an empty field is where to write it.
+    unsafe fn card_pressed_own(&mut self) {
+        let words = get_text(self.card_field);
+        if words.trim().is_empty() {
+            SetFocus(self.card_field);
+        } else {
+            self.answer_question(&words);
+        }
+    }
+
+    unsafe fn card_pressed(&mut self, slot: usize) {
+        let Some(act) = self.card_targets.get(slot).cloned().flatten() else { return };
+        match act {
+            CardAct::Choose(label) => {
+                self.answer_question(&label);
+            }
+            CardAct::SendOwn => self.card_pressed_own(),
+            CardAct::FocusField => {
+                SetFocus(self.card_field);
+            }
+        }
+    }
+
+    /// The controls of the cards in view each get a window of the pool at their place, wherever the transcript has scrolled to: for every frame the view moves, from the last card up to the
+    /// first above the view, and only a window whose place or words changed is touched.
+    unsafe fn place_card_controls(&mut self) {
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let area = self.transcript_area;
+        let height = area.bottom - area.top;
+        let mut in_view: Vec<(usize, POINT)> = Vec::new();
+        if self.panel == Panel::Chat && self.has_messages {
+            for at in (0..self.card_slots.len()).rev() {
+                let mut point = POINT { x: 0, y: 0 };
+                SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, self.card_slots[at].start as LPARAM);
+                if point.y + self.card_slots[at].tall <= 0 {
+                    break;
+                }
+                if point.y < height {
+                    in_view.push((at, point));
+                }
+            }
+        }
+        in_view.reverse();
+        // (the card's room is its width, less the space its rows keep at each side of their words: as much at the right as the first of its words stands from the card's left edge)
+        let (left_edge, right_edge) = (area.left + self.transcript_rect.0, self.column_right);
+        let gap = s(ds::space::S);
+        let mut used = 0;
+        let mut field: Option<RECT> = None;
+        'slots: for (at, point) in in_view {
+            let (parts, tall, has_field) = (self.card_slots[at].parts.clone(), self.card_slots[at].tall, self.card_slots[at].field);
+            let top = area.top + point.y;
+            let first_x = area.left + point.x;
+            let total = (right_edge - (first_x - left_edge) - first_x).max(s(120));
+            let fixed: i32 = parts.iter().map(|part| part.width).sum::<i32>() + gap * (parts.len() as i32 - 1);
+            let rest = (total - fixed).max(s(60));
+            let mut x = first_x;
+            // (cut off at an edge of the view: it would lie over the header or the composer)
+            let cut = ((area.top - top).max(0), (top + tall - area.bottom).max(0));
+            for (place, part) in parts.iter().enumerate() {
+                if used >= CARD_POOL {
+                    break 'slots;
+                }
+                let width = if part.width == 0 { rest } else { part.width };
+                let button = self.card_buttons[used];
+                set_button_style(button, part.kind, theme::code_back());
+                if get_text(button) != part.text {
+                    set_text(button, &part.text);
+                }
+                let showing = IsWindowVisible(button) != 0;
+                if !showing || child_area(button, self.window) != (x, top, width, tall) {
+                    SetWindowPos(button, HWND_TOP, x, top, width, tall, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
+                    if showing {
+                        UpdateWindow(button);
+                    }
+                }
+                if cut != self.card_cut[used] {
+                    self.card_cut[used] = cut;
+                    SetWindowRgn(button, if cut == (0, 0) { std::ptr::null_mut() } else { CreateRectRgn(0, cut.0, width, tall - cut.1) }, 1);
+                }
+                if self.card_tips[used] != part.tip {
+                    self.card_tips[used] = part.tip.clone();
+                    if part.tip.is_empty() {
+                        self.untip(button);
+                    } else {
+                        self.tip(button, &part.tip);
+                    }
+                }
+                if !showing {
+                    show(button, true);
+                }
+                if has_field && place == 0 && cut == (0, 0) {
+                    field = Some(rect(x, top, width, tall));
+                }
+                self.card_targets[used] = Some(part.act.clone());
+                used += 1;
+                x += width + gap;
+            }
+        }
+        for slot in used..CARD_POOL {
+            self.card_targets[slot] = None;
+            if IsWindowVisible(self.card_buttons[slot]) != 0 {
+                show(self.card_buttons[slot], false);
+            }
+        }
+        // The card's field: in its frame, when the whole of that is in view.
+        match field {
+            Some(frame) => {
+                let inset = s(ds::space::M);
+                let (x, y, width, tall) = (frame.left + inset, frame.top + (frame.bottom - frame.top - s(ds::size::FIELD_TEXT)) / 2, frame.right - frame.left - 2 * inset, s(ds::size::FIELD_TEXT));
+                let showing = IsWindowVisible(self.card_field) != 0;
+                if !showing || child_area(self.card_field, self.window) != (x, y, width, tall) {
+                    SetWindowPos(self.card_field, HWND_TOP, x, y, width, tall, if showing { SWP_NOACTIVATE | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW });
+                }
+            }
+            None => {
+                if IsWindowVisible(self.card_field) != 0 {
+                    show(self.card_field, false);
+                }
             }
         }
     }
@@ -6646,7 +6982,7 @@ impl App {
 
     /// A turn of the ring: only it is drawn again, and the words with it when the seconds they show have changed.
     unsafe fn spinner_tick(&mut self) {
-        if self.activity.is_empty() || self.panel != Panel::Chat || self.pending.is_some() {
+        if self.activity.is_empty() || self.panel != Panel::Chat || self.waits_for_person() {
             return;
         }
         let second = self.activity_since.map_or(0, |since| since.elapsed().as_secs());
@@ -6698,7 +7034,7 @@ impl App {
             self.draw_shape(device, shape);
         }
         if self.panel == Panel::Chat {
-            if !self.activity.is_empty() && self.pending.is_none() {
+            if !self.activity.is_empty() && !self.waits_for_person() {
                 let area = self.activity_area;
                 let elapsed = self.activity_since.map_or(0.0, |since| since.elapsed().as_secs_f32());
                 spinner(device, self.spinner_area(), (elapsed * 300.0) % 360.0, theme::line(), theme::accent(), s(ds::space::HAIR) as f32);
@@ -9131,6 +9467,7 @@ impl App {
             agent,
             events,
             pending: self.pending.take(),
+            question: self.question.take().map(|asked| agent::Question { question: asked.question, options: asked.options, answer: asked.answer }),
             partial: std::mem::take(&mut self.answer),
             tools_running: std::mem::take(&mut self.tools_running),
             queued: std::mem::take(&mut self.queued),
@@ -9216,20 +9553,23 @@ impl App {
             self.append_answer(&shown);
         }
         // (the calls it has under way, which its file does not know of yet)
-        if self.settings.compact_tools && !self.tools_running.is_empty() {
+        let running: Vec<RunEntry> = self.tools_running.iter().filter(|(_, (tool, _))| !cards::is_asking(tool)).map(|(id, (tool, summary))| RunEntry::running(id.clone(), tool.clone(), summary.clone())).collect();
+        if self.settings.compact_tools && !running.is_empty() {
             let at = self.open_run();
-            let running: Vec<RunEntry> = self.tools_running.iter().map(|(id, (tool, summary))| RunEntry::running(id.clone(), tool.clone(), summary.clone())).collect();
             self.runs[at].entries = running;
             self.write_run(at);
         }
-        for (index, tool, raw) in parked.writing {
+        for (index, tool, raw) in parked.writing.into_iter().filter(|(_, tool, _)| !cards::is_asking(tool)) {
             self.run_writes(index, tool, &raw);
         }
-        self.set_activity(if parked.pending.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
+        self.set_activity(if parked.pending.is_some() || parked.question.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
         self.update_buttons();
         self.update_status();
         if let Some(approval) = parked.pending {
             self.on_event(Event::Approval(approval));
+        }
+        if let Some(question) = parked.question {
+            self.on_event(Event::Question(question));
         }
         InvalidateRect(self.side, std::ptr::null(), 0);
     }
@@ -9549,14 +9889,11 @@ impl App {
                 }
                 let parked = self.parked.iter().find(|parked| parked.path.as_ref() == Some(path));
                 // How it stands, in a word, where its time would be; only one that needs saying has one.
-                let state = match parked {
-                    Some(parked) if parked.pending.is_some() => Some((t("Waiting"), theme::warn())),
-                    Some(_) => Some((t("Working"), theme::accent())),
-                    None if current && self.pending.is_some() => Some((t("Waiting"), theme::warn())),
-                    None if current && self.running => Some((t("Working"), theme::accent())),
-                    None if self.failed_sessions.contains(path) => Some((t("Error"), theme::bad())),
-                    None => None,
-                };
+                let state = side_state(parked.map(|parked| parked.pending.is_some() || parked.question.is_some()), current, self.waits_for_person(), self.running, self.failed_sessions.contains(path)).map(|state| match state {
+                    SideState::Waiting => (t("Waiting"), theme::warn()),
+                    SideState::Working => (t("Working"), theme::accent()),
+                    SideState::Error => (t("Error"), theme::bad()),
+                });
                 let left = area.left + s(ds::space::M);
                 let found = self.side_hits.is_some();
                 let mut text_right = area.right - s(ds::space::M);
@@ -10039,11 +10376,10 @@ impl App {
             }
         }
         // (the model's question waits: what is typed is its answer, a choice's number standing for the choice)
-        if let Some((answer, labels)) = self.question.take() {
-            let picked = text.trim().parse::<usize>().ok().and_then(|number| labels.get(number.wrapping_sub(1))).cloned();
-            let answer_text = picked.unwrap_or_else(|| text.clone());
-            self.append(&format!("{}\n", tf("Your answer: {0}", &[&answer_text])), Style::Tool);
-            if answer.send(answer_text).is_ok() {
+        if let Some(asked) = &self.question {
+            let labels: Vec<String> = asked.options.iter().map(|(label, _)| label.clone()).collect();
+            let answer = cards::answer_text(&labels, &text);
+            if self.answer_question(&answer) {
                 return;
             }
         }
@@ -10182,7 +10518,7 @@ impl App {
     }
 
     unsafe fn update_buttons(&self) {
-        let stoppable = self.running || self.waiting_to_connect();
+        let stoppable = is_stoppable(self.running, self.asking(), self.waiting_to_connect());
         set_text(self.send, if stoppable { "square" } else { "arrow-up" });
         if stoppable {
             SetTimer(self.window, TIMER_DOTS, SPINNER_MS, None);
@@ -10195,7 +10531,7 @@ impl App {
 
     /// Nothing to send, nothing to stop: the button says so.
     unsafe fn update_send_enabled(&self) {
-        let can = self.running || self.waiting_to_connect() || !self.attachments.is_empty() || GetWindowTextLengthW(self.composer) > 0;
+        let can = (self.running && !self.asking()) || self.waiting_to_connect() || !self.attachments.is_empty() || GetWindowTextLengthW(self.composer) > 0;
         EnableWindow(self.send, i32::from(can));
     }
 
@@ -10217,6 +10553,7 @@ impl App {
         self.turn_words_due = false;
         self.picture_blocks.clear();
         self.blocks.clear();
+        self.card_slots.clear();
         self.open_block = None;
         self.links.clear();
         self.link_hover = None;
@@ -10225,6 +10562,9 @@ impl App {
         self.run_carry.clear();
         self.asked_calls.clear();
         self.run_hover = None;
+        self.question = None;
+        self.plan_review = None;
+        set_text(self.card_field, "");
         // (a file that had gone may be back: it is looked for again)
         self.thumbs.retain(|_, kept| !matches!(kept.thumb, Thumb::Missing(_)));
         self.has_messages = false;
@@ -10248,6 +10588,9 @@ impl App {
         SendMessageW(self.transcript, WM_SETREDRAW, 0, 0);
         hold_layout(self.transcript_document, true);
         let results: HashMap<&str, &Message> = messages.iter().filter_map(|message| message.tool_call_id.as_deref().map(|id| (id, message))).collect();
+        // (the questions and plans it holds, as cards, each with what came of it)
+        let kept_cards = cards::of_messages(messages, self.card_next + 1);
+        self.card_next += kept_cards.len() as u64;
         for message in messages {
             match message.role.as_str() {
                 "user" => {
@@ -10268,6 +10611,14 @@ impl App {
                         self.mark_answer(text, &written_words(message));
                     }
                     for call in message.tool_calls.iter().flatten() {
+                        // A question put to the person, and a plan, are cards of their own, with what came of them.
+                        if cards::is_asking(&call.function.name) {
+                            if let Some((_, card)) = kept_cards.iter().find(|(id, _)| *id == call.id) {
+                                self.flush_told_calls(&mut told);
+                                self.write_card(card);
+                            }
+                            continue;
+                        }
                         // A session at work has calls still running, or still waiting for an answer: they say so when they end.
                         if let Some(result) = results.get(call.id.as_str()) {
                             let arguments = serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
@@ -10365,8 +10716,16 @@ impl App {
             }
             Event::Todos(items) => parked.todos = items,
             Event::WebSeen(on) => parked.web_seen = on,
+            Event::Question(question) => {
+                let words: String = question.question.lines().next().unwrap_or("").chars().take(120).collect();
+                parked.question = Some(question);
+                InvalidateRect(self.side, std::ptr::null(), 0);
+                FlashWindow(self.window, 1);
+                self.tray_note(t("Dogmind is waiting for you"), &words);
+            }
             Event::TurnEnded { .. } => {
                 parked.pending = None;
+                parked.question = None;
                 parked.interjected.clear();
                 // (what was said too late for this turn is for the next)
                 let late = std::mem::take(&mut *parked.agent.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
@@ -10624,6 +10983,8 @@ impl App {
                     }
                 }
             }
+            // (a question or a plan is a card of its own: the call that makes it has no row among the calls)
+            Event::ToolWriting { ref tool, .. } if cards::is_asking(tool) => {}
             Event::ToolWriting { index, tool, piece } => {
                 if self.settings.compact_tools {
                     self.run_writes(index, tool, &piece);
@@ -10639,6 +11000,9 @@ impl App {
                     }
                 }
             }
+            Event::ToolStarted { id, tool, summary } if cards::is_asking(&tool) => {
+                self.tools_running.insert(id, (tool, summary));
+            }
             Event::ToolStarted { id, tool, summary } => {
                 let summary: String = summary.chars().take(160).collect();
                 if self.settings.compact_tools {
@@ -10653,6 +11017,12 @@ impl App {
             Event::ToolProgress { tool, summary, .. } => {
                 let summary: String = summary.chars().take(120).collect();
                 self.set_activity(format!("{} — {}  {summary}", t(tool_name("explore")), t(tool_name(&tool))));
+            }
+            Event::ToolEnded { id, .. } if self.tools_running.get(&id).is_some_and(|(tool, _)| cards::is_asking(tool)) => {
+                self.tools_running.remove(&id);
+                if self.tools_running.is_empty() && !self.waits_for_person() {
+                    self.set_activity(t("Thinking…").into());
+                }
             }
             Event::ToolEnded { id, ok, declined, elapsed, output, images } => {
                 self.end_line();
@@ -10786,15 +11156,17 @@ impl App {
                 self.turn_changes.insert(turn, files);
             }
             Event::Question(question) => {
-                // (said in the transcript, choices numbered, till a card asks it: the next thing typed is the answer, a number picking a choice)
-                let mut said = format!("{}\n{}\n", t("The agent asks:"), question.question);
-                for (at, (label, meaning)) in question.options.iter().enumerate() {
-                    said.push_str(&if meaning.is_empty() { format!("  {}. {label}\n", at + 1) } else { format!("  {}. {label} — {meaning}\n", at + 1) });
-                }
-                said.push_str(&format!("{}\n", t("Type the number of a choice, or your own answer.")));
-                self.append(&said, Style::Tool);
-                self.question = Some((question.answer, question.options.into_iter().map(|(label, _)| label).collect()));
-                SetFocus(self.composer);
+                self.card_next += 1;
+                let id = self.card_next;
+                self.write_card(&Card::Question { id, question: question.question.clone(), options: question.options.clone(), state: AnswerState::Waiting });
+                let words: String = question.question.lines().next().unwrap_or("").chars().take(120).collect();
+                self.question = Some(AskedQuestion { answer: question.answer, question: question.question, options: question.options, card: id });
+                self.set_activity(String::new());
+                self.update_buttons();
+                InvalidateRect(self.side, std::ptr::null(), 0);
+                self.tray_note(t("Dogmind is waiting for you"), &words);
+                FlashWindow(self.window, 1);
+                self.focus_composer();
             }
             Event::Goal(goal) => {
                 // (said when it changes, till a bar shows it: set, cleared, or that of a session opened)
@@ -10884,9 +11256,10 @@ impl App {
                 }
             }
             Event::TurnEnded { cancelled } => {
-                // (a question or a plan the turn left unanswered goes with it)
+                // (a question or a plan the turn left unanswered goes with it, and its card says so)
                 self.question = None;
                 self.plan_review = None;
+                self.settle_waiting_cards();
                 // (what was said too late for this turn is for the next)
                 let late = std::mem::take(&mut *self.agent.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
                 self.queued.extend(late.into_iter().map(Outgoing::words));
@@ -11819,7 +12192,7 @@ impl App {
         ] {
             set_text(window, t(words));
         }
-        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.find_field, "Find in this conversation"), (self.side_search, "Search sessions")] {
+        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.card_field, "Write your own answer…"), (self.find_field, "Find in this conversation"), (self.side_search, "Search sessions")] {
             let cue = wide(t(words));
             SendMessageW(edit, EM_SETCUEBANNER, 0, cue.as_ptr() as LPARAM);
         }
@@ -12722,7 +13095,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
             set_button_fonts(app.fonts);
-            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search]) {
+            for edit in app.fields.into_iter().chain([app.feedback, app.card_field, app.composer_cue, app.find_field, app.side_search]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
             }
             // (the command's own size follows the screen's: it is set again when it is next shown, and this one keeps what it has)
@@ -13214,6 +13587,15 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 _ if (ID_COPY_POOL..ID_COPY_POOL + COPY_POOL as isize).contains(&id) => app.copy_answer((id - ID_COPY_POOL) as usize),
                 _ if (ID_FORK_POOL..ID_FORK_POOL + COPY_POOL as isize).contains(&id) => app.fork_from_answer((id - ID_FORK_POOL) as usize),
                 _ if (ID_BLOCK_POOL..ID_BLOCK_POOL + BLOCK_POOL as isize).contains(&id) => app.copy_block((id - ID_BLOCK_POOL) as usize),
+                _ if (ID_CARD_POOL..ID_CARD_POOL + CARD_POOL as isize).contains(&id) => app.card_pressed((id - ID_CARD_POOL) as usize),
+                CARD_FIELD_ID if code == EN_SETFOCUS as usize || code == EN_KILLFOCUS as usize => {
+                    // (its frame shows that the field has the focus)
+                    for button in app.card_buttons.clone() {
+                        if IsWindowVisible(button) != 0 {
+                            InvalidateRect(button, std::ptr::null(), 0);
+                        }
+                    }
+                }
                 _ if (ID_RUN_POOL..ID_RUN_POOL + RUN_POOL as isize).contains(&id) => {
                     if let Some(run) = app.run_targets[(id - ID_RUN_POOL) as usize] {
                         app.toggle_run(run);
@@ -13597,6 +13979,10 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
         app.send_typed(!control);
         return true;
     }
+    if key == VK_RETURN && message.hwnd == app.card_field {
+        app.card_pressed_own();
+        return true;
+    }
     if matches!(key, VK_PRIOR | VK_NEXT) && message.hwnd == app.composer && app.panel == Panel::Chat && app.has_messages {
         // Reading back without leaving what is being written.
         SendMessageW(app.transcript, WM_VSCROLL, if key == VK_PRIOR { SB_PAGEUP } else { SB_PAGEDOWN } as WPARAM, 0);
@@ -13615,7 +14001,7 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             return true;
         }
     }
-    if app.pending.is_some() && ![app.feedback, app.composer, app.find_field, app.side_search].contains(&GetFocus()) {
+    if app.pending.is_some() && ![app.feedback, app.card_field, app.composer, app.find_field, app.side_search].contains(&GetFocus()) {
         match key {
             0x59 => app.answer_approval(Decision::Approve), // Y
             0x41 => {
@@ -14387,6 +14773,13 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             transcript_region: ((0, 0), None),
             interjected: Vec::new(),
             question: None,
+            card_buttons: (0..CARD_POOL).map(|at| make_button(window, ID_CARD_POOL + at as isize, "", ButtonKind::Choice, theme::code_back())).collect(),
+            card_targets: vec![None; CARD_POOL],
+            card_cut: vec![(0, 0); CARD_POOL],
+            card_tips: vec![String::new(); CARD_POOL],
+            card_field: control(window, "EDIT", "", edit_style, 0, CARD_FIELD_ID),
+            card_slots: Vec::new(),
+            card_next: 0,
             plan_review: None,
             goal: None,
             queue_hits: Vec::new(),
@@ -14519,7 +14912,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let app = &mut *APP.load(Ordering::Relaxed);
         SendMessageW(app.composer, EM_SETEVENTMASK, 0, ENM_CHANGE as LPARAM);
         SendMessageW(app.note, EM_SETMARGINS, 3, 0); // EC_LEFTMARGIN | EC_RIGHTMARGIN
-        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search]) {
+        for edit in app.fields.into_iter().chain([app.feedback, app.card_field, app.composer_cue, app.find_field, app.side_search]) {
             SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
         }
         app.list_procedure = SetWindowLongPtrW(app.side, GWLP_WNDPROC, list_subclass as *const () as isize);
@@ -15106,6 +15499,26 @@ mod tests {
         assert_eq!(escape_does(false, true, true, true), EscapeDoes::Reject);
         assert_eq!(escape_does(false, true, false, true), EscapeDoes::Stop);
         assert_eq!(escape_does(false, true, false, false), EscapeDoes::Nothing);
+    }
+
+    /// A question or a plan that waits is the person's to answer, as an approval is: the sidebar says Waiting and not Working, and the send button is not a stop button as if the model were writing.
+    #[test]
+    fn a_session_that_waits_for_the_person_says_waiting_and_is_not_stopped_by_its_send_button() {
+        // the one on screen: waiting for an approval, an answer or a decision, with the turn still running
+        assert_eq!(side_state(None, true, true, true, false), Some(SideState::Waiting));
+        assert_eq!(side_state(None, true, false, true, false), Some(SideState::Working));
+        assert_eq!(side_state(None, true, false, false, false), None);
+        // one that is not on screen: parked at work, and whether it waits
+        assert_eq!(side_state(Some(true), false, false, false, false), Some(SideState::Waiting));
+        assert_eq!(side_state(Some(false), false, false, false, false), Some(SideState::Working));
+        // a session that is not the one shown, and failed
+        assert_eq!(side_state(None, false, true, true, true), Some(SideState::Error));
+        assert_eq!(side_state(None, false, true, true, false), None, "what the window waits for is the shown session's");
+        // the button
+        assert!(is_stoppable(true, false, false), "the model is writing");
+        assert!(!is_stoppable(true, true, false), "the model waits for an answer: the button sends it");
+        assert!(is_stoppable(false, false, true), "the connection is being waited for");
+        assert!(!is_stoppable(false, false, false));
     }
 
     #[test]
