@@ -62,6 +62,11 @@ fn escape(text: &str) -> String {
 /// The table's HTML, and a line under it when rows or columns were left out (`more`: its words, given the counts of rows and columns).
 pub fn html(text: &str, separator: char, more: &dyn Fn(usize, usize) -> String) -> String {
     let rows = rows(text, separator);
+    html_of(&rows, rows.len(), more)
+}
+
+/// The same of rows read already (a workbook's sheet), of `total` rows in all.
+pub fn html_of(rows: &[Vec<String>], total: usize, more: &dyn Fn(usize, usize) -> String) -> String {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut out = String::from("<table class=\"data\">");
     for (at, row) in rows.iter().take(MOST_ROWS).enumerate() {
@@ -76,8 +81,8 @@ pub fn html(text: &str, separator: char, more: &dyn Fn(usize, usize) -> String) 
         out.push_str("</tr>");
     }
     out.push_str("</table>");
-    if rows.len() > MOST_ROWS || columns > MOST_COLUMNS {
-        out.push_str(&format!("<p class=\"cut\">{}</p>", escape(&more(rows.len(), columns))));
+    if total > MOST_ROWS.min(rows.len()) || columns > MOST_COLUMNS {
+        out.push_str(&format!("<p class=\"cut\">{}</p>", escape(&more(total, columns))));
     }
     out
 }
