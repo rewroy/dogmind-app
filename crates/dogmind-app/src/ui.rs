@@ -1917,6 +1917,8 @@ struct App {
     transcript_region: ((i32, i32), Option<(i32, i32, i32, i32)>),
     /// Words sent to the turn under way that have not reached it yet.
     interjected: Vec<String>,
+    /// The model's question that waits for the person (Event::Question): where the answer goes, and the choices' labels, which a number picks.
+    question: Option<(std::sync::mpsc::Sender<String>, Vec<String>)>,
     /// The buttons on what waits above the input: where, which message, and what each does.
     queue_hits: Vec<(RECT, usize, QueueAct)>,
     /// Those buttons as their tips stand now.
@@ -9873,6 +9875,15 @@ impl App {
         }
         set_text(self.composer, "");
         self.composer_typed_at = None;
+        // (the model's question waits: what is typed is its answer, a choice's number standing for the choice)
+        if let Some((answer, labels)) = self.question.take() {
+            let picked = text.trim().parse::<usize>().ok().and_then(|number| labels.get(number.wrapping_sub(1))).cloned();
+            let answer_text = picked.unwrap_or_else(|| text.clone());
+            self.append(&format!("{}\n", tf("Your answer: {0}", &[&answer_text])), Style::Tool);
+            if answer.send(answer_text).is_ok() {
+                return;
+            }
+        }
         let images = std::mem::take(&mut self.attachments);
         self.show_attachments();
         self.send_or_wait(Outgoing { card: text.clone(), text, images }, interjects);
@@ -10611,6 +10622,17 @@ impl App {
                 }
                 self.turn_changes.insert(turn, files);
             }
+            Event::Question(question) => {
+                // (said in the transcript, choices numbered, till a card asks it: the next thing typed is the answer, a number picking a choice)
+                let mut said = format!("{}\n{}\n", t("The agent asks:"), question.question);
+                for (at, (label, meaning)) in question.options.iter().enumerate() {
+                    said.push_str(&if meaning.is_empty() { format!("  {}. {label}\n", at + 1) } else { format!("  {}. {label} — {meaning}\n", at + 1) });
+                }
+                said.push_str(&format!("{}\n", t("Type the number of a choice, or your own answer.")));
+                self.append(&said, Style::Tool);
+                self.question = Some((question.answer, question.options.into_iter().map(|(label, _)| label).collect()));
+                SetFocus(self.composer);
+            }
             Event::Turns(turns) => {
                 self.turns = turns;
                 if self.turns.is_empty() {
@@ -10676,6 +10698,8 @@ impl App {
                 }
             }
             Event::TurnEnded { cancelled } => {
+                // (a question the turn left unanswered goes with it)
+                self.question = None;
                 // (what was said too late for this turn is for the next)
                 let late = std::mem::take(&mut *self.agent.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
                 self.queued.extend(late.into_iter().map(Outgoing::words));
@@ -14169,6 +14193,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             placed_at: 0,
             transcript_region: ((0, 0), None),
             interjected: Vec::new(),
+            question: None,
             queue_hits: Vec::new(),
             queue_tips: Vec::new(),
             blocks: Vec::new(),
