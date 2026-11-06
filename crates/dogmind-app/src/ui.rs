@@ -28,7 +28,7 @@ use crate::machine::readable_build;
 use crate::diffview::{self, RowKind};
 use crate::settings::KeySource;
 use crate::toolrun::{self, LineKind, RunEntry, Tone, ToolRun};
-use crate::cards::{self, AnswerState, Card};
+use crate::cards::{self, AnswerState, Card, PlanState};
 use crate::notice;
 use crate::updates;
 use windows_sys::Win32::Foundation::*;
@@ -884,6 +884,10 @@ enum CardAct {
     /// What is in the card's field is the answer.
     SendOwn,
     FocusField,
+    /// The plan is approved.
+    Carry,
+    /// The plan is to be changed: what is written next says how.
+    Change,
 }
 
 /// One control of a card, on a row of its room.
@@ -912,6 +916,15 @@ struct AskedQuestion {
     question: String,
     options: Vec<(String, String)>,
     card: u64,
+}
+
+/// The plan that waits for the person's decision: where the answer goes, the plan as it was put, the card that shows it, and whether the person has pressed Change and what is written next
+/// is the change asked for.
+struct AskedPlan {
+    answer: std::sync::mpsc::Sender<Result<(), String>>,
+    plan: String,
+    card: u64,
+    changing: bool,
 }
 
 /// A message's pictures in the transcript: where their room in its card begins.
@@ -1196,8 +1209,9 @@ struct Parked {
     agent: Handle,
     events: Receiver<Event>,
     pending: Option<Approval>,
-    /// The model's question that waits for the person.
+    /// The model's question, and its plan, that wait for the person.
     question: Option<agent::Question>,
+    plan_review: Option<agent::PlanReview>,
     /// What has streamed since the last whole message, which the session file holds.
     partial: String,
     tools_running: HashMap<String, (String, String)>,
@@ -2007,8 +2021,8 @@ struct App {
     card_field: HWND,
     card_slots: Vec<CardSlot>,
     card_next: u64,
-    /// The plan that waits for the person's approval (Event::PlanReview): where the answer goes.
-    plan_review: Option<std::sync::mpsc::Sender<Result<(), String>>>,
+    /// The plan that waits for the person's decision (Event::PlanReview).
+    plan_review: Option<AskedPlan>,
     /// What this session works toward, as the agent last told it (Event::Goal).
     goal: Option<String>,
     /// The buttons on what waits above the input: where, which message, and what each does.
@@ -4495,6 +4509,26 @@ impl App {
                 }
                 self.card_row(&[" "], 6, theme::muted(), 80, false);
             }
+            Card::Plan { plan, state, .. } => {
+                // The plan as the transcript writes an answer, Markdown and all, under a word that says what it is; and under it a card with what can be done with it, or what was.
+                self.append(&format!("{}\n", t("Plan")), Style::Tool);
+                self.line_start = true;
+                self.append_answer(plan);
+                self.finish_answer();
+                self.append("\n", Style::Gap);
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                match state {
+                    PlanState::Waiting => {
+                        let button = |text: &str, kind: ButtonKind, act: CardAct, fonts: &Fonts| CardPart { text: text.to_string(), kind, act, width: text_width(fonts.strong, text) + s(ds::size::BUTTON_PADDING), tip: String::new() };
+                        let parts = vec![button(t("Carry it out"), ButtonKind::Primary, CardAct::Carry, &self.fonts), button(t("Change…"), ButtonKind::Secondary, CardAct::Change, &self.fonts)];
+                        self.card_room(s(ds::size::CONTROL), parts, false);
+                    }
+                    PlanState::Approved => self.card_row(&[t("Approved")], 10, theme::accent(), 60, false),
+                    PlanState::Changes(change) => self.card_row(&[&tf("Change requested: {0}", &[change])], 10, theme::warn(), 60, false),
+                    PlanState::Undecided => self.card_row(&[t("Not decided")], 10, theme::muted(), 60, false),
+                }
+                self.card_row(&[" "], 6, theme::muted(), 80, false);
+            }
         }
         self.replaying = held;
         self.line_start = true;
@@ -4525,15 +4559,21 @@ impl App {
     unsafe fn settle_waiting_cards(&mut self) {
         let mut changed = false;
         for item in &mut self.shown {
-            if let Shown::Card(Card::Question { state, .. }) = item {
-                if *state == AnswerState::Waiting {
+            match item {
+                Shown::Card(Card::Question { state, .. }) if *state == AnswerState::Waiting => {
                     *state = AnswerState::Unanswered;
                     changed = true;
                 }
+                Shown::Card(Card::Plan { state, .. }) if *state == PlanState::Waiting => {
+                    *state = PlanState::Undecided;
+                    changed = true;
+                }
+                _ => {}
             }
         }
         if changed {
             set_text(self.card_field, "");
+            self.reset_composer_cue();
             self.reflow();
         }
     }
@@ -4545,8 +4585,9 @@ impl App {
         set_text(self.card_field, "");
         let said = words.clone();
         self.settle_card(asked.card, |card| {
-            let Card::Question { state, .. } = card;
-            *state = AnswerState::Answered(said);
+            if let Card::Question { state, .. } = card {
+                *state = AnswerState::Answered(said);
+            }
         });
         let sent = asked.answer.send(words).is_ok();
         self.set_activity(t("Thinking…").into());
@@ -4554,6 +4595,42 @@ impl App {
         InvalidateRect(self.side, std::ptr::null(), 0);
         self.focus_composer();
         sent
+    }
+
+    /// The decision on the plan: by a press on Carry it out, or by what was typed. `Err`: what to change. `false`: no plan waits.
+    unsafe fn decide_plan(&mut self, decision: Result<(), String>) -> bool {
+        let Some(asked) = self.plan_review.take() else { return false };
+        let state = match &decision {
+            Ok(()) => PlanState::Approved,
+            Err(change) => PlanState::Changes(change.trim().to_string()),
+        };
+        self.settle_card(asked.card, |card| {
+            if let Card::Plan { state: kept, .. } = card {
+                *kept = state;
+            }
+        });
+        self.reset_composer_cue();
+        let sent = asked.answer.send(decision).is_ok();
+        self.set_activity(t("Thinking…").into());
+        self.update_buttons();
+        InvalidateRect(self.side, std::ptr::null(), 0);
+        self.focus_composer();
+        sent
+    }
+
+    /// Change, on the plan: the composer says what it is for, and what is written in it next is the change asked for.
+    unsafe fn plan_change_asked(&mut self) {
+        if let Some(asked) = &mut self.plan_review {
+            asked.changing = true;
+            set_text(self.composer_cue, t("What should change in the plan?"));
+            self.update_composer_cue();
+            self.focus_composer();
+        }
+    }
+
+    /// The composer's own hint again.
+    unsafe fn reset_composer_cue(&mut self) {
+        set_text(self.composer_cue, t("Message Dogmind"));
     }
 
     /// What was written in the card's field, as the answer; an empty field is where to write it.
@@ -4576,6 +4653,10 @@ impl App {
             CardAct::FocusField => {
                 SetFocus(self.card_field);
             }
+            CardAct::Carry => {
+                self.decide_plan(Ok(()));
+            }
+            CardAct::Change => self.plan_change_asked(),
         }
     }
 
@@ -9468,6 +9549,7 @@ impl App {
             events,
             pending: self.pending.take(),
             question: self.question.take().map(|asked| agent::Question { question: asked.question, options: asked.options, answer: asked.answer }),
+            plan_review: self.plan_review.take().map(|asked| agent::PlanReview { plan: asked.plan, answer: asked.answer }),
             partial: std::mem::take(&mut self.answer),
             tools_running: std::mem::take(&mut self.tools_running),
             queued: std::mem::take(&mut self.queued),
@@ -9562,7 +9644,7 @@ impl App {
         for (index, tool, raw) in parked.writing.into_iter().filter(|(_, tool, _)| !cards::is_asking(tool)) {
             self.run_writes(index, tool, &raw);
         }
-        self.set_activity(if parked.pending.is_some() || parked.question.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
+        self.set_activity(if parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
         self.update_buttons();
         self.update_status();
         if let Some(approval) = parked.pending {
@@ -9570,6 +9652,9 @@ impl App {
         }
         if let Some(question) = parked.question {
             self.on_event(Event::Question(question));
+        }
+        if let Some(review) = parked.plan_review {
+            self.on_event(Event::PlanReview(review));
         }
         InvalidateRect(self.side, std::ptr::null(), 0);
     }
@@ -9889,7 +9974,7 @@ impl App {
                 }
                 let parked = self.parked.iter().find(|parked| parked.path.as_ref() == Some(path));
                 // How it stands, in a word, where its time would be; only one that needs saying has one.
-                let state = side_state(parked.map(|parked| parked.pending.is_some() || parked.question.is_some()), current, self.waits_for_person(), self.running, self.failed_sessions.contains(path)).map(|state| match state {
+                let state = side_state(parked.map(|parked| parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some()), current, self.waits_for_person(), self.running, self.failed_sessions.contains(path)).map(|state| match state {
                     SideState::Waiting => (t("Waiting"), theme::warn()),
                     SideState::Working => (t("Working"), theme::accent()),
                     SideState::Error => (t("Error"), theme::bad()),
@@ -10367,11 +10452,10 @@ impl App {
         }
         set_text(self.composer, "");
         self.composer_typed_at = None;
-        // (a plan waits for approval: yes carries it out, anything else is what to change)
-        if let Some(answer) = self.plan_review.take() {
-            let yes = matches!(text.trim().trim_end_matches(['.', '!', '。', '！']).to_lowercase().as_str(), "yes" | "y" | "ok" | "go" | "はい" | "うん" | "承認" | "実行" | "お願い");
-            self.append(&format!("{}\n", if yes { t("Plan approved: plan mode is over.").to_string() } else { tf("Change the plan: {0}", &[&text]) }), Style::Tool);
-            if answer.send(if yes { Ok(()) } else { Err(text.clone()) }).is_ok() {
+        // (a plan waits for a decision: yes carries it out, anything else is what to change; after Change, whatever is written is)
+        if let Some(asked) = &self.plan_review {
+            let decision = if !asked.changing && cards::approves(&text) { Ok(()) } else { Err(text.clone()) };
+            if self.decide_plan(decision) {
                 return;
             }
         }
@@ -10723,9 +10807,16 @@ impl App {
                 FlashWindow(self.window, 1);
                 self.tray_note(t("Dogmind is waiting for you"), &words);
             }
+            Event::PlanReview(review) => {
+                parked.plan_review = Some(review);
+                InvalidateRect(self.side, std::ptr::null(), 0);
+                FlashWindow(self.window, 1);
+                self.tray_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
+            }
             Event::TurnEnded { .. } => {
                 parked.pending = None;
                 parked.question = None;
+                parked.plan_review = None;
                 parked.interjected.clear();
                 // (what was said too late for this turn is for the next)
                 let late = std::mem::take(&mut *parked.agent.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
@@ -11180,10 +11271,16 @@ impl App {
                 self.goal = goal;
             }
             Event::PlanReview(review) => {
-                // (said in the transcript till a card shows it: the next thing typed approves it, or says what to change)
-                self.append(&format!("{}\n{}\n{}\n", t("The plan:"), review.plan.trim_end(), t("Type yes to carry it out, or say what to change.")), Style::Tool);
-                self.plan_review = Some(review.answer);
-                SetFocus(self.composer);
+                self.card_next += 1;
+                let id = self.card_next;
+                self.write_card(&Card::Plan { id, plan: review.plan.clone(), state: PlanState::Waiting });
+                self.plan_review = Some(AskedPlan { answer: review.answer, plan: review.plan, card: id, changing: false });
+                self.set_activity(String::new());
+                self.update_buttons();
+                InvalidateRect(self.side, std::ptr::null(), 0);
+                self.tray_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
+                FlashWindow(self.window, 1);
+                self.focus_composer();
             }
             Event::ModeChanged(mode) => {
                 // (a plan approved: plan mode is over, as the agent says)
@@ -11260,6 +11357,7 @@ impl App {
                 self.question = None;
                 self.plan_review = None;
                 self.settle_waiting_cards();
+                self.reset_composer_cue();
                 // (what was said too late for this turn is for the next)
                 let late = std::mem::take(&mut *self.agent.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
                 self.queued.extend(late.into_iter().map(Outgoing::words));

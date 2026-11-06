@@ -1112,7 +1112,8 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
             centered(device, fonts.strong, if enabled { theme::on_accent() } else { theme::muted() });
         }
         1 => {
-            rounded(device, client, s(radius::CONTROL), lit.then_some(theme::raised()), Some(theme::line()));
+            // (on a card of the conversation, a well a shade off it, as the choices of a question are)
+            rounded(device, client, s(radius::CONTROL), if lit { Some(theme::raised()) } else { (backdrop == theme::code_back()).then(theme::surface) }, Some(theme::line()));
             centered(device, fonts.body, if enabled { theme::text() } else { theme::faint() });
         }
         2 => {
