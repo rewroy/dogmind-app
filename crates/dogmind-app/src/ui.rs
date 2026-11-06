@@ -2191,6 +2191,8 @@ struct App {
     pending_text: String,
     /// What has arrived of the answer and is not on screen yet (`reveal_tick`).
     reveal: String,
+    /// The reply's keys, hidden as they come in pieces: what is shown of it (the reply itself is kept as it was written).
+    stream_mask: crate::mask::StreamMask,
     /// When text last went in from it.
     revealed_at: std::time::Instant,
     /// `reveal` is going in now, at the end of a transcript whose paragraphs before it stay as they are.
@@ -3891,6 +3893,10 @@ impl App {
     /// The answer has been said: what is still held back goes out, and it can be copied. Ends also with a call beginning to be written, whose row comes under it.
     unsafe fn end_of_answer(&mut self) {
         self.thinking.clear();
+        // (a word held back, in case it was a key, goes out with the rest)
+        let held = self.stream_mask.finish();
+        self.reveal.push_str(&held);
+        self.flush_reveal();
         self.finish_answer();
         if !self.answer.is_empty() {
             self.last_answer = std::mem::take(&mut self.answer);
@@ -10001,7 +10007,7 @@ impl App {
             self.answer.clear();
         }
         if !self.answer.is_empty() {
-            let shown = self.answer.clone();
+            let shown = crate::mask::hide_keys(&self.answer).into_owned();
             self.append_answer(&shown);
         }
         // (the calls it has under way, which its file does not know of yet)
@@ -11067,7 +11073,7 @@ impl App {
                         if !text.trim().is_empty() {
                             self.flush_told_calls(&mut told);
                         }
-                        self.append_answer(text);
+                        self.append_answer(&crate::mask::hide_keys(text));
                         self.finish_answer();
                         self.last_answer = text.clone();
                         self.mark_answer(text, &written_words(message));
@@ -11084,10 +11090,10 @@ impl App {
                         // A session at work has calls still running, or still waiting for an answer: they say so when they end.
                         if let Some(result) = results.get(call.id.as_str()) {
                             let arguments = serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
-                            let summary: String = markdown::show_hidden(&dogmind_agent::tools::summary(&call.function.name, &arguments)).chars().take(160).collect();
+                            let summary: String = crate::mask::hide_keys(&markdown::show_hidden(&dogmind_agent::tools::summary(&call.function.name, &arguments))).chars().take(160).collect();
                             let pictures = self.pictures_of(&result.images);
                             if self.settings.compact_tools {
-                                self.told_call(&call.function.name, &summary, &markdown::show_hidden(result.content.as_deref().unwrap_or("")), &mut told);
+                                self.told_call(&call.function.name, &summary, &crate::mask::hide_keys(&markdown::show_hidden(result.content.as_deref().unwrap_or(""))), &mut told);
                                 if !pictures.is_empty() {
                                     self.flush_told_calls(&mut told);
                                     self.show_tool_pictures(&pictures);
@@ -11426,7 +11432,9 @@ impl App {
                     }
                 }
                 self.answer.push_str(&text);
-                self.reveal.push_str(&text);
+                // (what is shown of it has its keys hidden: the reply stays as the model wrote it)
+                let shown = self.stream_mask.push(&text);
+                self.reveal.push_str(&shown);
                 self.want_frames();
             }
             Event::AssistantEnded => {
@@ -15416,6 +15424,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             last_answer: String::new(),
             pending_text: String::new(),
             reveal: String::new(),
+            stream_mask: crate::mask::StreamMask::default(),
             revealed_at: std::time::Instant::now(),
             revealing: false,
             unkept: false,
