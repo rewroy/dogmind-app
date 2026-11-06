@@ -2203,6 +2203,24 @@ unsafe fn show(window: HWND, visible: bool) {
     ShowWindow(window, if visible { SW_SHOWNA } else { SW_HIDE });
 }
 
+/// The words of the button of an update that is on its way or here. They follow the stage the update is in and what was asked of it, and never how far a fetch has come: a note of
+/// progress changes the percent in the line above the button, and the button is not touched.
+fn update_button_words_of(update: &ReleaseUpdate, setup_is_here: bool, checking_setup: bool, restart_when_done: bool) -> Option<&'static str> {
+    match update {
+        ReleaseUpdate::Fetching { .. } => Some(t("Cancel")),
+        ReleaseUpdate::Ready(_) if setup_is_here => Some(if checking_setup { t("Checking…") } else if restart_when_done { t("Not now") } else { t("Restart to update") }),
+        _ => None,
+    }
+}
+
+fn update_button_kind_of(update: &ReleaseUpdate, restart_when_done: bool) -> ButtonKind {
+    match update {
+        ReleaseUpdate::Ready(_) if restart_when_done => ButtonKind::Secondary,
+        ReleaseUpdate::Ready(_) => ButtonKind::Primary,
+        _ => ButtonKind::Link,
+    }
+}
+
 /// A control where it now goes. Without SWP_NOCOPYBITS the system moves its old pixels along and asks it to draw only what it thinks is new, and what
 /// was covered or not yet drawn at the old place comes along as holes; one that has not moved is left alone.
 unsafe fn place(window: HWND, x: i32, y: i32, width: i32, height: i32) {
@@ -4866,19 +4884,20 @@ impl App {
         let provider = self.settings.active_provider().map_or(String::new(), |provider| provider.name.clone());
         // (which provider is in the menu: the name of the model is what changes, and what there is room for)
         let label = if self.model.is_empty() { provider } else { self.model.clone() };
-        set_text(self.model_chip, &label);
+        // (said again for every note of a download that goes by on the status line: a chip given the words it has is drawn again for nothing)
+        set_text_if_changed(self.model_chip, &label);
         let mode = self.current_mode();
         let name = MODES.iter().find(|(known, _)| *known == mode).map_or("", |(_, name)| name);
-        set_text(self.mode_chip, t(name));
+        set_text_if_changed(self.mode_chip, t(name));
         let efforts = self.efforts();
         let effort = efforts.iter().find(|(known, _)| *known == self.settings.effort.as_deref()).map_or("Default", |(_, name)| name);
-        set_text(self.effort_chip, &tf("Effort: {0}", &[&t(effort)]));
+        set_text_if_changed(self.effort_chip, &tf("Effort: {0}", &[&t(effort)]));
     }
 
     unsafe fn update_status(&mut self) {
         self.update_chips();
         let title = if self.workspace == Path::new(".") { "Dogmind".to_string() } else { format!("Dogmind — {}", self.workspace.file_name().map_or_else(|| self.workspace.display().to_string(), |name| name.to_string_lossy().into_owned())) };
-        set_text(self.window, &title);
+        set_text_if_changed(self.window, &title);
         InvalidateRect(self.window, &self.status_area, 0);
     }
 
@@ -8212,20 +8231,12 @@ impl App {
 
     /// The button under that line, if it has one: a way to stop the download, or to restart into what was fetched.
     fn update_button_words(&self) -> Option<&'static str> {
-        match &self.release_update {
-            ReleaseUpdate::Fetching { .. } => Some(t("Cancel")),
-            ReleaseUpdate::Ready(_) if self.ready_setup().is_some() => Some(if self.checking_setup { t("Checking…") } else if self.restart_when_done { t("Not now") } else { t("Restart to update") }),
-            _ => None,
-        }
+        update_button_words_of(&self.release_update, self.ready_setup().is_some(), self.checking_setup, self.restart_when_done)
     }
 
     /// How that button looks: the page's main button when it restarts into the update, a plain one to take that back, and a link to stop a download.
     fn update_button_kind(&self) -> ButtonKind {
-        match &self.release_update {
-            ReleaseUpdate::Ready(_) if self.restart_when_done => ButtonKind::Secondary,
-            ReleaseUpdate::Ready(_) => ButtonKind::Primary,
-            _ => ButtonKind::Link,
-        }
+        update_button_kind_of(&self.release_update, self.restart_when_done)
     }
 
     /// An update of this install is on its way or here: About tells of it by its own lines, and not by those of the look that found the release.
@@ -14530,6 +14541,22 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_note_of_progress_changes_the_percent_and_leaves_the_update_button_as_it_was() {
+        let fetching = |done: u64| ReleaseUpdate::Fetching { version: "0.2.0".into(), done, total: 1000, stop: Arc::new(AtomicBool::new(false)) };
+        for (checking, restart_when_done) in [(false, false), (false, true), (true, false)] {
+            let words = update_button_words_of(&fetching(0), false, checking, restart_when_done);
+            assert_eq!(words, Some(t("Cancel")), "a way to stop it, from the first note to the last");
+            for done in [1, 17, 500, 999, 1000] {
+                assert_eq!(update_button_words_of(&fetching(done), false, checking, restart_when_done), words, "at {done} of 1000");
+                assert_eq!(update_button_kind_of(&fetching(done), restart_when_done), update_button_kind_of(&fetching(0), restart_when_done));
+            }
+        }
+        assert_eq!(update_button_kind_of(&fetching(3), false), ButtonKind::Link);
+        // (the buttons of an update that is not being fetched are as they were: none when there is none)
+        assert_eq!(update_button_words_of(&ReleaseUpdate::None, false, false, false), None);
+    }
 
     #[test]
     fn what_is_japanese_in_a_rich_edit_stays_in_its_own_face() {

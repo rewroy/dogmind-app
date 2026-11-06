@@ -133,6 +133,21 @@ pub fn japanese(options: &Options) -> bool {
     (unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() }) & 0x3FF == 0x11
 }
 
+/// What a page that replaces another changes on the window.
+#[derive(Debug, PartialEq, Eq)]
+struct Redo {
+    /// The words of a button, or whether it shows: the buttons are made again, and only then.
+    buttons: bool,
+    /// Anything the window draws itself: the words, the bar, the line under it.
+    page: bool,
+}
+
+/// What `new` changes of what is on the window. A note of progress changes the bar and the line under it, and nothing of the buttons: renamed to the words they have, drawn again, they
+/// are erased to the system's colour and drawn over on the screen, a flicker of the Cancel button as often as the notes come.
+fn what_changes(old: &View, new: &View) -> Redo {
+    Redo { buttons: old.primary != new.primary || old.secondary != new.secondary || old.change != new.change, page: old != new }
+}
+
 /// Where a page puts the folder it shows.
 struct FolderRow {
     label: RECT,
@@ -142,7 +157,7 @@ struct FolderRow {
 }
 
 /// What a page says and what can be done on it.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq)]
 struct View {
     heading: String,
     detail: String,
@@ -426,16 +441,26 @@ impl App {
     }
 
     unsafe fn refresh(&mut self) {
-        self.view = self.view_of_page();
-        for (button, words) in [(self.primary, self.view.primary.clone()), (self.secondary, self.view.secondary.clone()), (self.change, self.view.change.clone())] {
-            set_text(button, words.as_deref().unwrap_or(""));
-            ShowWindow(button, if words.is_some() { SW_SHOWNA } else { SW_HIDE });
+        let view = self.view_of_page();
+        let redo = what_changes(&self.view, &view);
+        self.view = view;
+        if redo.buttons {
+            for (button, words) in [(self.primary, self.view.primary.clone()), (self.secondary, self.view.secondary.clone()), (self.change, self.view.change.clone())] {
+                if get_text(button) != words.as_deref().unwrap_or("") {
+                    set_text(button, words.as_deref().unwrap_or(""));
+                }
+                if (IsWindowVisible(button) != 0) != words.is_some() {
+                    ShowWindow(button, if words.is_some() { SW_SHOWNA } else { SW_HIDE });
+                }
+                InvalidateRect(button, std::ptr::null(), 0);
+            }
         }
-        self.place_buttons();
-        InvalidateRect(self.window, std::ptr::null(), 0);
-        InvalidateRect(self.primary, std::ptr::null(), 0);
-        InvalidateRect(self.secondary, std::ptr::null(), 0);
-        InvalidateRect(self.change, std::ptr::null(), 0);
+        if redo.buttons || redo.page && self.view.change.is_some() {
+            self.place_buttons();
+        }
+        if redo.page {
+            InvalidateRect(self.window, std::ptr::null(), 0);
+        }
         if self.options.auto {
             self.press_by_itself();
         }
@@ -938,6 +963,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.paint_button(&*(lparam as *const DRAWITEMSTRUCT));
             1
         }
+        // What a button is erased with before it is drawn: the page's colour, and not the system's button face, which shows for the moment between the two.
+        WM_CTLCOLORBTN => {
+            GetClassLongPtrW(window, GCLP_HBRBACKGROUND) as LRESULT
+        }
         WM_COMMAND => {
             match wparam & 0xFFFF {
                 1 => app.on_primary(),
@@ -1087,6 +1116,38 @@ mod tests {
     /// Everything a page says and puts on its buttons, as one string to look for words in.
     fn all_of(view: &View) -> String {
         [view.heading.as_str(), view.detail.as_str(), view.primary.as_deref().unwrap_or(""), view.secondary.as_deref().unwrap_or("")].join("\n")
+    }
+
+    fn working(fraction: f64, file: &str, secondary: Option<&str>) -> View {
+        View { heading: "Updating Dogmind...".into(), small: format!("Unpacking: {file}"), fraction: Some(fraction), secondary: secondary.map(str::to_string), ..View::default() }
+    }
+
+    /// The flicker of the Cancel button: every note of progress used to give each button its words again, which has Windows erase it to the system's colour and the window draw it over.
+    #[test]
+    fn a_note_of_progress_redraws_the_bar_and_leaves_the_buttons_alone() {
+        let before = working(0.10, "a.dll", Some("Cancel"));
+        for (fraction, file) in [(0.11, "a.dll"), (0.30, "b.dll"), (0.99, "z/y.txt")] {
+            let now = working(fraction, file, Some("Cancel"));
+            assert_eq!(what_changes(&before, &now), Redo { buttons: false, page: true }, "{fraction} {file}");
+        }
+        let same = before.clone();
+        assert_eq!(what_changes(&before, &same), Redo { buttons: false, page: false }, "a note that says what is said is no change at all");
+    }
+
+    #[test]
+    fn the_buttons_are_made_again_when_a_page_gives_them_other_words_or_takes_one_away() {
+        let ready = View { primary: Some("Update".into()), secondary: Some("Cancel".into()), ..View::default() };
+        let work = working(0.0, "", Some("Cancel"));
+        assert!(what_changes(&ready, &work).buttons, "the main button goes when the work begins");
+        // (what cannot be stopped any more has no Cancel)
+        let placing = working(0.95, "a.dll", None);
+        assert!(what_changes(&work, &placing).buttons);
+        assert!(what_changes(&View::default(), &ready).buttons, "the first page");
+        let other = View { secondary: Some("Close".into()), ..ready.clone() };
+        assert!(what_changes(&ready, &other).buttons);
+        let folder = View { change: Some("Change...".into()), ..ready.clone() };
+        assert!(what_changes(&ready, &folder).buttons);
+        assert!(!what_changes(&View::default(), &View::default()).page);
     }
 
     #[test]
