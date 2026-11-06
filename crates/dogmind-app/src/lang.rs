@@ -597,6 +597,7 @@ const JA: &[(&str, &str)] = &[
     ("No such command: {0}. /help lists them.", "{0} というコマンドはありません。/help で一覧を見られます。"),
     ("There is nothing to find in yet.", "検索できる内容がまだありません。"),
     ("This session has nothing to go back to yet.", "このセッションにはまだ戻れる地点がありません。"),
+    ("Files changed in this answer:", "この回答で変わったファイル:"),
     ("That session is at work: stop it first.", "そのセッションは作業中です。先に止めてください。"),
     // The window.
     ("New session", "新しいセッション"),
