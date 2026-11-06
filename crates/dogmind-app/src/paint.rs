@@ -912,9 +912,6 @@ pub fn file_row_text(added: usize, removed: usize, green: usize, red: usize, pat
     format!("{added}{PART}{removed}{PART}{green}{PART}{red}{PART}{path}")
 }
 
-/// The id of the field of a card, which a `Frame` button looks for the focus of.
-pub const CARD_FIELD_ID: isize = 9930;
-
 /// What a picture's button shows.
 #[derive(Clone)]
 pub enum Thumb {
@@ -1093,22 +1090,42 @@ unsafe extern "system" fn button_procedure(window: HWND, message: u32, wparam: W
 
 /// A button's text is its label, or `icon|label` for an icon before it.
 unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
-    let kind = state & 0xFF;
-    let (hover, pressed, enabled) = (state & FLAG_HOVER != 0, state & FLAG_PRESSED != 0, IsWindowEnabled(window) != 0);
-    let backdrop = (state >> BACKDROP_SHIFT) as u32;
-    let brush = CreateSolidBrush(backdrop);
-    FillRect(device, &client, brush);
-    DeleteObject(brush);
     let mut buffer = [0u16; 640];
     let length = GetWindowTextW(window, buffer.as_mut_ptr(), 640);
     let text = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
+    let (hover, pressed) = (state & FLAG_HOVER != 0 || forced_hover(), state & FLAG_PRESSED != 0);
+    draw_button_face(window, device, client, state & 0xFF, &text, (state >> BACKDROP_SHIFT) as u32, hover, pressed, IsWindowEnabled(window) != 0, GetFocus() == window);
+}
+
+/// A button that is no window, drawn where `area` is in `device`: in its own bitmap and put on at once, as a window's own paint is, for what a paint of another window's has to draw in
+/// its pixels (the controls of the cards over the transcript). `lit`: the pointer is on it; `ring`: the keys are on it.
+pub unsafe fn paint_button(device: HDC, area: RECT, kind: ButtonKind, text: &str, backdrop: u32, lit: bool, pressed: bool, ring: bool) {
+    let (width, height) = (area.right - area.left, area.bottom - area.top);
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let memory = CreateCompatibleDC(device);
+    let bitmap = CreateCompatibleBitmap(device, width, height);
+    let old = SelectObject(memory, bitmap);
+    draw_button_face(std::ptr::null_mut(), memory, RECT { left: 0, top: 0, right: width, bottom: height }, kind as isize, text, backdrop, lit, pressed, true, ring);
+    BitBlt(device, area.left, area.top, width, height, memory, 0, 0, SRCCOPY);
+    SelectObject(memory, old);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+}
+
+/// What a button looks like: its `kind` and words (`text`), on `backdrop`, with the pointer on it (`hover`), pressed, enabled, and with the keys on it (`focused`).
+unsafe fn draw_button_face(window: HWND, device: HDC, client: RECT, kind: isize, text: &str, backdrop: u32, hover: bool, pressed: bool, enabled: bool, focused: bool) {
+    let brush = CreateSolidBrush(backdrop);
+    FillRect(device, &client, brush);
+    DeleteObject(brush);
     // (a text of several parts has its own marks, and is not an icon before a label)
-    let (glyph, label) = if text.contains(PART) { (None, text.as_str()) } else { text.split_once('|').map_or((None, text.as_str()), |(glyph, label)| (Some(glyph), label)) };
+    let (glyph, label) = if text.contains(PART) { (None, text) } else { text.split_once('|').map_or((None, text), |(glyph, label)| (Some(glyph), label)) };
     let height = client.bottom;
     let Some(fonts) = BUTTON_FONTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().map(|fonts| fonts.0) else { return };
     let s = |value: i32| scale(fonts.dpi, value);
     let center = DT_CENTER | ONE_LINE;
-    let lit = hover || pressed || forced_hover();
+    let lit = hover || pressed;
     // A label with an icon before it, the two centred together.
     let centered = |device: HDC, font: HFONT, color: u32| {
         match glyph {
@@ -1199,7 +1216,7 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
                     draw_text(device, &words, area, fonts.small, theme::muted(), DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
                 }
             }
-            if attached && (lit || GetFocus() == window) {
+            if attached && (lit || focused) {
                 let cross = RECT { left: client.right - s(22), top: s(3), right: client.right - s(3), bottom: s(22) };
                 rounded(device, cross, s(design::radius::CONTROL), Some(theme::surface()), Some(theme::line()));
                 icon::draw(device, "x", cross, s(design::size::ICON_SMALL), theme::text());
@@ -1305,11 +1322,12 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
         }
         21 => {}
         20 => {
-            let focused = {
-                let focus = GetFocus();
-                !focus.is_null() && GetWindowLongPtrW(focus, GWLP_ID) == CARD_FIELD_ID
-            };
-            rounded(device, client, s(radius::CONTROL), Some(theme::surface()), Some(if focused { theme::accent() } else { theme::line() }));
+            // The field of a card, which is the composer: a frame with the words that say where to write; lit when the pointer is on it or the composer has the focus.
+            rounded(device, client, s(radius::CONTROL), Some(theme::surface()), Some(if lit { theme::accent() } else { theme::line() }));
+            let mut area = client;
+            area.left += s(design::space::M);
+            area.right -= s(design::space::M);
+            draw_text(device, label, area, fonts.body, theme::faint(), ONE_LINE);
         }
         selected => {
             if selected == 6 || lit {
@@ -1318,7 +1336,7 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
             draw_text(device, label, client, fonts.body, if selected == 6 { theme::text() } else { theme::muted() }, center);
         }
     }
-    if GetFocus() == window && KEYS_IN_USE.load(std::sync::atomic::Ordering::Relaxed) {
+    if focused && KEYS_IN_USE.load(std::sync::atomic::Ordering::Relaxed) {
         let ring = RECT { left: 1, top: 1, right: client.right - 1, bottom: client.bottom - 1 };
         let corner = match kind {
             4 | 12 | 13 => (height - 2) / 2,

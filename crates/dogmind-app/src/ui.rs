@@ -257,7 +257,7 @@ const ID_PROVIDER_DOWN: isize = 9051;
 /// Hidden controls of no size, one for each icon over the transcript that is in view: they are what Tab reaches and what a screen reader names, and an icon is pressed through them
 /// with Enter or Space as it is with the pointer. The icons themselves are drawn in the transcript's own paint (`paint_overlays`).
 const ID_PROXY_POOL: isize = 300; // ..300 + PROXY_POOL
-const PROXY_POOL: usize = 16;
+const PROXY_POOL: usize = 40;
 const ID_MODAL_CLOSE: isize = 9600;
 const ID_NAV: isize = 9601; // ..+ NAV_POOL
 const NAV_POOL: usize = 10;
@@ -291,8 +291,6 @@ const ID_READ_FOLDER_ADD: isize = 9650;
 const ID_READ_FOLDER_STOP: isize = 9651;
 const ID_READ_FOLDER_REMOVE: isize = 9800; // ..+ as many folders as there are
 /// What the cards of the transcript put over it as windows of their own (a choice, a file, the button of a field): a pool that goes round, as the pictures' does.
-const ID_CARD_POOL: isize = 12000; // ..+ CARD_POOL
-const CARD_POOL: usize = 40;
 const TIMER_COPIED: usize = 3;
 /// The hidden controls are made to say what is in view once the view has stood still a moment.
 const TIMER_PROXIES: usize = 21;
@@ -884,6 +882,24 @@ fn icon_under(hits: &[OverlayHit], x: i32, y: i32) -> Option<OverlayKey> {
     hits.iter().find(|hit| x >= hit.area.left && x < hit.area.right && y >= hit.area.top && y < hit.area.bottom).map(|hit| hit.key)
 }
 
+/// What a reader says of a control of a card: a choice's number and words, a file with its lines, an icon by its tip, the rest by what is written on it.
+fn card_part_words(part: &CardPart) -> String {
+    let mut pieces = part.text.split(PART);
+    match part.kind {
+        ButtonKind::Choice => {
+            let (number, _suggested, name, meaning) = (pieces.next().unwrap_or(""), pieces.next().unwrap_or(""), pieces.next().unwrap_or(""), pieces.next().unwrap_or(""));
+            if meaning.is_empty() { format!("{number}. {name}") } else { format!("{number}. {name}: {meaning}") }
+        }
+        ButtonKind::FileRow => {
+            let (added, removed) = (pieces.next().unwrap_or("0"), pieces.next().unwrap_or("0"));
+            let path = pieces.nth(2).unwrap_or("");
+            format!("{path}: +{added} \u{2212}{removed}")
+        }
+        _ if !part.tip.is_empty() => part.tip.clone(),
+        _ => part.text.split_once('|').map_or(part.text.clone(), |(_, label)| label.to_string()),
+    }
+}
+
 /// The order Tab goes to the icons in, which the hidden controls are put in: top to bottom and left to right, as the page's controls are, and no more than the controls there are.
 fn proxy_order(hits: &[OverlayHit]) -> Vec<OverlayKey> {
     let mut order: Vec<(i32, i32, OverlayKey)> = hits.iter().map(|hit| (hit.area.top, hit.area.left, hit.key)).collect();
@@ -891,7 +907,7 @@ fn proxy_order(hits: &[OverlayHit]) -> Vec<OverlayKey> {
     order.into_iter().take(PROXY_POOL).map(|(_, _, key)| key).collect()
 }
 
-/// An icon drawn in the transcript's paint, over its text: which answer, block or run it is of.
+/// An icon or control drawn in the transcript's paint, over its text: which answer, block, run or card it is of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OverlayKey {
     /// Copies the answer.
@@ -902,6 +918,8 @@ enum OverlayKey {
     Block(usize),
     /// Opens or closes the row of calls.
     Run(usize),
+    /// A control of a card: the card's room (`card_slots`) and the control's place across its row.
+    Card(usize, usize),
 }
 
 /// Where an icon was drawn the last time the transcript was painted, in the transcript's own pixels.
@@ -915,8 +933,9 @@ struct OverlayHit {
 enum CardAct {
     /// One of the model's choices: this label is the answer.
     Choose(String),
-    /// What is in the card's field is the answer.
+    /// What is written in the composer is the answer.
     SendOwn,
+    /// The card's field, which is the composer: the focus goes there.
     FocusField,
     /// The plan is approved.
     Carry,
@@ -941,12 +960,10 @@ struct CardPart {
     tip: String,
 }
 
-/// The room a card keeps over the transcript for controls, a row of an exact height: where it begins, and what lies over it, from the left. `field`: the first control is the frame of the
-/// card's field, which has the field in it.
+/// The room a card keeps for controls, a row of an exact height: where it begins, and what is drawn over it, from the left, in the transcript's paint.
 struct CardSlot {
     start: i32,
     parts: Vec<CardPart>,
-    field: bool,
     tall: i32,
 }
 
@@ -2066,13 +2083,7 @@ struct App {
     interjected: Vec<String>,
     /// The model's question that waits for the person (Event::Question).
     question: Option<AskedQuestion>,
-    /// What the cards of the transcript put over it: the buttons of a pool, what each does, how much of each is cut off at an edge of the view, and the words of its tip; the field of the
-    /// question's card; where each card keeps its room; and the number the next card has.
-    card_buttons: Vec<HWND>,
-    card_targets: Vec<Option<CardAct>>,
-    card_cut: Vec<(i32, i32)>,
-    card_tips: Vec<String>,
-    card_field: HWND,
+    /// Where each card keeps its room, with what is drawn over it (in the transcript's paint, with the icons), and the number the next card has.
     card_slots: Vec<CardSlot>,
     card_next: u64,
     /// The plan that waits for the person's decision (Event::PlanReview).
@@ -2367,21 +2378,6 @@ fn update_button_kind_of(update: &ReleaseUpdate, restart_when_done: bool) -> But
         ReleaseUpdate::Ready(_) if restart_when_done => ButtonKind::Secondary,
         ReleaseUpdate::Ready(_) => ButtonKind::Primary,
         _ => ButtonKind::Link,
-    }
-}
-
-/// The transcript's pixels have just been moved by `dy` (its host calls this from the call that moves them): the controls of the cards that lie over the text as windows are moved by the same, here
-/// and now. (The copy, branch, code and run icons are not windows: they are drawn in the text's own paint, and move with its pixels.)
-pub(crate) unsafe fn overlays_follow(dy: i32) {
-    let Some(app) = app() else { return };
-    if app.panel != Panel::Chat {
-        return;
-    }
-    for button in app.card_buttons.iter().chain([&app.card_field]) {
-        if IsWindowVisible(*button) != 0 {
-            let (x, y, ..) = child_area(*button, app.window);
-            SetWindowPos(*button, std::ptr::null_mut(), x, y + dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
     }
 }
 
@@ -3661,8 +3657,8 @@ impl App {
         }
     }
 
-    /// What lies over the transcript as windows of their own (a message's pictures, the controls of the cards) goes where the text has come to, after the text is drawn: for every frame the view
-    /// moves. The copy, branch, code and run icons are not among them: they are drawn in the text's paint, at the places of that frame.
+    /// What lies over the transcript as windows of their own (a message's pictures) goes where the text has come to, after the text is drawn: for every frame the view moves. The copy, branch,
+    /// code and run icons and the controls of the cards are not among them: they are drawn in the text's paint, at the places of that frame.
     unsafe fn place_overlays(&mut self) {
         let mut position = POINT { x: 0, y: 0 };
         SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
@@ -3673,7 +3669,6 @@ impl App {
             UpdateWindow(self.transcript);
         }
         self.place_pictures();
-        self.place_card_controls();
     }
 
     /// A new session with the conversation through this answer, opened: to go on from there another way. The answer is found in the saved
@@ -4413,17 +4408,17 @@ impl App {
         self.append_row(&rtf::Row { lines: &shown, face: UI_FACE, points, color, back: theme::code_back(), width: self.text_twips, right: false, column: 0, padding: (260, down) });
     }
 
-    /// Room for controls that lie over the card: a row of an exact height, with what goes on it. Without any, it is only room between two rows.
-    unsafe fn card_room(&mut self, tall: i32, parts: Vec<CardPart>, field: bool) {
+    /// Room for controls drawn over the card: a row of an exact height, with what goes on it. Without any, it is only room between two rows.
+    unsafe fn card_room(&mut self, tall: i32, parts: Vec<CardPart>) {
         let twips = (i64::from(tall) * 1440 / i64::from(self.dpi)) as i32;
         let first = self.insert_rtf(rtf::spacer_row(self.text_twips, self.text_twips, twips, theme::code_back(), (260, 0), false), None);
         if !parts.is_empty() {
             let start = text_start(self.transcript, first);
-            self.card_slots.push(CardSlot { start, parts, field, tall });
+            self.card_slots.push(CardSlot { start, parts, tall });
         }
     }
 
-    /// A card, in the state it is in, at the end of the transcript: shaded as a block of code is, with its controls as windows over rows of room of an exact height. It is kept with what the
+    /// A card, in the state it is in, at the end of the transcript: shaded as a block of code is, with its controls drawn over rows of room of an exact height. It is kept with what the
     /// transcript is written from, so that the transcript written again, at another width or in another theme, writes it as it stands then.
     unsafe fn write_card(&mut self, card: &Card) {
         let recording = !self.replaying;
@@ -4448,23 +4443,23 @@ impl App {
                 self.card_row(&lines, 11, theme::text(), 40, false);
                 match state {
                     AnswerState::Waiting => {
-                        self.card_room(s(8), Vec::new(), false);
+                        self.card_room(s(8), Vec::new());
                         for (at, (label, meaning)) in options.iter().enumerate() {
                             let suggested = if at == 0 { t("Suggested") } else { "" };
                             let part = CardPart { text: choice_text(at + 1, suggested, label, meaning), kind: ButtonKind::Choice, act: CardAct::Choose(label.clone()), width: 0, tip: String::new() };
-                            self.card_room(s(if meaning.is_empty() { 36 } else { 52 }), vec![part], false);
-                            self.card_room(s(5), Vec::new(), false);
+                            self.card_room(s(if meaning.is_empty() { 36 } else { 52 }), vec![part]);
+                            self.card_room(s(5), Vec::new());
                         }
                         let send = t("Send");
                         let width = text_width(self.fonts.strong, send) + s(ds::size::BUTTON_PADDING);
-                        let frame = CardPart { text: String::new(), kind: ButtonKind::Frame, act: CardAct::FocusField, width: 0, tip: String::new() };
+                        let frame = CardPart { text: t("Write your own answer…").to_string(), kind: ButtonKind::Frame, act: CardAct::FocusField, width: 0, tip: String::new() };
                         let button = CardPart { text: send.to_string(), kind: ButtonKind::Primary, act: CardAct::SendOwn, width, tip: String::new() };
-                        self.card_room(s(ds::size::CONTROL + 2), vec![frame, button], true);
+                        self.card_room(s(ds::size::CONTROL + 2), vec![frame, button]);
                     }
                     AnswerState::Answered(words) => self.card_row(&[&tf("Your answer: {0}", &[words])], 10, theme::accent(), 60, false),
                     AnswerState::Unanswered => self.card_row(&[t("Not answered")], 10, theme::muted(), 60, false),
                 }
-                self.card_room(s(12), Vec::new(), false);
+                self.card_room(s(12), Vec::new());
             }
             Card::Plan { plan, state, .. } => {
                 // The plan as the transcript writes an answer, Markdown and all, under a word that says what it is; and under it a card with what can be done with it, or what was.
@@ -4478,13 +4473,13 @@ impl App {
                     PlanState::Waiting => {
                         let button = |text: &str, kind: ButtonKind, act: CardAct, fonts: &Fonts| CardPart { text: text.to_string(), kind, act, width: text_width(fonts.strong, text) + s(ds::size::BUTTON_PADDING), tip: String::new() };
                         let parts = vec![button(t("Carry it out"), ButtonKind::Primary, CardAct::Carry, &self.fonts), button(t("Change…"), ButtonKind::Secondary, CardAct::Change, &self.fonts)];
-                        self.card_room(s(ds::size::CONTROL), parts, false);
+                        self.card_room(s(ds::size::CONTROL), parts);
                     }
                     PlanState::Approved => self.card_row(&[t("Approved")], 10, theme::accent(), 60, false),
                     PlanState::Changes(change) => self.card_row(&[&tf("Change requested: {0}", &[change])], 10, theme::warn(), 60, false),
                     PlanState::Undecided => self.card_row(&[t("Not decided")], 10, theme::muted(), 60, false),
                 }
-                self.card_room(s(12), Vec::new(), false);
+                self.card_room(s(12), Vec::new());
             }
             Card::Files { turn, rows, more, added, removed } => {
                 let count = rows.len() + more;
@@ -4492,7 +4487,7 @@ impl App {
                 let words = format!("{}  ·  {files}  ·  +{added}  \u{2212}{removed}", t("Changed in this answer"));
                 self.card_row(&[" "], 6, theme::muted(), 80, true);
                 self.card_row(&[&words], 8, theme::muted(), 26, false);
-                self.card_room(s(4), Vec::new(), false);
+                self.card_room(s(4), Vec::new());
                 let widest = cards::most_changed(rows);
                 for (at, row) in rows.iter().enumerate() {
                     let (green, red) = cards::bar(row.added, row.removed, widest);
@@ -4500,13 +4495,13 @@ impl App {
                     let (icon, tip) = if cards::opens_in_app(&row.path) && self.workspace.join(&row.path).is_file() { ("external-link", t("Open in its app")) } else { ("folder", t("Show in Explorer")) };
                     let file = CardPart { text: file_row_text(row.added, row.removed, green, red, &row.path), kind: ButtonKind::FileRow, act: CardAct::OpenDiff(*turn, at), width: 0, tip: String::new() };
                     let open = CardPart { text: icon.to_string(), kind: ButtonKind::Icon, act: CardAct::OpenFile(*turn, at), width: s(ds::size::ICON_BUTTON), tip: tip.to_string() };
-                    self.card_room(s(30), vec![file, open], false);
+                    self.card_room(s(30), vec![file, open]);
                 }
                 if *more > 0 {
                     let rest = CardPart { text: tf("and {0} more", &[more]), kind: ButtonKind::Ghost, act: CardAct::MoreFiles(*turn), width: 0, tip: String::new() };
-                    self.card_room(s(28), vec![rest], false);
+                    self.card_room(s(28), vec![rest]);
                 }
-                self.card_room(s(12), Vec::new(), false);
+                self.card_room(s(12), Vec::new());
             }
         }
         // (a table that ends the document has its last row drawn apart from the rest: a line after it, which is the room under a card anyway)
@@ -4555,7 +4550,6 @@ impl App {
             }
         }
         if changed {
-            set_text(self.card_field, "");
             self.reset_composer_cue();
             self.reflow();
         }
@@ -4565,7 +4559,7 @@ impl App {
     unsafe fn answer_question(&mut self, words: &str) -> bool {
         let Some(asked) = self.question.take() else { return false };
         let words = words.trim().to_string();
-        set_text(self.card_field, "");
+        self.reset_composer_cue();
         let said = words.clone();
         self.settle_card(asked.card, |card| {
             if let Card::Question { state, .. } = card {
@@ -4616,12 +4610,14 @@ impl App {
         set_text(self.composer_cue, t("Message Dogmind"));
     }
 
-    /// What was written in the card's field, as the answer; an empty field is where to write it.
+    /// What was written in the composer, as the answer; with nothing written it is where to write it.
     unsafe fn card_pressed_own(&mut self) {
-        let words = get_text(self.card_field);
+        let words = get_text(self.composer);
         if words.trim().is_empty() {
-            SetFocus(self.card_field);
+            self.focus_composer();
         } else {
+            set_text(self.composer, "");
+            self.composer_typed_at = None;
             self.answer_question(&words);
         }
     }
@@ -4684,16 +4680,14 @@ impl App {
         ShellExecuteW(self.window, verb.as_ptr(), target.as_ptr(), if arguments.len() > 1 { arguments.as_ptr() } else { std::ptr::null() }, std::ptr::null(), SW_SHOWNORMAL);
     }
 
-    unsafe fn card_pressed(&mut self, slot: usize) {
-        let Some(act) = self.card_targets.get(slot).cloned().flatten() else { return };
+    unsafe fn card_pressed(&mut self, slot: usize, part: usize) {
+        let Some(act) = self.card_slots.get(slot).and_then(|room| room.parts.get(part)).map(|part| part.act.clone()) else { return };
         match act {
             CardAct::Choose(label) => {
                 self.answer_question(&label);
             }
             CardAct::SendOwn => self.card_pressed_own(),
-            CardAct::FocusField => {
-                SetFocus(self.card_field);
-            }
+            CardAct::FocusField => self.focus_composer(),
             CardAct::Carry => {
                 self.decide_plan(Ok(()));
             }
@@ -4704,106 +4698,6 @@ impl App {
         }
     }
 
-    /// The controls of the cards in view each get a window of the pool at their place, wherever the transcript has scrolled to: for every frame the view moves, from the last card up to the
-    /// first above the view, and only a window whose place or words changed is touched.
-    unsafe fn place_card_controls(&mut self) {
-        let dpi = self.dpi;
-        let s = |value: i32| scale(dpi, value);
-        let area = self.transcript_area;
-        let height = area.bottom - area.top;
-        let mut in_view: Vec<(usize, POINT)> = Vec::new();
-        if self.panel == Panel::Chat && self.has_messages {
-            for at in (0..self.card_slots.len()).rev() {
-                let mut point = POINT { x: 0, y: 0 };
-                SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, self.card_slots[at].start as LPARAM);
-                if point.y + self.card_slots[at].tall <= 0 {
-                    break;
-                }
-                if point.y < height {
-                    in_view.push((at, point));
-                }
-            }
-        }
-        in_view.reverse();
-        // (the card's room is its width, less the space its rows keep at each side of their words: as much at the right as the first of its words stands from the card's left edge)
-        let (left_edge, right_edge) = (area.left + self.transcript_rect.0, self.column_right);
-        let gap = s(ds::space::S);
-        let mut used = 0;
-        let mut field: Option<RECT> = None;
-        'slots: for (at, point) in in_view {
-            let (parts, tall, has_field) = (self.card_slots[at].parts.clone(), self.card_slots[at].tall, self.card_slots[at].field);
-            let top = area.top + point.y;
-            let first_x = area.left + point.x;
-            let total = (right_edge - (first_x - left_edge) - first_x).max(s(120));
-            let fixed: i32 = parts.iter().map(|part| part.width).sum::<i32>() + gap * (parts.len() as i32 - 1);
-            let rest = (total - fixed).max(s(60));
-            let mut x = first_x;
-            // (cut off at an edge of the view: it would lie over the header or the composer)
-            let cut = ((area.top - top).max(0), (top + tall - area.bottom).max(0));
-            for (place, part) in parts.iter().enumerate() {
-                if used >= CARD_POOL {
-                    break 'slots;
-                }
-                let width = if part.width == 0 { rest } else { part.width };
-                let button = self.card_buttons[used];
-                set_button_style(button, part.kind, theme::code_back());
-                if get_text(button) != part.text {
-                    set_text(button, &part.text);
-                }
-                let showing = IsWindowVisible(button) != 0;
-                if !showing || child_area(button, self.window) != (x, top, width, tall) {
-                    SetWindowPos(button, HWND_TOP, x, top, width, tall, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
-                    if showing {
-                        UpdateWindow(button);
-                    }
-                }
-                if cut != self.card_cut[used] {
-                    self.card_cut[used] = cut;
-                    SetWindowRgn(button, if cut == (0, 0) { std::ptr::null_mut() } else { CreateRectRgn(0, cut.0, width, tall - cut.1) }, 1);
-                }
-                if self.card_tips[used] != part.tip {
-                    self.card_tips[used] = part.tip.clone();
-                    if part.tip.is_empty() {
-                        self.untip(button);
-                    } else {
-                        self.tip(button, &part.tip);
-                    }
-                }
-                if !showing {
-                    show(button, true);
-                }
-                if has_field && place == 0 && cut == (0, 0) {
-                    field = Some(rect(x, top, width, tall));
-                }
-                self.card_targets[used] = Some(part.act.clone());
-                used += 1;
-                x += width + gap;
-            }
-        }
-        for slot in used..CARD_POOL {
-            self.card_targets[slot] = None;
-            if IsWindowVisible(self.card_buttons[slot]) != 0 {
-                show(self.card_buttons[slot], false);
-            }
-        }
-        // The card's field: in its frame, when the whole of that is in view.
-        match field {
-            Some(frame) => {
-                let inset = s(ds::space::M);
-                let (x, y, width, tall) = (frame.left + inset, frame.top + (frame.bottom - frame.top - s(ds::size::FIELD_TEXT)) / 2, frame.right - frame.left - 2 * inset, s(ds::size::FIELD_TEXT));
-                let showing = IsWindowVisible(self.card_field) != 0;
-                if !showing || child_area(self.card_field, self.window) != (x, y, width, tall) {
-                    SetWindowPos(self.card_field, HWND_TOP, x, y, width, tall, if showing { SWP_NOACTIVATE | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_SHOWWINDOW });
-                }
-            }
-            None => {
-                if IsWindowVisible(self.card_field) != 0 {
-                    show(self.card_field, false);
-                }
-            }
-        }
-    }
-
     /// What an icon does.
     unsafe fn overlay_act(&mut self, key: OverlayKey) {
         match key {
@@ -4811,16 +4705,18 @@ impl App {
             OverlayKey::Fork(at) => self.fork_from_answer(at),
             OverlayKey::Block(at) => self.copy_block(at),
             OverlayKey::Run(at) => self.toggle_run(at),
+            OverlayKey::Card(slot, part) => self.card_pressed(slot, part),
         }
     }
 
     /// What an icon says of itself: in a tip, and to a screen reader.
-    fn overlay_words(&self, key: OverlayKey) -> &'static str {
+    fn overlay_words(&self, key: OverlayKey) -> String {
         match key {
-            OverlayKey::Copy(_) => t("Copy this answer"),
-            OverlayKey::Fork(_) => t("Branch from here: a new session with the conversation up to this answer"),
-            OverlayKey::Block(_) => t("Copy this code"),
-            OverlayKey::Run(_) => t("Show or hide these calls"),
+            OverlayKey::Copy(_) => t("Copy this answer").to_string(),
+            OverlayKey::Fork(_) => t("Branch from here: a new session with the conversation up to this answer").to_string(),
+            OverlayKey::Block(_) => t("Copy this code").to_string(),
+            OverlayKey::Run(_) => t("Show or hide these calls").to_string(),
+            OverlayKey::Card(slot, part) => self.card_slots.get(slot).and_then(|room| room.parts.get(part)).map_or(String::new(), card_part_words),
         }
     }
 
@@ -4886,6 +4782,29 @@ impl App {
                 found.push(OverlayHit { area: rect(point.x + scale(dpi, 4), point.y + scale(dpi, 4), size, size), key: OverlayKey::Run(at) });
             }
         }
+        // The controls of the cards: each row of a card's room has its parts across it, from where the row begins, a part with no width of its own taking what is left. (The room's width is the
+        // card's, less the space its rows keep at each side of their words: as much at the right as the first of its words stands from the card's left edge.)
+        let (left_edge, right_edge) = (self.transcript_rect.0, self.column_right - self.transcript_area.left);
+        let gap = scale(dpi, ds::space::S);
+        for at in (0..self.card_slots.len()).rev() {
+            let room = &self.card_slots[at];
+            let point = ask(room.start);
+            if point.y + room.tall <= 0 {
+                break;
+            }
+            if point.y >= height {
+                continue;
+            }
+            let total = (right_edge - (point.x - left_edge) - point.x).max(scale(dpi, 120));
+            let fixed: i32 = room.parts.iter().map(|part| part.width).sum::<i32>() + gap * (room.parts.len() as i32 - 1);
+            let rest = (total - fixed).max(scale(dpi, 60));
+            let mut x = point.x;
+            for (place, part) in room.parts.iter().enumerate() {
+                let width = if part.width == 0 { rest } else { part.width };
+                found.push(OverlayHit { area: rect(x, point.y, width, room.tall), key: OverlayKey::Card(at, place) });
+                x += width + gap;
+            }
+        }
         found
     }
 
@@ -4905,13 +4824,21 @@ impl App {
             let area = RECT { left: hit.area.left + dx, top: hit.area.top + dy, right: hit.area.right + dx, bottom: hit.area.bottom + dy };
             let pressed = self.overlay_press == Some(key) && self.overlay_hover == Some(key);
             let lit = self.overlay_hover == Some(key);
+            if let OverlayKey::Card(slot, part) = key {
+                if let Some(part) = self.card_slots.get(slot).and_then(|room| room.parts.get(part)) {
+                    // (the card's field is the composer: its frame is lit while the composer has the focus and the question waits for what is written in it)
+                    let composer = part.kind == ButtonKind::Frame && self.question.is_some() && GetFocus() == self.composer;
+                    paint_button(device, area, part.kind, &part.text, theme::code_back(), lit || composer, pressed, ring && focused == Some(key));
+                }
+                continue;
+            }
             let copied = self.overlay_copied == Some(key);
             let name = match key {
                 OverlayKey::Copy(_) | OverlayKey::Block(_) if copied => "check",
                 OverlayKey::Copy(_) | OverlayKey::Block(_) => "copy",
                 OverlayKey::Fork(_) => "git-branch",
                 OverlayKey::Run(at) if self.runs[at].expanded => "chevron-down",
-                OverlayKey::Run(_) => "chevron-right",
+                OverlayKey::Run(_) | OverlayKey::Card(..) => "chevron-right",
             };
             // As an icon button of the window draws: a shade under it when the pointer is on it, one up on a card of a block of code.
             if lit || pressed {
@@ -4926,7 +4853,11 @@ impl App {
         if test_log_on() {
             let mut position = POINT { x: 0, y: 0 };
             SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
-            let drawn: Vec<String> = self.overlay_hits.iter().map(|hit| format!("{:?}@{},{}", hit.key, hit.area.left, hit.area.top)).collect();
+            let drawn: Vec<String> = self.overlay_hits.iter().map(|hit| match hit.key {
+                // (what a control of a card says: a test finds the one it presses by it)
+                OverlayKey::Card(..) => format!("{:?}@{},{}<{}>", hit.key, hit.area.left, hit.area.top, self.overlay_words(hit.key)),
+                _ => format!("{:?}@{},{}", hit.key, hit.area.left, hit.area.top),
+            }).collect();
             test_log(&format!("icons scroll_y={} dpi={} area={},{},{} {} [hover {:?} press {:?}]", position.y, dpi, self.transcript_area.left, self.transcript_area.top, self.transcript_area.bottom, drawn.join(" "), self.overlay_hover, self.overlay_press));
         }
         // (what stands over the transcript is told of a moment after the view has come to rest)
@@ -4987,11 +4918,18 @@ impl App {
             SendMessageW(self.tooltip, TTM_DELTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
         }
         if let Some((key, area)) = wanted {
-            let words = wide(self.overlay_words(key));
-            tool.uFlags = TTF_SUBCLASS;
-            tool.rect = area;
-            tool.lpszText = words.as_ptr() as *mut u16;
-            SendMessageW(self.tooltip, TTM_ADDTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
+            // (a control of a card says what it is by its own words, and has a tip only where it has one: an icon alone)
+            let words = match key {
+                OverlayKey::Card(slot, part) => self.card_slots.get(slot).and_then(|room| room.parts.get(part)).map_or(String::new(), |part| part.tip.clone()),
+                _ => self.overlay_words(key),
+            };
+            if !words.is_empty() {
+                let words = wide(&words);
+                tool.uFlags = TTF_SUBCLASS;
+                tool.rect = area;
+                tool.lpszText = words.as_ptr() as *mut u16;
+                SendMessageW(self.tooltip, TTM_ADDTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
+            }
         }
         self.overlay_tip_for = wanted;
     }
@@ -5006,7 +4944,7 @@ impl App {
                 Some(key) => {
                     let words = self.overlay_words(*key);
                     if get_text(proxy) != words {
-                        set_text(proxy, words);
+                        set_text(proxy, &words);
                     }
                     // (a place in the order of the page's controls, and no size)
                     SetWindowPos(proxy, std::ptr::null_mut(), left, top + slot as i32, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -10940,7 +10878,6 @@ impl App {
         self.run_hover = None;
         self.question = None;
         self.plan_review = None;
-        set_text(self.card_field, "");
         self.turn_slots.clear();
         self.turn_end_slot = 0;
         self.turn_cards_waiting.clear();
@@ -11571,6 +11508,9 @@ impl App {
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.tray_note(t("Dogmind is waiting for you"), &words);
                 FlashWindow(self.window, 1);
+                // (the card's field is the composer: what is written in it is the answer)
+                set_text(self.composer_cue, t("Write your own answer…"));
+                self.update_composer_cue();
                 self.focus_composer();
             }
             Event::Goal(goal) => {
@@ -12605,7 +12545,7 @@ impl App {
         ] {
             set_text(window, t(words));
         }
-        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.card_field, "Write your own answer…"), (self.find_field, "Find in this conversation"), (self.side_search, "Search sessions")] {
+        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.find_field, "Find in this conversation"), (self.side_search, "Search sessions")] {
             let cue = wide(t(words));
             SendMessageW(edit, EM_SETCUEBANNER, 0, cue.as_ptr() as LPARAM);
         }
@@ -12957,7 +12897,7 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
         }
         return 0;
     }
-    if message == WM_MOUSEMOVE && !app.pointer_tracked && !forced_hover() {
+    if message == WM_MOUSEMOVE && !app.pointer_tracked && !test_pointer_stays() {
         app.pointer_tracked = true;
         let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: window, dwHoverTime: 0 };
         TrackMouseEvent(&mut track);
@@ -12966,7 +12906,7 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
         app.pointer_tracked = false;
         app.run_hover = None;
         // (a test that has no pointer of its own: the leave the system sends when the capture changes is not the pointer leaving)
-        if let Some(key) = if forced_hover() { None } else { app.overlay_hover.take() } {
+        if let Some(key) = if test_pointer_stays() { None } else { app.overlay_hover.take() } {
             app.invalidate_overlay(key);
             app.keep_overlay_tip();
         }
@@ -13180,6 +13120,13 @@ fn test_rows_painted() -> Option<u64> {
         return None;
     }
     *ON.get_or_init(|| std::env::var("DOGMIND_TEST_ROWPAINT").ok().map(|text| text.parse().unwrap_or(0)))
+}
+
+/// A debug build with `DOGMIND_TEST_POINTER` (or `DOGMIND_TEST_HOVER`) set keeps what the pointer is on as it is: a test sends the transcript's window the pointer's messages, the real pointer
+/// being elsewhere, and the system's own word that it has left (it comes when the capture changes) is not the pointer leaving.
+fn test_pointer_stays() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(debug_assertions) && *ON.get_or_init(|| std::env::var_os("DOGMIND_TEST_POINTER").is_some()) || forced_hover()
 }
 
 /// A debug build with `DOGMIND_TEST_STALE_SHAPES` set keeps a card's shape as it was first taken, which is how the corners were drawn before they followed the card: to see what that was.
@@ -13575,7 +13522,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
             set_button_fonts(app.fonts);
-            for edit in app.fields.into_iter().chain([app.feedback, app.card_field, app.composer_cue, app.find_field, app.side_search]) {
+            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
             }
             // (the command's own size follows the screen's: it is set again when it is next shown, and this one keeps what it has)
@@ -14081,15 +14028,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                         app.overlay_act(key);
                     }
                 }
-                _ if (ID_CARD_POOL..ID_CARD_POOL + CARD_POOL as isize).contains(&id) => app.card_pressed((id - ID_CARD_POOL) as usize),
-                CARD_FIELD_ID if code == EN_SETFOCUS as usize || code == EN_KILLFOCUS as usize => {
-                    // (its frame shows that the field has the focus)
-                    for button in app.card_buttons.clone() {
-                        if IsWindowVisible(button) != 0 {
-                            InvalidateRect(button, std::ptr::null(), 0);
-                        }
-                    }
-                }
                 ID_TOGGLE_THINKING => app.on_menu(M_THINKING),
                 ID_TOGGLE_SAFE => app.on_menu(M_SAFE),
                 ID_TOGGLE_LANGUAGE => {
@@ -14468,10 +14406,6 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
         app.send_typed(!control);
         return true;
     }
-    if key == VK_RETURN && message.hwnd == app.card_field {
-        app.card_pressed_own();
-        return true;
-    }
     if matches!(key, VK_PRIOR | VK_NEXT) && message.hwnd == app.composer && app.panel == Panel::Chat && app.has_messages {
         // Reading back without leaving what is being written.
         SendMessageW(app.transcript, WM_VSCROLL, if key == VK_PRIOR { SB_PAGEUP } else { SB_PAGEDOWN } as WPARAM, 0);
@@ -14490,7 +14424,7 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             return true;
         }
     }
-    if app.pending.is_some() && ![app.feedback, app.card_field, app.composer, app.find_field, app.side_search].contains(&GetFocus()) {
+    if app.pending.is_some() && ![app.feedback, app.composer, app.find_field, app.side_search].contains(&GetFocus()) {
         match key {
             0x59 => app.answer_approval(Decision::Approve), // Y
             0x41 => {
@@ -15272,11 +15206,6 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             transcript_region: ((0, 0), None),
             interjected: Vec::new(),
             question: None,
-            card_buttons: (0..CARD_POOL).map(|at| make_button(window, ID_CARD_POOL + at as isize, "", ButtonKind::Choice, theme::code_back())).collect(),
-            card_targets: vec![None; CARD_POOL],
-            card_cut: vec![(0, 0); CARD_POOL],
-            card_tips: vec![String::new(); CARD_POOL],
-            card_field: control(window, "EDIT", "", edit_style, 0, CARD_FIELD_ID),
             card_slots: Vec::new(),
             card_next: 0,
             plan_review: None,
@@ -15407,7 +15336,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let app = &mut *APP.load(Ordering::Relaxed);
         SendMessageW(app.composer, EM_SETEVENTMASK, 0, ENM_CHANGE as LPARAM);
         SendMessageW(app.note, EM_SETMARGINS, 3, 0); // EC_LEFTMARGIN | EC_RIGHTMARGIN
-        for edit in app.fields.into_iter().chain([app.feedback, app.card_field, app.composer_cue, app.find_field, app.side_search]) {
+        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search]) {
             SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
         }
         app.list_procedure = SetWindowLongPtrW(app.side, GWLP_WNDPROC, list_subclass as *const () as isize);
@@ -16231,6 +16160,17 @@ mod tests {
         let many: Vec<OverlayHit> = (0..PROXY_POOL as i32 + 5).map(|at| hit(0, at * 30, OverlayKey::Run(at as usize))).collect();
         assert_eq!(proxy_order(&many).len(), PROXY_POOL, "no more than there are controls");
         assert_eq!(proxy_order(&[]), Vec::<OverlayKey>::new());
+    }
+
+    #[test]
+    fn a_reader_is_told_what_a_control_of_a_card_is_by_its_words() {
+        let part = |text: String, kind: ButtonKind, tip: &str| CardPart { text, kind, act: CardAct::SendOwn, width: 0, tip: tip.to_string() };
+        assert_eq!(card_part_words(&part(choice_text(2, "", "notes.txt", ""), ButtonKind::Choice, "")), "2. notes.txt");
+        assert_eq!(card_part_words(&part(choice_text(1, "Suggested", "notes.md", "the usual"), ButtonKind::Choice, "")), "1. notes.md: the usual");
+        assert_eq!(card_part_words(&part(file_row_text(11, 0, 8, 0, "src/app.py"), ButtonKind::FileRow, "")), "src/app.py: +11 \u{2212}0");
+        assert_eq!(card_part_words(&part("external-link".to_string(), ButtonKind::Icon, "Open in its app")), "Open in its app");
+        assert_eq!(card_part_words(&part("Send".to_string(), ButtonKind::Primary, "")), "Send");
+        assert_eq!(card_part_words(&part("check|Carry it out".to_string(), ButtonKind::Primary, "")), "Carry it out");
     }
 
     #[test]
