@@ -15,6 +15,7 @@ mod machine;
 mod markdown;
 mod mask;
 mod highlight;
+mod notice;
 mod paint;
 mod preview;
 mod render;
