@@ -2919,6 +2919,12 @@ impl App {
             self.shown.push(Shown::Row { lines: row.lines.iter().map(|line| line.to_string()).collect(), face: row.face.to_string(), points: row.points, color: row.color, back: row.back, width: row.right.then_some(row.width), right: row.right, padding: row.padding });
         }
         let first = self.insert_rtf(rtf::row(row), Some(row.color));
+        if !self.replaying && !self.opening {
+            if let Some(pause) = test_rows_painted() {
+                RedrawWindow(self.transcript, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_UPDATENOW);
+                std::thread::sleep(std::time::Duration::from_millis(pause));
+            }
+        }
         if row.right {
             let start = text_start(self.transcript, first);
             // Words under the message's pictures are the lower part of one card, which begins at the pictures: two cards, each rounded, were
@@ -2963,6 +2969,24 @@ impl App {
             let mut point = POINT { x: 0, y: 0 };
             SendMessageW(edit, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, user_card.start as LPARAM);
             if point.y < client.bottom {
+                // A card that has grown since its shape was taken (the rows of a command's output keep coming) has the card's colour at its old foot and under it: the corners drawn at that foot
+                // are in the card now, and are filled with it; and the card is looked for again, as it is now.
+                if let Some(shape) = user_card.shape {
+                    let card = shape.at(point);
+                    let x = card.left + radius;
+                    if test_log_on() {
+                        test_log(&format!("card kept {},{},{},{} foot pixels {:06x} {:06x}", card.left, card.top, card.right, card.bottom, GetPixel(device, x, card.bottom), GetPixel(device, x, card.bottom + 1)));
+                    }
+                    if !test_stale_shapes() && card.bottom >= client.top && card.bottom + 1 < client.bottom && card_has_grown(GetPixel(device, x, card.bottom), GetPixel(device, x, card.bottom + 1), back) {
+                        let brush = CreateSolidBrush(back);
+                        for area in foot_corners(&card, radius) {
+                            FillRect(device, &area, brush);
+                        }
+                        DeleteObject(brush);
+                        user_card.shape = None;
+                        user_card.looked_at = None;
+                    }
+                }
                 let found = match user_card.shape {
                     Some(shape) => {
                         let mut card = shape.at(point);
@@ -2979,7 +3003,7 @@ impl App {
                     None => {
                         user_card.looked_at = Some(std::time::Instant::now());
                         let view = view.get_or_insert_with(|| ViewPixels::of(device, client));
-                        find_card(client, point, radius, |x, y| view.at(x, y) == back).map(|mut card| {
+                        find_card(client, point, radius, scale(self.dpi, 3), |x, y| view.at(x, y) == back).map(|mut card| {
                             let page = view.at(card.left - 1, card.top + radius);
                             // With the view at the top of the text, the top of the view is the top of a card that reaches it.
                             let mut scrolled = POINT { x: 0, y: 0 };
@@ -2989,6 +3013,9 @@ impl App {
                             // not rounded there, as its end is not in sight)
                             card.bottom_open |= card.bottom + 1 < client.bottom && view.at(card.left + radius, card.bottom + 1) != page;
                             card.top_open |= card.top > client.top && view.at(card.left + radius, card.top - 1) != page;
+                            if test_log_on() {
+                                test_log(&format!("card found {},{},{},{} top_open={} bottom_open={}", card.left, card.top, card.right, card.bottom, card.top_open, card.bottom_open));
+                            }
                             if !card.top_open && !card.bottom_open {
                                 user_card.shape = Some(CardShape::around(&card, point, page));
                             }
@@ -13127,6 +13154,35 @@ impl CardKind {
     }
 }
 
+/// Whether a card whose foot was found at some row goes on below it now: the row's pixel and the one under it are both the card's colour.
+fn card_has_grown(inside: u32, below: u32, back: u32) -> bool {
+    inside == back && below == back
+}
+
+/// The squares at the two lower corners of a card, which are drawn over to round it.
+fn foot_corners(card: &CardArea, radius: i32) -> [RECT; 2] {
+    [
+        RECT { left: card.left, top: card.bottom + 1 - radius, right: card.left + radius, bottom: card.bottom + 1 },
+        RECT { left: card.right + 1 - radius, top: card.bottom + 1 - radius, right: card.right + 1, bottom: card.bottom + 1 },
+    ]
+}
+
+/// Whether the rows of a block are each drawn as they come: a debug build with `DOGMIND_TEST_ROWPAINT` set to a number of milliseconds draws the transcript after each and waits that long,
+/// as it is drawn when a command's output comes in over some time while the window is being painted for other reasons.
+fn test_rows_painted() -> Option<u64> {
+    static ON: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    *ON.get_or_init(|| std::env::var("DOGMIND_TEST_ROWPAINT").ok().map(|text| text.parse().unwrap_or(0)))
+}
+
+/// A debug build with `DOGMIND_TEST_STALE_SHAPES` set keeps a card's shape as it was first taken, which is how the corners were drawn before they followed the card: to see what that was.
+fn test_stale_shapes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(debug_assertions) && *ON.get_or_init(|| std::env::var_os("DOGMIND_TEST_STALE_SHAPES").is_some())
+}
+
 /// A card's edges from the start of its text, and the colour of the page around it.
 #[derive(Clone, Copy)]
 struct CardShape {
@@ -13201,7 +13257,9 @@ struct CardArea {
 }
 
 /// The card around a point just before its text begins. `None`: it is not in view, or what is there is not one card's rectangle.
-fn find_card(client: RECT, text: POINT, radius: i32, is_card: impl Fn(i32, i32) -> bool) -> Option<CardArea> {
+/// `seam`: the most pixels from one that is the card's to the next that is when the rows of a card are walked across (3 design pixels, in this window's scale: the seam between rows is a
+/// fraction of a row's height and grows with the type, as the gap between two cards, which is more than that, does too).
+fn find_card(client: RECT, text: POINT, radius: i32, seam: i32, is_card: impl Fn(i32, i32) -> bool) -> Option<CardArea> {
     let x = text.x - 2;
     if x <= client.left || x >= client.right || text.y >= client.bottom {
         return None;
@@ -13214,7 +13272,7 @@ fn find_card(client: RECT, text: POINT, radius: i32, is_card: impl Fn(i32, i32) 
     let reach = |from: i32, step: i32, limit: i32| -> i32 {
         let mut y = from;
         loop {
-            let found = (1..=3).map(|gap| y + step * gap).take_while(|at| if step > 0 { *at < limit } else { *at > limit }).find(|at| is_card(x, *at));
+            let found = (1..=seam.max(3)).map(|gap| y + step * gap).take_while(|at| if step > 0 { *at < limit } else { *at > limit }).find(|at| is_card(x, *at));
             match found {
                 Some(at) => y = at,
                 None => return y,
@@ -16172,6 +16230,22 @@ mod tests {
     }
 
     #[test]
+    fn a_card_that_goes_on_below_its_foot_has_grown_and_its_old_corners_are_its_own() {
+        let (back, page) = (0x0034_3738, 0x001e_2021);
+        // (the card's last row, and the page under it: as it was when the shape was taken)
+        assert!(!card_has_grown(back, page, back));
+        // (more of it under the foot: rows came after)
+        assert!(card_has_grown(back, back, back));
+        // (a pixel that is not the card's, text selected in it, or the card gone from there: not grown)
+        assert!(!card_has_grown(page, back, back));
+        assert!(!card_has_grown(page, page, back));
+        let card = CardArea { left: 100, right: 300, top: 50, bottom: 120, top_open: false, bottom_open: false };
+        let [left, right] = foot_corners(&card, 10);
+        assert_eq!((left.left, left.top, left.right, left.bottom), (100, 111, 110, 121));
+        assert_eq!((right.left, right.top, right.right, right.bottom), (291, 111, 301, 121));
+    }
+
+    #[test]
     fn a_seam_of_a_line_or_two_between_the_rows_of_a_card_does_not_end_it() {
         let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
         let text = POINT { x: 322, y: 110 };
@@ -16181,11 +16255,18 @@ mod tests {
         };
         // (one line, or two, at the foot of the last row: the card is all of it)
         for seam in [150..=150, 150..=151, 120..=121] {
-            let found = find_card(client, text, 6, seamed(seam.clone())).unwrap_or_else(|| panic!("{seam:?}"));
+            let found = find_card(client, text, 6, 3, seamed(seam.clone())).unwrap_or_else(|| panic!("{seam:?}"));
             assert_eq!((found.top, found.bottom), (100, 160), "{seam:?}");
         }
         // (three lines are a gap between two cards)
-        let found = find_card(client, text, 6, seamed(150..=152)).unwrap();
+        let found = find_card(client, text, 6, 3, seamed(150..=152)).unwrap();
+        assert_eq!(found.bottom, 149);
+        // (at a larger scale of the window the seam between rows is larger, and the gap between cards with it: a seam of four lines, at 175%, is walked across and a gap of five is not)
+        let reach = scale(168, 3);
+        assert_eq!(reach, 5);
+        let found = find_card(client, text, 6, reach, seamed(150..=153)).unwrap();
+        assert_eq!(found.bottom, 160);
+        let found = find_card(client, text, 6, reach, seamed(150..=154)).unwrap();
         assert_eq!(found.bottom, 149);
     }
 
@@ -16193,14 +16274,14 @@ mod tests {
     fn a_card_is_found_by_its_edges_and_its_ends_out_of_view_stay_square() {
         let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
         let text = POINT { x: 322, y: 110 };
-        let whole = find_card(client, text, 6, card_at(300, 480, 100, 140)).unwrap();
+        let whole = find_card(client, text, 6, 3, card_at(300, 480, 100, 140)).unwrap();
         assert_eq!((whole.left, whole.right, whole.top, whole.bottom), (300, 480, 100, 140));
         assert!(!whole.top_open && !whole.bottom_open);
         // Its text has scrolled above the view; the rest of it is still there.
-        let above = find_card(client, POINT { x: 322, y: -30 }, 6, card_at(300, 480, -40, 20)).unwrap();
+        let above = find_card(client, POINT { x: 322, y: -30 }, 6, 3, card_at(300, 480, -40, 20)).unwrap();
         assert!(above.top_open && !above.bottom_open);
         assert_eq!((above.left, above.right, above.bottom), (300, 480, 20));
-        let below = find_card(client, POINT { x: 322, y: 290 }, 6, card_at(300, 480, 280, 400)).unwrap();
+        let below = find_card(client, POINT { x: 322, y: 290 }, 6, 3, card_at(300, 480, 280, 400)).unwrap();
         assert!(!below.top_open && below.bottom_open);
     }
 
@@ -16222,14 +16303,14 @@ mod tests {
     fn what_is_not_a_card_is_left_alone() {
         let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
         let text = POINT { x: 322, y: 110 };
-        assert!(find_card(client, text, 6, |_, _| false).is_none(), "another colour");
-        assert!(find_card(client, POINT { x: 322, y: 400 }, 6, |_, _| true).is_none(), "below the view");
-        assert!(find_card(client, text, 6, card_at(300, 480, 0, 299)).is_none(), "taller than the view: nothing to round");
+        assert!(find_card(client, text, 6, 3, |_, _| false).is_none(), "another colour");
+        assert!(find_card(client, POINT { x: 322, y: 400 }, 6, 3, |_, _| true).is_none(), "below the view");
+        assert!(find_card(client, text, 6, 3, card_at(300, 480, 0, 299)).is_none(), "taller than the view: nothing to round");
         // Text on the row walked across does not stop it, but an edge that is not straight is no card.
         let lettered = |x: i32, y: i32| card_at(300, 480, 100, 140)(x, y) && !(x == 400 && y == 110);
-        assert_eq!(find_card(client, text, 6, lettered).map(|card| card.right), Some(480));
+        assert_eq!(find_card(client, text, 6, 3, lettered).map(|card| card.right), Some(480));
         let stepped = |x: i32, y: i32| card_at(300, 480, 100, 140)(x, y) && !(x > 460 && y > 120);
-        assert!(find_card(client, text, 6, stepped).is_none());
+        assert!(find_card(client, text, 6, 3, stepped).is_none());
     }
 
     #[test]
