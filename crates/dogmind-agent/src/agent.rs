@@ -105,6 +105,9 @@ pub enum Command {
     ListTurns,
     /// Send what a turn's edits changed as [`Event::TurnChanges`]: the card under an answer of a session reopened.
     TurnChanges(u64),
+    /// Send the session's turns as [`Event::CardTurns`], for the cards under its answers: a reply of its own, so that one asked for the rewind
+    /// panel ([`Command::ListTurns`]) is never taken for it, nor it for that, whatever order they come in.
+    TurnsForCards,
     /// What the session works toward (/goal), or none to clear it: kept in the session, said to the model with the next message and again after
     /// a compaction, and told back as [`Event::Goal`].
     SetGoal(Option<String>),
@@ -236,7 +239,11 @@ pub enum Event {
     Turns(Vec<Turn>),
     /// What a turn's edits changed, file by file with its lines added and removed and its diff (`Checkpoints::turn_changes`): told when a turn that
     /// changed files ends, before [`Event::TurnEnded`], and when asked (`Command::TurnChanges`). What a command changed is not in it.
-    TurnChanges { turn: u64, files: Vec<crate::tools::FileChange> },
+    /// `session`: the session file it is of (none before the session has one), so that a reply that arrives after another session was opened
+    /// is known for what it is and dropped, not put under the answers of the one open now.
+    TurnChanges { session: Option<PathBuf>, turn: u64, files: Vec<crate::tools::FileChange> },
+    /// The session's turns, asked for the cards (Command::TurnsForCards), with the session they are of, as TurnChanges has it.
+    CardTurns { session: Option<PathBuf>, turns: Vec<Turn> },
     /// A rewind is done; `prompt` is what was typed, when the conversation went back to before it.
     Rewound { restored: Restored, prompt: Option<String> },
     /// The request waits for a server that is being restarted: its loading progress as `/health` gave it, or null when only a proxy in front of it answers. Till the next request.
@@ -1231,7 +1238,13 @@ impl Agent {
                 }
                 Command::TurnChanges(turn) => {
                     let files = self.marks.as_ref().map_or(Vec::new(), |marks| marks.turn_changes(turn, &self.workspace));
-                    self.emit(Event::TurnChanges { turn, files });
+                    let session = self.session.as_ref().map(|session| session.path.clone());
+                    self.emit(Event::TurnChanges { session, turn, files });
+                }
+                Command::TurnsForCards => {
+                    let turns = self.marks.as_ref().map_or(Vec::new(), |marks| marks.turns().to_vec());
+                    let session = self.session.as_ref().map(|session| session.path.clone());
+                    self.emit(Event::CardTurns { session, turns });
                 }
                 Command::Rewind { turn, files, conversation } => self.rewind(turn, files, conversation),
             }
@@ -1608,7 +1621,8 @@ impl Agent {
         if let Some(turn) = self.marks.as_ref().and_then(|marks| marks.turns().last()).map(|turn| turn.id) {
             let files = self.marks.as_ref().map_or(Vec::new(), |marks| marks.turn_changes(turn, &self.workspace));
             if !files.is_empty() {
-                self.emit(Event::TurnChanges { turn, files });
+                let session = self.session.as_ref().map(|session| session.path.clone());
+                self.emit(Event::TurnChanges { session, turn, files });
             }
         }
         match ended {
@@ -3284,6 +3298,38 @@ mod tests {
         assert_eq!(bodies[1].to_string().matches("## Session Goal").count(), 1, "said once, and held by the history after");
         let file = file.expect("the session has a file");
         assert_eq!(crate::session::goal_of(&file).as_deref(), Some("ship the login page"));
+    }
+
+    /// The cards' turns come in a reply of their own, never taken for the rewind panel's, and that reply and a turn's changes say which session they
+    /// are of, so that one that comes after another session was opened is dropped there.
+    #[test]
+    fn the_cards_replies_say_their_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _bodies) = server(vec![text_answer("hello")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        let mut file = None;
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).unwrap() {
+                Event::SessionFile(path) => file = Some(path),
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        run.handle.commands.send(Command::TurnsForCards).unwrap();
+        run.handle.commands.send(Command::TurnChanges(1)).unwrap();
+        let (mut cards, mut changes) = (None, None);
+        while cards.is_none() || changes.is_none() {
+            match run.events.recv_timeout(Duration::from_secs(20)).unwrap() {
+                Event::CardTurns { session, turns } => cards = Some((session, turns.len())),
+                Event::TurnChanges { session, .. } => changes = Some(session),
+                Event::Turns(_) => panic!("the cards' turns came as the rewind panel's"),
+                _ => {}
+            }
+        }
+        let file = file.expect("the session has a file");
+        assert_eq!(cards, Some((Some(file.clone()), 1)));
+        assert_eq!(changes, Some(Some(file)));
     }
 
     #[test]

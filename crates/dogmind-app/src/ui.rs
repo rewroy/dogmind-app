@@ -11536,7 +11536,10 @@ impl App {
                     self.append(&format!("{}\n", lines.join("\n")), Style::Tool);
                 }
             }
-            Event::TurnChanges { turn, files } => {
+            // (one of another session, asked for before that one was left: not for the answers shown now)
+            Event::TurnChanges { session, .. } if session.is_some() && self.current_session.is_some() && session != self.current_session => {}
+            Event::CardTurns { .. } => {}
+            Event::TurnChanges { turn, files, .. } => {
                 if let Some(slot) = self.turn_cards_waiting.remove(&turn) {
                     // (a session opened again: the card goes where the answer ended, when all that were asked for have come)
                     if !files.is_empty() {
