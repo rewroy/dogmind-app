@@ -28,6 +28,7 @@ use crate::machine::readable_build;
 use crate::diffview::{self, RowKind};
 use crate::settings::KeySource;
 use crate::toolrun::{self, LineKind, RunEntry, Tone, ToolRun};
+use crate::notice;
 use crate::updates;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::*;
@@ -280,6 +281,7 @@ const ID_UPDATE_OFFER: isize = 9906;
 const ID_RELEASE_OFFER: isize = 9907;
 const ID_TOGGLE_UPDATES: isize = 9908;
 const ID_SPEED_FIRST: isize = 9909;
+const ID_NOTICE_LATER: isize = 9910;
 const ID_DIFF_PREVIOUS: isize = 9900;
 const ID_DIFF_NEXT: isize = 9901;
 const ID_DIFF_CLOSE: isize = 9902;
@@ -1720,20 +1722,22 @@ struct App {
     builds: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
     /// A new build seen once, to be seen the same again before it is offered.
     update_seen: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
-    /// A new build is here, and the row above the input asks whether to restart into it; its button and its cross.
+    /// A new build is here, and the notice at the top of the main screen asks whether to restart into it. Its button (also the one that says how far the fetch of a release has come, and
+    /// updates once the setup is here) and, for the page of a release, its other one; and Later, that sends the notice away.
     update_offer: bool,
     update_offer_button: HWND,
-    update_offer_close: Option<RECT>,
+    notice_later: HWND,
     /// The build the person said no to, with the cross: they are asked again only for a newer one.
     update_declined: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
     /// They said yes while work was going on: it restarts when the work is done.
     restart_when_done: bool,
     /// The setup that waits is being checked before it is run (a thread reads all of its bytes: a second or two): the buttons that restart into it say so, and cannot be pressed again.
     checking_setup: bool,
-    /// A newer release on GitHub than this one, found on the app's own look: a row above the input tells of it, with a button for its page and a cross, unless its setup is being fetched or is here (`release_row`).
+    /// A newer release on GitHub than this one, found on the app's own look: the notice at the top of the main screen tells of it (`notice`), with a button for its page while nothing of its
+    /// setup is fetched, and for the update itself once it is. The version the tray has told of, once (`notice::balloon_due`).
     release_offer: Option<updates::Release>,
     release_offer_button: HWND,
-    release_offer_close: Option<RECT>,
+    tray_told_release: Option<String>,
     /// A look at GitHub is under way (a thread asks; the answer comes as a note), and what the last one came to, as the About page says it.
     release_checking: bool,
     release_outcome: Option<updates::Outcome>,
@@ -1742,7 +1746,7 @@ struct App {
     /// The setup of a newer release: fetched on its own in the background and checked, then offered; and what the last try came to, as About says it, and whether that is a trouble.
     release_update: ReleaseUpdate,
     release_update_said: Option<(String, bool)>,
-    /// The cross of the row that offers it was pressed: it is offered again at the next start.
+    /// Later was pressed on the notice of the setup that is here: it is offered again at the next start.
     release_ready_closed: bool,
     /// The switch on the About page for the app's own looks.
     toggle_updates: HWND,
@@ -2219,6 +2223,18 @@ fn update_button_kind_of(update: &ReleaseUpdate, restart_when_done: bool) -> But
         ReleaseUpdate::Ready(_) if restart_when_done => ButtonKind::Secondary,
         ReleaseUpdate::Ready(_) => ButtonKind::Primary,
         _ => ButtonKind::Link,
+    }
+}
+
+/// What the notice says, and the words on its button.
+fn notice_text(shown: &notice::Notice) -> (String, String) {
+    use notice::Notice;
+    match shown {
+        Notice::Page { version } => (tf("Dogmind {0} is available.", &[version]), t("Open the release page").to_string()),
+        Notice::Fetching { version, percent } => (tf("Dogmind {0} is available.", &[version]), tf("Downloading… {0}%", &[percent])),
+        Notice::UpdateNow { waiting: true, checking, .. } => (t("It restarts into the new version when this work is done.").to_string(), if *checking { t("Checking…") } else { t("Not now") }.to_string()),
+        Notice::UpdateNow { version: Some(version), checking, .. } => (tf("Dogmind {0} is ready to install.", &[version]), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
+        Notice::UpdateNow { version: None, checking, .. } => (t("A new version is here.").to_string(), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
     }
 }
 
@@ -5005,13 +5021,19 @@ impl App {
         for window in [self.composer, self.send, self.attach_button, self.model_chip, self.mode_chip, self.effort_chip] {
             show(window, chat);
         }
+        // The notice of a newer version, on the pages that have it; what is not there is hidden, once, and not hidden and shown again by every layout.
+        let notice = if notice::is_on_page(chat, looking_at_changes, bare) { self.notice() } else { None };
+        if notice.is_none() {
+            for window in [self.update_offer_button, self.release_offer_button, self.notice_later] {
+                show(window, false);
+            }
+        }
+        let notice_room = if notice.is_some() { self.notice_height() + s(ds::space::S) } else { 0 };
         if !chat {
             for window in &self.attached_windows {
                 show(*window, false);
             }
             show(self.vision_offer_button, false);
-            show(self.update_offer_button, false);
-            show(self.release_offer_button, false);
         }
         show(self.help_button, !bare && !squeezed);
         show(self.suggest, chat && !self.suggestions.is_empty());
@@ -5056,9 +5078,9 @@ impl App {
             let card_top = foot;
             let status_top = card_top + card_height + s(ds::space::XS);
             let above = card_top - waiting_height;
-            if !self.has_messages && above - greeting_height >= s(40) {
+            if !self.has_messages && above - greeting_height >= s(40) + notice_room {
                 let title = GREETINGS[self.greeting];
-                let bubble_top = s(40) + (above - s(40) - greeting_height) / 2;
+                let bubble_top = s(40) + notice_room + (above - s(40) - notice_room - greeting_height) / 2;
                 let bubble_width = (text_width(self.fonts.greeting, title) + s(60)).min(column);
                 let area = rect(left + (column - bubble_width) / 2, bubble_top, bubble_width, bubble_height);
                 // The drawing fills its square's width, and is about 0.82 of it high, centred. Its line is about 5% of its width.
@@ -5154,35 +5176,6 @@ impl App {
             self.activity_area = rect(left, card_top - s(ds::size::TEXT_ROW), column, s(ds::size::TEXT_LINE));
             let mut bottom = card_top - s(ds::size::QUEUE_STEP);
             self.queue_hits.clear();
-            self.update_offer_close = None;
-            // (a new build over this one, or the setup of a release that was fetched and checked: the same row and the same button)
-            let ready_version = self.release_ready().map(|ready| ready.version.clone());
-            let update_shown = self.update_offer || ready_version.is_some();
-            show(self.update_offer_button, update_shown);
-            if update_shown {
-                let tall = s(ds::size::QUEUE_STEP) + s(ds::space::XS);
-                let row = rect(left, bottom - tall, column, tall);
-                shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
-                let (words, action) = match (&ready_version, self.restart_when_done, self.update_offer) {
-                    (_, true, _) => (t("It restarts into the new version when this work is done.").to_string(), t("Not now")),
-                    (Some(version), false, false) => (tf("Dogmind {0} is ready to install.", &[version]), t("Restart to update")),
-                    _ => (t("A new version is here.").to_string(), t("Restart to update")),
-                };
-                // (while the setup is read again before it is run, the button says so and waits)
-                let action = if self.checking_setup { t("Checking…") } else { action };
-                set_text_if_changed(self.update_offer_button, action);
-                EnableWindow(self.update_offer_button, i32::from(!self.checking_setup));
-                let cross = s(ds::space::XL);
-                let across = (text_width(self.fonts.body, action) + s(ds::space::XL)).max(s(72));
-                let button_x = left + column - cross - s(ds::space::XS) - across;
-                place(self.update_offer_button, button_x, row.top + (tall - s(ds::size::ICON_BUTTON)) / 2, across, s(ds::size::ICON_BUTTON));
-                SetWindowPos(self.update_offer_button, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                shapes.push(Shape::Text { area: rect(left + s(ds::space::M), row.top, (button_x - left - s(ds::space::L)).max(0), tall), text: words, font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
-                let close = rect(left + column - cross - s(ds::space::XS), row.top + (tall - cross) / 2, cross, cross);
-                shapes.push(Shape::Icon { name: "x", area: close, size: s(ds::space::M), color: theme::muted() });
-                self.update_offer_close = Some(close);
-                bottom -= tall + s(ds::space::XS);
-            }
             self.vision_offer_close = None;
             show(self.vision_offer_button, self.vision_offer.is_some());
             if let Some(offer) = self.vision_offer {
@@ -5204,27 +5197,6 @@ impl App {
                 let close = rect(left + column - cross - s(ds::space::XS), row.top + (tall - cross) / 2, cross, cross);
                 shapes.push(Shape::Icon { name: "x", area: close, size: s(ds::space::M), color: theme::muted() });
                 self.vision_offer_close = Some(close);
-                bottom -= tall + s(ds::space::XS);
-            }
-            // A newer release than this one is out, found by the app's own look: said quietly, with its page. (A copy in an install fetches its setup, and then the row above says that.)
-            self.release_offer_close = None;
-            let offered = self.release_row().cloned();
-            show(self.release_offer_button, offered.is_some());
-            if let Some(release) = &offered {
-                let tall = s(ds::size::QUEUE_STEP) + s(ds::space::XS);
-                let row = rect(left, bottom - tall, column, tall);
-                shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
-                let (words, action) = (tf("Dogmind {0} is available.", &[&release.version]), t("Open the release page"));
-                set_text_if_changed(self.release_offer_button, action);
-                let cross = s(ds::space::XL);
-                let across = (text_width(self.fonts.body, action) + s(ds::space::XL)).max(s(72));
-                let button_x = left + column - cross - s(ds::space::XS) - across;
-                place(self.release_offer_button, button_x, row.top + (tall - s(ds::size::ICON_BUTTON)) / 2, across, s(ds::size::ICON_BUTTON));
-                SetWindowPos(self.release_offer_button, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                shapes.push(Shape::Text { area: rect(left + s(ds::space::M), row.top, (button_x - left - s(ds::space::L)).max(0), tall), text: words, font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
-                let close = rect(left + column - cross - s(ds::space::XS), row.top + (tall - cross) / 2, cross, cross);
-                shapes.push(Shape::Icon { name: "x", area: close, size: s(ds::space::M), color: theme::muted() });
-                self.release_offer_close = Some(close);
                 bottom -= tall + s(ds::space::XS);
             }
             if !waiting.is_empty() {
@@ -5317,6 +5289,10 @@ impl App {
                 }
             }
             let mut top = strip;
+            if let Some(notice) = &notice {
+                top += s(ds::space::XS);
+                top += self.place_notice(&mut shapes, notice, left, column, top);
+            }
             if finding {
                 top += s(ds::space::XS);
                 let bar = s(ds::size::MENU_ROW);
@@ -5381,7 +5357,9 @@ impl App {
             }
             let head = s(ds::size::DIFF_HEAD);
             shapes.push(Shape::Text { area: rect(inset + s(ds::space::M), 0, sidebar - 2 * inset - s(ds::space::M), head), text: self.panel_title.clone(), font: FontKind::Strong, color: theme::text(), flags: ONE_LINE });
-            place(self.list, inset, head, side_width, height - head - s(ds::space::S));
+            // (under the head, across the window; the files and the diff stand under it)
+            let under = head + notice.as_ref().map_or(0, |notice| self.place_notice(&mut shapes, notice, inset, width - 2 * inset, head));
+            place(self.list, inset, under, side_width, height - under - s(ds::space::S));
             let button = s(ds::size::ICON_BUTTON);
             let middle = (head - button) / 2;
             let mut x = width - s(ds::space::M) - button;
@@ -5391,7 +5369,7 @@ impl App {
             }
             let file = self.diff_file.and_then(|at| self.changes.get(at)).map_or(String::new(), |change| change.path.clone());
             shapes.push(Shape::Text { area: rect(sidebar + s(ds::space::L), 0, (x + button - sidebar - s(ds::space::XL)).max(0), head), text: file, font: FontKind::Body, color: theme::soft(), flags: (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
-            place(self.diff_view, sidebar, head, width - sidebar, height - head);
+            place(self.diff_view, sidebar, under, width - sidebar, height - under);
             self.clamp_diff();
             InvalidateRect(self.diff_view, std::ptr::null(), 0);
             self.shapes = shapes;
@@ -7917,6 +7895,15 @@ impl App {
         if IsWindowVisible(self.window) != 0 {
             return;
         }
+        // (a debug build told to by a test writes down what the balloon says: off the screen, no one sees it)
+        if cfg!(debug_assertions) {
+            if let Some(path) = std::env::var_os("DOGMIND_TEST_TRAYLOG") {
+                use std::io::Write as _;
+                if let std::result::Result::Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(file, "{title} | {words}");
+                }
+            }
+        }
         let mut data = self.tray_data();
         data.uFlags = NIF_INFO;
         data.dwInfoFlags = NIIF_NONE;
@@ -7929,15 +7916,37 @@ impl App {
         Shell_NotifyIconW(NIM_MODIFY, &data);
     }
 
+    /// The balloon of the tray for a version: once, and only while the window is hidden (`notice::balloon_due`). What the main screen has said to an open window counts as told.
+    unsafe fn tell_the_tray_of(&mut self, version: &str, setup_is_here: bool) {
+        let hidden = IsWindowVisible(self.window) == 0;
+        if notice::balloon_due(version, hidden, self.tray_told_release.as_deref(), self.settings.dismissed_update.as_deref()) {
+            let words = if setup_is_here { tf("Dogmind {0} is ready to install. Open the app to update.", &[&version]) } else { tf("Dogmind {0} is available. Open the app to update.", &[&version]) };
+            self.tray_note(t("A new version of Dogmind is here"), &words);
+        }
+        if updates::is_to_be_told(version, self.settings.dismissed_update.as_deref()) {
+            self.tray_told_release = Some(version.to_string());
+        }
+    }
+
+    /// Whether a page that has the notice is the one shown, with the notice on it.
+    fn notice_is_up(&self) -> bool {
+        notice::is_on_page(self.panel == Panel::Chat, self.panel == Panel::Diff, self.onboarding)
+    }
+
     /// Back from the tray. A look at GitHub an hour old is made again, so that a release that came out while the window was hidden shows on the main
     /// screen as it comes back, and not only on the About page.
     unsafe fn tray_open(&mut self) {
-        ShowWindow(self.window, SW_SHOW);
-        if IsIconic(self.window) != 0 {
-            ShowWindow(self.window, SW_RESTORE);
+        // (a test's copy shows itself where it is, and takes no one's focus)
+        if crate::machine::kept_from_the_real_machine() {
+            ShowWindow(self.window, SW_SHOWNA);
+        } else {
+            ShowWindow(self.window, SW_SHOW);
+            if IsIconic(self.window) != 0 {
+                ShowWindow(self.window, SW_RESTORE);
+            }
+            SetForegroundWindow(self.window);
+            SetFocus(if self.panel == Panel::Chat && self.pending.is_none() { self.composer } else { self.window });
         }
-        SetForegroundWindow(self.window);
-        SetFocus(if self.panel == Panel::Chat && self.pending.is_none() { self.composer } else { self.window });
         self.look_for_release_after(updates::ON_RETURN);
     }
 
@@ -8142,18 +8151,86 @@ impl App {
         }
     }
 
-    /// The same, for the row above the input: not after its cross was pressed, until the next start.
-    fn release_ready(&self) -> Option<&updates::Ready> {
-        self.ready_setup().filter(|_| !self.release_ready_closed)
+    /// The notice of a newer version that the main screen has now, if there is one (see `notice::notice`).
+    fn notice(&self) -> Option<notice::Notice> {
+        let stage = match &self.release_update {
+            ReleaseUpdate::None => notice::Stage::Nothing,
+            ReleaseUpdate::Fetching { version, done, total, .. } => notice::Stage::Fetching { version, percent: done * 100 / (*total).max(1) },
+            ReleaseUpdate::Ready(ready) => notice::Stage::Ready { version: &ready.version },
+        };
+        notice::notice(&notice::Situation {
+            offered: self.release_offer.as_ref().map(|release| release.version.as_str()),
+            stage,
+            setup_runs: self.ready_setup().is_some(),
+            dismissed: self.settings.dismissed_update.as_deref(),
+            ready_closed: self.release_ready_closed,
+            new_build: self.update_offer,
+            restart_when_done: self.restart_when_done,
+            checking: self.checking_setup,
+        })
     }
 
-    /// The release the row above the input tells of, with a button for its page: not while its setup is on its way or here, which have words of their own.
-    fn release_row(&self) -> Option<&updates::Release> {
-        self.release_offer.as_ref().filter(|release| match &self.release_update {
-            ReleaseUpdate::None => true,
-            ReleaseUpdate::Fetching { version, .. } => *version != release.version,
-            ReleaseUpdate::Ready(ready) => ready.version != release.version,
-        })
+    /// How high the notice is.
+    fn notice_height(&self) -> i32 {
+        scale(self.dpi, ds::size::ICON_BUTTON + 2 * ds::space::S)
+    }
+
+    /// The notice as a card of its own, across `width` from `left`, at `top`: what it says, its one button, and Later. The room it takes, with the gap under it.
+    unsafe fn place_notice(&mut self, shapes: &mut Vec<Shape>, notice: &notice::Notice, left: i32, width: i32, top: i32) -> i32 {
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let tall = self.notice_height();
+        shapes.push(Shape::Round { area: rect(left, top, width, tall), radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
+        let (words, label) = notice_text(notice);
+        // (one width for every state the button goes through: one that says how far the fetch has come does not move as the number grows)
+        let widest = [t("Update now (Dogmind restarts)").to_string(), t("Open the release page").to_string(), t("Not now").to_string(), t("Checking…").to_string(), tf("Downloading… {0}%", &[&100])]
+            .iter()
+            .map(|label| text_width(self.fonts.strong, label))
+            .max()
+            .unwrap_or(0);
+        let across = (widest + s(ds::space::XL)).max(s(96)).min((width / 2).max(s(96)));
+        let later = (text_width(self.fonts.small, t("Later")) + s(ds::space::XL)).max(s(56));
+        let later_x = left + width - s(ds::space::S) - later;
+        let main_x = later_x - s(ds::space::XS) - across;
+        let y = top + (tall - s(ds::size::ICON_BUTTON)) / 2;
+        let is_page = matches!(notice, notice::Notice::Page { .. });
+        let (main, other) = if is_page { (self.release_offer_button, self.update_offer_button) } else { (self.update_offer_button, self.release_offer_button) };
+        show(other, false);
+        set_text_if_changed(main, &label);
+        let (kind, enabled) = match notice {
+            notice::Notice::Page { .. } => (ButtonKind::Secondary, true),
+            notice::Notice::Fetching { .. } => (ButtonKind::Secondary, false),
+            notice::Notice::UpdateNow { waiting, checking, .. } => (if *waiting { ButtonKind::Secondary } else { ButtonKind::Primary }, !*checking),
+        };
+        set_button_style(main, kind, theme::surface());
+        EnableWindow(main, i32::from(enabled));
+        place(main, main_x, y, across, s(ds::size::ICON_BUTTON));
+        show(main, true);
+        set_text_if_changed(self.notice_later, t("Later"));
+        place(self.notice_later, later_x, y, later, s(ds::size::ICON_BUTTON));
+        show(self.notice_later, true);
+        shapes.push(Shape::Text { area: rect(left + s(ds::space::M), top, (main_x - left - s(ds::space::L)).max(0), tall), text: words, font: FontKind::Body, color: theme::text(), flags: ONE_LINE });
+        tall + s(ds::space::S)
+    }
+
+    /// Later on the notice: this version is not told of again unprompted (a newer one is), and what was asked of the update is taken back.
+    unsafe fn notice_sent_away(&mut self) {
+        let Some(shown) = self.notice() else { return };
+        let version = match &shown {
+            notice::Notice::Page { version } | notice::Notice::Fetching { version, .. } => Some(version.clone()),
+            notice::Notice::UpdateNow { version, .. } => version.clone(),
+        };
+        if let Some(version) = version {
+            self.dismiss_release(&version);
+        }
+        if matches!(shown, notice::Notice::UpdateNow { .. }) {
+            // (not this build: a newer one is offered again)
+            self.update_offer = false;
+            self.restart_when_done = false;
+            self.release_ready_closed = true;
+            self.update_declined = self.update_seen.clone();
+        }
+        self.layout();
     }
 
     /// The setup that was fetched, run to update this install: it waits for this app, and the engine it started, to end, puts the files of the new version in their places, and starts the
@@ -11076,6 +11153,7 @@ impl App {
                 }
                 // (a look that the person has turned off since it began tells nothing on its own)
                 if let Some(release) = updates::release_to_tell(&outcome, on_its_own, self.settings.check_for_updates, self.settings.dismissed_update.as_deref()) {
+                    self.tell_the_tray_of(&release.version, false);
                     self.release_offer = Some(release);
                 }
                 // (the About page says what its own button was asked for, and what the app learned on its own; that the app could not reach GitHub when no one asked is not news there)
@@ -11095,16 +11173,22 @@ impl App {
                     (*so_far, *of) = (done, total);
                     if self.panel == Panel::About {
                         self.layout();
+                    } else if self.notice_is_up() {
+                        // (on the main screen the notice's button says how far it has come: its words change, and nothing else is laid out again)
+                        if let Some(shown @ notice::Notice::Fetching { .. }) = self.notice() {
+                            set_text_if_changed(self.update_offer_button, &notice_text(&shown).1);
+                        }
                     }
                 }
             }
             Note::ReleaseFetched(Ok(ready)) => {
                 let again = matches!(&self.release_update, ReleaseUpdate::Ready(known) if known.version == ready.version);
+                let version_ready = ready.version.clone();
                 self.release_update = ReleaseUpdate::Ready(ready);
                 self.release_update_said = None;
                 if !again {
                     self.release_ready_closed = false;
-                    self.tray_note(t("A new version of Dogmind is here"), t("Open the app to restart into it."));
+                    self.tell_the_tray_of(&version_ready, true);
                 }
                 self.release_update_changed();
             }
@@ -12793,23 +12877,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.layout();
                 return 0;
             }
-            // (not this release: a later one is told of again)
-            if app.release_offer_close.is_some_and(|close| within(&close)) {
-                if let Some(release) = app.release_offer.take() {
-                    app.dismiss_release(&release.version);
-                }
-                app.layout();
-                return 0;
-            }
-            // (not this build: a newer one is offered again)
-            if app.update_offer_close.is_some_and(|close| within(&close)) {
-                app.update_offer = false;
-                app.restart_when_done = false;
-                app.release_ready_closed = true;
-                app.update_declined = app.update_seen.clone();
-                app.layout();
-                return 0;
-            }
             if let Some((at, act)) = app.queue_hits.iter().find(|(area, _, _)| within(area)).map(|(_, at, act)| (*at, *act)) {
                 app.queue_act(at, act);
             } else if let Some(at) = app.rail_hits.iter().find(|(area, _)| within(area)).map(|(_, at)| *at) {
@@ -12982,6 +13049,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_UPDATE_OFFER => app.update_offer_pressed(),
+                ID_NOTICE_LATER => app.notice_sent_away(),
                 ID_RELEASE_OFFER => {
                     if let Some(release) = app.release_offer.clone() {
                         app.open_release(&release.version, &release.page);
@@ -14128,10 +14196,10 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             update_seen: None,
             update_offer: false,
             update_offer_button: make_button(window, ID_UPDATE_OFFER, "", ButtonKind::Secondary, theme::surface()),
-            update_offer_close: None,
+            notice_later: make_button(window, ID_NOTICE_LATER, "", ButtonKind::Link, theme::surface()),
             release_offer: None,
             release_offer_button: make_button(window, ID_RELEASE_OFFER, "", ButtonKind::Secondary, theme::surface()),
-            release_offer_close: None,
+            tray_told_release: None,
             release_checking: false,
             release_outcome: None,
             install_folder: updates::install_folder(),
@@ -14549,6 +14617,37 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_notice_names_the_version_and_its_one_button_says_what_a_press_does() {
+        use notice::Notice;
+        let text = |shown: Notice| notice_text(&shown);
+        let said = |version: &str| tf("Dogmind {0} is available.", &[&version]);
+        assert_eq!(text(Notice::Page { version: "0.2.0".into() }), (said("0.2.0"), t("Open the release page").to_string()));
+        // (while the setup comes, the button is how far it has come)
+        assert_eq!(text(Notice::Fetching { version: "0.2.0".into(), percent: 37 }), (said("0.2.0"), tf("Downloading… {0}%", &[&37])));
+        // (once it is here and checked, one press updates, and the button says that Dogmind restarts)
+        let ready = text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: false, checking: false });
+        assert_eq!(ready, (tf("Dogmind {0} is ready to install.", &[&"0.2.0"]), t("Update now (Dogmind restarts)").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: false, checking: true }).1, t("Checking…"));
+        // (work under way is waited for, and the same button takes that back)
+        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: true, checking: false }), (t("It restarts into the new version when this work is done.").to_string(), t("Not now").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: None, waiting: false, checking: false }), (t("A new version is here.").to_string(), t("Update now (Dogmind restarts)").to_string()));
+        // (what the person reads in English is the words the test names)
+        if !lang::is_japanese() {
+            assert_eq!(ready.1, "Update now (Dogmind restarts)");
+        }
+    }
+
+    #[test]
+    fn the_notice_is_laid_out_on_the_chat_and_the_changes_and_nowhere_else() {
+        let on = |panel: Panel, onboarding: bool| notice::is_on_page(panel == Panel::Chat, panel == Panel::Diff, onboarding);
+        assert!(on(Panel::Chat, false) && on(Panel::Diff, false));
+        for panel in [Panel::About, Panel::General, Panel::Models, Panel::Help, Panel::Sessions, Panel::Rename] {
+            assert!(!on(panel, false), "a dialog stands over the page that has it");
+        }
+        assert!(!on(Panel::Chat, true), "the first screens ask nothing of the kind");
+    }
 
     #[test]
     fn a_note_of_progress_changes_the_percent_and_leaves_the_update_button_as_it_was() {
