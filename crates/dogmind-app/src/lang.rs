@@ -604,6 +604,10 @@ const JA: &[(&str, &str)] = &[
     ("The agent asks:", "エージェントからの質問:"),
     ("Type the number of a choice, or your own answer.", "選択肢の番号か、自分の答えを入力してください。"),
     ("Your answer: {0}", "あなたの答え: {0}"),
+    ("The plan:", "計画:"),
+    ("Type yes to carry it out, or say what to change.", "実行するなら「はい」、直すなら直してほしい点を入力してください。"),
+    ("Plan approved: plan mode is over.", "計画を承認しました。計画モードを終わります。"),
+    ("Change the plan: {0}", "計画の修正: {0}"),
     ("That session is at work: stop it first.", "そのセッションは作業中です。先に止めてください。"),
     // The window.
     ("New session", "新しいセッション"),

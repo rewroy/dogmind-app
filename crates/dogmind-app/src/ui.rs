@@ -1920,6 +1920,8 @@ struct App {
     interjected: Vec<String>,
     /// The model's question that waits for the person (Event::Question): where the answer goes, and the choices' labels, which a number picks.
     question: Option<(std::sync::mpsc::Sender<String>, Vec<String>)>,
+    /// The plan that waits for the person's approval (Event::PlanReview): where the answer goes.
+    plan_review: Option<std::sync::mpsc::Sender<Result<(), String>>>,
     /// The buttons on what waits above the input: where, which message, and what each does.
     queue_hits: Vec<(RECT, usize, QueueAct)>,
     /// Those buttons as their tips stand now.
@@ -9884,6 +9886,14 @@ impl App {
         }
         set_text(self.composer, "");
         self.composer_typed_at = None;
+        // (a plan waits for approval: yes carries it out, anything else is what to change)
+        if let Some(answer) = self.plan_review.take() {
+            let yes = matches!(text.trim().trim_end_matches(['.', '!', '。', '！']).to_lowercase().as_str(), "yes" | "y" | "ok" | "go" | "はい" | "うん" | "承認" | "実行" | "お願い");
+            self.append(&format!("{}\n", if yes { t("Plan approved: plan mode is over.").to_string() } else { tf("Change the plan: {0}", &[&text]) }), Style::Tool);
+            if answer.send(if yes { Ok(()) } else { Err(text.clone()) }).is_ok() {
+                return;
+            }
+        }
         // (the model's question waits: what is typed is its answer, a choice's number standing for the choice)
         if let Some((answer, labels)) = self.question.take() {
             let picked = text.trim().parse::<usize>().ok().and_then(|number| labels.get(number.wrapping_sub(1))).cloned();
@@ -10642,6 +10652,18 @@ impl App {
                 self.question = Some((question.answer, question.options.into_iter().map(|(label, _)| label).collect()));
                 SetFocus(self.composer);
             }
+            Event::PlanReview(review) => {
+                // (said in the transcript till a card shows it: the next thing typed approves it, or says what to change)
+                self.append(&format!("{}\n{}\n{}\n", t("The plan:"), review.plan.trim_end(), t("Type yes to carry it out, or say what to change.")), Style::Tool);
+                self.plan_review = Some(review.answer);
+                SetFocus(self.composer);
+            }
+            Event::ModeChanged(mode) => {
+                // (a plan approved: plan mode is over, as the agent says)
+                self.settings.mode = mode.name().to_string();
+                self.save();
+                self.update_status();
+            }
             Event::Turns(turns) => {
                 self.turns = turns;
                 if self.turns.is_empty() {
@@ -10707,8 +10729,9 @@ impl App {
                 }
             }
             Event::TurnEnded { cancelled } => {
-                // (a question the turn left unanswered goes with it)
+                // (a question or a plan the turn left unanswered goes with it)
                 self.question = None;
+                self.plan_review = None;
                 // (what was said too late for this turn is for the next)
                 let late = std::mem::take(&mut *self.agent.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
                 self.queued.extend(late.into_iter().map(Outgoing::words));
@@ -14203,6 +14226,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             transcript_region: ((0, 0), None),
             interjected: Vec::new(),
             question: None,
+            plan_review: None,
             queue_hits: Vec::new(),
             queue_tips: Vec::new(),
             blocks: Vec::new(),
