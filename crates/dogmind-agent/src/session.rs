@@ -21,6 +21,8 @@ enum Line {
     WebSeen,
     /// The tools this conversation is offered, the last of these lines counting: they are part of its prefix, and what is installed may differ when it is reopened.
     Tools { tools: serde_json::Value },
+    /// What the session works toward, as the person set it (/goal), the last of these lines counting; none: cleared.
+    Goal { goal: Option<String> },
 }
 
 pub struct Session {
@@ -84,7 +86,7 @@ impl Session {
                 Ok(Line::Meta { workspace: place, .. }) => workspace = place,
                 Ok(Line::Message { message }) => messages.push(message),
                 Ok(Line::Snapshot { messages: all }) => messages = all,
-                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. }) => {}
+                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. } | Line::Goal { .. }) => {}
                 Err(_) => {} // a line cut short by a crash
             }
         }
@@ -111,6 +113,10 @@ impl Session {
         self.write(&Line::WebSeen)
     }
 
+    pub fn set_goal(&mut self, goal: Option<&str>) -> Result<(), String> {
+        self.write(&Line::Goal { goal: goal.map(str::to_string) })
+    }
+
     pub fn set_tools(&mut self, tools: &serde_json::Value) -> Result<(), String> {
         self.write(&Line::Tools { tools: tools.clone() })
     }
@@ -130,6 +136,14 @@ fn lines_of(path: &Path) -> std::io::Result<impl Iterator<Item = String>> {
 pub fn web_seen(path: &Path) -> bool {
     let marked = serde_json::to_string(&Line::WebSeen).expect("a plain line serializes");
     lines_of(path).is_ok_and(|mut lines| lines.any(|line| line == marked))
+}
+
+/// What a session works toward, as the person last set it; none when it was never set or was cleared.
+pub fn goal_of(path: &Path) -> Option<String> {
+    lines_of(path).ok()?.filter(|line| line.starts_with("{\"kind\":\"goal\"")).filter_map(|line| match serde_json::from_str(&line) {
+        Ok(Line::Goal { goal }) => Some(goal),
+        _ => None,
+    }).last().flatten()
 }
 
 /// The tools a session was last offered; none in a file from before they were kept.

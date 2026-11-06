@@ -105,6 +105,9 @@ pub enum Command {
     ListTurns,
     /// Send what a turn's edits changed as [`Event::TurnChanges`]: the card under an answer of a session reopened.
     TurnChanges(u64),
+    /// What the session works toward (/goal), or none to clear it: kept in the session, said to the model with the next message and again after
+    /// a compaction, and told back as [`Event::Goal`].
+    SetGoal(Option<String>),
     /// Back to a turn's beginning: in the files, in the conversation, or both.
     Rewind { turn: u64, files: bool, conversation: bool },
     NewSession(PathBuf),
@@ -189,6 +192,8 @@ pub enum Event {
     Approval(Approval),
     /// The model asks the person (ask_user); the turn waits for the answer, or for the turn to be stopped.
     Question(Question),
+    /// The session's goal as it now stands (set, cleared, or that of a session opened): for the bar that shows it.
+    Goal(Option<String>),
     /// A plan waits for the person's approval (submit_plan): the turn waits.
     PlanReview(PlanReview),
     /// The agent changed the mode (a plan approved ends plan mode): the window shows and keeps it.
@@ -849,6 +854,9 @@ struct Agent {
     model: String,
     window: u64,
     workspace: PathBuf,
+    /// What the session works toward (Command::SetGoal), and whether the model is yet to be told it: with the next message, and after a compaction.
+    goal: Option<String>,
+    goal_due: bool,
     /// This session's use of its workspace: when it moves on and nothing else is there, commands lose their write access to it.
     #[cfg(windows)]
     place: Option<crate::workspace_grants::Use>,
@@ -1072,6 +1080,8 @@ impl Agent {
             model: String::new(),
             window: 0,
             workspace: config.workspace,
+            goal: None,
+            goal_due: false,
             #[cfg(windows)]
             place: None,
             sessions: config.sessions,
@@ -1180,6 +1190,14 @@ impl Agent {
                     let turns = self.marks.as_ref().map_or(Vec::new(), |marks| marks.turns().to_vec());
                     self.emit(Event::Turns(turns));
                 }
+                Command::SetGoal(goal) => {
+                    self.goal = goal.map(|goal| goal.trim().to_string()).filter(|goal| !goal.is_empty());
+                    self.goal_due = self.goal.is_some();
+                    if let Some(session) = &mut self.session {
+                        let _ = session.set_goal(self.goal.as_deref());
+                    }
+                    self.emit(Event::Goal(self.goal.clone()));
+                }
                 Command::TurnChanges(turn) => {
                     let files = self.marks.as_ref().map_or(Vec::new(), |marks| marks.turn_changes(turn, &self.workspace));
                     self.emit(Event::TurnChanges { turn, files });
@@ -1237,6 +1255,8 @@ impl Agent {
         self.bench = Workbench::new(&self.workspace);
         self.bench.web.settings = self.web.clone();
         self.load_extras();
+        (self.goal, self.goal_due) = (None, false);
+        self.emit(Event::Goal(None));
         self.web_seen = false;
         self.japanese_session = false;
         self.rewound.clear();
@@ -1278,6 +1298,9 @@ impl Agent {
                 self.rewound.clear();
                 self.web_seen = crate::session::web_seen(path);
                 self.emit(Event::WebSeen(self.web_seen));
+                // (the history has said it already; a compaction will say it again)
+                (self.goal, self.goal_due) = (crate::session::goal_of(path), false);
+                self.emit(Event::Goal(self.goal.clone()));
                 for message in &self.messages {
                     match (message.role.as_str(), message.content.as_deref()) {
                         ("user", Some(text)) => {
@@ -1377,6 +1400,9 @@ impl Agent {
             let mut session = Session::create(&self.sessions, &self.workspace, &now(), &stamp)?;
             let path = session.path.clone();
             let _ = session.set_tools(&self.tool_schemas);
+            if self.goal.is_some() {
+                let _ = session.set_goal(self.goal.as_deref());
+            }
             self.bench.baseline = Some(Arc::new(crate::baseline::Baseline::for_session(&path, &self.workspace)));
             self.session = Some(session);
             self.marks = Some(Checkpoints::open(&path));
@@ -1492,6 +1518,12 @@ impl Agent {
             }
         } else {
             self.bench.scratch = None;
+        }
+        // The goal the person set, with the first message after it was set and after each compaction: the history holds it the rest of the time.
+        if std::mem::take(&mut self.goal_due) {
+            if let Some(goal) = &self.goal {
+                message = prompt::with_note(&message, &format!("## Session Goal\n{goal}\n(Set by the user for this session: keep working toward it across turns, and say when it is met.)"));
+            }
         }
         if self.mode == Mode::Plan {
             message = prompt::with_note(&message, "## Plan Mode\nThe user wants a plan first. Look as much as you need with the read-only tools, then set out what you would change and why, and put it to the user with submit_plan. Nothing can be changed in this mode: once the user approves the plan, plan mode ends and you carry it out.");
@@ -2774,6 +2806,8 @@ impl Agent {
         if self.messages.is_empty() {
             return Ok(());
         }
+        // (what a compaction leaves may not hold the goal: it is said again with the next message)
+        self.goal_due |= self.goal.is_some();
         let (before, began) = (self.expected_use(), Instant::now());
         self.compaction_stage = "none";
         let result = self.compact_conversation(forced, refused);
@@ -3177,6 +3211,38 @@ mod tests {
         }
         assert_eq!(run.handle.live.lock().unwrap().mode, Mode::Plan);
         assert!(bodies.lock().unwrap()[1].to_string().contains("use a modal instead"));
+    }
+
+    /// The goal the person sets goes to the model with the next message once (the history holds it after that), is kept in the session file,
+    /// and is told back to the window.
+    #[test]
+    fn a_goal_is_said_once_and_kept_with_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, bodies) = server(vec![text_answer("on it"), text_answer("more")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::SetGoal(Some("  ship the login page  ".into()))).unwrap();
+        let told = loop {
+            if let Event::Goal(goal) = run.events.recv_timeout(Duration::from_secs(20)).unwrap() {
+                break goal;
+            }
+        };
+        assert_eq!(told.as_deref(), Some("ship the login page"));
+        run.handle.commands.send(Command::Send("start".into())).unwrap();
+        let mut file = None;
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).unwrap() {
+                Event::SessionFile(path) => file = Some(path),
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        run.handle.commands.send(Command::Send("go on".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies[0].to_string().matches("## Session Goal").count(), 1);
+        assert_eq!(bodies[1].to_string().matches("## Session Goal").count(), 1, "said once, and held by the history after");
+        let file = file.expect("the session has a file");
+        assert_eq!(crate::session::goal_of(&file).as_deref(), Some("ship the login page"));
     }
 
     #[test]
