@@ -485,6 +485,20 @@ fn keep_whole_in(folder: &Path, kind: &str, stamp: &str, whole: &str) -> Option<
     None
 }
 
+/// A tool's long result as the model is shown it: its head and its tail, and where all of it is kept (a file of `kind` in the temporary folder,
+/// [`keep_whole_as`]) to read the rest of with read_file or search_files. A result that was cut with no copy kept could not be had again: the
+/// part of a diff, a background command's report, an MCP tool's answer or a helper's that fell between head and tail was lost to the model.
+/// Where nothing could be written, the cut as [`cap`] makes it.
+pub fn spill(kind: &str, text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    match keep_whole_as(kind, text) {
+        Some(file) => cap_evenly(text, limit, Some(&file)),
+        None => cap(text, limit),
+    }
+}
+
 /// The head and the tail of a long output, and where all of it is when it was kept.
 fn cap_evenly(text: &str, limit: usize, whole: Option<&Path>) -> String {
     if text.len() <= limit {
@@ -669,7 +683,7 @@ impl Workbench {
         if lines.is_empty() {
             return Ok(wanted.map_or("no command has been started in the background".to_string(), |id| format!("there is no {id}")));
         }
-        Ok(cap(&lines.join("\n\n"), MAX_OUTPUT))
+        Ok(spill("jobs", &lines.join("\n\n"), MAX_OUTPUT))
     }
 
     fn job_stop(&self, arguments: &Value) -> Result<String, String> {
@@ -893,7 +907,7 @@ impl Workbench {
             }
             self.seen.insert(path, sha16(after.as_bytes()));
         }
-        let mut said = cap(&report, MAX_OUTPUT);
+        let mut said = spill("edits", &report, MAX_OUTPUT);
         if self.in_japanese {
             for edit in edits {
                 said.push_str(&not_japanese_note(edit.get("new_string").and_then(Value::as_str).unwrap_or("")));
@@ -1636,7 +1650,7 @@ fn show_diff(arguments: &Value, workspace: &Path, baseline: Option<&crate::basel
     if scope == "session" || !repository {
         let baseline = baseline.ok_or("this session has nothing to compare with yet: read the files themselves")?;
         let changes = baseline.changes(workspace, &paths);
-        return Ok(if changes.is_empty() { format!("no differences ({scope}): nothing has changed since this session began") } else { cap(&changes, MAX_OUTPUT) });
+        return Ok(if changes.is_empty() { format!("no differences ({scope}): nothing has changed since this session began") } else { spill("diff", &changes, MAX_OUTPUT) });
     }
     // (only what is under the workspace: a workspace that is a folder of a larger repository saw that repository's every change, which is
     // not its work and may be what its owner never meant to show)
@@ -1659,7 +1673,7 @@ fn show_diff(arguments: &Value, workspace: &Path, baseline: Option<&crate::basel
             diff.push_str(&format!("--- new file {} ---\n{}\n", change.path, change.diff));
         }
     }
-    Ok(if diff.is_empty() { format!("no differences ({scope})") } else { cap(&diff, MAX_OUTPUT) })
+    Ok(if diff.is_empty() { format!("no differences ({scope})") } else { spill("diff", &diff, MAX_OUTPUT) })
 }
 
 #[cfg(windows)]
@@ -2538,7 +2552,9 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let read = |handle: std::thread::JoinHandle<Vec<u8>>| String::from_utf8_lossy(&handle.join().unwrap_or_default()).into_owned();
     let (out, err) = (read(stdout), read(stderr));
     let mut report = String::from("sandbox: none (the person approved or allowed this command)\n");
-    report.push_str(&format!("stdout:\n{}\nstderr:\n{}\n", cap(&out, MAX_OUTPUT), cap(&err, MAX_OUTPUT / 2)));
+    // (all of it kept, as a sandboxed command's is: the part cut out is read back, not run again)
+    let whole = (out.len() > MAX_OUTPUT || err.len() > MAX_OUTPUT / 2).then(|| kept_whole(&out, &err)).flatten();
+    report.push_str(&format!("stdout:\n{}\nstderr:\n{}\n", cap_evenly(&out, MAX_OUTPUT, whole.as_deref()), cap_evenly(&err, MAX_OUTPUT / 2, whole.as_deref())));
     match status {
         Some(status) => report.push_str(&format!("exit_code: {}", status.code().unwrap_or(-1))),
         None => report.push_str(&format!("exit_code: none, {ended} after {} s", started.elapsed().as_secs())),
@@ -3748,6 +3764,25 @@ mod tests {
         let report = cap_evenly(&out, 1000, Some(&file));
         assert!(report.contains(&format!("all of it is in {}", file.display())) && report.contains("read_file"), "{report}");
         let _ = std::fs::remove_file(file);
+    }
+
+    /// A long result that was cut with no copy (a diff, a background command's report, an MCP tool's or a helper's answer) is kept whole and
+    /// the cut names where: the part between head and tail can be read back. A short one is as it was.
+    #[test]
+    fn a_long_result_is_kept_whole_and_the_cut_says_where() {
+        assert_eq!(spill("diff", "short", 1000), "short");
+        let text: String = (0..2000).map(|line| format!("line {line}\n")).collect();
+        let shown = spill("diff", &text, 1000);
+        assert!(shown.len() < 1400, "{}", shown.len());
+        assert!(shown.starts_with("line 0\n") && shown.ends_with("line 1999\n"));
+        let named = shown.split("all of it is in ").nth(1).and_then(|rest| rest.split(':').next()).map(str::to_string);
+        let mut file = named.expect("the cut names the file");
+        // (a Windows path's drive letter is followed by a colon too)
+        if file.len() == 1 {
+            file = shown.split("all of it is in ").nth(1).unwrap().split(": read").next().unwrap().to_string();
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        assert!(std::path::Path::new(&file).file_name().unwrap().to_string_lossy().starts_with("diff-"));
     }
 
     #[cfg(windows)]
