@@ -431,7 +431,7 @@ const M_PROVIDER: usize = 200; // and on
 const M_MODEL_CHOICE: usize = 9500; // and on
 
 /// What `/` offers, in this order.
-const COMMANDS: [(&str, &str); 43] = [
+const COMMANDS: [(&str, &str); 44] = [
     ("/setup", "Go through the first setup again"),
     ("/report", "Write what can be sent about a problem"),
     ("/help", "How to use this app"),
@@ -452,6 +452,7 @@ const COMMANDS: [(&str, &str); 43] = [
     ("/attach", "Add a picture to the next message: /attach file, or choose one"),
     ("/diff", "What changed in the folder, file by file"),
     ("/usage", "Tokens and speed of this session"),
+    ("/trajectory", "Where this session's time went: each turn's requests and tools"),
     ("/init", "Have the model write this project's DOGMIND.md"),
     ("/model", "Change how the model runs: /model Claude"),
     ("/effort", "How hard to think: none low medium high xhigh/max default"),
@@ -4730,6 +4731,14 @@ impl App {
                 }
             }
             "diff" => self.set_panel(Panel::Diff),
+            // (the report `dogmind-app --trajectory` prints, of this session, in the conversation: till a panel shows it as a table)
+            "trajectory" => match self.current_session.as_deref().map(dogmind_agent::trajectory::file_of) {
+                Some(file) if file.exists() => match dogmind_agent::trajectory_report::report_files(&file, None) {
+                    Ok(report) => self.append(&format!("{}\n", report.trim_end()), Style::Tool),
+                    Err(error) => self.say(&tf("The trajectory cannot be read: {0}", &[&error])),
+                },
+                _ => self.say(t("This session has no trajectory yet: it is written as the session runs.")),
+            },
             "usage" => {
                 let (prompt, cached, completion, requests) = self.totals;
                 let rate = self.rate.map_or(String::new(), |rate| tf(", last answer at {0} tok/s", &[&format!("{rate:.1}")]));
