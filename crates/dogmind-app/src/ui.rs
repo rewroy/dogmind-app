@@ -917,6 +917,35 @@ fn starts_the_engine(waits: bool, setting_up: bool, failed: Option<std::time::Du
     waits && !setting_up && failed.map_or(true, |ago| ago >= ENGINE_RETRY_AFTER)
 }
 
+/// Whether a setup under way keeps an engine from running. All of them do, for they work on the model's files and probe the card, but the fetch of the faster-writing data: it reads no
+/// shard and takes nothing of the card, so the engine that runs goes on, and one that is asked for starts.
+fn setup_holds_off_the_engine(setting_up: bool, fetching_drafter: bool) -> bool {
+    setting_up && !fetching_drafter
+}
+
+/// What the engine does once the faster-writing data is in the settings.
+#[derive(Debug, PartialEq)]
+enum DrafterRestart {
+    /// It has not begun, or is gone: its next start reads the settings as they are.
+    Not,
+    Now,
+    /// A turn, a tool run or a session in the background is not cut short for it.
+    WhenIdle,
+}
+
+fn drafter_restart(engine_began: bool, work_under_way: bool) -> DrafterRestart {
+    match (engine_began, work_under_way) {
+        (false, _) => DrafterRestart::Not,
+        (true, false) => DrafterRestart::Now,
+        (true, true) => DrafterRestart::WhenIdle,
+    }
+}
+
+/// What the status line says while the engine waits for the work under way to end before it starts again with the faster-writing data.
+fn drafter_restart_words() -> &'static str {
+    t("The faster-writing data is ready. The engine restarts when the work under way ends.")
+}
+
 /// Whether to have the engine read the prompt and the tools now. With a message already waiting that message's own request reads them, once.
 fn warms_on_connect(local: bool, straydog: bool, nothing_waits: bool) -> bool {
     local && straydog && nothing_waits
@@ -1872,6 +1901,8 @@ struct App {
     drafter: bool,
     /// The folder of a drafter being fetched on its own for the model that is there: this download is for it and no more.
     drafter_fetch: Option<PathBuf>,
+    /// The faster-writing data is in the settings, and the engine that is running began without it: it starts again once no work is under way.
+    drafter_restart_waits: bool,
     // State.
     pending: Option<Approval>,
     tools_running: HashMap<String, (String, String)>,
@@ -5112,7 +5143,7 @@ impl App {
                 let row = rect(left, bottom - tall, column, tall);
                 shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
                 let (words, action) = match offer {
-                    _ if self.setting_up => (t("Fetching the vision file.").to_string(), t("Cancel")),
+                    _ if self.setting_up && self.vision_fetch => (t("Fetching the vision file.").to_string(), t("Cancel")),
                     VisionOffer::Download(bytes) => (tf("Reading pictures takes a file of {0} that this model does not have yet.", &[&engine::gb_file(bytes)]), t("Download")),
                     VisionOffer::TurnOn => (t("Reading pictures is turned off.").to_string(), t("Turn on")),
                 };
@@ -6902,13 +6933,23 @@ impl App {
         }
         let middle = (area.top + area.bottom) / 2;
         let mut x = area.left + s(ds::space::S);
-        // Only what needs saying: at work, the stop button and the line above the input say so, and when all is well nothing does.
+        // Only what needs saying: at work, the stop button and the line above the input say so, and when all is well nothing does. (The engine that goes on while the faster-writing data
+        // is fetched says how far that has come, and then that it starts again.)
+        let beside = if self.drafter_restart_waits {
+            Some(drafter_restart_words())
+        } else {
+            Some(self.setup_status.as_str()).filter(|words| self.drafter_fetch.is_some() && !words.is_empty())
+        };
         if !self.connected {
             let dot = s(ds::space::S);
             let color = if matches!(self.connection.as_str(), "not connected" | "no engine") { theme::bad() } else { theme::warn() };
             rounded(device, rect(x, middle - dot / 2, dot, dot), dot / 2, Some(color), None);
             x += dot + s(ds::space::S);
             draw_text(device, t(self.connection.as_str()), RECT { left: x, right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+        } else if let Some(words) = beside {
+            let tall = area.bottom - area.top;
+            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
+            draw_text(device, words, RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
         } else if self.web_seen {
             let tall = area.bottom - area.top;
             icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::warn());
@@ -7660,6 +7701,9 @@ impl App {
         self.setup_status = text.clone();
         if matches!(self.panel, Panel::Models | Panel::Setup) {
             self.say_in_panel(&text);
+        } else if self.drafter_fetch.is_some() {
+            // (the engine's own state stays what it is: this goes beside it, on the status line)
+            self.update_status();
         } else {
             self.connection = text;
             self.update_status();
@@ -8631,6 +8675,11 @@ impl App {
     /// The vision file alone for the model that is there, the way the model's own download goes: its progress, its cancel, and on from where it stopped.
     unsafe fn start_vision_setup(&mut self) {
         if self.setting_up {
+            // (the engine runs while the faster-writing data is fetched, so a picture can be asked about then: the file waits for that download)
+            if self.drafter_fetch.is_some() {
+                let words = t("That can be done once the work under way has ended.");
+                if self.panel == Panel::Chat { self.say(words) } else { self.problem_in_panel(words) }
+            }
             return;
         }
         if self.engine_is_busy() {
@@ -8708,20 +8757,26 @@ impl App {
         if self.setting_up {
             return;
         }
+        if !installed.drafter {
+            // (the engine goes on while it is fetched, and starts again once it has ended and no work is under way)
+            self.start_drafter_setup(&installed);
+            return;
+        }
         if self.engine_is_busy() {
             let words = t("That can be done once the work under way has ended.");
             if self.panel == Panel::Chat { self.say(words) } else { self.problem_in_panel(words) }
             return;
         }
-        if installed.drafter {
-            self.start_drafter_off(&installed);
-        } else {
-            self.start_drafter_setup(&installed);
-        }
+        self.start_drafter_off(&installed);
+    }
+
+    /// Whether a setup under way keeps an engine from running (see `setup_holds_off_the_engine`).
+    fn setup_holds_off_the_engine(&self) -> bool {
+        setup_holds_off_the_engine(self.setting_up, self.drafter_fetch.is_some())
     }
 
     /// The drafter alone for the model that is there, with the progress, the cancel and the going on from where it stopped of the model's own download: its shards are not read again. The
-    /// settings take it in when it is built (`Note::SetupDone`), and the engine starts again with it.
+    /// engine keeps running meanwhile. The settings take the drafter in when it is built (`Note::SetupDone`), and the engine starts again with it, when no work is under way.
     unsafe fn start_drafter_setup(&mut self, installed: &crate::vision::Installed) {
         let Some(straydog) = engine::find(&self.settings) else {
             let words = engine::not_found_words();
@@ -8735,6 +8790,33 @@ impl App {
         self.update_drafter_chip();
         if self.panel == Panel::Chat {
             self.layout();
+        }
+    }
+
+    /// The faster-writing data is in the settings. The engine that began before it has to start again to take it in, and does when no work is under way: a turn, a tool run or a
+    /// session in the background is not cut short for it. One that has ended, or never began, needs nothing: its next start reads the settings.
+    unsafe fn restart_for_drafter(&mut self) {
+        let embedded = self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded);
+        let engine_began = embedded && !self.engine_waits && !self.connect_failed;
+        let waited = self.drafter_restart_waits;
+        match drafter_restart(engine_began, self.engine_is_busy()) {
+            DrafterRestart::Now => self.connect(),
+            DrafterRestart::Not => {
+                self.drafter_restart_waits = false;
+                if waited {
+                    self.update_status();
+                }
+            }
+            DrafterRestart::WhenIdle => {
+                self.drafter_restart_waits = true;
+                if !waited {
+                    // (the status line is under the conversation: another page says it where it says what it has to)
+                    if self.panel != Panel::Chat {
+                        self.say_in_panel(drafter_restart_words());
+                    }
+                    self.update_status();
+                }
+            }
         }
     }
 
@@ -9617,13 +9699,15 @@ impl App {
     /// The person has begun a message: the engine starts now, and has the prompt read by the time it is sent. Never at launch: nothing is asked of the GPU until
     /// someone has something to say.
     unsafe fn message_begun(&mut self) {
-        if starts_the_engine(self.engine_waits, self.setting_up, self.engine_failed_at.map(|at| at.elapsed())) {
+        if starts_the_engine(self.engine_waits, self.setup_holds_off_the_engine(), self.engine_failed_at.map(|at| at.elapsed())) {
             self.connect();
         }
     }
 
     /// Starts using the active provider: stops what the last one needed and connects on another thread.
     unsafe fn connect(&mut self) {
+        // (an engine that starts reads the settings as they are now)
+        self.drafter_restart_waits = false;
         self.engine_waits = false;
         self.engine_stop_told = false;
         self.connect_failed = false;
@@ -9643,7 +9727,7 @@ impl App {
         let Some(provider) = self.settings.active_provider().cloned() else { return };
         if provider.kind != Kind::Embedded {
             self.engine = None;
-        } else if self.setting_up {
+        } else if self.setup_holds_off_the_engine() {
             // It would want the files the setup is working on. When the setup ends, it connects.
             self.connection = "setting up the model".into();
             self.update_status();
@@ -10992,6 +11076,7 @@ impl App {
                 self.setting_up = false;
                 let was_vision = std::mem::take(&mut self.vision_fetch);
                 let drafter_folder = self.drafter_fetch.take();
+                let was_drafter = drafter_folder.is_some();
                 if was_vision && result.is_ok() {
                     self.vision_offer = None;
                     self.vision_told = false;
@@ -11010,6 +11095,10 @@ impl App {
                 }
                 self.progress = None;
                 self.setup_status.clear();
+                if was_drafter {
+                    // (the status line showed how far the fetch had come)
+                    self.update_status();
+                }
                 if self.panel == Panel::Models {
                     self.show_setup_button();
                 }
@@ -11025,18 +11114,24 @@ impl App {
                         if self.onboarding && self.panel == Panel::Models {
                             self.set_panel(Panel::Start);
                         }
-                        self.connect();
+                        if was_drafter {
+                            // (the engine was not stopped for this: it is not started again over the one that runs)
+                            self.restart_for_drafter();
+                        } else {
+                            self.connect();
+                        }
                     }
+                    // (the drafter's fetch left the engine as it was, and so does its end: there is nothing to start again)
                     Err(_) if cancelled => {
                         told(self, t("Download stopped. What has arrived stays in the folder, and downloading again goes on from there."));
                         // The engine was stopped for this, and a model it had is still there.
-                        if engine::is_set_up(&self.folder) && !self.onboarding {
+                        if !was_drafter && engine::is_set_up(&self.folder) && !self.onboarding {
                             self.connect();
                         }
                     }
                     Err(error) => {
                         told(self, &engine::setup_failure_words(&error));
-                        if engine::is_set_up(&self.folder) && !self.onboarding {
+                        if !was_drafter && engine::is_set_up(&self.folder) && !self.onboarding {
                             self.connect();
                         }
                     }
@@ -11109,7 +11204,10 @@ impl App {
         self.setup_tally = Default::default();
         self.progress = Some(0.0);
         self.show_setup_button();
-        self.engine = None; // A verify needs the files to itself, and its VRAM probe needs the card.
+        // A verify needs the files to itself, and its VRAM probe needs the card. (The drafter's fetch needs neither.)
+        if self.setup_holds_off_the_engine() {
+            self.engine = None;
+        }
         self.show_setup_status(first_words);
         let (poster, cancel) = (self.poster.clone(), self.setup_cancel.clone());
         std::thread::spawn(move || {
@@ -12446,6 +12544,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 keep_server_line(&app.folder, &app.leaving, &told);
                 app.update_status();
             }
+            if app.drafter_restart_waits {
+                app.restart_for_drafter();
+            }
             0
         }
         WM_FRAME => {
@@ -12778,7 +12879,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 ID_TOGGLE_UPDATES => app.updates_switched(),
                 ID_VISION_OFFER => match app.vision_offer {
-                    _ if app.setting_up => app.setup_cancel.store(true, Ordering::Relaxed),
+                    _ if app.setting_up && app.vision_fetch => app.setup_cancel.store(true, Ordering::Relaxed),
                     Some(VisionOffer::Download(_)) => app.start_vision_setup(),
                     Some(VisionOffer::TurnOn) => app.vision_switch(true),
                     None => {}
@@ -14045,6 +14146,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             kind: Kind::Server,
             drafter: true,
             drafter_fetch: None,
+            drafter_restart_waits: false,
             pending: None,
             tools_running: HashMap::new(),
             running: false,
@@ -14655,6 +14757,24 @@ mod tests {
         assert!(!starts_the_engine(true, true, None), "the setup is working on its files");
         assert!(!starts_the_engine(true, false, Some(second)), "it has just failed: another key is no reason to load it again");
         assert!(starts_the_engine(true, false, Some(ENGINE_RETRY_AFTER + second)), "later, it may have been put right");
+    }
+
+    #[test]
+    fn only_the_drafter_s_fetch_leaves_the_engine_running_and_startable() {
+        assert!(setup_holds_off_the_engine(true, false), "the model's own setup and the vision file's: the files, and the card's probe");
+        assert!(!setup_holds_off_the_engine(true, true), "the fetch reads no shard and takes nothing of the card");
+        assert!(!setup_holds_off_the_engine(false, false), "no setup, nothing held off");
+        // the engine that is asked for during the fetch starts, as it does with no setup
+        assert!(starts_the_engine(true, setup_holds_off_the_engine(true, true), None));
+        assert!(!starts_the_engine(true, setup_holds_off_the_engine(true, false), None));
+    }
+
+    #[test]
+    fn the_engine_starts_again_for_the_drafter_only_when_no_work_is_under_way() {
+        assert_eq!(drafter_restart(true, false), DrafterRestart::Now, "an engine that began, and nothing at work");
+        assert_eq!(drafter_restart(true, true), DrafterRestart::WhenIdle, "an answer, a tool run or a session in the background is not cut short");
+        assert_eq!(drafter_restart(false, false), DrafterRestart::Not, "no engine: its next start reads the settings");
+        assert_eq!(drafter_restart(false, true), DrafterRestart::Not, "and work under way on a server of another kind needs no engine");
     }
 
     #[test]

@@ -13,9 +13,17 @@ pub fn directory(installed: &Installed) -> PathBuf {
     installed.model.parent().map_or_else(|| installed.model.join("mtp"), |parent| parent.join("mtp"))
 }
 
+const FETCH: &str = "fetch-mtp";
+
 /// `straydog fetch-mtp`, for the folder the drafter goes in.
 pub fn fetch_arguments(directory: &Path) -> Vec<String> {
-    vec!["fetch-mtp".into(), "--model-draft".into(), directory.display().to_string()]
+    vec![FETCH.into(), "--model-draft".into(), directory.display().to_string()]
+}
+
+/// Whether a run of `straydog` is this fetch. It downloads and converts on the CPU: it reads no shard of the model and takes nothing of the card, so the engine that is running keeps
+/// running beside it, and the fetch is no second engine for one that starts.
+pub fn is_fetch(args: &[String]) -> bool {
+    args.first().is_some_and(|first| first == FETCH)
 }
 
 /// Whether a line of the settings is `model_draft`'s: one that sets it, or with `or_put_aside` one that a `#` has put aside too.
@@ -100,6 +108,19 @@ mod tests {
         assert_eq!(fetch_arguments(&directory(&one)), ["fetch-mtp", "--model-draft", r"D:\models\Qwen3.8-Flash-Next\mtp"]);
         let args = fetch_arguments(&directory(&one)).join(" ");
         assert!(!args.contains("setup") && !args.contains("--quant"), "no bundle is named, and none of its shards is read: {args}");
+    }
+
+    #[test]
+    fn only_the_fetch_is_the_run_that_leaves_the_engine_alone() {
+        let one = installed(r"D:\models\Qwen3.8-Flash-Next\Unsloth-UD-IQ1_S");
+        assert!(is_fetch(&fetch_arguments(&directory(&one))));
+        let config = Path::new("C");
+        let bundle = Bundle::new("Qwen3.8-Flash-Next", "Unsloth", "UD-IQ1_S");
+        let setup = crate::engine::setup_arguments(Some(&bundle), Path::new(r"D:\models"), config, true, true);
+        assert!(!is_fetch(&setup), "the model's own setup reads its shards and probes the card: {setup:?}");
+        let vision = crate::engine::vision_arguments(&Installed { drafter: true, ..one }, config);
+        assert!(!is_fetch(&vision), "the vision file's setup too: {vision:?}");
+        assert!(!is_fetch(&[]));
     }
 
     #[test]

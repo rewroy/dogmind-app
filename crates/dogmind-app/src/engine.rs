@@ -659,13 +659,47 @@ pub const ENGINE_EXIT: Duration = Duration::from_secs(30);
 /// One at a time: a start waits for the one before it, so that it sees that one's processes.
 static STARTING: Mutex<()> = Mutex::new(());
 
-/// Every `straydog.exe` on this PC, this app's or not: two on one card fight over its memory and the machine's.
+/// The `straydog.exe` processes of this app's own that are no engine, while they run: the drafter's fetch (`drafter::is_fetch`) takes no card and reads no shard, so an engine may
+/// start beside it.
+static BESIDE_ENGINES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Held while one of them runs.
+struct BesideEngines(u32);
+
+impl BesideEngines {
+    fn process(id: u32) -> BesideEngines {
+        BESIDE_ENGINES.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(id);
+        BesideEngines(id)
+    }
+}
+
+impl Drop for BesideEngines {
+    fn drop(&mut self) {
+        let mut beside = BESIDE_ENGINES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(at) = beside.iter().position(|&id| id == self.0) {
+            beside.remove(at);
+        }
+    }
+}
+
+/// The processes found, without those that are no engine.
+fn only_engines(found: Vec<u32>, beside: &[u32]) -> Vec<u32> {
+    found.into_iter().filter(|id| !beside.contains(id)).collect()
+}
+
+/// Every `straydog.exe` on this PC that is an engine, this app's or not: two on one card fight over its memory and the machine's.
 pub fn running_engines() -> Vec<u32> {
     // (a test's stand-in has nothing to do with an engine someone is running on this machine)
     #[cfg(debug_assertions)]
     if std::env::var_os("DOGMIND_TEST_IGNORE_ENGINES").is_some() {
         return Vec::new();
     }
+    let beside = BESIDE_ENGINES.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    only_engines(straydog_processes(), &beside)
+}
+
+/// Every `straydog.exe` on this PC.
+fn straydog_processes() -> Vec<u32> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
     let mut found = Vec::new();
@@ -908,6 +942,8 @@ pub fn run_setup(straydog: &Path, args: &[String], lines: &Sender<SetupLine>, wa
     command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     hidden(&mut command);
     let mut child = command.spawn().map_err(|error| start_failure(straydog, &error))?;
+    // (the fetch of the drafter is no engine: one that starts while it runs need not wait for it to end)
+    let _beside = crate::drafter::is_fetch(args).then(|| BesideEngines::process(child.id()));
     let job = Mutex::new(Job::holding(&child).ok());
     let mut stdout = child.stdout.take().ok_or("no stdout")?;
     let mut stderr = child.stderr.take().ok_or("no stderr")?;
@@ -1044,6 +1080,27 @@ mod tests {
         let error = wait_for_others(&yes, &|| vec![7u32, 9], Duration::ZERO, &mut |_| {}).unwrap_err();
         assert!(error.contains("process 7, 9"), "{error}");
         assert_eq!(wait_for_others(&|| false, &|| vec![7u32], Duration::from_secs(5), &mut |_| {}).unwrap_err(), "superseded");
+    }
+
+    #[test]
+    fn the_drafter_s_fetch_is_no_engine_for_the_one_that_starts_beside_it() {
+        // (numbers no process of this PC has: the list of what runs is the machine's, and only the filter is tried)
+        let (fetch, engine) = (0xFFFF_FF01u32, 0xFFFF_FF02u32);
+        let found = vec![fetch, engine];
+        assert_eq!(only_engines(found.clone(), &[]), found, "nothing is beside the engines until a fetch runs");
+        {
+            let _running = BesideEngines::process(fetch);
+            let beside = BESIDE_ENGINES.lock().unwrap().clone();
+            assert!(beside.contains(&fetch));
+            assert_eq!(only_engines(found.clone(), &beside), vec![engine], "another engine is still one");
+        }
+        assert!(!BESIDE_ENGINES.lock().unwrap().contains(&fetch), "the number is no exception once the fetch has ended: Windows gives it to another process later");
+        // two fetches that end in turn each take only their own number away
+        let (first, second) = (BesideEngines::process(fetch), BesideEngines::process(engine));
+        drop(first);
+        assert_eq!(BESIDE_ENGINES.lock().unwrap().iter().filter(|&&id| id == engine).count(), 1);
+        drop(second);
+        assert!(!BESIDE_ENGINES.lock().unwrap().iter().any(|&id| id == fetch || id == engine));
     }
 
     #[test]

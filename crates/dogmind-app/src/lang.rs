@@ -329,6 +329,7 @@ const JA: &[(&str, &str)] = &[
     ("The faster-writing data is off. Its file stays in {0}, and turning it on again needs no download.", "高速化データをオフにしました。ファイルは {0} に残っているので、もう一度オンにしてもダウンロードは要りません。"),
     ("The faster-writing data is not in {0}.", "高速化データが {0} にありません。"),
     ("No model is set up here.", "ここにはモデルが設定されていません。"),
+    ("The faster-writing data is ready. The engine restarts when the work under way ends.", "高速化データの準備ができました。今の作業が終わると、エンジンを再起動します。"),
     ("This model can't read pictures.", "このモデルは画像を読めません。"),
     ("This model's vision file did not load. Its log says why: /log", "このモデルの画像用ファイルを読み込めませんでした。理由はログにあります: /log"),
     ("Fetching the vision file.", "画像用ファイルを取得しています。"),
