@@ -256,32 +256,7 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
 
     let _ = writeln!(out, "\ntools");
     for line in lines.iter().filter(|line| line.ev() == "tool") {
-        let mut more = Vec::new();
-        for key in ["path", "cmd0"] {
-            if let Some(text) = line.v[key].as_str() {
-                more.push(text.to_string());
-            }
-        }
-        if let Some(code) = line.v["exit_code"].as_i64().filter(|code| *code != 0) {
-            more.push(format!("exit {code}"));
-        }
-        more.push(format!("{} bytes out", line.u("out_bytes").unwrap_or(0)));
-        if let Some(cut) = line.u("out_cut_bytes") {
-            more.push(format!("{cut} of them cut"));
-        }
-        if let Some(wait) = line.u("wait_ms") {
-            more.push(format!("{} waiting for the person", secs(wait)));
-        }
-        // (a command's time apart from the program's: what the app does before it starts and after it ends)
-        if let Some(prepare) = line.u("prepare_ms") {
-            let part = |key: &str, name: &str| line.u(key).filter(|ms| *ms > 0).map(|ms| format!("{name} {}", secs(ms)));
-            let parts: Vec<String> = [part("grant_ms", "grants"), part("repos_ms", "repositories"), part("toolchains_ms", "toolchains"), part("env_ms", "environment")].into_iter().flatten().collect();
-            more.push(format!("prepared in {}{}, ran {}, looked after in {}", secs(prepare), if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) }, secs(line.u("run_ms").unwrap_or(0)), secs(line.u("after_ms").unwrap_or(0))));
-        }
-        if let Some(runs) = line.v["browser_runs"].as_array() {
-            let ended: Vec<String> = runs.iter().map(|run| format!("{} {} in {}", run["of"].as_str().unwrap_or("?"), run["end"].as_str().unwrap_or("?"), secs(run["ms"].as_u64().unwrap_or(0)))).collect();
-            more.push(format!("{} browser runs: {}", runs.len(), ended.join("; ")));
-        }
+        let more = tool_notes(line);
         let _ = writeln!(out, "  {:>5} {:<16} {:>8}  {:<15} {}", short(line.req()), line.s("name"), secs(line.u("ms").unwrap_or(0)), line.s("outcome"), more.join(", "));
     }
 
@@ -335,6 +310,37 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
 
     circles(&mut out, &lines);
     out
+}
+
+/// What a tool's line says besides its name, time and outcome: its file or program, the exit code, the bytes, the wait for the person, a command's parts, a browser's runs.
+fn tool_notes(line: &Line) -> Vec<String> {
+    let mut more = Vec::new();
+    for key in ["path", "cmd0"] {
+        if let Some(text) = line.v[key].as_str() {
+            more.push(text.to_string());
+        }
+    }
+    if let Some(code) = line.v["exit_code"].as_i64().filter(|code| *code != 0) {
+        more.push(format!("exit {code}"));
+    }
+    more.push(format!("{} bytes out", line.u("out_bytes").unwrap_or(0)));
+    if let Some(cut) = line.u("out_cut_bytes") {
+        more.push(format!("{cut} of them cut"));
+    }
+    if let Some(wait) = line.u("wait_ms") {
+        more.push(format!("{} waiting for the person", secs(wait)));
+    }
+    // (a command's time apart from the program's: what the app does before it starts and after it ends)
+    if let Some(prepare) = line.u("prepare_ms") {
+        let part = |key: &str, name: &str| line.u(key).filter(|ms| *ms > 0).map(|ms| format!("{name} {}", secs(ms)));
+        let parts: Vec<String> = [part("grant_ms", "grants"), part("repos_ms", "repositories"), part("toolchains_ms", "toolchains"), part("env_ms", "environment")].into_iter().flatten().collect();
+        more.push(format!("prepared in {}{}, ran {}, looked after in {}", secs(prepare), if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) }, secs(line.u("run_ms").unwrap_or(0)), secs(line.u("after_ms").unwrap_or(0))));
+    }
+    if let Some(runs) = line.v["browser_runs"].as_array() {
+        let ended: Vec<String> = runs.iter().map(|run| format!("{} {} in {}", run["of"].as_str().unwrap_or("?"), run["end"].as_str().unwrap_or("?"), secs(run["ms"].as_u64().unwrap_or(0)))).collect();
+        more.push(format!("{} browser runs: {}", runs.len(), ended.join("; ")));
+    }
+    more
 }
 
 /// Where the time of some lines went.
@@ -501,6 +507,160 @@ fn circles(out: &mut String, lines: &[Line]) {
     }
 }
 
+/// A request of a turn, as a row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestRow {
+    /// `/12`: its number in the session.
+    pub id: String,
+    pub role: String,
+    /// The time to the first word, where it was told.
+    pub first_ms: Option<u64>,
+    /// The rest of the request after the first word.
+    pub generation_ms: u64,
+    pub prompt: Option<u64>,
+    /// The share of the prompt the engine had already, in percent.
+    pub cached_percent: Option<u64>,
+    /// What it wrote, counted where the server did not say.
+    pub tokens: Option<u64>,
+    /// Tokens a second: the server's where it said, else counted (and then `counted`).
+    pub rate: Option<f64>,
+    pub counted: bool,
+    pub end: String,
+    pub calls: Vec<String>,
+    /// The request this one repeats, and why.
+    pub retry_of: Option<(String, String)>,
+}
+
+/// A tool call of a turn, as a row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolRow {
+    pub id: String,
+    pub name: String,
+    pub ms: u64,
+    pub outcome: String,
+    /// The file or program, the exit code, the bytes: as the report says them.
+    pub notes: Vec<String>,
+}
+
+/// A turn: where its time went, as the report adds it up, and its requests and tools.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnSummary {
+    pub turn: u64,
+    pub chars: u64,
+    pub pictures: u64,
+    /// The main requests' time to the first word, and the rest of them.
+    pub prefill_ms: u64,
+    pub generation_ms: u64,
+    pub tools_ms: u64,
+    pub wall_ms: u64,
+    /// What it waited for the person, what compaction took, what retries waited.
+    pub waits_ms: u64,
+    pub compaction_ms: u64,
+    pub retries_ms: u64,
+    /// The run ended in it: there is no end of the turn.
+    pub unfinished: bool,
+    /// How it failed, where it did.
+    pub failed: Option<String>,
+    pub requests: Vec<RequestRow>,
+    pub tools: Vec<ToolRow>,
+}
+
+/// A trajectory as data: the turns (the connection before the first is not one) and the whole of the time.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Summary {
+    pub turns: Vec<TurnSummary>,
+    pub lines: usize,
+    /// Lines that could not be read.
+    pub unreadable: usize,
+}
+
+impl Summary {
+    /// The turns added up: its request and tool rows are not kept.
+    pub fn total(&self) -> TurnSummary {
+        let mut all = TurnSummary::default();
+        for turn in &self.turns {
+            all.prefill_ms += turn.prefill_ms;
+            all.generation_ms += turn.generation_ms;
+            all.tools_ms += turn.tools_ms;
+            all.wall_ms += turn.wall_ms;
+            all.waits_ms += turn.waits_ms;
+            all.compaction_ms += turn.compaction_ms;
+            all.retries_ms += turn.retries_ms;
+            all.unfinished |= turn.unfinished;
+        }
+        all
+    }
+}
+
+/// The trajectory's turns, each with where its time went (as the report adds it up), its requests and its tools: what a page draws as a table.
+pub fn summary(trajectory: &str) -> Summary {
+    let (lines, bad) = load(trajectory);
+    let mut turns: BTreeMap<u64, Vec<&Line>> = BTreeMap::new();
+    for line in &lines {
+        turns.entry(line.turn()).or_default().push(line);
+    }
+    let mut out = Summary { turns: Vec::new(), lines: lines.len(), unreadable: bad };
+    for (turn, in_turn) in &turns {
+        if *turn == 0 {
+            continue;
+        }
+        let spent = Spent::of(in_turn);
+        let began = in_turn.iter().find(|line| line.ev() == "turn_start");
+        let mut row = TurnSummary {
+            turn: *turn,
+            chars: began.and_then(|line| line.u("chars")).unwrap_or(0),
+            pictures: began.and_then(|line| line.u("images")).unwrap_or(0),
+            prefill_ms: spent.prefill,
+            generation_ms: spent.generation,
+            tools_ms: spent.tools.values().map(|(_, ms)| ms).sum(),
+            wall_ms: spent.wall,
+            waits_ms: spent.waits,
+            compaction_ms: spent.compaction,
+            retries_ms: spent.retries,
+            unfinished: spent.unfinished,
+            ..TurnSummary::default()
+        };
+        for line in in_turn {
+            match line.ev() {
+                "request" => {
+                    let (ms, first) = (line.u("ms").unwrap_or(0), line.u("first_ms"));
+                    let generation = first.map_or(ms, |first| ms.saturating_sub(first));
+                    let completion = line.u("completion");
+                    let (rate, counted) = match line.v["tps"].as_f64() {
+                        Some(rate) => (Some(rate), false),
+                        None => (completion.filter(|_| generation > 0).map(|tokens| tokens as f64 * 1000.0 / generation as f64), true),
+                    };
+                    row.requests.push(RequestRow {
+                        id: short(line.req()),
+                        role: line.s("role").to_string(),
+                        first_ms: first,
+                        generation_ms: generation,
+                        prompt: line.u("prompt"),
+                        cached_percent: line.u("prompt").zip(line.u("cached")).filter(|(prompt, _)| *prompt > 0).map(|(prompt, cached)| cached * 100 / prompt),
+                        tokens: completion.or(line.u("tokens_est")),
+                        rate,
+                        counted: counted && rate.is_some(),
+                        end: line.s("end").to_string(),
+                        calls: line.v["calls"].as_array().map(|calls| calls.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default(),
+                        retry_of: line.v["retry_of"].as_str().map(|of| (short(of), line.s("retry_why").to_string())),
+                    });
+                }
+                "tool" => row.tools.push(ToolRow { id: short(line.req()), name: line.s("name").to_string(), ms: line.u("ms").unwrap_or(0), outcome: line.s("outcome").to_string(), notes: tool_notes(line) }),
+                "failed" if row.failed.is_none() => row.failed = Some(line.s("kind").to_string()),
+                _ => {}
+            }
+        }
+        out.turns.push(row);
+    }
+    out
+}
+
+/// `summary` for a file.
+pub fn summary_file(trajectory: &Path) -> Result<Summary, String> {
+    let text = std::fs::read(trajectory).map_err(|error| format!("{}: {error}", trajectory.display()))?;
+    Ok(summary(&String::from_utf8_lossy(&text)))
+}
+
 /// `report` for files.
 pub fn report_files(trajectory: &Path, engine_log: Option<&Path>) -> Result<String, String> {
     let text = std::fs::read(trajectory).map_err(|error| format!("{}: {error}", trajectory.display()))?;
@@ -573,6 +733,43 @@ mod tests {
         assert!(said.contains("draft_stop at /1: 8328 tokens thrown away in 103.0 s (a run of 61 lines of code)"), "{said}");
         assert!(said.contains("next: /2 wrote 2714 tokens in 37.0 s, cached 36%, ended tool_calls"), "{said}");
         assert!(said.contains("signs of going round in circles\n  none"), "{said}");
+    }
+
+    #[test]
+    fn a_trajectory_as_data_has_each_turn_with_its_time_its_requests_and_its_tools() {
+        let lines = [
+            json!({"t": "2026-11-05T09:59:50.000+09:00", "ev": "connection", "turn": 0, "what": "connect", "ms": 1200, "outcome": "ok"}),
+            json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 40, "images": 2}),
+            request(1, "2026-11-05T10:01:43.000+09:00", "main", 2000, 103_000, 5000, 0, 8328, "stopped_app:draft_stop"),
+            request(2, "2026-11-05T10:02:20.000+09:00", "main", 1000, 37_000, 13_000, 4800, 2714, "tool_calls"),
+            tool(2, "create_file", 40, "ok", Some("index.html"), Some("aaaaaaaaaaaa"), "h1"),
+            json!({"t": "2026-11-05T10:02:21.000+09:00", "ev": "approval", "turn": 1, "req": "s/2", "tool": "execute_command", "wait_ms": 4000, "decision": "approve"}),
+            json!({"t": "2026-11-05T10:02:30.000+09:00", "ev": "turn_end", "turn": 1, "cancelled": false, "requests": 2, "tools": 1, "ms": 150_000}),
+            json!({"t": "2026-11-05T10:03:00.000+09:00", "ev": "turn_start", "turn": 2, "chars": 4, "images": 0}),
+            json!({"t": "2026-11-05T10:03:05.000+09:00", "ev": "failed", "turn": 2, "req": "s/3", "kind": "server_gone"}),
+        ];
+        let said = summary(&text(&lines));
+        // (the connection before the first turn is not a turn)
+        assert_eq!(said.turns.len(), 2);
+        let first = &said.turns[0];
+        assert_eq!((first.turn, first.chars, first.pictures), (1, 40, 2));
+        // The report's own sums: 3 s of the 140 s in the model before the first words, 137 s after, 40 ms of tools, 4 s waited, 150 s in all.
+        assert_eq!((first.prefill_ms, first.generation_ms, first.tools_ms, first.wall_ms, first.waits_ms), (3000, 137_000, 40, 150_000, 4000));
+        assert_eq!(first.requests.len(), 2);
+        assert_eq!((first.requests[0].id.as_str(), first.requests[0].role.as_str(), first.requests[0].first_ms, first.requests[0].generation_ms), ("/1", "main", Some(2000), 101_000));
+        assert_eq!((first.requests[1].cached_percent, first.requests[1].tokens, first.requests[1].end.as_str()), (Some(36), Some(2714), "tool_calls"));
+        assert!(first.requests[1].counted && first.requests[1].rate.is_some_and(|rate| (rate - 2714.0 * 1000.0 / 36_000.0).abs() < 0.01), "{:?}", first.requests[1]);
+        assert_eq!((first.tools[0].name.as_str(), first.tools[0].ms, first.tools[0].outcome.as_str()), ("create_file", 40, "ok"));
+        assert_eq!(first.tools[0].notes, vec!["index.html".to_string(), "10 bytes out".to_string()]);
+        assert!(!first.unfinished);
+        // A turn with no end, and how it failed.
+        let second = &said.turns[1];
+        assert!(second.unfinished);
+        assert_eq!(second.failed.as_deref(), Some("server_gone"));
+        let all = said.total();
+        assert_eq!((all.prefill_ms, all.tools_ms), (3000, 40));
+        // The printed report is of the same trajectory, and says the same of it.
+        assert!(report(&text(&lines), None).contains("tools 0.0 s (0%): create_file 1 x 0.0 s"));
     }
 
     #[test]

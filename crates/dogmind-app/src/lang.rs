@@ -679,6 +679,23 @@ const JA: &[(&str, &str)] = &[
     ("Copy", "コピー"),
     ("Copy this answer", "この回答をコピー"),
     ("Copy this code", "このコードをコピー"),
+    // The trajectory page.
+    ("Trajectory", "軌跡"),
+    ("Turn", "ターン"),
+    ("Requests", "リクエスト"),
+    ("Prefill s", "準備 秒"),
+    ("Generation s", "生成 秒"),
+    ("Tools s", "ツール 秒"),
+    ("Wall s", "合計 秒"),
+    ("All turns", "全ターン"),
+    ("Turn {0}", "ターン {0}"),
+    ("{0} characters", "{0} 文字"),
+    ("no end: the run stopped here", "終わりなし: ここで止まった"),
+    ("prompt {0}", "入力 {0}"),
+    ("cached {0}%", "キャッシュ {0}%"),
+    ("{0} tokens", "{0} トークン"),
+    ("{0} tok/s", "{0} トークン/秒"),
+    ("repeats {0} ({1})", "{0} のやり直し ({1})"),
     ("Paste", "貼り付け"),
     ("Select all", "すべて選択"),
     // The tray.
@@ -1038,7 +1055,7 @@ mod tests {
     fn everything_the_code_asks_for_has_its_japanese() {
         let table: HashMap<&str, &str> = JA.iter().copied().collect();
         let mut missing = Vec::new();
-        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("drafter.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs"), include_str!("cards.rs")] {
+        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("drafter.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs"), include_str!("cards.rs"), include_str!("trajectory.rs")] {
             for words in words_in(source) {
                 if !table.contains_key(words.as_str()) {
                     missing.push(words);
