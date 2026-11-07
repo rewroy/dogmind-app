@@ -7,7 +7,7 @@
 //! - A search that was refused says so, and which index it asked: "no results" means only that.
 //!
 //! None of this makes a model immune to what it reads. What holds when a page does persuade it is in the agent: once web content
-//! is in a conversation, commands ask.
+//! is in a conversation, a command that gets the network asks.
 
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::RandomState;

@@ -783,7 +783,7 @@ const JA: &[(&str, &str)] = &[
     ("and {0} more", "ほか {0} 件"),
     ("Changes", "変更"),
     ("and {0} more: /diff", "ほか {0} 件: /diff"),
-    ("Web content is here: commands ask", "Web の内容を含むため、コマンドは毎回確認します"),
+    ("Web content is here: network commands ask", "Web の内容を含むため、ネットワークを使うコマンドは毎回確認します"),
     // The preview.
     ("{0}: starting...", "{0}: 起動中..."),
     ("There was no vision file to turn on or off any more: nothing was changed.", "切り替える画像用ファイルがもうありません。何も変更していません。"),
