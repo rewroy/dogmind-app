@@ -198,6 +198,31 @@ const COUNTED: &[(&str, &str)] = &[
 
 const JA: &[(&str, &str)] = &[
     ("Let's go", "行こう"),
+    // Background work, and the notices that wake a session.
+    ("Wake later", "あとで再開"),
+    ("Notice", "通知"),
+    ("A background command ended", "バックグラウンドのコマンドが終わりました"),
+    ("A background command printed the line it was watched for", "バックグラウンドのコマンドが待っていた行を出力しました"),
+    ("A wait is up", "待機時間になりました"),
+    ("Exit code {0}  ·  ran {1}", "終了コード {0}  ·  実行時間 {1}"),
+    ("Timed out  ·  ran {0}", "時間切れ  ·  実行時間 {0}"),
+    ("Cancelled  ·  ran {0}", "中止  ·  実行時間 {0}"),
+    ("Did not run", "実行されませんでした"),
+    ("Ended  ·  ran {0}", "終了  ·  実行時間 {0}"),
+    ("Running for {0}, and going on", "{0} 実行中で、そのまま続いています"),
+    ("Set for {0}", "{0} の待機"),
+    ("{0} min {1} s", "{0} 分 {1} 秒"),
+    ("{0} h {1} min", "{0} 時間 {1} 分"),
+    ("In the background", "バックグラウンド"),
+    ("waits for {0}", "{0} を待っています"),
+    ("ended", "終了"),
+    ("in {0}", "あと {0}"),
+    ("These end when Dogmind quits.", "ここにあるものは、Dogmind を終了すると終わります。"),
+    ("Stop all", "すべて止める"),
+    ("It goes on with what waits in the background, and says here when it has something for you. Quit it from the tray icon's menu to end all of it.", "バックグラウンドで待っているものは続きます。用があるときはここでお知らせします。すべて終えるには、トレイのアイコンのメニューから終了してください。"),
+    ("Standing by", "待機中"),
+    (dogmind_agent::background::PAUSED_IN_A_ROW, "自動の再開を止めました。このセッションは、あなたの言葉なしに 30 回続けて自分で動き出しました。メッセージを書くと続きます。"),
+    (dogmind_agent::background::PAUSED_IN_AN_HOUR, "自動の再開を止めました。このセッションは、この 1 時間に 60 回自分で動き出しました。1 時間たつと続きます。"),
     // Commands.
     ("Go through the first setup again", "最初のセットアップをやり直す"),
     ("How to use this app", "このアプリの使い方"),
@@ -1113,7 +1138,7 @@ mod tests {
     #[test]
     fn what_a_person_reads_when_a_provider_fails_is_all_in_japanese() {
         let table: HashMap<&str, &str> = JA.iter().copied().collect();
-        for words in llm::WORDS.into_iter().chain(images::WORDS).chain(dogmind_agent::read_folders::WORDS).chain(dogmind_agent::workspace_grants::WORDS) {
+        for words in llm::WORDS.into_iter().chain(images::WORDS).chain(dogmind_agent::read_folders::WORDS).chain(dogmind_agent::workspace_grants::WORDS).chain(dogmind_agent::background::WORDS) {
             assert!(table.contains_key(words), "{words}");
         }
         assert!(table.contains_key(crate::settings::VARIABLE_NAME_ONLY));

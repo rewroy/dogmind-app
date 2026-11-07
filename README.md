@@ -120,6 +120,20 @@ AppContainers work by ACEs, so the first command in a workspace writes one on th
 folders, and these stay. To take them away: `icacls <folder> /remove <the profile's SID> /t`. The app's own file tools run
 outside the container and pass through the approvals instead.
 
+## Background work
+
+A command started with `background: true` goes on while the agent does other things, or ends its turn. When it ends, any way it ends, the session wakes itself: the app writes a notice, which the
+transcript shows as a row of its own and the model reads as the app's word, not yours (what the command printed in it is data, never instructions), and one turn runs with nobody sending anything.
+`wake_on`, a regular expression, wakes it once, at the first line the command prints that matches (`Listening on` for a server), and the command goes on. `wake_at` wakes it later, after 60 seconds
+to a day with a note, with at most five waits open; `command_stop` ends a command or cancels a wait, and that wakes nothing. A notice that comes during a turn waits for its end, and notices that come
+together are one turn.
+
+So that nothing runs away, a session wakes itself at most 30 times in a row with no word from you, and 60 times in an hour; past either it stops and the window says why (a message from you lets it
+go on after the first, the hour's passing after the second). Your Stop ends the turn, and the commands and waits of that session. A woken turn asks as any turn does and waits for you: the taskbar
+button flashes until you look, the tray says so when the window is hidden, and nothing approves for it. The panel on the right lists what is waiting, each with a stop of its own, and the list of
+sessions marks one that has something waiting. Closing the window leaves all of it going, in the tray; Quit from the tray ends it. Commands and waits do not outlive the app, and nothing watches
+files or listens for anything from outside it.
+
 ## Straydog
 
 The app shares no code with Straydog, which moves on its own. It starts `straydog.exe`, runs `straydog setup`, reads the bundles

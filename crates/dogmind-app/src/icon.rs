@@ -8,7 +8,7 @@ use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::Graphics::GdiPlus::*;
 
-const ICONS: [(&str, &str); 32] = [
+const ICONS: [(&str, &str); 34] = [
     ("globe", include_str!("../../../assets/lucide/globe.svg")),
     ("arrow-up", include_str!("../../../assets/lucide/arrow-up.svg")),
     ("check", include_str!("../../../assets/lucide/check.svg")),
@@ -41,6 +41,8 @@ const ICONS: [(&str, &str); 32] = [
     ("x", include_str!("../../../assets/lucide/x.svg")),
     ("file", include_str!("../../../assets/lucide/file.svg")),
     ("folder-open", include_str!("../../../assets/lucide/folder-open.svg")),
+    ("clock", include_str!("../../../assets/lucide/clock.svg")),
+    ("terminal", include_str!("../../../assets/lucide/terminal.svg")),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
