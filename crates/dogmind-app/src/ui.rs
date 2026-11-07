@@ -2120,7 +2120,7 @@ struct App {
     preview_close: HWND,
     todos: Vec<serde_json::Value>,
     git: Option<GitInfo>,
-    /// Web content is in this conversation, so commands ask.
+    /// Web content is in this conversation, so a command that gets the network asks.
     web_seen: bool,
     toggle_web: HWND,
     toggle_compact: HWND,
@@ -8098,7 +8098,7 @@ impl App {
         } else if self.web_seen {
             let tall = area.bottom - area.top;
             icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::warn());
-            draw_text(device, t("Web content is here: commands ask"), RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::warn(), ONE_LINE);
+            draw_text(device, t("Web content is here: network commands ask"), RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::warn(), ONE_LINE);
         }
         let wide = area.right - area.left;
         let mut right = area.right - s(ds::space::S);

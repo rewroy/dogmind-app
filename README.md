@@ -130,7 +130,10 @@ A package also has `tools\` beside the exe, so that a person installs nothing an
 Its tools read, search, create and edit files (`read_file`, `list_files`, `find_files`, `search_files`, `create_file`,
 `apply_patch`), run commands (`execute_command`), show what changed (`show_diff`), keep a to-do list, check a web page in a
 browser, and search and read the web when that is turned on. Edits and commands ask first, as the mode says (*default*,
-*accept edits*, *auto*), each with a Paw Note: the explanation shown before an approval. A long session is compacted in three
+*accept edits*, *auto*), each with a Paw Note: the explanation shown before an approval. Once web content is in a conversation (a
+search, a page, or what an MCP server you have not trusted returns), what it may have asked for needs your word every time, whatever
+the mode and the saved rules say: a command that uses the network, an MCP tool, a note kept or dropped, and an address that neither you nor
+the web gave. A command that does not use the network is weighed as it was before. A long session is compacted in three
 stages, and every session is kept in a file of its own. A project's `DOGMIND.md` (or its `AGENTS.md` or `CLAUDE.md`) says how it
 wants to be worked on. What the model reads is kept as small as a local model needs it: the system prompt is in
 `crates/dogmind-agent/src/prompt.rs` and the tool schemas in `tools.rs`.
