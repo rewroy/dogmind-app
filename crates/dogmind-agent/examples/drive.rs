@@ -68,6 +68,7 @@ fn main() {
         skills_off: Vec::new(),
         memory: None,
         mcp: None,
+        policy: Default::default(),
     };
     let handle = agent::start(config, sender, Box::new(|| {}));
     let send = |command: Command| {

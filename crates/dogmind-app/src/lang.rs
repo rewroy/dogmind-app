@@ -619,6 +619,8 @@ const JA: &[(&str, &str)] = &[
     ("No server yet. {0} lists them, and /mcp import copies Claude's and Codex's in.", "サーバーはまだありません。{0} に記述するか、/mcp import で Claude と Codex の設定を取り込めます。"),
     ("The notes in {0} could not be read ({1}). The file is left as it is.", "{0} のメモを読めませんでした（{1}）。ファイルはそのままにしてあります。"),
     ("Notes the model forgot are kept in {0}, so that you can get one back.", "モデルが忘れたメモは {0} に残してあります。戻したいときはそこからコピーしてください。"),
+    ("Notes the model forgot are kept, encrypted, in {0}. The latest:\n{1}", "モデルが忘れたメモは、暗号化して {0} に残してあります。直近のもの:\n{1}"),
+    ("The notes the model forgot, in {0}, could not be read ({1}). The file is left as it is.", "モデルが忘れたメモ ({0}) を読めませんでした ({1})。ファイルはそのままにしてあります。"),
     (dogmind_agent::workspace_grants::NOT_TAKEN_BACK, "コマンドが書き込めるようにしていた分の一部を、Windows が変更を拒んだため取り消せませんでした。一覧には残してあり、アプリを起動するたびにやり直します。"),
     ("Nothing is kept yet. The model keeps what later sessions would want, and you can ask it to.", "保持している内容はまだありません。後のセッションで役立つことはモデルが記録します。頼んで記録させることもできます。"),
     ("Every folder on PATH is open to sandboxed commands.", "PATH のフォルダーはすべてサンドボックス内のコマンドから使えます。"),

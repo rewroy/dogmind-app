@@ -465,6 +465,8 @@ pub struct Workbench {
     pub skills: Vec<crate::skills::Skill>,
     /// The folder of the notes kept between sessions.
     pub memory: Option<PathBuf>,
+    /// Whether the notes are kept sealed, and while the key is not unlocked, that nothing is written.
+    pub policy: Arc<crate::conversation_key::Policy>,
     pub mcp: Option<Arc<crate::mcp::Hub>>,
     jobs: Jobs,
     /// What this session has going on or waiting while no turn runs: the commands of `jobs`, and the waits.
@@ -722,7 +724,7 @@ impl Workbench {
             }
             "remember" | "forget" => {
                 let folder = self.memory.as_deref().ok_or("notes are not kept here")?;
-                if tool == "remember" { crate::memory::remember(folder, workspace, arguments) } else { crate::memory::forget(folder, workspace, arguments) }
+                if tool == "remember" { crate::memory::remember(folder, workspace, arguments, &self.policy) } else { crate::memory::forget(folder, workspace, arguments, &self.policy) }
             }
             "web_search" | "web_read" if !self.web.settings.enabled => Err("the web tools are turned off in Settings".to_string()),
             "web_search" => self.web.search(arguments, cancel),
