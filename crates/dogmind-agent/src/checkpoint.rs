@@ -64,9 +64,9 @@ struct Index {
 pub struct Checkpoints {
     folder: PathBuf,
     index: Index,
-    /// What the index is sealed with, in an encrypted session: the turns' titles are the first words of what the person asked, so the index is sealed whole as the notes are. The copies of files
-    /// are not: they are the workspace's own files, which lie in it in the clear.
-    sealed: Option<crate::session::Sealed>,
+    /// The session: the index is sealed when its file is (the turns' titles are the first words of what the person asked, so the index is sealed whole as the notes are), and whichever form the
+    /// file has when it is written, as every conversation may be changed to the other while this one is open. The copies of files are not: they are the workspace's own files, which lie in it in the clear.
+    session: PathBuf,
 }
 
 /// The index as it is on the disk: sealed, or plain JSON.
@@ -199,12 +199,13 @@ impl Checkpoints {
         let mut index = parsed.unwrap_or_default();
         // (what the index said it had come to may be less than what is there: the numbering goes on past every copy in the folder)
         index.next_copy = index.next_copy.max(after_the_last_copy(&folder));
-        Checkpoints { folder, index, sealed }
+        Checkpoints { folder, index, session: session.to_path_buf() }
     }
 
     fn save(&self) -> Result<(), String> {
         let text = serde_json::to_string(&self.index).map_err(|error| error.to_string())?;
-        write_index(&self.folder, &index_bytes(self.sealed.as_ref(), &text))
+        let sealed = crate::session::sealed_of(&self.session).map_err(|error| format!("{}: {error}", self.session.display()))?;
+        write_index(&self.folder, &index_bytes(sealed.as_ref(), &text))
     }
 
     pub fn begin(&mut self, title: &str, at: &str, message: Option<usize>) -> Result<(), String> {
@@ -528,7 +529,7 @@ mod tests {
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "now").unwrap();
         // (an index that says nothing of them)
-        let mut marks = Checkpoints { folder: folder.clone(), index: Index::default(), sealed: None };
+        let mut marks = Checkpoints { folder: folder.clone(), index: Index::default(), session: session.clone() };
         marks.begin("one", "t", Some(1)).unwrap();
         marks.before_edit(&[file]).unwrap();
         assert_eq!((read(&folder.join("0.bin")), read(&folder.join("1.bin")), read(&folder.join("2.bin"))), ("old zero".to_string(), "old one".to_string(), "now".to_string()));
