@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use dogmind_agent::agent::{self, Approval, Command, Decision, Event, Handle};
 use dogmind_agent::anthropic::{self, Anthropic};
+use dogmind_agent::background::Waiting;
 use dogmind_agent::codex::{self, Codex};
 use dogmind_agent::llm::{self, Client, Health, Provider};
 use dogmind_agent::message::Message;
@@ -316,6 +317,8 @@ const FIRST_RELEASE_LOOK_MS: u32 = 30_000;
 const RELEASE_LOOK_MS: u32 = 60 * 60 * 1000;
 /// The conversation's width below which the panel on the right gives way, at 96 dpi.
 const RIGHT_NEEDS: i32 = 480;
+/// How many commands, and as many waits, the panel on the right lists of what waits in the background: a session has five waits at most, and few commands.
+const WAITING_LISTED: usize = 6;
 /// How often a server that cannot be reached is tried again, while something waits to be sent to it.
 const RECONNECT_MS: u32 = 5000;
 /// How often the ring turns while there is work.
@@ -1048,16 +1051,21 @@ enum SideState {
     /// The model waits for the person: to approve something, to answer its question, to decide on its plan.
     Waiting,
     Working,
+    /// No turn is at work, and a background command or a wait will wake it.
+    StandingBy,
     Error,
 }
 
-/// What the sidebar says of a session. `parked`: it is at work out of sight, and whether it waits for the person. Else it is the one on screen (`current`), which `waits` and `running` speak for.
-fn side_state(parked: Option<bool>, current: bool, waits: bool, running: bool, failed: bool) -> Option<SideState> {
+/// What the sidebar says of a session. `parked`: it is out of sight with its agent, whether it waits for the person, and whether a turn is at work (else it stands by). Else it is the one on
+/// screen (`current`), which `waits`, `running` and `standing_by` (something waits in the background) speak for.
+fn side_state(parked: Option<(bool, bool)>, current: bool, waits: bool, running: bool, standing_by: bool, failed: bool) -> Option<SideState> {
     match parked {
-        Some(true) => Some(SideState::Waiting),
-        Some(false) => Some(SideState::Working),
+        Some((true, _)) => Some(SideState::Waiting),
+        Some((false, true)) => Some(SideState::Working),
+        Some((false, false)) => Some(SideState::StandingBy),
         None if current && waits => Some(SideState::Waiting),
         None if current && running => Some(SideState::Working),
+        None if current && standing_by => Some(SideState::StandingBy),
         None if failed => Some(SideState::Error),
         None => None,
     }
@@ -1303,7 +1311,14 @@ fn is_settings_place(panel: Panel) -> bool {
     SETTINGS_PLACES.iter().any(|(known, _, _)| *known == panel)
 }
 
-/// A session at work that is not on screen: its agent goes on, and what it says waits here.
+/// A row of the list of what waits, for the time that is drawn on it as it runs on: the nth command, or the nth wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitRow {
+    Command(usize),
+    Wait(usize),
+}
+
+/// A session that is not on screen, at work or with something waiting that will wake it: its agent goes on, and what it says waits here.
 struct Parked {
     path: Option<PathBuf>,
     workspace: PathBuf,
@@ -1333,6 +1348,13 @@ struct Parked {
     web_seen: bool,
     /// The session is being made shorter, and nothing has been asked of the model since.
     compacting: bool,
+    /// A turn is at work. False: it stands by, with a background command or a wait that will wake it.
+    running: bool,
+    /// The turn at work is one nobody sent: a command's end, a line, a wait woke it.
+    woken: bool,
+    /// What it has going or waiting in the background, as its agent last said, and when that was said.
+    waiting: Waiting,
+    waiting_taken: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -2010,6 +2032,14 @@ struct App {
     rename_seed: Option<String>,
     resume_paths: Vec<PathBuf>,
     parked: Vec<Parked>,
+    /// What the session on screen has going or waiting in the background, as its agent last said, and when that was said (the times of the panel run on from it).
+    waiting: Waiting,
+    waiting_taken: std::time::Instant,
+    /// A turn that nobody sent is at work: what it asks, and where it ends, are told to someone who may not be looking.
+    woken_turn: bool,
+    /// The stop of each row of the list of what waits, in the panel on the right (its id, or `*` for all of them), and where the time of each row is drawn.
+    waiting_hits: Vec<(RECT, String)>,
+    waiting_times: Vec<(RECT, WaitRow)>,
     /// What a session opened beside a working one will connect with.
     provider: Option<(Arc<dyn Provider>, String, u64)>,
     /// What sessions said after they stopped being on screen, until they are opened.
@@ -4417,8 +4447,8 @@ impl App {
     /// transcript is written from, so that the transcript written again, at another width or in another theme, writes it as it stands then.
     unsafe fn write_card(&mut self, card: &Card) {
         let recording = !self.replaying;
-        // (a question or a plan is for the person, and is seen: the view goes to it. The files an answer changed come under it, and the view goes there only if it was at the end)
-        let attention = !matches!(card, Card::Files { .. });
+        // (a question or a plan is for the person, and is seen: the view goes to it. The files an answer changed come under it, and the view goes there only if it was at the end; a notice is the same)
+        let attention = !matches!(card, Card::Files { .. } | Card::Notice { .. });
         let at_the_end = recording && !self.opening && self.transcript_at_end();
         if recording {
             self.close_run();
@@ -4473,6 +4503,18 @@ impl App {
                     PlanState::Approved => self.card_row(&[t("Approved")], 10, theme::accent(), 60, false),
                     PlanState::Changes(change) => self.card_row(&[&tf("Change requested: {0}", &[change])], 10, theme::warn(), 60, false),
                     PlanState::Undecided => self.card_row(&[t("Not decided")], 10, theme::muted(), 60, false),
+                }
+                self.card_room(s(12), Vec::new());
+            }
+            Card::Notice { wakes, at } => {
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                let label = if at.is_empty() { t("Notice").to_string() } else { format!("{}  ·  {at}", t("Notice")) };
+                self.card_row(&[&label], 8, theme::muted(), 26, false);
+                for wake in wakes {
+                    let row = cards::notice_row(wake);
+                    self.card_row(&[&row.title], 10, theme::accent(), 34, false);
+                    self.card_row(&[&row.what], 11, theme::text(), 30, false);
+                    self.card_row(&[&row.how], 10, if row.failed { theme::warn() } else { theme::muted() }, 44, false);
                 }
                 self.card_room(s(12), Vec::new());
             }
@@ -5716,6 +5758,8 @@ impl App {
         self.right_hits.clear();
         self.right_tab_hits.clear();
         self.preview_hits.clear();
+        self.waiting_hits.clear();
+        self.waiting_times.clear();
         self.dashboard_hit = None;
         if !self.files_shown() {
             self.files_hidden();
@@ -6306,7 +6350,7 @@ impl App {
         show(self.doc, false);
         // A row kept lit is one that is still there.
         if let Some(row) = self.hover_row {
-            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.right_tab_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).any(|area| same_rect(area, &row)) {
+            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.right_tab_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).chain(self.waiting_hits.iter().map(|(area, _)| area)).any(|area| same_rect(area, &row)) {
                 self.hover_row = None;
             }
         }
@@ -7207,6 +7251,114 @@ impl App {
         self.changes.iter().map(|change| change.path.clone()).find(|path| preview::is_page(path)).or_else(|| self.workspace.join("index.html").is_file().then(|| "index.html".to_string()))
     }
 
+    /// How many rows the list of what waits takes in the panel on the right: its heading, a row for each command and each wait (a second for what a command waits to read), what has stopped
+    /// waking, and the line that says these end with the app. At most so many are listed.
+    fn background_rows(&self) -> usize {
+        if self.waiting.is_empty() {
+            return 0;
+        }
+        let listed = |count: usize| count.min(WAITING_LISTED);
+        let commands = self.waiting.commands.iter().take(WAITING_LISTED).map(|command| 1 + usize::from(command.watching_for.is_some())).sum::<usize>();
+        let (more_commands, more_waits) = (self.waiting.commands.len() > WAITING_LISTED, self.waiting.waits.len() > WAITING_LISTED);
+        1 + commands + listed(self.waiting.waits.len()) + usize::from(more_commands) + usize::from(more_waits) + if self.waiting.paused.is_some() { 3 } else { 0 } + 1
+    }
+
+    /// The list of what the session has going or waiting in the background: each command and wait with a stop of its own, what stopped it from waking, and that these end with the app.
+    /// The times are drawn as the window paints them (`paint`), so that they run on without the panel being laid out again. Returns where the next section begins.
+    unsafe fn layout_waiting(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, mut y: i32) -> i32 {
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let row = s(ds::size::TEXT_ROW);
+        let (stop_wide, time_wide) = (s(ds::space::XL), s(88));
+        let indent = s(ds::size::RIGHT_INDENT);
+        shapes.push(Shape::Text { area: rect(x, y, width, s(ds::space::XL)), text: t("In the background").to_string(), font: FontKind::Strong, color: theme::muted(), flags: ONE_LINE });
+        // (more than one: all of them at a press)
+        if self.waiting.commands.len() + self.waiting.waits.len() > 1 {
+            let words = t("Stop all");
+            let across = text_width(self.fonts.small, words);
+            let area = rect(x + width - across, y + (s(ds::space::XL) - s(ds::size::TEXT_LINE)) / 2, across, s(ds::size::TEXT_LINE));
+            shapes.push(Shape::Text { area, text: words.to_string(), font: FontKind::Small, color: theme::accent_hover(), flags: DT_RIGHT | ONE_LINE });
+            self.waiting_hits.push((rect(area.left - s(6), y, across + s(12), s(ds::space::XL)), "*".to_string()));
+        }
+        y += s(ds::size::QUEUE_STEP);
+        let stop_at = |this: &mut App, shapes: &mut Vec<Shape>, y: i32, id: &str| {
+            let area = rect(x + width - stop_wide, y, stop_wide, row);
+            shapes.push(Shape::Icon { name: "x", area, size: s(ds::size::ICON_SMALL), color: theme::faint() });
+            this.waiting_hits.push((rect(area.left - s(4), y, stop_wide + s(4), row), id.to_string()));
+        };
+        let commands = self.waiting.commands.clone();
+        for (at, command) in commands.iter().enumerate().take(WAITING_LISTED) {
+            shapes.push(Shape::Icon { name: "terminal", area: rect(x, y, s(ds::space::L), row), size: s(ds::size::ICON_SMALL), color: theme::muted() });
+            let text_wide = width - indent - stop_wide - time_wide;
+            shapes.push(Shape::Text { area: rect(x + indent, y, text_wide, row), text: command.command.clone(), font: FontKind::Small, color: theme::text(), flags: ONE_LINE });
+            self.waiting_times.push((rect(x + width - stop_wide - time_wide, y, time_wide, row), WaitRow::Command(at)));
+            stop_at(self, shapes, y, &command.id);
+            y += row;
+            if let Some(pattern) = &command.watching_for {
+                shapes.push(Shape::Text { area: rect(x + indent, y, width - indent - stop_wide, row), text: tf("waits for {0}", &[pattern]), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
+                y += row;
+            }
+        }
+        if commands.len() > WAITING_LISTED {
+            shapes.push(Shape::Text { area: rect(x + indent, y, width - indent, row), text: tf("and {0} more", &[&(commands.len() - WAITING_LISTED)]), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
+            y += row;
+        }
+        let waits = self.waiting.waits.clone();
+        for (at, wait) in waits.iter().enumerate().take(WAITING_LISTED) {
+            shapes.push(Shape::Icon { name: "clock", area: rect(x, y, s(ds::space::L), row), size: s(ds::size::ICON_SMALL), color: theme::muted() });
+            shapes.push(Shape::Text { area: rect(x + indent, y, width - indent - stop_wide - time_wide, row), text: wait.note.clone(), font: FontKind::Small, color: theme::text(), flags: ONE_LINE });
+            self.waiting_times.push((rect(x + width - stop_wide - time_wide, y, time_wide, row), WaitRow::Wait(at)));
+            stop_at(self, shapes, y, &wait.id);
+            y += row;
+        }
+        if waits.len() > WAITING_LISTED {
+            shapes.push(Shape::Text { area: rect(x + indent, y, width - indent, row), text: tf("and {0} more", &[&(waits.len() - WAITING_LISTED)]), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
+            y += row;
+        }
+        if let Some(paused) = self.waiting.paused {
+            shapes.push(Shape::Text { area: rect(x, y, width, 3 * row), text: lang::notice(paused.sentence()), font: FontKind::Small, color: theme::warn(), flags: DT_WORDBREAK });
+            y += 3 * row;
+        }
+        shapes.push(Shape::Text { area: rect(x, y, width, row), text: t("These end when Dogmind quits.").to_string(), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
+        y + row
+    }
+
+    /// What a row of the list says of its time now: how long a command has run, or has to run, and how long until a wait is up. Counted on from when the agent last said.
+    fn waiting_time_words(&self, row: WaitRow) -> String {
+        let since = self.waiting_taken.elapsed().as_secs();
+        match row {
+            WaitRow::Command(at) => match self.waiting.commands.get(at) {
+                Some(command) if command.ended => t("ended").to_string(),
+                Some(command) => cards::duration_words(command.seconds + since),
+                None => String::new(),
+            },
+            WaitRow::Wait(at) => self.waiting.waits.get(at).map_or(String::new(), |wait| tf("in {0}", &[&cards::duration_words(wait.in_seconds.saturating_sub(since))])),
+        }
+    }
+
+    /// Once a second: the times in the list of what waits run on, where it is in view.
+    unsafe fn waiting_tick(&self) {
+        if self.waiting_times.is_empty() || self.panel != Panel::Chat || self.right_width == 0 {
+            return;
+        }
+        for (area, _) in &self.waiting_times {
+            InvalidateRect(self.window, area, 0);
+        }
+    }
+
+    /// A press on the stop of a row of the list, or on "Stop all": it ends that command or wait, which wakes nothing. The agent is not asked: what is going on is the window's to end, and what is left is read from it.
+    unsafe fn stop_waiting(&mut self, id: &str) {
+        if id == "*" {
+            self.agent.background.stop_all();
+        } else {
+            self.agent.background.stop(id);
+        }
+        self.waiting = self.agent.background.snapshot();
+        self.waiting_taken = std::time::Instant::now();
+        InvalidateRect(self.side, std::ptr::null(), 0);
+        self.layout();
+    }
+
     unsafe fn layout_right(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, height: i32) {
         if self.preview_file.is_some() {
             self.layout_preview(shapes, x, width, height);
@@ -7265,8 +7417,10 @@ impl App {
             self.files_place(x - margin + s(ds::space::S), top, width + 2 * margin - 2 * s(ds::space::S), (engine_top - top - s(ds::space::S)).max(s(ds::size::TEXT_ROW)));
             return;
         }
+        // What waits in the background has its place after the tasks, whatever else there is: it is what will wake the session, and it ends with the app.
+        let background_rows = self.background_rows();
         // What fits, past the two headings and above the engine: nothing is drawn off the bottom of the window.
-        let (max_tasks, max_changes) = share_rows(((engine_top - y - s(60)) / row).max(2), self.todos.len(), self.changes.len());
+        let (max_tasks, max_changes) = share_rows((((engine_top - y - s(60)) / row) - background_rows as i32).max(2), self.todos.len(), self.changes.len());
         if !self.todos.is_empty() {
             heading(shapes, &mut y, t("Tasks").to_string());
         }
@@ -7289,6 +7443,10 @@ impl App {
             plain(shapes, &mut y, tf("and {0} more", &[&(self.todos.len() - max_tasks)]), theme::faint());
         }
         if !self.todos.is_empty() {
+            y += s(ds::size::RIGHT_GAP);
+        }
+        if !self.waiting.is_empty() {
+            y = self.layout_waiting(shapes, x, width, y);
             y += s(ds::size::RIGHT_GAP);
         }
         if self.changes.is_empty() {
@@ -7419,6 +7577,14 @@ impl App {
                 continue;
             }
             self.draw_shape(device, shape);
+        }
+        // (the times of what waits: counted on from what the agent last said, drawn now)
+        if self.panel == Panel::Chat {
+            for (area, row) in &self.waiting_times {
+                if overlaps(area, &dirty) {
+                    draw_text(device, &self.waiting_time_words(*row), *area, self.fonts.small, theme::muted(), DT_RIGHT | ONE_LINE);
+                }
+            }
         }
         if self.panel == Panel::Chat {
             if !self.activity.is_empty() && !self.waits_for_person() {
@@ -8766,6 +8932,25 @@ impl App {
         }
     }
 
+    /// The taskbar button flashes: once. For what a turn that nobody sent asks, or says by ending, it goes on until the window has been looked at: when it came, no one was there.
+    unsafe fn flash_for_attention(&self, nobody_sent_the_turn: bool) {
+        // (a debug build told to by a test writes down that it did: the window is off the screen, and no one sees the button)
+        if cfg!(debug_assertions) {
+            if let Some(path) = std::env::var_os("DOGMIND_TEST_TRAYLOG") {
+                use std::io::Write as _;
+                if let std::result::Result::Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(file, "flash | {}", if nobody_sent_the_turn { "until it is looked at" } else { "once" });
+                }
+            }
+        }
+        if nobody_sent_the_turn {
+            let info = FLASHWINFO { cbSize: std::mem::size_of::<FLASHWINFO>() as u32, hwnd: self.window, dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG, uCount: u32::MAX, dwTimeout: 0 };
+            FlashWindowEx(&info);
+        } else {
+            FlashWindow(self.window, 1);
+        }
+    }
+
     /// A word from the tray, only while the window is out of sight.
     unsafe fn tray_note(&self, title: &str, words: &str) {
         if IsWindowVisible(self.window) != 0 {
@@ -8956,7 +9141,7 @@ impl App {
     /// An installer wants to replace these files. It closes as the tray's Quit does, unless it is working: then it stays, comes forward and says so, and the installer waits.
     /// Work that a restart would cut short: a turn, a setup, a session working in the background, a folder being opened to commands.
     fn at_work(&self) -> bool {
-        self.running || self.setting_up || !self.parked.is_empty() || self.read_folder_work.is_some() || self.pending.is_some()
+        self.running || self.setting_up || !self.parked.is_empty() || !self.waiting.is_empty() || self.read_folder_work.is_some() || self.pending.is_some()
     }
 
     /// A new build of the app or of its engine has come in over the files this copy runs from (`package.py` puts it beside the one in use, which
@@ -9627,7 +9812,8 @@ impl App {
 
     /// Work is under way that the engine cannot be taken from.
     fn engine_is_busy(&self) -> bool {
-        self.running || !self.parked.is_empty()
+        // (a session that only waits for a command to end is not using it: it would be woken by an engine that is there again)
+        self.running || self.parked.iter().any(|parked| parked.running)
     }
 
     /// The row used: on the files of the model set up, or only as a choice for one to come.
@@ -9951,7 +10137,8 @@ impl App {
             self.on_event(event);
         }
         self.flush_reveal();
-        if !self.running {
+        // (one that has a background command or a wait goes on out of sight when it is not at work too: what it waits for will wake it, and its agent must be there to be woken)
+        if !self.running && self.waiting.is_empty() {
             return;
         }
         // (asked for above: what is on screen is about to go)
@@ -9987,6 +10174,10 @@ impl App {
             todos: std::mem::take(&mut self.todos),
             web_seen: self.web_seen,
             compacting: self.activity == t("Compacting the session…"),
+            running: self.running,
+            woken: std::mem::take(&mut self.woken_turn),
+            waiting: std::mem::take(&mut self.waiting),
+            waiting_taken: self.waiting_taken,
         });
         self.running = false;
         self.stop_asked = false;
@@ -10037,7 +10228,11 @@ impl App {
         self.window_tokens = parked.window_tokens;
         self.rate = parked.rate;
         self.totals = parked.totals;
-        self.running = true;
+        // (one that stands by has no turn at work: it has what waits for it to wake)
+        self.running = parked.running;
+        self.woken_turn = parked.woken;
+        self.waiting = parked.waiting;
+        self.waiting_taken = parked.waiting_taken;
         self.todos = parked.todos;
         self.web_seen = parked.web_seen;
         self.changes.clear();
@@ -10046,7 +10241,8 @@ impl App {
         let messages = self.current_session.as_deref().map_or(Ok(Vec::new()), session::read).unwrap_or_default();
         self.set_panel(Panel::Chat);
         self.show_transcript(&messages);
-        for (notice, style) in parked.notices {
+        // (what it said when a turn of its own ended, in its time out of sight, and what it says now)
+        for (notice, style) in self.held_notices.remove(self.current_session.as_ref().unwrap_or(&PathBuf::new())).unwrap_or_default().into_iter().chain(parked.notices) {
             self.append(&format!("{notice}\n"), style);
         }
         self.answer = parked.partial;
@@ -10067,7 +10263,7 @@ impl App {
         for (index, tool, raw) in parked.writing.into_iter().filter(|(_, tool, _)| !cards::is_asking(tool)) {
             self.run_writes(index, tool, &raw);
         }
-        self.set_activity(if parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
+        self.set_activity(if !parked.running || parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
         self.update_buttons();
         self.update_status();
         if let Some(approval) = parked.pending {
@@ -10396,9 +10592,10 @@ impl App {
                 }
                 let parked = self.parked.iter().find(|parked| parked.path.as_ref() == Some(path));
                 // How it stands, in a word, where its time would be; only one that needs saying has one.
-                let state = side_state(parked.map(|parked| parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some()), current, self.waits_for_person(), self.running, self.failed_sessions.contains(path)).map(|state| match state {
+                let state = side_state(parked.map(|parked| (parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some(), parked.running)), current, self.waits_for_person(), self.running, !self.waiting.is_empty(), self.failed_sessions.contains(path)).map(|state| match state {
                     SideState::Waiting => (t("Waiting"), theme::warn()),
                     SideState::Working => (t("Working"), theme::accent()),
+                    SideState::StandingBy => (t("Standing by"), theme::muted()),
                     SideState::Error => (t("Error"), theme::bad()),
                 });
                 let left = area.left + s(ds::space::M);
@@ -11107,6 +11304,11 @@ impl App {
                         self.flush_told_calls(&mut told);
                         // (what the turn before it changed has its card here; a turn may begin with what the app said and not the person, which is not shown but is a place)
                         self.turn_slots.push((index, self.shown.len()));
+                        // (what woke the session with no one writing: the app's notice, in a row of its own)
+                        if let Some(wakes) = &message.notice {
+                            self.write_card(&Card::Notice { wakes: wakes.clone(), at: written_words(message) });
+                            continue;
+                        }
                         if dogmind_agent::prompt::is_nudge(text) {
                             continue;
                         }
@@ -11168,8 +11370,8 @@ impl App {
         }
     }
 
-    /// What a session out of sight says: its state is kept for when it is opened. `true`: its turn has ended.
-    unsafe fn absorb(&mut self, at: usize, event: Event) -> bool {
+    /// What a session out of sight says: its state is kept for when it is opened. Whether its turn has ended, and whether it has nothing left to wait for and goes.
+    unsafe fn absorb(&mut self, at: usize, event: Event) -> (bool, bool) {
         let event = hidden_shown(event);
         let parked = &mut self.parked[at];
         match event {
@@ -11197,11 +11399,26 @@ impl App {
             Event::ToolEnded { id, .. } => {
                 parked.tools_running.remove(&id);
             }
+            Event::TurnStarted => parked.running = true,
+            Event::Woken(_) => {
+                parked.running = true;
+                parked.woken = true;
+                InvalidateRect(self.side, std::ptr::null(), 0);
+            }
+            Event::Waiting(waiting) => {
+                parked.waiting = waiting;
+                parked.waiting_taken = std::time::Instant::now();
+                InvalidateRect(self.side, std::ptr::null(), 0);
+                // (nothing at work and nothing left to wake it: there is nothing to keep it for)
+                if !parked.running && parked.waiting.is_empty() {
+                    return (false, true);
+                }
+            }
             Event::Approval(approval) => {
-                let tool = approval.tool.clone();
+                let (tool, woken) = (approval.tool.clone(), parked.woken);
                 parked.pending = Some(approval);
                 InvalidateRect(self.side, std::ptr::null(), 0);
-                FlashWindow(self.window, 1);
+                self.flash_for_attention(woken);
                 self.tray_note(t("Dogmind is waiting for you"), &tf("It asks to use {0}.", &[&t(tool_name(&tool))]));
             }
             Event::Usage { used, window, usage } => {
@@ -11232,15 +11449,17 @@ impl App {
             Event::WebSeen(on) => parked.web_seen = on,
             Event::Question(question) => {
                 let words: String = question.question.lines().next().unwrap_or("").chars().take(120).collect();
+                let woken = parked.woken;
                 parked.question = Some(question);
                 InvalidateRect(self.side, std::ptr::null(), 0);
-                FlashWindow(self.window, 1);
+                self.flash_for_attention(woken);
                 self.tray_note(t("Dogmind is waiting for you"), &words);
             }
             Event::PlanReview(review) => {
+                let woken = parked.woken;
                 parked.plan_review = Some(review);
                 InvalidateRect(self.side, std::ptr::null(), 0);
-                FlashWindow(self.window, 1);
+                self.flash_for_attention(woken);
                 self.tray_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
             }
             Event::TurnEnded { .. } => {
@@ -11248,18 +11467,21 @@ impl App {
                 parked.question = None;
                 parked.plan_review = None;
                 parked.interjected.clear();
+                parked.running = false;
                 // (what was said too late for this turn is for the next)
                 let late = std::mem::take(&mut *parked.agent.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
                 parked.queued.extend(late.into_iter().map(Outgoing::words));
                 if parked.queued.is_empty() {
-                    return true;
+                    // (it goes when nothing waits for it: one that has a background command or a wait stays, to be woken)
+                    return (true, parked.waiting.is_empty());
                 }
                 let next = parked.queued.remove(0);
+                parked.running = true;
                 let _ = parked.agent.commands.send(send_command(next));
             }
             _ => {}
         }
-        false
+        (false, false)
     }
 
     unsafe fn drain(&mut self) {
@@ -11268,26 +11490,35 @@ impl App {
         }
         let mut at = 0;
         while at < self.parked.len() {
-            let mut ended = false;
+            let (mut ended, mut gone) = (false, false);
             while let Ok(event) = self.parked[at].events.try_recv() {
-                ended |= self.absorb(at, event);
+                let (turn_ended, nothing_left) = self.absorb(at, event);
+                (ended, gone) = (ended || turn_ended, gone || nothing_left);
             }
             if ended {
-                let parked = self.parked.remove(at);
-                let _ = parked.agent.commands.send(Command::Quit);
-                let words = if parked.title.is_empty() { t("The work is done.").to_string() } else { parked.title.clone() };
-                self.tray_note(t(if parked.failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &words);
-                if let (Some(path), true) = (&parked.path, parked.failed) {
+                // (once, as the turn ends: a turn nobody sent says so as one that was sent does)
+                let parked = &mut self.parked[at];
+                let (title, failed, woken) = (parked.title.clone(), std::mem::take(&mut parked.failed), std::mem::take(&mut parked.woken));
+                let (path, notices) = (parked.path.clone(), std::mem::take(&mut parked.notices));
+                let words = if title.is_empty() { t("The work is done.").to_string() } else { title };
+                self.tray_note(t(if failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &words);
+                if let (Some(path), true) = (&path, failed) {
                     self.failed_sessions.insert(path.clone());
                 }
-                if let (Some(path), false) = (parked.path, parked.notices.is_empty()) {
-                    self.held_notices.insert(path, parked.notices);
+                if let (Some(path), false) = (path, notices.is_empty()) {
+                    self.held_notices.insert(path, notices);
                 }
                 self.refresh_sessions();
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 if GetForegroundWindow() != self.window {
-                    FlashWindow(self.window, 1);
+                    self.flash_for_attention(woken);
                 }
+            }
+            if gone {
+                let parked = self.parked.remove(at);
+                let _ = parked.agent.commands.send(Command::Quit);
+                self.refresh_sessions();
+                InvalidateRect(self.side, std::ptr::null(), 0);
             } else {
                 at += 1;
             }
@@ -11630,7 +11861,7 @@ impl App {
                         SetFocus(self.window);
                     }
                 }
-                FlashWindow(self.window, 1);
+                self.flash_for_attention(self.woken_turn);
             }
             Event::Usage { used, window, usage } => {
                 // A report from a request under way comes a couple of times a second: only what it changes is drawn. The panel's words change with each thousand.
@@ -11702,7 +11933,7 @@ impl App {
                 self.update_buttons();
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.tray_note(t("Dogmind is waiting for you"), &words);
-                FlashWindow(self.window, 1);
+                self.flash_for_attention(self.woken_turn);
                 // (the card's field is the composer: what is written in it is the answer)
                 set_text(self.composer_cue, t("Write your own answer…"));
                 self.update_composer_cue();
@@ -11724,7 +11955,7 @@ impl App {
                 self.update_buttons();
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.tray_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
-                FlashWindow(self.window, 1);
+                self.flash_for_attention(self.woken_turn);
                 self.focus_composer();
             }
             Event::ModeChanged(mode) => {
@@ -11797,9 +12028,27 @@ impl App {
                     self.tell_about_vision();
                 }
             }
-            // (what the session has going on in the background, and a turn it woke itself for: shown as the next commit does)
-            Event::Woken(_) | Event::Waiting(_) => {}
+            // The session woke itself, with nobody sending anything: what woke it is a row of its own, and the turn is at work as any is.
+            Event::Woken(wakes) => {
+                self.running = true;
+                self.woken_turn = true;
+                self.turn_failed = false;
+                self.write_card(&Card::Notice { wakes, at: clock_now() });
+                self.update_buttons();
+                InvalidateRect(self.side, std::ptr::null(), 0);
+            }
+            // What it has going or waiting in the background: listed in the panel on the right, and marked in the list of sessions.
+            Event::Waiting(waiting) => {
+                let changed = !self.waiting.same_as(&waiting);
+                self.waiting = waiting;
+                self.waiting_taken = std::time::Instant::now();
+                if changed {
+                    InvalidateRect(self.side, std::ptr::null(), 0);
+                    self.layout();
+                }
+            }
             Event::TurnEnded { cancelled } => {
+                let woken = std::mem::take(&mut self.woken_turn);
                 // (a question or a plan the turn left unanswered goes with it, and its card says so)
                 self.question = None;
                 self.plan_review = None;
@@ -11834,7 +12083,7 @@ impl App {
                 self.update_buttons();
                 self.refresh_sessions();
                 if GetForegroundWindow() != self.window {
-                    FlashWindow(self.window, 1);
+                    self.flash_for_attention(woken);
                 }
                 self.flush_queue();
             }
@@ -13791,6 +14040,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         }
         WM_TIMER if wparam == TIMER_ENGINE => {
             app.watch_preview();
+            app.waiting_tick();
             if let Some(reason) = app.engine.as_mut().and_then(Engine::ended) {
                 app.engine = None;
                 // (one that ended before it was ready failed to start; one that had been working may be tried again at once)
@@ -13933,7 +14183,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         WM_MOUSEMOVE if app.panel == Panel::Chat => {
             let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
             let within = |area: &RECT| x >= area.left && x < area.right && y >= area.top && y < area.bottom;
-            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.right_tab_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
+            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.right_tab_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.waiting_hits.iter().map(|(area, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
             app.hover_on(found);
             app.rail_hover_at(x, y);
             0
@@ -13978,6 +14228,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.jump_to_turn(at);
             } else if let Some(file) = app.preview_hits.iter().find(|(area, _)| within(area)).map(|(_, file)| file.display().to_string()) {
                 app.open_preview(&file);
+            } else if let Some(id) = app.waiting_hits.iter().find(|(area, _)| within(area)).map(|(_, id)| id.clone()) {
+                app.stop_waiting(&id);
             } else if let Some(url) = app.dashboard_hit.as_ref().filter(|(area, _)| within(area)).map(|(_, url)| url.clone()) {
                 open_in_browser(&url);
             } else if let Some((_, at)) = app.right_hits.iter().find(|(area, _)| within(area)).copied() {
@@ -14343,7 +14595,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.remember_place();
             app.save();
             ShowWindow(window, SW_HIDE);
-            if !app.settings.tray_told {
+            if !app.waiting.is_empty() || app.parked.iter().any(|parked| !parked.waiting.is_empty()) {
+                // (what waits in the background goes on while the window is hidden, and says here when it has something for the person)
+                app.tray_note(t("Dogmind is still here"), t("It goes on with what waits in the background, and says here when it has something for you. Quit it from the tray icon's menu to end all of it."));
+            } else if !app.settings.tray_told {
                 app.settings.tray_told = true;
                 app.save();
                 app.tray_note(t("Dogmind is still here"), t("It keeps running in the tray, with the engine loaded. Quit it from the tray icon's menu."));
@@ -14862,6 +15117,7 @@ pub(crate) fn tool_name(tool: &str) -> &str {
         "execute_command" => "Run",
         "command_status" => "Check a command",
         "command_stop" => "Stop a command",
+        "wake_at" => "Wake later",
         "todo" => "Tasks",
         "skill" => "Skill",
         "remember" => "Remember",
@@ -15380,6 +15636,11 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             rename_seed: None,
             resume_paths: Vec::new(),
             parked: Vec::new(),
+            waiting: Waiting::default(),
+            waiting_taken: std::time::Instant::now(),
+            woken_turn: false,
+            waiting_hits: Vec::new(),
+            waiting_times: Vec::new(),
             provider: None,
             held_notices: HashMap::new(),
             failed_sessions: HashSet::new(),
@@ -15903,7 +16164,7 @@ mod tests {
     #[test]
     fn every_constant_word_has_its_japanese() {
         let mut words: Vec<&str> = COMMANDS.iter().map(|(_, about)| *about).collect();
-        words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page", "explore"].map(tool_name));
+        words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "wake_at", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page", "explore"].map(tool_name));
         words.extend(EFFORTS.iter().map(|(_, name)| *name));
         words.extend(efforts_for("DeepSeek-V4.1").iter().map(|(_, name)| *name));
         words.extend(MODES.iter().map(|(_, name)| *name));
@@ -16211,15 +16472,21 @@ mod tests {
     #[test]
     fn a_session_that_waits_for_the_person_says_waiting_and_is_not_stopped_by_its_send_button() {
         // the one on screen: waiting for an approval, an answer or a decision, with the turn still running
-        assert_eq!(side_state(None, true, true, true, false), Some(SideState::Waiting));
-        assert_eq!(side_state(None, true, false, true, false), Some(SideState::Working));
-        assert_eq!(side_state(None, true, false, false, false), None);
+        assert_eq!(side_state(None, true, true, true, false, false), Some(SideState::Waiting));
+        assert_eq!(side_state(None, true, false, true, false, false), Some(SideState::Working));
+        assert_eq!(side_state(None, true, false, false, false, false), None);
         // one that is not on screen: parked at work, and whether it waits
-        assert_eq!(side_state(Some(true), false, false, false, false), Some(SideState::Waiting));
-        assert_eq!(side_state(Some(false), false, false, false, false), Some(SideState::Working));
+        assert_eq!(side_state(Some((true, true)), false, false, false, false, false), Some(SideState::Waiting));
+        assert_eq!(side_state(Some((false, true)), false, false, false, false, false), Some(SideState::Working));
         // a session that is not the one shown, and failed
-        assert_eq!(side_state(None, false, true, true, true), Some(SideState::Error));
-        assert_eq!(side_state(None, false, true, true, false), None, "what the window waits for is the shown session's");
+        assert_eq!(side_state(None, false, true, true, false, true), Some(SideState::Error));
+        assert_eq!(side_state(None, false, true, true, false, false), None, "what the window waits for is the shown session's");
+        // something waits in the background, and no turn is at work: the list marks the session, the one on screen and one out of sight
+        assert_eq!(side_state(None, true, false, false, true, false), Some(SideState::StandingBy));
+        assert_eq!(side_state(Some((false, false)), false, false, false, false, false), Some(SideState::StandingBy));
+        assert_eq!(side_state(None, true, false, true, true, false), Some(SideState::Working), "a turn at work is said first");
+        assert_eq!(side_state(None, false, false, false, true, false), None, "what stands by on screen is the shown session's");
+        assert_eq!(side_state(Some((true, false)), false, false, false, false, false), Some(SideState::Waiting), "a woken turn that asks says so even where it has ended its work");
         // the button
         assert!(is_stoppable(true, false, false), "the model is writing");
         assert!(!is_stoppable(true, true, false), "the model waits for an answer: the button sends it");

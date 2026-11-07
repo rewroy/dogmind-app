@@ -4,9 +4,11 @@
 use std::collections::HashMap;
 
 use dogmind_agent::agent::{self, PlanOutcome};
-use dogmind_agent::message::Message;
+use dogmind_agent::message::{Message, Wake, WakeCause};
 use dogmind_agent::tools::FileChange;
 use serde_json::Value;
+
+use crate::lang::{t, tf};
 
 /// Where a question stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,17 +50,57 @@ pub enum Card {
     Plan { id: u64, plan: String, state: PlanState },
     /// The files turn `turn`'s edits changed: as many as the card lists, how many more there are, and the lines added and removed in all of them.
     Files { turn: u64, rows: Vec<FileRow>, more: usize, added: usize, removed: usize },
+    /// What woke the session with nobody writing (a background command ended, a line it was to wake for, a wait): the app's notice, in a row of its own and not a bubble of the person's.
+    /// `at`: when it came, as the transcript says times.
+    Notice { wakes: Vec<Wake>, at: String },
 }
 
 /// How many files a card lists: the rest are counted, and the Changes page has all of them.
 pub const MOST_FILES: usize = 8;
+
+/// The lines a notice row has for one thing that woke the session: what it was, which one, and how it went. `failed`: it went wrong (an exit code, a time out), and the line says so in a colour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticeRow {
+    pub title: String,
+    pub what: String,
+    pub how: String,
+    pub failed: bool,
+}
+
+/// A length of time in the words of the window: `45 s`, `1 min 31 s`, `2 h 5 min`.
+pub fn duration_words(seconds: u64) -> String {
+    match seconds {
+        0..=59 => tf("{0} s", &[&seconds]),
+        60..=3599 => tf("{0} min {1} s", &[&(seconds / 60), &(seconds % 60)]),
+        _ => tf("{0} h {1} min", &[&(seconds / 3600), &(seconds % 3600 / 60)]),
+    }
+}
+
+/// What a notice row says of one thing that woke the session.
+pub fn notice_row(wake: &Wake) -> NoticeRow {
+    let took = duration_words(wake.seconds);
+    match wake.cause {
+        WakeCause::CommandEnded => {
+            let (how, failed) = match (wake.exit_code, wake.ended.as_deref()) {
+                (Some(code), _) => (tf("Exit code {0}  ·  ran {1}", &[&code, &took]), code != 0),
+                (None, Some("timed out")) => (tf("Timed out  ·  ran {0}", &[&took]), true),
+                (None, Some("cancelled")) => (tf("Cancelled  ·  ran {0}", &[&took]), true),
+                (None, Some("not run")) => (t("Did not run").to_string(), true),
+                (None, _) => (tf("Ended  ·  ran {0}", &[&took]), false),
+            };
+            NoticeRow { title: t("A background command ended").to_string(), what: format!("{}  ·  {}", wake.id, wake.what), how, failed }
+        }
+        WakeCause::CommandLine => NoticeRow { title: t("A background command printed the line it was watched for").to_string(), what: format!("{}  ·  {}", wake.id, wake.what), how: tf("Running for {0}, and going on", &[&took]), failed: false },
+        WakeCause::Wait => NoticeRow { title: t("A wait is up").to_string(), what: wake.what.clone(), how: tf("Set for {0}", &[&took]), failed: false },
+    }
+}
 
 impl Card {
     /// The number a card has, which says which it is among those of the transcript.
     pub fn id(&self) -> Option<u64> {
         match self {
             Card::Question { id, .. } | Card::Plan { id, .. } => Some(*id),
-            Card::Files { .. } => None,
+            Card::Files { .. } | Card::Notice { .. } => None,
         }
     }
 
@@ -420,6 +462,33 @@ second")), Some("first line".to_string()));
         assert_eq!(goal_action("", None), GoalAction::None);
         assert_eq!(goal_action("", Some("  ")), GoalAction::None);
         assert_eq!(goal_action("", Some("ship the page")), GoalAction::Edit("ship the page".to_string()));
+    }
+
+    fn woke(cause: WakeCause, exit_code: Option<i64>, ended: Option<&str>, seconds: u64) -> Wake {
+        Wake { cause, id: if cause == WakeCause::Wait { "wait1".into() } else { "job2".into() }, what: if cause == WakeCause::Wait { "look at the deploy".into() } else { "cargo build --release".into() }, exit_code, ended: ended.map(str::to_string), seconds }
+    }
+
+    #[test]
+    fn a_notice_row_says_what_woke_the_session_which_one_and_how_it_went() {
+        let ok = notice_row(&woke(WakeCause::CommandEnded, Some(0), None, 91));
+        assert_eq!((ok.title.as_str(), ok.what.as_str(), ok.how.as_str(), ok.failed), ("A background command ended", "job2  ·  cargo build --release", "Exit code 0  ·  ran 1 min 31 s", false));
+        let bad = notice_row(&woke(WakeCause::CommandEnded, Some(101), None, 7));
+        assert_eq!((bad.how.as_str(), bad.failed), ("Exit code 101  ·  ran 7 s", true));
+        assert_eq!(notice_row(&woke(WakeCause::CommandEnded, None, Some("timed out"), 3600)).how, "Timed out  ·  ran 1 h 0 min");
+        assert!(notice_row(&woke(WakeCause::CommandEnded, None, Some("cancelled"), 4)).failed);
+        assert_eq!(notice_row(&woke(WakeCause::CommandEnded, None, Some("not run"), 0)).how, "Did not run");
+        let line = notice_row(&woke(WakeCause::CommandLine, None, None, 12));
+        assert!(line.title.contains("printed the line") && line.how == "Running for 12 s, and going on" && !line.failed, "{line:?}");
+        let wait = notice_row(&woke(WakeCause::Wait, None, None, 1800));
+        assert_eq!((wait.title.as_str(), wait.what.as_str(), wait.how.as_str()), ("A wait is up", "look at the deploy", "Set for 30 min 0 s"));
+    }
+
+    /// A notice is no one's words: a session that holds one opens with it as a row of its own, whatever the person said.
+    #[test]
+    fn a_notice_card_has_no_number_and_is_no_question() {
+        let card = Card::Notice { wakes: vec![woke(WakeCause::Wait, None, None, 60)], at: "14:32".into() };
+        assert_eq!(card.id(), None);
+        assert!(!is_asking("wake_at"));
     }
 
     #[test]
