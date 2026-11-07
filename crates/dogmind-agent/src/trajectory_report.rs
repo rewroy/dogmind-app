@@ -567,6 +567,8 @@ pub struct TurnSummary {
     pub turn: u64,
     pub chars: u64,
     pub pictures: u64,
+    /// Nobody sent it: a background command's end, a line it printed or a wait woke the session (the `wake` lines say which).
+    pub woken: bool,
     /// The main requests' time to the first word, and the rest of them.
     pub prefill_ms: u64,
     pub generation_ms: u64,
@@ -629,6 +631,7 @@ pub fn summary(trajectory: &str) -> Summary {
             turn: *turn,
             chars: began.and_then(|line| line.u("chars")).unwrap_or(0),
             pictures: began.and_then(|line| line.u("images")).unwrap_or(0),
+            woken: began.is_some_and(|line| line.v["woken"] == true),
             prefill_ms: spent.prefill,
             generation_ms: spent.generation,
             tools_ms: spent.tools.values().map(|(_, ms)| ms).sum(),

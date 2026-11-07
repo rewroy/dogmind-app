@@ -78,9 +78,18 @@ fn until_woken(run: &Run) -> Vec<crate::message::Wake> {
 #[test]
 fn a_background_commands_end_starts_a_turn_with_its_notice() {
     let (mut agent, provider, events, _kept) = after_a_turn(vec![says("The build passed.")]);
-    assert_eq!(started(&mut agent, "cargo build --release", finished(OK), Arc::default()), "job1");
+    // (it runs, and the window is told so; then it ends)
+    let done = running();
+    assert_eq!(started(&mut agent, "cargo build --release", done.clone(), Arc::default()), "job1");
+    agent.tell_waiting();
+    assert!(events.try_iter().any(|event| matches!(event, Event::Waiting(waiting) if waiting.commands.len() == 1)));
+    *done.lock().unwrap() = Some(Ok(OK.to_string()));
     assert!(wake(&mut agent));
-    assert_eq!(told(&events), ["woken:job1/command_ended", "started", "ended:false"]);
+    let all: Vec<Event> = events.try_iter().collect();
+    // (the window is told that nothing is going on before it is told of the turn: the list does not say a command that ended still runs while the turn answers)
+    let woken_at = all.iter().position(|event| matches!(event, Event::Woken(_))).expect("it was told of the turn");
+    assert!(matches!(all[..woken_at].iter().rev().find_map(|event| if let Event::Waiting(waiting) = event { Some(waiting) } else { None }), Some(waiting) if waiting.is_empty()), "the last list before the turn is empty");
+    assert!(all.iter().any(|event| matches!(event, Event::TurnEnded { cancelled: false })));
     assert_eq!(provider.requests(), 1);
     let notice = the_notice_in(&provider, 0);
     let text = notice.content.clone().unwrap();

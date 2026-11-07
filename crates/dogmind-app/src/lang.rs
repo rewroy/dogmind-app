@@ -200,6 +200,7 @@ const JA: &[(&str, &str)] = &[
     ("Let's go", "行こう"),
     // Background work, and the notices that wake a session.
     ("Wake later", "あとで再開"),
+    ("woken by background work", "バックグラウンドの作業で再開"),
     ("Notice", "通知"),
     ("A background command ended", "バックグラウンドのコマンドが終わりました"),
     ("A background command printed the line it was watched for", "バックグラウンドのコマンドが待っていた行を出力しました"),

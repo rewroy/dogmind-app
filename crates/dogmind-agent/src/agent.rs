@@ -1319,6 +1319,8 @@ impl Agent {
     /// Runs a turn for what a background command or a wait has to say, when there is anything and nothing stands in the way. True if a turn was run.
     fn wake_if_due(&mut self) -> bool {
         self.background.collect();
+        // (what ended is not listed as going on any more, whether or not a turn is run for it)
+        self.tell_waiting();
         if !self.background.has_pending() || self.provider.is_none() || self.messages.is_empty() || self.quiet_until.is_some_and(|until| Instant::now() < until) {
             return false;
         }
@@ -1331,6 +1333,8 @@ impl Agent {
             return false;
         }
         let items = self.background.take_pending();
+        // (the window lists what is left before it is told of the turn: a command that ended is not still running in it while the turn answers)
+        self.tell_waiting();
         self.woken_turn(items);
         true
     }
