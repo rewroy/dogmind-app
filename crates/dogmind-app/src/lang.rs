@@ -1066,6 +1066,10 @@ const JA: &[(&str, &str)] = &[
     ("{0}, changed by this session: {1} lines added, {2} removed", "{0}、このセッションで変更: {1} 行追加、{2} 行削除"),
     ("Copy the path", "パスをコピー"),
     ("Mention in the message", "メッセージで参照する"),
+    // The terminal, in the panel on the right.
+    ("Terminal", "ターミナル"),
+    ("Your own shell, in this session's folder.", "このセッションのフォルダーで動く、あなた自身のシェルです。"),
+    ("Commands here run with your own rights, apart from the agent's permissions. Nothing shown here is sent to the model.", "ここで実行するコマンドは、エージェントの権限とは別に、あなた自身の権限で動きます。ここに表示される内容はモデルには送られません。"),
 ];
 
 pub const HELP_JA: &str = "# はじめに
@@ -1157,7 +1161,7 @@ mod tests {
     fn everything_the_code_asks_for_has_its_japanese() {
         let table: HashMap<&str, &str> = JA.iter().copied().collect();
         let mut missing = Vec::new();
-        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("drafter.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs"), include_str!("cards.rs"), include_str!("trajectory.rs"), include_str!("files.rs"), include_str!("ui/files_panel.rs")] {
+        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("drafter.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs"), include_str!("cards.rs"), include_str!("trajectory.rs"), include_str!("files.rs"), include_str!("ui/files_panel.rs"), include_str!("ui/term_panel.rs")] {
             for words in words_in(source) {
                 if !table.contains_key(words.as_str()) {
                     missing.push(words);
