@@ -153,6 +153,17 @@ impl Cipher {
         out
     }
 
+    /// As `open`, for a blob that is not wanted after: opened where it lies, with no copy of it.
+    pub fn open_owned(&self, mut blob: Vec<u8>, aad: &[u8]) -> Option<Vec<u8>> {
+        if blob.len() < NONCE_BYTES + TAG_BYTES {
+            return None;
+        }
+        let nonce = Nonce::try_assume_unique_for_key(&blob[..NONCE_BYTES]).ok()?;
+        let plain_len = self.key.open_within(nonce, Aad::from(aad), &mut blob, NONCE_BYTES..).ok()?.len();
+        blob.truncate(plain_len);
+        Some(blob)
+    }
+
     /// What `seal` made, opened; none if one byte of it, or the `aad`, is not as it was.
     pub fn open(&self, blob: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
         if blob.len() < NONCE_BYTES + TAG_BYTES {
@@ -354,31 +365,62 @@ pub(crate) fn b64e(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn b64d(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let (mut bits, mut have) = (0u32, 0);
-    let text = text.trim_end_matches('=');
+    b64d_bytes(text.as_bytes())
+}
+
+/// What a letter of the standard alphabet is worth; 255 for what is not one.
+const B64_VALUE: [u8; 256] = {
+    let mut table = [255u8; 256];
+    let letters = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut at = 0;
+    while at < 64 {
+        table[letters[at] as usize] = at as u8;
+        at += 1;
+    }
+    table
+};
+
+/// A line of base64 read as the bytes it is, four letters to three bytes at a time: a session's every line goes through here, and a large one has hundreds of thousands.
+pub(crate) fn b64d_bytes(text: &[u8]) -> Option<Vec<u8>> {
+    let text = text.trim_ascii();
+    let mut end = text.len();
+    while end > 0 && text[end - 1] == b'=' {
+        end -= 1;
+    }
+    let text = &text[..end];
     if text.len() % 4 == 1 {
         return None;
     }
-    for letter in text.bytes() {
-        let value = match letter {
-            b'A'..=b'Z' => letter - b'A',
-            b'a'..=b'z' => letter - b'a' + 26,
-            b'0'..=b'9' => letter - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
-        bits = bits << 6 | u32::from(value);
-        have += 6;
-        if have >= 8 {
-            have -= 8;
-            out.push((bits >> have) as u8);
-            bits &= (1 << have) - 1;
+    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 3);
+    let mut groups = text.chunks_exact(4);
+    for group in groups.by_ref() {
+        let (a, b, c, d) = (B64_VALUE[group[0] as usize], B64_VALUE[group[1] as usize], B64_VALUE[group[2] as usize], B64_VALUE[group[3] as usize]);
+        if (a | b | c | d) & 0x80 != 0 {
+            return None;
+        }
+        out.extend_from_slice(&[a << 2 | b >> 4, b << 4 | c >> 2, c << 6 | d]);
+    }
+    let rest = groups.remainder();
+    let value = |at: usize| B64_VALUE[rest[at] as usize];
+    match rest.len() {
+        0 => {}
+        2 => {
+            let (a, b) = (value(0), value(1));
+            // (what is left over is the padding's zeros: anything else is not what an encoder made)
+            if (a | b) & 0x80 != 0 || b & 0x0F != 0 {
+                return None;
+            }
+            out.push(a << 2 | b >> 4);
+        }
+        _ => {
+            let (a, b, c) = (value(0), value(1), value(2));
+            if (a | b | c) & 0x80 != 0 || c & 0x03 != 0 {
+                return None;
+            }
+            out.extend_from_slice(&[a << 2 | b >> 4, b << 4 | c >> 2]);
         }
     }
-    // (what is left over is the padding's zeros: anything else is not what an encoder made)
-    (bits == 0).then_some(out)
+    Some(out)
 }
 
 fn derive(secret: &str, salt: &[u8], cost: &ScryptCost) -> Result<[u8; 32], KeyError> {
