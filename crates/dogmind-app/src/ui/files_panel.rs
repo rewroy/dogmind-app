@@ -165,6 +165,7 @@ impl App {
 
     /// The tree is not on screen: it is not watched, and what it shows is read again when it comes back.
     pub(super) unsafe fn files_hidden(&mut self) {
+        self.files_menu_close(false);
         show(self.tree_list, false);
         if self.tree_watcher.take().is_some() {
             self.tree_stale = true;
@@ -391,7 +392,12 @@ impl App {
                 self.tree.more(&row.path);
                 self.files_rebuild();
             }
-            files::RowKind::Problem(_) => self.files_toggle(&row.path),
+            files::RowKind::Problem(_) => {
+                if let Toggled::Read(place) = self.tree.retry(&row.path) {
+                    self.files_read(place);
+                }
+                self.files_rebuild();
+            }
             _ => {}
         }
     }
