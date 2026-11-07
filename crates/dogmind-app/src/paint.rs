@@ -875,8 +875,6 @@ pub enum ButtonKind {
     Icon = 7,
     /// A picture waiting to be sent: its small copy, with a cross on it for the pointer and the Delete key.
     Attached = 8,
-    /// A picture in the transcript: click to see it large.
-    Picture = 9,
     /// A row of a dialog's list of places: an icon and a name.
     Nav = 10,
     NavOn = 11,
@@ -952,6 +950,31 @@ unsafe fn draw_thumb(device: HDC, bitmap: HBITMAP, x: i32, y: i32, width: i32, h
     DeleteObject(round);
     SelectObject(source, previous);
     DeleteDC(source);
+}
+
+/// A picture's tile in `area` of `device`: its small copy, or the shape that holds its place while it is read, or why there is none. `attached`: a picture waiting to go, in the middle of a
+/// square of its own; else one in a message, from the top left of its place, as the text under it is. Shared by the button of an attached picture and by the transcript's own paint,
+/// which draws the pictures of its messages itself.
+pub unsafe fn draw_tile(device: HDC, area: RECT, thumb: &Thumb, attached: bool, fonts: &Fonts) {
+    let s = |value: i32| scale(fonts.dpi, value);
+    let radius = s(radius::SMALL);
+    match thumb {
+        Thumb::Ready { bitmap, width, height } => {
+            let (x, y) = if attached { (area.left + (area.right - area.left - width) / 2, area.top + (area.bottom - area.top - height) / 2) } else { (area.left, area.top) };
+            if attached {
+                rounded(device, area, radius, Some(theme::raised()), None);
+            }
+            draw_thumb(device, *bitmap, x, y, *width, *height, radius);
+        }
+        Thumb::Waiting => rounded(device, area, radius, Some(theme::raised()), None),
+        Thumb::Missing(words) => {
+            rounded(device, area, radius, Some(theme::raised()), Some(theme::line()));
+            let across = area.right - area.left - s(design::space::M);
+            let tall = text_height(fonts.small, words, across).min(area.bottom - area.top);
+            let inside = RECT { left: area.left + s(6), top: area.top + (area.bottom - area.top - tall) / 2, right: area.right - s(6), bottom: area.top + (area.bottom - area.top + tall) / 2 + 1 };
+            draw_text(device, words, inside, fonts.small, theme::muted(), DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+        }
+    }
 }
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -1194,29 +1217,10 @@ unsafe fn draw_button_face(window: HWND, device: HDC, client: RECT, kind: isize,
             let color = if label == "check" { theme::good() } else if lit { theme::text() } else { theme::faint() };
             icon::draw(device, label, client, s(design::size::ICON), color);
         }
-        8 | 9 => {
+        8 => {
             let thumb = THUMBS.with(|thumbs| thumbs.borrow().get(&(window as isize)).cloned()).unwrap_or(Thumb::Waiting);
-            let radius = s(radius::SMALL);
-            let attached = kind == 8;
-            match thumb {
-                Thumb::Ready { bitmap, width, height } => {
-                    // (a small one to send stands in the middle of its square; in a card, from the left, as the text under it does)
-                    let (x, y) = if attached { ((client.right - width) / 2, (client.bottom - height) / 2) } else { (0, 0) };
-                    if attached {
-                        rounded(device, client, radius, Some(theme::raised()), None);
-                    }
-                    draw_thumb(device, bitmap, x, y, width, height, radius);
-                }
-                Thumb::Waiting => rounded(device, client, radius, Some(theme::raised()), None),
-                Thumb::Missing(words) => {
-                    rounded(device, client, radius, Some(theme::raised()), Some(theme::line()));
-                    let across = client.right - s(design::space::M);
-                    let tall = text_height(fonts.small, &words, across).min(client.bottom);
-                    let area = RECT { left: s(6), top: (client.bottom - tall) / 2, right: client.right - s(6), bottom: (client.bottom + tall) / 2 + 1 };
-                    draw_text(device, &words, area, fonts.small, theme::muted(), DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
-                }
-            }
-            if attached && (lit || focused) {
+            draw_tile(device, client, &thumb, true, &fonts);
+            if lit || focused {
                 let cross = RECT { left: client.right - s(22), top: s(3), right: client.right - s(3), bottom: s(22) };
                 rounded(device, cross, s(design::radius::CONTROL), Some(theme::surface()), Some(theme::line()));
                 icon::draw(device, "x", cross, s(design::size::ICON_SMALL), theme::text());
