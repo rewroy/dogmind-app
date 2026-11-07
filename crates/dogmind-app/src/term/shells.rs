@@ -16,6 +16,7 @@ pub struct Shell {
 }
 
 /// The shells, by `Shell::id`, in the order the menu has them.
+#[cfg(test)]
 pub const IDS: [&str; 4] = ["pwsh", "powershell", "cmd", "git-bash"];
 
 #[derive(Clone, Debug, Default)]

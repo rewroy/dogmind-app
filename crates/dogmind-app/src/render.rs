@@ -408,9 +408,268 @@ pub unsafe fn ink(device: HDC, alphas: &[u8], width: u32, height: u32, ink: u32,
     .is_some()
 }
 
+// ---- A terminal's cells.
+
+/// The face a terminal is drawn in, and how large its cell is: the size is tuned so that a character is a whole number of pixels wide, and so a row of them, drawn as one run, ends
+/// exactly where its cells do (and the line characters of a box meet).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TermFont {
+    pub family: String,
+    /// In pixels, as tuned.
+    pub size: f32,
+    pub cell_width: i32,
+    pub cell_height: i32,
+    /// From the top of a cell to the baseline.
+    pub baseline: f32,
+}
+
+/// A row of cells, drawn: `text` starts at the cell `col` of row `row` and takes `cells` cells. A wide character is a run of its own, which is centred in its two cells.
+pub struct TermRun {
+    pub row: usize,
+    pub col: usize,
+    pub cells: usize,
+    pub text: String,
+    pub color: u32,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+/// A part of a row painted in a colour: a ground that is not the terminal's own, or a selection.
+pub struct TermGround {
+    pub row: usize,
+    pub col: usize,
+    pub cells: usize,
+    pub color: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TermLineKind {
+    Underline,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+    Strike,
+}
+
+pub struct TermLine {
+    pub row: usize,
+    pub col: usize,
+    pub cells: usize,
+    pub color: u32,
+    pub kind: TermLineKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TermCursorShape {
+    Block,
+    Underline,
+    Beam,
+    Hollow,
+}
+
+pub struct TermCursor {
+    pub row: usize,
+    pub col: usize,
+    pub cells: usize,
+    pub shape: TermCursorShape,
+    pub color: u32,
+}
+
+/// What is drawn of a terminal: the ground, the parts of it in other colours, the text, its lines, and the cursor (drawn last, over a character that it hides; that character is in
+/// `runs` as well, and the cursor's block draws it again in the colour it is given).
+pub struct TermScene {
+    pub ground: u32,
+    /// Where the cells begin, from the area's own corner.
+    pub origin: (i32, i32),
+    pub grounds: Vec<TermGround>,
+    pub runs: Vec<TermRun>,
+    pub lines: Vec<TermLine>,
+    pub cursor: Option<(TermCursor, Option<TermRun>)>,
+    /// Where the scrollbar's thumb is, as left, top, right and bottom in the area's own pixels, and its colour: there is one while lines are kept above the screen.
+    pub thumb: Option<((i32, i32, i32, i32), u32)>,
+}
+
+impl Engine {
+    /// The format of a terminal's text: its family at the size tuned, in the weight and style asked for.
+    unsafe fn terminal_format(&mut self, font: &TermFont, bold: bool, italic: bool) -> windows::core::Result<IDWriteTextFormat> {
+        let key = (format!("{}\u{1}{}", font.family, italic), if bold { 700 } else { 400 }, (font.size * 100.0) as u32);
+        if let Some(format) = self.formats.get(&key) {
+            return Ok(format.clone());
+        }
+        let locale = if crate::lang::is_japanese() { "ja-jp" } else { "en-us" };
+        let style = if italic { DWRITE_FONT_STYLE_ITALIC } else { DWRITE_FONT_STYLE_NORMAL };
+        let format = self.write.CreateTextFormat(&HSTRING::from(font.family.as_str()), self.collection.as_ref(), DWRITE_FONT_WEIGHT(key.1 as i32), style, DWRITE_FONT_STRETCH_NORMAL, font.size, &HSTRING::from(locale))?;
+        if let (Some(fallback), Ok(newer)) = (&self.fallback, format.cast::<IDWriteTextFormat1>()) {
+            newer.SetFontFallback(fallback)?;
+        }
+        self.formats.insert(key, format.clone());
+        Ok(format)
+    }
+
+    /// Whether DirectWrite has a family by this name.
+    unsafe fn has_family(&self, name: &str) -> bool {
+        let find = |collection: &IDWriteFontCollection| {
+            let (mut index, mut exists) = (0u32, windows::core::BOOL(0));
+            collection.FindFamilyName(&HSTRING::from(name), &mut index, &mut exists).is_ok() && exists.as_bool()
+        };
+        match &self.collection {
+            Some(collection) => find(collection),
+            None => {
+                let mut system: Option<IDWriteFontCollection> = None;
+                self.write.GetSystemFontCollection(&mut system, false).is_ok() && system.as_ref().is_some_and(find)
+            }
+        }
+    }
+}
+
+/// The advance of a character of the face at a size, and the height of its line and where the baseline is in it.
+unsafe fn measure_cell(engine: &mut Engine, family: &str, size: f32) -> windows::core::Result<(f32, f32, f32)> {
+    let probe = TermFont { family: family.to_string(), size, cell_width: 0, cell_height: 0, baseline: 0.0 };
+    let format = engine.terminal_format(&probe, false, false)?;
+    let units: Vec<u16> = "0000000000".encode_utf16().collect();
+    let layout = engine.write.CreateTextLayout(&units, &format, 10_000.0, 10_000.0)?;
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    layout.GetMetrics(&mut metrics)?;
+    let mut lines = [DWRITE_LINE_METRICS::default(); 1];
+    let mut count = 0u32;
+    layout.GetLineMetrics(Some(&mut lines), &mut count)?;
+    Ok((metrics.widthIncludingTrailingWhitespace / 10.0, lines[0].height, lines[0].baseline))
+}
+
+/// The face for a terminal, the first of `families` this PC has, at `points` for a screen of `dpi`; with a size that makes a character a whole number of pixels wide. None where
+/// DirectWrite is not there.
+pub unsafe fn terminal_font(families: &[&str], points: i32, dpi: u32) -> Option<TermFont> {
+    with_engine(|engine| {
+        let family = families.iter().find(|name| engine.has_family(name)).or(families.last()).copied().unwrap_or("Consolas");
+        let wanted = points as f32 * dpi as f32 / 72.0;
+        let (advance, ..) = measure_cell(engine, family, wanted)?;
+        let tuned = wanted * (advance.round().max(1.0) / advance.max(1.0));
+        let (advance, height, baseline) = measure_cell(engine, family, tuned)?;
+        Ok(TermFont { family: family.to_string(), size: tuned, cell_width: advance.round().max(1.0) as i32, cell_height: height.ceil().max(1.0) as i32, baseline })
+    })
+}
+
+/// A terminal's scene in `area` of the device: all of it, from the ground up. False where DirectWrite could not draw it.
+pub unsafe fn terminal(device: HDC, area: RECT, font: &TermFont, scene: &TermScene) -> bool {
+    with_engine(|engine| {
+        // (the formats are made first: a format is made with the engine, which the drawing below holds)
+        let mut formats = Vec::new();
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            formats.push(engine.terminal_format(font, bold, italic)?);
+        }
+        let format_of = |bold: bool, italic: bool| &formats[usize::from(bold) + 2 * usize::from(italic)];
+        let write = engine.write.clone();
+        engine.draw(device, area, |target, _| {
+            let (cell_w, cell_h) = (font.cell_width as f32, font.cell_height as f32);
+            let (left, top) = (scene.origin.0 as f32, scene.origin.1 as f32);
+            let brush = target.CreateSolidColorBrush(&color(scene.ground), None)?;
+            let rectangle = |row: usize, col: usize, cells: usize| D2D_RECT_F { left: left + col as f32 * cell_w, top: top + row as f32 * cell_h, right: left + (col + cells) as f32 * cell_w, bottom: top + (row + 1) as f32 * cell_h };
+            target.FillRectangle(&D2D_RECT_F { left: 0.0, top: 0.0, right: (area.right - area.left) as f32, bottom: (area.bottom - area.top) as f32 }, &brush);
+            for ground in &scene.grounds {
+                brush.SetColor(&color(ground.color));
+                target.FillRectangle(&rectangle(ground.row, ground.col, ground.cells), &brush);
+            }
+            let draw_run = |run: &TermRun, ink: u32, brush: &ID2D1SolidColorBrush| -> windows::core::Result<()> {
+                let units: Vec<u16> = run.text.encode_utf16().collect();
+                let place = rectangle(run.row, run.col, run.cells);
+                let layout = write.CreateTextLayout(&units, format_of(run.bold, run.italic), (place.right - place.left).max(1.0), cell_h)?;
+                layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                // (a wide character is centred in its cells, whichever face drew it)
+                layout.SetTextAlignment(if run.cells > 1 && run.text.chars().count() == 1 { DWRITE_TEXT_ALIGNMENT_CENTER } else { DWRITE_TEXT_ALIGNMENT_LEADING })?;
+                // (the baseline is where the measured cell has it, whichever face a character falls back to)
+                layout.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, cell_h, font.baseline)?;
+                brush.SetColor(&color(ink));
+                target.DrawTextLayout(Vector2 { X: place.left, Y: place.top }, &layout, brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT | D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                Ok(())
+            };
+            for run in &scene.runs {
+                draw_run(run, run.color, &brush)?;
+            }
+            let thick = (cell_h / 16.0).round().max(1.0);
+            for line in &scene.lines {
+                brush.SetColor(&color(line.color));
+                let cell = rectangle(line.row, line.col, line.cells);
+                let under = cell.top + font.baseline + thick.max(1.0);
+                let (left, right) = (cell.left, cell.right);
+                let bar = |from: f32, to: f32, at: f32, height: f32| D2D_RECT_F { left: from, top: at, right: to, bottom: at + height };
+                match line.kind {
+                    TermLineKind::Underline => target.FillRectangle(&bar(left, right, under.min(cell.bottom - thick), thick), &brush),
+                    TermLineKind::Double => {
+                        target.FillRectangle(&bar(left, right, (under - thick - 1.0).max(cell.top), thick), &brush);
+                        target.FillRectangle(&bar(left, right, under.min(cell.bottom - thick), thick), &brush);
+                    }
+                    TermLineKind::Strike => target.FillRectangle(&bar(left, right, cell.top + font.baseline * 0.62, thick), &brush),
+                    TermLineKind::Dotted | TermLineKind::Dashed | TermLineKind::Curly => {
+                        // (dots, dashes, or a wave of steps up and down)
+                        let step = if line.kind == TermLineKind::Dashed { 4.0 * thick } else { 2.0 * thick };
+                        let mut x = left;
+                        while x < right {
+                            let to = (x + if line.kind == TermLineKind::Dashed { 3.0 * thick } else { thick }).min(right);
+                            let rise = if line.kind == TermLineKind::Curly && ((x - left) / step) as i32 % 2 == 1 { -thick } else { 0.0 };
+                            target.FillRectangle(&bar(x, to, under.min(cell.bottom - thick) + rise, thick), &brush);
+                            x += step;
+                        }
+                    }
+                }
+            }
+            if let Some((cursor, hidden)) = &scene.cursor {
+                brush.SetColor(&color(cursor.color));
+                let cell = rectangle(cursor.row, cursor.col, cursor.cells);
+                match cursor.shape {
+                    TermCursorShape::Block => {
+                        target.FillRectangle(&cell, &brush);
+                        if let Some(run) = hidden {
+                            draw_run(run, run.color, &brush)?;
+                        }
+                    }
+                    TermCursorShape::Underline => target.FillRectangle(&D2D_RECT_F { top: cell.bottom - thick.max(2.0), ..cell }, &brush),
+                    TermCursorShape::Beam => target.FillRectangle(&D2D_RECT_F { right: cell.left + thick.max(2.0), ..cell }, &brush),
+                    TermCursorShape::Hollow => target.DrawRectangle(&D2D_RECT_F { left: cell.left + 0.5, top: cell.top + 0.5, right: cell.right - 0.5, bottom: cell.bottom - 0.5 }, &brush, 1.0, None),
+                }
+            }
+            if let Some(((left, top, right, bottom), thumb)) = scene.thumb {
+                brush.SetColor(&color(thumb));
+                let radius = (right - left) as f32 / 2.0;
+                target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: left as f32, top: top as f32, right: right as f32, bottom: bottom as f32 }, radiusX: radius, radiusY: radius }, &brush);
+            }
+            Ok(())
+        })
+    })
+    .is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terminal's face makes a character a whole number of pixels wide, at each scale a screen has, and a line of them as wide as its cells.
+    #[test]
+    fn a_terminals_face_is_tuned_to_whole_pixels_and_a_run_ends_where_its_cells_do() {
+        // SAFETY: DirectWrite, on this thread, which makes its own engine.
+        unsafe {
+            for dpi in [96, 120, 144, 168, 192] {
+                let font = terminal_font(&["Cascadia Mono", "Consolas"], 9, dpi).expect("DirectWrite");
+                assert!(font.cell_width >= 5 && font.cell_height > font.cell_width, "{font:?}");
+                // (ten characters, laid out as a run is: exactly ten cells, and so for sixty)
+                let widths = with_engine(|engine| {
+                    let format = engine.terminal_format(&font, false, false)?;
+                    let mut found = Vec::new();
+                    for count in [10usize, 60] {
+                        let units: Vec<u16> = "Wi0.".repeat(count / 4 + 1).encode_utf16().take(count).collect();
+                        let layout = engine.write.CreateTextLayout(&units, &format, 10_000.0, 100.0)?;
+                        let mut metrics = DWRITE_TEXT_METRICS::default();
+                        layout.GetMetrics(&mut metrics)?;
+                        found.push(metrics.widthIncludingTrailingWhitespace);
+                    }
+                    Ok(found)
+                })
+                .unwrap();
+                assert!((widths[0] - 10.0 * font.cell_width as f32).abs() < 0.5, "dpi {dpi}: {widths:?} for cells of {}", font.cell_width);
+                assert!((widths[1] - 60.0 * font.cell_width as f32).abs() < 1.0, "dpi {dpi}: {widths:?} for cells of {}", font.cell_width);
+            }
+        }
+    }
 
     #[test]
     fn an_arc_starts_and_ends_where_gdi_plus_puts_them() {

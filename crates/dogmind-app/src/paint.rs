@@ -1462,7 +1462,7 @@ pub unsafe fn tab_stops(parent: HWND, sidebar_right: i32) -> Vec<HWND> {
         let name = String::from_utf16_lossy(&class[..length.max(0) as usize]);
         let style = GetWindowLongPtrW(window, GWL_STYLE) as u32;
         let takes_input = match name.as_str() {
-            "DogButton" | "ListBox" => true,
+            "DogButton" | "ListBox" | "DogTerm" => true,
             "Edit" | "RICHEDIT50W" | crate::textview::CLASS => style & ES_READONLY as u32 == 0,
             _ => false,
         };

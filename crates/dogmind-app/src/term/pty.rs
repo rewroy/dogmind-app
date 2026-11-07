@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Console::{ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON};
+use windows_sys::Win32::System::Console::{ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, SetConsoleCtrlHandler, COORD, HPCON};
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Threading::*;
 
@@ -169,6 +169,8 @@ impl Pty {
                 console.close();
                 return Err(error);
             }
+            // (a process that was started with Ctrl+C turned off, from a shell that had it so, passes that on to what it starts: a shell that gets no Ctrl+C is no use. It is turned on again here.)
+            SetConsoleCtrlHandler(None, 0);
             let mut startup: STARTUPINFOEXW = std::mem::zeroed();
             startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
             // (none of this process's own standard handles go to the shell: it has the console's, and a process that was started with its output in a pipe would otherwise give the shell that pipe)

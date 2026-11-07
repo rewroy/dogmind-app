@@ -68,6 +68,8 @@ const WM_WAKE: u32 = WM_APP + 1;
 const WM_PREVIEW_MADE: u32 = WM_APP + 2;
 const WM_TRAY: u32 = WM_APP + 3;
 const WM_FRAME: u32 = WM_APP + 4;
+/// A terminal has written something, or has ended: its id, and 0 or 1.
+const WM_TERM: u32 = WM_APP + 6;
 const TRAY_BALLOON_CLICK: u32 = WM_USER + 5; // NIN_BALLOONUSERCLICK
 const M_TRAY_OPEN: usize = 9101;
 const M_TRAY_QUIT: usize = 9102;
@@ -243,6 +245,15 @@ const ID_ATTACHED: isize = 9060; // ..+ attach::MOST_IMAGES
 /// The list of the Files view of the panel on the right, and the little menu of a row of it.
 const ID_FILES: isize = 9070;
 const ID_FILES_MENU: isize = 9071;
+/// The Terminal view's controls: a tab and its close for each terminal there can be, a new terminal and the shells beside it, the page's own two and the bar's one, and the field a tab is renamed in.
+const ID_TERM_TAB: isize = 11000; // ..+ term::MOST_TERMINALS
+const ID_TERM_CLOSE: isize = 11010; // ..+ term::MOST_TERMINALS
+const ID_TERM_NEW: isize = 11020;
+const ID_TERM_SHELLS: isize = 11021;
+const ID_TERM_START: isize = 11022;
+const ID_TERM_START_SHELLS: isize = 11023;
+const ID_TERM_AGAIN: isize = 11024;
+const ID_TERM_RENAME: isize = 11025;
 /// How many pictures of a transcript are drawn at once: more than any view holds, and fewer than the small copies that are kept.
 const PICTURES_IN_VIEW: usize = 48;
 /// How many small copies are kept: a third of a megabyte at most for one.
@@ -321,6 +332,8 @@ const FIRST_RELEASE_LOOK_MS: u32 = 30_000;
 const RELEASE_LOOK_MS: u32 = 60 * 60 * 1000;
 /// The conversation's width below which the panel on the right gives way, at 96 dpi.
 const RIGHT_NEEDS: i32 = 480;
+/// The panel on the right is no wider than this while it shows a terminal.
+const TERMINAL_PANEL_MOST: i32 = 720;
 /// How many commands, and as many waits, the panel on the right lists of what waits in the background: a session has five waits at most, and few commands.
 const WAITING_LISTED: usize = 6;
 /// How often a server that cannot be reached is tried again, while something waits to be sent to it.
@@ -451,7 +464,7 @@ const M_PROVIDER: usize = 200; // and on
 const M_MODEL_CHOICE: usize = 9500; // and on
 
 /// What `/` offers, in this order.
-const COMMANDS: [(&str, &str); 46] = [
+const COMMANDS: [(&str, &str); 47] = [
     ("/setup", "Go through the first setup again"),
     ("/report", "Write what can be sent about a problem"),
     ("/help", "How to use this app"),
@@ -490,6 +503,7 @@ const COMMANDS: [(&str, &str); 46] = [
     ("/panel", "Show or hide the panel on the right"),
     ("/preview", "Show a web page or picture of the folder beside the conversation"),
     ("/files", "Show the files of the folder in the panel on the right"),
+    ("/terminal", "Show a terminal in the panel on the right, or open one"),
     ("/theme", "As Windows is set, dark, or light: the next of them"),
     ("/safe", "Allow safe commands without asking, or not"),
     ("/workspace", "Start a session in another folder"),
@@ -520,9 +534,11 @@ Ctrl+1 to 9\tthat session of the sidebar
 Ctrl+,\tsettings
 Ctrl+Shift+C\tcopy the last answer
 Ctrl+B\tthe panel on the right
+Ctrl+`\ta new terminal in it
+F6\tleave the terminal, for the message
 Ctrl+F\tfind in this conversation
 Ctrl+Shift+F\tsearch all sessions
-F2\tname this session
+F2\tname this session, or the terminal tab that has the keys
 Y / A / N\tapprove, always, reject
 N / P\tnext and previous change, in Changes
 
@@ -544,6 +560,7 @@ Skills: .claude/skills, .agents/skills, .codex/skills and .dogmind/skills, in th
 MCP servers: mcp.json in the data folder. They start with the app, and each call asks. Settings > Tools can trust what one returns.
 Web: what comes back is marked as data, and once it is in a conversation every command asks.
 Your instructions (Settings) go for every session; a DOGMIND.md for its project. /init has the model write one.
+Terminal: the panel on the right has your own shell. Its commands run with your rights, apart from the agent's, and what it shows is not sent to the model. Every key goes to the shell: Ctrl+C copies when something is selected and otherwise stops what runs, and Ctrl+V pastes.
 ";
 const INIT_PROMPT: &str = "Look through this project and write a DOGMIND.md at its root for agents who work here: what the project is, how to build and test it, its layout and its conventions. Keep it short, and only what you have checked.";
 
@@ -1869,6 +1886,10 @@ struct App {
     tree_menu: HWND,
     tree_menu_row: Option<files::Row>,
     tree_menu_hover: Option<usize>,
+    /// What the little list on screen offers and whose it is (a row of the tree, the shells a terminal can be started in, or what a right click on a terminal offers).
+    panel_menu: files_panel::PanelMenu,
+    /// The Terminal view of the panel on the right (`term_panel`): its windows and its terminals.
+    term: term_panel::TermView,
     /// The words over the panel on the right, where a press goes to the view each names.
     right_tab_hits: Vec<(RECT, RightView)>,
     collapsed: HashSet<String>,
@@ -5717,6 +5738,7 @@ impl App {
             }
             "panel" => self.toggle_right_panel(),
             "files" => self.show_files_view(),
+            "terminal" => self.terminal_command(),
             "preview" => {
                 let wanted = if argument.is_empty() { self.preview_candidate() } else { Some(argument.to_string()) };
                 match wanted {
@@ -5874,7 +5896,9 @@ impl App {
         } else if self.preview_file.is_some() && room >= s(760) {
             (room / 2).max(s(380))
         } else if self.preview_file.is_none() && self.settings.right_panel && room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS) {
-            s(ds::size::RIGHT_PANEL)
+            // (a terminal wants columns: nearly half of what the sidebar leaves, as far as the conversation can spare it)
+            let wanted = if self.settings.right_view == RightView::Terminal { (room * 45 / 100).clamp(s(ds::size::RIGHT_PANEL), s(TERMINAL_PANEL_MOST)) } else { s(ds::size::RIGHT_PANEL) };
+            wanted.min(room - s(RIGHT_NEEDS))
         } else {
             0
         };
@@ -5887,6 +5911,9 @@ impl App {
         self.dashboard_hit = None;
         if !self.files_shown() {
             self.files_hidden();
+        }
+        if !self.terminal_shown() {
+            self.terminal_hidden();
         }
         if self.preview_file.is_none() || right == 0 {
             if let Some(shown) = &self.preview {
@@ -13583,6 +13610,7 @@ impl App {
         self.tip(self.diff_close, t("Close"));
         self.tip(self.provider_up, t("Move up"));
         self.tip(self.provider_down, t("Move down"));
+        self.terminal_words();
         self.update_chips();
         self.update_toggles();
         self.update_drafter_chip();
@@ -14534,6 +14562,20 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.drain();
             0
         }
+        WM_TERM => {
+            app.terminal_wake(wparam as u64, lparam == 1);
+            0
+        }
+        // (a debug build told to: the commands of a test, which has no keyboard, pointer or focus to give the terminals)
+        #[cfg(debug_assertions)]
+        WM_COPYDATA if term_panel::hooks_on() => {
+            let data = &*(lparam as *const COPYDATASTRUCT);
+            if data.dwData == term_panel::HOOK {
+                let bytes = std::slice::from_raw_parts(data.lpData as *const u8, data.cbData as usize);
+                return app.terminal_hook(&String::from_utf8_lossy(bytes));
+            }
+            0
+        }
         WM_SIZE => {
             app.layout();
             0
@@ -14580,7 +14622,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
             set_button_fonts(app.fonts);
-            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search]) {
+            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.term.rename_field]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
             }
             // (the command's own size follows the screen's: it is set again when it is next shown, and this one keeps what it has)
@@ -14897,6 +14939,12 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 return 0;
             }
+            if lparam as HWND == app.term.rename_field {
+                if code == EN_KILLFOCUS as usize {
+                    app.terminal_rename_end(true);
+                }
+                return 0;
+            }
             if lparam as HWND == app.side_search {
                 if code == EN_CHANGE as usize {
                     // Each file of each session is read: after the typing pauses.
@@ -14941,6 +14989,17 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_ALWAYS => app.answer_approval(Decision::Always),
                 ID_REJECT => app.answer_approval(Decision::Reject),
                 ID_NEW_SESSION => app.new_session(),
+                ID_TERM_NEW | ID_TERM_START | ID_TERM_AGAIN => {
+                    app.terminal_new(None);
+                }
+                ID_TERM_SHELLS => app.terminal_shells_menu(app.term.shells_button),
+                ID_TERM_START_SHELLS => app.terminal_shells_menu(app.term.start_shells),
+                _ if (ID_TERM_TAB..ID_TERM_TAB + crate::term::MOST_TERMINALS as isize).contains(&id) => app.terminal_tab_pressed((id - ID_TERM_TAB) as usize),
+                _ if (ID_TERM_CLOSE..ID_TERM_CLOSE + crate::term::MOST_TERMINALS as isize).contains(&id) => {
+                    if let Some(terminal) = app.term.ids().get((id - ID_TERM_CLOSE) as usize).copied() {
+                        app.terminal_close(terminal);
+                    }
+                }
                 ID_DRAFTER => app.drafter_clicked(),
                 ID_SPEED_FIRST => {
                     app.settings.speed_first = !app.settings.speed_first;
@@ -15198,6 +15257,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 stop.store(true, Ordering::Relaxed);
             }
             dogmind_agent::workspace_grants::app_is_closing();
+            // (every shell, and all that it started, ends here: its job is closed)
+            app.terminals_end();
             let _ = app.agent.commands.send(Command::Quit);
             for parked in &app.parked {
                 parked.agent.cancel.store(true, Ordering::Relaxed);
@@ -15216,6 +15277,19 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
 
 /// Keys that belong to the window whichever control has the focus. `true`: taken.
 unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
+    // With the keys in a terminal, every key is the shell's but a few that stay the window's (see `terminal_key`).
+    if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) && message.hwnd == app.term.window && !app.modal_open {
+        match app.terminal_key(message) {
+            term_panel::TermKey::Taken => return true,
+            term_panel::TermKey::Dispatch => return false,
+            term_panel::TermKey::Pass => {}
+        }
+    }
+    // A tab being renamed: Enter keeps the name and Esc leaves it.
+    if message.message == WM_KEYDOWN && message.hwnd == app.term.rename_field && matches!(message.wParam as u16, VK_RETURN | VK_ESCAPE) {
+        app.terminal_rename_end(message.wParam as u16 == VK_RETURN);
+        return true;
+    }
     if message.message == WM_SYSKEYDOWN && app.panel == Panel::Providers && matches!(message.wParam as u16, VK_UP | VK_DOWN) {
         app.move_provider(if message.wParam as u16 == VK_UP { -1 } else { 1 });
         return true;
@@ -15238,7 +15312,7 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
         keys_in_use(true);
     }
     // Esc on the little menu of a file: it is put away, and nothing else (below, Esc stops the work or leaves a page).
-    if key == VK_ESCAPE && message.hwnd == app.tree_menu && app.tree_menu_row.is_some() {
+    if key == VK_ESCAPE && message.hwnd == app.tree_menu && app.panel_menu.whose != files_panel::MenuFor::Nothing {
         app.files_menu_close(true);
         return true;
     }
@@ -15322,6 +15396,13 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             _ => {}
         }
     }
+    if key == VK_F2 {
+        // (on a tab of the terminals: that tab's name; elsewhere, the session's)
+        if let Some(index) = app.term.tab_of(message.hwnd) {
+            app.terminal_rename_tab_at(index);
+            return true;
+        }
+    }
     if key == VK_F2 && app.panel == Panel::Chat {
         // The session on screen, by name; /delete for the rest of what the row's menu has.
         if let Some(path) = app.current_session.clone() {
@@ -15397,6 +15478,11 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
     if control && key == 0x42 {
         // Ctrl+B
         app.toggle_right_panel();
+        return true;
+    }
+    if term_panel::opens_a_terminal(key, crate::term::keymap::Mods { shift, ctrl: control, alt: GetKeyState(VK_MENU as i32) < 0 }) {
+        // Ctrl+`: a terminal, in the panel on the right
+        app.terminal_command_new();
         return true;
     }
     if control && key == 0x46 {
@@ -16072,6 +16158,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             tree_menu: control(window, "LISTBOX", "", list_style & !WS_VSCROLL | LBS_HASSTRINGS as u32, 0, ID_FILES_MENU),
             tree_menu_row: None,
             tree_menu_hover: None,
+            panel_menu: files_panel::PanelMenu { items: Vec::new(), whose: files_panel::MenuFor::Nothing },
+            term: term_panel::TermView::new(window, theme::sidebar()),
             right_tab_hits: Vec::new(),
             collapsed: HashSet::new(),
             all_sessions: Vec::new(),
@@ -16454,6 +16542,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         // (what a reader says of the list: its own name)
         set_text(app.tree_list, t("Files"));
         set_text(app.tree_menu, t("Files"));
+        SendMessageW(app.term.rename_field, WM_SETFONT, app.fonts.field as WPARAM, 1);
         app.transcript_procedure = SetWindowLongPtrW(app.transcript, GWLP_WNDPROC, transcript_subclass as *const () as isize);
         app.doc_procedure = SetWindowLongPtrW(app.doc, GWLP_WNDPROC, doc_subclass as *const () as isize);
         app.note_procedure = SetWindowLongPtrW(app.note, GWLP_WNDPROC, note_subclass as *const () as isize);

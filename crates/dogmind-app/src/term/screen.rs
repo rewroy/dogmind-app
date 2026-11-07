@@ -85,10 +85,6 @@ pub struct Glyph {
 }
 
 impl Glyph {
-    fn blank() -> Glyph {
-        Glyph { ch: ' ', marks: None, fg: Paint::Default, bg: Paint::Default, bold: false, italic: false, dim: false, inverse: false, hidden: false, strike: false, underline: Underline::None, underline_color: None, width: 1, selected: false }
-    }
-
     /// The characters it shows, with what combines with them.
     pub fn text(&self) -> String {
         let mut text = self.ch.to_string();
@@ -128,6 +124,8 @@ pub struct Snapshot {
     /// What the text colour and the ground are, where a program has set them (OSC 10 and 11).
     pub default_fg: Option<u32>,
     pub default_bg: Option<u32>,
+    /// The colours of the 256 that a program has set by number (OSC 4).
+    pub indexed: Vec<Option<u32>>,
 }
 
 /// The modes a program has set that decide what the window sends.
@@ -149,7 +147,6 @@ pub struct Screen {
     term: Term<Listener>,
     parser: Processor<StdSyncHandler>,
     events: Listener,
-    title: Option<String>,
     bell: bool,
     light: bool,
     foreground: u32,
@@ -170,7 +167,7 @@ impl Screen {
         let events = Listener::default();
         let config = Config { scrolling_history: history, ..Config::default() };
         let term = Term::new(config, &Size { cols: usize::from(cols.max(1)), rows: usize::from(rows.max(1)) }, events.clone());
-        Screen { term, parser: Processor::new(), events, title: None, bell: false, light: false, foreground: palette::indexed(false, 15), background: 0, cell_px: (8, 16) }
+        Screen { term, parser: Processor::new(), events, bell: false, light: false, foreground: palette::indexed(false, 15), background: 0, cell_px: (8, 16) }
     }
 
     /// The theme's text and ground, for what a program asks of them, and for the colours it sets by number.
@@ -216,8 +213,7 @@ impl Screen {
                     let window = WindowSize { num_lines: self.term.screen_lines() as u16, num_cols: self.term.columns() as u16, cell_width: self.cell_px.0, cell_height: self.cell_px.1 };
                     reply.extend_from_slice(format(window).as_bytes());
                 }
-                Event::Title(title) => self.title = Some(title),
-                Event::ResetTitle => self.title = None,
+                // (a program's title for the window is not shown: the tab says which shell it is, or what the person called it)
                 Event::Bell => self.bell = true,
                 // (a program does not write to the clipboard, nor read it: that is the person's)
                 _ => {}
@@ -233,11 +229,6 @@ impl Screen {
             257 => self.background,
             _ => self.foreground,
         }
-    }
-
-    /// What a program has set as the window's title, if it has.
-    pub fn title(&self) -> Option<&str> {
-        self.title.as_deref()
     }
 
     /// The bell has rung since this was last asked.
@@ -365,12 +356,14 @@ impl Screen {
             blinking: style.blinking,
         });
         let colors = self.term.colors();
-        Snapshot { cols, rows, cells, cursor, offset, history: self.term.history_size(), default_fg: colors[NamedColor::Foreground].map(color_of), default_bg: colors[NamedColor::Background].map(color_of) }
+        let indexed = (0..256).map(|index| colors[index].map(color_of)).collect();
+        Snapshot { cols, rows, cells, cursor, offset, history: self.term.history_size(), default_fg: colors[NamedColor::Foreground].map(color_of), default_bg: colors[NamedColor::Background].map(color_of), indexed }
     }
 
-    /// The colour a program set for a palette number, if it did.
-    pub fn palette_override(&self, index: usize) -> Option<u32> {
-        self.term.colors()[index].map(color_of)
+    /// Where the cursor is on the screen, as a column and a row.
+    pub fn cursor_position(&self) -> (usize, usize) {
+        let point = self.term.grid().cursor.point;
+        (point.column.0, usize::try_from(point.line.0).unwrap_or(0))
     }
 
     // ---- What can be read.
@@ -666,12 +659,27 @@ mod tests {
         assert_eq!(screen.visible_lines()[0], "ok");
     }
 
+    /// A program that asks for its next screen to be shown whole (CSI ? 2026) is held until it says so; one that never does is shown when the deadline comes, which the terminal waits for.
     #[test]
-    fn the_title_a_program_sets_is_kept_and_the_bell_is_told_once() {
+    fn a_synchronized_update_is_held_until_it_ends_or_its_time_is_up() {
         let mut screen = screen(20, 5);
-        assert_eq!(screen.title(), None);
-        screen.feed(b"\x1b]0;my title\x07");
-        assert_eq!(screen.title(), Some("my title"));
+        screen.feed(b"before\x1b[?2026hheld");
+        assert_eq!(screen.visible_lines()[0], "before", "held");
+        let deadline = screen.sync_deadline().expect("a time for it to be shown");
+        assert!(deadline > Instant::now() && deadline < Instant::now() + std::time::Duration::from_secs(1));
+        screen.feed(b"\x1b[?2026l");
+        assert_eq!(screen.visible_lines()[0], "beforeheld", "shown at its end");
+        assert!(screen.sync_deadline().is_none());
+        // (and one that does not end)
+        screen.feed(b"\r\n\x1b[?2026hnever ended");
+        assert_eq!(screen.visible_lines()[1], "");
+        screen.stop_sync();
+        assert_eq!(screen.visible_lines()[1], "never ended");
+    }
+
+    #[test]
+    fn the_bell_is_told_once() {
+        let mut screen = screen(20, 5);
         screen.feed(b"a\x07");
         assert!(screen.take_bell() && !screen.take_bell());
     }
