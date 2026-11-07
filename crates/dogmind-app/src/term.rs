@@ -193,12 +193,13 @@ impl Terminal {
     }
 
     /// The shell's own process.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(debug_assertions)]
     pub fn pid(&self) -> u32 {
         self.pty.pid()
     }
 
     /// The processes that end with this terminal: the shell and all it started.
+    #[cfg(any(test, debug_assertions))]
     pub fn processes(&self) -> Vec<u32> {
         self.pty.processes()
     }

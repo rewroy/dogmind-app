@@ -60,6 +60,7 @@ impl Job {
     }
 
     /// The processes in the job: the shell and what it has started, and has not ended.
+    #[cfg(any(test, debug_assertions))]
     pub fn processes(&self) -> Vec<u32> {
         // The list's two counts, and room for the ids: as many as the job will give (its own count is said, and a longer list is cut).
         let mut buffer = vec![0usize; 1 + 512];
@@ -230,11 +231,13 @@ impl Pty {
         self.console.resize(cols, rows);
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub fn pid(&self) -> u32 {
         self.pid
     }
 
     /// What ends with the terminal: the shell and all it started and has not ended. Where the shell is in no job, the shell.
+    #[cfg(any(test, debug_assertions))]
     pub fn processes(&self) -> Vec<u32> {
         match &self.job {
             Some(job) => job.processes(),
