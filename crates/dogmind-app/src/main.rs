@@ -2,21 +2,29 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod attach;
+mod cards;
+mod trajectory;
 mod crash;
 mod design;
 mod diffview;
+mod drafter;
 mod engine;
+mod files;
 mod frametrace;
 mod icon;
 mod keys;
 mod lang;
 mod machine;
 mod markdown;
+mod mask;
+mod office;
 mod highlight;
+mod notice;
 mod paint;
 mod preview;
 mod render;
 mod rtf;
+mod table;
 mod settings;
 mod textview;
 mod toolrun;

@@ -1,0 +1,499 @@
+//! The cards of the conversation that ask the person something or show something of the work: the model's question with its choices. What is on it, in each state, and what a session that is
+//! opened again has of it. Decisions only, with no window in them, so that a test can ask them: `ui.rs` draws what they answer.
+
+use std::collections::HashMap;
+
+use dogmind_agent::agent::{self, PlanOutcome};
+use dogmind_agent::message::{Message, Wake, WakeCause};
+use dogmind_agent::tools::FileChange;
+use serde_json::Value;
+
+use crate::lang::{t, tf};
+
+/// Where a question stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerState {
+    /// It waits for the person: its choices are buttons.
+    Waiting,
+    /// What the person answered, a choice's label or their own words.
+    Answered(String),
+    /// The turn was stopped, or the question closed, before it was answered.
+    Unanswered,
+}
+
+/// Where a plan stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanState {
+    /// It waits for the person: it can be carried out, or changed.
+    Waiting,
+    Approved,
+    /// What the person asked to be changed.
+    Changes(String),
+    /// Stopped, or closed, before it was decided.
+    Undecided,
+}
+
+/// One file of the card of an answer's changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRow {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
+    /// Whether there is a diff to show: a file that is binary, or too large to be read, has none.
+    pub has_diff: bool,
+}
+
+/// What a card of the transcript is: it is kept with the rest of what the transcript is written from, and written again, in whatever state it has come to, as the window changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Card {
+    Question { id: u64, question: String, options: Vec<(String, String)>, state: AnswerState },
+    Plan { id: u64, plan: String, state: PlanState },
+    /// The files turn `turn`'s edits changed: as many as the card lists, how many more there are, and the lines added and removed in all of them.
+    Files { turn: u64, rows: Vec<FileRow>, more: usize, added: usize, removed: usize },
+    /// What woke the session with nobody writing (a background command ended, a line it was to wake for, a wait): the app's notice, in a row of its own and not a bubble of the person's.
+    /// `at`: when it came, as the transcript says times.
+    Notice { wakes: Vec<Wake>, at: String },
+}
+
+/// How many files a card lists: the rest are counted, and the Changes page has all of them.
+pub const MOST_FILES: usize = 8;
+
+/// The lines a notice row has for one thing that woke the session: what it was, which one, and how it went. `failed`: it went wrong (an exit code, a time out), and the line says so in a colour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticeRow {
+    pub title: String,
+    pub what: String,
+    pub how: String,
+    pub failed: bool,
+}
+
+/// A length of time in the words of the window: `45 s`, `1 min 31 s`, `2 h 5 min`.
+pub fn duration_words(seconds: u64) -> String {
+    match seconds {
+        0..=59 => tf("{0} s", &[&seconds]),
+        60..=3599 => tf("{0} min {1} s", &[&(seconds / 60), &(seconds % 60)]),
+        _ => tf("{0} h {1} min", &[&(seconds / 3600), &(seconds % 3600 / 60)]),
+    }
+}
+
+/// What a notice row says of one thing that woke the session.
+pub fn notice_row(wake: &Wake) -> NoticeRow {
+    let took = duration_words(wake.seconds);
+    match wake.cause {
+        WakeCause::CommandEnded => {
+            let (how, failed) = match (wake.exit_code, wake.ended.as_deref()) {
+                (Some(code), _) => (tf("Exit code {0}  ·  ran {1}", &[&code, &took]), code != 0),
+                (None, Some("timed out")) => (tf("Timed out  ·  ran {0}", &[&took]), true),
+                (None, Some("cancelled")) => (tf("Cancelled  ·  ran {0}", &[&took]), true),
+                (None, Some("not run")) => (t("Did not run").to_string(), true),
+                (None, _) => (tf("Ended  ·  ran {0}", &[&took]), false),
+            };
+            NoticeRow { title: t("A background command ended").to_string(), what: format!("{}  ·  {}", wake.id, wake.what), how, failed }
+        }
+        WakeCause::CommandLine => NoticeRow { title: t("A background command printed the line it was watched for").to_string(), what: format!("{}  ·  {}", wake.id, wake.what), how: tf("Running for {0}, and going on", &[&took]), failed: false },
+        WakeCause::Wait => NoticeRow { title: t("A wait is up").to_string(), what: wake.what.clone(), how: tf("Set for {0}", &[&took]), failed: false },
+    }
+}
+
+impl Card {
+    /// The number a card has, which says which it is among those of the transcript.
+    pub fn id(&self) -> Option<u64> {
+        match self {
+            Card::Question { id, .. } | Card::Plan { id, .. } => Some(*id),
+            Card::Files { .. } | Card::Notice { .. } => None,
+        }
+    }
+
+    /// The card of the files turn `turn`'s edits changed.
+    pub fn files(turn: u64, changes: &[FileChange]) -> Card {
+        let rows = changes.iter().take(MOST_FILES).map(|change| FileRow { path: change.path.clone(), added: change.added, removed: change.removed, has_diff: !change.diff.is_empty() }).collect();
+        let (added, removed) = changes.iter().fold((0, 0), |(added, removed), change| (added + change.added, removed + change.removed));
+        Card::Files { turn, rows, more: changes.len().saturating_sub(MOST_FILES), added, removed }
+    }
+
+    /// The card of a call of `ask_user` or `submit_plan` that a session kept. `result` is what the call returned: none for a call that has no result, which is one still waiting (the window is told of it as it
+    /// happens) and is no card here. None for any other call.
+    pub fn of_call(id: u64, name: &str, arguments: &Value, result: Option<&str>) -> Option<Card> {
+        match name {
+            "ask_user" => {
+                let question = arguments.get("question").and_then(Value::as_str).map(str::trim).filter(|question| !question.is_empty())?.to_string();
+                let options = options_of(arguments);
+                let state = match agent::answer_in(result?) {
+                    Some(answer) => AnswerState::Answered(answer.to_string()),
+                    None => AnswerState::Unanswered,
+                };
+                Some(Card::Question { id, question, options, state })
+            }
+            "submit_plan" => {
+                let plan = arguments.get("plan").and_then(Value::as_str).map(str::trim).filter(|plan| !plan.is_empty())?.to_string();
+                let state = match agent::plan_outcome(result?) {
+                    PlanOutcome::Approved => PlanState::Approved,
+                    PlanOutcome::Changes(change) => PlanState::Changes(change),
+                    PlanOutcome::Undecided => PlanState::Undecided,
+                };
+                Some(Card::Plan { id, plan, state })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The cards a session's messages hold: one for each call of `ask_user` or `submit_plan` that has a result, in order, with its call's id and the number its card has (from `first_id`).
+pub fn of_messages(messages: &[Message], first_id: u64) -> Vec<(String, Card)> {
+    let results: HashMap<&str, &str> = messages.iter().filter_map(|message| Some((message.tool_call_id.as_deref()?, message.content.as_deref().unwrap_or("")))).collect();
+    let mut found = Vec::new();
+    for call in messages.iter().filter(|message| message.role == "assistant").flat_map(|message| message.tool_calls.iter().flatten()) {
+        let arguments = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+        if let Some(card) = Card::of_call(first_id + found.len() as u64, &call.function.name, &arguments, results.get(call.id.as_str()).copied()) {
+            found.push((call.id.clone(), card));
+        }
+    }
+    found
+}
+
+/// The choices a call of `ask_user` gives, as the agent reads them: a label, and what it means.
+fn options_of(arguments: &Value) -> Vec<(String, String)> {
+    arguments.get("options").and_then(Value::as_array).into_iter().flatten().filter_map(|option| {
+        let label = option.get("label").and_then(Value::as_str).or_else(|| option.as_str())?.trim();
+        (!label.is_empty()).then(|| (label.to_string(), option.get("description").and_then(Value::as_str).unwrap_or("").trim().to_string()))
+    }).take(6).collect()
+}
+
+/// Whether a tool is one whose call is a card of its own, and so has no row among the calls.
+pub fn is_asking(tool: &str) -> bool {
+    matches!(tool, "ask_user" | "submit_plan")
+}
+
+/// Whether what was typed while a plan waits approves it. Anything else is what to change.
+pub fn approves(typed: &str) -> bool {
+    matches!(typed.trim().trim_end_matches(['.', '!', '。', '！']).to_lowercase().as_str(), "yes" | "y" | "ok" | "go" | "はい" | "うん" | "承認" | "実行" | "お願い")
+}
+
+/// Where the card of a turn's files goes in what a session opened again was written as. `slots`: for each of the person's messages that was shown, its place in the message list and the
+/// place in what was written before it. The card goes before the words that come after the turn's own, or at `end`. None for a turn whose words are not in what was shown.
+pub fn place_of_turn(slots: &[(usize, usize)], end: usize, message: usize) -> Option<usize> {
+    slots.iter().any(|(at, _)| *at == message).then(|| slots.iter().find(|(at, _)| *at > message).map_or(end, |(_, place)| *place))
+}
+
+/// Where in what was written the card of turn `turn`, whose place was `slot` when none of the cards was in, goes now that those of `came` (each its own `(slot, turn)`) are in: after the
+/// cards that stood at an earlier place or, at its own place, are of an earlier turn, and before the others. So that the replies can come in any order and the cards are in theirs.
+pub fn card_position(came: &[(usize, u64)], slot: usize, turn: u64) -> usize {
+    slot + came.iter().filter(|other| **other < (slot, turn)).count()
+}
+
+/// What `/goal` with this word after it does, the session having this goal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GoalAction {
+    /// Make this the goal.
+    Set(String),
+    /// There is a goal: it goes.
+    Clear,
+    /// Said alone with a goal set: the goal, in full, in the composer after `/goal`, to read or to change and send.
+    Edit(String),
+    /// Nothing to show or to clear: the way to set one is said.
+    None,
+}
+
+pub fn goal_action(word: &str, goal: Option<&str>) -> GoalAction {
+    let goal = goal.map(str::trim).filter(|goal| !goal.is_empty());
+    match word.trim() {
+        "" => goal.map_or(GoalAction::None, |goal| GoalAction::Edit(goal.to_string())),
+        "clear" | "off" | "none" | "なし" | "消す" => if goal.is_some() { GoalAction::Clear } else { GoalAction::None },
+        set => GoalAction::Set(set.to_string()),
+    }
+}
+
+/// How many parts a file's bar has: as many as its length in whole, however many lines it changed.
+pub const BAR_PARTS: usize = 8;
+
+/// A file's bar: how many of its parts are added lines (green) and how many removed (red), against the file of the card that changed most. A file that changed at all has a part, and
+/// one that changed a tenth of the most has no more than that.
+pub fn bar(added: usize, removed: usize, most: usize) -> (usize, usize) {
+    let total = added + removed;
+    if total == 0 || most == 0 {
+        return (0, 0);
+    }
+    let parts = (total * BAR_PARTS).div_ceil(most).clamp(1, BAR_PARTS);
+    let green = if parts == 1 {
+        usize::from(added >= removed)
+    } else if added > 0 && removed > 0 {
+        // (lines of both kinds show both)
+        ((added * parts + total / 2) / total).clamp(1, parts - 1)
+    } else {
+        (added * parts) / total
+    };
+    (green, parts - green)
+}
+
+/// The most lines one file of the rows changed.
+pub fn most_changed(rows: &[FileRow]) -> usize {
+    rows.iter().map(|row| row.added + row.removed).max().unwrap_or(0)
+}
+
+/// Whether a file of the card is opened with its own app. What is a program or a script is not: opened, it would run, and what the agent wrote is not for that. These are shown in Explorer.
+pub fn opens_in_app(path: &str) -> bool {
+    const RUNS: [&str; 30] = [
+        "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp", "scr", "lnk", "url", "reg", "hta", "cpl", "jar", "pif", "appx", "msix", "dll", "sys", "py", "pyw", "sh", "gadget",
+    ];
+    let extension = path.rsplit(['/', '\\']).next().and_then(|name| name.rsplit_once('.')).map_or(String::new(), |(_, extension)| extension.to_lowercase());
+    !RUNS.contains(&extension.as_str())
+}
+
+/// The words of the bar under the session's title: its goal's first line. None when there is no goal, and no bar.
+pub fn goal_bar(goal: Option<&str>) -> Option<String> {
+    goal.and_then(|goal| goal.lines().map(str::trim).find(|line| !line.is_empty())).map(str::to_string)
+}
+
+/// What goes back to the model for what was typed while a question waits: a choice's number stands for the choice, anything else is the answer as it was written.
+pub fn answer_text(labels: &[String], typed: &str) -> String {
+    typed.trim().parse::<usize>().ok().and_then(|number| labels.get(number.wrapping_sub(1))).cloned().unwrap_or_else(|| typed.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(name: &str, arguments: Value, result: Option<&str>) -> Option<Card> {
+        Card::of_call(1, name, &arguments, result)
+    }
+
+    #[test]
+    fn a_question_a_session_kept_comes_back_with_its_answer() {
+        let ask = json!({"question": "Which word?", "options": [{"label": "hello", "description": "the long one"}, "hi"]});
+        let card = call("ask_user", ask.clone(), Some("the person answered: hello")).unwrap();
+        assert_eq!(card, Card::Question { id: 1, question: "Which word?".into(), options: vec![("hello".into(), "the long one".into()), ("hi".into(), String::new())], state: AnswerState::Answered("hello".into()) });
+        // (an answer in the person's own words is as good)
+        let own = call("ask_user", ask.clone(), Some("the person answered: neither, hey")).unwrap();
+        assert!(matches!(own, Card::Question { state: AnswerState::Answered(words), .. } if words == "neither, hey"));
+        // (stopped before it was answered: the card says so)
+        let stopped = call("ask_user", ask.clone(), Some("error: the user stopped the turn before answering")).unwrap();
+        assert!(matches!(stopped, Card::Question { state: AnswerState::Unanswered, .. }));
+        // (no result: the question is still waiting, and the window is told of it as it is asked)
+        assert_eq!(call("ask_user", ask, None), None);
+        assert_eq!(call("ask_user", json!({"options": ["a", "b"]}), Some("the person answered: a")), None, "no question, no card");
+        assert_eq!(call("read_file", json!({"path": "a"}), Some("x")), None, "no other call is a card");
+    }
+
+    fn asking(id: &str, name: &str, arguments: Value) -> Message {
+        use dogmind_agent::message::{FunctionCall, ToolCall};
+        Message { role: "assistant".into(), tool_calls: Some(vec![ToolCall { id: id.into(), kind: "function".into(), function: FunctionCall { name: name.into(), arguments: arguments.to_string() } }]), ..Message::default() }
+    }
+
+    #[test]
+    fn a_session_opened_again_shows_each_question_with_what_came_of_it() {
+        let messages = vec![
+            Message::text("user", "set up the notes"),
+            asking("q1", "ask_user", json!({"question": "Which name?", "options": ["notes.md", "notes.txt"]})),
+            Message::tool_result("q1", "the person answered: notes.txt"),
+            asking("r1", "read_file", json!({"path": "a"})),
+            Message::tool_result("r1", "text"),
+            asking("q2", "ask_user", json!({"question": "Which folder?", "options": ["a", "b"]})),
+            Message::tool_result("q2", "error: the user stopped the turn before answering"),
+            asking("q3", "ask_user", json!({"question": "Which size?", "options": ["s", "m"]})),
+            // (no result: a question still waiting is not one of the cards a file holds)
+        ];
+        let found = of_messages(&messages, 7);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].0, "q1");
+        assert_eq!(found[0].1, Card::Question { id: 7, question: "Which name?".into(), options: vec![("notes.md".into(), String::new()), ("notes.txt".into(), String::new())], state: AnswerState::Answered("notes.txt".into()) });
+        assert!(matches!(&found[1], (id, Card::Question { id: 8, state: AnswerState::Unanswered, .. }) if id == "q2"));
+    }
+
+    #[test]
+    fn a_plan_a_session_kept_comes_back_with_how_it_came_out() {
+        let plan = json!({"plan": "1. Add a page\n2. Link it"});
+        let kept = |result: &str| call("submit_plan", plan.clone(), Some(result)).unwrap();
+        let state = |card: Card| match card {
+            Card::Plan { state, plan, .. } => {
+                assert_eq!(plan, "1. Add a page\n2. Link it");
+                state
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(state(kept(agent::PLAN_APPROVED)), PlanState::Approved);
+        assert_eq!(state(kept(&format!("{}use a modal", agent::PLAN_CHANGE))), PlanState::Changes("use a modal".into()));
+        assert_eq!(state(kept("error: the user stopped the turn before deciding on the plan")), PlanState::Undecided);
+        assert_eq!(call("submit_plan", plan.clone(), None), None, "a plan still waiting is told as it happens");
+        assert_eq!(call("submit_plan", json!({"plan": "  "}), Some(agent::PLAN_APPROVED)), None, "no plan, no card");
+    }
+
+    #[test]
+    fn a_session_opened_again_shows_its_plan_beside_its_questions_in_order() {
+        let messages = vec![
+            Message::text("user", "add a page"),
+            asking("p1", "submit_plan", json!({"plan": "1. Write it"})),
+            Message::tool_result("p1", &format!("{}add a title", agent::PLAN_CHANGE)),
+            asking("p2", "submit_plan", json!({"plan": "1. Write it, with a title"})),
+            Message::tool_result("p2", agent::PLAN_APPROVED),
+        ];
+        let found = of_messages(&messages, 1);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0], ("p1".to_string(), Card::Plan { id: 1, plan: "1. Write it".into(), state: PlanState::Changes("add a title".into()) }));
+        assert_eq!(found[1], ("p2".to_string(), Card::Plan { id: 2, plan: "1. Write it, with a title".into(), state: PlanState::Approved }));
+    }
+
+    #[test]
+    fn a_plan_is_approved_by_a_yes_and_anything_else_asks_for_a_change() {
+        for yes in ["yes", "Yes.", " OK ", "はい", "実行！", "go"] {
+            assert!(approves(yes), "{yes}");
+        }
+        for change in ["use a modal", "no", "yes but smaller", ""] {
+            assert!(!approves(change), "{change}");
+        }
+    }
+
+    #[test]
+    fn the_card_of_an_answers_files_lists_a_few_and_counts_the_rest() {
+        let change = |path: &str, added: usize, removed: usize| FileChange { path: path.into(), added, removed, diff: if added + removed == 0 { String::new() } else { "@@\n+x\n".into() } };
+        let few = Card::files(3, &[change("a.rs", 4, 1), change("logo.png", 0, 0)]);
+        assert_eq!(few, Card::Files { turn: 3, rows: vec![FileRow { path: "a.rs".into(), added: 4, removed: 1, has_diff: true }, FileRow { path: "logo.png".into(), added: 0, removed: 0, has_diff: false }], more: 0, added: 4, removed: 1 });
+        let many: Vec<FileChange> = (0..MOST_FILES + 5).map(|at| change(&format!("f{at}.txt"), 2, 1)).collect();
+        match Card::files(4, &many) {
+            Card::Files { rows, more, added, removed, .. } => assert_eq!((rows.len(), more, added, removed), (MOST_FILES, 5, 2 * (MOST_FILES + 5), MOST_FILES + 5)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(few.id(), None, "a card of files is told by its turn");
+    }
+
+    #[test]
+    fn the_card_of_a_turns_files_goes_where_its_answer_ended_in_a_session_opened_again() {
+        // the person's words at message 1, 5 and 9, written at places 0, 10 and 20 of what was shown, which ends at 30
+        let slots = [(1, 0), (5, 10), (9, 20)];
+        assert_eq!(place_of_turn(&slots, 30, 1), Some(10), "before the next person's words");
+        assert_eq!(place_of_turn(&slots, 30, 5), Some(20));
+        assert_eq!(place_of_turn(&slots, 30, 9), Some(30), "the last turn's goes at the end");
+        assert_eq!(place_of_turn(&slots, 30, 3), None, "its words are not in what was shown: a compaction took them");
+        assert_eq!(place_of_turn(&[], 0, 1), None);
+    }
+
+    #[test]
+    fn a_file_bar_says_how_much_changed_and_of_what_kind() {
+        assert_eq!(bar(0, 0, 10), (0, 0), "nothing changed, no bar");
+        assert_eq!(bar(1, 0, 1), (BAR_PARTS, 0), "the file that changed most has the whole bar");
+        assert_eq!(bar(5, 5, 10), (BAR_PARTS / 2, BAR_PARTS / 2));
+        assert_eq!(bar(0, 40, 40), (0, BAR_PARTS), "only removed lines: all red");
+        assert_eq!(bar(1, 0, 100), (1, 0), "a little change still shows");
+        let (green, red) = bar(2, 1, 100);
+        assert_eq!(green + red, 1, "a part is all a tenth of the most has");
+        // (lines of both kinds show both when there is room for both)
+        let (green, red) = bar(99, 1, 100);
+        assert!(green >= 1 && red >= 1 && green + red == BAR_PARTS, "{green} {red}");
+        assert_eq!(bar(3, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn the_file_that_changed_most_sets_the_bars_scale() {
+        let row = |added: usize, removed: usize| FileRow { path: "x".into(), added, removed, has_diff: true };
+        assert_eq!(most_changed(&[row(2, 1), row(10, 4), row(1, 0)]), 14);
+        assert_eq!(most_changed(&[]), 0);
+    }
+
+    #[test]
+    fn a_program_the_agent_wrote_is_shown_in_explorer_and_not_run() {
+        for safe in ["notes.md", "src/app.rs", "logo.PNG", "data.csv", "README", "dir\\report.pdf"] {
+            assert!(opens_in_app(safe), "{safe}");
+        }
+        for risky in ["setup.exe", "run.BAT", "tools\\x.ps1", "a.vbs", "a.js", "a.lnk", "build.cmd", "pkg.msi", "x.dll", "run.py", "go.sh"] {
+            assert!(!opens_in_app(risky), "{risky}");
+        }
+    }
+
+    #[test]
+    fn a_number_typed_for_a_question_picks_its_choice() {
+        let labels: Vec<String> = ["hello", "hi"].iter().map(|label| label.to_string()).collect();
+        assert_eq!(answer_text(&labels, "2"), "hi");
+        assert_eq!(answer_text(&labels, " 1 "), "hello");
+        assert_eq!(answer_text(&labels, "3"), "3", "past the choices it is a word like any other");
+        assert_eq!(answer_text(&labels, "0"), "0");
+        assert_eq!(answer_text(&labels, "neither, hey"), "neither, hey");
+    }
+
+    #[test]
+    fn the_goal_bar_has_the_first_line_of_the_goal_and_is_not_there_without_one() {
+        assert_eq!(goal_bar(Some("keep the folder to what I asked for")), Some("keep the folder to what I asked for".to_string()));
+        assert_eq!(goal_bar(Some("
+  first line  
+second")), Some("first line".to_string()));
+        assert_eq!(goal_bar(Some("  
+ ")), None);
+        assert_eq!(goal_bar(None), None);
+    }
+
+    #[test]
+    fn a_card_goes_where_its_answer_ended_whatever_order_the_replies_come_in() {
+        // (answers 1, 2 and 3 ended at places 2, 2 and 5 of what was written, and answer 4 at 0: a card each)
+        let wanted = [(2usize, 1u64), (2, 2), (5, 3), (0, 4)];
+        let mut orders = vec![vec![0usize, 1, 2, 3]];
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = vec![a, b, c, d];
+                        if (0..4).all(|n| order.contains(&n)) {
+                            orders.push(order);
+                        }
+                    }
+                }
+            }
+        }
+        for order in orders {
+            let mut written: Vec<String> = (0..7).map(|n| format!("w{n}")).collect();
+            let mut came: Vec<(usize, u64)> = Vec::new();
+            for which in order.iter().copied() {
+                let (slot, turn) = wanted[which];
+                let at = card_position(&came, slot, turn);
+                written.insert(at, format!("card{turn}"));
+                came.push((slot, turn));
+            }
+            let text = written.join(" ");
+            assert_eq!(text, "card4 w0 w1 card1 card2 w2 w3 w4 card3 w5 w6", "{order:?}");
+        }
+    }
+
+    #[test]
+    fn goal_with_a_word_after_it_sets_it_clears_it_or_shows_it_in_one_way_each() {
+        assert_eq!(goal_action("ship the page", None), GoalAction::Set("ship the page".to_string()));
+        assert_eq!(goal_action("ship the page", Some("old")), GoalAction::Set("ship the page".to_string()));
+        assert_eq!(goal_action("clear", Some("old")), GoalAction::Clear);
+        assert_eq!(goal_action("消す", Some("old")), GoalAction::Clear);
+        // (nothing to clear, nothing to show: the way to set one is said, and nothing is sent)
+        assert_eq!(goal_action("clear", None), GoalAction::None);
+        assert_eq!(goal_action("", None), GoalAction::None);
+        assert_eq!(goal_action("", Some("  ")), GoalAction::None);
+        assert_eq!(goal_action("", Some("ship the page")), GoalAction::Edit("ship the page".to_string()));
+    }
+
+    fn woke(cause: WakeCause, exit_code: Option<i64>, ended: Option<&str>, seconds: u64) -> Wake {
+        Wake { cause, id: if cause == WakeCause::Wait { "wait1".into() } else { "job2".into() }, what: if cause == WakeCause::Wait { "look at the deploy".into() } else { "cargo build --release".into() }, exit_code, ended: ended.map(str::to_string), seconds }
+    }
+
+    #[test]
+    fn a_notice_row_says_what_woke_the_session_which_one_and_how_it_went() {
+        let ok = notice_row(&woke(WakeCause::CommandEnded, Some(0), None, 91));
+        assert_eq!((ok.title.as_str(), ok.what.as_str(), ok.how.as_str(), ok.failed), ("A background command ended", "job2  ·  cargo build --release", "Exit code 0  ·  ran 1 min 31 s", false));
+        let bad = notice_row(&woke(WakeCause::CommandEnded, Some(101), None, 7));
+        assert_eq!((bad.how.as_str(), bad.failed), ("Exit code 101  ·  ran 7 s", true));
+        assert_eq!(notice_row(&woke(WakeCause::CommandEnded, None, Some("timed out"), 3600)).how, "Timed out  ·  ran 1 h 0 min");
+        assert!(notice_row(&woke(WakeCause::CommandEnded, None, Some("cancelled"), 4)).failed);
+        assert_eq!(notice_row(&woke(WakeCause::CommandEnded, None, Some("not run"), 0)).how, "Did not run");
+        let line = notice_row(&woke(WakeCause::CommandLine, None, None, 12));
+        assert!(line.title.contains("printed the line") && line.how == "Running for 12 s, and going on" && !line.failed, "{line:?}");
+        let wait = notice_row(&woke(WakeCause::Wait, None, None, 1800));
+        assert_eq!((wait.title.as_str(), wait.what.as_str(), wait.how.as_str()), ("A wait is up", "look at the deploy", "Set for 30 min 0 s"));
+    }
+
+    /// A notice is no one's words: a session that holds one opens with it as a row of its own, whatever the person said.
+    #[test]
+    fn a_notice_card_has_no_number_and_is_no_question() {
+        let card = Card::Notice { wakes: vec![woke(WakeCause::Wait, None, None, 60)], at: "14:32".into() };
+        assert_eq!(card.id(), None);
+        assert!(!is_asking("wake_at"));
+    }
+
+    #[test]
+    fn the_two_tools_that_ask_are_cards_and_no_other_is() {
+        assert!(is_asking("ask_user") && is_asking("submit_plan"));
+        assert!(!is_asking("read_file") && !is_asking("todo"));
+    }
+}

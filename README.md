@@ -36,6 +36,7 @@ as plain text.
 It runs on Windows 11, without administrator rights. Run `DogmindSetup-VERSION.exe` (as `DogmindSetup-0.1.0.exe`), which puts it in `%LOCALAPPDATA%\Programs\Dogmind`, in the Start menu and in Installed apps. Its first page names that folder, and *Change...* opens Windows's folder picker to choose another: one that holds other things gets a `Dogmind` folder inside it, and one this user cannot write in without an administrator (`C:\Program Files`), or that is where settings and sessions are kept, is refused with the reason. An update goes where the install is, and does not offer the choice. Or extract the whole zip to a folder of your own and start `dogmind-app.exe`.
 To run a model on this PC it takes an NVIDIA GPU with a current driver, and about 76 GB free on a drive (75 GB to download; 70 GB stay). Without one, use another computer, a service, Codex or Claude.
 *Settings > Models on this PC* lists what Straydog can set up here. A model that needs more free graphics memory than the card has now is listed too, greyed and marked not recommended with what it needs, for whoever wants to try it.
+For Qwen3.8, *Faster-writing data* fetches its drafter (about 5 GB to download, 0.9 GB kept), whatever the graphics memory; turned on for a model that is set up already, it fetches the drafter alone while the engine keeps running, and the engine starts again with it once no work is going on.
 The first run asks how to reach a model and where to work; `/setup` goes through it again. Type `/` for the commands and `@` for the workspace's files. Enter sends, Shift+Enter starts a new line, Esc stops; Ctrl+N
 starts a session, Ctrl+, opens the settings, Ctrl+Shift+C copies the last answer. A right click on a session renames or
 deletes it.
@@ -45,13 +46,30 @@ waiting message has buttons to send it into the work now, to edit it, or to disc
 branch button starts a new session with the conversation up to that answer, to go on from there another way. From the second turn,
 a rail at the transcript's right edge has a mark for each of your messages: the one you are reading is longer, and a click goes to it.
 
+Some steps come as cards in the conversation. When the agent asks you something, a card holds the question with a button for
+each choice (its suggestion marked) and a field for your own answer, and the session shows *Waiting* until you answer. In plan
+mode (`/plan`) it puts its plan up as a card with *Carry it out* and *Change...*: nothing is changed until you carry it out. Under
+an answer that changed files, a card lists them with the lines added and removed: a click opens that file's diff, and its other
+button opens the file or shows it in Explorer. The cards stay when a session is opened again. `/goal TEXT` keeps a goal for the
+session, shown as a thin bar under the title and told to the model again after a compaction, and `/goal clear` ends it.
+`/trajectory` shows where a session's time went, turn by turn. A request that plainly asks for no changes ("just look", "don't
+change anything") makes that turn read-only, and a line says so before anything is refused; a phrase with an object ("without
+changing the tests") only limits that object. Keys and tokens that a tool brings back are hidden on screen; the model still gets
+them as they were.
+
+The panel on the right (the button at the right of the title, or `/panel`) has *Overview* and *Files*. *Files* shows the workspace
+as a tree, folders first, with the files this session changed marked, and follows the disk as it changes. A click previews a file
+beside the conversation (Markdown, HTML, pictures, code and text, CSV and TSV as tables, an Excel workbook's first sheet), a double
+click opens it in its app, and a right click opens it, shows it in Explorer, copies its path or mentions it in your message
+(`@path`).
+
 ## Updating, removing, and when something goes wrong
 
 New versions are published at [Releases](https://github.com/rewroy/dogmind-app/releases). The app asks GitHub for the newest release
-(a pre-release too) at most once a day, and *Settings > About* has *Check for updates*, and a switch (*Update automatically*) to turn the daily check off. The request carries
+(a pre-release too) every six hours, and again when its window comes back from the tray if the last look is an hour old; *Settings > About* has *Check for updates*, and a switch (*Update automatically*) to turn these looks off. The request carries
 nothing about you but the app's version. A copy that the installer put in its folder also downloads the newer release's setup in the background (not on a metered connection, unless you press
 *Check for updates*), and only if GitHub lists it with its size and SHA-256: the download is kept as `.partial` in the `updates` folder of the app's data until its size and hash are those GitHub published, and deleted if they are not, or if you cancel it
-(*Settings > About* shows its progress and a *Cancel*). Then a row above the input says the update is ready, with *Restart to update*: only that press, when no work is going on or when it ends, runs the setup
+(*Settings > About* shows its progress and a *Cancel*). Then a card at the top of the main screen, whatever page is open, says the update is ready, with *Update now (Dogmind restarts)* and *Later* (while the window is hidden, the tray says so once for each new version): only that press, when no work is going on or when it ends, runs the setup
 (`DogmindSetup-VERSION.exe --update --dir FOLDER --wait-pid PID`, which asks nothing, waits for the app to end, updates the folder, puts back what was there if it fails, and starts the app again). A copy unpacked from the zip
 is only told, with a button that opens the release's page. To update by hand, run the new `DogmindSetup-VERSION.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. Every file takes its place or none does: a failure puts back what was there, so the program is as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
 
@@ -87,8 +105,8 @@ every one. `RUSTFLAGS` takes the place of `.cargo/config.toml`'s flags, so the s
 
 `python -I scripts\package.py` then makes `dist\DogmindApp`, its zip and `dist\DogmindSetup-VERSION.exe`. The installer is `crates/dogmind-setup` and no tool besides: the package is on the end of that one executable, deflated file by file, and read as a stream. To try one in a scratch folder, `DogmindSetup.exe --test --dir FOLDER`: it writes no Start menu entry or registry key, only what they would say, in that folder. Without `--test`, `--dir FOLDER` only chooses the folder the first page starts with.
 
-To release: raise `version` in the workspace's `Cargo.toml`, build and package as above, and publish a GitHub release tagged
-`vVERSION` (as `v0.1.0`) with `dist\DogmindSetup-VERSION.exe`, `dist\DogmindSetup-VERSION.parts` (an app fetches an update by its parts only with that; without it, the whole setup) and `dist\DogmindApp-VERSION.zip`, keeping the PDBs. The app's
+Work goes on the next version's branch, `dev/X.Y.Z`, and `main` holds released versions only. To release: raise `version` in the workspace's `Cargo.toml` on `dev/X.Y.Z`, build and package as above, merge `dev/X.Y.Z` into `main` through a pull request with a merge commit (never a squash), and publish a GitHub pre-release tagged
+`vVERSION` (as `v0.1.0`) on that merge commit with `dist\DogmindSetup-VERSION.exe`, `dist\DogmindSetup-VERSION.parts` (an app fetches an update by its parts only with that; without it, the whole setup) and `dist\DogmindApp-VERSION.zip`, keeping the PDBs. The app's
 update check offers the newest release by its tag's version, pre-releases included, and never a draft; a tag that is not a version is passed over.
 
 No GPU toolkit is needed. To use the engine, copy a `straydog.exe` built by Straydog's README, with the toolkit's `cublas64_13.dll` and `cublasLt64_13.dll`, next to `dogmind-app.exe`.
@@ -105,10 +123,13 @@ stages, and every session is kept in a file of its own. A project's `DOGMIND.md`
 wants to be worked on. What the model reads is kept as small as a local model needs it: the system prompt is in
 `crates/dogmind-agent/src/prompt.rs` and the tool schemas in `tools.rs`.
 
+It can ask you a question with choices (`ask_user`), and in plan mode it puts its plan up for your approval (`submit_plan`) and
+carries it out once you approve.
+
 For a long look, `explore` hands a question to a helper with a context of its own and only the looking tools, and only its
 answer joins the conversation. A file of more than 800 lines read with no place in it comes as its outline, a turn is told at
-each 96 KB of files it has read, and a long command output or search result is kept whole in `%TEMP%\dogmind-output` for a week,
-its report saying where. A command left running in the background shows, at each `command_status`, what it has printed since the
+each 96 KB of files it has read, and any long tool result (a command's output, a search, an edit's report, a diff, an MCP tool's answer) is kept whole in
+`%TEMP%\dogmind-output` for a week, its report saying where to read the rest; so is what a compaction trims of an old output. A command left running in the background shows, at each `command_status`, what it has printed since the
 last look: a dev server's ready line among it.
 
 `execute_command` runs in an AppContainer, `DogmindApp.Exec`: a command can write only in the workspace, read
@@ -119,6 +140,20 @@ whole drive or holds your user folder cannot run commands at all (it still reads
 AppContainers work by ACEs, so the first command in a workspace writes one on that folder and its tree, and on the toolchain
 folders, and these stay. To take them away: `icacls <folder> /remove <the profile's SID> /t`. The app's own file tools run
 outside the container and pass through the approvals instead.
+
+## Background work
+
+A command started with `background: true` goes on while the agent does other things, or ends its turn. When it ends, any way it ends, the session wakes itself: the app writes a notice, which the
+transcript shows as a row of its own and the model reads as the app's word, not yours (what the command printed in it is data, never instructions), and one turn runs with nobody sending anything.
+`wake_on`, a regular expression, wakes it once, at the first line the command prints that matches (`Listening on` for a server), and the command goes on. `wake_at` wakes it later, after 60 seconds
+to a day with a note, with at most five waits open; `command_stop` ends a command or cancels a wait, and that wakes nothing. A notice that comes during a turn waits for its end, and notices that come
+together are one turn.
+
+So that nothing runs away, a session wakes itself at most 30 times in a row with no word from you, and 60 times in an hour; past either it stops and the window says why (a message from you lets it
+go on after the first, the hour's passing after the second). Your Stop ends the turn, and the commands and waits of that session. A woken turn asks as any turn does and waits for you: the taskbar
+button flashes until you look, the tray says so when the window is hidden, and nothing approves for it. The panel on the right lists what is waiting, each with a stop of its own, and the list of
+sessions marks one that has something waiting. Closing the window leaves all of it going, in the tray; Quit from the tray ends it. Commands and waits do not outlive the app, and nothing watches
+files or listens for anything from outside it.
 
 ## Straydog
 

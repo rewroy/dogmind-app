@@ -856,7 +856,7 @@ pub const ONE_LINE: u32 = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
 
 // ---- Buttons.
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ButtonKind {
     /// The one thing to do here: filled with the accent.
     Primary = 0,
@@ -875,8 +875,6 @@ pub enum ButtonKind {
     Icon = 7,
     /// A picture waiting to be sent: its small copy, with a cross on it for the pointer and the Delete key.
     Attached = 8,
-    /// A picture in the transcript: click to see it large.
-    Picture = 9,
     /// A row of a dialog's list of places: an icon and a name.
     Nav = 10,
     NavOn = 11,
@@ -889,6 +887,27 @@ pub enum ButtonKind {
     Link = 15,
     /// What cannot be undone.
     Danger = 17,
+    /// One of the choices a card puts to the person: its number, its label, what it means, and a mark on the one the model suggests (`choice_text`).
+    Choice = 18,
+    /// A file of the card of an answer's changes: its name, its lines added and removed and a small bar of them (`file_row_text`).
+    FileRow = 19,
+    /// The frame a field of a card stands in; the field itself is a control of its own over it.
+    Frame = 20,
+    /// A control of no size and nothing drawn: what Tab reaches and a screen reader names for something that is drawn elsewhere (the icons in the transcript).
+    Hidden = 21,
+}
+
+/// The parts of the text of a button that has more than one are told apart by this.
+pub const PART: char = '\u{1F}';
+
+/// The text of a `Choice` button.
+pub fn choice_text(number: usize, suggested: &str, label: &str, meaning: &str) -> String {
+    format!("{number}{PART}{suggested}{PART}{label}{PART}{meaning}")
+}
+
+/// The text of a `FileRow` button: lines added and removed, the parts of its bar that are green and red, and the file's name.
+pub fn file_row_text(added: usize, removed: usize, green: usize, red: usize, path: &str) -> String {
+    format!("{added}{PART}{removed}{PART}{green}{PART}{red}{PART}{path}")
 }
 
 /// What a picture's button shows.
@@ -933,6 +952,31 @@ unsafe fn draw_thumb(device: HDC, bitmap: HBITMAP, x: i32, y: i32, width: i32, h
     DeleteDC(source);
 }
 
+/// A picture's tile in `area` of `device`: its small copy, or the shape that holds its place while it is read, or why there is none. `attached`: a picture waiting to go, in the middle of a
+/// square of its own; else one in a message, from the top left of its place, as the text under it is. Shared by the button of an attached picture and by the transcript's own paint,
+/// which draws the pictures of its messages itself.
+pub unsafe fn draw_tile(device: HDC, area: RECT, thumb: &Thumb, attached: bool, fonts: &Fonts) {
+    let s = |value: i32| scale(fonts.dpi, value);
+    let radius = s(radius::SMALL);
+    match thumb {
+        Thumb::Ready { bitmap, width, height } => {
+            let (x, y) = if attached { (area.left + (area.right - area.left - width) / 2, area.top + (area.bottom - area.top - height) / 2) } else { (area.left, area.top) };
+            if attached {
+                rounded(device, area, radius, Some(theme::raised()), None);
+            }
+            draw_thumb(device, *bitmap, x, y, *width, *height, radius);
+        }
+        Thumb::Waiting => rounded(device, area, radius, Some(theme::raised()), None),
+        Thumb::Missing(words) => {
+            rounded(device, area, radius, Some(theme::raised()), Some(theme::line()));
+            let across = area.right - area.left - s(design::space::M);
+            let tall = text_height(fonts.small, words, across).min(area.bottom - area.top);
+            let inside = RECT { left: area.left + s(6), top: area.top + (area.bottom - area.top - tall) / 2, right: area.right - s(6), bottom: area.top + (area.bottom - area.top + tall) / 2 + 1 };
+            draw_text(device, words, inside, fonts.small, theme::muted(), DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+        }
+    }
+}
+
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const FLAG_HOVER: isize = 1 << 8;
 const FLAG_PRESSED: isize = 1 << 9;
@@ -952,6 +996,11 @@ pub fn forced_hover() -> bool {
     }
     #[cfg(not(debug_assertions))]
     false
+}
+
+/// Whether the keys are what is being used.
+pub fn keys_are_in_use() -> bool {
+    KEYS_IN_USE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// From a key that moves the focus, or a press of the pointer. What has the focus now shows it or stops showing it.
@@ -1033,6 +1082,10 @@ unsafe extern "system" fn button_procedure(window: HWND, message: u32, wparam: W
         // Reached with Tab: it shows, and Enter or Space presses it.
         WM_SETFOCUS | WM_KILLFOCUS => {
             InvalidateRect(window, std::ptr::null(), 0);
+            // (what it stands for is drawn elsewhere, and shows the focus there)
+            if state & 0xFF == ButtonKind::Hidden as isize {
+                PostMessageW(GetParent(window), crate::ui::WM_PROXY_FOCUS, 0, 0);
+            }
             0
         }
         WM_KEYDOWN if matches!(wparam as u16, VK_RETURN | VK_SPACE) && IsWindowEnabled(window) != 0 => {
@@ -1060,21 +1113,42 @@ unsafe extern "system" fn button_procedure(window: HWND, message: u32, wparam: W
 
 /// A button's text is its label, or `icon|label` for an icon before it.
 unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
-    let kind = state & 0xFF;
-    let (hover, pressed, enabled) = (state & FLAG_HOVER != 0, state & FLAG_PRESSED != 0, IsWindowEnabled(window) != 0);
-    let backdrop = (state >> BACKDROP_SHIFT) as u32;
+    let mut buffer = [0u16; 640];
+    let length = GetWindowTextW(window, buffer.as_mut_ptr(), 640);
+    let text = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
+    let (hover, pressed) = (state & FLAG_HOVER != 0 || forced_hover(), state & FLAG_PRESSED != 0);
+    draw_button_face(window, device, client, state & 0xFF, &text, (state >> BACKDROP_SHIFT) as u32, hover, pressed, IsWindowEnabled(window) != 0, GetFocus() == window);
+}
+
+/// A button that is no window, drawn where `area` is in `device`: in its own bitmap and put on at once, as a window's own paint is, for what a paint of another window's has to draw in
+/// its pixels (the controls of the cards over the transcript). `lit`: the pointer is on it; `ring`: the keys are on it.
+pub unsafe fn paint_button(device: HDC, area: RECT, kind: ButtonKind, text: &str, backdrop: u32, lit: bool, pressed: bool, ring: bool) {
+    let (width, height) = (area.right - area.left, area.bottom - area.top);
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let memory = CreateCompatibleDC(device);
+    let bitmap = CreateCompatibleBitmap(device, width, height);
+    let old = SelectObject(memory, bitmap);
+    draw_button_face(std::ptr::null_mut(), memory, RECT { left: 0, top: 0, right: width, bottom: height }, kind as isize, text, backdrop, lit, pressed, true, ring);
+    BitBlt(device, area.left, area.top, width, height, memory, 0, 0, SRCCOPY);
+    SelectObject(memory, old);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+}
+
+/// What a button looks like: its `kind` and words (`text`), on `backdrop`, with the pointer on it (`hover`), pressed, enabled, and with the keys on it (`focused`).
+unsafe fn draw_button_face(window: HWND, device: HDC, client: RECT, kind: isize, text: &str, backdrop: u32, hover: bool, pressed: bool, enabled: bool, focused: bool) {
     let brush = CreateSolidBrush(backdrop);
     FillRect(device, &client, brush);
     DeleteObject(brush);
-    let mut buffer = [0u16; 256];
-    let length = GetWindowTextW(window, buffer.as_mut_ptr(), 256);
-    let text = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
-    let (glyph, label) = text.split_once('|').map_or((None, text.as_str()), |(glyph, label)| (Some(glyph), label));
+    // (a text of several parts has its own marks, and is not an icon before a label)
+    let (glyph, label) = if text.contains(PART) { (None, text) } else { text.split_once('|').map_or((None, text), |(glyph, label)| (Some(glyph), label)) };
     let height = client.bottom;
     let Some(fonts) = BUTTON_FONTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().map(|fonts| fonts.0) else { return };
     let s = |value: i32| scale(fonts.dpi, value);
     let center = DT_CENTER | ONE_LINE;
-    let lit = hover || pressed || forced_hover();
+    let lit = hover || pressed;
     // A label with an icon before it, the two centred together.
     let centered = |device: HDC, font: HFONT, color: u32| {
         match glyph {
@@ -1096,7 +1170,8 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
             centered(device, fonts.strong, if enabled { theme::on_accent() } else { theme::muted() });
         }
         1 => {
-            rounded(device, client, s(radius::CONTROL), lit.then_some(theme::raised()), Some(theme::line()));
+            // (on a card of the conversation, a well a shade off it, as the choices of a question are)
+            rounded(device, client, s(radius::CONTROL), if lit { Some(theme::raised()) } else { (backdrop == theme::code_back()).then(theme::surface) }, Some(theme::line()));
             centered(device, fonts.body, if enabled { theme::text() } else { theme::faint() });
         }
         2 => {
@@ -1142,29 +1217,10 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
             let color = if label == "check" { theme::good() } else if lit { theme::text() } else { theme::faint() };
             icon::draw(device, label, client, s(design::size::ICON), color);
         }
-        8 | 9 => {
+        8 => {
             let thumb = THUMBS.with(|thumbs| thumbs.borrow().get(&(window as isize)).cloned()).unwrap_or(Thumb::Waiting);
-            let radius = s(radius::SMALL);
-            let attached = kind == 8;
-            match thumb {
-                Thumb::Ready { bitmap, width, height } => {
-                    // (a small one to send stands in the middle of its square; in a card, from the left, as the text under it does)
-                    let (x, y) = if attached { ((client.right - width) / 2, (client.bottom - height) / 2) } else { (0, 0) };
-                    if attached {
-                        rounded(device, client, radius, Some(theme::raised()), None);
-                    }
-                    draw_thumb(device, bitmap, x, y, width, height, radius);
-                }
-                Thumb::Waiting => rounded(device, client, radius, Some(theme::raised()), None),
-                Thumb::Missing(words) => {
-                    rounded(device, client, radius, Some(theme::raised()), Some(theme::line()));
-                    let across = client.right - s(design::space::M);
-                    let tall = text_height(fonts.small, &words, across).min(client.bottom);
-                    let area = RECT { left: s(6), top: (client.bottom - tall) / 2, right: client.right - s(6), bottom: (client.bottom + tall) / 2 + 1 };
-                    draw_text(device, &words, area, fonts.small, theme::muted(), DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
-                }
-            }
-            if attached && (lit || GetFocus() == window) {
+            draw_tile(device, client, &thumb, true, &fonts);
+            if lit || focused {
                 let cross = RECT { left: client.right - s(22), top: s(3), right: client.right - s(3), bottom: s(22) };
                 rounded(device, cross, s(design::radius::CONTROL), Some(theme::surface()), Some(theme::line()));
                 icon::draw(device, "x", cross, s(design::size::ICON_SMALL), theme::text());
@@ -1214,6 +1270,69 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
                 DeleteObject(brush);
             }
         }
+        18 => {
+            let mut parts = label.split(PART);
+            let (number, suggested, name, meaning) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            // On a card, a well a shade off it; the pointer on it, lit in the accent's frame.
+            rounded(device, client, s(radius::CONTROL), Some(if lit { theme::raised() } else { theme::surface() }), Some(if lit { theme::accent() } else { theme::line() }));
+            let mut area = client;
+            area.left += s(design::space::M);
+            area.right -= s(design::space::M);
+            // (the number is what picks it from the composer too)
+            let badge = s(design::space::L);
+            draw_text(device, number, RECT { left: area.left, right: area.left + badge, ..client }, fonts.small, theme::faint(), DT_CENTER | ONE_LINE);
+            area.left += badge + s(design::space::S);
+            if !suggested.is_empty() {
+                let across = text_width(fonts.small, suggested) + 2 * s(design::space::S);
+                let pill = rect(area.right - across, (height - s(20)) / 2, across, s(20));
+                rounded(device, pill, s(10), None, Some(theme::accent()));
+                draw_text(device, suggested, pill, fonts.small, theme::accent(), DT_CENTER | ONE_LINE);
+                area.right -= across + s(design::space::S);
+            }
+            if meaning.is_empty() {
+                draw_text(device, name, RECT { left: area.left, right: area.right, top: 0, bottom: height }, fonts.strong, theme::text(), ONE_LINE);
+            } else {
+                draw_text(device, name, RECT { left: area.left, right: area.right, top: s(7), bottom: height / 2 + s(2) }, fonts.strong, theme::text(), ONE_LINE);
+                draw_text(device, meaning, RECT { left: area.left, right: area.right, top: height / 2, bottom: height - s(7) }, fonts.small, theme::muted(), ONE_LINE);
+            }
+        }
+        19 => {
+            let mut parts = label.split(PART);
+            let mut number = || parts.next().and_then(|part| part.parse::<usize>().ok()).unwrap_or(0);
+            let (added, removed, green, red) = (number(), number(), number(), number());
+            let path = parts.next().unwrap_or("");
+            if lit {
+                rounded(device, client, s(radius::SMALL), Some(theme::raised()), None);
+            }
+            let right = client.right - s(design::space::M);
+            let mut left_of_numbers = right;
+            // The bar: all its parts, the lines added green, the lines removed red, and what is left of it the card's line.
+            if added + removed > 0 {
+                let (cell, gap, tall) = (s(5), s(1), s(10));
+                let across = crate::cards::BAR_PARTS as i32 * (cell + gap) - gap;
+                let top = (height - tall) / 2;
+                for part in 0..crate::cards::BAR_PARTS {
+                    let color = if part < green { theme::good() } else if part < green + red { theme::bad() } else { theme::line() };
+                    rounded(device, rect(right - across + part as i32 * (cell + gap), top, cell, tall), s(1), Some(color), None);
+                }
+                left_of_numbers = right - across - s(design::space::M);
+                let (minus, plus) = (format!("\u{2212}{removed}"), format!("+{added}"));
+                let (minus_width, plus_width) = (text_width(fonts.small, &minus), text_width(fonts.small, &plus));
+                draw_text(device, &minus, RECT { left: left_of_numbers - minus_width, right: left_of_numbers, top: 0, bottom: height }, fonts.small, theme::bad(), DT_RIGHT | ONE_LINE);
+                draw_text(device, &plus, RECT { left: left_of_numbers - minus_width - s(design::space::S) - plus_width, right: left_of_numbers - minus_width - s(design::space::S), top: 0, bottom: height }, fonts.small, theme::good(), DT_RIGHT | ONE_LINE);
+                left_of_numbers -= minus_width + plus_width + s(design::space::S) + s(design::space::M);
+            }
+            draw_text(device, path, RECT { left: client.left + s(design::space::M), right: left_of_numbers, top: 0, bottom: height }, fonts.body, if lit { theme::text() } else { theme::soft() }, (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS);
+        }
+        21 => {}
+        20 => {
+            // The field of a card, which is the composer: a frame with the words that say where to write; lit when the pointer is on it or the composer has the focus.
+            rounded(device, client, s(radius::CONTROL), Some(theme::surface()), Some(if lit { theme::accent() } else { theme::line() }));
+            let mut area = client;
+            area.left += s(design::space::M);
+            area.right -= s(design::space::M);
+            draw_text(device, label, area, fonts.body, theme::faint(), ONE_LINE);
+        }
         selected => {
             if selected == 6 || lit {
                 rounded(device, client, s(radius::SMALL), Some(if selected == 6 { theme::raised() } else { theme::surface() }), None);
@@ -1221,7 +1340,7 @@ unsafe fn draw_button(window: HWND, device: HDC, client: RECT, state: isize) {
             draw_text(device, label, client, fonts.body, if selected == 6 { theme::text() } else { theme::muted() }, center);
         }
     }
-    if GetFocus() == window && KEYS_IN_USE.load(std::sync::atomic::Ordering::Relaxed) {
+    if focused && KEYS_IN_USE.load(std::sync::atomic::Ordering::Relaxed) {
         let ring = RECT { left: 1, top: 1, right: client.right - 1, bottom: client.bottom - 1 };
         let corner = match kind {
             4 | 12 | 13 => (height - 2) / 2,
@@ -1254,8 +1373,14 @@ pub unsafe fn make_button(parent: HWND, id: isize, text: &str, kind: ButtonKind,
     window
 }
 
+/// The kind and backdrop a button is drawn with. One that has them already is left as it is, not drawn again: a layout that runs for every note of progress would have each of its buttons
+/// drawn at the rate the notes come.
 pub unsafe fn set_button_style(window: HWND, kind: ButtonKind, backdrop: u32) {
-    SetWindowLongPtrW(window, GWLP_USERDATA, kind as isize | ((backdrop as isize) << BACKDROP_SHIFT));
+    let wanted = kind as isize | ((backdrop as isize) << BACKDROP_SHIFT);
+    if GetWindowLongPtrW(window, GWLP_USERDATA) & !(FLAG_HOVER | FLAG_PRESSED) == wanted {
+        return;
+    }
+    SetWindowLongPtrW(window, GWLP_USERDATA, wanted);
     InvalidateRect(window, std::ptr::null(), 0);
 }
 
@@ -1475,6 +1600,47 @@ mod bundled_face {
             DeleteDC(device);
             DeleteObject(font);
             assert!(full.contains("Bold"), "{full}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod button_style_tests {
+    use super::*;
+
+    /// A button that has the style it is asked for is not drawn again, however often the layout asks; one that is given another is.
+    #[test]
+    fn a_button_is_drawn_again_only_when_its_style_changes() {
+        // SAFETY: a window of this test's own, off every screen and never activated, made and ended on this thread.
+        unsafe {
+            register_button_class();
+            let class = wide("DogButton");
+            let window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, class.as_ptr(), wide("Cancel").as_ptr(), WS_POPUP | WS_VISIBLE, -20000, -20000, 120, 40, std::ptr::null_mut(), std::ptr::null_mut(), GetModuleHandleW(std::ptr::null()), std::ptr::null());
+            assert!(!window.is_null());
+            let wanted_again = |window: HWND| {
+                let mut area: RECT = std::mem::zeroed();
+                GetUpdateRect(window, &mut area, 0) != 0
+            };
+            let settle = |window: HWND| {
+                UpdateWindow(window);
+            };
+            set_button_style(window, ButtonKind::Link, 0x202020);
+            settle(window);
+            assert!(!wanted_again(window), "drawn, and nothing asks for more");
+            for _ in 0..5 {
+                set_button_style(window, ButtonKind::Link, 0x202020);
+                assert!(!wanted_again(window), "the same style is no reason to draw it again");
+            }
+            // (the pointer on it is not undone by the layout that says what it is)
+            SetWindowLongPtrW(window, GWLP_USERDATA, GetWindowLongPtrW(window, GWLP_USERDATA) | FLAG_HOVER);
+            set_button_style(window, ButtonKind::Link, 0x202020);
+            assert!(GetWindowLongPtrW(window, GWLP_USERDATA) & FLAG_HOVER != 0);
+            set_button_style(window, ButtonKind::Secondary, 0x202020);
+            assert!(wanted_again(window), "another kind is drawn");
+            settle(window);
+            set_button_style(window, ButtonKind::Secondary, 0x303030);
+            assert!(wanted_again(window), "and another backdrop");
+            DestroyWindow(window);
         }
     }
 }
