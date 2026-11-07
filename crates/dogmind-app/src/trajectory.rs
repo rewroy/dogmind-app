@@ -81,7 +81,7 @@ pub fn rows(summary: &Summary, open: &BTreeSet<u64>) -> Vec<Row> {
 
 /// What a turn says besides its figures: how much was written to begin it, that it has no end, how it failed.
 fn turn_note(turn: &TurnSummary) -> String {
-    let mut parts = vec![tf("{0} characters", &[&turn.chars])];
+    let mut parts = vec![if turn.woken { t("woken by background work").to_string() } else { tf("{0} characters", &[&turn.chars]) }];
     if turn.pictures > 0 {
         parts.push(tf("{0} pictures", &[&turn.pictures]));
     }
@@ -186,6 +186,15 @@ mod tests {
         // (the server's own rate is not marked as counted)
         let page = rows(&run(), &BTreeSet::from([2]));
         assert_eq!(page[3].note, "prompt 9000, cached 90%, 300 tokens, 31.5 tok/s, stop");
+    }
+
+    /// A turn nobody sent says so, where a turn of the person's says how much they wrote.
+    #[test]
+    fn a_turn_that_woke_itself_says_so_and_not_how_much_was_written() {
+        let woken = summary(r#"{"t":"2026-11-05T10:00:00.000+09:00","ev":"turn_start","turn":1,"chars":900,"images":0,"woken":true}"#);
+        let page = rows(&woken, &BTreeSet::new());
+        assert_eq!(page[1].note, "woken by background work, no end: the run stopped here");
+        assert!(woken.turns[0].woken);
     }
 
     #[test]

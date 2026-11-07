@@ -7269,7 +7269,7 @@ impl App {
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let row = s(ds::size::TEXT_ROW);
-        let (stop_wide, time_wide) = (s(ds::space::XL), s(88));
+        let (stop_wide, time_wide) = (s(ds::space::XL), s(76));
         let indent = s(ds::size::RIGHT_INDENT);
         shapes.push(Shape::Text { area: rect(x, y, width, s(ds::space::XL)), text: t("In the background").to_string(), font: FontKind::Strong, color: theme::muted(), flags: ONE_LINE });
         // (more than one: all of them at a press)
