@@ -22,7 +22,8 @@ use dogmind_agent::read_folders;
 use dogmind_agent::safety::{AlwaysScope, Mode};
 use dogmind_agent::session;
 use dogmind_agent::tools::{FileChange, GitInfo};
-use dogmind_agent::conversation_key::Policy;
+use dogmind_agent::conversation_key::{self, Cipher, KeyError, Keystore, Pending, Policy};
+use dogmind_agent::conversion;
 use dogmind_agent::web::{WebSettings, WARNING_MARK};
 
 use crate::design as ds;
@@ -267,7 +268,7 @@ const ID_PROXY_POOL: isize = 300; // ..300 + PROXY_POOL
 const PROXY_POOL: usize = 40;
 const ID_MODAL_CLOSE: isize = 9600;
 const ID_NAV: isize = 9601; // ..+ NAV_POOL
-const NAV_POOL: usize = 10;
+const NAV_POOL: usize = 11;
 const ID_THEME_SEGMENT: isize = 9640; // ..+ 3 (past ID_NAV's pool)
 const ID_TEXT_SIZE: isize = 9630; // ..+ TEXT_SIZES
 const ID_SKILL_TOGGLE: isize = 10000; // ..+ as many skills as there are
@@ -288,6 +289,7 @@ const ID_VISION_OFFER: isize = 9905;
 const ID_UPDATE_OFFER: isize = 9906;
 const ID_RELEASE_OFFER: isize = 9907;
 const ID_TOGGLE_UPDATES: isize = 9908;
+const ID_TOGGLE_REMEMBER: isize = 9912;
 const ID_SPEED_FIRST: isize = 9909;
 const ID_NOTICE_LATER: isize = 9910;
 const ID_GOAL_CLEAR: isize = 9911;
@@ -767,6 +769,9 @@ enum Note {
     ReadFolderProgress(u64),
     /// It has ended, with what to say of it, and whether that is a problem.
     ReadFolderDone(String, bool),
+    /// How many conversations and notes are changed, of how many.
+    CryptProgress(usize, usize),
+    CryptDone(CryptOutcome),
 }
 
 /// A picture waiting to go: the agent has looked it over and holds its bytes, and the file is what is shown of it.
@@ -1415,10 +1420,21 @@ enum Panel {
     Tools,
     /// What the model keeps between sessions, for `/memory`.
     Memory,
+    /// Whether conversations are encrypted, and the passphrase and the recovery code that go with it.
+    Privacy,
+    /// The choice to encrypt, with the passphrase it asks for.
+    CryptoOn,
+    CryptoPassphrase,
+    CryptoCode,
+    CryptoOff,
+    /// A change of every conversation, going on or done, with the recovery code that is shown once.
+    CryptoWork,
+    /// At the start of an app whose conversations are encrypted, with the key not yet in memory.
+    Unlock,
 }
 
 /// The places of the settings, in their list.
-const SETTINGS_PLACES: [(Panel, &str, &str); 10] = [
+const SETTINGS_PLACES: [(Panel, &str, &str); 11] = [
     (Panel::General, "settings", "General"),
     (Panel::Appearance, "sun", "Appearance"),
     (Panel::Providers, "plug", "Models and connections"),
@@ -1428,6 +1444,7 @@ const SETTINGS_PLACES: [(Panel, &str, &str); 10] = [
     (Panel::Skills, "book-open", "Skills"),
     (Panel::Memory, "paw-print", "Memory"),
     (Panel::Instructions, "pencil", "Your instructions"),
+    (Panel::Privacy, "lock", "Privacy"),
     (Panel::About, "info", "About"),
 ];
 
@@ -1984,6 +2001,8 @@ struct App {
     release_ready_closed: bool,
     /// The switch on the About page for the app's own looks.
     toggle_updates: HWND,
+    /// "Remember on this PC", for the key of encrypted conversations.
+    toggle_remember: HWND,
     read_folder_add: HWND,
     read_folder_stop: HWND,
     read_folder_remove: Vec<HWND>,
@@ -2027,6 +2046,7 @@ struct App {
     mcp: Arc<dogmind_agent::mcp::Hub>,
     /// Whether conversations are written encrypted, shared with every agent: while the key is not unlocked, none is opened or written.
     policy: Arc<Policy>,
+    crypt: Crypt,
     branch: Option<String>,
     session_title: String,
     totals: (u64, u64, u64, u32), // prompt, cached, completion, requests
@@ -2384,6 +2404,91 @@ enum Leaving {
     Going,
     /// What it comes to.
     Gone(String),
+}
+
+/// What a change of every conversation is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CryptJob {
+    On,
+    Off,
+    /// A change that was stopped before it was done, finished at this start.
+    FinishOn,
+    FinishOff,
+}
+
+struct CryptWork {
+    job: CryptJob,
+    done: usize,
+    total: usize,
+}
+
+/// What a change of every conversation came to, back from the thread that ran it.
+struct CryptOutcome {
+    job: CryptJob,
+    /// The key, once there is one, even where the change did not go through.
+    cipher: Option<Arc<Cipher>>,
+    /// The recovery code, shown once.
+    code: Option<String>,
+    changed: usize,
+    /// What could not be carried over, and was left out.
+    lost: Vec<String>,
+    error: Option<String>,
+}
+
+/// What the app holds of the encryption of conversations (`dogmind_agent::conversation_key`): the key file, and the key itself once it is unlocked, in memory only.
+struct Crypt {
+    keystore: Option<Keystore>,
+    cipher: Option<Arc<Cipher>>,
+    /// The key file is there and cannot be read: said at the start, and nothing is opened.
+    damaged: Option<String>,
+    /// At the unlock page: the recovery code is typed, with a new passphrase, in place of the passphrase.
+    by_code: bool,
+    work: Option<CryptWork>,
+    /// What the work page says when nothing is going on, and the recovery code it shows once.
+    said: String,
+    said_is_a_problem: bool,
+    code: Option<String>,
+    /// The box "Remember on this PC", as the page that has it shows it.
+    remember: bool,
+    /// The session the copy before this one had open, held while the key is asked for.
+    resume: Option<PathBuf>,
+    /// Where the work page goes when it is done.
+    back: Panel,
+    /// What the start left for after the key: the look at what earlier runs left writable reads the conversations' workspaces.
+    sweep_due: bool,
+}
+
+impl Crypt {
+    /// What the data folder says: no key file, conversations as they are; one, and the key is asked for unless Windows has it for this user.
+    fn open(folder: &Path) -> (Crypt, Arc<Policy>) {
+        let mut crypt = Crypt { keystore: None, cipher: None, damaged: None, by_code: false, work: None, said: String::new(), said_is_a_problem: false, code: None, remember: true, resume: None, back: Panel::Chat, sweep_due: false };
+        let policy = match Keystore::load(folder) {
+            Err(KeyError::Missing) => Policy::off(),
+            Err(error) => {
+                crypt.damaged = Some(error.to_string());
+                Policy::locked()
+            }
+            Ok(keystore) => {
+                let policy = match keystore.unlock_remembered() {
+                    Ok(cipher) => {
+                        crypt.cipher = Some(cipher.clone());
+                        Policy::on(cipher)
+                    }
+                    Err(_) => Policy::locked(),
+                };
+                crypt.remember = keystore.is_remembered();
+                crypt.keystore = Some(keystore);
+                policy
+            }
+        };
+        crypt.sweep_due = crypt.is_locked();
+        (crypt, policy)
+    }
+
+    /// Nothing is opened or written: the key is asked for, or its file cannot be read.
+    fn is_locked(&self) -> bool {
+        self.damaged.is_some() || (self.keystore.is_some() && self.cipher.is_none())
+    }
 }
 
 /// How a download goes on after the network drops, before it says so and stops: an hour and more, in all, of a drop being waited out.
@@ -6378,7 +6483,7 @@ impl App {
 
     /// Whether this panel is shown as a dialog over the app. The first run has the window to itself.
     fn is_dialog(&self, panel: Panel) -> bool {
-        matches!(panel, Panel::Rename | Panel::ConfirmDelete | Panel::ConfirmRemove | Panel::Sessions | Panel::Rewind) || (!self.onboarding && (matches!(panel, Panel::Help | Panel::About) || is_settings_place(panel)))
+        matches!(panel, Panel::Rename | Panel::ConfirmDelete | Panel::ConfirmRemove | Panel::Sessions | Panel::Rewind | Panel::CryptoOn | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff | Panel::CryptoWork | Panel::Unlock) || (!self.onboarding && (matches!(panel, Panel::Help | Panel::About) || is_settings_place(panel)))
     }
 
     /// The controls that move between the window and a dialog as they are needed, and those that only a dialog has.
@@ -6399,7 +6504,7 @@ impl App {
         all.push(self.vision_delete);
         all.extend(self.read_folder_remove.iter().copied());
         all.extend([self.read_folder_add, self.read_folder_stop]);
-        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_compact, self.toggle_updates, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
+        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_compact, self.toggle_updates, self.toggle_remember, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
         all
     }
 
@@ -6498,7 +6603,7 @@ impl App {
         let margin = s(ds::DIALOG_MARGIN);
         let (rows, chosen) = self.nav_rows();
         let (card_width, wanted_height) = match self.panel {
-            Panel::Rename | Panel::ConfirmDelete | Panel::ConfirmRemove => (s(ds::size::SHORT_DIALOG).min(width - 2 * margin), 0),
+            Panel::Rename | Panel::ConfirmDelete | Panel::ConfirmRemove | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff => (s(ds::size::SHORT_DIALOG).min(width - 2 * margin), 0),
             Panel::Sessions | Panel::Rewind => (s(ds::size::LIST_DIALOG).min(width - 2 * margin), 0),
             Panel::Help => ds::dialog_size((width, height), 80, (s(640), s(420)), (s(800), s(640)), margin),
             _ => ds::dialog_size((width, height), 80, (s(720), s(460)), (s(900), s(640)), margin),
@@ -6921,6 +7026,80 @@ impl App {
                         form.buttons(0, &[self.buttons[0]]);
                     }
                 }
+            }
+            Panel::Privacy => {
+                form.note(t("If you forget the passphrase and lose the recovery code, the conversations cannot be read by anyone."), theme::muted());
+                if self.crypt.keystore.is_none() {
+                    form.note(t("Conversations, and the notes the model keeps, are stored as plain text in this app's folder. They can be encrypted, under a passphrase that only you know."), theme::muted());
+                    form.buttons(0, &[self.buttons[0]]);
+                } else {
+                    form.note(t("Conversations are encrypted: each message, each picture and each note the model keeps. The key is kept only under your passphrase, under a recovery code and, if you chose it, under your Windows account."), theme::muted());
+                    form.toggle(t("Remember on this PC"), self.toggle_remember);
+                    form.note(t("With this on, Dogmind asks for nothing when it starts on this PC. The passphrase and the recovery code still open the conversations on another PC, or after Windows is installed again."), theme::muted());
+                    form.buttons(0, &[self.buttons[0], self.buttons[1], self.buttons[2]]);
+                }
+                form.note(t("Not encrypted: the files of your workspaces and the copies kept to undo an edit (they lie in the workspace as they are), the timing records of a session (counts, times and names, never what was said), and the settings."), theme::muted());
+                form.note(&log, log_color);
+            }
+            Panel::CryptoOn => {
+                form.note(t("Choose a passphrase for your conversations. Then you are shown a recovery code, once. If you forget the passphrase, the recovery code is the only way back: with neither, the conversations cannot be read by anyone."), theme::muted());
+                form.field(t("Passphrase"), self.fields[0]);
+                form.field(t("Again"), self.fields[1]);
+                form.toggle(t("Remember on this PC"), self.toggle_remember);
+                form.note(t("Every conversation and note you have is encrypted now, one at a time, and new ones as they begin. With the box ticked, Dogmind asks for nothing when it starts on this PC."), theme::muted());
+                form.y += s(ds::space::XS);
+                form.buttons(0, &[self.buttons[0], self.buttons[1]]);
+                form.note(&log, log_color);
+            }
+            Panel::CryptoPassphrase => {
+                form.field(t("New passphrase"), self.fields[0]);
+                form.field(t("Again"), self.fields[1]);
+                form.note(t("The conversations are not touched, and the recovery code still works."), theme::muted());
+                form.y += s(ds::space::XS);
+                form.buttons(0, &[self.buttons[0], self.buttons[1]]);
+                form.note(&log, log_color);
+            }
+            Panel::CryptoCode => {
+                form.note(t("A new recovery code replaces the old one, which stops working. The passphrase stays as it is. The new code is shown once."), theme::muted());
+                form.y += s(ds::space::XS);
+                form.buttons(0, &[self.buttons[0], self.buttons[1]]);
+                form.note(&log, log_color);
+            }
+            Panel::CryptoOff => {
+                form.note(t("Every conversation and note is written back as plain text, and the key file is removed. Anyone who can open this app's folder can then read them."), theme::muted());
+                form.y += s(ds::space::XS);
+                form.buttons(0, &[self.buttons[0], self.buttons[1]]);
+                form.note(&log, log_color);
+            }
+            Panel::CryptoWork => {
+                let said = self.crypt_words();
+                form.note(&said, if self.crypt.said_is_a_problem { theme::bad() } else { theme::text() });
+                if self.crypt.code.is_some() {
+                    form.field(t("Recovery code"), self.fields[0]);
+                    form.note(t("Write this code down and keep it somewhere safe. It is shown once, and nothing else keeps it. If you forget the passphrase, it is the only way back to your conversations; if you lose both, they cannot be read by anyone."), theme::warn());
+                }
+                if self.crypt.work.is_none() {
+                    form.y += s(ds::space::XS);
+                    form.buttons(0, &[self.buttons[0]]);
+                }
+            }
+            Panel::Unlock => {
+                if let Some(why) = &self.crypt.damaged {
+                    form.note(&tf("{0} It is conversation-key.json in {1}. Put back a copy of it, and start Dogmind again.", &[&t(why), &self.folder.display()]), theme::bad());
+                } else if !self.crypt.by_code {
+                    form.note(t("Your conversations are encrypted. Type your passphrase to open them."), theme::muted());
+                    form.field(t("Passphrase"), self.fields[0]);
+                    form.y += s(ds::space::XS);
+                    form.buttons(0, &[self.buttons[0], self.buttons[1]]);
+                } else {
+                    form.note(t("Type the recovery code you were shown, and choose a new passphrase."), theme::muted());
+                    form.field(t("Recovery code"), self.fields[0]);
+                    form.field(t("New passphrase"), self.fields[1]);
+                    form.field(t("Again"), self.fields[2]);
+                    form.y += s(ds::space::XS);
+                    form.buttons(0, &[self.buttons[0], self.buttons[1]]);
+                }
+                form.note(&log, log_color);
             }
             Panel::Sessions | Panel::Rewind => {
                 if !self.list_rows.is_empty() {
@@ -8251,6 +8430,77 @@ impl App {
                 }
                 self.panel_log = said.join("\n");
             }
+            Panel::Privacy => {
+                self.panel_title = t("Settings").into();
+                let on = self.crypt.keystore.is_some();
+                if let Some(keystore) = &self.crypt.keystore {
+                    self.crypt.remember = keystore.is_remembered();
+                }
+                set_text(self.buttons[0], if on { t("Change passphrase...") } else { t("Encrypt conversations...") });
+                set_text(self.buttons[1], t("New recovery code..."));
+                set_text(self.buttons[2], t("Turn off encryption..."));
+                self.set_button_kinds(&[if on { ButtonKind::Secondary } else { ButtonKind::Primary }, ButtonKind::Secondary, ButtonKind::Danger]);
+                self.update_toggles();
+            }
+            Panel::CryptoOn => {
+                self.panel_title = t("Encrypt conversations").into();
+                self.crypt_fields_ready(2);
+                self.crypt.remember = true;
+                set_text(self.buttons[0], t("Encrypt"));
+                set_text(self.buttons[1], t("Cancel"));
+                self.set_button_kinds(&[ButtonKind::Primary, ButtonKind::Secondary]);
+                self.update_toggles();
+            }
+            Panel::CryptoPassphrase => {
+                self.panel_title = t("Change the passphrase").into();
+                self.crypt_fields_ready(2);
+                set_text(self.buttons[0], t("Change"));
+                set_text(self.buttons[1], t("Cancel"));
+                self.set_button_kinds(&[ButtonKind::Primary, ButtonKind::Secondary]);
+            }
+            Panel::CryptoCode => {
+                self.panel_title = t("New recovery code").into();
+                set_text(self.buttons[0], t("Make a new code"));
+                set_text(self.buttons[1], t("Cancel"));
+                self.set_button_kinds(&[ButtonKind::Primary, ButtonKind::Secondary]);
+            }
+            Panel::CryptoOff => {
+                self.panel_title = t("Turn off encryption?").into();
+                set_text(self.buttons[0], t("Turn off encryption"));
+                set_text(self.buttons[1], t("Cancel"));
+                self.set_button_kinds(&[ButtonKind::Danger, ButtonKind::Secondary]);
+            }
+            Panel::CryptoWork => {
+                self.panel_title = t(match self.crypt.work.as_ref().map(|work| work.job) {
+                    Some(CryptJob::On | CryptJob::FinishOn) => "Encrypting conversations",
+                    Some(CryptJob::Off | CryptJob::FinishOff) => "Decrypting conversations",
+                    None if self.crypt.code.is_some() => "Recovery code",
+                    None => "Done",
+                }).into();
+                self.crypt_fields_ready(0);
+                // (the code is shown to be read and copied, and is nowhere else once this page is gone)
+                if let Some(code) = &self.crypt.code {
+                    set_text(self.fields[0], code);
+                    SendMessageW(self.fields[0], EM_SETREADONLY, 1, 0);
+                }
+                set_text(self.buttons[0], t("Done"));
+                self.set_button_kinds(&[ButtonKind::Primary]);
+            }
+            Panel::Unlock => {
+                self.panel_title = t("Unlock your conversations").into();
+                self.crypt_fields_ready(if self.crypt.by_code { 3 } else { 1 });
+                // (the code is typed as it was shown, so it is not hidden; the passphrases are)
+                if self.crypt.by_code {
+                    SendMessageW(self.fields[0], EM_SETPASSWORDCHAR, 0, 0);
+                }
+                set_text(self.buttons[0], t("Unlock"));
+                set_text(self.buttons[1], if self.crypt.by_code { t("Use the passphrase instead") } else { t("Use the recovery code instead") });
+                self.set_button_kinds(&[ButtonKind::Primary, ButtonKind::Link]);
+                if self.crypt.damaged.is_some() {
+                    show(self.buttons[0], false);
+                    show(self.buttons[1], false);
+                }
+            }
             Panel::Skills => {
                 self.panel_title = t("Skills").into();
                 while self.skill_toggles.len() < self.skills.len() {
@@ -8384,7 +8634,8 @@ impl App {
         if self.modal_open {
             let (rows, chosen) = self.nav_rows();
             SetFocus(match panel {
-                Panel::Rename => self.fields[0],
+                Panel::Rename | Panel::CryptoOn | Panel::CryptoPassphrase => self.fields[0],
+                Panel::Unlock if self.crypt.damaged.is_none() => self.fields[0],
                 Panel::Sessions | Panel::Rewind if !self.list_rows.is_empty() => self.list,
                 _ if rows.is_empty() => self.modal,
                 _ => self.nav_buttons[chosen],
@@ -8826,7 +9077,7 @@ impl App {
     }
 
     unsafe fn update_toggles(&self) {
-        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_updates, self.settings.check_for_updates)] {
+        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_updates, self.settings.check_for_updates), (self.toggle_remember, self.crypt.remember)] {
             set_button_style(toggle, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         }
         for (at, (segment, (known, name))) in self.theme_segments.iter().zip(THEMES).enumerate() {
@@ -10432,6 +10683,248 @@ impl App {
     }
 
     /// The sidebar's list, read on another thread: there may be many sessions.
+    /// The fields a page of this kind types in, empty and with their text hidden; the others are shut. Nothing typed on one of these pages stays in a field when it goes.
+    unsafe fn crypt_fields_ready(&self, typed: usize) {
+        for (at, field) in self.fields.iter().enumerate() {
+            set_text(*field, "");
+            SendMessageW(*field, EM_SETREADONLY, 0, 0);
+            SendMessageW(*field, EM_SETPASSWORDCHAR, if at < typed { 0x2022 } else { 0 }, 0);
+        }
+    }
+
+    /// What the work page says: how far a change has come, or how it ended.
+    fn crypt_words(&self) -> String {
+        match &self.crypt.work {
+            Some(CryptWork { job, done, total }) if *total > 0 => match job {
+                CryptJob::On | CryptJob::FinishOn => tf("Encrypting {0} of {1}...", &[done, total]),
+                CryptJob::Off | CryptJob::FinishOff => tf("Decrypting {0} of {1}...", &[done, total]),
+            },
+            Some(CryptWork { job: CryptJob::On | CryptJob::FinishOn, .. }) => t("Encrypting...").to_string(),
+            Some(_) => t("Decrypting...").to_string(),
+            None => self.crypt.said.clone(),
+        }
+    }
+
+    /// Whether a conversation is being written: what a change of every file would take the ground from.
+    fn conversations_are_in_use(&self) -> bool {
+        self.running || self.parked.iter().any(|parked| parked.running)
+    }
+
+    /// The two passphrases typed from this field on, if they are one and not empty.
+    unsafe fn typed_passphrase(&mut self, first: usize) -> Option<String> {
+        let (one, again) = (get_text(self.fields[first]), get_text(self.fields[first + 1]));
+        if one.is_empty() {
+            self.problem_in_panel(t(conversation_key::EMPTY_PASSPHRASE));
+            return None;
+        }
+        if one != again {
+            self.problem_in_panel(t("The two passphrases are not the same."));
+            return None;
+        }
+        Some(one)
+    }
+
+    unsafe fn crypt_turn_on(&mut self) {
+        let Some(passphrase) = self.typed_passphrase(0) else { return };
+        if self.conversations_are_in_use() {
+            self.problem_in_panel(t("A conversation is at work. Let it finish or stop it first: the files are written to while it goes."));
+            return;
+        }
+        let remember = self.crypt.remember;
+        self.start_crypt(CryptJob::On, passphrase, remember);
+    }
+
+    unsafe fn crypt_turn_off(&mut self) {
+        if self.conversations_are_in_use() {
+            self.problem_in_panel(t("A conversation is at work. Let it finish or stop it first: the files are written to while it goes."));
+            return;
+        }
+        self.start_crypt(CryptJob::Off, String::new(), false);
+    }
+
+    /// A change of every conversation, off this thread: it takes as long as the conversations are many and long. The page that shows it has no way out until it is done.
+    unsafe fn start_crypt(&mut self, job: CryptJob, passphrase: String, remember: bool) {
+        self.crypt.work = Some(CryptWork { job, done: 0, total: 0 });
+        self.crypt.said.clear();
+        self.crypt.said_is_a_problem = false;
+        self.crypt.code = None;
+        self.crypt.back = if matches!(job, CryptJob::FinishOn | CryptJob::FinishOff) { Panel::Chat } else { Panel::Privacy };
+        self.set_panel(Panel::CryptoWork);
+        let (data, poster, policy, cipher) = (self.folder.clone(), self.poster.clone(), self.policy.clone(), self.crypt.cipher.clone());
+        std::thread::spawn(move || {
+            let progress_poster = poster.clone();
+            let mut progress = move |done: usize, total: usize| progress_poster.send(Note::CryptProgress(done, total));
+            let mut hooks = conversion::Hooks::reporting(&mut progress);
+            let mut outcome = CryptOutcome { job, cipher: cipher.clone(), code: None, changed: 0, lost: Vec::new(), error: None };
+            let locked = || conversion::Ended::Failed(conversation_key::LOCKED.to_string());
+            let result = match job {
+                CryptJob::On => conversion::begin_on(&data, &policy, &passphrase, remember).and_then(|(mut keystore, made, code)| {
+                    // (the key and the code are the window's from here, whether or not what follows is done: a stop leaves the rest to the next start)
+                    outcome.cipher = Some(made.clone());
+                    outcome.code = Some(code);
+                    conversion::finish_on(&data, &mut keystore, &made, &mut hooks)
+                }),
+                CryptJob::Off => cipher.as_ref().ok_or_else(locked).and_then(|cipher| conversion::turn_off(&data, &policy, cipher, &mut hooks)),
+                CryptJob::FinishOn | CryptJob::FinishOff => cipher.as_ref().ok_or_else(locked).and_then(|cipher| conversion::finish_pending(&data, &policy, cipher, &mut hooks)).map(|done| done.map(|(_, report)| report).unwrap_or_default()),
+            };
+            match result {
+                Ok(report) => (outcome.changed, outcome.lost) = (report.changed, report.lost),
+                Err(error) => outcome.error = Some(error.to_string()),
+            }
+            poster.send(Note::CryptDone(outcome));
+        });
+    }
+
+    /// A change of every conversation has ended: what the key file and the key are now, and what is said of it.
+    unsafe fn crypt_finished(&mut self, outcome: CryptOutcome) {
+        self.crypt.work = None;
+        // (the key file as it is now: made, changed, or gone)
+        self.crypt.keystore = Keystore::load(&self.folder).ok();
+        self.crypt.cipher = if self.crypt.keystore.is_some() { outcome.cipher.clone() } else { None };
+        if self.crypt.cipher.is_some() && outcome.job == CryptJob::On {
+            self.crypt.code = outcome.code.clone();
+        }
+        if let Some(keystore) = &self.crypt.keystore {
+            self.crypt.remember = keystore.is_remembered();
+        }
+        let mut said = match (&outcome.error, outcome.job) {
+            (Some(error), _) => tf("It stopped: {0}. What was changed stays changed, and the next start of Dogmind finishes the rest.", &[&t(error)]),
+            (None, CryptJob::On | CryptJob::FinishOn) => tf("{0} conversations and notes are encrypted.", &[&outcome.changed]),
+            (None, CryptJob::Off | CryptJob::FinishOff) => tf("{0} conversations and notes are plain again, and the key file is removed.", &[&outcome.changed]),
+        };
+        if !outcome.lost.is_empty() {
+            said = format!("{said}\n{}\n{}", t("These could not be carried over, and were left out:"), outcome.lost.join("\n"));
+        }
+        self.crypt.said = said;
+        self.crypt.said_is_a_problem = outcome.error.is_some() || !outcome.lost.is_empty();
+        self.set_panel(Panel::CryptoWork);
+    }
+
+    /// Done: the recovery code is gone from the window, and the page it came from is back.
+    unsafe fn crypt_done(&mut self) {
+        self.crypt.code = None;
+        self.crypt.said.clear();
+        self.crypt_fields_ready(0);
+        let back = self.crypt.back;
+        self.crypt.back = Panel::Chat;
+        self.set_panel(back);
+        self.after_unlock();
+    }
+
+    /// What waited for the key: the list of conversations, the look at what earlier runs left writable, and the session the app was left with.
+    unsafe fn after_unlock(&mut self) {
+        if self.crypt.is_locked() || self.crypt.work.is_some() {
+            return;
+        }
+        self.refresh_sessions();
+        if std::mem::take(&mut self.crypt.sweep_due) {
+            self.sweep_grants();
+        }
+        if let Some(session) = self.crypt.resume.take().filter(|session| session.is_file()) {
+            self.open_session(session);
+        }
+    }
+
+    /// What earlier runs left writable, now that what this one uses is counted: the workspaces of the conversations are among what is counted, so it waits for the key.
+    unsafe fn sweep_grants(&self) {
+        let (data, mut named, poster) = (self.folder.clone(), self.settings.workspaces.clone(), self.poster.clone());
+        std::thread::spawn(move || {
+            named.extend(session::list(&data.join("sessions")).into_iter().map(|summary| summary.workspace));
+            named.sort();
+            named.dedup();
+            let left: Vec<String> = dogmind_agent::workspace_grants::sweep(&data, &named).iter().map(|folder| format!("{}: {}", folder.display(), t(dogmind_agent::workspace_grants::NOT_TAKEN_BACK))).collect();
+            if !left.is_empty() {
+                poster.send(Note::ReadFolderDone(left.join("\n"), true));
+            }
+        });
+    }
+
+    /// The key is in memory: every agent may open and write, and a change that was stopped is finished.
+    unsafe fn unlocked(&mut self, cipher: Arc<Cipher>) {
+        self.policy.set_on(cipher.clone());
+        self.crypt.cipher = Some(cipher);
+        self.crypt_fields_ready(0);
+        match self.crypt.keystore.as_ref().and_then(Keystore::pending) {
+            Some(pending) => self.start_crypt(if pending == Pending::Encrypt { CryptJob::FinishOn } else { CryptJob::FinishOff }, String::new(), false),
+            None => {
+                self.set_panel(Panel::Chat);
+                self.after_unlock();
+            }
+        }
+    }
+
+    unsafe fn crypt_unlock(&mut self) {
+        if self.crypt.damaged.is_some() {
+            return;
+        }
+        let by_code = self.crypt.by_code;
+        let result = if by_code {
+            let Some(new) = self.typed_passphrase(1) else { return };
+            let code = get_text(self.fields[0]);
+            match self.crypt.keystore.as_mut() {
+                Some(keystore) => keystore.reset_passphrase_with_recovery(&code, &new),
+                None => return,
+            }
+        } else {
+            let passphrase = get_text(self.fields[0]);
+            match &self.crypt.keystore {
+                Some(keystore) => keystore.unlock(&passphrase),
+                None => return,
+            }
+        };
+        match result {
+            Ok(cipher) => {
+                self.crypt.by_code = false;
+                self.unlocked(cipher);
+            }
+            Err(error) => {
+                set_text(self.fields[0], "");
+                self.problem_in_panel(t(&error.to_string()));
+            }
+        }
+    }
+
+    unsafe fn crypt_change_passphrase(&mut self) {
+        let Some(new) = self.typed_passphrase(0) else { return };
+        let (Some(keystore), Some(cipher)) = (self.crypt.keystore.as_mut(), self.crypt.cipher.clone()) else { return };
+        match keystore.change_passphrase(&cipher, &new) {
+            Ok(()) => {
+                self.set_panel(Panel::Privacy);
+                self.say_in_panel(t("The passphrase is changed."));
+            }
+            Err(error) => self.problem_in_panel(t(&error.to_string())),
+        }
+    }
+
+    unsafe fn crypt_new_code(&mut self) {
+        let (Some(keystore), Some(cipher)) = (self.crypt.keystore.as_mut(), self.crypt.cipher.clone()) else { return };
+        match keystore.new_recovery_code(&cipher) {
+            Ok(code) => {
+                self.crypt.code = Some(code);
+                self.crypt.said = t("A new recovery code is made. The old one does not work any more.").to_string();
+                self.crypt.said_is_a_problem = false;
+                self.crypt.back = Panel::Privacy;
+                self.set_panel(Panel::CryptoWork);
+            }
+            Err(error) => self.problem_in_panel(t(&error.to_string())),
+        }
+    }
+
+    /// The box "Remember on this PC": on the page of the settings it is the key file's, and changes it at once; on the page that turns encryption on it is only the choice.
+    unsafe fn crypt_remember_switched(&mut self) {
+        let on = !self.crypt.remember;
+        if self.panel == Panel::Privacy {
+            let (Some(keystore), Some(cipher)) = (self.crypt.keystore.as_mut(), self.crypt.cipher.clone()) else { return };
+            if let Err(error) = keystore.set_remembered(&cipher, on) {
+                self.problem_in_panel(t(&error.to_string()));
+                return;
+            }
+        }
+        self.crypt.remember = on;
+        self.update_toggles();
+        self.layout();
+    }
+
     unsafe fn refresh_sessions(&self) {
         let (poster, folder) = (self.poster.clone(), self.folder.join("sessions"));
         std::thread::spawn(move || poster.send(Note::Sessions(session::list(&folder))));
@@ -12239,7 +12732,11 @@ impl App {
             Note::EngineStarted(..) | Note::Status(..) | Note::Models(..) | Note::Connected { .. } | Note::ConnectFailed(..) => {}
             Note::Attached { path, result } => self.file_attached(path, result),
             Note::Thumb { path, room, decoded } => self.thumb_came(path, room, decoded),
-            Note::Sessions(sessions) => {
+            Note::Sessions(mut sessions) => {
+                // (the reason a conversation cannot be opened is its name in the list: said in the person's language)
+                for summary in sessions.iter_mut().filter(|summary| summary.unreadable.is_some()) {
+                    summary.title = t(&summary.title).to_string();
+                }
                 self.all_sessions = sessions;
                 if let Some(summary) = self.all_sessions.iter().find(|summary| self.current_session.as_ref() == Some(&summary.path)) {
                     if self.session_title != summary.title {
@@ -12321,6 +12818,16 @@ impl App {
                     self.layout();
                 }
             }
+            Note::CryptProgress(done, total) => {
+                if let Some(work) = &mut self.crypt.work {
+                    work.done = done;
+                    work.total = total;
+                }
+                if self.panel == Panel::CryptoWork {
+                    self.layout();
+                }
+            }
+            Note::CryptDone(outcome) => self.crypt_finished(outcome),
             Note::ReadFolderDone(words, problem) => {
                 self.read_folder_work = None;
                 self.read_folder_said = (words, problem);
@@ -12915,6 +13422,20 @@ impl App {
                     }
                     self.refresh_sessions();
                 }
+            }
+            (Panel::Privacy, 0) => self.set_panel(if self.crypt.keystore.is_some() { Panel::CryptoPassphrase } else { Panel::CryptoOn }),
+            (Panel::Privacy, 1) if self.crypt.keystore.is_some() => self.set_panel(Panel::CryptoCode),
+            (Panel::Privacy, 2) if self.crypt.keystore.is_some() => self.set_panel(Panel::CryptoOff),
+            (Panel::CryptoOn | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff, 1) => self.set_panel(Panel::Privacy),
+            (Panel::CryptoOn, 0) => self.crypt_turn_on(),
+            (Panel::CryptoPassphrase, 0) => self.crypt_change_passphrase(),
+            (Panel::CryptoCode, 0) => self.crypt_new_code(),
+            (Panel::CryptoOff, 0) => self.crypt_turn_off(),
+            (Panel::CryptoWork, 0) => self.crypt_done(),
+            (Panel::Unlock, 0) => self.crypt_unlock(),
+            (Panel::Unlock, 1) => {
+                self.crypt.by_code = !self.crypt.by_code;
+                self.set_panel(Panel::Unlock);
             }
             (Panel::Rename, 0) => {
                 let name = get_text(self.fields[0]);
@@ -14437,6 +14958,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_TOGGLE_UPDATES => app.updates_switched(),
+                ID_TOGGLE_REMEMBER => app.crypt_remember_switched(),
                 ID_VISION_OFFER => match app.vision_offer {
                     _ if app.setting_up && app.vision_fetch => app.setup_cancel.store(true, Ordering::Relaxed),
                     Some(VisionOffer::Download(_)) => app.start_vision_setup(),
@@ -14718,6 +15240,8 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
         let chosen = app.nav_rows();
         let count = chosen.0.len();
         match key {
+            // (what is asked before anything is opened, and a change of every conversation under way, have no way out but their own)
+            VK_ESCAPE if matches!(app.panel, Panel::Unlock | Panel::CryptoWork) => {}
             VK_ESCAPE => app.set_panel(Panel::Chat),
             VK_TAB if !control => {
                 let mut stops: Vec<HWND> = chosen.0.get(chosen.1).map(|_| app.nav_buttons[chosen.1]).into_iter().collect();
@@ -14742,6 +15266,7 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             }
             VK_RETURN if !shift && app.panel == Panel::Providers && app.fields.contains(&message.hwnd) => app.on_button(1),
             VK_RETURN if !shift && app.panel == Panel::Rename && app.fields.contains(&message.hwnd) => app.on_button(0),
+            VK_RETURN if !shift && matches!(app.panel, Panel::Unlock | Panel::CryptoOn | Panel::CryptoPassphrase) && app.fields.contains(&message.hwnd) => app.on_button(0),
             VK_RETURN if !shift && matches!(app.panel, Panel::Sessions | Panel::Rewind) && message.hwnd == app.list => app.on_button(0),
             _ => return false,
         }
@@ -15432,15 +15957,15 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             "plan" => Mode::Plan,
             _ => Mode::Default,
         };
-        let policy = Policy::off();
+        let (crypt, policy) = Crypt::open(&folder);
         let handle = agent::start(
             agent_config(&saved, &folder, workspace.clone(), mode, servers.clone(), policy.clone()),
             event_sender,
             Box::new(move || waker.wake()),
         );
         let _ = handle.commands.send(Command::SetSafeCommands(saved.safe_commands));
-        // What earlier runs left writable, now that what this one uses is counted.
-        {
+        // What earlier runs left writable, now that what this one uses is counted. (With the key to ask for, the conversations' workspaces are not known yet: after it.)
+        if !crypt.sweep_due {
             let (data, mut named, poster) = (folder.clone(), saved.workspaces.clone(), poster.clone());
             std::thread::spawn(move || {
                 named.extend(session::list(&data.join("sessions")).into_iter().map(|summary| summary.workspace));
@@ -15620,6 +16145,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             release_update_said: None,
             release_ready_closed: false,
             toggle_updates: make_button(pane, ID_TOGGLE_UPDATES, "", ButtonKind::Toggle, theme::background()),
+            toggle_remember: make_button(pane, ID_TOGGLE_REMEMBER, "", ButtonKind::Toggle, theme::background()),
             update_declined: None,
             restart_when_done: false,
             checking_setup: false,
@@ -15660,6 +16186,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             skills: Vec::new(),
             mcp: servers.clone(),
             policy: policy.clone(),
+            crypt,
             branch: None,
             session_title: String::new(),
             totals: (0, 0, 0, 0),
@@ -15968,9 +16495,19 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
                 app.finish_onboarding();
             }
             // The session the copy before this one had open, as the person left it.
-            if let Some(session) = restart.resume.filter(|session| session.is_file()) {
+            let resume = restart.resume.filter(|session| session.is_file());
+            if app.crypt.is_locked() {
+                app.crypt.resume = resume;
+            } else if let Some(session) = resume {
                 app.open_session(session);
             }
+        }
+        // The key, or the question for it, before anything is opened: with no way past it but the key, the passphrase or the recovery code.
+        if app.crypt.is_locked() {
+            app.set_panel(Panel::Unlock);
+        } else if let Some(pending) = app.crypt.keystore.as_ref().and_then(Keystore::pending) {
+            // (a change of every conversation that was stopped before it was done, finished now)
+            app.start_crypt(if pending == Pending::Encrypt { CryptJob::FinishOn } else { CryptJob::FinishOff }, String::new(), false);
         }
 
         crate::frametrace::start();
@@ -17029,5 +17566,55 @@ mod tests {
         let Event::ToolStarted { summary: same, .. } = hidden_shown(Event::ToolStarted { id: "b".into(), tool: "read_file".into(), summary: "日本語.md 👍🏽".into() }) else { panic!("it is the same event") };
         assert_eq!(same, "日本語.md 👍🏽");
         assert_eq!(markdown::show_hidden(&format!("{bad}ls")).as_ref(), "<U+202E>ls", "an approval card's command reads in order");
+    }
+}
+
+#[cfg(test)]
+mod crypt_tests {
+    use super::*;
+
+    /// What the start makes of the data folder: no key file is conversations as they are; a key file is a question, unless this Windows user has the key; one that cannot be read is no way in.
+    #[test]
+    fn the_start_asks_for_the_key_exactly_when_the_folder_says_it_must() {
+        let data = tempfile::tempdir().unwrap();
+        let (crypt, policy) = Crypt::open(data.path());
+        assert!(!crypt.is_locked() && crypt.keystore.is_none() && policy.writer().unwrap().is_none());
+
+        // a key file that is not kept on this PC: locked, and nothing may be written until it is unlocked
+        let (_, cipher, _) = Keystore::create(data.path(), "the passphrase of the test", false, None).unwrap();
+        let (crypt, policy) = Crypt::open(data.path());
+        assert!(crypt.is_locked() && crypt.sweep_due && crypt.cipher.is_none());
+        assert_eq!(policy.writer().unwrap_err(), conversation_key::LOCKED);
+        assert_eq!(crypt.keystore.as_ref().unwrap().unlock("the passphrase of the test").unwrap().fingerprint(), cipher.fingerprint());
+
+        // one that is: the key is here at once, and nothing is asked
+        std::fs::remove_file(conversation_key::path_in(data.path())).unwrap();
+        let (mut keystore, cipher, _) = Keystore::create(data.path(), "the passphrase of the test", true, Some(Pending::Encrypt)).unwrap();
+        let (crypt, policy) = Crypt::open(data.path());
+        assert!(!crypt.is_locked() && crypt.remember && !crypt.sweep_due);
+        assert_eq!(policy.writer().unwrap().unwrap().fingerprint(), cipher.fingerprint());
+        assert_eq!(crypt.keystore.as_ref().unwrap().pending(), Some(Pending::Encrypt), "the change that was stopped is still to be finished");
+        // the box cleared: the same key file asks again
+        keystore.set_remembered(&cipher, false).unwrap();
+        assert!(Crypt::open(data.path()).0.is_locked());
+
+        // a file that cannot be read is locked, and says why
+        std::fs::write(conversation_key::path_in(data.path()), "{not a key file").unwrap();
+        let (crypt, policy) = Crypt::open(data.path());
+        assert!(crypt.is_locked() && crypt.damaged.is_some() && crypt.keystore.is_none());
+        assert!(policy.writer().is_err());
+    }
+
+    /// Remove takes the key file with the conversations it was for, and the page's words are in both languages.
+    #[test]
+    fn the_key_file_goes_with_what_remove_takes() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("settings.json"), r#"{"providers": []}"#).unwrap();
+        std::fs::create_dir_all(data.path().join("sessions")).unwrap();
+        Keystore::create(data.path(), "the passphrase of the test", false, None).unwrap();
+        let mut taken: Vec<String> = settings::what_remove_takes(data.path(), None, None).unwrap().into_iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        taken.sort();
+        assert_eq!(taken, ["conversation-key.json", "sessions", "settings.json"]);
+        assert!(settings::what_remove_leaves(data.path(), None).is_empty());
     }
 }
