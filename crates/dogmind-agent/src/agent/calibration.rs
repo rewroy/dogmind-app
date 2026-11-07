@@ -145,7 +145,14 @@ fn rows_of(root: &Path) -> Vec<Row> {
         let mut files: Vec<_> = std::fs::read_dir(folder.join("sessions")).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !crate::trajectory::is_trajectory(path)).collect();
         files.sort();
         for file in files {
-            let Ok(messages) = crate::session::read(&file) else { continue };
+            // (a session that does not open, an encrypted one whose key is not unlocked here among them, is said, and not left out of the count without a word)
+            let messages = match crate::session::read(&file) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    eprintln!("not read: {error}");
+                    continue;
+                }
+            };
             for (at, message) in messages.iter().enumerate() {
                 let Some(reasoning) = message.reasoning_content.as_deref().filter(|text| message.role == "assistant" && text.chars().count() > 200) else { continue };
                 let shown = lines_shown(&messages[..at]);
