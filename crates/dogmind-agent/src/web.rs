@@ -465,6 +465,10 @@ fn follow(url: &str, headers: &[(String, String)], settings: &WebSettings, stop:
         let mut response = http::request_at(&addresses, "GET", &target, &all, None, CONNECT, stop)?;
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             if let Some(next) = response.header("location").and_then(|location| join_address(&current, location)) {
+                // The same address again is asked for the same answer, so it is a loop: said now, not after the limit.
+                if same_address(&target, &next, settings) {
+                    return Err(Failure::Stream(format!("{current}: the site redirects this address to itself")));
+                }
                 current = next;
                 // What authenticates goes only to where it was meant for.
                 all.retain(|(name, _)| matches!(name.as_str(), "User-Agent" | "Accept-Encoding"));
@@ -489,6 +493,11 @@ fn follow(url: &str, headers: &[(String, String)], settings: &WebSettings, stop:
         return Ok(Answer { status, content_type, final_url: current, body });
     }
     Err(Failure::Stream(format!("{url}: more than {MAX_REDIRECTS} redirects")))
+}
+
+/// Whether `address` is the very one `asked` was made for: the same scheme, host, port and path as they go out on the wire (a host's case and a fragment do not count).
+fn same_address(asked: &Url, address: &str, settings: &WebSettings) -> bool {
+    target_of(address, settings).is_ok_and(|other| other.tls == asked.tls && other.host.eq_ignore_ascii_case(&asked.host) && other.port == asked.port && other.path == asked.path)
 }
 
 fn percent(text: &str) -> String {
@@ -560,7 +569,10 @@ pub fn join_address(base: &str, link: &str) -> Option<String> {
             other => parts.push(other),
         }
     }
-    Some(format!("{origin}/{}{}", parts.join("/"), query.map_or(String::new(), |query| format!("?{query}"))))
+    // A link to a folder (`2026/11/`, `.`, `..`) keeps its final slash: a site may send `a` on to `a/`, and without the slash that link is a loop.
+    let to_a_folder = link_path.ends_with('/') || matches!(link_path.rsplit('/').next(), Some("." | ".."));
+    let slash = if to_a_folder && !parts.is_empty() { "/" } else { "" };
+    Some(format!("{origin}/{}{slash}{}", parts.join("/"), query.map_or(String::new(), |query| format!("?{query}"))))
 }
 
 #[cfg(windows)]
@@ -1212,6 +1224,102 @@ mod tests {
         assert!(answer.final_url.ends_with("/x"));
     }
 
+    /// A server that answers by the path in each request line, whatever the connection, and keeps the paths asked in the order they came.
+    fn serve_by_path(answer: impl Fn(&str) -> String + Send + Sync + 'static) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (asked, answer) = (std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), std::sync::Arc::new(answer));
+        let log = asked.clone();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let (asked, answer) = (asked.clone(), answer.clone());
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 4096];
+                    let count = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+                    let head = String::from_utf8_lossy(&request[..count]).into_owned();
+                    let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    asked.lock().unwrap().push(path.clone());
+                    let _ = stream.write_all(answer(&path).as_bytes());
+                    while matches!(std::io::Read::read(&mut stream, &mut request), Ok(count) if count > 0) {}
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), log)
+    }
+
+    fn html_answer(html: &str) -> String {
+        format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{html}", html.len())
+    }
+
+    fn redirect_answer(status: &str, location: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n")
+    }
+
+    const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+
+    /// WordPress sends every page `/a` on to `/a/`. An address given with its slash is asked for with it and is not sent on at all; one given without it is sent on once.
+    #[test]
+    fn an_address_keeps_its_final_slash_so_a_site_that_adds_it_is_not_looped_on() {
+        let (base, asked) = serve_by_path(|path| match path {
+            "/a" => redirect_answer("301 Moved Permanently", "/a/"),
+            "/a/" => html_answer("<title>Events</title><p>November events at the park.</p>"),
+            "/a/?q=1" => html_answer("<title>Query</title><p>With a query.</p>"),
+            _ => NOT_FOUND.to_string(),
+        });
+        let mut web = local();
+        let cancel = AtomicBool::new(false);
+        let page = web.read(&json!({"url": format!("{base}/a/")}), &cancel).unwrap();
+        assert!(page.contains("November events at the park.") && page.contains(&format!("Address: {base}/a/\n")), "{page}");
+        assert_eq!(*asked.lock().unwrap(), ["/a/"], "no redirect at all");
+        asked.lock().unwrap().clear();
+        let page = web.read(&json!({"url": format!("{base}/a")}), &cancel).unwrap();
+        assert!(page.contains("November events at the park.") && page.contains(&format!("Address: {base}/a/\n")), "{page}");
+        assert_eq!(*asked.lock().unwrap(), ["/a", "/a/"], "one redirect");
+        asked.lock().unwrap().clear();
+        let page = web.read(&json!({"url": format!("{base}/a/?q=1")}), &cancel).unwrap();
+        assert!(page.contains("With a query."), "{page}");
+        assert_eq!(*asked.lock().unwrap(), ["/a/?q=1"]);
+    }
+
+    /// An address sent on to itself is asked for the same answer again: it is said at once, and not after the limit.
+    #[test]
+    fn a_site_that_redirects_an_address_to_itself_is_told_so_at_once() {
+        let (base, asked) = serve_by_path(|path| match path {
+            "/loop" | "/loop?x=1" => redirect_answer("301 Moved Permanently", path),
+            _ => NOT_FOUND.to_string(),
+        });
+        let mut web = local();
+        let cancel = AtomicBool::new(false);
+        for path in ["/loop", "/loop?x=1"] {
+            asked.lock().unwrap().clear();
+            let said = web.read(&json!({"url": format!("{base}{path}")}), &cancel).unwrap_err();
+            assert!(said.contains("the site redirects this address to itself") && said.contains(&format!("{base}{path}")), "{said}");
+            assert!(!said.contains("more than"), "{said}");
+            assert_eq!(*asked.lock().unwrap(), [path], "asked once");
+        }
+    }
+
+    /// What counts as the same address is what goes out on the wire: a host's case and a fragment do not make another, a slash or a query does.
+    #[test]
+    fn an_address_is_the_same_as_another_by_what_is_asked_for() {
+        let settings = WebSettings { allow_local: true, ..WebSettings::default() };
+        let asked = target_of("https://Example.com/a/", &settings).unwrap();
+        assert!(same_address(&asked, "https://example.com/a/", &settings));
+        assert!(same_address(&asked, "https://EXAMPLE.com/a/#top", &settings));
+        for other in ["https://example.com/a", "https://example.com/a/?x=1", "http://example.com/a/", "https://example.com:8443/a/", "https://example.org/a/", "mailto:a@b.c"] {
+            assert!(!same_address(&asked, other, &settings), "{other}");
+        }
+    }
+
+    /// A circle through two addresses is not the same address again, and ends at the limit as it did.
+    #[test]
+    fn a_circle_of_two_addresses_still_ends_at_the_limit() {
+        let (base, asked) = serve_by_path(|path| redirect_answer("302 Found", if path == "/one" { "/two" } else { "/one" }));
+        let said = local().read(&json!({"url": format!("{base}/one")}), &AtomicBool::new(false)).unwrap_err();
+        assert!(said.contains("more than 5 redirects"), "{said}");
+        assert_eq!(asked.lock().unwrap().len(), MAX_REDIRECTS + 1);
+    }
+
     #[test]
     fn a_redirect_to_this_machine_is_refused() {
         let first = "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data\r\nContent-Length: 0\r\n\r\n";
@@ -1265,6 +1373,14 @@ mod tests {
         assert_eq!(join_address(base, "../c?y=2").as_deref(), Some("https://example.com/c?y=2"));
         assert_eq!(join_address(base, "?y=2").as_deref(), Some("https://example.com/a/b.html?y=2"));
         assert_eq!(join_address(base, "//other.org/x").as_deref(), Some("https://other.org/x"));
+        // A link to a folder keeps its final slash, as a redirect that names one does.
+        assert_eq!(join_address(base, "2026/11/").as_deref(), Some("https://example.com/a/2026/11/"));
+        assert_eq!(join_address(base, "2026/11/?page=2").as_deref(), Some("https://example.com/a/2026/11/?page=2"));
+        assert_eq!(join_address(base, "/events/").as_deref(), Some("https://example.com/events/"));
+        assert_eq!(join_address("https://example.com/a/b/c.html", "..").as_deref(), Some("https://example.com/a/"));
+        assert_eq!(join_address("https://example.com/a/b/c.html", "./").as_deref(), Some("https://example.com/a/b/"));
+        assert_eq!(join_address("https://example.com/a", "a/").as_deref(), Some("https://example.com/a/"));
+        assert_eq!(join_address("https://example.com/a/b.html", "../..").as_deref(), Some("https://example.com/"));
         for link in ["javascript:alert(1)", "mailto:a@b.c", "#top", "data:text/html,x"] {
             assert_eq!(join_address(base, link), None, "{link}");
         }
