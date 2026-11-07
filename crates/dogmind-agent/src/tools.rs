@@ -65,7 +65,8 @@ pub fn schemas() -> Value {
             "timeout_seconds": {"type": "integer", "description": "How long to wait for it, default 180. Past that it goes on in the background."},
             "purpose": {"type": "string", "description": "A few words on why, for the user when they are asked."},
             "network": {"type": "boolean", "description": "Needs the network, and is not curl, a package install or remote git, which get it anyway. Asks the user."},
-            "background": {"type": "boolean", "description": "Start it and go on, for what takes minutes. Comes back with an id for command_status."}
+            "background": {"type": "boolean", "description": "Start it and go on, for what takes minutes. Gives an id for command_status; its end wakes you."},
+            "wake_on": {"type": "string", "description": "With background: a regex. The first line it prints that matches wakes you, once. A server: \"Listening on\"."}
         }), &["command"]),
         function("list_files", "List a folder. {} is the workspace.", json!({
             "path": {"type": "string"},
@@ -86,6 +87,13 @@ pub fn schemas() -> Value {
             "scope": {"type": "string", "enum": ["session", "workspace", "staged", "unstaged"], "description": "session: since this session began. workspace: against HEAD, or outside git as session. staged, unstaged: git's index."},
             "paths": {"type": "array", "items": {"type": "string"}}
         }), &["scope"]),
+        function("ask_user", "Ask the person one question with 2-4 choices, your pick first, only when their answer alone settles what to do. They may answer in their own words. Waits for it.", json!({
+            "question": {"type": "string"},
+            "options": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "description": {"type": "string"}}, "required": ["label"]}}
+        }), &["question", "options"]),
+        function("submit_plan", "Plan mode: put the finished plan (Markdown) to the person. Approved, plan mode ends and you carry it out now; if not, you get what to change.", json!({
+            "plan": {"type": "string"}
+        }), &["plan"]),
         function("todo", "A checklist, only for work with several separate deliverables. Send only what changed.", json!({
             "todos": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "doing", "done", "blocked"]}}, "required": ["id"]}},
             "merge": {"type": "boolean", "description": "false: replace the whole list."}
@@ -101,8 +109,12 @@ pub fn schemas() -> Value {
             "wait_ms": {"type": "integer"},
             "steps": {"type": "string", "description": "JS run after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results. A reload (await reload()) starts the next part in the new load; variables do not carry over."}
         }), &[]),
-        function("command_status", "A background command's state, and what it printed since the last look.", json!({"id": {"type": "string"}}), &[]),
-        function("command_stop", "End a background command.", json!({"id": {"type": "string"}}), &["id"]),
+        function("command_status", "A background command's state, and what it printed since the last look. Also your waits.", json!({"id": {"type": "string"}}), &[]),
+        function("command_stop", "End a background command, or cancel a wait, by its id.", json!({"id": {"type": "string"}}), &["id"]),
+        function("wake_at", "Wake yourself later: after delay_seconds you get a turn with your note. At most 5 waits; they end with the app.", json!({
+            "delay_seconds": {"type": "integer", "description": "60 to 86400."},
+            "note": {"type": "string"}
+        }), &["delay_seconds", "note"]),
         function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
     ])
 }
@@ -134,25 +146,109 @@ pub fn is_read(tool: &str) -> bool {
     matches!(tool, "read_file" | "list_files" | "search_files" | "show_diff" | "find_files")
 }
 
-struct Job {
-    id: String,
-    command: String,
-    started: Instant,
-    cancel: Arc<AtomicBool>,
+/// A command started in the background. The workbench holds it for the model's `command_status` and `command_stop`, and the session's [`crate::background::Background`] for what wakes the session and what the window lists.
+pub struct Job {
+    pub(crate) id: String,
+    pub(crate) command: String,
+    pub(crate) started: Instant,
+    /// When it was started, on this PC's clock, for the person to read.
+    pub(crate) started_at: String,
+    pub(crate) cancel: Arc<AtomicBool>,
     result: Arc<Mutex<Option<Result<String, String>>>>,
     /// It was started to run in the session's scratch folder, and not in the workspace.
     in_scratch: bool,
     /// Its output has been in a report of all of them: the next such report says so in a line.
     told: AtomicBool,
     /// What it has printed while it runs, and how far a look at it has got.
-    live: Arc<Live>,
+    pub(crate) live: Arc<Live>,
     looked: AtomicU64,
+    /// It was ended on purpose (`command_stop`, the person's Stop or a stop of the list, a session that was left): that wakes nothing.
+    stopped: AtomicBool,
+    /// Its end has been looked at for a notice, which was made or was not due (the model had read the end already).
+    announced: AtomicBool,
+    /// The pattern its `wake_on` gave: the first line it prints that matches wakes the session.
+    pub(crate) wake_on: Option<String>,
+}
+
+impl Job {
+    pub(crate) fn new(id: &str, command: &str, started: Instant, cancel: Arc<AtomicBool>, result: CommandResult, live: Arc<Live>, wake_on: Option<String>) -> Job {
+        Job { id: id.to_string(), command: command.to_string(), started, started_at: chrono::Local::now().format("%H:%M").to_string(), cancel, result, in_scratch: false, told: AtomicBool::new(false), live, looked: AtomicU64::new(0), stopped: AtomicBool::new(false), announced: AtomicBool::new(false), wake_on }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_told(&self) {
+        self.told.store(true, Ordering::Relaxed);
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Ends it, as one who asked for that: its end wakes nothing.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn announced(&self) -> bool {
+        self.announced.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_announced(&self) {
+        self.announced.store(true, Ordering::Relaxed);
+    }
+
+    /// The model has read how it ended (`command_status`).
+    pub(crate) fn told(&self) -> bool {
+        self.told.load(Ordering::Relaxed)
+    }
+
+    /// What it came to, once it has ended: the report, or why it did not run.
+    pub(crate) fn outcome(&self) -> Option<Result<String, String>> {
+        self.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    pub fn has_ended(&self) -> bool {
+        self.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some()
+    }
 }
 
 /// What a command has printed so far, its two streams as they came, for a look while it runs. A dev server never ends, and what it said
 /// (where it listens, the error it stopped on) was out of reach until it did. Only the end is kept.
 #[derive(Default)]
-pub struct Live(Mutex<(std::collections::VecDeque<u8>, u64)>);
+pub struct Live {
+    kept: Mutex<(std::collections::VecDeque<u8>, u64)>,
+    /// What looks for the line a `wake_on` waits for.
+    watch: Mutex<Option<Watch>>,
+    /// When the command's thread had its result.
+    ended: Mutex<Option<Instant>>,
+}
+
+/// The first printed line that matches a pattern, found as the bytes come.
+struct Watch {
+    pattern: regex::Regex,
+    /// The line that is being printed, in the bytes it came in.
+    line: Vec<u8>,
+    found: Option<(String, Instant)>,
+    /// The line has been given to the one who asked for it.
+    taken: bool,
+}
+
+impl Watch {
+    /// Whether this line is the one: it is kept, with when it came.
+    fn sees(&mut self, line: &[u8]) -> bool {
+        let text = decode_text(line);
+        let text = text.trim_end_matches('\r');
+        if !self.pattern.is_match(text) {
+            return false;
+        }
+        self.found = Some((text.to_string(), Instant::now()));
+        true
+    }
+}
+
+/// A line that is longer is looked at as far as this, which no program's one line of news needs to pass.
+const WATCHED_LINE: usize = 4096;
 
 /// What is kept of a running command's output for a look, and what one look shows of what is new.
 const LIVE_KEPT: usize = 64 * 1024;
@@ -160,17 +256,57 @@ const LIVE_SHOWN: usize = 4 * 1024;
 
 impl Live {
     pub fn push(&self, bytes: &[u8]) {
-        let mut kept = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        kept.0.extend(bytes);
-        kept.1 += bytes.len() as u64;
-        let over = kept.0.len().saturating_sub(LIVE_KEPT);
-        kept.0.drain(..over);
+        {
+            let mut kept = self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            kept.0.extend(bytes);
+            kept.1 += bytes.len() as u64;
+            let over = kept.0.len().saturating_sub(LIVE_KEPT);
+            kept.0.drain(..over);
+        }
+        let mut watch = self.watch.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(watch) = watch.as_mut().filter(|watch| watch.found.is_none()) else { return };
+        for byte in bytes {
+            if *byte == b'\n' {
+                let line = std::mem::take(&mut watch.line);
+                if watch.sees(&line) {
+                    return;
+                }
+            } else if watch.line.len() < WATCHED_LINE {
+                watch.line.push(*byte);
+            }
+        }
+        // (a line that is not ended yet, as a prompt is, is looked at too: it may be all the line there will be)
+        let line = watch.line.clone();
+        watch.sees(&line);
+    }
+
+    /// Looks for the first line that matches `pattern`, from now on.
+    pub fn watch_for(&self, pattern: regex::Regex) {
+        *self.watch.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Watch { pattern, line: Vec::new(), found: None, taken: false });
+    }
+
+    /// The line that matched, and when, the one time it is asked for.
+    pub fn take_line(&self) -> Option<(String, Instant)> {
+        let mut watch = self.watch.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let watch = watch.as_mut().filter(|watch| !watch.taken)?;
+        let found = watch.found.clone()?;
+        watch.taken = true;
+        Some(found)
+    }
+
+    /// The command's thread has what it came to.
+    pub(crate) fn mark_ended(&self) {
+        *self.ended.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+    }
+
+    pub(crate) fn ended_at(&self) -> Option<Instant> {
+        *self.ended.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// What came after its first `from` bytes, at most the last `most` of it, and where the next look starts: not past a character that has come only in part, which is kept for the next look
     /// and shown whole then.
-    fn since(&self, from: u64, most: usize) -> (String, u64) {
-        let kept = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    pub(crate) fn since(&self, from: u64, most: usize) -> (String, u64) {
+        let kept = self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (buffer, total) = (&kept.0, kept.1);
         let new = total.saturating_sub(from);
         let shown = (new.min(buffer.len() as u64) as usize).min(most);
@@ -250,7 +386,7 @@ fn decode_text(bytes: &[u8]) -> String {
 
 /// Commands going on in the background. They do not outlive the session that started them.
 #[derive(Default)]
-struct Jobs(Vec<Job>);
+struct Jobs(Vec<Arc<Job>>);
 
 impl Drop for Jobs {
     fn drop(&mut self) {
@@ -260,7 +396,7 @@ impl Drop for Jobs {
     }
 }
 
-type CommandResult = Arc<Mutex<Option<Result<String, String>>>>;
+pub(crate) type CommandResult = Arc<Mutex<Option<Result<String, String>>>>;
 
 /// What a command started in the background runs with: not its timeout, which is how long a call waits for it, and a background one
 /// does not. As the model gave it, it was how long the job had before it was ended, and a long build was stopped in the middle without a word.
@@ -272,6 +408,12 @@ fn background_arguments(arguments: &Value) -> Value {
     given
 }
 
+/// The pattern a command's `wake_on` gives, as a regular expression. None when it gives none.
+fn wake_pattern(arguments: &Value) -> Result<Option<regex::Regex>, String> {
+    let Some(pattern) = arguments.get("wake_on").and_then(Value::as_str).map(str::trim).filter(|pattern| !pattern.is_empty()) else { return Ok(None) };
+    RegexBuilder::new(pattern).size_limit(1 << 20).build().map(Some).map_err(|error| format!("wake_on is not a regular expression that can be used ({}): the command was not started", error.to_string().lines().last().unwrap_or("").trim()))
+}
+
 /// A command on a thread of its own, with what ends it and where its result will be. It has minutes to itself unless the call says otherwise.
 fn spawn_command(arguments: &Value, workspace: &Path) -> (Arc<AtomicBool>, CommandResult, Arc<Live>) {
     let mut given = arguments.clone();
@@ -279,9 +421,15 @@ fn spawn_command(arguments: &Value, workspace: &Path) -> (Arc<AtomicBool>, Comma
         given["timeout_seconds"] = json!(3600);
     }
     let (cancel, result, live): (_, CommandResult, _) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)), Arc::new(Live::default()));
+    // (the line it is to wake the session for: a pattern that does not compile was refused before the command was started)
+    if let Ok(Some(pattern)) = wake_pattern(&given) {
+        live.watch_for(pattern);
+    }
     let (stop, done, place, printed) = (cancel.clone(), result.clone(), workspace.to_path_buf(), live.clone());
     std::thread::spawn(move || {
-        let outcome = execute_command(&given, &place, &stop, Some(printed));
+        let outcome = execute_command(&given, &place, &stop, Some(printed.clone()));
+        // (the time it ended is set before what it came to, which is what is looked for: the one is never there without the other)
+        printed.mark_ended();
         *done.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
     });
     (cancel, result, live)
@@ -319,6 +467,8 @@ pub struct Workbench {
     pub memory: Option<PathBuf>,
     pub mcp: Option<Arc<crate::mcp::Hub>>,
     jobs: Jobs,
+    /// What this session has going on or waiting while no turn runs: the commands of `jobs`, and the waits.
+    pub background: Arc<crate::background::Background>,
     /// A file whose `create_file` the app cut off to get it on disk: the next write to it goes on from there, whether or not the model says append.
     cut_file: Option<PathBuf>,
     /// What has been read of each file and what it was then, while that is still in the conversation.
@@ -455,8 +605,8 @@ fn kept_whole(out: &str, err: &str) -> Option<PathBuf> {
     keep_whole_as("command", &format!("stdout:\n{out}\nstderr:\n{err}\n"))
 }
 
-/// A long result, whole, in a file of its own kind (`command`, `search`) in the temporary folder.
-fn keep_whole_as(kind: &str, whole: &str) -> Option<PathBuf> {
+/// A long result, whole, in a file of its own kind (`command`, `search`, `trimmed`) in the temporary folder.
+pub(crate) fn keep_whole_as(kind: &str, whole: &str) -> Option<PathBuf> {
     const KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
     let folder = std::env::temp_dir().join("dogmind-output");
     std::fs::create_dir_all(&folder).ok()?;
@@ -483,6 +633,20 @@ fn keep_whole_in(folder: &Path, kind: &str, stamp: &str, whole: &str) -> Option<
         }
     }
     None
+}
+
+/// A tool's long result as the model is shown it: its head and its tail, and where all of it is kept (a file of `kind` in the temporary folder,
+/// [`keep_whole_as`]) to read the rest of with read_file or search_files. A result that was cut with no copy kept could not be had again: the
+/// part of a diff, a background command's report, an MCP tool's answer or a helper's that fell between head and tail was lost to the model.
+/// Where nothing could be written, the cut as [`cap`] makes it.
+pub fn spill(kind: &str, text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    match keep_whole_as(kind, text) {
+        Some(file) => cap_evenly(text, limit, Some(&file)),
+        None => cap(text, limit),
+    }
 }
 
 /// The head and the tail of a long output, and where all of it is when it was kept.
@@ -537,6 +701,9 @@ impl Workbench {
                 let place = self.scratch_for(arguments).unwrap_or_else(|| workspace.to_path_buf());
                 if arguments.get("background").and_then(Value::as_bool) == Some(true) {
                     self.start_job(arguments, &place)
+                } else if arguments.get("wake_on").and_then(Value::as_str).is_some_and(|pattern| !pattern.trim().is_empty()) {
+                    // (waited for, it would be no one's to wake: the turn is at the command)
+                    Err("wake_on is for a command started with background: true, which goes on while you do other things. The command was not started.".to_string())
                 } else {
                     self.run_command(arguments, &place, cancel)
                 }
@@ -545,6 +712,7 @@ impl Workbench {
             "check_page" => crate::page_check::check_page(arguments, workspace, cancel),
             "command_status" => self.job_status(arguments),
             "command_stop" => self.job_stop(arguments),
+            "wake_at" => self.wake_at(arguments),
             "todo" => self.todo(arguments),
             "skill" => self.read_skill(arguments),
             _ if tool.starts_with("mcp__") => {
@@ -602,18 +770,24 @@ impl Workbench {
     }
 
     fn start_job(&mut self, arguments: &Value, workspace: &Path) -> Result<String, String> {
+        // (before anything is started: a pattern that cannot be used is the model's to correct)
+        let watching = wake_pattern(arguments)?.is_some();
         let started = Instant::now();
         let (cancel, result, live) = spawn_command(&background_arguments(arguments), workspace);
         let id = self.add_job(arguments, started, cancel, result, live)?;
-        Ok(format!("started as {id}. Go on with other work, and use command_status for it; do not wait in a loop."))
+        let wakes = if watching { " The first line it prints that matches wake_on wakes you, once, and it goes on; its end wakes you too." } else { " Its end wakes you with what it came to." };
+        Ok(format!("started as {id}.{wakes} Go on with other work, or end your turn if there is nothing else to do: use command_status to look at it, and do not wait in a loop."))
     }
 
     /// `started`: when it began, which for a command that was waited for and went on in the background is when it was started and not when it was left.
-    fn add_job(&mut self, arguments: &Value, started: Instant, cancel: Arc<AtomicBool>, result: CommandResult, live: Arc<Live>) -> Result<String, String> {
+    pub(crate) fn add_job(&mut self, arguments: &Value, started: Instant, cancel: Arc<AtomicBool>, result: CommandResult, live: Arc<Live>) -> Result<String, String> {
         let id = format!("job{}", self.jobs.0.len() + 1);
         let command = text_arg(arguments, "command")?.to_string();
         let in_scratch = self.scratch_for(arguments).is_some();
-        self.jobs.0.push(Job { id: id.clone(), command, started, cancel, result, in_scratch, told: AtomicBool::new(false), live, looked: AtomicU64::new(0) });
+        let wake_on = arguments.get("wake_on").and_then(Value::as_str).map(str::trim).filter(|pattern| !pattern.is_empty()).map(str::to_string);
+        let job = Arc::new(Job { in_scratch, ..Job::new(&id, &command, started, cancel, result, live, wake_on) });
+        self.background.add_job(job.clone());
+        self.jobs.0.push(job);
         Ok(id)
     }
 
@@ -665,22 +839,35 @@ impl Workbench {
 
     fn job_status(&self, arguments: &Value) -> Result<String, String> {
         let wanted = arguments.get("id").and_then(Value::as_str);
-        let lines: Vec<String> = self.jobs.0.iter().filter(|job| wanted.is_none_or(|id| job.id == id)).map(|job| Workbench::job_report(job, wanted.is_none())).collect();
+        let mut lines: Vec<String> = self.jobs.0.iter().filter(|job| wanted.is_none_or(|id| job.id == id)).map(|job| Workbench::job_report(job, wanted.is_none())).collect();
+        lines.extend(self.background.wait_lines(wanted));
         if lines.is_empty() {
-            return Ok(wanted.map_or("no command has been started in the background".to_string(), |id| format!("there is no {id}")));
+            return Ok(wanted.map_or("no command has been started in the background, and no wait is set".to_string(), |id| format!("there is no {id}")));
         }
-        Ok(cap(&lines.join("\n\n"), MAX_OUTPUT))
+        Ok(spill("jobs", &lines.join("\n\n"), MAX_OUTPUT))
+    }
+
+    /// `wake_at`: the session wakes after this long, with the model's note.
+    fn wake_at(&self, arguments: &Value) -> Result<String, String> {
+        let delay = arguments.get("delay_seconds").and_then(Value::as_u64).ok_or("delay_seconds is required: a whole number of seconds, from 60 to 86400")?;
+        let note = arguments.get("note").and_then(Value::as_str).unwrap_or("");
+        self.background.add_wait(delay, note)
     }
 
     fn job_stop(&self, arguments: &Value) -> Result<String, String> {
         let id = text_arg(arguments, "id")?;
+        // A wait is cancelled by its id, here too: it will not wake the session.
+        if self.background.cancel_wait(id) {
+            return Ok(format!("{id} is cancelled: it will not wake you"));
+        }
         let job = self.jobs.0.iter().find(|job| job.id == id).ok_or_else(|| format!("there is no {id}"))?;
         // One that has ended is not being ended: nothing was stopped, and what it came to is what `command_status` says of it.
-        if job.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some() {
+        if job.has_ended() {
             return Ok(format!("{id} had already ended, so nothing was stopped. As command_status gives it:\n{}", Workbench::job_report(job, false)));
         }
-        job.cancel.store(true, Ordering::Relaxed);
-        Ok(format!("{id} is being ended"))
+        // (a command that is stopped on purpose does not wake the session when it ends)
+        job.stop();
+        Ok(format!("{id} is being ended; it will not wake you"))
     }
 
     /// A read has come back. The same lines of the same file as they were are already in the conversation, and are not sent again to be paid for twice.
@@ -893,7 +1080,7 @@ impl Workbench {
             }
             self.seen.insert(path, sha16(after.as_bytes()));
         }
-        let mut said = cap(&report, MAX_OUTPUT);
+        let mut said = spill("edits", &report, MAX_OUTPUT);
         if self.in_japanese {
             for edit in edits {
                 said.push_str(&not_japanese_note(edit.get("new_string").and_then(Value::as_str).unwrap_or("")));
@@ -1636,7 +1823,7 @@ fn show_diff(arguments: &Value, workspace: &Path, baseline: Option<&crate::basel
     if scope == "session" || !repository {
         let baseline = baseline.ok_or("this session has nothing to compare with yet: read the files themselves")?;
         let changes = baseline.changes(workspace, &paths);
-        return Ok(if changes.is_empty() { format!("no differences ({scope}): nothing has changed since this session began") } else { cap(&changes, MAX_OUTPUT) });
+        return Ok(if changes.is_empty() { format!("no differences ({scope}): nothing has changed since this session began") } else { spill("diff", &changes, MAX_OUTPUT) });
     }
     // (only what is under the workspace: a workspace that is a folder of a larger repository saw that repository's every change, which is
     // not its work and may be what its owner never meant to show)
@@ -1659,7 +1846,7 @@ fn show_diff(arguments: &Value, workspace: &Path, baseline: Option<&crate::basel
             diff.push_str(&format!("--- new file {} ---\n{}\n", change.path, change.diff));
         }
     }
-    Ok(if diff.is_empty() { format!("no differences ({scope})") } else { cap(&diff, MAX_OUTPUT) })
+    Ok(if diff.is_empty() { format!("no differences ({scope})") } else { spill("diff", &diff, MAX_OUTPUT) })
 }
 
 #[cfg(windows)]
@@ -2538,7 +2725,9 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let read = |handle: std::thread::JoinHandle<Vec<u8>>| String::from_utf8_lossy(&handle.join().unwrap_or_default()).into_owned();
     let (out, err) = (read(stdout), read(stderr));
     let mut report = String::from("sandbox: none (the person approved or allowed this command)\n");
-    report.push_str(&format!("stdout:\n{}\nstderr:\n{}\n", cap(&out, MAX_OUTPUT), cap(&err, MAX_OUTPUT / 2)));
+    // (all of it kept, as a sandboxed command's is: the part cut out is read back, not run again)
+    let whole = (out.len() > MAX_OUTPUT || err.len() > MAX_OUTPUT / 2).then(|| kept_whole(&out, &err)).flatten();
+    report.push_str(&format!("stdout:\n{}\nstderr:\n{}\n", cap_evenly(&out, MAX_OUTPUT, whole.as_deref()), cap_evenly(&err, MAX_OUTPUT / 2, whole.as_deref())));
     match status {
         Some(status) => report.push_str(&format!("exit_code: {}", status.code().unwrap_or(-1))),
         None => report.push_str(&format!("exit_code: none, {ended} after {} s", started.elapsed().as_secs())),
@@ -2571,6 +2760,7 @@ pub fn summary(tool: &str, arguments: &Value) -> String {
         "remember" => text("note").chars().take(80).collect(),
         "forget" => text("words").to_string(),
         "command_status" | "command_stop" => text("id").to_string(),
+        "wake_at" => format!("{}: {}", arguments.get("delay_seconds").and_then(Value::as_u64).map_or(String::new(), |seconds| format!("{seconds} s")), text("note").chars().take(100).collect::<String>()),
         "explore" => text("task").lines().next().unwrap_or("").chars().take(100).collect(),
         _ if tool.starts_with("mcp__") => arguments.to_string().chars().take(120).collect(),
         "web_search" => arguments.get("queries").and_then(Value::as_array).map_or(String::new(), |queries| queries.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
@@ -2673,6 +2863,22 @@ mod power_tests {
         };
         bench.job_stop(&json!({"id": "job1"})).unwrap();
         assert!(seen.contains("is running") && seen.contains("printed:\nready-now"), "{seen}");
+    }
+
+    /// `wake_on` belongs to a command started in the background, and has to be a pattern: what is wrong with it is said before anything is started.
+    #[test]
+    fn wake_on_is_for_a_background_command_and_has_to_be_a_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bench, cancel) = (Workbench::default(), AtomicBool::new(false));
+        let waited = bench.run("execute_command", &json!({"command": "echo x", "wake_on": "x"}), dir.path(), &cancel).unwrap_err();
+        assert!(waited.contains("background: true") && waited.contains("not started"), "{waited}");
+        let bad = bench.run("execute_command", &json!({"command": "echo x", "background": true, "wake_on": "("}), dir.path(), &cancel).unwrap_err();
+        assert!(bad.contains("regular expression") && bad.contains("not started"), "{bad}");
+        assert!(bench.job_status(&json!({})).unwrap().starts_with("no command"), "nothing was started");
+        let schemas = schemas();
+        let tool = |name: &str| schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == name).unwrap_or_else(|| panic!("no {name}")).clone();
+        assert!(tool("execute_command")["function"]["parameters"]["properties"].get("wake_on").is_some());
+        assert_eq!(tool("wake_at")["function"]["parameters"]["required"], json!(["delay_seconds", "note"]));
     }
 
     #[test]
@@ -2888,7 +3094,7 @@ mod tests {
     fn every_generated_schema_has_a_tool() {
         let schemas = schemas();
         let names: Vec<&str> = schemas.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "todo", "find_files", "check_page", "command_status", "command_stop", "explore"]);
+        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "ask_user", "submit_plan", "todo", "find_files", "check_page", "command_status", "command_stop", "wake_at", "explore"]);
     }
 
     #[test]
@@ -3703,7 +3909,7 @@ mod tests {
         let status = bench.job_status(&json!({"id": at_work})).unwrap();
         let seconds: u64 = status.split("for ").nth(1).and_then(|rest| rest.split(" s").next()).and_then(|number| number.parse().ok()).unwrap();
         assert!((42..50).contains(&seconds), "counted from its real start, not from when it was left: {status}");
-        assert_eq!(bench.job_stop(&json!({"id": at_work})).unwrap(), format!("{at_work} is being ended"));
+        assert_eq!(bench.job_stop(&json!({"id": at_work})).unwrap(), format!("{at_work} is being ended; it will not wake you"));
         assert!(bench.jobs.0[1].cancel.load(Ordering::Relaxed));
         assert_eq!(bench.job_stop(&json!({"id": "job9"})).unwrap_err(), "there is no job9");
     }
@@ -3748,6 +3954,25 @@ mod tests {
         let report = cap_evenly(&out, 1000, Some(&file));
         assert!(report.contains(&format!("all of it is in {}", file.display())) && report.contains("read_file"), "{report}");
         let _ = std::fs::remove_file(file);
+    }
+
+    /// A long result that was cut with no copy (a diff, a background command's report, an MCP tool's or a helper's answer) is kept whole and
+    /// the cut names where: the part between head and tail can be read back. A short one is as it was.
+    #[test]
+    fn a_long_result_is_kept_whole_and_the_cut_says_where() {
+        assert_eq!(spill("diff", "short", 1000), "short");
+        let text: String = (0..2000).map(|line| format!("line {line}\n")).collect();
+        let shown = spill("diff", &text, 1000);
+        assert!(shown.len() < 1400, "{}", shown.len());
+        assert!(shown.starts_with("line 0\n") && shown.ends_with("line 1999\n"));
+        let named = shown.split("all of it is in ").nth(1).and_then(|rest| rest.split(':').next()).map(str::to_string);
+        let mut file = named.expect("the cut names the file");
+        // (a Windows path's drive letter is followed by a colon too)
+        if file.len() == 1 {
+            file = shown.split("all of it is in ").nth(1).unwrap().split(": read").next().unwrap().to_string();
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        assert!(std::path::Path::new(&file).file_name().unwrap().to_string_lossy().starts_with("diff-"));
     }
 
     #[cfg(windows)]

@@ -209,10 +209,14 @@ pub enum Written {
     Markdown,
     /// In the colours of this language, when `highlight` knows it.
     Source(String),
+    /// A CSV (`,`) or TSV (`\t`) file as a table (`table`).
+    Table(char),
+    /// An Excel workbook's first sheet as a table (`office`).
+    Workbook,
 }
 
 pub fn written(path: &Path) -> Option<Written> {
-    const SOURCE: [&str; 45] = ["txt", "log", "csv", "tsv", "json", "jsonc", "toml", "yaml", "yml", "ini", "cfg", "conf", "xml", "rs", "py", "js", "jsx", "ts", "tsx", "mjs", "c", "h", "cc", "cpp", "hpp", "cs", "java", "kt", "go", "swift", "rb", "php", "scala", "dart", "sh", "bash", "zsh", "ps1", "bat", "cmd", "sql", "css", "scss", "vue", "lua"];
+    const SOURCE: [&str; 43] = ["txt", "log", "json", "jsonc", "toml", "yaml", "yml", "ini", "cfg", "conf", "xml", "rs", "py", "js", "jsx", "ts", "tsx", "mjs", "c", "h", "cc", "cpp", "hpp", "cs", "java", "kt", "go", "swift", "rb", "php", "scala", "dart", "sh", "bash", "zsh", "ps1", "bat", "cmd", "sql", "css", "scss", "vue", "lua"];
     let name = path.file_name()?.to_str()?.to_ascii_lowercase();
     if matches!(name.as_str(), "makefile" | "dockerfile") {
         return Some(Written::Source(name));
@@ -220,6 +224,9 @@ pub fn written(path: &Path) -> Option<Written> {
     let extension = name.rsplit_once('.')?.1.to_string();
     match extension.as_str() {
         "md" | "markdown" => Some(Written::Markdown),
+        "csv" => Some(Written::Table(',')),
+        "tsv" => Some(Written::Table('\t')),
+        "xlsx" | "xlsm" => Some(Written::Workbook),
         known if SOURCE.contains(&known) => Some(Written::Source(extension)),
         _ => None,
     }
@@ -234,7 +241,7 @@ pub fn can_show(path: &str) -> bool {
 /// What is there to be looked at and not only read as code, and has a place of its own in the panel on the right.
 pub fn is_page(path: &str) -> bool {
     let path = Path::new(path);
-    shows_as_it_is(path) || written(path) == Some(Written::Markdown)
+    shows_as_it_is(path) || matches!(written(path), Some(Written::Markdown | Written::Table(_) | Written::Workbook))
 }
 
 /// A colour as a page writes it.
@@ -244,7 +251,7 @@ fn css(color: u32) -> String {
 
 /// A file as a page: nothing runs in it, and only pictures of its own folder are let in. What it refers to is under `base`.
 fn page_of(body: &str, base: &str) -> String {
-    const SHEET: &str = "html{color-scheme:SCHEME}*{box-sizing:border-box}body{margin:0;padding:18px 20px;background:BACK;color:TEXT;font:15px/1.65 'Segoe UI Variable Text','BIZ UDGothic','Yu Gothic UI','Segoe UI',sans-serif;overflow-wrap:anywhere}h1,h2,h3,h4,h5,h6{line-height:1.3;margin:1.4em 0 .5em}h1{font-size:1.6em;border-bottom:1px solid LINE;padding-bottom:.25em}h2{font-size:1.3em}h3{font-size:1.1em}h1:first-child,h2:first-child,h3:first-child{margin-top:0}p{margin:0 0 .9em}a{color:ACCENT}ul,ol{margin:0 0 .9em;padding-left:1.6em}li{margin:.2em 0}blockquote{margin:0 0 .9em;padding:.1em 0 .1em 1em;border-left:3px solid LINE;color:MUTED}hr{border:0;border-top:1px solid LINE;margin:1.2em 0}img{max-width:100%}code{font:.9em Consolas,monospace;background:CODE;padding:.1em .3em;border-radius:4px}pre{background:CODE;padding:12px 14px;border-radius:8px;overflow:auto;margin:0 0 .9em}pre code{background:none;padding:0;font-size:13px;line-height:1.5}table{border-collapse:collapse;margin:0 0 .9em}th,td{border:1px solid LINE;padding:.3em .7em}th{background:CODE}.k{color:KEYWORD}.s{color:STRING}.c{color:MUTED}.u{color:MUTED}.n{color:NUMBER}pre.source{margin:0;padding:0;background:none;font:13px/1.55 Consolas,monospace;counter-reset:n;white-space:pre}pre.source .l{display:block;min-height:1.55em;counter-increment:n}pre.source .l::before{content:counter(n);display:inline-block;width:3.2em;margin-right:1em;text-align:right;color:FAINT;user-select:none}pre.source .m{background:MARK}pre.source .m:focus{outline:none}.cut{color:MUTED;font-size:13px;margin-top:1em}";
+    const SHEET: &str = "html{color-scheme:SCHEME}*{box-sizing:border-box}body{margin:0;padding:18px 20px;background:BACK;color:TEXT;font:15px/1.65 'Segoe UI Variable Text','BIZ UDGothic','Yu Gothic UI','Segoe UI',sans-serif;overflow-wrap:anywhere}h1,h2,h3,h4,h5,h6{line-height:1.3;margin:1.4em 0 .5em}h1{font-size:1.6em;border-bottom:1px solid LINE;padding-bottom:.25em}h2{font-size:1.3em}h3{font-size:1.1em}h1:first-child,h2:first-child,h3:first-child{margin-top:0}p{margin:0 0 .9em}a{color:ACCENT}ul,ol{margin:0 0 .9em;padding-left:1.6em}li{margin:.2em 0}blockquote{margin:0 0 .9em;padding:.1em 0 .1em 1em;border-left:3px solid LINE;color:MUTED}hr{border:0;border-top:1px solid LINE;margin:1.2em 0}img{max-width:100%}code{font:.9em Consolas,monospace;background:CODE;padding:.1em .3em;border-radius:4px}pre{background:CODE;padding:12px 14px;border-radius:8px;overflow:auto;margin:0 0 .9em}pre code{background:none;padding:0;font-size:13px;line-height:1.5}table{border-collapse:collapse;margin:0 0 .9em}th,td{border:1px solid LINE;padding:.3em .7em}th{background:CODE}.k{color:KEYWORD}.s{color:STRING}.c{color:MUTED}.u{color:MUTED}.n{color:NUMBER}pre.source{margin:0;padding:0;background:none;font:13px/1.55 Consolas,monospace;counter-reset:n;white-space:pre}pre.source .l{display:block;min-height:1.55em;counter-increment:n}pre.source .l::before{content:counter(n);display:inline-block;width:3.2em;margin-right:1em;text-align:right;color:FAINT;user-select:none}pre.source .m{background:MARK}pre.source .m:focus{outline:none}.cut{color:MUTED;font-size:13px;margin-top:1em}table.data{font-size:13px;margin:0}table.data th{position:sticky;top:0;text-align:left}table.data td.n{text-align:right;font-variant-numeric:tabular-nums}table.data th,table.data td{overflow-wrap:normal}";
     let sheet = SHEET.replace("SCHEME", if theme::is_light() { "light" } else { "dark" })
         .replace("BACK", &css(theme::background())).replace("TEXT", &css(theme::text())).replace("LINE", &css(theme::line())).replace("ACCENT", &css(theme::accent_hover()))
         .replace("MUTED", &css(theme::muted())).replace("FAINT", &css(theme::faint())).replace("CODE", &css(theme::code_back()))
@@ -283,6 +290,30 @@ fn written_page(root: &Path, file: &Path, kind: &Written, marked: Option<(usize,
     const MOST_TEXT: usize = 256 * 1024;
     const MOST_PAGE: usize = 1800 * 1024;
     let bytes = std::fs::read(file).map_err(|error| format!("{}: {error}", file.display()))?;
+    // A workbook is a zip of XML, not text: its first sheet as a table, and the names of all its sheets.
+    if *kind == Written::Workbook {
+        let (rows, sheets, total) = crate::office::first_sheet(&bytes, crate::table::MOST_ROWS, crate::table::MOST_COLUMNS)
+            .map_err(|error| tf("This workbook cannot be shown: {0}", &[&error]))?;
+        let mut body = String::new();
+        if sheets.len() > 1 {
+            body.push_str(&format!("<p class=\"cut\">{}</p>", markdown::escape(&tf("Sheets: {0} (the first is shown)", &[&sheets.join(", ")]))));
+        }
+        body.push_str(&crate::table::html_of(&rows, total, &|rows, columns| {
+            tf("{0} rows and {1} columns: the first {2} rows and {3} columns are shown.", &[&rows.to_string(), &columns.to_string(),
+                &crate::table::MOST_ROWS.min(rows).to_string(), &crate::table::MOST_COLUMNS.min(columns).to_string()])
+        }));
+        // (as a text's page: what NavigateToString takes; the cells were bounded, so this is a last guard)
+        if body.len() > MOST_PAGE {
+            let mut cut = MOST_PAGE;
+            while !body.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            body.truncate(cut);
+            body.push_str(&format!("</table><p class=\"cut\">{}</p>", markdown::escape(&tf("Only the first {0} KB are shown.", &[&(MOST_PAGE / 1024)]))));
+        }
+        let base = file.parent().and_then(|folder| address_of(root, folder)).unwrap_or_else(|| format!("https://{HOST}"));
+        return Ok(page_of(&body, &format!("{base}/")));
+    }
     // (as the agent reads a file: what PowerShell's > writes is UTF-16, and a Japanese Windows keeps much of its text in Shift_JIS)
     let Some((whole, encoding)) = dogmind_agent::tools::text_of_file(&bytes) else {
         return Err(t("This file is not text, so it has no preview.").to_string());
@@ -295,6 +326,11 @@ fn written_page(root: &Path, file: &Path, kind: &Written, marked: Option<(usize,
     let mut body = match kind {
         Written::Markdown => markdown::to_html(text),
         Written::Source(language) => markdown::source_html(text, language, marked),
+        Written::Workbook => String::new(),
+        Written::Table(separator) => crate::table::html(text, *separator, &|rows, columns| {
+            tf("{0} rows and {1} columns: the first {2} rows and {3} columns are shown.", &[&rows.to_string(), &columns.to_string(),
+                &crate::table::MOST_ROWS.min(rows).to_string(), &crate::table::MOST_COLUMNS.min(columns).to_string()])
+        }),
     };
     if body.len() > MOST_PAGE {
         // (colour takes room: plain, it fits)
@@ -746,8 +782,9 @@ mod tests {
         // ("日本語,売上" and its row, as Excel writes a CSV on a Japanese Windows)
         let sjis = dir.path().join("sales.csv");
         std::fs::write(&sjis, [0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA, b',', 0x94, 0x84, 0x8F, 0xE3, b'\r', b'\n', b'1', b',', b'2', b'\r', b'\n']).unwrap();
-        let page = written_page(dir.path(), &sjis, &Written::Source("csv".to_string()), None).unwrap();
-        assert!(page.contains("日本語") && page.contains("売上") && page.contains("Shift_JIS") && !page.contains('\u{FFFD}'), "{page}");
+        assert_eq!(written(&sjis), Some(Written::Table(',')), "a CSV is a table");
+        let page = written_page(dir.path(), &sjis, &Written::Table(','), None).unwrap();
+        assert!(page.contains("<th>日本語</th>") && page.contains("<th>売上</th>") && page.contains("Shift_JIS") && !page.contains('\u{FFFD}'), "{page}");
         // (plain UTF-8 says nothing of it)
         let plain = dir.path().join("a.txt");
         std::fs::write(&plain, "見出し\n").unwrap();

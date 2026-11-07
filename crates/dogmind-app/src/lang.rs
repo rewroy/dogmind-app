@@ -198,6 +198,32 @@ const COUNTED: &[(&str, &str)] = &[
 
 const JA: &[(&str, &str)] = &[
     ("Let's go", "行こう"),
+    // Background work, and the notices that wake a session.
+    ("Wake later", "あとで再開"),
+    ("woken by background work", "バックグラウンドの作業で再開"),
+    ("Notice", "通知"),
+    ("A background command ended", "バックグラウンドのコマンドが終わりました"),
+    ("A background command printed the line it was watched for", "バックグラウンドのコマンドが待っていた行を出力しました"),
+    ("A wait is up", "待機時間になりました"),
+    ("Exit code {0}  ·  ran {1}", "終了コード {0}  ·  実行時間 {1}"),
+    ("Timed out  ·  ran {0}", "時間切れ  ·  実行時間 {0}"),
+    ("Cancelled  ·  ran {0}", "中止  ·  実行時間 {0}"),
+    ("Did not run", "実行されませんでした"),
+    ("Ended  ·  ran {0}", "終了  ·  実行時間 {0}"),
+    ("Running for {0}, and going on", "{0} 実行中で、そのまま続いています"),
+    ("Set for {0}", "{0} の待機"),
+    ("{0} min {1} s", "{0} 分 {1} 秒"),
+    ("{0} h {1} min", "{0} 時間 {1} 分"),
+    ("In the background", "バックグラウンド"),
+    ("waits for {0}", "{0} を待っています"),
+    ("ended", "終了"),
+    ("in {0}", "あと {0}"),
+    ("These end when Dogmind quits.", "ここにあるものは、Dogmind を終了すると終わります。"),
+    ("Stop all", "すべて止める"),
+    ("It goes on with what waits in the background, and says here when it has something for you. Quit it from the tray icon's menu to end all of it.", "バックグラウンドで待っているものは続きます。用があるときはここでお知らせします。すべて終えるには、トレイのアイコンのメニューから終了してください。"),
+    ("Standing by", "待機中"),
+    (dogmind_agent::background::PAUSED_IN_A_ROW, "自動の再開を止めました。このセッションは、あなたの言葉なしに 30 回続けて自分で動き出しました。メッセージを書くと続きます。"),
+    (dogmind_agent::background::PAUSED_IN_AN_HOUR, "自動の再開を止めました。このセッションは、この 1 時間に 60 回自分で動き出しました。1 時間たつと続きます。"),
     // Commands.
     ("Go through the first setup again", "最初のセットアップをやり直す"),
     ("How to use this app", "このアプリの使い方"),
@@ -214,6 +240,9 @@ const JA: &[(&str, &str)] = &[
     ("Copy the last answer", "最後の回答をコピー"),
     ("What changed in the folder, file by file", "フォルダーの変更をファイルごとに見る"),
     ("Tokens and speed of this session", "このセッションのトークン数と速度"),
+    ("Where this session's time went: each turn's requests and tools", "このセッションの時間の使われ方: ターンごとの要求と道具"),
+    ("The trajectory cannot be read: {0}", "経過の記録を読めません: {0}"),
+    ("This session has no trajectory yet: it is written as the session runs.", "このセッションにはまだ経過の記録がありません。セッションが進むと書かれます。"),
     ("Have the model write this project's DOGMIND.md", "このプロジェクトの DOGMIND.md をモデルに書かせる"),
     ("Change how the model runs: /model Claude", "接続先を変更: /model Claude"),
     ("How hard to think: none low medium high xhigh/max default", "思考の強さ: none low medium high xhigh/max default"),
@@ -325,6 +354,11 @@ const JA: &[(&str, &str)] = &[
     ("Get it too", "一緒に取得する"),
     ("That can be done once the work under way has ended.", "今の作業が終わるとできるようになります。"),
     ("Setting up the vision file...", "画像用ファイルを準備しています..."),
+    ("Getting the faster-writing data...", "高速化データを取得しています..."),
+    ("The faster-writing data is off. Its file stays in {0}, and turning it on again needs no download.", "高速化データをオフにしました。ファイルは {0} に残っているので、もう一度オンにしてもダウンロードは要りません。"),
+    ("The faster-writing data is not in {0}.", "高速化データが {0} にありません。"),
+    ("No model is set up here.", "ここにはモデルが設定されていません。"),
+    ("The faster-writing data is ready. The engine restarts when the work under way ends.", "高速化データの準備ができました。今の作業が終わると、エンジンを再起動します。"),
     ("This model can't read pictures.", "このモデルは画像を読めません。"),
     ("This model's vision file did not load. Its log says why: /log", "このモデルの画像用ファイルを読み込めませんでした。理由はログにあります: /log"),
     ("Fetching the vision file.", "画像用ファイルを取得しています。"),
@@ -507,13 +541,18 @@ const JA: &[(&str, &str)] = &[
     ("Dogmind {0} is up to date.", "Dogmind {0} は最新です。"),
     ("Dogmind {0} is available.", "Dogmind {0} の新しいバージョンがあります。"),
     ("Open the release page", "リリースページを開く"),
+    ("Update now (Dogmind restarts)", "今すぐ更新 (Dogmind が再起動します)"),
+    ("Downloading… {0}%", "ダウンロード中… {0}%"),
+    ("Later", "あとで"),
+    ("Dogmind {0} is available. Open the app to update.", "Dogmind {0} の新しいバージョンがあります。アプリを開いて更新してください。"),
+    ("Dogmind {0} is ready to install. Open the app to update.", "Dogmind {0} をインストールする準備ができました。アプリを開いて更新してください。"),
     ("No release has been published yet.", "公開されているリリースはまだありません。"),
     ("This test build asks no one.", "このテストビルドはどこにも問い合わせません。"),
     ("Could not reach GitHub.", "GitHub に接続できませんでした。"),
     ("GitHub did not answer in time.", "GitHub からの応答が時間内にありませんでした。"),
     ("GitHub answered with an error ({0}). Try again later.", "GitHub がエラーを返しました ({0})。しばらくしてからもう一度お試しください。"),
     ("GitHub's answer could not be read.", "GitHub からの応答を読み取れませんでした。"),
-    ("Dogmind asks GitHub for the newest release at most once a day. It sends only its name and version. When there is a newer one, it downloads the setup in the background and checks it, and restarts into it only when you press Restart to update.", "Dogmind は 1 日に 1 回まで、GitHub に最新のリリースを問い合わせます。送るのは名前とバージョンだけです。新しいリリースがあると、セットアップをバックグラウンドでダウンロードして検証し、「再起動して更新」を押したときだけ再起動して更新します。"),
+    ("Dogmind asks GitHub for the newest release every six hours, and when you bring the window back from the tray after an hour. It sends only its name and version. When there is a newer one, it says so on the main screen, downloads the setup in the background and checks it, and restarts into it only when you press Restart to update.", "Dogmind は 6 時間ごとと、タスクトレイから 1 時間ぶりに開いたときに、GitHub に最新のリリースを問い合わせます。送るのは名前とバージョンだけです。新しいリリースがあるとメイン画面でお知らせし、セットアップをバックグラウンドでダウンロードして検証し、「再起動して更新」を押したときだけ再起動して更新します。"),
     ("Downloading Dogmind {0}… {1}%", "Dogmind {0} をダウンロードしています… {1}%"),
     ("Dogmind {0} is ready to install.", "Dogmind {0} をインストールする準備ができました。"),
     ("The update download was cancelled, and its partial file deleted. The next automatic look tries again.", "更新のダウンロードを中止し、途中のファイルを削除しました。次の自動確認でもう一度試します。"),
@@ -592,6 +631,33 @@ const JA: &[(&str, &str)] = &[
     ("No such command: {0}. /help lists them.", "{0} というコマンドはありません。/help で一覧を見られます。"),
     ("There is nothing to find in yet.", "検索できる内容がまだありません。"),
     ("This session has nothing to go back to yet.", "このセッションにはまだ戻れる地点がありません。"),
+    ("This workbook cannot be shown: {0}", "このブックは表示できません: {0}"),
+    ("Sheets: {0} (the first is shown)", "シート: {0}(最初のシートを表示しています)"),
+    ("{0} rows and {1} columns: the first {2} rows and {3} columns are shown.", "{0} 行 {1} 列あります。最初の {2} 行 {3} 列を表示しています。"),
+    ("Changed in this answer", "この回答で変更したファイル"),
+    ("1 file", "1 件"),
+    ("{0} files", "{0} 件"),
+    ("Open in its app", "既定のアプリで開く"),
+    ("Show in Explorer", "エクスプローラーで表示"),
+    ("Question", "質問"),
+    ("Send", "送信"),
+    ("Suggested", "おすすめ"),
+    ("Write your own answer…", "自分の言葉で答える…"),
+    ("Not answered", "回答なし"),
+    ("Your answer: {0}", "あなたの答え: {0}"),
+    ("Plan", "計画"),
+    ("Carry it out", "実行する"),
+    ("Change…", "変更…"),
+    ("Approved", "承認しました"),
+    ("Change requested: {0}", "変更を依頼: {0}"),
+    ("Not decided", "未決定"),
+    ("What should change in the plan?", "計画のどこを変えますか?"),
+    ("It has a plan for you.", "計画を提案しています。"),
+    ("What this session works toward, kept across turns: /goal text, /goal clear", "このセッションの目標。ターンをまたいで保つ: /goal 目標、/goal clear"),
+    ("Goal: {0}", "目標: {0}"),
+    ("Goal", "目標"),
+    ("Clear the goal", "目標を消す"),
+    ("No goal is set: /goal text sets one.", "目標はありません。/goal で設定できます。"),
     ("That session is at work: stop it first.", "そのセッションは作業中です。先に止めてください。"),
     // The window.
     ("New session", "新しいセッション"),
@@ -637,6 +703,25 @@ const JA: &[(&str, &str)] = &[
     // Text menus.
     ("Cut", "切り取り"),
     ("Copy", "コピー"),
+    ("Copy this answer", "この回答をコピー"),
+    ("Copy this code", "このコードをコピー"),
+    // The trajectory page.
+    ("Trajectory", "軌跡"),
+    ("Turn", "ターン"),
+    ("Requests", "リクエスト"),
+    ("Prefill s", "準備 秒"),
+    ("Generation s", "生成 秒"),
+    ("Tools s", "ツール 秒"),
+    ("Wall s", "合計 秒"),
+    ("All turns", "全ターン"),
+    ("Turn {0}", "ターン {0}"),
+    ("{0} characters", "{0} 文字"),
+    ("no end: the run stopped here", "終わりなし: ここで止まった"),
+    ("prompt {0}", "入力 {0}"),
+    ("cached {0}%", "キャッシュ {0}%"),
+    ("{0} tokens", "{0} トークン"),
+    ("{0} tok/s", "{0} トークン/秒"),
+    ("repeats {0} ({1})", "{0} のやり直し ({1})"),
     ("Paste", "貼り付け"),
     ("Select all", "すべて選択"),
     // The tray.
@@ -858,6 +943,7 @@ const JA: &[(&str, &str)] = &[
     ("Session compacted: the earlier conversation is now a summary", "セッションを圧縮しました: これまでの会話を要約に置き換えました"),
     ("There is nothing to compact yet: the conversation is short.", "会話がまだ短いので、圧縮するものはありません。"),
     ("Session compacted: the oldest turns were dropped", "セッションを圧縮しました: いちばん古いターンを削除しました"),
+    ("Read-only: no files will be changed in this turn. Say so if that is not what you meant.", "読み取り専用: このターンではファイルを変更しません。意図と違う場合は、そう伝えてください。"),
     ("the engine stopped answering: /log shows why, and writing again tries once more", "エンジンの応答が止まりました。原因は /log で確認できます。もう一度入力すると再試行します。"),
     ("another Straydog is running on this PC (process {0}). Two on one GPU fight over its memory and the machine's, so this one was not started. Close it and restart the engine, or reach it as an OpenAI-compatible provider.", "この PC で別の Straydog が動いています (プロセス {0})。1 つの GPU で 2 つ動かすとメモリを奪い合うため、起動しませんでした。それを閉じてからエンジンを起動し直すか、OpenAI 互換の接続先として接続してください。"),
     ("port {0} on this PC is taken. Choose another port for the engine in settings.json, or close what holds it.", "この PC のポート {0} は使用中です。settings.json でエンジンの別のポートを選ぶか、使っているものを閉じてください。"),
@@ -905,6 +991,20 @@ const JA: &[(&str, &str)] = &[
     ("The best for this PC", "この PC に最適なもの"),
     ("Straydog looks at this machine and chooses", "Straydog がこのマシンを調べて選びます"),
     ("Recommended for this PC  ·  ", "おすすめ  ·  "),
+    // The files of the folder, in the panel on the right.
+    ("Overview", "概要"),
+    ("Files", "ファイル"),
+    ("Show the files of the folder in the panel on the right", "右のパネルにフォルダーのファイルを表示します"),
+    ("Reading…", "読み込み中…"),
+    ("Empty", "空"),
+    ("{0} more…", "ほか {0} 件…"),
+    ("This folder could not be read: {0}", "このフォルダーを読めません: {0}"),
+    ("{0}, folder, {1}", "{0}、フォルダー、{1}"),
+    ("expanded", "展開中"),
+    ("collapsed", "折りたたみ中"),
+    ("{0}, changed by this session: {1} lines added, {2} removed", "{0}、このセッションで変更: {1} 行追加、{2} 行削除"),
+    ("Copy the path", "パスをコピー"),
+    ("Mention in the message", "メッセージで参照する"),
 ];
 
 pub const HELP_JA: &str = "# はじめに
@@ -996,7 +1096,7 @@ mod tests {
     fn everything_the_code_asks_for_has_its_japanese() {
         let table: HashMap<&str, &str> = JA.iter().copied().collect();
         let mut missing = Vec::new();
-        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs")] {
+        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("drafter.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs"), include_str!("cards.rs"), include_str!("trajectory.rs"), include_str!("files.rs"), include_str!("ui/files_panel.rs")] {
             for words in words_in(source) {
                 if !table.contains_key(words.as_str()) {
                     missing.push(words);
@@ -1039,7 +1139,7 @@ mod tests {
     #[test]
     fn what_a_person_reads_when_a_provider_fails_is_all_in_japanese() {
         let table: HashMap<&str, &str> = JA.iter().copied().collect();
-        for words in llm::WORDS.into_iter().chain(images::WORDS).chain(dogmind_agent::read_folders::WORDS).chain(dogmind_agent::workspace_grants::WORDS) {
+        for words in llm::WORDS.into_iter().chain(images::WORDS).chain(dogmind_agent::read_folders::WORDS).chain(dogmind_agent::workspace_grants::WORDS).chain(dogmind_agent::background::WORDS) {
             assert!(table.contains_key(words), "{words}");
         }
         assert!(table.contains_key(crate::settings::VARIABLE_NAME_ONLY));
@@ -1093,6 +1193,15 @@ mod tests {
         assert_eq!(shown, "セッションを保存できませんでした: C:\\a.jsonl: アクセスが拒否されました。");
         assert_eq!(without_system_code("a (os error 1) b (os error 2)"), "a b");
         assert_eq!(without_system_code("no such thing (os error"), "no such thing (os error");
+    }
+
+    /// The line a read-only turn shows is the agent's English, and a window in Japanese shows its Japanese.
+    #[test]
+    fn the_line_of_a_read_only_turn_is_in_japanese_for_a_japanese_window() {
+        let words = dogmind_agent::prompt::READ_ONLY_NOTICE;
+        assert_eq!(notice_in(words, false), words);
+        let shown = notice_in(words, true);
+        assert!(shown.starts_with("読み取り専用") && shown.contains("ファイルを変更しません") && !shown.contains("Read-only"), "{shown}");
     }
 
     #[test]

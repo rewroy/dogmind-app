@@ -239,39 +239,66 @@ impl Checkpoints {
 
     fn session_changes_within(&self, workspace: &Path, most_read: u64) -> Vec<FileChange> {
         self.plan(0).into_iter().filter_map(|saved| {
-            let before = saved.copy.as_ref().map(|copy| self.folder.join(copy));
-            let now = std::fs::metadata(&saved.path).ok().filter(std::fs::Metadata::is_file).map(|data| data.len());
-            let changed = match (&before, now) {
-                (None, None) => false,
-                (None, Some(_)) | (Some(_), None) => true,
-                // (a copy that cannot be read to compare is not one that proves it the same)
-                (Some(before), Some(_)) => !same_bytes(before, &saved.path).unwrap_or(false),
-            };
-            if !changed {
-                return None;
-            }
-            let name = saved.path.strip_prefix(workspace).unwrap_or(&saved.path).display().to_string();
-            let before_size = before.as_ref().and_then(|copy| std::fs::metadata(copy).ok()).map(|data| data.len());
-            if before_size.is_some_and(|size| size > most_read) || now.is_some_and(|size| size > most_read) {
-                return Some(FileChange::without_diff(&name));
-            }
-            let read = |path: &Path| std::fs::read(path).ok();
-            let (before_bytes, after_bytes) = (before.as_ref().and_then(|copy| read(copy)), now.and_then(|_| read(&saved.path)));
-            // (a file that is there and cannot be read now is a change whose words are not known)
-            if (before.is_some() && before_bytes.is_none()) || (now.is_some() && after_bytes.is_none()) {
-                return Some(FileChange::without_diff(&name));
-            }
-            let text = |bytes: &Option<Vec<u8>>| -> Result<Option<String>, ()> {
-                match bytes {
-                    None => Ok(None),
-                    Some(bytes) => crate::tools::text_of_file(bytes).map(|(text, _)| Some(text)).ok_or(()),
-                }
-            };
-            Some(match (text(&before_bytes), text(&after_bytes)) {
-                (Ok(before), Ok(after)) => FileChange::between(&name, before.as_deref(), after.as_deref()),
-                _ => FileChange::without_diff(&name),
-            })
+            let now = std::fs::metadata(&saved.path).ok().filter(std::fs::Metadata::is_file).map(|_| saved.path.clone());
+            self.change_of(&saved, now, workspace, most_read)
         }).collect()
+    }
+
+    /// What turn `id`'s edits changed, for the card under its answer: each file the turn saved, against what it held when the next turn that saved
+    /// it began (that turn's copy), or now when none did. Told as [`Checkpoints::session_changes`] tells a change. None for a turn that is not
+    /// here, and none of a file that came back to what it was.
+    pub fn turn_changes(&self, id: u64, workspace: &Path) -> Vec<FileChange> {
+        self.turn_changes_within(id, workspace, crate::baseline::MOST_READ)
+    }
+
+    fn turn_changes_within(&self, id: u64, workspace: &Path, most_read: u64) -> Vec<FileChange> {
+        let Some(at) = self.index.turns.iter().position(|turn| turn.id == id) else { return Vec::new() };
+        let turns = &self.index.turns;
+        turns[at].files.iter().filter_map(|saved| {
+            let later = turns[at + 1..].iter().find_map(|turn| turn.files.iter().find(|next| next.path == saved.path));
+            let after = match later {
+                Some(next) => next.copy.as_ref().map(|copy| self.folder.join(copy)),
+                None => std::fs::metadata(&saved.path).ok().filter(std::fs::Metadata::is_file).map(|_| saved.path.clone()),
+            };
+            self.change_of(saved, after, workspace, most_read)
+        }).collect()
+    }
+
+    /// A saved file's change from its copy to `after` (the file as it is now, or a later copy; none: it was not there), or none when the bytes are
+    /// the same. Whether it changed is told by its bytes, sizes first and then block by block, with no whole-file read; what is shown of the change
+    /// is the text as the agent reads files. A file over `most_read` or a binary one is said to have changed, with no diff.
+    fn change_of(&self, saved: &Saved, after: Option<PathBuf>, workspace: &Path, most_read: u64) -> Option<FileChange> {
+        let before = saved.copy.as_ref().map(|copy| self.folder.join(copy));
+        let changed = match (&before, &after) {
+            (None, None) => false,
+            (None, Some(_)) | (Some(_), None) => true,
+            // (a copy that cannot be read to compare is not one that proves it the same)
+            (Some(before), Some(after)) => !same_bytes(before, after).unwrap_or(false),
+        };
+        if !changed {
+            return None;
+        }
+        let name = saved.path.strip_prefix(workspace).unwrap_or(&saved.path).display().to_string();
+        let size = |path: &Option<PathBuf>| path.as_ref().and_then(|path| std::fs::metadata(path).ok()).map(|data| data.len());
+        if size(&before).is_some_and(|size| size > most_read) || size(&after).is_some_and(|size| size > most_read) {
+            return Some(FileChange::without_diff(&name));
+        }
+        let read = |path: &Option<PathBuf>| path.as_ref().map(|path| std::fs::read(path).ok());
+        let (before_bytes, after_bytes) = (read(&before), read(&after));
+        // (a file that is there and cannot be read now is a change whose words are not known)
+        if matches!(before_bytes, Some(None)) || matches!(after_bytes, Some(None)) {
+            return Some(FileChange::without_diff(&name));
+        }
+        let text = |bytes: Option<Option<Vec<u8>>>| -> Result<Option<String>, ()> {
+            match bytes.flatten() {
+                None => Ok(None),
+                Some(bytes) => crate::tools::text_of_file(&bytes).map(|(text, _)| Some(text)).ok_or(()),
+            }
+        };
+        Some(match (text(before_bytes), text(after_bytes)) {
+            (Ok(before), Ok(after)) => FileChange::between(&name, before.as_deref(), after.as_deref()),
+            _ => FileChange::without_diff(&name),
+        })
     }
 
     /// Back to a turn's beginning. What is there now is saved first: a rewind can itself be rewound.
@@ -713,6 +740,31 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!((changes[0].path.as_str(), changes[0].added, changes[0].removed), ("a.txt", 1, 1));
         assert!(changes[0].diff.contains("-one") && changes[0].diff.contains("+three"));
+    }
+
+    /// A turn's card is what that turn did: a file it edited, against the copy the next turn that edited it saved, or against now; a file it saved
+    /// and left as it was is not on it, and a turn that is not there has none.
+    #[test]
+    fn a_turns_changes_are_its_own() {
+        let mut f = fixture();
+        std::fs::write(&f.file, "one\n").unwrap();
+        std::fs::write(&f.other, "same\n").unwrap();
+        f.marks.begin("first", "t", Some(1)).unwrap();
+        f.marks.before_edit(&[f.file.clone(), f.other.clone()]).unwrap();
+        std::fs::write(&f.file, "two\nmore\n").unwrap();
+        f.marks.begin("second", "t", Some(2)).unwrap();
+        f.marks.before_edit(&[f.file.clone()]).unwrap();
+        std::fs::write(&f.file, "three\nmore\n").unwrap();
+        let root = f.file.parent().unwrap().to_path_buf();
+        let (first, second) = (f.marks.turns()[0].id, f.marks.turns()[1].id);
+        let one = f.marks.turn_changes(first, &root);
+        assert_eq!(one.len(), 1, "{one:?}");
+        assert_eq!((one[0].path.as_str(), one[0].added, one[0].removed), ("a.txt", 2, 1));
+        assert!(one[0].diff.contains("-one") && one[0].diff.contains("+two") && !one[0].diff.contains("three"));
+        let two = f.marks.turn_changes(second, &root);
+        assert_eq!((two[0].path.as_str(), two[0].added, two[0].removed), ("a.txt", 1, 1));
+        assert!(two[0].diff.contains("-two") && two[0].diff.contains("+three"));
+        assert!(f.marks.turn_changes(first + 100, &root).is_empty());
     }
 
     #[test]

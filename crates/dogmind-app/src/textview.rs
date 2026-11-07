@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, GetDC, GetObjectType, GetSysColor, OBJ_BITMAP, InvalidateRect, ReleaseDC, ScreenToClient, UpdateWindow, COLOR_WINDOW, HBITMAP, HDC, HRGN, PAINTSTRUCT};
+use windows_sys::Win32::Graphics::Gdi::{BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EndPaint, GetDC, GetObjectType, GetSysColor, OBJ_BITMAP, InvalidateRect, ReleaseDC, ScreenToClient, SelectObject, UpdateWindow, COLOR_WINDOW, HBITMAP, HDC, HRGN, PAINTSTRUCT, SRCCOPY};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::Controls::{EnableScrollBar, SetScrollInfo, SetScrollPos, ShowScrollBar};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
@@ -502,11 +502,21 @@ impl Host {
             return;
         }
         let text = self.text_rect();
+        if crate::ui::test_log_on() {
+            crate::ui::test_log(&format!("paint {},{},{},{}", dirty.left, dirty.top, dirty.right, dirty.bottom));
+        }
         let bounds = windows::Win32::Foundation::RECTL { left: text.left, top: text.top, right: text.right, bottom: text.bottom };
         let mut update = dirty;
         if let Some(target) = self.target() {
-            let area = windows::Win32::Foundation::RECT { left: dirty.left, top: dirty.top, right: dirty.right, bottom: dirty.bottom };
-            if target.BindDC(windows::Win32::Graphics::Gdi::HDC(device), &area).is_ok() {
+            // The text, its fades and the icons over it are drawn into a bitmap of the area, and the bitmap is put on the window at once: a frame that is taken of the window while it is being drawn
+            // has all of the area as it was or all of it as it is, and no icon is ever off for the few milliseconds between the text's being drawn and its own.
+            let (width, height) = (dirty.right - dirty.left, dirty.bottom - dirty.top);
+            let memory = CreateCompatibleDC(device);
+            let bitmap = CreateCompatibleBitmap(device, width, height);
+            let previous = SelectObject(memory, bitmap);
+            let area = windows::Win32::Foundation::RECT { left: 0, top: 0, right: width, bottom: height };
+            let mut done = false;
+            if target.BindDC(windows::Win32::Graphics::Gdi::HDC(memory), &area).is_ok() {
                 let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(self.window).max(96) as f32;
                 target.SetDpi(dpi, dpi);
                 target.BeginDraw();
@@ -526,14 +536,24 @@ impl Host {
                     *self.target.borrow_mut() = None;
                 }
                 if drawn >= 0 && ended.is_ok() {
-                    return;
+                    // Over the text, in the same bitmap: the icons that lie over it are part of its pixels, drawn where the text has put their places in this very frame.
+                    crate::ui::paint_overlays(self.window, memory, -dirty.left, -dirty.top);
+                    BitBlt(device, dirty.left, dirty.top, width, height, memory, 0, 0, SRCCOPY);
+                    done = true;
                 }
+            }
+            SelectObject(memory, previous);
+            DeleteObject(bitmap);
+            DeleteDC(memory);
+            if done {
+                return;
             }
         }
         // TxDraw, on the device: DVASPECT_CONTENT, TXTVIEW_ACTIVE.
         type Draw = unsafe extern "system" fn(*mut c_void, u32, i32, *mut c_void, *mut c_void, HDC, HDC, *const windows::Win32::Foundation::RECTL, *const c_void, *mut RECT, isize, u32, i32) -> i32;
         let call: Draw = self.slot(slot::DRAW);
         call(self.services.get(), 1, 0, std::ptr::null_mut(), std::ptr::null_mut(), device, std::ptr::null_mut(), &bounds, std::ptr::null(), &mut update, 0, 0, 0);
+        crate::ui::paint_overlays(self.window, device, 0, 0);
     }
 }
 
@@ -618,6 +638,10 @@ unsafe extern "system" fn invalidate_rect(this: *mut Host, area: *const RECT, er
     if IsWindowVisible(host.window) == 0 {
         host.missing(if area.is_null() { host.client() } else { *area });
     }
+    if crate::ui::test_log_on() {
+        let place = if area.is_null() { host.client() } else { *area };
+        crate::ui::test_log(&format!("invalidate {},{},{},{}", place.left, place.top, place.right, place.bottom));
+    }
     InvalidateRect(host.window, area, erase);
 }
 
@@ -661,6 +685,10 @@ unsafe extern "system" fn scroll_window_ex(this: *mut Host, dx: i32, dy: i32, sc
         host.missing(host.client());
     }
     ScrollWindowEx(host.window, dx, dy, scroll, clip, region, update, flags as _);
+    if crate::ui::test_log_on() {
+        crate::ui::test_log(&format!("blit dx={dx} dy={dy}"));
+    }
+    // (what is drawn over the text, the icons and the controls of the cards, is drawn in its paint and moves with its pixels: the band it uncovers is drawn with its own)
     if dy != 0 {
         host.bands_again(dy.abs());
     }

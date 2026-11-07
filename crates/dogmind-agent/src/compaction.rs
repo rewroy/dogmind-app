@@ -6,6 +6,8 @@ use crate::message::Message;
 
 const SUMMARY_HEADER: &str = "[SUMMARY OF EARLIER TURNS]\n## Main-model Session Checkpoint\n";
 pub const TRIMMED_TOOL_CHARS: usize = 600;
+/// What an output must be over what is kept of it to be kept whole as well: the marker that says where takes this much.
+const KEPT_MARKER: usize = 1024;
 /// Messages kept verbatim after the system prompt, and the turns a checkpoint needs before it is worth writing.
 const HEAD: usize = 6;
 const CHECKPOINT_TURNS: usize = 16;
@@ -68,7 +70,14 @@ pub fn trim_tool_outputs(messages: &mut [Message], want: usize, head: bool, all:
         while !content.is_char_boundary(cut) {
             cut -= 1;
         }
-        let trimmed = format!("{}\n--- trimmed by compaction: {} bytes ---", &content[..cut], content.len() - cut);
+        // (all of it kept, so that what was trimmed is read back rather than done again: a build's log, a search, a file read; not for an
+        // output that the longer marker would leave no shorter)
+        let rest = (content.len() > TRIMMED_TOOL_CHARS + KEPT_MARKER).then(|| crate::tools::keep_whole_as("trimmed", content)).flatten()
+            .map_or(String::new(), |file| format!("; all of it is in {}: read the part you need from there with read_file or search_files", file.display()));
+        let trimmed = format!("{}\n--- trimmed by compaction: {} bytes{rest} ---", &content[..cut], content.len() - cut);
+        if trimmed.len() >= content.len() {
+            continue;
+        }
         saved += content.len() - trimmed.len();
         message.content = Some(trimmed);
     }
@@ -391,4 +400,19 @@ mod tests {
         assert!(said.content.as_deref().unwrap().ends_with("The user's latest request was among them:\nthe real request"), "{said:?}");
         assert_eq!(out.last(), messages.last());
     }
+    /// What stage 0 trims of an old tool output is kept whole on disk, and the trimmed output says where: the model reads it back instead of
+    /// running the command or the search again.
+    #[test]
+    fn a_trimmed_output_says_where_all_of_it_is() {
+        let mut messages = conversation(12);
+        let long: String = (0..400).map(|line| format!("result line {line}\n")).collect();
+        let at = messages.iter().position(|message| message.role == "tool").unwrap() + 4 * 4;
+        messages[at].content = Some(long.clone());
+        assert!(trim_tool_outputs(&mut messages, usize::MAX, false, false) > 0);
+        let trimmed = messages[at].content.clone().unwrap();
+        assert!(trimmed.contains("trimmed by compaction"), "{trimmed}");
+        let file = trimmed.split("all of it is in ").nth(1).and_then(|rest| rest.split(": read the part").next()).expect("names the file");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), long);
+    }
+
 }

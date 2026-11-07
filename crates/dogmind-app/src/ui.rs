@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use dogmind_agent::agent::{self, Approval, Command, Decision, Event, Handle};
 use dogmind_agent::anthropic::{self, Anthropic};
+use dogmind_agent::background::Waiting;
 use dogmind_agent::codex::{self, Codex};
 use dogmind_agent::llm::{self, Client, Health, Provider};
 use dogmind_agent::message::Message;
@@ -28,6 +29,8 @@ use crate::machine::readable_build;
 use crate::diffview::{self, RowKind};
 use crate::settings::KeySource;
 use crate::toolrun::{self, LineKind, RunEntry, Tone, ToolRun};
+use crate::cards::{self, AnswerState, Card, PlanState};
+use crate::notice;
 use crate::updates;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::*;
@@ -45,6 +48,8 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::attach;
+use crate::drafter;
+use crate::files;
 use crate::engine::{self, Catalog, CatalogEntry, Engine, Refusal, SetupLine};
 use crate::preview::{self, Preview};
 use crate::icon;
@@ -53,6 +58,8 @@ use crate::rtf;
 use crate::lang::{self, t, tf};
 use crate::markdown;
 use crate::settings::{self, Kind, ProviderConfig, Settings, TEXT_SIZES};
+
+mod files_panel;
 
 const WM_WAKE: u32 = WM_APP + 1;
 const WM_PREVIEW_MADE: u32 = WM_APP + 2;
@@ -230,9 +237,11 @@ const ID_FOLDER_CHIP: isize = 9052;
 const ID_TOGGLE_DISPLAY: isize = 9054;
 const ID_ATTACH: isize = 9055;
 const ID_ATTACHED: isize = 9060; // ..+ attach::MOST_IMAGES
-const ID_PICTURES: isize = 9070; // ..+ PICTURE_POOL
-/// How many pictures of a transcript are on screen at once: each is a window, and these go round.
-const PICTURE_POOL: usize = 12;
+/// The list of the Files view of the panel on the right, and the little menu of a row of it.
+const ID_FILES: isize = 9070;
+const ID_FILES_MENU: isize = 9071;
+/// How many pictures of a transcript are drawn at once: more than any view holds, and fewer than the small copies that are kept.
+const PICTURES_IN_VIEW: usize = 48;
 /// How many small copies are kept: a third of a megabyte at most for one.
 const THUMBS_KEPT: usize = 64;
 const M_DISPLAY: usize = 9310; // ..+ 3
@@ -251,10 +260,10 @@ const M_EDIT_COPY: usize = 9302;
 const M_EDIT_PASTE: usize = 9303;
 const M_EDIT_ALL: usize = 9304;
 const ID_PROVIDER_DOWN: isize = 9051;
-const ID_COPY_POOL: isize = 300; // ..300 + COPY_POOL
-const COPY_POOL: usize = 24;
-const ID_BLOCK_POOL: isize = 340; // ..340 + BLOCK_POOL
-const BLOCK_POOL: usize = 12;
+/// Hidden controls of no size, one for each icon over the transcript that is in view: they are what Tab reaches and what a screen reader names, and an icon is pressed through them
+/// with Enter or Space as it is with the pointer. The icons themselves are drawn in the transcript's own paint (`paint_overlays`).
+const ID_PROXY_POOL: isize = 300; // ..300 + PROXY_POOL
+const PROXY_POOL: usize = 40;
 const ID_MODAL_CLOSE: isize = 9600;
 const ID_NAV: isize = 9601; // ..+ NAV_POOL
 const NAV_POOL: usize = 10;
@@ -279,29 +288,37 @@ const ID_UPDATE_OFFER: isize = 9906;
 const ID_RELEASE_OFFER: isize = 9907;
 const ID_TOGGLE_UPDATES: isize = 9908;
 const ID_SPEED_FIRST: isize = 9909;
+const ID_NOTICE_LATER: isize = 9910;
+const ID_GOAL_CLEAR: isize = 9911;
 const ID_DIFF_PREVIOUS: isize = 9900;
 const ID_DIFF_NEXT: isize = 9901;
 const ID_DIFF_CLOSE: isize = 9902;
 const ID_READ_FOLDER_ADD: isize = 9650;
 const ID_READ_FOLDER_STOP: isize = 9651;
 const ID_READ_FOLDER_REMOVE: isize = 9800; // ..+ as many folders as there are
-const ID_RUN_POOL: isize = 380; // ..380 + RUN_POOL
-/// Beside each copy button of an answer, one that branches the conversation from it.
-const ID_FORK_POOL: isize = 400; // ..400 + COPY_POOL
-const RUN_POOL: usize = 12;
+/// What the cards of the transcript put over it as windows of their own (a choice, a file, the button of a field): a pool that goes round, as the pictures' does.
 const TIMER_COPIED: usize = 3;
+/// The hidden controls are made to say what is in view once the view has stood still a moment.
+const TIMER_PROXIES: usize = 21;
+/// Posted by a hidden control that gains or loses the focus: the icon it stands for shows the ring, or does not.
+pub(crate) const WM_PROXY_FOCUS: u32 = WM_APP + 9;
+/// The id of the one tip that follows the icon the pointer is on.
+const OVERLAY_TIP: usize = usize::MAX - 200;
 const TIMER_SEARCH: usize = 4;
 const TIMER_CHANGES: usize = 5;
 const TIMER_REFLOW: usize = 6;
 const TIMER_RECONNECT: usize = 7;
 /// Whether a new build has come in over the app or the engine it runs.
 const TIMER_UPDATE: usize = 8;
-/// Whether it is time to ask GitHub for a newer release: the first time a little after the start, then once an hour (it asks only when a day has gone by since the last answer).
+/// Whether it is time to ask GitHub for a newer release: the first time a little after the start, then once an hour (it asks only when six hours have gone by since the last
+/// answer; and when the window comes back from the tray, an hour: Self::tray_open).
 const TIMER_RELEASES: usize = 9;
 const FIRST_RELEASE_LOOK_MS: u32 = 30_000;
 const RELEASE_LOOK_MS: u32 = 60 * 60 * 1000;
 /// The conversation's width below which the panel on the right gives way, at 96 dpi.
 const RIGHT_NEEDS: i32 = 480;
+/// How many commands, and as many waits, the panel on the right lists of what waits in the background: a session has five waits at most, and few commands.
+const WAITING_LISTED: usize = 6;
 /// How often a server that cannot be reached is tried again, while something waits to be sent to it.
 const RECONNECT_MS: u32 = 5000;
 /// How often the ring turns while there is work.
@@ -430,7 +447,7 @@ const M_PROVIDER: usize = 200; // and on
 const M_MODEL_CHOICE: usize = 9500; // and on
 
 /// What `/` offers, in this order.
-const COMMANDS: [(&str, &str); 43] = [
+const COMMANDS: [(&str, &str); 46] = [
     ("/setup", "Go through the first setup again"),
     ("/report", "Write what can be sent about a problem"),
     ("/help", "How to use this app"),
@@ -451,6 +468,8 @@ const COMMANDS: [(&str, &str); 43] = [
     ("/attach", "Add a picture to the next message: /attach file, or choose one"),
     ("/diff", "What changed in the folder, file by file"),
     ("/usage", "Tokens and speed of this session"),
+    ("/trajectory", "Where this session's time went: each turn's requests and tools"),
+    ("/goal", "What this session works toward, kept across turns: /goal text, /goal clear"),
     ("/init", "Have the model write this project's DOGMIND.md"),
     ("/model", "Change how the model runs: /model Claude"),
     ("/effort", "How hard to think: none low medium high xhigh/max default"),
@@ -466,6 +485,7 @@ const COMMANDS: [(&str, &str); 43] = [
     ("/dashboard", "Open Straydog's dashboard in the browser"),
     ("/panel", "Show or hide the panel on the right"),
     ("/preview", "Show a web page or picture of the folder beside the conversation"),
+    ("/files", "Show the files of the folder in the panel on the right"),
     ("/theme", "As Windows is set, dark, or light: the next of them"),
     ("/safe", "Allow safe commands without asking, or not"),
     ("/workspace", "Start a session in another folder"),
@@ -730,6 +750,10 @@ enum Note {
     Workspace { path: PathBuf, files: Vec<String>, branch: Option<String>, skills: Vec<dogmind_agent::skills::Skill> },
     /// For this workspace: there may be another by the time it comes.
     Changes(PathBuf, Result<Vec<FileChange>, String>),
+    /// A folder of the Files view has been read (`path`: from the workspace, with `/`), or why not.
+    FolderRead { root: PathBuf, path: String, result: Result<Vec<files::Entry>, String> },
+    /// The disk says these folders of the workspace have changed.
+    WorkspaceChanged { root: PathBuf, changed: files::Changed },
     Found(u64, Vec<session::Hit>),
     Git(PathBuf, Option<GitInfo>),
     Setup(SetupLine),
@@ -866,6 +890,148 @@ struct CodeBlock {
     text: String,
 }
 
+/// The icon at a point of the transcript, among those drawn in its last paint; the first drawn where two overlap.
+fn icon_under(hits: &[OverlayHit], x: i32, y: i32) -> Option<OverlayKey> {
+    hits.iter().find(|hit| x >= hit.area.left && x < hit.area.right && y >= hit.area.top && y < hit.area.bottom).map(|hit| hit.key)
+}
+
+/// Where a message's picture stands in the transcript: the place of its room's first character is the top of the row, and the card keeps its padding there. `offset`: the picture's
+/// place among those of its message (`attach::Tiles::at`); `size`: a tile's.
+fn picture_area(room: POINT, offset: (i32, i32), size: (i32, i32), dpi: u32) -> RECT {
+    rect(room.x + offset.0, room.y + offset.1 + scale(dpi, 7), size.0, size.1)
+}
+
+/// Whether any of a tile is in a view `height` tall.
+fn tile_is_in_view(area: &RECT, height: i32) -> bool {
+    area.bottom > 0 && area.top < height
+}
+
+/// A file's name as it is said: its last part, or the whole path where it has none.
+fn file_name_of(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
+/// What a reader says of a control of a card: a choice's number and words, a file with its lines, an icon by its tip, the rest by what is written on it.
+fn card_part_words(part: &CardPart) -> String {
+    let mut pieces = part.text.split(PART);
+    match part.kind {
+        ButtonKind::Choice => {
+            let (number, _suggested, name, meaning) = (pieces.next().unwrap_or(""), pieces.next().unwrap_or(""), pieces.next().unwrap_or(""), pieces.next().unwrap_or(""));
+            if meaning.is_empty() { format!("{number}. {name}") } else { format!("{number}. {name}: {meaning}") }
+        }
+        ButtonKind::FileRow => {
+            let (added, removed) = (pieces.next().unwrap_or("0"), pieces.next().unwrap_or("0"));
+            let path = pieces.nth(2).unwrap_or("");
+            format!("{path}: +{added} \u{2212}{removed}")
+        }
+        _ if !part.tip.is_empty() => part.tip.clone(),
+        _ => part.text.split_once('|').map_or(part.text.clone(), |(_, label)| label.to_string()),
+    }
+}
+
+/// The order Tab goes to the icons in, which the hidden controls are put in: top to bottom and left to right, as the page's controls are, and no more than the controls there are.
+fn proxy_order(hits: &[OverlayHit]) -> Vec<OverlayKey> {
+    let mut order: Vec<(i32, i32, OverlayKey)> = hits.iter().map(|hit| (hit.area.top, hit.area.left, hit.key)).collect();
+    order.sort_by_key(|(top, left, _)| (*top, *left));
+    order.into_iter().take(PROXY_POOL).map(|(_, _, key)| key).collect()
+}
+
+/// An icon or control drawn in the transcript's paint, over its text: which answer, block, run or card it is of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OverlayKey {
+    /// Copies the answer.
+    Copy(usize),
+    /// Branches the conversation from the answer.
+    Fork(usize),
+    /// Copies the block of code.
+    Block(usize),
+    /// Opens or closes the row of calls.
+    Run(usize),
+    /// A control of a card: the card's room (`card_slots`) and the control's place across its row.
+    Card(usize, usize),
+    /// A picture of a message or an answer (`picture_blocks`) and its place among that message's pictures: opened beside the conversation.
+    Picture(usize, usize),
+}
+
+/// Where an icon was drawn the last time the transcript was painted, in the transcript's own pixels.
+struct OverlayHit {
+    area: RECT,
+    key: OverlayKey,
+}
+
+/// The widths of the three chips in the foot of the composer, in pixels. The mode's and the effort's are their words' (`mode`, `effort`: what their words need), whatever room there is: the
+/// mode's "Plan first" was cut to "Plan..." in a narrow window by a share of the room. The model's is its own words (`model`) up to `most`, and what the others leave, down to `least`
+/// (or its own words, if they are fewer): its long name is what gives way first, then the effort's words (the mode's are never cut).
+fn chip_widths(room: i32, mode: i32, effort: i32, model: i32, most: i32, least: i32) -> (i32, i32, i32) {
+    let floor = least.min(model);
+    // (the effort's words are cut before the mode's, and after the model's name has given what it can)
+    let effort = effort.min((room - mode - floor).max(0));
+    (mode, effort, model.min(most).min(room - mode - effort).max(floor))
+}
+
+/// What a control that a card puts over the transcript does when it is pressed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum CardAct {
+    /// One of the model's choices: this label is the answer.
+    Choose(String),
+    /// What is written in the composer is the answer.
+    SendOwn,
+    /// The card's field, which is the composer: the focus goes there.
+    FocusField,
+    /// The plan is approved.
+    Carry,
+    /// The plan is to be changed: what is written next says how.
+    Change,
+    /// The changes of this file of an answer (the turn, and the file's place in its card), on the Changes page.
+    OpenDiff(u64, usize),
+    /// The file itself, in its own app, or shown in Explorer.
+    OpenFile(u64, usize),
+    /// All the files of an answer, on the Changes page.
+    MoreFiles(u64),
+}
+
+/// One control of a card, on a row of its room.
+#[derive(Clone)]
+struct CardPart {
+    text: String,
+    kind: ButtonKind,
+    act: CardAct,
+    /// In pixels: nothing, the rest of the row's width.
+    width: i32,
+    tip: String,
+}
+
+/// The room a card keeps for controls, a row of an exact height: where it begins, and what is drawn over it, from the left, in the transcript's paint.
+struct CardSlot {
+    start: i32,
+    parts: Vec<CardPart>,
+    tall: i32,
+}
+
+/// What the trajectory page shows: the session's turns, which of them are open, and the rows of the table as that makes them.
+struct TrajectoryPage {
+    summary: dogmind_agent::trajectory_report::Summary,
+    open: std::collections::BTreeSet<u64>,
+    rows: Vec<crate::trajectory::Row>,
+}
+
+/// The model's question that waits for the person: where the answer goes, the question as it was asked, and the card that shows it.
+struct AskedQuestion {
+    answer: std::sync::mpsc::Sender<String>,
+    question: String,
+    options: Vec<(String, String)>,
+    card: u64,
+}
+
+/// The plan that waits for the person's decision: where the answer goes, the plan as it was put, the card that shows it, and whether the person has pressed Change and what is written next
+/// is the change asked for.
+struct AskedPlan {
+    answer: std::sync::mpsc::Sender<Result<(), String>>,
+    plan: String,
+    card: u64,
+    changing: bool,
+}
+
 /// A message's pictures in the transcript: where their room in its card begins.
 struct PictureBlock {
     start: i32,
@@ -877,6 +1043,37 @@ struct PictureBlock {
 struct KeptThumb {
     thumb: Thumb,
     used: u64,
+}
+
+/// How a session stands in the sidebar, in a word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SideState {
+    /// The model waits for the person: to approve something, to answer its question, to decide on its plan.
+    Waiting,
+    Working,
+    /// No turn is at work, and a background command or a wait will wake it.
+    StandingBy,
+    Error,
+}
+
+/// What the sidebar says of a session. `parked`: it is out of sight with its agent, whether it waits for the person, and whether a turn is at work (else it stands by). Else it is the one on
+/// screen (`current`), which `waits`, `running` and `standing_by` (something waits in the background) speak for.
+fn side_state(parked: Option<(bool, bool)>, current: bool, waits: bool, running: bool, standing_by: bool, failed: bool) -> Option<SideState> {
+    match parked {
+        Some((true, _)) => Some(SideState::Waiting),
+        Some((false, true)) => Some(SideState::Working),
+        Some((false, false)) => Some(SideState::StandingBy),
+        None if current && waits => Some(SideState::Waiting),
+        None if current && running => Some(SideState::Working),
+        None if current && standing_by => Some(SideState::StandingBy),
+        None if failed => Some(SideState::Error),
+        None => None,
+    }
+}
+
+/// Whether the send button is a stop button: the model is at work. Not while it waits for words from the person (a question, a plan), when what is typed is its answer and the button sends it.
+fn is_stoppable(running: bool, asking: bool, connecting: bool) -> bool {
+    (running && !asking) || connecting
 }
 
 /// What Esc means now.
@@ -914,6 +1111,35 @@ const ENGINE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3
 /// Whether what the person has just begun starts the engine: only one waiting for that, and not again right after it failed.
 fn starts_the_engine(waits: bool, setting_up: bool, failed: Option<std::time::Duration>) -> bool {
     waits && !setting_up && failed.map_or(true, |ago| ago >= ENGINE_RETRY_AFTER)
+}
+
+/// Whether a setup under way keeps an engine from running. All of them do, for they work on the model's files and probe the card, but the fetch of the faster-writing data: it reads no
+/// shard and takes nothing of the card, so the engine that runs goes on, and one that is asked for starts.
+fn setup_holds_off_the_engine(setting_up: bool, fetching_drafter: bool) -> bool {
+    setting_up && !fetching_drafter
+}
+
+/// What the engine does once the faster-writing data is in the settings.
+#[derive(Debug, PartialEq)]
+enum DrafterRestart {
+    /// It has not begun, or is gone: its next start reads the settings as they are.
+    Not,
+    Now,
+    /// A turn, a tool run or a session in the background is not cut short for it.
+    WhenIdle,
+}
+
+fn drafter_restart(engine_began: bool, work_under_way: bool) -> DrafterRestart {
+    match (engine_began, work_under_way) {
+        (false, _) => DrafterRestart::Not,
+        (true, false) => DrafterRestart::Now,
+        (true, true) => DrafterRestart::WhenIdle,
+    }
+}
+
+/// What the status line says while the engine waits for the work under way to end before it starts again with the faster-writing data.
+fn drafter_restart_words() -> &'static str {
+    t("The faster-writing data is ready. The engine restarts when the work under way ends.")
 }
 
 /// Whether to have the engine read the prompt and the tools now. With a message already waiting that message's own request reads them, once.
@@ -1085,7 +1311,14 @@ fn is_settings_place(panel: Panel) -> bool {
     SETTINGS_PLACES.iter().any(|(known, _, _)| *known == panel)
 }
 
-/// A session at work that is not on screen: its agent goes on, and what it says waits here.
+/// A row of the list of what waits, for the time that is drawn on it as it runs on: the nth command, or the nth wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitRow {
+    Command(usize),
+    Wait(usize),
+}
+
+/// A session that is not on screen, at work or with something waiting that will wake it: its agent goes on, and what it says waits here.
 struct Parked {
     path: Option<PathBuf>,
     workspace: PathBuf,
@@ -1093,6 +1326,9 @@ struct Parked {
     agent: Handle,
     events: Receiver<Event>,
     pending: Option<Approval>,
+    /// The model's question, and its plan, that wait for the person.
+    question: Option<agent::Question>,
+    plan_review: Option<agent::PlanReview>,
     /// What has streamed since the last whole message, which the session file holds.
     partial: String,
     tools_running: HashMap<String, (String, String)>,
@@ -1112,6 +1348,13 @@ struct Parked {
     web_seen: bool,
     /// The session is being made shorter, and nothing has been asked of the model since.
     compacting: bool,
+    /// A turn is at work. False: it stands by, with a background command or a wait that will wake it.
+    running: bool,
+    /// The turn at work is one nobody sent: a command's end, a line, a wait woke it.
+    woken: bool,
+    /// What it has going or waiting in the background, as its agent last said, and when that was said.
+    waiting: Waiting,
+    waiting_taken: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -1461,6 +1704,8 @@ enum Shown {
     Pictures { pictures: Vec<(PathBuf, (i32, i32))>, width: i32, alone: bool, right: bool },
     /// Tool calls as one row: which of `runs`.
     Run(usize),
+    /// A card that asks something of the person or shows something of the work, in the state it is in now.
+    Card(Card),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1588,6 +1833,25 @@ struct App {
     side: HWND,
     side_rows: Vec<SideRow>,
     side_hover: Option<usize>,
+    /// The Files view of the panel on the right (`files_panel`): the tree of the workspace, the list that shows its rows, the row selected and the one under the pointer, what the tree
+    /// is of, the watcher of its folder (only while it is in view), and whether what it shows may be old (it was out of view, unwatched).
+    tree: files::Tree,
+    tree_list: HWND,
+    tree_rows: Vec<files::Row>,
+    tree_selected: Option<String>,
+    tree_hover: Option<usize>,
+    tree_for: Option<PathBuf>,
+    tree_watcher: Option<files::Watcher>,
+    tree_stale: bool,
+    tree_dpi: u32,
+    /// The tree's `version` when the list was last made from it.
+    tree_version: Option<u64>,
+    /// The little menu of a row, and the row it is of.
+    tree_menu: HWND,
+    tree_menu_row: Option<files::Row>,
+    tree_menu_hover: Option<usize>,
+    /// The two words over the panel on the right, where a press goes to the view they name (true: the files).
+    right_tab_hits: Vec<(RECT, bool)>,
     collapsed: HashSet<String>,
     all_sessions: Vec<session::Summary>,
     /// The session on screen, once it has a file.
@@ -1602,9 +1866,15 @@ struct App {
     effort_chip: HWND,
     help_button: HWND,
     doc: HWND,
-    copy_buttons: Vec<HWND>,
-    /// Beside each copy button, its answer's branch button: the conversation through that answer, as a session of its own.
-    fork_buttons: Vec<HWND>,
+    /// The icons over the transcript, drawn in its own paint where each stood in that frame: for hit-testing, which is the pointer's, and for the hidden controls. Which of them
+    /// the pointer is over, which is pressed, and which has just copied (shown as a check mark till the timer).
+    overlay_hits: Vec<OverlayHit>,
+    overlay_hover: Option<OverlayKey>,
+    overlay_press: Option<OverlayKey>,
+    overlay_copied: Option<OverlayKey>,
+    overlay_tip_for: Option<(OverlayKey, RECT)>,
+    proxies: Vec<HWND>,
+    proxy_keys: Vec<Option<OverlayKey>>,
     /// Where each answer ends in the transcript, and its text.
     answers: Vec<(i32, String)>,
     /// Each card of what the person wrote, in order: its corners are drawn over.
@@ -1624,8 +1894,6 @@ struct App {
     rail_tips: Vec<(RECT, usize)>,
     /// Where the text column ends at the right, in the window.
     column_right: i32,
-    /// Which answer each visible copy button stands for.
-    copy_targets: Vec<Option<usize>>,
     transcript_area: RECT,
     /// The transcript's scrollbar as this window draws it: the control's own is cut off by its region, a wide dark band in the page.
     thumb: Option<RECT>,
@@ -1687,20 +1955,22 @@ struct App {
     builds: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
     /// A new build seen once, to be seen the same again before it is offered.
     update_seen: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
-    /// A new build is here, and the row above the input asks whether to restart into it; its button and its cross.
+    /// A new build is here, and the notice at the top of the main screen asks whether to restart into it. Its button (also the one that says how far the fetch of a release has come, and
+    /// updates once the setup is here) and, for the page of a release, its other one; and Later, that sends the notice away.
     update_offer: bool,
     update_offer_button: HWND,
-    update_offer_close: Option<RECT>,
+    notice_later: HWND,
     /// The build the person said no to, with the cross: they are asked again only for a newer one.
     update_declined: Option<Vec<Option<(std::time::SystemTime, u64)>>>,
     /// They said yes while work was going on: it restarts when the work is done.
     restart_when_done: bool,
     /// The setup that waits is being checked before it is run (a thread reads all of its bytes: a second or two): the buttons that restart into it say so, and cannot be pressed again.
     checking_setup: bool,
-    /// A newer release on GitHub than this one, found on the app's own look: a row above the input tells of it, with a button for its page and a cross, unless its setup is being fetched or is here (`release_row`).
+    /// A newer release on GitHub than this one, found on the app's own look: the notice at the top of the main screen tells of it (`notice`), with a button for its page while nothing of its
+    /// setup is fetched, and for the update itself once it is. The version the tray has told of, once (`notice::balloon_due`).
     release_offer: Option<updates::Release>,
     release_offer_button: HWND,
-    release_offer_close: Option<RECT>,
+    tray_told_release: Option<String>,
     /// A look at GitHub is under way (a thread asks; the answer comes as a note), and what the last one came to, as the About page says it.
     release_checking: bool,
     release_outcome: Option<updates::Outcome>,
@@ -1709,7 +1979,7 @@ struct App {
     /// The setup of a newer release: fetched on its own in the background and checked, then offered; and what the last try came to, as About says it, and whether that is a trouble.
     release_update: ReleaseUpdate,
     release_update_said: Option<(String, bool)>,
-    /// The cross of the row that offers it was pressed: it is offered again at the next start.
+    /// Later was pressed on the notice of the setup that is here: it is offered again at the next start.
     release_ready_closed: bool,
     /// The switch on the About page for the app's own looks.
     toggle_updates: HWND,
@@ -1762,6 +2032,14 @@ struct App {
     rename_seed: Option<String>,
     resume_paths: Vec<PathBuf>,
     parked: Vec<Parked>,
+    /// What the session on screen has going or waiting in the background, as its agent last said, and when that was said (the times of the panel run on from it).
+    waiting: Waiting,
+    waiting_taken: std::time::Instant,
+    /// A turn that nobody sent is at work: what it asks, and where it ends, are told to someone who may not be looking.
+    woken_turn: bool,
+    /// The stop of each row of the list of what waits, in the panel on the right (its id, or `*` for all of them), and where the time of each row is drawn.
+    waiting_hits: Vec<(RECT, String)>,
+    waiting_times: Vec<(RECT, WaitRow)>,
     /// What a session opened beside a working one will connect with.
     provider: Option<(Arc<dyn Provider>, String, u64)>,
     /// What sessions said after they stopped being on screen, until they are opened.
@@ -1772,11 +2050,23 @@ struct App {
     turn_failed: bool,
     /// The session's turns, the rows of the rewind panel, and the rows of the rules panel.
     turns: Vec<dogmind_agent::checkpoint::Turn>,
+    /// What each turn's edits changed (Event::TurnChanges), by the turn: the data of the card under its answer.
+    turn_changes: std::collections::BTreeMap<u64, Vec<dogmind_agent::tools::FileChange>>,
     rewind_rows: Vec<u64>,
     shown_rules: Vec<rules::Rule>,
     changes: Vec<FileChange>,
     /// The file to show first when the changes come, chosen in the panel on the right.
     change_wanted: Option<usize>,
+    /// The files of one answer, which the Changes page lists in place of the workspace's, when it was opened from the card under that answer.
+    turn_view: Option<Vec<FileChange>>,
+    /// A session opened again: where each person's words begin in the message list and in what was written (`shown`), and where the end is: the places the cards of the files each
+    /// answer changed go to. The turns whose changes were asked for and have not come, each with its place, and the cards that have come.
+    turn_slots: Vec<(usize, usize)>,
+    turn_end_slot: usize,
+    turn_cards_waiting: HashMap<u64, usize>,
+    turn_cards_came: Vec<(usize, u64)>,
+    /// The bar under the title with the session's goal: its button, which clears it.
+    goal_clear: HWND,
     // The panel on the right.
     right_width: i32,
     right_toggle: HWND,
@@ -1818,6 +2108,8 @@ struct App {
     sidebar_width: i32,
     /// The Changes page: its window, the file shown as rows, where the view is, and what the pointer has chosen.
     diff_view: HWND,
+    /// The trajectory page, when the Changes page's window shows it: the table's rows and which turns are open.
+    trajectory: Option<TrajectoryPage>,
     diff_previous: HWND,
     diff_next: HWND,
     diff_close: HWND,
@@ -1867,29 +2159,39 @@ struct App {
     panel_log: String,
     progress: Option<f64>,
     kind: Kind,
+    /// For a model not yet there: whether to fetch its drafter with it. Of the model that is there, the settings say.
     drafter: bool,
+    /// The folder of a drafter being fetched on its own for the model that is there: this download is for it and no more.
+    drafter_fetch: Option<PathBuf>,
+    /// The faster-writing data is in the settings, and the engine that is running began without it: it starts again once no work is under way.
+    drafter_restart_waits: bool,
     // State.
     pending: Option<Approval>,
     tools_running: HashMap<String, (String, String)>,
     running: bool,
     has_messages: bool,
     queued: Vec<Outgoing>,
-    /// Where the view was when what lies over the transcript was last placed.
-    placed_at: i32,
+    /// Where the view stood when the thumb was last placed.
+    thumb_at: i32,
     /// What of the transcript control shows: its size less the scrollbar's strip, and the rail's place in it, cut out.
     transcript_region: ((i32, i32), Option<(i32, i32, i32, i32)>),
     /// Words sent to the turn under way that have not reached it yet.
     interjected: Vec<String>,
+    /// The model's question that waits for the person (Event::Question).
+    question: Option<AskedQuestion>,
+    /// Where each card keeps its room, with what is drawn over it (in the transcript's paint, with the icons), and the number the next card has.
+    card_slots: Vec<CardSlot>,
+    card_next: u64,
+    /// The plan that waits for the person's decision (Event::PlanReview).
+    plan_review: Option<AskedPlan>,
+    /// What this session works toward, as the agent last told it (Event::Goal).
+    goal: Option<String>,
     /// The buttons on what waits above the input: where, which message, and what each does.
     queue_hits: Vec<(RECT, usize, QueueAct)>,
     /// Those buttons as their tips stand now.
     queue_tips: Vec<(RECT, QueueAct)>,
-    /// The blocks of code in the transcript, each with a copy button while in view, and which it stands for.
+    /// The blocks of code in the transcript, each with a copy icon over it while in view.
     blocks: Vec<CodeBlock>,
-    block_buttons: Vec<HWND>,
-    /// The chevrons of the runs in view, and which each stands for.
-    run_buttons: Vec<HWND>,
-    run_targets: Vec<Option<usize>>,
     /// Tool calls in the transcript, one row to each run.
     runs: Vec<ToolRun>,
     /// The run still going on, at the end of the transcript.
@@ -1906,7 +2208,6 @@ struct App {
     plain_writing: Option<RunEntry>,
     /// When a request under way last said how it was going.
     request_live: Option<std::time::Instant>,
-    block_targets: Vec<Option<usize>>,
     /// Where the block being written is kept in `shown`.
     open_block: Option<usize>,
     /// A block has begun and its first row is still to come: that row is where its card is found.
@@ -1946,11 +2247,10 @@ struct App {
     /// What goes with the next message, and the windows that show it.
     attachments: Vec<Attached>,
     attached_windows: Vec<HWND>,
-    /// The windows that show pictures in the transcript, what each is showing now, and how much of its top and bottom is cut off at the transcript's edges.
-    picture_windows: Vec<HWND>,
-    picture_shown: Vec<Option<(PathBuf, (i32, i32))>>,
-    picture_cut: Vec<(i32, i32)>,
+    /// The pictures of the transcript's messages: drawn in its own paint, from the places that same frame gives their rooms.
     picture_blocks: Vec<PictureBlock>,
+    /// The small copies the view wants now: they are not the ones to be forgotten.
+    thumb_wanted: std::collections::HashSet<(PathBuf, (i32, i32))>,
     thumbs: HashMap<(PathBuf, (i32, i32)), KeptThumb>,
     thumb_clock: u64,
     /// Whether what is connected reads pictures; none until it has said.
@@ -1967,6 +2267,8 @@ struct App {
     pending_text: String,
     /// What has arrived of the answer and is not on screen yet (`reveal_tick`).
     reveal: String,
+    /// The reply's keys, hidden as they come in pieces: what is shown of it (the reply itself is kept as it was written).
+    stream_mask: crate::mask::StreamMask,
     /// When text last went in from it.
     revealed_at: std::time::Instant,
     /// `reveal` is going in now, at the end of a transcript whose paragraphs before it stay as they are.
@@ -2156,6 +2458,70 @@ unsafe fn redraw(window: HWND, on: bool) {
 
 unsafe fn show(window: HWND, visible: bool) {
     ShowWindow(window, if visible { SW_SHOWNA } else { SW_HIDE });
+}
+
+/// The words of the button of an update that is on its way or here. They follow the stage the update is in and what was asked of it, and never how far a fetch has come: a note of
+/// progress changes the percent in the line above the button, and the button is not touched.
+fn update_button_words_of(update: &ReleaseUpdate, setup_is_here: bool, checking_setup: bool, restart_when_done: bool) -> Option<&'static str> {
+    match update {
+        ReleaseUpdate::Fetching { .. } => Some(t("Cancel")),
+        ReleaseUpdate::Ready(_) if setup_is_here => Some(if checking_setup { t("Checking…") } else if restart_when_done { t("Not now") } else { t("Restart to update") }),
+        _ => None,
+    }
+}
+
+fn update_button_kind_of(update: &ReleaseUpdate, restart_when_done: bool) -> ButtonKind {
+    match update {
+        ReleaseUpdate::Ready(_) if restart_when_done => ButtonKind::Secondary,
+        ReleaseUpdate::Ready(_) => ButtonKind::Primary,
+        _ => ButtonKind::Link,
+    }
+}
+
+/// A debug build with `DOGMIND_TEST_ICONLOG` set to a file writes there, a line each and with the time in microseconds, what the transcript's host does to its pixels (moves them,
+/// asks for a part of them again, draws a part) and where the icons stood in each frame it drew: what a test reads to say whether any frame had an icon away from its answer.
+static TEST_LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+
+pub(crate) fn test_log_on() -> bool {
+    cfg!(debug_assertions) && TEST_LOG.get_or_init(|| std::env::var_os("DOGMIND_TEST_ICONLOG").and_then(|path| std::fs::File::create(path).ok()).map(std::sync::Mutex::new)).is_some()
+}
+
+pub(crate) fn test_log(line: &str) {
+    use std::io::Write;
+    if !test_log_on() {
+        return;
+    }
+    if let Some(Some(file)) = TEST_LOG.get() {
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_micros());
+        let _ = writeln!(file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()), "{at} {line}");
+    }
+}
+
+/// Whether the icons are drawn in a colour that nothing else of the window has, for a test to find them by: a debug build with `DOGMIND_TEST_ICONCOLOR` set.
+fn icons_marked() -> bool {
+    static MARKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(debug_assertions) && *MARKED.get_or_init(|| std::env::var_os("DOGMIND_TEST_ICONCOLOR").is_some())
+}
+
+/// The transcript's host has drawn its text (and its fades) on `device`: the icons over the text are drawn on the same device now, at the places the text has in this frame.
+pub(crate) unsafe fn paint_overlays(window: HWND, device: HDC, dx: i32, dy: i32) {
+    let Some(app) = app() else { return };
+    // (the composer and the side page are hosts of the same kind: the icons are over the transcript's text and no other's)
+    if window == app.transcript {
+        app.paint_overlay_icons(device, dx, dy);
+    }
+}
+
+/// What the notice says, and the words on its button.
+fn notice_text(shown: &notice::Notice) -> (String, String) {
+    use notice::Notice;
+    match shown {
+        Notice::Page { version } => (tf("Dogmind {0} is available.", &[version]), t("Open the release page").to_string()),
+        Notice::Fetching { version, percent } => (tf("Dogmind {0} is available.", &[version]), tf("Downloading… {0}%", &[percent])),
+        Notice::UpdateNow { waiting: true, checking, .. } => (t("It restarts into the new version when this work is done.").to_string(), if *checking { t("Checking…") } else { t("Not now") }.to_string()),
+        Notice::UpdateNow { version: Some(version), checking, .. } => (tf("Dogmind {0} is ready to install.", &[version]), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
+        Notice::UpdateNow { version: None, checking, .. } => (t("A new version is here.").to_string(), if *checking { t("Checking…") } else { t("Update now (Dogmind restarts)") }.to_string()),
+    }
 }
 
 /// A control where it now goes. Without SWP_NOCOPYBITS the system moves its old pixels along and asks it to draw only what it thinks is new, and what
@@ -2644,6 +3010,12 @@ impl App {
             self.shown.push(Shown::Row { lines: row.lines.iter().map(|line| line.to_string()).collect(), face: row.face.to_string(), points: row.points, color: row.color, back: row.back, width: row.right.then_some(row.width), right: row.right, padding: row.padding });
         }
         let first = self.insert_rtf(rtf::row(row), Some(row.color));
+        if !self.replaying && !self.opening {
+            if let Some(pause) = test_rows_painted() {
+                RedrawWindow(self.transcript, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_UPDATENOW);
+                std::thread::sleep(std::time::Duration::from_millis(pause));
+            }
+        }
         if row.right {
             let start = text_start(self.transcript, first);
             // Words under the message's pictures are the lower part of one card, which begins at the pictures: two cards, each rounded, were
@@ -2688,6 +3060,24 @@ impl App {
             let mut point = POINT { x: 0, y: 0 };
             SendMessageW(edit, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, user_card.start as LPARAM);
             if point.y < client.bottom {
+                // A card that has grown since its shape was taken (the rows of a command's output keep coming) has the card's colour at its old foot and under it: the corners drawn at that foot
+                // are in the card now, and are filled with it; and the card is looked for again, as it is now.
+                if let Some(shape) = user_card.shape {
+                    let card = shape.at(point);
+                    let x = card.left + radius;
+                    if test_log_on() {
+                        test_log(&format!("card kept {},{},{},{} foot pixels {:06x} {:06x}", card.left, card.top, card.right, card.bottom, GetPixel(device, x, card.bottom), GetPixel(device, x, card.bottom + 1)));
+                    }
+                    if !test_stale_shapes() && card.bottom >= client.top && card.bottom + 1 < client.bottom && card_has_grown(GetPixel(device, x, card.bottom), GetPixel(device, x, card.bottom + 1), back) {
+                        let brush = CreateSolidBrush(back);
+                        for area in foot_corners(&card, radius) {
+                            FillRect(device, &area, brush);
+                        }
+                        DeleteObject(brush);
+                        user_card.shape = None;
+                        user_card.looked_at = None;
+                    }
+                }
                 let found = match user_card.shape {
                     Some(shape) => {
                         let mut card = shape.at(point);
@@ -2704,12 +3094,19 @@ impl App {
                     None => {
                         user_card.looked_at = Some(std::time::Instant::now());
                         let view = view.get_or_insert_with(|| ViewPixels::of(device, client));
-                        find_card(client, point, radius, |x, y| view.at(x, y) == back).map(|mut card| {
+                        find_card(client, point, radius, scale(self.dpi, 3), |x, y| view.at(x, y) == back).map(|mut card| {
                             let page = view.at(card.left - 1, card.top + radius);
                             // With the view at the top of the text, the top of the view is the top of a card that reaches it.
                             let mut scrolled = POINT { x: 0, y: 0 };
                             SendMessageW(edit, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(scrolled) as LPARAM);
                             card.top_open = card.top_open && scrolled.y > 0;
+                            // (what goes on below where the card was found to end, or above where it begins, in a colour that is not the page's, is the card in the fade at an edge of the view: it is
+                            // not rounded there, as its end is not in sight)
+                            card.bottom_open |= card.bottom + 1 < client.bottom && view.at(card.left + radius, card.bottom + 1) != page;
+                            card.top_open |= card.top > client.top && view.at(card.left + radius, card.top - 1) != page;
+                            if test_log_on() {
+                                test_log(&format!("card found {},{},{},{} top_open={} bottom_open={}", card.left, card.top, card.right, card.bottom, card.top_open, card.bottom_open));
+                            }
                             if !card.top_open && !card.bottom_open {
                                 user_card.shape = Some(CardShape::around(&card, point, page));
                             }
@@ -2795,6 +3192,7 @@ impl App {
         self.turn_words_due = false;
         self.picture_blocks.clear();
         self.blocks.clear();
+        self.card_slots.clear();
         self.links.clear();
         self.link_hover = None;
         self.runs.iter_mut().for_each(|run| run.first = -1);
@@ -2821,6 +3219,7 @@ impl App {
                 }
                 Shown::Pictures { pictures, width, alone, right } => self.append_pictures(pictures, (*width).min((self.text_twips * 4 / 5).max(800)), *alone, *right),
                 Shown::Run(at) => self.write_run(*at),
+                Shown::Card(card) => self.write_card(card),
                 Shown::Block(code) => {
                     self.begin_block();
                     if let Some(block) = self.blocks.last_mut() {
@@ -2842,7 +3241,6 @@ impl App {
         }
         redraw(edit, true);
         InvalidateRect(edit, std::ptr::null(), 0);
-        self.place_copy_buttons();
     }
 
     /// The lines of a Markdown table have ended: as a table if they are one, and as they were written if they are not.
@@ -2918,60 +3316,11 @@ impl App {
         }
     }
 
-    /// The top right of each block in view has a copy button of the pool. As with the answers' buttons: for every frame the view moves, and only what moved.
-    unsafe fn place_block_buttons(&mut self) {
-        let dpi = self.dpi;
-        let size = scale(dpi, 24);
-        let area = self.transcript_area;
-        let height = area.bottom - area.top;
-        self.block_targets.iter_mut().for_each(|target| *target = None);
-        let mut in_view: Vec<(usize, POINT)> = Vec::new();
-        if self.panel == Panel::Chat && self.has_messages {
-            for at in (0..self.blocks.len()).rev() {
-                let block = &mut self.blocks[at];
-                if !block.found {
-                    block.at = text_start(self.transcript, block.at);
-                    block.found = true;
-                }
-                let mut point = POINT { x: 0, y: 0 };
-                SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, block.at as LPARAM);
-                if point.y < -size {
-                    break;
-                }
-                // (half out of the view it would stand over what is above the transcript)
-                if point.y >= 0 && point.y <= height - size && !block.text.is_empty() {
-                    in_view.push((at, point));
-                }
-            }
-        }
-        let used = in_view.len().min(self.block_buttons.len());
-        let x = area.left + self.transcript_rect.1 - GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) * 3 / 5 - size - scale(dpi, 4);
-        for (slot, (at, point)) in in_view.into_iter().rev().take(used).enumerate() {
-            let button = self.block_buttons[slot];
-            // (its first line, whose top is near the block's, with the button inside the block)
-            let top = area.top + point.y + scale(dpi, 1);
-            let showing = IsWindowVisible(button) != 0;
-            if !showing || child_area(button, self.window) != (x, top, size, size) {
-                SetWindowPos(button, HWND_TOP, x, top, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
-            }
-            if !showing {
-                show(button, true);
-            }
-            self.block_targets[slot] = Some(at);
-        }
-        for button in &self.block_buttons[used..] {
-            if IsWindowVisible(*button) != 0 {
-                show(*button, false);
-            }
-        }
-    }
-
-    unsafe fn copy_block(&mut self, slot: usize) {
-        let Some(at) = self.block_targets.get(slot).copied().flatten() else { return };
-        let text = self.blocks[at].text.clone();
+    unsafe fn copy_block(&mut self, at: usize) {
+        let Some(block) = self.blocks.get(at) else { return };
+        let text = block.text.clone();
         self.copy_to_clipboard(text.trim_end_matches('\n'));
-        set_text(self.block_buttons[slot], "check");
-        SetTimer(self.window, TIMER_COPIED, 1400, None);
+        self.copied(OverlayKey::Block(at));
     }
 
     /// What opens and closes a block: a little space, and what the code is in if it says.
@@ -3389,85 +3738,26 @@ impl App {
         self.append("\n", Style::CopyRow);
         self.unkept = false;
         self.line_start = true;
-        self.place_copy_buttons();
     }
 
-    /// The view has moved, by whatever moved it: what lies over the text follows. The wheel's scroll is the control's own, carried out over
-    /// many timer ticks after the message that began it has returned, so that no message of ours can say when it ends: a button placed on the wheel's
-    /// message stayed where the text had been, over whatever came there. Asked after each paint and tick of the control, and only a move does anything.
-    unsafe fn follow_the_view(&mut self) {
+    /// The view has moved, by whatever moved it: the thumb follows. The wheel's scroll is the control's own, carried out over many timer ticks after the message that began it has
+    /// returned, so that no message of ours can say when it ends. Asked after each paint and tick of the control, and only a move does anything. (What the text carries, the icons and
+    /// the pictures of its messages, is drawn in its own paint and needs no following.)
+    unsafe fn follow_the_thumb(&mut self) {
         let mut position = POINT { x: 0, y: 0 };
         SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
-        if position.y != self.placed_at {
-            self.place_copy_buttons();
+        if position.y != self.thumb_at {
+            self.thumb_at = position.y;
             self.place_thumb();
         }
     }
 
-    /// Each answer on screen gets a button of the pool at its row, wherever the transcript has scrolled to. This runs for every frame the view
-    /// moves: only the answers from the last one up to the first above the view are asked about, and only a button whose place changed is moved.
-    unsafe fn place_copy_buttons(&mut self) {
-        let mut position = POINT { x: 0, y: 0 };
-        SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
-        self.placed_at = position.y;
-        self.place_pictures();
-        self.place_block_buttons();
-        self.place_run_buttons();
-        let dpi = self.dpi;
-        let (size, area) = (scale(dpi, ds::size::ICON_BUTTON), self.transcript_area);
-        let visible = self.panel == Panel::Chat && self.has_messages;
-        let height = area.bottom - area.top;
-        self.copy_targets.iter_mut().for_each(|target| *target = None);
-        let mut in_view: Vec<(usize, POINT)> = Vec::new();
-        if visible {
-            for at in (0..self.answers.len()).rev() {
-                let mut point = POINT { x: 0, y: 0 };
-                SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, self.answers[at].0 as LPARAM);
-                if point.y < -size {
-                    break;
-                }
-                // (half out of the view it would stand over what is above the transcript)
-                if point.y >= 0 && point.y <= height - size {
-                    in_view.push((at, point));
-                }
-            }
-        }
-        // (every answer's, not only the last one's and the one under the pointer: shown only there, they were not found)
-        let used = in_view.len().min(self.copy_buttons.len());
-        // (a branch is of a saved session, and not of an answer still coming)
-        let forks = self.current_session.is_some();
-        for (slot, (at, point)) in in_view.into_iter().rev().take(used).enumerate() {
-            let left = area.left + point.x - scale(dpi, 2);
-            for (button, x, wanted) in [(self.copy_buttons[slot], left, true), (self.fork_buttons[slot], left + size, forks)] {
-                let showing = IsWindowVisible(button) != 0;
-                if !wanted {
-                    if showing {
-                        show(button, false);
-                    }
-                    continue;
-                }
-                if !showing || child_area(button, self.window) != (x, area.top + point.y, size, size) {
-                    // (it stays above the transcript once it is there, and to say so again costs more than the move)
-                    SetWindowPos(button, HWND_TOP, x, area.top + point.y, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
-                }
-                if !showing {
-                    show(button, true);
-                }
-            }
-            self.copy_targets[slot] = Some(at);
-        }
-        for button in self.copy_buttons[used..].iter().chain(&self.fork_buttons[used..]) {
-            if IsWindowVisible(*button) != 0 {
-                show(*button, false);
-            }
-        }
-    }
-
-
     /// A new session with the conversation through this answer, opened: to go on from there another way. The answer is found in the saved
     /// session by its words, and by how many answers before it have the same.
-    unsafe fn fork_from_answer(&mut self, slot: usize) {
-        let Some(at) = self.copy_targets.get(slot).copied().flatten() else { return };
+    unsafe fn fork_from_answer(&mut self, at: usize) {
+        if at >= self.answers.len() {
+            return;
+        }
         let Some(path) = self.current_session.clone() else { return };
         let words = self.answers[at].1.clone();
         let same_before = self.answers[..at].iter().filter(|(_, other)| *other == words).count();
@@ -3488,12 +3778,25 @@ impl App {
         }
     }
 
-    unsafe fn copy_answer(&mut self, slot: usize) {
-        let Some(at) = self.copy_targets.get(slot).copied().flatten() else { return };
-        let text = self.answers[at].1.clone();
+    unsafe fn copy_answer(&mut self, at: usize) {
+        let Some((_, text)) = self.answers.get(at) else { return };
+        let text = text.clone();
         self.copy_to_clipboard(&text);
-        set_text(self.copy_buttons[slot], "check");
+        self.copied(OverlayKey::Copy(at));
+    }
+
+    /// An icon has copied: it shows a check mark for a moment.
+    unsafe fn copied(&mut self, key: OverlayKey) {
+        self.overlay_copied = Some(key);
+        self.invalidate_overlay(key);
         SetTimer(self.window, TIMER_COPIED, 1400, None);
+    }
+
+    /// The icon of `key`, as it was last drawn, drawn again.
+    unsafe fn invalidate_overlay(&self, key: OverlayKey) {
+        if let Some(hit) = self.overlay_hits.iter().find(|hit| hit.key == key) {
+            InvalidateRect(self.transcript, &hit.area, 0);
+        }
     }
 
     unsafe fn end_line(&mut self) {
@@ -3555,10 +3858,6 @@ impl App {
         (run.first, run.head_end, run.last) = written;
         run.written = lines.into_iter().next().map_or(String::new(), |(line, _)| line);
         run.written_at = Some(std::time::Instant::now());
-        // (its button stands at the end of its words, wherever they now end, and goes when there is nothing more to see)
-        if !self.replaying && !self.opening {
-            self.place_run_buttons();
-        }
     }
 
     /// The run going on, or a new one with whatever was left running from the last.
@@ -3592,7 +3891,6 @@ impl App {
             self.write_run(at);
         }
         self.line_start = true;
-        self.place_run_buttons();
     }
 
     /// A row with nothing in it goes. It is the last thing in the transcript but for what is on its way in.
@@ -3655,6 +3953,10 @@ impl App {
     /// The answer has been said: what is still held back goes out, and it can be copied. Ends also with a call beginning to be written, whose row comes under it.
     unsafe fn end_of_answer(&mut self) {
         self.thinking.clear();
+        // (a word held back, in case it was a key, goes out with the rest)
+        let held = self.stream_mask.finish();
+        self.reveal.push_str(&held);
+        self.flush_reveal();
         self.finish_answer();
         if !self.answer.is_empty() {
             self.last_answer = std::mem::take(&mut self.answer);
@@ -3689,7 +3991,6 @@ impl App {
                 self.set_activity(String::new());
             }
             self.write_run(at);
-            self.place_run_buttons();
         }
     }
 
@@ -3785,9 +4086,6 @@ impl App {
         GetScrollInfo(self.transcript, SB_VERT, &mut bar);
         if bar.nPage == 0 || bar.nPos + 2 * bar.nPage as i32 >= bar.nMax {
             self.write_run(at);
-            if self.runs[at].expandable() {
-                self.place_run_buttons();
-            }
         }
     }
 
@@ -3833,6 +4131,7 @@ impl App {
         self.rail_turns.iter_mut().for_each(|turn| moved(&mut turn.start));
         self.picture_blocks.iter_mut().for_each(|block| moved(&mut block.start));
         self.blocks.iter_mut().for_each(|block| moved(&mut block.at));
+        self.card_slots.iter_mut().for_each(|slot| moved(&mut slot.start));
         for (from, to, _) in &mut self.links {
             moved(from);
             moved(to);
@@ -3858,58 +4157,7 @@ impl App {
             self.follow_end = true;
             self.want_frames();
         }
-        self.place_copy_buttons();
         self.place_thumb();
-    }
-
-    /// The chevron of each run in view with more to show, at the end of its words. As with the copy buttons: for every frame the view moves, and only what moved.
-    unsafe fn place_run_buttons(&mut self) {
-        let dpi = self.dpi;
-        let size = scale(dpi, 20);
-        let area = self.transcript_area;
-        let height = area.bottom - area.top;
-        self.run_targets.iter_mut().for_each(|target| *target = None);
-        let mut in_view: Vec<(usize, POINT)> = Vec::new();
-        if self.panel == Panel::Chat && self.has_messages {
-            for at in (0..self.runs.len()).rev() {
-                let run = &self.runs[at];
-                if run.first < 0 {
-                    continue;
-                }
-                let mut point = POINT { x: 0, y: 0 };
-                SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, run.head_end as LPARAM);
-                if point.y < -size {
-                    break;
-                }
-                // (half out of the view it would stand over what is above the transcript)
-                if run.expandable() && point.y >= 0 && point.y <= height - size {
-                    in_view.push((at, point));
-                }
-            }
-        }
-        let used = in_view.len().min(self.run_buttons.len());
-        for (slot, (at, point)) in in_view.into_iter().rev().take(used).enumerate() {
-            let button = self.run_buttons[slot];
-            // (level with its words, whose line is lower in the row than the button's middle would be)
-            let (x, top) = (area.left + point.x + scale(dpi, 4), area.top + point.y + scale(dpi, 4));
-            let name = if self.runs[at].expanded { "chevron-down" } else { "chevron-right" };
-            if get_text(button) != name {
-                set_text(button, name);
-            }
-            let showing = IsWindowVisible(button) != 0;
-            if !showing || child_area(button, self.window) != (x, top, size, size) {
-                SetWindowPos(button, HWND_TOP, x, top, size, size, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
-            }
-            if !showing {
-                show(button, true);
-            }
-            self.run_targets[slot] = Some(at);
-        }
-        for button in &self.run_buttons[used..] {
-            if IsWindowVisible(*button) != 0 {
-                show(*button, false);
-            }
-        }
     }
 
     /// The calls of a session's file that went well, as one row.
@@ -3978,8 +4226,8 @@ impl App {
         if self.shown.is_empty() {
             self.append("\n", Style::Gap);
         }
-        // (said in the middle of a run, it stands clear of the run's row)
-        if matches!(self.shown.last(), Some(Shown::Run(_))) {
+        // (said in the middle of a run, it stands clear of the run's row; and of a card)
+        if matches!(self.shown.last(), Some(Shown::Run(_) | Shown::Card(_))) {
             self.append("\n", Style::Gap);
         }
         let lines: Vec<&str> = text.trim().lines().collect();
@@ -4023,7 +4271,6 @@ impl App {
             if self.text_twips != before {
                 KillTimer(self.window, TIMER_REFLOW);
                 self.reflow();
-                self.place_copy_buttons();
                 self.place_thumb();
             }
         }
@@ -4101,9 +4348,6 @@ impl App {
                 self.place_rail();
             }
         }
-        if !self.replaying {
-            self.place_pictures();
-        }
     }
 
     /// A small copy of a file at a size, from what is kept, or asked for on another thread and not there yet.
@@ -4126,12 +4370,13 @@ impl App {
         Thumb::Waiting
     }
 
-    /// The copy asked for longest ago goes, as long as no window is showing it.
+    /// The copy asked for longest ago goes, as long as the view does not want it and it is not one of a picture waiting to go.
     unsafe fn forget_a_thumb(&mut self) {
         let attached_room = self.attached_room();
-        let oldest = self.thumbs.iter().filter(|((path, room), kept)| {
+        let oldest = self.thumbs.iter().filter(|(key, kept)| {
+            let (path, room) = *key;
             !matches!(kept.thumb, Thumb::Waiting)
-                && !self.picture_shown.iter().flatten().any(|(shown, shown_room)| shown == path && shown_room == room)
+                && !self.thumb_wanted.contains(*key)
                 && !(*room == attached_room && self.attachments.iter().any(|attached| attached.path == *path))
         }).min_by_key(|(_, kept)| kept.used).map(|(key, _)| key.clone());
         if let Some(kept) = oldest.and_then(|key| self.thumbs.remove(&key)) {
@@ -4153,9 +4398,13 @@ impl App {
             Err(attach::Undecoded::Unreadable) => Thumb::Missing(t("This picture cannot be shown here").to_string()),
         };
         self.thumbs.insert((path.clone(), room), KeptThumb { thumb: thumb.clone(), used: self.thumb_clock });
-        for (slot, shown) in self.picture_shown.iter().enumerate() {
-            if shown.as_ref().is_some_and(|(known, known_room)| *known == path && *known_room == room) {
-                set_thumb(self.picture_windows[slot], thumb.clone());
+        // (the tiles of the transcript that were holding its place are drawn again)
+        for hit in &self.overlay_hits {
+            if let OverlayKey::Picture(block, at) = hit.key {
+                let same = self.picture_blocks.get(block).is_some_and(|block| block.paths.get(at) == Some(&path) && (block.tiles.width, block.tiles.height) == room);
+                if same {
+                    InvalidateRect(self.transcript, &hit.area, 0);
+                }
             }
         }
         if room == self.attached_room() {
@@ -4167,62 +4416,643 @@ impl App {
         }
     }
 
-    /// The pictures in view each get a window of the pool at their place, wherever the transcript has scrolled to. Runs for every frame the view
-    /// moves: only the blocks from the last one up to the first above the view are asked about, and only a window whose place changed is moved.
-    unsafe fn place_pictures(&mut self) {
-        let height = self.transcript_area.bottom - self.transcript_area.top;
-        let visible = self.panel == Panel::Chat && self.has_messages;
-        let mut wanted: Vec<(PathBuf, (i32, i32), RECT)> = Vec::new();
-        if visible {
-            for block in self.picture_blocks.iter().rev() {
-                let mut point = POINT { x: 0, y: 0 };
-                SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, block.start as LPARAM);
-                if point.y + block.tiles.total_height() < 0 {
-                    break;
-                }
-                if point.y >= height {
-                    continue;
-                }
-                for (at, path) in block.paths.iter().enumerate() {
-                    let (x, y) = block.tiles.at(at);
-                    // (the place of the row's character is its top, and the card has its padding there)
-                    let top = point.y + y + scale(self.dpi, 7);
-                    if top + block.tiles.height > 0 && top < height && wanted.len() < PICTURE_POOL {
-                        wanted.push((path.clone(), (block.tiles.width, block.tiles.height), rect(point.x + x, top, block.tiles.width, block.tiles.height)));
+    /// Whether the model waits for the person: for an approval, an answer to its question, or a decision on its plan.
+    fn waits_for_person(&self) -> bool {
+        self.pending.is_some() || self.asking()
+    }
+
+    /// Whether the model waits for the person's words, as for a question or a plan, and not for a press on a card of approval.
+    fn asking(&self) -> bool {
+        self.question.is_some() || self.plan_review.is_some()
+    }
+
+    /// A row of a card's own, in its colour: as a block of code is written, but kept by the card and not by itself. `first`: the card's first row, from which its corners are rounded.
+    unsafe fn card_row(&mut self, lines: &[&str], points: i32, color: u32, down: i32, first: bool) {
+        self.block_card_due = first;
+        let shown: Vec<&str> = if lines.is_empty() { vec![" "] } else { lines.to_vec() };
+        self.append_row(&rtf::Row { lines: &shown, face: UI_FACE, points, color, back: theme::code_back(), width: self.text_twips, right: false, column: 0, padding: (260, down) });
+    }
+
+    /// Room for controls drawn over the card: a row of an exact height, with what goes on it. Without any, it is only room between two rows.
+    unsafe fn card_room(&mut self, tall: i32, parts: Vec<CardPart>) {
+        let twips = (i64::from(tall) * 1440 / i64::from(self.dpi)) as i32;
+        let first = self.insert_rtf(rtf::spacer_row(self.text_twips, self.text_twips, twips, theme::code_back(), (260, 0), false), None);
+        if !parts.is_empty() {
+            let start = text_start(self.transcript, first);
+            self.card_slots.push(CardSlot { start, parts, tall });
+        }
+    }
+
+    /// A card, in the state it is in, at the end of the transcript: shaded as a block of code is, with its controls drawn over rows of room of an exact height. It is kept with what the
+    /// transcript is written from, so that the transcript written again, at another width or in another theme, writes it as it stands then.
+    unsafe fn write_card(&mut self, card: &Card) {
+        let recording = !self.replaying;
+        // (a question or a plan is for the person, and is seen: the view goes to it. The files an answer changed come under it, and the view goes there only if it was at the end; a notice is the same)
+        let attention = !matches!(card, Card::Files { .. } | Card::Notice { .. });
+        let at_the_end = recording && !self.opening && self.transcript_at_end();
+        if recording {
+            self.close_run();
+            self.end_line();
+            self.room_over_a_block();
+            self.shown.push(Shown::Card(card.clone()));
+        }
+        // (what goes in is the card's own: none of it is a part of the transcript's record)
+        let held = std::mem::replace(&mut self.replaying, true);
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        match card {
+            Card::Question { question, options, state, .. } => {
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                self.card_row(&[t("Question")], 8, theme::muted(), 26, false);
+                let lines: Vec<&str> = question.lines().collect();
+                self.card_row(&lines, 11, theme::text(), 40, false);
+                match state {
+                    AnswerState::Waiting => {
+                        self.card_room(s(8), Vec::new());
+                        for (at, (label, meaning)) in options.iter().enumerate() {
+                            let suggested = if at == 0 { t("Suggested") } else { "" };
+                            let part = CardPart { text: choice_text(at + 1, suggested, label, meaning), kind: ButtonKind::Choice, act: CardAct::Choose(label.clone()), width: 0, tip: String::new() };
+                            self.card_room(s(if meaning.is_empty() { 36 } else { 52 }), vec![part]);
+                            self.card_room(s(5), Vec::new());
+                        }
+                        let send = t("Send");
+                        let width = text_width(self.fonts.strong, send) + s(ds::size::BUTTON_PADDING);
+                        let frame = CardPart { text: t("Write your own answer…").to_string(), kind: ButtonKind::Frame, act: CardAct::FocusField, width: 0, tip: String::new() };
+                        let button = CardPart { text: send.to_string(), kind: ButtonKind::Primary, act: CardAct::SendOwn, width, tip: String::new() };
+                        self.card_room(s(ds::size::CONTROL + 2), vec![frame, button]);
                     }
+                    AnswerState::Answered(words) => self.card_row(&[&tf("Your answer: {0}", &[words])], 10, theme::accent(), 60, false),
+                    AnswerState::Unanswered => self.card_row(&[t("Not answered")], 10, theme::muted(), 60, false),
+                }
+                self.card_room(s(12), Vec::new());
+            }
+            Card::Plan { plan, state, .. } => {
+                // The plan as the transcript writes an answer, Markdown and all, under a word that says what it is; and under it a card with what can be done with it, or what was.
+                self.append(&format!("{}\n", t("Plan")), Style::Tool);
+                self.line_start = true;
+                self.append_answer(plan);
+                self.finish_answer();
+                self.append("\n", Style::Gap);
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                match state {
+                    PlanState::Waiting => {
+                        let button = |text: &str, kind: ButtonKind, act: CardAct, fonts: &Fonts| CardPart { text: text.to_string(), kind, act, width: text_width(fonts.strong, text) + s(ds::size::BUTTON_PADDING), tip: String::new() };
+                        let parts = vec![button(t("Carry it out"), ButtonKind::Primary, CardAct::Carry, &self.fonts), button(t("Change…"), ButtonKind::Secondary, CardAct::Change, &self.fonts)];
+                        self.card_room(s(ds::size::CONTROL), parts);
+                    }
+                    PlanState::Approved => self.card_row(&[t("Approved")], 10, theme::accent(), 60, false),
+                    PlanState::Changes(change) => self.card_row(&[&tf("Change requested: {0}", &[change])], 10, theme::warn(), 60, false),
+                    PlanState::Undecided => self.card_row(&[t("Not decided")], 10, theme::muted(), 60, false),
+                }
+                self.card_room(s(12), Vec::new());
+            }
+            Card::Notice { wakes, at } => {
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                let label = if at.is_empty() { t("Notice").to_string() } else { format!("{}  ·  {at}", t("Notice")) };
+                self.card_row(&[&label], 8, theme::muted(), 26, false);
+                for wake in wakes {
+                    let row = cards::notice_row(wake);
+                    self.card_row(&[&row.title], 10, theme::accent(), 34, false);
+                    self.card_row(&[&row.what], 11, theme::text(), 30, false);
+                    self.card_row(&[&row.how], 10, if row.failed { theme::warn() } else { theme::muted() }, 44, false);
+                }
+                self.card_room(s(12), Vec::new());
+            }
+            Card::Files { turn, rows, more, added, removed } => {
+                let count = rows.len() + more;
+                let files = if count == 1 { t("1 file").to_string() } else { tf("{0} files", &[&count]) };
+                let words = format!("{}  ·  {files}  ·  +{added}  \u{2212}{removed}", t("Changed in this answer"));
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                self.card_row(&[&words], 8, theme::muted(), 26, false);
+                self.card_room(s(4), Vec::new());
+                let widest = cards::most_changed(rows);
+                for (at, row) in rows.iter().enumerate() {
+                    let (green, red) = cards::bar(row.added, row.removed, widest);
+                    // (a file that is gone, or that is a program, is shown in Explorer and not opened)
+                    let (icon, tip) = if cards::opens_in_app(&row.path) && self.workspace.join(&row.path).is_file() { ("external-link", t("Open in its app")) } else { ("folder", t("Show in Explorer")) };
+                    let file = CardPart { text: file_row_text(row.added, row.removed, green, red, &row.path), kind: ButtonKind::FileRow, act: CardAct::OpenDiff(*turn, at), width: 0, tip: String::new() };
+                    let open = CardPart { text: icon.to_string(), kind: ButtonKind::Icon, act: CardAct::OpenFile(*turn, at), width: s(ds::size::ICON_BUTTON), tip: tip.to_string() };
+                    self.card_room(s(30), vec![file, open]);
+                }
+                if *more > 0 {
+                    let rest = CardPart { text: tf("and {0} more", &[more]), kind: ButtonKind::Ghost, act: CardAct::MoreFiles(*turn), width: 0, tip: String::new() };
+                    self.card_room(s(28), vec![rest]);
+                }
+                self.card_room(s(12), Vec::new());
+            }
+        }
+        // (a table that ends the document has its last row drawn apart from the rest: a line after it, which is the room under a card anyway)
+        self.append("
+", Style::Gap);
+        self.replaying = held;
+        self.line_start = true;
+        self.para_next = Some(Para::AfterBlock);
+        if recording && !self.opening {
+            if attention || at_the_end {
+                self.follow_end = true;
+                self.scrolled_up_at = None;
+                self.want_frames();
+            }
+            self.place_thumb();
+        }
+    }
+
+    /// The card with this number in the state `settle` leaves it in: the transcript is written again with it.
+    unsafe fn settle_card(&mut self, id: u64, settle: impl FnOnce(&mut Card)) {
+        let found = self.shown.iter_mut().find_map(|item| match item {
+            Shown::Card(card) if card.id() == Some(id) => Some(card),
+            _ => None,
+        });
+        if let Some(card) = found {
+            settle(card);
+            self.reflow();
+        }
+    }
+
+    /// Cards that still wait, when the turn that asked has ended: unanswered.
+    unsafe fn settle_waiting_cards(&mut self) {
+        let mut changed = false;
+        for item in &mut self.shown {
+            match item {
+                Shown::Card(Card::Question { state, .. }) if *state == AnswerState::Waiting => {
+                    *state = AnswerState::Unanswered;
+                    changed = true;
+                }
+                Shown::Card(Card::Plan { state, .. }) if *state == PlanState::Waiting => {
+                    *state = PlanState::Undecided;
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        if changed {
+            self.reset_composer_cue();
+            self.reflow();
+        }
+    }
+
+    /// The answer to the model's question: by a press on a choice, by what was written in the card's field, or by what was typed in the composer. `false`: nothing asks.
+    unsafe fn answer_question(&mut self, words: &str) -> bool {
+        let Some(asked) = self.question.take() else { return false };
+        let words = words.trim().to_string();
+        self.reset_composer_cue();
+        let said = words.clone();
+        self.settle_card(asked.card, |card| {
+            if let Card::Question { state, .. } = card {
+                *state = AnswerState::Answered(said);
+            }
+        });
+        let sent = asked.answer.send(words).is_ok();
+        self.set_activity(t("Thinking…").into());
+        self.update_buttons();
+        InvalidateRect(self.side, std::ptr::null(), 0);
+        self.focus_composer();
+        sent
+    }
+
+    /// The decision on the plan: by a press on Carry it out, or by what was typed. `Err`: what to change. `false`: no plan waits.
+    unsafe fn decide_plan(&mut self, decision: Result<(), String>) -> bool {
+        let Some(asked) = self.plan_review.take() else { return false };
+        let state = match &decision {
+            Ok(()) => PlanState::Approved,
+            Err(change) => PlanState::Changes(change.trim().to_string()),
+        };
+        self.settle_card(asked.card, |card| {
+            if let Card::Plan { state: kept, .. } = card {
+                *kept = state;
+            }
+        });
+        self.reset_composer_cue();
+        let sent = asked.answer.send(decision).is_ok();
+        self.set_activity(t("Thinking…").into());
+        self.update_buttons();
+        InvalidateRect(self.side, std::ptr::null(), 0);
+        self.focus_composer();
+        sent
+    }
+
+    /// Change, on the plan: the composer says what it is for, and what is written in it next is the change asked for.
+    unsafe fn plan_change_asked(&mut self) {
+        if let Some(asked) = &mut self.plan_review {
+            asked.changing = true;
+            set_text(self.composer_cue, t("What should change in the plan?"));
+            self.update_composer_cue();
+            self.focus_composer();
+        }
+    }
+
+    /// The composer's own hint again.
+    unsafe fn reset_composer_cue(&mut self) {
+        set_text(self.composer_cue, t("Message Dogmind"));
+    }
+
+    /// What was written in the composer, as the answer; with nothing written it is where to write it.
+    unsafe fn card_pressed_own(&mut self) {
+        let words = get_text(self.composer);
+        if words.trim().is_empty() {
+            self.focus_composer();
+        } else {
+            set_text(self.composer, "");
+            self.composer_typed_at = None;
+            self.answer_question(&words);
+        }
+    }
+
+    /// The turns of the session just opened: for each that saved files, what it changed is asked for, and its card goes where its answer ended, before the next person's words or at the end.
+    unsafe fn turns_for_cards(&mut self, turns: &[dogmind_agent::checkpoint::Turn]) {
+        self.turn_cards_waiting.clear();
+        self.turn_cards_came.clear();
+        for turn in turns.iter().filter(|turn| !turn.files.is_empty()) {
+            // (one whose words are no longer in the conversation, as a compaction took them, has no place in it)
+            let Some(slot) = turn.message.and_then(|message| cards::place_of_turn(&self.turn_slots, self.turn_end_slot, message)) else { continue };
+            self.turn_cards_waiting.insert(turn.id, slot);
+            let _ = self.agent.commands.send(Command::TurnChanges(turn.id));
+        }
+    }
+
+    /// The card of what a turn of a session opened again changed, where its answer ended: put in what the transcript is written from, one reply at a time as they come (the places of
+    /// the others are not moved by it: `cards::card_position`), and the transcript written again a moment after the last that came together.
+    unsafe fn put_turn_card(&mut self, slot: usize, turn: u64, files: &[dogmind_agent::tools::FileChange]) {
+        let at = cards::card_position(&self.turn_cards_came, slot, turn).min(self.shown.len());
+        self.turn_cards_came.push((slot, turn));
+        self.shown.insert(at, Shown::Card(Card::files(turn, files)));
+        // (a block being written is a place in the list too)
+        if let Some(open) = self.open_block.as_mut().filter(|open| **open >= at) {
+            *open += 1;
+        }
+        SetTimer(self.window, TIMER_REFLOW, 60, None);
+    }
+
+    /// Whether the view is at the end of the transcript, or there is nothing to scroll.
+    unsafe fn transcript_at_end(&self) -> bool {
+        let mut bar: SCROLLINFO = std::mem::zeroed();
+        bar.cbSize = std::mem::size_of::<SCROLLINFO>() as u32;
+        bar.fMask = SIF_ALL;
+        GetScrollInfo(self.transcript, SB_VERT, &mut bar);
+        bar.nPage == 0 || bar.nPos + bar.nPage as i32 + 4 >= bar.nMax
+    }
+
+    /// The files an answer changed, on the Changes page: with the diff of file `at` of its card in view, or from the first.
+    unsafe fn open_turn_diff(&mut self, turn: u64, at: usize) {
+        let Some(files) = self.turn_changes.get(&turn).cloned() else { return };
+        self.turn_view = Some(files);
+        self.change_wanted = Some(at);
+        self.set_panel(Panel::Diff);
+    }
+
+    /// A file of an answer's card, in its own app, or shown in Explorer when it is a program (which the app does not run), or no longer there.
+    unsafe fn open_turn_file(&mut self, turn: u64, at: usize) {
+        let Some(path) = self.turn_changes.get(&turn).and_then(|files| files.get(at)).map(|file| file.path.clone()) else { return };
+        let file = self.workspace.join(&path);
+        let (verb, target, arguments) = if file.is_file() && cards::opens_in_app(&path) {
+            ("open", file.to_string_lossy().replace('/', "\\"), String::new())
+        } else if file.is_file() {
+            ("open", "explorer.exe".to_string(), format!("/select,\"{}\"", file.to_string_lossy().replace('/', "\\")))
+        } else {
+            // (gone: the folder it was in)
+            ("open", "explorer.exe".to_string(), format!("\"{}\"", file.parent().unwrap_or(&self.workspace).to_string_lossy().replace('/', "\\")))
+        };
+        let (verb, target, arguments) = (wide(verb), wide(&target), wide(&arguments));
+        ShellExecuteW(self.window, verb.as_ptr(), target.as_ptr(), if arguments.len() > 1 { arguments.as_ptr() } else { std::ptr::null() }, std::ptr::null(), SW_SHOWNORMAL);
+    }
+
+    unsafe fn card_pressed(&mut self, slot: usize, part: usize) {
+        let Some(act) = self.card_slots.get(slot).and_then(|room| room.parts.get(part)).map(|part| part.act.clone()) else { return };
+        match act {
+            CardAct::Choose(label) => {
+                self.answer_question(&label);
+            }
+            CardAct::SendOwn => self.card_pressed_own(),
+            CardAct::FocusField => self.focus_composer(),
+            CardAct::Carry => {
+                self.decide_plan(Ok(()));
+            }
+            CardAct::Change => self.plan_change_asked(),
+            CardAct::OpenDiff(turn, at) => self.open_turn_diff(turn, at),
+            CardAct::OpenFile(turn, at) => self.open_turn_file(turn, at),
+            CardAct::MoreFiles(turn) => self.open_turn_diff(turn, 0),
+        }
+    }
+
+    /// What an icon does.
+    unsafe fn overlay_act(&mut self, key: OverlayKey) {
+        match key {
+            OverlayKey::Copy(at) => self.copy_answer(at),
+            OverlayKey::Fork(at) => self.fork_from_answer(at),
+            OverlayKey::Block(at) => self.copy_block(at),
+            OverlayKey::Run(at) => self.toggle_run(at),
+            OverlayKey::Card(slot, part) => self.card_pressed(slot, part),
+            OverlayKey::Picture(block, at) => {
+                if let Some(path) = self.picture_blocks.get(block).and_then(|block| block.paths.get(at)).cloned() {
+                    self.open_picture(&path);
                 }
             }
         }
-        for slot in 0..PICTURE_POOL {
-            let window = self.picture_windows[slot];
-            let Some((path, room, place)) = wanted.get(slot) else {
-                if self.picture_shown[slot].take().is_some() {
-                    show(window, false);
+    }
+
+    /// What an icon says of itself: in a tip, and to a screen reader.
+    fn overlay_words(&self, key: OverlayKey) -> String {
+        match key {
+            OverlayKey::Copy(_) => t("Copy this answer").to_string(),
+            OverlayKey::Fork(_) => t("Branch from here: a new session with the conversation up to this answer").to_string(),
+            OverlayKey::Block(_) => t("Copy this code").to_string(),
+            OverlayKey::Run(_) => t("Show or hide these calls").to_string(),
+            OverlayKey::Card(slot, part) => self.card_slots.get(slot).and_then(|room| room.parts.get(part)).map_or(String::new(), card_part_words),
+            OverlayKey::Picture(block, at) => self.picture_blocks.get(block).and_then(|block| block.paths.get(at)).map_or(String::new(), |path| file_name_of(path)),
+        }
+    }
+
+    /// The icons of the answers, code blocks and rows of calls in view, each where it stands now: the places come from the text, asked for from the last one up to the first above the view.
+    /// What is in view is the same set whatever has moved it, which is the point of asking at the moment of drawing.
+    unsafe fn overlays_in_view(&mut self) -> Vec<OverlayHit> {
+        let mut found = Vec::new();
+        if self.panel != Panel::Chat || !self.has_messages {
+            return found;
+        }
+        let dpi = self.dpi;
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(self.transcript, &mut client);
+        let height = client.bottom;
+        let ask = |char_at: i32| {
+            let mut point = POINT { x: 0, y: 0 };
+            SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, char_at as LPARAM);
+            point
+        };
+        // The answers: a copy icon at the row's start, and the branch icon beside it.
+        let size = scale(dpi, ds::size::ICON_BUTTON);
+        let forks = self.current_session.is_some();
+        for at in (0..self.answers.len()).rev() {
+            let point = ask(self.answers[at].0);
+            if point.y < -size {
+                break;
+            }
+            if point.y < height {
+                let left = point.x - scale(dpi, 2);
+                found.push(OverlayHit { area: rect(left, point.y, size, size), key: OverlayKey::Copy(at) });
+                if forks {
+                    found.push(OverlayHit { area: rect(left + size, point.y, size, size), key: OverlayKey::Fork(at) });
+                }
+            }
+        }
+        // The blocks of code: at the top right of each, inside it.
+        let size = scale(dpi, 24);
+        let x = self.transcript_rect.1 - GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) * 3 / 5 - size - scale(dpi, 4);
+        for at in (0..self.blocks.len()).rev() {
+            if !self.blocks[at].found {
+                self.blocks[at].at = text_start(self.transcript, self.blocks[at].at);
+                self.blocks[at].found = true;
+            }
+            let point = ask(self.blocks[at].at);
+            if point.y < -size {
+                break;
+            }
+            if point.y < height && !self.blocks[at].text.is_empty() {
+                found.push(OverlayHit { area: rect(x, point.y + scale(dpi, 1), size, size), key: OverlayKey::Block(at) });
+            }
+        }
+        // The rows of calls that have more to show: at the end of their words.
+        let size = scale(dpi, 20);
+        for at in (0..self.runs.len()).rev() {
+            if self.runs[at].first < 0 {
+                continue;
+            }
+            let point = ask(self.runs[at].head_end);
+            if point.y < -size {
+                break;
+            }
+            if self.runs[at].expandable() && point.y < height {
+                found.push(OverlayHit { area: rect(point.x + scale(dpi, 4), point.y + scale(dpi, 4), size, size), key: OverlayKey::Run(at) });
+            }
+        }
+        // The controls of the cards: each row of a card's room has its parts across it, from where the row begins, a part with no width of its own taking what is left. (The room's width is the
+        // card's, less the space its rows keep at each side of their words: as much at the right as the first of its words stands from the card's left edge.)
+        let (left_edge, right_edge) = (self.transcript_rect.0, self.column_right - self.transcript_area.left);
+        let gap = scale(dpi, ds::space::S);
+        for at in (0..self.card_slots.len()).rev() {
+            let room = &self.card_slots[at];
+            let point = ask(room.start);
+            if point.y + room.tall <= 0 {
+                break;
+            }
+            if point.y >= height {
+                continue;
+            }
+            let total = (right_edge - (point.x - left_edge) - point.x).max(scale(dpi, 120));
+            let fixed: i32 = room.parts.iter().map(|part| part.width).sum::<i32>() + gap * (room.parts.len() as i32 - 1);
+            let rest = (total - fixed).max(scale(dpi, 60));
+            let mut x = point.x;
+            for (place, part) in room.parts.iter().enumerate() {
+                let width = if part.width == 0 { rest } else { part.width };
+                found.push(OverlayHit { area: rect(x, point.y, width, room.tall), key: OverlayKey::Card(at, place) });
+                x += width + gap;
+            }
+        }
+        // The pictures of the messages: each tile where its card's room is in this frame (the place of the room's character is its top, and the card has its padding there).
+        let mut wanted: Vec<(PathBuf, (i32, i32))> = Vec::new();
+        for at in (0..self.picture_blocks.len()).rev() {
+            let block = &self.picture_blocks[at];
+            let point = ask(block.start);
+            if point.y + block.tiles.total_height() < 0 {
+                break;
+            }
+            if point.y >= height {
+                continue;
+            }
+            for (index, path) in block.paths.iter().enumerate() {
+                let (x, y) = block.tiles.at(index);
+                let area = picture_area(point, (x, y), (block.tiles.width, block.tiles.height), dpi);
+                if tile_is_in_view(&area, height) && wanted.len() < PICTURES_IN_VIEW {
+                    found.push(OverlayHit { area, key: OverlayKey::Picture(at, index) });
+                    wanted.push((path.clone(), (block.tiles.width, block.tiles.height)));
+                }
+            }
+        }
+        // (what the view wants is asked for, or kept from being forgotten, before any of it is drawn)
+        self.thumb_wanted = wanted.iter().cloned().collect();
+        for (path, room) in wanted {
+            self.thumb_of(&path, room);
+        }
+        found
+    }
+
+    /// The icons, in the transcript's paint: after the text, in the same device context, each where the text has put its place in this very frame. They are part of the pixels the host
+    /// moves when it scrolls them, and the band that comes into view is drawn with its own. Whatever the pointer or the keys have done to one shows in its colour.
+    /// `dx`, `dy`: where the transcript's own pixels are in `device` (the bitmap of the area drawn, or the window itself).
+    unsafe fn paint_overlay_icons(&mut self, device: HDC, dx: i32, dy: i32) {
+        self.overlay_hits = self.overlays_in_view();
+        let dpi = self.dpi;
+        let focused = {
+            let focus = GetFocus();
+            self.proxies.iter().position(|proxy| *proxy == focus).and_then(|at| self.proxy_keys[at])
+        };
+        let ring = focused.is_some() && keys_are_in_use();
+        // (drawing a picture may ask for its small copy, which is the app's to keep: the list is taken out while it is drawn from)
+        let hits = std::mem::take(&mut self.overlay_hits);
+        for hit in &hits {
+            let key = hit.key;
+            let area = RECT { left: hit.area.left + dx, top: hit.area.top + dy, right: hit.area.right + dx, bottom: hit.area.bottom + dy };
+            let pressed = self.overlay_press == Some(key) && self.overlay_hover == Some(key);
+            let lit = self.overlay_hover == Some(key);
+            if let OverlayKey::Card(slot, part) = key {
+                if let Some(part) = self.card_slots.get(slot).and_then(|room| room.parts.get(part)) {
+                    // (the card's field is the composer: its frame is lit while the composer has the focus and the question waits for what is written in it)
+                    let composer = part.kind == ButtonKind::Frame && self.question.is_some() && GetFocus() == self.composer;
+                    paint_button(device, area, part.kind, &part.text, theme::code_back(), lit || composer, pressed, ring && focused == Some(key));
                 }
                 continue;
+            }
+            if let OverlayKey::Picture(block, index) = key {
+                let Some((path, room)) = self.picture_blocks.get(block).and_then(|block| block.paths.get(index).map(|path| (path.clone(), (block.tiles.width, block.tiles.height)))) else { continue };
+                let thumb = self.thumb_of(&path, room);
+                draw_tile(device, area, &thumb, false, &self.fonts);
+                // (the picture's own edge, which is the tile's where it is still being read; it stands from the tile's top left)
+                let edge = match thumb {
+                    Thumb::Ready { width, height, .. } => RECT { left: area.left, top: area.top, right: area.left + width, bottom: area.top + height },
+                    _ => area,
+                };
+                if lit || pressed {
+                    rounded(device, edge, scale(dpi, ds::radius::SMALL), None, Some(theme::accent()));
+                }
+                if ring && focused == Some(key) {
+                    // (two lines, as a picture's colours are anything: one would be lost against some)
+                    for inset in [1, 2] {
+                        rounded(device, RECT { left: edge.left + inset, top: edge.top + inset, right: edge.right - inset, bottom: edge.bottom - inset }, scale(dpi, ds::radius::SMALL) - inset, None, Some(theme::accent()));
+                    }
+                }
+                continue;
+            }
+            let copied = self.overlay_copied == Some(key);
+            let name = match key {
+                OverlayKey::Copy(_) | OverlayKey::Block(_) if copied => "check",
+                OverlayKey::Copy(_) | OverlayKey::Block(_) => "copy",
+                OverlayKey::Fork(_) => "git-branch",
+                OverlayKey::Run(at) if self.runs[at].expanded => "chevron-down",
+                OverlayKey::Run(_) | OverlayKey::Card(..) | OverlayKey::Picture(..) => "chevron-right",
             };
-            if self.picture_shown[slot].as_ref().is_none_or(|(known, known_room)| known != path || known_room != room) {
-                self.picture_shown[slot] = Some((path.clone(), *room));
-                let thumb = self.thumb_of(path, *room);
-                set_thumb(window, thumb);
-                let name = path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
-                self.tip(window, &name);
+            // As an icon button of the window draws: a shade under it when the pointer is on it, one up on a card of a block of code.
+            if lit || pressed {
+                rounded(device, area, scale(dpi, ds::radius::SMALL), Some(if pressed { theme::raised() } else { theme::surface() }), None);
             }
-            let area = self.transcript_area;
-            let (width, tall) = (place.right - place.left, place.bottom - place.top);
-            let (left, top) = (area.left + place.left, area.top + place.top);
-            let showing = IsWindowVisible(window) != 0;
-            if !showing || child_area(window, self.window) != (left, top, width, tall) {
-                SetWindowPos(window, HWND_TOP, left, top, width, tall, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
+            let color = if icons_marked() { 0x00FF_00FF } else if name == "check" { theme::good() } else if lit || pressed { theme::text() } else { theme::faint() };
+            icon::draw(device, name, area, scale(dpi, ds::size::ICON), color);
+            if ring && focused == Some(key) {
+                rounded(device, RECT { left: area.left + 1, top: area.top + 1, right: area.right - 1, bottom: area.bottom - 1 }, scale(dpi, ds::radius::SMALL), None, Some(theme::accent()));
             }
-            // (it would lie over the header or the composer past the transcript's edge)
-            let cut = ((area.top - top).max(0), (top + tall - area.bottom).max(0));
-            if cut != self.picture_cut[slot] {
-                self.picture_cut[slot] = cut;
-                SetWindowRgn(window, if cut == (0, 0) { std::ptr::null_mut() } else { CreateRectRgn(0, cut.0, width, tall - cut.1) }, 1);
+        }
+        self.overlay_hits = hits;
+        if test_log_on() {
+            let mut position = POINT { x: 0, y: 0 };
+            SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
+            let drawn: Vec<String> = self.overlay_hits.iter().map(|hit| match hit.key {
+                // (what a control of a card says: a test finds the one it presses by it)
+                OverlayKey::Card(..) => format!("{:?}@{},{}<{}>", hit.key, hit.area.left, hit.area.top, self.overlay_words(hit.key)),
+                OverlayKey::Picture(..) => format!("{:?}@{},{},{},{}", hit.key, hit.area.left, hit.area.top, hit.area.right - hit.area.left, hit.area.bottom - hit.area.top),
+                _ => format!("{:?}@{},{}", hit.key, hit.area.left, hit.area.top),
+            }).collect();
+            test_log(&format!("icons scroll_y={} dpi={} area={},{},{} {} [hover {:?} press {:?} focus {:?}]", position.y, dpi, self.transcript_area.left, self.transcript_area.top, self.transcript_area.bottom, drawn.join(" "), self.overlay_hover, self.overlay_press, focused));
+        }
+        // (what stands over the transcript is told of a moment after the view has come to rest)
+        SetTimer(self.window, TIMER_PROXIES, 150, None);
+        self.keep_overlay_tip();
+    }
+
+    /// The icon under a point of the transcript, as it was drawn.
+    fn overlay_at(&self, x: i32, y: i32) -> Option<OverlayKey> {
+        icon_under(&self.overlay_hits, x, y)
+    }
+
+    /// The pointer is at a point of the transcript: the icon under it is lit, and the one it left is not.
+    unsafe fn overlay_pointer(&mut self, x: i32, y: i32) {
+        let over = self.overlay_at(x, y);
+        if over == self.overlay_hover {
+            return;
+        }
+        let was = std::mem::replace(&mut self.overlay_hover, over);
+        if test_log_on() {
+            test_log(&format!("hover {was:?} -> {over:?} at {x},{y}"));
+        }
+        for key in [was, over].into_iter().flatten() {
+            self.invalidate_overlay(key);
+        }
+        self.keep_overlay_tip();
+    }
+
+    /// The pointer's place again, from where it is, after the view has moved under it.
+    unsafe fn overlay_pointer_again(&mut self) {
+        let mut point = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut point);
+        ScreenToClient(self.transcript, &mut point);
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(self.transcript, &mut client);
+        let inside = point.x >= 0 && point.y >= 0 && point.x < client.right && point.y < client.bottom;
+        if inside {
+            self.overlay_pointer(point.x, point.y);
+        }
+    }
+
+    /// The one tip of the icons stands over the icon the pointer is on, with its words; none where it is on none.
+    unsafe fn keep_overlay_tip(&mut self) {
+        let wanted = self.overlay_hover.and_then(|key| self.overlay_hits.iter().find(|hit| hit.key == key).map(|hit| (key, hit.area)));
+        let same = |a: &Option<(OverlayKey, RECT)>, b: &Option<(OverlayKey, RECT)>| match (a, b) {
+            (Some((key, area)), Some((other, place))) => key == other && same_rect(area, place),
+            (None, None) => true,
+            _ => false,
+        };
+        if same(&wanted, &self.overlay_tip_for) {
+            return;
+        }
+        let mut tool: TTTOOLINFOW = std::mem::zeroed();
+        tool.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        tool.hwnd = self.transcript;
+        tool.uId = OVERLAY_TIP;
+        if self.overlay_tip_for.is_some() {
+            SendMessageW(self.tooltip, TTM_DELTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
+        }
+        if let Some((key, area)) = wanted {
+            // (a control of a card says what it is by its own words, and has a tip only where it has one: an icon alone)
+            let words = match key {
+                OverlayKey::Card(slot, part) => self.card_slots.get(slot).and_then(|room| room.parts.get(part)).map_or(String::new(), |part| part.tip.clone()),
+                _ => self.overlay_words(key),
+            };
+            if !words.is_empty() {
+                if test_log_on() {
+                    test_log(&format!("tip {key:?} <{words}>"));
+                }
+                let words = wide(&words);
+                tool.uFlags = TTF_SUBCLASS;
+                tool.rect = area;
+                tool.lpszText = words.as_ptr() as *mut u16;
+                SendMessageW(self.tooltip, TTM_ADDTOOLW, 0, std::ptr::addr_of!(tool) as LPARAM);
             }
-            if !showing {
-                show(window, true);
+        }
+        self.overlay_tip_for = wanted;
+    }
+
+    /// The hidden controls say what the icons in view are, top to bottom: Tab goes to each, a screen reader reads its words, and Enter or Space does what the icon does.
+    unsafe fn sync_proxies(&mut self) {
+        let keys = proxy_order(&self.overlay_hits);
+        let (left, top) = (self.transcript_area.left + 1, self.transcript_area.top);
+        for slot in 0..PROXY_POOL {
+            let proxy = self.proxies[slot];
+            match keys.get(slot) {
+                Some(key) => {
+                    let words = self.overlay_words(*key);
+                    if get_text(proxy) != words {
+                        set_text(proxy, &words);
+                    }
+                    // (a place in the order of the page's controls, and no size)
+                    SetWindowPos(proxy, std::ptr::null_mut(), left, top + slot as i32, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE);
+                    self.proxy_keys[slot] = Some(*key);
+                    if IsWindowVisible(proxy) == 0 {
+                        show(proxy, true);
+                    }
+                }
+                None => {
+                    self.proxy_keys[slot] = None;
+                    if IsWindowVisible(proxy) != 0 && GetFocus() != proxy {
+                        show(proxy, false);
+                    }
+                }
             }
         }
     }
@@ -4690,7 +5520,34 @@ impl App {
                     self.say(t("Copied the last answer."));
                 }
             }
-            "diff" => self.set_panel(Panel::Diff),
+            "diff" => {
+                self.trajectory = None;
+                self.set_panel(Panel::Diff);
+            }
+            // (the bar under the title is where the goal is seen: none of the three writes a line in the conversation, but where there is no goal to show or to clear, which says how to set one)
+            "goal" => match cards::goal_action(argument, self.goal.as_deref()) {
+                cards::GoalAction::Set(goal) => {
+                    let _ = self.agent.commands.send(Command::SetGoal(Some(goal)));
+                }
+                cards::GoalAction::Clear => {
+                    let _ = self.agent.commands.send(Command::SetGoal(None));
+                }
+                // (the goal in the composer, as it was set, to read in full or to change and send)
+                cards::GoalAction::Edit(goal) => {
+                    set_text(self.composer, &format!("/goal {goal}"));
+                    SendMessageW(self.composer, EM_SETSEL, usize::MAX, -1);
+                    self.focus_composer();
+                }
+                cards::GoalAction::None => self.say(t("No goal is set: /goal text sets one.")),
+            },
+            // (the trajectory of this session as a table: a page of its own, with the turns that open into their requests and tools)
+            "trajectory" => match self.current_session.as_deref().map(dogmind_agent::trajectory::file_of) {
+                Some(file) if file.exists() => match dogmind_agent::trajectory_report::summary_file(&file) {
+                    Ok(summary) => self.show_trajectory(summary),
+                    Err(error) => self.say(&tf("The trajectory cannot be read: {0}", &[&error])),
+                },
+                _ => self.say(t("This session has no trajectory yet: it is written as the session runs.")),
+            },
             "usage" => {
                 let (prompt, cached, completion, requests) = self.totals;
                 let rate = self.rate.map_or(String::new(), |rate| tf(", last answer at {0} tok/s", &[&format!("{rate:.1}")]));
@@ -4735,6 +5592,7 @@ impl App {
                 }
             }
             "panel" => self.toggle_right_panel(),
+            "files" => self.show_files_view(),
             "preview" => {
                 let wanted = if argument.is_empty() { self.preview_candidate() } else { Some(argument.to_string()) };
                 match wanted {
@@ -4804,19 +5662,20 @@ impl App {
         let provider = self.settings.active_provider().map_or(String::new(), |provider| provider.name.clone());
         // (which provider is in the menu: the name of the model is what changes, and what there is room for)
         let label = if self.model.is_empty() { provider } else { self.model.clone() };
-        set_text(self.model_chip, &label);
+        // (said again for every note of a download that goes by on the status line: a chip given the words it has is drawn again for nothing)
+        set_text_if_changed(self.model_chip, &label);
         let mode = self.current_mode();
         let name = MODES.iter().find(|(known, _)| *known == mode).map_or("", |(_, name)| name);
-        set_text(self.mode_chip, t(name));
+        set_text_if_changed(self.mode_chip, t(name));
         let efforts = self.efforts();
         let effort = efforts.iter().find(|(known, _)| *known == self.settings.effort.as_deref()).map_or("Default", |(_, name)| name);
-        set_text(self.effort_chip, &tf("Effort: {0}", &[&t(effort)]));
+        set_text_if_changed(self.effort_chip, &tf("Effort: {0}", &[&t(effort)]));
     }
 
     unsafe fn update_status(&mut self) {
         self.update_chips();
         let title = if self.workspace == Path::new(".") { "Dogmind".to_string() } else { format!("Dogmind — {}", self.workspace.file_name().map_or_else(|| self.workspace.display().to_string(), |name| name.to_string_lossy().into_owned())) };
-        set_text(self.window, &title);
+        set_text_if_changed(self.window, &title);
         InvalidateRect(self.window, &self.status_area, 0);
     }
 
@@ -4859,7 +5718,8 @@ impl App {
         let looking_at_changes = self.panel == Panel::Diff;
         let squeezed = looking_at_changes || (chat && !bare && self.preview_file.is_some() && width - s(ds::size::SIDEBAR_SMALL) < s(760));
         let sidebar = if bare || (squeezed && !looking_at_changes) { 0 } else if width < s(960) { s(ds::size::SIDEBAR_SMALL) } else { s(ds::size::SIDEBAR) };
-        self.sidebar_width = sidebar;
+        // (the trajectory's table has the whole window: there is no sidebar to fill)
+        self.sidebar_width = if looking_at_changes && self.trajectory.is_some() { 0 } else { sidebar };
         let inset = s(ds::space::S);
         let side_row = s(ds::size::SIDE_ROW);
         let side_width = sidebar - 2 * inset;
@@ -4896,8 +5756,14 @@ impl App {
         };
         self.right_width = right;
         self.right_hits.clear();
+        self.right_tab_hits.clear();
         self.preview_hits.clear();
+        self.waiting_hits.clear();
+        self.waiting_times.clear();
         self.dashboard_hit = None;
+        if !self.files_shown() {
+            self.files_hidden();
+        }
         if self.preview_file.is_none() || right == 0 {
             if let Some(shown) = &self.preview {
                 shown.hide();
@@ -4923,13 +5789,20 @@ impl App {
         for window in [self.composer, self.send, self.attach_button, self.model_chip, self.mode_chip, self.effort_chip] {
             show(window, chat);
         }
+        // The notice of a newer version, on the pages that have it; what is not there is hidden, once, and not hidden and shown again by every layout.
+        let notice = if notice::is_on_page(chat, looking_at_changes, bare) { self.notice() } else { None };
+        if notice.is_none() {
+            for window in [self.update_offer_button, self.release_offer_button, self.notice_later] {
+                show(window, false);
+            }
+        }
+        let notice_room = if notice.is_some() { self.notice_height() + s(ds::space::S) } else { 0 };
         if !chat {
             for window in &self.attached_windows {
                 show(*window, false);
             }
             show(self.vision_offer_button, false);
-            show(self.update_offer_button, false);
-            show(self.release_offer_button, false);
+            show(self.goal_clear, false);
         }
         show(self.help_button, !bare && !squeezed);
         show(self.suggest, chat && !self.suggestions.is_empty());
@@ -4974,9 +5847,9 @@ impl App {
             let card_top = foot;
             let status_top = card_top + card_height + s(ds::space::XS);
             let above = card_top - waiting_height;
-            if !self.has_messages && above - greeting_height >= s(40) {
+            if !self.has_messages && above - greeting_height >= s(40) + notice_room {
                 let title = GREETINGS[self.greeting];
-                let bubble_top = s(40) + (above - s(40) - greeting_height) / 2;
+                let bubble_top = s(40) + notice_room + (above - s(40) - notice_room - greeting_height) / 2;
                 let bubble_width = (text_width(self.fonts.greeting, title) + s(60)).min(column);
                 let area = rect(left + (column - bubble_width) / 2, bubble_top, bubble_width, bubble_height);
                 // The drawing fills its square's width, and is about 0.82 of it high, centred. Its line is about 5% of its width.
@@ -5008,11 +5881,10 @@ impl App {
             let chip = s(ds::size::ICON_BUTTON);
             // They give way to the send button in a narrow window.
             let room = column - s(100);
-            let fit = |chip: HWND, most: i32| (text_width(self.fonts.small, &get_text(chip)) + s(ds::size::BUTTON_PADDING)).min(most);
-            // The short ones keep their words as long as they can: the long name of a model is what gives way.
-            let mode_width = fit(self.mode_chip, s(140).min(room * 30 / 100));
-            let effort_width = fit(self.effort_chip, s(150).min(room * 30 / 100));
-            let model_width = fit(self.model_chip, s(300).min(room - mode_width - effort_width));
+            let want = |chip: HWND| text_width(self.fonts.small, &get_text(chip)) + s(ds::size::BUTTON_PADDING);
+            // The short ones keep their words (the mode's is never cut: "Plan first"): the long name of a model is what gives way.
+            // (less the gaps between the chips and a little to the send button)
+            let (mode_width, effort_width, model_width) = chip_widths(room - s(ds::space::HAIR) - s(ds::space::XS) - s(ds::space::M), want(self.mode_chip), want(self.effort_chip).min(s(260)), want(self.model_chip), s(300), s(60));
             place(self.attach_button, left + s(ds::space::S), row_top + s(ds::size::CHIP_INSET), chip, chip);
             let chips = left + s(ds::space::S) + chip + s(ds::space::HAIR);
             place(self.model_chip, chips, row_top + s(ds::size::CHIP_INSET), model_width, chip);
@@ -5072,35 +5944,6 @@ impl App {
             self.activity_area = rect(left, card_top - s(ds::size::TEXT_ROW), column, s(ds::size::TEXT_LINE));
             let mut bottom = card_top - s(ds::size::QUEUE_STEP);
             self.queue_hits.clear();
-            self.update_offer_close = None;
-            // (a new build over this one, or the setup of a release that was fetched and checked: the same row and the same button)
-            let ready_version = self.release_ready().map(|ready| ready.version.clone());
-            let update_shown = self.update_offer || ready_version.is_some();
-            show(self.update_offer_button, update_shown);
-            if update_shown {
-                let tall = s(ds::size::QUEUE_STEP) + s(ds::space::XS);
-                let row = rect(left, bottom - tall, column, tall);
-                shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
-                let (words, action) = match (&ready_version, self.restart_when_done, self.update_offer) {
-                    (_, true, _) => (t("It restarts into the new version when this work is done.").to_string(), t("Not now")),
-                    (Some(version), false, false) => (tf("Dogmind {0} is ready to install.", &[version]), t("Restart to update")),
-                    _ => (t("A new version is here.").to_string(), t("Restart to update")),
-                };
-                // (while the setup is read again before it is run, the button says so and waits)
-                let action = if self.checking_setup { t("Checking…") } else { action };
-                set_text_if_changed(self.update_offer_button, action);
-                EnableWindow(self.update_offer_button, i32::from(!self.checking_setup));
-                let cross = s(ds::space::XL);
-                let across = (text_width(self.fonts.body, action) + s(ds::space::XL)).max(s(72));
-                let button_x = left + column - cross - s(ds::space::XS) - across;
-                place(self.update_offer_button, button_x, row.top + (tall - s(ds::size::ICON_BUTTON)) / 2, across, s(ds::size::ICON_BUTTON));
-                SetWindowPos(self.update_offer_button, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                shapes.push(Shape::Text { area: rect(left + s(ds::space::M), row.top, (button_x - left - s(ds::space::L)).max(0), tall), text: words, font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
-                let close = rect(left + column - cross - s(ds::space::XS), row.top + (tall - cross) / 2, cross, cross);
-                shapes.push(Shape::Icon { name: "x", area: close, size: s(ds::space::M), color: theme::muted() });
-                self.update_offer_close = Some(close);
-                bottom -= tall + s(ds::space::XS);
-            }
             self.vision_offer_close = None;
             show(self.vision_offer_button, self.vision_offer.is_some());
             if let Some(offer) = self.vision_offer {
@@ -5108,7 +5951,7 @@ impl App {
                 let row = rect(left, bottom - tall, column, tall);
                 shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
                 let (words, action) = match offer {
-                    _ if self.setting_up => (t("Fetching the vision file.").to_string(), t("Cancel")),
+                    _ if self.setting_up && self.vision_fetch => (t("Fetching the vision file.").to_string(), t("Cancel")),
                     VisionOffer::Download(bytes) => (tf("Reading pictures takes a file of {0} that this model does not have yet.", &[&engine::gb_file(bytes)]), t("Download")),
                     VisionOffer::TurnOn => (t("Reading pictures is turned off.").to_string(), t("Turn on")),
                 };
@@ -5122,27 +5965,6 @@ impl App {
                 let close = rect(left + column - cross - s(ds::space::XS), row.top + (tall - cross) / 2, cross, cross);
                 shapes.push(Shape::Icon { name: "x", area: close, size: s(ds::space::M), color: theme::muted() });
                 self.vision_offer_close = Some(close);
-                bottom -= tall + s(ds::space::XS);
-            }
-            // A newer release than this one is out, found by the app's own look: said quietly, with its page. (A copy in an install fetches its setup, and then the row above says that.)
-            self.release_offer_close = None;
-            let offered = self.release_row().cloned();
-            show(self.release_offer_button, offered.is_some());
-            if let Some(release) = &offered {
-                let tall = s(ds::size::QUEUE_STEP) + s(ds::space::XS);
-                let row = rect(left, bottom - tall, column, tall);
-                shapes.push(Shape::Round { area: row, radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
-                let (words, action) = (tf("Dogmind {0} is available.", &[&release.version]), t("Open the release page"));
-                set_text_if_changed(self.release_offer_button, action);
-                let cross = s(ds::space::XL);
-                let across = (text_width(self.fonts.body, action) + s(ds::space::XL)).max(s(72));
-                let button_x = left + column - cross - s(ds::space::XS) - across;
-                place(self.release_offer_button, button_x, row.top + (tall - s(ds::size::ICON_BUTTON)) / 2, across, s(ds::size::ICON_BUTTON));
-                SetWindowPos(self.release_offer_button, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                shapes.push(Shape::Text { area: rect(left + s(ds::space::M), row.top, (button_x - left - s(ds::space::L)).max(0), tall), text: words, font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
-                let close = rect(left + column - cross - s(ds::space::XS), row.top + (tall - cross) / 2, cross, cross);
-                shapes.push(Shape::Icon { name: "x", area: close, size: s(ds::space::M), color: theme::muted() });
-                self.release_offer_close = Some(close);
                 bottom -= tall + s(ds::space::XS);
             }
             if !waiting.is_empty() {
@@ -5235,6 +6057,25 @@ impl App {
                 }
             }
             let mut top = strip;
+            // The session's goal, as a thin bar under its name, with a cross that clears it.
+            show(self.goal_clear, cards::goal_bar(self.goal.as_deref()).is_some());
+            if let Some(goal) = cards::goal_bar(self.goal.as_deref()) {
+                let bar = s(ds::size::TEXT_ROW);
+                top += s(ds::space::XS);
+                shapes.push(Shape::Round { area: rect(left, top, column, bar), radius: s(ds::radius::CONTROL), fill: Some(theme::surface()), border: None });
+                let label = t("Goal");
+                let label_width = text_width(self.fonts.small, label);
+                shapes.push(Shape::Text { area: rect(left + s(ds::space::M), top, label_width, bar), text: label.to_string(), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
+                let cross = s(ds::size::ICON_BUTTON) - s(ds::space::XS);
+                let words_left = left + s(ds::space::M) + label_width + s(ds::space::S);
+                shapes.push(Shape::Text { area: rect(words_left, top, (left + column - cross - words_left).max(0), bar), text: goal, font: FontKind::Small, color: theme::soft(), flags: ONE_LINE });
+                place(self.goal_clear, left + column - cross - s(ds::space::XS), top + (bar - cross) / 2, cross, cross);
+                top += bar + s(ds::space::XS);
+            }
+            if let Some(notice) = &notice {
+                top += s(ds::space::XS);
+                top += self.place_notice(&mut shapes, notice, left, column, top);
+            }
             if finding {
                 top += s(ds::space::XS);
                 let bar = s(ds::size::MENU_ROW);
@@ -5278,7 +6119,6 @@ impl App {
         if self.modal_open {
             self.layout_modal(width, height);
             self.shapes = shapes;
-            self.place_copy_buttons();
             InvalidateRect(self.window, std::ptr::null(), 0);
             return;
         }
@@ -5292,14 +6132,17 @@ impl App {
             for window in self.shared_controls() {
                 show(window, false);
             }
-            show(self.list, !self.list_rows.is_empty());
+            let table = self.trajectory.is_some();
+            show(self.list, !table && !self.list_rows.is_empty());
             // (nothing to go between)
             for window in [self.diff_previous, self.diff_next] {
-                show(window, !self.diff_starts.is_empty());
+                show(window, !table && !self.diff_starts.is_empty());
             }
             let head = s(ds::size::DIFF_HEAD);
-            shapes.push(Shape::Text { area: rect(inset + s(ds::space::M), 0, sidebar - 2 * inset - s(ds::space::M), head), text: self.panel_title.clone(), font: FontKind::Strong, color: theme::text(), flags: ONE_LINE });
-            place(self.list, inset, head, side_width, height - head - s(ds::space::S));
+            shapes.push(Shape::Text { area: rect(inset + s(ds::space::M), 0, if table { text_width(self.fonts.strong, &self.panel_title) + s(ds::space::XS) } else { sidebar - 2 * inset - s(ds::space::M) }, head), text: self.panel_title.clone(), font: FontKind::Strong, color: theme::text(), flags: ONE_LINE });
+            // (under the head, across the window; the files and the diff stand under it)
+            let under = head + notice.as_ref().map_or(0, |notice| self.place_notice(&mut shapes, notice, inset, width - 2 * inset, head));
+            place(self.list, inset, under, side_width, height - under - s(ds::space::S));
             let button = s(ds::size::ICON_BUTTON);
             let middle = (head - button) / 2;
             let mut x = width - s(ds::space::M) - button;
@@ -5307,13 +6150,14 @@ impl App {
                 place(window, x, middle, button, button);
                 x -= button + s(ds::space::XS);
             }
-            let file = self.diff_file.and_then(|at| self.changes.get(at)).map_or(String::new(), |change| change.path.clone());
-            shapes.push(Shape::Text { area: rect(sidebar + s(ds::space::L), 0, (x + button - sidebar - s(ds::space::XL)).max(0), head), text: file, font: FontKind::Body, color: theme::soft(), flags: (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
-            place(self.diff_view, sidebar, head, width - sidebar, height - head);
+            let file = if table { self.session_title.clone() } else { self.diff_file.and_then(|at| self.changes.get(at)).map_or(String::new(), |change| change.path.clone()) };
+            let from = if table { inset + s(ds::space::M) + text_width(self.fonts.strong, &self.panel_title) + s(ds::space::XL) } else { sidebar + s(ds::space::L) };
+            shapes.push(Shape::Text { area: rect(from, 0, (x + button - from - s(ds::space::XL)).max(0), head), text: file, font: FontKind::Body, color: theme::soft(), flags: (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
+            let across = if table { 0 } else { sidebar };
+            place(self.diff_view, across, under, width - across, height - under);
             self.clamp_diff();
             InvalidateRect(self.diff_view, std::ptr::null(), 0);
             self.shapes = shapes;
-            self.place_copy_buttons();
             InvalidateRect(self.window, std::ptr::null(), 0);
             return;
         }
@@ -5506,12 +6350,11 @@ impl App {
         show(self.doc, false);
         // A row kept lit is one that is still there.
         if let Some(row) = self.hover_row {
-            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).any(|area| same_rect(area, &row)) {
+            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.right_tab_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).chain(self.waiting_hits.iter().map(|(area, _)| area)).any(|area| same_rect(area, &row)) {
                 self.hover_row = None;
             }
         }
         self.shapes = shapes;
-        self.place_copy_buttons();
         InvalidateRect(self.window, std::ptr::null(), 0);
     }
 
@@ -6408,6 +7251,114 @@ impl App {
         self.changes.iter().map(|change| change.path.clone()).find(|path| preview::is_page(path)).or_else(|| self.workspace.join("index.html").is_file().then(|| "index.html".to_string()))
     }
 
+    /// How many rows the list of what waits takes in the panel on the right: its heading, a row for each command and each wait (a second for what a command waits to read), what has stopped
+    /// waking, and the line that says these end with the app. At most so many are listed.
+    fn background_rows(&self) -> usize {
+        if self.waiting.is_empty() {
+            return 0;
+        }
+        let listed = |count: usize| count.min(WAITING_LISTED);
+        let commands = self.waiting.commands.iter().take(WAITING_LISTED).map(|command| 1 + usize::from(command.watching_for.is_some())).sum::<usize>();
+        let (more_commands, more_waits) = (self.waiting.commands.len() > WAITING_LISTED, self.waiting.waits.len() > WAITING_LISTED);
+        1 + commands + listed(self.waiting.waits.len()) + usize::from(more_commands) + usize::from(more_waits) + if self.waiting.paused.is_some() { 3 } else { 0 } + 1
+    }
+
+    /// The list of what the session has going or waiting in the background: each command and wait with a stop of its own, what stopped it from waking, and that these end with the app.
+    /// The times are drawn as the window paints them (`paint`), so that they run on without the panel being laid out again. Returns where the next section begins.
+    unsafe fn layout_waiting(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, mut y: i32) -> i32 {
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let row = s(ds::size::TEXT_ROW);
+        let (stop_wide, time_wide) = (s(ds::space::XL), s(76));
+        let indent = s(ds::size::RIGHT_INDENT);
+        shapes.push(Shape::Text { area: rect(x, y, width, s(ds::space::XL)), text: t("In the background").to_string(), font: FontKind::Strong, color: theme::muted(), flags: ONE_LINE });
+        // (more than one: all of them at a press)
+        if self.waiting.commands.len() + self.waiting.waits.len() > 1 {
+            let words = t("Stop all");
+            let across = text_width(self.fonts.small, words);
+            let area = rect(x + width - across, y + (s(ds::space::XL) - s(ds::size::TEXT_LINE)) / 2, across, s(ds::size::TEXT_LINE));
+            shapes.push(Shape::Text { area, text: words.to_string(), font: FontKind::Small, color: theme::accent_hover(), flags: DT_RIGHT | ONE_LINE });
+            self.waiting_hits.push((rect(area.left - s(6), y, across + s(12), s(ds::space::XL)), "*".to_string()));
+        }
+        y += s(ds::size::QUEUE_STEP);
+        let stop_at = |this: &mut App, shapes: &mut Vec<Shape>, y: i32, id: &str| {
+            let area = rect(x + width - stop_wide, y, stop_wide, row);
+            shapes.push(Shape::Icon { name: "x", area, size: s(ds::size::ICON_SMALL), color: theme::faint() });
+            this.waiting_hits.push((rect(area.left - s(4), y, stop_wide + s(4), row), id.to_string()));
+        };
+        let commands = self.waiting.commands.clone();
+        for (at, command) in commands.iter().enumerate().take(WAITING_LISTED) {
+            shapes.push(Shape::Icon { name: "terminal", area: rect(x, y, s(ds::space::L), row), size: s(ds::size::ICON_SMALL), color: theme::muted() });
+            let text_wide = width - indent - stop_wide - time_wide;
+            shapes.push(Shape::Text { area: rect(x + indent, y, text_wide, row), text: command.command.clone(), font: FontKind::Small, color: theme::text(), flags: ONE_LINE });
+            self.waiting_times.push((rect(x + width - stop_wide - time_wide, y, time_wide, row), WaitRow::Command(at)));
+            stop_at(self, shapes, y, &command.id);
+            y += row;
+            if let Some(pattern) = &command.watching_for {
+                shapes.push(Shape::Text { area: rect(x + indent, y, width - indent - stop_wide, row), text: tf("waits for {0}", &[pattern]), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
+                y += row;
+            }
+        }
+        if commands.len() > WAITING_LISTED {
+            shapes.push(Shape::Text { area: rect(x + indent, y, width - indent, row), text: tf("and {0} more", &[&(commands.len() - WAITING_LISTED)]), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
+            y += row;
+        }
+        let waits = self.waiting.waits.clone();
+        for (at, wait) in waits.iter().enumerate().take(WAITING_LISTED) {
+            shapes.push(Shape::Icon { name: "clock", area: rect(x, y, s(ds::space::L), row), size: s(ds::size::ICON_SMALL), color: theme::muted() });
+            shapes.push(Shape::Text { area: rect(x + indent, y, width - indent - stop_wide - time_wide, row), text: wait.note.clone(), font: FontKind::Small, color: theme::text(), flags: ONE_LINE });
+            self.waiting_times.push((rect(x + width - stop_wide - time_wide, y, time_wide, row), WaitRow::Wait(at)));
+            stop_at(self, shapes, y, &wait.id);
+            y += row;
+        }
+        if waits.len() > WAITING_LISTED {
+            shapes.push(Shape::Text { area: rect(x + indent, y, width - indent, row), text: tf("and {0} more", &[&(waits.len() - WAITING_LISTED)]), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
+            y += row;
+        }
+        if let Some(paused) = self.waiting.paused {
+            shapes.push(Shape::Text { area: rect(x, y, width, 3 * row), text: lang::notice(paused.sentence()), font: FontKind::Small, color: theme::warn(), flags: DT_WORDBREAK });
+            y += 3 * row;
+        }
+        shapes.push(Shape::Text { area: rect(x, y, width, row), text: t("These end when Dogmind quits.").to_string(), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
+        y + row
+    }
+
+    /// What a row of the list says of its time now: how long a command has run, or has to run, and how long until a wait is up. Counted on from when the agent last said.
+    fn waiting_time_words(&self, row: WaitRow) -> String {
+        let since = self.waiting_taken.elapsed().as_secs();
+        match row {
+            WaitRow::Command(at) => match self.waiting.commands.get(at) {
+                Some(command) if command.ended => t("ended").to_string(),
+                Some(command) => cards::duration_words(command.seconds + since),
+                None => String::new(),
+            },
+            WaitRow::Wait(at) => self.waiting.waits.get(at).map_or(String::new(), |wait| tf("in {0}", &[&cards::duration_words(wait.in_seconds.saturating_sub(since))])),
+        }
+    }
+
+    /// Once a second: the times in the list of what waits run on, where it is in view.
+    unsafe fn waiting_tick(&self) {
+        if self.waiting_times.is_empty() || self.panel != Panel::Chat || self.right_width == 0 {
+            return;
+        }
+        for (area, _) in &self.waiting_times {
+            InvalidateRect(self.window, area, 0);
+        }
+    }
+
+    /// A press on the stop of a row of the list, or on "Stop all": it ends that command or wait, which wakes nothing. The agent is not asked: what is going on is the window's to end, and what is left is read from it.
+    unsafe fn stop_waiting(&mut self, id: &str) {
+        if id == "*" {
+            self.agent.background.stop_all();
+        } else {
+            self.agent.background.stop(id);
+        }
+        self.waiting = self.agent.background.snapshot();
+        self.waiting_taken = std::time::Instant::now();
+        InvalidateRect(self.side, std::ptr::null(), 0);
+        self.layout();
+    }
+
     unsafe fn layout_right(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, height: i32) {
         if self.preview_file.is_some() {
             self.layout_preview(shapes, x, width, height);
@@ -6416,8 +7367,21 @@ impl App {
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let row = s(ds::size::TEXT_ROW);
-        // (its first heading level with the session's name)
-        let mut y = (s(ds::size::TITLE_STRIP) - s(ds::space::XL)) / 2;
+        // The two views of the panel, as two words over it (level with the session's name): the one shown is underlined.
+        let words_top = (s(ds::size::TITLE_STRIP) - s(ds::space::XL)) / 2;
+        let mut across_to = x;
+        for (words, files) in [(t("Overview"), false), (t("Files"), true)] {
+            let across = text_width(self.fonts.strong, words);
+            let on = self.settings.right_files == files;
+            shapes.push(Shape::Text { area: rect(across_to, words_top, across, s(ds::space::XL)), text: words.to_string(), font: FontKind::Strong, color: if on { theme::text() } else { theme::muted() }, flags: ONE_LINE });
+            if on {
+                shapes.push(Shape::Fill { area: rect(across_to, words_top + s(ds::space::XL) + s(ds::space::HAIR), across, s(ds::space::HAIR)), color: theme::accent() });
+            }
+            self.right_tab_hits.push((rect(across_to - s(ds::space::S), words_top - s(ds::space::XS), across + 2 * s(ds::space::S), s(ds::space::XL) + s(ds::space::M)), files));
+            across_to += across + s(ds::space::XL);
+        }
+        // (what is under them begins past the strip the session's name has)
+        let mut y = s(ds::size::TITLE_STRIP) + s(ds::space::S);
         let heading = |shapes: &mut Vec<Shape>, y: &mut i32, text: String| {
             shapes.push(Shape::Text { area: rect(x, *y, width, s(ds::space::XL)), text, font: FontKind::Strong, color: theme::muted(), flags: ONE_LINE });
             *y += s(ds::size::QUEUE_STEP);
@@ -6446,8 +7410,17 @@ impl App {
             engine_top -= s(ds::size::QUEUE_STEP);
             shapes.push(Shape::Text { area: rect(x, engine_top, width, s(ds::space::XL)), text: t("Engine").to_string(), font: FontKind::Strong, color: theme::muted(), flags: ONE_LINE });
         }
+        // The files of the folder: the list takes what is between the two words and the engine's lines.
+        if self.settings.right_files {
+            let margin = s(ds::size::RIGHT_GAP);
+            let top = s(ds::size::TITLE_STRIP);
+            self.files_place(x - margin + s(ds::space::S), top, width + 2 * margin - 2 * s(ds::space::S), (engine_top - top - s(ds::space::S)).max(s(ds::size::TEXT_ROW)));
+            return;
+        }
+        // What waits in the background has its place after the tasks, whatever else there is: it is what will wake the session, and it ends with the app.
+        let background_rows = self.background_rows();
         // What fits, past the two headings and above the engine: nothing is drawn off the bottom of the window.
-        let (max_tasks, max_changes) = share_rows(((engine_top - y - s(60)) / row).max(2), self.todos.len(), self.changes.len());
+        let (max_tasks, max_changes) = share_rows((((engine_top - y - s(60)) / row) - background_rows as i32).max(2), self.todos.len(), self.changes.len());
         if !self.todos.is_empty() {
             heading(shapes, &mut y, t("Tasks").to_string());
         }
@@ -6470,6 +7443,10 @@ impl App {
             plain(shapes, &mut y, tf("and {0} more", &[&(self.todos.len() - max_tasks)]), theme::faint());
         }
         if !self.todos.is_empty() {
+            y += s(ds::size::RIGHT_GAP);
+        }
+        if !self.waiting.is_empty() {
+            y = self.layout_waiting(shapes, x, width, y);
             y += s(ds::size::RIGHT_GAP);
         }
         if self.changes.is_empty() {
@@ -6550,7 +7527,7 @@ impl App {
 
     /// A turn of the ring: only it is drawn again, and the words with it when the seconds they show have changed.
     unsafe fn spinner_tick(&mut self) {
-        if self.activity.is_empty() || self.panel != Panel::Chat || self.pending.is_some() {
+        if self.activity.is_empty() || self.panel != Panel::Chat || self.waits_for_person() {
             return;
         }
         let second = self.activity_since.map_or(0, |since| since.elapsed().as_secs());
@@ -6601,8 +7578,16 @@ impl App {
             }
             self.draw_shape(device, shape);
         }
+        // (the times of what waits: counted on from what the agent last said, drawn now)
         if self.panel == Panel::Chat {
-            if !self.activity.is_empty() && self.pending.is_none() {
+            for (area, row) in &self.waiting_times {
+                if overlaps(area, &dirty) {
+                    draw_text(device, &self.waiting_time_words(*row), *area, self.fonts.small, theme::muted(), DT_RIGHT | ONE_LINE);
+                }
+            }
+        }
+        if self.panel == Panel::Chat {
+            if !self.activity.is_empty() && !self.waits_for_person() {
                 let area = self.activity_area;
                 let elapsed = self.activity_since.map_or(0.0, |since| since.elapsed().as_secs_f32());
                 spinner(device, self.spinner_area(), (elapsed * 300.0) % 360.0, theme::line(), theme::accent(), s(ds::space::HAIR) as f32);
@@ -6817,7 +7802,6 @@ impl App {
             self.scrolled_up_at = Some(std::time::Instant::now());
         }
         SendMessageW(edit, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
-        self.place_copy_buttons();
         self.place_thumb();
     }
 
@@ -6883,7 +7867,6 @@ impl App {
         // (the end gives the following view back, as scrolling to it does)
         self.follow_end = at == room;
         SendMessageW(self.transcript, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
-        self.place_copy_buttons();
         self.place_thumb();
     }
 
@@ -6898,13 +7881,23 @@ impl App {
         }
         let middle = (area.top + area.bottom) / 2;
         let mut x = area.left + s(ds::space::S);
-        // Only what needs saying: at work, the stop button and the line above the input say so, and when all is well nothing does.
+        // Only what needs saying: at work, the stop button and the line above the input say so, and when all is well nothing does. (The engine that goes on while the faster-writing data
+        // is fetched says how far that has come, and then that it starts again.)
+        let beside = if self.drafter_restart_waits {
+            Some(drafter_restart_words())
+        } else {
+            Some(self.setup_status.as_str()).filter(|words| self.drafter_fetch.is_some() && !words.is_empty())
+        };
         if !self.connected {
             let dot = s(ds::space::S);
             let color = if matches!(self.connection.as_str(), "not connected" | "no engine") { theme::bad() } else { theme::warn() };
             rounded(device, rect(x, middle - dot / 2, dot, dot), dot / 2, Some(color), None);
             x += dot + s(ds::space::S);
             draw_text(device, t(self.connection.as_str()), RECT { left: x, right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+        } else if let Some(words) = beside {
+            let tall = area.bottom - area.top;
+            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
+            draw_text(device, words, RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
         } else if self.web_seen {
             let tall = area.bottom - area.top;
             icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::warn());
@@ -6992,6 +7985,14 @@ impl App {
             InvalidateRect(field, std::ptr::null(), 0);
         }
         self.panel = panel;
+        // (the files of one answer are listed on the Changes page that its card opened, and are not what the next opening of it lists)
+        if panel != Panel::Diff && self.turn_view.take().is_some() {
+            self.refresh_changes();
+        }
+        // (and the trajectory page is gone with the page that held it)
+        if panel != Panel::Diff {
+            self.trajectory = None;
+        }
         // (the About page's button waits while a look is going on, and is not to stay that way on another page)
         EnableWindow(self.buttons[1], 1);
         self.panel_log.clear();
@@ -7099,7 +8100,7 @@ impl App {
                 self.set_button_kinds(&[ButtonKind::Link, ButtonKind::Secondary, ButtonKind::Link, ButtonKind::Link]);
                 self.update_toggles();
                 self.show_release_controls();
-                self.tip(self.toggle_updates, t("Dogmind asks GitHub for the newest release at most once a day. It sends only its name and version. When there is a newer one, it downloads the setup in the background and checks it, and restarts into it only when you press Restart to update."));
+                self.tip(self.toggle_updates, t("Dogmind asks GitHub for the newest release every six hours, and when you bring the window back from the tray after an hour. It sends only its name and version. When there is a newer one, it says so on the main screen, downloads the setup in the background and checks it, and restarts into it only when you press Restart to update."));
             }
             Panel::General => {
                 self.panel_title = t("Settings").into();
@@ -7237,6 +8238,13 @@ impl App {
                 SendMessageW(self.doc, EM_SETBKGNDCOLOR, 0, theme::surface() as LPARAM);
                 set_text(self.buttons[0], t("Save"));
                 self.set_button_kinds(&[ButtonKind::Primary]);
+            }
+            Panel::Diff if self.trajectory.is_some() => {
+                self.panel_title = t("Trajectory").into();
+                self.diff_rows.clear();
+                self.diff_starts.clear();
+                self.diff_file = None;
+                self.diff_words = String::new();
             }
             Panel::Diff => {
                 self.panel_title = t("Changes").into();
@@ -7441,11 +8449,36 @@ impl App {
         self.layout();
     }
 
+    /// The trajectory page, on the Changes page's window, with every turn shut.
+    unsafe fn show_trajectory(&mut self, summary: dogmind_agent::trajectory_report::Summary) {
+        let open = std::collections::BTreeSet::new();
+        let rows = crate::trajectory::rows(&summary, &open);
+        self.trajectory = Some(TrajectoryPage { summary, open, rows });
+        self.diff_scroll = 0;
+        self.set_panel(Panel::Diff);
+    }
+
+    /// A turn's row opened or shut: the rows are made again.
+    unsafe fn toggle_trajectory_turn(&mut self, turn: u64) {
+        let Some(page) = &mut self.trajectory else { return };
+        if !page.open.remove(&turn) {
+            page.open.insert(turn);
+        }
+        page.rows = crate::trajectory::rows(&page.summary, &page.open);
+        self.clamp_diff();
+        InvalidateRect(self.diff_view, std::ptr::null(), 0);
+    }
+
+    /// How many rows the Changes page's window has: those of the diff, or of the trajectory's table.
+    fn diff_len(&self) -> usize {
+        self.trajectory.as_ref().map_or(self.diff_rows.len(), |page| page.rows.len())
+    }
+
     /// How far the view can go, as the window and the file are now.
     unsafe fn diff_room(&self) -> i32 {
         let mut client: RECT = std::mem::zeroed();
         GetClientRect(self.diff_view, &mut client);
-        (self.diff_rows.len() as i32 * scale(self.dpi, ds::size::DIFF_ROW) - client.bottom).max(0)
+        (self.diff_len() as i32 * scale(self.dpi, ds::size::DIFF_ROW) - client.bottom).max(0)
     }
 
     unsafe fn clamp_diff(&mut self) {
@@ -7513,6 +8546,82 @@ impl App {
         }
     }
 
+    /// The trajectory's table: each column at its own place across, in the characters of the monospace face, the header kept at the top, the rows in view under it.
+    unsafe fn paint_trajectory(&self, device: HDC, client: RECT) {
+        use crate::trajectory::{column_starts, RowKind, COLUMNS};
+        let Some(page) = &self.trajectory else { return };
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let row = s(ds::size::DIFF_ROW);
+        let face = self.fonts.code;
+        let character = text_width(face, "0").max(1);
+        let (starts, notes) = column_starts();
+        let bar = s(ds::space::M);
+        let width = client.right - bar;
+        SetBkMode(device, TRANSPARENT as _);
+        let cell = |device: HDC, text: &str, column: usize, y: i32, color: u32| {
+            let (left, room) = (starts[column] as i32 * character, COLUMNS[column].chars as i32 * character);
+            let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | if COLUMNS[column].right { DT_RIGHT } else { 0 };
+            draw_text(device, text, RECT { left, right: left + room, top: y, bottom: y + row }, face, color, flags);
+        };
+        // (the header's row is the first, and stays where it is)
+        let first = ((self.diff_scroll / row) as usize).max(1);
+        let mut y = first as i32 * row - self.diff_scroll;
+        for (at, line) in page.rows.iter().enumerate().skip(first) {
+            if y >= client.bottom {
+                break;
+            }
+            {
+                let band = rect(0, y, width, row);
+                let back = match line.kind {
+                    RowKind::Turn { .. } if at % 2 == 1 => Some(theme::surface()),
+                    RowKind::Total => Some(theme::raised()),
+                    _ => None,
+                };
+                if let Some(color) = back {
+                    let brush = CreateSolidBrush(color);
+                    FillRect(device, &band, brush);
+                    DeleteObject(brush);
+                }
+                let color = match line.kind {
+                    RowKind::Turn { .. } | RowKind::Total => theme::text(),
+                    _ => theme::muted(),
+                };
+                if let RowKind::Turn { open, .. } = line.kind {
+                    icon::draw(device, if open { "chevron-down" } else { "chevron-right" }, rect(0, y, s(ds::size::ICON), row), s(ds::size::ICON_SMALL), theme::muted());
+                }
+                for (column, text) in line.cells.iter().enumerate() {
+                    cell(device, text, column, y, color);
+                }
+                if !line.note.is_empty() {
+                    draw_text(device, &line.note, RECT { left: notes as i32 * character, right: width, top: y, bottom: y + row }, face, theme::faint(), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                }
+            }
+            y += row;
+        }
+        // The header, over whatever has scrolled under it, with the line under it.
+        let head = rect(0, 0, client.right, row);
+        let brush = CreateSolidBrush(theme::background());
+        FillRect(device, &head, brush);
+        DeleteObject(brush);
+        if let Some(line) = page.rows.first() {
+            for (column, text) in line.cells.iter().enumerate() {
+                cell(device, text, column, 0, theme::faint());
+            }
+        }
+        let rule = rect(0, row - 1, client.right, 1);
+        let brush = CreateSolidBrush(theme::line());
+        FillRect(device, &rule, brush);
+        DeleteObject(brush);
+        // Where the view is in the whole of the table.
+        let total = page.rows.len() as i32 * row;
+        if total > client.bottom {
+            let tall = thumb_height(client.bottom, client.bottom, total, s(ds::space::XXL));
+            let at = thumb_offset(client.bottom - tall, self.diff_scroll, total - client.bottom);
+            rounded(device, rect(client.right - s(ds::size::THUMB) - s(ds::size::THUMB) / 2, at, s(ds::size::THUMB), tall), s(ds::size::THUMB) / 2, Some(if self.diff_thumb_grab.is_some() { theme::muted() } else { theme::line() }), None);
+        }
+    }
+
     /// The window of the Changes page: only the rows in view are drawn, as long as a file may be.
     unsafe fn paint_diff(&self, device: HDC, client: RECT) {
         use crate::highlight::Kind;
@@ -7521,6 +8630,9 @@ impl App {
         let brush = CreateSolidBrush(theme::background());
         FillRect(device, &client, brush);
         DeleteObject(brush);
+        if self.trajectory.is_some() {
+            return self.paint_trajectory(device, client);
+        }
         if self.diff_rows.is_empty() {
             draw_text(device, &self.diff_words, RECT { left: s(ds::space::L), right: client.right - s(ds::space::L), top: 0, bottom: s(ds::size::DIFF_HEAD) }, self.fonts.body, theme::muted(), ONE_LINE);
             return;
@@ -7656,6 +8768,9 @@ impl App {
         self.setup_status = text.clone();
         if matches!(self.panel, Panel::Models | Panel::Setup) {
             self.say_in_panel(&text);
+        } else if self.drafter_fetch.is_some() {
+            // (the engine's own state stays what it is: this goes beside it, on the status line)
+            self.update_status();
         } else {
             self.connection = text;
             self.update_status();
@@ -7817,10 +8932,38 @@ impl App {
         }
     }
 
+    /// The taskbar button flashes: once. For what a turn that nobody sent asks, or says by ending, it goes on until the window has been looked at: when it came, no one was there.
+    unsafe fn flash_for_attention(&self, nobody_sent_the_turn: bool) {
+        // (a debug build told to by a test writes down that it did: the window is off the screen, and no one sees the button)
+        if cfg!(debug_assertions) {
+            if let Some(path) = std::env::var_os("DOGMIND_TEST_TRAYLOG") {
+                use std::io::Write as _;
+                if let std::result::Result::Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(file, "flash | {}", if nobody_sent_the_turn { "until it is looked at" } else { "once" });
+                }
+            }
+        }
+        if nobody_sent_the_turn {
+            let info = FLASHWINFO { cbSize: std::mem::size_of::<FLASHWINFO>() as u32, hwnd: self.window, dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG, uCount: u32::MAX, dwTimeout: 0 };
+            FlashWindowEx(&info);
+        } else {
+            FlashWindow(self.window, 1);
+        }
+    }
+
     /// A word from the tray, only while the window is out of sight.
     unsafe fn tray_note(&self, title: &str, words: &str) {
         if IsWindowVisible(self.window) != 0 {
             return;
+        }
+        // (a debug build told to by a test writes down what the balloon says: off the screen, no one sees it)
+        if cfg!(debug_assertions) {
+            if let Some(path) = std::env::var_os("DOGMIND_TEST_TRAYLOG") {
+                use std::io::Write as _;
+                if let std::result::Result::Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(file, "{title} | {words}");
+                }
+            }
         }
         let mut data = self.tray_data();
         data.uFlags = NIF_INFO;
@@ -7834,14 +8977,38 @@ impl App {
         Shell_NotifyIconW(NIM_MODIFY, &data);
     }
 
-    /// Back from the tray.
-    unsafe fn tray_open(&self) {
-        ShowWindow(self.window, SW_SHOW);
-        if IsIconic(self.window) != 0 {
-            ShowWindow(self.window, SW_RESTORE);
+    /// The balloon of the tray for a version: once, and only while the window is hidden (`notice::balloon_due`). What the main screen has said to an open window counts as told.
+    unsafe fn tell_the_tray_of(&mut self, version: &str, setup_is_here: bool) {
+        let hidden = IsWindowVisible(self.window) == 0;
+        if notice::balloon_due(version, hidden, self.tray_told_release.as_deref(), self.settings.dismissed_update.as_deref()) {
+            let words = if setup_is_here { tf("Dogmind {0} is ready to install. Open the app to update.", &[&version]) } else { tf("Dogmind {0} is available. Open the app to update.", &[&version]) };
+            self.tray_note(t("A new version of Dogmind is here"), &words);
         }
-        SetForegroundWindow(self.window);
-        SetFocus(if self.panel == Panel::Chat && self.pending.is_none() { self.composer } else { self.window });
+        if updates::is_to_be_told(version, self.settings.dismissed_update.as_deref()) {
+            self.tray_told_release = Some(version.to_string());
+        }
+    }
+
+    /// Whether a page that has the notice is the one shown, with the notice on it.
+    fn notice_is_up(&self) -> bool {
+        notice::is_on_page(self.panel == Panel::Chat, self.panel == Panel::Diff, self.onboarding)
+    }
+
+    /// Back from the tray. A look at GitHub an hour old is made again, so that a release that came out while the window was hidden shows on the main
+    /// screen as it comes back, and not only on the About page.
+    unsafe fn tray_open(&mut self) {
+        // (a test's copy shows itself where it is, and takes no one's focus)
+        if crate::machine::kept_from_the_real_machine() {
+            ShowWindow(self.window, SW_SHOWNA);
+        } else {
+            ShowWindow(self.window, SW_SHOW);
+            if IsIconic(self.window) != 0 {
+                ShowWindow(self.window, SW_RESTORE);
+            }
+            SetForegroundWindow(self.window);
+            SetFocus(if self.panel == Panel::Chat && self.pending.is_none() { self.composer } else { self.window });
+        }
+        self.look_for_release_after(updates::ON_RETURN);
     }
 
     unsafe fn tray_menu(&mut self) {
@@ -7974,7 +9141,7 @@ impl App {
     /// An installer wants to replace these files. It closes as the tray's Quit does, unless it is working: then it stays, comes forward and says so, and the installer waits.
     /// Work that a restart would cut short: a turn, a setup, a session working in the background, a folder being opened to commands.
     fn at_work(&self) -> bool {
-        self.running || self.setting_up || !self.parked.is_empty() || self.read_folder_work.is_some() || self.pending.is_some()
+        self.running || self.setting_up || !self.parked.is_empty() || !self.waiting.is_empty() || self.read_folder_work.is_some() || self.pending.is_some()
     }
 
     /// A new build of the app or of its engine has come in over the files this copy runs from (`package.py` puts it beside the one in use, which
@@ -8045,18 +9212,86 @@ impl App {
         }
     }
 
-    /// The same, for the row above the input: not after its cross was pressed, until the next start.
-    fn release_ready(&self) -> Option<&updates::Ready> {
-        self.ready_setup().filter(|_| !self.release_ready_closed)
+    /// The notice of a newer version that the main screen has now, if there is one (see `notice::notice`).
+    fn notice(&self) -> Option<notice::Notice> {
+        let stage = match &self.release_update {
+            ReleaseUpdate::None => notice::Stage::Nothing,
+            ReleaseUpdate::Fetching { version, done, total, .. } => notice::Stage::Fetching { version, percent: done * 100 / (*total).max(1) },
+            ReleaseUpdate::Ready(ready) => notice::Stage::Ready { version: &ready.version },
+        };
+        notice::notice(&notice::Situation {
+            offered: self.release_offer.as_ref().map(|release| release.version.as_str()),
+            stage,
+            setup_runs: self.ready_setup().is_some(),
+            dismissed: self.settings.dismissed_update.as_deref(),
+            ready_closed: self.release_ready_closed,
+            new_build: self.update_offer,
+            restart_when_done: self.restart_when_done,
+            checking: self.checking_setup,
+        })
     }
 
-    /// The release the row above the input tells of, with a button for its page: not while its setup is on its way or here, which have words of their own.
-    fn release_row(&self) -> Option<&updates::Release> {
-        self.release_offer.as_ref().filter(|release| match &self.release_update {
-            ReleaseUpdate::None => true,
-            ReleaseUpdate::Fetching { version, .. } => *version != release.version,
-            ReleaseUpdate::Ready(ready) => ready.version != release.version,
-        })
+    /// How high the notice is.
+    fn notice_height(&self) -> i32 {
+        scale(self.dpi, ds::size::ICON_BUTTON + 2 * ds::space::S)
+    }
+
+    /// The notice as a card of its own, across `width` from `left`, at `top`: what it says, its one button, and Later. The room it takes, with the gap under it.
+    unsafe fn place_notice(&mut self, shapes: &mut Vec<Shape>, notice: &notice::Notice, left: i32, width: i32, top: i32) -> i32 {
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let tall = self.notice_height();
+        shapes.push(Shape::Round { area: rect(left, top, width, tall), radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
+        let (words, label) = notice_text(notice);
+        // (one width for every state the button goes through: one that says how far the fetch has come does not move as the number grows)
+        let widest = [t("Update now (Dogmind restarts)").to_string(), t("Open the release page").to_string(), t("Not now").to_string(), t("Checking…").to_string(), tf("Downloading… {0}%", &[&100])]
+            .iter()
+            .map(|label| text_width(self.fonts.strong, label))
+            .max()
+            .unwrap_or(0);
+        let across = (widest + s(ds::space::XL)).max(s(96)).min((width / 2).max(s(96)));
+        let later = (text_width(self.fonts.small, t("Later")) + s(ds::space::XL)).max(s(56));
+        let later_x = left + width - s(ds::space::S) - later;
+        let main_x = later_x - s(ds::space::XS) - across;
+        let y = top + (tall - s(ds::size::ICON_BUTTON)) / 2;
+        let is_page = matches!(notice, notice::Notice::Page { .. });
+        let (main, other) = if is_page { (self.release_offer_button, self.update_offer_button) } else { (self.update_offer_button, self.release_offer_button) };
+        show(other, false);
+        set_text_if_changed(main, &label);
+        let (kind, enabled) = match notice {
+            notice::Notice::Page { .. } => (ButtonKind::Secondary, true),
+            notice::Notice::Fetching { .. } => (ButtonKind::Secondary, false),
+            notice::Notice::UpdateNow { waiting, checking, .. } => (if *waiting { ButtonKind::Secondary } else { ButtonKind::Primary }, !*checking),
+        };
+        set_button_style(main, kind, theme::surface());
+        EnableWindow(main, i32::from(enabled));
+        place(main, main_x, y, across, s(ds::size::ICON_BUTTON));
+        show(main, true);
+        set_text_if_changed(self.notice_later, t("Later"));
+        place(self.notice_later, later_x, y, later, s(ds::size::ICON_BUTTON));
+        show(self.notice_later, true);
+        shapes.push(Shape::Text { area: rect(left + s(ds::space::M), top, (main_x - left - s(ds::space::L)).max(0), tall), text: words, font: FontKind::Body, color: theme::text(), flags: ONE_LINE });
+        tall + s(ds::space::S)
+    }
+
+    /// Later on the notice: this version is not told of again unprompted (a newer one is), and what was asked of the update is taken back.
+    unsafe fn notice_sent_away(&mut self) {
+        let Some(shown) = self.notice() else { return };
+        let version = match &shown {
+            notice::Notice::Page { version } | notice::Notice::Fetching { version, .. } => Some(version.clone()),
+            notice::Notice::UpdateNow { version, .. } => version.clone(),
+        };
+        if let Some(version) = version {
+            self.dismiss_release(&version);
+        }
+        if matches!(shown, notice::Notice::UpdateNow { .. }) {
+            // (not this build: a newer one is offered again)
+            self.update_offer = false;
+            self.restart_when_done = false;
+            self.release_ready_closed = true;
+            self.update_declined = self.update_seen.clone();
+        }
+        self.layout();
     }
 
     /// The setup that was fetched, run to update this install: it waits for this app, and the engine it started, to end, puts the files of the new version in their places, and starts the
@@ -8137,20 +9372,12 @@ impl App {
 
     /// The button under that line, if it has one: a way to stop the download, or to restart into what was fetched.
     fn update_button_words(&self) -> Option<&'static str> {
-        match &self.release_update {
-            ReleaseUpdate::Fetching { .. } => Some(t("Cancel")),
-            ReleaseUpdate::Ready(_) if self.ready_setup().is_some() => Some(if self.checking_setup { t("Checking…") } else if self.restart_when_done { t("Not now") } else { t("Restart to update") }),
-            _ => None,
-        }
+        update_button_words_of(&self.release_update, self.ready_setup().is_some(), self.checking_setup, self.restart_when_done)
     }
 
     /// How that button looks: the page's main button when it restarts into the update, a plain one to take that back, and a link to stop a download.
     fn update_button_kind(&self) -> ButtonKind {
-        match &self.release_update {
-            ReleaseUpdate::Ready(_) if self.restart_when_done => ButtonKind::Secondary,
-            ReleaseUpdate::Ready(_) => ButtonKind::Primary,
-            _ => ButtonKind::Link,
-        }
+        update_button_kind_of(&self.release_update, self.restart_when_done)
     }
 
     /// An update of this install is on its way or here: About tells of it by its own lines, and not by those of the look that found the release.
@@ -8264,13 +9491,18 @@ impl App {
         DestroyWindow(self.window);
     }
 
-    /// The app's own look at GitHub for a newer release, when the timer says it may be time. It is made only if the person has not turned it off, if a day has gone by since GitHub
+    /// The app's own look at GitHub for a newer release, when the timer says it may be time. It is made only if the person has not turned it off, if six hours have gone by since GitHub
     /// last answered, and if there is anywhere to ask; and not on the first screens, where a new install has just fetched the newest there is.
     unsafe fn look_for_release(&mut self) {
+        self.look_for_release_after(updates::EVERY);
+    }
+
+    /// The same, when `every` seconds have gone by since GitHub last answered.
+    unsafe fn look_for_release_after(&mut self, every: u64) {
         if !self.settings.check_for_updates || self.onboarding || !matches!(self.leaving, Leaving::No) || !updates::can_ask() {
             return;
         }
-        if updates::is_due(self.settings.last_update_check, updates::now()) {
+        if updates::is_due_after(self.settings.last_update_check, updates::now(), every) {
             self.start_release_look(true);
         }
     }
@@ -8343,7 +9575,7 @@ impl App {
         }
         self.save();
         self.update_toggles();
-        // (turned on, it looks at once if a day has gone by: that is what turning it on asks for)
+        // (turned on, it looks at once if six hours have gone by: that is what turning it on asks for)
         self.look_for_release();
         self.layout();
     }
@@ -8580,7 +9812,8 @@ impl App {
 
     /// Work is under way that the engine cannot be taken from.
     fn engine_is_busy(&self) -> bool {
-        self.running || !self.parked.is_empty()
+        // (a session that only waits for a command to end is not using it: it would be woken by an engine that is there again)
+        self.running || self.parked.iter().any(|parked| parked.running)
     }
 
     /// The row used: on the files of the model set up, or only as a choice for one to come.
@@ -8627,6 +9860,11 @@ impl App {
     /// The vision file alone for the model that is there, the way the model's own download goes: its progress, its cancel, and on from where it stopped.
     unsafe fn start_vision_setup(&mut self) {
         if self.setting_up {
+            // (the engine runs while the faster-writing data is fetched, so a picture can be asked about then: the file waits for that download)
+            if self.drafter_fetch.is_some() {
+                let words = t("That can be done once the work under way has ended.");
+                if self.panel == Panel::Chat { self.say(words) } else { self.problem_in_panel(words) }
+            }
             return;
         }
         if self.engine_is_busy() {
@@ -8660,12 +9898,130 @@ impl App {
         }
     }
 
+    /// A file alone is being fetched for the model that is there: its progress has a bar of its own, not one nearly full with the model.
+    fn fetching_alone(&self) -> bool {
+        self.vision_fetch || self.drafter_fetch.is_some()
+    }
+
+    /// The model set up, when the Models page is about it and it has a drafter: its settings say what the row says. Another one chosen is still only a choice, and only the list says
+    /// which models have a drafter.
+    fn drafter_for_installed(&self) -> Option<crate::vision::Installed> {
+        let installed = self.vision_for_installed()?;
+        self.catalog.iter().find(|entry| entry.is(&installed.bundle)).filter(|entry| entry.drafter_bytes.is_some()).map(|_| installed)
+    }
+
+    /// Whether the row stands on: as the settings of the model set up say, or the choice made.
+    fn drafter_is_on(&self) -> bool {
+        if self.drafter_fetch.is_some() {
+            return true;
+        }
+        match self.drafter_for_installed() {
+            Some(installed) => installed.drafter,
+            None => self.drafter,
+        }
+    }
+
     unsafe fn update_drafter_chip(&self) {
+        let on = self.drafter_is_on();
         if self.modal_open {
-            set_button_style(self.drafter_chip, if self.drafter { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
+            set_button_style(self.drafter_chip, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         } else {
             set_button_style(self.drafter_chip, ButtonKind::Select, theme::background());
-            set_text(self.drafter_chip, if self.drafter { t("Build it too (about 5 GB more to download)") } else { t("Leave it out") });
+            set_text(self.drafter_chip, if on { t("Build it too (about 5 GB more to download)") } else { t("Leave it out") });
+        }
+    }
+
+    /// The row used: on the settings of the model set up, or only as a choice for one to come.
+    unsafe fn drafter_clicked(&mut self) {
+        let Some(installed) = self.drafter_for_installed() else {
+            self.drafter = !self.drafter;
+            self.update_drafter_chip();
+            self.layout();
+            return;
+        };
+        if self.setting_up {
+            return;
+        }
+        if !installed.drafter {
+            // (the engine goes on while it is fetched, and starts again once it has ended and no work is under way)
+            self.start_drafter_setup(&installed);
+            return;
+        }
+        if self.engine_is_busy() {
+            let words = t("That can be done once the work under way has ended.");
+            if self.panel == Panel::Chat { self.say(words) } else { self.problem_in_panel(words) }
+            return;
+        }
+        self.start_drafter_off(&installed);
+    }
+
+    /// Whether a setup under way keeps an engine from running (see `setup_holds_off_the_engine`).
+    fn setup_holds_off_the_engine(&self) -> bool {
+        setup_holds_off_the_engine(self.setting_up, self.drafter_fetch.is_some())
+    }
+
+    /// The drafter alone for the model that is there, with the progress, the cancel and the going on from where it stopped of the model's own download: its shards are not read again. The
+    /// engine keeps running meanwhile. The settings take the drafter in when it is built (`Note::SetupDone`), and the engine starts again with it, when no work is under way.
+    unsafe fn start_drafter_setup(&mut self, installed: &crate::vision::Installed) {
+        let Some(straydog) = engine::find(&self.settings) else {
+            let words = engine::not_found_words();
+            if self.panel == Panel::Chat { self.say(words) } else { self.problem_in_panel(words) }
+            return;
+        };
+        let folder = drafter::directory(installed);
+        let args = drafter::fetch_arguments(&folder);
+        self.drafter_fetch = Some(folder);
+        self.run_setup(straydog, args, t("Getting the faster-writing data...").to_string());
+        self.update_drafter_chip();
+        if self.panel == Panel::Chat {
+            self.layout();
+        }
+    }
+
+    /// The faster-writing data is in the settings. The engine that began before it has to start again to take it in, and does when no work is under way: a turn, a tool run or a
+    /// session in the background is not cut short for it. One that has ended, or never began, needs nothing: its next start reads the settings.
+    unsafe fn restart_for_drafter(&mut self) {
+        let embedded = self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded);
+        let engine_began = embedded && !self.engine_waits && !self.connect_failed;
+        let waited = self.drafter_restart_waits;
+        match drafter_restart(engine_began, self.engine_is_busy()) {
+            DrafterRestart::Now => self.connect(),
+            DrafterRestart::Not => {
+                self.drafter_restart_waits = false;
+                if waited {
+                    self.update_status();
+                }
+            }
+            DrafterRestart::WhenIdle => {
+                self.drafter_restart_waits = true;
+                if !waited {
+                    // (the status line is under the conversation: another page says it where it says what it has to)
+                    if self.panel != Panel::Chat {
+                        self.say_in_panel(drafter_restart_words());
+                    }
+                    self.update_status();
+                }
+            }
+        }
+    }
+
+    /// The engine's next start has no drafter, and it starts again now. Its file stays where it is: setup never takes one away, and turning the row on again needs no download.
+    unsafe fn start_drafter_off(&mut self, installed: &crate::vision::Installed) {
+        match drafter::turn_off(&engine::config_path(&self.folder)) {
+            Ok(_) => {
+                let words = tf("The faster-writing data is off. Its file stays in {0}, and turning it on again needs no download.", &[&shown_path(&drafter::directory(installed))]);
+                if self.panel == Panel::Chat { self.say(&words) } else { self.say_in_panel(&words) }
+            }
+            Err(error) => {
+                if self.panel == Panel::Chat { self.say(&error) } else { self.problem_in_panel(&error) }
+                return;
+            }
+        }
+        self.update_drafter_chip();
+        self.layout();
+        if self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded) {
+            self.engine = None;
+            self.connect();
         }
     }
 
@@ -8781,7 +10137,8 @@ impl App {
             self.on_event(event);
         }
         self.flush_reveal();
-        if !self.running {
+        // (one that has a background command or a wait goes on out of sight when it is not at work too: what it waits for will wake it, and its agent must be there to be woken)
+        if !self.running && self.waiting.is_empty() {
             return;
         }
         // (asked for above: what is on screen is about to go)
@@ -8801,6 +10158,8 @@ impl App {
             agent,
             events,
             pending: self.pending.take(),
+            question: self.question.take().map(|asked| agent::Question { question: asked.question, options: asked.options, answer: asked.answer }),
+            plan_review: self.plan_review.take().map(|asked| agent::PlanReview { plan: asked.plan, answer: asked.answer }),
             partial: std::mem::take(&mut self.answer),
             tools_running: std::mem::take(&mut self.tools_running),
             queued: std::mem::take(&mut self.queued),
@@ -8815,6 +10174,10 @@ impl App {
             todos: std::mem::take(&mut self.todos),
             web_seen: self.web_seen,
             compacting: self.activity == t("Compacting the session…"),
+            running: self.running,
+            woken: std::mem::take(&mut self.woken_turn),
+            waiting: std::mem::take(&mut self.waiting),
+            waiting_taken: self.waiting_taken,
         });
         self.running = false;
         self.stop_asked = false;
@@ -8865,7 +10228,11 @@ impl App {
         self.window_tokens = parked.window_tokens;
         self.rate = parked.rate;
         self.totals = parked.totals;
-        self.running = true;
+        // (one that stands by has no turn at work: it has what waits for it to wake)
+        self.running = parked.running;
+        self.woken_turn = parked.woken;
+        self.waiting = parked.waiting;
+        self.waiting_taken = parked.waiting_taken;
         self.todos = parked.todos;
         self.web_seen = parked.web_seen;
         self.changes.clear();
@@ -8874,7 +10241,8 @@ impl App {
         let messages = self.current_session.as_deref().map_or(Ok(Vec::new()), session::read).unwrap_or_default();
         self.set_panel(Panel::Chat);
         self.show_transcript(&messages);
-        for (notice, style) in parked.notices {
+        // (what it said when a turn of its own ended, in its time out of sight, and what it says now)
+        for (notice, style) in self.held_notices.remove(self.current_session.as_ref().unwrap_or(&PathBuf::new())).unwrap_or_default().into_iter().chain(parked.notices) {
             self.append(&format!("{notice}\n"), style);
         }
         self.answer = parked.partial;
@@ -8882,24 +10250,30 @@ impl App {
             self.answer.clear();
         }
         if !self.answer.is_empty() {
-            let shown = self.answer.clone();
+            let shown = crate::mask::hide_keys(&self.answer).into_owned();
             self.append_answer(&shown);
         }
         // (the calls it has under way, which its file does not know of yet)
-        if self.settings.compact_tools && !self.tools_running.is_empty() {
+        let running: Vec<RunEntry> = self.tools_running.iter().filter(|(_, (tool, _))| !cards::is_asking(tool)).map(|(id, (tool, summary))| RunEntry::running(id.clone(), tool.clone(), summary.clone())).collect();
+        if self.settings.compact_tools && !running.is_empty() {
             let at = self.open_run();
-            let running: Vec<RunEntry> = self.tools_running.iter().map(|(id, (tool, summary))| RunEntry::running(id.clone(), tool.clone(), summary.clone())).collect();
             self.runs[at].entries = running;
             self.write_run(at);
         }
-        for (index, tool, raw) in parked.writing {
+        for (index, tool, raw) in parked.writing.into_iter().filter(|(_, tool, _)| !cards::is_asking(tool)) {
             self.run_writes(index, tool, &raw);
         }
-        self.set_activity(if parked.pending.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
+        self.set_activity(if !parked.running || parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
         self.update_buttons();
         self.update_status();
         if let Some(approval) = parked.pending {
             self.on_event(Event::Approval(approval));
+        }
+        if let Some(question) = parked.question {
+            self.on_event(Event::Question(question));
+        }
+        if let Some(review) = parked.plan_review {
+            self.on_event(Event::PlanReview(review));
         }
         InvalidateRect(self.side, std::ptr::null(), 0);
     }
@@ -9001,7 +10375,6 @@ impl App {
             let range = CharRange { first, last };
             SendMessageW(self.transcript, EM_EXSETSEL, 0, std::ptr::addr_of!(range) as LPARAM);
             SendMessageW(self.transcript, EM_SCROLLCARET, 0, 0);
-            self.place_copy_buttons();
         }
         self.layout();
     }
@@ -9219,14 +10592,12 @@ impl App {
                 }
                 let parked = self.parked.iter().find(|parked| parked.path.as_ref() == Some(path));
                 // How it stands, in a word, where its time would be; only one that needs saying has one.
-                let state = match parked {
-                    Some(parked) if parked.pending.is_some() => Some((t("Waiting"), theme::warn())),
-                    Some(_) => Some((t("Working"), theme::accent())),
-                    None if current && self.pending.is_some() => Some((t("Waiting"), theme::warn())),
-                    None if current && self.running => Some((t("Working"), theme::accent())),
-                    None if self.failed_sessions.contains(path) => Some((t("Error"), theme::bad())),
-                    None => None,
-                };
+                let state = side_state(parked.map(|parked| (parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some(), parked.running)), current, self.waits_for_person(), self.running, !self.waiting.is_empty(), self.failed_sessions.contains(path)).map(|state| match state {
+                    SideState::Waiting => (t("Waiting"), theme::warn()),
+                    SideState::Working => (t("Working"), theme::accent()),
+                    SideState::StandingBy => (t("Standing by"), theme::muted()),
+                    SideState::Error => (t("Error"), theme::bad()),
+                });
                 let left = area.left + s(ds::space::M);
                 let found = self.side_hits.is_some();
                 let mut text_right = area.right - s(ds::space::M);
@@ -9528,13 +10899,15 @@ impl App {
     /// The person has begun a message: the engine starts now, and has the prompt read by the time it is sent. Never at launch: nothing is asked of the GPU until
     /// someone has something to say.
     unsafe fn message_begun(&mut self) {
-        if starts_the_engine(self.engine_waits, self.setting_up, self.engine_failed_at.map(|at| at.elapsed())) {
+        if starts_the_engine(self.engine_waits, self.setup_holds_off_the_engine(), self.engine_failed_at.map(|at| at.elapsed())) {
             self.connect();
         }
     }
 
     /// Starts using the active provider: stops what the last one needed and connects on another thread.
     unsafe fn connect(&mut self) {
+        // (an engine that starts reads the settings as they are now)
+        self.drafter_restart_waits = false;
         self.engine_waits = false;
         self.engine_stop_told = false;
         self.connect_failed = false;
@@ -9554,7 +10927,7 @@ impl App {
         let Some(provider) = self.settings.active_provider().cloned() else { return };
         if provider.kind != Kind::Embedded {
             self.engine = None;
-        } else if self.setting_up {
+        } else if self.setup_holds_off_the_engine() {
             // It would want the files the setup is working on. When the setup ends, it connects.
             self.connection = "setting up the model".into();
             self.update_status();
@@ -9698,6 +11071,21 @@ impl App {
         }
         set_text(self.composer, "");
         self.composer_typed_at = None;
+        // (a plan waits for a decision: yes carries it out, anything else is what to change; after Change, whatever is written is)
+        if let Some(asked) = &self.plan_review {
+            let decision = if !asked.changing && cards::approves(&text) { Ok(()) } else { Err(text.clone()) };
+            if self.decide_plan(decision) {
+                return;
+            }
+        }
+        // (the model's question waits: what is typed is its answer, a choice's number standing for the choice)
+        if let Some(asked) = &self.question {
+            let labels: Vec<String> = asked.options.iter().map(|(label, _)| label.clone()).collect();
+            let answer = cards::answer_text(&labels, &text);
+            if self.answer_question(&answer) {
+                return;
+            }
+        }
         let images = std::mem::take(&mut self.attachments);
         self.show_attachments();
         self.send_or_wait(Outgoing { card: text.clone(), text, images }, interjects);
@@ -9833,7 +11221,7 @@ impl App {
     }
 
     unsafe fn update_buttons(&self) {
-        let stoppable = self.running || self.waiting_to_connect();
+        let stoppable = is_stoppable(self.running, self.asking(), self.waiting_to_connect());
         set_text(self.send, if stoppable { "square" } else { "arrow-up" });
         if stoppable {
             SetTimer(self.window, TIMER_DOTS, SPINNER_MS, None);
@@ -9846,7 +11234,7 @@ impl App {
 
     /// Nothing to send, nothing to stop: the button says so.
     unsafe fn update_send_enabled(&self) {
-        let can = self.running || self.waiting_to_connect() || !self.attachments.is_empty() || GetWindowTextLengthW(self.composer) > 0;
+        let can = (self.running && !self.asking()) || self.waiting_to_connect() || !self.attachments.is_empty() || GetWindowTextLengthW(self.composer) > 0;
         EnableWindow(self.send, i32::from(can));
     }
 
@@ -9868,6 +11256,7 @@ impl App {
         self.turn_words_due = false;
         self.picture_blocks.clear();
         self.blocks.clear();
+        self.card_slots.clear();
         self.open_block = None;
         self.links.clear();
         self.link_hover = None;
@@ -9876,6 +11265,12 @@ impl App {
         self.run_carry.clear();
         self.asked_calls.clear();
         self.run_hover = None;
+        self.question = None;
+        self.plan_review = None;
+        self.turn_slots.clear();
+        self.turn_end_slot = 0;
+        self.turn_cards_waiting.clear();
+        self.turn_cards_came.clear();
         // (a file that had gone may be back: it is looked for again)
         self.thumbs.retain(|_, kept| !matches!(kept.thumb, Thumb::Missing(_)));
         self.has_messages = false;
@@ -9899,11 +11294,24 @@ impl App {
         SendMessageW(self.transcript, WM_SETREDRAW, 0, 0);
         hold_layout(self.transcript_document, true);
         let results: HashMap<&str, &Message> = messages.iter().filter_map(|message| message.tool_call_id.as_deref().map(|id| (id, message))).collect();
-        for message in messages {
+        // (the questions and plans it holds, as cards, each with what came of it)
+        let kept_cards = cards::of_messages(messages, self.card_next + 1);
+        self.card_next += kept_cards.len() as u64;
+        for (index, message) in messages.iter().enumerate() {
             match message.role.as_str() {
                 "user" => {
-                    if let Some(text) = message.content.as_deref().filter(|text| !dogmind_agent::prompt::is_nudge(text)) {
+                    if let Some(text) = message.content.as_deref() {
                         self.flush_told_calls(&mut told);
+                        // (what the turn before it changed has its card here; a turn may begin with what the app said and not the person, which is not shown but is a place)
+                        self.turn_slots.push((index, self.shown.len()));
+                        // (what woke the session with no one writing: the app's notice, in a row of its own)
+                        if let Some(wakes) = &message.notice {
+                            self.write_card(&Card::Notice { wakes: wakes.clone(), at: written_words(message) });
+                            continue;
+                        }
+                        if dogmind_agent::prompt::is_nudge(text) {
+                            continue;
+                        }
                         let pictures: Vec<(PathBuf, (i32, i32))> = self.current_session.as_deref().map_or(Vec::new(), |session| message.images.iter().map(|image| (dogmind_agent::images::file_of(session, image), (image.width as i32, image.height as i32))).collect());
                         self.show_user(typed_text(text), &pictures, &written_words(message));
                     }
@@ -9913,19 +11321,27 @@ impl App {
                         if !text.trim().is_empty() {
                             self.flush_told_calls(&mut told);
                         }
-                        self.append_answer(text);
+                        self.append_answer(&crate::mask::hide_keys(text));
                         self.finish_answer();
                         self.last_answer = text.clone();
                         self.mark_answer(text, &written_words(message));
                     }
                     for call in message.tool_calls.iter().flatten() {
+                        // A question put to the person, and a plan, are cards of their own, with what came of them.
+                        if cards::is_asking(&call.function.name) {
+                            if let Some((_, card)) = kept_cards.iter().find(|(id, _)| *id == call.id) {
+                                self.flush_told_calls(&mut told);
+                                self.write_card(card);
+                            }
+                            continue;
+                        }
                         // A session at work has calls still running, or still waiting for an answer: they say so when they end.
                         if let Some(result) = results.get(call.id.as_str()) {
                             let arguments = serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
-                            let summary: String = markdown::show_hidden(&dogmind_agent::tools::summary(&call.function.name, &arguments)).chars().take(160).collect();
+                            let summary: String = crate::mask::hide_keys(&markdown::show_hidden(&dogmind_agent::tools::summary(&call.function.name, &arguments))).chars().take(160).collect();
                             let pictures = self.pictures_of(&result.images);
                             if self.settings.compact_tools {
-                                self.told_call(&call.function.name, &summary, &markdown::show_hidden(result.content.as_deref().unwrap_or("")), &mut told);
+                                self.told_call(&call.function.name, &summary, &crate::mask::hide_keys(&markdown::show_hidden(result.content.as_deref().unwrap_or(""))), &mut told);
                                 if !pictures.is_empty() {
                                     self.flush_told_calls(&mut told);
                                     self.show_tool_pictures(&pictures);
@@ -9942,6 +11358,7 @@ impl App {
             }
         }
         self.flush_told_calls(&mut told);
+        self.turn_end_slot = self.shown.len();
         self.opening = false;
         hold_layout(self.transcript_document, false);
         SendMessageW(self.transcript, WM_SETREDRAW, 1, 0);
@@ -9949,13 +11366,12 @@ impl App {
         if self.has_messages {
             SendMessageW(self.transcript, WM_VSCROLL, SB_BOTTOM as WPARAM, 0);
             InvalidateRect(self.transcript, std::ptr::null(), 0);
-            self.place_copy_buttons();
             self.place_thumb();
         }
     }
 
-    /// What a session out of sight says: its state is kept for when it is opened. `true`: its turn has ended.
-    unsafe fn absorb(&mut self, at: usize, event: Event) -> bool {
+    /// What a session out of sight says: its state is kept for when it is opened. Whether its turn has ended, and whether it has nothing left to wait for and goes.
+    unsafe fn absorb(&mut self, at: usize, event: Event) -> (bool, bool) {
         let event = hidden_shown(event);
         let parked = &mut self.parked[at];
         match event {
@@ -9983,11 +11399,26 @@ impl App {
             Event::ToolEnded { id, .. } => {
                 parked.tools_running.remove(&id);
             }
+            Event::TurnStarted => parked.running = true,
+            Event::Woken(_) => {
+                parked.running = true;
+                parked.woken = true;
+                InvalidateRect(self.side, std::ptr::null(), 0);
+            }
+            Event::Waiting(waiting) => {
+                parked.waiting = waiting;
+                parked.waiting_taken = std::time::Instant::now();
+                InvalidateRect(self.side, std::ptr::null(), 0);
+                // (nothing at work and nothing left to wake it: there is nothing to keep it for)
+                if !parked.running && parked.waiting.is_empty() {
+                    return (false, true);
+                }
+            }
             Event::Approval(approval) => {
-                let tool = approval.tool.clone();
+                let (tool, woken) = (approval.tool.clone(), parked.woken);
                 parked.pending = Some(approval);
                 InvalidateRect(self.side, std::ptr::null(), 0);
-                FlashWindow(self.window, 1);
+                self.flash_for_attention(woken);
                 self.tray_note(t("Dogmind is waiting for you"), &tf("It asks to use {0}.", &[&t(tool_name(&tool))]));
             }
             Event::Usage { used, window, usage } => {
@@ -10016,21 +11447,41 @@ impl App {
             }
             Event::Todos(items) => parked.todos = items,
             Event::WebSeen(on) => parked.web_seen = on,
+            Event::Question(question) => {
+                let words: String = question.question.lines().next().unwrap_or("").chars().take(120).collect();
+                let woken = parked.woken;
+                parked.question = Some(question);
+                InvalidateRect(self.side, std::ptr::null(), 0);
+                self.flash_for_attention(woken);
+                self.tray_note(t("Dogmind is waiting for you"), &words);
+            }
+            Event::PlanReview(review) => {
+                let woken = parked.woken;
+                parked.plan_review = Some(review);
+                InvalidateRect(self.side, std::ptr::null(), 0);
+                self.flash_for_attention(woken);
+                self.tray_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
+            }
             Event::TurnEnded { .. } => {
                 parked.pending = None;
+                parked.question = None;
+                parked.plan_review = None;
                 parked.interjected.clear();
+                parked.running = false;
                 // (what was said too late for this turn is for the next)
                 let late = std::mem::take(&mut *parked.agent.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
                 parked.queued.extend(late.into_iter().map(Outgoing::words));
                 if parked.queued.is_empty() {
-                    return true;
+                    // (it goes when nothing waits for it: one that has a background command or a wait stays, to be woken)
+                    return (true, parked.waiting.is_empty());
                 }
                 let next = parked.queued.remove(0);
+                parked.running = true;
                 let _ = parked.agent.commands.send(send_command(next));
             }
             _ => {}
         }
-        false
+        (false, false)
     }
 
     unsafe fn drain(&mut self) {
@@ -10039,26 +11490,35 @@ impl App {
         }
         let mut at = 0;
         while at < self.parked.len() {
-            let mut ended = false;
+            let (mut ended, mut gone) = (false, false);
             while let Ok(event) = self.parked[at].events.try_recv() {
-                ended |= self.absorb(at, event);
+                let (turn_ended, nothing_left) = self.absorb(at, event);
+                (ended, gone) = (ended || turn_ended, gone || nothing_left);
             }
             if ended {
-                let parked = self.parked.remove(at);
-                let _ = parked.agent.commands.send(Command::Quit);
-                let words = if parked.title.is_empty() { t("The work is done.").to_string() } else { parked.title.clone() };
-                self.tray_note(t(if parked.failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &words);
-                if let (Some(path), true) = (&parked.path, parked.failed) {
+                // (once, as the turn ends: a turn nobody sent says so as one that was sent does)
+                let parked = &mut self.parked[at];
+                let (title, failed, woken) = (parked.title.clone(), std::mem::take(&mut parked.failed), std::mem::take(&mut parked.woken));
+                let (path, notices) = (parked.path.clone(), std::mem::take(&mut parked.notices));
+                let words = if title.is_empty() { t("The work is done.").to_string() } else { title };
+                self.tray_note(t(if failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &words);
+                if let (Some(path), true) = (&path, failed) {
                     self.failed_sessions.insert(path.clone());
                 }
-                if let (Some(path), false) = (parked.path, parked.notices.is_empty()) {
-                    self.held_notices.insert(path, parked.notices);
+                if let (Some(path), false) = (path, notices.is_empty()) {
+                    self.held_notices.insert(path, notices);
                 }
                 self.refresh_sessions();
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 if GetForegroundWindow() != self.window {
-                    FlashWindow(self.window, 1);
+                    self.flash_for_attention(woken);
                 }
+            }
+            if gone {
+                let parked = self.parked.remove(at);
+                let _ = parked.agent.commands.send(Command::Quit);
+                self.refresh_sessions();
+                InvalidateRect(self.side, std::ptr::null(), 0);
             } else {
                 at += 1;
             }
@@ -10168,9 +11628,6 @@ impl App {
             self.follow_carried = 0.0;
             return true;
         }
-        if !self.answers.is_empty() || !self.picture_blocks.is_empty() || !self.blocks.is_empty() {
-            self.place_copy_buttons();
-        }
         self.place_thumb();
         false
     }
@@ -10193,8 +11650,15 @@ impl App {
                 }
                 self.look_at_workspace();
                 self.changes.clear();
+                // (what each answer changed is the session's own: the answers of the one before are not marked in the tree)
+                self.turn_changes.clear();
+                self.files_marks();
                 self.refresh_changes();
                 self.show_transcript(&transcript);
+                // (what each answer of it changed: the cards come when the agent has said)
+                if !transcript.is_empty() && self.current_session.is_some() {
+                    let _ = self.agent.commands.send(Command::TurnsForCards);
+                }
                 for (notice, style) in notices {
                     self.append(&format!("{notice}\n"), style);
                 }
@@ -10244,7 +11708,9 @@ impl App {
                     }
                 }
                 self.answer.push_str(&text);
-                self.reveal.push_str(&text);
+                // (what is shown of it has its keys hidden: the reply stays as the model wrote it)
+                let shown = self.stream_mask.push(&text);
+                self.reveal.push_str(&shown);
                 self.want_frames();
             }
             Event::AssistantEnded => {
@@ -10275,6 +11741,8 @@ impl App {
                     }
                 }
             }
+            // (a question or a plan is a card of its own: the call that makes it has no row among the calls)
+            Event::ToolWriting { ref tool, .. } if cards::is_asking(tool) => {}
             Event::ToolWriting { index, tool, piece } => {
                 if self.settings.compact_tools {
                     self.run_writes(index, tool, &piece);
@@ -10290,6 +11758,9 @@ impl App {
                     }
                 }
             }
+            Event::ToolStarted { id, tool, summary } if cards::is_asking(&tool) => {
+                self.tools_running.insert(id, (tool, summary));
+            }
             Event::ToolStarted { id, tool, summary } => {
                 let summary: String = summary.chars().take(160).collect();
                 if self.settings.compact_tools {
@@ -10304,6 +11775,12 @@ impl App {
             Event::ToolProgress { tool, summary, .. } => {
                 let summary: String = summary.chars().take(120).collect();
                 self.set_activity(format!("{} — {}  {summary}", t(tool_name("explore")), t(tool_name(&tool))));
+            }
+            Event::ToolEnded { id, .. } if self.tools_running.get(&id).is_some_and(|(tool, _)| cards::is_asking(tool)) => {
+                self.tools_running.remove(&id);
+                if self.tools_running.is_empty() && !self.waits_for_person() {
+                    self.set_activity(t("Thinking…").into());
+                }
             }
             Event::ToolEnded { id, ok, declined, elapsed, output, images } => {
                 self.end_line();
@@ -10384,7 +11861,7 @@ impl App {
                         SetFocus(self.window);
                     }
                 }
-                FlashWindow(self.window, 1);
+                self.flash_for_attention(self.woken_turn);
             }
             Event::Usage { used, window, usage } => {
                 // A report from a request under way comes a couple of times a second: only what it changes is drawn. The panel's words change with each thousand.
@@ -10424,6 +11901,68 @@ impl App {
                 if self.right_width == 0 && !lines.is_empty() {
                     self.append(&format!("{}\n", lines.join("\n")), Style::Tool);
                 }
+            }
+            // (one of another session, asked for before that one was left: not for the answers shown now)
+            Event::TurnChanges { session, .. } if session.is_some() && self.current_session.is_some() && session != self.current_session => {}
+            Event::CardTurns { session, .. } if session.is_some() && self.current_session.is_some() && session != self.current_session => {}
+            Event::CardTurns { turns, .. } => self.turns_for_cards(&turns),
+            Event::TurnChanges { turn, files, .. } => {
+                if let Some(slot) = self.turn_cards_waiting.remove(&turn) {
+                    // (a session opened again: the card goes where the answer ended, as soon as its reply has come, whatever came before and whatever does not)
+                    if !files.is_empty() {
+                        self.put_turn_card(slot, turn, &files);
+                    }
+                    self.turn_changes.insert(turn, files.clone());
+                } else {
+                    // (a card under the answer: the files, and their lines added and removed)
+                    if !files.is_empty() && !self.turn_changes.contains_key(&turn) {
+                        self.write_card(&Card::files(turn, &files));
+                    }
+                    self.turn_changes.insert(turn, files.clone());
+                }
+                // (the tree of the folder marks them, and reads again the folders they are in)
+                self.files_turn_changed(&files);
+            }
+            Event::Question(question) => {
+                self.card_next += 1;
+                let id = self.card_next;
+                self.write_card(&Card::Question { id, question: question.question.clone(), options: question.options.clone(), state: AnswerState::Waiting });
+                let words: String = question.question.lines().next().unwrap_or("").chars().take(120).collect();
+                self.question = Some(AskedQuestion { answer: question.answer, question: question.question, options: question.options, card: id });
+                self.set_activity(String::new());
+                self.update_buttons();
+                InvalidateRect(self.side, std::ptr::null(), 0);
+                self.tray_note(t("Dogmind is waiting for you"), &words);
+                self.flash_for_attention(self.woken_turn);
+                // (the card's field is the composer: what is written in it is the answer)
+                set_text(self.composer_cue, t("Write your own answer…"));
+                self.update_composer_cue();
+                self.focus_composer();
+            }
+            Event::Goal(goal) => {
+                // (the bar under the title shows it, while there is one: set, or that of a session opened)
+                if goal != self.goal {
+                    self.goal = goal;
+                    self.layout();
+                }
+            }
+            Event::PlanReview(review) => {
+                self.card_next += 1;
+                let id = self.card_next;
+                self.write_card(&Card::Plan { id, plan: review.plan.clone(), state: PlanState::Waiting });
+                self.plan_review = Some(AskedPlan { answer: review.answer, plan: review.plan, card: id, changing: false });
+                self.set_activity(String::new());
+                self.update_buttons();
+                InvalidateRect(self.side, std::ptr::null(), 0);
+                self.tray_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
+                self.flash_for_attention(self.woken_turn);
+                self.focus_composer();
+            }
+            Event::ModeChanged(mode) => {
+                // (a plan approved: plan mode is over, as the agent says)
+                self.settings.mode = mode.name().to_string();
+                self.save();
+                self.update_status();
             }
             Event::Turns(turns) => {
                 self.turns = turns;
@@ -10489,7 +12028,32 @@ impl App {
                     self.tell_about_vision();
                 }
             }
+            // The session woke itself, with nobody sending anything: what woke it is a row of its own, and the turn is at work as any is.
+            Event::Woken(wakes) => {
+                self.running = true;
+                self.woken_turn = true;
+                self.turn_failed = false;
+                self.write_card(&Card::Notice { wakes, at: clock_now() });
+                self.update_buttons();
+                InvalidateRect(self.side, std::ptr::null(), 0);
+            }
+            // What it has going or waiting in the background: listed in the panel on the right, and marked in the list of sessions.
+            Event::Waiting(waiting) => {
+                let changed = !self.waiting.same_as(&waiting);
+                self.waiting = waiting;
+                self.waiting_taken = std::time::Instant::now();
+                if changed {
+                    InvalidateRect(self.side, std::ptr::null(), 0);
+                    self.layout();
+                }
+            }
             Event::TurnEnded { cancelled } => {
+                let woken = std::mem::take(&mut self.woken_turn);
+                // (a question or a plan the turn left unanswered goes with it, and its card says so)
+                self.question = None;
+                self.plan_review = None;
+                self.settle_waiting_cards();
+                self.reset_composer_cue();
                 // (what was said too late for this turn is for the next)
                 let late = std::mem::take(&mut *self.agent.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
                 self.queued.extend(late.into_iter().map(Outgoing::words));
@@ -10519,7 +12083,7 @@ impl App {
                 self.update_buttons();
                 self.refresh_sessions();
                 if GetForegroundWindow() != self.window {
-                    FlashWindow(self.window, 1);
+                    self.flash_for_attention(woken);
                 }
                 self.flush_queue();
             }
@@ -10681,10 +12245,20 @@ impl App {
                     self.layout();
                 }
             }
+            Note::FolderRead { root, path, result } => self.files_read_came(root, path, result),
+            Note::WorkspaceChanged { root, changed } => self.files_changed_on_disk(&root, changed),
             Note::Changes(path, found) => {
                 if path != self.workspace {
                     return;
                 }
+                if self.panel == Panel::Diff && self.trajectory.is_some() {
+                    return;
+                }
+                // (opened from the card under an answer: that answer's files, with their diffs, and nothing the workspace has besides)
+                let found = match (&self.turn_view, self.panel == Panel::Diff) {
+                    (Some(files), true) => Ok(files.clone()),
+                    _ => found,
+                };
                 if self.panel != Panel::Diff {
                     self.changes = found.unwrap_or_default();
                     self.layout();
@@ -10758,6 +12332,7 @@ impl App {
                         self.offer_context(Some(0));
                         self.update_licence_link();
                         self.update_vision_chip();
+                        self.update_drafter_chip();
                     }
                     Err(error) => {
                         self.catalog.clear();
@@ -10791,6 +12366,7 @@ impl App {
                 }
                 // (a look that the person has turned off since it began tells nothing on its own)
                 if let Some(release) = updates::release_to_tell(&outcome, on_its_own, self.settings.check_for_updates, self.settings.dismissed_update.as_deref()) {
+                    self.tell_the_tray_of(&release.version, false);
                     self.release_offer = Some(release);
                 }
                 // (the About page says what its own button was asked for, and what the app learned on its own; that the app could not reach GitHub when no one asked is not news there)
@@ -10810,16 +12386,22 @@ impl App {
                     (*so_far, *of) = (done, total);
                     if self.panel == Panel::About {
                         self.layout();
+                    } else if self.notice_is_up() {
+                        // (on the main screen the notice's button says how far it has come: its words change, and nothing else is laid out again)
+                        if let Some(shown @ notice::Notice::Fetching { .. }) = self.notice() {
+                            set_text_if_changed(self.update_offer_button, &notice_text(&shown).1);
+                        }
                     }
                 }
             }
             Note::ReleaseFetched(Ok(ready)) => {
                 let again = matches!(&self.release_update, ReleaseUpdate::Ready(known) if known.version == ready.version);
+                let version_ready = ready.version.clone();
                 self.release_update = ReleaseUpdate::Ready(ready);
                 self.release_update_said = None;
                 if !again {
                     self.release_ready_closed = false;
-                    self.tray_note(t("A new version of Dogmind is here"), t("Open the app to restart into it."));
+                    self.tell_the_tray_of(&version_ready, true);
                 }
                 self.release_update_changed();
             }
@@ -10853,13 +12435,13 @@ impl App {
                 SetupLine::Progress { stage, done, total } => {
                     self.setup_tally.hear(&SetupLine::Progress { stage: stage.clone(), done, total });
                     // (a file alone has a bar of its own: not one nearly full with the model that was there)
-                    let (place, words) = if self.vision_fetch { engine::setup_progress(&stage, done, total, &Default::default()) } else { engine::setup_progress(&stage, done, total, &self.setup_tally) };
+                    let (place, words) = if self.fetching_alone() { engine::setup_progress(&stage, done, total, &Default::default()) } else { engine::setup_progress(&stage, done, total, &self.setup_tally) };
                     self.progress = Some(place);
                     self.show_setup_status(words);
                 }
                 SetupLine::Text(text) => {
                     self.setup_tally.hear(&SetupLine::Text(text.clone()));
-                    if let Some((here, whole)) = self.setup_tally.overall().filter(|_| !self.vision_fetch) {
+                    if let Some((here, whole)) = self.setup_tally.overall().filter(|_| !self.fetching_alone()) {
                         self.progress = Some(here / whole);
                     }
                     if !text.is_empty() {
@@ -10901,18 +12483,30 @@ impl App {
                 let cancelled = self.setup_cancel.swap(false, Ordering::Relaxed);
                 self.setting_up = false;
                 let was_vision = std::mem::take(&mut self.vision_fetch);
+                let drafter_folder = self.drafter_fetch.take();
+                let was_drafter = drafter_folder.is_some();
                 if was_vision && result.is_ok() {
                     self.vision_offer = None;
                     self.vision_told = false;
                 }
+                // The drafter that has been built goes into the settings, as setup would have put it, before the engine starts again.
+                let result = match (result, drafter_folder) {
+                    (Ok(()), Some(folder)) => drafter::turn_on(&engine::config_path(&self.folder), &folder).map(|_| ()),
+                    (result, _) => result,
+                };
                 if self.panel == Panel::Models {
                     self.update_vision_chip();
+                    self.update_drafter_chip();
                 }
                 if self.panel == Panel::Chat {
                     self.layout();
                 }
                 self.progress = None;
                 self.setup_status.clear();
+                if was_drafter {
+                    // (the status line showed how far the fetch had come)
+                    self.update_status();
+                }
                 if self.panel == Panel::Models {
                     self.show_setup_button();
                 }
@@ -10928,18 +12522,24 @@ impl App {
                         if self.onboarding && self.panel == Panel::Models {
                             self.set_panel(Panel::Start);
                         }
-                        self.connect();
+                        if was_drafter {
+                            // (the engine was not stopped for this: it is not started again over the one that runs)
+                            self.restart_for_drafter();
+                        } else {
+                            self.connect();
+                        }
                     }
+                    // (the drafter's fetch left the engine as it was, and so does its end: there is nothing to start again)
                     Err(_) if cancelled => {
                         told(self, t("Download stopped. What has arrived stays in the folder, and downloading again goes on from there."));
                         // The engine was stopped for this, and a model it had is still there.
-                        if engine::is_set_up(&self.folder) && !self.onboarding {
+                        if !was_drafter && engine::is_set_up(&self.folder) && !self.onboarding {
                             self.connect();
                         }
                     }
                     Err(error) => {
                         told(self, &engine::setup_failure_words(&error));
-                        if engine::is_set_up(&self.folder) && !self.onboarding {
+                        if !was_drafter && engine::is_set_up(&self.folder) && !self.onboarding {
                             self.connect();
                         }
                     }
@@ -10993,7 +12593,7 @@ impl App {
             }
         }
         let vision = if self.vision_for_installed().is_some() { self.vision_is_on() } else { self.vision_wanted };
-        let mut args = engine::setup_arguments(entry.bundle.as_ref(), &folder, &engine::config_path(&self.folder), self.drafter, vision);
+        let mut args = engine::setup_arguments(entry.bundle.as_ref(), &folder, &engine::config_path(&self.folder), self.drafter_is_on(), vision);
         // One short of graphics memory is set up only when chosen, and by a Straydog that is told so: it refuses otherwise.
         if !entry.runs {
             if !engine::setup_can_force(&straydog) {
@@ -11012,7 +12612,10 @@ impl App {
         self.setup_tally = Default::default();
         self.progress = Some(0.0);
         self.show_setup_button();
-        self.engine = None; // A verify needs the files to itself, and its VRAM probe needs the card.
+        // A verify needs the files to itself, and its VRAM probe needs the card. (The drafter's fetch needs neither.)
+        if self.setup_holds_off_the_engine() {
+            self.engine = None;
+        }
         self.show_setup_status(first_words);
         let (poster, cancel) = (self.poster.clone(), self.setup_cancel.clone());
         std::thread::spawn(move || {
@@ -11026,6 +12629,8 @@ impl App {
             // A PC left alone for a download of hours does not sleep through it. It ends with this thread.
             windows_sys::Win32::System::Power::SetThreadExecutionState(windows_sys::Win32::System::Power::ES_CONTINUOUS | windows_sys::Win32::System::Power::ES_SYSTEM_REQUIRED);
             let waker = poster.clone();
+            // (a Straydog older than the app does not know every option: asked of its help, here and not on the window's thread)
+            let args = engine::for_this_straydog(&straydog, args);
             let mut tries = 0;
             let result = loop {
                 let waker = waker.clone();
@@ -11398,6 +13003,7 @@ impl App {
         // What has only an icon says what it is when the pointer rests on it.
         for (window, words) in [
             (self.help_button, t("Help")),
+            (self.goal_clear, t("Clear the goal")),
             (self.right_toggle, t("Show or hide the panel on the right")),
             (self.attach_button, t("Attach a picture")),
             (self.preview_reload, t("Reload")),
@@ -11410,15 +13016,6 @@ impl App {
             (self.provider_down, t("Move down")),
         ] {
             self.tip(window, words);
-        }
-        for button in self.copy_buttons.iter().chain(&self.block_buttons) {
-            self.tip(*button, t("Copy"));
-        }
-        for button in &self.fork_buttons {
-            self.tip(*button, t("Branch from here: a new session with the conversation up to this answer"));
-        }
-        for button in &self.run_buttons {
-            self.tip(*button, t("Show or hide these calls"));
         }
         self.tip(self.modal_close, t("Close"));
         self.tip(self.diff_previous, t("Previous change (P)"));
@@ -11725,7 +13322,33 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
     if message == WM_MOUSEMOVE && !(app.links.is_empty() && app.runs.is_empty()) {
         app.track_link(lparam);
     }
-    if message == WM_MOUSEMOVE && !app.pointer_tracked && !forced_hover() {
+    // The icons over the text are drawn in its paint: the pointer is theirs when it is over one, and a press on one is not a press on the text.
+    if message == WM_MOUSEMOVE {
+        let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
+        app.overlay_pointer(x, y);
+    }
+    if matches!(message, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
+        let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
+        if let Some(key) = app.overlay_at(x, y) {
+            app.overlay_press = Some(key);
+            SetCapture(window);
+            app.invalidate_overlay(key);
+            return 0;
+        }
+    }
+    if message == WM_LBUTTONUP && app.overlay_press.is_some() {
+        let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
+        let pressed = app.overlay_press.take();
+        ReleaseCapture();
+        if let Some(key) = pressed {
+            app.invalidate_overlay(key);
+            if app.overlay_at(x, y) == Some(key) {
+                app.overlay_act(key);
+            }
+        }
+        return 0;
+    }
+    if message == WM_MOUSEMOVE && !app.pointer_tracked && !test_pointer_stays() {
         app.pointer_tracked = true;
         let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: window, dwHoverTime: 0 };
         TrackMouseEvent(&mut track);
@@ -11733,9 +13356,18 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
     if message == WM_MOUSELEAVE {
         app.pointer_tracked = false;
         app.run_hover = None;
+        // (a test that has no pointer of its own: the leave the system sends when the capture changes is not the pointer leaving)
+        if let Some(key) = if test_pointer_stays() { None } else { app.overlay_hover.take() } {
+            app.invalidate_overlay(key);
+            app.keep_overlay_tip();
+        }
         if app.link_hover.take().is_some() {
             InvalidateRect(app.window, &app.status_area, 0);
         }
+    }
+    if message == WM_SETCURSOR && app.overlay_hover.is_some() {
+        SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
+        return 1;
     }
     // (a row that has nothing more to show only says its whole path)
     if message == WM_SETCURSOR && app.link_hover.is_some() && app.run_hover.map_or(true, |run| app.runs[run].expandable()) {
@@ -11806,11 +13438,14 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
         CallWindowProcW(base, window, message, wparam, lparam)
     };
     if matches!(message, WM_VSCROLL | WM_MOUSEWHEEL | WM_KEYDOWN | WM_LBUTTONUP | WM_SIZE) {
-        app.place_copy_buttons();
         app.place_thumb();
+        // (what moved under the pointer is what it is on now)
+        if matches!(message, WM_VSCROLL | WM_MOUSEWHEEL | WM_KEYDOWN) {
+            app.overlay_pointer_again();
+        }
     }
     if matches!(message, WM_PAINT | WM_TIMER) && app.panel == Panel::Chat {
-        app.follow_the_view();
+        app.follow_the_thumb();
     }
     if matches!(message, WM_PAINT | WM_PRINT | WM_PRINTCLIENT) {
         if message != WM_PAINT {
@@ -11914,6 +13549,47 @@ impl CardKind {
     }
 }
 
+/// Whether a card whose foot was found at some row goes on below it now: the row's pixel and the one under it are both the card's colour.
+fn card_has_grown(inside: u32, below: u32, back: u32) -> bool {
+    inside == back && below == back
+}
+
+/// The squares at the two lower corners of a card, which are drawn over to round it.
+fn foot_corners(card: &CardArea, radius: i32) -> [RECT; 2] {
+    [
+        RECT { left: card.left, top: card.bottom + 1 - radius, right: card.left + radius, bottom: card.bottom + 1 },
+        RECT { left: card.right + 1 - radius, top: card.bottom + 1 - radius, right: card.right + 1, bottom: card.bottom + 1 },
+    ]
+}
+
+/// Whether the rows of a block are each drawn as they come: a debug build with `DOGMIND_TEST_ROWPAINT` set to a number of milliseconds draws the transcript after each and waits that long,
+/// as it is drawn when a command's output comes in over some time while the window is being painted for other reasons.
+fn test_rows_painted() -> Option<u64> {
+    static ON: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    *ON.get_or_init(|| std::env::var("DOGMIND_TEST_ROWPAINT").ok().map(|text| text.parse().unwrap_or(0)))
+}
+
+/// A debug build with `DOGMIND_TEST_POINTER` (or `DOGMIND_TEST_HOVER`) set keeps what the pointer is on as it is: a test sends the transcript's window the pointer's messages, the real pointer
+/// being elsewhere, and the system's own word that it has left (it comes when the capture changes) is not the pointer leaving.
+fn test_pointer_stays() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(debug_assertions) && *ON.get_or_init(|| std::env::var_os("DOGMIND_TEST_POINTER").is_some()) || forced_hover()
+}
+
+/// A debug build with `DOGMIND_TEST_NOFADE` set draws no fade at the edges of the text: a test that reads colours of the cards near them sees them as they are.
+fn test_no_fade() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("DOGMIND_TEST_NOFADE").is_some()
+}
+
+/// A debug build with `DOGMIND_TEST_STALE_SHAPES` set keeps a card's shape as it was first taken, which is how the corners were drawn before they followed the card: to see what that was.
+fn test_stale_shapes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(debug_assertions) && *ON.get_or_init(|| std::env::var_os("DOGMIND_TEST_STALE_SHAPES").is_some())
+}
+
 /// A card's edges from the start of its text, and the colour of the page around it.
 #[derive(Clone, Copy)]
 struct CardShape {
@@ -11988,7 +13664,9 @@ struct CardArea {
 }
 
 /// The card around a point just before its text begins. `None`: it is not in view, or what is there is not one card's rectangle.
-fn find_card(client: RECT, text: POINT, radius: i32, is_card: impl Fn(i32, i32) -> bool) -> Option<CardArea> {
+/// `seam`: the most pixels from one that is the card's to the next that is when the rows of a card are walked across (3 design pixels, in this window's scale: the seam between rows is a
+/// fraction of a row's height and grows with the type, as the gap between two cards, which is more than that, does too).
+fn find_card(client: RECT, text: POINT, radius: i32, seam: i32, is_card: impl Fn(i32, i32) -> bool) -> Option<CardArea> {
     let x = text.x - 2;
     if x <= client.left || x >= client.right || text.y >= client.bottom {
         return None;
@@ -11997,13 +13675,18 @@ fn find_card(client: RECT, text: POINT, radius: i32, is_card: impl Fn(i32, i32) 
     if !is_card(x, from) {
         return None;
     }
-    let (mut top, mut bottom) = (from, from);
-    while top > client.top && is_card(x, top - 1) {
-        top -= 1;
-    }
-    while bottom + 1 < client.bottom && is_card(x, bottom + 1) {
-        bottom += 1;
-    }
+    // A card that is rows of a table has a seam between two of them, a line or two of another colour, where the control draws their edges at fractions of a pixel: it is walked over.
+    let reach = |from: i32, step: i32, limit: i32| -> i32 {
+        let mut y = from;
+        loop {
+            let found = (1..=seam.max(3)).map(|gap| y + step * gap).take_while(|at| if step > 0 { *at < limit } else { *at > limit }).find(|at| is_card(x, *at));
+            match found {
+                Some(at) => y = at,
+                None => return y,
+            }
+        }
+    };
+    let (top, bottom) = (reach(from, -1, client.top - 1), reach(from, 1, client.bottom));
     let (top_open, bottom_open) = (top == client.top, bottom + 1 == client.bottom);
     if top_open && bottom_open || bottom - top < 2 * radius {
         return None;
@@ -12021,7 +13704,7 @@ fn find_card(client: RECT, text: POINT, radius: i32, is_card: impl Fn(i32, i32) 
     }
     let height = bottom - top;
     let whole = left > client.left && right - left >= 2 * radius && height >= 2 * radius
-        && (top + radius..=bottom - radius).all(|y| is_card(left, y) && is_card(right, y) && !is_card(left - 1, y) && (right + 1 == client.right || !is_card(right + 1, y)));
+        && (top + radius..=bottom - radius).all(|y| !is_card(x, y) || (is_card(left, y) && is_card(right, y) && !is_card(left - 1, y) && (right + 1 == client.right || !is_card(right + 1, y))));
     whole.then_some(CardArea { left, right, top, bottom, top_open, bottom_open })
 }
 
@@ -12044,11 +13727,16 @@ unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPAR
     let Some(app) = app() else { return DefWindowProcW(window, message, wparam, lparam) };
     let base = std::mem::transmute::<isize, WNDPROC>(app.list_procedure);
     let is_side = window == app.side;
+    let is_tree = window == app.tree_list;
     match message {
         WM_MOUSEMOVE | WM_MOUSELEAVE => {
+            // (a test that has no pointer of its own: the leave the system sends is not the pointer leaving)
+            if message == WM_MOUSELEAVE && is_tree && test_pointer_stays() {
+                return 0;
+            }
             let found = if message == WM_MOUSEMOVE { SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam) } else { 0x10000 };
             let hover = ((found >> 16) & 0xFFFF == 0).then_some((found & 0xFFFF) as usize);
-            let slot = if is_side { &mut app.side_hover } else if window == app.suggest { &mut app.suggest_hover } else { &mut app.list_hover };
+            let slot = if is_side { &mut app.side_hover } else if is_tree { &mut app.tree_hover } else if window == app.suggest { &mut app.suggest_hover } else { &mut app.list_hover };
             if *slot != hover {
                 for index in [*slot, hover].into_iter().flatten() {
                     let mut area: RECT = std::mem::zeroed();
@@ -12065,6 +13753,35 @@ unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPAR
             }
             with_thin_bar(app, window, base, message, wparam, lparam)
         }
+        // The files of the folder: a press on a row's own button, a double click, the keys and the menu.
+        WM_RBUTTONUP if is_tree => {
+            let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
+            if (found >> 16) & 0xFFFF == 0 {
+                app.files_menu((found & 0xFFFF) as usize, ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32));
+            }
+            0
+        }
+        WM_CONTEXTMENU if is_tree => {
+            app.files_menu_from_key();
+            0
+        }
+        WM_LBUTTONUP if is_tree && app.bar_grab.is_none() => {
+            let result = CallWindowProcW(base, window, message, wparam, lparam);
+            let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
+            if (found >> 16) & 0xFFFF == 0 {
+                app.files_row_clicked((found & 0xFFFF) as usize, (lparam & 0xFFFF) as i16 as i32);
+            }
+            result
+        }
+        WM_LBUTTONDBLCLK if is_tree => {
+            let result = CallWindowProcW(base, window, message, wparam, lparam);
+            let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
+            if (found >> 16) & 0xFFFF == 0 {
+                app.files_row_double_clicked((found & 0xFFFF) as usize);
+            }
+            result
+        }
+        WM_KEYDOWN if is_tree && app.files_key(wparam as u16) => 0,
         WM_RBUTTONUP if is_side => {
             let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
             if (found >> 16) & 0xFFFF == 0 {
@@ -12121,7 +13838,7 @@ unsafe extern "system" fn diff_procedure(window: HWND, message: u32, wparam: WPA
         WM_LBUTTONDOWN => {
             SetCapture(window);
             if on_strip {
-                let total = app.diff_rows.len() as i32 * row;
+                let total = app.diff_len() as i32 * row;
                 if total > client.bottom {
                     let tall = thumb_height(client.bottom, client.bottom, total, scale(app.dpi, ds::space::XXL));
                     let at = thumb_offset(client.bottom - tall, app.diff_scroll, total - client.bottom);
@@ -12131,7 +13848,16 @@ unsafe extern "system" fn diff_procedure(window: HWND, message: u32, wparam: WPA
                     app.diff_to((i64::from(y - grab) * i64::from(total - client.bottom) / i64::from((client.bottom - tall).max(1))) as i32);
                 }
             } else {
-                let at = row_at(app, y).min(app.diff_rows.len().saturating_sub(1));
+                let at = row_at(app, y).min(app.diff_len().saturating_sub(1));
+                // (on the trajectory page a press on a turn's row opens it or shuts it)
+                if app.trajectory.is_some() {
+                    // (not the header, which stays over the rows that scroll under it)
+                    let hit = if y < row { None } else { app.trajectory.as_ref().and_then(|page| page.rows.get(row_at(app, y)).map(|line| line.kind)) };
+                    if let Some(crate::trajectory::RowKind::Turn { turn, .. }) = hit {
+                        app.toggle_trajectory_turn(turn);
+                    }
+                    return 0;
+                }
                 app.diff_chosen = Some((at, at));
                 InvalidateRect(window, std::ptr::null(), 0);
             }
@@ -12139,11 +13865,11 @@ unsafe extern "system" fn diff_procedure(window: HWND, message: u32, wparam: WPA
         }
         WM_MOUSEMOVE if wparam & 1 != 0 => { // MK_LBUTTON
             if let Some(grab) = app.diff_thumb_grab {
-                let total = app.diff_rows.len() as i32 * row;
+                let total = app.diff_len() as i32 * row;
                 let tall = thumb_height(client.bottom, client.bottom, total, scale(app.dpi, ds::space::XXL));
                 app.diff_to((i64::from(y - grab) * i64::from((total - client.bottom).max(0)) / i64::from((client.bottom - tall).max(1))) as i32);
             } else if let Some((from, _)) = app.diff_chosen {
-                let at = row_at(app, y).min(app.diff_rows.len().saturating_sub(1));
+                let at = row_at(app, y).min(app.diff_len().saturating_sub(1));
                 app.diff_chosen = Some((from, at));
                 // (past an edge, the view goes along)
                 if y < 0 {
@@ -12314,6 +14040,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         }
         WM_TIMER if wparam == TIMER_ENGINE => {
             app.watch_preview();
+            app.waiting_tick();
             if let Some(reason) = app.engine.as_mut().and_then(Engine::ended) {
                 app.engine = None;
                 // (one that ended before it was ready failed to start; one that had been working may be tried again at once)
@@ -12347,6 +14074,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 keep_server_line(&app.folder, &app.leaving, &told);
                 app.update_status();
             }
+            if app.drafter_restart_waits {
+                app.restart_for_drafter();
+            }
             0
         }
         WM_FRAME => {
@@ -12356,9 +14086,18 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         }
         WM_TIMER if wparam == TIMER_COPIED => {
             KillTimer(window, TIMER_COPIED);
-            for button in app.copy_buttons.iter().chain(&app.block_buttons) {
-                set_text(*button, "copy");
+            if let Some(key) = app.overlay_copied.take() {
+                app.invalidate_overlay(key);
             }
+            0
+        }
+        WM_TIMER if wparam == TIMER_PROXIES => {
+            KillTimer(window, TIMER_PROXIES);
+            app.sync_proxies();
+            0
+        }
+        WM_PROXY_FOCUS => {
+            InvalidateRect(app.transcript, std::ptr::null(), 0);
             0
         }
         WM_TIMER if wparam == TIMER_UPDATE => {
@@ -12366,7 +14105,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_TIMER if wparam == TIMER_RELEASES => {
-            // (the first look came a little after the start; from here the timer asks once an hour whether a day has gone by)
+            // (the first look came a little after the start; from here the timer asks once an hour whether six hours have gone by)
             SetTimer(window, TIMER_RELEASES, RELEASE_LOOK_MS, None);
             app.look_for_release();
             0
@@ -12409,7 +14148,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     } else {
                         app.follow_end = false;
                         SendMessageW(app.transcript, WM_VSCROLL, if y < thumb.top { SB_PAGEUP } else { SB_PAGEDOWN } as WPARAM, 0);
-                        app.place_copy_buttons();
                         app.place_thumb();
                     }
                 }
@@ -12445,7 +14183,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         WM_MOUSEMOVE if app.panel == Panel::Chat => {
             let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
             let within = |area: &RECT| x >= area.left && x < area.right && y >= area.top && y < area.bottom;
-            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
+            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.right_tab_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.waiting_hits.iter().map(|(area, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
             app.hover_on(found);
             app.rail_hover_at(x, y);
             0
@@ -12482,29 +14220,16 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.layout();
                 return 0;
             }
-            // (not this release: a later one is told of again)
-            if app.release_offer_close.is_some_and(|close| within(&close)) {
-                if let Some(release) = app.release_offer.take() {
-                    app.dismiss_release(&release.version);
-                }
-                app.layout();
-                return 0;
-            }
-            // (not this build: a newer one is offered again)
-            if app.update_offer_close.is_some_and(|close| within(&close)) {
-                app.update_offer = false;
-                app.restart_when_done = false;
-                app.release_ready_closed = true;
-                app.update_declined = app.update_seen.clone();
-                app.layout();
-                return 0;
-            }
-            if let Some((at, act)) = app.queue_hits.iter().find(|(area, _, _)| within(area)).map(|(_, at, act)| (*at, *act)) {
+            if let Some(files) = app.right_tab_at(x, y) {
+                app.set_right_view(files);
+            } else if let Some((at, act)) = app.queue_hits.iter().find(|(area, _, _)| within(area)).map(|(_, at, act)| (*at, *act)) {
                 app.queue_act(at, act);
             } else if let Some(at) = app.rail_hits.iter().find(|(area, _)| within(area)).map(|(_, at)| *at) {
                 app.jump_to_turn(at);
             } else if let Some(file) = app.preview_hits.iter().find(|(area, _)| within(area)).map(|(_, file)| file.display().to_string()) {
                 app.open_preview(&file);
+            } else if let Some(id) = app.waiting_hits.iter().find(|(area, _)| within(area)).map(|(_, id)| id.clone()) {
+                app.stop_waiting(&id);
             } else if let Some(url) = app.dashboard_hit.as_ref().filter(|(area, _)| within(area)).map(|(_, url)| url.clone()) {
                 open_in_browser(&url);
             } else if let Some((_, at)) = app.right_hits.iter().find(|(area, _)| within(area)).copied() {
@@ -12524,7 +14249,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_CTLCOLORLISTBOX => {
-            let side = lparam as HWND == app.side || app.panel == Panel::Diff;
+            let side = lparam as HWND == app.side || lparam as HWND == app.tree_list || app.panel == Panel::Diff;
             SetBkColor(wparam as HDC, if side { theme::sidebar() } else { theme::surface() });
             app.brushes[if side { 1 } else { 2 }] as LRESULT
         }
@@ -12543,6 +14268,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             let item = &mut *(lparam as *mut MEASUREITEMSTRUCT);
             item.itemHeight = if item.CtlID as isize == ID_SUGGEST {
                 scale(app.dpi, ds::size::MENU_ROW) as u32
+            } else if item.CtlID as isize == ID_FILES {
+                scale(app.dpi, ds::size::TEXT_ROW) as u32
+            } else if item.CtlID as isize == ID_FILES_MENU {
+                scale(app.dpi, files_panel::MENU_ROW) as u32
             } else if item.CtlID as isize == ID_SIDE {
                 match app.side_rows.get(item.itemID as usize) {
                     Some(SideRow::Session { .. }) if app.side_hits.is_some() => scale(app.dpi, ds::size::SIDE_ROW_TALL) as u32,
@@ -12566,6 +14295,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             if item.itemID != u32::MAX {
                 if item.hwndItem == app.side {
                     app.draw_side_row(item);
+                } else if item.hwndItem == app.tree_list {
+                    app.draw_file_row(item);
+                } else if item.hwndItem == app.tree_menu {
+                    app.draw_menu_row(item);
                 } else if item.hwndItem == app.suggest {
                     app.draw_suggestion(item);
                 } else if item.hwndItem == app.list {
@@ -12629,11 +14362,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                         app.open_picture(&path);
                     }
                 }
-                _ if (ID_PICTURES..ID_PICTURES + PICTURE_POOL as isize).contains(&id) => {
-                    if let Some((path, _)) = app.picture_shown.get((id - ID_PICTURES) as usize).cloned().flatten() {
-                        app.open_picture(&path);
-                    }
-                }
                 ID_PANEL_TOGGLE => app.toggle_right_panel(),
                 ID_PREVIEW_RELOAD => {
                     if let Some(shown) = &app.preview {
@@ -12653,11 +14381,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_ALWAYS => app.answer_approval(Decision::Always),
                 ID_REJECT => app.answer_approval(Decision::Reject),
                 ID_NEW_SESSION => app.new_session(),
-                ID_DRAFTER => {
-                    app.drafter = !app.drafter;
-                    app.update_drafter_chip();
-                    app.layout();
-                }
+                ID_DRAFTER => app.drafter_clicked(),
                 ID_SPEED_FIRST => {
                     app.settings.speed_first = !app.settings.speed_first;
                     app.save();
@@ -12675,6 +14399,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_UPDATE_OFFER => app.update_offer_pressed(),
+                ID_NOTICE_LATER => app.notice_sent_away(),
                 ID_RELEASE_OFFER => {
                     if let Some(release) = app.release_offer.clone() {
                         app.open_release(&release.version, &release.page);
@@ -12683,7 +14408,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 ID_TOGGLE_UPDATES => app.updates_switched(),
                 ID_VISION_OFFER => match app.vision_offer {
-                    _ if app.setting_up => app.setup_cancel.store(true, Ordering::Relaxed),
+                    _ if app.setting_up && app.vision_fetch => app.setup_cancel.store(true, Ordering::Relaxed),
                     Some(VisionOffer::Download(_)) => app.start_vision_setup(),
                     Some(VisionOffer::TurnOn) => app.vision_switch(true),
                     None => {}
@@ -12800,12 +14525,12 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_HELP => app.set_panel(Panel::Help),
-                _ if (ID_COPY_POOL..ID_COPY_POOL + COPY_POOL as isize).contains(&id) => app.copy_answer((id - ID_COPY_POOL) as usize),
-                _ if (ID_FORK_POOL..ID_FORK_POOL + COPY_POOL as isize).contains(&id) => app.fork_from_answer((id - ID_FORK_POOL) as usize),
-                _ if (ID_BLOCK_POOL..ID_BLOCK_POOL + BLOCK_POOL as isize).contains(&id) => app.copy_block((id - ID_BLOCK_POOL) as usize),
-                _ if (ID_RUN_POOL..ID_RUN_POOL + RUN_POOL as isize).contains(&id) => {
-                    if let Some(run) = app.run_targets[(id - ID_RUN_POOL) as usize] {
-                        app.toggle_run(run);
+                ID_GOAL_CLEAR => {
+                    let _ = app.agent.commands.send(Command::SetGoal(None));
+                }
+                _ if (ID_PROXY_POOL..ID_PROXY_POOL + PROXY_POOL as isize).contains(&id) => {
+                    if let Some(key) = app.proxy_keys[(id - ID_PROXY_POOL) as usize] {
+                        app.overlay_act(key);
                     }
                 }
                 ID_TOGGLE_THINKING => app.on_menu(M_THINKING),
@@ -12825,6 +14550,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_PROVIDER_DOWN => app.move_provider(1),
                 ID_TOGGLE_COMPACT => app.on_menu(M_COMPACT_CHOICE + usize::from(app.settings.compact_tools)),
                 ID_TOGGLE_WEB => app.on_menu(M_WEB_CHOICE + usize::from(app.settings.web_tools)),
+                ID_FILES => {
+                    if code == LBN_SELCHANGE as usize {
+                        app.files_selection_changed();
+                    }
+                }
                 ID_SUGGEST => {
                     if code == LBN_SELCHANGE as usize {
                         let at = SendMessageW(app.suggest, LB_GETCURSEL, 0, 0);
@@ -12838,6 +14568,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     app.offer_context(selected);
                     app.update_licence_link();
                     app.update_vision_chip();
+                    app.update_drafter_chip();
                     app.layout();
                 }
                 ID_LIST if code == LBN_DBLCLK as usize && app.panel == Panel::Sessions => app.on_button(0),
@@ -12864,7 +14595,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.remember_place();
             app.save();
             ShowWindow(window, SW_HIDE);
-            if !app.settings.tray_told {
+            if !app.waiting.is_empty() || app.parked.iter().any(|parked| !parked.waiting.is_empty()) {
+                // (what waits in the background goes on while the window is hidden, and says here when it has something for the person)
+                app.tray_note(t("Dogmind is still here"), t("It goes on with what waits in the background, and says here when it has something for you. Quit it from the tray icon's menu to end all of it."));
+            } else if !app.settings.tray_told {
                 app.settings.tray_told = true;
                 app.save();
                 app.tray_note(t("Dogmind is still here"), t("It keeps running in the tray, with the engine loaded. Quit it from the tray icon's menu."));
@@ -12941,6 +14675,11 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
     let key = message.wParam as u16;
     if matches!(key, VK_TAB | VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT) {
         keys_in_use(true);
+    }
+    // Esc on the little menu of a file: it is put away, and nothing else (below, Esc stops the work or leaves a page).
+    if key == VK_ESCAPE && message.hwnd == app.tree_menu && app.tree_menu_row.is_some() {
+        app.files_menu_close(true);
+        return true;
     }
     let shift = GetKeyState(VK_SHIFT as i32) < 0;
     let control = GetKeyState(VK_CONTROL as i32) < 0;
@@ -13233,11 +14972,26 @@ unsafe fn title_bar(window: HWND) {
 /// command is left out, as it is being approved; a file's content may be long, and its first part tells what it is.
 /// What a call says of itself, and what it brought back, is drawn as it is written: a command with a right-to-left override in it showed its end backwards, as `echo safe live world`
 /// for what ran as `echo safe <U+202E> dlrow evil`. What acts on text and shows nothing is shown as its mark before any of it is drawn.
+/// So are keys and tokens a tool brought back or a call names: hidden but their beginning (mask::hide_keys), where they are shown.
 fn hidden_shown(event: Event) -> Event {
+    let event = keys_hidden(event);
     match event {
         Event::ToolStarted { id, tool, summary } if markdown::has_marks(&summary) => Event::ToolStarted { id, tool, summary: markdown::show_hidden(&summary).into_owned() },
         Event::ToolProgress { id, tool, summary } if markdown::has_marks(&summary) => Event::ToolProgress { id, tool, summary: markdown::show_hidden(&summary).into_owned() },
         Event::ToolEnded { id, ok, declined, elapsed, output, images } if markdown::has_marks(&output) => Event::ToolEnded { id, ok, declined, elapsed, output: markdown::show_hidden(&output).into_owned(), images },
+        other => other,
+    }
+}
+
+fn keys_hidden(event: Event) -> Event {
+    let hide = |text: String| match crate::mask::hide_keys(&text) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(hidden) => hidden,
+    };
+    match event {
+        Event::ToolStarted { id, tool, summary } => Event::ToolStarted { id, tool, summary: hide(summary) },
+        Event::ToolProgress { id, tool, summary } => Event::ToolProgress { id, tool, summary: hide(summary) },
+        Event::ToolEnded { id, ok, declined, elapsed, output, images } => Event::ToolEnded { id, ok, declined, elapsed, output: hide(output), images },
         other => other,
     }
 }
@@ -13363,6 +15117,7 @@ pub(crate) fn tool_name(tool: &str) -> &str {
         "execute_command" => "Run",
         "command_status" => "Check a command",
         "command_stop" => "Stop a command",
+        "wake_at" => "Wake later",
         "todo" => "Tasks",
         "skill" => "Skill",
         "remember" => "Remember",
@@ -13714,7 +15469,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         crate::textview::set_name(doc, "Document");
         // (a line an edge of the view cuts in half fades out there, as it does in a browser's chat, and does not read as letters gone wrong)
         for reading in [transcript, doc] {
-            crate::textview::fade_edges(reading, ds::size::TEXT_FADE);
+            crate::textview::fade_edges(reading, if test_no_fade() { 0 } else { ds::size::TEXT_FADE });
         }
         let side = control(window, "LISTBOX", "", list_style, 0, ID_SIDE);
         let list = control(window, "LISTBOX", "", list_style, 0, ID_LIST);
@@ -13739,6 +15494,20 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             side,
             side_rows: Vec::new(),
             side_hover: None,
+            tree: files::Tree::new(),
+            tree_list: control(window, "LISTBOX", "", list_style | LBS_HASSTRINGS as u32 | WS_TABSTOP, 0, ID_FILES),
+            tree_rows: Vec::new(),
+            tree_selected: None,
+            tree_hover: None,
+            tree_for: None,
+            tree_watcher: None,
+            tree_stale: false,
+            tree_dpi: 0,
+            tree_version: None,
+            tree_menu: control(window, "LISTBOX", "", list_style & !WS_VSCROLL | LBS_HASSTRINGS as u32, 0, ID_FILES_MENU),
+            tree_menu_row: None,
+            tree_menu_hover: None,
+            right_tab_hits: Vec::new(),
             collapsed: HashSet::new(),
             all_sessions: Vec::new(),
             current_session: None,
@@ -13752,8 +15521,13 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             effort_chip: chip(ID_EFFORT_CHIP, theme::surface()),
             help_button: make_button(window, ID_HELP, "circle-question-mark", ButtonKind::Icon, theme::sidebar()),
             doc,
-            copy_buttons: (0..COPY_POOL).map(|at| make_button(window, ID_COPY_POOL + at as isize, "copy", ButtonKind::Icon, theme::background())).collect(),
-            fork_buttons: (0..COPY_POOL).map(|at| make_button(window, ID_FORK_POOL + at as isize, "git-branch", ButtonKind::Icon, theme::background())).collect(),
+            overlay_hits: Vec::new(),
+            overlay_hover: None,
+            overlay_press: None,
+            overlay_copied: None,
+            overlay_tip_for: None,
+            proxies: (0..PROXY_POOL).map(|at| make_button(window, ID_PROXY_POOL + at as isize, "", ButtonKind::Hidden, theme::background())).collect(),
+            proxy_keys: vec![None; PROXY_POOL],
             answers: Vec::new(),
             user_cards: Vec::new(),
             rail_turns: Vec::new(),
@@ -13764,7 +15538,6 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             rail_hits: Vec::new(),
             rail_tips: Vec::new(),
             column_right: 0,
-            copy_targets: vec![None; COPY_POOL],
             transcript_area: rect(0, 0, 0, 0),
             thumb: None,
             thumb_grab: None,
@@ -13805,10 +15578,10 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             update_seen: None,
             update_offer: false,
             update_offer_button: make_button(window, ID_UPDATE_OFFER, "", ButtonKind::Secondary, theme::surface()),
-            update_offer_close: None,
+            notice_later: make_button(window, ID_NOTICE_LATER, "", ButtonKind::Link, theme::surface()),
             release_offer: None,
             release_offer_button: make_button(window, ID_RELEASE_OFFER, "", ButtonKind::Secondary, theme::surface()),
-            release_offer_close: None,
+            tray_told_release: None,
             release_checking: false,
             release_outcome: None,
             install_folder: updates::install_folder(),
@@ -13863,15 +15636,27 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             rename_seed: None,
             resume_paths: Vec::new(),
             parked: Vec::new(),
+            waiting: Waiting::default(),
+            waiting_taken: std::time::Instant::now(),
+            woken_turn: false,
+            waiting_hits: Vec::new(),
+            waiting_times: Vec::new(),
             provider: None,
             held_notices: HashMap::new(),
             failed_sessions: HashSet::new(),
             turn_failed: false,
             turns: Vec::new(),
+            turn_changes: std::collections::BTreeMap::new(),
             rewind_rows: Vec::new(),
             shown_rules: Vec::new(),
             changes: Vec::new(),
             change_wanted: None,
+            turn_view: None,
+            turn_slots: Vec::new(),
+            turn_end_slot: 0,
+            turn_cards_waiting: HashMap::new(),
+            turn_cards_came: Vec::new(),
+            goal_clear: make_button(window, ID_GOAL_CLEAR, "x", ButtonKind::Icon, theme::surface()),
             right_width: 0,
             right_toggle: make_button(window, ID_PANEL_TOGGLE, "panel-right", ButtonKind::Icon, theme::background()),
             right_hits: Vec::new(),
@@ -13907,6 +15692,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             setup_kind: Kind::Embedded,
             sidebar_width: 0,
             diff_view,
+            trajectory: None,
             diff_previous: make_button(window, ID_DIFF_PREVIOUS, "chevron-up", ButtonKind::Icon, theme::background()),
             diff_next: make_button(window, ID_DIFF_NEXT, "chevron-down", ButtonKind::Icon, theme::background()),
             diff_close: make_button(window, ID_DIFF_CLOSE, "x", ButtonKind::Icon, theme::background()),
@@ -13948,20 +15734,24 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             progress: None,
             kind: Kind::Server,
             drafter: true,
+            drafter_fetch: None,
+            drafter_restart_waits: false,
             pending: None,
             tools_running: HashMap::new(),
             running: false,
             has_messages: false,
             queued: Vec::new(),
-            placed_at: 0,
+            thumb_at: 0,
             transcript_region: ((0, 0), None),
             interjected: Vec::new(),
+            question: None,
+            card_slots: Vec::new(),
+            card_next: 0,
+            plan_review: None,
+            goal: None,
             queue_hits: Vec::new(),
             queue_tips: Vec::new(),
             blocks: Vec::new(),
-            block_buttons: (0..BLOCK_POOL).map(|at| make_button(window, ID_BLOCK_POOL + at as isize, "copy", ButtonKind::Icon, theme::code_back())).collect(),
-            run_buttons: (0..RUN_POOL).map(|at| make_button(window, ID_RUN_POOL + at as isize, "chevron-right", ButtonKind::Icon, theme::background())).collect(),
-            run_targets: vec![None; RUN_POOL],
             runs: Vec::new(),
             run_open: None,
             run_writing: false,
@@ -13970,7 +15760,6 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             run_hover: None,
             plain_writing: None,
             request_live: None,
-            block_targets: vec![None; BLOCK_POOL],
             open_block: None,
             block_card_due: false,
             last_inserted: (0, 0),
@@ -13993,9 +15782,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             attach_button: make_button(window, ID_ATTACH, "paperclip", ButtonKind::Icon, theme::surface()),
             attachments: Vec::new(),
             attached_windows: (0..attach::MOST_IMAGES).map(|at| make_button(window, ID_ATTACHED + at as isize, "", ButtonKind::Attached, theme::surface())).collect(),
-            picture_windows: (0..PICTURE_POOL).map(|at| make_button(window, ID_PICTURES + at as isize, "", ButtonKind::Picture, theme::user_back())).collect(),
-            picture_shown: vec![None; PICTURE_POOL],
-            picture_cut: vec![(0, 0); PICTURE_POOL],
+            thumb_wanted: std::collections::HashSet::new(),
             picture_blocks: Vec::new(),
             thumbs: HashMap::new(),
             thumb_clock: 0,
@@ -14013,6 +15800,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             last_answer: String::new(),
             pending_text: String::new(),
             reveal: String::new(),
+            stream_mask: crate::mask::StreamMask::default(),
             revealed_at: std::time::Instant::now(),
             revealing: false,
             unkept: false,
@@ -14093,6 +15881,11 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         SetWindowLongPtrW(app.list, GWLP_WNDPROC, list_subclass as *const () as isize);
         app.composer_procedure = SetWindowLongPtrW(app.composer, GWLP_WNDPROC, composer_subclass as *const () as isize);
         SetWindowLongPtrW(app.suggest, GWLP_WNDPROC, list_subclass as *const () as isize);
+        SetWindowLongPtrW(app.tree_list, GWLP_WNDPROC, list_subclass as *const () as isize);
+        SetWindowLongPtrW(app.tree_menu, GWLP_WNDPROC, files_panel::menu_subclass as *const () as isize);
+        // (what a reader says of the list: its own name)
+        set_text(app.tree_list, t("Files"));
+        set_text(app.tree_menu, t("Files"));
         app.transcript_procedure = SetWindowLongPtrW(app.transcript, GWLP_WNDPROC, transcript_subclass as *const () as isize);
         app.doc_procedure = SetWindowLongPtrW(app.doc, GWLP_WNDPROC, doc_subclass as *const () as isize);
         app.note_procedure = SetWindowLongPtrW(app.note, GWLP_WNDPROC, note_subclass as *const () as isize);
@@ -14222,6 +16015,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_notice_names_the_version_and_its_one_button_says_what_a_press_does() {
+        use notice::Notice;
+        let text = |shown: Notice| notice_text(&shown);
+        let said = |version: &str| tf("Dogmind {0} is available.", &[&version]);
+        assert_eq!(text(Notice::Page { version: "0.2.0".into() }), (said("0.2.0"), t("Open the release page").to_string()));
+        // (while the setup comes, the button is how far it has come)
+        assert_eq!(text(Notice::Fetching { version: "0.2.0".into(), percent: 37 }), (said("0.2.0"), tf("Downloading… {0}%", &[&37])));
+        // (once it is here and checked, one press updates, and the button says that Dogmind restarts)
+        let ready = text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: false, checking: false });
+        assert_eq!(ready, (tf("Dogmind {0} is ready to install.", &[&"0.2.0"]), t("Update now (Dogmind restarts)").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: false, checking: true }).1, t("Checking…"));
+        // (work under way is waited for, and the same button takes that back)
+        assert_eq!(text(Notice::UpdateNow { version: Some("0.2.0".into()), waiting: true, checking: false }), (t("It restarts into the new version when this work is done.").to_string(), t("Not now").to_string()));
+        assert_eq!(text(Notice::UpdateNow { version: None, waiting: false, checking: false }), (t("A new version is here.").to_string(), t("Update now (Dogmind restarts)").to_string()));
+        // (what the person reads in English is the words the test names)
+        if !lang::is_japanese() {
+            assert_eq!(ready.1, "Update now (Dogmind restarts)");
+        }
+    }
+
+    #[test]
+    fn the_notice_is_laid_out_on_the_chat_and_the_changes_and_nowhere_else() {
+        let on = |panel: Panel, onboarding: bool| notice::is_on_page(panel == Panel::Chat, panel == Panel::Diff, onboarding);
+        assert!(on(Panel::Chat, false) && on(Panel::Diff, false));
+        for panel in [Panel::About, Panel::General, Panel::Models, Panel::Help, Panel::Sessions, Panel::Rename] {
+            assert!(!on(panel, false), "a dialog stands over the page that has it");
+        }
+        assert!(!on(Panel::Chat, true), "the first screens ask nothing of the kind");
+    }
+
+    #[test]
+    fn a_note_of_progress_changes_the_percent_and_leaves_the_update_button_as_it_was() {
+        let fetching = |done: u64| ReleaseUpdate::Fetching { version: "0.2.0".into(), done, total: 1000, stop: Arc::new(AtomicBool::new(false)) };
+        for (checking, restart_when_done) in [(false, false), (false, true), (true, false)] {
+            let words = update_button_words_of(&fetching(0), false, checking, restart_when_done);
+            assert_eq!(words, Some(t("Cancel")), "a way to stop it, from the first note to the last");
+            for done in [1, 17, 500, 999, 1000] {
+                assert_eq!(update_button_words_of(&fetching(done), false, checking, restart_when_done), words, "at {done} of 1000");
+                assert_eq!(update_button_kind_of(&fetching(done), restart_when_done), update_button_kind_of(&fetching(0), restart_when_done));
+            }
+        }
+        assert_eq!(update_button_kind_of(&fetching(3), false), ButtonKind::Link);
+        // (the buttons of an update that is not being fetched are as they were: none when there is none)
+        assert_eq!(update_button_words_of(&ReleaseUpdate::None, false, false, false), None);
+    }
+
+    #[test]
     fn what_is_japanese_in_a_rich_edit_stays_in_its_own_face() {
         // SAFETY: a hidden control of this test's own, on this thread, and the structures are as long as they say.
         unsafe {
@@ -14324,7 +16164,7 @@ mod tests {
     #[test]
     fn every_constant_word_has_its_japanese() {
         let mut words: Vec<&str> = COMMANDS.iter().map(|(_, about)| *about).collect();
-        words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page", "explore"].map(tool_name));
+        words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "wake_at", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page", "explore"].map(tool_name));
         words.extend(EFFORTS.iter().map(|(_, name)| *name));
         words.extend(efforts_for("DeepSeek-V4.1").iter().map(|(_, name)| *name));
         words.extend(MODES.iter().map(|(_, name)| *name));
@@ -14561,6 +16401,24 @@ mod tests {
     }
 
     #[test]
+    fn only_the_drafter_s_fetch_leaves_the_engine_running_and_startable() {
+        assert!(setup_holds_off_the_engine(true, false), "the model's own setup and the vision file's: the files, and the card's probe");
+        assert!(!setup_holds_off_the_engine(true, true), "the fetch reads no shard and takes nothing of the card");
+        assert!(!setup_holds_off_the_engine(false, false), "no setup, nothing held off");
+        // the engine that is asked for during the fetch starts, as it does with no setup
+        assert!(starts_the_engine(true, setup_holds_off_the_engine(true, true), None));
+        assert!(!starts_the_engine(true, setup_holds_off_the_engine(true, false), None));
+    }
+
+    #[test]
+    fn the_engine_starts_again_for_the_drafter_only_when_no_work_is_under_way() {
+        assert_eq!(drafter_restart(true, false), DrafterRestart::Now, "an engine that began, and nothing at work");
+        assert_eq!(drafter_restart(true, true), DrafterRestart::WhenIdle, "an answer, a tool run or a session in the background is not cut short");
+        assert_eq!(drafter_restart(false, false), DrafterRestart::Not, "no engine: its next start reads the settings");
+        assert_eq!(drafter_restart(false, true), DrafterRestart::Not, "and work under way on a server of another kind needs no engine");
+    }
+
+    #[test]
     fn the_prompt_is_read_ahead_only_when_no_message_would_read_it_anyway() {
         assert!(warms_on_connect(true, true, true));
         assert!(!warms_on_connect(true, true, false), "the message's own request reads it, once");
@@ -14608,6 +16466,32 @@ mod tests {
         assert_eq!(escape_does(false, true, true, true), EscapeDoes::Reject);
         assert_eq!(escape_does(false, true, false, true), EscapeDoes::Stop);
         assert_eq!(escape_does(false, true, false, false), EscapeDoes::Nothing);
+    }
+
+    /// A question or a plan that waits is the person's to answer, as an approval is: the sidebar says Waiting and not Working, and the send button is not a stop button as if the model were writing.
+    #[test]
+    fn a_session_that_waits_for_the_person_says_waiting_and_is_not_stopped_by_its_send_button() {
+        // the one on screen: waiting for an approval, an answer or a decision, with the turn still running
+        assert_eq!(side_state(None, true, true, true, false, false), Some(SideState::Waiting));
+        assert_eq!(side_state(None, true, false, true, false, false), Some(SideState::Working));
+        assert_eq!(side_state(None, true, false, false, false, false), None);
+        // one that is not on screen: parked at work, and whether it waits
+        assert_eq!(side_state(Some((true, true)), false, false, false, false, false), Some(SideState::Waiting));
+        assert_eq!(side_state(Some((false, true)), false, false, false, false, false), Some(SideState::Working));
+        // a session that is not the one shown, and failed
+        assert_eq!(side_state(None, false, true, true, false, true), Some(SideState::Error));
+        assert_eq!(side_state(None, false, true, true, false, false), None, "what the window waits for is the shown session's");
+        // something waits in the background, and no turn is at work: the list marks the session, the one on screen and one out of sight
+        assert_eq!(side_state(None, true, false, false, true, false), Some(SideState::StandingBy));
+        assert_eq!(side_state(Some((false, false)), false, false, false, false, false), Some(SideState::StandingBy));
+        assert_eq!(side_state(None, true, false, true, true, false), Some(SideState::Working), "a turn at work is said first");
+        assert_eq!(side_state(None, false, false, false, true, false), None, "what stands by on screen is the shown session's");
+        assert_eq!(side_state(Some((true, false)), false, false, false, false, false), Some(SideState::Waiting), "a woken turn that asks says so even where it has ended its work");
+        // the button
+        assert!(is_stoppable(true, false, false), "the model is writing");
+        assert!(!is_stoppable(true, true, false), "the model waits for an answer: the button sends it");
+        assert!(is_stoppable(false, false, true), "the connection is being waited for");
+        assert!(!is_stoppable(false, false, false));
     }
 
     #[test]
@@ -14812,17 +16696,143 @@ mod tests {
     }
 
     #[test]
+    fn the_pointer_is_over_the_icon_drawn_under_it_and_tab_goes_down_the_page() {
+        let hit = |left: i32, top: i32, key: OverlayKey| OverlayHit { area: RECT { left, top, right: left + 28, bottom: top + 28 }, key };
+        let hits = vec![hit(60, 300, OverlayKey::Fork(1)), hit(30, 300, OverlayKey::Copy(1)), hit(30, 100, OverlayKey::Copy(0)), hit(500, 120, OverlayKey::Block(0))];
+        assert_eq!(icon_under(&hits, 40, 310), Some(OverlayKey::Copy(1)));
+        assert_eq!(icon_under(&hits, 70, 310), Some(OverlayKey::Fork(1)));
+        assert_eq!(icon_under(&hits, 58, 310), None, "between the two icons of a row: the first is 28 wide, and the second begins at 60");
+        assert_eq!(icon_under(&hits, 40, 128), None, "the icon's edge is not in it");
+        assert_eq!(icon_under(&hits, 10, 10), None);
+        // top to bottom, and left to right on a row
+        assert_eq!(proxy_order(&hits), vec![OverlayKey::Copy(0), OverlayKey::Block(0), OverlayKey::Copy(1), OverlayKey::Fork(1)]);
+        let many: Vec<OverlayHit> = (0..PROXY_POOL as i32 + 5).map(|at| hit(0, at * 30, OverlayKey::Run(at as usize))).collect();
+        assert_eq!(proxy_order(&many).len(), PROXY_POOL, "no more than there are controls");
+        assert_eq!(proxy_order(&[]), Vec::<OverlayKey>::new());
+    }
+
+    #[test]
+    fn a_pictures_place_is_its_rooms_place_in_the_frame_and_moves_with_it_by_as_much() {
+        let dpi = 168;
+        let sizes = [(640, 480); 5];
+        let tiles = attach::Tiles::of(&sizes, scale(dpi, 400), dpi);
+        assert!(tiles.per_row >= 2 && tiles.rows >= 2, "five tiles are in more than one row");
+        for index in 0..sizes.len() {
+            let (x, y) = tiles.at(index);
+            let here = picture_area(POINT { x: 30, y: 200 }, (x, y), (tiles.width, tiles.height), dpi);
+            // (the card's padding is above the row's first line)
+            assert_eq!((here.left, here.top), (30 + x, 200 + y + scale(dpi, 7)));
+            assert_eq!((here.right - here.left, here.bottom - here.top), (tiles.width, tiles.height));
+            // The same room a step further down the page, as a scroll or a line that came in above it makes it: the tile is a step further down, and no other way.
+            let moved = picture_area(POINT { x: 30, y: 200 + 57 }, (x, y), (tiles.width, tiles.height), dpi);
+            assert_eq!((moved.left - here.left, moved.top - here.top, moved.right - here.right, moved.bottom - here.bottom), (0, 57, 0, 57));
+        }
+        // the tiles of a row stand side by side with the gap between them, the rows one under another
+        let (first, second, below) = (tiles.at(0), tiles.at(1), tiles.at(tiles.per_row as usize));
+        assert_eq!((second.0 - first.0, second.1), (tiles.width + tiles.gap, first.1));
+        assert_eq!((below.0, below.1 - first.1), (first.0, tiles.height + tiles.gap));
+    }
+
+    #[test]
+    fn a_tile_is_in_view_when_any_of_it_is_and_not_at_the_edge() {
+        let tile = |top: i32, bottom: i32| RECT { left: 0, top, right: 50, bottom };
+        assert!(tile_is_in_view(&tile(100, 200), 500));
+        assert!(tile_is_in_view(&tile(-90, 10), 500), "its foot is in view");
+        assert!(tile_is_in_view(&tile(490, 600), 500), "its head is in view");
+        assert!(!tile_is_in_view(&tile(-100, 0), 500), "it ends where the view begins");
+        assert!(!tile_is_in_view(&tile(500, 600), 500), "it begins where the view ends");
+    }
+
+    #[test]
+    fn the_pictures_of_a_message_are_named_by_their_files_and_take_their_turn_among_the_icons() {
+        assert_eq!(file_name_of(Path::new("C:/work/shots/chart.png")), "chart.png");
+        assert_eq!(file_name_of(Path::new("chart.png")), "chart.png");
+        let tile = |left: i32, top: i32, key: OverlayKey| OverlayHit { area: RECT { left, top, right: left + 100, bottom: top + 80 }, key };
+        let hits = vec![tile(120, 300, OverlayKey::Picture(0, 1)), tile(10, 300, OverlayKey::Picture(0, 0)), tile(10, 100, OverlayKey::Copy(0))];
+        // (the pointer is on the tile it is over, and the hidden controls are in the page's order)
+        assert_eq!(icon_under(&hits, 20, 310), Some(OverlayKey::Picture(0, 0)));
+        assert_eq!(icon_under(&hits, 200, 370), Some(OverlayKey::Picture(0, 1)));
+        assert_eq!(icon_under(&hits, 112, 310), None, "in the gap between two tiles");
+        assert_eq!(proxy_order(&hits), vec![OverlayKey::Copy(0), OverlayKey::Picture(0, 0), OverlayKey::Picture(0, 1)]);
+    }
+
+    #[test]
+    fn a_reader_is_told_what_a_control_of_a_card_is_by_its_words() {
+        let part = |text: String, kind: ButtonKind, tip: &str| CardPart { text, kind, act: CardAct::SendOwn, width: 0, tip: tip.to_string() };
+        assert_eq!(card_part_words(&part(choice_text(2, "", "notes.txt", ""), ButtonKind::Choice, "")), "2. notes.txt");
+        assert_eq!(card_part_words(&part(choice_text(1, "Suggested", "notes.md", "the usual"), ButtonKind::Choice, "")), "1. notes.md: the usual");
+        assert_eq!(card_part_words(&part(file_row_text(11, 0, 8, 0, "src/app.py"), ButtonKind::FileRow, "")), "src/app.py: +11 \u{2212}0");
+        assert_eq!(card_part_words(&part("external-link".to_string(), ButtonKind::Icon, "Open in its app")), "Open in its app");
+        assert_eq!(card_part_words(&part("Send".to_string(), ButtonKind::Primary, "")), "Send");
+        assert_eq!(card_part_words(&part("check|Carry it out".to_string(), ButtonKind::Primary, "")), "Carry it out");
+    }
+
+    #[test]
+    fn the_mode_chip_has_its_words_whatever_the_room_and_the_models_name_gives_way() {
+        // (a wide window: all three have their words, the model's up to its most)
+        assert_eq!(chip_widths(900, 96, 130, 260, 300, 60), (96, 130, 260));
+        assert_eq!(chip_widths(900, 96, 130, 500, 300, 60), (96, 130, 300));
+        // (a narrow one: the share of the room a chip was held to cut "Plan first"; now it does not, and the model's name takes what is left)
+        assert_eq!(chip_widths(320, 96, 130, 260, 300, 60), (96, 130, 94));
+        // (narrower: the model's name is down to its least, and the effort's words give way next; the mode's stay)
+        assert_eq!(chip_widths(200, 96, 130, 260, 300, 60), (96, 44, 60));
+        assert_eq!(chip_widths(200, 96, 130, 40, 300, 60), (96, 64, 40));
+        assert_eq!(chip_widths(100, 96, 130, 260, 300, 60), (96, 0, 60));
+    }
+
+    #[test]
+    fn a_card_that_goes_on_below_its_foot_has_grown_and_its_old_corners_are_its_own() {
+        let (back, page) = (0x0034_3738, 0x001e_2021);
+        // (the card's last row, and the page under it: as it was when the shape was taken)
+        assert!(!card_has_grown(back, page, back));
+        // (more of it under the foot: rows came after)
+        assert!(card_has_grown(back, back, back));
+        // (a pixel that is not the card's, text selected in it, or the card gone from there: not grown)
+        assert!(!card_has_grown(page, back, back));
+        assert!(!card_has_grown(page, page, back));
+        let card = CardArea { left: 100, right: 300, top: 50, bottom: 120, top_open: false, bottom_open: false };
+        let [left, right] = foot_corners(&card, 10);
+        assert_eq!((left.left, left.top, left.right, left.bottom), (100, 111, 110, 121));
+        assert_eq!((right.left, right.top, right.right, right.bottom), (291, 111, 301, 121));
+    }
+
+    #[test]
+    fn a_seam_of_a_line_or_two_between_the_rows_of_a_card_does_not_end_it() {
+        let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
+        let text = POINT { x: 322, y: 110 };
+        let seamed = |seam: std::ops::RangeInclusive<i32>| {
+            let card = card_at(300, 480, 100, 160);
+            move |x: i32, y: i32| card(x, y) && !seam.contains(&y)
+        };
+        // (one line, or two, at the foot of the last row: the card is all of it)
+        for seam in [150..=150, 150..=151, 120..=121] {
+            let found = find_card(client, text, 6, 3, seamed(seam.clone())).unwrap_or_else(|| panic!("{seam:?}"));
+            assert_eq!((found.top, found.bottom), (100, 160), "{seam:?}");
+        }
+        // (three lines are a gap between two cards)
+        let found = find_card(client, text, 6, 3, seamed(150..=152)).unwrap();
+        assert_eq!(found.bottom, 149);
+        // (at a larger scale of the window the seam between rows is larger, and the gap between cards with it: a seam of four lines, at 175%, is walked across and a gap of five is not)
+        let reach = scale(168, 3);
+        assert_eq!(reach, 5);
+        let found = find_card(client, text, 6, reach, seamed(150..=153)).unwrap();
+        assert_eq!(found.bottom, 160);
+        let found = find_card(client, text, 6, reach, seamed(150..=154)).unwrap();
+        assert_eq!(found.bottom, 149);
+    }
+
+    #[test]
     fn a_card_is_found_by_its_edges_and_its_ends_out_of_view_stay_square() {
         let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
         let text = POINT { x: 322, y: 110 };
-        let whole = find_card(client, text, 6, card_at(300, 480, 100, 140)).unwrap();
+        let whole = find_card(client, text, 6, 3, card_at(300, 480, 100, 140)).unwrap();
         assert_eq!((whole.left, whole.right, whole.top, whole.bottom), (300, 480, 100, 140));
         assert!(!whole.top_open && !whole.bottom_open);
         // Its text has scrolled above the view; the rest of it is still there.
-        let above = find_card(client, POINT { x: 322, y: -30 }, 6, card_at(300, 480, -40, 20)).unwrap();
+        let above = find_card(client, POINT { x: 322, y: -30 }, 6, 3, card_at(300, 480, -40, 20)).unwrap();
         assert!(above.top_open && !above.bottom_open);
         assert_eq!((above.left, above.right, above.bottom), (300, 480, 20));
-        let below = find_card(client, POINT { x: 322, y: 290 }, 6, card_at(300, 480, 280, 400)).unwrap();
+        let below = find_card(client, POINT { x: 322, y: 290 }, 6, 3, card_at(300, 480, 280, 400)).unwrap();
         assert!(!below.top_open && below.bottom_open);
     }
 
@@ -14844,14 +16854,14 @@ mod tests {
     fn what_is_not_a_card_is_left_alone() {
         let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
         let text = POINT { x: 322, y: 110 };
-        assert!(find_card(client, text, 6, |_, _| false).is_none(), "another colour");
-        assert!(find_card(client, POINT { x: 322, y: 400 }, 6, |_, _| true).is_none(), "below the view");
-        assert!(find_card(client, text, 6, card_at(300, 480, 0, 299)).is_none(), "taller than the view: nothing to round");
+        assert!(find_card(client, text, 6, 3, |_, _| false).is_none(), "another colour");
+        assert!(find_card(client, POINT { x: 322, y: 400 }, 6, 3, |_, _| true).is_none(), "below the view");
+        assert!(find_card(client, text, 6, 3, card_at(300, 480, 0, 299)).is_none(), "taller than the view: nothing to round");
         // Text on the row walked across does not stop it, but an edge that is not straight is no card.
         let lettered = |x: i32, y: i32| card_at(300, 480, 100, 140)(x, y) && !(x == 400 && y == 110);
-        assert_eq!(find_card(client, text, 6, lettered).map(|card| card.right), Some(480));
+        assert_eq!(find_card(client, text, 6, 3, lettered).map(|card| card.right), Some(480));
         let stepped = |x: i32, y: i32| card_at(300, 480, 100, 140)(x, y) && !(x > 460 && y > 120);
-        assert!(find_card(client, text, 6, stepped).is_none());
+        assert!(find_card(client, text, 6, 3, stepped).is_none());
     }
 
     #[test]

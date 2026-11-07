@@ -24,6 +24,51 @@ pub struct Message {
     /// When it was written, `YYYY-MM-DD HH:MM` on this PC's clock, for the person to see beside it. Kept in the session; no request carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
+    /// What woke the session, when this message is the harness's notice of it and not anything the person wrote (see [`Wake`]): the window shows it as a notice row. The message's text is what the model reads of it.
+    /// A reader that does not know the field leaves it out, and reads the message as one the app wrote and the person did not (its text begins as such messages do, [`crate::prompt::DRAFT_NOTE`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<Vec<Wake>>,
+}
+
+/// What woke a session by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeCause {
+    /// A command started in the background ended, any way it did.
+    CommandEnded,
+    /// A command started in the background printed the line its `wake_on` waits for.
+    CommandLine,
+    /// A wait the model set (`wake_at`) is up.
+    Wait,
+}
+
+impl WakeCause {
+    pub fn name(self) -> &'static str {
+        match self {
+            WakeCause::CommandEnded => "command_ended",
+            WakeCause::CommandLine => "command_line",
+            WakeCause::Wait => "wait",
+        }
+    }
+}
+
+/// One thing that woke a session, as the session keeps it and the window shows it: no more than that, and never what a command printed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wake {
+    pub cause: WakeCause,
+    /// `job1`, `wait2`.
+    pub id: String,
+    /// The command's first line, or the wait's note.
+    pub what: String,
+    /// How a command that ended did: its exit code, or none (stopped, timed out, not run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    /// Why there is no exit code: `timed out`, `cancelled`, `not run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
+    /// How long the command had run, or how long the wait was.
+    #[serde(default)]
+    pub seconds: u64,
 }
 
 /// A picture in the session's folder ([`crate::images::file_of`]).
@@ -86,7 +131,7 @@ impl Message {
 
     /// As an OpenAI-compatible server or Codex reads it: without Claude's own form, nor when it was written.
     pub fn without_provider_blocks(&self) -> Message {
-        Message { provider_blocks: None, at: None, ..self.clone() }
+        Message { provider_blocks: None, at: None, notice: None, ..self.clone() }
     }
 }
 

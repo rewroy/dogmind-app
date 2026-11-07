@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "low");
         assert_eq!(body["system"], "s");
-        assert_eq!(body["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 16);
         assert_eq!(body["tools"][0]["eager_input_streaming"], true);
         assert!(body["tools"][0].get("input_schema").is_some());
         for field in ["temperature", "top_p", "top_k", "tool_choice"] {
