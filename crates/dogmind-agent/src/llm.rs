@@ -227,6 +227,7 @@ impl Completion {
             images: Vec::new(),
             // (the conversation gives it one as it goes in)
             at: None,
+            notice: None,
         }
     }
 }

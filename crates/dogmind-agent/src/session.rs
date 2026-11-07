@@ -601,6 +601,77 @@ mod tests {
 }
 
 #[cfg(test)]
+mod notice_tests {
+    use super::*;
+    use crate::message::{Wake, WakeCause};
+
+    fn notice() -> Message {
+        let wake = Wake { cause: WakeCause::CommandEnded, id: "job1".into(), what: "cargo build".into(), exit_code: Some(0), ended: None, seconds: 91 };
+        Message { notice: Some(vec![wake]), ..Message::text("user", format!("{}Notice from the harness: job1 ended.", crate::prompt::DRAFT_NOTE)) }
+    }
+
+    /// A session with a notice in it: it comes back as one, whether it is a line of its own or in a snapshot, it is not the person's words to the list, the search or the model's request.
+    #[test]
+    fn a_notice_is_kept_as_one_and_is_not_taken_for_the_persons_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
+        session.append(&Message::text("user", crate::prompt::user_message("build it", "now"))).unwrap();
+        session.append(&Message::text("assistant", "started")).unwrap();
+        session.append(&notice()).unwrap();
+        session.append(&Message::text("assistant", "it passed")).unwrap();
+        let path = session.path.clone();
+        for messages in [read(&path).unwrap(), Session::open(&path).unwrap().2] {
+            assert_eq!(messages.len(), 4);
+            assert_eq!(messages[2].notice.as_ref().map(|wakes| wakes[0].id.as_str()), Some("job1"));
+            assert!(messages[0].notice.is_none() && messages[3].notice.is_none());
+        }
+        session.snapshot(&read(&path).unwrap()).unwrap();
+        assert!(read(&path).unwrap()[2].notice.is_some(), "a compaction's snapshot keeps it");
+        assert_eq!(list(dir.path())[0].title, "build it");
+        assert!(search(dir.path(), "harness").is_empty(), "the app's word is not what was said");
+        let body = crate::llm::request_body("m", &[notice()], None, None);
+        assert!(body["messages"][0].get("notice").is_none() && body["messages"][0]["content"].as_str().unwrap().contains("job1 ended"), "{body}");
+    }
+
+    /// What a window from before notices does with such a session: the message is read as the app's word and not the person's, as the one the app's own checks and cut-off answers are;
+    /// and a line of a kind it does not know is skipped, as a line a crash cut is, with the rest read.
+    #[test]
+    fn a_session_with_a_notice_opens_in_a_reader_from_before_them() {
+        // (the message as that reader has it: the fields it knows, and no more)
+        #[derive(Deserialize)]
+        struct Before {
+            role: String,
+            content: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum LineBefore {
+            Message { message: Before },
+        }
+        let line = serde_json::to_string(&Line::Message { message: notice() }).unwrap();
+        let LineBefore::Message { message } = serde_json::from_str(&line).expect("the old reader reads a message that has a notice field");
+        assert_eq!(message.role, "user");
+        assert!(crate::prompt::is_nudge(message.content.as_deref().unwrap()), "it shows as the app's word, never as the person's bubble");
+
+        // a line of a kind no reader has (what a later app may write): it is skipped by `read`, `open`, `list` and `fork`, and what is around it is read
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
+        session.append(&Message::text("user", "first")).unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("{\"kind\":\"wake\",\"what\":\"a line of a kind that is not known\"}\n");
+        fs::write(&path, text).unwrap();
+        let mut again = Session::open(&path).unwrap().0;
+        again.append(&Message::text("assistant", "after it")).unwrap();
+        assert_eq!(read(&path).unwrap().len(), 2);
+        assert_eq!(Session::open(&path).unwrap().2.len(), 2);
+        assert_eq!(list(dir.path())[0].messages, 2);
+        assert_eq!(Session::open(&fork(&path, 1, None).unwrap()).unwrap().2.len(), 2);
+    }
+}
+
+#[cfg(test)]
 mod crash_tests {
     use super::*;
 
