@@ -9,6 +9,7 @@ mod design;
 mod diffview;
 mod drafter;
 mod engine;
+mod files;
 mod frametrace;
 mod icon;
 mod keys;

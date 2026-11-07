@@ -965,6 +965,20 @@ const JA: &[(&str, &str)] = &[
     ("The best for this PC", "この PC に最適なもの"),
     ("Straydog looks at this machine and chooses", "Straydog がこのマシンを調べて選びます"),
     ("Recommended for this PC  ·  ", "おすすめ  ·  "),
+    // The files of the folder, in the panel on the right.
+    ("Overview", "概要"),
+    ("Files", "ファイル"),
+    ("Show the files of the folder in the panel on the right", "右のパネルにフォルダーのファイルを表示します"),
+    ("Reading…", "読み込み中…"),
+    ("Empty", "空"),
+    ("{0} more…", "ほか {0} 件…"),
+    ("This folder could not be read: {0}", "このフォルダーを読めません: {0}"),
+    ("{0}, folder, {1}", "{0}、フォルダー、{1}"),
+    ("expanded", "展開中"),
+    ("collapsed", "折りたたみ中"),
+    ("{0}, changed by this session: {1} lines added, {2} removed", "{0}、このセッションで変更: {1} 行追加、{2} 行削除"),
+    ("Copy the path", "パスをコピー"),
+    ("Mention in the message", "メッセージで参照する"),
 ];
 
 pub const HELP_JA: &str = "# はじめに
@@ -1056,7 +1070,7 @@ mod tests {
     fn everything_the_code_asks_for_has_its_japanese() {
         let table: HashMap<&str, &str> = JA.iter().copied().collect();
         let mut missing = Vec::new();
-        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("drafter.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs"), include_str!("cards.rs"), include_str!("trajectory.rs")] {
+        for source in [include_str!("ui.rs"), include_str!("engine.rs"), include_str!("drafter.rs"), include_str!("settings.rs"), include_str!("toolrun.rs"), include_str!("attach.rs"), include_str!("preview.rs"), include_str!("cards.rs"), include_str!("trajectory.rs"), include_str!("files.rs"), include_str!("ui/files_panel.rs")] {
             for words in words_in(source) {
                 if !table.contains_key(words.as_str()) {
                     missing.push(words);
