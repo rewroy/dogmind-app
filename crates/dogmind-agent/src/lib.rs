@@ -14,6 +14,7 @@ pub mod checkpoint;
 pub mod codex;
 pub mod compaction;
 pub mod conversation_key;
+pub mod conversion;
 pub mod http;
 pub mod images;
 pub mod llm;
