@@ -10788,6 +10788,8 @@ impl App {
             self.crypt.remember = keystore.is_remembered();
         }
         let mut said = match (&outcome.error, outcome.job) {
+            // (no key was made: nothing was changed, and there is nothing for a next start to finish)
+            (Some(error), CryptJob::On) if outcome.cipher.is_none() => t(error).to_string(),
             (Some(error), _) => tf("It stopped: {0}. What was changed stays changed, and the next start of Dogmind finishes the rest.", &[&t(error)]),
             (None, CryptJob::On | CryptJob::FinishOn) => tf("{0} conversations and notes are encrypted.", &[&outcome.changed]),
             (None, CryptJob::Off | CryptJob::FinishOff) => tf("{0} conversations and notes are plain again, and the key file is removed.", &[&outcome.changed]),
