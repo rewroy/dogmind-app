@@ -233,9 +233,8 @@ const ID_FOLDER_CHIP: isize = 9052;
 const ID_TOGGLE_DISPLAY: isize = 9054;
 const ID_ATTACH: isize = 9055;
 const ID_ATTACHED: isize = 9060; // ..+ attach::MOST_IMAGES
-const ID_PICTURES: isize = 9070; // ..+ PICTURE_POOL
-/// How many pictures of a transcript are on screen at once: each is a window, and these go round.
-const PICTURE_POOL: usize = 12;
+/// How many pictures of a transcript are drawn at once: more than any view holds, and fewer than the small copies that are kept.
+const PICTURES_IN_VIEW: usize = 48;
 /// How many small copies are kept: a third of a megabyte at most for one.
 const THUMBS_KEPT: usize = 64;
 const M_DISPLAY: usize = 9310; // ..+ 3
@@ -882,6 +881,22 @@ fn icon_under(hits: &[OverlayHit], x: i32, y: i32) -> Option<OverlayKey> {
     hits.iter().find(|hit| x >= hit.area.left && x < hit.area.right && y >= hit.area.top && y < hit.area.bottom).map(|hit| hit.key)
 }
 
+/// Where a message's picture stands in the transcript: the place of its room's first character is the top of the row, and the card keeps its padding there. `offset`: the picture's
+/// place among those of its message (`attach::Tiles::at`); `size`: a tile's.
+fn picture_area(room: POINT, offset: (i32, i32), size: (i32, i32), dpi: u32) -> RECT {
+    rect(room.x + offset.0, room.y + offset.1 + scale(dpi, 7), size.0, size.1)
+}
+
+/// Whether any of a tile is in a view `height` tall.
+fn tile_is_in_view(area: &RECT, height: i32) -> bool {
+    area.bottom > 0 && area.top < height
+}
+
+/// A file's name as it is said: its last part, or the whole path where it has none.
+fn file_name_of(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
 /// What a reader says of a control of a card: a choice's number and words, a file with its lines, an icon by its tip, the rest by what is written on it.
 fn card_part_words(part: &CardPart) -> String {
     let mut pieces = part.text.split(PART);
@@ -920,6 +935,8 @@ enum OverlayKey {
     Run(usize),
     /// A control of a card: the card's room (`card_slots`) and the control's place across its row.
     Card(usize, usize),
+    /// A picture of a message or an answer (`picture_blocks`) and its place among that message's pictures: opened beside the conversation.
+    Picture(usize, usize),
 }
 
 /// Where an icon was drawn the last time the transcript was painted, in the transcript's own pixels.
@@ -2094,8 +2111,8 @@ struct App {
     running: bool,
     has_messages: bool,
     queued: Vec<Outgoing>,
-    /// Where the view was when what lies over the transcript was last placed.
-    placed_at: i32,
+    /// Where the view stood when the thumb was last placed.
+    thumb_at: i32,
     /// What of the transcript control shows: its size less the scrollbar's strip, and the rail's place in it, cut out.
     transcript_region: ((i32, i32), Option<(i32, i32, i32, i32)>),
     /// Words sent to the turn under way that have not reached it yet.
@@ -2170,11 +2187,10 @@ struct App {
     /// What goes with the next message, and the windows that show it.
     attachments: Vec<Attached>,
     attached_windows: Vec<HWND>,
-    /// The windows that show pictures in the transcript, what each is showing now, and how much of its top and bottom is cut off at the transcript's edges.
-    picture_windows: Vec<HWND>,
-    picture_shown: Vec<Option<(PathBuf, (i32, i32))>>,
-    picture_cut: Vec<(i32, i32)>,
+    /// The pictures of the transcript's messages: drawn in its own paint, from the places that same frame gives their rooms.
     picture_blocks: Vec<PictureBlock>,
+    /// The small copies the view wants now: they are not the ones to be forgotten.
+    thumb_wanted: std::collections::HashSet<(PathBuf, (i32, i32))>,
     thumbs: HashMap<(PathBuf, (i32, i32)), KeptThumb>,
     thumb_clock: u64,
     /// Whether what is connected reads pictures; none until it has said.
@@ -3165,7 +3181,6 @@ impl App {
         }
         redraw(edit, true);
         InvalidateRect(edit, std::ptr::null(), 0);
-        self.place_overlays();
     }
 
     /// The lines of a Markdown table have ended: as a table if they are one, and as they were written if they are not.
@@ -3663,33 +3678,18 @@ impl App {
         self.append("\n", Style::CopyRow);
         self.unkept = false;
         self.line_start = true;
-        self.place_overlays();
     }
 
-    /// The view has moved, by whatever moved it: what lies over the text follows. The wheel's scroll is the control's own, carried out over
-    /// many timer ticks after the message that began it has returned, so that no message of ours can say when it ends: a button placed on the wheel's
-    /// message stayed where the text had been, over whatever came there. Asked after each paint and tick of the control, and only a move does anything.
-    unsafe fn follow_the_view(&mut self) {
+    /// The view has moved, by whatever moved it: the thumb follows. The wheel's scroll is the control's own, carried out over many timer ticks after the message that began it has
+    /// returned, so that no message of ours can say when it ends. Asked after each paint and tick of the control, and only a move does anything. (What the text carries, the icons and
+    /// the pictures of its messages, is drawn in its own paint and needs no following.)
+    unsafe fn follow_the_thumb(&mut self) {
         let mut position = POINT { x: 0, y: 0 };
         SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
-        if position.y != self.placed_at {
-            self.place_overlays();
+        if position.y != self.thumb_at {
+            self.thumb_at = position.y;
             self.place_thumb();
         }
-    }
-
-    /// What lies over the transcript as windows of their own (a message's pictures) goes where the text has come to, after the text is drawn: for every frame the view moves. The copy, branch,
-    /// code and run icons and the controls of the cards are not among them: they are drawn in the text's paint, at the places of that frame.
-    unsafe fn place_overlays(&mut self) {
-        let mut position = POINT { x: 0, y: 0 };
-        SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
-        let moved = position.y != self.placed_at;
-        self.placed_at = position.y;
-        // The text first: the view is drawn where it has moved to, and only then is anything that lies over it moved.
-        if moved && self.panel == Panel::Chat && self.has_messages {
-            UpdateWindow(self.transcript);
-        }
-        self.place_pictures();
     }
 
     /// A new session with the conversation through this answer, opened: to go on from there another way. The answer is found in the saved
@@ -4097,7 +4097,6 @@ impl App {
             self.follow_end = true;
             self.want_frames();
         }
-        self.place_overlays();
         self.place_thumb();
     }
 
@@ -4212,7 +4211,6 @@ impl App {
             if self.text_twips != before {
                 KillTimer(self.window, TIMER_REFLOW);
                 self.reflow();
-                self.place_overlays();
                 self.place_thumb();
             }
         }
@@ -4290,9 +4288,6 @@ impl App {
                 self.place_rail();
             }
         }
-        if !self.replaying {
-            self.place_pictures();
-        }
     }
 
     /// A small copy of a file at a size, from what is kept, or asked for on another thread and not there yet.
@@ -4315,12 +4310,13 @@ impl App {
         Thumb::Waiting
     }
 
-    /// The copy asked for longest ago goes, as long as no window is showing it.
+    /// The copy asked for longest ago goes, as long as the view does not want it and it is not one of a picture waiting to go.
     unsafe fn forget_a_thumb(&mut self) {
         let attached_room = self.attached_room();
-        let oldest = self.thumbs.iter().filter(|((path, room), kept)| {
+        let oldest = self.thumbs.iter().filter(|(key, kept)| {
+            let (path, room) = *key;
             !matches!(kept.thumb, Thumb::Waiting)
-                && !self.picture_shown.iter().flatten().any(|(shown, shown_room)| shown == path && shown_room == room)
+                && !self.thumb_wanted.contains(*key)
                 && !(*room == attached_room && self.attachments.iter().any(|attached| attached.path == *path))
         }).min_by_key(|(_, kept)| kept.used).map(|(key, _)| key.clone());
         if let Some(kept) = oldest.and_then(|key| self.thumbs.remove(&key)) {
@@ -4342,9 +4338,13 @@ impl App {
             Err(attach::Undecoded::Unreadable) => Thumb::Missing(t("This picture cannot be shown here").to_string()),
         };
         self.thumbs.insert((path.clone(), room), KeptThumb { thumb: thumb.clone(), used: self.thumb_clock });
-        for (slot, shown) in self.picture_shown.iter().enumerate() {
-            if shown.as_ref().is_some_and(|(known, known_room)| *known == path && *known_room == room) {
-                set_thumb(self.picture_windows[slot], thumb.clone());
+        // (the tiles of the transcript that were holding its place are drawn again)
+        for hit in &self.overlay_hits {
+            if let OverlayKey::Picture(block, at) = hit.key {
+                let same = self.picture_blocks.get(block).is_some_and(|block| block.paths.get(at) == Some(&path) && (block.tiles.width, block.tiles.height) == room);
+                if same {
+                    InvalidateRect(self.transcript, &hit.area, 0);
+                }
             }
         }
         if room == self.attached_room() {
@@ -4352,66 +4352,6 @@ impl App {
                 if attached.path == path {
                     set_thumb(self.attached_windows[at], thumb.clone());
                 }
-            }
-        }
-    }
-
-    /// The pictures in view each get a window of the pool at their place, wherever the transcript has scrolled to. Runs for every frame the view
-    /// moves: only the blocks from the last one up to the first above the view are asked about, and only a window whose place changed is moved.
-    unsafe fn place_pictures(&mut self) {
-        let height = self.transcript_area.bottom - self.transcript_area.top;
-        let visible = self.panel == Panel::Chat && self.has_messages;
-        let mut wanted: Vec<(PathBuf, (i32, i32), RECT)> = Vec::new();
-        if visible {
-            for block in self.picture_blocks.iter().rev() {
-                let mut point = POINT { x: 0, y: 0 };
-                SendMessageW(self.transcript, EM_POSFROMCHAR_RICH, std::ptr::addr_of_mut!(point) as WPARAM, block.start as LPARAM);
-                if point.y + block.tiles.total_height() < 0 {
-                    break;
-                }
-                if point.y >= height {
-                    continue;
-                }
-                for (at, path) in block.paths.iter().enumerate() {
-                    let (x, y) = block.tiles.at(at);
-                    // (the place of the row's character is its top, and the card has its padding there)
-                    let top = point.y + y + scale(self.dpi, 7);
-                    if top + block.tiles.height > 0 && top < height && wanted.len() < PICTURE_POOL {
-                        wanted.push((path.clone(), (block.tiles.width, block.tiles.height), rect(point.x + x, top, block.tiles.width, block.tiles.height)));
-                    }
-                }
-            }
-        }
-        for slot in 0..PICTURE_POOL {
-            let window = self.picture_windows[slot];
-            let Some((path, room, place)) = wanted.get(slot) else {
-                if self.picture_shown[slot].take().is_some() {
-                    show(window, false);
-                }
-                continue;
-            };
-            if self.picture_shown[slot].as_ref().is_none_or(|(known, known_room)| known != path || known_room != room) {
-                self.picture_shown[slot] = Some((path.clone(), *room));
-                let thumb = self.thumb_of(path, *room);
-                set_thumb(window, thumb);
-                let name = path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
-                self.tip(window, &name);
-            }
-            let area = self.transcript_area;
-            let (width, tall) = (place.right - place.left, place.bottom - place.top);
-            let (left, top) = (area.left + place.left, area.top + place.top);
-            let showing = IsWindowVisible(window) != 0;
-            if !showing || child_area(window, self.window) != (left, top, width, tall) {
-                SetWindowPos(window, HWND_TOP, left, top, width, tall, if showing { SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS } else { SWP_NOACTIVATE | SWP_NOCOPYBITS });
-            }
-            // (it would lie over the header or the composer past the transcript's edge)
-            let cut = ((area.top - top).max(0), (top + tall - area.bottom).max(0));
-            if cut != self.picture_cut[slot] {
-                self.picture_cut[slot] = cut;
-                SetWindowRgn(window, if cut == (0, 0) { std::ptr::null_mut() } else { CreateRectRgn(0, cut.0, width, tall - cut.1) }, 1);
-            }
-            if !showing {
-                show(window, true);
             }
         }
     }
@@ -4541,7 +4481,6 @@ impl App {
                 self.scrolled_up_at = None;
                 self.want_frames();
             }
-            self.place_overlays();
             self.place_thumb();
         }
     }
@@ -4731,6 +4670,11 @@ impl App {
             OverlayKey::Block(at) => self.copy_block(at),
             OverlayKey::Run(at) => self.toggle_run(at),
             OverlayKey::Card(slot, part) => self.card_pressed(slot, part),
+            OverlayKey::Picture(block, at) => {
+                if let Some(path) = self.picture_blocks.get(block).and_then(|block| block.paths.get(at)).cloned() {
+                    self.open_picture(&path);
+                }
+            }
         }
     }
 
@@ -4742,6 +4686,7 @@ impl App {
             OverlayKey::Block(_) => t("Copy this code").to_string(),
             OverlayKey::Run(_) => t("Show or hide these calls").to_string(),
             OverlayKey::Card(slot, part) => self.card_slots.get(slot).and_then(|room| room.parts.get(part)).map_or(String::new(), card_part_words),
+            OverlayKey::Picture(block, at) => self.picture_blocks.get(block).and_then(|block| block.paths.get(at)).map_or(String::new(), |path| file_name_of(path)),
         }
     }
 
@@ -4830,6 +4775,31 @@ impl App {
                 x += width + gap;
             }
         }
+        // The pictures of the messages: each tile where its card's room is in this frame (the place of the room's character is its top, and the card has its padding there).
+        let mut wanted: Vec<(PathBuf, (i32, i32))> = Vec::new();
+        for at in (0..self.picture_blocks.len()).rev() {
+            let block = &self.picture_blocks[at];
+            let point = ask(block.start);
+            if point.y + block.tiles.total_height() < 0 {
+                break;
+            }
+            if point.y >= height {
+                continue;
+            }
+            for (index, path) in block.paths.iter().enumerate() {
+                let (x, y) = block.tiles.at(index);
+                let area = picture_area(point, (x, y), (block.tiles.width, block.tiles.height), dpi);
+                if tile_is_in_view(&area, height) && wanted.len() < PICTURES_IN_VIEW {
+                    found.push(OverlayHit { area, key: OverlayKey::Picture(at, index) });
+                    wanted.push((path.clone(), (block.tiles.width, block.tiles.height)));
+                }
+            }
+        }
+        // (what the view wants is asked for, or kept from being forgotten, before any of it is drawn)
+        self.thumb_wanted = wanted.iter().cloned().collect();
+        for (path, room) in wanted {
+            self.thumb_of(&path, room);
+        }
         found
     }
 
@@ -4844,7 +4814,9 @@ impl App {
             self.proxies.iter().position(|proxy| *proxy == focus).and_then(|at| self.proxy_keys[at])
         };
         let ring = focused.is_some() && keys_are_in_use();
-        for hit in &self.overlay_hits {
+        // (drawing a picture may ask for its small copy, which is the app's to keep: the list is taken out while it is drawn from)
+        let hits = std::mem::take(&mut self.overlay_hits);
+        for hit in &hits {
             let key = hit.key;
             let area = RECT { left: hit.area.left + dx, top: hit.area.top + dy, right: hit.area.right + dx, bottom: hit.area.bottom + dy };
             let pressed = self.overlay_press == Some(key) && self.overlay_hover == Some(key);
@@ -4857,13 +4829,33 @@ impl App {
                 }
                 continue;
             }
+            if let OverlayKey::Picture(block, index) = key {
+                let Some((path, room)) = self.picture_blocks.get(block).and_then(|block| block.paths.get(index).map(|path| (path.clone(), (block.tiles.width, block.tiles.height)))) else { continue };
+                let thumb = self.thumb_of(&path, room);
+                draw_tile(device, area, &thumb, false, &self.fonts);
+                // (the picture's own edge, which is the tile's where it is still being read; it stands from the tile's top left)
+                let edge = match thumb {
+                    Thumb::Ready { width, height, .. } => RECT { left: area.left, top: area.top, right: area.left + width, bottom: area.top + height },
+                    _ => area,
+                };
+                if lit || pressed {
+                    rounded(device, edge, scale(dpi, ds::radius::SMALL), None, Some(theme::accent()));
+                }
+                if ring && focused == Some(key) {
+                    // (two lines, as a picture's colours are anything: one would be lost against some)
+                    for inset in [1, 2] {
+                        rounded(device, RECT { left: edge.left + inset, top: edge.top + inset, right: edge.right - inset, bottom: edge.bottom - inset }, scale(dpi, ds::radius::SMALL) - inset, None, Some(theme::accent()));
+                    }
+                }
+                continue;
+            }
             let copied = self.overlay_copied == Some(key);
             let name = match key {
                 OverlayKey::Copy(_) | OverlayKey::Block(_) if copied => "check",
                 OverlayKey::Copy(_) | OverlayKey::Block(_) => "copy",
                 OverlayKey::Fork(_) => "git-branch",
                 OverlayKey::Run(at) if self.runs[at].expanded => "chevron-down",
-                OverlayKey::Run(_) | OverlayKey::Card(..) => "chevron-right",
+                OverlayKey::Run(_) | OverlayKey::Card(..) | OverlayKey::Picture(..) => "chevron-right",
             };
             // As an icon button of the window draws: a shade under it when the pointer is on it, one up on a card of a block of code.
             if lit || pressed {
@@ -4875,15 +4867,17 @@ impl App {
                 rounded(device, RECT { left: area.left + 1, top: area.top + 1, right: area.right - 1, bottom: area.bottom - 1 }, scale(dpi, ds::radius::SMALL), None, Some(theme::accent()));
             }
         }
+        self.overlay_hits = hits;
         if test_log_on() {
             let mut position = POINT { x: 0, y: 0 };
             SendMessageW(self.transcript, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
             let drawn: Vec<String> = self.overlay_hits.iter().map(|hit| match hit.key {
                 // (what a control of a card says: a test finds the one it presses by it)
                 OverlayKey::Card(..) => format!("{:?}@{},{}<{}>", hit.key, hit.area.left, hit.area.top, self.overlay_words(hit.key)),
+                OverlayKey::Picture(..) => format!("{:?}@{},{},{},{}", hit.key, hit.area.left, hit.area.top, hit.area.right - hit.area.left, hit.area.bottom - hit.area.top),
                 _ => format!("{:?}@{},{}", hit.key, hit.area.left, hit.area.top),
             }).collect();
-            test_log(&format!("icons scroll_y={} dpi={} area={},{},{} {} [hover {:?} press {:?}]", position.y, dpi, self.transcript_area.left, self.transcript_area.top, self.transcript_area.bottom, drawn.join(" "), self.overlay_hover, self.overlay_press));
+            test_log(&format!("icons scroll_y={} dpi={} area={},{},{} {} [hover {:?} press {:?} focus {:?}]", position.y, dpi, self.transcript_area.left, self.transcript_area.top, self.transcript_area.bottom, drawn.join(" "), self.overlay_hover, self.overlay_press, focused));
         }
         // (what stands over the transcript is told of a moment after the view has come to rest)
         SetTimer(self.window, TIMER_PROXIES, 150, None);
@@ -4949,6 +4943,9 @@ impl App {
                 _ => self.overlay_words(key),
             };
             if !words.is_empty() {
+                if test_log_on() {
+                    test_log(&format!("tip {key:?} <{words}>"));
+                }
                 let words = wide(&words);
                 tool.uFlags = TTF_SUBCLASS;
                 tool.rect = area;
@@ -6043,7 +6040,6 @@ impl App {
         if self.modal_open {
             self.layout_modal(width, height);
             self.shapes = shapes;
-            self.place_overlays();
             InvalidateRect(self.window, std::ptr::null(), 0);
             return;
         }
@@ -6083,7 +6079,6 @@ impl App {
             self.clamp_diff();
             InvalidateRect(self.diff_view, std::ptr::null(), 0);
             self.shapes = shapes;
-            self.place_overlays();
             InvalidateRect(self.window, std::ptr::null(), 0);
             return;
         }
@@ -6281,7 +6276,6 @@ impl App {
             }
         }
         self.shapes = shapes;
-        self.place_overlays();
         InvalidateRect(self.window, std::ptr::null(), 0);
     }
 
@@ -7587,7 +7581,6 @@ impl App {
             self.scrolled_up_at = Some(std::time::Instant::now());
         }
         SendMessageW(edit, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
-        self.place_overlays();
         self.place_thumb();
     }
 
@@ -7653,7 +7646,6 @@ impl App {
         // (the end gives the following view back, as scrolling to it does)
         self.follow_end = at == room;
         SendMessageW(self.transcript, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
-        self.place_overlays();
         self.place_thumb();
     }
 
@@ -10132,7 +10124,6 @@ impl App {
             let range = CharRange { first, last };
             SendMessageW(self.transcript, EM_EXSETSEL, 0, std::ptr::addr_of!(range) as LPARAM);
             SendMessageW(self.transcript, EM_SCROLLCARET, 0, 0);
-            self.place_overlays();
         }
         self.layout();
     }
@@ -11118,7 +11109,6 @@ impl App {
         if self.has_messages {
             SendMessageW(self.transcript, WM_VSCROLL, SB_BOTTOM as WPARAM, 0);
             InvalidateRect(self.transcript, std::ptr::null(), 0);
-            self.place_overlays();
             self.place_thumb();
         }
     }
@@ -11351,9 +11341,6 @@ impl App {
             self.follow_speed = 0.0;
             self.follow_carried = 0.0;
             return true;
-        }
-        if !self.answers.is_empty() || !self.picture_blocks.is_empty() || !self.blocks.is_empty() {
-            self.place_overlays();
         }
         self.place_thumb();
         false
@@ -13138,7 +13125,6 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
         CallWindowProcW(base, window, message, wparam, lparam)
     };
     if matches!(message, WM_VSCROLL | WM_MOUSEWHEEL | WM_KEYDOWN | WM_LBUTTONUP | WM_SIZE) {
-        app.place_overlays();
         app.place_thumb();
         // (what moved under the pointer is what it is on now)
         if matches!(message, WM_VSCROLL | WM_MOUSEWHEEL | WM_KEYDOWN) {
@@ -13146,7 +13132,7 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
         }
     }
     if matches!(message, WM_PAINT | WM_TIMER) && app.panel == Panel::Chat {
-        app.follow_the_view();
+        app.follow_the_thumb();
     }
     if matches!(message, WM_PAINT | WM_PRINT | WM_PRINTCLIENT) {
         if message != WM_PAINT {
@@ -13278,6 +13264,11 @@ fn test_rows_painted() -> Option<u64> {
 fn test_pointer_stays() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     cfg!(debug_assertions) && *ON.get_or_init(|| std::env::var_os("DOGMIND_TEST_POINTER").is_some()) || forced_hover()
+}
+
+/// A debug build with `DOGMIND_TEST_NOFADE` set draws no fade at the edges of the text: a test that reads colours of the cards near them sees them as they are.
+fn test_no_fade() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("DOGMIND_TEST_NOFADE").is_some()
 }
 
 /// A debug build with `DOGMIND_TEST_STALE_SHAPES` set keeps a card's shape as it was first taken, which is how the corners were drawn before they followed the card: to see what that was.
@@ -13809,7 +13800,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     } else {
                         app.follow_end = false;
                         SendMessageW(app.transcript, WM_VSCROLL, if y < thumb.top { SB_PAGEUP } else { SB_PAGEDOWN } as WPARAM, 0);
-                        app.place_overlays();
                         app.place_thumb();
                     }
                 }
@@ -14009,11 +13999,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     if code == THUMB_REMOVE {
                         app.remove_attachment(at);
                     } else if let Some(path) = app.attachments.get(at).map(|attached| attached.path.clone()) {
-                        app.open_picture(&path);
-                    }
-                }
-                _ if (ID_PICTURES..ID_PICTURES + PICTURE_POOL as isize).contains(&id) => {
-                    if let Some((path, _)) = app.picture_shown.get((id - ID_PICTURES) as usize).cloned().flatten() {
                         app.open_picture(&path);
                     }
                 }
@@ -15110,7 +15095,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         crate::textview::set_name(doc, "Document");
         // (a line an edge of the view cuts in half fades out there, as it does in a browser's chat, and does not read as letters gone wrong)
         for reading in [transcript, doc] {
-            crate::textview::fade_edges(reading, ds::size::TEXT_FADE);
+            crate::textview::fade_edges(reading, if test_no_fade() { 0 } else { ds::size::TEXT_FADE });
         }
         let side = control(window, "LISTBOX", "", list_style, 0, ID_SIDE);
         let list = control(window, "LISTBOX", "", list_style, 0, ID_LIST);
@@ -15363,7 +15348,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             running: false,
             has_messages: false,
             queued: Vec::new(),
-            placed_at: 0,
+            thumb_at: 0,
             transcript_region: ((0, 0), None),
             interjected: Vec::new(),
             question: None,
@@ -15404,9 +15389,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             attach_button: make_button(window, ID_ATTACH, "paperclip", ButtonKind::Icon, theme::surface()),
             attachments: Vec::new(),
             attached_windows: (0..attach::MOST_IMAGES).map(|at| make_button(window, ID_ATTACHED + at as isize, "", ButtonKind::Attached, theme::surface())).collect(),
-            picture_windows: (0..PICTURE_POOL).map(|at| make_button(window, ID_PICTURES + at as isize, "", ButtonKind::Picture, theme::user_back())).collect(),
-            picture_shown: vec![None; PICTURE_POOL],
-            picture_cut: vec![(0, 0); PICTURE_POOL],
+            thumb_wanted: std::collections::HashSet::new(),
             picture_blocks: Vec::new(),
             thumbs: HashMap::new(),
             thumb_clock: 0,
@@ -16322,6 +16305,51 @@ mod tests {
         let many: Vec<OverlayHit> = (0..PROXY_POOL as i32 + 5).map(|at| hit(0, at * 30, OverlayKey::Run(at as usize))).collect();
         assert_eq!(proxy_order(&many).len(), PROXY_POOL, "no more than there are controls");
         assert_eq!(proxy_order(&[]), Vec::<OverlayKey>::new());
+    }
+
+    #[test]
+    fn a_pictures_place_is_its_rooms_place_in_the_frame_and_moves_with_it_by_as_much() {
+        let dpi = 168;
+        let sizes = [(640, 480); 5];
+        let tiles = attach::Tiles::of(&sizes, scale(dpi, 400), dpi);
+        assert!(tiles.per_row >= 2 && tiles.rows >= 2, "five tiles are in more than one row");
+        for index in 0..sizes.len() {
+            let (x, y) = tiles.at(index);
+            let here = picture_area(POINT { x: 30, y: 200 }, (x, y), (tiles.width, tiles.height), dpi);
+            // (the card's padding is above the row's first line)
+            assert_eq!((here.left, here.top), (30 + x, 200 + y + scale(dpi, 7)));
+            assert_eq!((here.right - here.left, here.bottom - here.top), (tiles.width, tiles.height));
+            // The same room a step further down the page, as a scroll or a line that came in above it makes it: the tile is a step further down, and no other way.
+            let moved = picture_area(POINT { x: 30, y: 200 + 57 }, (x, y), (tiles.width, tiles.height), dpi);
+            assert_eq!((moved.left - here.left, moved.top - here.top, moved.right - here.right, moved.bottom - here.bottom), (0, 57, 0, 57));
+        }
+        // the tiles of a row stand side by side with the gap between them, the rows one under another
+        let (first, second, below) = (tiles.at(0), tiles.at(1), tiles.at(tiles.per_row as usize));
+        assert_eq!((second.0 - first.0, second.1), (tiles.width + tiles.gap, first.1));
+        assert_eq!((below.0, below.1 - first.1), (first.0, tiles.height + tiles.gap));
+    }
+
+    #[test]
+    fn a_tile_is_in_view_when_any_of_it_is_and_not_at_the_edge() {
+        let tile = |top: i32, bottom: i32| RECT { left: 0, top, right: 50, bottom };
+        assert!(tile_is_in_view(&tile(100, 200), 500));
+        assert!(tile_is_in_view(&tile(-90, 10), 500), "its foot is in view");
+        assert!(tile_is_in_view(&tile(490, 600), 500), "its head is in view");
+        assert!(!tile_is_in_view(&tile(-100, 0), 500), "it ends where the view begins");
+        assert!(!tile_is_in_view(&tile(500, 600), 500), "it begins where the view ends");
+    }
+
+    #[test]
+    fn the_pictures_of_a_message_are_named_by_their_files_and_take_their_turn_among_the_icons() {
+        assert_eq!(file_name_of(Path::new("C:/work/shots/chart.png")), "chart.png");
+        assert_eq!(file_name_of(Path::new("chart.png")), "chart.png");
+        let tile = |left: i32, top: i32, key: OverlayKey| OverlayHit { area: RECT { left, top, right: left + 100, bottom: top + 80 }, key };
+        let hits = vec![tile(120, 300, OverlayKey::Picture(0, 1)), tile(10, 300, OverlayKey::Picture(0, 0)), tile(10, 100, OverlayKey::Copy(0))];
+        // (the pointer is on the tile it is over, and the hidden controls are in the page's order)
+        assert_eq!(icon_under(&hits, 20, 310), Some(OverlayKey::Picture(0, 0)));
+        assert_eq!(icon_under(&hits, 200, 370), Some(OverlayKey::Picture(0, 1)));
+        assert_eq!(icon_under(&hits, 112, 310), None, "in the gap between two tiles");
+        assert_eq!(proxy_order(&hits), vec![OverlayKey::Copy(0), OverlayKey::Picture(0, 0), OverlayKey::Picture(0, 1)]);
     }
 
     #[test]
