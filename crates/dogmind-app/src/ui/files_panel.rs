@@ -80,20 +80,25 @@ pub(super) fn key_does(key: u16, control: bool, row: Option<&Row>) -> KeyDoes {
 }
 
 impl App {
-    /// The panel shows the tree: it is the chat, the panel is there, and no preview is in its place.
-    pub(super) fn files_shown(&self) -> bool {
-        self.panel == Panel::Chat && self.right_width > 0 && self.preview_file.is_none() && self.settings.right_files
+    /// The panel shows this view: it is the chat, the panel is there, and no preview is in its place.
+    pub(super) fn view_shown(&self, view: RightView) -> bool {
+        self.panel == Panel::Chat && self.right_width > 0 && self.preview_file.is_none() && self.settings.right_view == view
     }
 
-    /// Which of the panel's two views, and its choice kept.
-    pub(super) unsafe fn set_right_view(&mut self, files: bool) {
-        if self.settings.right_files == files {
+    /// The panel shows the tree.
+    pub(super) fn files_shown(&self) -> bool {
+        self.view_shown(RightView::Files)
+    }
+
+    /// Which of the panel's views, and its choice kept.
+    pub(super) unsafe fn set_right_view(&mut self, view: RightView) {
+        if self.settings.right_view == view {
             return;
         }
-        self.settings.right_files = files;
+        self.settings.right_view = view;
         self.save();
         self.layout();
-        if files && self.files_shown() {
+        if view == RightView::Files && self.files_shown() {
             SetFocus(self.tree_list);
         }
     }
@@ -109,7 +114,7 @@ impl App {
         if !self.settings.right_panel {
             self.settings.right_panel = true;
         }
-        self.settings.right_files = true;
+        self.settings.right_view = RightView::Files;
         self.save();
         self.layout();
         if self.right_width == 0 {
@@ -597,9 +602,9 @@ impl App {
         self.files_menu(at, (area.left + scale(self.dpi, 40), area.bottom));
     }
 
-    /// The tabs of the panel, and the row under a point of the window, for a press.
-    pub(super) fn right_tab_at(&self, x: i32, y: i32) -> Option<bool> {
-        self.right_tab_hits.iter().find(|(area, _)| x >= area.left && x < area.right && y >= area.top && y < area.bottom).map(|(_, files)| *files)
+    /// The view whose word of the panel is under a point of the window, for a press.
+    pub(super) fn right_tab_at(&self, x: i32, y: i32) -> Option<RightView> {
+        self.right_tab_hits.iter().find(|(area, _)| x >= area.left && x < area.right && y >= area.top && y < area.bottom).map(|(_, view)| *view)
     }
 }
 

@@ -29,7 +29,7 @@ use dogmind_agent::web::{WebSettings, WARNING_MARK};
 use crate::design as ds;
 use crate::machine::readable_build;
 use crate::diffview::{self, RowKind};
-use crate::settings::KeySource;
+use crate::settings::{KeySource, RightView};
 use crate::toolrun::{self, LineKind, RunEntry, Tone, ToolRun};
 use crate::cards::{self, AnswerState, Card, PlanState};
 use crate::notice;
@@ -62,6 +62,7 @@ use crate::markdown;
 use crate::settings::{self, Kind, ProviderConfig, Settings, TEXT_SIZES};
 
 mod files_panel;
+mod term_panel;
 
 const WM_WAKE: u32 = WM_APP + 1;
 const WM_PREVIEW_MADE: u32 = WM_APP + 2;
@@ -1868,8 +1869,8 @@ struct App {
     tree_menu: HWND,
     tree_menu_row: Option<files::Row>,
     tree_menu_hover: Option<usize>,
-    /// The two words over the panel on the right, where a press goes to the view they name (true: the files).
-    right_tab_hits: Vec<(RECT, bool)>,
+    /// The words over the panel on the right, where a press goes to the view each names.
+    right_tab_hits: Vec<(RECT, RightView)>,
     collapsed: HashSet<String>,
     all_sessions: Vec<session::Summary>,
     /// The session on screen, once it has a file.
@@ -7564,17 +7565,17 @@ impl App {
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let row = s(ds::size::TEXT_ROW);
-        // The two views of the panel, as two words over it (level with the session's name): the one shown is underlined.
+        // The views of the panel, as words over it (level with the session's name): the one shown is underlined.
         let words_top = (s(ds::size::TITLE_STRIP) - s(ds::space::XL)) / 2;
         let mut across_to = x;
-        for (words, files) in [(t("Overview"), false), (t("Files"), true)] {
+        for (words, view) in [(t("Overview"), RightView::Overview), (t("Files"), RightView::Files), (t("Terminal"), RightView::Terminal)] {
             let across = text_width(self.fonts.strong, words);
-            let on = self.settings.right_files == files;
+            let on = self.settings.right_view == view;
             shapes.push(Shape::Text { area: rect(across_to, words_top, across, s(ds::space::XL)), text: words.to_string(), font: FontKind::Strong, color: if on { theme::text() } else { theme::muted() }, flags: ONE_LINE });
             if on {
                 shapes.push(Shape::Fill { area: rect(across_to, words_top + s(ds::space::XL) + s(ds::space::HAIR), across, s(ds::space::HAIR)), color: theme::accent() });
             }
-            self.right_tab_hits.push((rect(across_to - s(ds::space::S), words_top - s(ds::space::XS), across + 2 * s(ds::space::S), s(ds::space::XL) + s(ds::space::M)), files));
+            self.right_tab_hits.push((rect(across_to - s(ds::space::S), words_top - s(ds::space::XS), across + 2 * s(ds::space::S), s(ds::space::XL) + s(ds::space::M)), view));
             across_to += across + s(ds::space::XL);
         }
         // (what is under them begins past the strip the session's name has)
@@ -7588,6 +7589,12 @@ impl App {
             *y += s(ds::space::XL);
         };
 
+        // The terminal has the panel to the foot of the window: no engine line under it.
+        if self.settings.right_view == RightView::Terminal {
+            self.dashboard_hit = None;
+            self.layout_terminal_view(shapes, x, width, s(ds::size::TITLE_STRIP), height);
+            return;
+        }
         // The engine, at the foot: what it is and the way to its dashboard.
         self.dashboard_hit = None;
         let foot = height - s(ds::space::L);
@@ -7608,7 +7615,7 @@ impl App {
             shapes.push(Shape::Text { area: rect(x, engine_top, width, s(ds::space::XL)), text: t("Engine").to_string(), font: FontKind::Strong, color: theme::muted(), flags: ONE_LINE });
         }
         // The files of the folder: the list takes what is between the two words and the engine's lines.
-        if self.settings.right_files {
+        if self.settings.right_view == RightView::Files {
             let margin = s(ds::size::RIGHT_GAP);
             let top = s(ds::size::TITLE_STRIP);
             self.files_place(x - margin + s(ds::space::S), top, width + 2 * margin - 2 * s(ds::space::S), (engine_top - top - s(ds::space::S)).max(s(ds::size::TEXT_ROW)));
@@ -14773,8 +14780,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.layout();
                 return 0;
             }
-            if let Some(files) = app.right_tab_at(x, y) {
-                app.set_right_view(files);
+            if let Some(view) = app.right_tab_at(x, y) {
+                app.set_right_view(view);
             } else if let Some((at, act)) = app.queue_hits.iter().find(|(area, _, _)| within(area)).map(|(_, at, act)| (*at, *act)) {
                 app.queue_act(at, act);
             } else if let Some(at) = app.rail_hits.iter().find(|(area, _)| within(area)).map(|(_, at)| *at) {
