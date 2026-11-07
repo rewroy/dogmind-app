@@ -156,7 +156,7 @@ fn sealed_from(first: &[u8]) -> std::io::Result<Option<Sealed>> {
     }
     let header: Header = serde_json::from_str(text).map_err(|_| damaged_header())?;
     if header.version != FORMAT {
-        return Err(std::io::Error::other(Unreadable("This conversation was written by a newer version of Dogmind.")));
+        return Err(std::io::Error::other(Unreadable(conversation_key::NEWER_FORMAT)));
     }
     let id: [u8; ID_BYTES] = from_hex(&header.id).and_then(|bytes| bytes.try_into().ok()).ok_or_else(damaged_header)?;
     let cipher = conversation_key::find(&header.key).ok_or_else(no_key)?;
@@ -347,7 +347,7 @@ pub const DAMAGE_NOTICE: &str = "some lines of this conversation could not be re
 /// The lines that could not be read, as a person is told of them.
 pub fn damage_words(damaged: &[usize]) -> String {
     let shown: Vec<String> = damaged.iter().take(12).map(usize::to_string).collect();
-    format!("{DAMAGE_NOTICE}{}{}", shown.join(", "), if damaged.len() > shown.len() { format!(" and {} more", damaged.len() - shown.len()) } else { String::new() })
+    format!("{DAMAGE_NOTICE}{}{}", shown.join(", "), if damaged.len() > shown.len() { format!(" (+{})", damaged.len() - shown.len()) } else { String::new() })
 }
 
 /// A session that is open: where it is, what it has said, and the lines that did not open.

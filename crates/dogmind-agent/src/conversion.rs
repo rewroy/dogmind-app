@@ -52,7 +52,12 @@ pub struct Hooks<'a> {
     moments: usize,
 }
 
-impl Hooks<'_> {
+impl<'a> Hooks<'a> {
+    /// Hooks that only tell how far the change has come.
+    pub fn reporting(progress: &'a mut dyn FnMut(usize, usize)) -> Hooks<'a> {
+        Hooks { progress: Some(progress), ..Hooks::default() }
+    }
+
     fn moment(&mut self) -> Result<(), Ended> {
         if self.stop_after.is_some_and(|after| self.moments >= after) {
             return Err(Ended::Stopped);

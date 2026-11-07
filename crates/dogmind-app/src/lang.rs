@@ -6,7 +6,7 @@ use std::fmt::Display;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-use dogmind_agent::{images, llm};
+use dogmind_agent::{conversation_key, images, llm};
 
 static JAPANESE: AtomicBool = AtomicBool::new(false);
 
@@ -176,6 +176,7 @@ const NOTICES: &[(&str, &str)] = &[
     (llm::REFUSED, "サーバーがこの依頼を受け付けませんでした。会話はそのまま残っています。サーバーからの内容: "),
     (llm::NO_ANSWER, "サーバーから応答がありません。起動しているか、アドレスが正しいかを確認してください: "),
     ("the session could not be saved: ", "セッションを保存できませんでした: "),
+    (dogmind_agent::session::DAMAGE_NOTICE, "この会話の読み取れない行を省いて開きました: 行 "),
     ("this turn cannot be rewound: ", "このターンは巻き戻せません: "),
     ("a rewind will not bring this edit back: ", "この編集は巻き戻しでは戻せません: "),
     ("the rule could not be saved, so it lasts this session: ", "ルールを保存できなかったため、このセッションの間だけ有効です: "),
@@ -818,6 +819,63 @@ const JA: &[(&str, &str)] = &[
     ("Back", "戻る"),
     ("Help", "ヘルプ"),
     ("Done", "完了"),
+    ("Privacy", "プライバシー"),
+    ("If you forget the passphrase and lose the recovery code, the conversations cannot be read by anyone.", "パスフレーズを忘れ、回復コードも失うと、会話は誰にも読めなくなります。"),
+    ("Conversations, and the notes the model keeps, are stored as plain text in this app's folder. They can be encrypted, under a passphrase that only you know.", "会話と、モデルが残すメモは、このアプリのフォルダーに平文で保存されています。あなただけが知るパスフレーズで暗号化できます。"),
+    ("Conversations are encrypted: each message, each picture and each note the model keeps. The key is kept only under your passphrase, under a recovery code and, if you chose it, under your Windows account.", "会話は暗号化されています。メッセージ、画像、モデルが残すメモのすべてです。鍵は、あなたのパスフレーズ、回復コード、そして選んだ場合は Windows のアカウントのもとにだけ保存されます。"),
+    ("Remember on this PC", "この PC で覚える"),
+    ("With this on, Dogmind asks for nothing when it starts on this PC. The passphrase and the recovery code still open the conversations on another PC, or after Windows is installed again.", "オンにすると、この PC で Dogmind を起動するときに何も聞きません。別の PC や、Windows を入れ直したあとでも、パスフレーズと回復コードで会話を開けます。"),
+    ("Not encrypted: the files of your workspaces and the copies kept to undo an edit (they lie in the workspace as they are), the timing records of a session (counts, times and names, never what was said), and the settings.", "暗号化しないもの: ワークスペースのファイルと、編集を元に戻すために残すそのコピー(ワークスペースにはもともとそのまま置かれています)、セッションの計測記録(回数、時間、名前だけで、話した内容は含みません)、設定。"),
+    ("Choose a passphrase for your conversations. Then you are shown a recovery code, once. If you forget the passphrase, the recovery code is the only way back: with neither, the conversations cannot be read by anyone.", "会話のパスフレーズを決めてください。そのあと回復コードを一度だけ表示します。パスフレーズを忘れたときに戻る方法は回復コードだけで、どちらもなければ会話は誰にも読めません。"),
+    ("Passphrase", "パスフレーズ"),
+    ("Again", "もう一度"),
+    ("Every conversation and note you have is encrypted now, one at a time, and new ones as they begin. With the box ticked, Dogmind asks for nothing when it starts on this PC.", "今ある会話とメモをすべて 1 件ずつ暗号化し、新しい会話は始まるときから暗号化します。チェックを入れておくと、この PC で Dogmind を起動するときに何も聞きません。"),
+    ("New passphrase", "新しいパスフレーズ"),
+    ("The conversations are not touched, and the recovery code still works.", "会話には手を加えず、回復コードもそのまま使えます。"),
+    ("A new recovery code replaces the old one, which stops working. The passphrase stays as it is. The new code is shown once.", "新しい回復コードは古いものに置き換わり、古いコードは使えなくなります。パスフレーズはそのままです。新しいコードは一度だけ表示します。"),
+    ("Every conversation and note is written back as plain text, and the key file is removed. Anyone who can open this app's folder can then read them.", "すべての会話とメモを平文に戻し、鍵のファイルを削除します。そのあとは、このアプリのフォルダーを開ける人なら誰でも読めます。"),
+    ("Recovery code", "回復コード"),
+    ("Write this code down and keep it somewhere safe. It is shown once, and nothing else keeps it. If you forget the passphrase, it is the only way back to your conversations; if you lose both, they cannot be read by anyone.", "このコードを書き留めて、安全な場所に保管してください。表示は一度だけで、ほかには保存されません。パスフレーズを忘れたとき会話に戻る方法はこのコードだけで、両方を失うと会話は誰にも読めません。"),
+    ("{0} It is conversation-key.json in {1}. Put back a copy of it, and start Dogmind again.", "{0} 対象は {1} の conversation-key.json です。コピーを戻して、Dogmind をもう一度起動してください。"),
+    ("Your conversations are encrypted. Type your passphrase to open them.", "会話は暗号化されています。開くにはパスフレーズを入力してください。"),
+    ("Type the recovery code you were shown, and choose a new passphrase.", "表示された回復コードを入力し、新しいパスフレーズを決めてください。"),
+    ("Change passphrase...", "パスフレーズを変更..."),
+    ("Encrypt conversations...", "会話を暗号化..."),
+    ("New recovery code...", "新しい回復コード..."),
+    ("Turn off encryption...", "暗号化をやめる..."),
+    ("Encrypt conversations", "会話を暗号化"),
+    ("Encrypt", "暗号化する"),
+    ("Change the passphrase", "パスフレーズの変更"),
+    ("Change", "変更"),
+    ("New recovery code", "新しい回復コード"),
+    ("Make a new code", "新しいコードを作る"),
+    ("Turn off encryption?", "暗号化をやめますか?"),
+    ("Turn off encryption", "暗号化をやめる"),
+    ("Encrypting conversations", "会話を暗号化しています"),
+    ("Decrypting conversations", "会話を平文に戻しています"),
+    ("Unlock your conversations", "会話のロックを解除"),
+    ("Unlock", "ロック解除"),
+    ("Use the passphrase instead", "パスフレーズを使う"),
+    ("Use the recovery code instead", "回復コードを使う"),
+    ("The two passphrases are not the same.", "2 つのパスフレーズが一致しません。"),
+    ("A conversation is at work. Let it finish or stop it first: the files are written to while it goes.", "会話が作業中です。先に終わらせるか止めてください。作業中はファイルに書き込まれます。"),
+    ("Encrypting {0} of {1}...", "{1} 件中 {0} 件を暗号化しています..."),
+    ("Decrypting {0} of {1}...", "{1} 件中 {0} 件を平文に戻しています..."),
+    ("Encrypting...", "暗号化しています..."),
+    ("Decrypting...", "平文に戻しています..."),
+    ("It stopped: {0}. What was changed stays changed, and the next start of Dogmind finishes the rest.", "途中で止まりました: {0}。変更済みの分はそのままで、残りは次に Dogmind を起動したときに仕上げます。"),
+    ("{0} conversations and notes are encrypted.", "{0} 件の会話とメモを暗号化しました。"),
+    ("{0} conversations and notes are plain again, and the key file is removed.", "{0} 件の会話とメモを平文に戻し、鍵のファイルを削除しました。"),
+    ("These could not be carried over, and were left out:", "次のものは引き継げず、除きました:"),
+    ("The passphrase is changed.", "パスフレーズを変更しました。"),
+    ("A new recovery code is made. The old one does not work any more.", "新しい回復コードを作りました。古いコードはもう使えません。"),
+    (conversation_key::WRONG_SECRET, "違います。"),
+    (conversation_key::LOCKED, "会話は暗号化されていて、まだロックが解除されていません。"),
+    (conversation_key::OTHER_KEY, "この会話は別の鍵で暗号化されていて、この PC の鍵ではありません。"),
+    (conversation_key::NOT_REMEMBERED, "Windows がこの PC 用に鍵を保存してくれなかったため、何も変更していません。"),
+    (conversation_key::EMPTY_PASSPHRASE, "パスフレーズは空にできません。"),
+    (conversation_key::KEYSTORE_DAMAGED, "会話の鍵を保存したファイルが壊れています。"),
+    (conversation_key::NEWER_FORMAT, "この会話は、より新しい版の Dogmind が書いたものです。"),
     ("About Dogmind", "Dogmind について"),
     ("Settings", "設定"),
     ("Connect again", "再接続"),
@@ -1142,7 +1200,7 @@ mod tests {
     #[test]
     fn what_a_person_reads_when_a_provider_fails_is_all_in_japanese() {
         let table: HashMap<&str, &str> = JA.iter().copied().collect();
-        for words in llm::WORDS.into_iter().chain(images::WORDS).chain(dogmind_agent::read_folders::WORDS).chain(dogmind_agent::workspace_grants::WORDS).chain(dogmind_agent::background::WORDS) {
+        for words in llm::WORDS.into_iter().chain(images::WORDS).chain(conversation_key::WORDS).chain(dogmind_agent::read_folders::WORDS).chain(dogmind_agent::workspace_grants::WORDS).chain(dogmind_agent::background::WORDS) {
             assert!(table.contains_key(words), "{words}");
         }
         assert!(table.contains_key(crate::settings::VARIABLE_NAME_ONLY));

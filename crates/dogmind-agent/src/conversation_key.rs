@@ -43,7 +43,8 @@ pub const OTHER_KEY: &str = "This conversation is encrypted with another key, wh
 pub const NOT_REMEMBERED: &str = "Windows would not keep the key for this PC, so nothing was changed.";
 pub const EMPTY_PASSPHRASE: &str = "A passphrase cannot be empty.";
 pub const KEYSTORE_DAMAGED: &str = "The file that holds the key of the conversations is damaged.";
-pub const WORDS: [&str; 6] = [WRONG_SECRET, LOCKED, OTHER_KEY, NOT_REMEMBERED, EMPTY_PASSPHRASE, KEYSTORE_DAMAGED];
+pub const NEWER_FORMAT: &str = "This conversation was written by a newer version of Dogmind.";
+pub const WORDS: [&str; 7] = [WRONG_SECRET, LOCKED, OTHER_KEY, NOT_REMEMBERED, EMPTY_PASSPHRASE, KEYSTORE_DAMAGED, NEWER_FORMAT];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyError {
