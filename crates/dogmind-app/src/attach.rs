@@ -111,15 +111,14 @@ pub enum Undecoded {
 /// A small copy of a file, for a room this large. A file larger than the agent takes of a picture is not read, and one that declares more pixels than it takes is not decoded: it is
 /// one that cannot be shown, as is any that is damaged.
 pub fn decode(path: &Path, room_width: i32, room_height: i32) -> Result<Decoded, Undecoded> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|_| Undecoded::Gone)?;
     let most = dogmind_agent::images::MOST_BYTES as u64;
-    if file.metadata().map_err(|_| Undecoded::Gone)?.len() > most {
+    let size = std::fs::metadata(path).map_err(|_| Undecoded::Gone)?.len();
+    // (a picture of an encrypted session is sealed whole and is opened here, as a plain one is read: it is a little larger than what it holds)
+    if size > most + 64 || (size > most && !dogmind_agent::images::is_sealed(path)) {
         return Err(Undecoded::Unreadable);
     }
-    // (and no more than that is read of a file that grows meanwhile: what is one byte past is refused by `decode_picture`)
-    let mut bytes = Vec::new();
-    file.take(most + 1).read_to_end(&mut bytes).map_err(|_| Undecoded::Gone)?;
+    let bytes = dogmind_agent::images::read_stored(path).map_err(|error| if error.kind() == std::io::ErrorKind::NotFound { Undecoded::Gone } else { Undecoded::Unreadable })?;
+    // (what is one byte past is refused by `decode_picture`, as it is for a file that grew meanwhile)
     decode_bytes(&bytes, room_width, room_height)
 }
 

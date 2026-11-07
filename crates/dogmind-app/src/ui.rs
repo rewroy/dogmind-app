@@ -5281,7 +5281,21 @@ impl App {
             self.warn(&tf("{0} is no longer there.", &[&path.display()]));
             return;
         }
-        self.open_preview(&path.display().to_string());
+        // A picture of an encrypted session is sealed in its file, and the browser beside the conversation reads files: the one that is asked for is put, plain, in the folder
+        // that is emptied at every start, and no other is.
+        let shown = if dogmind_agent::images::is_sealed(path) {
+            let folder = self.folder.join("attachments");
+            let copy = folder.join(path.file_name().unwrap_or_default());
+            let made = dogmind_agent::images::read_stored(path).and_then(|bytes| std::fs::create_dir_all(&folder).and_then(|()| std::fs::write(&copy, bytes)));
+            if made.is_err() {
+                self.warn(t("This picture cannot be opened here."));
+                return;
+            }
+            copy
+        } else {
+            path.to_path_buf()
+        };
+        self.open_preview(&shown.display().to_string());
     }
 
     fn current_mode(&self) -> Mode {

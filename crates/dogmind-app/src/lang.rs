@@ -962,6 +962,7 @@ const JA: &[(&str, &str)] = &[
     ("Up to {0} pictures can go with one message.", "1 つのメッセージに添付できる画像は {0} 枚までです。"),
     ("File not found", "ファイルが見つかりません"),
     ("This picture cannot be shown here", "この画像はここに表示できません"),
+    ("This picture cannot be opened here.", "この画像をここで開けません。"),
     ("{0} is no longer there.", "{0} はもうありません。"),
     ("This model on this PC cannot see pictures: it has no vision file. Not every model has one. If yours does, put its mmproj-*.gguf beside the model, in {0}, and start the engine again.", "この PC のモデルにはビジョンファイルがないため、画像を読めません。ビジョンファイルのないモデルもあります。お使いのモデルにある場合は、mmproj-*.gguf をモデルと同じ場所 ({0} の中) に置いて、エンジンを起動し直してください。"),
     // The transcript and its controls.
