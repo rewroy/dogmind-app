@@ -278,6 +278,17 @@ impl Tree {
         Toggled::Nothing
     }
 
+    /// A folder that could not be read is to be read again: the row that says so is pressed.
+    pub fn retry(&mut self, path: &str) -> Toggled {
+        self.version += 1;
+        let Some(node) = self.node_mut(path) else { return Toggled::Nothing };
+        if matches!(node.state, State::Failed(_)) {
+            node.state = State::Reading;
+            return Toggled::Read(path.to_string());
+        }
+        Toggled::Nothing
+    }
+
     /// A folder's read has come. What was in it that still is keeps what the person did to it (open, how much of it shows); the rest is new.
     pub fn read_came(&mut self, path: &str, result: Result<Vec<Entry>, String>) {
         self.version += 1;
@@ -735,9 +746,14 @@ mod tests {
         let rows = tree.rows();
         assert_eq!(rows[1].kind, RowKind::Empty);
         assert_eq!(rows[3].kind, RowKind::Problem("Access is denied.".into()));
-        // closed and opened again, a folder that failed is read again
+        // closed and opened again, a folder that failed is read again; and the row that says it failed, pressed, reads it again with the folder still open
         assert_eq!(tree.toggle("locked"), Toggled::Nothing);
         assert_eq!(tree.toggle("locked"), Toggled::Read("locked".into()));
+        tree.read_came("locked", Err("Access is denied.".into()));
+        assert_eq!(tree.retry("locked"), Toggled::Read("locked".into()));
+        assert!(tree.is_open("locked") && tree.rows().iter().any(|row| row.kind == RowKind::Reading));
+        assert_eq!(tree.retry("locked"), Toggled::Nothing, "it is being read: no second read");
+        assert_eq!(tree.retry("empty"), Toggled::Nothing, "a folder that was read has nothing to try again");
     }
 
     #[test]
