@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod anthropic;
+pub mod background;
 pub mod baseline;
 #[cfg(windows)]
 pub mod bundled;

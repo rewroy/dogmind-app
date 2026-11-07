@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::background::{self, Background, Waiting};
 use crate::checkpoint::{Checkpoints, Restored, Turn};
 use crate::compaction;
 use crate::llm::{self, Delta, LlmError, Provider, Request, Usage};
 use crate::images::{self, Attachment, ImageLimit};
-use crate::message::{ImageRef, Message};
+use crate::message::{ImageRef, Message, Wake};
 use crate::prompt;
 use crate::rules::{self, Rule};
 use crate::safety::{self, delegated, resolve, AlwaysScope, Gate, Mode, Risk, Verdict};
@@ -61,6 +62,10 @@ enum Restarted {
     /// It did not come back in the time there is.
     GaveUp,
 }
+/// How often the loop looks at what the background has to say while something is going on or waiting. A command's end is told within this, and a wait is up by it.
+const WAKE_LOOK_EVERY: Duration = Duration::from_millis(250);
+/// After a turn, how long before one is run for what the background has to say: what the person typed meanwhile, which the window sends when it hears the turn has ended, comes first.
+const WAKE_AFTER_A_TURN: Duration = Duration::from_millis(400);
 const OVERFLOW_RETRIES: u32 = 2;
 /// In a row: a long job meets failures along the way, and a model that gets nowhere meets nothing else.
 const MAX_FAILED_CALLS: usize = 12;
@@ -251,6 +256,10 @@ pub enum Event {
     Notice(String),
     Failed(String),
     TurnEnded { cancelled: bool },
+    /// The session woke itself, with nobody sending anything: this is what woke it, which the transcript shows as a notice row. [`Event::TurnStarted`] follows, and the turn ends as any does.
+    Woken(Vec<Wake>),
+    /// What the session has going on or waiting in the background, told when it changes: commands, waits, and whether waking has stopped.
+    Waiting(Waiting),
 }
 
 /// How far a request has come, told every so often while it streams: a long answer, or a call with a whole file in its arguments, is minutes of nothing else.
@@ -343,6 +352,8 @@ pub struct Handle {
     pub live: Arc<Mutex<Live>>,
     /// What the person adds while a turn is at work: the model reads it before its next step.
     pub interject: Arc<Mutex<Vec<String>>>,
+    /// What the session has going on or waiting while no turn runs: the window lists it and stops any of it (`Background::stop`) without a word to the agent.
+    pub background: Arc<Background>,
 }
 
 pub struct Config {
@@ -387,8 +398,12 @@ pub fn start(config: Config, events: Sender<Event>, wake: Box<dyn Fn() + Send>) 
     let added = interject.clone();
     let live = Arc::new(Mutex::new(Live { mode: config.mode, effort: config.effort.clone(), safe_commands: false }));
     let shared = live.clone();
+    let background = Arc::new(Background::default());
+    let kept = background.clone();
     std::thread::spawn(move || {
         let mut agent = Agent::new(config, events, wake, flag);
+        agent.bench.background = background.clone();
+        agent.background = background;
         #[cfg(windows)]
         {
             agent.place = Some(place);
@@ -398,7 +413,7 @@ pub fn start(config: Config, events: Sender<Event>, wake: Box<dyn Fn() + Send>) 
         agent.load_extras();
         agent.run(inbox);
     });
-    Handle { commands, cancel, live, interject }
+    Handle { commands, cancel, live, interject, background: kept }
 }
 
 /// What a model wrote before any tool call it wrote out in its own markup (DeepSeek's DSML, a `<tool_call>`): a server that was not
@@ -965,6 +980,14 @@ struct Agent {
     refusal: Option<&'static str>,
     /// Why a compaction went as it did, for its line.
     compaction_stage: &'static str,
+    /// What this session has going on or waiting: shared with the window, which lists it and stops any of it.
+    background: Arc<Background>,
+    /// What the window was last told of it.
+    last_waiting: Waiting,
+    /// Until when no turn is run for what the background has to say.
+    quiet_until: Option<Instant>,
+    /// The `wake` lines of the turn that begins, for its first request: they say which it was.
+    wake_lines: Vec<Value>,
 }
 
 /// A session's scratch folder: outside the workspace, in the sandbox's own temp area, which is the one place besides a workspace where a command may write. Named for the session's file.
@@ -1102,6 +1125,8 @@ impl Agent {
         // (Visual Studio's build tools are looked for from here, in the background: the gate weighs a command without waiting for them, and its environment then usually finds them ready)
         #[cfg(windows)]
         crate::msvc::look_ahead();
+        let background = Arc::new(Background::default());
+        bench.background = background.clone();
         Agent {
             tool_schemas: tools::schemas_for(config.web.enabled, false, false, Vec::new()),
             home: config.home,
@@ -1158,6 +1183,10 @@ impl Agent {
             approval_wait: None,
             refusal: None,
             compaction_stage: "",
+            background,
+            last_waiting: Waiting::default(),
+            quiet_until: None,
+            wake_lines: Vec::new(),
         }
     }
 
@@ -1174,7 +1203,26 @@ impl Agent {
     }
 
     fn run(&mut self, inbox: Receiver<Command>) {
-        while let Ok(command) = inbox.recv() {
+        use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+        loop {
+            // What the person sent comes before anything that woke the session.
+            let command = match inbox.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Empty) => {
+                    if self.wake_if_due() {
+                        continue;
+                    }
+                    self.tell_waiting();
+                    // (with something going on or waiting it looks again soon; with nothing it sleeps until it is sent something)
+                    let next = if self.background.has_work() { inbox.recv_timeout(WAKE_LOOK_EVERY) } else { inbox.recv().map_err(|_| RecvTimeoutError::Disconnected) };
+                    match next {
+                        Ok(command) => command,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+            };
             self.read_live();
             match command {
                 Command::Quit => return,
@@ -1252,7 +1300,73 @@ impl Agent {
                 }
                 Command::Rewind { turn, files, conversation } => self.rewind(turn, files, conversation),
             }
+            self.tell_waiting();
         }
+    }
+
+    /// What the window lists of the background, told when it is not what it was last told.
+    fn tell_waiting(&mut self) {
+        // (the pause is looked at again: an hour that has passed lifts the one that an hour made)
+        let _ = self.background.may_wake();
+        let now = self.background.snapshot();
+        if self.last_waiting.same_as(&now) {
+            return;
+        }
+        self.last_waiting = now.clone();
+        self.emit(Event::Waiting(now));
+    }
+
+    /// Runs a turn for what a background command or a wait has to say, when there is anything and nothing stands in the way. True if a turn was run.
+    fn wake_if_due(&mut self) -> bool {
+        self.background.collect();
+        if !self.background.has_pending() || self.provider.is_none() || self.messages.is_empty() || self.quiet_until.is_some_and(|until| Instant::now() < until) {
+            return false;
+        }
+        if let Err(paused) = self.background.may_wake() {
+            // (said once, and the window lists it: what has come waits, and is told when the person writes, or the hour has passed)
+            if self.background.pause_to_tell().is_some() {
+                self.emit(Event::Notice(paused.sentence().to_string()));
+            }
+            self.tell_waiting();
+            return false;
+        }
+        let items = self.background.take_pending();
+        self.woken_turn(items);
+        true
+    }
+
+    /// A turn nobody sent: the session is woken with what its background work has to say, as a notice of the harness's and not the person's words. It goes on as any turn does:
+    /// it asks when it needs to and waits for the answer, and it ends when it is done or the person stops it.
+    fn woken_turn(&mut self, items: Vec<background::Pending>) {
+        self.background.woke();
+        self.turn_began = std::time::SystemTime::now();
+        let turn_began = Instant::now();
+        self.bench.new_turn();
+        self.cancel.store(false, Ordering::Relaxed);
+        let wakes: Vec<Wake> = items.iter().map(|item| item.wake.clone()).collect();
+        self.emit(Event::Woken(wakes.clone()));
+        self.emit(Event::TurnStarted);
+        self.traj.begin_turn();
+        let text = background::notice_text(&items);
+        // (what woke it, and how long after: told with the turn's first request, which is the one it is about)
+        self.wake_lines = items.iter().map(|item| {
+            let mut fields = json!({"cause": item.wake.cause.name(), "id": item.wake.id, "after_ms": item.happened.elapsed().as_millis() as u64, "together": items.len()});
+            if let Some(word) = first_word_of(&item.wake.what).filter(|_| item.wake.cause != crate::message::WakeCause::Wait) {
+                fields["cmd0"] = json!(word);
+            }
+            fields
+        }).collect();
+        self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": 0, "first": false, "woken": true}));
+        let message = self.messages.len();
+        if let Some(marks) = &mut self.marks {
+            let title = format!("(woken) {}", wakes.iter().map(|wake| format!("{} {}", wake.id, match wake.cause { crate::message::WakeCause::CommandEnded => "ended", crate::message::WakeCause::CommandLine => "printed", crate::message::WakeCause::Wait => "is up" })).collect::<Vec<_>>().join(", "));
+            if let Err(error) = marks.begin(&title, &now(), Some(message)) {
+                self.emit(Event::Notice(format!("this turn cannot be rewound: {error}")));
+            }
+        }
+        self.push(Message { notice: Some(wakes), ..Message::text("user", text) });
+        let ended = self.iterate();
+        self.finish_turn(ended, turn_began);
     }
 
     /// What depends on the workspace and the settings: its skills, the notes' folder, and so the tools on offer.
@@ -1300,7 +1414,10 @@ impl Agent {
     fn new_session(&mut self, workspace: PathBuf) {
         self.move_to(&workspace);
         self.workspace = workspace;
+        // (what the last session had going or waiting is ended with it)
+        self.background.reset();
         self.bench = Workbench::new(&self.workspace);
+        self.bench.background = self.background.clone();
         self.bench.web.settings = self.web.clone();
         self.load_extras();
         (self.goal, self.goal_due) = (None, false);
@@ -1333,7 +1450,9 @@ impl Agent {
             Ok((session, workspace, messages)) => {
                 self.move_to(&workspace);
                 self.workspace = workspace;
+                self.background.reset();
                 self.bench = Workbench::new(&self.workspace);
+                self.bench.background = self.background.clone();
                 self.bench.web.settings = self.web.clone();
                 self.bench.baseline = Some(Arc::new(crate::baseline::Baseline::for_session(path, &self.workspace)));
                 self.load_extras();
@@ -1501,6 +1620,8 @@ impl Agent {
     fn turn(&mut self, text: &str, pictures: Vec<Attachment>, kept: Vec<ImageRef>) {
         self.turn_began = std::time::SystemTime::now();
         let turn_began = Instant::now();
+        // (what counted against waking in a row is no longer counted: the person is here)
+        self.background.person_spoke();
         self.bench.new_turn();
         self.cancel.store(false, Ordering::Relaxed);
         self.emit(Event::TurnStarted);
@@ -1593,6 +1714,11 @@ impl Agent {
             self.emit(Event::SessionFile(path));
         }
         let ended = self.iterate();
+        self.finish_turn(ended, turn_began);
+    }
+
+    /// How a turn ends, whoever began it: what it left half done is closed, its end is recorded and told. A turn the person stopped stops the background work too: the commands, and the waits.
+    fn finish_turn(&mut self, ended: Ended, turn_began: Instant) {
         let before = self.messages.len();
         // A word to go on with what no one went on with would be read as still standing, after what the person writes next.
         if matches!(ended, Ended::Failed(_) | Ended::Cancelled) && self.messages.last().is_some_and(|last| last.role == "user" && last.content.as_deref().is_some_and(prompt::is_nudge)) {
@@ -1625,6 +1751,13 @@ impl Agent {
                 self.emit(Event::TurnChanges { session, turn, files });
             }
         }
+        if cancelled {
+            // (before the window is told: it lists what is left, and there is none)
+            self.background.stop_all();
+            self.tell_waiting();
+        }
+        // (the window sends what was typed during the turn when it hears this: it goes before a turn that nobody sent)
+        self.quiet_until = Some(Instant::now() + WAKE_AFTER_A_TURN);
         match ended {
             Ended::Done => self.emit(Event::TurnEnded { cancelled: false }),
             Ended::Cancelled => self.emit(Event::TurnEnded { cancelled: true }),
@@ -1818,6 +1951,9 @@ impl Agent {
             }
             let req_id = self.traj.request_id();
             self.last_req = Some(req_id.clone());
+            for fields in std::mem::take(&mut self.wake_lines) {
+                self.traj.write("wake", Some(&req_id), fields);
+            }
             let folder = self.picture_folder();
             let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
             let mut written = String::new();
@@ -2721,6 +2857,8 @@ impl Agent {
         self.tool_ended(id, ok, declined, &output, elapsed);
         self.emit(Event::ToolEnded { id: id.to_string(), ok, declined, elapsed, output: output.clone(), images: images.clone() });
         self.push(Message { images, ..Message::tool_result(id, output) });
+        // (a command may have been started, ended or stopped by this call, or a wait set)
+        self.tell_waiting();
     }
 
     fn permission(&mut self, tool: &str, arguments: &Value) -> Permission {
@@ -3375,7 +3513,7 @@ mod tests {
         assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "so are the tools");
         assert_eq!(second[2]["reasoning_content"], "thinking");
         assert!(bodies[0].get("tool_choice").is_none() && bodies[0].get("max_tokens").is_none());
-        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 15, "Dogmind's ten and the app's five");
+        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 16, "Dogmind's ten and the app's six");
     }
 
     #[test]
@@ -7162,4 +7300,7 @@ mod tests {
         assert_eq!(requests, ["1", "2"], "{lines:?}");
         assert_eq!(of_kind(&lines, "turn_start").iter().map(|line| line["turn"].as_u64().unwrap()).collect::<Vec<_>>(), [1, 2]);
     }
+
+    /// A session that goes on by itself: what a background command or a wait wakes it for.
+    mod wake;
 }

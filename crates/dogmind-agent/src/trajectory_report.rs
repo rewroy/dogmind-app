@@ -186,6 +186,8 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         let spent = Spent::of(in_turn);
         let began = in_turn.iter().find(|line| line.ev() == "turn_start");
         let shown = match began {
+            // (a turn nobody sent: what woke it is under `wakes`)
+            Some(began) if began.v["woken"] == true => format!("turn {turn}: woken by the harness, with no word from the person"),
             Some(began) => format!("turn {turn}: {} characters, {} pictures", began.u("chars").unwrap_or(0), began.u("images").unwrap_or(0)),
             None => format!("turn {turn}"),
         };
@@ -252,6 +254,23 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         let (from, to) = (first.map(|at| at.with_timezone(&Utc)), last.map(|at| at.with_timezone(&Utc)));
         let others = engine.iter().filter(|entry| !matched.contains(&(*entry as *const EngineLine)) && matches!((entry.at, from, to), (Some(at), Some(from), Some(to)) if at >= from - chrono::Duration::seconds(5) && at <= to + chrono::Duration::seconds(5))).count();
         let _ = writeln!(out, "  {} of {} requests joined to the engine's log: {by_id} by id, {by_time} by time; {others} other engine lines in this run's time", joined.len(), requests.len());
+    }
+
+    // Turns that nobody sent: what woke each, how long after it happened the turn began, and the request the turn made first.
+    let wakes: Vec<&Line> = lines.iter().filter(|line| line.ev() == "wake").collect();
+    if !wakes.is_empty() {
+        let _ = writeln!(out, "\nwakes (turns nobody sent)");
+        for line in wakes {
+            let cause = match line.s("cause") {
+                "command_ended" => "ended",
+                "command_line" => "printed the line it was to wake for",
+                "wait" => "is up",
+                other => other,
+            };
+            let program = line.v["cmd0"].as_str().map_or(String::new(), |program| format!(" ({program})"));
+            let together = line.u("together").filter(|count| *count > 1).map_or(String::new(), |count| format!(", with {} others in the same turn", count - 1));
+            let _ = writeln!(out, "  {}{program} {cause}: turn {} began {} after, its first request {}{together}", line.s("id"), line.turn(), secs(line.u("after_ms").unwrap_or(0)), short(line.req()));
+        }
     }
 
     let _ = writeln!(out, "\ntools");

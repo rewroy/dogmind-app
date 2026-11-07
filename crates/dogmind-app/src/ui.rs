@@ -11797,6 +11797,8 @@ impl App {
                     self.tell_about_vision();
                 }
             }
+            // (what the session has going on in the background, and a turn it woke itself for: shown as the next commit does)
+            Event::Woken(_) | Event::Waiting(_) => {}
             Event::TurnEnded { cancelled } => {
                 // (a question or a plan the turn left unanswered goes with it, and its card says so)
                 self.question = None;
