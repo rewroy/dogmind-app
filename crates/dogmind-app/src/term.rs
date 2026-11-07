@@ -7,9 +7,6 @@
 //! - `screen`: the grid, the scrollback, the selection, and the parsing of the escape sequences that a shell writes.
 //! - `palette`: the colours of the cells, in the theme, and how far apart text is held from its ground.
 
-// (what the Terminal view of the panel on the right uses, which is the next change: until then nothing but the tests asks for it)
-#![allow(dead_code)]
-
 pub mod keymap;
 pub mod palette;
 pub mod pty;
@@ -195,6 +192,8 @@ impl Terminal {
         self.exit_code().is_some() && self.shared.finished.load(Ordering::Acquire)
     }
 
+    /// The shell's own process.
+    #[cfg(any(test, debug_assertions))]
     pub fn pid(&self) -> u32 {
         self.pty.pid()
     }

@@ -1068,6 +1068,19 @@ const JA: &[(&str, &str)] = &[
     ("Mention in the message", "メッセージで参照する"),
     // The terminal, in the panel on the right.
     ("Terminal", "ターミナル"),
+    ("New terminal", "新しいターミナル"),
+    ("Choose a shell", "シェルを選ぶ"),
+    ("Close the terminal", "ターミナルを閉じる"),
+    ("Show a terminal in the panel on the right, or open one", "右のパネルにターミナルを表示します。なければ開きます"),
+    ("Exited with code {0}", "終了コード {0} で終了しました"),
+    ("Exited with code 0x{0}", "終了コード 0x{0} で終了しました"),
+    ("{0} terminals are open: close one to open another.", "ターミナルが {0} 個開いています。新しく開くには、どれかを閉じてください。"),
+    ("No shell was found on this PC.", "この PC にシェルが見つかりません。"),
+    ("The shell could not be started: {0}", "シェルを起動できませんでした: {0}"),
+    ("PowerShell 7", "PowerShell 7"),
+    ("Windows PowerShell", "Windows PowerShell"),
+    ("Command Prompt", "コマンド プロンプト"),
+    ("Git Bash", "Git Bash"),
     ("Your own shell, in this session's folder.", "このセッションのフォルダーで動く、あなた自身のシェルです。"),
     ("Commands here run with your own rights, apart from the agent's permissions. Nothing shown here is sent to the model.", "ここで実行するコマンドは、エージェントの権限とは別に、あなた自身の権限で動きます。ここに表示される内容はモデルには送られません。"),
 ];
@@ -1093,9 +1106,11 @@ Ctrl+1 から 9\tサイドバーのそのセッション
 Ctrl+,\t設定
 Ctrl+Shift+C\t最後の回答をコピー
 Ctrl+B\t右側のパネル
+Ctrl+`\tそこに新しいターミナル
+F6\tターミナルから出て、メッセージ欄へ
 Ctrl+F\tこの会話を検索
 Ctrl+Shift+F\t全セッションを検索
-F2\tこのセッションに名前を付ける
+F2\tこのセッションに名前を付ける (ターミナルのタブにキーがあるときは、そのタブ)
 Y / A / N\t承認、常に許可、却下
 N / P\t次と前の変更 (変更の画面で)
 
@@ -1117,6 +1132,7 @@ N / P\t次と前の変更 (変更の画面で)
 MCP サーバー: データフォルダーの mcp.json。アプリと一緒に起動し、呼び出しのたびに確認します。設定 > ツール で返す内容を信頼できます。
 Web: 返ってきた内容はデータとして扱い、会話に入ると以後のコマンドはすべて確認します。
 カスタム指示 (設定) は全セッション共通、DOGMIND.md はそのプロジェクト用です。/init でモデルに書かせることもできます。
+ターミナル: 右側のパネルの「ターミナル」は、あなた自身のシェルです。コマンドはエージェントの権限とは別に、あなた自身の権限で動き、そこに表示される内容はモデルには送られません。キーはすべてシェルに渡ります。Ctrl+C は選択があるときはコピー、ないときは実行中のものを止め、Ctrl+V は貼り付けです。
 ";
 
 #[cfg(test)]

@@ -19,6 +19,34 @@ pub(super) enum MenuDoes {
 /// What the menu of a row offers, in order: open, show in Explorer, copy the path, mention it in the message.
 pub(super) const MENU_ITEMS: [(MenuDoes, &str); 4] = [(MenuDoes::Open, "Open"), (MenuDoes::Explorer, "Show in Explorer"), (MenuDoes::Copy, "Copy the path"), (MenuDoes::Mention, "Mention in the message")];
 
+/// A row of the little menu over the window: its words, a mark where it is the one chosen before, and whether it can be chosen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MenuItem {
+    pub label: String,
+    pub checked: bool,
+    pub enabled: bool,
+}
+
+impl MenuItem {
+    pub(super) fn new(label: &str) -> MenuItem {
+        MenuItem { label: label.to_string(), checked: false, enabled: true }
+    }
+}
+
+/// Whose the menu is that is on screen. One list window serves them all: the rows of a file in the tree, the shells a terminal can start, and what a right click on a terminal offers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum MenuFor {
+    Nothing,
+    Files,
+    Shells,
+    Terminal,
+}
+
+pub(super) struct PanelMenu {
+    pub items: Vec<MenuItem>,
+    pub whose: MenuFor,
+}
+
 /// The first row's depth is indented this much more than its folder's chevron; each depth below it, this much again (unscaled pixels).
 const INDENT: i32 = 14;
 
@@ -170,7 +198,9 @@ impl App {
 
     /// The tree is not on screen: it is not watched, and what it shows is read again when it comes back.
     pub(super) unsafe fn files_hidden(&mut self) {
-        self.files_menu_close(false);
+        if self.panel_menu.whose == MenuFor::Files {
+            self.files_menu_close(false);
+        }
         show(self.tree_list, false);
         if self.tree_watcher.take().is_some() {
             self.tree_stale = true;
@@ -471,73 +501,107 @@ impl App {
         SendMessageW(self.tree_list, LB_SETCURSEL, index, 0);
         self.files_selection_changed();
         self.tree_menu_row = Some(row);
-        self.tree_menu_hover = None;
-        SendMessageW(self.tree_menu, LB_RESETCONTENT, 0, 0);
-        let mut widest = 0;
-        for (_, words) in MENU_ITEMS {
-            let words = t(words);
-            widest = widest.max(text_width(self.fonts.body, words));
-            let units = wide(words);
-            SendMessageW(self.tree_menu, LB_ADDSTRING, 0, units.as_ptr() as LPARAM);
-        }
-        let s = |value: i32| scale(self.dpi, value);
-        let (width, height) = ((widest + 2 * s(ds::space::L) + 2).max(s(190)), MENU_ITEMS.len() as i32 * s(MENU_ROW) + 2);
-        // (in the window's pixels, and kept inside it)
+        let items: Vec<MenuItem> = MENU_ITEMS.iter().map(|(_, words)| MenuItem::new(t(words))).collect();
         let mut point = POINT { x: at.0, y: at.1 };
         ClientToScreen(self.tree_list, &mut point);
         ScreenToClient(self.window, &mut point);
+        self.panel_menu_show(items, MenuFor::Files, (point.x, point.y));
+    }
+
+    /// A little list stands over the window at `at` (in the window's pixels, and kept inside it), with these rows; the keys are in it.
+    pub(super) unsafe fn panel_menu_show(&mut self, items: Vec<MenuItem>, whose: MenuFor, at: (i32, i32)) {
+        self.tree_menu_hover = None;
+        SendMessageW(self.tree_menu, LB_RESETCONTENT, 0, 0);
+        let mut widest = 0;
+        for item in &items {
+            widest = widest.max(text_width(self.fonts.body, &item.label));
+            let units = wide(&item.label);
+            SendMessageW(self.tree_menu, LB_ADDSTRING, 0, units.as_ptr() as LPARAM);
+        }
+        let s = |value: i32| scale(self.dpi, value);
+        // (room for the mark of the one chosen before, where there is one)
+        let marked = if items.iter().any(|item| item.checked) { s(ds::size::ICON_SMALL) + s(ds::space::S) } else { 0 };
+        let (width, height) = ((widest + marked + 2 * s(ds::space::L) + 2).max(s(190)), items.len() as i32 * s(MENU_ROW) + 2);
         let mut client: RECT = std::mem::zeroed();
         GetClientRect(self.window, &mut client);
-        let (x, y) = (point.x.min(client.right - width - s(ds::space::XS)).max(0), point.y.min(client.bottom - height - s(ds::space::XS)).max(0));
+        let (x, y) = (at.0.min(client.right - width - s(ds::space::XS)).max(0), at.1.min(client.bottom - height - s(ds::space::XS)).max(0));
+        let first = items.iter().position(|item| item.enabled).unwrap_or(0);
+        self.panel_menu = PanelMenu { items, whose };
         SetWindowPos(self.tree_menu, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW);
-        SendMessageW(self.tree_menu, LB_SETCURSEL, 0, 0);
+        SendMessageW(self.tree_menu, LB_SETCURSEL, first, 0);
         SetFocus(self.tree_menu);
         InvalidateRect(self.tree_menu, std::ptr::null(), 0);
     }
 
-    /// The menu is put away, and the keys go back to the tree unless they went somewhere else.
+    /// The menu is put away, and the keys go back to where it was opened from unless they went somewhere else.
     pub(super) unsafe fn files_menu_close(&mut self, refocus: bool) {
-        if self.tree_menu_row.take().is_none() {
+        let whose = std::mem::replace(&mut self.panel_menu.whose, MenuFor::Nothing);
+        if whose == MenuFor::Nothing {
             return;
         }
+        self.tree_menu_row = None;
         self.tree_menu_hover = None;
         show(self.tree_menu, false);
         if refocus {
-            SetFocus(self.tree_list);
+            SetFocus(if whose == MenuFor::Files { self.tree_list } else { self.term.window });
         }
     }
 
-    /// An item of the menu is chosen: what it says is done to the row it is of, and the menu goes.
+    /// An item of the menu is chosen: what it says is done, to the row it is of for a file, and the menu goes.
     pub(super) unsafe fn files_menu_choose(&mut self, at: usize) {
-        let Some(row) = self.tree_menu_row.clone() else { return };
-        self.files_menu_close(true);
-        match MENU_ITEMS.get(at).map(|(what, _)| *what) {
-            Some(MenuDoes::Open) => self.files_open_in_app(&row),
-            Some(MenuDoes::Explorer) => self.files_show_in_explorer(&row),
-            Some(MenuDoes::Copy) => {
-                let disk = self.tree_disk_path(&row);
-                self.copy_to_clipboard(&disk.display().to_string());
+        let whose = self.panel_menu.whose;
+        if !self.panel_menu.items.get(at).is_some_and(|item| item.enabled) {
+            return;
+        }
+        match whose {
+            MenuFor::Nothing => {}
+            MenuFor::Shells => {
+                self.files_menu_close(true);
+                self.terminal_shell_chosen(at);
             }
-            Some(MenuDoes::Mention) => self.files_mention(&row),
-            None => {}
+            MenuFor::Terminal => {
+                self.files_menu_close(true);
+                self.terminal_menu_chosen(at);
+            }
+            MenuFor::Files => {
+                let Some(row) = self.tree_menu_row.clone() else { return };
+                self.files_menu_close(true);
+                match MENU_ITEMS.get(at).map(|(what, _)| *what) {
+                    Some(MenuDoes::Open) => self.files_open_in_app(&row),
+                    Some(MenuDoes::Explorer) => self.files_show_in_explorer(&row),
+                    Some(MenuDoes::Copy) => {
+                        let disk = self.tree_disk_path(&row);
+                        self.copy_to_clipboard(&disk.display().to_string());
+                    }
+                    Some(MenuDoes::Mention) => self.files_mention(&row),
+                    None => {}
+                }
+            }
         }
     }
 
-    /// A row of the menu, drawn: its words, lit under the pointer or the keys, and a hair of a frame round all of them.
+    /// A row of the menu, drawn: its words, lit under the pointer or the keys, a mark on the one chosen before, and a hair of a frame round all of them.
     pub(super) unsafe fn draw_menu_row(&self, item: &DRAWITEMSTRUCT) {
         let device = item.hDC;
         let (area, dpi) = (item.rcItem, self.dpi);
         let s = |value: i32| scale(dpi, value);
         FillRect(device, &area, self.brushes[2]);
-        let Some((_, words)) = MENU_ITEMS.get(item.itemID as usize) else { return };
-        if item.itemState & ODS_SELECTED != 0 {
+        let Some(row) = self.panel_menu.items.get(item.itemID as usize) else { return };
+        if item.itemState & ODS_SELECTED != 0 && row.enabled {
             let shade = RECT { left: area.left + s(ds::space::XS), right: area.right - s(ds::space::XS), top: area.top + s(ds::space::HAIR), bottom: area.bottom - s(ds::space::HAIR) };
             rounded(device, shade, s(ds::radius::SMALL), Some(theme::raised()), None);
         }
-        draw_text(device, t(words), RECT { left: area.left + s(ds::space::L), right: area.right - s(ds::space::L), ..area }, self.fonts.body, theme::text(), ONE_LINE);
+        let mut text_left = area.left + s(ds::space::L);
+        if self.panel_menu.items.iter().any(|item| item.checked) {
+            if row.checked {
+                icon::draw(device, "check", RECT { left: text_left, right: text_left + s(ds::size::ICON_SMALL), ..area }, s(ds::size::ICON_SMALL), theme::accent());
+            }
+            text_left += s(ds::size::ICON_SMALL) + s(ds::space::S);
+        }
+        draw_text(device, &row.label, RECT { left: text_left, right: area.right - s(ds::space::L), ..area }, self.fonts.body, if row.enabled { theme::text() } else { theme::faint() }, ONE_LINE);
         // (the frame: each row draws its own share, the first the top and the last the foot)
         let brush = CreateSolidBrush(theme::line());
-        let last = item.itemID as usize + 1 == MENU_ITEMS.len();
+        let last = item.itemID as usize + 1 == self.panel_menu.items.len();
         let edges = [
             (true, RECT { left: area.left, top: area.top, right: area.left + 1, bottom: area.bottom }),
             (true, RECT { left: area.right - 1, top: area.top, right: area.right, bottom: area.bottom }),
@@ -614,7 +678,7 @@ pub(super) unsafe extern "system" fn menu_subclass(window: HWND, message: u32, w
     let base = std::mem::transmute::<isize, WNDPROC>(app.list_procedure);
     let row_under = |lparam: LPARAM| {
         let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
-        ((found >> 16) & 0xFFFF == 0).then_some((found & 0xFFFF) as usize).filter(|at| *at < MENU_ITEMS.len())
+        ((found >> 16) & 0xFFFF == 0).then_some((found & 0xFFFF) as usize).filter(|at| *at < app.panel_menu.items.len())
     };
     match message {
         WM_MOUSEMOVE => {
