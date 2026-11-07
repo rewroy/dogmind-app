@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::conversation_key::{self, b64d, b64e, from_hex, hex, random_bytes, Cipher, Policy};
+use crate::conversation_key::{self, b64d, b64d_bytes, b64e, from_hex, hex, random_bytes, Cipher, Policy};
 use crate::message::Message;
 use crate::prompt::typed_text;
 
@@ -86,8 +86,8 @@ impl Sealed {
     }
 
     fn open_line(&self, number: u64, text: &[u8]) -> Option<String> {
-        let blob = b64d(std::str::from_utf8(text).ok()?.trim())?;
-        String::from_utf8(self.cipher.open(&blob, &self.aad(number))?).ok()
+        let blob = b64d_bytes(text)?;
+        String::from_utf8(self.cipher.open_owned(blob, &self.aad(number))?).ok()
     }
 
     fn file_aad(&self, kind: &str, name: &str) -> Vec<u8> {
@@ -274,7 +274,8 @@ pub(crate) struct Entries {
 }
 
 pub(crate) fn entries_of(path: &Path) -> std::io::Result<Entries> {
-    let mut lines = BufReader::new(File::open(path)?).split(b'\n');
+    // (a line of a session is tens of kilobytes: read in blocks that hold a few)
+    let mut lines = BufReader::with_capacity(1 << 16, File::open(path)?).split(b'\n');
     let first = lines.next().and_then(Result::ok);
     let sealed = match &first {
         Some(bytes) => sealed_from(bytes)?,
