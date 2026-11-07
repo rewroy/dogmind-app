@@ -20,6 +20,7 @@ bytes 1.12.1  MIT
 castaway 0.2.4  MIT
 cfg-if 1.0.5  MIT OR Apache-2.0
 chrono 0.4.45  MIT OR Apache-2.0
+cipher 0.4.4  MIT OR Apache-2.0
 clap 4.6.7  MIT OR Apache-2.0
 clap_builder 4.6.7  MIT OR Apache-2.0
 clap_derive 4.6.7  MIT OR Apache-2.0
@@ -65,6 +66,7 @@ gif 0.14.2  MIT OR Apache-2.0
 globset 0.4.21  Unlicense OR MIT
 hashbrown 0.17.1  MIT OR Apache-2.0
 heck 0.5.0  MIT OR Apache-2.0
+hmac 0.12.1  MIT OR Apache-2.0
 http 1.5.0  MIT OR Apache-2.0
 http-body 1.1.0  MIT
 http-body-util 0.1.5  MIT
@@ -77,6 +79,7 @@ ignore 0.4.34  Unlicense OR MIT
 image 0.25.10  MIT OR Apache-2.0
 image-webp 0.2.4  MIT OR Apache-2.0
 indexmap 2.14.2  Apache-2.0 OR MIT
+inout 0.1.4  MIT OR Apache-2.0
 is_terminal_polyfill 1.70.2  MIT OR Apache-2.0
 itertools 0.14.0  MIT OR Apache-2.0
 itoa 1.0.18  MIT OR Apache-2.0
@@ -115,6 +118,7 @@ onig 6.5.3  MIT
 onig_sys 69.9.3  MIT
 paste 1.0.15  MIT OR Apache-2.0
 pastey 0.2.3  MIT OR Apache-2.0
+pbkdf2 0.12.2  MIT OR Apache-2.0
 percent-encoding 2.3.2  MIT OR Apache-2.0
 pin-project-lite 0.2.17  Apache-2.0 OR MIT
 png 0.18.1  MIT OR Apache-2.0
@@ -135,11 +139,13 @@ regex-syntax 0.8.11  MIT OR Apache-2.0
 ring 0.17.14  Apache-2.0 AND ISC
 rustls 0.23.46  Apache-2.0 OR ISC OR MIT
 rustls-pki-types 1.15.1  MIT OR Apache-2.0
-rustls-webpki 0.103.15  ISC
+rustls-webpki 0.103.16  ISC
 rustversion 1.0.23  MIT OR Apache-2.0
 ryu 1.0.23  Apache-2.0 OR BSL-1.0
+salsa20 0.10.2  MIT OR Apache-2.0
 same-file 1.0.6  Unlicense/MIT
 schannel 0.1.30  MIT
+scrypt 0.11.0  MIT OR Apache-2.0
 serde 1.0.229  MIT OR Apache-2.0
 serde_core 1.0.229  MIT OR Apache-2.0
 serde_derive 1.0.229  MIT OR Apache-2.0
@@ -196,7 +202,7 @@ ureq-proto 0.6.5  MIT OR Apache-2.0
 utf8-zero 0.8.1  MIT OR Apache-2.0
 utf8parse 0.2.2  Apache-2.0 OR MIT
 walkdir 2.5.0  Unlicense/MIT
-webpki-roots 1.0.9  CDLA-Permissive-2.0
+webpki-roots 1.0.11  CDLA-Permissive-2.0
 webview2-com 0.39.1  MIT
 webview2-com-macros 0.8.1  MIT
 webview2-com-sys 0.39.1  MIT
@@ -1186,7 +1192,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
-These crates: block-buffer 0.10.4, cpufeatures 0.2.17, crypto-common 0.1.7, digest 0.10.7, sha2 0.10.9
+These crates: block-buffer 0.10.4, cipher 0.4.4, cpufeatures 0.2.17, crypto-common 0.1.7, digest 0.10.7, hmac 0.12.1, inout 0.1.4, pbkdf2 0.12.2, salsa20 0.10.2, scrypt 0.11.0, sha2 0.10.9
 ------------------------------------------------------------------------
 Apache License
                         Version 2.0, January 2004
@@ -1876,6 +1882,35 @@ limitations under the License.
 ~~~~
 
 ------------------------------------------------------------------------
+These crates: cipher 0.4.4
+------------------------------------------------------------------------
+Copyright (c) 2016-2020 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
 These crates: clap 4.6.7, clap_builder 4.6.7, clap_derive 4.6.7, clap_lex 1.1.1
 ------------------------------------------------------------------------
 Apache License
@@ -2475,7 +2510,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ------------------------------------------------------------------------
-These crates: digest 0.10.7
+These crates: digest 0.10.7, hmac 0.12.1
 ------------------------------------------------------------------------
 Copyright (c) 2017 Artyom Pavlov
 
@@ -4307,6 +4342,36 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
+These crates: inout 0.1.4
+------------------------------------------------------------------------
+Copyright (c) 2022 The RustCrypto Project Developers
+Copyright (c) 2022 Artyom Pavlov
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
 These crates: libc 0.2.191
 ------------------------------------------------------------------------
 Copyright (c) The Rust Project Developers
@@ -5709,6 +5774,36 @@ information.
 > SOFTWARE.
 
 ------------------------------------------------------------------------
+These crates: pbkdf2 0.12.2
+------------------------------------------------------------------------
+Copyright (c) 2017 Artyom Pavlov
+Copyright (c) 2018-2023 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
 These crates: percent-encoding 2.3.2
 ------------------------------------------------------------------------
 Copyright (c) 2013-2025 The rust-url developers
@@ -7086,7 +7181,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
-These crates: rustls-webpki 0.103.15
+These crates: rustls-webpki 0.103.16
 ------------------------------------------------------------------------
 Except as otherwise noted, this project is licensed under the following
 (ISC-style) terms:
@@ -7136,6 +7231,35 @@ ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
+These crates: salsa20 0.10.2
+------------------------------------------------------------------------
+Copyright (c) 2019 Eric McCorkle
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
 These crates: same-file 1.0.6, winapi-util 0.1.11
 ------------------------------------------------------------------------
 The MIT License (MIT)
@@ -7170,6 +7294,35 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
+These crates: scrypt 0.11.0
+------------------------------------------------------------------------
+Copyright (c) 2021-2023 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
 These crates: serde_urlencoded 0.7.1
@@ -7980,7 +8133,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
-These crates: webpki-roots 1.0.9
+These crates: webpki-roots 1.0.11
 ------------------------------------------------------------------------
 # Community Data License Agreement - Permissive - Version 2.0
 
