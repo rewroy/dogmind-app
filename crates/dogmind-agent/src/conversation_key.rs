@@ -203,6 +203,12 @@ enum State {
     On(Arc<Cipher>),
 }
 
+impl Default for Policy {
+    fn default() -> Policy {
+        Policy { state: Mutex::new(State::Off) }
+    }
+}
+
 impl Policy {
     pub fn off() -> Arc<Policy> {
         Arc::new(Policy { state: Mutex::new(State::Off) })
@@ -244,6 +250,37 @@ impl Policy {
             State::On(cipher) => Ok(Some(cipher.clone())),
         }
     }
+}
+
+/// What a file of text that is kept whole (the notes, an index) says on its first line when it is sealed: the format and the fingerprint of the key. The second line is the text sealed, in base64.
+const SEALED_TEXT: &str = "dogmind-sealed 1 ";
+
+fn text_aad(name: &str) -> Vec<u8> {
+    format!("dogmind sealed text 1 {name}").into_bytes()
+}
+
+/// A file's whole text, sealed under the key with the file's name as additional data: it opens only as that file.
+pub fn seal_text(cipher: &Cipher, name: &str, text: &str) -> String {
+    format!("{SEALED_TEXT}{}\n{}\n", cipher.fingerprint(), b64e(&cipher.seal(text.as_bytes(), &text_aad(name))))
+}
+
+/// Whether what a file holds is text that is sealed, by its first line.
+pub fn is_sealed_text(bytes: &[u8]) -> bool {
+    bytes.starts_with(SEALED_TEXT.as_bytes())
+}
+
+/// A file's text as it is: what a plain file holds, or what a sealed one holds when its key is here. An error in words when it is not (the key is not unlocked, or is another's), or when the file does not open: it is damaged, or it is another file's.
+pub fn open_text(name: &str, bytes: &[u8]) -> Result<String, String> {
+    if !is_sealed_text(bytes) {
+        return String::from_utf8(bytes.to_vec()).map_err(|error| error.to_string());
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines = text.lines();
+    let fingerprint = lines.next().and_then(|first| first.strip_prefix(SEALED_TEXT)).unwrap_or("").trim();
+    let cipher = find(fingerprint).ok_or_else(|| if any_unlocked() { OTHER_KEY.to_string() } else { LOCKED.to_string() })?;
+    let blob = lines.next().and_then(|line| b64d(line.trim())).ok_or_else(|| "this file is damaged".to_string())?;
+    let plain = cipher.open(&blob, &text_aad(name)).ok_or_else(|| "this file does not open: it is damaged, or it is another's".to_string())?;
+    String::from_utf8(plain).map_err(|error| error.to_string())
 }
 
 /// The recovery code as it is shown: five letters and digits at a time.

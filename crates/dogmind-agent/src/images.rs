@@ -203,20 +203,53 @@ fn fitted(picture: &Attachment, limit: ImageLimit) -> Result<(Vec<u8>, String, u
     Ok((bytes, if as_jpeg { "image/jpeg" } else { "image/png" }.to_string(), shown.width(), shown.height()))
 }
 
-/// Into the session's folder, by what is in it: the same picture twice is one file, so it stays the same bytes.
+/// Into the session's folder, by what is in it: the same picture twice is one file, so it stays the same bytes. The file is the picture as it is, or, in an encrypted session, the picture
+/// sealed whole (`store`).
 pub(crate) fn save(session: &Path, picture: &Attachment, limit: ImageLimit) -> Result<ImageRef, String> {
     let (bytes, media_type, width, height) = fitted(picture, limit)?;
     let digest: String = Sha256::digest(&bytes).iter().take(16).map(|byte| format!("{byte:02x}")).collect();
     let file = format!("{digest}.{}", extension_of(&media_type));
-    let folder = folder_of(session);
-    let target = folder.join(&file);
-    if !target.exists() {
-        std::fs::create_dir_all(&folder).map_err(|_| NOT_SAVED.to_string())?;
-        let partial = target.with_extension("partial");
-        std::fs::write(&partial, &bytes).map_err(|_| NOT_SAVED.to_string())?;
-        std::fs::rename(&partial, &target).map_err(|_| NOT_SAVED.to_string())?;
-    }
+    store(session, &file, &bytes).map_err(|_| NOT_SAVED.to_string())?;
     Ok(ImageRef { file, media_type, width, height })
+}
+
+/// What starts a picture that is sealed: no picture format starts so.
+const SEALED: &[u8; 8] = crate::session::SEALED_MARK;
+
+/// A picture in a session's folder, under its name, if it is not there already: whole or not at all. In an encrypted session it is sealed with the session's id and its own name as
+/// additional data, so that it opens only as that session's picture of that name.
+pub(crate) fn store(session: &Path, file: &str, bytes: &[u8]) -> Result<(), String> {
+    let folder = folder_of(session);
+    let target = folder.join(file);
+    if target.exists() {
+        return Ok(());
+    }
+    let kept = match crate::session::sealed_of(session).map_err(|error| error.to_string())? {
+        Some(sealed) => std::borrow::Cow::Owned(sealed.seal_marked("picture", file, bytes)),
+        None => std::borrow::Cow::Borrowed(bytes),
+    };
+    std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+    let partial = target.with_extension("partial");
+    std::fs::write(&partial, &kept).map_err(|error| error.to_string())?;
+    std::fs::rename(&partial, &target).map_err(|error| error.to_string())
+}
+
+/// A picture of a session as it was: read from its file, and opened if it is sealed. A file that is not sealed is read as it is, whatever the session is.
+pub fn read_stored(path: &Path) -> std::io::Result<Vec<u8>> {
+    let bytes = std::fs::read(path)?;
+    if !bytes.starts_with(SEALED) {
+        return Ok(bytes);
+    }
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let session = path.parent().map_or_else(PathBuf::new, |folder| folder.with_extension("jsonl"));
+    let sealed = crate::session::sealed_of(&session)?.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "this picture is sealed, and its conversation is not"))?;
+    sealed.open_marked("picture", &name, &bytes).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "this picture does not open: it is damaged, or it is not this conversation's"))
+}
+
+/// Whether a picture's file is sealed, by its first bytes.
+pub fn is_sealed(path: &Path) -> bool {
+    let mut head = [0u8; 8];
+    std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut head)).is_ok() && head == *SEALED
 }
 
 pub(crate) fn base64(bytes: &[u8]) -> String {
@@ -250,13 +283,15 @@ pub(crate) fn loaded(message: &Message, folder: Option<&Path>) -> (Vec<Loaded>, 
     let mut pictures = Vec::new();
     for image in &message.images {
         // (a file with nothing in it, as a power cut can leave: a service refuses the empty picture, and with it every later request of this conversation)
-        match folder.and_then(|folder| std::fs::read(folder.join(&image.file)).ok()).filter(|bytes| !bytes.is_empty()) {
+        match folder.and_then(|folder| read_stored(&folder.join(&image.file)).ok()).filter(|bytes| !bytes.is_empty()) {
             Some(bytes) => pictures.push(Loaded { media_type: image.media_type.clone(), data: base64(&bytes) }),
             None => {
                 if !text.is_empty() {
                     text.push('\n');
                 }
-                text.push_str(&gone_note(&image.file));
+                // (a file that is there and does not open is not one that is gone: a sealed picture that is damaged, or whose key is not here)
+                let there = folder.is_some_and(|folder| std::fs::metadata(folder.join(&image.file)).is_ok_and(|file| file.is_file() && file.len() > 0));
+                text.push_str(&if there { unreadable_note(&image.file) } else { gone_note(&image.file) });
             }
         }
     }
@@ -265,6 +300,10 @@ pub(crate) fn loaded(message: &Message, folder: Option<&Path>) -> (Vec<Loaded>, 
 
 fn gone_note(file: &str) -> String {
     format!("[A picture that was here, {file}, is no longer on this computer, so it could not be shown.]")
+}
+
+fn unreadable_note(file: &str) -> String {
+    format!("[A picture that was here, {file}, could not be read, so it could not be shown.]")
 }
 
 /// What stands in a message for a picture no longer sent. The file stays.
