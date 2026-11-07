@@ -22,6 +22,7 @@ use dogmind_agent::read_folders;
 use dogmind_agent::safety::{AlwaysScope, Mode};
 use dogmind_agent::session;
 use dogmind_agent::tools::{FileChange, GitInfo};
+use dogmind_agent::conversation_key::Policy;
 use dogmind_agent::web::{WebSettings, WARNING_MARK};
 
 use crate::design as ds;
@@ -2024,6 +2025,8 @@ struct App {
     files: Vec<String>,
     skills: Vec<dogmind_agent::skills::Skill>,
     mcp: Arc<dogmind_agent::mcp::Hub>,
+    /// Whether conversations are written encrypted, shared with every agent: while the key is not unlocked, none is opened or written.
+    policy: Arc<Policy>,
     branch: Option<String>,
     session_title: String,
     totals: (u64, u64, u64, u32), // prompt, cached, completion, requests
@@ -2400,7 +2403,7 @@ unsafe fn open_in_browser(url: &str) {
     ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), target.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
 }
 
-fn agent_config(settings: &Settings, folder: &Path, workspace: PathBuf, mode: Mode, mcp: Arc<dogmind_agent::mcp::Hub>) -> agent::Config {
+fn agent_config(settings: &Settings, folder: &Path, workspace: PathBuf, mode: Mode, mcp: Arc<dogmind_agent::mcp::Hub>, policy: Arc<Policy>) -> agent::Config {
     // SAFETY: it takes nothing, and only reads a setting.
     let japanese_system = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() } & 0x3FF == 0x11;
     agent::Config {
@@ -2417,6 +2420,7 @@ fn agent_config(settings: &Settings, folder: &Path, workspace: PathBuf, mode: Mo
         skills_off: settings.skills_off.clone(),
         memory: Some(folder.join("memory")),
         mcp: Some(mcp),
+        policy,
     }
 }
 
@@ -8231,7 +8235,19 @@ impl App {
                 }
                 let forgotten = dogmind_agent::memory::forgotten_file(&memory_folder);
                 if forgotten.is_file() {
-                    said.push(tf("Notes the model forgot are kept in {0}, so that you can get one back.", &[&forgotten.display()]));
+                    if dogmind_agent::conversation_key::is_sealed_text(&std::fs::read(&forgotten).unwrap_or_default()) {
+                        // (encrypted: no editor shows it, so what it holds is here, the latest, for a note to be got back by hand)
+                        match dogmind_agent::memory::forgotten_text(&memory_folder) {
+                            Ok(text) => {
+                                let latest: Vec<&str> = text.lines().filter(|line| line.starts_with("- ")).collect();
+                                let shown: Vec<&str> = latest.iter().rev().take(10).rev().copied().collect();
+                                said.push(tf("Notes the model forgot are kept, encrypted, in {0}. The latest:\n{1}", &[&forgotten.display(), &shown.join("\n")]));
+                            }
+                            Err(error) => said.push(tf("The notes the model forgot, in {0}, could not be read ({1}). The file is left as it is.", &[&forgotten.display(), &error])),
+                        }
+                    } else {
+                        said.push(tf("Notes the model forgot are kept in {0}, so that you can get one back.", &[&forgotten.display()]));
+                    }
                 }
                 self.panel_log = said.join("\n");
             }
@@ -10072,7 +10088,7 @@ impl App {
         let (sender, events) = channel();
         let waker = self.poster.clone();
         let handle = agent::start(
-            agent_config(&self.settings, &self.folder, self.workspace.clone(), self.current_mode(), self.mcp.clone()),
+            agent_config(&self.settings, &self.folder, self.workspace.clone(), self.current_mode(), self.mcp.clone(), self.policy.clone()),
             sender,
             Box::new(move || waker.wake()),
         );
@@ -14451,7 +14467,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 _ if (ID_MEMORY_REMOVE..ID_MEMORY_REMOVE + app.memory_remove.len() as isize).contains(&id) => {
                     if let Some((scope, note)) = app.memory_notes.get((id - ID_MEMORY_REMOVE) as usize).cloned() {
-                        match dogmind_agent::memory::forget_one(&app.folder.join("memory"), &app.workspace, scope, &note) {
+                        match dogmind_agent::memory::forget_one(&app.folder.join("memory"), &app.workspace, scope, &note, &app.policy) {
                             Ok(_) => app.set_panel(Panel::Memory),
                             Err(error) => app.problem_in_panel(&error),
                         }
@@ -15416,8 +15432,9 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             "plan" => Mode::Plan,
             _ => Mode::Default,
         };
+        let policy = Policy::off();
         let handle = agent::start(
-            agent_config(&saved, &folder, workspace.clone(), mode, servers.clone()),
+            agent_config(&saved, &folder, workspace.clone(), mode, servers.clone(), policy.clone()),
             event_sender,
             Box::new(move || waker.wake()),
         );
@@ -15642,6 +15659,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             files: Vec::new(),
             skills: Vec::new(),
             mcp: servers.clone(),
+            policy: policy.clone(),
             branch: None,
             session_title: String::new(),
             totals: (0, 0, 0, 0),
@@ -16384,7 +16402,7 @@ mod tests {
         let key = KeySource::of("credential:t").read("t", &store).unwrap();
         let client = Client::new(&format!("http://127.0.0.1:{port}/v1"), key).unwrap();
         let (events_to, events) = channel();
-        let config = agent_config(&Settings::default(), dir.path(), dir.path().to_path_buf(), Mode::Default, dogmind_agent::mcp::Hub::start(&dir.path().join("mcp.json")));
+        let config = agent_config(&Settings::default(), dir.path(), dir.path().to_path_buf(), Mode::Default, dogmind_agent::mcp::Hub::start(&dir.path().join("mcp.json")), Policy::off());
         let handle = agent::start(config, events_to, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "m".into(), 100_000)).unwrap();
         handle.commands.send(Command::Send("hello".into())).unwrap();
@@ -16448,7 +16466,7 @@ mod tests {
         let (told, seen) = channel();
         std::thread::spawn(move || serve_one(listener, told));
         let (events_to, events) = channel();
-        let config = agent_config(&Settings::default(), dir.path(), dir.path().to_path_buf(), Mode::Default, dogmind_agent::mcp::Hub::start(&dir.path().join("mcp.json")));
+        let config = agent_config(&Settings::default(), dir.path(), dir.path().to_path_buf(), Mode::Default, dogmind_agent::mcp::Hub::start(&dir.path().join("mcp.json")), Policy::off());
         let handle = agent::start(config, events_to, Box::new(|| {}));
         let client = Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap();
         handle.commands.send(Command::Provider(Arc::new(client), "m".into(), 100_000)).unwrap();
