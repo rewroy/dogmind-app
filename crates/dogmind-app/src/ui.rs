@@ -48,6 +48,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::attach;
 use crate::drafter;
+use crate::files;
 use crate::engine::{self, Catalog, CatalogEntry, Engine, Refusal, SetupLine};
 use crate::preview::{self, Preview};
 use crate::icon;
@@ -56,6 +57,8 @@ use crate::rtf;
 use crate::lang::{self, t, tf};
 use crate::markdown;
 use crate::settings::{self, Kind, ProviderConfig, Settings, TEXT_SIZES};
+
+mod files_panel;
 
 const WM_WAKE: u32 = WM_APP + 1;
 const WM_PREVIEW_MADE: u32 = WM_APP + 2;
@@ -233,6 +236,9 @@ const ID_FOLDER_CHIP: isize = 9052;
 const ID_TOGGLE_DISPLAY: isize = 9054;
 const ID_ATTACH: isize = 9055;
 const ID_ATTACHED: isize = 9060; // ..+ attach::MOST_IMAGES
+/// The list of the Files view of the panel on the right, and the little menu of a row of it.
+const ID_FILES: isize = 9070;
+const ID_FILES_MENU: isize = 9071;
 /// How many pictures of a transcript are drawn at once: more than any view holds, and fewer than the small copies that are kept.
 const PICTURES_IN_VIEW: usize = 48;
 /// How many small copies are kept: a third of a megabyte at most for one.
@@ -438,7 +444,7 @@ const M_PROVIDER: usize = 200; // and on
 const M_MODEL_CHOICE: usize = 9500; // and on
 
 /// What `/` offers, in this order.
-const COMMANDS: [(&str, &str); 45] = [
+const COMMANDS: [(&str, &str); 46] = [
     ("/setup", "Go through the first setup again"),
     ("/report", "Write what can be sent about a problem"),
     ("/help", "How to use this app"),
@@ -476,6 +482,7 @@ const COMMANDS: [(&str, &str); 45] = [
     ("/dashboard", "Open Straydog's dashboard in the browser"),
     ("/panel", "Show or hide the panel on the right"),
     ("/preview", "Show a web page or picture of the folder beside the conversation"),
+    ("/files", "Show the files of the folder in the panel on the right"),
     ("/theme", "As Windows is set, dark, or light: the next of them"),
     ("/safe", "Allow safe commands without asking, or not"),
     ("/workspace", "Start a session in another folder"),
@@ -740,6 +747,10 @@ enum Note {
     Workspace { path: PathBuf, files: Vec<String>, branch: Option<String>, skills: Vec<dogmind_agent::skills::Skill> },
     /// For this workspace: there may be another by the time it comes.
     Changes(PathBuf, Result<Vec<FileChange>, String>),
+    /// A folder of the Files view has been read (`path`: from the workspace, with `/`), or why not.
+    FolderRead { root: PathBuf, path: String, result: Result<Vec<files::Entry>, String> },
+    /// The disk says these folders of the workspace have changed.
+    WorkspaceChanged { root: PathBuf, changed: files::Changed },
     Found(u64, Vec<session::Hit>),
     Git(PathBuf, Option<GitInfo>),
     Setup(SetupLine),
@@ -1800,6 +1811,25 @@ struct App {
     side: HWND,
     side_rows: Vec<SideRow>,
     side_hover: Option<usize>,
+    /// The Files view of the panel on the right (`files_panel`): the tree of the workspace, the list that shows its rows, the row selected and the one under the pointer, what the tree
+    /// is of, the watcher of its folder (only while it is in view), and whether what it shows may be old (it was out of view, unwatched).
+    tree: files::Tree,
+    tree_list: HWND,
+    tree_rows: Vec<files::Row>,
+    tree_selected: Option<String>,
+    tree_hover: Option<usize>,
+    tree_for: Option<PathBuf>,
+    tree_watcher: Option<files::Watcher>,
+    tree_stale: bool,
+    tree_dpi: u32,
+    /// The tree's `version` when the list was last made from it.
+    tree_version: Option<u64>,
+    /// The little menu of a row, and the row it is of.
+    tree_menu: HWND,
+    tree_menu_row: Option<files::Row>,
+    tree_menu_hover: Option<usize>,
+    /// The two words over the panel on the right, where a press goes to the view they name (true: the files).
+    right_tab_hits: Vec<(RECT, bool)>,
     collapsed: HashSet<String>,
     all_sessions: Vec<session::Summary>,
     /// The session on screen, once it has a file.
@@ -5520,6 +5550,7 @@ impl App {
                 }
             }
             "panel" => self.toggle_right_panel(),
+            "files" => self.show_files_view(),
             "preview" => {
                 let wanted = if argument.is_empty() { self.preview_candidate() } else { Some(argument.to_string()) };
                 match wanted {
@@ -5683,8 +5714,12 @@ impl App {
         };
         self.right_width = right;
         self.right_hits.clear();
+        self.right_tab_hits.clear();
         self.preview_hits.clear();
         self.dashboard_hit = None;
+        if !self.files_shown() {
+            self.files_hidden();
+        }
         if self.preview_file.is_none() || right == 0 {
             if let Some(shown) = &self.preview {
                 shown.hide();
@@ -6271,7 +6306,7 @@ impl App {
         show(self.doc, false);
         // A row kept lit is one that is still there.
         if let Some(row) = self.hover_row {
-            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).any(|area| same_rect(area, &row)) {
+            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.right_tab_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).any(|area| same_rect(area, &row)) {
                 self.hover_row = None;
             }
         }
@@ -7180,8 +7215,21 @@ impl App {
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let row = s(ds::size::TEXT_ROW);
-        // (its first heading level with the session's name)
-        let mut y = (s(ds::size::TITLE_STRIP) - s(ds::space::XL)) / 2;
+        // The two views of the panel, as two words over it (level with the session's name): the one shown is underlined.
+        let words_top = (s(ds::size::TITLE_STRIP) - s(ds::space::XL)) / 2;
+        let mut across_to = x;
+        for (words, files) in [(t("Overview"), false), (t("Files"), true)] {
+            let across = text_width(self.fonts.strong, words);
+            let on = self.settings.right_files == files;
+            shapes.push(Shape::Text { area: rect(across_to, words_top, across, s(ds::space::XL)), text: words.to_string(), font: FontKind::Strong, color: if on { theme::text() } else { theme::muted() }, flags: ONE_LINE });
+            if on {
+                shapes.push(Shape::Fill { area: rect(across_to, words_top + s(ds::space::XL) + s(ds::space::HAIR), across, s(ds::space::HAIR)), color: theme::accent() });
+            }
+            self.right_tab_hits.push((rect(across_to - s(ds::space::S), words_top - s(ds::space::XS), across + 2 * s(ds::space::S), s(ds::space::XL) + s(ds::space::M)), files));
+            across_to += across + s(ds::space::XL);
+        }
+        // (what is under them begins past the strip the session's name has)
+        let mut y = s(ds::size::TITLE_STRIP) + s(ds::space::S);
         let heading = |shapes: &mut Vec<Shape>, y: &mut i32, text: String| {
             shapes.push(Shape::Text { area: rect(x, *y, width, s(ds::space::XL)), text, font: FontKind::Strong, color: theme::muted(), flags: ONE_LINE });
             *y += s(ds::size::QUEUE_STEP);
@@ -7209,6 +7257,13 @@ impl App {
         if engine_top < foot {
             engine_top -= s(ds::size::QUEUE_STEP);
             shapes.push(Shape::Text { area: rect(x, engine_top, width, s(ds::space::XL)), text: t("Engine").to_string(), font: FontKind::Strong, color: theme::muted(), flags: ONE_LINE });
+        }
+        // The files of the folder: the list takes what is between the two words and the engine's lines.
+        if self.settings.right_files {
+            let margin = s(ds::size::RIGHT_GAP);
+            let top = s(ds::size::TITLE_STRIP);
+            self.files_place(x - margin + s(ds::space::S), top, width + 2 * margin - 2 * s(ds::space::S), (engine_top - top - s(ds::space::S)).max(s(ds::size::TEXT_ROW)));
+            return;
         }
         // What fits, past the two headings and above the engine: nothing is drawn off the bottom of the window.
         let (max_tasks, max_changes) = share_rows(((engine_top - y - s(60)) / row).max(2), self.todos.len(), self.changes.len());
@@ -11364,6 +11419,9 @@ impl App {
                 }
                 self.look_at_workspace();
                 self.changes.clear();
+                // (what each answer changed is the session's own: the answers of the one before are not marked in the tree)
+                self.turn_changes.clear();
+                self.files_marks();
                 self.refresh_changes();
                 self.show_transcript(&transcript);
                 // (what each answer of it changed: the cards come when the agent has said)
@@ -11623,14 +11681,16 @@ impl App {
                     if !files.is_empty() {
                         self.put_turn_card(slot, turn, &files);
                     }
-                    self.turn_changes.insert(turn, files);
+                    self.turn_changes.insert(turn, files.clone());
                 } else {
                     // (a card under the answer: the files, and their lines added and removed)
                     if !files.is_empty() && !self.turn_changes.contains_key(&turn) {
                         self.write_card(&Card::files(turn, &files));
                     }
-                    self.turn_changes.insert(turn, files);
+                    self.turn_changes.insert(turn, files.clone());
                 }
+                // (the tree of the folder marks them, and reads again the folders they are in)
+                self.files_turn_changed(&files);
             }
             Event::Question(question) => {
                 self.card_next += 1;
@@ -11934,6 +11994,8 @@ impl App {
                     self.layout();
                 }
             }
+            Note::FolderRead { root, path, result } => self.files_read_came(root, path, result),
+            Note::WorkspaceChanged { root, changed } => self.files_changed_on_disk(&root, changed),
             Note::Changes(path, found) => {
                 if path != self.workspace {
                     return;
@@ -13414,11 +13476,16 @@ unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPAR
     let Some(app) = app() else { return DefWindowProcW(window, message, wparam, lparam) };
     let base = std::mem::transmute::<isize, WNDPROC>(app.list_procedure);
     let is_side = window == app.side;
+    let is_tree = window == app.tree_list;
     match message {
         WM_MOUSEMOVE | WM_MOUSELEAVE => {
+            // (a test that has no pointer of its own: the leave the system sends is not the pointer leaving)
+            if message == WM_MOUSELEAVE && is_tree && test_pointer_stays() {
+                return 0;
+            }
             let found = if message == WM_MOUSEMOVE { SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam) } else { 0x10000 };
             let hover = ((found >> 16) & 0xFFFF == 0).then_some((found & 0xFFFF) as usize);
-            let slot = if is_side { &mut app.side_hover } else if window == app.suggest { &mut app.suggest_hover } else { &mut app.list_hover };
+            let slot = if is_side { &mut app.side_hover } else if is_tree { &mut app.tree_hover } else if window == app.suggest { &mut app.suggest_hover } else { &mut app.list_hover };
             if *slot != hover {
                 for index in [*slot, hover].into_iter().flatten() {
                     let mut area: RECT = std::mem::zeroed();
@@ -13435,6 +13502,35 @@ unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPAR
             }
             with_thin_bar(app, window, base, message, wparam, lparam)
         }
+        // The files of the folder: a press on a row's own button, a double click, the keys and the menu.
+        WM_RBUTTONUP if is_tree => {
+            let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
+            if (found >> 16) & 0xFFFF == 0 {
+                app.files_menu((found & 0xFFFF) as usize, ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32));
+            }
+            0
+        }
+        WM_CONTEXTMENU if is_tree => {
+            app.files_menu_from_key();
+            0
+        }
+        WM_LBUTTONUP if is_tree && app.bar_grab.is_none() => {
+            let result = CallWindowProcW(base, window, message, wparam, lparam);
+            let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
+            if (found >> 16) & 0xFFFF == 0 {
+                app.files_row_clicked((found & 0xFFFF) as usize, (lparam & 0xFFFF) as i16 as i32);
+            }
+            result
+        }
+        WM_LBUTTONDBLCLK if is_tree => {
+            let result = CallWindowProcW(base, window, message, wparam, lparam);
+            let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
+            if (found >> 16) & 0xFFFF == 0 {
+                app.files_row_double_clicked((found & 0xFFFF) as usize);
+            }
+            result
+        }
+        WM_KEYDOWN if is_tree && app.files_key(wparam as u16) => 0,
         WM_RBUTTONUP if is_side => {
             let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
             if (found >> 16) & 0xFFFF == 0 {
@@ -13835,7 +13931,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         WM_MOUSEMOVE if app.panel == Panel::Chat => {
             let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
             let within = |area: &RECT| x >= area.left && x < area.right && y >= area.top && y < area.bottom;
-            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
+            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.right_tab_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
             app.hover_on(found);
             app.rail_hover_at(x, y);
             0
@@ -13872,7 +13968,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.layout();
                 return 0;
             }
-            if let Some((at, act)) = app.queue_hits.iter().find(|(area, _, _)| within(area)).map(|(_, at, act)| (*at, *act)) {
+            if let Some(files) = app.right_tab_at(x, y) {
+                app.set_right_view(files);
+            } else if let Some((at, act)) = app.queue_hits.iter().find(|(area, _, _)| within(area)).map(|(_, at, act)| (*at, *act)) {
                 app.queue_act(at, act);
             } else if let Some(at) = app.rail_hits.iter().find(|(area, _)| within(area)).map(|(_, at)| *at) {
                 app.jump_to_turn(at);
@@ -13897,7 +13995,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_CTLCOLORLISTBOX => {
-            let side = lparam as HWND == app.side || app.panel == Panel::Diff;
+            let side = lparam as HWND == app.side || lparam as HWND == app.tree_list || app.panel == Panel::Diff;
             SetBkColor(wparam as HDC, if side { theme::sidebar() } else { theme::surface() });
             app.brushes[if side { 1 } else { 2 }] as LRESULT
         }
@@ -13916,6 +14014,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             let item = &mut *(lparam as *mut MEASUREITEMSTRUCT);
             item.itemHeight = if item.CtlID as isize == ID_SUGGEST {
                 scale(app.dpi, ds::size::MENU_ROW) as u32
+            } else if item.CtlID as isize == ID_FILES {
+                scale(app.dpi, ds::size::TEXT_ROW) as u32
+            } else if item.CtlID as isize == ID_FILES_MENU {
+                scale(app.dpi, files_panel::MENU_ROW) as u32
             } else if item.CtlID as isize == ID_SIDE {
                 match app.side_rows.get(item.itemID as usize) {
                     Some(SideRow::Session { .. }) if app.side_hits.is_some() => scale(app.dpi, ds::size::SIDE_ROW_TALL) as u32,
@@ -13939,6 +14041,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             if item.itemID != u32::MAX {
                 if item.hwndItem == app.side {
                     app.draw_side_row(item);
+                } else if item.hwndItem == app.tree_list {
+                    app.draw_file_row(item);
+                } else if item.hwndItem == app.tree_menu {
+                    app.draw_menu_row(item);
                 } else if item.hwndItem == app.suggest {
                     app.draw_suggestion(item);
                 } else if item.hwndItem == app.list {
@@ -14190,6 +14296,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_PROVIDER_DOWN => app.move_provider(1),
                 ID_TOGGLE_COMPACT => app.on_menu(M_COMPACT_CHOICE + usize::from(app.settings.compact_tools)),
                 ID_TOGGLE_WEB => app.on_menu(M_WEB_CHOICE + usize::from(app.settings.web_tools)),
+                ID_FILES => {
+                    if code == LBN_SELCHANGE as usize {
+                        app.files_selection_changed();
+                    }
+                }
                 ID_SUGGEST => {
                     if code == LBN_SELCHANGE as usize {
                         let at = SendMessageW(app.suggest, LB_GETCURSEL, 0, 0);
@@ -14307,6 +14418,11 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
     let key = message.wParam as u16;
     if matches!(key, VK_TAB | VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT) {
         keys_in_use(true);
+    }
+    // Esc on the little menu of a file: it is put away, and nothing else (below, Esc stops the work or leaves a page).
+    if key == VK_ESCAPE && message.hwnd == app.tree_menu && app.tree_menu_row.is_some() {
+        app.files_menu_close(true);
+        return true;
     }
     let shift = GetKeyState(VK_SHIFT as i32) < 0;
     let control = GetKeyState(VK_CONTROL as i32) < 0;
@@ -15120,6 +15236,20 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             side,
             side_rows: Vec::new(),
             side_hover: None,
+            tree: files::Tree::new(),
+            tree_list: control(window, "LISTBOX", "", list_style | LBS_HASSTRINGS as u32 | WS_TABSTOP, 0, ID_FILES),
+            tree_rows: Vec::new(),
+            tree_selected: None,
+            tree_hover: None,
+            tree_for: None,
+            tree_watcher: None,
+            tree_stale: false,
+            tree_dpi: 0,
+            tree_version: None,
+            tree_menu: control(window, "LISTBOX", "", list_style & !WS_VSCROLL | LBS_HASSTRINGS as u32, 0, ID_FILES_MENU),
+            tree_menu_row: None,
+            tree_menu_hover: None,
+            right_tab_hits: Vec::new(),
             collapsed: HashSet::new(),
             all_sessions: Vec::new(),
             current_session: None,
@@ -15488,6 +15618,11 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         SetWindowLongPtrW(app.list, GWLP_WNDPROC, list_subclass as *const () as isize);
         app.composer_procedure = SetWindowLongPtrW(app.composer, GWLP_WNDPROC, composer_subclass as *const () as isize);
         SetWindowLongPtrW(app.suggest, GWLP_WNDPROC, list_subclass as *const () as isize);
+        SetWindowLongPtrW(app.tree_list, GWLP_WNDPROC, list_subclass as *const () as isize);
+        SetWindowLongPtrW(app.tree_menu, GWLP_WNDPROC, files_panel::menu_subclass as *const () as isize);
+        // (what a reader says of the list: its own name)
+        set_text(app.tree_list, t("Files"));
+        set_text(app.tree_menu, t("Files"));
         app.transcript_procedure = SetWindowLongPtrW(app.transcript, GWLP_WNDPROC, transcript_subclass as *const () as isize);
         app.doc_procedure = SetWindowLongPtrW(app.doc, GWLP_WNDPROC, doc_subclass as *const () as isize);
         app.note_procedure = SetWindowLongPtrW(app.note, GWLP_WNDPROC, note_subclass as *const () as isize);

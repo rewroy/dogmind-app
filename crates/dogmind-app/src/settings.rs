@@ -221,6 +221,8 @@ pub struct Settings {
     pub set_up: bool,
     /// The panel on the right of a conversation.
     pub right_panel: bool,
+    /// What it shows: the folder's files (true), or the overview of the session's tasks and changes.
+    pub right_files: bool,
     pub web_tools: bool,
     /// What answers are written in: `auto`, `ja` or `en`.
     pub language: String,
@@ -317,6 +319,7 @@ impl Default for Settings {
             straydog: None,
             set_up: false,
             right_panel: true,
+            right_files: false,
             web_tools: true,
             language: "auto".into(),
             display_language: "system".into(),
