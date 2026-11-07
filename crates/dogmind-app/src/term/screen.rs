@@ -268,6 +268,7 @@ impl Screen {
     }
 
     /// How many lines have scrolled off the top and are kept.
+    #[cfg(any(test, debug_assertions))]
     pub fn history(&self) -> usize {
         self.term.history_size()
     }
@@ -392,6 +393,7 @@ impl Screen {
     }
 
     /// Everything: the lines kept above the screen, and the screen, a row to a line, with the empty rows under the last that has anything left off.
+    #[cfg(any(test, debug_assertions))]
     pub fn text(&self) -> String {
         let top = -(self.term.history_size() as i32);
         let mut lines: Vec<String> = (top..self.term.screen_lines() as i32).map(|line| self.line_text(Line(line))).collect();
@@ -402,6 +404,7 @@ impl Screen {
     }
 
     /// Where each character that is not a space is, in the cells in view: its row and its column, the character, and how many cells it takes. For a test of what lines up.
+    #[cfg(any(test, debug_assertions))]
     pub fn cells_in_view(&self) -> Vec<(usize, usize, char, u8)> {
         let snapshot = self.snapshot();
         let mut found = Vec::new();
