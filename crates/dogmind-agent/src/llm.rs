@@ -228,6 +228,7 @@ impl Completion {
             // (the conversation gives it one as it goes in)
             at: None,
             notice: None,
+            helper: None,
         }
     }
 }

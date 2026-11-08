@@ -28,6 +28,32 @@ pub struct Message {
     /// A reader that does not know the field leaves it out, and reads the message as one the app wrote and the person did not (its text begins as such messages do, [`crate::prompt::DRAFT_NOTE`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<Vec<Wake>>,
+    /// On the result of an `explore` call: where the helper's own conversation is kept, and how its work went (see [`HelperRef`]). Kept in the session; no request carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper: Option<HelperRef>,
+}
+
+/// An `explore` helper's work as the call's result records it: the helper's conversation is a session of its own beside the one that started it
+/// ([`crate::session::helper_file_of`], by `number`), and the rest is what a window says of it without opening that file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelperRef {
+    /// Which of the session's helper files it is, from 1.
+    pub number: u32,
+    /// The requests in which it called a tool.
+    #[serde(default)]
+    pub steps: u32,
+    /// How many different files it read.
+    #[serde(default)]
+    pub files: u32,
+    /// How long it worked, in milliseconds.
+    #[serde(default)]
+    pub ms: u64,
+    /// How much of its context it had come to: what its last request read and wrote.
+    #[serde(default)]
+    pub tokens: u64,
+    /// The person stopped it (or the turn) before it answered.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 /// What woke a session by itself.
@@ -131,7 +157,7 @@ impl Message {
 
     /// As an OpenAI-compatible server or Codex reads it: without Claude's own form, nor when it was written.
     pub fn without_provider_blocks(&self) -> Message {
-        Message { provider_blocks: None, at: None, notice: None, ..self.clone() }
+        Message { provider_blocks: None, at: None, notice: None, helper: None, ..self.clone() }
     }
 }
 

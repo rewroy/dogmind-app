@@ -117,6 +117,8 @@ pub struct RequestNote<'a> {
     pub retry: Option<(String, &'static str, u64)>,
     /// Whether the app was watching this request's reasoning for a draft: `on`, or `off:` and why (the person asked for no change, a file has been written, it has stopped one this turn).
     pub draft_watch: Option<&'static str>,
+    /// For a helper's request: the name of the file its conversation is kept in, beside the session.
+    pub helper_file: Option<&'a str>,
 }
 
 pub struct Trajectory {
@@ -256,6 +258,9 @@ impl Trajectory {
         });
         if let Some(watch) = note.draft_watch {
             fields["draft_watch"] = json!(watch);
+        }
+        if let Some(file) = note.helper_file {
+            fields["helper_file"] = json!(file);
         }
         if let Some((again, why, wait_ms)) = note.retry {
             fields["retry_of"] = json!(again);
