@@ -1,9 +1,14 @@
 //! What the agent keeps from one session to the next: short notes the model chooses to remember, one file for the person and one
 //! for each project, in the app's own folder. A new session reads them. They are pointers, not proof, and the model is told so.
+//!
+//! The notes are written from what was said, so when the person has chosen to have conversations encrypted (`conversation_key`) a file of notes is kept sealed whole: it is written
+//! whole each time as it is, so sealing it costs no write more. A sealed file is read whenever its key is here, and says so in words when it is not. A plain file is read as it is.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+
+use crate::conversation_key::{self, Policy};
 use sha2::{Digest, Sha256};
 
 const MAX_NOTE: usize = 600;
@@ -29,11 +34,20 @@ fn file_of(folder: &Path, workspace: &Path, scope: &str) -> Result<PathBuf, Stri
 
 /// The notes in a file: none where there is no file, and an error where the file is there and cannot be read (damaged, or held by another program), which is not the same as none.
 fn read_notes(file: &Path) -> Result<Vec<String>, String> {
-    match std::fs::read_to_string(file) {
-        Ok(text) => Ok(text.lines().filter_map(|line| line.strip_prefix("- ")).map(str::to_string).collect()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+    Ok(text_of(file)?.lines().filter_map(|line| line.strip_prefix("- ")).map(str::to_string).collect())
+}
+
+/// A file's text, sealed or plain: none where there is no file.
+fn text_of(file: &Path) -> Result<String, String> {
+    match std::fs::read(file) {
+        Ok(bytes) => conversation_key::open_text(&name_of(file), &bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn name_of(file: &Path) -> String {
+    file.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 // One change at a time, read and written whole: every session's agent and the window share these files. Two at once each read the
@@ -45,21 +59,30 @@ fn notes_to_change(file: &Path) -> Result<Vec<String>, String> {
     read_notes(file).map_err(|error| format!("{}: {error}: the notes cannot be read, and were not changed", file.display()))
 }
 
-fn write(file: &Path, notes: &[String]) -> Result<(), String> {
+fn write(file: &Path, notes: &[String], policy: &Policy) -> Result<(), String> {
+    let text: String = notes.iter().map(|note| format!("- {note}\n")).collect();
+    write_text(file, &text, policy)
+}
+
+/// A file's whole text, written beside it and then in its place, sealed when `policy` says so; while the key is not unlocked, nothing is written.
+fn write_text(file: &Path, text: &str, policy: &Policy) -> Result<(), String> {
+    let kept = match policy.writer()? {
+        Some(cipher) => conversation_key::seal_text(&cipher, &name_of(file), text),
+        None => text.to_string(),
+    };
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
-    let text: String = notes.iter().map(|note| format!("- {note}\n")).collect();
     let partial = file.with_extension("partial");
     // (on the disk before it takes the place: after a power cut, a rename that got there without its bytes leaves the notes empty)
     std::fs::File::create(&partial).and_then(|mut out| {
-        std::io::Write::write_all(&mut out, text.as_bytes())?;
+        std::io::Write::write_all(&mut out, kept.as_bytes())?;
         out.sync_all()
     }).map_err(|error| format!("{}: {error}", partial.display()))?;
     std::fs::rename(&partial, file).map_err(|error| format!("{}: {error}", file.display()))
 }
 
-pub fn remember(folder: &Path, workspace: &Path, arguments: &Value) -> Result<String, String> {
+pub fn remember(folder: &Path, workspace: &Path, arguments: &Value, policy: &Policy) -> Result<String, String> {
     let note = arguments.get("note").and_then(Value::as_str).ok_or("note is required")?.split_whitespace().collect::<Vec<_>>().join(" ");
     if note.is_empty() {
         return Err("note is required".into());
@@ -81,7 +104,7 @@ pub fn remember(folder: &Path, workspace: &Path, arguments: &Value) -> Result<St
     notes.push(note);
     let dropped = notes.len().saturating_sub(MAX_NOTES);
     notes.drain(..dropped);
-    write(&file, &notes)?;
+    write(&file, &notes, policy)?;
     Ok(format!("remembered, for {} sessions", if scope == "user" { "all" } else { "this project's" }))
 }
 
@@ -93,12 +116,30 @@ pub fn forgotten_file(folder: &Path) -> PathBuf {
 /// The most that file holds; the oldest go from its start.
 const MAX_FORGOTTEN: u64 = 256 * 1024;
 
+/// What `forgotten.md` holds, as text: it is sealed whole like the notes when the person has chosen so.
+pub fn forgotten_text(folder: &Path) -> Result<String, String> {
+    text_of(&forgotten_file(folder))
+}
+
 /// `note` added to `forgotten.md`, under the time and where it was kept. (A note the person takes out in the Memory panel is not: they chose that, and may have chosen it to be rid of what it holds.)
-fn keep_forgotten(folder: &Path, workspace: &Path, scope: &str, note: &str) -> Result<(), String> {
+fn keep_forgotten(folder: &Path, workspace: &Path, scope: &str, note: &str, policy: &Policy) -> Result<(), String> {
     let file = forgotten_file(folder);
     std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
     let place = if scope == "user" { "you, in every project".to_string() } else { format!("project {}", workspace.display()) };
     let entry = format!("\n## {} ({place})\n- {note}\n", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+    // (a file that is sealed, or is to be, is read and written whole, as the notes are; a plain one is only added to, as it was)
+    let sealed_file = std::fs::read(&file).is_ok_and(|bytes| conversation_key::is_sealed_text(&bytes));
+    if sealed_file || policy.writer()?.is_some() {
+        let mut text = text_of(&file).map_err(|error| format!("{}: {error}: the note was not dropped", file.display()))?;
+        text.push_str(&entry);
+        if text.len() as u64 > MAX_FORGOTTEN {
+            let from = text.len() - (MAX_FORGOTTEN as usize / 2).min(text.len());
+            let from = (from..=text.len()).find(|at| text.is_char_boundary(*at)).unwrap_or(text.len());
+            let at = text[from..].find("\n## ").map_or(from, |found| from + found);
+            text = text[at..].to_string();
+        }
+        return write_text(&file, &text, policy).map_err(|error| format!("{error}: the note was not dropped"));
+    }
     std::fs::OpenOptions::new().create(true).append(true).open(&file).and_then(|mut out| {
         std::io::Write::write_all(&mut out, entry.as_bytes())?;
         out.sync_all()
@@ -125,7 +166,7 @@ fn listed(found: &[(&'static str, String)]) -> String {
 
 /// Drops one note: the one whose whole text is `words`, or the only one that holds them (three characters at least: "e" holds nearly every note). Where several hold them, or the words are
 /// too short to pick one by, none is dropped, and the result lists the ones that match for a better pick. A note dropped is first added to `forgotten.md`.
-pub fn forget(folder: &Path, workspace: &Path, arguments: &Value) -> Result<String, String> {
+pub fn forget(folder: &Path, workspace: &Path, arguments: &Value, policy: &Policy) -> Result<String, String> {
     let words = arguments.get("words").and_then(Value::as_str).ok_or("words is required")?.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     if words.is_empty() {
         return Err("words is required".into());
@@ -152,9 +193,9 @@ pub fn forget(folder: &Path, workspace: &Path, arguments: &Value) -> Result<Stri
     let mut notes = notes_to_change(&file)?;
     let Some(place) = notes.iter().position(|kept| *kept == note) else { return Ok("that note was already gone".to_string()) };
     // (first: a note that could not be kept for getting back is not dropped)
-    keep_forgotten(folder, workspace, scope, &note)?;
+    keep_forgotten(folder, workspace, scope, &note, policy)?;
     notes.remove(place);
-    write(&file, &notes)?;
+    write(&file, &notes, policy)?;
     Ok(format!("forgot: {note} (kept in {}, for the user to get it back)", forgotten_file(folder).display()))
 }
 
@@ -169,13 +210,13 @@ pub fn unreadable(folder: &Path, workspace: &Path) -> Vec<(PathBuf, String)> {
 }
 
 /// One note gone, as the person chose it: `false` when it was not there any more.
-pub fn forget_one(folder: &Path, workspace: &Path, scope: &str, note: &str) -> Result<bool, String> {
+pub fn forget_one(folder: &Path, workspace: &Path, scope: &str, note: &str, policy: &Policy) -> Result<bool, String> {
     let file = file_of(folder, workspace, scope)?;
     let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut notes = notes_to_change(&file)?;
     let Some(at) = notes.iter().position(|kept| kept == note) else { return Ok(false) };
     notes.remove(at);
-    write(&file, &notes)?;
+    write(&file, &notes, policy)?;
     Ok(true)
 }
 
@@ -238,6 +279,19 @@ pub fn schemas() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // (the notes as they were kept before there was a choice: plain)
+    fn remember(folder: &Path, workspace: &Path, arguments: &Value) -> Result<String, String> {
+        super::remember(folder, workspace, arguments, &Policy::default())
+    }
+
+    fn forget(folder: &Path, workspace: &Path, arguments: &Value) -> Result<String, String> {
+        super::forget(folder, workspace, arguments, &Policy::default())
+    }
+
+    fn forget_one(folder: &Path, workspace: &Path, scope: &str, note: &str) -> Result<bool, String> {
+        super::forget_one(folder, workspace, scope, note, &Policy::default())
+    }
 
     /// Notes kept by many at once are all kept; notes that cannot be read are not written over.
     #[test]
@@ -425,5 +479,89 @@ mod tests {
         std::fs::remove_file(folder.join("user.md")).unwrap();
         assert!(unreadable(&folder, workspace).is_empty());
         assert!(!prompt_section(&folder, workspace).contains("could not be read"));
+    }
+}
+
+#[cfg(test)]
+mod sealed_tests {
+    use super::*;
+    use crate::conversation_key::Cipher;
+
+    fn on() -> (std::sync::Arc<Policy>, std::sync::Arc<Cipher>) {
+        let key = Cipher::generate().unwrap();
+        (Policy::on(key.clone()), key)
+    }
+
+    /// The notes are sealed whole in a file of their own, read back whole, and what the model forgot goes to a sealed file too; nothing of them is in the clear.
+    #[test]
+    fn notes_and_what_was_forgotten_are_sealed_and_come_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("C:/w");
+        let (policy, key) = on();
+        remember(dir.path(), workspace, &json!({"note": "the deploy key lives in the vault, named banana", "scope": "user"}), &policy).unwrap();
+        remember(dir.path(), workspace, &json!({"note": "builds with make, not cargo"}), &policy).unwrap();
+        for name in ["user.md", &format!("project-{}.md", project_key(workspace))] {
+            let bytes = std::fs::read(dir.path().join(name)).unwrap();
+            assert!(conversation_key::is_sealed_text(&bytes), "{name}");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.starts_with(&format!("dogmind-sealed 1 {}\n", key.fingerprint())) && !text.contains("banana") && !text.contains("make"), "{text}");
+        }
+        assert_eq!(notes(dir.path(), workspace).iter().map(|(scope, note)| (*scope, note.as_str())).collect::<Vec<_>>(), [("project", "builds with make, not cargo"), ("user", "the deploy key lives in the vault, named banana")]);
+        assert!(prompt_section(dir.path(), workspace).contains("named banana"));
+        // forgetting one: the note leaves the file and is kept, sealed, where it can be got back
+        assert!(forget(dir.path(), workspace, &json!({"words": "banana"}), &policy).unwrap().starts_with("forgot: "));
+        let forgotten = std::fs::read(forgotten_file(dir.path())).unwrap();
+        assert!(conversation_key::is_sealed_text(&forgotten) && !String::from_utf8_lossy(&forgotten).contains("banana"));
+        assert!(forgotten_text(dir.path()).unwrap().contains("- the deploy key lives in the vault, named banana"));
+        assert_eq!(notes(dir.path(), workspace).len(), 1);
+        // a second forgotten note is added to the first
+        assert!(forget_one(dir.path(), workspace, "project", "builds with make, not cargo", &policy).unwrap());
+        remember(dir.path(), workspace, &json!({"note": "one more kept note"}), &policy).unwrap();
+        forget(dir.path(), workspace, &json!({"words": "one more kept"}), &policy).unwrap();
+        let text = forgotten_text(dir.path()).unwrap();
+        assert!(text.contains("banana") && text.contains("one more kept note"), "{text}");
+    }
+
+    /// A plain file of notes is read as it is while the choice is made, and is sealed when it is next written: the notes of before are not lost to the choice.
+    #[test]
+    fn a_plain_file_is_read_and_is_sealed_when_it_is_written_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("C:/w");
+        std::fs::write(dir.path().join("user.md"), "- an old plain note\n").unwrap();
+        let (policy, _) = on();
+        assert_eq!(notes(dir.path(), workspace)[0].1, "an old plain note");
+        remember(dir.path(), workspace, &json!({"note": "a new note", "scope": "user"}), &policy).unwrap();
+        assert!(conversation_key::is_sealed_text(&std::fs::read(dir.path().join("user.md")).unwrap()));
+        assert_eq!(notes(dir.path(), workspace).len(), 2);
+    }
+
+    /// Notes under a key that is not here are said to be unreadable, in words; they are not shown as none, and not written over. A file that is another's, or changed by a byte, does not open.
+    #[test]
+    fn notes_that_do_not_open_are_said_so_and_are_never_written_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("C:/w");
+        let (policy, key) = on();
+        remember(dir.path(), workspace, &json!({"note": "a note", "scope": "user"}), &policy).unwrap();
+        let file = dir.path().join("user.md");
+        let before = std::fs::read(&file).unwrap();
+        // moved to another name
+        std::fs::copy(&file, dir.path().join("project-0000.md")).unwrap();
+        assert!(read_notes(&dir.path().join("project-0000.md")).unwrap_err().contains("does not open"));
+        // one byte changed
+        let mut changed = before.clone();
+        let last = changed.len() - 3;
+        changed[last] = if changed[last] == b'A' { b'B' } else { b'A' };
+        std::fs::write(dir.path().join("project-0001.md"), &changed).unwrap();
+        assert!(read_notes(&dir.path().join("project-0001.md")).is_err());
+        // its key is not here
+        conversation_key::forget(key.fingerprint());
+        assert!(unreadable(dir.path(), workspace).iter().any(|(path, _)| *path == file));
+        assert!(notes(dir.path(), workspace).is_empty());
+        assert!(remember(dir.path(), workspace, &json!({"note": "another", "scope": "user"}), &Policy::default()).unwrap_err().contains("not changed"));
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        // and a policy that waits for its key writes nothing
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(remember(dir.path(), workspace, &json!({"note": "x", "scope": "user"}), &Policy::locked()).unwrap_err(), conversation_key::LOCKED);
+        assert!(!file.exists());
     }
 }

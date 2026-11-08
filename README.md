@@ -57,11 +57,52 @@ change anything") makes that turn read-only, and a line says so before anything 
 changing the tests") only limits that object. Keys and tokens that a tool brings back are hidden on screen; the model still gets
 them as they were.
 
-The panel on the right (the button at the right of the title, or `/panel`) has *Overview* and *Files*. *Files* shows the workspace
+The panel on the right (the button at the right of the title, or `/panel`) has *Overview*, *Files* and *Terminal*. *Files* shows the workspace
 as a tree, folders first, with the files this session changed marked, and follows the disk as it changes. A click previews a file
 beside the conversation (Markdown, HTML, pictures, code and text, CSV and TSV as tables, an Excel workbook's first sheet), a double
 click opens it in its app, and a right click opens it, shows it in Explorer, copies its path or mentions it in your message
 (`@path`).
+
+*Terminal* (`/terminal`, or Ctrl+`` ` ``) is your own shell, beside the conversation: PowerShell 7, Windows PowerShell, the Command
+Prompt, and Git Bash where a full Git for Windows is installed (the Git that comes with Dogmind has no bash). **New terminal** opens
+the shell you chose last, the arrow beside it lists the others, and it starts in the session's folder (your own folder when there is
+none). Programs behave as in Windows Terminal (it is a pseudo console, ConPTY): colours in 16, 256 and true colour, bold,
+underline, the cursor, wide Japanese characters, git, python, vim, a progress bar. The shell has your own environment, so a
+`NO_COLOR` in it (a variable some tools set for what they start) is the shell's too, and programs that honour it print plain text.
+Each terminal is a tab, up to 8: double click a
+tab to rename it, and its cross closes it, which ends the shell and everything it started, as quitting Dogmind does. A terminal goes
+on running while the panel is collapsed, another view is shown or you open another session. A shell that has ended stays on the
+screen with its exit code and a *New terminal* button, and never starts again by itself. While it has the keys, every key is the
+shell's (Tab, the arrows, F-keys, Ctrl and Alt with a letter) except Ctrl+`` ` `` (another terminal), Ctrl+Tab and Ctrl+1 to 9 (the
+sessions) and F6, which leaves the terminal for the message box. Ctrl+C copies what is selected, and otherwise is the shell's ^C;
+Ctrl+V, Ctrl+Shift+V and Shift+Insert paste (as a paste, where the shell asks for that); a drag selects (a double click a word, a
+triple click a line), the wheel and Shift+PgUp go back through the last 10,000 lines, and a right click offers copy, paste and select
+all. An IME's result goes in as text, with its window at the cursor. Its colours and its face (Cascadia Mono, or Consolas) follow
+the theme, and a reader of the screen finds a document called Terminal, with the text in view and the cursor's line.
+**What you do there is yours, not the agent's.** The commands run with your own rights and none of the agent's permissions
+or limits apply to them, and nothing a terminal shows is sent to the model.
+
+## Encrypting conversations
+
+Conversations are kept as plain JSON lines in `%LOCALAPPDATA%\DogmindApp\sessions`, and are not encrypted unless you turn that on in *Settings > Privacy*. Off is the default, and it costs nothing.
+
+- **What is encrypted.** Every message of a conversation, one line at a time (AES-256-GCM; a line cannot be moved to another file or another place, and a line changed by a byte is reported as damage, never dropped without a word); the pictures of a conversation, each whole; the notes the model keeps for later sessions, and the ones it forgot; the index of a session's undo points, which holds the first words of what you asked. An encrypted session still begins with one plain line that says it is encrypted, with the file's random id and a fingerprint of the key, and nothing of the conversation. Writing stays one appended line at a time, so the disk is written no more than before.
+- **What is not.** The files of your workspaces and the copies kept to undo an edit (they lie in the workspace as they are, whatever is chosen). The timing record beside each session (`.trajectory.jsonl`: counts, times, names, outcomes and short hashes, never what was said; it does name the files a tool touched and a command's first word, and holds the one line a server said of a failure). The settings. A picture you open in the panel beside the conversation, and the copies of attached pictures that commands can read, are put in plain in `attachments`, which is emptied at every start of the app.
+- **Turning it on.** You type a passphrase twice and are shown a recovery code, once; the box *Remember on this PC* is ticked unless you clear it. Then the conversations you already have are encrypted one at a time, with progress: each is written whole beside the old file and renamed over it, so that a crash or a power cut leaves every file either all old or all new, and the next start finishes what is left. New conversations are encrypted as they begin, and plain ones still open as they are. Nothing is changed while a conversation is at work.
+- **The key.** A random 256-bit key encrypts the conversations. It is kept only wrapped (AES-256-GCM) in `conversation-key.json`, under a key made with scrypt from your passphrase, under a key made with scrypt from the recovery code (about 160 bits), and, if *Remember on this PC* is ticked, under Windows' DPAPI for your Windows user. Either the passphrase or the recovery code opens the conversations, on this PC, on another, or after Windows is installed again; the DPAPI copy opens them on this PC for you alone, and with it the app asks nothing when it starts. Without it, a dialog asks for the passphrase (or the recovery code, and then a new passphrase), and until it is answered no conversation is opened or written.
+- **Changing it.** *Settings > Privacy* changes the passphrase (the conversations are not touched), makes a new recovery code (the old one stops working), turns *Remember on this PC* on or off, and turns encryption off, which writes every conversation back as plain text and removes the key file, after one confirmation.
+- **If you lose both the passphrase and the recovery code, the conversations cannot be read, by anyone, you included.** There is no other way in. Write the recovery code down when it is shown: it is shown once and kept nowhere. A copy of the app's folder, with its `conversation-key.json`, stays sealed.
+- **What it costs.** Measured on this PC with a folder of 200 test sessions (157 MiB, the largest 24 MiB): unlocking takes 38 ms with the passphrase and 0.2 ms with the copy for this PC; opening the largest session takes 60 ms instead of 42 ms; appending a line takes 4 us instead of 3 us; listing every session takes 233 ms instead of 126 ms, and searching all of them 0.6 s instead of 0.4 s. The files are a third larger (base64 and a tag on each line), and encrypting the whole folder the first time took 2.8 s.
+
+## Keeping the conversation for the engine's next start
+
+When the engine starts again (an update of the app, a change of settings that restarts it), the next message of a long conversation makes it read the whole conversation again: on a small graphics card a conversation of 36,000 tokens took 84 seconds before the first word. *Settings > Privacy > Keep the conversation's state for the next start* turns that off. It is **off by default**, and with it off nothing here changes.
+
+- **What is kept.** The engine's own state of the conversation it held last, at the place where its last reply began: the same numbers it would work out by reading the conversation again (not the text of the conversation, which the app keeps as it always does). A conversation with a picture in it is not kept, nor one under 1024 tokens.
+- **Where, and sealed how.** In the engine's data folder, `conversation` (one file for a model, a new one replacing the old), sealed with AES-256-GCM under a random key that Windows' DPAPI wraps for your Windows account: the same sealing as the engine's other saved state (the system prompt's). Another Windows user cannot open it, and a changed byte refuses it. The file is about 28 KB for each token of the conversation, a little more with the faster-writing drafter (1.0 GB for 36,000 tokens).
+- **When it is written.** Once, when the engine stops on purpose, and at no other time: nothing is written while you work, and not after each message, so the drive sees one write when the app is closed. The app asks the engine to stop over a pipe that only the app holds, and waits for it to end, at most 20 seconds, then ends it as it always did. This covers quitting the app, an update, a change of settings that restarts the engine, and Windows logging off or shutting down (the app tells Windows why it waits). A state too large for the drive's free room or the memory is not written, and the engine's log says so in one line.
+- **At the next start.** The engine reads the file only for the first message that goes on from that conversation, and the log's line for it says `reused 36100 from kept, loaded in 3.2 s`. A message that does not go on from it leaves the file as it is, for a later one. A file of another build of the engine, or one that does not open, is deleted; so is the file, at the engine's start, if the option has been turned off.
+- **With encrypted conversations.** The state is sealed for your Windows account, which opens it without your passphrase. So when the conversations are encrypted and *Remember on this PC* is off, the option is off and cannot be turned on (the page says why), and turning that combination on turns the option off. With *Remember on this PC* ticked, Windows opens the conversations' key for your account in the same way, and the state is no more readable than the key is.
 
 ## Updating, removing, and when something goes wrong
 
@@ -118,7 +159,10 @@ A package also has `tools\` beside the exe, so that a person installs nothing an
 Its tools read, search, create and edit files (`read_file`, `list_files`, `find_files`, `search_files`, `create_file`,
 `apply_patch`), run commands (`execute_command`), show what changed (`show_diff`), keep a to-do list, check a web page in a
 browser, and search and read the web when that is turned on. Edits and commands ask first, as the mode says (*default*,
-*accept edits*, *auto*), each with a Paw Note: the explanation shown before an approval. A long session is compacted in three
+*accept edits*, *auto*), each with a Paw Note: the explanation shown before an approval. Once web content is in a conversation (a
+search, a page, or what an MCP server you have not trusted returns), what it may have asked for needs your word every time, whatever
+the mode and the saved rules say: a command that uses the network, an MCP tool, a note kept or dropped, and an address that neither you nor
+the web gave. A command that does not use the network is weighed as it was before. A long session is compacted in three
 stages, and every session is kept in a file of its own. A project's `DOGMIND.md` (or its `AGENTS.md` or `CLAUDE.md`) says how it
 wants to be worked on. What the model reads is kept as small as a local model needs it: the system prompt is in
 `crates/dogmind-agent/src/prompt.rs` and the tool schemas in `tools.rs`.
