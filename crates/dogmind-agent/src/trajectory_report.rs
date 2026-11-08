@@ -220,10 +220,11 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
             _ => "-".to_string(),
         };
         let calls: Vec<&str> = line.v["calls"].as_array().map(|calls| calls.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-        let _ = writeln!(out, "  {:>5} {:<10} first {:>8} gen {:>8} prompt {:>6} cached {:>4} wrote {:>6} tok at {:>6} tok/s  {}{}{}",
+        let _ = writeln!(out, "  {:>5} {:<10} first {:>8} gen {:>8} prompt {:>6} cached {:>4} wrote {:>6} tok at {:>6} tok/s  {}{}{}{}",
             short(line.req()), line.s("role"), first.map_or("-".to_string(), secs), secs(generation), line.u("prompt").map_or("-".to_string(), |tokens| tokens.to_string()), cached,
             completion.or(line.u("tokens_est")).map_or("-".to_string(), |tokens| tokens.to_string()), rate, line.s("end"), if calls.is_empty() { String::new() } else { format!(" [{}]", calls.join(", ")) },
-            match line.v["retry_of"].as_str() { Some(of) => format!("  (repeats {} after {}, {})", short(of), secs(line.u("wait_ms").unwrap_or(0)), line.s("retry_why")), None => String::new() });
+            match line.v["retry_of"].as_str() { Some(of) => format!("  (repeats {} after {}, {})", short(of), secs(line.u("wait_ms").unwrap_or(0)), line.s("retry_why")), None => String::new() },
+            match line.v["helper_file"].as_str() { Some(file) => format!("  (the helper's steps are in {file})"), None => String::new() });
         if let Some(server) = line.v.get("server").filter(|server| server.is_object()) {
             // The app's first word minus the server's own time to its first token is a wait before the server began: the request was behind another's.
             if let (Some(first_ms), Some(ttft)) = (first.map(|first| first as f64), server.get("ttft_seconds").and_then(Value::as_f64)) {
@@ -548,6 +549,8 @@ pub struct RequestRow {
     pub calls: Vec<String>,
     /// The request this one repeats, and why.
     pub retry_of: Option<(String, String)>,
+    /// For a helper's request: the name of the file beside the session that holds the helper's conversation.
+    pub helper_file: Option<String>,
 }
 
 /// A tool call of a turn, as a row.
@@ -665,6 +668,7 @@ pub fn summary(trajectory: &str) -> Summary {
                         end: line.s("end").to_string(),
                         calls: line.v["calls"].as_array().map(|calls| calls.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default(),
                         retry_of: line.v["retry_of"].as_str().map(|of| (short(of), line.s("retry_why").to_string())),
+                        helper_file: line.v["helper_file"].as_str().map(str::to_string),
                     });
                 }
                 "tool" => row.tools.push(ToolRow { id: short(line.req()), name: line.s("name").to_string(), ms: line.u("ms").unwrap_or(0), outcome: line.s("outcome").to_string(), notes: tool_notes(line) }),
