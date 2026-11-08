@@ -34,6 +34,20 @@ impl Kind {
     }
 }
 
+/// What the panel on the right shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RightView {
+    /// The folder's files as a tree.
+    Files,
+    /// The person's own shells.
+    Terminal,
+    /// The session's tasks, what waits, the changes and the engine. (A name no version of this app knows is this too: the file is not refused for it.)
+    #[default]
+    #[serde(other)]
+    Overview,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
@@ -155,6 +169,19 @@ impl ProviderConfig {
     }
 }
 
+/// Whether the engine may keep the conversation's state for the next start. The state is sealed for the Windows account, which opens it without
+/// the passphrase: where the conversations are encrypted, it may be kept only if the key is remembered on this PC, which Windows opens for the account
+/// in the same way. (Then the state is no more readable than the key.)
+pub fn keep_conversation_allowed(encrypted: bool, remembered: bool) -> bool {
+    !encrypted || remembered
+}
+
+/// The option as it stands, given what the person chose: turned off where the encryption does not allow it. (Turning that combination on turns the
+/// option off; the choice is not given back when the combination goes.)
+pub fn keep_conversation_after(chosen: bool, encrypted: bool, remembered: bool) -> bool {
+    chosen && keep_conversation_allowed(encrypted, remembered)
+}
+
 /// What to do with a key pasted in a connection's name.
 pub const NAME_HOLDS_A_KEY: &str = "That looks like a key, and a name is written in the settings file and in messages. Give the connection a name of your own, and paste the key in the API key field.";
 
@@ -213,6 +240,10 @@ pub struct Settings {
     /// Speed first, for a PC short of memory: the engine leaves a partially resident model's low-weight routes on the CPU out
     /// (`--expert-floor`). Off by default; it changes answers a little.
     pub speed_first: bool,
+    /// Keep the conversation's state for the next start: when the app stops the engine, the engine keeps the state of the conversation it held last,
+    /// sealed for this Windows account (`--keep-conversation`). Off by default. Never on while the conversations are encrypted and the key is not
+    /// remembered on this PC ([`keep_conversation_allowed`]).
+    pub keep_conversation: bool,
     pub port: u16,
     pub models_folder: Option<PathBuf>,
     /// `straydog.exe`, when it is not beside this app.
@@ -221,8 +252,10 @@ pub struct Settings {
     pub set_up: bool,
     /// The panel on the right of a conversation.
     pub right_panel: bool,
-    /// What it shows: the folder's files (true), or the overview of the session's tasks and changes.
-    pub right_files: bool,
+    /// What it shows. (Before the Terminal view the choice was `right_files`, true for the files: `Settings::load` reads that key where it is, see `migrate`.)
+    pub right_view: RightView,
+    /// The shell the last new terminal was started with, by its name in `term::shells` (`pwsh`, `powershell`, `cmd`, `git-bash`); empty before one was chosen.
+    pub terminal_shell: String,
     pub web_tools: bool,
     /// What answers are written in: `auto`, `ja` or `en`.
     pub language: String,
@@ -314,12 +347,14 @@ impl Default for Settings {
             vram: None,
             context: None,
             speed_first: false,
+            keep_conversation: false,
             port: 18480,
             models_folder: None,
             straydog: None,
             set_up: false,
             right_panel: true,
-            right_files: false,
+            right_view: RightView::Overview,
+            terminal_shell: String::new(),
             web_tools: true,
             language: "auto".into(),
             display_language: "system".into(),
@@ -337,6 +372,18 @@ impl Default for Settings {
             dismissed_update: None,
         }
     }
+}
+
+/// A file written by a version that kept the panel's choice as `right_files` (true: the files) says it as `right_view` now, unless it says that already; the old key goes.
+fn migrate(mut file: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = file.as_object_mut() {
+        if let Some(old) = map.remove("right_files") {
+            if !map.contains_key("right_view") {
+                map.insert("right_view".into(), if old == serde_json::Value::Bool(true) { "files" } else { "overview" }.into());
+            }
+        }
+    }
+    file
 }
 
 impl Settings {
@@ -357,7 +404,7 @@ impl Settings {
                 return Settings::default();
             }
         };
-        match serde_json::from_str(&text) {
+        match serde_json::from_str::<serde_json::Value>(&text).map(migrate).and_then(serde_json::from_value) {
             Ok(settings) => settings,
             Err(_) => {
                 let _ = std::fs::rename(path, path.with_extension("json.broken"));
@@ -545,7 +592,7 @@ pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
 const MADE_FOLDERS: [&str; 7] = ["sessions", "memory", "preview", "crashes", "attachments", "models", "updates"];
 /// The beginnings of the names of the files it makes there: each as it is, written beside itself first (`.part`, `.partial`), or
 /// moved aside when it could not be read (`.broken`, `.unreadable-TIME.json`), or the engine's copies of its own (`engine.toml.old`).
-const MADE_FILES: [&str; 11] = ["settings.json", "engine.toml", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-", "workspace-grants.json", "read-folders.json", "mcp.json", "mcp.partial", "report.txt"];
+const MADE_FILES: [&str; 12] = ["settings.json", "engine.toml", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-", "workspace-grants.json", "read-folders.json", "mcp.json", "mcp.partial", "report.txt", "conversation-key.json"];
 
 /// Whether the app makes this, at the top of its data folder: a name of its own, a folder as a folder and a file as a file.
 fn made_here(path: &Path) -> bool {
@@ -583,6 +630,26 @@ pub fn what_remove_leaves(data: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// The conversation's state is kept only where it is no more readable than the conversations: with no encryption, or with the key remembered on this PC,
+    /// which Windows opens for the account as it opens the state. Encrypted and not remembered, the option is off whatever was chosen, and choosing it is
+    /// refused; when the combination goes, the choice is not given back.
+    #[test]
+    fn the_conversations_state_is_kept_only_where_the_encryption_allows_it() {
+        use super::{keep_conversation_after, keep_conversation_allowed, Settings};
+        assert!(!Settings::default().keep_conversation, "off by default");
+        for (encrypted, remembered, allowed) in [(false, false, true), (false, true, true), (true, true, true), (true, false, false)] {
+            assert_eq!(keep_conversation_allowed(encrypted, remembered), allowed, "encrypted {encrypted}, remembered {remembered}");
+            assert_eq!(keep_conversation_after(true, encrypted, remembered), allowed);
+            assert!(!keep_conversation_after(false, encrypted, remembered), "not chosen, not kept");
+        }
+        // the choice is a key of the settings file, off when the file does not have it
+        let mut settings = Settings::default();
+        settings.keep_conversation = true;
+        let text = serde_json::to_string(&settings).unwrap();
+        assert!(serde_json::from_str::<Settings>(&text).unwrap().keep_conversation);
+        assert!(!serde_json::from_str::<Settings>("{}").unwrap().keep_conversation);
+    }
+
     use super::*;
 
     #[test]
@@ -1023,5 +1090,45 @@ mod tests {
         let claude = ProviderConfig { name: "c".into(), kind: Kind::Anthropic, base_url: String::new(), model: String::new(), api_key: String::new() };
         assert!(claude.problem().is_some(), "no key");
         assert!(ProviderConfig { api_key: "env:K".into(), ..claude }.problem().is_none());
+    }
+    fn loaded(text: &str) -> Settings {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, text).unwrap();
+        Settings::load(&path)
+    }
+
+    /// A file from before the Terminal view says which view was shown as `right_files`; it is read as the view it meant, and not written again.
+    #[test]
+    fn the_panels_old_choice_is_read_as_the_view_it_meant() {
+        assert_eq!(loaded(r#"{"right_files": true}"#).right_view, RightView::Files);
+        assert_eq!(loaded(r#"{"right_files": false}"#).right_view, RightView::Overview);
+        assert_eq!(loaded("{}").right_view, RightView::Overview);
+        // (the new key wins over the old when a file somehow has both)
+        assert_eq!(loaded(r#"{"right_files": true, "right_view": "terminal"}"#).right_view, RightView::Terminal);
+        assert_eq!(loaded(r#"{"right_view": "files"}"#).right_view, RightView::Files);
+        // (a view that a later version has is the overview here, and the file is not refused for it)
+        let later = loaded(r#"{"right_view": "something_later", "right_panel": false}"#);
+        assert_eq!((later.right_view, later.right_panel), (RightView::Overview, false));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"right_files": true}"#).unwrap();
+        Settings::load(&path).save(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("\"right_view\": \"files\"") && !written.contains("right_files"), "{written}");
+        assert!(!path.with_extension("json.broken").exists(), "nothing was refused");
+    }
+
+    #[test]
+    fn the_shell_last_chosen_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        assert_eq!(settings.terminal_shell, "");
+        settings.terminal_shell = "git-bash".into();
+        settings.right_view = RightView::Terminal;
+        settings.save(&path).unwrap();
+        let back = Settings::load(&path);
+        assert_eq!((back.terminal_shell.as_str(), back.right_view), ("git-bash", RightView::Terminal));
     }
 }

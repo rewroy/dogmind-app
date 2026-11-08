@@ -54,7 +54,9 @@ impl Url {
         if host.is_empty() {
             return Err(format!("{url}: no host"));
         }
-        let mut path = format!("/{}", path.trim_start_matches('/').trim_end_matches('/'));
+        // The path is kept as it was given, final slash included: a site may answer `/a` with a redirect to `/a/`, and an address without its slash
+        // would be asked for again and again.
+        let mut path = if path.is_empty() { "/".to_string() } else { path.to_string() };
         if let Some(query) = query {
             path.push('?');
             path.push_str(query);
@@ -732,13 +734,40 @@ pub(crate) mod tests {
         assert!(Url::parse("http://").is_err());
     }
 
+    /// An address is asked for as it was given: a site may redirect `/a` to `/a/`, and an address that lost its final slash would never get there.
+    #[test]
+    fn a_path_keeps_its_final_slash_and_its_query_after_one() {
+        let path = |address: &str| Url::parse(address).unwrap().path;
+        assert_eq!(path("https://example.com/a/"), "/a/");
+        assert_eq!(path("https://example.com/a"), "/a");
+        assert_eq!(path("https://example.com/"), "/");
+        assert_eq!(path("https://example.com"), "/");
+        assert_eq!(path("https://example.com/a/?q=1"), "/a/?q=1");
+        assert_eq!(path("https://example.com/events/date/2026/11/"), "/events/date/2026/11/");
+        assert_eq!(path("https://example.com/a/b/#top"), "/a/b/");
+    }
+
+    /// A provider's base address with or without its final slash asks for the same path.
+    #[test]
+    fn a_base_with_and_without_a_final_slash_joins_to_the_same_path() {
+        for (plain, slashed) in [("http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1/"), ("https://api.anthropic.com/v1", "https://api.anthropic.com/v1/"), ("http://localhost:8080", "http://localhost:8080/")] {
+            let (plain, slashed) = (Url::parse(plain).unwrap(), Url::parse(slashed).unwrap());
+            for rest in ["chat/completions", "/chat/completions", "models/m"] {
+                assert_eq!(plain.join(rest).path, slashed.join(rest).path, "{plain:?} {rest}");
+                assert_eq!(slashed.join(rest).path.matches("//").count(), 0, "one slash between: {:?}", slashed.join(rest).path);
+            }
+        }
+        assert_eq!(Url::parse("http://127.0.0.1:8080/v1/").unwrap().join("chat/completions").path, "/v1/chat/completions");
+        assert_eq!(Url::parse("http://localhost:8080/").unwrap().join("models").path, "/models");
+    }
+
     /// A query with no path before it, an IPv6 address, and a fragment: each is where it belongs, and the fragment goes nowhere.
     #[test]
     fn a_url_with_a_query_and_no_path_or_an_ipv6_address_is_read_as_one() {
         let query = Url::parse("https://example.com?q=x").unwrap();
         assert_eq!((query.host.as_str(), query.port, query.path.as_str()), ("example.com", 443, "/?q=x"));
         let with_path = Url::parse("http://example.com:8080/a/b/?q=1/2#frag").unwrap();
-        assert_eq!((with_path.host.as_str(), with_path.port, with_path.path.as_str()), ("example.com", 8080, "/a/b?q=1/2"));
+        assert_eq!((with_path.host.as_str(), with_path.port, with_path.path.as_str()), ("example.com", 8080, "/a/b/?q=1/2"));
         let local = Url::parse("http://[::1]:8080/v1").unwrap();
         assert_eq!((local.host.as_str(), local.port, local.path.as_str(), local.host_for_header()), ("::1", 8080, "/v1", "[::1]".to_string()));
         let bare = Url::parse("http://[::1]/").unwrap();

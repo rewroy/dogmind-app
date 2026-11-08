@@ -4,7 +4,7 @@
 use crate::lang::{t, tf};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
@@ -464,6 +464,10 @@ pub fn engine_arguments(settings: &Settings, folder: &Path) -> Vec<String> {
     if settings.speed_first {
         args.extend(["--expert-floor".to_string(), SPEED_FIRST_FLOOR.to_string()]);
     }
+    if settings.keep_conversation {
+        // (the engine keeps the conversation's state when it stops on purpose, and this app stops it by a line on the pipe only it holds: `Engine::stop`)
+        args.extend(["--keep-conversation".to_string(), "--stop-on-stdin".to_string()]);
+    }
     args
 }
 
@@ -491,6 +495,15 @@ pub fn setup_can_force(straydog: &Path) -> bool {
 pub fn setup_takes(straydog: &Path, option: &str) -> bool {
     let mut command = Command::new(straydog);
     command.args(["setup", "--help"]).stdin(Stdio::null());
+    hidden(&mut command);
+    command.output().is_ok_and(|output| help_has(&String::from_utf8_lossy(&output.stdout), option))
+}
+
+/// Whether this Straydog's server takes `option`, by the words of its help: `--keep-conversation` is newer than the `straydog.exe` of 0.1.7, and an option the server does not
+/// know ends it before it starts.
+pub fn server_takes(straydog: &Path, option: &str) -> bool {
+    let mut command = Command::new(straydog);
+    command.arg("--help").stdin(Stdio::null());
     hidden(&mut command);
     command.output().is_ok_and(|output| help_has(&String::from_utf8_lossy(&output.stdout), option))
 }
@@ -606,8 +619,14 @@ fn is_backtrace_note(line: &str) -> bool {
 }
 
 pub struct Engine {
-    child: Child,
+    /// None once it has been handed to the thread that ends it (`Drop`).
+    child: Option<Child>,
     _job: Option<Job>,
+    /// The pipe to its standard input, when it was started to keep the conversation (`--stop-on-stdin`): a line `stop` on it ends the engine, once it
+    /// has kept the state. No one else holds it.
+    stop: Option<ChildStdin>,
+    /// How long it is given to end after it was asked to stop.
+    stop_limit: Duration,
     /// Why it is not held by a job, when it is not: it then does not end with this app if the app is killed, and the trajectory says so.
     pub not_held: Option<String>,
     /// The last lines it wrote to its error stream (see `listen`).
@@ -619,8 +638,10 @@ pub struct Engine {
 impl Engine {
     pub fn start(straydog: &Path, settings: &Settings, folder: &Path) -> Result<Engine, String> {
         std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
+        // (a Straydog that does not know the option is started without it, and stopped as it always was)
+        let settings = &Settings { keep_conversation: settings.keep_conversation && server_takes(straydog, "--keep-conversation"), ..settings.clone() };
         let mut command = Command::new(straydog);
-        command.args(engine_arguments(settings, folder)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        command.args(engine_arguments(settings, folder)).stdin(if settings.keep_conversation { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::null()).stderr(Stdio::piped());
         hidden(&mut command);
         let mut child = command.spawn().map_err(|error| start_failure(straydog, &error))?;
         let (job, not_held) = match Job::holding(&child) {
@@ -628,17 +649,23 @@ impl Engine {
             Err(why) => (None, Some(why)),
         };
         let said = child.stderr.take().map_or_else(Said::default, listen);
-        Ok(Engine { child, _job: job, not_held, said, port: settings.port })
+        let stop = child.stdin.take();
+        Ok(Engine { child: Some(child), _job: job, stop, stop_limit: ENGINE_STOP, not_held, said, port: settings.port })
     }
 
     /// Its process number: an installer that is to replace its files waits for it to end.
     pub fn id(&self) -> u32 {
-        self.child.id()
+        self.child.as_ref().map_or(0, Child::id)
+    }
+
+    /// Whether it is stopped by asking, to keep the conversation's state: the window waits for it when Windows is ending the session.
+    pub fn stops_gracefully(&self) -> bool {
+        self.stop.is_some()
     }
 
     /// Why it ended, if it has.
     pub fn ended(&mut self) -> Option<String> {
-        let status = self.child.try_wait().ok()??;
+        let status = self.child.as_mut()?.try_wait().ok()??;
         // (its last words may still be on their way to the reader)
         std::thread::sleep(Duration::from_millis(100));
         let lines: Vec<String> = self.said.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().cloned().collect();
@@ -647,10 +674,71 @@ impl Engine {
 }
 
 impl Drop for Engine {
+    /// An engine that is not to keep the conversation is killed, and has ended when this returns. One that is (`stop`) is asked to stop, and given
+    /// [`ENGINE_STOP`] to end by itself, on a thread of its own, killed after that: a window that changes the engine's settings goes on meanwhile,
+    /// and a start of the next engine waits for this one as it waits for any (`wait_for_others`). The end of the app, and what needs the engine gone
+    /// (its files, the card), wait for it: [`wait_for_endings`].
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let Some(mut child) = self.child.take() else { return };
+        let job = self._job.take();
+        let Some(stop) = self.stop.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(job);
+            return;
+        };
+        let limit = self.stop_limit;
+        let ending = std::thread::Builder::new().name("engine-stop".into()).spawn(move || {
+            end_gracefully(&mut child, stop, limit);
+            let _ = child.wait();
+            // (the job is let go once it has ended: until then, an app that is killed takes the engine with it)
+            drop(job);
+        });
+        match ending {
+            Ok(thread) => ENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(thread),
+            // (nothing was moved out of this value that the closure's failure did not drop: the job it held ended the engine)
+            Err(_) => {}
+        }
     }
+}
+
+/// How long an engine that was asked to stop is given to end by itself, with the state of the conversation kept: the server seals and writes a
+/// state of tens of thousands of tokens in seconds, and the worker hands back its memory and the card. Past this it is killed, as every engine is
+/// when the app is not to keep the conversation.
+pub const ENGINE_STOP: Duration = Duration::from_secs(20);
+
+/// The engines asked to stop whose ends are waited for on threads of their own.
+static ENDING: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Wait until every engine that was asked to stop has ended (at most [`ENGINE_STOP`] after it was asked): at the end of the app, which a job would
+/// otherwise take the engine from in the middle of its keeping, and before anything that needs the engine's files or the card.
+pub fn wait_for_endings() {
+    let threads = std::mem::take(&mut *ENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    for thread in threads {
+        let _ = thread.join();
+    }
+}
+
+/// Ask the engine to stop: a line `stop` on the pipe to its standard input, which it reads as it reads Ctrl+C (no console, no address and no key
+/// to reach it by: the pipe is held by this process alone). Then wait for it to end, up to `limit`, and kill it after that, as an engine that was never
+/// asked. Whether it ended by itself.
+fn end_gracefully(child: &mut Child, mut stop: ChildStdin, limit: Duration) -> bool {
+    use std::io::Write;
+    let asked = stop.write_all(b"stop\n").and_then(|()| stop.flush());
+    // (the pipe stays open until it has ended: an engine that sees it close is not asked to do anything by that)
+    if asked.is_ok() {
+        let began = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if began.elapsed() < limit => std::thread::sleep(Duration::from_millis(50)),
+                _ => break,
+            }
+        }
+    }
+    drop(stop);
+    let _ = child.kill();
+    false
 }
 
 /// How long an engine that was just stopped has to go: a worker takes seconds to hand back its memory and the GPU.
@@ -1394,6 +1482,108 @@ mod tests {
         assert_eq!(parse_list(free, true).unwrap().machine, "RTX 5070 Ti (16 GB)  ·  62 GB of memory, 28 GB free now");
     }
 
+    /// A server that has the option lists it in its help as an option of its own at the start of a line; one that only talks of it, or lists another, does not.
+    #[test]
+    fn a_server_that_lists_the_option_is_the_one_that_takes_it() {
+        let help = "Options:
+  -m, --model <DIR>
+      --keep-conversation
+          Windows: with --keep-conversation the state is kept.
+      --stop-on-stdin
+";
+        assert!(help_has(help, "--keep-conversation") && help_has(help, "--stop-on-stdin"));
+        assert!(!help_has("  --model <DIR>
+      --stop-on-stdin
+          turn it on with --keep-conversation
+", "--keep-conversation"));
+        assert!(!server_takes(Path::new(r"C:\no\such\straydog.exe"), "--keep-conversation"));
+    }
+
+    /// The option reaches the engine's command line with the pipe it is stopped by, and without it neither is there.
+    #[test]
+    fn the_option_reaches_the_engine_with_the_pipe_it_is_stopped_by() {
+        let on = engine_arguments(&Settings { keep_conversation: true, ..Settings::default() }, Path::new("D"));
+        assert!(on.contains(&"--keep-conversation".to_string()) && on.contains(&"--stop-on-stdin".to_string()), "{on:?}");
+        let off = engine_arguments(&Settings::default(), Path::new("D"));
+        assert!(!off.iter().any(|argument| argument.contains("keep-conversation") || argument.contains("stop-on-stdin")), "{off:?}");
+        // (the rest of the command line is the same)
+        let rest: Vec<&String> = on.iter().filter(|argument| *argument != "--keep-conversation" && *argument != "--stop-on-stdin").collect();
+        assert_eq!(rest, off.iter().collect::<Vec<_>>());
+    }
+
+    /// A stand-in for an engine that is stopped by a line on its input: it reads a line (as the engine reads `stop`) and ends, or, `stubborn`, goes on
+    /// for half a minute whatever it is told.
+    fn stoppable(stubborn: bool) -> (Child, ChildStdin) {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/c", if stubborn { "ping -n 30 127.0.0.1 > nul" } else { "set /p line= & exit /b 0" }]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+        hidden(&mut command);
+        let mut child = command.spawn().unwrap();
+        let stop = child.stdin.take().unwrap();
+        (child, stop)
+    }
+
+    /// Whether the process `id` is running (its name shows in the task list).
+    fn is_running(id: u32) -> bool {
+        let mut command = Command::new("tasklist");
+        command.args(["/FI", &format!("PID eq {id}"), "/NH"]).stdin(Stdio::null());
+        hidden(&mut command);
+        String::from_utf8_lossy(&command.output().unwrap().stdout).split_whitespace().any(|word| word == id.to_string())
+    }
+
+    /// An engine that is asked to stop is waited for: it ends by itself, and is not killed (it exits with the code it chose, which a killed process does not); one
+    /// that does not end within the limit is killed after the limit, and not before.
+    #[test]
+    fn a_graceful_stop_waits_for_the_engine_and_kills_it_after_the_limit() {
+        let (mut child, stop) = stoppable(false);
+        let began = std::time::Instant::now();
+        assert!(end_gracefully(&mut child, stop, Duration::from_secs(20)), "an engine that ends when told is waited for");
+        assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+        assert_eq!(child.wait().unwrap().code(), Some(0), "it ended by itself");
+        let (mut child, stop) = stoppable(true);
+        let limit = Duration::from_millis(700);
+        let began = std::time::Instant::now();
+        assert!(!end_gracefully(&mut child, stop, limit), "an engine that does not end is not said to have");
+        assert!(began.elapsed() >= limit && began.elapsed() < Duration::from_secs(10), "waited the limit, then killed it: {:?}", began.elapsed());
+        let status = child.wait().unwrap();
+        assert_ne!(status.code(), Some(0), "it was killed: {status:?}");
+        // an engine that has gone already (its pipe broken) is no one to wait for
+        let (mut child, stop) = stoppable(false);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let began = std::time::Instant::now();
+        assert!(!end_gracefully(&mut child, stop, Duration::from_secs(20)));
+        assert!(began.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Dropping an engine that keeps the conversation does not hold the window up: the end is waited for on a thread of its own, and `wait_for_endings` (the end
+    /// of the app, what needs the engine gone) waits for it; an engine that is not to keep it is killed at once, as it was.
+    #[test]
+    fn a_dropped_engine_that_keeps_the_conversation_ends_on_its_own_and_is_waited_for() {
+        let (child, stop) = stoppable(false);
+        let id = child.id();
+        let engine = Engine { child: Some(child), _job: None, stop: Some(stop), stop_limit: Duration::from_secs(20), not_held: None, said: Said::default(), port: 0 };
+        assert!(engine.stops_gracefully());
+        let began = std::time::Instant::now();
+        drop(engine);
+        assert!(began.elapsed() < Duration::from_secs(2), "the drop waited {:?}", began.elapsed());
+        wait_for_endings();
+        assert!(!is_running(id), "it has ended by the time the app may go");
+        // one that does not end: killed after the limit it was given
+        let (child, stop) = stoppable(true);
+        let engine = Engine { child: Some(child), _job: None, stop: Some(stop), stop_limit: Duration::from_millis(500), not_held: None, said: Said::default(), port: 0 };
+        let began = std::time::Instant::now();
+        drop(engine);
+        wait_for_endings();
+        assert!(began.elapsed() >= Duration::from_millis(500) && began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+        // not asked to keep it: killed at once
+        let (child, _) = stoppable(true);
+        let engine = Engine { child: Some(child), _job: None, stop: None, stop_limit: ENGINE_STOP, not_held: None, said: Said::default(), port: 0 };
+        assert!(!engine.stops_gracefully());
+        let began = std::time::Instant::now();
+        drop(engine);
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+    }
+
     /// An engine stand-in: a program that writes `lines` to its error stream and exits with `code`, listened to as the engine is.
     fn stand_in(lines: &[&str], code: i32) -> Engine {
         let mut steps: Vec<String> = lines.iter().map(|line| format!("echo {line} 1>&2")).collect();
@@ -1403,7 +1593,7 @@ mod tests {
         hidden(&mut command);
         let mut child = command.spawn().unwrap();
         let said = child.stderr.take().map_or_else(Said::default, listen);
-        Engine { child, _job: None, not_held: None, said, port: 0 }
+        Engine { child: Some(child), _job: None, stop: None, stop_limit: ENGINE_STOP, not_held: None, said, port: 0 }
     }
 
     fn why_it_ended(lines: &[&str], code: i32) -> String {

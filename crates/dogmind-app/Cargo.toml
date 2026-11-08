@@ -21,6 +21,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # An update is fetched, and what comes is checked by the SHA-256 GitHub published for it: as dogmind-agent has it. The files of a setup that is put together from parts are inflated to be checked.
 flate2 = "1"
 sha2 = "0.10"
+# The terminal's screen: its grid, its scrollback, its selection and the parsing of what a shell writes (`term::screen`). Not its own pseudo console and its event loop: `term::pty` starts the shell, in a job that ends it with what it started.
+alacritty_terminal = { version = "0.26", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # The on-demand preview only; the loader is linked in, so there is no DLL to ship.
@@ -55,6 +57,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
+    "Win32_System_Shutdown",
     "Win32_System_Threading",
     "Win32_UI_Controls",
     "Win32_UI_HiDpi",

@@ -64,6 +64,52 @@ struct Index {
 pub struct Checkpoints {
     folder: PathBuf,
     index: Index,
+    /// The session: the index is sealed when its file is (the turns' titles are the first words of what the person asked, so the index is sealed whole as the notes are), and whichever form the
+    /// file has when it is written, as every conversation may be changed to the other while this one is open. The copies of files are not: they are the workspace's own files, which lie in it in the clear.
+    session: PathBuf,
+}
+
+/// The index as it is on the disk: sealed, or plain JSON.
+fn index_bytes(sealed: Option<&crate::session::Sealed>, text: &str) -> Vec<u8> {
+    match sealed {
+        Some(sealed) => sealed.seal_marked("index", INDEX, text.as_bytes()),
+        None => text.as_bytes().to_vec(),
+    }
+}
+
+/// An index file's text. A sealed one opens with its session's key; none that does not.
+fn index_text(sealed: Option<&crate::session::Sealed>, bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(crate::session::SEALED_MARK) {
+        return String::from_utf8(sealed?.open_marked("index", INDEX, bytes)?).ok();
+    }
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+fn write_index(folder: &Path, bytes: &[u8]) -> Result<(), String> {
+    std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
+    let partial = folder.join("index.partial");
+    // (on the disk before it takes the place: after a power cut, a rename that got there without its bytes leaves no turns to go back to)
+    std::fs::File::create(&partial).and_then(|mut out| {
+        std::io::Write::write_all(&mut out, bytes)?;
+        out.sync_all()
+    }).map_err(|error| format!("{}: {error}", partial.display()))?;
+    std::fs::rename(&partial, folder.join(INDEX)).map_err(|error| format!("{}: {error}", folder.display()))
+}
+
+/// A session's index put in the form of the session's new file: sealed, or plain. Done when every session is changed to the other, with the session's own file as it was and as it is.
+pub(crate) fn reseal_index(session: &Path, from: Option<&crate::session::Sealed>, to: Option<&crate::session::Sealed>) -> Result<(), String> {
+    let folder = folder_of(session);
+    let bytes = match std::fs::read(folder.join(INDEX)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", folder.display())),
+    };
+    let text = index_text(from, &bytes).ok_or_else(|| format!("{}: the index of this session's checkpoints does not open", folder.display()))?;
+    let now = index_bytes(to, &text);
+    if now == bytes {
+        return Ok(());
+    }
+    write_index(&folder, &now)
 }
 
 /// Whether the path, or any folder on the way to it, is a link or a junction (`is_symlink` is true of a junction on Windows too), looked at and not gone through.
@@ -143,8 +189,9 @@ impl Checkpoints {
     /// named can still be found, and none of them is written over by what comes next.
     pub fn open(session: &Path) -> Checkpoints {
         let folder = folder_of(session);
-        let text = std::fs::read_to_string(folder.join(INDEX));
-        let parsed = text.as_ref().ok().and_then(|text| serde_json::from_str::<Index>(text).ok());
+        let sealed = crate::session::sealed_of(session).ok().flatten();
+        let text = std::fs::read(folder.join(INDEX)).ok().and_then(|bytes| index_text(sealed.as_ref(), &bytes));
+        let parsed = text.as_ref().and_then(|text| serde_json::from_str::<Index>(text).ok());
         if parsed.is_none() && folder.join(INDEX).exists() {
             let aside = folder.join(format!("index.damaged-{}.json", chrono::Local::now().format("%Y%m%d-%H%M%S")));
             let _ = std::fs::rename(folder.join(INDEX), aside);
@@ -152,19 +199,13 @@ impl Checkpoints {
         let mut index = parsed.unwrap_or_default();
         // (what the index said it had come to may be less than what is there: the numbering goes on past every copy in the folder)
         index.next_copy = index.next_copy.max(after_the_last_copy(&folder));
-        Checkpoints { folder, index }
+        Checkpoints { folder, index, session: session.to_path_buf() }
     }
 
     fn save(&self) -> Result<(), String> {
-        std::fs::create_dir_all(&self.folder).map_err(|error| format!("{}: {error}", self.folder.display()))?;
         let text = serde_json::to_string(&self.index).map_err(|error| error.to_string())?;
-        let partial = self.folder.join("index.partial");
-        // (on the disk before it takes the place: after a power cut, a rename that got there without its bytes leaves no turns to go back to)
-        std::fs::File::create(&partial).and_then(|mut out| {
-            std::io::Write::write_all(&mut out, text.as_bytes())?;
-            out.sync_all()
-        }).map_err(|error| format!("{}: {error}", partial.display()))?;
-        std::fs::rename(&partial, self.folder.join(INDEX)).map_err(|error| format!("{}: {error}", self.folder.display()))
+        let sealed = crate::session::sealed_of(&self.session).map_err(|error| format!("{}: {error}", self.session.display()))?;
+        write_index(&self.folder, &index_bytes(sealed.as_ref(), &text))
     }
 
     pub fn begin(&mut self, title: &str, at: &str, message: Option<usize>) -> Result<(), String> {
@@ -488,7 +529,7 @@ mod tests {
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "now").unwrap();
         // (an index that says nothing of them)
-        let mut marks = Checkpoints { folder: folder.clone(), index: Index::default() };
+        let mut marks = Checkpoints { folder: folder.clone(), index: Index::default(), session: session.clone() };
         marks.begin("one", "t", Some(1)).unwrap();
         marks.before_edit(&[file]).unwrap();
         assert_eq!((read(&folder.join("0.bin")), read(&folder.join("1.bin")), read(&folder.join("2.bin"))), ("old zero".to_string(), "old one".to_string(), "now".to_string()));
@@ -785,5 +826,39 @@ mod tests {
         f.marks.begin("one", "t", Some(1)).unwrap();
         assert_eq!(f.marks.restore(1, "t"), Restored::default());
         assert_eq!(f.marks.turns().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod sealed_tests {
+    use super::*;
+    use crate::conversation_key::Cipher;
+    use crate::session::Session;
+
+    /// The index of an encrypted session's checkpoints is sealed (the turns' titles are the first words of what was asked), the copies are not, and a session changed from one form to the other has its index changed with it.
+    #[test]
+    fn the_index_of_an_encrypted_session_is_sealed_and_follows_the_session_between_the_two_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = Cipher::generate().unwrap();
+        let session = Session::create_with(dir.path(), Path::new("w"), "now", "1", Some(&key)).unwrap().path.clone();
+        let mut marks = Checkpoints::open(&session);
+        marks.begin("tell me the secret of banana", "now", Some(1)).unwrap();
+        let index = std::fs::read(folder_of(&session).join(INDEX)).unwrap();
+        assert!(index.starts_with(crate::session::SEALED_MARK) && !String::from_utf8_lossy(&index).contains("banana"));
+        assert_eq!(Checkpoints::open(&session).turns()[0].title, "tell me the secret of banana");
+        // to plain, and back: what it says is the same
+        let sealed = crate::session::sealed_of(&session).unwrap();
+        reseal_index(&session, sealed.as_ref(), None).unwrap();
+        let plain = std::fs::read_to_string(folder_of(&session).join(INDEX)).unwrap();
+        assert!(plain.contains("banana") && plain.starts_with('{'));
+        reseal_index(&session, None, sealed.as_ref()).unwrap();
+        assert!(std::fs::read(folder_of(&session).join(INDEX)).unwrap().starts_with(crate::session::SEALED_MARK));
+        assert_eq!(Checkpoints::open(&session).turns().len(), 1);
+        // a session with no index has nothing to change
+        reseal_index(&dir.path().join("none.jsonl"), None, sealed.as_ref()).unwrap();
+        // a plain session keeps a plain index, as it always did
+        let plain_session = Session::create(dir.path(), Path::new("w"), "now", "2").unwrap().path.clone();
+        Checkpoints::open(&plain_session).begin("plain title", "now", Some(1)).unwrap();
+        assert!(std::fs::read_to_string(folder_of(&plain_session).join(INDEX)).unwrap().contains("plain title"));
     }
 }
