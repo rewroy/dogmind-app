@@ -169,6 +169,19 @@ impl ProviderConfig {
     }
 }
 
+/// Whether the engine may keep the conversation's state for the next start. The state is sealed for the Windows account, which opens it without
+/// the passphrase: where the conversations are encrypted, it may be kept only if the key is remembered on this PC, which Windows opens for the account
+/// in the same way. (Then the state is no more readable than the key.)
+pub fn keep_conversation_allowed(encrypted: bool, remembered: bool) -> bool {
+    !encrypted || remembered
+}
+
+/// The option as it stands, given what the person chose: turned off where the encryption does not allow it. (Turning that combination on turns the
+/// option off; the choice is not given back when the combination goes.)
+pub fn keep_conversation_after(chosen: bool, encrypted: bool, remembered: bool) -> bool {
+    chosen && keep_conversation_allowed(encrypted, remembered)
+}
+
 /// What to do with a key pasted in a connection's name.
 pub const NAME_HOLDS_A_KEY: &str = "That looks like a key, and a name is written in the settings file and in messages. Give the connection a name of your own, and paste the key in the API key field.";
 
@@ -227,6 +240,10 @@ pub struct Settings {
     /// Speed first, for a PC short of memory: the engine leaves a partially resident model's low-weight routes on the CPU out
     /// (`--expert-floor`). Off by default; it changes answers a little.
     pub speed_first: bool,
+    /// Keep the conversation's state for the next start: when the app stops the engine, the engine keeps the state of the conversation it held last,
+    /// sealed for this Windows account (`--keep-conversation`). Off by default. Never on while the conversations are encrypted and the key is not
+    /// remembered on this PC ([`keep_conversation_allowed`]).
+    pub keep_conversation: bool,
     pub port: u16,
     pub models_folder: Option<PathBuf>,
     /// `straydog.exe`, when it is not beside this app.
@@ -330,6 +347,7 @@ impl Default for Settings {
             vram: None,
             context: None,
             speed_first: false,
+            keep_conversation: false,
             port: 18480,
             models_folder: None,
             straydog: None,
@@ -612,6 +630,26 @@ pub fn what_remove_leaves(data: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// The conversation's state is kept only where it is no more readable than the conversations: with no encryption, or with the key remembered on this PC,
+    /// which Windows opens for the account as it opens the state. Encrypted and not remembered, the option is off whatever was chosen, and choosing it is
+    /// refused; when the combination goes, the choice is not given back.
+    #[test]
+    fn the_conversations_state_is_kept_only_where_the_encryption_allows_it() {
+        use super::{keep_conversation_after, keep_conversation_allowed, Settings};
+        assert!(!Settings::default().keep_conversation, "off by default");
+        for (encrypted, remembered, allowed) in [(false, false, true), (false, true, true), (true, true, true), (true, false, false)] {
+            assert_eq!(keep_conversation_allowed(encrypted, remembered), allowed, "encrypted {encrypted}, remembered {remembered}");
+            assert_eq!(keep_conversation_after(true, encrypted, remembered), allowed);
+            assert!(!keep_conversation_after(false, encrypted, remembered), "not chosen, not kept");
+        }
+        // the choice is a key of the settings file, off when the file does not have it
+        let mut settings = Settings::default();
+        settings.keep_conversation = true;
+        let text = serde_json::to_string(&settings).unwrap();
+        assert!(serde_json::from_str::<Settings>(&text).unwrap().keep_conversation);
+        assert!(!serde_json::from_str::<Settings>("{}").unwrap().keep_conversation);
+    }
+
     use super::*;
 
     #[test]
