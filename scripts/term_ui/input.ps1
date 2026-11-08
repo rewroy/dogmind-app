@@ -47,7 +47,7 @@ Term $a "input $id \x03" | Out-Null
 Check '^C stops it' (Wait-Until { @((Info $a $id).processes -split ',').Count -le 1 })
 # a shell that asks for bracketed paste (bash does), and a paste is then a paste
 $p = Term $a 'new git-bash'
-Check 'Git Bash starts in the workspace' (Wait-Until { (Term-Read $a "grid $p" 'g.txt') -match 'work/input' } 25)
+Check 'Git Bash starts in the workspace' (Wait-Until { ((Term-Read $a "grid $p" 'g.txt') -replace "`r?`n", '') -match 'work/input' } 25)
 Check 'Git Bash asks for bracketed paste' (Wait-Until { (Info $a $p).bracketed -eq 'true' } 25)
 Term $a "paste $p echo first
 echo second" | Out-Null
@@ -62,5 +62,6 @@ Check 'and a line that is typed after it runs' (Wait-Until { (($g = Term-Read $a
 Stop-App $a
 $results | ConvertTo-Json | Set-Content "$S\out\results-input.json"
 "{0} checks, {1} failed" -f $results.Count, @($results | ? { -not $_.Ok }).Count
+
 
 

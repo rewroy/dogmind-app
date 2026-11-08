@@ -108,7 +108,14 @@ impl App {
                 let cells = terminal.with_screen(|screen| screen.cells_in_view());
                 wrote(after, &cells.iter().map(|(row, col, ch, width)| format!("{row}\t{col}\t{ch}\t{width}\n")).collect::<String>())
             }),
+            // The runs of text the window would draw of this terminal now, each with its row, its column and its colour: what is drawn is made of these.
+            "runs" => self.terminal_by_id(id).map_or(0, |terminal| {
+                let snapshot = terminal.with_screen(|screen| screen.snapshot());
+                let scene = scene_of(&snapshot, true, theme::is_light(), scale(self.dpi, PAD), (self.term.area.2, self.term.area.3), self.dpi);
+                wrote(after, &scene.runs.iter().map(|run| format!("{}\t{}\t{:06X}\t{}\n", run.row, run.col, run.color, run.text)).collect::<String>())
+            }),
             // 1 where what the window last drew of this terminal is what its screen holds now.
+            "paintnote" => wrote(rest, &self.term.paint_note),
             "drawn" => self.terminal_by_id(id).map_or(0, |terminal| {
                 let now = terminal.with_screen(|screen| snapshot_sum(&screen.snapshot()));
                 isize::from(self.term.painted == (terminal.id, now))
@@ -186,6 +193,11 @@ impl App {
                     ("choose", number) => self.files_menu_choose(number.trim().parse().unwrap_or(usize::MAX)),
                     _ => self.files_menu_close(true),
                 }
+                1
+            }
+            // The window is drawn now, so that a picture taken after it is of what the screen holds and not of what the system last kept of the window.
+            "repaint" => {
+                RedrawWindow(self.window, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
                 1
             }
             _ => 0,
