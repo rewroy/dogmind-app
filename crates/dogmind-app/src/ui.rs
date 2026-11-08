@@ -302,6 +302,7 @@ const ID_UPDATE_OFFER: isize = 9906;
 const ID_RELEASE_OFFER: isize = 9907;
 const ID_TOGGLE_UPDATES: isize = 9908;
 const ID_TOGGLE_REMEMBER: isize = 9912;
+const ID_TOGGLE_KEEP: isize = 9913;
 const ID_SPEED_FIRST: isize = 9909;
 const ID_NOTICE_LATER: isize = 9910;
 const ID_GOAL_CLEAR: isize = 9911;
@@ -2025,6 +2026,8 @@ struct App {
     toggle_updates: HWND,
     /// "Remember on this PC", for the key of encrypted conversations.
     toggle_remember: HWND,
+    /// "Keep the conversation's state for the next start", on the Privacy page.
+    toggle_keep: HWND,
     read_folder_add: HWND,
     read_folder_stop: HWND,
     read_folder_remove: Vec<HWND>,
@@ -6532,7 +6535,7 @@ impl App {
         all.push(self.vision_delete);
         all.extend(self.read_folder_remove.iter().copied());
         all.extend([self.read_folder_add, self.read_folder_stop]);
-        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_compact, self.toggle_updates, self.toggle_remember, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
+        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_compact, self.toggle_updates, self.toggle_remember, self.toggle_keep, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
         all
     }
 
@@ -7065,6 +7068,12 @@ impl App {
                     form.toggle(t("Remember on this PC"), self.toggle_remember);
                     form.note(t("With this on, Dogmind asks for nothing when it starts on this PC. The passphrase and the recovery code still open the conversations on another PC, or after Windows is installed again."), theme::muted());
                     form.buttons(0, &[self.buttons[0], self.buttons[1], self.buttons[2]]);
+                }
+                form.toggle(t("Keep the conversation's state for the next start"), self.toggle_keep);
+                if self.keep_conversation_allowed() {
+                    form.note(t("When the app stops the engine, the engine keeps the state of the conversation it held, so that its next start goes on from it and does not read the conversation again. The state is sealed for this Windows account, as the engine's other saved state is."), theme::muted());
+                } else {
+                    form.note(t("Off: the conversations are encrypted and not remembered on this PC, and a state sealed for the Windows account would be readable without the passphrase. Tick Remember on this PC to allow it."), theme::muted());
                 }
                 form.note(t("Not encrypted: the files of your workspaces and the copies kept to undo an edit (they lie in the workspace as they are), the timing records of a session (counts, times and names, never what was said), and the settings."), theme::muted());
                 form.note(&log, log_color);
@@ -9111,9 +9120,11 @@ impl App {
     }
 
     unsafe fn update_toggles(&self) {
-        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_updates, self.settings.check_for_updates), (self.toggle_remember, self.crypt.remember)] {
+        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_updates, self.settings.check_for_updates), (self.toggle_remember, self.crypt.remember), (self.toggle_keep, self.keep_conversation_on())] {
             set_button_style(toggle, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         }
+        // (where the encryption does not allow it, the switch cannot be turned on: the line under it says why)
+        EnableWindow(self.toggle_keep, i32::from(self.keep_conversation_allowed()));
         for (at, (segment, (known, name))) in self.theme_segments.iter().zip(THEMES).enumerate() {
             set_text(*segment, t(if at == 0 { "System" } else { name }));
             set_button_style(*segment, if self.settings.theme == known { ButtonKind::SegmentOn } else { ButtonKind::Segment }, theme::surface());
@@ -9974,6 +9985,8 @@ impl App {
         RedrawWindow(self.window, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
         let (poster, data, settings) = (self.poster.clone(), self.folder.clone(), self.settings.clone());
         std::thread::spawn(move || {
+            // (an engine that keeps the conversation's state ends on its own account, up to 20 seconds after it was asked)
+            engine::wait_for_endings();
             // (what the agents were doing ends with them, and only then is it not in use)
             std::thread::sleep(std::time::Duration::from_millis(1500));
             let mut problems = Vec::new();
@@ -10159,6 +10172,7 @@ impl App {
         self.engine = None;
         let (poster, config) = (self.poster.clone(), engine::config_path(&self.folder));
         std::thread::spawn(move || {
+            engine::wait_for_endings();
             // (the engine's end lets go of the file a moment after it has been told)
             let mut result = crate::vision::switch(&config, on);
             for _ in 0..30 {
@@ -10821,6 +10835,7 @@ impl App {
         if let Some(keystore) = &self.crypt.keystore {
             self.crypt.remember = keystore.is_remembered();
         }
+        self.settle_keep_conversation();
         let mut said = match (&outcome.error, outcome.job) {
             // (no key was made: nothing was changed, and there is nothing for a next start to finish)
             (Some(error), CryptJob::On) if outcome.cipher.is_none() => t(error).to_string(),
@@ -10957,7 +10972,44 @@ impl App {
             }
         }
         self.crypt.remember = on;
+        self.settle_keep_conversation();
+        self.layout();
+    }
+
+    /// Whether the engine may keep the conversation's state for the next start: as the encryption of the conversations says (`settings::keep_conversation_allowed`).
+    fn keep_conversation_allowed(&self) -> bool {
+        self.keep_conversation_after(true)
+    }
+
+    /// `chosen`, where the encryption of the conversations allows it.
+    fn keep_conversation_after(&self, chosen: bool) -> bool {
+        let encrypted = self.crypt.keystore.is_some() || self.crypt.damaged.is_some();
+        crate::settings::keep_conversation_after(chosen, encrypted, self.crypt.keystore.as_ref().is_some_and(Keystore::is_remembered))
+    }
+
+    /// The option as it stands: the person's choice, where the encryption allows it.
+    fn keep_conversation_on(&self) -> bool {
+        self.keep_conversation_after(self.settings.keep_conversation)
+    }
+
+    /// The option is turned off where the encryption does not allow it (conversations encrypted and the key not remembered on this PC): turning that
+    /// combination on turns the option off, and it stays off when the combination goes.
+    unsafe fn settle_keep_conversation(&mut self) {
+        if self.keep_conversation_on() != self.settings.keep_conversation {
+            self.settings.keep_conversation = false;
+            self.save();
+        }
         self.update_toggles();
+    }
+
+    unsafe fn keep_conversation_switched(&mut self) {
+        if !self.keep_conversation_allowed() {
+            return;
+        }
+        self.settings.keep_conversation = !self.settings.keep_conversation;
+        self.save();
+        self.update_toggles();
+        self.tip(self.toggle_keep, t("Takes effect when the engine starts again"));
         self.layout();
     }
 
@@ -11538,6 +11590,7 @@ impl App {
                     return;
                 }
                 self.engine = None;
+                self.settle_keep_conversation();
                 let (settings, folder) = (self.settings.clone(), self.folder.clone());
                 std::thread::spawn(move || {
                     let mut say = |text: String| poster.send(Note::Status(generation, text));
@@ -13192,6 +13245,7 @@ impl App {
         self.show_setup_status(first_words);
         let (poster, cancel) = (self.poster.clone(), self.setup_cancel.clone());
         std::thread::spawn(move || {
+            engine::wait_for_endings();
             let (lines, seen) = channel();
             let forward = poster.clone();
             let relay = std::thread::spawn(move || {
@@ -15027,6 +15081,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 ID_TOGGLE_UPDATES => app.updates_switched(),
                 ID_TOGGLE_REMEMBER => app.crypt_remember_switched(),
+                ID_TOGGLE_KEEP => app.keep_conversation_switched(),
                 ID_VISION_OFFER => match app.vision_offer {
                     _ if app.setting_up && app.vision_fetch => app.setup_cancel.store(true, Ordering::Relaxed),
                     Some(VisionOffer::Download(_)) => app.start_vision_setup(),
@@ -15233,9 +15288,23 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             }
             0
         }
+        // Windows asks whether the session may end. An engine that keeps the conversation's state is given the time it needs: the system is told why it
+        // waits, and the engine is asked to stop when the session does end (below).
+        WM_QUERYENDSESSION => {
+            if app.engine.as_ref().is_some_and(Engine::stops_gracefully) {
+                let reason = crate::paint::wide(t("Dogmind is keeping the conversation for the next start"));
+                windows_sys::Win32::System::Shutdown::ShutdownBlockReasonCreate(window, reason.as_ptr());
+            }
+            1
+        }
         // Windows is ending: as if it had been quit.
         WM_ENDSESSION if wparam != 0 => {
             DestroyWindow(window);
+            0
+        }
+        // (and not after all)
+        WM_ENDSESSION => {
+            windows_sys::Win32::System::Shutdown::ShutdownBlockReasonDestroy(window);
             0
         }
         _ if message == app.please_quit => {
@@ -15265,6 +15334,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 let _ = parked.agent.commands.send(Command::Quit);
             }
             app.engine = None;
+            // (an engine that keeps the conversation's state ends on its own account, up to 20 seconds after it was asked; this app does not go before it has)
+            ShowWindow(window, SW_HIDE);
+            engine::wait_for_endings();
+            windows_sys::Win32::System::Shutdown::ShutdownBlockReasonDestroy(window);
             // (before the controls go, after this: the document holds the text services, and they hold the control's host, which goes with
             // its window whether anything holds it or not)
             release_document(std::mem::replace(&mut app.transcript_document, std::ptr::null_mut()));
@@ -16243,6 +16316,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             release_ready_closed: false,
             toggle_updates: make_button(pane, ID_TOGGLE_UPDATES, "", ButtonKind::Toggle, theme::background()),
             toggle_remember: make_button(pane, ID_TOGGLE_REMEMBER, "", ButtonKind::Toggle, theme::background()),
+            toggle_keep: make_button(pane, ID_TOGGLE_KEEP, "", ButtonKind::Toggle, theme::background()),
             update_declined: None,
             restart_when_done: false,
             checking_setup: false,
