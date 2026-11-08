@@ -26,6 +26,7 @@ mod render;
 mod rtf;
 mod table;
 mod settings;
+mod steps;
 mod term;
 mod textview;
 mod toolrun;

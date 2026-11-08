@@ -62,7 +62,10 @@ use crate::markdown;
 use crate::settings::{self, Kind, ProviderConfig, Settings, TEXT_SIZES};
 
 mod files_panel;
+mod helper_view;
 mod term_panel;
+
+use helper_view::{HelperLive, StepsView};
 
 const WM_WAKE: u32 = WM_APP + 1;
 const WM_PREVIEW_MADE: u32 = WM_APP + 2;
@@ -237,6 +240,8 @@ const ID_TOGGLE_LANGUAGE: isize = 46;
 const ID_PREVIEW_RELOAD: isize = 9047;
 const ID_PREVIEW_BROWSER: isize = 9048;
 const ID_PREVIEW_CLOSE: isize = 9049;
+/// The button that puts away a helper's steps from the panel on the right.
+const ID_STEPS_CLOSE: isize = 9072;
 const ID_PROVIDER_UP: isize = 9050;
 const ID_FOLDER_CHIP: isize = 9052;
 const ID_TOGGLE_DISPLAY: isize = 9054;
@@ -1013,6 +1018,12 @@ enum CardAct {
     OpenFile(u64, usize),
     /// All the files of an answer, on the Changes page.
     MoreFiles(u64),
+    /// Nothing: a line of a card that only says something.
+    None,
+    /// Stop the helper of this call, and it alone.
+    StopHelper(String),
+    /// Show the steps of the helper of this call in the panel on the right.
+    OpenHelper(String),
 }
 
 /// One control of a card, on a row of its room.
@@ -1031,6 +1042,8 @@ struct CardSlot {
     start: i32,
     parts: Vec<CardPart>,
     tall: i32,
+    /// The call whose helper's card this row is of, and which row of it: the words of its first part are changed where they stand as the helper works (`helper_refresh`).
+    owner: Option<(String, usize)>,
 }
 
 /// What the trajectory page shows: the session's turns, which of them are open, and the rows of the table as that makes them.
@@ -1380,6 +1393,8 @@ struct Parked {
     /// What it has going or waiting in the background, as its agent last said, and when that was said.
     waiting: Waiting,
     waiting_taken: std::time::Instant,
+    /// The cards of its helpers at work, and when each was last heard from.
+    helpers: Vec<(Card, std::time::Instant)>,
 }
 
 #[derive(Clone)]
@@ -2143,6 +2158,12 @@ struct App {
     preview_reload: HWND,
     preview_browser: HWND,
     preview_close: HWND,
+    /// The steps of a helper, shown in the panel on the right in place of what it showed ("Show its steps"): the page, its window, and the button that puts it away.
+    steps: Option<StepsView>,
+    steps_view: HWND,
+    steps_close: HWND,
+    /// The helpers at work in this session, by their call.
+    helpers_live: HashMap<String, HelperLive>,
     todos: Vec<serde_json::Value>,
     git: Option<GitInfo>,
     /// Web content is in this conversation, so a command that gets the network asks.
@@ -4573,7 +4594,16 @@ impl App {
         let first = self.insert_rtf(rtf::spacer_row(self.text_twips, self.text_twips, twips, theme::code_back(), (260, 0), false), None);
         if !parts.is_empty() {
             let start = text_start(self.transcript, first);
-            self.card_slots.push(CardSlot { start, parts, tall });
+            self.card_slots.push(CardSlot { start, parts, tall, owner: None });
+        }
+    }
+
+    /// A row of a helper's card that is changed as the helper works: `row` is its place among those of its call.
+    unsafe fn card_room_owned(&mut self, tall: i32, parts: Vec<CardPart>, call: &str, row: usize) {
+        let before = self.card_slots.len();
+        self.card_room(tall, parts);
+        if let Some(slot) = self.card_slots.get_mut(before) {
+            slot.owner = Some((call.to_string(), row));
         }
     }
 
@@ -4582,7 +4612,7 @@ impl App {
     unsafe fn write_card(&mut self, card: &Card) {
         let recording = !self.replaying;
         // (a question or a plan is for the person, and is seen: the view goes to it. The files an answer changed come under it, and the view goes there only if it was at the end; a notice is the same)
-        let attention = !matches!(card, Card::Files { .. } | Card::Notice { .. });
+        let attention = !matches!(card, Card::Files { .. } | Card::Notice { .. } | Card::Helper { .. });
         let at_the_end = recording && !self.opening && self.transcript_at_end();
         if recording {
             self.close_run();
@@ -4649,6 +4679,34 @@ impl App {
                     self.card_row(&[&row.title], 10, theme::accent(), 34, false);
                     self.card_row(&[&row.what], 11, theme::text(), 30, false);
                     self.card_row(&[&row.how], 10, if row.failed { theme::warn() } else { theme::muted() }, 44, false);
+                }
+                self.card_room(s(12), Vec::new());
+            }
+            Card::Helper { call, task, number, state } => {
+                // What a helper is doing, in a card of its own: its task in one line, and while it works where it is with Stop beside it and the last things it read or searched in rows that keep
+                // their height (so that they are changed where they stand); once it is over, how it went and the way to its steps.
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                self.card_row(&[t("Helper")], 8, theme::muted(), 26, false);
+                self.card_room(s(26), vec![CardPart { text: task.clone(), kind: ButtonKind::Task, act: CardAct::None, width: 0, tip: task.clone() }]);
+                match state {
+                    cards::HelperState::Working { .. } => {
+                        let since = self.helpers_live.get(call).map_or(0, |live| live.told_at.elapsed().as_millis() as u64);
+                        let parts = self.helper_status_parts(call, state, since);
+                        self.card_room_owned(s(ds::size::CONTROL), parts, call, 0);
+                        for (at, line) in cards::helper_recent(state).into_iter().enumerate() {
+                            self.card_room_owned(s(22), vec![CardPart { text: line, kind: ButtonKind::Note, act: CardAct::None, width: 0, tip: String::new() }], call, at + 1);
+                        }
+                    }
+                    _ => {
+                        if let Some((words, good)) = cards::helper_outcome(state) {
+                            self.card_row(&[&words], 10, if good { theme::accent() } else { theme::warn() }, 40, false);
+                        }
+                        if number.is_some() {
+                            let show = t("Show its steps");
+                            let part = CardPart { text: show.to_string(), kind: ButtonKind::Secondary, act: CardAct::OpenHelper(call.clone()), width: text_width(self.fonts.strong, show) + s(ds::size::BUTTON_PADDING), tip: t("Show what it read and searched, in the panel on the right").to_string() };
+                            self.card_room(s(ds::size::CONTROL), vec![part]);
+                        }
+                    }
                 }
                 self.card_room(s(12), Vec::new());
             }
@@ -4719,6 +4777,8 @@ impl App {
                 _ => {}
             }
         }
+        // (a helper still at work when its turn is over is not)
+        changed |= self.helpers_settle();
         if changed {
             self.reset_composer_cue();
             self.reflow();
@@ -4865,6 +4925,9 @@ impl App {
             CardAct::OpenDiff(turn, at) => self.open_turn_diff(turn, at),
             CardAct::OpenFile(turn, at) => self.open_turn_file(turn, at),
             CardAct::MoreFiles(turn) => self.open_turn_diff(turn, 0),
+            CardAct::None => {}
+            CardAct::StopHelper(call) => self.helper_stop_pressed(&call),
+            CardAct::OpenHelper(call) => self.steps_open(&call),
         }
     }
 
@@ -5865,7 +5928,7 @@ impl App {
         let bare = self.onboarding;
         // (a small window gives what it can to the conversation)
         let looking_at_changes = self.panel == Panel::Diff;
-        let squeezed = looking_at_changes || (chat && !bare && self.preview_file.is_some() && width - s(ds::size::SIDEBAR_SMALL) < s(760));
+        let squeezed = looking_at_changes || (chat && !bare && (self.preview_file.is_some() || self.steps.is_some()) && width - s(ds::size::SIDEBAR_SMALL) < s(760));
         let sidebar = if bare || (squeezed && !looking_at_changes) { 0 } else if width < s(960) { s(ds::size::SIDEBAR_SMALL) } else { s(ds::size::SIDEBAR) };
         // (the trajectory's table has the whole window: there is no sidebar to fill)
         self.sidebar_width = if looking_at_changes && self.trajectory.is_some() { 0 } else { sidebar };
@@ -5896,9 +5959,9 @@ impl App {
         // (always there while it is on and there is room: it is also where the engine's dashboard is reached from)
         let right = if !chat || bare {
             0
-        } else if self.preview_file.is_some() && room >= s(760) {
+        } else if (self.preview_file.is_some() || self.steps.is_some()) && room >= s(760) {
             (room / 2).max(s(380))
-        } else if self.preview_file.is_none() && self.settings.right_panel && room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS) {
+        } else if self.preview_file.is_none() && (self.settings.right_panel || self.steps.is_some()) && room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS) {
             // (a terminal wants columns: nearly half of what the sidebar leaves, as far as the conversation can spare it)
             let wanted = if self.settings.right_view == RightView::Terminal { (room * 45 / 100).clamp(s(ds::size::RIGHT_PANEL), s(TERMINAL_PANEL_MOST)) } else { s(ds::size::RIGHT_PANEL) };
             wanted.min(room - s(RIGHT_NEEDS))
@@ -5926,11 +5989,16 @@ impl App {
                 ShowWindow(button, SW_HIDE);
             }
         }
+        if self.steps.is_none() || right == 0 {
+            for window in [self.steps_view, self.steps_close] {
+                ShowWindow(window, SW_HIDE);
+            }
+        }
         if right > 0 {
             self.layout_right(&mut shapes, width - right + s(ds::size::RIGHT_GAP), right - 2 * s(ds::size::RIGHT_GAP), height);
         }
         // (no switch for what could not show)
-        let toggles = chat && !bare && (self.preview_file.is_some() || room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS));
+        let toggles = chat && !bare && (self.preview_file.is_some() || self.steps.is_some() || room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS));
         show(self.right_toggle, toggles);
         show(self.folder_chip, chat && !bare);
 
@@ -7368,6 +7436,7 @@ impl App {
         self.preview_written = preview::newest_beside(&file);
         self.preview_loaded = 0;
         self.preview_gone = false;
+        self.steps = None;
         self.preview_file = Some(file.clone());
         self.preview_root = Some(root.clone());
         self.preview_blocked = 0;
@@ -7596,6 +7665,10 @@ impl App {
     unsafe fn layout_right(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, height: i32) {
         if self.preview_file.is_some() {
             self.layout_preview(shapes, x, width, height);
+            return;
+        }
+        if self.steps.is_some() {
+            self.layout_steps(shapes, x, width, height);
             return;
         }
         let dpi = self.dpi;
@@ -10480,6 +10553,7 @@ impl App {
         let (handle, events) = self.spawn_agent();
         let agent = std::mem::replace(&mut self.agent, handle);
         let events = std::mem::replace(&mut self.events, events);
+        let helpers = self.take_live_helpers();
         self.parked.push(Parked {
             path: self.current_session.clone(),
             workspace: self.workspace.clone(),
@@ -10507,6 +10581,7 @@ impl App {
             woken: std::mem::take(&mut self.woken_turn),
             waiting: std::mem::take(&mut self.waiting),
             waiting_taken: self.waiting_taken,
+            helpers,
         });
         self.running = false;
         self.stop_asked = false;
@@ -10582,8 +10657,11 @@ impl App {
             let shown = crate::mask::hide_keys(&self.answer).into_owned();
             self.append_answer(&shown);
         }
+        // (the helpers it has at work have their cards, and are not rows of the calls)
+        let helping: Vec<String> = parked.helpers.iter().filter_map(|(card, _)| card.helper_call().map(str::to_string)).collect();
+        self.restore_live_helpers(parked.helpers);
         // (the calls it has under way, which its file does not know of yet)
-        let running: Vec<RunEntry> = self.tools_running.iter().filter(|(_, (tool, _))| !cards::is_asking(tool)).map(|(id, (tool, summary))| RunEntry::running(id.clone(), tool.clone(), summary.clone())).collect();
+        let running: Vec<RunEntry> = self.tools_running.iter().filter(|(id, (tool, _))| !cards::is_asking(tool) && !helping.iter().any(|call| call == *id)).map(|(id, (tool, summary))| RunEntry::running(id.clone(), tool.clone(), summary.clone())).collect();
         if self.settings.compact_tools && !running.is_empty() {
             let at = self.open_run();
             self.runs[at].entries = running;
@@ -11861,6 +11939,9 @@ impl App {
 
     unsafe fn show_transcript(&mut self, messages: &[Message]) {
         set_text(self.transcript, "");
+        // (what the panel on the right showed of the session before is of it)
+        self.steps = None;
+        self.helpers_live.clear();
         self.shown.clear();
         self.answers.clear();
         self.user_cards.clear();
@@ -11939,12 +12020,13 @@ impl App {
                         self.mark_answer(text, &written_words(message));
                     }
                     for call in message.tool_calls.iter().flatten() {
-                        // A question put to the person, and a plan, are cards of their own, with what came of them.
+                        // A question put to the person, a plan and a helper's look are cards of their own, with what came of them.
+                        if let Some((_, card)) = kept_cards.iter().find(|(id, _)| *id == call.id) {
+                            self.flush_told_calls(&mut told);
+                            self.write_card(card);
+                            continue;
+                        }
                         if cards::is_asking(&call.function.name) {
-                            if let Some((_, card)) = kept_cards.iter().find(|(id, _)| *id == call.id) {
-                                self.flush_told_calls(&mut told);
-                                self.write_card(card);
-                            }
                             continue;
                         }
                         // A session at work has calls still running, or still waiting for an answer: they say so when they end.
@@ -12011,6 +12093,18 @@ impl App {
             Event::ToolEnded { id, .. } => {
                 parked.tools_running.remove(&id);
             }
+            Event::HelperStarted { id, task, file, .. } => {
+                let number = file.as_deref().and_then(|name| session::helper_number(Path::new(name)));
+                parked.helpers.push((Card::helper_begun(&id, &task, number), std::time::Instant::now()));
+            }
+            Event::HelperStep { id, step, most, tool, summary, tokens, elapsed } => {
+                if let Some((card, told_at)) = parked.helpers.iter_mut().find(|(card, _)| card.helper_call() == Some(id.as_str())) {
+                    card.helper_step(step, most, &tool, &summary, tokens, elapsed.as_millis() as u64);
+                    *told_at = std::time::Instant::now();
+                }
+            }
+            // (a helper that ended while it was out of sight is in the file the session is shown from)
+            Event::HelperEnded { id, .. } => parked.helpers.retain(|(card, _)| card.helper_call() != Some(id.as_str())),
             Event::TurnStarted => parked.running = true,
             Event::Woken(_) => {
                 parked.running = true;
@@ -12383,15 +12477,20 @@ impl App {
                     self.tools_running.insert(id, (tool, summary));
                 }
             }
-            // (a look by a helper takes minutes: what it is reading now says it is getting somewhere)
-            Event::HelperStep { tool, summary, .. } => {
-                let summary: String = summary.chars().take(120).collect();
-                self.set_activity(format!("{} — {}  {summary}", t(tool_name("explore")), t(tool_name(&tool))));
-            }
-            Event::HelperStarted { .. } | Event::HelperEnded { .. } => {}
+            // (a look by a helper takes minutes: its card says what it is on, and how long it has gone on)
+            Event::HelperStarted { id, task, file, .. } => self.helper_begin(id, task, file),
+            Event::HelperStep { id, step, most, tool, summary, tokens, elapsed } => self.helper_step_told(&id, step, most, &tool, &summary, tokens, elapsed),
+            Event::HelperEnded { id, how, steps, files, tokens, elapsed, helper } => self.helper_end_told(&id, &how, steps, files, tokens, elapsed, helper.map(|helper| helper.number)),
             Event::ToolEnded { id, .. } if self.tools_running.get(&id).is_some_and(|(tool, _)| cards::is_asking(tool)) => {
                 self.tools_running.remove(&id);
                 if self.tools_running.is_empty() && !self.waits_for_person() {
+                    self.set_activity(t("Thinking…").into());
+                }
+            }
+            // (a helper's call has its card: what the call came to is said there, and not in a row of the calls)
+            Event::ToolEnded { id, .. } if self.tools_running.get(&id).is_some_and(|(tool, _)| tool == "explore") && self.has_helper_card(&id) => {
+                self.tools_running.remove(&id);
+                if self.tools_running.is_empty() || !self.settings.compact_tools {
                     self.set_activity(t("Thinking…").into());
                 }
             }
@@ -13651,6 +13750,7 @@ impl App {
             (self.preview_reload, t("Reload")),
             (self.preview_browser, t("Open in browser")),
             (self.preview_close, t("Close the preview")),
+            (self.steps_close, t("Close the steps")),
             (self.find_previous, t("Previous")),
             (self.find_next, t("Next")),
             (self.find_close, t("Close")),
@@ -14902,6 +15002,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         WM_TIMER if wparam == TIMER_DOTS => {
             app.rate_tick();
             app.run_tick();
+            app.helper_tick();
             app.spinner_tick();
             0
         }
@@ -15037,6 +15138,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_PREVIEW_CLOSE => app.close_preview(),
+                ID_STEPS_CLOSE => app.steps_close(),
                 ID_FIND_PREVIOUS => app.find_go(false),
                 ID_FIND_NEXT => app.find_go(true),
                 ID_FIND_CLOSE => app.close_find(),
@@ -15370,6 +15472,13 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
     }
     if message.message == WM_LBUTTONDOWN {
         keys_in_use(false);
+    }
+    if message.message == WM_MOUSEWHEEL && app.panel == Panel::Chat && app.steps.is_some() {
+        let (x, y) = ((message.lParam & 0xFFFF) as i16 as i32, ((message.lParam >> 16) & 0xFFFF) as i16 as i32);
+        if WindowFromPoint(POINT { x, y }) == app.steps_view {
+            app.steps_wheel(message.wParam);
+            return true;
+        }
     }
     if message.message == WM_MOUSEWHEEL && app.panel == Panel::Diff {
         let (x, y) = ((message.lParam & 0xFFFF) as i16 as i32, ((message.lParam >> 16) & 0xFFFF) as i16 as i32);
@@ -16173,6 +16282,10 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let class = WNDCLASSW { lpfnWndProc: Some(diff_procedure), hInstance: instance, lpszClassName: diff_class.as_ptr(), hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW), ..std::mem::zeroed() };
         RegisterClassW(&class);
         let diff_view = CreateWindowExW(0, diff_class.as_ptr(), std::ptr::null(), WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 0, 0, window, std::ptr::null_mut(), instance, std::ptr::null());
+        let steps_class = wide("DogSteps");
+        let class = WNDCLASSW { lpfnWndProc: Some(helper_view::steps_procedure), hInstance: instance, lpszClassName: steps_class.as_ptr(), hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW), ..std::mem::zeroed() };
+        RegisterClassW(&class);
+        let steps_view = CreateWindowExW(0, steps_class.as_ptr(), std::ptr::null(), WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP, 0, 0, 0, 0, window, std::ptr::null_mut(), instance, std::ptr::null());
         let (modal_class, pane_class) = (wide("DogModal"), wide("DogPane"));
         for name in [&modal_class, &pane_class] {
             let class = WNDCLASSW { lpfnWndProc: Some(modal_procedure), hInstance: instance, lpszClassName: name.as_ptr(), hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW), ..std::mem::zeroed() };
@@ -16416,6 +16529,10 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             preview_reload: make_button(window, ID_PREVIEW_RELOAD, "rotate-cw", ButtonKind::Icon, theme::sidebar()),
             preview_browser: make_button(window, ID_PREVIEW_BROWSER, "external-link", ButtonKind::Icon, theme::sidebar()),
             preview_close: make_button(window, ID_PREVIEW_CLOSE, "x", ButtonKind::Icon, theme::sidebar()),
+            steps: None,
+            steps_view,
+            steps_close: make_button(window, ID_STEPS_CLOSE, "x", ButtonKind::Icon, theme::sidebar()),
+            helpers_live: HashMap::new(),
             todos: Vec::new(),
             git: None,
             web_seen: false,

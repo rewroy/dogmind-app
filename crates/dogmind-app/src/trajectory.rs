@@ -113,6 +113,9 @@ fn request_row(request: &RequestRow) -> Row {
     if let Some((of, why)) = &request.retry_of {
         parts.push(tf("repeats {0} ({1})", &[of, why]));
     }
+    if let Some(file) = &request.helper_file {
+        parts.push(tf("its steps are in {0}", &[file]));
+    }
     let first = request.first_ms.unwrap_or(0);
     Row {
         kind: RowKind::Request,
