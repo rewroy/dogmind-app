@@ -68,8 +68,21 @@ function Start-App {
 }
 function Stop-App($a) { if ($a -and $a.Process -and -not $a.Process.HasExited) { Stop-Process -Id $a.Process.Id -Force -Confirm:$false -EA SilentlyContinue } }
 function Shot($a, [string]$Name, [int]$Flag = 3) {
+  # (the app draws first: the system keeps what a window last drew, and a picture taken in the moment after a change can be of the one before)
+  if ($env:DOGMIND_TEST_TERMINAL) { [void][Hook]::Send($a.Window, 'repaint'); Start-Sleep -Milliseconds 250 }
   $r = New-Object UI+RECT; if ($Flag -band 1) { [void][UI]::GetClientRect($a.Window, [ref]$r) } else { [void][UI]::GetWindowRect($a.Window, [ref]$r) }
-  $b = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T); $g = [System.Drawing.Graphics]::FromImage($b); $d = $g.GetHdc(); [void][UI]::PrintWindow($a.Window, $d, $Flag); $g.ReleaseHdc($d); $g.Dispose()
+  $b = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T); $g = [System.Drawing.Graphics]::FromImage($b); $d = $g.GetHdc(); [void][UI]::PrintWindow($a.Window, $d, $Flag); $g.ReleaseHdc($d)
+  # The terminal's window is asked for its own picture (it draws itself on the device it is given), and put where it stands: of what it holds now, and not of what the system last composed of it.
+  $term = [UI]::Kids($a.Window) | ? { [UI]::Cls($_) -eq 'DogTerm' -and [UI]::IsWindowVisible($_) } | Select-Object -First 1
+  if ($term) {
+    $own = New-Object UI+RECT; [void][UI]::GetClientRect($term, [ref]$own)
+    $corner = New-Object UI+POINT; [void][UI]::ClientToScreen($term, [ref]$corner)
+    $origin = New-Object UI+POINT; [void][UI]::ClientToScreen($a.Window, [ref]$origin)
+    $piece = New-Object System.Drawing.Bitmap $own.R, $own.B
+    $pg = [System.Drawing.Graphics]::FromImage($piece); $pd = $pg.GetHdc(); [void][UI]::PrintWindow($term, $pd, 1); $pg.ReleaseHdc($pd); $pg.Dispose()
+    $g.DrawImage($piece, ($corner.X - $origin.X), ($corner.Y - $origin.Y)); $piece.Dispose()
+  }
+  $g.Dispose()
   $file = "$Shots\$Name.png"; $b.Save($file, [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose(); $file
 }
 function Kids($a) { @([UI]::Kids($a.Window)) }
@@ -117,4 +130,21 @@ function Term-Wait($a, [int]$Id, [scriptblock]$Test, [int]$Seconds = 20) {
   $false
 }
 
+
+
+
+
+
+# What a hook says of a terminal, as a table of its words.
+function Info($a, $id) { $h = @{}; foreach ($l in (Term-Read $a "info $id" 'info.txt') -split "`r?`n") { if ($l -match '^(\w+)=(.*)$') { $h[$Matches[1]] = $Matches[2] } }; $h }
+# How many pixels of a row of cells in a picture of the app have a colour (not a grey): the row, the picture, the terminal's place in the window and the size of a cell.
+function Colourful([string]$File, [int]$Row, $Info) {
+  $win = ($Info.window -replace '[()]', '') -split ', '; $cell = $Info.cell -split 'x'
+  $src = [System.Drawing.Image]::FromFile($File)
+  $crop = [System.Drawing.Rectangle]::new([int]$win[0] + 6, [int]$win[1] + 6 + $Row * [int]$cell[1], [int]$win[2] - 12, [int]$cell[1])
+  $bmp = New-Object System.Drawing.Bitmap $crop.Width, $crop.Height
+  $g = [System.Drawing.Graphics]::FromImage($bmp); $g.DrawImage($src, (New-Object System.Drawing.Rectangle 0, 0, $bmp.Width, $bmp.Height), $crop, 'Pixel'); $g.Dispose()
+  $count = 0; for ($y = 0; $y -lt $bmp.Height; $y++) { for ($x = 0; $x -lt $bmp.Width; $x++) { $p = $bmp.GetPixel($x, $y); if ([Math]::Abs($p.R - $p.G) -gt 60 -or [Math]::Abs($p.G - $p.B) -gt 60) { $count++ } } }
+  $bmp.Dispose(); $src.Dispose(); $count
+}
 

@@ -30,14 +30,19 @@ foreach ($theme in 'dark', 'light') {
   Check "the $shell prompt came ($theme)" $ok
   $esc = '$e=[char]27; '
   Term $a ('input {0} {1}"$e[31mred$e[32m green$e[33m yellow$e[34m blue$e[35m magenta$e[36m cyan$e[0m  $e[1;31mBOLDRED$e[0m $e[38;5;208morange256$e[0m $e[38;2;80;160;255mtruecolor$e[0m $e[4munderline$e[0m $e[7minverse$e[0m $e[41m redbg $e[0m"\r' -f $id, $esc) | Out-Null
-  $ok = Term-Wait $a $id { param($g) $g -match 'truecolor' }
+  $ok = Term-Wait $a $id { param($g) ($g -replace "`r?`n", '') -match 'truecolor' }
   Check "colours were written ($theme)" $ok
   Term $a ('input {0} "日本語の出力 あいう|"; "abcdef|"\r' -f $id) | Out-Null
   $ok = Term-Wait $a $id { param($g) $g -match 'あいう\|' }
   Check "Japanese was written ($theme)" $ok
   Start-Sleep -Milliseconds 500
   $d0 = Term $a "drawn $id"
-  Shot $a "term-3-powershell-$theme" | Out-Null
+  $png = Shot $a "term-3-powershell-$theme"
+  # The coloured line is in the picture: its row, from what the screen has, and how many pixels of it are not grey; a picture taken again a moment later if it is not (and how many times it took is said).
+  $view = (Term-Read $a "view $id" 'v.txt') -split "`r?`n"; $row = @(0..($view.Count - 1) | ? { $view[$_] -like 'red green*' })[0]
+  $tries = 0; $count = Colourful $png $row (Info $a $id)
+  while ($count -lt 300 -and $tries -lt 4) { $tries++; Start-Sleep -Milliseconds 800; $png = Shot $a "term-3-powershell-$theme"; $count = Colourful $png $row (Info $a $id) }
+  Check "the picture of the colours has them ($theme)" ($count -ge 300) "row $row, $count coloured pixels, picture taken again $tries times"
   $d1 = Term $a "drawn $id"
   Check "the window shows what the screen holds ($theme)" ($d0 -eq 1) "before the shot $d0, after $d1"
   # an exited shell
@@ -69,6 +74,8 @@ Shot $a "term-10-own-scale" | Out-Null
 Stop-App $a
 $results | ConvertTo-Json | Set-Content "$S\out\results-shots.json"
 "{0} checks, {1} failed" -f $results.Count, @($results | ? { -not $_.Ok }).Count
+
+
 
 
 

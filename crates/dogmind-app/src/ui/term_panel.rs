@@ -91,6 +91,9 @@ pub(super) struct TermView {
     area: (i32, i32, i32, i32),
     /// What was last drawn: the terminal, and a sum of the cells (for a test to say that what is on screen is what the screen holds).
     painted: (u64, u64),
+    /// What the last paint made of the terminal, for a test to read.
+    #[cfg(debug_assertions)]
+    paint_note: String,
     /// The window's element for a reader of the screen, once one has asked, and what it was last told: a sum of the text and where the cursor was; a moment is being waited for.
     element: Option<windows::Win32::UI::Accessibility::IRawElementProviderSimple>,
     told: (u64, usize),
@@ -132,6 +135,8 @@ impl TermView {
             forced_focus: false,
             area: (0, 0, 0, 0),
             painted: (0, 0),
+            #[cfg(debug_assertions)]
+            paint_note: String::new(),
             element: None,
             told: (0, 0),
             told_soon: false,
@@ -957,7 +962,12 @@ impl App {
         });
         let drawn_of = (terminal.id, snapshot_sum(&snapshot));
         let scene = scene_of(&snapshot, focused && terminal.exit_code().is_none(), light, scale(self.dpi, PAD), (client.right, client.bottom), self.dpi);
-        if !render::terminal(device, client, &font, &scene) {
+        let ok = render::terminal(device, client, &font, &scene);
+        #[cfg(debug_assertions)]
+        {
+            self.term.paint_note = format!("ok={ok} runs={} first_red={:?} device={:?} client={:?}", scene.runs.len(), scene.runs.iter().find(|run| run.text == "red").map(|run| format!("{:06X}", run.color)), device, (client.right, client.bottom));
+        }
+        if !ok {
             let brush = CreateSolidBrush(ground);
             FillRect(device, &client, brush);
             DeleteObject(brush);
@@ -1246,6 +1256,15 @@ pub(super) unsafe extern "system" fn term_procedure(window: HWND, message: u32, 
         }
         WM_TIMER if wparam == TIMER_ACCESS => {
             app.terminal_tell_reader();
+            0
+        }
+        // Asked to draw itself on a device of someone else's (a picture of the window): what it holds now, there.
+        WM_PRINTCLIENT | WM_PRINT if wparam != 0 => {
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            if client.right > 0 && client.bottom > 0 {
+                app.paint_terminal(wparam as HDC, client);
+            }
             0
         }
         WM_PAINT => {
