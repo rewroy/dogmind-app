@@ -895,6 +895,12 @@ pub enum ButtonKind {
     Frame = 20,
     /// A control of no size and nothing drawn: what Tab reaches and a screen reader names for something that is drawn elsewhere (the icons in the transcript).
     Hidden = 21,
+    /// A line of small quiet words on a card, which nothing is done with: what a helper has just read.
+    Note = 22,
+    /// A line of the card's own words, in the colour of text: the task of a helper.
+    Task = 23,
+    /// A line with its words at the left and its figures at the right (the text's two parts are told apart by `PART`): where a helper is, and how long it has taken.
+    Status = 24,
 }
 
 /// The parts of the text of a button that has more than one are told apart by this.
@@ -1269,6 +1275,16 @@ unsafe fn draw_button_face(window: HWND, device: HDC, client: RECT, kind: isize,
                 FillRect(device, &line, brush);
                 DeleteObject(brush);
             }
+        }
+        22 => draw_text(device, label, client, fonts.small, theme::muted(), ONE_LINE),
+        23 => draw_text(device, label, client, fonts.body, theme::text(), ONE_LINE),
+        24 => {
+            let mut parts = label.split(PART);
+            let (words, figures) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            // (the figures keep their room whole, and the words give way to them)
+            let across = text_width(fonts.small, figures);
+            draw_text(device, figures, RECT { left: (client.right - across).max(client.left), ..client }, fonts.small, theme::muted(), DT_RIGHT | ONE_LINE);
+            draw_text(device, words, RECT { right: (client.right - across - s(design::space::M)).max(client.left), ..client }, fonts.strong, theme::text(), ONE_LINE);
         }
         18 => {
             let mut parts = label.split(PART);

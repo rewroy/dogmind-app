@@ -242,7 +242,7 @@ pub fn helper_file_of(parent: &Path, number: u32) -> PathBuf {
 }
 
 /// Which helper of its session a file is; none for any other file.
-fn helper_number(path: &Path) -> Option<u32> {
+pub fn helper_number(path: &Path) -> Option<u32> {
     let stem = path.file_name()?.to_str()?.strip_suffix(".jsonl")?;
     let (_, number) = stem.rsplit_once(HELPER_MARK)?;
     if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
