@@ -417,7 +417,9 @@ impl App {
         let rows = lines.len() + usize::from(cut > 0);
         let tall = rows as i32 * row + 2 * pad;
         if let Some(device) = device {
-            rounded(device, rect(x, y, width, tall), s(ds::radius::SMALL), Some(theme::code_back()), None);
+            // (the panel is the sidebar's colour, and a block of code in the light theme is nearly it: white sets it off, as it does a button here)
+            let back = if theme::is_light() { theme::surface() } else { theme::code_back() };
+            rounded(device, rect(x, y, width, tall), s(ds::radius::SMALL), Some(back), None);
             let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
             for (at, line) in lines.iter().enumerate() {
                 draw_text(device, &line.replace('\t', "    "), rect(x + pad, y + pad + at as i32 * row, width - 2 * pad, row), self.fonts.code, color, flags);
