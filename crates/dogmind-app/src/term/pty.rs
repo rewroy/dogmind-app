@@ -174,7 +174,8 @@ impl Pty {
             SetConsoleCtrlHandler(None, 0);
             let mut startup: STARTUPINFOEXW = std::mem::zeroed();
             startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-            // (none of this process's own standard handles go to the shell: it has the console's, and a process that was started with its output in a pipe would otherwise give the shell that pipe)
+            // (none of this process's own standard handles go to the shell: it has the console's, and a process that was started with its output in a pipe would otherwise give the shell that pipe.
+            // Invalid handles and null ones were both tried, and the shell is the same with either: its output is not redirected, it does virtual terminal, and programs colour for it)
             startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
             startup.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
             startup.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
