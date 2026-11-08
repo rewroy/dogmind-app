@@ -45,12 +45,19 @@ public static class UI {
 [void][UI]::SetThreadDpiAwarenessContext([IntPtr](-4))
 
 function Start-App {
-  param([string]$Exe = (Join-Path $PSScriptRoot '..\..\target\debug\dogmind-app.exe'), [string]$Data, [int]$Width = 1280, [int]$Height = 860, [hashtable]$Env = @{}, [string[]]$AppArgs = @())
+  param([string]$Exe = (Join-Path $PSScriptRoot '..\..\target\debug\dogmind-app.exe'), [string]$Data, [int]$Width = 1280, [int]$Height = 860, [hashtable]$Env = @{}, [string[]]$AppArgs = @(), [switch]$Piped)
   $saved = @{}
-  foreach ($k in @{ DOGMIND_DATA = $Data; DOGMIND_TEST_KEYS = '1'; DOGMIND_TEST_IGNORE_ENGINES = '1' }.GetEnumerator()) { $saved[$k.Key] = [Environment]::GetEnvironmentVariable($k.Key); [Environment]::SetEnvironmentVariable($k.Key, $k.Value) }
-  foreach ($k in $Env.GetEnumerator()) { $saved[$k.Key] = [Environment]::GetEnvironmentVariable($k.Key); [Environment]::SetEnvironmentVariable($k.Key, $k.Value) }
-  $p = if ($AppArgs.Count) { Start-Process $Exe -ArgumentList ($AppArgs | % { '"' + $_ + '"' }) -WindowStyle Hidden -PassThru } else { Start-Process $Exe -WindowStyle Hidden -PassThru }
-  foreach ($k in $saved.GetEnumerator()) { [Environment]::SetEnvironmentVariable($k.Key, $k.Value) }
+  # (a variable that is to be gone is removed: PowerShell gives .NET's SetEnvironmentVariable an empty text for a null, which leaves the variable there, empty, and PowerShell 7 takes an empty NO_COLOR as set)
+  function Set-Var([string]$Name, $Value) { if ($null -eq $Value) { Remove-Item "Env:$Name" -EA SilentlyContinue } else { [Environment]::SetEnvironmentVariable($Name, $Value) } }
+  # (NO_COLOR is not passed on unless a test gives it: a harness may have it set, and a shell that has it prints plain text, as it should)
+  foreach ($k in @{ DOGMIND_DATA = $Data; DOGMIND_TEST_KEYS = '1'; DOGMIND_TEST_IGNORE_ENGINES = '1'; NO_COLOR = $null }.GetEnumerator()) { $saved[$k.Key] = [Environment]::GetEnvironmentVariable($k.Key); Set-Var $k.Key $k.Value }
+  foreach ($k in $Env.GetEnumerator()) { $saved[$k.Key] = [Environment]::GetEnvironmentVariable($k.Key); Set-Var $k.Key $k.Value }
+  # -Piped: started with its standard input, output and error in files, as a program started from a pipe is: a shell it starts must not be given them.
+  if ($Piped) {
+    New-Item -ItemType Directory -Force "$script:S\out" | Out-Null; Set-Content "$script:S\out\app-stdin.txt" ''
+    $p = Start-Process $Exe -WindowStyle Hidden -PassThru -RedirectStandardInput "$script:S\out\app-stdin.txt" -RedirectStandardOutput "$script:S\out\app-stdout.txt" -RedirectStandardError "$script:S\out\app-stderr.txt"
+  } else { $p = if ($AppArgs.Count) { Start-Process $Exe -ArgumentList ($AppArgs | % { '"' + $_ + '"' }) -WindowStyle Hidden -PassThru } else { Start-Process $Exe -WindowStyle Hidden -PassThru } }
+  foreach ($k in $saved.GetEnumerator()) { Set-Var $k.Key $k.Value }
   $h = [IntPtr]::Zero; $t = Get-Date
   while ($h -eq [IntPtr]::Zero -and ((Get-Date) - $t).TotalSeconds -lt 20) { $h = [UI]::FindTop($p.Id, 'DogmindApp'); if ($h -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 20 } }
   if ($h -eq [IntPtr]::Zero) { Stop-Process -Id $p.Id -Force -Confirm:$false -EA SilentlyContinue; throw 'no window' }
@@ -137,14 +144,38 @@ function Term-Wait($a, [int]$Id, [scriptblock]$Test, [int]$Seconds = 20) {
 
 # What a hook says of a terminal, as a table of its words.
 function Info($a, $id) { $h = @{}; foreach ($l in (Term-Read $a "info $id" 'info.txt') -split "`r?`n") { if ($l -match '^(\w+)=(.*)$') { $h[$Matches[1]] = $Matches[2] } }; $h }
-# How many pixels of a row of cells in a picture of the app have a colour (not a grey): the row, the picture, the terminal's place in the window and the size of a cell.
-function Colourful([string]$File, [int]$Row, $Info) {
-  $win = ($Info.window -replace '[()]', '') -split ', '; $cell = $Info.cell -split 'x'
-  $src = [System.Drawing.Image]::FromFile($File)
-  $crop = [System.Drawing.Rectangle]::new([int]$win[0] + 6, [int]$win[1] + 6 + $Row * [int]$cell[1], [int]$win[2] - 12, [int]$cell[1])
-  $bmp = New-Object System.Drawing.Bitmap $crop.Width, $crop.Height
-  $g = [System.Drawing.Graphics]::FromImage($bmp); $g.DrawImage($src, (New-Object System.Drawing.Rectangle 0, 0, $bmp.Width, $bmp.Height), $crop, 'Pixel'); $g.Dispose()
-  $count = 0; for ($y = 0; $y -lt $bmp.Height; $y++) { for ($x = 0; $x -lt $bmp.Width; $x++) { $p = $bmp.GetPixel($x, $y); if ([Math]::Abs($p.R - $p.G) -gt 60 -or [Math]::Abs($p.G - $p.B) -gt 60) { $count++ } } }
-  $bmp.Dispose(); $src.Dispose(); $count
-}
 
+# What the pixels of a span of cells in a picture of the app show (the picture, the terminal's place in the window and its cell from `Info`, the row, the first column and how many columns).
+# Ink: the colour of the pixels farthest from the ground, taken as a mean, with its hue. Filled: how much of the span is far from the ground (an inverse word, a red ground).
+# Reddish: how much of it is red. Underline: whether one pixel row in the lower half of the cell is ink from end to end.
+function Span-Look([string]$File, $Info, [int]$Row, [int]$Col, [int]$Count) {
+  $win = ($Info.window -replace '[()]', '') -split ', '; $cell = $Info.cell -split 'x'; $cw = [int]$cell[0]; $ch = [int]$cell[1]
+  $src = [System.Drawing.Bitmap]::FromFile($File)
+  $pad = 6; $left = [int]$win[0] + $pad + $Col * $cw; $top = [int]$win[1] + $pad + $Row * $ch; $width = $Count * $cw
+  # (the ground is the terminal's own, from its left margin on this row: its right edge has the thumb of the scroll bar)
+  $ground = $src.GetPixel([int]$win[0] + 2, $top + 2)
+  $far = @(); $filled = 0; $reddish = 0; $total = $width * $ch; $rowInk = New-Object 'int[]' $ch
+  for ($y = 0; $y -lt $ch; $y++) {
+    for ($x = 0; $x -lt $width; $x++) {
+      $p = $src.GetPixel($left + $x, $top + $y)
+      $diff = [Math]::Abs($p.R - $ground.R) + [Math]::Abs($p.G - $ground.G) + [Math]::Abs($p.B - $ground.B)
+      if ($diff -gt 100) { $rowInk[$y]++ }
+      if ($diff -gt 300) { $filled++ }
+      if ($p.R -gt 120 -and ($p.R - $p.G) -gt 70 -and ($p.R - $p.B) -gt 70) { $reddish++ }
+      if ($diff -gt 150) { $far += , @($diff, $p.R, $p.G, $p.B) }
+    }
+  }
+  $src.Dispose()
+  $top20 = @($far | Sort-Object { - $_[0] } | Select-Object -First ([Math]::Max(4, [int]($far.Count * 0.2))))
+  if ($top20.Count) { $r = ($top20 | % { $_[1] } | Measure-Object -Average).Average; $g = ($top20 | % { $_[2] } | Measure-Object -Average).Average; $b = ($top20 | % { $_[3] } | Measure-Object -Average).Average } else { $r = $g = $b = 0 }
+  $c = [System.Drawing.Color]::FromArgb([int]$r, [int]$g, [int]$b)
+  $line = $false; for ($y = [int]($ch / 2); $y -lt $ch; $y++) { if ($rowInk[$y] -ge 0.95 * $width) { $line = $true } }
+  [pscustomobject]@{ Hue = [int]$c.GetHue(); Spread = [int]([Math]::Max($r, [Math]::Max($g, $b)) - [Math]::Min($r, [Math]::Min($g, $b))); Rgb ="$([int]$r),$([int]$g),$([int]$b)"; Filled = [Math]::Round($filled / $total, 2); Reddish = [Math]::Round($reddish / $total, 2); Underline = $line }
+}
+# Where a word is on the screen: the row and the column of its first letter, looked for from the last row that begins with `From`, in the rows of the visible screen (text of a hook's `view`).
+function Word-At([string[]]$View, [string]$From, [string]$Word) {
+  $start = @(0..($View.Count - 1) | ? { $View[$_] -like "$From*" })[-1]
+  if ($null -eq $start) { return $null }
+  for ($r = $start; $r -lt [Math]::Min($View.Count, $start + 3); $r++) { $c = $View[$r].IndexOf($Word); if ($c -ge 0) { return [pscustomobject]@{ Row = $r; Col = $c } } }
+  $null
+}

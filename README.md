@@ -67,7 +67,9 @@ click opens it in its app, and a right click opens it, shows it in Explorer, cop
 Prompt, and Git Bash where a full Git for Windows is installed (the Git that comes with Dogmind has no bash). **New terminal** opens
 the shell you chose last, the arrow beside it lists the others, and it starts in the session's folder (your own folder when there is
 none). Programs behave as in Windows Terminal (it is a pseudo console, ConPTY): colours in 16, 256 and true colour, bold,
-underline, the cursor, wide Japanese characters, git, python, vim, a progress bar. Each terminal is a tab, up to 8: double click a
+underline, the cursor, wide Japanese characters, git, python, vim, a progress bar. The shell has your own environment, so a
+`NO_COLOR` in it (a variable some tools set for what they start) is the shell's too, and programs that honour it print plain text.
+Each terminal is a tab, up to 8: double click a
 tab to rename it, and its cross closes it, which ends the shell and everything it started, as quitting Dogmind does. A terminal goes
 on running while the panel is collapsed, another view is shown or you open another session. A shell that has ended stays on the
 screen with its exit code and a *New terminal* button, and never starts again by itself. While it has the keys, every key is the

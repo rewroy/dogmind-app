@@ -29,8 +29,9 @@ foreach ($theme in 'dark', 'light') {
   $ok = Term-Wait $a $id { param($g) $g.Trim().Length -gt 10 }
   Check "the $shell prompt came ($theme)" $ok
   $esc = '$e=[char]27; '
-  Term $a ('input {0} {1}"$e[31mred$e[32m green$e[33m yellow$e[34m blue$e[35m magenta$e[36m cyan$e[0m  $e[1;31mBOLDRED$e[0m $e[38;5;208morange256$e[0m $e[38;2;80;160;255mtruecolor$e[0m $e[4munderline$e[0m $e[7minverse$e[0m $e[41m redbg $e[0m"\r' -f $id, $esc) | Out-Null
-  $ok = Term-Wait $a $id { param($g) ($g -replace "`r?`n", '') -match 'truecolor' }
+  # two rows, each shorter than the terminal is wide at this size: the sixteen colours on the first, and bold, the 256 and true colours, an underline, an inverse word and a red ground on the second
+  Term $a ('input {0} {1}"$e[31mred$e[32m green$e[33m yellow$e[34m blue$e[35m magenta$e[36m cyan$e[0m"; "$e[1;31mBOLDRED$e[0m $e[38;5;208morange256$e[0m $e[38;2;80;160;255mtruecolor$e[0m $e[4munderline$e[0m $e[7minverse$e[0m $e[41m redbg $e[0m"\r' -f $id, $esc) | Out-Null
+  $ok = Term-Wait $a $id { param($g) $g -match '(?m)^BOLDRED orange256 truecolor underline inverse\s+redbg' }
   Check "colours were written ($theme)" $ok
   Term $a ('input {0} "日本語の出力 あいう|"; "abcdef|"\r' -f $id) | Out-Null
   $ok = Term-Wait $a $id { param($g) $g -match 'あいう\|' }
@@ -38,11 +39,24 @@ foreach ($theme in 'dark', 'light') {
   Start-Sleep -Milliseconds 500
   $d0 = Term $a "drawn $id"
   $png = Shot $a "term-3-powershell-$theme"
-  # The coloured line is in the picture: its row, from what the screen has, and how many pixels of it are not grey; a picture taken again a moment later if it is not (and how many times it took is said).
-  $view = (Term-Read $a "view $id" 'v.txt') -split "`r?`n"; $row = @(0..($view.Count - 1) | ? { $view[$_] -like 'red green*' })[0]
-  $tries = 0; $count = Colourful $png $row (Info $a $id)
-  while ($count -lt 300 -and $tries -lt 4) { $tries++; Start-Sleep -Milliseconds 800; $png = Shot $a "term-3-powershell-$theme"; $count = Colourful $png $row (Info $a $id) }
-  Check "the picture of the colours has them ($theme)" ($count -ge 300) "row $row, $count coloured pixels, picture taken again $tries times"
+  # The picture has what the rows say, measured in the picture, on the words' own cells and not on the whole screen: the hue of each coloured word, a line under the underlined one, the inverse one filled,
+  # the red ground red. The plain words of the same rows are measured too, to say what these are not.
+  $view = (Term-Read $a "view $id" 'v.txt') -split "`r?`n"; $info = Info $a $id
+  function Look([string]$From, [string]$Word) { $at = Word-At $view $From $Word; if (-not $at) { return $null }; Span-Look $png $info $at.Row $at.Col $Word.Length }
+  $look = @{}
+  foreach ($w in 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan') { $look[$w] = Look 'red green' $w }
+  foreach ($w in 'BOLDRED', 'orange256', 'truecolor', 'underline', 'inverse', 'redbg') { $look[$w] = Look 'BOLDRED' $w }
+  # (a colour is a hue in a range with its channels apart by 40 or more: the plain text's own are 15 apart, in either theme)
+  function Hue($w, $from, $to) { $l = $look[$w]; [bool]($l -and $l.Spread -ge 40 -and $l.Hue -ge $from -and $l.Hue -le $to) }
+  function Said($w) { $l = $look[$w]; if ($l) { "$w hue $($l.Hue) spread $($l.Spread) rgb $($l.Rgb) filled $($l.Filled) reddish $($l.Reddish) line $($l.Underline)" } else { "$w not on the screen" } }
+  Check "red is red in the picture ($theme)" ((Hue 'red' 345 360) -or (Hue 'red' 0 15)) (Said 'red')
+  Check "green is green in the picture ($theme)" (Hue 'green' 85 160) (Said 'green')
+  Check "bold red is red in the picture ($theme)" ((Hue 'BOLDRED' 345 360) -or (Hue 'BOLDRED' 0 15)) (Said 'BOLDRED')
+  Check "the 256-colour orange is orange in the picture ($theme)" (Hue 'orange256' 20 45) (Said 'orange256')
+  Check "the true colour is that blue in the picture ($theme)" (Hue 'truecolor' 200 225) (Said 'truecolor')
+  Check "the underlined word has its line, the plain one has none ($theme)" ($look['underline'] -and $look['underline'].Underline -and $look['truecolor'] -and -not $look['truecolor'].Underline) "$(Said 'underline'); $(Said 'truecolor')"
+  Check "the inverse word is a filled block, the plain one is not ($theme)" ($look['inverse'] -and $look['inverse'].Filled -ge 0.5 -and $look['truecolor'] -and $look['truecolor'].Filled -lt 0.35) "$(Said 'inverse'); $(Said 'truecolor')"
+  Check "the red ground is red in the picture ($theme)" ($look['redbg'] -and $look['redbg'].Reddish -ge 0.5) (Said 'redbg')
   $d1 = Term $a "drawn $id"
   Check "the window shows what the screen holds ($theme)" ($d0 -eq 1) "before the shot $d0, after $d1"
   # an exited shell
