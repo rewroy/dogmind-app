@@ -8,9 +8,10 @@ const SUMMARY_HEADER: &str = "[SUMMARY OF EARLIER TURNS]\n## Main-model Session 
 pub const TRIMMED_TOOL_CHARS: usize = 600;
 /// What an output must be over what is kept of it to be kept whole as well: the marker that says where takes this much.
 const KEPT_MARKER: usize = 1024;
-/// Messages kept verbatim after the system prompt, and the turns a checkpoint needs before it is worth writing.
+/// Messages kept verbatim after the system prompt.
 const HEAD: usize = 6;
-const CHECKPOINT_TURNS: usize = 16;
+/// The least reasoning that may stand in for a checkpoint the model wrote only in its thinking, twice: below this it is a few lines of working, not a sum of the work (the real case was 6,405 characters).
+pub const MIN_THOUGHT_CHECKPOINT: usize = 1_000;
 /// The newest messages stage 0 leaves alone.
 const RECENT: usize = 8;
 /// What is kept of a request whose turn went with the oldest messages.
@@ -144,8 +145,23 @@ pub fn has_a_middle(messages: &[Message], keep: usize) -> bool {
     round_start(messages, messages.len().saturating_sub(keep)).max(head_end) > head_end
 }
 
-pub fn worth_a_checkpoint(messages: &[Message]) -> bool {
-    messages.iter().filter(|message| matches!(message.role.as_str(), "user" | "assistant")).count() >= CHECKPOINT_TURNS
+/// The reasoning of a reply that was all thinking, when it is a checkpoint after all: long enough (`MIN_THOUGHT_CHECKPOINT`) and in the shape the checkpoint prompt asks for, structured Markdown, which is
+/// at least two heading lines, or a heading and three bullets. Plain working-out of the same length is not one, and the turns it would stand for go for good.
+pub fn checkpoint_in_thinking(reasoning: &str) -> Option<String> {
+    let text = reasoning.trim();
+    if text.chars().count() < MIN_THOUGHT_CHECKPOINT {
+        return None;
+    }
+    let lines = || text.lines().map(str::trim_start);
+    let headings = lines().filter(|line| line.starts_with('#')).count();
+    let bullets = lines().filter(|line| line.starts_with("- ") || line.starts_with("* ")).count();
+    (headings >= 2 || (headings >= 1 && bullets >= 3)).then(|| text.to_string())
+}
+
+/// Where two conversations first differ: the first message the engine has to read again, as everything before it it holds. `None` when they are the same; the length of the shorter when one is the start of the other.
+pub fn first_difference(before: &[Message], after: &[Message]) -> Option<usize> {
+    let common = before.iter().zip(after).take_while(|(was, now)| was == now).count();
+    (common < before.len() || common < after.len()).then_some(common)
 }
 
 /// `[system, *head, summary, *recent]`, keeping the newest `keep` messages.
@@ -292,7 +308,6 @@ mod tests {
     #[test]
     fn a_checkpoint_keeps_head_and_recent_and_no_orphans() {
         let messages = conversation(10);
-        assert!(worth_a_checkpoint(&messages));
         for keep in 1..12 {
             let out = apply_checkpoint(&messages, "the state", keep);
             no_orphans(&out);
@@ -320,6 +335,33 @@ mod tests {
         // With the request among what stays, it is not said twice.
         let staying = apply_checkpoint(&conversation(10), "the state", 12);
         assert!(!staying.iter().any(|message| message.content.as_deref().is_some_and(|text| text.contains("latest request"))));
+    }
+
+    /// Thinking stands in for a checkpoint only with the length and the shape of one.
+    #[test]
+    fn thinking_is_a_checkpoint_only_when_it_is_long_and_structured() {
+        let long = |shape: &str| format!("{shape}\n{}", "x".repeat(MIN_THOUGHT_CHECKPOINT));
+        assert!(checkpoint_in_thinking(&long("## One\n## Two")).is_some(), "two headings");
+        assert!(checkpoint_in_thinking(&long("# One\n  - a\n* b\n- c")).is_some(), "a heading and three bullets, however indented");
+        assert!(checkpoint_in_thinking(&long("## One\n- a\n- b")).is_none(), "a heading and two bullets");
+        assert!(checkpoint_in_thinking(&long("## One")).is_none(), "one heading");
+        assert!(checkpoint_in_thinking(&long("- a\n- b\n- c\n- d")).is_none(), "bullets with no heading");
+        assert!(checkpoint_in_thinking(&long("it has a # in it, and - dashes - too")).is_none(), "only at the start of a line");
+        assert!(checkpoint_in_thinking("## One\n## Two\n- a\n- b\n- c").is_none(), "short");
+        let whole = long("\n  ## One\n## Two\n\n");
+        assert_eq!(checkpoint_in_thinking(&whole).as_deref(), Some(whole.trim()), "as written, less the blank at its ends");
+    }
+
+    #[test]
+    fn two_conversations_differ_from_the_first_message_that_does() {
+        let (a, b, c) = (Message::text("user", "a"), Message::text("user", "b"), Message::text("user", "c"));
+        assert_eq!(first_difference(&[a.clone(), b.clone()], &[a.clone(), b.clone()]), None);
+        assert_eq!(first_difference(&[], &[]), None);
+        assert_eq!(first_difference(&[a.clone(), b.clone()], &[a.clone(), c.clone()]), Some(1));
+        assert_eq!(first_difference(&[a.clone(), b.clone()], &[c.clone()]), Some(0));
+        assert_eq!(first_difference(&[a.clone(), b.clone()], &[a.clone()]), Some(1), "one is the start of the other: the length of the shorter");
+        assert_eq!(first_difference(&[a.clone()], &[a.clone(), b.clone(), c.clone()]), Some(1));
+        assert_eq!(first_difference(&[], &[a]), Some(0));
     }
 
     #[test]
