@@ -2129,6 +2129,8 @@ impl Agent {
                         }
                         Vec::new()
                     }
+                    // (told above, before the clock)
+                    Delta::Prefill(..) => Vec::new(),
                 };
                 told.extend(meter.due(now, window));
                 if !told.is_empty() {
