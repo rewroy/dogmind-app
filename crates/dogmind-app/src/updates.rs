@@ -836,6 +836,15 @@ fn stream(first: &Url, setup: &Setup, partial: &Path, test_server: Option<&Url>,
     Ok(())
 }
 
+/// Fetch a Straydog release asset with Dogmind's redirect, size and SHA-256 checks.
+pub(crate) fn fetch_straydog_asset(asset: &Setup, partial: &Path, stop: &AtomicBool) -> Result<(), Failed> {
+    const STRAYDOG_DOWNLOADS: &str = "/rewroy/Straydog/releases/download/";
+    let first = plain_address(&asset.url).filter(|url| {
+        url.tls && url.port == 443 && url.host == "github.com" && url.path.starts_with(STRAYDOG_DOWNLOADS) && !url.path.contains("..")
+    }).ok_or(Failed::NotAllowed)?;
+    stream(&first, asset, partial, None, &mut |_, _| {}, stop)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

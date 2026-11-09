@@ -34,6 +34,7 @@ use crate::toolrun::{self, LineKind, RunEntry, Tone, ToolRun};
 use crate::cards::{self, AnswerState, Card, PlanState};
 use crate::notice;
 use crate::updates;
+use crate::engine_updates;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::*;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -306,6 +307,7 @@ const ID_VISION_OFFER: isize = 9905;
 const ID_UPDATE_OFFER: isize = 9906;
 const ID_RELEASE_OFFER: isize = 9907;
 const ID_TOGGLE_UPDATES: isize = 9908;
+const ID_TOGGLE_STRAYDOG_UPDATES: isize = 9914;
 const ID_TOGGLE_REMEMBER: isize = 9912;
 const ID_TOGGLE_KEEP: isize = 9913;
 const ID_SPEED_FIRST: isize = 9909;
@@ -756,6 +758,7 @@ enum Note {
     EngineVersion(Option<String>, Option<u64>),
     /// A look at GitHub's latest release is over: whether the app made it on its own, and what it came to.
     ReleaseLooked { on_its_own: bool, outcome: updates::Outcome },
+    StraydogUpdate(engine_updates::Result),
     /// How far the setup of a newer release has come, of how many bytes.
     ReleaseProgress { done: u64, total: u64 },
     /// The setup of a newer release is fetched and checked and waits to be run, or why it is not.
@@ -2039,6 +2042,9 @@ struct App {
     release_ready_closed: bool,
     /// The switch on the About page for the app's own looks.
     toggle_updates: HWND,
+    toggle_straydog_updates: HWND,
+    engine_update_cancel: Arc<AtomicBool>,
+    engine_update_inflight: Arc<AtomicBool>,
     /// "Remember on this PC", for the key of encrypted conversations.
     toggle_remember: HWND,
     /// "Keep the conversation's state for the next start", on the Privacy page.
@@ -6603,7 +6609,7 @@ impl App {
         all.push(self.vision_delete);
         all.extend(self.read_folder_remove.iter().copied());
         all.extend([self.read_folder_add, self.read_folder_stop]);
-        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_compact, self.toggle_updates, self.toggle_remember, self.toggle_keep, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
+        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_compact, self.toggle_updates, self.toggle_straydog_updates, self.toggle_remember, self.toggle_keep, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
         all
     }
 
@@ -7260,6 +7266,11 @@ impl App {
                 }
                 form.toggle_centered(t("Update automatically"), self.toggle_updates);
                 let what_it_does = t("It downloads in the background and asks before restarting.");
+                let tall = text_height(self.fonts.small, what_it_does, form.width);
+                form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: what_it_does.to_string(), font: FontKind::Small, color: theme::muted(), flags: DT_CENTER | DT_WORDBREAK });
+                form.y += tall + s(ds::space::HAIR) + s(ds::space::S);
+                form.toggle_centered(t("Update bundled Straydog automatically"), self.toggle_straydog_updates);
+                let what_it_does = t("It downloads a verified engine in the background and uses it on the next engine start.");
                 let tall = text_height(self.fonts.small, what_it_does, form.width);
                 form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, tall + s(ds::space::HAIR)), text: what_it_does.to_string(), font: FontKind::Small, color: theme::muted(), flags: DT_CENTER | DT_WORDBREAK });
                 form.y += tall + s(ds::space::HAIR) + s(ds::space::S);
@@ -8414,6 +8425,7 @@ impl App {
                 self.update_toggles();
                 self.show_release_controls();
                 self.tip(self.toggle_updates, t("Dogmind asks GitHub for the newest release every six hours, and when you bring the window back from the tray after an hour. It sends only its name and version. When there is a newer one, it says so on the main screen, downloads the setup in the background and checks it, and restarts into it only when you press Restart to update."));
+                self.tip(self.toggle_straydog_updates, t("At startup, Dogmind checks for a newer compatible Straydog and stages it. The running engine is left alone. This does not update an engine you chose yourself."));
             }
             Panel::General => {
                 self.panel_title = t("Settings").into();
@@ -9193,7 +9205,7 @@ impl App {
     }
 
     unsafe fn update_toggles(&self) {
-        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_updates, self.settings.check_for_updates), (self.toggle_remember, self.crypt.remember), (self.toggle_keep, self.keep_conversation_on())] {
+        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_updates, self.settings.check_for_updates), (self.toggle_straydog_updates, self.settings.check_straydog_updates), (self.toggle_remember, self.crypt.remember), (self.toggle_keep, self.keep_conversation_on())] {
             set_button_style(toggle, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         }
         // (where the encryption does not allow it, the switch cannot be turned on: the line under it says why)
@@ -9977,6 +9989,27 @@ impl App {
         // (turned on, it looks at once if six hours have gone by: that is what turning it on asks for)
         self.look_for_release();
         self.layout();
+    }
+
+    unsafe fn straydog_updates_switched(&mut self) {
+        self.settings.check_straydog_updates = !self.settings.check_straydog_updates;
+        self.engine_update_cancel.store(!self.settings.check_straydog_updates, Ordering::Relaxed);
+        self.save();
+        self.update_toggles();
+        self.layout();
+        if self.settings.check_straydog_updates { self.start_straydog_update(); }
+    }
+
+    fn start_straydog_update(&self) {
+        if !self.settings.check_straydog_updates || self.engine_update_inflight.swap(true, Ordering::AcqRel) { return }
+        let (poster, settings, data, cancel, inflight) = (self.poster.clone(), self.settings.clone(), self.folder.clone(), self.engine_update_cancel.clone(), self.engine_update_inflight.clone());
+        std::thread::spawn(move || {
+            let outcome = engine_updates::check_and_stage(&settings, &data, &cancel);
+            inflight.store(false, Ordering::Release);
+            if !cancel.load(Ordering::Relaxed) {
+                if let Some(outcome) = outcome { poster.send(Note::StraydogUpdate(outcome)); }
+            }
+        });
     }
 
     unsafe fn asked_to_quit(&mut self) {
@@ -12840,6 +12873,7 @@ impl App {
                 self.update_status();
             }
             Note::Connected { generation, provider, model, window, straydog, vision } if generation == current => {
+                if straydog && self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded) { engine_updates::mark_ready(&self.folder); }
                 self.note_connection("ok");
                 self.connected = true;
                 self.connect_retrying = false;
@@ -12869,6 +12903,11 @@ impl App {
             }
             Note::Models(generation, models) if generation == current => self.provider_models = models,
             Note::ConnectFailed(generation, error) if generation == current => {
+                if self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded) && engine_updates::rollback_if_pending(&self.folder) {
+                    self.say(t("The newer Straydog could not start. The previous engine is being restored."));
+                    self.connect();
+                    return;
+                }
                 self.note_connection(&format!("error:{}", dogmind_agent::agent::failure_kind(&error)));
                 self.connection = "not connected".into();
                 // (writing tries again)
@@ -13112,6 +13151,10 @@ impl App {
                     self.fetch_release_setup(release, on_its_own);
                 }
             }
+            Note::StraydogUpdate(outcome) => match outcome {
+                engine_updates::Result::Ready(version) => self.say(&tf("Straydog {0} is ready for the next engine start.", &[&version])),
+                engine_updates::Result::ModelNotReady(reason) | engine_updates::Result::Failed(reason) => self.say(&reason),
+            },
             Note::ReleaseProgress { done, total } => {
                 if let ReleaseUpdate::Fetching { done: so_far, total: of, .. } = &mut self.release_update {
                     (*so_far, *of) = (done, total);
@@ -15188,6 +15231,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_TOGGLE_UPDATES => app.updates_switched(),
+                ID_TOGGLE_STRAYDOG_UPDATES => app.straydog_updates_switched(),
                 ID_TOGGLE_REMEMBER => app.crypt_remember_switched(),
                 ID_TOGGLE_KEEP => app.keep_conversation_switched(),
                 ID_VISION_OFFER => match app.vision_offer {
@@ -16437,6 +16481,9 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             release_update_said: None,
             release_ready_closed: false,
             toggle_updates: make_button(pane, ID_TOGGLE_UPDATES, "", ButtonKind::Toggle, theme::background()),
+            toggle_straydog_updates: make_button(pane, ID_TOGGLE_STRAYDOG_UPDATES, "", ButtonKind::Toggle, theme::background()),
+            engine_update_cancel: Arc::new(AtomicBool::new(false)),
+            engine_update_inflight: Arc::new(AtomicBool::new(false)),
             toggle_remember: make_button(pane, ID_TOGGLE_REMEMBER, "", ButtonKind::Toggle, theme::background()),
             toggle_keep: make_button(pane, ID_TOGGLE_KEEP, "", ButtonKind::Toggle, theme::background()),
             update_declined: None,
@@ -16756,11 +16803,13 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             ShowWindow(window, if app.settings.maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
         }
         SetTimer(window, TIMER_ENGINE, 1000, None);
+        engine_updates::prefer_bundled_if_newer(&app.folder);
         // What this copy runs, to see a new build come in over it.
         app.builds = std::env::current_exe().ok().into_iter().chain(engine::find(&app.settings)).map(|path| { let now = stamp(&path); (path, now) }).collect();
         SetTimer(window, TIMER_UPDATE, 5000, None);
         SetTimer(window, TIMER_RELEASES, FIRST_RELEASE_LOOK_MS, None);
         app.tidy_updates();
+        app.start_straydog_update();
         app.update_status();
         app.refresh_sessions();
         if !needs_folder {
