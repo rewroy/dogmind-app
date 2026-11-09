@@ -12908,8 +12908,9 @@ impl App {
             }
             Note::Models(generation, models) if generation == current => self.provider_models = models,
             Note::ConnectFailed(generation, error) if generation == current => {
-                if self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded)
-                    && self.connecting_engine.as_deref().is_some_and(|attempted| engine_updates::rollback_if_pending(&self.folder, attempted)) {
+                // (a connection that failed did so before it was ready)
+                let embedded = self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded);
+                if engine_updates::roll_back_after_failed_start(&self.folder, embedded, true, self.connecting_engine.as_deref()) {
                     self.say(t("The newer Straydog could not start. The previous engine is being restored."));
                     self.connect();
                     return;
@@ -14859,34 +14860,42 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.engine = None;
                 // (one that ended before it was ready failed to start; one that had been working may be tried again at once)
                 let never_ready = !app.connected;
-                if never_ready {
-                    app.engine_failed_at = Some(std::time::Instant::now());
-                }
-                app.connected = false;
-                // The next word written starts it again: the conversation is all still here.
-                app.engine_waits = true;
-                app.connection = "starts when you write".into();
-                // (what still waits for it to answer waits no longer)
-                app.generation.fetch_add(1, Ordering::SeqCst);
-                if !app.running {
-                    app.queued_back_to_composer();
-                    app.set_activity(String::new());
-                    app.update_buttons();
-                }
-                // (the engine's last word before it ended, as its own line under the app's sentence)
-                let told = llm::gone_with_line(&reason);
-                if !app.engine_stop_told {
-                    app.engine_stop_told = true;
-                    app.end_line();
-                    // (never ready, what it said is all a person has to go on: a driver, a folder it could not open)
-                    let (words, said) = if never_ready && llm::gone_words(&reason) == llm::SERVER_GONE { (tf("the engine did not start: {0}", &[&engine::in_plain_words(&reason)]), None) } else { lang::failure_parts(&told, true) };
-                    app.append(&format!("{words}\n"), Style::Bad);
-                    if let Some(said) = said {
-                        app.append(&format!("{said}\n"), Style::Said);
+                // (a newer engine that ended before it was ready is put back to the previous one here, as a connection that failed would: the generation moves on, and that failure would arrive too late)
+                let embedded = app.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded);
+                if engine_updates::roll_back_after_failed_start(&app.folder, embedded, never_ready, app.connecting_engine.as_deref()) {
+                    keep_server_line(&app.folder, &app.leaving, &llm::gone_with_line(&reason));
+                    app.say(t("The newer Straydog could not start. The previous engine is being restored."));
+                    app.connect();
+                } else {
+                    if never_ready {
+                        app.engine_failed_at = Some(std::time::Instant::now());
                     }
+                    app.connected = false;
+                    // The next word written starts it again: the conversation is all still here.
+                    app.engine_waits = true;
+                    app.connection = "starts when you write".into();
+                    // (what still waits for it to answer waits no longer)
+                    app.generation.fetch_add(1, Ordering::SeqCst);
+                    if !app.running {
+                        app.queued_back_to_composer();
+                        app.set_activity(String::new());
+                        app.update_buttons();
+                    }
+                    // (the engine's last word before it ended, as its own line under the app's sentence)
+                    let told = llm::gone_with_line(&reason);
+                    if !app.engine_stop_told {
+                        app.engine_stop_told = true;
+                        app.end_line();
+                        // (never ready, what it said is all a person has to go on: a driver, a folder it could not open)
+                        let (words, said) = if never_ready && llm::gone_words(&reason) == llm::SERVER_GONE { (tf("the engine did not start: {0}", &[&engine::in_plain_words(&reason)]), None) } else { lang::failure_parts(&told, true) };
+                        app.append(&format!("{words}\n"), Style::Bad);
+                        if let Some(said) = said {
+                            app.append(&format!("{said}\n"), Style::Said);
+                        }
+                    }
+                    keep_server_line(&app.folder, &app.leaving, &told);
+                    app.update_status();
                 }
-                keep_server_line(&app.folder, &app.leaving, &told);
-                app.update_status();
             }
             if app.drafter_restart_waits {
                 app.restart_for_drafter();
