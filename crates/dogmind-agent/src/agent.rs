@@ -6795,6 +6795,19 @@ mod tests {
 
     /// A server that writes each answer's events one at a time and keeps going until the client hangs up, as an engine at its own speed does, and keeps the bodies it was sent.
     fn trickling_server(answers: Vec<Vec<Value>>) -> (Client, Arc<Mutex<Vec<Value>>>) {
+        trickling(answers, None)
+    }
+
+    /// The same, but the first answer stops after its first `after` events and waits for the test to send on the gate: a stop that is set before that is set before the rest of the stream arrives, whatever the
+    /// machine is doing. That answer is not ended by the server either (no end of the stream, no `[DONE]`), only by the client hanging up, so a client that took all it was sent at once has still not been
+    /// given a complete answer. A gate that is dropped opens it. The others are as `trickling_server`'s.
+    fn gated_trickling_server(answers: Vec<Vec<Value>>, after: usize) -> (Client, Arc<Mutex<Vec<Value>>>, std::sync::mpsc::Sender<()>) {
+        let (gate, opened) = std::sync::mpsc::channel();
+        let (client, bodies) = trickling(answers, Some((after, opened)));
+        (client, bodies, gate)
+    }
+
+    fn trickling(answers: Vec<Vec<Value>>, mut gate: Option<(usize, std::sync::mpsc::Receiver<()>)>) -> (Client, Arc<Mutex<Vec<Value>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -6817,13 +6830,26 @@ mod tests {
                 kept.lock().unwrap().push(serde_json::from_str::<Value>(&body).unwrap());
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n");
                 let mut events: Vec<String> = answer.iter().map(|event| format!("data: {event}\n\n")).collect();
-                events.push("data: [DONE]\n\n".to_string());
-                for event in events {
+                let gated = gate.take();
+                if gated.is_none() {
+                    events.push("data: [DONE]\n\n".to_string());
+                }
+                for (at, event) in events.into_iter().enumerate() {
+                    if let Some((after, opened)) = &gated {
+                        if at == *after {
+                            let _ = opened.recv_timeout(Duration::from_secs(20));
+                        }
+                    }
                     if stream.write_all(format!("{:x}\r\n{event}\r\n", event.len()).as_bytes()).is_err() {
                         break;
                     }
                     let _ = stream.flush();
                     std::thread::sleep(Duration::from_millis(3));
+                }
+                if gated.is_some() {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+                    while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+                    continue;
                 }
                 let _ = stream.write_all(b"0\r\n\r\n");
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -7206,7 +7232,8 @@ mod tests {
     #[test]
     fn stopping_in_the_middle_of_a_write_keeps_what_there_is_where_no_one_need_be_asked() {
         let dir = tempfile::tempdir().unwrap();
-        let (client, bodies) = trickling_server(vec![pieces(&write_arguments(200, 12_000)), vec![serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]})]]);
+        // (two pieces of the write arrive, and then the stream waits: the stop is set before the rest of it, so the write is cut half way whatever the machine is doing)
+        let (client, bodies, gate) = gated_trickling_server(vec![pieces(&write_arguments(200, 12_000)), vec![serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]})]], 2);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
         run.handle.commands.send(Command::Send("make a page".into())).unwrap();
         loop {
@@ -7214,8 +7241,8 @@ mod tests {
                 break;
             }
         }
-        std::thread::sleep(Duration::from_millis(15));
         run.handle.cancel.store(true, Ordering::Relaxed);
+        gate.send(()).unwrap();
         let (_, cancelled) = until_end(&run, Decision::Reject);
         assert!(cancelled);
         let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
@@ -7232,7 +7259,7 @@ mod tests {
     #[test]
     fn stopping_in_the_middle_of_a_write_that_would_ask_writes_nothing_and_asks_no_one() {
         let dir = tempfile::tempdir().unwrap();
-        let (client, _) = trickling_server(vec![pieces(&write_arguments(200, 12_000))]);
+        let (client, _, gate) = gated_trickling_server(vec![pieces(&write_arguments(200, 12_000))], 2);
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Send("make a page".into())).unwrap();
         loop {
@@ -7240,8 +7267,8 @@ mod tests {
                 break;
             }
         }
-        std::thread::sleep(Duration::from_millis(15));
         run.handle.cancel.store(true, Ordering::Relaxed);
+        gate.send(()).unwrap();
         let (log, cancelled) = until_end(&run, Decision::Reject);
         assert!(cancelled);
         assert!(!log.iter().any(|line| line.starts_with("approval:")), "{log:?}");
