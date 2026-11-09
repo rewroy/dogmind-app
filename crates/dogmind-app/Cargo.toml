@@ -21,7 +21,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # An update is fetched, and what comes is checked by the SHA-256 GitHub published for it: as dogmind-agent has it. The files of a setup that is put together from parts are inflated to be checked.
 flate2 = "1"
 sha2 = "0.10"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# zip 2.6 needs both names to enable its flate2 decoder without the zopfli compressor.
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
 # The terminal's screen: its grid, its scrollback, its selection and the parsing of what a shell writes (`term::screen`). Not its own pseudo console and its event loop: `term::pty` starts the shell, in a job that ends it with what it started.
 alacritty_terminal = { version = "0.26", default-features = false }
 

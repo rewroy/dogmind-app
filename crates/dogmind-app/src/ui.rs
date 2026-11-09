@@ -13159,7 +13159,10 @@ impl App {
             }
             Note::StraydogUpdate(outcome) => match outcome {
                 engine_updates::Result::Ready(version) => self.say(&tf("Straydog {0} is ready for the next engine start.", &[&version])),
-                engine_updates::Result::ModelNotReady(reason) | engine_updates::Result::Failed(reason) => self.say(&reason),
+                engine_updates::Result::ModelNotReady(reason) => self.say(&reason),
+                engine_updates::Result::Failed(_) => {
+                    self.say(t("The Straydog update could not be prepared. See engine.log for details."));
+                }
             },
             Note::ReleaseProgress { done, total } => {
                 if let ReleaseUpdate::Fetching { done: so_far, total: of, .. } = &mut self.release_update {
@@ -16838,9 +16841,19 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             app.set_panel(Panel::Welcome);
         } else {
             if app.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded) {
-                app.engine_waits = true;
-                app.connection = "starts when you write".into();
-                app.update_status();
+                // A debug-only live check can exercise the full Connected/ConnectFailed path
+                // without sending a prompt or changing the normal lazy engine start.
+                #[cfg(debug_assertions)]
+                let eager_test = std::env::var_os("DOGMIND_TEST_EAGER_EMBEDDED").is_some();
+                #[cfg(not(debug_assertions))]
+                let eager_test = false;
+                if eager_test {
+                    app.connect();
+                } else {
+                    app.engine_waits = true;
+                    app.connection = "starts when you write".into();
+                    app.update_status();
+                }
             } else {
                 app.connect();
             }
