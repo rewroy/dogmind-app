@@ -254,6 +254,9 @@ pub enum Event {
     RequestStarted,
     /// The session is being made shorter, which can be minutes of the model summing it up: till the next request, or the turn's end.
     Compacting,
+    /// The server is reading the prompt, before the answer's first word: `done` of `total` tokens. Told about once a second while it reads
+    /// (Straydog); after a compaction, or on a small GPU, that can be minutes.
+    Reading { done: u64, total: u64 },
     /// More of the arguments of a tool call the model is still writing: `index` is which of its answer. Told every so often, and at once for a new call.
     ToolWriting { index: usize, tool: String, piece: String },
     ToolStarted { id: String, tool: String, summary: String },
@@ -1692,7 +1695,11 @@ impl Agent {
         self.cancel.store(false, Ordering::Relaxed);
         let mut answered = false;
         let mut clock = Clock::start();
-        let streamed = provider.stream(&request, &self.cancel, &mut |_| {
+        let streamed = provider.stream(&request, &self.cancel, &mut |delta| {
+            // (the prompt being read is no word)
+            if matches!(delta, Delta::Prefill(..)) {
+                return;
+            }
             clock.word();
             answered = true;
             self.cancel.store(true, Ordering::Relaxed);
@@ -2074,6 +2081,12 @@ impl Agent {
                 // (at once while words come, as the stream looks at its flag after each: the watch is for the wait before them)
                 if person.load(Ordering::Relaxed) {
                     cancel.store(true, Ordering::Relaxed);
+                }
+                // (the prompt being read: no word yet)
+                if let Delta::Prefill(done, total) = delta {
+                    let _ = events.send(Event::Reading { done, total });
+                    wake();
+                    return;
                 }
                 let now = Instant::now();
                 clock.word();
@@ -2847,7 +2860,7 @@ impl Agent {
             let mut clock = Clock::start();
             // (the person's Stop on the turn ends it, and so does the one on this helper alone: the stream has a flag of its own that either sets)
             let halt = AtomicBool::new(false);
-            let streamed = while_watching(&|| person.load(Ordering::Relaxed) || stops.asked(id), &halt, || provider.stream(&request, &halt, &mut |_| clock.word()));
+            let streamed = while_watching(&|| person.load(Ordering::Relaxed) || stops.asked(id), &halt, || provider.stream(&request, &halt, &mut |delta| if !matches!(delta, Delta::Prefill(..)) { clock.word() }));
             self.traced_with("helper", &req_id, &clock, &streamed, run.name.as_deref());
             let completion = match streamed {
                 Ok(completion) => completion,
@@ -3394,7 +3407,10 @@ impl Agent {
             let req_id = self.traj.request_id();
             let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false, request_id: Some(&req_id) };
             let mut clock = Clock::start();
-            let streamed = provider.stream(&request, &self.cancel, &mut |_| clock.word());
+            let streamed = provider.stream(&request, &self.cancel, &mut |delta| match delta {
+                Delta::Prefill(done, total) => self.emit(Event::Reading { done, total }),
+                _ => clock.word(),
+            });
             self.traced("checkpoint", &req_id, &clock, &streamed);
             let answer = streamed?;
             // A thinking model may end its turn with all of it in its thinking and no reply (Qwen3.8 at its highest effort, 111,868 tokens

@@ -301,6 +301,7 @@ const JA: &[(&str, &str)] = &[
     ("The settings could not be saved: {0}\n", "設定を保存できませんでした: {0}\n"),
     ("Thinking…", "考え中…"),
     ("Compacting the session…", "セッションを圧縮しています…"),
+    ("Reading the conversation: {0} of {1} tokens ({2}%)", "会話を読み込み中: {1} token のうち {0}({2}%)"),
     (dogmind_agent::safety::REASON_OFF_THIS_PC, "このパスは、このPCの外にある別のマシンやデバイスにつながっています。開くと、あなたのサインイン情報をそこに渡すことになります: {0}"),
     (dogmind_agent::safety::REASON_SECRET_READ, "秘密が置かれた場所を読みます: {0}"),
     (dogmind_agent::safety::REASON_RUNS_OFF_THIS_PC, "このPCの外の場所で実行します: {0}"),
