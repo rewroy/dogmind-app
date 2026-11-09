@@ -1,7 +1,7 @@
 //! Background updates of the bundled Straydog engine. Nothing here replaces a running program.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::engine;
+use crate::lang::{t, tf};
 use crate::settings::Settings;
 use crate::updates::{self, Setup};
 
@@ -39,6 +40,16 @@ pub enum Result {
     Ready(String),
     ModelNotReady(String),
     Failed(String),
+}
+
+pub fn log_failure(data: &Path, reason: &str) {
+    if let Ok(mut log) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(engine::log_path(data))
+    {
+        let _ = writeln!(log, "[Dogmind Straydog update] {reason}");
+    }
 }
 
 fn plain_version(version: &str) -> bool {
@@ -220,9 +231,12 @@ fn check_model(exe: &Path, settings: &Settings, data: &Path) -> std::result::Res
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("モデル確認を開始できません: {error}"))?;
+    let mut child = command.spawn().map_err(|error| {
+        tf(
+            "The new Straydog model check could not start: {0}",
+            &[&error],
+        )
+    })?;
     let start = Instant::now();
     loop {
         if child
@@ -235,7 +249,7 @@ fn check_model(exe: &Path, settings: &Settings, data: &Path) -> std::result::Res
         if start.elapsed() >= Duration::from_secs(5) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("モデル確認が時間内に終わりません".into());
+            return Err(t("The new Straydog model check timed out.").into());
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -247,18 +261,21 @@ fn check_model(exe: &Path, settings: &Settings, data: &Path) -> std::result::Res
         if said.lines().count() == 1 && said.starts_with("Straydog model ready: ") {
             return Ok(());
         }
-        return Err("新しい Straydog のモデル確認結果を読めません".into());
+        return Err(t("The new Straydog returned an unreadable model check result.").into());
     }
     if output.status.code() == Some(2) {
-        return Err("新しい Straydog は --check-model に対応していないため自動更新しません".into());
+        return Err(
+            t("The new Straydog does not support model checks, so it was not selected.").into(),
+        );
     }
     let reason = String::from_utf8_lossy(&output.stderr)
         .lines()
         .next()
-        .unwrap_or("モデルの確認に失敗しました")
+        .unwrap_or(t("Model check failed."))
         .to_string();
-    Err(format!(
-        "新しい Straydog は現在のモデルを使用できません: {reason}"
+    Err(tf(
+        "The new Straydog cannot use this model: {0}",
+        &[&reason],
     ))
 }
 
@@ -476,12 +493,12 @@ where
     let mut attempt = || -> std::result::Result<Result, String> {
         fs::create_dir_all(&root).map_err(|error| error.to_string())?;
         if fs::symlink_metadata(&root).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            return Err("更新先にリンクは使えません".into());
+            return Err(t("The engine update folder cannot be a link.").into());
         }
         if version_folder.exists() {
             if fs::symlink_metadata(&version_folder).is_ok_and(|meta| meta.file_type().is_symlink())
             {
-                return Err("更新先にリンクは使えません".into());
+                return Err(t("The engine update folder cannot be a link.").into());
             }
             let ready = version_folder.join("straydog.exe");
             let libraries_present = needed_libraries(&ready)
@@ -501,7 +518,7 @@ where
         }
         if partial.exists() {
             if fs::symlink_metadata(&partial).is_ok_and(|meta| meta.file_type().is_symlink()) {
-                return Err("更新先にリンクは使えません".into());
+                return Err(t("The engine update folder cannot be a link.").into());
             }
             fs::remove_dir_all(&partial).map_err(|error| error.to_string())?
         }
@@ -509,27 +526,28 @@ where
         let sums_file = partial.join(SUMS);
         fetch(&release.sums, &sums_file, stop).map_err(|error| format!("SHA256SUMS: {error:?}"))?;
         if stop.load(Ordering::Relaxed) {
-            return Err("更新を取り消しました".into());
+            return Err(t("The engine update was cancelled.").into());
         }
         let sums = fs::read_to_string(&sums_file).map_err(|error| error.to_string())?;
-        let expected = sum_for(&sums, EXE).ok_or("SHA256SUMS に単体 EXE の固定値がありません")?;
+        let expected =
+            sum_for(&sums, EXE).ok_or(t("SHA256SUMS does not list the standalone engine."))?;
         if expected != release.exe.sha256 {
-            return Err("単体 EXE の公開ダイジェストが一致しません".into());
+            return Err(t("The engine digest disagrees with SHA256SUMS.").into());
         }
         let exe = partial.join("straydog.exe");
         fetch(&release.exe, &exe, stop).map_err(|error| format!("Straydog EXE: {error:?}"))?;
         if stop.load(Ordering::Relaxed) {
-            return Err("更新を取り消しました".into());
+            return Err(t("The engine update was cancelled.").into());
         }
         if sha256(&exe).as_deref() != Some(expected.as_str()) {
-            return Err("単体 EXE の SHA-256 が一致しません".into());
+            return Err(t("The engine file failed its SHA-256 check.").into());
         }
         copy_libraries(running, &exe, &partial, release, &sums, stop, fetch)?;
         if stop.load(Ordering::Relaxed) {
-            return Err("更新を取り消しました".into());
+            return Err(t("The engine update was cancelled.").into());
         }
         if version(&exe).as_deref() != Some(release.version.as_str()) {
-            return Err("単体 EXE の版が release tag と一致しません".into());
+            return Err(t("The engine version disagrees with the release tag.").into());
         }
         grant_worker_access(&partial)?;
         if let Err(reason) = check_model(&exe, settings, data) {
@@ -537,13 +555,17 @@ where
             return Ok(Result::ModelNotReady(reason));
         }
         if stop.load(Ordering::Relaxed) {
-            return Err("更新を取り消しました".into());
+            return Err(t("The engine update was cancelled.").into());
         }
         fs::rename(&partial, &version_folder).map_err(|error| error.to_string())?;
         select(data, &release.version).map_err(|error| error.to_string())?;
         Ok(Result::Ready(release.version.clone()))
     };
     let outcome = attempt().unwrap_or_else(Result::Failed);
+    match &outcome {
+        Result::Failed(reason) | Result::ModelNotReady(reason) => log_failure(data, reason),
+        Result::Ready(_) => {}
+    }
     if !matches!(outcome, Result::Ready(_)) {
         let _ = fs::remove_dir_all(&partial);
     }
@@ -594,14 +616,16 @@ fn copy_libraries<F>(
 where
     F: FnMut(&Setup, &Path, &AtomicBool) -> std::result::Result<(), updates::Failed>,
 {
-    let names = needed_libraries(exe).ok_or("新版 EXE の cuBLAS 依存を判定できません")?;
+    let names =
+        needed_libraries(exe).ok_or(t("Cannot identify the new engine's cuBLAS dependency."))?;
     let old = running
         .parent()
-        .ok_or("現行 Straydog のフォルダがありません")?;
-    let old_names = needed_libraries(running).ok_or("現行 EXE の cuBLAS 依存を判定できません")?;
+        .ok_or(t("The current engine folder is missing."))?;
+    let old_names = needed_libraries(running)
+        .ok_or(t("Cannot identify the current engine's cuBLAS dependency."))?;
     if names == old_names {
         if !names.iter().all(|name| old.join(name).is_file()) {
-            return Err("現行 Straydog の cuBLAS DLL が見つかりません".into());
+            return Err(t("The current engine's cuBLAS DLL is missing.").into());
         }
         for name in &names {
             fs::copy(old.join(name), partial.join(name)).map_err(|error| error.to_string())?;
@@ -614,12 +638,11 @@ where
         return Ok(());
     }
     let zip_name = format!("straydog-v{}-windows-x86_64-cuda.zip", release.version);
-    let zip = release
-        .zip
-        .as_ref()
-        .ok_or("新版の cuBLAS が必要ですが ZIP がありません")?;
+    let zip = release.zip.as_ref().ok_or(t(
+        "The new cuBLAS requires a release ZIP, but none was published.",
+    ))?;
     if sum_for(sums, &zip_name).as_deref() != Some(zip.sha256.as_str()) {
-        return Err("ZIP の公開ダイジェストが一致しません".into());
+        return Err(t("The ZIP digest disagrees with SHA256SUMS.").into());
     }
     let zip_path = partial.join(&zip_name);
     fetch(zip, &zip_path, stop).map_err(|error| format!("Straydog ZIP: {error:?}"))?;
@@ -632,22 +655,27 @@ where
     for name in &names {
         let mut source = archive
             .by_name(&format!("{prefix}{name}"))
-            .map_err(|error| format!("ZIP に {name} がありません: {error}"))?;
+            .map_err(|error| tf("The release ZIP is missing {0}: {1}", &[name, &error]))?;
         if source.size() == 0 || source.size() > 512 << 20 {
-            return Err(format!("ZIP の {name} の長さが異常です"));
+            return Err(tf("The release ZIP has an invalid size for {0}.", &[name]));
         }
         let mut target = fs::File::create(partial.join(name)).map_err(|error| error.to_string())?;
         let copied = std::io::copy(&mut source, &mut target).map_err(|error| error.to_string())?;
         if copied != source.size() {
-            return Err(format!("ZIP の {name} を完全に展開できません"));
+            return Err(tf("The release ZIP did not fully extract {0}.", &[name]));
         }
         target.sync_all().map_err(|error| error.to_string())?;
     }
     let mut license = archive
         .by_name(&format!("{prefix}NVIDIA-CUDA-LICENSE.txt"))
-        .map_err(|error| format!("ZIP に NVIDIA のライセンスがありません: {error}"))?;
+        .map_err(|error| {
+            tf(
+                "The release ZIP is missing the NVIDIA license: {0}",
+                &[&error],
+            )
+        })?;
     if license.size() == 0 || license.size() > 1 << 20 {
-        return Err("ZIP の NVIDIA ライセンスの長さが異常です".into());
+        return Err(t("The release ZIP has an invalid NVIDIA license size.").into());
     }
     let mut target = fs::File::create(partial.join("NVIDIA-CUDA-LICENSE.txt"))
         .map_err(|error| error.to_string())?;
@@ -675,14 +703,17 @@ fn worker_sid() -> std::result::Result<String, String> {
     unsafe {
         let result = DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid);
         if result != 0 {
-            return Err(format!("AppContainer SID を取得できません: 0x{result:08x}"));
+            return Err(tf(
+                "Cannot obtain the AppContainer SID: {0}",
+                &[&format!("0x{result:08x}")],
+            ));
         }
         let mut text = std::ptr::null_mut();
         if ConvertSidToStringSidW(sid, &mut text) == 0 {
             FreeSid(sid);
-            return Err(format!(
-                "AppContainer SID を文字列にできません: {}",
-                std::io::Error::last_os_error()
+            return Err(tf(
+                "Cannot read the AppContainer SID: {0}",
+                &[&std::io::Error::last_os_error()],
             ));
         }
         let len = (0..).take_while(|&i| *text.add(i) != 0).count();
@@ -695,13 +726,27 @@ fn worker_sid() -> std::result::Result<String, String> {
 }
 
 #[cfg(windows)]
+fn system_icacls() -> std::result::Result<PathBuf, String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buffer = [0u16; 32768];
+    // SAFETY: buffer is writable for the given length; Windows returns its UTF-16 length.
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err(t("Cannot locate the Windows system directory.").into());
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])).join("icacls.exe"))
+}
+
+#[cfg(windows)]
 fn grant_worker_access(folder: &Path) -> std::result::Result<(), String> {
     let sid = worker_sid()?;
+    let icacls = system_icacls()?;
     let items = [
         (
             folder
                 .parent()
-                .ok_or("更新先の親フォルダがありません")?
+                .ok_or(t("The engine update parent folder is missing."))?
                 .to_path_buf(),
             format!("*{sid}:(RX)"),
         ),
@@ -719,7 +764,7 @@ fn grant_worker_access(folder: &Path) -> std::result::Result<(), String> {
             })
             .map(|path| (path, format!("*{sid}:(RX)"))),
     ) {
-        let mut grant_command = Command::new("icacls.exe");
+        let mut grant_command = Command::new(&icacls);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -735,12 +780,12 @@ fn grant_worker_access(folder: &Path) -> std::result::Result<(), String> {
             .status()
             .map_err(|error| error.to_string())?;
         if !status.success() {
-            return Err(format!(
-                "AppContainer に {} の実行権を付けられません",
-                path.display()
+            return Err(tf(
+                "Cannot grant AppContainer access to {0}.",
+                &[&path.display()],
             ));
         }
-        let mut verify_command = Command::new("icacls.exe");
+        let mut verify_command = Command::new(&icacls);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -755,7 +800,10 @@ fn grant_worker_access(folder: &Path) -> std::result::Result<(), String> {
             .status()
             .map_err(|error| error.to_string())?;
         if !status.success() {
-            return Err(format!("{} の ACL を検証できません", path.display()));
+            return Err(tf(
+                "Cannot verify the access rights of {0}.",
+                &[&path.display()],
+            ));
         }
     }
     Ok(())
@@ -763,7 +811,7 @@ fn grant_worker_access(folder: &Path) -> std::result::Result<(), String> {
 
 #[cfg(not(windows))]
 fn grant_worker_access(_folder: &Path) -> std::result::Result<(), String> {
-    Err("Windows のみ対応します".into())
+    Err(t("Engine updates are supported only on Windows.").into())
 }
 
 #[cfg(test)]
@@ -1061,7 +1109,7 @@ mod tests {
             .contains("verification tree is missing"));
         assert!(check_model(&unknown, &settings, data.path())
             .unwrap_err()
-            .contains("--check-model"));
+            .contains("Straydog"));
     }
 
     #[cfg(windows)]
@@ -1194,5 +1242,57 @@ mod tests {
         assert!(rollback_if_pending(data.path(), &attempted));
         assert!(selected(data.path()).is_none());
         assert!(running.is_file());
+    }
+
+    /// Run only against an explicitly prepared, isolated DOGMIND_DATA and model.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a real Windows CUDA engine and local model"]
+    fn live_staged_engine_connect_and_rollback() {
+        dogmind_agent::sandbox::no_error_boxes();
+        let data = PathBuf::from(std::env::var_os("DOGMIND_DATA").expect("DOGMIND_DATA"));
+        let app = PathBuf::from(std::env::var_os("DOGMIND_LIVE_APP").expect("DOGMIND_LIVE_APP"));
+        let case = std::env::var("DOGMIND_LIVE_CASE").expect("DOGMIND_LIVE_CASE");
+        let settings = Settings::load(&data.join("settings.json"));
+        let attempted = selected(&data).expect("selected staged executable");
+        let start_and_wait = |exe: &Path| -> std::result::Result<(), String> {
+            let start = Instant::now();
+            let keep_going = || start.elapsed() < Duration::from_secs(180);
+            let mut say = |words: String| println!("engine status: {words}");
+            let engine = engine::start_alone(exe, &settings, &data, &keep_going, &mut say)?;
+            println!("engine started: {} port={}", exe.display(), engine.port);
+            let client = engine::client(engine.port);
+            engine::wait_ready(&client, &keep_going, &mut say)?;
+            let info = client.describe()?;
+            assert!(info.straydog, "the server must identify as Straydog");
+            println!("engine connected: {} port={}", exe.display(), engine.port);
+            drop(engine);
+            Ok(())
+        };
+        match case.as_str() {
+            "ready" => {
+                start_and_wait(&attempted).unwrap();
+                mark_ready(&data, &attempted);
+                assert!(!root(&data).join(PENDING).exists());
+                println!("ready marker cleared; selected={}", attempted.display());
+            }
+            "rollback" => {
+                let failure = start_and_wait(&attempted).unwrap_err();
+                println!("staged engine failed: {failure}");
+                assert!(rollback_if_pending(&data, &attempted));
+                assert_eq!(
+                    fs::read_to_string(root(&data).join(FAILED)).unwrap(),
+                    "v0.1.11"
+                );
+                assert!(selected(&data).is_none());
+                let bundled = app.join("straydog.exe");
+                start_and_wait(&bundled).unwrap();
+                println!(
+                    "bundled engine connected after rollback: {}",
+                    bundled.display()
+                );
+            }
+            other => panic!("unknown live test case: {other}"),
+        }
     }
 }
