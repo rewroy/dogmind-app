@@ -76,13 +76,8 @@ const EMPTY_RETRIES: u32 = 2;
 const CHARS_A_TOKEN: usize = 3;
 /// What a forced compaction leaves after its checkpoint: it is asked for, so a short conversation is worth it too.
 const FORCED_KEEP: usize = 4;
-/// What a checkpoint leaves of the newest messages, when it is not asked for by name.
-const CHECKPOINT_KEEP: usize = 12;
-
-/// How many of the newest messages a checkpoint leaves as they are.
-fn checkpoint_keep(forced: bool) -> usize {
-    if forced { FORCED_KEEP } else { CHECKPOINT_KEEP }
-}
+/// What an automatic compaction leaves, of the window, once its checkpoint is in: the engine reads all of it again from the root, so the less the better, and the checkpoint stands for the rest.
+const LEAN_SHARE: u64 = 4;
 
 /// A summary of the earlier conversation, and where it came from.
 struct Checkpoint {
@@ -3227,11 +3222,12 @@ impl Agent {
         permission
     }
 
-    /// A checkpoint first whenever there is a middle to sum up, however few turns it is made of: it extends what the engine holds, and only what follows the head is read again afterwards, where a trim
-    /// changes the conversation near its start and all of it after that is read again, some minutes at 500 tokens a second (so what a compaction costs is the size of what is left after it, and one that
-    /// stops just under the trigger is back within a few requests). Then stage 0, then truncation, both aiming at half the window. `forced` goes on past stage 0 whatever it saved. `refused`: the server has
-    /// said this conversation is too long to send, so it is made shorter before the checkpoint is asked for. An error leaves the conversation as it found it, and so does a stop: only a model that
-    /// answered and could not sum it up, or a request it cannot hold, makes turns go.
+    /// A checkpoint first whenever there is a middle to sum up, however few turns it is made of: it extends what the engine holds, and a trim changes the conversation near its start so that all of it after
+    /// that is read again, some minutes at 500 tokens a second. What a compaction costs is the size of what is left after it (the engine reads all of that again from the root), and one that stops just under
+    /// the trigger is back within a few requests, so an automatic one leaves little: the system message, the first request, the checkpoint, the latest request and the round in progress, shortened to a quarter
+    /// of the window if need be (see `apply_lean_checkpoint`). One asked for by name, or after a refusal (`forced`), keeps the newest `FORCED_KEEP` messages as they are. With no checkpoint: stage 0, then
+    /// truncation, both aiming at half the window. `forced` goes on past stage 0 whatever it saved. `refused`: the server has said this conversation is too long to send, so it is made shorter before the
+    /// checkpoint is asked for. An error leaves the conversation as it found it, and so does a stop: only a model that answered and could not sum it up, or a request it cannot hold, makes turns go.
     fn compact(&mut self, forced: bool, refused: bool) -> Result<(), String> {
         if self.messages.is_empty() {
             return Ok(());
@@ -3256,7 +3252,7 @@ impl Agent {
         let found = self.messages.clone();
         self.bench.forget_reads();
         // (a middle is all it takes: how many turns it is made of says nothing of what it weighs, and a few big reads fill a window as well as many small turns)
-        let worth = compaction::has_a_middle(&self.messages, checkpoint_keep(forced));
+        let worth = if forced { compaction::has_a_middle(&self.messages, FORCED_KEEP) } else { compaction::has_a_lean_middle(&self.messages) };
         let mut no_checkpoint = false;
         if worth && !refused {
             if self.checkpoint_or_restore(forced, &found)? {
@@ -3378,13 +3374,13 @@ impl Agent {
         match self.checkpoint() {
             Ok(Some(checkpoint)) => {
                 self.compaction_stage = if checkpoint.from_thinking { "checkpoint_from_thinking" } else { "checkpoint" };
-                self.messages = compaction::apply_checkpoint(&self.messages, &checkpoint.text, checkpoint_keep(forced));
+                self.messages = if forced { compaction::apply_checkpoint(&self.messages, &checkpoint.text, FORCED_KEEP) } else { compaction::apply_lean_checkpoint(&self.messages, &checkpoint.text) };
                 if let Some(marks) = &mut self.marks {
                     marks.conversation_cut(0);
                 }
                 compaction::strip_thinking(&mut self.messages);
                 self.use_estimate();
-                let trimmed = self.fit_what_a_checkpoint_kept();
+                let trimmed = self.fit_what_a_checkpoint_kept(!forced);
                 let mut notice = "Session compacted: the earlier conversation is now a summary".to_string();
                 if trimmed > 0 {
                     notice.push_str(&format!(", and the tool outputs it kept were shortened by {} KB, to fit", trimmed / 1024));
@@ -3403,12 +3399,22 @@ impl Agent {
     /// After a checkpoint: the summary stands for what went, but the newest messages are kept whatever they weigh, and stage 0 leaves the newest eight and the round in progress alone, so a round of
     /// large reads can leave the conversation too long still. The next request would then be refused, and a second checkpoint asked for, which may be refused too, when shortening what was kept
     /// would have been enough. So the fit is checked here, and the tool outputs of what was kept are shortened, the oldest first and the newest too if need be, until it fits. Returns the
-    /// characters saved; the stage is its own in the trajectory (`checkpoint_trim`, and `checkpoint_trim_all` where the newest had to go too).
-    fn fit_what_a_checkpoint_kept(&mut self) -> usize {
-        if !compaction::needed(self.expected_use(), self.window) {
-            return 0;
-        }
-        let target = self.window.saturating_sub(self.window * 15 / 100 + compaction::reserve(self.window));
+    /// characters saved; the stage is its own in the trajectory (`checkpoint_trim`, and `checkpoint_trim_all` where the newest had to go too). After a lean checkpoint (`lean`: the automatic one) what is
+    /// left is read again whole from the root, so it goes down to a quarter of the window (`LEAN_SHARE`), the round in progress's outputs too, or as far as shortening them can take it.
+    fn fit_what_a_checkpoint_kept(&mut self, lean: bool) -> usize {
+        let target = if lean {
+            // (a window that is not known has no share of it)
+            let share = self.window / LEAN_SHARE;
+            if self.window == 0 || self.expected_use() <= share {
+                return 0;
+            }
+            share
+        } else {
+            if !compaction::needed(self.expected_use(), self.window) {
+                return 0;
+            }
+            self.window.saturating_sub(self.window * 15 / 100 + compaction::reserve(self.window))
+        };
         let over = self.expected_use().saturating_sub(target) as usize * CHARS_A_TOKEN;
         let mut saved = compaction::trim_tool_outputs(&mut self.messages, over, true, false);
         let mut stage = "checkpoint_trim";
@@ -5728,33 +5734,61 @@ mod tests {
         (agent, provider, events, [dir, sessions])
     }
 
-    /// A checkpoint keeps the newest twelve messages whatever they weigh, and a round of large reads among them leaves the conversation too long still: it is fitted by shortening the tool
-    /// outputs it kept, before any request, and no second checkpoint is asked for.
+    /// A forced checkpoint (asked for by name, or after a refusal) keeps the newest four messages whatever they weigh, and a round of large reads among them leaves the conversation too long still: it is
+    /// fitted by shortening the tool outputs it kept, before any request, and no second checkpoint is asked for.
     #[test]
-    fn a_checkpoint_that_leaves_the_conversation_too_long_is_fitted_and_not_asked_for_again() {
-        for (size, unanswered, stage) in [(45_000, false, "checkpoint_trim"), (90_000, false, "checkpoint_trim_all"), (90_000, true, "checkpoint_trim_all")] {
-            let messages = conversation_of_reads(size, unanswered);
-            let (mut agent, provider, events, _kept) = agent_holding(messages.clone(), 60_000, vec![says("the state of the work")]);
-            // (the scenario: the checkpoint on its own leaves too much)
-            let plain = agent_holding(compaction::apply_checkpoint(&messages, "the state of the work", 12), 60_000, Vec::new()).0;
-            assert!(compaction::needed(plain.expected_use(), plain.window), "{size}: the twelve kept messages alone are too long");
-            assert!(agent.compact(false, false).is_ok());
-            assert_eq!(provider.requests(), 1, "{size}: the checkpoint, and no second one");
-            assert!(!compaction::needed(agent.expected_use(), agent.window), "{size} {unanswered}: it fits now, before any request: {} of {}", agent.expected_use(), agent.window);
-            assert_eq!(agent.compaction_stage, stage, "{size} {unanswered}");
-            assert!(agent.messages.iter().any(|message| user_text(message).contains("the state of the work")), "the summary stands for the earlier turns");
-            assert!(agent.messages.iter().any(|message| user_text(message).contains("trimmed by compaction")), "what was kept was shortened");
-            // the oldest go first, and no more than is needed: with 45,000 characters one early one is enough, and the other two stay whole
-            let whole = agent.messages.iter().filter(|message| message.role == "tool" && message.content.as_deref().is_some_and(|text| text.len() >= size)).count();
-            assert!(if size == 45_000 { whole == 2 } else { whole <= 1 }, "{size} {unanswered}: {whole} whole");
-            let notices: Vec<String> = events.try_iter().filter_map(|event| if let Event::Notice(text) = event { Some(text) } else { None }).collect();
-            assert!(notices.iter().any(|text| text.contains("the earlier conversation is now a summary") && text.contains("shortened by")), "{notices:?}");
-        }
+    fn a_forced_checkpoint_that_leaves_the_conversation_too_long_is_fitted_and_not_asked_for_again() {
+        let messages = conversation_of_reads(150_000, true);
+        let (mut agent, provider, events, _kept) = agent_holding(messages.clone(), 60_000, vec![says("the state of the work")]);
+        // (the scenario: the checkpoint on its own leaves too much)
+        let plain = agent_holding(compaction::apply_checkpoint(&messages, "the state of the work", FORCED_KEEP), 60_000, Vec::new()).0;
+        assert!(compaction::needed(plain.expected_use(), plain.window), "the kept messages alone are too long");
+        assert!(agent.compact(true, false).is_ok());
+        assert_eq!(provider.requests(), 1, "the checkpoint, and no second one");
+        assert!(!compaction::needed(agent.expected_use(), agent.window), "it fits now, before any request: {} of {}", agent.expected_use(), agent.window);
+        assert_eq!(agent.compaction_stage, "checkpoint_trim_all", "the round in progress's outputs had to go too");
+        assert!(agent.messages.iter().any(|message| user_text(message).contains("the state of the work")), "the summary stands for the earlier turns");
+        assert!(agent.messages.iter().any(|message| user_text(message).contains("trimmed by compaction")), "what was kept was shortened");
+        let notices: Vec<String> = events.try_iter().filter_map(|event| if let Event::Notice(text) = event { Some(text) } else { None }).collect();
+        assert!(notices.iter().any(|text| text.contains("the earlier conversation is now a summary") && text.contains("shortened by")), "{notices:?}");
         // one that already fits is left as the checkpoint made it
         let (mut agent, provider, _events, _kept) = agent_holding(conversation_of_reads(3_000, false), 60_000, vec![says("the state of the work")]);
-        assert!(agent.compact(false, false).is_ok());
+        assert!(agent.compact(true, false).is_ok());
         assert_eq!((provider.requests(), agent.compaction_stage), (1, "checkpoint"));
         assert!(!agent.messages.iter().any(|message| user_text(message).contains("trimmed by compaction")));
+    }
+
+    /// An automatic compaction leaves the system message, the first request, the checkpoint, the latest request and the round in progress, and no more than a quarter of the window: what is left is read again
+    /// whole by the engine, and the less there is the longer it lasts. What the checkpoint stands for, the big reads of the turns before included, is not kept, and the round's own outputs are shortened if they
+    /// alone are over the quarter.
+    #[test]
+    fn an_automatic_checkpoint_leaves_the_requests_and_the_round_in_progress_and_at_most_a_quarter_of_the_window() {
+        for (size, unanswered, stage) in [(3_000, false, "checkpoint"), (90_000, false, "checkpoint"), (45_000, true, "checkpoint_trim_all"), (90_000, true, "checkpoint_trim_all")] {
+            let messages = conversation_of_reads(size, unanswered);
+            let (mut agent, provider, events, _kept) = agent_holding(messages.clone(), 60_000, vec![says("the state of the work")]);
+            assert!(agent.compact(false, false).is_ok());
+            assert_eq!(provider.requests(), 1, "{size} {unanswered}: the checkpoint, and no second one");
+            assert_eq!(agent.compaction_stage, stage, "{size} {unanswered}");
+            assert!(agent.expected_use() <= agent.window / 4, "{size} {unanswered}: a quarter of the window at most: {} of {}", agent.expected_use(), agent.window);
+            let said = |message: &Message| message.role == "user" && user_text(message).starts_with("question ");
+            let asked: Vec<&str> = agent.messages.iter().filter(|message| said(message)).map(user_text).collect();
+            assert_eq!(asked, ["question 0", "question 19"], "{size} {unanswered}: the first request and the latest");
+            assert_eq!(agent.messages[0].role, "system");
+            assert!(agent.messages.iter().any(|message| user_text(message).starts_with("[SUMMARY OF EARLIER TURNS]") && user_text(message).contains("the state of the work")));
+            let (calls, results) = (agent.messages.iter().filter(|message| message.tool_calls.is_some()).count(), agent.messages.iter().filter(|message| message.role == "tool").count());
+            assert_eq!((calls, results), (usize::from(unanswered), usize::from(unanswered)), "{size} {unanswered}: the round in progress, with its result, and no other");
+            if unanswered {
+                let result = agent.messages.iter().find(|message| message.role == "tool").unwrap();
+                assert!(user_text(result).contains("trimmed by compaction"), "{size}: shortened to fit");
+                assert_eq!(agent.messages.last().unwrap().role, "tool", "the round is the end of it");
+            } else {
+                assert!(!agent.messages.iter().any(|message| user_text(message).contains("trimmed by compaction")), "nothing of it is left to shorten");
+                assert_eq!(agent.messages.last().map(user_text), Some("question 19"));
+            }
+            assert!(agent.messages.len() <= 6, "{size} {unanswered}: {}", agent.messages.len());
+            let notices: Vec<String> = events.try_iter().filter_map(|event| if let Event::Notice(text) = event { Some(text) } else { None }).collect();
+            assert!(notices.iter().any(|text| text.contains("the earlier conversation is now a summary")), "{notices:?}");
+        }
     }
 
     /// A user message, and then `rounds` rounds of one call and its result each, the result of round `n` being `size(n)` characters: few turns, and as big as the tools made it. The last round is unanswered, as
@@ -5848,18 +5882,18 @@ mod tests {
         }
     }
 
-    /// A trim that reaches what the trigger asks for (the window less 15% and the reserve) stands alone, though it did not reach half the window: no turn goes for want of it. With no middle there is no checkpoint to ask for.
+    /// A trim that reaches what the trigger asks for (the window less 15% and the reserve) stands alone, though it did not reach half the window: no turn goes for want of it. (The model wrote no checkpoint here.)
     #[test]
     fn a_trim_that_reaches_the_triggers_target_stands_alone_though_it_is_not_half_the_window() {
         // (the outputs the trim may take are those between the head and the newest eight messages: three here, and the rest are not its to take)
         let messages = rounds_of_reads(9, |round| if matches!(round, 2 | 3 | 4) { 30_000 } else { 28_000 });
-        assert!(!compaction::has_a_middle(&messages, 12), "the scenario: nothing for a checkpoint to sum up");
+        assert!(compaction::has_a_lean_middle(&messages), "the scenario: a middle to sum up, and the model answers without a checkpoint");
         let turns = messages.len();
-        let (mut agent, provider, _events, _kept) = agent_holding(messages, 100_000, Vec::new());
+        let (mut agent, provider, _events, _kept) = agent_holding(messages, 100_000, vec![says("")]);
         let (target, half) = (agent.window - agent.window * 15 / 100 - compaction::reserve(agent.window), agent.window / 2);
         assert!(compaction::needed(agent.expected_use(), agent.window), "the scenario: over the trigger");
         assert!(agent.compact(false, false).is_ok());
-        assert_eq!(provider.requests(), 0, "no checkpoint was asked for");
+        assert_eq!(provider.requests(), 1, "the checkpoint was asked for, and not written");
         assert_eq!(agent.compaction_stage, "trim");
         assert_eq!(agent.messages.len(), turns, "no turn went");
         let used = agent.expected_use();
@@ -5938,8 +5972,8 @@ mod tests {
         assert_eq!(line["messages_before"].as_u64(), Some(was.len() as u64));
         let (after, first) = (line["messages_after"].as_u64().unwrap() as usize, line["first_changed"].as_u64().unwrap() as usize);
         assert!(after < was.len(), "{line}");
-        // (the system prompt and the first three turns stay, which is eight messages, and the summary takes the place of the first of the middle)
-        assert_eq!(first, 8, "{line}");
+        // (the system prompt and the first request stay, which is two messages, and the summary takes the place of the first of the rest: an automatic compaction leaves four in all)
+        assert_eq!((first, after), (2, 4), "{line}");
         let held: usize = was[..first].iter().map(Message::chars).sum();
         assert_eq!(line["unchanged_tokens_est"].as_u64(), Some((held / CHARS_A_TOKEN) as u64), "{line}");
         // The ones it had before: the line still says them.
@@ -5979,7 +6013,7 @@ mod tests {
             message.reasoning_content = Some("t".repeat(thinking.next().unwrap()));
         }
         let turns = messages.len();
-        let (mut agent, provider, _events, _kept) = agent_holding(messages, 32_768, vec![says("a summary")]);
+        let (mut agent, provider, _events, _kept) = agent_holding(messages.clone(), 32_768, vec![says("")]);
         agent.used = 33_077;
         agent.counted = agent.messages.len();
         assert!(compaction::needed(agent.expected_use(), agent.window), "the scenario is a full window");
@@ -5989,8 +6023,18 @@ mod tests {
         assert!(!compaction::needed(agent.expected_use(), agent.window), "it fits now: {} of {}", agent.expected_use(), agent.window);
         assert_eq!(agent.compaction_stage, "trim_all");
         assert_eq!(agent.messages.len(), turns, "no turn went: shortening what was read was enough");
-        assert_eq!(provider.requests(), 0, "and nothing was asked of the model");
+        assert_eq!(provider.requests(), 1, "only the checkpoint was asked of the model, and it wrote none");
         assert!(agent.messages.iter().filter(|message| message.role == "tool").any(|message| user_text(message).contains("trimmed by compaction")));
+        // With a checkpoint written the same turn is summed up: the request and the round in progress stay, in a quarter of the window.
+        let (mut agent, provider, _events, _kept) = agent_holding(messages, 32_768, vec![says("a summary")]);
+        agent.used = 33_077;
+        agent.counted = agent.messages.len();
+        assert!(agent.compact(false, false).is_ok());
+        assert_eq!(provider.requests(), 1);
+        assert_eq!(agent.compaction_stage, "checkpoint_trim_all", "the round in progress alone was over a quarter of the window");
+        assert!(agent.expected_use() <= agent.window / 4, "{} of {}", agent.expected_use(), agent.window);
+        assert_eq!(agent.messages.iter().filter(|message| message.role == "tool").count(), 2, "the round in progress, with both its results");
+        assert!(agent.messages.iter().any(|message| user_text(message).contains("a summary")) && agent.messages.iter().any(|message| user_text(message).starts_with("uuuu")));
     }
 
     #[test]

@@ -177,6 +177,54 @@ pub fn apply_checkpoint(messages: &[Message], checkpoint: &str, keep: usize) -> 
     out
 }
 
+/// Whether a message is the person's own request: a user message that neither the app's nudges nor a wake's notice are.
+fn is_a_request(message: &Message) -> bool {
+    message.role == "user" && message.notice.is_none() && !message.content.as_deref().is_some_and(crate::prompt::is_nudge)
+}
+
+/// What a lean checkpoint keeps, as indexes in order: the system message, the first user message, the latest request when it is another, and the round the model is in, which it has not read the results of.
+/// Everything between them is what the checkpoint stands for.
+fn lean_kept(messages: &[Message]) -> Vec<usize> {
+    let first = messages.iter().position(|message| message.role == "user");
+    let latest = messages.iter().rposition(is_a_request).or(first);
+    let mut kept: Vec<usize> = Vec::new();
+    kept.extend(messages.first().filter(|message| message.role == "system").map(|_| 0));
+    kept.extend(first);
+    kept.extend(latest.filter(|latest| Some(*latest) != first));
+    kept.extend(round_in_progress(messages)..messages.len());
+    kept.sort_unstable();
+    kept.dedup();
+    kept
+}
+
+/// Whether anything lies between the first user message and the latest request or the round in progress, for a lean checkpoint to sum up.
+pub fn has_a_lean_middle(messages: &[Message]) -> bool {
+    lean_kept(messages).len() < messages.len()
+}
+
+/// `[system, first user message, summary, latest request, round in progress]`, for the checkpoint an automatic compaction writes: what is left after one is read again whole by the engine from the root, so it
+/// is only what the work cannot go on without, and the checkpoint stands for the rest (what was trimmed or dropped of the outputs stays in its files). The latest request is kept as the person wrote it, which
+/// is why the summary does not say it again. The calls of the round and all their results stay together.
+pub fn apply_lean_checkpoint(messages: &[Message], checkpoint: &str) -> Vec<Message> {
+    let first = messages.iter().position(|message| message.role == "user");
+    let summary = Message::text("assistant", format!("{SUMMARY_HEADER}{}", checkpoint.trim()));
+    let mut out = Vec::new();
+    let mut summarized = false;
+    for at in lean_kept(messages) {
+        // (the summary goes in the place of what it stands for, after the first message of the person's)
+        if !summarized && at > first.unwrap_or(0) {
+            out.push(summary.clone());
+            summarized = true;
+        }
+        let message = messages[at].clone();
+        out.push(if summarized { Message { reasoning_content: None, ..message } } else { message });
+    }
+    if !summarized {
+        out.push(summary);
+    }
+    out
+}
+
 /// What the person last asked for, to say in a summary, if it is among what goes and not among what stays.
 fn latest_request(going: &[Message], staying: &[Message]) -> String {
     let typed = |message: &&Message| message.role == "user" && !message.content.as_deref().is_some_and(crate::prompt::is_nudge);
@@ -362,6 +410,84 @@ mod tests {
         assert_eq!(first_difference(&[a.clone(), b.clone()], &[a.clone()]), Some(1), "one is the start of the other: the length of the shorter");
         assert_eq!(first_difference(&[a.clone()], &[a.clone(), b.clone(), c.clone()]), Some(1));
         assert_eq!(first_difference(&[], &[a]), Some(0));
+    }
+
+    fn call_of(id: &str, results: usize) -> Message {
+        Message {
+            role: "assistant".into(),
+            reasoning_content: Some("thinking".into()),
+            tool_calls: Some((0..results).map(|at| ToolCall { id: format!("{id}-{at}"), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: "{}".into() } }).collect()),
+            ..Message::default()
+        }
+    }
+
+    fn results_of(id: &str, results: usize) -> Vec<Message> {
+        (0..results).map(|at| Message::tool_result(&format!("{id}-{at}"), "r")).collect()
+    }
+
+    /// The text of each message, or the name of its calls and results, as a line to compare.
+    fn shape(messages: &[Message]) -> Vec<String> {
+        messages.iter().map(|message| match (message.role.as_str(), &message.tool_calls, &message.tool_call_id) {
+            (_, Some(calls), _) => format!("calls {}", calls.iter().map(|call| call.id.as_str()).collect::<Vec<_>>().join(",")),
+            (_, _, Some(id)) => format!("result {id}"),
+            (role, _, _) => format!("{role}: {}", message.content.as_deref().unwrap_or("").lines().last().unwrap_or("")),
+        }).collect()
+    }
+
+    /// An automatic compaction leaves the system message, the first user message, the summary, the latest request, and the round in progress: nothing else, whatever it weighed.
+    #[test]
+    fn a_lean_checkpoint_keeps_the_first_request_the_latest_and_the_round_in_progress() {
+        let mut older = vec![call_of("a", 1)];
+        older.extend(results_of("a", 1));
+        older.push(Message::text("assistant", "an answer"));
+        older.extend([Message::text("user", "second"), call_of("b", 2)]);
+        older.extend(results_of("b", 2));
+        // In the middle of a round: three calls at once, answered, and the model has not read them.
+        let mut messages = vec![Message::text("system", "prompt"), Message::text("user", "first")];
+        messages.extend(older.clone());
+        messages.extend([Message::text("user", crate::prompt::CONTINUE_NUDGE), Message::text("user", "latest"), Message::text("assistant", "looking"), call_of("c", 3)]);
+        messages.extend(results_of("c", 3));
+        let out = apply_lean_checkpoint(&messages, " the state ");
+        assert_eq!(shape(&out), ["system: prompt", "user: first", "assistant: the state", "user: latest", "calls c-0,c-1,c-2", "result c-0", "result c-1", "result c-2"]);
+        assert!(out[2].content.as_deref().unwrap().starts_with(SUMMARY_HEADER) && out[2].content.as_deref().unwrap().ends_with("the state"));
+        assert!(out[4].reasoning_content.is_none() && out[0] == messages[0] && out[1] == messages[1], "the thinking of what is kept goes, as a checkpoint's does");
+        no_orphans(&out);
+        assert!(has_a_lean_middle(&messages));
+
+        // At the start of a turn: the new request is the last message, and there is no round.
+        let mut messages = vec![Message::text("system", "prompt"), Message::text("user", "first")];
+        messages.extend(older.clone());
+        messages.push(Message::text("user", "new"));
+        let out = apply_lean_checkpoint(&messages, "the state");
+        assert_eq!(shape(&out), ["system: prompt", "user: first", "assistant: the state", "user: new"]);
+
+        // In the first turn: the only request is the first and the latest, and it is not said twice.
+        let mut messages = vec![Message::text("system", "prompt"), Message::text("user", "first")];
+        for round in ["a", "b", "c"] {
+            messages.push(call_of(round, 2));
+            messages.extend(results_of(round, 2));
+        }
+        let out = apply_lean_checkpoint(&messages, "the state");
+        assert_eq!(shape(&out), ["system: prompt", "user: first", "assistant: the state", "calls c-0,c-1", "result c-0", "result c-1"]);
+        no_orphans(&out);
+        assert!(!out.iter().any(|message| message.content.as_deref().is_some_and(|text| text.contains("latest request"))));
+        assert!(out.len() < messages.len());
+    }
+
+    #[test]
+    fn there_is_a_lean_middle_only_when_something_lies_between_what_is_kept() {
+        let mut messages = vec![Message::text("system", "prompt"), Message::text("user", "first")];
+        assert!(!has_a_lean_middle(&messages), "only the request");
+        messages.push(call_of("a", 1));
+        messages.extend(results_of("a", 1));
+        assert!(!has_a_lean_middle(&messages), "only the round in progress");
+        messages.extend([call_of("b", 1)]);
+        messages.extend(results_of("b", 1));
+        assert!(has_a_lean_middle(&messages), "a round before the one in progress");
+        let mut turns = vec![Message::text("system", "prompt"), Message::text("user", "first"), Message::text("assistant", "answer"), Message::text("user", "second")];
+        assert!(has_a_lean_middle(&turns), "an answer between two requests");
+        turns.remove(2);
+        assert!(!has_a_lean_middle(&turns), "two requests and nothing between");
     }
 
     #[test]
