@@ -281,6 +281,8 @@ pub struct Settings {
     /// Ask GitHub, now and then, whether a newer release is out, and fetch its setup in the background when it is (see `updates`). Off: the app neither asks nor fetches on its own. Either way
     /// nothing is installed unless the person presses Restart to update.
     pub check_for_updates: bool,
+    /// Whether the bundled local Straydog is checked and staged independently of Dogmind updates.
+    pub check_straydog_updates: bool,
     /// When GitHub last answered such a question, in seconds since 1970: it is asked again a day later, at the soonest.
     pub last_update_check: Option<u64>,
     /// The release whose notice the person closed (or followed to its page): they are not told of that one again.
@@ -368,6 +370,7 @@ impl Default for Settings {
             skills_off: Vec::new(),
             skills_on: Vec::new(),
             check_for_updates: true,
+            check_straydog_updates: true,
             last_update_check: None,
             dismissed_update: None,
         }
@@ -589,7 +592,7 @@ pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
 }
 
 /// The folders this app makes in its data folder, by name.
-const MADE_FOLDERS: [&str; 7] = ["sessions", "memory", "preview", "crashes", "attachments", "models", "updates"];
+const MADE_FOLDERS: [&str; 8] = ["sessions", "memory", "preview", "crashes", "attachments", "models", "updates", "engine-updates"];
 /// The beginnings of the names of the files it makes there: each as it is, written beside itself first (`.part`, `.partial`), or
 /// moved aside when it could not be read (`.broken`, `.unreadable-TIME.json`), or the engine's copies of its own (`engine.toml.old`).
 const MADE_FILES: [&str; 12] = ["settings.json", "engine.toml", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-", "workspace-grants.json", "read-folders.json", "mcp.json", "mcp.partial", "report.txt", "conversation-key.json"];

@@ -19,7 +19,9 @@ use crate::settings::Settings;
 pub fn find(settings: &Settings) -> Option<PathBuf> {
     let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|folder| folder.join("straydog.exe")));
     let on_path = std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|folder| folder.join("straydog.exe")).find(|file| file.is_file()));
-    settings.straydog.clone().filter(|file| file.is_file()).or(beside.filter(|file| file.is_file())).or(on_path)
+    settings.straydog.clone().filter(|file| file.is_file())
+        .or_else(|| beside.as_ref().filter(|file| file.is_file()).and_then(|_| crate::engine_updates::selected(&crate::settings::data_folder())))
+        .or(beside.filter(|file| file.is_file())).or(on_path)
 }
 
 const QWEN: &str = "Qwen3.8-Flash-Next";
