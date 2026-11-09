@@ -36,6 +36,8 @@ pub const SYSTEM_PROMPT: &str = "You are Dogmind, an agent on the user's own com
 
 ";
 pub const CHECKPOINT_PROMPT: &str = include_str!("../../../assets/dogmind/checkpoint_prompt.md");
+/// After a checkpoint request answered with thinking alone.
+pub const CHECKPOINT_AGAIN: &str = "Your reply was empty: the checkpoint was only in your thinking. Write the checkpoint itself now, as your reply.";
 pub const CODEX_JSON: &str = include_str!("../../../assets/dogmind/codex.json");
 pub const DOGMIND_COMMIT: &str = include_str!("../../../assets/dogmind/SOURCE");
 

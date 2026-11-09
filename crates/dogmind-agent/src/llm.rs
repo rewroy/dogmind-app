@@ -188,6 +188,15 @@ pub enum Delta<'a> {
     Tool(usize, &'a str),
     /// A piece of the arguments of that call.
     Arguments(usize, &'a str),
+    /// The server reading the prompt, before any word of the answer: how many of its tokens it has read, of how many (Straydog says so
+    /// about once a second while it reads, in a comment of the stream: `: prefill 4096/90724`).
+    Prefill(u64, u64),
+}
+
+/// What a comment of the stream says of the prompt's reading (`: prefill 4096/90724`, the text after the colon): read, of how many.
+fn prefill_said(comment: &str) -> Option<(u64, u64)> {
+    let (done, total) = comment.trim().strip_prefix("prefill ")?.split_once('/')?;
+    Some((done.parse().ok()?, total.parse().ok()?))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -228,6 +237,7 @@ impl Completion {
             // (the conversation gives it one as it goes in)
             at: None,
             notice: None,
+            helper: None,
         }
     }
 }
@@ -574,7 +584,12 @@ impl Client {
             while let Some(at) = pending.iter().position(|&byte| byte == b'\n') {
                 let line: Vec<u8> = pending.drain(..=at).collect();
                 let line = String::from_utf8_lossy(&line);
-                let Some(data) = line.trim_end().strip_prefix("data:") else { continue };
+                let line = line.trim_end();
+                if let Some((done, total)) = line.strip_prefix(':').and_then(prefill_said) {
+                    on(Delta::Prefill(done, total));
+                    continue;
+                }
+                let Some(data) = line.strip_prefix("data:") else { continue };
                 let data = data.trim_start();
                 if data == "[DONE]" {
                     return Ok(assembly.finish());
@@ -689,6 +704,16 @@ pub struct ServerInfo {
 mod tests {
     use super::*;
 
+    /// Straydog's comment while it reads a prompt is read as how far it has got; other comments, and a malformed one, are nothing.
+    #[test]
+    fn the_prompts_reading_is_read_from_the_streams_comments() {
+        assert_eq!(prefill_said(" prefill 4096/90724"), Some((4096, 90724)));
+        assert_eq!(prefill_said("prefill 0/12"), Some((0, 12)));
+        assert_eq!(prefill_said(" keep-alive"), None);
+        assert_eq!(prefill_said(" prefill 4096"), None);
+        assert_eq!(prefill_said(" prefill a/b"), None);
+    }
+
     fn feed(events: &[&str]) -> (Completion, Vec<String>) {
         let mut assembly = Assembly::default();
         let mut seen = Vec::new();
@@ -698,6 +723,7 @@ mod tests {
                 Delta::Content(text) => format!("c:{text}"),
                 Delta::Tool(_, name) => format!("t:{name}"),
                 Delta::Arguments(index, text) => format!("a{index}:{text}"),
+                Delta::Prefill(done, total) => format!("p:{done}/{total}"),
             })).unwrap();
         }
         (assembly.finish(), seen)

@@ -175,6 +175,41 @@ pub const ANSWERED: &str = "the person answered: ";
 pub const PLAN_APPROVED: &str = "the person approved the plan, and plan mode is over: carry the plan out now, in this turn";
 pub const PLAN_CHANGE: &str = "the person wants the plan changed, and plan mode goes on: ";
 
+/// How an `explore` helper ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelperEnd {
+    Answered,
+    /// The person's Stop on the helper, or on the turn.
+    Stopped,
+    /// It could not go on: why.
+    Failed(String),
+}
+
+/// What an `explore` call returns when the person stopped the helper alone: the agent that asked goes on without an answer.
+pub const HELPER_STOPPED: &str = "stopped by the person";
+
+/// The person's Stop on an `explore` helper alone, which the window says without a word to the agent: the turn goes on, and the helper's call ends with [`HELPER_STOPPED`].
+#[derive(Default)]
+pub struct HelperStop {
+    asked: Mutex<Option<String>>,
+}
+
+impl HelperStop {
+    /// Stop the helper of this call.
+    pub fn stop(&self, id: &str) {
+        *self.asked.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.to_string());
+    }
+
+    fn asked(&self, id: &str) -> bool {
+        self.asked.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_deref() == Some(id)
+    }
+
+    /// A Stop that came after its helper had ended is for no other.
+    fn forget(&self) {
+        *self.asked.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
 /// The answer in the result of an `ask_user` call that the session kept; none when the call failed, or was stopped before it was answered.
 pub fn answer_in(result: &str) -> Option<&str> {
     result.strip_prefix(ANSWERED)
@@ -219,11 +254,19 @@ pub enum Event {
     RequestStarted,
     /// The session is being made shorter, which can be minutes of the model summing it up: till the next request, or the turn's end.
     Compacting,
+    /// The server is reading the prompt, before the answer's first word: `done` of `total` tokens. Told about once a second while it reads
+    /// (Straydog); after a compaction, or on a small GPU, that can be minutes.
+    Reading { done: u64, total: u64 },
     /// More of the arguments of a tool call the model is still writing: `index` is which of its answer. Told every so often, and at once for a new call.
     ToolWriting { index: usize, tool: String, piece: String },
     ToolStarted { id: String, tool: String, summary: String },
-    /// What a call that takes a while (`explore`) is doing now: one of its own calls, by its tool and what it is on.
-    ToolProgress { id: String, tool: String, summary: String },
+    /// An `explore` helper has begun (`id` is the call's): its task as a line, the most requests it can have, and the name of the file its conversation is kept in beside the session
+    /// (none when it could not be kept).
+    HelperStarted { id: String, task: String, most: u32, file: Option<String> },
+    /// The helper calls a tool: in which of its requests (`step`, of `most`), the tool and what it is on (the path, or the pattern), what its context has come to in tokens, and how long it has worked.
+    HelperStep { id: String, step: u32, most: u32, tool: String, summary: String, tokens: u64, elapsed: Duration },
+    /// The helper is done, whichever way: `steps` requests that called a tool, `files` different files it read, and what the call's record of it is (`helper`, none when it was not kept).
+    HelperEnded { id: String, how: HelperEnd, steps: u32, files: u32, tokens: u64, elapsed: Duration, helper: Option<crate::message::HelperRef> },
     /// `images`: what the call opened for the model to see, kept with the session, which the person sees too.
     ToolEnded { id: String, ok: bool, declined: bool, elapsed: Duration, output: String, images: Vec<ImageRef> },
     /// Words written during the turn have reached it, between two of its steps.
@@ -354,6 +397,8 @@ pub struct Handle {
     pub interject: Arc<Mutex<Vec<String>>>,
     /// What the session has going on or waiting while no turn runs: the window lists it and stops any of it (`Background::stop`) without a word to the agent.
     pub background: Arc<Background>,
+    /// The person's Stop on a helper alone: the window sets it while a turn is at work.
+    pub helper_stop: Arc<HelperStop>,
 }
 
 pub struct Config {
@@ -402,6 +447,8 @@ pub fn start(config: Config, events: Sender<Event>, wake: Box<dyn Fn() + Send>) 
     let shared = live.clone();
     let background = Arc::new(Background::default());
     let kept = background.clone();
+    let helper_stop = Arc::new(HelperStop::default());
+    let helper_stops = helper_stop.clone();
     std::thread::spawn(move || {
         let mut agent = Agent::new(config, events, wake, flag);
         agent.bench.background = background.clone();
@@ -411,11 +458,12 @@ pub fn start(config: Config, events: Sender<Event>, wake: Box<dyn Fn() + Send>) 
             agent.place = Some(place);
         }
         agent.interject = added;
+        agent.helper_stop = helper_stops;
         agent.live = shared;
         agent.load_extras();
         agent.run(inbox);
     });
-    Handle { commands, cancel, live, interject, background: kept }
+    Handle { commands, cancel, live, interject, background: kept, helper_stop }
 }
 
 /// What a model wrote before any tool call it wrote out in its own markup (DeepSeek's DSML, a `<tool_call>`): a server that was not
@@ -437,6 +485,11 @@ fn arguments_of(call: &crate::message::ToolCall) -> Option<Value> {
 /// `run`, with the person's Stop passed on to `halt` within 15 ms of it: a stream that the app stops too has a flag of its own, and the
 /// person's is never set by anything else.
 fn with_the_persons_stop<R>(person: &AtomicBool, halt: &AtomicBool, run: impl FnOnce() -> R) -> R {
+    while_watching(&|| person.load(Ordering::Relaxed), halt, run)
+}
+
+/// `run`, with `halt` set within 15 ms of `stopped` being true: for a request that more than the person's Stop on the turn can end.
+fn while_watching<R>(stopped: &(impl Fn() -> bool + Sync), halt: &AtomicBool, run: impl FnOnce() -> R) -> R {
     struct Over<'a>(&'a AtomicBool);
     impl Drop for Over<'_> {
         fn drop(&mut self) {
@@ -447,7 +500,7 @@ fn with_the_persons_stop<R>(person: &AtomicBool, halt: &AtomicBool, run: impl Fn
     std::thread::scope(|scope| {
         scope.spawn(|| {
             while running.load(Ordering::Relaxed) {
-                if person.load(Ordering::Relaxed) {
+                if stopped() {
                     halt.store(true, Ordering::Relaxed);
                 }
                 std::thread::sleep(Duration::from_millis(15));
@@ -991,6 +1044,10 @@ struct Agent {
     quiet_until: Option<Instant>,
     /// The `wake` lines of the turn that begins, for its first request: they say which it was.
     wake_lines: Vec<Value>,
+    /// The person's Stop on a helper alone (shared with the window).
+    helper_stop: Arc<HelperStop>,
+    /// What a helper's call is to record in its result, by the call's id, until the result is written.
+    helper_refs: HashMap<String, crate::message::HelperRef>,
 }
 
 /// A session's scratch folder: outside the workspace, in the sandbox's own temp area, which is the one place besides a workspace where a command may write. Named for the session's file.
@@ -1021,6 +1078,20 @@ impl Drop for Agent {
             let _ = std::fs::remove_dir_all(folder);
         }
     }
+}
+
+/// An `explore` helper at work: where its conversation is kept, and what it has done so far.
+struct HelperRun {
+    file: Option<Session>,
+    number: Option<u32>,
+    name: Option<String>,
+    began: Instant,
+    /// Its requests in which it called a tool.
+    steps: u32,
+    /// The files it read, once each.
+    files: HashSet<String>,
+    tokens: u64,
+    stopped: bool,
 }
 
 /// What a call's line in the trajectory needs from its beginning.
@@ -1191,6 +1262,8 @@ impl Agent {
             last_waiting: Waiting::default(),
             quiet_until: None,
             wake_lines: Vec::new(),
+            helper_stop: Arc::default(),
+            helper_refs: HashMap::new(),
         }
     }
 
@@ -1622,7 +1695,11 @@ impl Agent {
         self.cancel.store(false, Ordering::Relaxed);
         let mut answered = false;
         let mut clock = Clock::start();
-        let streamed = provider.stream(&request, &self.cancel, &mut |_| {
+        let streamed = provider.stream(&request, &self.cancel, &mut |delta| {
+            // (the prompt being read is no word)
+            if matches!(delta, Delta::Prefill(..)) {
+                return;
+            }
             clock.word();
             answered = true;
             self.cancel.store(true, Ordering::Relaxed);
@@ -2005,6 +2082,12 @@ impl Agent {
                 if person.load(Ordering::Relaxed) {
                     cancel.store(true, Ordering::Relaxed);
                 }
+                // (the prompt being read: no word yet)
+                if let Delta::Prefill(done, total) = delta {
+                    let _ = events.send(Event::Reading { done, total });
+                    wake();
+                    return;
+                }
                 let now = Instant::now();
                 clock.word();
                 let mut told = match delta {
@@ -2046,6 +2129,8 @@ impl Agent {
                         }
                         Vec::new()
                     }
+                    // (told above, before the clock)
+                    Delta::Prefill(..) => Vec::new(),
                 };
                 told.extend(meter.due(now, window));
                 if !told.is_empty() {
@@ -2065,7 +2150,7 @@ impl Agent {
             };
             let (usage, timings) = result.as_ref().ok().map_or((None, None), |completion| (completion.usage.as_ref(), completion.timings.as_ref()));
             let named: Vec<String> = calling.iter().map(|call| call.function.name.clone()).filter(|name| !name.is_empty()).collect();
-            self.traj.request(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is) });
+            self.traj.request(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is), helper_file: None });
             let base = self.messages.len();
             let saved = if cuts { cut_answer(&written, &reasoned, &calling, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) } else { None };
             // Writing a file out in its reasoning: every token of it is typed again in the call. It goes on from what it had decided, in a request of which all but the last few tokens are
@@ -2401,11 +2486,16 @@ impl Agent {
 
     /// The line of a request that is not a step of the conversation (a helper's, a checkpoint's, the engine's warm-up): what came back, as far as it is known.
     fn traced(&mut self, role: &'static str, req_id: &str, clock: &Clock, result: &Result<llm::Completion, LlmError>) {
+        self.traced_with(role, req_id, clock, result, None);
+    }
+
+    /// As `traced`; `helper_file` is the file a helper's conversation is kept in.
+    fn traced_with(&mut self, role: &'static str, req_id: &str, clock: &Clock, result: &Result<llm::Completion, LlmError>, helper_file: Option<&str>) {
         let (usage, timings) = result.as_ref().ok().map_or((None, None), |completion| (completion.usage.as_ref(), completion.timings.as_ref()));
         let (reasoning, content, calls) = result.as_ref().ok().map_or((0, 0, Vec::new()), |completion| (completion.reasoning.chars().count(), completion.content.chars().count(), completion.tool_calls.iter().map(|call| call.function.name.clone()).collect()));
         // (a warm-up is ended by the app at its first word, which is how it is meant to end)
         let end = if role == "warm" && matches!(result, Err(LlmError::Cancelled)) { "stopped_app:warm_up".to_string() } else { trajectory::end_of(result) };
-        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: 0, retry: None, draft_watch: None });
+        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: 0, retry: None, draft_watch: None, helper_file });
     }
 
     /// An intervention of the app's own, in the trajectory, for the request that was made last: the one it ended or follows.
@@ -2675,47 +2765,136 @@ impl Agent {
     /// A look across many files, by a helper with a context of its own (`explore`), as Deepseek Harness's subagents do: what it reads fills
     /// its context and not this one, and only its answer joins the conversation. It has the looking tools only, and each of its calls goes
     /// through the gate as the session's own do; one that would need the person's leave is not made, and it is told to say so.
+    /// The helper's conversation is kept as a session of its own beside this one (`session::helper_file_of`), the window is told how it goes
+    /// (`Event::HelperStarted`, `HelperStep`, `HelperEnded`), and the person can stop it alone (`HelperStop`): the call then returns [`HELPER_STOPPED`] and the turn goes on.
     fn explore(&mut self, id: &str, arguments: &Value) -> Result<String, String> {
         let Some(provider) = self.provider.clone() else { return Err(llm::NOT_READY.into()) };
         let task = arguments.get("task").and_then(Value::as_str).map(str::trim).filter(|task| !task.is_empty()).ok_or_else(|| "task is empty: say what to look into".to_string())?;
         let schemas = tools::helper_schemas();
         let mut messages = vec![Message::text("system", prompt::helper_prompt(&self.workspace)), Message::text("user", task)];
+        // (a Stop pressed on the card of an earlier helper, after that had ended, is for none that begins now)
+        self.helper_stop.forget();
+        let mut run = HelperRun { file: None, number: None, name: None, began: Instant::now(), steps: 0, files: HashSet::new(), tokens: 0, stopped: false };
+        if let Some((session, number, name)) = self.begin_helper_file() {
+            (run.file, run.number, run.name) = (Some(session), Some(number), Some(name));
+        }
+        for message in &messages {
+            self.keep_helper(&mut run, message);
+        }
+        self.emit(Event::HelperStarted { id: id.to_string(), task: tools::summary("explore", arguments), most: HELPER_STEPS as u32, file: run.name.clone() });
+        let result = self.helper_steps(&provider, id, &schemas, &mut messages, &mut run);
+        let how = match (&result, run.stopped) {
+            (_, true) => HelperEnd::Stopped,
+            (Ok(_), false) => HelperEnd::Answered,
+            (Err(why), false) => HelperEnd::Failed(why.clone()),
+        };
+        let (elapsed, files) = (run.began.elapsed(), run.files.len() as u32);
+        let reference = run.number.map(|number| crate::message::HelperRef { number, steps: run.steps, files, ms: elapsed.as_millis() as u64, tokens: run.tokens, stopped: run.stopped });
+        if let Some(reference) = &reference {
+            self.helper_refs.insert(id.to_string(), reference.clone());
+        }
+        self.emit(Event::HelperEnded { id: id.to_string(), how, steps: run.steps, files, tokens: run.tokens, elapsed, helper: reference });
+        result
+    }
+
+    /// The file for a helper's conversation, beside this session's: it, its number and its name. None when the session has no file or the file could not be made, which the person is told.
+    fn begin_helper_file(&self) -> Option<(Session, u32, String)> {
+        let parent = self.session.as_ref()?.path.clone();
+        match Session::create_helper(&self.policy, &parent, &self.workspace, &now()) {
+            Ok((session, number)) => {
+                let name = session.path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                Some((session, number, name))
+            }
+            Err(error) => {
+                self.emit(Event::Notice(format!("the helper's steps could not be saved: {error}")));
+                None
+            }
+        }
+    }
+
+    /// A message of the helper's conversation, on disk as one of the session's is. A file that cannot be written to is left, and said once.
+    fn keep_helper(&self, run: &mut HelperRun, message: &Message) {
+        let Some(session) = &mut run.file else { return };
+        let mut kept = message.clone();
+        if kept.at.is_none() && matches!(kept.role.as_str(), "user" | "assistant") {
+            kept.at = Some(crate::message::written_now());
+        }
+        if let Err(error) = session.append(&kept) {
+            self.emit(Event::Notice(format!("the helper's steps could not be saved: {error}")));
+            run.file = None;
+        }
+    }
+
+    /// The person stopped the helper alone, or the turn: `request` is the one it was on.
+    fn helper_stopped(&mut self, run: &mut HelperRun, request: usize) -> Result<String, String> {
+        run.stopped = true;
+        self.intervened("helper_stopped", json!({"step": request, "steps": run.steps}));
+        if self.cancelled() {
+            return Err("stopped".into());
+        }
+        Ok(HELPER_STOPPED.into())
+    }
+
+    /// The helper's requests, each answered by tool calls it makes or by its answer.
+    fn helper_steps(&mut self, provider: &Arc<dyn Provider>, id: &str, schemas: &Value, messages: &mut Vec<Message>, run: &mut HelperRun) -> Result<String, String> {
         let (baseline, secrets) = (self.bench.baseline.clone(), self.gate.secrets.clone());
         // (half of the window for what it reads: the rest for its thinking and its answer)
         let room = (self.window as usize).saturating_mul(CHARS_A_TOKEN) / 2;
         let mut told_enough = false;
+        let (person, stops) = (self.cancel.clone(), self.helper_stop.clone());
         // (past its last word, a round or two for a model that calls a tool still: each call is turned down, and it is asked again)
         for step in 0..=HELPER_STEPS + HELPER_PAST_ENOUGH {
-            if self.cancelled() {
-                return Err("stopped".into());
+            if self.cancelled() || stops.asked(id) {
+                return self.helper_stopped(run, step);
             }
             let last = step >= HELPER_STEPS || messages.iter().map(Message::chars).sum::<usize>() > room;
             if last && !told_enough {
                 self.intervened("helper_enough", json!({"step": step}));
-                messages.push(Message::text("user", prompt::HELPER_ENOUGH));
+                let nudge = Message::text("user", prompt::HELPER_ENOUGH);
+                self.keep_helper(run, &nudge);
+                messages.push(nudge);
                 told_enough = true;
             }
             // The tools are offered to the end. Not offered, a real model (DeepSeek-V4.1) went on calling one, in its own markup: that came back as
             // the answer, and the agent that asked got that and nothing of what the helper had found.
             let req_id = self.traj.request_id();
-            let request = Request { model: &self.model, messages: &messages, tools: Some(&schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id) };
+            let request = Request { model: &self.model, messages, tools: Some(schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id) };
             let mut clock = Clock::start();
-            let streamed = provider.stream(&request, &self.cancel, &mut |_| clock.word());
-            self.traced("helper", &req_id, &clock, &streamed);
-            let completion = streamed.map_err(|error| format!("the helper's request failed: {error}"))?;
+            // (the person's Stop on the turn ends it, and so does the one on this helper alone: the stream has a flag of its own that either sets)
+            let halt = AtomicBool::new(false);
+            let streamed = while_watching(&|| person.load(Ordering::Relaxed) || stops.asked(id), &halt, || provider.stream(&request, &halt, &mut |delta| if !matches!(delta, Delta::Prefill(..)) { clock.word() }));
+            self.traced_with("helper", &req_id, &clock, &streamed, run.name.as_deref());
+            let completion = match streamed {
+                Ok(completion) => completion,
+                Err(LlmError::Cancelled) => return self.helper_stopped(run, step),
+                Err(error) => return Err(format!("the helper's request failed: {error}")),
+            };
+            // (what its context has come to: what the server counted of its last request, or else about what is in it)
+            run.tokens = completion.usage.as_ref().map(|usage| usage.prompt + usage.completion).filter(|tokens| *tokens > 0).unwrap_or_else(|| (messages.iter().map(Message::chars).sum::<usize>() / CHARS_A_TOKEN) as u64);
             let answer = without_call_markup(&completion.content).trim().to_string();
             if completion.tool_calls.is_empty() || (last && !answer.is_empty()) {
+                self.keep_helper(run, &completion.message());
                 return if answer.is_empty() { Err("the helper ended with nothing to say".into()) } else { Ok(tools::spill("helper", &answer, HELPER_ANSWER)) };
             }
-            messages.push(completion.message());
+            let said = completion.message();
+            self.keep_helper(run, &said);
+            messages.push(said);
+            if !last {
+                run.steps += 1;
+            }
             for call in &completion.tool_calls {
                 let arguments: Value = parse_arguments(&call.function.arguments).unwrap_or(Value::Null);
                 let name = call.function.name.as_str();
                 if last {
-                    messages.push(Message::tool_result(&call.id, prompt::HELPER_NO_MORE));
+                    let turned_down = Message::tool_result(&call.id, prompt::HELPER_NO_MORE);
+                    self.keep_helper(run, &turned_down);
+                    messages.push(turned_down);
                     continue;
                 }
-                self.emit(Event::ToolProgress { id: id.to_string(), tool: name.to_string(), summary: tools::summary(name, &arguments) });
+                if self.cancelled() || stops.asked(id) {
+                    return self.helper_stopped(run, step);
+                }
+                self.emit(Event::HelperStep { id: id.to_string(), step: step as u32 + 1, most: HELPER_STEPS as u32, tool: name.to_string(), summary: tools::summary(name, &arguments), tokens: run.tokens, elapsed: run.began.elapsed() });
                 let result = if !tools::HELPER_TOOLS.contains(&name) {
                     Err(format!("{name} is not yours: you have read_file, search_files, find_files and list_files"))
                 } else if self.gate.check(name, &arguments, &self.workspace) != Verdict::Allow {
@@ -2723,7 +2902,14 @@ impl Agent {
                 } else {
                     Workbench::run_read(name, &arguments, &self.workspace, baseline.as_deref(), &secrets, &self.cancel).0
                 };
-                messages.push(Message::tool_result(&call.id, result.unwrap_or_else(|error| format!("error: {error}"))));
+                if name == "read_file" && result.is_ok() {
+                    if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                        run.files.insert(resolve(&self.workspace, path).to_string_lossy().to_lowercase());
+                    }
+                }
+                let answered = Message::tool_result(&call.id, result.unwrap_or_else(|error| format!("error: {error}")));
+                self.keep_helper(run, &answered);
+                messages.push(answered);
             }
         }
         Err("the helper went on calling tools after it was told to answer, and gave no answer".into())
@@ -2873,7 +3059,8 @@ impl Agent {
         }
         self.tool_ended(id, ok, declined, &output, elapsed);
         self.emit(Event::ToolEnded { id: id.to_string(), ok, declined, elapsed, output: output.clone(), images: images.clone() });
-        self.push(Message { images, ..Message::tool_result(id, output) });
+        let helper = self.helper_refs.remove(id);
+        self.push(Message { images, helper, ..Message::tool_result(id, output) });
         // (a command may have been started, ended or stopped by this call, or a wait set)
         self.tell_waiting();
     }
@@ -3217,12 +3404,31 @@ impl Agent {
         complete_tool_calls(&mut messages);
         messages.push(Message::text("user", prompt::CHECKPOINT_PROMPT));
         let folder = self.picture_folder();
-        let req_id = self.traj.request_id();
-        let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false, request_id: Some(&req_id) };
-        let mut clock = Clock::start();
-        let streamed = provider.stream(&request, &self.cancel, &mut |_| clock.word());
-        self.traced("checkpoint", &req_id, &clock, &streamed);
-        let completion = streamed?;
+        let mut completion = None;
+        for asked in 0..2 {
+            let req_id = self.traj.request_id();
+            let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false, request_id: Some(&req_id) };
+            let mut clock = Clock::start();
+            let streamed = provider.stream(&request, &self.cancel, &mut |delta| match delta {
+                Delta::Prefill(done, total) => self.emit(Event::Reading { done, total }),
+                _ => clock.word(),
+            });
+            self.traced("checkpoint", &req_id, &clock, &streamed);
+            let answer = streamed?;
+            // A thinking model may end its turn with all of it in its thinking and no reply (Qwen3.8 at its highest effort, 111,868 tokens
+            // in: 6,405 characters of thinking and none of reply). Asked once more, in the same conversation, which the engine holds, it is
+            // to write it. (Going on without one, a compaction trimmed every tool output, and the engine read 90,724 tokens again: 17
+            // minutes on an 8 GB GPU.)
+            let thought_only = answer.tool_calls.is_empty() && answer.finish == "stop" && answer.content.trim().is_empty() && !answer.reasoning.trim().is_empty();
+            if asked == 0 && thought_only && !self.cancelled() {
+                messages.push(answer.message());
+                messages.push(Message::text("user", prompt::CHECKPOINT_AGAIN));
+                continue;
+            }
+            completion = Some(answer);
+            break;
+        }
+        let Some(completion) = completion else { return Ok(None) };
         // (one with no word of how it ended may have been cut anywhere: the turns it would stand for go for good, so it must be whole)
         if !completion.tool_calls.is_empty() || completion.finish == "length" || completion.finish.is_empty() || completion.content.trim().is_empty() {
             return Ok(None);
@@ -5425,6 +5631,29 @@ mod tests {
         assert!(provider.messages(19).iter().any(|message| user_text(message).contains("the state of the work")));
     }
 
+    /// A checkpoint answered with thinking alone is asked for once more in the same conversation (what the engine holds, extended), and
+    /// that reply is the checkpoint: the compaction does not go on to trim the conversation's outputs, which the engine would read again whole.
+    #[test]
+    fn a_checkpoint_answered_with_thinking_alone_is_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut steps = nearly_full(dir.path());
+        let thought: Step = Box::new(|_: &AtomicBool| Ok(llm::Completion { reasoning: "the state, in my head".into(), finish: "stop".into(), ..llm::Completion::default() }));
+        steps.extend([thought, says("the state of the work"), says("go on")]);
+        let (run, provider) = scripted(dir.path(), steps, Mode::Default);
+        asked_nine(&run);
+        run.handle.commands.send(Command::Send("question 9".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let first = provider.messages(18);
+        let again = provider.messages(19);
+        assert_eq!(first.last().unwrap().content.as_deref(), Some(prompt::CHECKPOINT_PROMPT));
+        assert_eq!(again[..first.len()], first[..], "the second extends the first");
+        assert_eq!(again[first.len()].reasoning_content.as_deref(), Some("the state, in my head"));
+        assert_eq!(again.last().unwrap().content.as_deref(), Some(prompt::CHECKPOINT_AGAIN));
+        let next = provider.messages(20);
+        assert!(next.iter().any(|message| user_text(message).contains("the state of the work")), "the second reply is the checkpoint");
+        assert!(!next.iter().any(|message| message.content.as_deref().is_some_and(|text| text.contains("trimmed by compaction"))), "nothing was trimmed");
+    }
+
     /// Twenty turns, the last three of them with a read of `size` characters; the last unanswered when `unanswered`, as a round is when the next request is about to be sent.
     fn conversation_of_reads(size: usize, unanswered: bool) -> Vec<Message> {
         let call = |id: &str| Message {
@@ -7426,4 +7655,7 @@ mod tests {
 
     /// What the agent does with conversations encrypted at rest.
     mod encrypted;
+
+    /// An `explore` helper's conversation: kept, sealed, told, stopped, branched and deleted with the session.
+    mod helper;
 }

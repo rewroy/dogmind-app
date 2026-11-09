@@ -142,7 +142,7 @@ fn rows_of(root: &Path) -> Vec<Row> {
     folders.sort();
     for folder in folders {
         let tag = folder.file_name().unwrap().to_string_lossy().trim_end_matches("-data").to_string();
-        let mut files: Vec<_> = std::fs::read_dir(folder.join("sessions")).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !crate::trajectory::is_trajectory(path)).collect();
+        let mut files: Vec<_> = std::fs::read_dir(folder.join("sessions")).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !crate::trajectory::is_trajectory(path) && !crate::session::is_helper(path)).collect();
         files.sort();
         for file in files {
             // (a session that does not open, an encrypted one whose key is not unlocked here among them, is said, and not left out of the count without a word)
