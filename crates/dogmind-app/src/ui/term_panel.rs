@@ -261,7 +261,7 @@ impl App {
             for window in self.term.tab_buttons.clone().into_iter().chain(self.term.close_buttons.clone()).chain([self.term.new_button, self.term.shells_button, self.term.again_button]) {
                 show(window, false);
             }
-            self.layout_terminal_page(shapes, x, width, top, bottom);
+            self.layout_terminal_page(shapes, x, width, top);
             return;
         }
         show(self.term.start_button, false);
@@ -341,18 +341,14 @@ impl App {
         }
     }
 
-    /// The page of a view with no terminal in it: what it is, how to begin one, and, quietly, what it is not.
-    unsafe fn layout_terminal_page(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32, bottom: i32) {
+    /// The page of a view with no terminal in it: its name and how to begin one.
+    unsafe fn layout_terminal_page(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32) {
         let s = |value: i32| scale(self.dpi, value);
         let mut y = top + s(ds::space::XL);
         shapes.push(Shape::Icon { name: "terminal", area: rect(x, y, s(ds::size::ICON_LARGE), s(ds::size::ICON_LARGE)), size: s(ds::size::ICON_LARGE), color: theme::muted() });
         y += s(ds::size::ICON_LARGE) + s(ds::space::S);
         shapes.push(Shape::Text { area: rect(x, y, width, s(ds::space::XL)), text: t("Terminal").to_string(), font: FontKind::Strong, color: theme::text(), flags: ONE_LINE });
-        y += s(ds::size::QUEUE_STEP);
-        let about = t("Your own shell, in this session's folder.");
-        let tall = text_height(self.fonts.small, about, width);
-        shapes.push(Shape::Text { area: rect(x, y, width, tall), text: about.to_string(), font: FontKind::Small, color: theme::muted(), flags: DT_WORDBREAK });
-        y += tall + s(ds::space::L);
+        y += s(ds::size::QUEUE_STEP) + s(ds::space::M);
         // The button for a new terminal, in the shell last used, and the arrow beside it for the others.
         let words = t("New terminal");
         let button_width = (text_width(self.fonts.strong, words) + s(ds::size::BUTTON_PADDING)).min(width - s(ds::size::CONTROL) - s(ds::space::XS));
@@ -363,11 +359,6 @@ impl App {
         set_button_style(self.term.start_shells, ButtonKind::Secondary, ground());
         show(self.term.start_button, true);
         show(self.term.start_shells, true);
-        // At the foot of the page, quietly: what these commands are, and that the model does not see them.
-        let rights = t("Commands here run with your own rights, apart from the agent's permissions. Nothing shown here is sent to the model.");
-        let tall = text_height(self.fonts.small, rights, width);
-        let at = (bottom - s(ds::space::L) - tall).max(y + s(ds::size::CONTROL) + s(ds::space::L));
-        shapes.push(Shape::Text { area: rect(x, at, width, tall), text: rights.to_string(), font: FontKind::Small, color: theme::faint(), flags: DT_WORDBREAK });
     }
 
     /// The window now has `cols` by `rows` cells: every terminal is told, the one that is not shown as well, so that each is as it will be when it is.
