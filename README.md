@@ -50,7 +50,11 @@ Some steps come as cards in the conversation. When the agent asks you something,
 each choice (its suggestion marked) and a field for your own answer, and the session shows *Waiting* until you answer. In plan
 mode (`/plan`) it puts its plan up as a card with *Carry it out* and *Change...*: nothing is changed until you carry it out. Under
 an answer that changed files, a card lists them with the lines added and removed: a click opens that file's diff, and its other
-button opens the file or shows it in Explorer. The cards stay when a session is opened again. `/goal TEXT` keeps a goal for the
+button opens the file or shows it in Explorer. When the agent sends a long look to a helper (`explore`), a card shows the helper's task, the step
+it is on ("Step 7 of 20"), the last three things it read or searched, and its time and tokens, with a *Stop* button that stops that helper alone:
+the agent is told that you stopped it, and goes on with what it has. Once the helper is over, the card says how it ended (done, stopped, or could
+not finish) with the time, the steps and the files it read, and *Show its steps* opens the helper's conversation, read only, in the panel on the
+right (its close button goes back to what the panel showed). The cards stay when a session is opened again. `/goal TEXT` keeps a goal for the
 session, shown as a thin bar under the title and told to the model again after a compaction, and `/goal clear` ends it.
 `/trajectory` shows where a session's time went, turn by turn. A request that plainly asks for no changes ("just look", "don't
 change anything") makes that turn read-only, and a line says so before anything is refused; a phrase with an object ("without
@@ -61,7 +65,7 @@ The panel on the right (the button at the right of the title, or `/panel`) has *
 as a tree, folders first, with the files this session changed marked, and follows the disk as it changes. A click previews a file
 beside the conversation (Markdown, HTML, pictures, code and text, CSV and TSV as tables, an Excel workbook's first sheet), a double
 click opens it in its app, and a right click opens it, shows it in Explorer, copies its path or mentions it in your message
-(`@path`).
+(`@path`). A helper's steps take the panel's place while they are shown, and a preview opened after them takes theirs.
 
 *Terminal* (`/terminal`, or Ctrl+`` ` ``) is your own shell, beside the conversation: PowerShell 7, Windows PowerShell, the Command
 Prompt, and Git Bash where a full Git for Windows is installed (the Git that comes with Dogmind has no bash). **New terminal** opens
@@ -86,7 +90,7 @@ or limits apply to them, and nothing a terminal shows is sent to the model.
 
 Conversations are kept as plain JSON lines in `%LOCALAPPDATA%\DogmindApp\sessions`, and are not encrypted unless you turn that on in *Settings > Privacy*. Off is the default, and it costs nothing.
 
-- **What is encrypted.** Every message of a conversation, one line at a time (AES-256-GCM; a line cannot be moved to another file or another place, and a line changed by a byte is reported as damage, never dropped without a word); the pictures of a conversation, each whole; the notes the model keeps for later sessions, and the ones it forgot; the index of a session's undo points, which holds the first words of what you asked. An encrypted session still begins with one plain line that says it is encrypted, with the file's random id and a fingerprint of the key, and nothing of the conversation. Writing stays one appended line at a time, so the disk is written no more than before.
+- **What is encrypted.** Every message of a conversation, one line at a time (AES-256-GCM; a line cannot be moved to another file or another place, and a line changed by a byte is reported as damage, never dropped without a word); the pictures of a conversation, each whole; each `explore` helper's conversation, in its file beside the session; the notes the model keeps for later sessions, and the ones it forgot; the index of a session's undo points, which holds the first words of what you asked. An encrypted session still begins with one plain line that says it is encrypted, with the file's random id and a fingerprint of the key, and nothing of the conversation. Writing stays one appended line at a time, so the disk is written no more than before.
 - **What is not.** The files of your workspaces and the copies kept to undo an edit (they lie in the workspace as they are, whatever is chosen). The timing record beside each session (`.trajectory.jsonl`: counts, times, names, outcomes and short hashes, never what was said; it does name the files a tool touched and a command's first word, and holds the one line a server said of a failure). The settings. A picture you open in the panel beside the conversation, and the copies of attached pictures that commands can read, are put in plain in `attachments`, which is emptied at every start of the app.
 - **Turning it on.** You type a passphrase twice and are shown a recovery code, once; the box *Remember on this PC* is ticked unless you clear it. Then the conversations you already have are encrypted one at a time, with progress: each is written whole beside the old file and renamed over it, so that a crash or a power cut leaves every file either all old or all new, and the next start finishes what is left. New conversations are encrypted as they begin, and plain ones still open as they are. Nothing is changed while a conversation is at work.
 - **The key.** A random 256-bit key encrypts the conversations. It is kept only wrapped (AES-256-GCM) in `conversation-key.json`, under a key made with scrypt from your passphrase, under a key made with scrypt from the recovery code (about 160 bits), and, if *Remember on this PC* is ticked, under Windows' DPAPI for your Windows user. Either the passphrase or the recovery code opens the conversations, on this PC, on another, or after Windows is installed again; the DPAPI copy opens them on this PC for you alone, and with it the app asks nothing when it starts. Without it, a dialog asks for the passphrase (or the recovery code, and then a new passphrase), and until it is answered no conversation is opened or written.
@@ -171,7 +175,9 @@ It can ask you a question with choices (`ask_user`), and in plan mode it puts it
 carries it out once you approve.
 
 For a long look, `explore` hands a question to a helper with a context of its own and only the looking tools, and only its
-answer joins the conversation. A file of more than 800 lines read with no place in it comes as its outline, a turn is told at
+answer joins the conversation. The helper's own conversation (its requests, the tools it called and what they brought back) is kept beside the
+session as `<session>.helper-N.jsonl`, encrypted with it when *Settings > Privacy* has that on; a branch of the session takes the helper files of what it
+keeps, and deleting the session deletes them. A file of more than 800 lines read with no place in it comes as its outline, a turn is told at
 each 96 KB of files it has read, and any long tool result (a command's output, a search, an edit's report, a diff, an MCP tool's answer) is kept whole in
 `%TEMP%\dogmind-output` for a week, its report saying where to read the rest; so is what a compaction trims of an old output. A command left running in the background shows, at each `command_status`, what it has printed since the
 last look: a dev server's ready line among it.

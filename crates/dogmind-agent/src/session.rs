@@ -233,6 +233,52 @@ fn lines_in(path: &Path) -> u64 {
     File::open(path).map_or(0, |file| BufReader::new(file).split(b'\n').map_while(Result::ok).count() as u64)
 }
 
+const HELPER_MARK: &str = ".helper-";
+
+/// The conversation of the `number`th `explore` helper of a session, beside it: `<session>.helper-<number>.jsonl`. It is written as a session is, by the same writer, so what the
+/// conversation key does for a session it does for this; it goes with the session when that is deleted (`remove_helpers`) and is carried by a branch of it (`fork`).
+pub fn helper_file_of(parent: &Path, number: u32) -> PathBuf {
+    parent.with_extension(format!("helper-{number}.jsonl"))
+}
+
+/// Which helper of its session a file is; none for any other file.
+pub fn helper_number(path: &Path) -> Option<u32> {
+    let stem = path.file_name()?.to_str()?.strip_suffix(".jsonl")?;
+    let (_, number) = stem.rsplit_once(HELPER_MARK)?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    number.parse().ok()
+}
+
+/// Whether a file of the sessions' folder is a helper's conversation and not a session of its own.
+pub fn is_helper(path: &Path) -> bool {
+    helper_number(path).is_some()
+}
+
+/// The helpers' files of a session, by number.
+pub fn helpers_of(parent: &Path) -> Vec<(u32, PathBuf)> {
+    let (Some(folder), Some(stem)) = (parent.parent(), parent.file_stem().and_then(|stem| stem.to_str())) else { return Vec::new() };
+    let prefix = format!("{stem}{HELPER_MARK}");
+    let mut found: Vec<(u32, PathBuf)> = fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path())
+        .filter(|path| path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(&prefix)))
+        .filter_map(|path| helper_number(&path).map(|number| (number, path))).collect();
+    found.sort();
+    found
+}
+
+/// The helper file the `number`th helper of `parent` has, if it is there.
+pub fn helper_path(parent: &Path, number: u32) -> Option<PathBuf> {
+    Some(helper_file_of(parent, number)).filter(|path| path.is_file())
+}
+
+/// With a session that is deleted: its helpers' conversations go.
+pub fn remove_helpers(parent: &Path) {
+    for (_, path) in helpers_of(parent) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// A workspace's sessions, the newest first, and the workspaces with the most recent session first.
 pub fn by_workspace(sessions: Vec<Summary>) -> Vec<(PathBuf, Vec<Summary>)> {
     let key = |path: &Path| path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
@@ -386,6 +432,11 @@ impl Session {
                 Err(error) => return Err(format!("{}: {error}", path.display())),
             }
         };
+        Session::begin(path, file, workspace, now, writer)
+    }
+
+    /// A file just made, with what every session starts with: for an encrypted one its plain first line, then its first line of meta.
+    fn begin(path: PathBuf, file: File, workspace: &Path, now: &str, writer: Option<&Arc<Cipher>>) -> Result<Session, String> {
         let sealed = writer.map(Sealed::new).transpose()?;
         let mut session = Session { path, file, sealed, generation: GENERATION.load(Ordering::SeqCst) };
         if let Some(sealed) = &session.sealed {
@@ -396,6 +447,21 @@ impl Session {
         }
         session.write(&Line::Meta { workspace: workspace.to_path_buf(), created: now.to_string() })?;
         Ok(session)
+    }
+
+    /// The conversation of an `explore` helper, as a session of its own beside `parent` (`helper_file_of`), under the next number that is free; encrypted when `policy` says so, as a
+    /// session is. The number is returned with it.
+    pub fn create_helper(policy: &Policy, parent: &Path, workspace: &Path, now: &str) -> Result<(Session, u32), String> {
+        let writer = policy.writer()?;
+        let mut number = helpers_of(parent).last().map_or(1, |(last, _)| last + 1);
+        loop {
+            let path = helper_file_of(parent, number);
+            match OpenOptions::new().create_new(true).append(true).open(&path) {
+                Ok(file) => return Ok((Session::begin(path, file, workspace, now, writer.as_ref())?, number)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => number += 1,
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            }
+        }
     }
 
     /// The session's messages, and it ready to append to. A tool call left without its result (the app was closed
@@ -641,6 +707,13 @@ pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf,
     if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
         copy.write(&Line::Title { title: title.to_string() })?;
     }
+    // The helpers the kept messages came from go with them, under the branch's own name and the numbers they had (the messages say them): copied as they are, line for line, so that
+    // an encrypted one needs no key to be copied and a line that did not open is not lost in the copy.
+    for number in messages.iter().filter_map(|message| message.helper.as_ref().map(|helper| helper.number)) {
+        if let Some(from) = helper_path(path, number) {
+            fs::copy(&from, helper_file_of(&copy.path, number)).map_err(|error| format!("{}: {error}", from.display()))?;
+        }
+    }
     let from = crate::images::folder_of(path);
     for image in messages.iter().flat_map(|message| &message.images) {
         // (one gone from the original is gone from the branch too: it says so where it would show)
@@ -682,7 +755,7 @@ pub fn complete_tool_calls(messages: &mut Vec<Message>) {
 /// The sessions in a folder, the newest first. An encrypted one whose key is not here is listed too, saying so: it is not left out of the list as if it were gone.
 pub fn list(folder: &Path) -> Vec<Summary> {
     let mut paths: Vec<PathBuf> = fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !crate::trajectory::is_trajectory(path)).collect();
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !crate::trajectory::is_trajectory(path) && !is_helper(path)).collect();
     paths.sort();
     paths.reverse();
     paths.into_iter().filter_map(|path| {

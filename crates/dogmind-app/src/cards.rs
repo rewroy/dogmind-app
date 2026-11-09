@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use dogmind_agent::agent::{self, PlanOutcome};
+use dogmind_agent::agent::{self, HelperEnd, PlanOutcome};
 use dogmind_agent::message::{Message, Wake, WakeCause};
 use dogmind_agent::tools::FileChange;
 use serde_json::Value;
@@ -43,6 +43,23 @@ pub struct FileRow {
     pub has_diff: bool,
 }
 
+/// How many of the things an `explore` helper read or searched its card shows at a time.
+pub const RECENT: usize = 3;
+
+/// Where an `explore` helper stands, as its card says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelperState {
+    /// At work: in which of its requests, of the most it has (none are counted before its first call); what it read or searched last, the latest last; what its context has come to in tokens;
+    /// how long it had worked when the agent last said (ms); and whether the person has pressed Stop and the helper has not yet ended.
+    Working { step: u32, most: u32, recent: Vec<String>, tokens: u64, ms: u64, stopping: bool },
+    /// It answered.
+    Done { steps: u32, files: u32, tokens: u64, ms: u64 },
+    /// The person stopped it.
+    Stopped { steps: u32, files: u32, tokens: u64, ms: u64 },
+    /// It could not go on, and why.
+    Failed { why: String, steps: u32, ms: u64 },
+}
+
 /// What a card of the transcript is: it is kept with the rest of what the transcript is written from, and written again, in whatever state it has come to, as the window changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Card {
@@ -53,6 +70,8 @@ pub enum Card {
     /// What woke the session with nobody writing (a background command ended, a line it was to wake for, a wait): the app's notice, in a row of its own and not a bubble of the person's.
     /// `at`: when it came, as the transcript says times.
     Notice { wakes: Vec<Wake>, at: String },
+    /// An `explore` helper: the call it is of, its task as a line, which of the session's helper files holds its steps (none when they were not kept), and where it stands.
+    Helper { call: String, task: String, number: Option<u32>, state: HelperState },
 }
 
 /// How many files a card lists: the rest are counted, and the Changes page has all of them.
@@ -100,8 +119,77 @@ impl Card {
     pub fn id(&self) -> Option<u64> {
         match self {
             Card::Question { id, .. } | Card::Plan { id, .. } => Some(*id),
-            Card::Files { .. } | Card::Notice { .. } => None,
+            Card::Files { .. } | Card::Notice { .. } | Card::Helper { .. } => None,
         }
+    }
+
+    /// The call a helper's card is of.
+    pub fn helper_call(&self) -> Option<&str> {
+        match self {
+            Card::Helper { call, .. } => Some(call),
+            _ => None,
+        }
+    }
+
+    /// The card of a helper that has begun.
+    pub fn helper_begun(call: &str, task: &str, number: Option<u32>) -> Card {
+        Card::Helper { call: call.to_string(), task: task.to_string(), number, state: HelperState::Working { step: 0, most: 0, recent: Vec::new(), tokens: 0, ms: 0, stopping: false } }
+    }
+
+    /// The helper called a tool: the request it is on, what it is on, what its context has come to, and how long it has worked.
+    pub fn helper_step(&mut self, step: u32, most: u32, tool: &str, summary: &str, tokens: u64, ms: u64) {
+        let Card::Helper { state: HelperState::Working { step: now, most: of, recent, tokens: used, ms: worked, .. }, .. } = self else { return };
+        (*now, *of, *used, *worked) = (step, most, tokens, ms);
+        let line = if summary.trim().is_empty() { t(crate::ui::tool_name(tool)).to_string() } else { format!("{}  {}", t(crate::ui::tool_name(tool)), summary.trim()) };
+        recent.push(line.lines().next().unwrap_or("").to_string());
+        let extra = recent.len().saturating_sub(RECENT);
+        recent.drain(..extra);
+    }
+
+    /// Stop has been pressed: the card says so until the helper ends.
+    pub fn helper_stopping(&mut self) {
+        if let Card::Helper { state: HelperState::Working { stopping, .. }, .. } = self {
+            *stopping = true;
+        }
+    }
+
+    /// The helper has ended. `number`: its file, where it is known by now.
+    pub fn helper_ended(&mut self, how: &HelperEnd, steps: u32, files: u32, tokens: u64, ms: u64, number: Option<u32>) {
+        let Card::Helper { number: kept, state, .. } = self else { return };
+        *kept = number.or(*kept);
+        *state = match how {
+            HelperEnd::Answered => HelperState::Done { steps, files, tokens, ms },
+            HelperEnd::Stopped => HelperState::Stopped { steps, files, tokens, ms },
+            HelperEnd::Failed(why) => HelperState::Failed { why: why.clone(), steps, ms },
+        };
+    }
+
+    /// A helper that is still at work when its turn has ended is not: it was stopped.
+    pub fn helper_settled(&mut self) -> bool {
+        let Card::Helper { state: state @ HelperState::Working { .. }, .. } = self else { return false };
+        let HelperState::Working { step, tokens, ms, .. } = state.clone() else { return false };
+        *state = HelperState::Stopped { steps: step, files: 0, tokens, ms };
+        true
+    }
+
+    /// The card of a call of `explore` that a session kept, from the call's result: how it went comes from the record the result holds of its helper, which a result from before there was one
+    /// does not have (then there is no card, and the call is a row of the calls as any is).
+    pub fn of_helper_call(name: &str, call: &str, arguments: &Value, result: Option<&Message>) -> Option<Card> {
+        if name != "explore" {
+            return None;
+        }
+        let result = result?;
+        let helper = result.helper.as_ref()?;
+        let task = dogmind_agent::tools::summary("explore", arguments);
+        let words = result.content.as_deref().unwrap_or("");
+        let state = if helper.stopped {
+            HelperState::Stopped { steps: helper.steps, files: helper.files, tokens: helper.tokens, ms: helper.ms }
+        } else if let Some(why) = words.strip_prefix("error: ") {
+            HelperState::Failed { why: why.lines().next().unwrap_or("").to_string(), steps: helper.steps, ms: helper.ms }
+        } else {
+            HelperState::Done { steps: helper.steps, files: helper.files, tokens: helper.tokens, ms: helper.ms }
+        };
+        Some(Card::Helper { call: call.to_string(), task, number: Some(helper.number), state })
     }
 
     /// The card of the files turn `turn`'s edits changed.
@@ -138,17 +226,73 @@ impl Card {
     }
 }
 
-/// The cards a session's messages hold: one for each call of `ask_user` or `submit_plan` that has a result, in order, with its call's id and the number its card has (from `first_id`).
+/// The cards a session's messages hold: one for each call of `ask_user` or `submit_plan` that has a result, and each of `explore` whose result records its helper, in order, with its call's id and the number its card has (from `first_id`).
 pub fn of_messages(messages: &[Message], first_id: u64) -> Vec<(String, Card)> {
-    let results: HashMap<&str, &str> = messages.iter().filter_map(|message| Some((message.tool_call_id.as_deref()?, message.content.as_deref().unwrap_or("")))).collect();
+    let results: HashMap<&str, &Message> = messages.iter().filter_map(|message| Some((message.tool_call_id.as_deref()?, message))).collect();
     let mut found = Vec::new();
     for call in messages.iter().filter(|message| message.role == "assistant").flat_map(|message| message.tool_calls.iter().flatten()) {
         let arguments = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-        if let Some(card) = Card::of_call(first_id + found.len() as u64, &call.function.name, &arguments, results.get(call.id.as_str()).copied()) {
+        let result = results.get(call.id.as_str()).copied();
+        let card = Card::of_call(first_id + found.len() as u64, &call.function.name, &arguments, result.map(|message| message.content.as_deref().unwrap_or("")))
+            .or_else(|| Card::of_helper_call(&call.function.name, &call.id, &arguments, result));
+        if let Some(card) = card {
             found.push((call.id.clone(), card));
         }
     }
     found
+}
+
+/// A count of tokens in the words of the window: `850`, `14.2k`.
+pub fn token_count_words(tokens: u64) -> String {
+    if tokens < 1000 {
+        tokens.to_string()
+    } else {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    }
+}
+
+fn steps_words(steps: u32) -> String {
+    if steps == 1 { t("1 step").to_string() } else { tf("{0} steps", &[&steps]) }
+}
+
+fn files_read_words(files: u32) -> String {
+    if files == 1 { t("1 file read").to_string() } else { tf("{0} files read", &[&files]) }
+}
+
+/// What a working helper's status row says, its words and then its figures, `since` milliseconds after the agent last said how it was going: "Step 7 of 20", and "1 min 12 s  ·  14.2k tokens".
+pub fn helper_status(state: &HelperState, since: u64) -> (String, String) {
+    let HelperState::Working { step, most, tokens, ms, stopping, .. } = state else { return (String::new(), String::new()) };
+    let time = duration_words((ms + since) / 1000);
+    let figures = if *tokens > 0 { format!("{time}  ·  {}", tf("{0} tokens", &[&token_count_words(*tokens)])) } else { time };
+    let left = if *stopping {
+        t("Stopping…").to_string()
+    } else if *step == 0 {
+        t("Starting…").to_string()
+    } else {
+        tf("Step {0} of {1}", &[step, most])
+    };
+    (left, figures)
+}
+
+/// The latest things a working helper read or searched, the oldest first, in as many rows as its card keeps (the rest empty).
+pub fn helper_recent(state: &HelperState) -> [String; RECENT] {
+    let mut rows: [String; RECENT] = Default::default();
+    if let HelperState::Working { recent, .. } = state {
+        for (row, line) in rows.iter_mut().zip(recent) {
+            row.clone_from(line);
+        }
+    }
+    rows
+}
+
+/// How a helper that is over came out, in a line: what it says and whether it went well.
+pub fn helper_outcome(state: &HelperState) -> Option<(String, bool)> {
+    match state {
+        HelperState::Working { .. } => None,
+        HelperState::Done { steps, files, ms, .. } => Some((tf("Done  ·  {0}  ·  {1}  ·  {2}", &[&duration_words(ms / 1000), &steps_words(*steps), &files_read_words(*files)]), true)),
+        HelperState::Stopped { steps, files, ms, .. } => Some((tf("Stopped by you  ·  {0}  ·  {1}  ·  {2}", &[&duration_words(ms / 1000), &steps_words(*steps), &files_read_words(*files)]), false)),
+        HelperState::Failed { why, .. } => Some((tf("Could not finish: {0}", &[&crate::lang::notice(why)]), false)),
+    }
 }
 
 /// The choices a call of `ask_user` gives, as the agent reads them: a label, and what it means.
@@ -495,5 +639,98 @@ second")), Some("first line".to_string()));
     fn the_two_tools_that_ask_are_cards_and_no_other_is() {
         assert!(is_asking("ask_user") && is_asking("submit_plan"));
         assert!(!is_asking("read_file") && !is_asking("todo"));
+    }
+
+    fn working(card: &Card) -> (u32, u32, Vec<String>, u64, u64, bool) {
+        match card {
+            Card::Helper { state: HelperState::Working { step, most, recent, tokens, ms, stopping }, .. } => (*step, *most, recent.clone(), *tokens, *ms, *stopping),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A helper's card from its start to its end: what it reads and searches comes in a few rows, the latest last; the figures are the agent's latest.
+    #[test]
+    fn a_helpers_card_follows_what_the_agent_tells_of_it() {
+        let mut card = Card::helper_begun("c7", "Where is the table?", Some(2));
+        assert_eq!(working(&card), (0, 0, vec![], 0, 0, false));
+        assert_eq!(helper_status(&HelperState::Working { step: 0, most: 0, recent: vec![], tokens: 0, ms: 0, stopping: false }, 0), ("Starting…".to_string(), "0 s".to_string()));
+        for (at, (tool, summary)) in [("read_file", "src/a.py"), ("search_files", "put in src"), ("list_files", "."), ("read_file", "src/b.py")].iter().enumerate() {
+            card.helper_step(at as u32 + 1, 20, tool, summary, 1500 * (at as u64 + 1), 4000 * (at as u64 + 1));
+        }
+        let (step, most, recent, tokens, ms, _) = working(&card);
+        assert_eq!((step, most, tokens, ms), (4, 20, 6000, 16000));
+        assert_eq!(recent, ["Search  put in src", "List  .", "Read  src/b.py"], "the last {RECENT}, the latest last");
+        let state = match &card {
+            Card::Helper { state, .. } => state.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(helper_status(&state, 0), ("Step 4 of 20".to_string(), "16 s  ·  6.0k tokens".to_string()));
+        assert_eq!(helper_status(&state, 62_000).1, "1 min 18 s  ·  6.0k tokens", "the time runs on from the agent's last word");
+        assert_eq!(helper_recent(&state).to_vec(), ["Search  put in src", "List  .", "Read  src/b.py"]);
+        assert!(helper_outcome(&state).is_none(), "nothing is over yet");
+        card.helper_stopping();
+        assert_eq!(helper_status(&match &card { Card::Helper { state, .. } => state.clone(), _ => unreachable!() }, 0).0, "Stopping…");
+        card.helper_ended(&HelperEnd::Stopped, 4, 3, 6000, 17000, None);
+        assert_eq!(card, Card::Helper { call: "c7".into(), task: "Where is the table?".into(), number: Some(2), state: HelperState::Stopped { steps: 4, files: 3, tokens: 6000, ms: 17000 } });
+        // (a step told after the end changes nothing: the figures of an ended helper are its own)
+        card.helper_step(5, 20, "read_file", "x", 1, 1);
+        assert!(matches!(card, Card::Helper { state: HelperState::Stopped { steps: 4, .. }, .. }));
+    }
+
+    #[test]
+    fn a_helper_is_told_over_in_a_line_that_says_how_it_went() {
+        let outcome = |state: HelperState| helper_outcome(&state).unwrap();
+        assert_eq!(outcome(HelperState::Done { steps: 22, files: 14, tokens: 31000, ms: 197_000 }), ("Done  ·  3 min 17 s  ·  22 steps  ·  14 files read".to_string(), true));
+        assert_eq!(outcome(HelperState::Done { steps: 1, files: 1, tokens: 0, ms: 4000 }).0, "Done  ·  4 s  ·  1 step  ·  1 file read");
+        assert_eq!(outcome(HelperState::Stopped { steps: 3, files: 0, tokens: 0, ms: 61_000 }), ("Stopped by you  ·  1 min 1 s  ·  3 steps  ·  0 files read".to_string(), false));
+        assert_eq!(outcome(HelperState::Failed { why: "the helper ended with nothing to say".into(), steps: 2, ms: 9000 }), ("Could not finish: the helper ended with nothing to say".to_string(), false));
+        assert_eq!((token_count_words(850), token_count_words(14_250)), ("850".to_string(), "14.2k".to_string()));
+    }
+
+    /// A session that is opened again has each helper's card from the call's result alone, and a result from before there was a record of its helper has none.
+    #[test]
+    fn a_session_opened_again_shows_each_helper_with_how_it_went() {
+        use dogmind_agent::message::HelperRef;
+        let kept = |id: &str, output: &str, helper: Option<HelperRef>| Message { helper, ..Message::tool_result(id, output) };
+        let reference = |number: u32, stopped: bool| Some(HelperRef { number, steps: 22, files: 14, ms: 197_000, tokens: 31_000, stopped });
+        let messages = vec![
+            Message::text("user", "look into the table"),
+            asking("e1", "explore", json!({"task": "Where is the table?\nSecond line"})),
+            kept("e1", "It is in src/table.py.", reference(1, false)),
+            asking("e2", "explore", json!({"task": "Look again"})),
+            kept("e2", "stopped by the person", reference(2, true)),
+            asking("e3", "explore", json!({"task": "And again"})),
+            kept("e3", "error: the helper's request failed: down", reference(3, false)),
+            asking("e4", "explore", json!({"task": "From an older session"})),
+            kept("e4", "It was here.", None),
+            asking("e5", "explore", json!({"task": "Still under way"})),
+        ];
+        let found = of_messages(&messages, 1);
+        assert_eq!(found.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["e1", "e2", "e3"], "a call with no record of its helper, and one with no result, are rows of the calls");
+        let state = |at: usize| match &found[at].1 {
+            Card::Helper { call, task, number, state } => (call.clone(), task.clone(), *number, state.clone()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(state(0), ("e1".into(), "Where is the table?".into(), Some(1), HelperState::Done { steps: 22, files: 14, tokens: 31_000, ms: 197_000 }));
+        assert!(matches!(state(1), (_, _, Some(2), HelperState::Stopped { steps: 22, files: 14, .. })));
+        assert!(matches!(state(2), (_, _, Some(3), HelperState::Failed { ref why, .. }) if why == "the helper's request failed: down"));
+        assert_eq!(found[0].1.helper_call(), Some("e1"));
+        assert_eq!(found[0].1.id(), None, "a helper's card is told by its call and takes no number");
+    }
+
+    #[test]
+    fn a_helper_still_at_work_when_its_turn_ends_is_told_as_stopped() {
+        let mut card = Card::helper_begun("c1", "Look", None);
+        card.helper_step(3, 20, "read_file", "a", 900, 7000);
+        assert!(card.helper_settled());
+        assert!(matches!(card, Card::Helper { state: HelperState::Stopped { steps: 3, tokens: 900, ms: 7000, .. }, .. }));
+        assert!(!card.helper_settled(), "nothing to settle twice");
+    }
+
+    #[test]
+    fn what_a_helpers_card_says_has_its_japanese() {
+        for words in ["Helper", "Starting…", "Stopping…", "Step {0} of {1}", "1 step", "{0} steps", "1 file read", "{0} files read", "Done  ·  {0}  ·  {1}  ·  {2}", "Stopped by you  ·  {0}  ·  {1}  ·  {2}", "Could not finish: {0}", "Stop", "Show its steps", "{0} tokens"] {
+            assert!(crate::lang::has_japanese(words), "{words}");
+        }
     }
 }
