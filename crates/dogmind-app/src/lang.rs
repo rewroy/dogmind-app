@@ -1103,8 +1103,6 @@ const JA: &[(&str, &str)] = &[
     ("Windows PowerShell", "Windows PowerShell"),
     ("Command Prompt", "コマンド プロンプト"),
     ("Git Bash", "Git Bash"),
-    ("Your own shell, in this session's folder.", "このセッションのフォルダーで動く、あなた自身のシェルです。"),
-    ("Commands here run with your own rights, apart from the agent's permissions. Nothing shown here is sent to the model.", "ここで実行するコマンドは、エージェントの権限とは別に、あなた自身の権限で動きます。ここに表示される内容はモデルには送られません。"),
 ];
 
 pub const HELP_JA: &str = "# はじめに
