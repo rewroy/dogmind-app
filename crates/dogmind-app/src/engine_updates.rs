@@ -308,7 +308,10 @@ pub fn rollback(data: &Path) -> bool {
 
 /// Only the first start after a switch can cause an automatic rollback. A later unrelated
 /// connection error must not replace an engine that has already served successfully.
-pub fn rollback_if_pending(data: &Path) -> bool {
+pub fn rollback_if_pending(data: &Path, attempted: &Path) -> bool {
+    if selected(data).as_deref() != Some(attempted) {
+        return false;
+    }
     let pending = fs::read_to_string(root(data).join(PENDING)).ok();
     let active =
         selected(data).and_then(|exe| exe.parent()?.file_name()?.to_str().map(str::to_string));
@@ -318,7 +321,10 @@ pub fn rollback_if_pending(data: &Path) -> bool {
     rollback(data)
 }
 
-pub fn mark_ready(data: &Path) {
+pub fn mark_ready(data: &Path, started: &Path) {
+    if selected(data).as_deref() != Some(started) {
+        return;
+    }
     let pending = fs::read_to_string(root(data).join(PENDING)).ok();
     let active =
         selected(data).and_then(|exe| exe.parent()?.file_name()?.to_str().map(str::to_string));
@@ -961,9 +967,10 @@ mod tests {
             fs::write(location.join("straydog.exe"), b"MZ").unwrap();
         }
         select(data.path(), "0.1.11").unwrap();
-        mark_ready(data.path());
+        let first = selected(data.path()).unwrap();
+        mark_ready(data.path(), &first);
         assert!(
-            !rollback_if_pending(data.path()),
+            !rollback_if_pending(data.path(), &first),
             "a later unrelated failure keeps the working engine"
         );
         select(data.path(), "0.1.12").unwrap();
@@ -971,7 +978,11 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .contains("v0.1.12"));
-        assert!(rollback_if_pending(data.path()));
+        mark_ready(data.path(), &first);
+        assert_eq!(fs::read_to_string(folder.join(PENDING)).unwrap(), "v0.1.12");
+        let second = selected(data.path()).unwrap();
+        assert!(!rollback_if_pending(data.path(), &first));
+        assert!(rollback_if_pending(data.path(), &second));
         assert!(selected(data.path())
             .unwrap()
             .to_string_lossy()
@@ -1179,7 +1190,8 @@ mod tests {
             Result::Ready(_)
         ));
         assert!(selected(data.path()).is_some());
-        assert!(rollback_if_pending(data.path()));
+        let attempted = selected(data.path()).unwrap();
+        assert!(rollback_if_pending(data.path(), &attempted));
         assert!(selected(data.path()).is_none());
         assert!(running.is_file());
     }

@@ -1876,6 +1876,7 @@ struct App {
     notes: Receiver<Note>,
     poster: Poster,
     engine: Option<Engine>,
+    connecting_engine: Option<PathBuf>,
     generation: Arc<AtomicU64>,
     panel: Panel,
     dpi: u32,
@@ -11641,6 +11642,7 @@ impl App {
         self.connected = false;
         self.vision = None;
         self.straydog = false;
+        self.connecting_engine = None;
         self.model.clear();
         self.provider_models.clear();
         self.rate = None;
@@ -11700,6 +11702,7 @@ impl App {
                     self.set_panel(Panel::Models);
                     return;
                 }
+                self.connecting_engine = Some(straydog.clone());
                 self.engine = None;
                 self.settle_keep_conversation();
                 let (settings, folder) = (self.settings.clone(), self.folder.clone());
@@ -12873,7 +12876,9 @@ impl App {
                 self.update_status();
             }
             Note::Connected { generation, provider, model, window, straydog, vision } if generation == current => {
-                if straydog && self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded) { engine_updates::mark_ready(&self.folder); }
+                if straydog && self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded) {
+                    if let Some(started) = self.connecting_engine.as_deref() { engine_updates::mark_ready(&self.folder, started); }
+                }
                 self.note_connection("ok");
                 self.connected = true;
                 self.connect_retrying = false;
@@ -12903,7 +12908,8 @@ impl App {
             }
             Note::Models(generation, models) if generation == current => self.provider_models = models,
             Note::ConnectFailed(generation, error) if generation == current => {
-                if self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded) && engine_updates::rollback_if_pending(&self.folder) {
+                if self.settings.active_provider().is_some_and(|provider| provider.kind == Kind::Embedded)
+                    && self.connecting_engine.as_deref().is_some_and(|attempted| engine_updates::rollback_if_pending(&self.folder, attempted)) {
                     self.say(t("The newer Straydog could not start. The previous engine is being restored."));
                     self.connect();
                     return;
@@ -16373,6 +16379,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             notes,
             poster,
             engine: None,
+            connecting_engine: None,
             generation: Arc::new(AtomicU64::new(0)),
             panel: Panel::Chat,
             dpi,
