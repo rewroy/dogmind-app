@@ -338,6 +338,19 @@ pub fn rollback_if_pending(data: &Path, attempted: &Path) -> bool {
     rollback(data)
 }
 
+/// A newer engine that fails before it is ready goes back to the previous one, whichever way the
+/// failure is seen first: the connection giving up, or the process ending. `true` when it did.
+pub fn roll_back_after_failed_start(
+    data: &Path,
+    embedded: bool,
+    never_ready: bool,
+    attempted: Option<&Path>,
+) -> bool {
+    embedded
+        && never_ready
+        && attempted.is_some_and(|attempted| rollback_if_pending(data, attempted))
+}
+
 pub fn mark_ready(data: &Path, started: &Path) {
     if selected(data).as_deref() != Some(started) {
         return;
@@ -1036,6 +1049,62 @@ mod tests {
             .to_string_lossy()
             .contains("v0.1.11"));
         assert_eq!(fs::read_to_string(folder.join(FAILED)).unwrap(), "v0.1.12");
+    }
+
+    #[test]
+    fn an_engine_that_ends_before_it_is_ready_returns_to_the_previous_version() {
+        let data = tempfile::tempdir().unwrap();
+        let folder = root(data.path());
+        for version in ["0.1.10", "0.1.11"] {
+            let location = folder.join(format!("v{version}"));
+            fs::create_dir_all(&location).unwrap();
+            fs::write(location.join("straydog.exe"), b"MZ").unwrap();
+        }
+        select(data.path(), "0.1.10").unwrap();
+        let previous = selected(data.path()).unwrap();
+        mark_ready(data.path(), &previous);
+        select(data.path(), "0.1.11").unwrap();
+        let newer = selected(data.path()).unwrap();
+        assert!(newer.to_string_lossy().contains("v0.1.11"));
+
+        // None of these is the first start of the newer engine failing before it was ready.
+        assert!(
+            !roll_back_after_failed_start(data.path(), true, false, Some(&newer)),
+            "an engine that had been ready is not rolled back"
+        );
+        assert!(
+            !roll_back_after_failed_start(data.path(), false, true, Some(&newer)),
+            "only the bundled engine is rolled back"
+        );
+        assert!(
+            !roll_back_after_failed_start(data.path(), true, true, Some(&previous)),
+            "an engine that is not the selected one is not rolled back"
+        );
+        assert!(
+            !roll_back_after_failed_start(data.path(), true, true, None),
+            "no engine was started"
+        );
+        assert_eq!(selected(data.path()).as_deref(), Some(newer.as_path()));
+        assert!(folder.join(PENDING).is_file());
+        assert!(!folder.join(FAILED).exists());
+
+        assert!(roll_back_after_failed_start(
+            data.path(),
+            true,
+            true,
+            Some(&newer)
+        ));
+        let now = selected(data.path()).unwrap();
+        assert_eq!(now, previous);
+        assert!(!now.to_string_lossy().contains("v0.1.11"));
+        assert_eq!(fs::read_to_string(folder.join(FAILED)).unwrap(), "v0.1.11");
+        assert!(!folder.join(PENDING).exists());
+
+        assert!(
+            !roll_back_after_failed_start(data.path(), true, true, Some(&newer)),
+            "a second failure does not roll back again"
+        );
+        assert_eq!(selected(data.path()).as_deref(), Some(previous.as_path()));
     }
 
     #[cfg(windows)]
