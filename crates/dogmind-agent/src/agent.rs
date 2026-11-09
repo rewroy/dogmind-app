@@ -3389,12 +3389,28 @@ impl Agent {
         complete_tool_calls(&mut messages);
         messages.push(Message::text("user", prompt::CHECKPOINT_PROMPT));
         let folder = self.picture_folder();
-        let req_id = self.traj.request_id();
-        let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false, request_id: Some(&req_id) };
-        let mut clock = Clock::start();
-        let streamed = provider.stream(&request, &self.cancel, &mut |_| clock.word());
-        self.traced("checkpoint", &req_id, &clock, &streamed);
-        let completion = streamed?;
+        let mut completion = None;
+        for asked in 0..2 {
+            let req_id = self.traj.request_id();
+            let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false, request_id: Some(&req_id) };
+            let mut clock = Clock::start();
+            let streamed = provider.stream(&request, &self.cancel, &mut |_| clock.word());
+            self.traced("checkpoint", &req_id, &clock, &streamed);
+            let answer = streamed?;
+            // A thinking model may end its turn with all of it in its thinking and no reply (Qwen3.8 at its highest effort, 111,868 tokens
+            // in: 6,405 characters of thinking and none of reply). Asked once more, in the same conversation, which the engine holds, it is
+            // to write it. (Going on without one, a compaction trimmed every tool output, and the engine read 90,724 tokens again: 17
+            // minutes on an 8 GB GPU.)
+            let thought_only = answer.tool_calls.is_empty() && answer.finish == "stop" && answer.content.trim().is_empty() && !answer.reasoning.trim().is_empty();
+            if asked == 0 && thought_only && !self.cancelled() {
+                messages.push(answer.message());
+                messages.push(Message::text("user", prompt::CHECKPOINT_AGAIN));
+                continue;
+            }
+            completion = Some(answer);
+            break;
+        }
+        let Some(completion) = completion else { return Ok(None) };
         // (one with no word of how it ended may have been cut anywhere: the turns it would stand for go for good, so it must be whole)
         if !completion.tool_calls.is_empty() || completion.finish == "length" || completion.finish.is_empty() || completion.content.trim().is_empty() {
             return Ok(None);
@@ -5595,6 +5611,29 @@ mod tests {
         assert_eq!(asked.last().unwrap().content.as_deref(), Some(prompt::CHECKPOINT_PROMPT));
         assert_eq!(asked[..held.len()], held[..], "the engine prefills only what follows what it holds");
         assert!(provider.messages(19).iter().any(|message| user_text(message).contains("the state of the work")));
+    }
+
+    /// A checkpoint answered with thinking alone is asked for once more in the same conversation (what the engine holds, extended), and
+    /// that reply is the checkpoint: the compaction does not go on to trim the conversation's outputs, which the engine would read again whole.
+    #[test]
+    fn a_checkpoint_answered_with_thinking_alone_is_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut steps = nearly_full(dir.path());
+        let thought: Step = Box::new(|_: &AtomicBool| Ok(llm::Completion { reasoning: "the state, in my head".into(), finish: "stop".into(), ..llm::Completion::default() }));
+        steps.extend([thought, says("the state of the work"), says("go on")]);
+        let (run, provider) = scripted(dir.path(), steps, Mode::Default);
+        asked_nine(&run);
+        run.handle.commands.send(Command::Send("question 9".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let first = provider.messages(18);
+        let again = provider.messages(19);
+        assert_eq!(first.last().unwrap().content.as_deref(), Some(prompt::CHECKPOINT_PROMPT));
+        assert_eq!(again[..first.len()], first[..], "the second extends the first");
+        assert_eq!(again[first.len()].reasoning_content.as_deref(), Some("the state, in my head"));
+        assert_eq!(again.last().unwrap().content.as_deref(), Some(prompt::CHECKPOINT_AGAIN));
+        let next = provider.messages(20);
+        assert!(next.iter().any(|message| user_text(message).contains("the state of the work")), "the second reply is the checkpoint");
+        assert!(!next.iter().any(|message| message.content.as_deref().is_some_and(|text| text.contains("trimmed by compaction"))), "nothing was trimmed");
     }
 
     /// Twenty turns, the last three of them with a read of `size` characters; the last unanswered when `unanswered`, as a round is when the next request is about to be sent.
