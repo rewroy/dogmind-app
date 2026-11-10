@@ -1626,10 +1626,15 @@ fn environment(temp: Option<&Path>, workspace: &Path, build_tools: impl FnOnce()
     out
 }
 
-/// A command's environment from what it inherits. The PATH comes out as the bundled tools, then what the machine has (without a person's own Python, Node or Git), then the folders of
-/// Visual Studio's compiler when `build_tools` finds them, and last the bundled Git's Unix tools: nothing that is earlier on it can be shadowed by a later one.
+/// A command's environment from what it inherits. The PATH comes out as the bundled tools and the folder `npm install -g` fills, then what the machine has (without a person's own Python,
+/// Node or Git, and without a folder of MSYS or Cygwin programs, which cannot start here and would stand in for Windows' own `find` and `sort`), and last the folders of Visual Studio's
+/// compiler when `build_tools` finds them: nothing that is earlier on it can be shadowed by a later one.
 fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, temp: String, workspace: &Path, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<(String, String)> {
     crate::msvc::add_to(&mut block, build_tools);
+    // (before anything is made of it, with a bundle or without: `path_of` leaves the same ones off)
+    if let Some((_, path)) = block.iter_mut().find(|(name, _)| name.eq_ignore_ascii_case("PATH")) {
+        *path = crate::bundled::without_unix_runtimes(path);
+    }
     if let Some(root) = bundled {
         let inherited = block.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH")).map(|(_, path)| path.clone()).unwrap_or_default();
         let added = crate::bundled::environment(root, &inherited, &temp, workspace);
@@ -1644,11 +1649,13 @@ fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, t
     block
 }
 
-/// The folders on the PATH a command starts with, in order, made as `environment_block` makes it: the bundled tools, the machine's without a person's own Python, Node or Git, and then Visual
-/// Studio's. Only the PATH is made: `environment_block` goes on to ask git for a name and to write a config file, which a question about a name in a command must not do.
+/// The folders on the PATH a command starts with, in order, made as `environment_block` makes it: the bundled tools, the machine's without a person's own Python, Node or Git and without MSYS
+/// or Cygwin folders, and then Visual Studio's. Only the PATH is made: `environment_block` goes on to ask git for a name and to write a config file, which a question about a name in a command
+/// must not do.
 fn path_of(mut block: Vec<(String, String)>, bundled: Option<&Path>, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<PathBuf> {
     crate::msvc::add_to(&mut block, build_tools);
     let inherited = block.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH")).map(|(_, path)| path.clone()).unwrap_or_default();
+    let inherited = crate::bundled::without_unix_runtimes(&inherited);
     let path = bundled.map_or(inherited.clone(), |root| crate::bundled::path_with(root, &inherited));
     std::env::split_paths(&path).collect()
 }
@@ -2860,6 +2867,30 @@ mod tests {
         drop(holder);
     }
 
+    /// Git for Windows can put its `usr\bin` on a person's PATH ahead of System32. Its `find` is MSYS's and cannot start in the container (0xC0000142), so a command that means Windows'
+    /// `find` must still get that one. Needs Git for Windows installed in its usual place; without it the test says so and passes.
+    #[test]
+    #[ignore = "sets PATH for the process: run alone"]
+    fn windows_find_runs_with_gits_usr_bin_first_on_the_inherited_path() {
+        let usr_bin = Path::new("C:\\Program Files\\Git\\usr\\bin");
+        if !usr_bin.join("msys-2.0.dll").is_file() || !usr_bin.join("find.exe").is_file() {
+            println!("skipped: {} has no msys-2.0.dll and find.exe on this machine", usr_bin.display());
+            return;
+        }
+        let folder = work_folder("msys-find");
+        let saved = std::env::var_os("PATH").unwrap_or_default();
+        let first = std::env::join_paths(std::iter::once(usr_bin.to_path_buf()).chain(std::env::split_paths(&saved))).unwrap();
+        // SAFETY: this test runs alone, as its reason says.
+        unsafe { std::env::set_var("PATH", &first) };
+        let done = command("echo a:b| find /c \":\"", &folder, false);
+        // SAFETY: as above.
+        unsafe { std::env::set_var("PATH", &saved) };
+        let said = decode(&done.stdout);
+        println!("status {:?}: {}{}", done.status, said.trim(), decode(&done.stderr));
+        assert_eq!(done.status, Some(0), "{said} {}", decode(&done.stderr));
+        assert_eq!(said.trim(), "1", "{}", decode(&done.stderr));
+    }
+
     /// A command's parts are timed: before the process, the process, and after it.
     #[test]
     fn a_command_has_its_own_parts_timed() {
@@ -3019,6 +3050,41 @@ mod tests {
         let none = environment_block(start(), Some(&root), temp, &work, || None);
         assert_eq!(path_folders(&none), [root.join("python"), root.join("node"), root.join("git\\cmd"), global, other]);
         assert!(none.iter().all(|(name, _)| name != "LIB" && name != "INCLUDE"));
+    }
+
+    #[test]
+    fn a_folder_of_msys_or_cygwin_programs_is_left_off_a_commands_path_and_only_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, work) = (dir.path().join("tools"), dir.path().join("work"));
+        for (folder, program) in [("python", "python.exe"), ("node", "node.exe"), ("git\\cmd", "git.exe")] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            std::fs::write(root.join(folder).join(program), "").unwrap();
+        }
+        let folder = |name: &str, files: &[&str]| {
+            let folder = dir.path().join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            files.iter().for_each(|file| std::fs::write(folder.join(file), "").unwrap());
+            folder
+        };
+        let (unix, cyg, plain) = (folder("unix", &["msys-2.0.dll", "find.exe"]), folder("cyg", &["cygwin1.dll"]), folder("plain", &["find.exe"]));
+        let inherited = std::env::join_paths([&unix, &cyg, &plain]).unwrap().to_string_lossy().into_owned();
+        let start = || vec![("PATH".to_string(), inherited.clone()), ("SystemRoot".to_string(), "C:\\Windows".to_string())];
+        let temp = dir.path().display().to_string();
+        let global = PathBuf::from(&temp).join("npm-global");
+        let bundled = [root.join("python"), root.join("node"), root.join("git\\cmd")];
+        // Without a bundle: the machine's PATH, minus the two.
+        assert_eq!(path_folders(&environment_block(start(), None, temp.clone(), &work, || None)), [plain.clone()]);
+        assert_eq!(path_of(start(), None, || None), [plain.clone()]);
+        // With one: the same, after its own, and `path_of` says what `environment_block` gives.
+        let made = path_folders(&environment_block(start(), Some(&root), temp.clone(), &work, || None));
+        assert_eq!(made, [bundled[0].clone(), bundled[1].clone(), bundled[2].clone(), global.clone(), plain.clone()]);
+        assert_eq!(path_of(start(), Some(&root), || None), made.iter().filter(|folder| **folder != global).cloned().collect::<Vec<_>>());
+        // (and Visual Studio's still come last)
+        let with_build = path_of(start(), Some(&root), || Some(build_tools()));
+        assert_eq!(with_build, [bundled[0].clone(), bundled[1].clone(), bundled[2].clone(), plain.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
+        // A program the app starts outside the sandbox keeps them: `path_for_programs` is `path_with` of the PATH it has.
+        let outside: Vec<PathBuf> = std::env::split_paths(&crate::bundled::path_with(&root, &inherited)).collect();
+        assert_eq!(outside, [bundled[0].clone(), bundled[1].clone(), bundled[2].clone(), unix, cyg, plain]);
     }
 
     /// In the real sandbox, on a machine with Visual Studio's C++ tools: `cl` and `link` are found by PATH, and the headers and libraries by INCLUDE and LIB, with nothing set by hand.
