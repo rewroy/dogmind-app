@@ -11,6 +11,8 @@ use std::sync::Mutex;
 const ON_PATH: [&str; 3] = ["python", "node", "git\\cmd"];
 /// Programs that come from here. A folder of a person's that holds one of these is left off a command's PATH, so that `python3`, `pip` or `npm` from there cannot be what runs.
 pub const NAMES: [&str; 3] = ["python.exe", "node.exe", "git.exe"];
+/// The runtime of MSYS (Git's `usr\bin`, MSYS2) and of Cygwin: a folder with one of these in it holds programs that cannot start in the sandbox.
+const UNIX_RUNTIMES: [&str; 2] = ["msys-2.0.dll", "cygwin1.dll"];
 /// Written when everything in `tools\` can be read by the sandbox: a stop half way goes on from the start next time.
 const OPENED: &str = ".open-to-sandbox";
 /// What the workspace gets from `pip install`, which cannot write in the bundled folder.
@@ -127,12 +129,24 @@ fn joined(folders: Vec<PathBuf>, otherwise: &str) -> String {
     std::env::join_paths(folders).map_or_else(|_| otherwise.to_string(), |joined| joined.to_string_lossy().into_owned())
 }
 
+/// `path` without the folders that hold the MSYS or Cygwin runtime (its DLL right in them), for a command that runs in the sandbox: nothing in such a folder can start in a container
+/// (it ends with 0xC0000142), and one that comes before System32 puts its `find` and `sort` in place of Windows' own. An empty entry stays, and so does a folder that is not there.
+/// Not for a program the app starts outside the sandbox, where these work (see `path_for_programs`).
+pub fn without_unix_runtimes(path: &str) -> String {
+    let all: Vec<PathBuf> = std::env::split_paths(path).collect();
+    let kept: Vec<PathBuf> = all.iter().filter(|folder| folder.as_os_str().is_empty() || !UNIX_RUNTIMES.iter().any(|runtime| folder.join(runtime).is_file())).cloned().collect();
+    if kept.len() == all.len() {
+        return path.to_string();
+    }
+    joined(kept, path)
+}
+
 /// PATH for a command: what is here first, without anything of a person's that holds the same programs.
 pub fn path_with(root: &Path, inherited: &str) -> String {
     joined(folders_with(root, inherited, None), inherited)
 }
 
-/// Same for a program the app starts itself, such as an MCP server run with `npx`.
+/// Same for a program the app starts itself, such as an MCP server run with `npx`. MSYS and Cygwin folders stay on it: outside the sandbox their programs start.
 pub fn path_for_programs() -> Option<String> {
     let root = root()?;
     Some(path_with(&root, &std::env::var("PATH").unwrap_or_default()))
@@ -260,6 +274,23 @@ mod tests {
         let path = path_with(&root, &inherited(&[&own_node, &other]));
         let found: Vec<PathBuf> = std::env::split_paths(&path).collect();
         assert_eq!(found, [root.join("python"), root.join("node"), root.join("git\\cmd"), other]);
+    }
+
+    #[test]
+    fn only_a_folder_that_holds_the_runtime_itself_is_left_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (unix, cyg, deeper, plain) = (dir.path().join("unix"), dir.path().join("cyg"), dir.path().join("deeper"), dir.path().join("plain"));
+        for (folder, file) in [(&unix, "msys-2.0.dll"), (&cyg, "cygwin1.dll"), (&deeper.join("bin"), "msys-2.0.dll"), (&plain, "find.exe")] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join(file), "").unwrap();
+        }
+        let missing = dir.path().join("not-there");
+        // (the runtime must be directly in the folder; an empty entry and a missing folder are as they were)
+        let path = format!("{};;{};{};{};{}", unix.display(), missing.display(), cyg.display(), deeper.display(), plain.display());
+        assert_eq!(without_unix_runtimes(&path), format!(";{};{};{}", missing.display(), deeper.display(), plain.display()));
+        assert_eq!(without_unix_runtimes(""), "");
+        let untouched = format!("{};;{}", missing.display(), plain.display());
+        assert_eq!(without_unix_runtimes(&untouched), untouched);
     }
 
     /// A bundle with these programs in it (empty files will do: only that they are there is looked at), and `sandbox_fix.cjs` beside node's.
