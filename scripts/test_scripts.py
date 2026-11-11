@@ -147,6 +147,12 @@ class Fetching(unittest.TestCase):
                 # What is in the cache and is not that is fetched again.
                 (cache / "x.bin").write_bytes(b"changed since")
                 self.assertEqual(fetch_tools.sha256(fetch_tools.fetch("https://example.invalid/x", "x.bin", wanted)), wanted)
+                (cache / "x.bin").unlink()
+                with self.assertRaises(SystemExit):
+                    fetch_tools.fetch("https://example.invalid/x", "x.bin", wanted, "0" * 64)
+                self.assertEqual(list(cache.iterdir()), [], "a wrong SHA3 pin leaves no cached download")
+                wanted_sha3 = fetch_tools.sha3_256(source)
+                self.assertEqual(fetch_tools.sha3_256(fetch_tools.fetch("https://example.invalid/x", "x.bin", wanted, wanted_sha3)), wanted_sha3)
 
 
 if __name__ == "__main__":
