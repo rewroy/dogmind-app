@@ -51,10 +51,18 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def fetch(url, name, wanted):
+def sha3_256(path):
+    digest = hashlib.sha3_256()
+    with open(path, "rb") as file:
+        for block in iter(lambda: file.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def fetch(url, name, wanted, wanted_sha3=None):
     """The file in the cache, fetched if it is not there, and never left there unless its hash is the one pinned."""
     path = cache() / name
-    if path.is_file() and sha256(path) == wanted:
+    if path.is_file() and sha256(path) == wanted and (wanted_sha3 is None or sha3_256(path) == wanted_sha3):
         return path
     part = path.with_name(path.name + ".part")
     request = urllib.request.Request(url, headers={"User-Agent": "dogmind-package"})
@@ -65,6 +73,11 @@ def fetch(url, name, wanted):
     if found != wanted:
         part.unlink()
         sys.exit(f"{url}: sha256 {found}, and {wanted} is what is pinned: not used")
+    if wanted_sha3 is not None:
+        found_sha3 = sha3_256(part)
+        if found_sha3 != wanted_sha3:
+            part.unlink()
+            sys.exit(f"{url}: sha3-256 {found_sha3}, and {wanted_sha3} is what is pinned: not used")
     os.replace(part, path)
     return path
 
@@ -94,9 +107,9 @@ def main():
     if "--relock" in sys.argv:
         relock()
     lock = json.loads(LOCK.read_text(encoding="utf-8"))
-    for key in () if "--fonts-only" in sys.argv else ("python", "node", "git"):
+    for key in () if "--fonts-only" in sys.argv else ("python", "sqlite", "node", "git"):
         item = lock[key]
-        print(key, item["version"], fetch(item["url"], item["file"], item["sha256"]))
+        print(key, item["version"], fetch(item["url"], item["file"], item["sha256"], item.get("sha3_256")))
     for item in lock["fonts"]["files"] + [lock["fonts"]["license"]]:
         fetch(item["url"], item["file"], item["sha256"])
     if "--fonts-only" in sys.argv:

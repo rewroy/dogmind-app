@@ -281,6 +281,8 @@ pub struct Settings {
     /// Ask GitHub, now and then, whether a newer release is out, and fetch its setup in the background when it is (see `updates`). Off: the app neither asks nor fetches on its own. Either way
     /// nothing is installed unless the person presses Restart to update.
     pub check_for_updates: bool,
+    /// Whether the bundled local Straydog is checked and staged independently of Dogmind updates.
+    pub check_straydog_updates: bool,
     /// When GitHub last answered such a question, in seconds since 1970: it is asked again a day later, at the soonest.
     pub last_update_check: Option<u64>,
     /// The release whose notice the person closed (or followed to its page): they are not told of that one again.
@@ -368,6 +370,7 @@ impl Default for Settings {
             skills_off: Vec::new(),
             skills_on: Vec::new(),
             check_for_updates: true,
+            check_straydog_updates: true,
             last_update_check: None,
             dismissed_update: None,
         }
@@ -550,23 +553,6 @@ impl KeysMoved {
 /// Under what Credential Manager keeps the search service's key.
 pub const SEARCH_KEY_TARGET: &str = "web-search";
 
-/// A VRAM budget as a person writes it: a number of GiB, or `auto` (or nothing) for what Straydog finds free.
-pub fn parse_vram(text: &str) -> Result<Option<f64>, String> {
-    let text = text.trim();
-    if text.is_empty() || text.eq_ignore_ascii_case("auto") {
-        return Ok(None);
-    }
-    match text.parse::<f64>() {
-        Ok(gib) if gib > 0.0 => Ok(Some(gib)),
-        _ => Err(t("The graphics memory limit is a number of GB, or leave it empty.").to_string()),
-    }
-}
-
-/// As it stands in its field: empty is what the field's hint says, automatic.
-pub fn show_vram(vram: Option<f64>) -> String {
-    vram.map_or(String::new(), |gib| gib.to_string())
-}
-
 /// The app's folder: settings, sessions, the engine's settings and its log.
 pub fn data_folder() -> PathBuf {
     data_folder_from(std::env::var_os("DOGMIND_DATA").map(PathBuf::from), std::env::var_os("LOCALAPPDATA").map(PathBuf::from), std::env::temp_dir())
@@ -589,7 +575,7 @@ pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
 }
 
 /// The folders this app makes in its data folder, by name.
-const MADE_FOLDERS: [&str; 7] = ["sessions", "memory", "preview", "crashes", "attachments", "models", "updates"];
+const MADE_FOLDERS: [&str; 8] = ["sessions", "memory", "preview", "crashes", "attachments", "models", "updates", "engine-updates"];
 /// The beginnings of the names of the files it makes there: each as it is, written beside itself first (`.part`, `.partial`), or
 /// moved aside when it could not be read (`.broken`, `.unreadable-TIME.json`), or the engine's copies of its own (`engine.toml.old`).
 const MADE_FILES: [&str; 12] = ["settings.json", "engine.toml", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-", "workspace-grants.json", "read-folders.json", "mcp.json", "mcp.partial", "report.txt", "conversation-key.json"];
@@ -775,20 +761,6 @@ mod tests {
         expected.sort();
         assert_eq!(names(what_remove_takes(&data, None, None).unwrap()), expected);
         assert_eq!(names(what_remove_leaves(&data, None)), ["Sessions.lnk", "my photos", "notes.txt", "permissions.txt", "settings.ini", "settings.json.d"], "a file of a folder's name is not the folder, nor a folder of a file's");
-    }
-
-    #[test]
-    fn a_vram_budget_is_auto_unless_a_number_is_given() {
-        assert_eq!(Settings::default().vram, None);
-        assert_eq!(show_vram(None), "");
-        assert_eq!(show_vram(Some(8.0)), "8");
-        for text in ["", "  ", "auto", "AUTO", " Auto "] {
-            assert_eq!(parse_vram(text), Ok(None), "{text:?}");
-        }
-        assert_eq!(parse_vram(" 5.5 "), Ok(Some(5.5)));
-        for text in ["-1", "0", "lots"] {
-            assert!(parse_vram(text).is_err(), "{text:?}");
-        }
     }
 
     #[test]
