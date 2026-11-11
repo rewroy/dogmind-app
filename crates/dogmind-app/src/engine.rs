@@ -118,6 +118,8 @@ pub struct CatalogEntry {
     pub detail: String,
     /// The most this model takes on this machine, when Straydog says.
     pub context: Option<u64>,
+    /// The engine's model limit, independent of what fits on this machine. Older engines omit it.
+    pub context_max: Option<u64>,
     /// What it takes on the drive once it is all there, when Straydog says.
     pub disk_bytes: Option<u64>,
     /// `None` for Straydog's own choice, which is not yet a model.
@@ -187,6 +189,8 @@ pub struct Catalog {
     pub entries: Vec<CatalogEntry>,
     /// This PC's GPU and memory in a line, when Straydog says.
     pub machine: String,
+    /// The smallest card's physical memory. A single --vram value is a per-GPU budget.
+    pub gpu_vram_bytes: Option<u64>,
     /// When nothing can run here. `entries` has only bundles short of graphics memory then, if any.
     pub refusal: Option<Refusal>,
 }
@@ -195,7 +199,7 @@ pub struct Catalog {
 /// quantization names of 0.1.3 and before, which `legacy_labels` reads. What it does not say or does not read is not offered, and Straydog's own choice
 /// always is. It says no creator and no licence of a bundle.
 pub fn parse_catalog(help: &str) -> Vec<CatalogEntry> {
-    let mut entries = vec![CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, bundle: None, name: t("The best for this PC").into(), origin: String::new(), detail: t("Straydog looks at this machine and chooses").into(), context: None, disk_bytes: None, licence: None, runs: true }];
+    let mut entries = vec![CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, bundle: None, name: t("The best for this PC").into(), origin: String::new(), detail: t("Straydog looks at this machine and chooses").into(), context: None, context_max: None, disk_bytes: None, licence: None, runs: true }];
     for line in help.lines().filter(|line| line.contains(" GB)")) {
         let line = line.split(". ").next().unwrap_or(line);
         for part in line.split(';') {
@@ -211,7 +215,7 @@ pub fn parse_catalog(help: &str) -> Vec<CatalogEntry> {
                 // (the model the help names is the table's, under the name it had then: `DeepSeek-V4.1-Flash` is `DeepSeek-V4.1-Flash-1017`'s start)
                 let Some((labelled, provider, quant)) = legacy_labels(quant).filter(|(labelled, ..)| labelled.starts_with(model)) else { continue };
                 let bundle = Bundle::new(labelled, provider, quant);
-                entries.push(CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, name: bundle.name(), bundle: Some(bundle), origin: origin("", provider), detail: size.to_string(), context: None, disk_bytes: None, licence: None, runs: true });
+                entries.push(CatalogEntry { download_bytes: None, vision_bytes: None, drafter_bytes: None, name: bundle.name(), bundle: Some(bundle), origin: origin("", provider), detail: size.to_string(), context: None, context_max: None, disk_bytes: None, licence: None, runs: true });
             }
         }
     }
@@ -325,6 +329,7 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
             },
             bundle: Some(named),
             context: bundle.get("context").and_then(Value::as_u64),
+            context_max: bundle.get("context_max").and_then(Value::as_u64),
             disk_bytes,
             runs,
         };
@@ -343,7 +348,9 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     short_entries.sort_by_key(unsloth_last);
     entries.extend(short_entries);
     let machine = value.get("machine");
-    let gpus: Vec<String> = machine.and_then(|machine| machine.get("gpus")).and_then(Value::as_array).into_iter().flatten().map(|gpu| {
+    let gpu_values = machine.and_then(|machine| machine.get("gpus")).and_then(Value::as_array);
+    let gpu_vram_bytes = gpu_values.into_iter().flatten().filter_map(|gpu| gpu.get("total_bytes").and_then(Value::as_u64)).filter(|&bytes| bytes > 0).min();
+    let gpus: Vec<String> = gpu_values.into_iter().flatten().map(|gpu| {
         format!("{} ({})", word(gpu, "name"), memory_gb(gpu.get("total_bytes").and_then(Value::as_u64).unwrap_or(0)))
     }).collect();
     let ram = machine.and_then(|machine| machine.get("ram_bytes")).and_then(Value::as_u64).unwrap_or(0);
@@ -365,7 +372,7 @@ pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
     } else {
         shortest.map(|(_, needs, has)| Refusal::TooLittleMemory { needs, has })
     };
-    Some(Catalog { entries, machine: parts.join("  ·  "), refusal })
+    Some(Catalog { entries, machine: parts.join("  ·  "), gpu_vram_bytes, refusal })
 }
 
 /// What `straydog --version` says.

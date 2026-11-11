@@ -553,23 +553,6 @@ impl KeysMoved {
 /// Under what Credential Manager keeps the search service's key.
 pub const SEARCH_KEY_TARGET: &str = "web-search";
 
-/// A VRAM budget as a person writes it: a number of GiB, or `auto` (or nothing) for what Straydog finds free.
-pub fn parse_vram(text: &str) -> Result<Option<f64>, String> {
-    let text = text.trim();
-    if text.is_empty() || text.eq_ignore_ascii_case("auto") {
-        return Ok(None);
-    }
-    match text.parse::<f64>() {
-        Ok(gib) if gib > 0.0 => Ok(Some(gib)),
-        _ => Err(t("The graphics memory limit is a number of GB, or leave it empty.").to_string()),
-    }
-}
-
-/// As it stands in its field: empty is what the field's hint says, automatic.
-pub fn show_vram(vram: Option<f64>) -> String {
-    vram.map_or(String::new(), |gib| gib.to_string())
-}
-
 /// The app's folder: settings, sessions, the engine's settings and its log.
 pub fn data_folder() -> PathBuf {
     data_folder_from(std::env::var_os("DOGMIND_DATA").map(PathBuf::from), std::env::var_os("LOCALAPPDATA").map(PathBuf::from), std::env::temp_dir())
@@ -778,20 +761,6 @@ mod tests {
         expected.sort();
         assert_eq!(names(what_remove_takes(&data, None, None).unwrap()), expected);
         assert_eq!(names(what_remove_leaves(&data, None)), ["Sessions.lnk", "my photos", "notes.txt", "permissions.txt", "settings.ini", "settings.json.d"], "a file of a folder's name is not the folder, nor a folder of a file's");
-    }
-
-    #[test]
-    fn a_vram_budget_is_auto_unless_a_number_is_given() {
-        assert_eq!(Settings::default().vram, None);
-        assert_eq!(show_vram(None), "");
-        assert_eq!(show_vram(Some(8.0)), "8");
-        for text in ["", "  ", "auto", "AUTO", " Auto "] {
-            assert_eq!(parse_vram(text), Ok(None), "{text:?}");
-        }
-        assert_eq!(parse_vram(" 5.5 "), Ok(Some(5.5)));
-        for text in ["-1", "0", "lots"] {
-            assert!(parse_vram(text).is_err(), "{text:?}");
-        }
     }
 
     #[test]
