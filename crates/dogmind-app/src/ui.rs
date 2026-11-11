@@ -2177,7 +2177,13 @@ struct App {
     web_seen: bool,
     toggle_web: HWND,
     toggle_compact: HWND,
-    context_auto: Option<u64>,
+    context_follows_model: bool,
+    vram_slider: HWND,
+    context_slider: HWND,
+    vram_steps: i32,
+    vram_max_steps: i32,
+    context_steps: i32,
+    context_max_steps: i32,
     /// Going through the first setup: a model folder or a provider leads on to the workspace.
     onboarding: bool,
     setup_kind: Kind,
@@ -2619,7 +2625,9 @@ unsafe fn redraw(window: HWND, on: bool) {
 }
 
 unsafe fn show(window: HWND, visible: bool) {
-    ShowWindow(window, if visible { SW_SHOWNA } else { SW_HIDE });
+    if (GetWindowLongPtrW(window, GWL_STYLE) as u32 & WS_VISIBLE != 0) != visible {
+        ShowWindow(window, if visible { SW_SHOWNA } else { SW_HIDE });
+    }
 }
 
 /// The words of the button of an update that is on its way or here. They follow the stage the update is in and what was asked of it, and never how far a fetch has come: a note of
@@ -2689,6 +2697,7 @@ fn notice_text(shown: &notice::Notice) -> (String, String) {
 /// A control where it now goes. Without SWP_NOCOPYBITS the system moves its old pixels along and asks it to draw only what it thinks is new, and what
 /// was covered or not yet drawn at the old place comes along as holes; one that has not moved is left alone.
 unsafe fn place(window: HWND, x: i32, y: i32, width: i32, height: i32) {
+    if child_area(window, GetParent(window)) == (x, y, width, height) { return; }
     SetWindowPos(window, std::ptr::null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
 }
 
@@ -6407,6 +6416,8 @@ impl App {
         // (a PC that cannot run a model is not asked where to keep one)
         let refused = self.panel == Panel::Models && self.refusal.is_some();
         show(self.drafter_chip, self.panel == Panel::Models && !refused);
+        show(self.vram_slider, self.panel == Panel::Models && !refused);
+        show(self.context_slider, self.panel == Panel::Models && !refused);
         show(self.speed_chip, self.panel == Panel::Models && !refused);
         show(self.vision_chip, self.panel == Panel::Models && !refused && self.vision_row().is_some());
         show(self.vision_delete, false);
@@ -6414,7 +6425,7 @@ impl App {
         show(self.toggle_display, matches!(self.panel, Panel::Setup | Panel::Welcome));
         let field_count: usize = match self.panel {
             Panel::Models if refused => 0,
-            Panel::Models => 3,
+            Panel::Models => 1,
             Panel::SetupDetails => match self.setup_kind {
                 Kind::Server => 3,
                 Kind::Anthropic => 2,
@@ -6486,6 +6497,8 @@ impl App {
             // A label as wide as the longest of them, and over its field where that would leave a field too narrow.
             let mut names: Vec<&str> = self.labels[..field_count].iter().map(String::as_str).collect();
             if self.panel == Panel::Models {
+                names.push(t("Graphics memory limit (GB)"));
+                names.push(t("Longest conversation (tokens)"));
                 names.push(t("Faster-writing data (5 GB)"));
             }
             if self.panel == Panel::Models {
@@ -6525,6 +6538,12 @@ impl App {
                 top += row + s(ds::space::M);
             }
             if self.panel == Panel::Models && !refused {
+                for (label, slider) in [(t("Graphics memory limit (GB)"), self.vram_slider), (t("Longest conversation (tokens)"), self.context_slider)] {
+                    shapes.push(Shape::Text { area: rect(left, top, label_width, if stacked { label_row } else { row }), text: label.into(), font: FontKind::Body, color: theme::muted(), flags: ONE_LINE });
+                    top += label_row;
+                    place(slider, field_left, top, field_width, row);
+                    top += row + s(ds::space::M);
+                }
                 shapes.push(Shape::Text { area: rect(left, top, label_width, if stacked { label_row } else { row }), text: t("Faster-writing data (5 GB)").into(), font: FontKind::Body, color: theme::muted(), flags: ONE_LINE });
                 top += label_row;
                 place(self.drafter_chip, field_left, top + s(ds::space::XS), s(380).min(field_width), s(30));
@@ -6594,7 +6613,7 @@ impl App {
 
     /// The controls that move between the window and a dialog as they are needed, and those that only a dialog has.
     fn shared_controls(&self) -> Vec<HWND> {
-        let mut all = vec![self.list, self.doc, self.kind_chip, self.drafter_chip, self.speed_chip, self.vision_chip, self.licence_link, self.toggle_display, self.provider_up, self.provider_down];
+        let mut all = vec![self.list, self.doc, self.kind_chip, self.drafter_chip, self.speed_chip, self.vision_chip, self.licence_link, self.toggle_display, self.provider_up, self.provider_down, self.vram_slider, self.context_slider];
         all.extend(self.fields);
         all.extend(self.buttons);
         all
@@ -6815,10 +6834,7 @@ impl App {
                     _ => {}
                 }
             }
-            Panel::Models => {
-                field_cue(self.fields[1], t("Automatic"));
-                field_cue(self.fields[2], t("Automatic"));
-            }
+            Panel::Models => {}
             Panel::Tools => field_cue(self.fields[KEY_FIELD], t("Optional. Kept in Credential Manager")),
             _ => {}
         }
@@ -6955,8 +6971,8 @@ impl App {
                     form.y += s(ds::size::LINK);
                 }
                 form.field_with_button(t("Where models are kept"), self.fields[0], self.buttons[1]);
-                form.field(t("Graphics memory limit (GB)"), self.fields[1]);
-                form.field(t("Longest conversation (tokens)"), self.fields[2]);
+                form.select(t("Graphics memory limit (GB)"), self.vram_slider);
+                form.select(t("Longest conversation (tokens)"), self.context_slider);
                 form.toggle(t("Faster-writing data (5 GB)"), self.drafter_chip);
                 form.toggle(t("Speed first (for a PC short of memory)"), self.speed_chip);
                 if let Some(words) = self.vision_row() {
@@ -8690,9 +8706,11 @@ impl App {
                 self.labels = [t("Where models are kept").into(), t("Graphics memory limit (GB)").into(), t("Longest conversation (tokens)").into(), String::new()];
                 let folder = self.settings.models_folder.clone().map_or(String::new(), |folder| folder.display().to_string());
                 set_text(self.fields[0], &folder);
-                self.context_auto = None;
-                set_text(self.fields[1], &settings::show_vram(self.settings.vram));
-                set_text(self.fields[2], &self.settings.context.map_or(String::new(), |context| context.to_string()));
+                self.context_follows_model = self.settings.context.is_none();
+                self.vram_steps = self.settings.vram.map_or(0, |gib| (gib * 100.0).round() as i32);
+                self.vram_max_steps = 0;
+                self.context_steps = self.settings.context.map_or(0, |tokens| (tokens / 1024) as i32);
+                self.context_max_steps = 256;
                 self.update_drafter_chip();
                 self.update_speed_chip();
                 self.update_vision_chip();
@@ -8708,7 +8726,7 @@ impl App {
                 }
                 match engine::find(&self.settings) {
                     Some(straydog) => {
-                        self.list_rows.push(ListRow { title: t("Asking Straydog...").into(), detail: String::new(), active: false });
+                        self.panel_log = t("Asking Straydog...").into();
                         let poster = self.poster.clone();
                         std::thread::spawn(move || poster.send(Note::Catalog(engine::load_catalog(&straydog))));
                     }
@@ -9193,16 +9211,52 @@ impl App {
         set_text(self.licence_link, line.as_deref().unwrap_or(""));
     }
 
-    /// The context field follows the chosen model's largest, until something else is typed there.
+    /// The context slider follows the model's largest until the person moves it.
     unsafe fn offer_context(&mut self, at: Option<usize>) {
-        let Some(context) = at.and_then(|at| self.catalog.get(at)).and_then(|entry| entry.context) else { return };
-        let typed = get_text(self.fields[2]);
-        let typed = typed.trim();
-        let untouched = typed.is_empty() || typed.parse::<u64>().ok() == self.context_auto;
-        if untouched {
-            set_text(self.fields[2], &context.to_string());
-            self.context_auto = Some(context);
+        let entry = at.and_then(|at| self.catalog.get(at));
+        let context = entry.and_then(|entry| entry.context_max).unwrap_or(262_144);
+        self.context_max_steps = (context.min(u32::MAX as u64) / 1024).max(1) as i32;
+        if self.context_follows_model {
+            self.context_steps = default_context_steps(entry, self.context_max_steps);
+        } else {
+            self.context_steps = self.context_steps.min(self.context_max_steps);
         }
+        InvalidateRect(self.context_slider, std::ptr::null(), 0);
+    }
+
+    unsafe fn move_model_slider(&mut self, window: HWND, next: i32) {
+        if window == self.vram_slider {
+            if self.vram_max_steps == 0 { return; }
+            self.vram_steps = next.clamp(0, self.vram_max_steps);
+        } else {
+            self.context_follows_model = false;
+            self.context_steps = next.clamp(1, self.context_max_steps);
+        }
+        InvalidateRect(window, std::ptr::null(), 0);
+    }
+
+    unsafe fn paint_model_slider(&self, window: HWND, device: HDC, width: i32, height: i32) {
+        let (value, max, words, limit) = if window == self.vram_slider {
+            let words = if self.vram_steps == 0 { t("Auto").to_string() } else { format!("{:.2} GB", self.vram_steps as f64 / 100.0) };
+            (self.vram_steps, self.vram_max_steps, words, format!("{}: {:.2}", t("Max"), self.vram_max_steps as f64 / 100.0))
+        } else {
+            let words = if self.context_steps == 0 { t("Auto").to_string() } else { tf("{0} tokens", &[&(self.context_steps as u64 * 1024)]) };
+            (self.context_steps, self.context_max_steps, words, format!("{}: {}", t("Max"), self.context_max_steps as u64 * 1024))
+        };
+        FillRect(device, &rect(0, 0, width, height), self.brushes[0]);
+        let focused = GetFocus() == window;
+        if focused { rounded(device, rect(0, 0, width, height), scale(self.dpi, ds::radius::CONTROL), None, Some(theme::accent())); }
+        let inset = scale(self.dpi, 8);
+        draw_text(device, &words, rect(inset, 0, width / 2 - inset, height / 2), self.fonts.small, if max == 0 { theme::muted() } else { theme::text() }, ONE_LINE);
+        if max > 0 { draw_text(device, &limit, rect(width / 2, 0, width / 2 - inset, height / 2), self.fonts.small, theme::muted(), DT_RIGHT | ONE_LINE); }
+        let (left, right) = (inset, (width - inset).max(inset + 1));
+        let track_y = height * 3 / 4;
+        let track_h = scale(self.dpi, 4).max(2);
+        rounded(device, rect(left, track_y - track_h / 2, right - left, track_h), track_h / 2, Some(theme::raised()), None);
+        let thumb_x = left + ((right - left) as i64 * value.clamp(0, max) as i64 / max.max(1) as i64) as i32;
+        if thumb_x > left { rounded(device, rect(left, track_y - track_h / 2, thumb_x - left, track_h), track_h / 2, Some(theme::accent()), None); }
+        let dot = scale(self.dpi, 12);
+        rounded(device, rect(thumb_x - dot / 2, track_y - dot / 2, dot, dot), dot / 2, Some(if max == 0 { theme::muted() } else { theme::accent() }), None);
     }
 
     unsafe fn update_toggles(&self) {
@@ -10166,11 +10220,14 @@ impl App {
     }
 
     unsafe fn fill_list(&self) {
+        let visible = IsWindowVisible(self.list) != 0;
+        if visible { SendMessageW(self.list, WM_SETREDRAW, 0, 0); }
         SendMessageW(self.list, LB_RESETCONTENT, 0, 0);
         for _ in &self.list_rows {
             SendMessageW(self.list, LB_ADDSTRING, 0, 0);
         }
-        InvalidateRect(self.list, std::ptr::null(), 1);
+        if visible { SendMessageW(self.list, WM_SETREDRAW, 1, 0); }
+        InvalidateRect(self.list, std::ptr::null(), 0);
     }
 
     /// The model set up, as the settings say.
@@ -13095,6 +13152,11 @@ impl App {
                 }
                 match result {
                     Ok(catalog) => {
+                        if let Some(bytes) = catalog.gpu_vram_bytes {
+                            self.vram_max_steps = vram_steps_for_bytes(bytes);
+                            self.vram_steps = self.vram_steps.min(self.vram_max_steps);
+                        }
+                        InvalidateRect(self.vram_slider, std::ptr::null(), 0);
                         self.catalog = catalog.entries;
                         self.machine_line = catalog.machine;
                         self.refusal = catalog.refusal;
@@ -13110,6 +13172,7 @@ impl App {
                         self.update_licence_link();
                         self.update_vision_chip();
                         self.update_drafter_chip();
+                        self.panel_log.clear();
                     }
                     Err(error) => {
                         self.catalog.clear();
@@ -13124,7 +13187,7 @@ impl App {
                 } else {
                     self.layout();
                 }
-                RedrawWindow(self.window, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+                InvalidateRect(if self.modal_open { self.pane } else { self.window }, std::ptr::null(), 0);
             }
             Note::EngineVersion(said, made) => {
                 self.engine_version = Some(engine_words(said.as_deref(), made));
@@ -13333,10 +13396,8 @@ impl App {
     }
 
     unsafe fn store_engine_fields(&mut self) -> Result<(), String> {
-        let (vram, context) = (get_text(self.fields[1]), get_text(self.fields[2]));
-        let context = context.trim();
-        self.settings.vram = settings::parse_vram(&vram)?;
-        self.settings.context = if context.is_empty() { None } else { Some(context.parse().map_err(|_| t("The longest conversation is a number of tokens, or leave it empty.").to_string())?) };
+        self.settings.vram = (self.vram_steps > 0).then(|| self.vram_steps as f64 / 100.0);
+        self.settings.context = (self.context_steps > 0).then(|| self.context_steps as u32 * 1024);
         let folder = get_text(self.fields[0]);
         self.settings.models_folder = (!folder.trim().is_empty()).then(|| PathBuf::from(folder.trim()));
         self.save();
@@ -14606,6 +14667,75 @@ unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPAR
 }
 
 /// The diff: the wheel, a drag of its thumb or across its rows.
+fn vram_steps_for_bytes(bytes: u64) -> i32 {
+    ((bytes as u128 * 100 / (1u128 << 30)).min(25_600)) as i32
+}
+
+fn default_context_steps(entry: Option<&CatalogEntry>, max_steps: i32) -> i32 {
+    let deepseek = entry.and_then(|entry| entry.bundle.as_ref()).and_then(|bundle| bundle.model.as_deref()).is_some_and(|model| model.starts_with("DeepSeek"));
+    if deepseek { max_steps.min(256) } else { max_steps }
+}
+
+fn model_slider_step_at(x: i32, width: i32, max: i32, inset: i32) -> i32 {
+    ((x - inset) as i64 * max as i64 / (width - 2 * inset).max(1) as i64).clamp(0, max as i64) as i32
+}
+
+unsafe extern "system" fn model_slider_procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let Some(app) = app() else { return DefWindowProcW(window, message, wparam, lparam) };
+    let is_vram = window == app.vram_slider;
+    let (value, max) = if is_vram { (app.vram_steps, app.vram_max_steps) } else { (app.context_steps, app.context_max_steps) };
+    match message {
+        WM_ERASEBKGND => 1,
+        WM_GETDLGCODE => DLGC_WANTARROWS as LRESULT,
+        WM_SETFOCUS | WM_KILLFOCUS => { InvalidateRect(window, std::ptr::null(), 0); 0 }
+        WM_PAINT => {
+            let mut paint: PAINTSTRUCT = std::mem::zeroed();
+            let target = BeginPaint(window, &mut paint);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            if client.right > 0 && client.bottom > 0 {
+                let device = CreateCompatibleDC(target);
+                let bitmap = CreateCompatibleBitmap(target, client.right, client.bottom);
+                let previous = SelectObject(device, bitmap);
+                app.paint_model_slider(window, device, client.right, client.bottom);
+                BitBlt(target, 0, 0, client.right, client.bottom, device, 0, 0, SRCCOPY);
+                SelectObject(device, previous);
+                DeleteObject(bitmap);
+                DeleteDC(device);
+            }
+            EndPaint(window, &paint);
+            0
+        }
+        WM_LBUTTONDOWN | WM_MOUSEMOVE if message == WM_LBUTTONDOWN || GetCapture() == window => {
+            if max == 0 { return 0; }
+            if message == WM_LBUTTONDOWN { SetFocus(window); SetCapture(window); }
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let next = model_slider_step_at(x, client.right, max, scale(app.dpi, 8));
+            app.move_model_slider(window, next);
+            0
+        }
+        WM_LBUTTONUP => { if GetCapture() == window { ReleaseCapture(); } 0 }
+        WM_KEYDOWN if max > 0 => {
+            let step = if is_vram { 10 } else { 1 };
+            let page = if is_vram { 100 } else { 16 };
+            let next = match wparam as u16 {
+                VK_LEFT | VK_DOWN => value - step,
+                VK_RIGHT | VK_UP => value + step,
+                VK_PRIOR => value + page,
+                VK_NEXT => value - page,
+                VK_HOME => 0,
+                VK_END => max,
+                _ => return DefWindowProcW(window, message, wparam, lparam),
+            };
+            app.move_model_slider(window, next);
+            0
+        }
+        _ => DefWindowProcW(window, message, wparam, lparam),
+    }
+}
+
 unsafe extern "system" fn diff_procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let Some(app) = app() else { return DefWindowProcW(window, message, wparam, lparam) };
     let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
@@ -16352,6 +16482,9 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let steps_class = wide("DogSteps");
         let class = WNDCLASSW { lpfnWndProc: Some(helper_view::steps_procedure), hInstance: instance, lpszClassName: steps_class.as_ptr(), hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW), ..std::mem::zeroed() };
         RegisterClassW(&class);
+        let slider_class = wide("DogSlider");
+        let class = WNDCLASSW { lpfnWndProc: Some(model_slider_procedure), hInstance: instance, lpszClassName: slider_class.as_ptr(), hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW), ..std::mem::zeroed() };
+        RegisterClassW(&class);
         let steps_view = CreateWindowExW(0, steps_class.as_ptr(), std::ptr::null(), WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP, 0, 0, 0, 0, window, std::ptr::null_mut(), instance, std::ptr::null());
         let (modal_class, pane_class) = (wide("DogModal"), wide("DogPane"));
         for name in [&modal_class, &pane_class] {
@@ -16381,6 +16514,9 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         }
         let side = control(window, "LISTBOX", "", list_style, 0, ID_SIDE);
         let list = control(window, "LISTBOX", "", list_style, 0, ID_LIST);
+        let fields = std::array::from_fn(|_| control(window, "EDIT", "", edit_style, 0, 0));
+        let vram_slider = control(window, "DogSlider", "", WS_TABSTOP, 0, 0);
+        let context_slider = control(window, "DogSlider", "", WS_TABSTOP, 0, 0);
         let chip = |id: isize, backdrop: u32| make_button(window, id, "", ButtonKind::Chip, backdrop);
         let app = Box::new(App {
             window,
@@ -16609,7 +16745,13 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             web_seen: false,
             toggle_web: make_button(pane, ID_TOGGLE_WEB, "", ButtonKind::Toggle, theme::background()),
             toggle_compact: make_button(pane, ID_TOGGLE_COMPACT, "", ButtonKind::Toggle, theme::background()),
-            context_auto: None,
+            context_follows_model: false,
+            vram_slider,
+            context_slider,
+            vram_steps: 0,
+            vram_max_steps: 0,
+            context_steps: 0,
+            context_max_steps: 256,
             onboarding: false,
             setup_kind: Kind::Embedded,
             sidebar_width: 0,
@@ -16636,7 +16778,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             list,
             list_rows: Vec::new(),
             list_hover: None,
-            fields: std::array::from_fn(|_| control(window, "EDIT", "", edit_style, 0, 0)),
+            fields,
             labels: std::array::from_fn(|_| String::new()),
             buttons: std::array::from_fn(|at| make_button(window, ID_BUTTONS + at as isize, "", ButtonKind::Secondary, theme::background())),
             kind_chip: make_button(window, ID_KIND_CHIP, "", ButtonKind::Select, theme::background()),
@@ -16958,6 +17100,24 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_sliders_use_card_memory_and_engine_limits() {
+        let list = r#"{"machine":{"gpus":[{"name":"A","total_bytes":17179869184},{"name":"B","total_bytes":8589934592}]},"bundles":[
+            {"model":"Qwen3.8-Flash-Next","provider":"P","quant":"Q2_0","runs":true,"context":32768,"context_max":262144},
+            {"model":"DeepSeek-V4.1-Flash-1017","provider":"P","quant":"IQ2_XS","runs":true,"context":65536,"context_max":1048576}]}"#;
+        let catalog = engine::parse_list(list, true).unwrap();
+        assert_eq!(catalog.gpu_vram_bytes.map(vram_steps_for_bytes), Some(800));
+        let qwen = catalog.entries.iter().find(|entry| entry.name.starts_with("Qwen")).unwrap();
+        let deepseek = catalog.entries.iter().find(|entry| entry.name.starts_with("DeepSeek")).unwrap();
+        assert_eq!(qwen.context, Some(32_768));
+        assert_eq!(qwen.context_max, Some(262_144));
+        assert_eq!(default_context_steps(Some(qwen), 256), 256);
+        assert_eq!(deepseek.context_max, Some(1_048_576));
+        assert_eq!(default_context_steps(Some(deepseek), 1024), 256);
+        assert_eq!(model_slider_step_at(-100, 340, 800, 8), 0);
+        assert_eq!(model_slider_step_at(340, 340, 800, 8), 800);
+    }
 
     #[test]
     fn the_notice_names_the_version_and_its_one_button_says_what_a_press_does() {
