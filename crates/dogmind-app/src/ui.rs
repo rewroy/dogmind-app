@@ -8726,7 +8726,7 @@ impl App {
                 }
                 match engine::find(&self.settings) {
                     Some(straydog) => {
-                        self.panel_log = t("Asking Straydog...").into();
+                        if !self.setting_up { self.panel_log = t("Asking Straydog...").into(); }
                         let poster = self.poster.clone();
                         std::thread::spawn(move || poster.send(Note::Catalog(engine::load_catalog(&straydog))));
                     }
@@ -13172,7 +13172,7 @@ impl App {
                         self.update_licence_link();
                         self.update_vision_chip();
                         self.update_drafter_chip();
-                        self.panel_log.clear();
+                        if self.panel_log == t("Asking Straydog...") { self.panel_log.clear(); }
                     }
                     Err(error) => {
                         self.catalog.clear();
