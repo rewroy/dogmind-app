@@ -51,6 +51,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
+dependencies = [
+ "derive_arbitrary",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -245,6 +254,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "derive_arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b034bd7d5f032402a2479444dcc6f74e36a03f31854d41680fb240ef682a1ac"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -257,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "dogmind-agent"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "chrono",
  "flate2",
@@ -277,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "dogmind-app"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "alacritty_terminal",
  "dogmind-agent",
@@ -292,11 +312,12 @@ dependencies = [
  "windows-core",
  "windows-numerics",
  "windows-sys 0.59.0",
+ "zip",
 ]
 
 [[package]]
 name = "dogmind-setup"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "flate2",
  "serde_json",
@@ -1534,6 +1555,20 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "zip"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1dcb24d0152526ae49b9b96c1dcf71850ca1e0b882e4e28ed898a93c41334744"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "crossbeam-utils",
+ "flate2",
+ "indexmap",
+ "memchr",
+]
 
 [[package]]
 name = "zlib-rs"

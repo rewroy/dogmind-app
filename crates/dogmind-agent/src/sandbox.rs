@@ -94,7 +94,7 @@ impl Drop for Desktop {
     }
 }
 
-/// Lets the container use a window station or desktop: these rights, and a label it may write under, as a container runs at low integrity.
+/// Lets the container use a desktop of the app's own: these rights, and a label it may write under, as a container runs at low integrity. Never a window station: see `STATION`.
 unsafe fn let_container_use(object: HANDLE, sid: PSID, rights: u32) -> Result<(), String> {
     let (mut old, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
     if GetSecurityInfo(object, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), &mut old, std::ptr::null_mut(), &mut descriptor) != 0 {
@@ -128,9 +128,31 @@ unsafe fn let_container_use(object: HANDLE, sid: PSID, rights: u32) -> Result<()
 
 /// One window station for all commands, for as long as the app runs. One made by a program is not interactive: nothing in it can reach the screen, and the system does not show
 /// its hard errors, which it would show on the desktop in use from any desktop of the person's own station, for a program that has put its error mode back to the default.
+///
+/// It is not the app's own. Only an administrator can name a station, and the one the system gives for no name is the same for every program of this logon
+/// (`Service-0x0-<logon id>$`): the sandbox of every Chromium browser runs its processes there. So nothing is ever written on it. An ACE for this container on it was the end
+/// of each of those that loads user32: win32k refused them, and Chrome and Edge played no sound and no protected video until the person signed out. Measured on Windows 11
+/// 26300 with Chrome 157, on a station nothing else used: the same list written back, a label, or an ACE for an ordinary group changed nothing, and an ACE for one
+/// AppContainer broke it, by either call that writes one.
 static STATION: Mutex<usize> = Mutex::new(0);
-/// Everything but ending the session and reading the screen.
-const ON_ITS_STATION: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0200 | READ_CONTROL;
+
+/// The station, opened: made if nothing has made it yet, with the list of the person's own station, as a browser makes it. That list allows all application packages what a
+/// program needs to be in a station, which is all a container gets here. (No name: see `STATION`. Everything but ending the session and reading the screen.)
+unsafe fn open_station() -> Result<usize, String> {
+    let (mut list, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
+    let read = GetSecurityInfo(GetProcessWindowStation() as HANDLE, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), &mut list, std::ptr::null_mut(), &mut descriptor);
+    if read != 0 {
+        return Err(format!("the access list of the person's window station could not be read (error {read})"));
+    }
+    let attributes = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: descriptor, bInheritHandle: 0 };
+    let made = CreateWindowStationW(std::ptr::null(), 0, 0x37F | READ_CONTROL, &attributes);
+    let failed = made.is_null().then(|| last_error("a window station for commands"));
+    LocalFree(descriptor as HLOCAL);
+    match failed {
+        Some(failed) => Err(failed),
+        None => Ok(made as usize),
+    }
+}
 
 impl Desktop {
     unsafe fn new(sid: PSID) -> Result<Desktop, String> {
@@ -139,13 +161,7 @@ impl Desktop {
         let own = wide(&name);
         let mut station = STATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if *station == 0 {
-            // (with no name, as only an administrator can choose one: the system gives it one; WINSTA_ALL_ACCESS)
-            let made = CreateWindowStationW(std::ptr::null(), 0, 0x37F | READ_CONTROL | WRITE_DAC | WRITE_OWNER, std::ptr::null());
-            if made.is_null() {
-                return Err(last_error("a window station of its own"));
-            }
-            let_container_use(made as HANDLE, sid, ON_ITS_STATION)?;
-            *station = made as usize;
+            *station = open_station()?;
         }
         // A desktop is made in the process's station. The app's own threads have theirs already, and it is back in a moment.
         let usual = GetProcessWindowStation();
@@ -1626,10 +1642,15 @@ fn environment(temp: Option<&Path>, workspace: &Path, build_tools: impl FnOnce()
     out
 }
 
-/// A command's environment from what it inherits. The PATH comes out as the bundled tools, then what the machine has (without a person's own Python, Node or Git), then the folders of
-/// Visual Studio's compiler when `build_tools` finds them, and last the bundled Git's Unix tools: nothing that is earlier on it can be shadowed by a later one.
+/// A command's environment from what it inherits. The PATH comes out as the bundled tools and the folder `npm install -g` fills, then what the machine has (without a person's own Python,
+/// Node or Git, and without a folder of MSYS or Cygwin programs, which cannot start here and would stand in for Windows' own `find` and `sort`), and last the folders of Visual Studio's
+/// compiler when `build_tools` finds them: nothing that is earlier on it can be shadowed by a later one.
 fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, temp: String, workspace: &Path, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<(String, String)> {
     crate::msvc::add_to(&mut block, build_tools);
+    // (before anything is made of it, with a bundle or without: `path_of` leaves the same ones off)
+    if let Some((_, path)) = block.iter_mut().find(|(name, _)| name.eq_ignore_ascii_case("PATH")) {
+        *path = crate::bundled::without_unix_runtimes(path);
+    }
     if let Some(root) = bundled {
         let inherited = block.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH")).map(|(_, path)| path.clone()).unwrap_or_default();
         let added = crate::bundled::environment(root, &inherited, &temp, workspace);
@@ -1644,11 +1665,13 @@ fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, t
     block
 }
 
-/// The folders on the PATH a command starts with, in order, made as `environment_block` makes it: the bundled tools, the machine's without a person's own Python, Node or Git, and then Visual
-/// Studio's. Only the PATH is made: `environment_block` goes on to ask git for a name and to write a config file, which a question about a name in a command must not do.
+/// The folders on the PATH a command starts with, in order, made as `environment_block` makes it: the bundled tools, the machine's without a person's own Python, Node or Git and without MSYS
+/// or Cygwin folders, and then Visual Studio's. Only the PATH is made: `environment_block` goes on to ask git for a name and to write a config file, which a question about a name in a command
+/// must not do.
 fn path_of(mut block: Vec<(String, String)>, bundled: Option<&Path>, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<PathBuf> {
     crate::msvc::add_to(&mut block, build_tools);
     let inherited = block.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH")).map(|(_, path)| path.clone()).unwrap_or_default();
+    let inherited = crate::bundled::without_unix_runtimes(&inherited);
     let path = bundled.map_or(inherited.clone(), |root| crate::bundled::path_with(root, &inherited));
     std::env::split_paths(&path).collect()
 }
@@ -1964,6 +1987,38 @@ mod tests {
         assert!(name.contains('\\') && name.contains("DogmindExec-"), "{name}");
         // SAFETY: as above.
         assert!(unsafe { desktop.windows() }.is_empty());
+    }
+
+    #[test]
+    fn the_station_is_shared_with_browsers_and_is_left_as_it_was_found() {
+        // Its access list and label, as text.
+        unsafe fn security_of(station: usize) -> String {
+            let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let asked = DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+            assert_eq!(GetSecurityInfo(station as HANDLE, SE_WINDOW_OBJECT, asked, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut descriptor), 0);
+            let mut text: *mut u16 = std::ptr::null_mut();
+            assert_ne!(ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, SDDL_REVISION_1, asked, &mut text, std::ptr::null_mut()), 0);
+            let length = (0..).take_while(|&at| *text.add(at) != 0).count();
+            let said = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+            LocalFree(text as HLOCAL);
+            LocalFree(descriptor as HLOCAL);
+            said
+        }
+        // SAFETY: the handles are the app's, and the SID lives as long as the process.
+        unsafe {
+            let station = {
+                let mut station = STATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *station == 0 {
+                    *station = open_station().unwrap();
+                }
+                *station
+            };
+            let before = security_of(station);
+            assert!(before.contains(";;;AC)"), "all application packages may be in it, which is how a container is: {before}");
+            let desktop = Desktop::new(profile_sid().unwrap()).unwrap();
+            assert_eq!(security_of(station), before, "a browser's sandbox is in this station too, and an ACE for one container on it ends its audio and its protected video");
+            drop(desktop);
+        }
     }
 
     #[test]
@@ -2860,6 +2915,30 @@ mod tests {
         drop(holder);
     }
 
+    /// Git for Windows can put its `usr\bin` on a person's PATH ahead of System32. Its `find` is MSYS's and cannot start in the container (0xC0000142), so a command that means Windows'
+    /// `find` must still get that one. Needs Git for Windows installed in its usual place; without it the test says so and passes.
+    #[test]
+    #[ignore = "sets PATH for the process: run alone"]
+    fn windows_find_runs_with_gits_usr_bin_first_on_the_inherited_path() {
+        let usr_bin = Path::new("C:\\Program Files\\Git\\usr\\bin");
+        if !usr_bin.join("msys-2.0.dll").is_file() || !usr_bin.join("find.exe").is_file() {
+            println!("skipped: {} has no msys-2.0.dll and find.exe on this machine", usr_bin.display());
+            return;
+        }
+        let folder = work_folder("msys-find");
+        let saved = std::env::var_os("PATH").unwrap_or_default();
+        let first = std::env::join_paths(std::iter::once(usr_bin.to_path_buf()).chain(std::env::split_paths(&saved))).unwrap();
+        // SAFETY: this test runs alone, as its reason says.
+        unsafe { std::env::set_var("PATH", &first) };
+        let done = command("echo a:b| find /c \":\"", &folder, false);
+        // SAFETY: as above.
+        unsafe { std::env::set_var("PATH", &saved) };
+        let said = decode(&done.stdout);
+        println!("status {:?}: {}{}", done.status, said.trim(), decode(&done.stderr));
+        assert_eq!(done.status, Some(0), "{said} {}", decode(&done.stderr));
+        assert_eq!(said.trim(), "1", "{}", decode(&done.stderr));
+    }
+
     /// A command's parts are timed: before the process, the process, and after it.
     #[test]
     fn a_command_has_its_own_parts_timed() {
@@ -3019,6 +3098,41 @@ mod tests {
         let none = environment_block(start(), Some(&root), temp, &work, || None);
         assert_eq!(path_folders(&none), [root.join("python"), root.join("node"), root.join("git\\cmd"), global, other]);
         assert!(none.iter().all(|(name, _)| name != "LIB" && name != "INCLUDE"));
+    }
+
+    #[test]
+    fn a_folder_of_msys_or_cygwin_programs_is_left_off_a_commands_path_and_only_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, work) = (dir.path().join("tools"), dir.path().join("work"));
+        for (folder, program) in [("python", "python.exe"), ("node", "node.exe"), ("git\\cmd", "git.exe")] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            std::fs::write(root.join(folder).join(program), "").unwrap();
+        }
+        let folder = |name: &str, files: &[&str]| {
+            let folder = dir.path().join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            files.iter().for_each(|file| std::fs::write(folder.join(file), "").unwrap());
+            folder
+        };
+        let (unix, cyg, plain) = (folder("unix", &["msys-2.0.dll", "find.exe"]), folder("cyg", &["cygwin1.dll"]), folder("plain", &["find.exe"]));
+        let inherited = std::env::join_paths([&unix, &cyg, &plain]).unwrap().to_string_lossy().into_owned();
+        let start = || vec![("PATH".to_string(), inherited.clone()), ("SystemRoot".to_string(), "C:\\Windows".to_string())];
+        let temp = dir.path().display().to_string();
+        let global = PathBuf::from(&temp).join("npm-global");
+        let bundled = [root.join("python"), root.join("node"), root.join("git\\cmd")];
+        // Without a bundle: the machine's PATH, minus the two.
+        assert_eq!(path_folders(&environment_block(start(), None, temp.clone(), &work, || None)), [plain.clone()]);
+        assert_eq!(path_of(start(), None, || None), [plain.clone()]);
+        // With one: the same, after its own, and `path_of` says what `environment_block` gives.
+        let made = path_folders(&environment_block(start(), Some(&root), temp.clone(), &work, || None));
+        assert_eq!(made, [bundled[0].clone(), bundled[1].clone(), bundled[2].clone(), global.clone(), plain.clone()]);
+        assert_eq!(path_of(start(), Some(&root), || None), made.iter().filter(|folder| **folder != global).cloned().collect::<Vec<_>>());
+        // (and Visual Studio's still come last)
+        let with_build = path_of(start(), Some(&root), || Some(build_tools()));
+        assert_eq!(with_build, [bundled[0].clone(), bundled[1].clone(), bundled[2].clone(), plain.clone(), PathBuf::from("C:\\vs\\bin"), PathBuf::from("C:\\kits\\bin")]);
+        // A program the app starts outside the sandbox keeps them: `path_for_programs` is `path_with` of the PATH it has.
+        let outside: Vec<PathBuf> = std::env::split_paths(&crate::bundled::path_with(&root, &inherited)).collect();
+        assert_eq!(outside, [bundled[0].clone(), bundled[1].clone(), bundled[2].clone(), unix, cyg, plain]);
     }
 
     /// In the real sandbox, on a machine with Visual Studio's C++ tools: `cl` and `link` are found by PATH, and the headers and libraries by INCLUDE and LIB, with nothing set by hand.

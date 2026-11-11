@@ -117,6 +117,17 @@ def refuse_sandbox_setup():
     setup._create_app_container_profile = refused
 
 
+# What this app asks of a checkpoint beyond Dogmind's own prompt: its automatic compaction keeps little beside the checkpoint (see compaction::apply_lean_checkpoint), so the checkpoint must carry
+# what the work goes on from. Appended to Dogmind's prompt as it is, so that --check still says when Dogmind's own words change.
+CHECKPOINT_ADDITION = (
+    "\n"
+    "After this checkpoint the work goes on from it alone, with only the first request, the latest request and the round in progress kept beside it. It must therefore\n"
+    "include what is needed to continue the current task without reading anything again: the file names and line numbers involved, the decisions made, the steps done\n"
+    "and the steps not yet done, and the key facts from the latest tool results (what was found, not the raw output).\n"
+    "Keep the checkpoint to about 1,500 tokens, and do not drop any of those items to do it: write explanations as short bullet points, not prose, and do not restate\n"
+    "the contents of files. Never shorten a list to get there: every file read and every request so far stays in it, one line each, even past 1,500 tokens.\n"
+)
+
 def generate(dogmind):
     sys.path.insert(0, str(dogmind / "src"))
     refuse_sandbox_setup()
@@ -140,7 +151,7 @@ def generate(dogmind):
     commit = subprocess.run(["git", "-C", str(dogmind), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     return {
         "system_prompt.md": prune_text("".join(getattr(prompt, name) for name in SECTIONS)),
-        "checkpoint_prompt.md": agent_compaction._MAIN_MODEL_CHECKPOINT_PROMPT,
+        "checkpoint_prompt.md": agent_compaction._MAIN_MODEL_CHECKPOINT_PROMPT + CHECKPOINT_ADDITION,
         "tools.json": json.dumps(tools, indent=1, ensure_ascii=False, sort_keys=True) + "\n",
         "codex.json": json.dumps({"disabled_features": list(codex._DISABLED_FEATURES), "forbidden_method_parts": list(codex._FORBIDDEN_METHOD_PARTS), "context_fallback": codex.CODEX_SUBSCRIPTION_CONTEXT_FALLBACK}, indent=1) + "\n",
         "SOURCE": commit + "\n",

@@ -229,7 +229,7 @@ def assemble_tools(target):
         path = cache / item["file"]
         if not path.is_file():
             sys.exit(f"{path} is missing: run python -I scripts/fetch_tools.py")
-        if fetch.sha256(path) != item["sha256"]:
+        if fetch.sha256(path) != item["sha256"] or ("sha3_256" in item and fetch.sha3_256(path) != item["sha3_256"]):
             sys.exit(f"{path} is not what tools.lock.json pins: delete it and run python -I scripts/fetch_tools.py")
         return path
 
@@ -240,6 +240,8 @@ def assemble_tools(target):
     # Python. No `._pth`: that file turns on isolated mode, which keeps a script's own folder off the path and ignores every PYTHON variable.
     python = building / "python"
     extract(cached(lock["python"]), python, keep=lambda name: name not in ("python.cat", "python3t.dll") and not name.endswith("._pth"))
+    # The embeddable Python has an older SQLite DLL. Use the separately pinned official x64 build.
+    extract(cached(lock["sqlite"]), python, keep=lambda name: name == "sqlite3.dll")
     version = "".join(lock["python"]["version"].split(".")[:2])
     (python / f"python{version}.zip").stat()
     site = python / "Lib" / "site-packages"
@@ -250,6 +252,9 @@ def assemble_tools(target):
     for name, text in SHIMS.items():
         (python / name).write_bytes(text.replace("\r\n", "\n").replace("\n", "\r\n").encode())
     parts.append((f"Python {lock['python']['version']}", python / "LICENSE.txt", "In tools\\python, from the embeddable build at python.org."))
+    sqlite_notice = building / "sqlite-notice.txt"
+    sqlite_notice.write_text(f"SQLite {lock['sqlite']['version']} is in the public domain. See https://www.sqlite.org/copyright.html.\n", encoding="utf-8")
+    parts.append((f"SQLite {lock['sqlite']['version']}", sqlite_notice, "The sqlite3.dll beside the bundled Python, from sqlite.org."))
     module_files = {}
     for wheel in lock["wheels"]:
         files = []
@@ -311,6 +316,7 @@ def assemble_tools(target):
     # What the licences say is kept before the old folder goes; the swap comes last, so that a failure above leaves what was there.
     texts = [(title, path.read_text(encoding="utf-8", errors="replace"), note) for title, path, note in parts]
     notice.unlink()
+    sqlite_notice.unlink()
     if target.exists():
         refuse_unless_tools(target)
         shutil.rmtree(target)

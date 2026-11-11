@@ -8,9 +8,10 @@ const SUMMARY_HEADER: &str = "[SUMMARY OF EARLIER TURNS]\n## Main-model Session 
 pub const TRIMMED_TOOL_CHARS: usize = 600;
 /// What an output must be over what is kept of it to be kept whole as well: the marker that says where takes this much.
 const KEPT_MARKER: usize = 1024;
-/// Messages kept verbatim after the system prompt, and the turns a checkpoint needs before it is worth writing.
+/// Messages kept verbatim after the system prompt.
 const HEAD: usize = 6;
-const CHECKPOINT_TURNS: usize = 16;
+/// The least reasoning that may stand in for a checkpoint the model wrote only in its thinking, twice: below this it is a few lines of working, not a sum of the work (the real case was 6,405 characters).
+pub const MIN_THOUGHT_CHECKPOINT: usize = 1_000;
 /// The newest messages stage 0 leaves alone.
 const RECENT: usize = 8;
 /// What is kept of a request whose turn went with the oldest messages.
@@ -144,8 +145,23 @@ pub fn has_a_middle(messages: &[Message], keep: usize) -> bool {
     round_start(messages, messages.len().saturating_sub(keep)).max(head_end) > head_end
 }
 
-pub fn worth_a_checkpoint(messages: &[Message]) -> bool {
-    messages.iter().filter(|message| matches!(message.role.as_str(), "user" | "assistant")).count() >= CHECKPOINT_TURNS
+/// The reasoning of a reply that was all thinking, when it is a checkpoint after all: long enough (`MIN_THOUGHT_CHECKPOINT`) and in the shape the checkpoint prompt asks for, structured Markdown, which is
+/// at least two heading lines, or a heading and three bullets. Plain working-out of the same length is not one, and the turns it would stand for go for good.
+pub fn checkpoint_in_thinking(reasoning: &str) -> Option<String> {
+    let text = reasoning.trim();
+    if text.chars().count() < MIN_THOUGHT_CHECKPOINT {
+        return None;
+    }
+    let lines = || text.lines().map(str::trim_start);
+    let headings = lines().filter(|line| line.starts_with('#')).count();
+    let bullets = lines().filter(|line| line.starts_with("- ") || line.starts_with("* ")).count();
+    (headings >= 2 || (headings >= 1 && bullets >= 3)).then(|| text.to_string())
+}
+
+/// Where two conversations first differ: the first message the engine has to read again, as everything before it it holds. `None` when they are the same; the length of the shorter when one is the start of the other.
+pub fn first_difference(before: &[Message], after: &[Message]) -> Option<usize> {
+    let common = before.iter().zip(after).take_while(|(was, now)| was == now).count();
+    (common < before.len() || common < after.len()).then_some(common)
 }
 
 /// `[system, *head, summary, *recent]`, keeping the newest `keep` messages.
@@ -158,6 +174,54 @@ pub fn apply_checkpoint(messages: &[Message], checkpoint: &str, keep: usize) -> 
     summary.push_str(&latest_request(&messages[head_end..recent_start], &messages[recent_start..]));
     out.push(Message::text("assistant", summary));
     out.extend(messages[recent_start..].iter().cloned().map(|message| Message { reasoning_content: None, ..message }));
+    out
+}
+
+/// Whether a message is the person's own request: a user message that neither the app's nudges nor a wake's notice are.
+fn is_a_request(message: &Message) -> bool {
+    message.role == "user" && message.notice.is_none() && !message.content.as_deref().is_some_and(crate::prompt::is_nudge)
+}
+
+/// What a lean checkpoint keeps, as indexes in order: the system message, the first user message, the latest request when it is another, and the round the model is in, which it has not read the results of.
+/// Everything between them is what the checkpoint stands for.
+fn lean_kept(messages: &[Message]) -> Vec<usize> {
+    let first = messages.iter().position(|message| message.role == "user");
+    let latest = messages.iter().rposition(is_a_request).or(first);
+    let mut kept: Vec<usize> = Vec::new();
+    kept.extend(messages.first().filter(|message| message.role == "system").map(|_| 0));
+    kept.extend(first);
+    kept.extend(latest.filter(|latest| Some(*latest) != first));
+    kept.extend(round_in_progress(messages)..messages.len());
+    kept.sort_unstable();
+    kept.dedup();
+    kept
+}
+
+/// Whether anything lies between the first user message and the latest request or the round in progress, for a lean checkpoint to sum up.
+pub fn has_a_lean_middle(messages: &[Message]) -> bool {
+    lean_kept(messages).len() < messages.len()
+}
+
+/// `[system, first user message, summary, latest request, round in progress]`, for the checkpoint an automatic compaction writes: what is left after one is read again whole by the engine from the root, so it
+/// is only what the work cannot go on without, and the checkpoint stands for the rest (what was trimmed or dropped of the outputs stays in its files). The latest request is kept as the person wrote it, which
+/// is why the summary does not say it again. The calls of the round and all their results stay together.
+pub fn apply_lean_checkpoint(messages: &[Message], checkpoint: &str) -> Vec<Message> {
+    let first = messages.iter().position(|message| message.role == "user");
+    let summary = Message::text("assistant", format!("{SUMMARY_HEADER}{}", checkpoint.trim()));
+    let mut out = Vec::new();
+    let mut summarized = false;
+    for at in lean_kept(messages) {
+        // (the summary goes in the place of what it stands for, after the first message of the person's)
+        if !summarized && at > first.unwrap_or(0) {
+            out.push(summary.clone());
+            summarized = true;
+        }
+        let message = messages[at].clone();
+        out.push(if summarized { Message { reasoning_content: None, ..message } } else { message });
+    }
+    if !summarized {
+        out.push(summary);
+    }
     out
 }
 
@@ -292,7 +356,6 @@ mod tests {
     #[test]
     fn a_checkpoint_keeps_head_and_recent_and_no_orphans() {
         let messages = conversation(10);
-        assert!(worth_a_checkpoint(&messages));
         for keep in 1..12 {
             let out = apply_checkpoint(&messages, "the state", keep);
             no_orphans(&out);
@@ -320,6 +383,111 @@ mod tests {
         // With the request among what stays, it is not said twice.
         let staying = apply_checkpoint(&conversation(10), "the state", 12);
         assert!(!staying.iter().any(|message| message.content.as_deref().is_some_and(|text| text.contains("latest request"))));
+    }
+
+    /// Thinking stands in for a checkpoint only with the length and the shape of one.
+    #[test]
+    fn thinking_is_a_checkpoint_only_when_it_is_long_and_structured() {
+        let long = |shape: &str| format!("{shape}\n{}", "x".repeat(MIN_THOUGHT_CHECKPOINT));
+        assert!(checkpoint_in_thinking(&long("## One\n## Two")).is_some(), "two headings");
+        assert!(checkpoint_in_thinking(&long("# One\n  - a\n* b\n- c")).is_some(), "a heading and three bullets, however indented");
+        assert!(checkpoint_in_thinking(&long("## One\n- a\n- b")).is_none(), "a heading and two bullets");
+        assert!(checkpoint_in_thinking(&long("## One")).is_none(), "one heading");
+        assert!(checkpoint_in_thinking(&long("- a\n- b\n- c\n- d")).is_none(), "bullets with no heading");
+        assert!(checkpoint_in_thinking(&long("it has a # in it, and - dashes - too")).is_none(), "only at the start of a line");
+        assert!(checkpoint_in_thinking("## One\n## Two\n- a\n- b\n- c").is_none(), "short");
+        let whole = long("\n  ## One\n## Two\n\n");
+        assert_eq!(checkpoint_in_thinking(&whole).as_deref(), Some(whole.trim()), "as written, less the blank at its ends");
+    }
+
+    #[test]
+    fn two_conversations_differ_from_the_first_message_that_does() {
+        let (a, b, c) = (Message::text("user", "a"), Message::text("user", "b"), Message::text("user", "c"));
+        assert_eq!(first_difference(&[a.clone(), b.clone()], &[a.clone(), b.clone()]), None);
+        assert_eq!(first_difference(&[], &[]), None);
+        assert_eq!(first_difference(&[a.clone(), b.clone()], &[a.clone(), c.clone()]), Some(1));
+        assert_eq!(first_difference(&[a.clone(), b.clone()], &[c.clone()]), Some(0));
+        assert_eq!(first_difference(&[a.clone(), b.clone()], &[a.clone()]), Some(1), "one is the start of the other: the length of the shorter");
+        assert_eq!(first_difference(&[a.clone()], &[a.clone(), b.clone(), c.clone()]), Some(1));
+        assert_eq!(first_difference(&[], &[a]), Some(0));
+    }
+
+    fn call_of(id: &str, results: usize) -> Message {
+        Message {
+            role: "assistant".into(),
+            reasoning_content: Some("thinking".into()),
+            tool_calls: Some((0..results).map(|at| ToolCall { id: format!("{id}-{at}"), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: "{}".into() } }).collect()),
+            ..Message::default()
+        }
+    }
+
+    fn results_of(id: &str, results: usize) -> Vec<Message> {
+        (0..results).map(|at| Message::tool_result(&format!("{id}-{at}"), "r")).collect()
+    }
+
+    /// The text of each message, or the name of its calls and results, as a line to compare.
+    fn shape(messages: &[Message]) -> Vec<String> {
+        messages.iter().map(|message| match (message.role.as_str(), &message.tool_calls, &message.tool_call_id) {
+            (_, Some(calls), _) => format!("calls {}", calls.iter().map(|call| call.id.as_str()).collect::<Vec<_>>().join(",")),
+            (_, _, Some(id)) => format!("result {id}"),
+            (role, _, _) => format!("{role}: {}", message.content.as_deref().unwrap_or("").lines().last().unwrap_or("")),
+        }).collect()
+    }
+
+    /// An automatic compaction leaves the system message, the first user message, the summary, the latest request, and the round in progress: nothing else, whatever it weighed.
+    #[test]
+    fn a_lean_checkpoint_keeps_the_first_request_the_latest_and_the_round_in_progress() {
+        let mut older = vec![call_of("a", 1)];
+        older.extend(results_of("a", 1));
+        older.push(Message::text("assistant", "an answer"));
+        older.extend([Message::text("user", "second"), call_of("b", 2)]);
+        older.extend(results_of("b", 2));
+        // In the middle of a round: three calls at once, answered, and the model has not read them.
+        let mut messages = vec![Message::text("system", "prompt"), Message::text("user", "first")];
+        messages.extend(older.clone());
+        messages.extend([Message::text("user", crate::prompt::CONTINUE_NUDGE), Message::text("user", "latest"), Message::text("assistant", "looking"), call_of("c", 3)]);
+        messages.extend(results_of("c", 3));
+        let out = apply_lean_checkpoint(&messages, " the state ");
+        assert_eq!(shape(&out), ["system: prompt", "user: first", "assistant: the state", "user: latest", "calls c-0,c-1,c-2", "result c-0", "result c-1", "result c-2"]);
+        assert!(out[2].content.as_deref().unwrap().starts_with(SUMMARY_HEADER) && out[2].content.as_deref().unwrap().ends_with("the state"));
+        assert!(out[4].reasoning_content.is_none() && out[0] == messages[0] && out[1] == messages[1], "the thinking of what is kept goes, as a checkpoint's does");
+        no_orphans(&out);
+        assert!(has_a_lean_middle(&messages));
+
+        // At the start of a turn: the new request is the last message, and there is no round.
+        let mut messages = vec![Message::text("system", "prompt"), Message::text("user", "first")];
+        messages.extend(older.clone());
+        messages.push(Message::text("user", "new"));
+        let out = apply_lean_checkpoint(&messages, "the state");
+        assert_eq!(shape(&out), ["system: prompt", "user: first", "assistant: the state", "user: new"]);
+
+        // In the first turn: the only request is the first and the latest, and it is not said twice.
+        let mut messages = vec![Message::text("system", "prompt"), Message::text("user", "first")];
+        for round in ["a", "b", "c"] {
+            messages.push(call_of(round, 2));
+            messages.extend(results_of(round, 2));
+        }
+        let out = apply_lean_checkpoint(&messages, "the state");
+        assert_eq!(shape(&out), ["system: prompt", "user: first", "assistant: the state", "calls c-0,c-1", "result c-0", "result c-1"]);
+        no_orphans(&out);
+        assert!(!out.iter().any(|message| message.content.as_deref().is_some_and(|text| text.contains("latest request"))));
+        assert!(out.len() < messages.len());
+    }
+
+    #[test]
+    fn there_is_a_lean_middle_only_when_something_lies_between_what_is_kept() {
+        let mut messages = vec![Message::text("system", "prompt"), Message::text("user", "first")];
+        assert!(!has_a_lean_middle(&messages), "only the request");
+        messages.push(call_of("a", 1));
+        messages.extend(results_of("a", 1));
+        assert!(!has_a_lean_middle(&messages), "only the round in progress");
+        messages.extend([call_of("b", 1)]);
+        messages.extend(results_of("b", 1));
+        assert!(has_a_lean_middle(&messages), "a round before the one in progress");
+        let mut turns = vec![Message::text("system", "prompt"), Message::text("user", "first"), Message::text("assistant", "answer"), Message::text("user", "second")];
+        assert!(has_a_lean_middle(&turns), "an answer between two requests");
+        turns.remove(2);
+        assert!(!has_a_lean_middle(&turns), "two requests and nothing between");
     }
 
     #[test]

@@ -5,6 +5,13 @@
   "url": "https://www.python.org/ftp/python/3.14.10/python-3.14.10-embed-amd64.zip",
   "sha256": "90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159"
  },
+ "sqlite": {
+  "version": "3.54.1",
+  "file": "sqlite-dll-win-x64-3540100.zip",
+  "url": "https://www.sqlite.org/2026/sqlite-dll-win-x64-3540100.zip",
+  "sha256": "f436f53ad8f965af43f3817b42c99c0689e6787f6b7ace208fe38dab7ffc4971",
+  "sha3_256": "c2d09c8babb9399277055c057c97a53f1ffd7c5f11d0c1f2118ffdfa39f2daa4"
+ },
  "node": {
   "version": "26.13.0",
   "file": "node-v26.13.0-win-x64.zip",
