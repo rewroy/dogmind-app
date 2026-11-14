@@ -13,10 +13,10 @@
   "sha3_256": "c2d09c8babb9399277055c057c97a53f1ffd7c5f11d0c1f2118ffdfa39f2daa4"
  },
  "node": {
-  "version": "26.13.0",
-  "file": "node-v26.13.0-win-x64.zip",
-  "url": "https://nodejs.org/dist/v26.13.0/node-v26.13.0-win-x64.zip",
-  "sha256": "dcc60d59a0746999f99064a01c020445d54d84228c691cdbf25b49ac3b59150a"
+  "version": "26.13.1",
+  "file": "node-v26.13.1-win-x64.zip",
+  "url": "https://nodejs.org/dist/v26.13.1/node-v26.13.1-win-x64.zip",
+  "sha256": "e2edda75bfb089654705cf65a13b58933bfd5f57148e8ebda916f58a2474f1f7"
  },
  "git": {
   "version": "2.56.0.windows.4",
