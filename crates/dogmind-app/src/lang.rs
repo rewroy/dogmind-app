@@ -404,6 +404,8 @@ const JA: &[(&str, &str)] = &[
     ("A key comes from console.anthropic.com, under API keys, and is paid by use: a Claude plan does not include it.", "キーは console.anthropic.com の API keys で発行します。従量課金で、Claude のプランには含まれません。"),
     ("Cannot run here: this PC has no NVIDIA GPU", "この PC では動かせません: NVIDIA の GPU がありません"),
     ("Cannot run here yet: the NVIDIA driver needs updating", "まだ動かせません: NVIDIA ドライバーの更新が必要です"),
+    ("No NVIDIA driver was found on this PC. To run a model on this PC you need an NVIDIA GPU and a driver that supports CUDA 13. Another computer or an online service can be used too.", "この PC で NVIDIA のドライバーが見つかりません。この PC でモデルを動かすには、NVIDIA の GPU と、CUDA 13 に対応したドライバーが必要です。別のコンピューターやオンラインのサービスも使えます。"),
+    ("The NVIDIA driver is too old (it supports CUDA up to {0}), so this PC cannot run the model. Update the NVIDIA driver to the latest version and try again (a version that supports CUDA 13 is needed).", "NVIDIA のドライバーが古いため(CUDA {0} まで対応)、この PC ではモデルを動かせません。NVIDIA のドライバーを最新版に更新してから、もう一度お試しください(CUDA 13 に対応した版が必要です)。"),
     ("Cannot run here: this GPU is too old", "動かせません: この GPU は古すぎます"),
     ("Straydog runs on an NVIDIA GeForce RTX 20 series or newer, and this PC's GPU is older. You can still use a model on another computer, an online service, Codex or Claude.", "Straydog は NVIDIA GeForce RTX 20 シリーズ以降で動きます。この PC の GPU はそれより古いものです。別のコンピューターのモデル、オンラインサービス、Codex、Claude は使えます。"),
     ("Cannot run here: too little graphics memory", "この PC では動かせません: グラフィックスメモリが足りません"),
