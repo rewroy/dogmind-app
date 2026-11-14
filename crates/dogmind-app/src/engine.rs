@@ -272,6 +272,117 @@ pub fn nvidia_driver_is_here() -> bool {
     std::env::var_os("SystemRoot").is_some_and(|root| Path::new(&root).join("System32").join("nvcuda.dll").is_file())
 }
 
+/// The CUDA version (as `cuDriverGetVersion` gives it: 13000 is 13.0) that the engine's build needs of the driver.
+pub const CUDA_NEEDED: u32 = 13000;
+
+/// Whether this PC's NVIDIA driver can run what the engine is built on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Driver {
+    /// No `nvcuda.dll`, or it does not answer: no NVIDIA driver.
+    Missing,
+    /// A driver that supports up to this CUDA version, which is less than the engine needs.
+    TooOld(u32),
+    /// A driver that supports this CUDA version or a newer one.
+    Fine(u32),
+}
+
+/// What the driver's CUDA version (`None`: there is no driver, or it did not answer) means for the engine.
+pub fn classify_driver(version: Option<u32>) -> Driver {
+    match version {
+        None | Some(0) => Driver::Missing,
+        Some(version) if version < CUDA_NEEDED => Driver::TooOld(version),
+        Some(version) => Driver::Fine(version),
+    }
+}
+
+/// A CUDA version as people write it: 12080 is "12.8".
+pub fn cuda_version_words(version: u32) -> String {
+    format!("{}.{}", version / 1000, version % 1000 / 10)
+}
+
+impl Driver {
+    /// What to tell the person when the engine cannot run on this driver; `None` when it can.
+    pub fn problem(&self) -> Option<String> {
+        match self {
+            Driver::Fine(_) => None,
+            Driver::Missing => Some(t("No NVIDIA driver was found on this PC. To run a model on this PC you need an NVIDIA GPU and a driver that supports CUDA 13. Another computer or an online service can be used too.").to_string()),
+            Driver::TooOld(version) => Some(tf("The NVIDIA driver is too old (it supports CUDA up to {0}), so this PC cannot run the model. Update the NVIDIA driver to the latest version and try again (a version that supports CUDA 13 is needed).", &[&cuda_version_words(*version)])),
+        }
+    }
+}
+
+/// The CUDA version the installed NVIDIA driver supports, asked of `nvcuda.dll` in the system folder alone (a copy beside this app or on PATH is no driver). `cuDriverGetVersion` needs no
+/// initialization of CUDA, so this touches no GPU. `None` when there is no such library, no such function, or the call fails.
+fn driver_cuda_version() -> Option<u32> {
+    use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    if cfg!(debug_assertions) {
+        if std::env::var_os("DOGMIND_TEST_NO_NVIDIA").is_some() {
+            return None;
+        }
+        if let Some(version) = std::env::var("DOGMIND_TEST_CUDA_DRIVER").ok().and_then(|text| text.parse().ok()) {
+            return Some(version);
+        }
+    }
+    let name: Vec<u16> = "nvcuda.dll".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: the library is the system's; the one function asked of it has this signature in CUDA's driver API, and it is not called after the library is freed.
+    unsafe {
+        let library = LoadLibraryExW(name.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if library.is_null() {
+            return None;
+        }
+        let version = GetProcAddress(library, c"cuDriverGetVersion".as_ptr().cast()).and_then(|function| {
+            let function: unsafe extern "system" fn(*mut i32) -> i32 = std::mem::transmute(function);
+            let mut version = 0i32;
+            (function(&mut version) == 0).then_some(version).and_then(|version| u32::try_from(version).ok())
+        });
+        FreeLibrary(library);
+        version
+    }
+}
+
+/// What a check found that was fine: it does not change while this app runs, so it is not made again.
+static DRIVER_FINE: Mutex<Option<Driver>> = Mutex::new(None);
+
+/// Whether the NVIDIA driver can run the engine. A driver that was fine is remembered; one that was not is looked at again each time, as a person who has just updated it presses the button
+/// again. `fresh` looks again whatever was found.
+pub fn check_driver(fresh: bool) -> Driver {
+    let mut remembered = DRIVER_FINE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let (false, Some(found)) = (fresh, *remembered) {
+        return found;
+    }
+    let found = classify_driver(driver_cuda_version());
+    *remembered = matches!(found, Driver::Fine(_)).then_some(found);
+    found
+}
+
+/// The words for a driver that cannot run the engine, now; `None` when it can. For another thread: loading the driver's library takes a moment.
+pub fn driver_problem(fresh: bool) -> Option<String> {
+    check_driver(fresh).problem()
+}
+
+/// Whether a line is Straydog's own report of crashing on a null pointer: what an engine that cannot get a CUDA device count from a missing or old driver ends with
+/// (`Straydog crashed: access violation (0xC0000005) reading 0x0 at straydog.exe+0xD5FC81, called from ...`).
+pub fn is_null_read_crash(line: &str) -> bool {
+    line.contains("Straydog crashed: access violation") && line.contains("reading 0x0 at ")
+}
+
+/// Keeps a line in the engine's log, under this app's name: what was shown in other words is still there for whoever reads the log.
+pub fn keep_in_log(folder: &Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(log_path(folder)) {
+        let _ = writeln!(log, "[Dogmind] {line}");
+    }
+}
+
+/// The driver's words in place of a null-read crash line, when the driver was found not to be able to run the engine; the line itself otherwise.
+pub fn crash_in_driver_words(line: &str, driver: Driver) -> String {
+    match driver.problem().filter(|_| is_null_read_crash(line)) {
+        Some(words) => words,
+        None => line.to_string(),
+    }
+}
+
 /// What `straydog setup --list` says of this PC and of the bundles this app offers, the recommended first: `None` when it is not that JSON
 /// (an older `straydog.exe`).
 pub fn parse_list(json: &str, driver_here: bool) -> Option<Catalog> {
@@ -853,6 +964,10 @@ pub fn in_plain_words(error: &str) -> String {
     if error.contains(NO_CODE) {
         return Refusal::OldCard.words();
     }
+    // (a crash on a null pointer, as the driver that is missing or too old makes it: looked at again now, as it is the driver that is in question)
+    if is_null_read_crash(error) {
+        return crash_in_driver_words(error, check_driver(true));
+    }
     let lower = error.to_lowercase();
     if lower.contains("driver version is insufficient") || lower.contains("no cuda-capable device") || lower.contains("cuda initialization") {
         return if nvidia_driver_is_here() { Refusal::Driver(error.trim().to_string()).words() } else { Refusal::NoNvidia.words() };
@@ -1284,6 +1399,60 @@ mod tests {
         assert_eq!(full.overall(), Some((75.0, 75.0)));
         full.hear(&SetupLine::Text("Setting up Qwen in D:\\m of the disk".into()));
         assert_eq!(full.overall(), Some((75.0, 75.0)), "another line changes nothing");
+    }
+
+    #[test]
+    fn the_drivers_cuda_version_is_told_apart_from_none_and_from_too_old() {
+        assert_eq!(classify_driver(None), Driver::Missing);
+        assert_eq!(classify_driver(Some(0)), Driver::Missing, "a driver that says it supports nothing is no driver");
+        assert_eq!(classify_driver(Some(11040)), Driver::TooOld(11040));
+        assert_eq!(classify_driver(Some(12080)), Driver::TooOld(12080));
+        assert_eq!(classify_driver(Some(12999)), Driver::TooOld(12999));
+        assert_eq!(classify_driver(Some(13000)), Driver::Fine(13000));
+        assert_eq!(classify_driver(Some(13030)), Driver::Fine(13030));
+        assert_eq!(classify_driver(Some(14000)), Driver::Fine(14000));
+        assert_eq!(cuda_version_words(12080), "12.8");
+        assert_eq!(cuda_version_words(11040), "11.4");
+        assert_eq!(cuda_version_words(12000), "12.0");
+        assert_eq!(cuda_version_words(12060), "12.6");
+    }
+
+    #[test]
+    fn a_driver_that_cannot_run_the_engine_is_said_in_words_that_mean_it() {
+        assert_eq!(Driver::Fine(13000).problem(), None);
+        let none = Driver::Missing.problem().unwrap();
+        assert!(none.contains("CUDA 13") && none.contains("NVIDIA"), "{none}");
+        let old = Driver::TooOld(12080).problem().unwrap();
+        assert!(old.contains("12.8") && old.contains("CUDA 13"), "{old}");
+        assert_ne!(none, old);
+        // Said as the failure of a setup, they stay as they are, and a setup is not run again on their account.
+        for words in [&none, &old] {
+            assert!(!setup_may_recover(words), "{words}");
+            assert_eq!(&setup_failure_words(words), words);
+            assert_eq!(&in_plain_words(words), words);
+        }
+    }
+
+    #[test]
+    fn a_crash_on_a_null_pointer_is_the_drivers_words_only_where_the_driver_cannot_run_the_engine() {
+        let crash = "Straydog crashed: access violation (0xC0000005) reading 0x0 at straydog.exe+0xD5FC81, called from straydog.exe+0xC7EFC8 < straydog.exe+0xC7E000";
+        assert!(is_null_read_crash(crash));
+        assert!(!is_null_read_crash("Straydog crashed: access violation (0xC0000005) reading 0x10 at nvcuda64.dll+0x1A2B3C"));
+        assert!(!is_null_read_crash("Straydog crashed: access violation (0xC0000005) writing 0x0 at straydog.exe+0x40"));
+        assert!(!is_null_read_crash("Straydog crashed: illegal instruction (0xC000001D) at straydog.exe+0x1234"));
+        assert_eq!(crash_in_driver_words(crash, Driver::Missing), Driver::Missing.problem().unwrap());
+        assert_eq!(crash_in_driver_words(crash, Driver::TooOld(12080)), Driver::TooOld(12080).problem().unwrap());
+        assert_eq!(crash_in_driver_words(crash, Driver::Fine(13000)), crash, "with a driver that can run it, the crash is the crash");
+        let other = "Straydog crashed: access violation (0xC0000005) reading 0x10 at nvcuda64.dll+0x1A2B3C";
+        assert_eq!(crash_in_driver_words(other, Driver::Missing), other);
+        assert_eq!(crash_in_driver_words("disk full", Driver::Missing), "disk full");
+    }
+
+    #[test]
+    fn the_drivers_check_runs_here_and_says_the_same_to_both_questions() {
+        let found = check_driver(true);
+        assert_eq!(check_driver(false), found);
+        assert_eq!(driver_problem(false), found.problem());
     }
 
     #[test]
