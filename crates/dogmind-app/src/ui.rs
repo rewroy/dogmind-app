@@ -11759,6 +11759,23 @@ impl App {
                     self.set_panel(Panel::Models);
                     return;
                 }
+                // An NVIDIA driver that is missing or too old for CUDA 13 cannot run the engine, which would only crash: this is said, and no engine is started. (A driver found fine is
+                // remembered, so this costs a moment once; one that is not is looked at again each time, in case it has been updated.)
+                if let Some(words) = engine::driver_problem(false) {
+                    self.connection = "not connected".into();
+                    self.engine = None;
+                    // (once, however many times it is tried)
+                    let words = format!("{words}
+");
+                    if !matches!(self.shown.last(), Some(Shown::Text(held, _, _)) if held.ends_with(&words)) {
+                        self.end_line();
+                        self.append(&words, Style::Bad);
+                    }
+                    self.connect_failed = true;
+                    self.queued_back_to_composer();
+                    self.update_status();
+                    return;
+                }
                 self.connecting_engine = Some(straydog.clone());
                 self.engine = None;
                 self.settle_keep_conversation();
@@ -13385,7 +13402,12 @@ impl App {
                         }
                     }
                     Err(error) => {
-                        told(self, &engine::setup_failure_words(&error));
+                        let words = engine::setup_failure_words(&error);
+                        // (a crash line that was said as the driver's problem stays in the log as it was)
+                        if words != error && engine::is_null_read_crash(&error) {
+                            engine::keep_in_log(&self.folder, &error);
+                        }
+                        told(self, &words);
                         if !was_drafter && engine::is_set_up(&self.folder) && !self.onboarding {
                             self.connect();
                         }
@@ -13475,10 +13497,13 @@ impl App {
             // A PC left alone for a download of hours does not sleep through it. It ends with this thread.
             windows_sys::Win32::System::Power::SetThreadExecutionState(windows_sys::Win32::System::Power::ES_CONTINUOUS | windows_sys::Win32::System::Power::ES_SYSTEM_REQUIRED);
             let waker = poster.clone();
+            // The engine asks CUDA for the cards before it sets up anything, and an NVIDIA driver that is missing or too old for CUDA 13 ends it in a crash: that is said here, in words, and
+            // the engine is not started. (The drafter's fetch uses no card. Looked at anew each time: a person who updated the driver presses the button again.)
+            let driver_problem = if crate::drafter::is_fetch(&args) { None } else { engine::driver_problem(true) };
             // (a Straydog older than the app does not know every option: asked of its help, here and not on the window's thread)
-            let args = engine::for_this_straydog(&straydog, args);
+            let args = if driver_problem.is_some() { args } else { engine::for_this_straydog(&straydog, args) };
             let mut tries = 0;
-            let result = loop {
+            let result = if let Some(words) = driver_problem { Err(words) } else { loop {
                 let waker = waker.clone();
                 let result = engine::run_setup(&straydog, &args, &lines, &move || waker.wake(), &cancel);
                 // A network that drops goes on by itself: what has arrived stays, and a person may be asleep.
@@ -13497,7 +13522,7 @@ impl App {
                     }
                     _ => break result,
                 }
-            };
+            } };
             drop(lines);
             let _ = relay.join();
             poster.send(Note::SetupDone(result));
