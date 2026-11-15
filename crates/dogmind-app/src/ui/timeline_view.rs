@@ -22,6 +22,28 @@ const LEVEL: i32 = 14;
 const MARK: i32 = 18;
 /// The most lines of its own that what is going on now, and a thought, take.
 const MOST_LINES: i32 = 3;
+/// The lines the line of what goes on now takes at the most.
+const NOW_LINES: i32 = 2;
+
+/// Words that fit `tall` in `width`: as they are, or as many of them as fit with an ellipsis after.
+unsafe fn within_lines(font: HFONT, words: &str, width: i32, tall: i32) -> String {
+    if text_height(font, words, width) <= tall {
+        return words.to_string();
+    }
+    let chars: Vec<char> = words.chars().collect();
+    let (mut fits, mut over) = (0, chars.len());
+    // (the most characters that fit, found by halves: a line of what goes on is redrawn every second)
+    while over - fits > 1 {
+        let middle = (fits + over) / 2;
+        let tried: String = chars[..middle].iter().collect::<String>() + "…";
+        if text_height(font, &tried, width) <= tall {
+            fits = middle;
+        } else {
+            over = middle;
+        }
+    }
+    chars[..fits].iter().collect::<String>().trim_end().to_string() + "…"
+}
 /// A row of the path that is a line of small words, and a card's inner space.
 const CARD_PAD: i32 = 10;
 
@@ -162,7 +184,9 @@ impl App {
         } else {
             None
         };
-        path::Inputs { running: self.running, wait, background: self.waiting.commands.len() + self.waiting.waits.len() }
+        // (the time now, for the band of the turn at work to reach)
+        let wall_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
+        path::Inputs { running: self.running, wait, background: self.waiting.commands.len() + self.waiting.waits.len(), wall_ms }
     }
 
     /// Nothing of the view is on screen: its window goes, and the keys go back to the composer if it had them.
@@ -525,10 +549,12 @@ impl App {
         used += line;
         let text_width_in = width - mark;
         let one = text_height(fonts.body, "A", text_width_in).max(1);
-        let tall = text_height(fonts.body, &now.text, text_width_in).clamp(one, one * MOST_LINES);
+        // (two lines at the most, cut with an ellipsis: a long command is the rest of a line, not the panel's height)
+        let words = within_lines(fonts.body, &now.text, text_width_in, one * NOW_LINES);
+        let tall = text_height(fonts.body, &words, text_width_in).clamp(one, one * NOW_LINES);
         if let Some(device) = device {
             icon::draw(device, who_icon(now.who), rect(x, y + used, s(MARK), one), s(ds::size::ICON), if now.who == path::Who::Idle { theme::faint() } else { mark_color(who_tone(now.who)) });
-            draw_text(device, &now.text, rect(x + mark, y + used, text_width_in, tall), fonts.body, theme::text(), DT_WORDBREAK);
+            draw_text(device, &words, rect(x + mark, y + used, text_width_in, tall), fonts.body, theme::text(), DT_WORDBREAK);
         }
         used += tall + s(ds::space::S);
         let Some(heading) = heading else { return used + s(ds::space::XS) };
@@ -750,8 +776,127 @@ impl App {
                 }
                 tall
             }
+            path::Kind::Band => self.timeline_band(device, row, left, y, room),
         }
     }
+
+    /// An open turn's band: the model's requests in one lane and the calls in the one under it, each part where it lay in the turn's time, a mark over
+    /// where the app took a step of its own, and under them what each colour is (only those the band has).
+    unsafe fn timeline_band(&self, device: Option<HDC>, row: &path::Row, x: i32, y: i32, width: i32) -> i32 {
+        use dogmind_agent::timeline::Lane;
+        let Some(band) = &row.band else { return 0 };
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let fonts = &self.fonts;
+        let (lane, gap, tick) = (s(BAND_LANE), s(BAND_GAP), s(BAND_TICK));
+        let has_calls = band.parts.iter().chain(&row.live_part).any(|part| part.lane == Lane::Calls);
+        let top = y + s(ds::space::XS) + if band.marks.is_empty() { 0 } else { tick + s(ds::space::HAIR) };
+        let lanes_tall = lane + if has_calls { gap + lane } else { 0 };
+        let length = band.length.max(1) as f64;
+        let place = |ms: u64| x + ((ms as f64 / length) * f64::from(width)).round() as i32;
+        if let Some(device) = device {
+            // The track under each lane: the time nothing of it was going on.
+            fill(device, rect(x, top, width, lane), theme::code_back());
+            if has_calls {
+                fill(device, rect(x, top + lane + gap, width, lane), theme::code_back());
+            }
+            for (part, live) in band.parts.iter().map(|part| (part, false)).chain(row.live_part.iter().map(|part| (part, true))) {
+                let lane_top = if part.lane == Lane::Calls { top + lane + gap } else { top };
+                // (a surface gap between neighbours; a part too short for a pixel still shows as one)
+                let (from, to) = (place(part.from), place(part.to));
+                let area = rect(from, lane_top, (to - from - s(ds::space::HAIR)).max(s(1)), lane);
+                draw_part(device, part.part, area, s(BAND_STRIPE));
+                if live {
+                    // (the part going on now: its end is now, and it says so with a line at it)
+                    fill(device, rect(area.right, lane_top - s(ds::space::HAIR), s(ds::space::HAIR), lane + 2 * s(ds::space::HAIR)), theme::text());
+                }
+                if part.part == dogmind_agent::timeline::Part::Rereading {
+                    // (read from the start: the wait a person most wants to find, marked over its lane as well as by its colour)
+                    draw_text(device, "!", rect(from, top - tick - s(ds::space::HAIR), (to - from).max(s(8)), tick + s(ds::space::HAIR)), fonts.small, part_color(part.part), ONE_LINE);
+                }
+            }
+            for &at in &band.marks {
+                let middle = place(at);
+                fill(device, rect(middle - s(1), top - tick, s(2), tick), theme::muted());
+            }
+        }
+        let mut used = top - y + lanes_tall + s(ds::space::S);
+        // What the colours are: a chip and its words, as many on a line as fit.
+        let (parts, marked) = path::band_key(band, row.live_part.as_ref());
+        let chip = s(BAND_CHIP);
+        let line = s(ds::size::TEXT_LINE);
+        let mut across = 0;
+        let mut entries: Vec<(Option<dogmind_agent::timeline::Part>, &str)> = parts.iter().map(|part| (Some(*part), path::part_words(*part))).collect();
+        if marked {
+            entries.push((None, t("Dogmind's own steps")));
+        }
+        for (part, words) in entries {
+            let wide = chip + s(ds::space::XS) + text_width(fonts.small, words) + s(ds::space::M);
+            if across > 0 && across + wide > width {
+                across = 0;
+                used += line;
+            }
+            if let Some(device) = device {
+                let middle = y + used + (line - chip) / 2;
+                match part {
+                    Some(part) => draw_part(device, part, rect(x + across, middle, chip, chip), s(BAND_STRIPE)),
+                    None => fill(device, rect(x + across + chip / 2 - s(1), middle, s(2), chip), theme::muted()),
+                }
+                draw_text(device, words, rect(x + across + chip + s(ds::space::XS), y + used, wide - chip, line), fonts.small, theme::muted(), ONE_LINE);
+            }
+            across += wide;
+        }
+        used + line + s(ds::space::S)
+    }
+}
+
+/// A lane of the band, its gap to the next, the room over it for a mark, a chip of its key, and the stripes of a part drawn in tone on tone.
+const BAND_LANE: i32 = 10;
+const BAND_GAP: i32 = 4;
+const BAND_TICK: i32 = 7;
+const BAND_CHIP: i32 = 10;
+const BAND_STRIPE: i32 = 4;
+
+/// The colours of the band's parts: three hues that stay apart for every kind of colour vision (blue the prompt read, orange the model thinking, aqua it
+/// writing), a neutral for waiting and for calls, and the status colours, each with its word in the key, for what went wrong or waits for the person.
+fn part_color(part: dogmind_agent::timeline::Part) -> u32 {
+    use dogmind_agent::timeline::Part;
+    let light = theme::is_light();
+    let pick = |dark: u32, bright: u32| if light { bright } else { dark };
+    match part {
+        Part::Waiting => pick(rgb(96, 93, 88), rgb(196, 192, 185)),
+        Part::Reading | Part::Growing | Part::Parking => pick(rgb(0x39, 0x87, 0xe5), rgb(0x2a, 0x78, 0xd6)),
+        Part::Rereading | Part::Person => rgb(0xfa, 0xb2, 0x19),
+        Part::Thinking | Part::Generating => pick(rgb(0xd9, 0x59, 0x26), rgb(0xeb, 0x68, 0x34)),
+        Part::Writing => pick(rgb(0x19, 0x9e, 0x70), rgb(0x1b, 0xaf, 0x7a)),
+        Part::Call => pick(rgb(150, 146, 138), rgb(150, 146, 138)),
+        Part::CallFailed => rgb(0xd0, 0x3b, 0x3b),
+    }
+}
+
+/// A part filled with its colour; growing the K/V, setting a conversation aside and a request's time not split into thinking and writing have stripes of
+/// a darker step of it (by their spacing), so that they are told apart from the plain part of the same hue without another colour.
+unsafe fn draw_part(device: HDC, part: dogmind_agent::timeline::Part, area: RECT, stripe: i32) {
+    use dogmind_agent::timeline::Part;
+    let color = part_color(part);
+    fill(device, area, color);
+    let every = match part {
+        Part::Growing | Part::Generating => stripe,
+        Part::Parking => stripe * 2,
+        _ => return,
+    };
+    let darker = darken(color);
+    let mut at = area.left + every / 2;
+    while at < area.right {
+        fill(device, RECT { left: at, top: area.top, right: (at + (stripe / 2).max(1)).min(area.right), bottom: area.bottom }, darker);
+        at += every;
+    }
+}
+
+/// A colour two thirds as bright: the stripes' step.
+fn darken(color: u32) -> u32 {
+    let channel = |shift: u32| ((color >> shift) & 0xff) * 2 / 3;
+    channel(0) | (channel(8) << 8) | (channel(16) << 16)
 }
 
 /// The tone of the mark of what is going on, by whose it is.
