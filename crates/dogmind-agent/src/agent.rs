@@ -1081,6 +1081,16 @@ struct Agent {
     program: Option<Program>,
     /// The calls the programs of this response have made, as the model would have written them: what is checked after the response looks at them as it does at the model's own.
     program_calls: Vec<crate::message::ToolCall>,
+    /// What the last warm-up sent, for the conversation that begins next (see [`Agent::ensure_session`]).
+    warmed: Option<Warmed>,
+}
+
+/// The prefix a warm-up had the engine read: its folder, its system prompt, its tools, and the skills they were made with.
+struct Warmed {
+    workspace: PathBuf,
+    prompt: String,
+    tools: Value,
+    skills: Vec<skills::Skill>,
 }
 
 /// A session's scratch folder: outside the workspace, in the sandbox's own temp area, which is the one place besides a workspace where a command may write. Named for the session's file.
@@ -1328,6 +1338,7 @@ impl Agent {
             code_mode: config.code_mode,
             program: None,
             program_calls: Vec::new(),
+            warmed: None,
         }
     }
 
@@ -1518,6 +1529,11 @@ impl Agent {
     /// What depends on the workspace and the settings: its skills, the notes' folder, and so the tools on offer.
     fn load_extras(&mut self) {
         let found = skills::without(skills::discover(&self.workspace, self.home.as_deref()), &self.skills_off);
+        self.extras_with(found);
+    }
+
+    /// The tools and what the bench holds, with these skills.
+    fn extras_with(&mut self, found: Vec<skills::Skill>) {
         let servers = self.mcp.as_ref().map_or(Vec::new(), |hub| hub.schemas());
         self.tool_schemas = tools::schemas_for(self.web.enabled, found.iter().any(|skill| skill.for_the_model), self.memory.is_some(), servers, self.code_mode);
         if self.provider.as_ref().is_some_and(|provider| provider.shows_calls_as_written()) {
@@ -1732,6 +1748,17 @@ impl Agent {
         if self.messages.is_empty() {
             // What has come up since the last session ended is here for this one.
             self.load_extras();
+            // The skills the warm-up was made with, where nothing else has changed since: a folder another program keeps in step with its own (a
+            // desktop app's synced skills) can be found half written, and a list that differs from the warm-up's by them had the engine read the
+            // whole prefix again (4.6K tokens, 3.6 s on DeepSeek) where it had just read it.
+            if let Some(warmed) = self.warmed.take().filter(|warmed| warmed.workspace == self.workspace) {
+                let fresh = std::mem::take(&mut self.bench.skills);
+                self.extras_with(warmed.skills);
+                if self.frozen_prompt() != warmed.prompt || self.tool_schemas != warmed.tools {
+                    // (the person's settings, notes or instructions have changed since: the conversation begins with them)
+                    self.extras_with(fresh);
+                }
+            }
             let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
             let mut session = Session::create_under(&self.policy, &self.sessions, &self.workspace, &now(), &stamp)?;
             let path = session.path.clone();
@@ -1770,7 +1797,9 @@ impl Agent {
         }
         // (the tools the first message will find, or this was for nothing)
         self.load_extras();
-        let messages = [Message::text("system", self.frozen_prompt()), Message::text("user", ".")];
+        let prompt = self.frozen_prompt();
+        self.warmed = Some(Warmed { workspace: self.workspace.clone(), prompt: prompt.clone(), tools: self.tool_schemas.clone(), skills: self.bench.skills.clone() });
+        let messages = [Message::text("system", prompt), Message::text("user", ".")];
         let req_id = self.traj.request_id();
         let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id) };
         // Its first word is enough, which stops it as Stop does: Stop itself ends it at once, for what was written during it to begin.
@@ -5739,6 +5768,45 @@ mod tests {
         let tools = provider.seen.lock().unwrap();
         assert_eq!(tools[0].1, tools[1].1, "the same tools, for the same reason");
         assert_eq!(turn.iter().filter(|message| message.role == "user").count(), 1, "what warmed it is no part of the conversation");
+    }
+
+    /// A skill another program is writing can be there for the warm-up and gone for the first message a moment later (a desktop app's synced
+    /// skills, found half written): the first message keeps the prefix the engine has just read. What the person changes in between still counts.
+    #[test]
+    fn a_skill_gone_between_the_warm_up_and_the_first_message_leaves_the_prefix_as_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(".claude/skills/synced/haiku");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("SKILL.md"), "---\nname: haiku\ndescription: Writes haiku\n---\nBody").unwrap();
+        let (run, provider) = scripted(dir.path(), vec![says("warm"), says("ok")], Mode::Default);
+        run.handle.commands.send(Command::WarmPrefix).unwrap();
+        while provider.requests() == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_dir_all(&folder).unwrap();
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let (warm, turn) = (provider.messages(0), provider.messages(1));
+        assert!(warm[0].content.as_deref().unwrap_or("").contains("haiku"), "the warm-up had the skill");
+        assert_eq!(warm[0].content, turn[0].content, "the prefix the engine read, not one without the skill");
+        let tools = provider.seen.lock().unwrap();
+        assert_eq!(tools[0].1, tools[1].1);
+    }
+
+    #[test]
+    fn what_the_person_turns_on_between_the_warm_up_and_the_first_message_is_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, provider) = scripted(dir.path(), vec![says("warm"), says("ok")], Mode::Default);
+        run.handle.commands.send(Command::WarmPrefix).unwrap();
+        while provider.requests() == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        web_on(&run);
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let tools = provider.seen.lock().unwrap();
+        let has_web = |at: usize| tools[at].1.as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "web_read");
+        assert!(!has_web(0) && has_web(1), "the web the person turned on, though the warm-up was read without it");
     }
 
     #[test]
