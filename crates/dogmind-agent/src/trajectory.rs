@@ -5,7 +5,8 @@
 //! event ends, whole and in one write, so a run that is killed loses at most the event in flight. Nothing is buffered across events.
 //!
 //! It holds names, sizes, counts, times, ids, outcomes and short hashes, and never what was said: no message, no reasoning, no file content, no command. The session file has those, and
-//! a request id (`<session id>/<n>`) says which of its messages a line is about. The one exception is a `failed` line, which holds the one line a server said of its failure (cut, and with its
+//! a request id (`<session id>/<n>`) says which of its messages a line is about: a request line says, as `message`, the place of the assistant message it made among the session's messages, and a
+//! tool line the id of its call as `id`, which is the call's in that message. The one exception is a `failed` line, which holds the one line a server said of its failure (cut, and with its
 //! keys and headers hidden): it is the server's own error, and what a person who sends the trajectory is asked for.
 
 use std::fs::{self, File, OpenOptions};
@@ -119,6 +120,8 @@ pub struct RequestNote<'a> {
     pub draft_watch: Option<&'static str>,
     /// For a helper's request: the name of the file its conversation is kept in, beside the session.
     pub helper_file: Option<&'a str>,
+    /// Where the assistant message this request made is in the session's messages, counting from 0 (an id, as the request's own is: what the message says is not here). None when it made no message.
+    pub message: Option<usize>,
 }
 
 pub struct Trajectory {
@@ -262,6 +265,9 @@ impl Trajectory {
         if let Some(file) = note.helper_file {
             fields["helper_file"] = json!(file);
         }
+        if let Some(message) = note.message {
+            fields["message"] = json!(message);
+        }
         if let Some((again, why, wait_ms)) = note.retry {
             fields["retry_of"] = json!(again);
             fields["retry_why"] = json!(why);
@@ -341,6 +347,21 @@ mod tests {
         assert_eq!(kept, json!({"ttft_seconds": 1.5, "resumed_from": "live", "images": 2}));
         assert_eq!(kept_timings(&json!({"a": [1]})), None);
         assert_eq!(kept_timings(&Value::Null), None);
+    }
+
+    #[test]
+    fn a_request_says_where_the_message_it_made_is_and_a_request_that_made_none_says_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("s.jsonl");
+        let mut traj = Trajectory::new();
+        traj.open(&session);
+        let clock = Clock::start();
+        let note = |id: &'static str, message: Option<usize>| RequestNote { id, role: "main", clock: &clock, end: "tool_calls".into(), usage: None, timings: None, reasoning_chars: 0, content_chars: 0, calls: vec!["read_file".into()], tokens_est: 0, retry: None, draft_watch: None, helper_file: None, message };
+        traj.request(note("s/1", Some(2)));
+        traj.request(note("s/2", None));
+        let lines: Vec<Value> = fs::read_to_string(file_of(&session)).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(lines[0]["message"], 2);
+        assert!(lines[1].get("message").is_none(), "{}", lines[1]);
     }
 
     #[test]

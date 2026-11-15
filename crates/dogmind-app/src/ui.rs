@@ -12545,6 +12545,8 @@ impl App {
             }
             // (what a long session is waiting for, which is not the model thinking: it is asked to sum the session up, and nothing of that shows)
             Event::Compacting => self.set_activity(t("Compacting the session…").into()),
+            // (the request goes again, after a connection that broke, an answer with nothing in it or a conversation that was too long; the next request's start puts "Thinking…" back)
+            Event::Retrying { .. } => self.set_activity(t("Retrying the request…").into()),
             // (the engine reading the prompt before the first word, which after a compaction or on a small GPU can be minutes)
             Event::Reading { done, total } => {
                 let percent = (done * 100).checked_div(total).unwrap_or(0);
@@ -12556,7 +12558,7 @@ impl App {
                 self.set_activity(waiting);
             }
             Event::RequestStarted => {
-                if self.activity == t("Compacting the session…") || self.activity == t("Waiting for the server to restart…") || self.activity.starts_with(&tf("Waiting for the server: {0}", &[&""])) {
+                if self.activity == t("Compacting the session…") || self.activity == t("Retrying the request…") || self.activity == t("Waiting for the server to restart…") || self.activity.starts_with(&tf("Waiting for the server: {0}", &[&""])) {
                     self.set_activity(t("Thinking…").into());
                 }
                 // (the next answer does not start at the speed the last one ended)

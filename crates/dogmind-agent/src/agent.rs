@@ -263,6 +263,9 @@ pub enum Event {
     RequestStarted,
     /// The session is being made shorter, which can be minutes of the model summing it up: till the next request, or the turn's end.
     Compacting,
+    /// The last request is to be made again, after `wait_ms` of waiting (told as the wait begins, or, for a server that was restarting, with what has been waited): `why` is as the trajectory says it
+    /// (`overflow`, `transient`, `server_restart`, `empty`). [`Event::RequestStarted`] follows.
+    Retrying { why: String, wait_ms: u64 },
     /// The server is reading the prompt, before the answer's first word: `done` of `total` tokens. Told about once a second while it reads
     /// (Straydog); after a compaction, or on a small GPU, that can be minutes.
     Reading { done: u64, total: u64 },
@@ -1135,7 +1138,7 @@ fn path_for_trajectory(path: &str, workspace: &Path) -> String {
 
 /// The first word of a command, and no more: a program's name, never its arguments, which can hold a key or a person's words. A first word with an `=` in it is an assignment
 /// (`KEY=value cmd`), and says nothing.
-fn first_word_of(command: &str) -> Option<String> {
+pub(crate) fn first_word_of(command: &str) -> Option<String> {
     let word = command.split_whitespace().next()?.trim_matches(|c| c == '"' || c == '\'' || c == '&' || c == '.');
     if word.contains('=') || word.contains('$') {
         return Some("(assignment)".to_string());
@@ -1200,6 +1203,16 @@ enum Ended {
     Done,
     Cancelled,
     Failed(String),
+}
+
+/// What ended a stream from outside, short of the person's Stop: the app's own stops (see `iterate`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stopped {
+    Not,
+    /// Code drafted in the reasoning.
+    Draft,
+    /// A `create_file` cut to get it on disk.
+    CutWrite,
 }
 
 fn now() -> String {
@@ -2177,9 +2190,12 @@ impl Agent {
             };
             let (usage, timings) = result.as_ref().ok().map_or((None, None), |completion| (completion.usage.as_ref(), completion.timings.as_ref()));
             let named: Vec<String> = calling.iter().map(|call| call.function.name.clone()).filter(|name| !name.is_empty()).collect();
-            self.traj.request(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is), helper_file: None });
             let base = self.messages.len();
             let saved = if cuts { cut_answer(&written, &reasoned, &calling, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) } else { None };
+            // (where its message will be, for the trajectory: a reader puts the step beside what the model said. Every message this request makes goes in at `base`.)
+            let stopped = if drafting && stopped_by_the_app { Stopped::Draft } else if cut && stopped_by_the_app { Stopped::CutWrite } else { Stopped::Not };
+            let message = self.makes_a_message(&result, &written, saved.as_ref().map(|(answer, ..)| answer), stopped, transient < TRANSIENT_RETRIES).then_some(base);
+            self.traj.request(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is), helper_file: None, message });
             // Writing a file out in its reasoning: every token of it is typed again in the call. It goes on from what it had decided, in a request of which all but the last few tokens are
             // read already. Whatever it was thinking about before is left to it, however long: only this is stopped, and what it is told is to write. Its connection has closed by now, so
             // the engine is not writing into nothing. (The tokens it wrote were spent all the same.)
@@ -2227,6 +2243,7 @@ impl Agent {
                         self.intervened("continue_nudge", json!({"why": "overflow"}));
                         self.push(Message::text("user", prompt::CONTINUE_NUDGE));
                     }
+                    self.emit(Event::Retrying { why: "overflow".into(), wait_ms: 0 });
                     retry = Some((req_id.clone(), "overflow", 0));
                     continue;
                 }
@@ -2234,7 +2251,9 @@ impl Agent {
                 Err(LlmError::Transient(message)) if saved.is_some() && transient < TRANSIENT_RETRIES => {
                     transient += 1;
                     self.emit(Event::Notice(llm::BROKE_OFF.into()));
-                    let waited = self.wait_to_retry(retry_pause(transient, &message));
+                    let pause = retry_pause(transient, &message);
+                    self.emit(Event::Retrying { why: "transient".into(), wait_ms: pause.as_millis() as u64 });
+                    let waited = self.wait_to_retry(pause);
                     retry = Some((req_id.clone(), "transient", waited));
                     generated += meter.tokens;
                     let (answer, path, tail) = saved.expect("just looked at");
@@ -2284,7 +2303,18 @@ impl Agent {
                         }
                         self.push(Message::text("user", if begun.is_empty() { prompt::CONTINUE_NUDGE.to_string() } else { prompt::calls_broken_off(&begun) }));
                     }
-                    let waited = waited_for_restart.unwrap_or_else(|| self.wait_to_retry(retry_pause(transient, &message)));
+                    // (a server that was restarting has been waited for already: what is told is that wait. The other is told as it begins.)
+                    let waited = match waited_for_restart {
+                        Some(waited) => {
+                            self.emit(Event::Retrying { why: "server_restart".into(), wait_ms: waited });
+                            waited
+                        }
+                        None => {
+                            let pause = retry_pause(transient, &message);
+                            self.emit(Event::Retrying { why: "transient".into(), wait_ms: pause.as_millis() as u64 });
+                            self.wait_to_retry(pause)
+                        }
+                    };
                     retry = Some((req_id.clone(), if waited_for_restart.is_some() { "server_restart" } else { "transient" }, waited));
                     continue;
                 }
@@ -2332,6 +2362,7 @@ impl Agent {
                 if empties > EMPTY_RETRIES {
                     return Ended::Failed(llm::UNFINISHED.into());
                 }
+                self.emit(Event::Retrying { why: "empty".into(), wait_ms: 0 });
                 retry = Some((req_id.clone(), "empty", 0));
                 continue;
             }
@@ -2522,7 +2553,7 @@ impl Agent {
         let (reasoning, content, calls) = result.as_ref().ok().map_or((0, 0, Vec::new()), |completion| (completion.reasoning.chars().count(), completion.content.chars().count(), completion.tool_calls.iter().map(|call| call.function.name.clone()).collect()));
         // (a warm-up is ended by the app at its first word, which is how it is meant to end)
         let end = if role == "warm" && matches!(result, Err(LlmError::Cancelled)) { "stopped_app:warm_up".to_string() } else { trajectory::end_of(result) };
-        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: 0, retry: None, draft_watch: None, helper_file });
+        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: 0, retry: None, draft_watch: None, helper_file, message: None });
     }
 
     /// An intervention of the app's own, in the trajectory, for the request that was made last: the one it ended or follows.
@@ -2564,11 +2595,7 @@ impl Agent {
     /// The turn is over with a file half written, by the person or by a server that has gone: what is there of it stays on disk if that needs no one's word, as nobody is there to ask.
     /// True if it did.
     fn keep_cut_write(&mut self, answer: llm::Completion) -> bool {
-        let Some(call) = answer.tool_calls.last().cloned() else { return false };
-        let Ok(arguments) = serde_json::from_str::<Value>(&call.function.arguments) else { return false };
-        if !self.runs_unasked(&call.function.name, &arguments) {
-            return false;
-        }
+        let Some((call, arguments)) = self.cut_write_to_keep(&answer) else { return false };
         self.push(answer.message());
         self.emit(Event::AssistantEnded);
         self.tool_started(&call.id, &call.function.name, Some(&arguments), &call.function.arguments, 1);
@@ -2583,6 +2610,27 @@ impl Agent {
         }
         self.finish_call(&call.id, result, false, started.elapsed());
         true
+    }
+
+    /// The call at the end of an answer that was cut, with its arguments, when `keep_cut_write` would keep it: they are JSON, and it would run with no one asked.
+    fn cut_write_to_keep(&self, answer: &llm::Completion) -> Option<(crate::message::ToolCall, Value)> {
+        let call = answer.tool_calls.last().cloned()?;
+        let arguments = serde_json::from_str::<Value>(&call.function.arguments).ok()?;
+        self.runs_unasked(&call.function.name, &arguments).then_some((call, arguments))
+    }
+
+    /// Whether the conversation takes an assistant message from a request that ended as `result`. It does from an answer that has a call or a word in it; from one that broke off with words
+    /// written, which `keep_written` puts in; and from a `create_file` cut where its last whole line is (`saved`), which is kept to be gone on with, or run as it is where no one need be asked.
+    /// `may_retry`: the connection may break and the request go again.
+    fn makes_a_message(&self, result: &Result<llm::Completion, LlmError>, written: &str, saved: Option<&llm::Completion>, stopped: Stopped, may_retry: bool) -> bool {
+        match result {
+            Ok(completion) => !completion.tool_calls.is_empty() || !completion.content.trim().is_empty(),
+            Err(LlmError::Cancelled) if stopped == Stopped::Draft => !written.is_empty(),
+            Err(LlmError::Cancelled) if stopped == Stopped::CutWrite && saved.is_some() => true,
+            Err(LlmError::Transient(_)) if saved.is_some() && may_retry => true,
+            Err(LlmError::Overflow(_) | LlmError::NoVision(_)) => !written.is_empty(),
+            Err(_) => !written.is_empty() || saved.is_some_and(|answer| self.cut_write_to_keep(answer).is_some()),
+        }
     }
 
     /// Whether this call would run with no one asked.
@@ -4058,6 +4106,9 @@ mod tests {
         let kept = messages.iter().position(|message| message["role"] == "assistant").unwrap();
         assert_eq!(messages[kept]["content"], "half an");
         assert!(messages[kept + 1]["content"].as_str().unwrap().contains("second"));
+        // The half answer is the message that request made, and the trajectory says where it is.
+        let first = of_kind(&trajectory_of(&run), "request")[0].clone();
+        assert_eq!(first["message"].as_u64(), Some(kept as u64), "{first}");
     }
 
     /// What Straydog sends when its worker reports a fatal error, in words that read like a full context.
@@ -7901,6 +7952,47 @@ mod tests {
     }
 
     #[test]
+    fn a_request_says_where_its_message_is_in_the_session_and_a_tool_says_which_call_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "content here").unwrap();
+        let (client, _) = server(vec![call_answer("read_file", serde_json::json!({"path": "a.txt"})), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("read it".into())).unwrap();
+        let session = session_file(&run);
+        until_end(&run, Decision::Reject);
+        let messages = crate::session::read(&session).unwrap();
+        let lines = trajectory_of(&run);
+        let places: Vec<u64> = of_kind(&lines, "request").iter().map(|line| line["message"].as_u64().expect("a message")).collect();
+        // (the system prompt, the person's words, the answer with its call, the call's result, the last answer)
+        assert_eq!(places, [2, 4], "{lines:?}");
+        assert!(places.iter().all(|at| messages[*at as usize].role == "assistant"));
+        let call = &messages[2].tool_calls.as_ref().unwrap()[0];
+        assert_eq!(of_kind(&lines, "tool")[0]["id"], call.id.as_str(), "the call is told by the id the message has for it");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some(call.id.as_str()));
+    }
+
+    #[test]
+    fn a_request_asked_again_is_told_to_the_window_and_the_empty_one_made_no_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, _) = scripted(dir.path(), vec![says(""), says("hello")], Mode::Default);
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        let mut retries = Vec::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::Retrying { why, wait_ms } => retries.push((why, wait_ms)),
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(retries, [("empty".to_string(), 0)]);
+        let lines = trajectory_of(&run);
+        let requests = of_kind(&lines, "request");
+        assert_eq!(requests.len(), 2, "{lines:?}");
+        assert!(requests[0].get("message").is_none(), "an answer with nothing in it does not join the conversation: {}", requests[0]);
+        assert_eq!((requests[1]["message"].as_u64(), requests[1]["retry_why"].as_str()), (Some(2), Some("empty")));
+    }
+
+    #[test]
     fn a_stop_of_the_persons_and_a_stop_of_the_apps_are_recorded_as_each() {
         // The person's.
         let dir = tempfile::tempdir().unwrap();
@@ -7938,6 +8030,8 @@ mod tests {
         assert!(stop["tokens_before"].as_u64().unwrap() > 0 && stop["run"].as_u64().unwrap() >= DRAFT_LINES as u64, "{stop}");
         assert_eq!(lines[3]["end"], "stop");
         assert_eq!(of_kind(&lines, "turn_end")[0]["cancelled"], false);
+        // The draft stopped made no message (nothing was said); the request that went on from it did.
+        assert!(lines[1].get("message").is_none() && lines[3]["message"].is_u64(), "{lines:?}");
     }
 
     #[test]
