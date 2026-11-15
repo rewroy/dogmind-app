@@ -568,6 +568,11 @@ pub const NOT_CALLABLE: [&str; 5] = ["run_code", "submit_plan", "ask_user", "exp
 
 /// The rules the model reads before the tools it can call from a program.
 const RULES: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Use it when the work needs three or more tool calls whose order can be decided up front (several reads, a search then reads). Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws.";
+/// The rules that push for programs, to measure whether a model can write them when it is told to (DOGMIND_CODE_MODE_EAGER=1): the
+/// default ones above left DeepSeek writing none in six runs, as it puts calls that do not depend on each other in one answer already.
+const RULES_EAGER: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Prefer it to calling tools one at a time whenever the work needs two or more calls: read, search, edit and run the tests in one program where you can, and decide in the program what to do with what a call returned. Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws.";
+/// The switch to [`RULES_EAGER`], read when the tools are made.
+pub const EAGER_VARIABLE: &str = "DOGMIND_CODE_MODE_EAGER";
 /// How much of a tool's first sentence its declaration keeps.
 const ABOUT_MOST: usize = 160;
 
@@ -579,7 +584,12 @@ pub fn callable(offered: &Json) -> Vec<String> {
 /// The `run_code` tool as the model is offered it: the rules and, for each tool it can call, a line that says how (`tools.read_file({path, start_line?, limit?}) — Read a text file...`), made from
 /// the tools that are offered with it, so that the web, notes and servers' tools are in it only when they are.
 pub fn schema(offered: &Json) -> Json {
-    let mut description = String::from(RULES);
+    schema_with(offered, std::env::var(EAGER_VARIABLE).is_ok_and(|value| value.trim() == "1"))
+}
+
+/// [`schema`], with the rules that push for programs or the default ones.
+fn schema_with(offered: &Json, eager: bool) -> Json {
+    let mut description = String::from(if eager { RULES_EAGER } else { RULES });
     for tool in offered.as_array().into_iter().flatten() {
         if let Some(line) = declaration(tool) {
             description.push('\n');
@@ -1070,6 +1080,17 @@ mod tests {
             function["description"] = json!(description);
         }
         json!({"type": "function", "function": function})
+    }
+
+    #[test]
+    fn the_rules_that_push_for_programs_differ_only_in_when_and_keep_the_same_tools() {
+        let offered = json!([tool("read_file", Some("Read a text file."), json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}))]);
+        let lines = |eager: bool| schema_with(&offered, eager)["function"]["description"].as_str().unwrap().lines().map(str::to_string).collect::<Vec<_>>();
+        let (plain, eager) = (lines(false), lines(true));
+        assert!(plain[0].contains("three or more tool calls") && eager[0].contains("two or more calls"), "{plain:?} {eager:?}");
+        assert_eq!(plain[1..], eager[1..]);
+        // (the default is the plain one: the switch is only read when it says 1)
+        assert_eq!(schema(&offered), schema_with(&offered, std::env::var(EAGER_VARIABLE).is_ok_and(|value| value.trim() == "1")));
     }
 
     #[test]
