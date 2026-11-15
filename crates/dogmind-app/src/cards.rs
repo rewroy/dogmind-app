@@ -390,13 +390,17 @@ pub fn most_changed(rows: &[FileRow]) -> usize {
     rows.iter().map(|row| row.added + row.removed).max().unwrap_or(0)
 }
 
-/// Whether a file of the card is opened with its own app. What is a program or a script is not: opened, it would run, and what the agent wrote is not for that. These are shown in Explorer.
+/// Whether a file of a card is opened with its own app: only a kind that is read or looked at, a document, a picture, a table, a page, sound or film, or text. Anything
+/// else is shown in Explorer: Windows runs more kinds when they are opened than any list of them would name (a console snap-in, an application manifest, a help file, a
+/// setup file, a shell command file), and what the agent wrote is not to be run by a press on a card.
 pub fn opens_in_app(path: &str) -> bool {
-    const RUNS: [&str; 30] = [
-        "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp", "scr", "lnk", "url", "reg", "hta", "cpl", "jar", "pif", "appx", "msix", "dll", "sys", "py", "pyw", "sh", "gadget",
+    const OPENS: [&str; 52] = [
+        "txt", "md", "markdown", "csv", "tsv", "json", "xml", "yaml", "yml", "toml", "ini", "log", "html", "htm", "css", "svg", "png", "jpg", "jpeg", "gif", "webp", "bmp",
+        "ico", "tif", "tiff", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "mp3", "wav", "ogg", "flac", "m4a", "mp4", "webm", "mov",
+        "mkv", "rs", "c", "h", "cpp", "hpp", "go", "java",
     ];
     let extension = path.rsplit(['/', '\\']).next().and_then(|name| name.rsplit_once('.')).map_or(String::new(), |(_, extension)| extension.to_lowercase());
-    !RUNS.contains(&extension.as_str())
+    OPENS.contains(&extension.as_str())
 }
 
 /// The words of the bar under the session's title: its goal's first line. None when there is no goal, and no bar.
@@ -551,11 +555,15 @@ mod tests {
 
     #[test]
     fn a_program_the_agent_wrote_is_shown_in_explorer_and_not_run() {
-        for safe in ["notes.md", "src/app.rs", "logo.PNG", "data.csv", "README", "dir\\report.pdf"] {
+        for safe in ["notes.md", "src/app.rs", "logo.PNG", "data.csv", "dir\\report.pdf", "web/index.html", "report.docx", "sheet.xlsx", "clip.mp4"] {
             assert!(opens_in_app(safe), "{safe}");
         }
         for risky in ["setup.exe", "run.BAT", "tools\\x.ps1", "a.vbs", "a.js", "a.lnk", "build.cmd", "pkg.msi", "x.dll", "run.py", "go.sh"] {
             assert!(!opens_in_app(risky), "{risky}");
+        }
+        // (kinds a list of what runs would leave out: only what is named as safe opens, and anything else, or no kind at all, is shown)
+        for unnamed in ["console.msc", "types.ps1xml", "tool.application", "tool.appref-ms", "x.settingcontent-ms", "help.chm", "setup.inf", "desktop.scf", "a.ws", "lib.library-ms", "README", "a.rb", "a.unknown"] {
+            assert!(!opens_in_app(unnamed), "{unnamed}");
         }
     }
 
