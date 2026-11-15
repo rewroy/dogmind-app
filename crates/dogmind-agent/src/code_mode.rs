@@ -35,7 +35,10 @@ const THREAD_STACK: usize = 8 << 20;
 const LOG_MOST: usize = 256 * 1024;
 /// How often `run` looks at the cancel flag while the program runs, and how long past its time limit it waits for a program that does not answer the engine's interrupt.
 const POLL: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
 const GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const GRACE: Duration = Duration::from_millis(300);
 /// The name the program's source has, in the engine's errors (the line numbers in them are the body's own).
 const PROGRAM_FILE: &str = "program.js";
 
@@ -390,6 +393,12 @@ fn execute(program: &str, code: &str, names: &[String], limits: &Limits, shared:
         };
         let setup: Function = ctx.eval_with_options(SETUP, options("tools.js")).map_err(|error| describe_engine_error(&ctx, error))?;
         setup.call::<_, ()>((host, write, names.to_vec())).map_err(|error| describe_engine_error(&ctx, error))?;
+        // (tests only: a wait the engine's interrupt does not reach, as nothing a program can do here is, for the way `run` leaves such a program behind)
+        #[cfg(test)]
+        {
+            let sleep = Function::new(ctx.clone(), |ms: u32| std::thread::sleep(Duration::from_millis(u64::from(ms)))).map_err(|error| describe_engine_error(&ctx, error))?;
+            ctx.globals().set("__test_sleep", sleep).map_err(|error| describe_engine_error(&ctx, error))?;
+        }
         // The program's own time starts here, after the setup.
         let promise: Promise = ctx.eval_with_options(program, options(PROGRAM_FILE)).map_err(|error| describe_engine_error(&ctx, error))?;
         let value: Value = promise.finish().map_err(|error| describe_engine_error(&ctx, error))?;
@@ -806,6 +815,20 @@ mod tests {
         assert_eq!(outcome.stopped, Some(Stop::Time));
         assert_eq!(outcome.error, None);
         assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        assert!(render(&outcome, &limits).contains("time limit"));
+    }
+
+    /// A program in something the engine's interrupt does not reach is not waited for past its time and the grace after it: the turn goes on, the
+    /// run stopped by its time, and the program's thread is left to end by itself.
+    #[test]
+    fn a_program_the_interrupt_cannot_reach_is_left_behind_once_it_is_past_its_time_and_the_grace() {
+        let limits = Limits { time: Duration::from_millis(200), ..limits() };
+        let began = Instant::now();
+        let outcome = run("__test_sleep(4000); return 1;", &[], &limits, &AtomicBool::new(false), &mut |_, _| panic!("no call"));
+        let waited = began.elapsed();
+        assert!(waited >= limits.time + GRACE && waited < Duration::from_millis(2500), "left at its time and the grace, not at the sleep's end: {waited:?}");
+        assert_eq!((outcome.stopped, outcome.value.as_deref()), (Some(Stop::Time), None));
+        assert_eq!(outcome.error, None, "no word of an engine that stopped: it was left");
         assert!(render(&outcome, &limits).contains("time limit"));
     }
 
