@@ -141,8 +141,6 @@ pub struct RequestNote<'a> {
     pub draft_watch: Option<&'static str>,
     /// For a helper's request: the name of the file its conversation is kept in, beside the session.
     pub helper_file: Option<&'a str>,
-    /// Where the assistant message this request made is in the session's messages, counting from 0 (an id, as the request's own is: what the message says is not here). None when it made no message.
-    pub message: Option<usize>,
 }
 
 pub struct Trajectory {
@@ -156,6 +154,8 @@ pub struct Trajectory {
     /// This turn's requests and tools, for its end.
     pub turn_requests: u64,
     pub turn_tools: u64,
+    /// A request's line that waits for the message it made ([`Trajectory::message_at`]): written with it, or as it is before whatever line comes next.
+    waiting: Option<(String, Value)>,
 }
 
 impl Default for Trajectory {
@@ -169,7 +169,7 @@ const HELD_MOST: usize = 64;
 
 impl Trajectory {
     pub fn new() -> Trajectory {
-        Trajectory { file: None, session_id: String::new(), turn: 0, requests: 0, warm: 0, held: Vec::new(), turn_requests: 0, turn_tools: 0 }
+        Trajectory { file: None, session_id: String::new(), turn: 0, requests: 0, warm: 0, held: Vec::new(), turn_requests: 0, turn_tools: 0, waiting: None }
     }
 
     /// Begins writing beside this session. A session that is opened again goes on where its file left off: its turns and its requests keep counting.
@@ -202,6 +202,7 @@ impl Trajectory {
 
     /// No session: what follows waits for the next.
     pub fn close(&mut self) {
+        self.write_waiting();
         self.file = None;
         self.session_id.clear();
         (self.turn, self.requests, self.turn_requests, self.turn_tools) = (0, 0, 0, 0);
@@ -238,6 +239,12 @@ impl Trajectory {
 
     /// One line: its kind, the time, the turn, and the request it belongs to when it does, then its own fields.
     pub fn write(&mut self, ev: &str, req: Option<&str>, fields: Value) {
+        // (a request's line that waits for its message is written first, as it is: it made none, and the order of the lines is the order of what happened)
+        self.write_waiting();
+        self.write_line(ev, req, fields);
+    }
+
+    fn write_line(&mut self, ev: &str, req: Option<&str>, fields: Value) {
         let mut line = Map::new();
         line.insert("t".into(), json!(now()));
         line.insert("ev".into(), json!(ev));
@@ -258,6 +265,34 @@ impl Trajectory {
     }
 
     pub fn request(&mut self, note: RequestNote) {
+        let id = note.id.to_string();
+        let fields = self.request_fields(note);
+        self.write("request", Some(&id), fields);
+    }
+
+    /// A request whose line says where the message it made is in the session: it waits for [`Trajectory::message_at`], or for the next line
+    /// to be written (it made none). Said once the message is in, where it is cannot be wrong: the reader no longer has to guess which it was.
+    pub fn request_waiting(&mut self, note: RequestNote) {
+        self.write_waiting();
+        let id = note.id.to_string();
+        self.waiting = Some((id, self.request_fields(note)));
+    }
+
+    /// The message the request that waits made is at `index` of the session's messages: its line is written with that.
+    pub fn message_at(&mut self, index: usize) {
+        if let Some((id, mut fields)) = self.waiting.take() {
+            fields["message"] = json!(index);
+            self.write_line("request", Some(&id), fields);
+        }
+    }
+
+    fn write_waiting(&mut self) {
+        if let Some((id, fields)) = self.waiting.take() {
+            self.write_line("request", Some(&id), fields);
+        }
+    }
+
+    fn request_fields(&mut self, note: RequestNote) -> Value {
         if note.role != "warm" {
             self.turn_requests += 1;
         }
@@ -286,9 +321,6 @@ impl Trajectory {
         if let Some(file) = note.helper_file {
             fields["helper_file"] = json!(file);
         }
-        if let Some(message) = note.message {
-            fields["message"] = json!(message);
-        }
         // (when it began to write a call and its answer, from its start: what is before them after the first word is thinking)
         if let Some(writing) = note.clock.writing_ms() {
             fields["writing_ms"] = json!(writing);
@@ -304,7 +336,7 @@ impl Trajectory {
         if let Some(server) = note.timings.and_then(kept_timings) {
             fields["server"] = server;
         }
-        self.write("request", Some(note.id), fields);
+        fields
     }
 
     /// An intervention of the app's own, with what it came to. `req`: the request it ended or followed.
@@ -384,12 +416,16 @@ mod tests {
         let mut traj = Trajectory::new();
         traj.open(&session);
         let clock = Clock::start();
-        let note = |id: &'static str, message: Option<usize>| RequestNote { id, role: "main", clock: &clock, end: "tool_calls".into(), usage: None, timings: None, reasoning_chars: 0, content_chars: 0, calls: vec!["read_file".into()], tokens_est: 0, retry: None, draft_watch: None, helper_file: None, message };
-        traj.request(note("s/1", Some(2)));
-        traj.request(note("s/2", None));
+        let note = |id: &'static str| RequestNote { id, role: "main", clock: &clock, end: "tool_calls".into(), usage: None, timings: None, reasoning_chars: 0, content_chars: 0, calls: vec!["read_file".into()], tokens_est: 0, retry: None, draft_watch: None, helper_file: None };
+        traj.request_waiting(note("s/1"));
+        traj.message_at(2);
+        // (the second makes none: the next line writes it as it is, before itself)
+        traj.request_waiting(note("s/2"));
+        traj.write("turn_end", None, json!({}));
         let lines: Vec<Value> = fs::read_to_string(file_of(&session)).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert_eq!(lines[0]["message"], 2);
         assert!(lines[1].get("message").is_none(), "{}", lines[1]);
+        assert_eq!((lines[1]["ev"].as_str(), lines[2]["ev"].as_str()), (Some("request"), Some("turn_end")), "in the order they happened");
     }
 
     #[test]
