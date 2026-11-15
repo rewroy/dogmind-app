@@ -2587,6 +2587,7 @@ fn agent_config(settings: &Settings, folder: &Path, workspace: PathBuf, mode: Mo
         memory: Some(folder.join("memory")),
         mcp: Some(mcp),
         policy,
+        code_mode: false,
     }
 }
 

@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 use crate::background::{self, Background, Waiting};
 use crate::checkpoint::{Checkpoints, Restored, Turn};
+use crate::code_mode;
 use crate::compaction;
 use crate::llm::{self, Delta, LlmError, Provider, Request, Usage};
 use crate::images::{self, Attachment, ImageLimit};
@@ -133,6 +134,8 @@ pub enum Command {
     SetEffort(Option<String>),
     SetSafeCommands(bool),
     SetWeb(WebSettings),
+    /// Code Mode on or off: a conversation that has begun keeps the tools it began with.
+    SetCodeMode(bool),
     SetLanguage(String),
     /// The skills turned off, by name. A session already begun keeps the list its prompt was written with, but cannot read one that is off.
     SetSkillsOff(Vec<String>),
@@ -167,6 +170,8 @@ pub struct Approval {
     pub rule: Option<Rule>,
     /// What `Always` would allow for this session instead: a file, or folders. With neither of these, this exact call.
     pub scope: Option<AlwaysScope>,
+    /// The call is one a program makes (`run_code`) in the middle of its run: what the program says it does.
+    pub program: Option<String>,
     pub answer: Sender<(Decision, Option<String>)>,
 }
 
@@ -437,6 +442,8 @@ pub struct Config {
     pub mcp: Option<Arc<mcp::Hub>>,
     /// Whether conversations are written encrypted, shared with the window and the other agents: while it waits for the key, no session is opened or written.
     pub policy: Arc<crate::conversation_key::Policy>,
+    /// Code Mode: the model may run a short program that calls the tools (`run_code`) instead of calling them one at a time.
+    pub code_mode: bool,
 }
 
 /// Starts the agent. `wake` is called after every event, for a UI that sleeps until it has something to draw.
@@ -1068,6 +1075,12 @@ struct Agent {
     helper_stop: Arc<HelperStop>,
     /// What a helper's call is to record in its result, by the call's id, until the result is written.
     helper_refs: HashMap<String, crate::message::HelperRef>,
+    /// Code Mode is on: `run_code` is a tool.
+    code_mode: bool,
+    /// The program at work (a `run_code` call), for the calls it makes.
+    program: Option<Program>,
+    /// The calls the programs of this response have made, as the model would have written them: what is checked after the response looks at them as it does at the model's own.
+    program_calls: Vec<crate::message::ToolCall>,
 }
 
 /// A session's scratch folder: outside the workspace, in the sandbox's own temp area, which is the one place besides a workspace where a command may write. Named for the session's file.
@@ -1127,6 +1140,23 @@ struct ToolMeta {
     edited: Vec<PathBuf>,
     parallel: usize,
     req: Option<String>,
+    /// The call of a program (`run_code`) that made this one.
+    parent: Option<String>,
+    /// For a `run_code` call: how many calls its program made, and its own running time in milliseconds.
+    program: Option<(usize, u64)>,
+}
+
+/// A program at work (a `run_code` call).
+struct Program {
+    id: String,
+    /// What it says it does, for the person who is asked about one of its calls.
+    description: String,
+    /// The calls it has made so far.
+    calls: u32,
+    /// How long the person was waited for in them.
+    waited: Duration,
+    /// One of them was from a stranger (the web, a server not trusted): what the program returns may hold what a stranger wrote.
+    stranger: bool,
 }
 
 /// A path as the trajectory says it: from the workspace when it is in it, and as its file name only when it is not (a picture a check made in the sandbox's folder: where that is says
@@ -1226,13 +1256,14 @@ impl Agent {
         // The app's own folder: the sessions and the rules are there, and what keeps its keys.
         let mut gate = Gate::new();
         gate.secrets.extend(config.rules.parent().map(Path::to_path_buf));
+        gate.code_mode = config.code_mode;
         // (Visual Studio's build tools are looked for from here, in the background: the gate weighs a command without waiting for them, and its environment then usually finds them ready)
         #[cfg(windows)]
         crate::msvc::look_ahead();
         let background = Arc::new(Background::default());
         bench.background = background.clone();
         Agent {
-            tool_schemas: tools::schemas_for(config.web.enabled, false, false, Vec::new()),
+            tool_schemas: tools::schemas_for(config.web.enabled, false, false, Vec::new(), config.code_mode),
             home: config.home,
             skills_off: config.skills_off,
             memory: config.memory,
@@ -1294,6 +1325,9 @@ impl Agent {
             wake_lines: Vec::new(),
             helper_stop: Arc::default(),
             helper_refs: HashMap::new(),
+            code_mode: config.code_mode,
+            program: None,
+            program_calls: Vec::new(),
         }
     }
 
@@ -1367,6 +1401,7 @@ impl Agent {
                     self.gate.secrets.extend(files);
                 }
                 Command::SetWeb(web) => self.set_web(web),
+                Command::SetCodeMode(on) => self.set_code_mode(on),
                 Command::NewSession(workspace) => self.new_session(workspace),
                 Command::WarmPrefix => self.warm_prefix(),
                 Command::Resume(path) => self.resume(&path),
@@ -1484,7 +1519,7 @@ impl Agent {
     fn load_extras(&mut self) {
         let found = skills::without(skills::discover(&self.workspace, self.home.as_deref()), &self.skills_off);
         let servers = self.mcp.as_ref().map_or(Vec::new(), |hub| hub.schemas());
-        self.tool_schemas = tools::schemas_for(self.web.enabled, found.iter().any(|skill| skill.for_the_model), self.memory.is_some(), servers);
+        self.tool_schemas = tools::schemas_for(self.web.enabled, found.iter().any(|skill| skill.for_the_model), self.memory.is_some(), servers, self.code_mode);
         if self.provider.as_ref().is_some_and(|provider| provider.shows_calls_as_written()) {
             tools::for_calls_shown_as_written(&mut self.tool_schemas);
         }
@@ -1514,6 +1549,16 @@ impl Agent {
             if let Some(session) = &mut self.session {
                 let _ = session.set_tools(&tools);
             }
+        }
+    }
+
+    /// With no conversation yet it decides what one will begin with. In one, its tools are part of its prefix, so they stay: turned off, a call to `run_code` is answered as a call to a tool there
+    /// is none of; turned on, it is offered from the next conversation.
+    fn set_code_mode(&mut self, on: bool) {
+        self.code_mode = on;
+        self.gate.code_mode = on;
+        if self.messages.is_empty() {
+            self.load_extras();
         }
     }
 
@@ -2379,6 +2424,7 @@ impl Agent {
                 let calls = one_shape_for_edits(&completion.tool_calls);
                 let most = note_repeats(&calls, &self.workspace, &mut repeats, &mut self.repeated);
                 let failures = self.run_tools(&calls);
+                let nested = std::mem::take(&mut self.program_calls);
                 failed_calls = if failures == calls.len() { failed_calls + failures } else { 0 };
                 let edited = std::mem::take(&mut self.edited);
                 // What a command wrote counts as an edit for the calls that look: what they would answer now is not what they did. (Not for what the model wrote: the draft watch is for that.)
@@ -2398,7 +2444,7 @@ impl Agent {
                 if most >= REPEATS_STOPPED && !edited && !changed {
                     return Ended::Failed(format!("the model made the same call {most} times with nothing edited in between: stopped so that you can look"));
                 }
-                unchecked = still_unchecked(unchecked, &calls);
+                unchecked = still_unchecked(unchecked, &[calls.as_slice(), nested.as_slice()].concat());
                 // (a local model's: what a service costs is not minutes of someone's waiting. It goes on if the work is not done.)
                 if cuts && wrote && generated >= next_cost_note {
                     next_cost_note = generated + COST_NOTED_EVERY;
@@ -2761,54 +2807,59 @@ impl Agent {
             }
         };
         self.tool_started(&call.id, name, Some(&arguments), &call.function.arguments, 1);
-        match self.permission(name, &arguments) {
+        let ran = self.run_call(&call.id, name, &arguments, false);
+        self.finish_call_with(&call.id, ran.result, ran.declined, started.elapsed(), ran.images);
+        ran.failed
+    }
+
+    /// A call that has begun, run: the gate first (the rules, the person's approval, plan mode's limits), then the tool, and what follows from its result. A call of the model's own and one a program
+    /// makes (`nested`) go through this alike; what is done with the result is for the caller to do: the first puts it in the conversation, the second gives it to the program.
+    fn run_call(&mut self, id: &str, name: &str, arguments: &Value, nested: bool) -> Ran {
+        if nested && code_mode::NOT_CALLABLE.contains(&name) {
+            self.refusal = Some("refused_gate");
+            return Ran::turned_down(format!("{name} cannot be called from a program: call it directly"), 1);
+        }
+        match self.permission(name, arguments) {
             Permission::Run => {}
             Permission::Refused(message, how) => {
                 self.refusal = Some(how);
-                self.finish_call(&call.id, Err(message), true, started.elapsed());
-                return 0;
+                return Ran::turned_down(message, 0);
             }
             // (a tool that does not exist, again and again, is a model that gets nowhere; a person's no is not)
             Permission::Denied(message) => {
                 self.refusal = Some("refused_gate");
-                self.finish_call(&call.id, Err(message), true, started.elapsed());
-                return 1;
+                return Ran::turned_down(message, 1);
             }
         }
         if name == "read_file" {
-            if let Some(path) = self.picture_at(&arguments) {
+            if let Some(path) = self.picture_at(arguments) {
+                if nested {
+                    return Ran::done(Ok(format!("{}: a picture, and a picture cannot be read from a program: read it with read_file directly", path.display())), 0);
+                }
                 let (result, pictures) = self.read_picture(&path);
                 let failed = usize::from(result.is_err());
-                self.finish_call_with(&call.id, result, false, started.elapsed(), pictures);
-                return failed;
+                return Ran { images: pictures, ..Ran::done(result, failed) };
             }
         }
-        if name == "submit_plan" {
-            let result = self.submit_plan(&arguments);
+        let special = match name {
+            "submit_plan" => Some(self.submit_plan(arguments)),
+            "ask_user" => Some(self.ask_user(arguments)),
+            "explore" => Some(self.explore(id, arguments)),
+            "run_code" => Some(self.run_program(id, arguments)),
+            _ => None,
+        };
+        if let Some(result) = special {
             let failed = usize::from(result.is_err());
-            self.finish_call(&call.id, result, false, started.elapsed());
-            return failed;
+            return Ran::done(result, failed);
         }
-        if name == "ask_user" {
-            let result = self.ask_user(&arguments);
-            let failed = usize::from(result.is_err());
-            self.finish_call(&call.id, result, false, started.elapsed());
-            return failed;
-        }
-        if name == "explore" {
-            let result = self.explore(&call.id, &arguments);
-            let failed = usize::from(result.is_err());
-            self.finish_call(&call.id, result, false, started.elapsed());
-            return failed;
-        }
-        let edited = edited_paths(name, &arguments, &self.workspace);
+        let edited = edited_paths(name, arguments, &self.workspace);
         if !edited.is_empty() {
             if let Some(Err(error)) = self.marks.as_mut().map(|marks| marks.before_edit(&edited)) {
                 self.emit(Event::Notice(format!("a rewind will not bring this edit back: {error}")));
             }
         }
         self.bench.secrets.clone_from(&self.gate.secrets);
-        let result = self.bench.run(name, &arguments, &self.workspace, &self.cancel);
+        let result = self.bench.run(name, arguments, &self.workspace, &self.cancel);
         // A server's answer is as much a stranger's as a page: it may have come from one.
         let from_a_stranger = matches!(name, "web_search" | "web_read") || (name.starts_with("mcp__") && !self.mcp.as_ref().is_some_and(|hub| hub.trusts_tool(name)));
         if from_a_stranger && result.is_ok() && !self.web_seen {
@@ -2830,11 +2881,68 @@ impl Agent {
             self.changed_by_commands = true;
             self.repeated.clear();
         }
-        let result = self.with_changes_noted(name, &arguments, result);
+        let result = self.with_changes_noted(name, arguments, result);
         // (a command that ran and failed is a failure too: a model can spend an hour on those with nothing being wrong with a call)
         let failed = usize::from(result.as_ref().map_or(true, |output| name == "execute_command" && command_failed(output)));
-        self.finish_call(&call.id, result, false, started.elapsed());
-        failed
+        Ran { stranger: from_a_stranger && result.is_ok(), ..Ran::done(result, failed) }
+    }
+
+    /// A `run_code` call: its program runs in the embedded engine, and each tool it calls goes through [`Agent::program_call`]. What comes back is what the program returned, what it logged and how
+    /// it ended; an error that was not caught, or a stop, is a failed call. A program that called a stranger's tool (the web, a server not trusted) is given back marked as the web's text is.
+    fn run_program(&mut self, id: &str, arguments: &Value) -> Result<String, String> {
+        let Some(code) = arguments.get("code").and_then(Value::as_str).filter(|code| !code.trim().is_empty()) else {
+            return Err("code is required: the body of an async function, in plain JavaScript".into());
+        };
+        let said = arguments.get("description").and_then(Value::as_str).map(str::trim).filter(|said| !said.is_empty());
+        // (a model that left it out is still told to the person: the program's first line)
+        let description = said.map_or_else(|| code.trim().lines().next().unwrap_or("").chars().take(80).collect(), str::to_string);
+        let limits = code_mode::Limits::default().with_timeout_seconds(arguments.get("timeout_seconds").and_then(Value::as_f64));
+        let offered = code_mode::callable(&self.tool_schemas);
+        let names: Vec<&str> = offered.iter().map(String::as_str).collect();
+        self.program = Some(Program { id: id.to_string(), description, calls: 0, waited: Duration::ZERO, stranger: false });
+        let cancel = self.cancel.clone();
+        let outcome = code_mode::run(code, &names, &limits, &cancel, &mut |tool, args| self.program_call(tool, args));
+        let (waited, stranger) = self.program.take().map_or((Duration::ZERO, false), |program| (program.waited, program.stranger));
+        // (the people waited for in its calls are this call's wait, as for any call)
+        self.approval_wait = (!waited.is_zero()).then_some(waited);
+        if let Some(meta) = self.running.get_mut(id) {
+            meta.program = Some((outcome.calls.len(), outcome.ms));
+        }
+        let mut text = code_mode::render(&outcome, &limits);
+        if stranger {
+            text = crate::web::envelope("run_code", &text);
+        }
+        if outcome.error.is_some() || outcome.stopped.is_some() {
+            Err(text)
+        } else {
+            Ok(text)
+        }
+    }
+
+    /// A call the running program makes: it goes through the same steps as a direct one ([`Agent::run_call`]) and its result is the program's. It has a line in the trajectory of its own, with the
+    /// program's call as its `parent`, and counts as a call of the turn; nothing of it joins the conversation, and the window is not told of it.
+    fn program_call(&mut self, name: &str, arguments: Value) -> Result<String, String> {
+        self.read_live();
+        let Some(program) = self.program.as_mut() else { return Err("no program is running".into()) };
+        program.calls += 1;
+        let (parent, id) = (program.id.clone(), format!("{}.{}", program.id, program.calls));
+        let raw = arguments.to_string();
+        let started = Instant::now();
+        self.call_begun(&id, name, Some(&arguments), &raw, 1, Some(&parent));
+        let ran = self.run_call(&id, name, &arguments, true);
+        let (ok, output) = match &ran.result {
+            Ok(output) => (true, output.clone()),
+            Err(error) => (false, format!("error: {error}")),
+        };
+        if let Some(program) = self.program.as_mut() {
+            program.waited += self.approval_wait.unwrap_or_default();
+            program.stranger |= ran.stranger;
+        }
+        self.tool_ended(&id, ok, ran.declined, &output, started.elapsed());
+        self.program_calls.push(crate::message::ToolCall { id, kind: "function".into(), function: crate::message::FunctionCall { name: name.to_string(), arguments: raw } });
+        // (a command may have been started, ended or stopped by this call, or a wait set)
+        self.tell_waiting();
+        ran.result
     }
 
     /// A look across many files, by a helper with a context of its own (`explore`), as Deepseek Harness's subagents do: what it reads fills
@@ -3030,6 +3138,11 @@ impl Agent {
     fn tool_started(&mut self, id: &str, name: &str, arguments: Option<&Value>, raw: &str, parallel: usize) {
         let summary = arguments.map_or(String::new(), |arguments| tools::summary(name, arguments));
         self.emit(Event::ToolStarted { id: id.to_string(), tool: name.to_string(), summary });
+        self.call_begun(id, name, arguments, raw, parallel, None);
+    }
+
+    /// A call's line in the trajectory is begun, with no word to the window (a program's calls are told to it by their program's: `parent` is the call of that program).
+    fn call_begun(&mut self, id: &str, name: &str, arguments: Option<&Value>, raw: &str, parallel: usize, parent: Option<&str>) {
         let path = arguments.and_then(|arguments| {
             let named = arguments.get("path").and_then(Value::as_str).or_else(|| arguments.pointer("/edits/0/path").and_then(Value::as_str)).or_else(|| arguments.pointer("/expected_files/0").and_then(Value::as_str));
             named.map(|path| path_for_trajectory(path, &self.workspace))
@@ -3046,7 +3159,7 @@ impl Agent {
         }
         self.approval_wait = None;
         self.refusal = None;
-        self.running.insert(id.to_string(), ToolMeta { name: name.to_string(), at: chrono::Local::now(), path, cmd0, args_bytes: raw.len(), args_hash: trajectory::short_hash(raw.as_bytes()), edited, parallel, req: self.last_req.clone() });
+        self.running.insert(id.to_string(), ToolMeta { name: name.to_string(), at: chrono::Local::now(), path, cmd0, args_bytes: raw.len(), args_hash: trajectory::short_hash(raw.as_bytes()), edited, parallel, req: self.last_req.clone(), parent: parent.map(str::to_string), program: None });
     }
 
     /// The call's line: how it ended and how long it ran, without the wait for the person (which has its own).
@@ -3079,6 +3192,13 @@ impl Agent {
         }
         if meta.parallel > 1 {
             line["parallel"] = json!(meta.parallel);
+        }
+        if let Some(parent) = &meta.parent {
+            line["parent"] = json!(parent);
+        }
+        if let Some((calls, ms)) = meta.program {
+            line["nested"] = json!(calls);
+            line["program_ms"] = json!(ms);
         }
         if meta.name == "execute_command" && ok {
             if let Some((_, code)) = output.rsplit_once("exit_code: ") {
@@ -3232,6 +3352,7 @@ impl Agent {
             always_allowed: offered,
             rule: rule.clone(),
             scope: scope.clone(),
+            program: self.program.as_ref().map(|program| program.description.clone()),
             answer,
         }));
         // (whichever way it ends, the wait is recorded: what the person was waited for is time of the run that no model or tool had)
@@ -3288,7 +3409,11 @@ impl Agent {
         let wait = asked.elapsed();
         self.approval_wait = Some(wait);
         let req = self.last_req.clone();
-        self.traj.write("approval", req.as_deref(), json!({"tool": tool, "risk": risk_name, "asked": trajectory::stamp(asked_at), "answered": trajectory::now(), "wait_ms": wait.as_millis() as u64, "decision": decision}));
+        let mut line = json!({"tool": tool, "risk": risk_name, "asked": trajectory::stamp(asked_at), "answered": trajectory::now(), "wait_ms": wait.as_millis() as u64, "decision": decision});
+        if let Some(program) = &self.program {
+            line["parent"] = json!(program.id);
+        }
+        self.traj.write("approval", req.as_deref(), line);
         permission
     }
 
@@ -3553,6 +3678,25 @@ impl Agent {
     }
 }
 
+/// What a call came to: its result, whether the person or a mode turned it down, how many failures it counts for, the pictures it opened, and whether its text may hold what a stranger wrote.
+struct Ran {
+    result: Result<String, String>,
+    declined: bool,
+    failed: usize,
+    images: Vec<ImageRef>,
+    stranger: bool,
+}
+
+impl Ran {
+    fn done(result: Result<String, String>, failed: usize) -> Ran {
+        Ran { result, declined: false, failed, images: Vec::new(), stranger: false }
+    }
+
+    fn turned_down(message: String, failed: usize) -> Ran {
+        Ran { declined: true, ..Ran::done(Err(message), failed) }
+    }
+}
+
 enum Permission {
     Run,
     /// By a person, or by a mode they chose; and which: `declined_person`, `refused_gate` (the mode, or the app) or `cancelled` (the turn stopped while it was asked).
@@ -3658,7 +3802,7 @@ mod tests {
     fn run_agent(workspace: &Path, client: Client, mode: Mode) -> Run {
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         Run { handle, events, _sessions: sessions }
     }
@@ -4715,7 +4859,7 @@ mod tests {
         ]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send("go".into())).unwrap();
@@ -5239,7 +5383,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let file = sessions.path().join("instructions.md");
         std::fs::write(&file, "回答の最後に参考にしたファイルを挙げてください").unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: true, instructions: Some(file), home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: true, instructions: Some(file), home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send("修正".into())).unwrap();
@@ -5287,7 +5431,7 @@ mod tests {
         let (client, bodies) = server(vec![call_answer("skill", serde_json::json!({"name": "pdf"})), text_answer("read it"), text_answer("started")]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: work.clone(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: Some(home), skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: work.clone(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: Some(home), skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send("convert it".into())).unwrap();
@@ -5351,7 +5495,7 @@ mod tests {
         ]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send(format!("read {page}"))).unwrap();
@@ -5377,7 +5521,7 @@ mod tests {
         ]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send(format!("read {page}"))).unwrap();
@@ -5688,7 +5832,7 @@ mod tests {
     /// The same, with the folder of the sessions made by the test: a step that must know where the session's own files are can then look.
     fn scripted_with(workspace: &Path, sessions: tempfile::TempDir, provider: Scripted, mode: Mode) -> (Run, Arc<Scripted>) {
         let (sender, events) = channel();
-        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         let provider = Arc::new(provider);
         handle.commands.send(Command::Provider(provider.clone(), "model".into(), 100_000)).unwrap();
         (Run { handle, events, _sessions: sessions }, provider)
@@ -5849,7 +5993,7 @@ mod tests {
     fn agent_holding(messages: Vec<Message>, window: u64, steps: Vec<Step>) -> (Agent, Arc<Scripted>, Receiver<Event>, [tempfile::TempDir; 2]) {
         let (dir, sessions) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (sender, events) = channel();
-        let config = Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() };
+        let config = Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false };
         let mut agent = Agent::new(config, sender, Box::new(|| {}), Arc::new(AtomicBool::new(false)));
         let provider = Arc::new(Scripted { steps: Mutex::new(steps.into()), ..Scripted::default() });
         agent.provider = Some(provider.clone());
@@ -7521,7 +7665,7 @@ mod tests {
             let (client, bodies) = server(vec![call_answer("mcp__srv__t", serde_json::json!({})), text_answer("done")]);
             let (sender, events) = channel();
             let sessions = tempfile::tempdir().unwrap();
-            let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default() }, sender, Box::new(|| {}));
+            let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
             handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
             let run = Run { handle, events, _sessions: sessions };
             run.handle.commands.send(Command::Send("go".into())).unwrap();
@@ -7894,7 +8038,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Send("hi".into())).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         let (log, _) = until_end(&run, Decision::Reject);
@@ -8255,4 +8399,7 @@ mod tests {
 
     /// An `explore` helper's conversation: kept, sealed, told, stopped, branched and deleted with the session.
     mod helper;
+
+    /// Code Mode: a program that calls the tools (`run_code`), its calls through the gate, and what is kept of them.
+    mod run_code;
 }

@@ -137,7 +137,7 @@ pub fn schemas() -> Value {
 }
 
 /// All the tools of a session: those every session has, and those that depend on what is on.
-pub fn schemas_for(web: bool, skills: bool, memory: bool, mcp: Vec<Value>) -> Value {
+pub fn schemas_for(web: bool, skills: bool, memory: bool, mcp: Vec<Value>, code_mode: bool) -> Value {
     let mut all = schemas();
     let Some(list) = all.as_array_mut() else { return all };
     let mut add = |more: Value| {
@@ -155,6 +155,13 @@ pub fn schemas_for(web: bool, skills: bool, memory: bool, mcp: Vec<Value>) -> Va
         add(crate::memory::schemas());
     }
     add(Value::Array(mcp));
+    // (last, as it tells what the others are)
+    if code_mode {
+        let run_code = crate::code_mode::schema(&all);
+        if let Some(list) = all.as_array_mut() {
+            list.push(run_code);
+        }
+    }
     all
 }
 
@@ -2788,6 +2795,7 @@ pub fn summary(tool: &str, arguments: &Value) -> String {
         "command_status" | "command_stop" => text("id").to_string(),
         "wake_at" => format!("{}: {}", arguments.get("delay_seconds").and_then(Value::as_u64).map_or(String::new(), |seconds| format!("{seconds} s")), text("note").chars().take(100).collect::<String>()),
         "explore" => text("task").lines().next().unwrap_or("").chars().take(100).collect(),
+        "run_code" => text("description").lines().next().unwrap_or("").chars().take(100).collect(),
         _ if tool.starts_with("mcp__") => arguments.to_string().chars().take(120).collect(),
         "web_search" => arguments.get("queries").and_then(Value::as_array).map_or(String::new(), |queries| queries.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
         _ => String::new(),
@@ -2822,14 +2830,14 @@ mod power_tests {
     #[test]
     fn the_tools_of_a_session_depend_on_what_is_on() {
         let names = |value: Value| value.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
-        let plain = names(schemas_for(false, false, false, Vec::new()));
+        let plain = names(schemas_for(false, false, false, Vec::new(), false));
         assert!(plain.contains(&"find_files".to_string()) && !plain.contains(&"skill".to_string()) && !plain.contains(&"web_read".to_string()) && !plain.contains(&"remember".to_string()));
-        let all = names(schemas_for(true, true, true, vec![json!({"type": "function", "function": {"name": "mcp__s__t"}})]));
+        let all = names(schemas_for(true, true, true, vec![json!({"type": "function", "function": {"name": "mcp__s__t"}})], false));
         assert!(all.contains(&"mcp__s__t".to_string()));
         for tool in ["skill", "web_read", "remember", "forget", "command_status"] {
             assert!(all.contains(&tool.to_string()), "{tool}");
         }
-        let schemas = schemas_for(false, false, false, Vec::new());
+        let schemas = schemas_for(false, false, false, Vec::new(), false);
         let command = schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "execute_command").unwrap();
         assert!(command["function"]["parameters"]["properties"].get("background").is_some());
     }
@@ -3059,7 +3067,7 @@ mod change_tests {
 
     #[test]
     fn a_session_is_told_of_the_network_as_a_thing_to_ask_for() {
-        let schemas = schemas_for(false, false, false, Vec::new());
+        let schemas = schemas_for(false, false, false, Vec::new(), false);
         let command = schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "execute_command").unwrap();
         assert!(command["function"]["parameters"]["properties"].get("network").is_some());
         assert!(command["function"]["parameters"]["properties"]["network"]["description"].as_str().unwrap().contains("Asks the user"));
@@ -3209,7 +3217,7 @@ mod tests {
     #[test]
     fn create_file_asks_for_parts_unless_the_provider_shows_a_call_as_it_is_written() {
         let description = |schemas: &Value| schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "create_file").unwrap()["function"]["description"].as_str().unwrap().to_string();
-        let mut schemas = schemas_for(true, true, true, Vec::new());
+        let mut schemas = schemas_for(true, true, true, Vec::new(), false);
         assert_eq!(description(&schemas), CREATE_FILE_IN_PARTS);
         assert!(description(&schemas).contains("Over about 300 lines"));
         let others: Vec<Value> = schemas.as_array().unwrap().iter().filter(|tool| tool["function"]["name"] != "create_file").cloned().collect();

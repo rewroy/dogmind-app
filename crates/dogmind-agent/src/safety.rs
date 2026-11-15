@@ -505,6 +505,8 @@ pub struct Gate {
     wide_read: Regex,
     /// The folders a command's programs are found in besides the one it runs in. None: the PATH a command starts with.
     pub path: Option<Vec<PathBuf>>,
+    /// Code Mode is on: `run_code` is a tool. Off, it is none, as any name the gate does not know.
+    pub code_mode: bool,
 }
 
 impl Default for Gate {
@@ -556,6 +558,7 @@ impl Gate {
             // Words that read many files, of which the keys are some: what names them one by one is looked at, and this is not.
             wide_read: Regex::new(r"(?i)^\s*((type|findstr)\b.*[*?]|findstr\b.*\s/[sfgd])").expect("the pattern is valid"),
             path: None,
+            code_mode: false,
         }
     }
 
@@ -655,6 +658,8 @@ impl Gate {
             "show_diff" | "todo" | "skill" | "remember" | "forget" | "command_status" | "command_stop" | "wake_at" | "check_page" | "ask_user" | "submit_plan" => Verdict::Allow,
             // (its own calls are each through this gate, and it has only the looking ones)
             "explore" => Verdict::Allow,
+            // (so are a program's: it does nothing but call tools, and each call is judged on its own)
+            "run_code" if self.code_mode => Verdict::Allow,
             "web_read" => Verdict::Allow,
             "web_search" => match crate::web::query_problem(arguments) {
                 Some(problem) => Verdict::Ask { risk: Risk::Medium, reason: Some(problem) },
@@ -900,6 +905,15 @@ mod network_words {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn run_code_is_a_tool_to_the_gate_only_with_code_mode_on_and_then_asks_no_one() {
+        let mut gate = Gate::new();
+        let work = Path::new("C:/work");
+        assert_eq!(gate.check("run_code", &json!({"code": "return 1;"}), work), Verdict::Deny("no such tool: run_code".into()));
+        gate.code_mode = true;
+        assert_eq!(gate.check("run_code", &json!({"code": "return 1;"}), work), Verdict::Allow);
+    }
 
     #[test]
     fn what_destroys_the_system_is_denied_in_every_spelling() {

@@ -673,7 +673,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let prompt = system_prompt(folder.path(), false, "", "");
         assert!(prompt.len() < 5_500, "the system prompt has grown to {} characters", prompt.len());
-        let tools = crate::tools::schemas_for(false, false, false, Vec::new()).to_string();
+        let tools = crate::tools::schemas_for(false, false, false, Vec::new(), false).to_string();
         // (5,150 until check_page took views and a wait: pictures at a phone's width and after an animation were what a real model, asked, missed most;
         // then steps, to click and type in a page as Playwright would, which the person asked for)
         // (then explore, a look by a helper in a context of its own, which saves a review far more than it costs: 197K tokens of one went on reading)
