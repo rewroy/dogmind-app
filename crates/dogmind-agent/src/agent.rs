@@ -719,13 +719,6 @@ const DRAFT_LINES: usize = 100;
 const PROSE_BETWEEN: usize = 2;
 /// The long side of a picture a model reads back from its own work.
 const OWN_PICTURE_SIDE: u32 = 1024;
-/// What a request is told it has cost, each time this much more has gone by with something written: on a slow model, this is over three minutes.
-const COST_NOTED_EVERY: u64 = 8000;
-
-fn cost_note(generated: u64) -> String {
-    format!("{}This request has cost {generated} tokens so far, about 40 a second. If what was asked for now exists, end your turn now with the result and what has not been run. Do not polish it or check it further.", prompt::DRAFT_NOTE)
-}
-
 /// Whether a line of reasoning is code, whichever language: sentences do not end in these, in English or in Japanese.
 fn is_code_line(line: &str) -> bool {
     let line = line.trim();
@@ -2159,7 +2152,7 @@ impl Agent {
         let (mut transient, mut overflow, mut failed_calls) = (0u32, 0u32, 0usize);
         let (mut cut_off, mut empties) = (0u32, 0u32);
         let mut drafts_stopped = 0u32;
-        let (mut generated, mut wrote, mut next_cost_note) = (0u64, false, COST_NOTED_EVERY);
+        let (mut generated, mut wrote) = (0u64, false);
         let mut repeats: HashMap<String, u32> = HashMap::new();
         // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
         let not_to_run = self.messages.iter().rev().filter(|message| message.role == "user").map(|message| message.content.as_deref().unwrap_or(""))
@@ -2499,12 +2492,6 @@ impl Agent {
                     return Ended::Failed(format!("the model made the same call {most} times with nothing edited in between: stopped so that you can look"));
                 }
                 unchecked = still_unchecked(unchecked, &[calls.as_slice(), nested.as_slice()].concat());
-                // (a local model's: what a service costs is not minutes of someone's waiting. It goes on if the work is not done.)
-                if cuts && wrote && generated >= next_cost_note {
-                    next_cost_note = generated + COST_NOTED_EVERY;
-                    self.intervened("cost_note", json!({"generated": generated}));
-                    self.push(Message::text("user", cost_note(generated)));
-                }
                 continue;
             }
             if completion.finish == "length" {
@@ -5023,7 +5010,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_request_with_something_written_is_told_what_it_has_cost_and_a_short_one_is_not() {
+    fn a_long_request_with_something_written_is_not_told_what_it_has_cost() {
         let answer = |tokens: u64| sse(&[
             serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-1", "function": {"name": "create_file", "arguments": serde_json::json!({"path": "a.html", "content": "x\n"}).to_string()}}]}, "finish_reason": "tool_calls"}]}),
             serde_json::json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": tokens}, "timings": {"predicted_per_second": 40.0}}),
@@ -5037,11 +5024,8 @@ mod tests {
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 3, "{log:?}");
         let last = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap().clone();
-        assert_eq!(last(1)["role"], "tool", "not yet");
-        assert_eq!(last(2)["role"], "user");
-        let said = last(2)["content"].as_str().unwrap().to_string();
-        assert!(said.contains("9500 tokens") && said.contains("end your turn"), "{said}");
-        assert!(prompt::is_nudge(&said), "not shown as something the person said");
+        assert_eq!(last(1)["role"], "tool");
+        assert_eq!(last(2)["role"], "tool", "after 9,500 tokens the work goes on from the tool's result, with no word from the app to end the turn");
     }
 
     #[test]
@@ -7687,9 +7671,9 @@ Body").unwrap();
     }
 
     #[test]
-    fn a_write_cut_off_counts_for_what_it_cost() {
+    fn a_long_write_is_not_told_what_it_has_cost() {
         let dir = tempfile::tempdir().unwrap();
-        // Each cut comes at some 3000 tokens as they are counted: three cuts are past where a note is due.
+        // Each cut comes at some 3000 tokens as they are counted: three cuts were past where a note of the cost was due, when the app sent one.
         let script = || pieces(&write_arguments(1000, usize::MAX));
         let (client, bodies) = trickling_server(vec![script(), script(), script(), script(), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
@@ -7697,7 +7681,7 @@ Body").unwrap();
         let (log, _) = until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         let told = bodies.iter().flat_map(|body| body["messages"].as_array().unwrap().iter()).filter_map(|message| message["content"].as_str()).any(|said| said.contains("This request has cost"));
-        assert!(told, "{log:?}");
+        assert!(!told, "nothing tells the model to end its turn over what it has written: {log:?}");
     }
 
     #[test]
