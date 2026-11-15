@@ -228,8 +228,19 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         if let Some(server) = line.v.get("server").filter(|server| server.is_object()) {
             // The app's first word minus the server's own time to its first token is a wait before the server began: the request was behind another's.
             if let (Some(first_ms), Some(ttft)) = (first.map(|first| first as f64), server.get("ttft_seconds").and_then(Value::as_f64)) {
-                let queued = (first_ms - ttft * 1000.0) / 1000.0;
-                if queued >= 1.0 {
+                // A call comes whole when the server has written it, so for an answer that was only a call the app's first word is the end of the generation, not the first token: the time
+                // the server took to write it (its tokens at its speed) is not a wait. It is taken where the app saw much less of the generation than the server says it made.
+                let after_ms = generation as f64;
+                let made_ms = completion.zip(server.get("decode_tokens_per_second").and_then(Value::as_f64)).filter(|(_, rate)| *rate > 0.0).map(|(tokens, rate)| tokens as f64 * 1000.0 / rate);
+                let unseen_ms = made_ms.filter(|made| after_ms * 2.0 < *made).map_or(0.0, |made| made - after_ms);
+                let queued = (first_ms - ttft * 1000.0 - unseen_ms) / 1000.0;
+                // (no speed from the server to take its writing from the wait: the first word of an answer that was only a call comes at the end of it)
+                let only_a_call = !calls.is_empty() && line.u("reasoning_chars") == Some(0) && line.u("content_chars") == Some(0);
+                if made_ms.is_none() && only_a_call && after_ms < 1000.0 && first_ms - ttft * 1000.0 >= 1000.0 {
+                    let _ = writeln!(out, "        queued at the server: cannot be told (the answer was only a call, which the server sends whole once it has written it, and it did not say how long that took)");
+                } else if queued >= 1.0 && unseen_ms > 0.0 {
+                    let _ = writeln!(out, "        queued at the server: {queued:.1} s (the app's first word came after {:.1} s, when the server had written the answer, which took it {:.1} s after its first token {ttft:.2} s after it began)", first_ms / 1000.0, unseen_ms / 1000.0);
+                } else if queued >= 1.0 {
                     let _ = writeln!(out, "        queued at the server: {queued:.1} s (the app's first word came after {:.1} s, the server's own first token {ttft:.2} s after it began)", first_ms / 1000.0);
                 }
             }
@@ -891,6 +902,38 @@ mod tests {
         assert!(said.contains("prepared in 0.3 s (grants 0.0 s, repositories 0.2 s, environment 0.0 s), ran 0.6 s, looked after in 0.1 s") || said.contains("prepared in 0.3 s (grants 0.0 s, repositories 0.3 s, environment 0.0 s), ran 0.6 s, looked after in 0.1 s"), "{said}");
         let compaction = json!({"t": "2026-11-05T10:01:00.000+09:00", "ev": "compaction", "turn": 1, "stage": "checkpoint", "before_tokens": 24962, "after_tokens": 18137, "window": 32768, "ms": 41341, "outcome": "ok"});
         assert!(report(&text(&[json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 4, "images": 0}), compaction]), None).contains("compaction (checkpoint): 24962 tokens to 18137 in 41.3 s, of a window of 32768"));
+    }
+
+    /// A call the server sends whole, once it has written it, is the app's first word at the end of the generation: the server's time to write it is not a wait before it began.
+    #[test]
+    fn a_call_sent_whole_at_the_end_is_not_counted_as_a_wait_at_the_server() {
+        let call_only = |n: u64, first: u64, completion: u64, server: Value| {
+            // 305 tokens: 7.3 s at 42 tokens a second, and the whole of the request is the wait for them (nothing after the first word)
+            let mut line = request(n, "2026-11-05T10:00:30.000+09:00", "main", first, first + 10, 5000, 0, completion, "stop");
+            line["server"] = server;
+            line["calls"] = json!(["create_file"]);
+            line["reasoning_chars"] = json!(0);
+            line["content_chars"] = json!(0);
+            line
+        };
+        let speed = json!({"ttft_seconds": 0.05, "decode_tokens_per_second": 42.0});
+        let begin = json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 4, "images": 0});
+        // 305 tokens at 42 tokens a second take 7.3 s, and that is the first word: no wait
+        let said = report(&text(&[begin.clone(), call_only(1, 7300, 305, speed.clone())]), None);
+        assert!(!said.contains("queued at the server"), "{said}");
+        // the same behind a request of 20 s
+        let said = report(&text(&[begin.clone(), call_only(1, 27_300, 305, speed.clone())]), None);
+        assert!(said.contains("queued at the server: 20.0 s (the app's first word came after 27.3 s, when the server had written the answer, which took it 7.3 s after its first token 0.05 s after it began)"), "{said}");
+        // no speed told: a first word that long cannot be taken for a wait, nor for none
+        let said = report(&text(&[begin.clone(), call_only(1, 7300, 305, json!({"ttft_seconds": 0.05}))]), None);
+        assert!(said.contains("queued at the server: cannot be told") && !said.contains("queued at the server: 7"), "{said}");
+        // an answer streamed as it was written: its first word is the first token, as it was
+        let mut streamed = request(1, "2026-11-05T10:00:30.000+09:00", "main", 10_400, 17_700, 5000, 0, 305, "stop");
+        streamed["server"] = json!({"ttft_seconds": 0.4, "decode_tokens_per_second": 42.0});
+        streamed["reasoning_chars"] = json!(900);
+        streamed["content_chars"] = json!(0);
+        let said = report(&text(&[begin.clone(), streamed]), None);
+        assert!(said.contains("queued at the server: 10.0 s (the app's first word came after 10.4 s, the server's own first token 0.40 s after it began)"), "{said}");
     }
 
     #[test]
