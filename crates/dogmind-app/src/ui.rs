@@ -11798,6 +11798,7 @@ impl App {
                     if let Ok(info) = &result {
                         client.suppresses_letters = info.suppresses_letters;
                         client.tool_writing = info.tool_writing;
+                        client.vision = info.vision;
                     }
                     poster.send(match result {
                         Ok(info) => Note::Connected { generation, model: if provider.model.is_empty() { info.model } else { provider.model }, window: info.context, straydog: info.straydog, vision: info.vision, provider: Arc::new(client) },
@@ -11818,6 +11819,7 @@ impl App {
                         client.replay_reasoning = info.straydog;
                         client.suppresses_letters = info.suppresses_letters;
                         client.tool_writing = info.tool_writing;
+                        client.vision = info.vision;
                         Ok::<_, String>((client, info))
                     })();
                     poster.send(match result {

@@ -2933,6 +2933,10 @@ impl Agent {
     /// A picture for the model to see, where a tool's result can hold one. Copied to the session's folder as one the person attached.
     fn read_picture(&mut self, path: &Path) -> (Result<String, String>, Vec<ImageRef>) {
         let shown = path.display();
+        // (a model whose server says it reads no pictures would refuse the next request for it: told now, with nothing sent)
+        if self.provider.as_ref().and_then(|provider| provider.reads_pictures()) == Some(false) {
+            return (Err(format!("{shown} is a picture, and this model reads no pictures. Say so, and go on without it.")), Vec::new());
+        }
         if !self.provider.as_ref().is_some_and(|provider| provider.images_in_tool_results()) {
             return (Err(format!("{shown} is a picture, and this model cannot be shown one by a tool. Say so, and ask the user to attach it to a message.")), Vec::new());
         }
@@ -5376,6 +5380,8 @@ mod tests {
         steps: Mutex<std::collections::VecDeque<Step>>,
         seen: Mutex<Vec<(Vec<Message>, Value)>>,
         tool_pictures: bool,
+        /// What the server says of the model's pictures (None: it says nothing).
+        reads: Option<bool>,
     }
 
     impl Scripted {
@@ -5397,6 +5403,9 @@ mod tests {
         }
         fn images_in_tool_results(&self) -> bool {
             self.tool_pictures
+        }
+        fn reads_pictures(&self) -> Option<bool> {
+            self.reads
         }
     }
 
@@ -7538,6 +7547,20 @@ mod tests {
         let (failed, _) = turn_said(&run);
         assert_eq!(failed, [llm::NO_VISION]);
         assert_eq!(provider.requests(), 1);
+    }
+
+    #[test]
+    fn a_picture_opened_for_a_model_that_reads_none_is_refused_with_no_request_spent_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), images::tests::encoded(16, 16, image::ImageFormat::Png)).unwrap();
+        let read = || calls(&[("read_file", serde_json::json!({"path": "shot.png"}))]);
+        // (a server whose tool results could hold one, and which says this model reads none)
+        let (run, provider) = scripted_as(dir.path(), Scripted { steps: Mutex::new(vec![read(), says("no picture then")].into()), tool_pictures: true, reads: Some(false), ..Scripted::default() }, Mode::Default);
+        run.handle.commands.send(Command::Send("look".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log[0].starts_with("tool:false:") && log[0].contains("reads no pictures"), "{log:?}");
+        assert_eq!(provider.requests(), 2, "the answer after the tool is the second request, and no refused one is between");
+        assert!(provider.messages(1).iter().all(|message| message.images.is_empty()));
     }
 
     #[test]

@@ -469,6 +469,10 @@ pub trait Provider: Send + Sync {
     fn images_in_tool_results(&self) -> bool {
         false
     }
+    /// Whether the model reads pictures at all, where its server says: Some(false) is one a picture would only be refused by.
+    fn reads_pictures(&self) -> Option<bool> {
+        None
+    }
     /// Whether a call it was still writing can join the conversation as far as it had come. A provider with blocks of its own to send back cannot make those up.
     fn keeps_cut_writes(&self) -> bool {
         false
@@ -500,7 +504,11 @@ impl Provider for Client {
 
     /// Straydog's API takes them, and its template shows them inside the tool's response. The services' chat completions take text there.
     fn images_in_tool_results(&self) -> bool {
-        self.replay_reasoning
+        self.replay_reasoning && self.vision != Some(false)
+    }
+
+    fn reads_pictures(&self) -> Option<bool> {
+        self.vision
     }
 
     fn answers(&self) -> bool {
@@ -555,11 +563,13 @@ pub struct Client {
     pub suppresses_letters: bool,
     /// The server says it can send the calls as the model writes them (see [`WRITING`]): an older one refuses the request that asks.
     pub tool_writing: bool,
+    /// Whether the model reads pictures, where the server says (`/props`): a picture is never sent to one that does not.
+    pub vision: Option<bool>,
 }
 
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
-        Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false })
+        Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None })
     }
 
     /// The request a model's turn is sent as, for this server.
@@ -867,6 +877,19 @@ mod tests {
         assert!(!described(r#"{"tool_writing": false}"#).tool_writing);
         assert!(!described(r#"{"tool_writing": "yes"}"#).tool_writing);
         assert!(!described("{}").tool_writing);
+    }
+
+    #[test]
+    fn a_tool_result_holds_a_picture_only_for_a_model_that_is_not_said_to_read_none() {
+        let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        assert!(client.images_in_tool_results() && client.reads_pictures().is_none(), "a server that says nothing");
+        client.vision = Some(true);
+        assert!(client.images_in_tool_results());
+        client.vision = Some(false);
+        assert!(!client.images_in_tool_results() && client.reads_pictures() == Some(false));
+        client.vision = None;
+        client.replay_reasoning = false;
+        assert!(!client.images_in_tool_results(), "a server that is not Straydog, as before");
     }
 
     /// The head of the request a server is sent by `stream`, as the server reads it, lower-cased.
