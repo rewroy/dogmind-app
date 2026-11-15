@@ -649,6 +649,22 @@ pub struct Row {
     pub band: Option<Band>,
     /// The part of the band going on now, at its end.
     pub live_part: Option<BandPart>,
+    /// The turn a band row is of: a press on a part of it goes to the step it was of.
+    pub turn: u64,
+}
+
+/// The step of a turn a time of its band (milliseconds after it began) was in: the one whose request or calls ran then, else the last that had
+/// begun by then.
+pub fn step_at(turn: &TurnPath, ms: u64) -> Option<usize> {
+    let start = timeline::millis(&turn.started)?;
+    let after = |time: &str| timeline::millis(time).map(|at| (at - start).max(0) as u64);
+    let spans: Vec<(usize, u64, u64)> = turn.steps.iter().enumerate().filter_map(|(place, step)| {
+        let begin = after(&step.started)?;
+        // (a step lasts while its calls run too: they are its)
+        let calls_end = step.calls.iter().filter_map(|call| after(&call.started).map(|from| from + call.wait_ms.unwrap_or(0) + call.ms)).max().unwrap_or(0);
+        Some((place, begin, (begin + step.ms).max(calls_end)))
+    }).collect();
+    spans.iter().find(|(_, begin, end)| (*begin..(*end).max(*begin + 1)).contains(&ms)).or_else(|| spans.iter().filter(|(_, begin, _)| *begin <= ms).last()).map(|(place, ..)| *place)
 }
 
 /// The parts a band's key names, in the order it names them: those that are in the band, then whether it has the app's own marks.
@@ -692,7 +708,7 @@ fn band_row(turn: &TurnPath, is_live: bool, context: &Context) -> Option<Row> {
             live_part = Some(BandPart { lane, from, to: now, part });
         }
     }
-    (band.length > 0).then(|| Row { kind: Kind::Band, indent: 1, band: Some(band), live_part, ..Row::default() })
+    (band.length > 0).then(|| Row { kind: Kind::Band, indent: 1, band: Some(band), live_part, turn: turn.turn, ..Row::default() })
 }
 
 /// What the rows are made from besides the files.
@@ -1723,6 +1739,22 @@ mod tests {
         assert!(shown.contains(&"To the first token: 0.60 s".to_string()) && !shown.iter().any(|text| text.starts_with("Drafted tokens")), "{shown:#?}");
         let all = texts(&rows_for(&timeline, &Live::new(Instant::now()), &opened(Some(Key::Server(1, 0)))));
         assert!(all.contains(&"Drafted tokens: 65".to_string()) && all.contains(&"What the server says".to_string()), "{all:#?}");
+    }
+
+    /// A press on the band goes to the step whose request or calls ran at that time; between two, to the one begun before.
+    #[test]
+    fn a_time_of_the_band_is_in_the_step_that_ran_then() {
+        let at = |seconds: &str| format!("2026-11-05T10:00:{seconds}+09:00");
+        let step = |started: &str, ms: u64, calls: Vec<CallRow>| Step { kind: StepKind::Model, started: at(started), ms, calls, ..Step::default() };
+        let running = CallRow { started: at("03.000"), ms: 4000, ..call("c", "execute_command", "cargo", "ok") };
+        let first = step("01.000", 2000, vec![running]);
+        let second = step("09.000", 1000, Vec::new());
+        let turn = TurnPath { turn: 1, started: at("00.000"), steps: vec![first, second], ..TurnPath::default() };
+        assert_eq!(step_at(&turn, 1500), Some(0), "its request");
+        assert_eq!(step_at(&turn, 5000), Some(0), "its call");
+        assert_eq!(step_at(&turn, 8000), Some(0), "between: the one begun before");
+        assert_eq!(step_at(&turn, 9500), Some(1));
+        assert_eq!(step_at(&turn, 500), None, "before any began");
     }
 
     #[test]

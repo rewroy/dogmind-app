@@ -400,12 +400,38 @@ impl App {
         self.timeline_row_at(y).and_then(|at| self.timeline.rows[at].key)
     }
 
-    /// A press on a row that opens: it opens or shuts, and the keys are on it.
-    pub(super) unsafe fn timeline_click(&mut self, y: i32) {
+    /// A press on a row that opens: it opens or shuts, and the keys are on it. On a turn's band: the step that ran at that time opens, in view.
+    pub(super) unsafe fn timeline_click(&mut self, x: i32, y: i32) {
+        if let Some(at) = self.timeline_row_at(y).filter(|at| self.timeline.rows[*at].kind == path::Kind::Band) {
+            self.timeline_band_click(at, x);
+            return;
+        }
         if let Some(key) = self.timeline_key_at(y) {
             self.timeline.selected = Some(key);
             self.timeline_toggle(key, None);
         }
+    }
+
+    /// From where the wait was to what it was: the time under the pointer, as the band was drawn (its left and its width are a row's at its indent),
+    /// is in a step, which is opened and brought to the top of the view.
+    unsafe fn timeline_band_click(&mut self, at: usize, x: i32) {
+        let row = &self.timeline.rows[at];
+        let (Some(length), turn, indent) = (row.band.as_ref().map(|band| band.length), row.turn, row.indent) else { return };
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(self.timeline.window, &mut client);
+        let level = s(LEVEL) * i32::from(indent);
+        let (left, width) = (s(PAD) + level, (self.timeline_content_width(client.right) - level).max(1));
+        let ms = (f64::from((x - left).clamp(0, width)) / f64::from(width) * length as f64) as u64;
+        let Some(place) = self.timeline.timeline.as_ref().and_then(|timeline| timeline.turns.iter().find(|path| path.turn == turn)).and_then(|path| path::step_at(path, ms)) else { return };
+        let key = Key::Step(turn, place);
+        self.timeline.selected = Some(key);
+        self.timeline_toggle(key, Some(true));
+        if let Some(placed) = self.timeline.rows.iter().position(|row| row.key == Some(key)).and_then(|row| self.timeline.placed.get(row).copied()) {
+            self.timeline_to(placed.top - s(ds::space::S));
+        }
+        InvalidateRect(self.timeline.window, std::ptr::null(), 0);
     }
 
     /// A row opened or shut (`open`: which, or the other of what it is), the row staying where it stands in the window and not the content under it.
@@ -981,7 +1007,7 @@ unsafe extern "system" fn timeline_procedure(window: HWND, message: u32, wparam:
                     app.timeline_to((i64::from(y - grab - head) * i64::from(total - view) / i64::from((view - tall).max(1))) as i32);
                 }
             } else {
-                app.timeline_click(y);
+                app.timeline_click(x, y);
             }
             0
         }
