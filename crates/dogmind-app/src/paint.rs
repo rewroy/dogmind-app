@@ -945,7 +945,7 @@ fn on_the_cross(client: RECT, x: i32, y: i32, dpi: u32) -> bool {
 }
 
 /// A small copy, in rounded corners, its alpha over what is there.
-unsafe fn draw_thumb(device: HDC, bitmap: HBITMAP, x: i32, y: i32, width: i32, height: i32, radius: i32) {
+pub(crate) unsafe fn draw_thumb(device: HDC, bitmap: HBITMAP, x: i32, y: i32, width: i32, height: i32, radius: i32) {
     let source = CreateCompatibleDC(device);
     let previous = SelectObject(source, bitmap);
     let round = CreateRoundRectRgn(x, y, x + width + 1, y + height + 1, radius * 2, radius * 2);
