@@ -142,7 +142,7 @@ pub fn schemas() -> Value {
             "delay_seconds": {"type": "integer", "description": "60 to 86400."},
             "note": {"type": "string"}
         }), &["delay_seconds", "note"]),
-        function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
+        function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads. Not for one file: read that file yourself.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
     ])
 }
 
@@ -1375,7 +1375,14 @@ fn outline(lines: &[&str]) -> Vec<(usize, usize)> {
 /// A large file, as its head and its outline: each part's first line with its number, to read with `start_line` and `limit`.
 fn outlined(lines: &[&str], parts: &[(usize, usize)], size: u64) -> String {
     let shown = |line: &str| -> String { if line.len() > 160 { format!("{}…", &line[..line.floor_char_boundary(160)]) } else { line.to_string() } };
-    let mut out = format!("--- {} lines, {} KB: more than to read whole. Its first lines, then where its parts begin ---\n", lines.len(), size / 1024);
+    // (and the way to all of it, for a task that needs all of it, such as summing a document up: a model given only the outline once took
+    // the long way round, a helper that read it all again, 105 s of a 186-s task)
+    let reads = lines.len().div_ceil(500).max((size as usize).div_ceil(MAX_READ));
+    let mut out = format!(
+        "--- {} lines, {} KB: more than to read whole at once. Its first lines, then where its parts begin. All of it is {reads} reads: read_file with start_line=1, then from where each one says to go on ---\n",
+        lines.len(),
+        size / 1024
+    );
     for (at, line) in lines.iter().enumerate().take(OUTLINE_HEAD) {
         out.push_str(&format!("{}|{}\n", at + 1, shown(line)));
     }
@@ -3663,6 +3670,9 @@ mod tests {
         assert!(out.starts_with("--- ") && out.contains("--- outline ---") && out.contains("|pub fn part_59(x: u32) -> u32 {") && out.contains("start_line and limit"), "{}", &out[..out.len().min(600)]);
         assert!(!out.contains("let v7 = x + 59;"), "the bodies are not in it");
         assert!(out.len() < 8000, "{}", out.len());
+        // (and how to read all of it, where all of it is wanted: its lines in reads of 500)
+        let reads = source.lines().count().div_ceil(500);
+        assert!(out.lines().next().unwrap().contains(&format!("All of it is {reads} reads: read_file with start_line=1")), "{}", out.lines().next().unwrap());
         // A place asked for is read as it was.
         let part = bench.run("read_file", &json!({"path": "big.rs", "start_line": 100, "limit": 5}), dir.path(), &cancel).unwrap();
         assert!(part.starts_with("100|") && !part.contains("outline"), "{part}");
