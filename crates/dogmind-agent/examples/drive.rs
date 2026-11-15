@@ -88,6 +88,7 @@ fn main() {
         instructions: None,
         home: None,
         skills_off: Vec::new(),
+        skills_on: Vec::new(),
         memory: None,
         mcp: None,
         policy: Default::default(),

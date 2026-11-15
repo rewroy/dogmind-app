@@ -139,6 +139,9 @@ pub enum Command {
     SetLanguage(String),
     /// The skills turned off, by name. A session already begun keeps the list its prompt was written with, but cannot read one that is off.
     SetSkillsOff(Vec<String>),
+    /// The skills the person turned on, by name: one that needs what this app has not (a server not configured, another app's feature) is offered
+    /// only so. As [`Command::SetSkillsOff`] for a session already begun.
+    SetSkillsOn(Vec<String>),
     /// Files that hold keys, as the settings name them: reading one asks, as for any other place secrets are kept.
     SetSecrets(Vec<PathBuf>),
     /// Have a local engine read what every new session begins with, before the first message needs it.
@@ -436,6 +439,8 @@ pub struct Config {
     pub home: Option<PathBuf>,
     /// The skills the person has turned off, by name: neither offered to the model nor started by `/name`.
     pub skills_off: Vec<String>,
+    /// The skills the person turned on: of those that need what this app has not, only these are offered.
+    pub skills_on: Vec<String>,
     /// The folder of the notes kept between sessions. None: no notes are kept.
     pub memory: Option<PathBuf>,
     /// The MCP servers, shared by every session.
@@ -1016,6 +1021,7 @@ struct Agent {
     home: Option<PathBuf>,
     /// The skills the person has turned off, by name.
     skills_off: Vec<String>,
+    skills_on: Vec<String>,
     memory: Option<PathBuf>,
     mcp: Option<Arc<mcp::Hub>>,
     policy: Arc<crate::conversation_key::Policy>,
@@ -1266,6 +1272,7 @@ impl Agent {
             tool_schemas: tools::schemas_for(config.web.enabled, false, false, Vec::new(), config.code_mode),
             home: config.home,
             skills_off: config.skills_off,
+            skills_on: config.skills_on,
             memory: config.memory,
             mcp: config.mcp,
             policy: config.policy,
@@ -1390,12 +1397,11 @@ impl Agent {
                 Command::SetLanguage(language) => self.language = language,
                 Command::SetSkillsOff(names) => {
                     self.skills_off = names;
-                    if self.messages.is_empty() {
-                        self.load_extras();
-                    } else {
-                        // (its prompt and its tools are the engine's kept prefix: only what may be read changes)
-                        self.bench.skills = skills::without(skills::discover(&self.workspace, self.home.as_deref()), &self.skills_off);
-                    }
+                    self.skills_changed();
+                }
+                Command::SetSkillsOn(names) => {
+                    self.skills_on = names;
+                    self.skills_changed();
                 }
                 Command::SetSecrets(files) => {
                     self.gate.secrets.truncate(1);
@@ -1518,8 +1524,27 @@ impl Agent {
 
     /// What depends on the workspace and the settings: its skills, the notes' folder, and so the tools on offer.
     fn load_extras(&mut self) {
-        let found = skills::without(skills::discover(&self.workspace, self.home.as_deref()), &self.skills_off);
+        let found = self.allowed(skills::discover(&self.workspace, self.home.as_deref()));
         self.extras_with(found);
+    }
+
+    /// The skills the model may be told of and start: not one the person turned off, nor one that needs what this app has not (a server not
+    /// configured, another app's feature) unless they turned it on. The window decides the same for what it shows; this holds before it has said
+    /// (a warm-up as a conversation begins), and where there is no window.
+    fn allowed(&self, found: Vec<skills::Skill>) -> Vec<skills::Skill> {
+        let servers = self.mcp.as_ref().map_or(Vec::new(), |hub| hub.server_parts());
+        let named = |list: &[String], skill: &skills::Skill| list.iter().any(|name| name.eq_ignore_ascii_case(&skill.name));
+        found.into_iter().filter(|skill| !named(&self.skills_off, skill) && (named(&self.skills_on, skill) || skill.needs_what_is_not_here(&servers).is_none())).collect()
+    }
+
+    /// What the person turned on or off: with no conversation yet, what one begins with; in one, only what may be read (its prompt and its tools
+    /// are the engine's kept prefix).
+    fn skills_changed(&mut self) {
+        if self.messages.is_empty() {
+            self.load_extras();
+        } else {
+            self.bench.skills = self.allowed(skills::discover(&self.workspace, self.home.as_deref()));
+        }
     }
 
     /// The tools and what the bench holds, with these skills.
@@ -1747,7 +1772,9 @@ impl Agent {
             // whole prefix again (4.6K tokens, 3.6 s on DeepSeek) where it had just read it.
             if let Some(warmed) = self.warmed.take().filter(|warmed| warmed.workspace == self.workspace) {
                 let fresh = std::mem::take(&mut self.bench.skills);
-                self.extras_with(warmed.skills);
+                // (what the person has turned off since, or on, counts: the warm-up's are taken as they would be found now)
+                let kept = self.allowed(warmed.skills);
+                self.extras_with(kept);
                 if self.frozen_prompt() != warmed.prompt || self.tool_schemas != warmed.tools {
                     // (the person's settings, notes or instructions have changed since: the conversation begins with them)
                     self.extras_with(fresh);
@@ -3812,7 +3839,7 @@ mod tests {
     fn run_agent(workspace: &Path, client: Client, mode: Mode) -> Run {
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         Run { handle, events, _sessions: sessions }
     }
@@ -4869,7 +4896,7 @@ mod tests {
         ]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send("go".into())).unwrap();
@@ -5393,7 +5420,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let file = sessions.path().join("instructions.md");
         std::fs::write(&file, "回答の最後に参考にしたファイルを挙げてください").unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: true, instructions: Some(file), home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: true, instructions: Some(file), home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send("修正".into())).unwrap();
@@ -5441,7 +5468,7 @@ mod tests {
         let (client, bodies) = server(vec![call_answer("skill", serde_json::json!({"name": "pdf"})), text_answer("read it"), text_answer("started")]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: work.clone(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: Some(home), skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: work.clone(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: Some(home), skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send("convert it".into())).unwrap();
@@ -5505,7 +5532,7 @@ mod tests {
         ]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send(format!("read {page}"))).unwrap();
@@ -5531,7 +5558,7 @@ mod tests {
         ]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send(format!("read {page}"))).unwrap();
@@ -5771,6 +5798,58 @@ mod tests {
         assert_eq!(tools[0].1, tools[1].1);
     }
 
+    /// A skill that needs what this app has not (here a server's tools) is not offered from the warm-up on, before the window has said anything;
+    /// one the person turned on is; and one the person turns off after the warm-up is not brought back by it.
+    #[test]
+    fn a_skill_that_cannot_work_here_is_left_out_from_the_warm_up_on_and_one_turned_off_after_it_stays_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, description: &str| {
+            let folder = dir.path().join(".claude/skills").join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("SKILL.md"), format!("---
+name: {name}
+description: {description}
+---
+Body")).unwrap();
+        };
+        write("browser", "Drives a browser through mcp__Claude_Browser__tabs.");
+        write("haiku", "Writes haiku");
+        write("limerick", "Writes limericks");
+        let (run, provider) = scripted(dir.path(), vec![says("warm"), says("ok")], Mode::Default);
+        run.handle.commands.send(Command::WarmPrefix).unwrap();
+        while provider.requests() == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        run.handle.commands.send(Command::SetSkillsOff(vec!["limerick".into()])).unwrap();
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let prompt = |at: usize| provider.messages(at)[0].content.clone().unwrap_or_default();
+        assert!(!prompt(0).contains("- browser:") && prompt(0).contains("- haiku:") && prompt(0).contains("- limerick:"), "{}", prompt(0));
+        assert!(!prompt(1).contains("- browser:") && prompt(1).contains("- haiku:"), "{}", prompt(1));
+        assert!(!prompt(1).contains("- limerick:"), "turned off after the warm-up, and not brought back by it");
+        // One written for another app's feature, turned on by the person, is offered, warm-up and all (one whose server's tools are not here is
+        // not listed whatever the person says: there is nothing to call).
+        let other = tempfile::tempdir().unwrap();
+        let folder = other.path().join(".claude/skills/research");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("SKILL.md"), "---
+name: research
+description: This skill coordinates research subagents, so use it only with a tool for spawning them.
+---
+Body").unwrap();
+        let listed = |on: Vec<String>| {
+            let (run, provider) = scripted(other.path(), vec![says("warm"), says("ok")], Mode::Default);
+            run.handle.commands.send(Command::SetSkillsOn(on)).unwrap();
+            run.handle.commands.send(Command::WarmPrefix).unwrap();
+            run.handle.commands.send(Command::Send("hi".into())).unwrap();
+            until_end(&run, Decision::Approve);
+            assert_eq!(provider.messages(0)[0].content, provider.messages(1)[0].content);
+            provider.messages(1)[0].content.as_deref().unwrap_or("").contains("- research:")
+        };
+        assert!(!listed(Vec::new()), "off until the person says");
+        assert!(listed(vec!["research".into()]));
+    }
+
     #[test]
     fn what_the_person_turns_on_between_the_warm_up_and_the_first_message_is_in_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -5881,7 +5960,7 @@ mod tests {
     /// The same, with the folder of the sessions made by the test: a step that must know where the session's own files are can then look.
     fn scripted_with(workspace: &Path, sessions: tempfile::TempDir, provider: Scripted, mode: Mode) -> (Run, Arc<Scripted>) {
         let (sender, events) = channel();
-        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         let provider = Arc::new(provider);
         handle.commands.send(Command::Provider(provider.clone(), "model".into(), 100_000)).unwrap();
         (Run { handle, events, _sessions: sessions }, provider)
@@ -6042,7 +6121,7 @@ mod tests {
     fn agent_holding(messages: Vec<Message>, window: u64, steps: Vec<Step>) -> (Agent, Arc<Scripted>, Receiver<Event>, [tempfile::TempDir; 2]) {
         let (dir, sessions) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (sender, events) = channel();
-        let config = Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false };
+        let config = Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false };
         let mut agent = Agent::new(config, sender, Box::new(|| {}), Arc::new(AtomicBool::new(false)));
         let provider = Arc::new(Scripted { steps: Mutex::new(steps.into()), ..Scripted::default() });
         agent.provider = Some(provider.clone());
@@ -7714,7 +7793,7 @@ mod tests {
             let (client, bodies) = server(vec![call_answer("mcp__srv__t", serde_json::json!({})), text_answer("done")]);
             let (sender, events) = channel();
             let sessions = tempfile::tempdir().unwrap();
-            let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+            let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
             handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
             let run = Run { handle, events, _sessions: sessions };
             run.handle.commands.send(Command::Send("go".into())).unwrap();
@@ -8087,7 +8166,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Send("hi".into())).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         let (log, _) = until_end(&run, Decision::Reject);

@@ -7,7 +7,7 @@ use crate::conversation_key::{Cipher, Policy, LOCKED};
 fn run_under(workspace: &Path, client: Client, policy: Arc<Policy>, memory: Option<PathBuf>) -> Run {
     let (sender, events) = channel();
     let sessions = tempfile::tempdir().unwrap();
-    let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory, mcp: None, policy, code_mode: false }, sender, Box::new(|| {}));
+    let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory, mcp: None, policy, code_mode: false }, sender, Box::new(|| {}));
     handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
     Run { handle, events, _sessions: sessions }
 }
