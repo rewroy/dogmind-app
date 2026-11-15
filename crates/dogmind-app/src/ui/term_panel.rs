@@ -341,14 +341,11 @@ impl App {
         }
     }
 
-    /// The page of a view with no terminal in it: its name and how to begin one.
-    unsafe fn layout_terminal_page(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32) {
+    /// The page of a view with no terminal in it: the way to begin one, alone. (The view's name is over it already: a prompt's mark and the
+    /// name again under it read as a stray `>`.)
+    unsafe fn layout_terminal_page(&mut self, _shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32) {
         let s = |value: i32| scale(self.dpi, value);
-        let mut y = top + s(ds::space::XL);
-        shapes.push(Shape::Icon { name: "terminal", area: rect(x, y, s(ds::size::ICON_LARGE), s(ds::size::ICON_LARGE)), size: s(ds::size::ICON_LARGE), color: theme::muted() });
-        y += s(ds::size::ICON_LARGE) + s(ds::space::S);
-        shapes.push(Shape::Text { area: rect(x, y, width, s(ds::space::XL)), text: t("Terminal").to_string(), font: FontKind::Strong, color: theme::text(), flags: ONE_LINE });
-        y += s(ds::size::QUEUE_STEP) + s(ds::space::M);
+        let y = top + s(ds::space::XL);
         // The button for a new terminal, in the shell last used, and the arrow beside it for the others.
         let words = t("New terminal");
         let button_width = (text_width(self.fonts.strong, words) + s(ds::size::BUTTON_PADDING)).min(width - s(ds::size::CONTROL) - s(ds::space::XS));
