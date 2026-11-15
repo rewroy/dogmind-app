@@ -257,6 +257,8 @@ pub struct Settings {
     /// The shell the last new terminal was started with, by its name in `term::shells` (`pwsh`, `powershell`, `cmd`, `git-bash`); empty before one was chosen.
     pub terminal_shell: String,
     pub web_tools: bool,
+    /// Code Mode: the model may run a short program that calls several tools at once (`run_code`) instead of calling them one at a time. Off by default. A conversation that has begun keeps the tools it began with.
+    pub code_mode: bool,
     /// What answers are written in: `auto`, `ja` or `en`.
     pub language: String,
     /// What the interface is written in: `system`, `en` or `ja`.
@@ -358,6 +360,7 @@ impl Default for Settings {
             right_view: RightView::Overview,
             terminal_shell: String::new(),
             web_tools: true,
+            code_mode: false,
             language: "auto".into(),
             display_language: "system".into(),
             theme: "system".into(),
@@ -660,6 +663,16 @@ mod tests {
         // (and a settings file from before has no list of what was turned on)
         let older: Settings = serde_json::from_str(r#"{"skills_off": ["pdf"]}"#).unwrap();
         assert!(!older.skill_is_on("pdf", false) && older.skills_on.is_empty());
+    }
+
+    #[test]
+    fn code_mode_is_off_until_it_is_turned_on_and_a_file_that_does_not_say_has_it_off() {
+        assert!(!Settings::default().code_mode);
+        let older: Settings = serde_json::from_str(r#"{"active": "This PC", "web_tools": false}"#).unwrap();
+        assert!(!older.code_mode);
+        let on: Settings = serde_json::from_str(r#"{"code_mode": true}"#).unwrap();
+        assert!(on.code_mode);
+        assert!(serde_json::from_str::<Settings>(&serde_json::to_string(&on).unwrap()).unwrap().code_mode);
     }
 
     #[test]
