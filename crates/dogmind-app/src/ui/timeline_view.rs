@@ -50,6 +50,9 @@ const CARD_PAD: i32 = 10;
 /// The Timeline view's window, and what it shows.
 pub(super) struct TimelineView {
     pub window: HWND,
+    /// The field to look for something in the path, and what is looked for there (in small letters).
+    pub search: HWND,
+    query: String,
     pub live: path::Live,
     timeline: Option<Timeline>,
     /// Why the last read failed, if it did.
@@ -94,8 +97,12 @@ impl TimelineView {
         RegisterClassW(&class);
         let title = wide("Timeline");
         let window = CreateWindowExW(0, class_name.as_ptr(), title.as_ptr(), WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP, 0, 0, 0, 0, parent, std::ptr::null_mut(), instance, std::ptr::null());
+        // (a child of the window, as the panel's other fields are: what it tells comes to the window's own procedure)
+        let search = control(parent, "EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL as u32, 0, 0);
         TimelineView {
             window,
+            search,
+            query: String::new(),
             live: path::Live::new(Instant::now()),
             timeline: None,
             error: None,
@@ -186,22 +193,29 @@ impl App {
         };
         // (the time now, for the band of the turn at work to reach)
         let wall_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
-        path::Inputs { running: self.running, wait, background: self.waiting.commands.len() + self.waiting.waits.len(), wall_ms }
+        path::Inputs { running: self.running, wait, background: self.waiting.commands.len() + self.waiting.waits.len(), wall_ms, query: self.timeline.query.clone() }
     }
 
     /// Nothing of the view is on screen: its window goes, and the keys go back to the composer if it had them.
     pub(super) unsafe fn timeline_hidden(&mut self) {
-        let had_the_keys = GetFocus() == self.timeline.window;
+        let had_the_keys = [self.timeline.window, self.timeline.search].contains(&GetFocus());
         show(self.timeline.window, false);
+        show(self.timeline.search, false);
         if had_the_keys {
             self.focus_composer();
         }
     }
 
     /// The view from `top` to the foot of the window, with the panel's margins; read again if anything happened while it was out of sight.
-    pub(super) unsafe fn layout_timeline_view(&mut self, x: i32, width: i32, top: i32, bottom: i32) {
+    pub(super) unsafe fn layout_timeline_view(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32, bottom: i32) {
         let s = |value: i32| scale(self.dpi, value);
         let margin = s(ds::size::RIGHT_GAP);
+        // The field to look for something in the path, over it, in a field drawn as the panel's others are.
+        let field = rect(x, top + s(ds::space::XS), width, s(ds::size::FIELD_TEXT) + 2 * s(ds::size::FIELD_INSET));
+        shapes.push(Shape::Round { area: field, radius: s(ds::radius::SMALL), fill: Some(theme::surface()), border: Some(theme::line()) });
+        place(self.timeline.search, field.left + s(ds::space::S), field.top + s(ds::size::FIELD_INSET), (field.right - field.left) - 2 * s(ds::space::S), s(ds::size::FIELD_TEXT));
+        show(self.timeline.search, true);
+        let top = field.bottom + s(ds::space::XS);
         // (as wide as the files' list: a little way from the panel's edge)
         place(self.timeline.window, x - margin + s(ds::space::S), top, width + 2 * margin - 2 * s(ds::space::S), (bottom - top).max(s(60)));
         let was_hidden = IsWindowVisible(self.timeline.window) == 0;
@@ -213,6 +227,14 @@ impl App {
         if self.timeline.made_from.as_ref().is_some_and(|made| made.2 != self.timeline_inputs()) {
             InvalidateRect(self.timeline.window, std::ptr::null(), 0);
         }
+    }
+
+    /// What is looked for has changed: the path shows only what has it, at once (it is read from what is already there).
+    pub(super) unsafe fn timeline_query_changed(&mut self) {
+        self.timeline.query = get_text(self.timeline.search).trim().to_lowercase();
+        self.timeline.scroll = 0;
+        self.timeline.follow = self.timeline.query.is_empty();
+        InvalidateRect(self.timeline.window, std::ptr::null(), 0);
     }
 
     /// The session on screen is another: nothing of the last is its.

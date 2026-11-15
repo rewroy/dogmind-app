@@ -4,7 +4,7 @@
 //! Nothing is made up. The model's words are its own, and the person's request is theirs; a line that is neither is the app's (marked as such), or is drawn from the call the model made (and says so).
 //! Every word that comes from a conversation is shown as the conversation shows it: what acts on text and shows nothing is shown as its mark, and keys and tokens are hidden but their beginning.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use dogmind_agent::agent::Event;
@@ -69,6 +69,21 @@ pub struct Inputs {
     pub background: usize,
     /// The time now, in milliseconds since 1970: the band of a turn at work reaches it. None: it ends where the files do.
     pub wall_ms: Option<i64>,
+    /// What the person looks for, in small letters: only the turns and steps with it are shown, open. Empty: all of them.
+    pub query: String,
+}
+
+/// Whether a step has what is looked for (`query`, in small letters): in why it was taken, its calls' tools (as named here and as the model named
+/// them) and what they were on, or what its helper did.
+fn step_has(step: &Step, query: &str) -> bool {
+    let has = |text: &str| text.to_lowercase().contains(query);
+    step.why.as_ref().is_some_and(|why| has(&why.text))
+        || step.calls.iter().any(|call| has(&call.name) || has(t(tool_name(&call.name))) || call.target.as_deref().is_some_and(has)
+            || call.helper_steps.iter().any(|helper| helper.why.as_ref().is_some_and(|why| has(&why.text)) || helper.calls.iter().any(|(name, target)| has(name) || target.as_deref().is_some_and(has))))
+        || match &step.kind {
+            StepKind::Model => false,
+            other => has(&harness_words(other).2),
+        }
 }
 
 /// What is going on in the request that is under way, as the events say it.
@@ -731,19 +746,28 @@ pub fn rows(timeline: Option<&Timeline>, live: &Live, inputs: &Inputs, opened: &
     let context = Context { live, inputs, opened, at };
     let now = live.now(inputs, at);
     let mut out = Vec::new();
+    let query = inputs.query.trim().to_lowercase();
+    let query = query.as_str();
     for (place, turn) in all.iter().enumerate() {
         let latest = place + 1 == all.len();
+        // (looked for: a turn with it in its request or in a step is shown, open, with only the steps that have it)
+        if !query.is_empty() && !turn.asked.to_lowercase().contains(query) && !turn.steps.iter().any(|step| step_has(step, query)) {
+            continue;
+        }
         turn_rows(&mut out, turn, latest && inputs.running, latest, &context, &now);
     }
     if out.is_empty() {
-        out.push(Row { kind: Kind::Note, tone: Tone::Muted, text: t("Nothing has happened in this session yet.").to_string(), ..Row::default() });
+        let none = if query.is_empty() { t("Nothing has happened in this session yet.") } else { t("No matches") };
+        out.push(Row { kind: Kind::Note, tone: Tone::Muted, text: none.to_string(), ..Row::default() });
     }
     out
 }
 
 fn turn_rows(out: &mut Vec<Row>, turn: &TurnPath, is_live: bool, latest: bool, context: &Context, now: &Now) {
     let key = Key::Turn(turn.turn);
-    let open = context.opened.get(&key).copied().unwrap_or(latest);
+    let query = context.inputs.query.trim().to_lowercase();
+    let query = query.as_str();
+    let open = !query.is_empty() || context.opened.get(&key).copied().unwrap_or(latest);
     let (result, result_tone) = turn_result(turn, is_live);
     let asked = if turn.woken {
         String::new()
@@ -765,6 +789,10 @@ fn turn_rows(out: &mut Vec<Row>, turn: &TurnPath, is_live: bool, latest: bool, c
     let last_model = turn.steps.iter().rposition(|step| step.kind == StepKind::Model);
     let running_here = is_live && last_model.is_some_and(|at| turn.steps[at].calls.iter().any(|call| context.live.is_running(&call.id)));
     for (place, step) in turn.steps.iter().enumerate() {
+        // (looked for: only the steps that have it, unless it is in the turn's request)
+        if !query.is_empty() && !turn.asked.to_lowercase().contains(query) && !step_has(step, query) {
+            continue;
+        }
         step_rows(out, turn, place, step, is_live, running_here && Some(place) == last_model, context);
     }
     if is_live && !running_here {
@@ -1220,6 +1248,7 @@ pub fn keyed(rows: &[Row]) -> Vec<usize> {
 mod tests {
     use super::*;
     use dogmind_agent::timeline::{HelperStep, TodoItem, TurnEnd, Why};
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     fn later(from: Instant, seconds: u64) -> Instant {
@@ -1330,7 +1359,7 @@ mod tests {
         noted(&mut live, &[Event::TurnStarted, Event::RequestStarted], at);
         let (sender, _answers) = std::sync::mpsc::channel();
         live.note(&Event::Question(dogmind_agent::agent::Question { question: "Which one?".into(), options: Vec::new(), answer: sender }), later(at, 2));
-        let asking = |wait| Inputs { running: true, wait: Some(wait), background: 0, wall_ms: None };
+        let asking = |wait| Inputs { running: true, wait: Some(wait), background: 0, wall_ms: None, query: String::new() };
         let now = live.now(&asking(PersonWait::Question), later(at, 9));
         assert_eq!((now.who, now.text.as_str(), now.seconds), (Who::Person, "Waiting for your answer", Some(7)));
         assert_eq!(live.now(&asking(PersonWait::Plan), later(at, 9)).text, "Waiting for you to review a plan");
@@ -1581,7 +1610,7 @@ mod tests {
         let at = Instant::now();
         let mut live = Live::new(at);
         noted(&mut live, &[Event::TurnStarted, Event::RequestStarted, Event::AssistantEnded], at);
-        let waiting = Inputs { running: true, wait: Some(PersonWait::Approval { tool: "create_file".into(), summary: "a.rs".into() }), background: 0, wall_ms: None };
+        let waiting = Inputs { running: true, wait: Some(PersonWait::Approval { tool: "create_file".into(), summary: "a.rs".into() }), background: 0, wall_ms: None, query: String::new() };
         let rows = rows(None, &live, &waiting, &HashMap::new(), at);
         let last = rows.last().unwrap();
         assert_eq!((last.kind, last.tone, last.label.as_str(), last.text.as_str()), (Kind::Live, Tone::Person, "You", "Waiting for your approval: Write  a.rs"));
@@ -1739,6 +1768,29 @@ mod tests {
         assert!(shown.contains(&"To the first token: 0.60 s".to_string()) && !shown.iter().any(|text| text.starts_with("Drafted tokens")), "{shown:#?}");
         let all = texts(&rows_for(&timeline, &Live::new(Instant::now()), &opened(Some(Key::Server(1, 0)))));
         assert!(all.contains(&"Drafted tokens: 65".to_string()) && all.contains(&"What the server says".to_string()), "{all:#?}");
+    }
+
+    /// What is looked for shows only the turns and steps that have it, open: in why a step was taken, its calls and what they were on, or the turn's
+    /// request (then all its steps); nothing that has it says so.
+    #[test]
+    fn what_is_looked_for_shows_only_the_turns_and_steps_with_it() {
+        let reading = model(Some(("I will read the budget.", WhySource::Content)), vec![call("a", "read_file", "budget.txt", "ok")]);
+        let testing = model(Some(("Now the tests.", WhySource::Content)), vec![call("b", "execute_command", "cargo", "ok")]);
+        let other = model(Some(("Writing it.", WhySource::Content)), vec![call("c", "create_file", "notes.md", "ok")]);
+        let timeline = Timeline { turns: vec![turn(1, "Read the budget", vec![reading.clone()], done(100)), turn(2, "Run the tests", vec![testing, other], done(100))], heading: None };
+        let shown = |query: &str| {
+            let inputs = Inputs { query: query.into(), ..Inputs::default() };
+            texts(&rows(Some(&timeline), &Live::new(Instant::now()), &inputs, &HashMap::new(), Instant::now()))
+        };
+        let cargo = shown("cargo");
+        assert!(cargo.iter().any(|text| text.contains("Run the tests")) && !cargo.iter().any(|text| text.contains("Read the budget")), "{cargo:#?}");
+        assert!(cargo.iter().any(|text| text == "Now the tests.") && !cargo.iter().any(|text| text == "Writing it."), "only the step with it: {cargo:#?}");
+        // (by the tool's own name too, and in small or capital letters alike)
+        assert!(shown("create_file").iter().any(|text| text == "Writing it."));
+        assert!(shown("BUDGET").iter().any(|text| text == "I will read the budget."));
+        assert_eq!(shown("nowhere"), ["No matches"]);
+        // Empty: all of it, the earlier turn folded as before.
+        assert!(shown("").iter().any(|text| text.contains("Read the budget")));
     }
 
     /// A press on the band goes to the step whose request or calls ran at that time; between two, to the one begun before.
