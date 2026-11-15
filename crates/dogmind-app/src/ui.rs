@@ -7754,7 +7754,7 @@ impl App {
         // The timeline has the panel to the foot of the window too: the path is long.
         if self.settings.right_view == RightView::Timeline {
             self.dashboard_hit = None;
-            self.layout_timeline_view(x, width, s(ds::size::TITLE_STRIP), height);
+            self.layout_timeline_view(shapes, x, width, s(ds::size::TITLE_STRIP), height);
             return;
         }
         // The engine, at the foot: what it is and the way to its dashboard.
@@ -13931,7 +13931,7 @@ impl App {
         ] {
             set_text(window, t(words));
         }
-        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.find_field, "Find in this conversation"), (self.side_search, "Search sessions")] {
+        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.find_field, "Find in this conversation"), (self.side_search, "Search sessions"), (self.timeline.search, "Search the timeline")] {
             let cue = wide(t(words));
             SendMessageW(edit, EM_SETCUEBANNER, 0, cue.as_ptr() as LPARAM);
         }
@@ -15040,7 +15040,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
             set_button_fonts(app.fonts);
-            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.term.rename_field]) {
+            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.term.rename_field, app.timeline.search]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
             }
             // (the command's own size follows the screen's: it is set again when it is next shown, and this one keeps what it has)
@@ -15370,6 +15370,12 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             if lparam as HWND == app.term.rename_field {
                 if code == EN_KILLFOCUS as usize {
                     app.terminal_rename_end(true);
+                }
+                return 0;
+            }
+            if lparam as HWND == app.timeline.search {
+                if code == EN_CHANGE as usize {
+                    app.timeline_query_changed();
                 }
                 return 0;
             }
@@ -15841,6 +15847,15 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             }
             _ => {}
         }
+    }
+    // In the timeline's search: Escape lets go of what is looked for, Enter and Down go to the path.
+    if message.hwnd == app.timeline.search && matches!(key, VK_ESCAPE | VK_RETURN | VK_DOWN) {
+        if key == VK_ESCAPE {
+            set_text(app.timeline.search, "");
+            app.timeline_query_changed();
+        }
+        SetFocus(app.timeline.window);
+        return true;
     }
     if message.hwnd == app.side_search {
         match key {
@@ -17025,7 +17040,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let app = &mut *APP.load(Ordering::Relaxed);
         SendMessageW(app.composer, EM_SETEVENTMASK, 0, ENM_CHANGE as LPARAM);
         SendMessageW(app.note, EM_SETMARGINS, 3, 0); // EC_LEFTMARGIN | EC_RIGHTMARGIN
-        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search]) {
+        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.timeline.search]) {
             SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
         }
         app.list_procedure = SetWindowLongPtrW(app.side, GWLP_WNDPROC, list_subclass as *const () as isize);
