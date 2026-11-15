@@ -31,10 +31,13 @@ fn main() {
     let mut key_file: Option<PathBuf> = None;
     // `--code-mode`: the model is offered `run_code`.
     let mut code_mode = false;
+    // `--effort LEVEL`: the thinking level the app sends (`reasoning_effort`), as the person's setting would; none sends nothing.
+    let mut effort: Option<String> = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--refuse" => refuse = true,
             "--code-mode" => code_mode = true,
+            "--effort" => effort = args.next().filter(|level| !level.is_empty()),
             "--warm-wait" => warm_wait = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
             "--between" => between = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
             "--warm-between" => warm_between = true,
@@ -82,7 +85,7 @@ fn main() {
         sessions: data.join("sessions"),
         rules: data.join("permissions.json"),
         mode,
-        effort: None,
+        effort: effort.clone(),
         web: WebSettings::default(),
         language: "auto".into(),
         japanese_system: false,
