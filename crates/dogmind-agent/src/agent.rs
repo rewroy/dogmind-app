@@ -2152,7 +2152,7 @@ impl Agent {
         let (mut transient, mut overflow, mut failed_calls) = (0u32, 0u32, 0usize);
         let (mut cut_off, mut empties) = (0u32, 0u32);
         let mut drafts_stopped = 0u32;
-        let (mut generated, mut wrote) = (0u64, false);
+        let mut wrote = false;
         let mut repeats: HashMap<String, u32> = HashMap::new();
         // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
         let not_to_run = self.messages.iter().rev().filter(|message| message.role == "user").map(|message| message.content.as_deref().unwrap_or(""))
@@ -2292,7 +2292,6 @@ impl Agent {
             // read already. Whatever it was thinking about before is left to it, however long: only this is stopped, and what it is told is to write. Its connection has closed by now, so
             // the engine is not writing into nothing. (The tokens it wrote were spent all the same.)
             if drafting && stopped_by_the_app && matches!(result, Err(LlmError::Cancelled)) {
-                generated += meter.tokens;
                 // (what it had come to when it was stopped, and what the stop cost: the tokens that are thrown away)
                 let run = watch.as_ref().map_or(0, DraftWatch::stats);
                 self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run}));
@@ -2308,7 +2307,6 @@ impl Agent {
                 // Ended here, not by the person: the rest goes on in the next call.
                 Err(LlmError::Cancelled) if cut && stopped_by_the_app && saved.is_some() => {
                     // (an answer cut here has no count of its own, and it is the long ones that come this way)
-                    generated += meter.tokens;
                     let (answer, path, tail) = saved.expect("just looked at");
                     self.cut_write_noted("size", &answer, &path, meter.tokens);
                     self.note_cut_write(&answer, path, tail);
@@ -2347,7 +2345,6 @@ impl Agent {
                     self.emit(Event::Retrying { why: "transient".into(), wait_ms: pause.as_millis() as u64 });
                     let waited = self.wait_to_retry(pause);
                     retry = Some((req_id.clone(), "transient", waited));
-                    generated += meter.tokens;
                     let (answer, path, tail) = saved.expect("just looked at");
                     self.cut_write_noted("broken_connection", &answer, &path, meter.tokens);
                     self.note_cut_write(&answer, path, tail);
@@ -2438,7 +2435,6 @@ impl Agent {
                 }
             }
             if let Some(usage) = &completion.usage {
-                generated += usage.completion as u64;
                 self.used = usage.prompt + usage.completion;
                 self.window = usage.window.unwrap_or(self.window);
                 self.report_usage(Some(usage.clone()));
