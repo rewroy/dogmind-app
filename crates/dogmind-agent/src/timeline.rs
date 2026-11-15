@@ -945,7 +945,7 @@ mod tests {
     }
 
     fn user(words: &str) -> Message {
-        Message::text("user", prompt::user_message(words, "2026-11-05 10:00:00 +09:00"))
+        Message::text("user", words)
     }
 
     fn call(id: &str, name: &str, arguments: Value) -> ToolCall {

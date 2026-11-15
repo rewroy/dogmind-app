@@ -189,12 +189,20 @@ fn lean_kept(messages: &[Message]) -> Vec<usize> {
     let latest = messages.iter().rposition(is_a_request).or(first);
     let mut kept: Vec<usize> = Vec::new();
     kept.extend(messages.first().filter(|message| message.role == "system").map(|_| 0));
-    kept.extend(first);
-    kept.extend(latest.filter(|latest| Some(*latest) != first));
+    // (the app's facts that follow a message of the person's go with it: the first one's say what the workspace is)
+    for at in first.into_iter().chain(latest.filter(|latest| Some(*latest) != first)) {
+        kept.push(at);
+        kept.extend(facts_after(messages, at));
+    }
     kept.extend(round_in_progress(messages)..messages.len());
     kept.sort_unstable();
     kept.dedup();
     kept
+}
+
+/// The app's facts right after the message at `at`, if they are there ([`crate::prompt::app_facts`]).
+fn facts_after(messages: &[Message], at: usize) -> Option<usize> {
+    messages.get(at + 1).filter(|next| next.role == "user" && next.content.as_deref().is_some_and(crate::prompt::is_app_facts)).map(|_| at + 1)
 }
 
 /// Whether anything lies between the first user message and the latest request or the round in progress, for a lean checkpoint to sum up.
@@ -207,6 +215,8 @@ pub fn has_a_lean_middle(messages: &[Message]) -> bool {
 /// is why the summary does not say it again. The calls of the round and all their results stay together.
 pub fn apply_lean_checkpoint(messages: &[Message], checkpoint: &str) -> Vec<Message> {
     let first = messages.iter().position(|message| message.role == "user");
+    // (after the first message of the person's and the app's facts with it)
+    let first = first.map(|first| facts_after(messages, first).unwrap_or(first));
     let summary = Message::text("assistant", format!("{SUMMARY_HEADER}{}", checkpoint.trim()));
     let mut out = Vec::new();
     let mut summarized = false;
@@ -369,7 +379,7 @@ mod tests {
     #[test]
     fn a_checkpoint_says_the_request_in_the_persons_words_and_drops_the_thinking_after_the_head() {
         let mut messages = conversation(4);
-        messages.push(Message::text("user", crate::prompt::user_message_in("the real request", "now", None)));
+        messages.push(Message::text("user", "the real request"));
         for turn in 0..10 {
             messages.push(Message { role: "assistant".into(), reasoning_content: Some("x".repeat(5000)), tool_calls: Some(vec![ToolCall { id: format!("n{turn}"), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: "{}".into() } }]), ..Message::default() });
             messages.push(Message::tool_result(&format!("n{turn}"), "r"));
@@ -557,7 +567,7 @@ mod tests {
     #[test]
     fn truncation_keeps_the_request_being_worked_on() {
         let mut messages = conversation(4);
-        messages.push(Message::text("user", crate::prompt::user_message_in("the real request", "now", None)));
+        messages.push(Message::text("user", "the real request"));
         for turn in 0..6 {
             messages.push(Message { role: "assistant".into(), tool_calls: Some(vec![ToolCall { id: format!("n{turn}"), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: "{}".into() } }]), ..Message::default() });
             messages.push(Message::tool_result(&format!("n{turn}"), "x".repeat(5000)));
