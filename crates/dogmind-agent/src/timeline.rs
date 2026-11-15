@@ -169,6 +169,23 @@ pub struct CallRow {
     pub output: Option<String>,
     /// For an `explore`: the file its helper's conversation is kept in, beside the session.
     pub helper_file: Option<String>,
+    /// For an `explore`: the steps its helper took, read from that file by [`read`] (none where it is not there).
+    pub helper_steps: Vec<HelperStep>,
+}
+
+/// A step of an `explore` helper's own conversation: why, in its words, and the calls it made (each its tool and what it was on).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HelperStep {
+    pub why: Option<Why>,
+    pub calls: Vec<(String, Option<String>)>,
+}
+
+/// The steps of a helper's conversation, from its messages: one for each answer of its model.
+pub fn helper_steps(messages: &[Message]) -> Vec<HelperStep> {
+    messages.iter().filter(|message| message.role == "assistant").map(|message| HelperStep {
+        why: why_of(message),
+        calls: message.tool_calls.iter().flatten().map(|call| (call.function.name.clone(), target_of(&call.function.arguments))).collect(),
+    }).collect()
 }
 
 /// Where the work is heading.
@@ -196,7 +213,17 @@ pub fn read(session: &Path) -> Result<Timeline, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    Ok(build(&messages, &trajectory))
+    let mut timeline = build(&messages, &trajectory);
+    // (an explore's helper keeps its conversation in a file of its own beside the session: what it did is read from there)
+    for call in timeline.turns.iter_mut().flat_map(|turn| turn.steps.iter_mut()).flat_map(|step| step.calls.iter_mut()) {
+        // (a name alone: the trajectory's word is not a way to another folder)
+        if let Some(file) = call.helper_file.as_deref().filter(|file| !file.contains(['/', '\\', ':'])) {
+            if let Ok(helper) = session::read(&session.with_file_name(file)) {
+                call.helper_steps = helper_steps(&helper);
+            }
+        }
+    }
+    Ok(timeline)
 }
 
 /// The timeline of a conversation's messages and its trajectory (the file's text).
@@ -809,6 +836,7 @@ fn call_row(call: Option<&ToolCall>, tool: Option<(usize, &Line)>, output: Optio
         arguments: call.map(|call| if call.function.arguments.len() <= ARGUMENTS_WHOLE { call.function.arguments.clone() } else { ends_of(&call.function.arguments, END_BYTES) }),
         output,
         helper_file: tool.and_then(|(at, _)| helper_of.get(&at)).map(|file| file.to_string()),
+        helper_steps: Vec::new(),
     }
 }
 
@@ -1158,6 +1186,29 @@ mod tests {
         assert_eq!((explore.name.as_str(), explore.target.as_deref(), explore.helper_file.as_deref()), ("explore", Some("Where is the needle?"), Some("s.helper-1.jsonl")));
         assert_eq!(said.turns[0].steps[0].why.as_ref().map(|why| why.source), Some(WhySource::Target));
         assert_eq!(said.turns[0].steps[1].calls.len(), 0);
+    }
+
+    /// Read from the files, an explore's call has the steps of its helper's own conversation: why in the helper's words, and what it called.
+    #[test]
+    fn an_explore_call_read_from_the_files_has_its_helpers_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session::Session::create(dir.path(), dir.path(), "2026-11-05 10:00:00 +09:00", "20261105-100000").unwrap();
+        for message in [Message::text("system", "s"), user("find"), assistant("", "", vec![call("e1", "explore", json!({"task": "Where is the needle?"}))]), Message::tool_result("e1", "At a.txt:1."), assistant("Done", "", vec![])] {
+            session.append(&message).unwrap();
+        }
+        let (mut helper, _) = session::Session::create_helper(&Default::default(), &session.path, dir.path(), "2026-11-05 10:00:02 +09:00").unwrap();
+        for message in [Message::text("system", "h"), user("Where is the needle?"), assistant("I will search for it.", "", vec![call("h1", "search_files", json!({"pattern": "needle"}))]), Message::tool_result("h1", "a.txt:1"), assistant("", "It is in a.txt, so I answer.", vec![])] {
+            helper.append(&message).unwrap();
+        }
+        let helper_file = helper.path.file_name().unwrap().to_string_lossy().into_owned();
+        let helper_line = json!({"t": "2026-11-05T10:00:02.100+09:00", "ev": "request", "turn": 1, "req": "20261105-100000/2", "role": "helper", "started": "2026-11-05T10:00:02.100+09:00", "ms": 500, "content_chars": 0, "calls": ["search_files"], "end": "tool_calls", "helper_file": helper_file});
+        let lines = [turn_start(1, "2026-11-05T10:00:00.000+09:00", 4), request(1, 1, "2026-11-05T10:00:01.000+09:00", 1000, 0, &["explore"], "tool_calls"), helper_line,
+                     tool(1, 1, "e1", "explore", "2026-11-05T10:00:02.000+09:00", None), request(1, 3, "2026-11-05T10:00:05.000+09:00", 1000, 4, &[], "stop")];
+        std::fs::write(trajectory::file_of(&session.path), text(&lines)).unwrap();
+        let read_back = read(&session.path).unwrap();
+        let explore = &read_back.turns[0].steps[0].calls[0];
+        let steps: Vec<(Option<&str>, Vec<(&str, Option<&str>)>)> = explore.helper_steps.iter().map(|step| (step.why.as_ref().map(|why| why.text.as_str()), step.calls.iter().map(|(name, target)| (name.as_str(), target.as_deref())).collect())).collect();
+        assert_eq!(steps, [(Some("I will search for it."), vec![("search_files", Some("needle"))]), (Some("It is in a.txt, so I answer."), vec![])]);
     }
 
     #[test]
