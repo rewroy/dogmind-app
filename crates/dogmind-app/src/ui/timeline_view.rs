@@ -750,6 +750,11 @@ impl App {
             path::Kind::Caption => {
                 let tall = s(ds::size::TEXT_LINE) + s(ds::space::XS);
                 if let Some(device) = device {
+                    // (a caption that opens what is folded under it has the chevron a step has)
+                    if row.key.is_some() {
+                        icon::draw(device, if row.open { "chevron-down" } else { "chevron-right" }, rect(left, y + s(ds::space::XS), s(MARK + 4), s(ds::size::TEXT_LINE)), s(ds::size::ICON_SMALL), theme::muted());
+                    }
+                    outline(device, rect(x, y, width, tall));
                     draw_text(device, &row.text, rect(left + s(MARK + 4), y + s(ds::space::XS), (room - s(MARK + 4)).max(0), s(ds::size::TEXT_LINE)), fonts.small, theme::muted(), ONE_LINE);
                 }
                 tall
