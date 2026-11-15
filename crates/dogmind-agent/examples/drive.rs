@@ -51,6 +51,7 @@ fn main() {
     let info = client.describe().expect("the server answers");
     client.replay_reasoning = info.straydog;
     client.suppresses_letters = info.suppresses_letters;
+    client.tool_writing = info.tool_writing;
     println!("server: model {} window {} straydog {}", info.model, info.context, info.straydog);
 
     let (sender, events) = channel();
