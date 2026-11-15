@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use dogmind_agent::agent::Event;
-use dogmind_agent::timeline::{self, CallRow, Heading, RequestDetail, Step, StepKind, Timeline, TurnPath, WhySource};
+use dogmind_agent::timeline::{self, Band, BandPart, CallRow, Heading, Lane, Part, RequestDetail, Step, StepKind, Timeline, TurnPath, WhySource};
 use serde_json::Value;
 
 use crate::cards::{duration_words, is_asking, token_count_words};
@@ -67,6 +67,8 @@ pub struct Inputs {
     pub running: bool,
     pub wait: Option<PersonWait>,
     pub background: usize,
+    /// The time now, in milliseconds since 1970: the band of a turn at work reaches it. None: it ends where the files do.
+    pub wall_ms: Option<i64>,
 }
 
 /// What is going on in the request that is under way, as the events say it.
@@ -287,6 +289,29 @@ impl Live {
         self.tools.iter().any(|running| running.id == id)
     }
 
+    /// What the part of the band that is going on now is, in which lane, and since when: the person asked, a call running, the model reading, thinking or
+    /// writing, or a wait of the app's or the server's. None when no turn is at work.
+    pub fn band_part(&self, inputs: &Inputs) -> Option<(Lane, Part, Instant)> {
+        if !inputs.running {
+            return None;
+        }
+        if inputs.wait.is_some() {
+            return Some((Lane::Calls, Part::Person, self.asked_at.unwrap_or(self.since)));
+        }
+        let (lane, part) = match self.phase {
+            Phase::Idle => return None,
+            Phase::Running => {
+                let since = self.tools.iter().map(|running| running.since).min().unwrap_or(self.since);
+                return Some((Lane::Calls, Part::Call, since));
+            }
+            Phase::Reading { .. } => (Lane::Requests, Part::Reading),
+            Phase::Thinking => (Lane::Requests, Part::Thinking),
+            Phase::Writing | Phase::Answering => (Lane::Requests, Part::Writing),
+            Phase::Starting | Phase::Asking | Phase::Checking | Phase::Preparing | Phase::Compacting | Phase::Retrying { .. } | Phase::Restarting { .. } => (Lane::Requests, Part::Waiting),
+        };
+        Some((lane, part, self.since))
+    }
+
     /// Whether the files, read when they had this many turns, can have the turn that is at work.
     fn files_have_the_turn(&self, turns: usize) -> bool {
         self.begun.as_ref().is_none_or(|begun| turns > begun.files)
@@ -497,6 +522,8 @@ pub enum Kind {
     Live,
     /// A word on its own: there is nothing to show.
     Note,
+    /// An open turn's time as a band (`Row::band`), with what its colours are under it.
+    Band,
 }
 
 /// Whose words a row has, or how it came out: the colour of a row.
@@ -537,12 +564,63 @@ pub struct Row {
     pub indent: u8,
     /// The step in progress.
     pub current: bool,
+    /// A band row's band; for a turn at work its last part is the one going on now (`live_part`).
+    pub band: Option<Band>,
+    /// The part of the band going on now, at its end.
+    pub live_part: Option<BandPart>,
+}
+
+/// The parts a band's key names, in the order it names them: those that are in the band, then whether it has the app's own marks.
+pub fn band_key(band: &Band, live: Option<&BandPart>) -> (Vec<Part>, bool) {
+    let mut parts: Vec<Part> = band.parts.iter().chain(live).map(|part| part.part).collect();
+    parts.sort();
+    parts.dedup();
+    (parts, !band.marks.is_empty())
+}
+
+/// What a part of the band is, in a few words.
+pub fn part_words(part: Part) -> &'static str {
+    match part {
+        Part::Waiting => t("Waiting (queue, network)"),
+        Part::Parking => t("Setting another conversation aside"),
+        Part::Growing => t("Growing the K/V"),
+        Part::Reading => t("Reading the prompt"),
+        Part::Rereading => t("Reading it all again"),
+        Part::Thinking => t("Thinking"),
+        Part::Writing => t("Writing"),
+        Part::Generating => t("Thinking and writing"),
+        Part::Call => t("Calls"),
+        Part::CallFailed => t("Failed calls"),
+        Part::Person => t("Waiting for you"),
+    }
+}
+
+/// An open turn's band: from the files, and for a turn at work to the time now, its last part the one going on.
+fn band_row(turn: &TurnPath, is_live: bool, context: &Context) -> Option<Row> {
+    let mut band = timeline::band(turn).unwrap_or_default();
+    let mut live_part = None;
+    if is_live {
+        let start = timeline::millis(&turn.started);
+        if let (Some(start), Some(now), Some((lane, part, since))) = (start, context.inputs.wall_ms, context.live.band_part(context.inputs)) {
+            let now = (now - start).max(0) as u64;
+            // (from when it began, as the window's clock has it, and not before what the files have of its lane)
+            let began = now.saturating_sub(context.at.saturating_duration_since(since).as_millis() as u64);
+            let known = band.parts.iter().filter(|known| known.lane == lane).map(|known| known.to).max().unwrap_or(0);
+            let from = began.max(known).min(now);
+            band.length = band.length.max(now);
+            live_part = Some(BandPart { lane, from, to: now, part });
+        }
+    }
+    (band.length > 0).then(|| Row { kind: Kind::Band, indent: 1, band: Some(band), live_part, ..Row::default() })
 }
 
 /// What the rows are made from besides the files.
 struct Context<'a> {
     live: &'a Live,
+    inputs: &'a Inputs,
     opened: &'a HashMap<Key, bool>,
+    /// The window's clock now: what is going on began this long before it.
+    at: Instant,
 }
 
 /// The rows of the path, the earlier turns folded to a line each and the latest open; a click's choices in `opened` win over both. While a turn runs, the step in progress is the last row of it:
@@ -553,7 +631,7 @@ pub fn rows(timeline: Option<&Timeline>, live: &Live, inputs: &Inputs, opened: &
     let in_file = inputs.running && turns.last().is_some_and(|last| last.ended.is_none()) && live.files_have_the_turn(turns.len());
     let made = (inputs.running && !in_file).then(|| live.turn_not_in_file(turns.last().map_or(1, |last| last.turn + 1)));
     let all: Vec<&TurnPath> = turns.iter().chain(made.iter()).collect();
-    let context = Context { live, opened };
+    let context = Context { live, inputs, opened, at };
     let now = live.now(inputs, at);
     let mut out = Vec::new();
     for (place, turn) in all.iter().enumerate() {
@@ -584,6 +662,8 @@ fn turn_rows(out: &mut Vec<Row>, turn: &TurnPath, is_live: bool, latest: bool, c
     }
     let label = if turn.woken { t("Woken by background work") } else { t("This turn's request") };
     out.push(Row { kind: Kind::Turn, key: Some(key), open: true, tone: if turn.woken { Tone::App } else { Tone::Person }, icon: "chevron-down", label: label.to_string(), text: asked, right: result, right_tone: result_tone, ..Row::default() });
+    // (its time as a band under the request, where the wait was: the steps under it say what each part was)
+    out.extend(band_row(turn, is_live, context));
     // The step whose calls are under way is the one in progress; with none, the step in progress is a row of its own.
     let last_model = turn.steps.iter().rposition(|step| step.kind == StepKind::Model);
     let running_here = is_live && last_model.is_some_and(|at| turn.steps[at].calls.iter().any(|call| context.live.is_running(&call.id)));
@@ -838,6 +918,8 @@ fn server_facts(server: &BTreeMap<String, Value>, indent: u8) -> Vec<Row> {
     server.iter().map(|(name, value)| {
         let text = match value.as_f64() {
             Some(seconds) if name.ends_with("_seconds") => tf("{0} s", &[&format!("{seconds:.2}")]),
+            Some(rate) if name.ends_with("_per_second") => format!("{rate:.1}"),
+            _ if name == "resumed_from" => resumed_words(value.as_str().unwrap_or("")),
             _ => value_words(value),
         };
         fact(indent, &server_label(name), text)
@@ -846,15 +928,50 @@ fn server_facts(server: &BTreeMap<String, Value>, indent: u8) -> Vec<Row> {
 
 /// What the engine calls a number of its own, in words; a name this does not know is shown as it is, with its underscores gone.
 fn server_label(name: &str) -> String {
-    match name {
-        "prefill_seconds" => t("Reading the prompt").to_string(),
-        "ttft_seconds" => t("To the first token").to_string(),
-        "request_seconds" => t("The request").to_string(),
-        "decode_tokens_per_second" => t("Writing speed (tokens per second)").to_string(),
-        "cached_tokens" => t("Tokens it already had").to_string(),
-        "resumed_from" => t("Went on from").to_string(),
-        other => other.replace('_', " "),
+    let words = match name {
+        "prefill_seconds" => "Reading the prompt",
+        "prefill_tokens" => "Tokens read",
+        "prefill_tokens_per_second" => "Reading speed (tokens per second)",
+        "prefill_drive_bytes" => "Bytes read from the drive while reading",
+        "ttft_seconds" => "To the first token",
+        "first_text_seconds" => "To the first words",
+        "request_seconds" => "The request",
+        "resume_seconds" => "Going on from what it kept",
+        "checkpoint_seconds" => "Keeping where to go on from",
+        "encode_seconds" => "Turning the prompt into tokens",
+        "kv_growth_seconds" => "Growing the K/V",
+        "park_seconds" => "Setting another conversation aside",
+        "decode_seconds" => "Time writing",
+        "decode_tokens_per_second" => "Writing speed (tokens per second)",
+        "decode_passes" => "Passes while writing",
+        "decode_forward_tokens" => "Tokens through those passes",
+        "generated_tokens" => "Tokens written",
+        "cached_tokens" => "Tokens it already had",
+        "agreed_tokens" => "Tokens that matched what it had",
+        "draft_tokens" => "Drafted tokens",
+        "accepted_drafts" => "Drafted tokens accepted",
+        "engine_draft_runs" => "The engine's own drafts",
+        "engine_draft_tokens" => "Tokens the engine drafted",
+        "accepted_engine_drafts" => "Of those, accepted",
+        "resumed_from" => "Went on from",
+        other => return other.replace('_', " "),
+    };
+    t(words).to_string()
+}
+
+/// Where the engine went on from (`resumed_from`), in words.
+fn resumed_words(from: &str) -> String {
+    match from {
+        "live" => t("the conversation it had open"),
+        "root" => t("the system prompt it kept"),
+        "root_before" => t("the system prompt before the last"),
+        "turn" => t("the start of this turn"),
+        "prior" => t("the turn before"),
+        "prefix" => t("a beginning it kept"),
+        "none" => t("nothing: it read it all"),
+        other => return other.to_string(),
     }
+    .to_string()
 }
 
 fn field_label(name: &str) -> String {
@@ -1088,7 +1205,7 @@ mod tests {
         noted(&mut live, &[Event::TurnStarted, Event::RequestStarted], at);
         let (sender, _answers) = std::sync::mpsc::channel();
         live.note(&Event::Question(dogmind_agent::agent::Question { question: "Which one?".into(), options: Vec::new(), answer: sender }), later(at, 2));
-        let asking = |wait| Inputs { running: true, wait: Some(wait), background: 0 };
+        let asking = |wait| Inputs { running: true, wait: Some(wait), background: 0, wall_ms: None };
         let now = live.now(&asking(PersonWait::Question), later(at, 9));
         assert_eq!((now.who, now.text.as_str(), now.seconds), (Who::Person, "Waiting for your answer", Some(7)));
         assert_eq!(live.now(&asking(PersonWait::Plan), later(at, 9)).text, "Waiting for you to review a plan");
@@ -1243,7 +1360,7 @@ mod tests {
         let rows = rows_for(&timeline, &Live::new(Instant::now()), &opened);
         let facts = texts(&rows);
         for wanted in ["Started: 10:00:01", "Time to the first word: 120 ms", "Total time: 2.1 s", "Prompt: 5000 tokens", "Cached: 4000 tokens", "Written: 50 tokens", "Speed: 40.5 tokens per second", "Ended: It asked for calls", "Request: s/3", "What the server says",
-            "Reading the prompt: 0.12 s", "Went on from: live", "Arguments", "Output", "1|fn main() {}"] {
+            "Reading the prompt: 0.12 s", "Went on from: the conversation it had open", "Arguments", "Output", "1|fn main() {}"] {
             assert!(facts.iter().any(|fact| fact == wanted), "{wanted} in {facts:#?}");
         }
         let code: Vec<&str> = rows.iter().filter(|row| row.kind == Kind::Code).map(|row| row.text.as_str()).collect();
@@ -1339,7 +1456,7 @@ mod tests {
         let at = Instant::now();
         let mut live = Live::new(at);
         noted(&mut live, &[Event::TurnStarted, Event::RequestStarted, Event::AssistantEnded], at);
-        let waiting = Inputs { running: true, wait: Some(PersonWait::Approval { tool: "create_file".into(), summary: "a.rs".into() }), background: 0 };
+        let waiting = Inputs { running: true, wait: Some(PersonWait::Approval { tool: "create_file".into(), summary: "a.rs".into() }), background: 0, wall_ms: None };
         let rows = rows(None, &live, &waiting, &HashMap::new(), at);
         let last = rows.last().unwrap();
         assert_eq!((last.kind, last.tone, last.label.as_str(), last.text.as_str()), (Kind::Live, Tone::Person, "You", "Waiting for your approval: Write  a.rs"));
@@ -1407,5 +1524,47 @@ mod tests {
         assert_eq!(ms_words(30), "30 ms");
         assert_eq!(ms_words(2100), "2.1 s");
         assert_eq!(ms_words(65_000), "1 min 5 s");
+    }
+
+    /// An open turn has its band under its request, a folded one none; for the turn at work the part going on now runs from where its lane's parts
+    /// end to the time now; and the key names what the band has, the app's marks too.
+    #[test]
+    fn an_open_turn_has_its_band_and_the_turn_at_work_has_the_part_going_on_reach_now() {
+        let request = RequestDetail { started: "2026-11-05T10:00:01.000+09:00".into(), first_ms: Some(500), ms: 2000, server: [("ttft_seconds".to_string(), serde_json::json!(0.4)), ("prefill_seconds".to_string(), serde_json::json!(0.3))].into_iter().collect(), ..RequestDetail::default() };
+        let mut step = model(Some(("Reading.", WhySource::Content)), Vec::new());
+        step.request = Some(request);
+        let retry = Step { kind: StepKind::Retry { why: "empty".into(), wait_ms: 0 }, started: "2026-11-05T10:00:04.000+09:00".into(), ..Step::default() };
+        let started = |turn: TurnPath| TurnPath { started: "2026-11-05T10:00:00.000+09:00".into(), ..turn };
+        let earlier = started(turn(1, "First", vec![step.clone()], done(3000)));
+        let latest = started(turn(2, "Go", vec![step, retry], None));
+        let timeline = Timeline { turns: vec![earlier, latest], heading: None };
+        let finished = rows_for(&timeline, &Live::new(Instant::now()), &HashMap::new());
+        let kinds: Vec<Kind> = finished.iter().map(|row| row.kind).collect();
+        assert_eq!(kinds[..3], [Kind::Turn, Kind::Turn, Kind::Band], "the folded turn has none, the open one has it under its request");
+        let band = finished[2].band.as_ref().unwrap();
+        assert_eq!(band.parts.iter().map(|part| part.part).collect::<Vec<_>>(), [Part::Waiting, Part::Reading, Part::Waiting, Part::Thinking]);
+        assert_eq!(band_key(band, None), (vec![Part::Waiting, Part::Reading, Part::Thinking], true));
+        assert_eq!(part_words(Part::Reading), "Reading the prompt");
+        // The turn at work, thinking for the last four seconds, ten seconds after it began.
+        let begun = Instant::now();
+        let mut live = Live::new(begun);
+        for event in [Event::TurnStarted, Event::RequestStarted, Event::Reasoning("so".into())] {
+            live.note(&event, begun);
+        }
+        let wall = timeline::millis("2026-11-05T10:00:10.000+09:00");
+        let inputs = Inputs { running: true, wall_ms: wall, ..Inputs::default() };
+        let at_work = rows(Some(&timeline), &live, &inputs, &HashMap::new(), begun + Duration::from_secs(4));
+        let row = at_work.iter().find(|row| row.kind == Kind::Band).unwrap();
+        let now = row.live_part.expect("the part going on now");
+        assert_eq!((now.lane, now.part, now.from, now.to), (Lane::Requests, Part::Thinking, 6000, 10_000), "from when it began, not from the turn's start");
+        assert_eq!(row.band.as_ref().unwrap().length, 10_000);
+    }
+
+    #[test]
+    fn the_servers_numbers_have_names_in_words_and_where_it_went_on_from_is_said() {
+        let facts = server_facts(&[("resumed_from".to_string(), serde_json::json!("root")), ("agreed_tokens".to_string(), serde_json::json!(4483)), ("decode_tokens_per_second".to_string(), serde_json::json!(77.67))].into_iter().collect(), 2);
+        let said: Vec<(&str, &str)> = facts.iter().map(|row| (row.label.as_str(), row.text.as_str())).collect();
+        assert_eq!(said, [("Tokens that matched what it had", "4483"), ("Writing speed (tokens per second)", "77.7"), ("Went on from", "the system prompt it kept")]);
+        assert!(facts.iter().all(|row| !row.label.contains('_')));
     }
 }
