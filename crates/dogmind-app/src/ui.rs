@@ -236,6 +236,7 @@ const ID_FIND_NEXT: isize = 42;
 const ID_FIND_CLOSE: isize = 43;
 const ID_PANEL_TOGGLE: isize = 44;
 const ID_TOGGLE_WEB: isize = 45;
+const ID_TOGGLE_CODE_MODE: isize = 9915;
 const ID_TOGGLE_COMPACT: isize = 9056;
 const ID_TOGGLE_LANGUAGE: isize = 46;
 const ID_PREVIEW_RELOAD: isize = 9047;
@@ -2178,6 +2179,7 @@ struct App {
     /// Web content is in this conversation, so a command that gets the network asks.
     web_seen: bool,
     toggle_web: HWND,
+    toggle_code_mode: HWND,
     toggle_compact: HWND,
     context_follows_model: bool,
     vram_slider: HWND,
@@ -2587,7 +2589,7 @@ fn agent_config(settings: &Settings, folder: &Path, workspace: PathBuf, mode: Mo
         memory: Some(folder.join("memory")),
         mcp: Some(mcp),
         policy,
-        code_mode: false,
+        code_mode: settings.code_mode,
     }
 }
 
@@ -6632,7 +6634,7 @@ impl App {
         all.push(self.vision_delete);
         all.extend(self.read_folder_remove.iter().copied());
         all.extend([self.read_folder_add, self.read_folder_stop]);
-        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_compact, self.toggle_updates, self.toggle_straydog_updates, self.toggle_remember, self.toggle_keep, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
+        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_code_mode, self.toggle_compact, self.toggle_updates, self.toggle_straydog_updates, self.toggle_remember, self.toggle_keep, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
         all
     }
 
@@ -7046,6 +7048,7 @@ impl App {
             }
             Panel::Tools => {
                 form.toggle(t("Web search and reading"), self.toggle_web);
+                form.toggle(t("Code Mode: let the model run a short program that calls several tools at once"), self.toggle_code_mode);
                 let setting = self.settings.search_key.clone();
                 self.key_rows(form, &setting, t("Brave Search key"));
                 form.section(t("MCP servers"));
@@ -8295,6 +8298,17 @@ impl App {
         }
     }
 
+    /// The Tools page's switch for Code Mode: every agent is told, and a conversation that has begun keeps the tools it began with.
+    unsafe fn code_mode_switched(&mut self) {
+        self.settings.code_mode = !self.settings.code_mode;
+        self.save();
+        let _ = self.agent.commands.send(Command::SetCodeMode(self.settings.code_mode));
+        for parked in &self.parked {
+            let _ = parked.agent.commands.send(Command::SetCodeMode(self.settings.code_mode));
+        }
+        self.update_toggles();
+    }
+
     /// To every agent, as the settings have changed.
     unsafe fn apply_web(&self) {
         let web = web_settings(&self.settings);
@@ -9263,7 +9277,7 @@ impl App {
     }
 
     unsafe fn update_toggles(&self) {
-        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_updates, self.settings.check_for_updates), (self.toggle_straydog_updates, self.settings.check_straydog_updates), (self.toggle_remember, self.crypt.remember), (self.toggle_keep, self.keep_conversation_on())] {
+        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_code_mode, self.settings.code_mode), (self.toggle_updates, self.settings.check_for_updates), (self.toggle_straydog_updates, self.settings.check_straydog_updates), (self.toggle_remember, self.crypt.remember), (self.toggle_keep, self.keep_conversation_on())] {
             set_button_style(toggle, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         }
         // (where the encryption does not allow it, the switch cannot be turned on: the line under it says why)
@@ -12682,7 +12696,8 @@ impl App {
                 self.always_line = always;
                 // The sentences (why it asks, what the model says it is for) are in the body face above; what is run or written is in the control, in a monospace face with room between its lines.
                 let (purpose, code) = approval_parts(&approval.tool, &approval.summary, &approval.details);
-                self.approval_head = markdown::show_hidden(&[reason, purpose].iter().filter(|part| !part.is_empty()).cloned().collect::<Vec<String>>().join("\n")).into_owned();
+                let from_program = approval.program.as_ref().map_or(String::new(), |program| tf("From a program: {0}", &[program]));
+                self.approval_head = markdown::show_hidden(&[reason, from_program, purpose].iter().filter(|part| !part.is_empty()).cloned().collect::<Vec<String>>().join("\n")).into_owned();
                 // (a line at its end with nothing on it would have it scroll for nothing)
                 // (a command is read from its first character: what hides in it is shown as its mark)
                 self.show_command(&markdown::show_hidden(&code).trim_end().replace('\n', "\r\n"));
@@ -15562,6 +15577,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_PROVIDER_DOWN => app.move_provider(1),
                 ID_TOGGLE_COMPACT => app.on_menu(M_COMPACT_CHOICE + usize::from(app.settings.compact_tools)),
                 ID_TOGGLE_WEB => app.on_menu(M_WEB_CHOICE + usize::from(app.settings.web_tools)),
+                ID_TOGGLE_CODE_MODE => app.code_mode_switched(),
                 ID_FILES => {
                     if code == LBN_SELCHANGE as usize {
                         app.files_selection_changed();
@@ -16196,6 +16212,7 @@ pub(crate) fn tool_name(tool: &str) -> &str {
         "web_read" => "Read the web",
         "check_page" => "Check a page",
         "explore" => "Look into",
+        "run_code" => "Run a program",
         other => other,
     }
 }
@@ -16781,6 +16798,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             git: None,
             web_seen: false,
             toggle_web: make_button(pane, ID_TOGGLE_WEB, "", ButtonKind::Toggle, theme::background()),
+            toggle_code_mode: make_button(pane, ID_TOGGLE_CODE_MODE, "", ButtonKind::Toggle, theme::background()),
             toggle_compact: make_button(pane, ID_TOGGLE_COMPACT, "", ButtonKind::Toggle, theme::background()),
             context_follows_model: false,
             vram_slider,
@@ -17306,7 +17324,7 @@ mod tests {
     #[test]
     fn every_constant_word_has_its_japanese() {
         let mut words: Vec<&str> = COMMANDS.iter().map(|(_, about)| *about).collect();
-        words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "wake_at", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page", "explore"].map(tool_name));
+        words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "wake_at", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page", "explore", "run_code"].map(tool_name));
         words.extend(EFFORTS.iter().map(|(_, name)| *name));
         words.extend(efforts_for("DeepSeek-V4.1").iter().map(|(_, name)| *name));
         words.extend(MODES.iter().map(|(_, name)| *name));
