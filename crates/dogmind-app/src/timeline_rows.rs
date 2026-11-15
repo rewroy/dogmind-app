@@ -662,6 +662,8 @@ pub enum Kind {
     Band,
     /// Which part of the turn's time its band shows, and a press to show all of it (`Key::Whole`).
     Span,
+    /// Small copies of pictures (`Row::pictures`): those the person sent with the request, or those a call's result opened.
+    Pictures,
 }
 
 /// Whose words a row has, or how it came out: the colour of a row.
@@ -711,6 +713,8 @@ pub struct Row {
     /// A band row's whole length, and the part of it the band shows (from and to milliseconds after the turn began), when a part was chosen.
     pub whole: u64,
     pub span: Option<(u64, u64)>,
+    /// A pictures row's pictures: their files in the session's folder of pictures.
+    pub pictures: Vec<String>,
 }
 
 /// When each step of a turn ran, by its place: from and to milliseconds after the turn began, its calls' time being its own.
@@ -871,6 +875,10 @@ fn turn_rows(out: &mut Vec<Row>, turn: &TurnPath, is_live: bool, latest: bool, c
     }
     let label = if turn.woken { t("Woken by background work") } else { t("This turn's request") };
     out.push(Row { kind: Kind::Turn, key: Some(key), open: true, tone: if turn.woken { Tone::App } else { Tone::Person }, icon: "chevron-down", label: label.to_string(), text: asked, right: result, right_tone: result_tone, ..Row::default() });
+    // (what the person sent with it, under their words)
+    if !turn.asked_images.is_empty() {
+        out.push(Row { kind: Kind::Pictures, indent: 1, pictures: turn.asked_images.clone(), ..Row::default() });
+    }
     // (its time as a band under the request, where the wait was: the steps under it say what each part was)
     let band = band_row(turn, is_live, context);
     // (a part of its time chosen: which, and only the steps that ran in it)
@@ -1014,6 +1022,10 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
     out.push(Row { kind: Kind::Call, tone, icon, label: name, text: call.target.as_deref().map(safe).unwrap_or_default(), right, right_tone: tone, indent, ..Row::default() });
     if !open {
         return;
+    }
+    // (what it opened for the model to see, as the model saw it)
+    if !call.images.is_empty() {
+        out.push(Row { kind: Kind::Pictures, indent: indent + 1, pictures: call.images.clone(), ..Row::default() });
     }
     let inner = indent + 1;
     if !call.outcome.is_empty() && call.outcome != "ok" {
@@ -1590,6 +1602,20 @@ mod tests {
             ("x", Tone::Bad, "Read the web", "", "You declined"),
             ("square", Tone::Muted, "Search", "foo", "did not run"),
         ]);
+    }
+
+    /// The pictures the person sent are under their request; those a call opened are under the call, when its step is open.
+    #[test]
+    fn pictures_are_under_the_request_that_sent_them_and_the_call_that_opened_them() {
+        let step = model(Some(("Looking.", WhySource::Content)), vec![CallRow { images: vec!["2-shot.png".into()], ..call("a", "read_file", "shot.png", "ok") }]);
+        let path = TurnPath { asked_images: vec!["1-a.png".into()], ..turn(1, "What is this?", vec![step], done(100)) };
+        let timeline = Timeline { turns: vec![path], heading: None };
+        let pictures = |opened: &HashMap<Key, bool>| -> Vec<(Vec<String>, u8)> {
+            rows_for(&timeline, &Live::new(Instant::now()), opened).into_iter().filter(|row| row.kind == Kind::Pictures).map(|row| (row.pictures, row.indent)).collect()
+        };
+        assert_eq!(pictures(&HashMap::new()), [(vec!["1-a.png".to_string()], 1)], "the step shut: only the request's");
+        let open = HashMap::from([(Key::Step(1, 0), true)]);
+        assert_eq!(pictures(&open), [(vec!["1-a.png".to_string()], 1), (vec!["2-shot.png".to_string()], 3)]);
     }
 
     #[test]

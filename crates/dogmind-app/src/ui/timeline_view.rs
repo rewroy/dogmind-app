@@ -139,6 +139,8 @@ impl TimelineView {
 struct Frame {
     now: path::Now,
     selected: Option<Key>,
+    /// The small copies of the pictures of the rows in view, by their files, as far as they are read.
+    pictures: HashMap<String, crate::paint::Thumb>,
 }
 
 /// The colour of words, by whose they are.
@@ -570,7 +572,7 @@ impl App {
         let mut client: RECT = std::mem::zeroed();
         GetClientRect(self.timeline.window, &mut client);
         let width = self.timeline_content_width(client.right);
-        let frame = Frame { now: self.timeline.live.now(&inputs, Instant::now()), selected: self.timeline.selected };
+        let frame = Frame { now: self.timeline.live.now(&inputs, Instant::now()), selected: self.timeline.selected, pictures: HashMap::new() };
         self.timeline_lay_out(width, &frame);
         if let (Some(before), Some(after)) = (before, place(&self.timeline)) {
             self.timeline.scroll += after - before;
@@ -648,7 +650,7 @@ impl App {
         let inputs = self.timeline_inputs();
         self.timeline_rebuild(&inputs, at);
         let width = self.timeline_content_width(client.right);
-        let frame = Frame { now: self.timeline.live.now(&inputs, at), selected: self.timeline.selected.filter(|_| GetFocus() == self.timeline.window) };
+        let mut frame = Frame { now: self.timeline.live.now(&inputs, at), selected: self.timeline.selected.filter(|_| GetFocus() == self.timeline.window), pictures: HashMap::new() };
         let heading = path::heading(self.timeline.timeline.as_ref(), &self.timeline.live, &inputs);
         let head = self.timeline_head(None, 0, 0, width, &frame.now, heading.as_ref());
         self.timeline.head_height = head;
@@ -656,6 +658,15 @@ impl App {
         let view = (client.bottom - head).max(0);
         let room = self.timeline_room(view);
         self.timeline.scroll = if self.timeline.follow { room } else { self.timeline.scroll.clamp(0, room) };
+        // (the pictures of the rows in view: their small copies, asked for where they are not read yet)
+        let wanted: Vec<String> = steps::in_view(&self.timeline.placed, self.timeline.scroll, view).flat_map(|at| self.timeline.rows[at].pictures.clone()).collect();
+        if let Some(folder) = self.current_session.as_deref().map(dogmind_agent::images::folder_of).filter(|_| !wanted.is_empty()) {
+            let room = (s(PICTURE), s(PICTURE));
+            for file in wanted {
+                let thumb = self.thumb_of(&folder.join(&file), room);
+                frame.pictures.insert(file, thumb);
+            }
+        }
         let (rows, placed, scroll) = (&self.timeline.rows, &self.timeline.placed, self.timeline.scroll);
         for at in steps::in_view(placed, scroll, view) {
             self.timeline_row(Some(device), &rows[at], s(PAD), head + placed[at].top - scroll, width, at == 0, &frame);
@@ -928,6 +939,37 @@ impl App {
                 tall
             }
             path::Kind::Band => self.timeline_band(device, row, left, y, room),
+            path::Kind::Pictures => {
+                // Small copies, side by side as many as fit, and how many more there are.
+                let (size, gap) = (s(PICTURE), s(ds::space::S));
+                let tall = size + s(ds::space::S);
+                if let Some(device) = device {
+                    let text_left = left + s(MARK + 4);
+                    let fit = (((x + width - text_left) + gap) / (size + gap)).max(1) as usize;
+                    let more = row.pictures.len().saturating_sub(fit);
+                    let shown = if more > 0 { fit.saturating_sub(1).max(1) } else { fit };
+                    for (place, file) in row.pictures.iter().take(shown).enumerate() {
+                        let cell = rect(text_left + place as i32 * (size + gap), y + s(ds::space::XS), size, size);
+                        match frame.pictures.get(file) {
+                            Some(crate::paint::Thumb::Ready { bitmap, width: wide, height: high }) => {
+                                // (as it came, in the middle of its square)
+                                let (wide, high) = ((*wide).min(size), (*high).min(size));
+                                crate::paint::draw_thumb(device, *bitmap, cell.left + (size - wide) / 2, cell.top + (size - high) / 2, wide, high, s(ds::radius::SMALL));
+                            }
+                            Some(crate::paint::Thumb::Missing(_)) => {
+                                rounded(device, cell, s(ds::radius::SMALL), Some(theme::code_back()), Some(theme::line()));
+                                icon::draw(device, "file", cell, s(ds::size::ICON_SMALL), theme::faint());
+                            }
+                            _ => rounded(device, cell, s(ds::radius::SMALL), Some(theme::code_back()), None),
+                        }
+                    }
+                    if more > 0 {
+                        let cell = rect(text_left + shown as i32 * (size + gap), y + s(ds::space::XS), size, size);
+                        draw_text(device, &format!("+{}", row.pictures.len() - shown), cell, fonts.small, theme::muted(), DT_CENTER | ONE_LINE);
+                    }
+                }
+                tall
+            }
             path::Kind::Span => {
                 // Which part of the turn's time the band over it shows, and at the right the press that shows all of it, as a link is drawn.
                 let tall = s(ds::size::TEXT_LINE) + s(ds::space::XS);
@@ -1024,6 +1066,8 @@ const BAND_GAP: i32 = 4;
 const BAND_TICK: i32 = 7;
 const BAND_CHIP: i32 = 10;
 const BAND_STRIPE: i32 = 4;
+/// The side of a picture's small copy.
+const PICTURE: i32 = 64;
 /// How far the pointer goes across a band, held down, before it is a drag and not a press.
 const DRAG_FROM: i32 = 4;
 

@@ -53,6 +53,8 @@ pub struct TurnPath {
     pub woken: bool,
     /// When the turn began, as the trajectory says it.
     pub started: String,
+    /// The pictures the person sent with it: their files in the session's folder of pictures ([`crate::images::folder_of`]).
+    pub asked_images: Vec<String>,
     pub steps: Vec<Step>,
     /// None: the run ended in it (it was killed, or it is going on).
     pub ended: Option<TurnEnd>,
@@ -171,6 +173,8 @@ pub struct CallRow {
     pub helper_file: Option<String>,
     /// For an `explore`: the steps its helper took, read from that file by [`read`] (none where it is not there).
     pub helper_steps: Vec<HelperStep>,
+    /// The pictures its result opened for the model to see (as `asked_images`).
+    pub images: Vec<String>,
 }
 
 /// A step of an `explore` helper's own conversation: why, in its words, and the calls it made (each its tool and what it was on).
@@ -446,10 +450,11 @@ fn path_of(turn: u64, in_turn: &[(usize, &Line)], range: Option<Range<usize>>, m
     let begun = in_turn.iter().map(|(_, line)| *line).find(|line| line.ev() == "turn_start");
     let woken = begun.is_some_and(|line| line.v["woken"] == true);
     let asked = if woken { String::new() } else { range.as_ref().and_then(|range| asked_in(&messages[range.start])).unwrap_or_default() };
+    let asked_images = if woken { Vec::new() } else { range.as_ref().map_or_else(Vec::new, |range| messages[range.start].images.iter().map(|image| image.file.clone()).collect()) };
     let failed = in_turn.iter().any(|(_, line)| line.ev() == "failed");
     let ended = in_turn.iter().map(|(_, line)| *line).find(|line| line.ev() == "turn_end")
         .map(|line| TurnEnd { ms: line.u("ms").unwrap_or(0), cancelled: line.v["cancelled"] == true, failed: failed || line.s("ended") == "failed" });
-    TurnPath { turn, asked, woken, started: begun.map_or(String::new(), |line| line.s("t").to_string()), steps: steps_of(in_turn, range, messages, trusted), ended }
+    TurnPath { turn, asked, woken, started: begun.map_or(String::new(), |line| line.s("t").to_string()), asked_images, steps: steps_of(in_turn, range, messages, trusted), ended }
 }
 
 /// How many characters of words a message has.
@@ -794,7 +799,9 @@ fn call_rows(request: &Line, made: Option<usize>, messages: &[Message], tools: &
             let found = unused.iter().position(|(_, tool)| !call.id.is_empty() && tool.s("id") == call.id)
                 .or_else(|| unused.iter().position(|(_, tool)| tool.s("id").is_empty() && tool.s("name") == call.function.name));
             let tool = found.map(|place| unused.remove(place));
-            rows.push(call_row(Some(call), tool, output_after(messages, at, &call.id), helper_of));
+            let mut row = call_row(Some(call), tool, output_after(messages, at, &call.id), helper_of);
+            row.images = images_after(messages, at, &call.id);
+            rows.push(row);
         }
     }
     for tool in unused {
@@ -821,6 +828,13 @@ fn output_after(messages: &[Message], at: usize, id: &str) -> Option<String> {
         .map(|message| ends_of(message.content.as_deref().unwrap_or(""), END_BYTES))
 }
 
+/// The pictures the result of the call `id` opened, from the results that follow the message `at`.
+fn images_after(messages: &[Message], at: usize, id: &str) -> Vec<String> {
+    messages[at + 1..].iter().take_while(|message| message.role != "assistant")
+        .find(|message| message.role == "tool" && message.tool_call_id.as_deref() == Some(id))
+        .map_or_else(Vec::new, |message| message.images.iter().map(|image| image.file.clone()).collect())
+}
+
 fn call_row(call: Option<&ToolCall>, tool: Option<(usize, &Line)>, output: Option<String>, helper_of: &HashMap<usize, &str>) -> CallRow {
     let line = tool.map(|(_, line)| line);
     let target = line.and_then(|line| line.v["path"].as_str().or_else(|| line.v["cmd0"].as_str()).map(str::to_string)).or_else(|| call.and_then(|call| target_of(&call.function.arguments)));
@@ -837,6 +851,7 @@ fn call_row(call: Option<&ToolCall>, tool: Option<(usize, &Line)>, output: Optio
         output,
         helper_file: tool.and_then(|(at, _)| helper_of.get(&at)).map(|file| file.to_string()),
         helper_steps: Vec::new(),
+        images: Vec::new(),
     }
 }
 
@@ -1265,6 +1280,25 @@ mod tests {
         let afresh = [kept.clone(), vec![assistant("", "", vec![call("t4", "todo", json!({"todos": [{"id": "z", "text": "only this"}], "merge": false}))])]].concat();
         assert_eq!(todos(build(&afresh, "").heading), [("only this".to_string(), "doing".to_string())]);
         assert_eq!(build(&[Message::text("system", "s"), user("hello")], "").heading, None);
+    }
+
+    /// The pictures the person sent with a request, and those a call's result opened, are named by their files.
+    #[test]
+    fn the_pictures_of_a_request_and_of_a_calls_result_are_named_by_their_files() {
+        let lines = [
+            json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 17, "images": 2}),
+            request(1, 1, "2026-11-05T10:00:01.000+09:00", 100, 0, &["read_file"], "tool_calls"),
+            tool(1, 1, "c1", "read_file", "2026-11-05T10:00:02.000+09:00", Some("shot.png")),
+        ];
+        let picture = |file: &str| crate::message::ImageRef { file: file.into(), media_type: "image/png".into(), width: 10, height: 10 };
+        let mut asked = user("what is in these?");
+        asked.images = vec![picture("1-a.png"), picture("1-b.png")];
+        let mut opened = Message::tool_result("c1", "shot.png: this picture");
+        opened.images = vec![picture("2-shot.png")];
+        let messages = vec![Message::text("system", "s"), asked, assistant("", "", vec![call("c1", "read_file", json!({"path": "shot.png"}))]), opened];
+        let said = build(&messages, &text(&lines));
+        assert_eq!(said.turns[0].asked_images, ["1-a.png", "1-b.png"]);
+        assert_eq!(said.turns[0].steps[0].calls[0].images, ["2-shot.png"]);
     }
 
     #[test]

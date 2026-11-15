@@ -4596,6 +4596,10 @@ impl App {
                 }
             }
         }
+        // (the timeline's rows of pictures ask for theirs as they are drawn: the next drawing has it)
+        if self.timeline_shown() {
+            InvalidateRect(self.timeline.window, std::ptr::null(), 0);
+        }
     }
 
     /// Whether the model waits for the person: for an approval, an answer to its question, or a decision on its plan.
