@@ -30,6 +30,7 @@ mod settings;
 mod steps;
 mod term;
 mod textview;
+mod timeline_rows;
 mod toolrun;
 mod ui;
 mod updates;

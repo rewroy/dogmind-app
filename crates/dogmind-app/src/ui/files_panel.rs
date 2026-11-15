@@ -129,6 +129,9 @@ impl App {
         if view == RightView::Files && self.files_shown() {
             SetFocus(self.tree_list);
         }
+        if view == RightView::Timeline && self.timeline_shown() {
+            SetFocus(self.timeline.window);
+        }
     }
 
     /// `/files`: the panel is there with the tree in it, or it says why it cannot be.

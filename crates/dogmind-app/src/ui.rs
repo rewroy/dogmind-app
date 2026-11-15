@@ -65,6 +65,7 @@ use crate::settings::{self, Kind, ProviderConfig, Settings, TEXT_SIZES};
 mod files_panel;
 mod helper_view;
 mod term_panel;
+mod timeline_view;
 
 use helper_view::{HelperLive, StepsView};
 
@@ -783,6 +784,8 @@ enum Note {
     Changes(PathBuf, Result<Vec<FileChange>, String>),
     /// A folder of the Files view has been read (`path`: from the workspace, with `/`), or why not.
     FolderRead { root: PathBuf, path: String, result: Result<Vec<files::Entry>, String> },
+    /// The path of a session has been read from its files (the Timeline view), or why not.
+    Timeline { session: PathBuf, result: Result<dogmind_agent::timeline::Timeline, String> },
     /// The disk says these folders of the workspace have changed.
     WorkspaceChanged { root: PathBuf, changed: files::Changed },
     Found(u64, Vec<session::Hit>),
@@ -1913,6 +1916,8 @@ struct App {
     panel_menu: files_panel::PanelMenu,
     /// The Terminal view of the panel on the right (`term_panel`): its windows and its terminals.
     term: term_panel::TermView,
+    /// The Timeline view of the panel on the right (`timeline_view`): its window, the session's path read from its files, and what the events say between two reads.
+    timeline: timeline_view::TimelineView,
     /// The words over the panel on the right, where a press goes to the view each names.
     right_tab_hits: Vec<(RECT, RightView)>,
     collapsed: HashSet<String>,
@@ -5984,7 +5989,7 @@ impl App {
             (room / 2).max(s(380))
         } else if self.preview_file.is_none() && (self.settings.right_panel || self.steps.is_some()) && room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS) {
             // (a terminal wants columns: nearly half of what the sidebar leaves, as far as the conversation can spare it)
-            let wanted = if self.settings.right_view == RightView::Terminal { (room * 45 / 100).clamp(s(ds::size::RIGHT_PANEL), s(TERMINAL_PANEL_MOST)) } else { s(ds::size::RIGHT_PANEL) };
+            let wanted = if matches!(self.settings.right_view, RightView::Terminal | RightView::Timeline) { (room * 45 / 100).clamp(s(ds::size::RIGHT_PANEL), s(TERMINAL_PANEL_MOST)) } else { s(ds::size::RIGHT_PANEL) };
             wanted.min(room - s(RIGHT_NEEDS))
         } else {
             0
@@ -6001,6 +6006,9 @@ impl App {
         }
         if !self.terminal_shown() {
             self.terminal_hidden();
+        }
+        if !self.timeline_shown() {
+            self.timeline_hidden();
         }
         if self.preview_file.is_none() || right == 0 {
             if let Some(shown) = &self.preview {
@@ -7711,15 +7719,18 @@ impl App {
         // The views of the panel, as words over it (level with the session's name): the one shown is underlined.
         let words_top = (s(ds::size::TITLE_STRIP) - s(ds::space::XL)) / 2;
         let mut across_to = x;
-        for (words, view) in [(t("Overview"), RightView::Overview), (t("Files"), RightView::Files), (t("Terminal"), RightView::Terminal)] {
-            let across = text_width(self.fonts.strong, words);
+        let views = [(t("Overview"), RightView::Overview), (t("Files"), RightView::Files), (t("Terminal"), RightView::Terminal), (t("Timeline"), RightView::Timeline)];
+        let widths: Vec<i32> = views.iter().map(|(words, _)| text_width(self.fonts.strong, words)).collect();
+        // (four words in a panel as narrow as this one: the room between them gives way before the words do)
+        let gap = ((width - widths.iter().sum::<i32>()) / (views.len() as i32 - 1)).clamp(s(ds::space::S), s(ds::space::XL));
+        for ((words, view), across) in views.into_iter().zip(widths) {
             let on = self.settings.right_view == view;
             shapes.push(Shape::Text { area: rect(across_to, words_top, across, s(ds::space::XL)), text: words.to_string(), font: FontKind::Strong, color: if on { theme::text() } else { theme::muted() }, flags: ONE_LINE });
             if on {
                 shapes.push(Shape::Fill { area: rect(across_to, words_top + s(ds::space::XL) + s(ds::space::HAIR), across, s(ds::space::HAIR)), color: theme::accent() });
             }
-            self.right_tab_hits.push((rect(across_to - s(ds::space::S), words_top - s(ds::space::XS), across + 2 * s(ds::space::S), s(ds::space::XL) + s(ds::space::M)), view));
-            across_to += across + s(ds::space::XL);
+            self.right_tab_hits.push((rect(across_to - gap / 2, words_top - s(ds::space::XS), across + gap, s(ds::space::XL) + s(ds::space::M)), view));
+            across_to += across + gap;
         }
         // (what is under them begins past the strip the session's name has)
         let mut y = s(ds::size::TITLE_STRIP) + s(ds::space::S);
@@ -7736,6 +7747,12 @@ impl App {
         if self.settings.right_view == RightView::Terminal {
             self.dashboard_hit = None;
             self.layout_terminal_view(shapes, x, width, s(ds::size::TITLE_STRIP), height);
+            return;
+        }
+        // The timeline has the panel to the foot of the window too: the path is long.
+        if self.settings.right_view == RightView::Timeline {
+            self.dashboard_hit = None;
+            self.layout_timeline_view(x, width, s(ds::size::TITLE_STRIP), height);
             return;
         }
         // The engine, at the foot: what it is and the way to its dashboard.
@@ -11957,6 +11974,7 @@ impl App {
         self.show_user(&out.card, &shown, &clock_now());
         // (from now: behind a warm-up its turn may not begin for most of a minute)
         self.set_activity(t("Thinking…").into());
+        self.timeline_will_ask(&out.card);
         self.running = true;
         self.stop_asked = false;
         self.update_buttons();
@@ -12076,6 +12094,7 @@ impl App {
         set_text(self.transcript, "");
         // (what the panel on the right showed of the session before is of it)
         self.steps = None;
+        self.timeline_session_changed();
         self.helpers_live.clear();
         self.shown.clear();
         self.answers.clear();
@@ -12475,6 +12494,7 @@ impl App {
 
     unsafe fn on_event(&mut self, event: Event) {
         let event = hidden_shown(event);
+        self.timeline_event(&event);
         let live_report = matches!(&event, Event::Usage { usage, .. } if usage.prompt == 0 && usage.completion == 0);
         if !matches!(event, Event::Content(_) | Event::RequestStarted) && !live_report {
             self.flush_reveal();
@@ -13114,6 +13134,7 @@ impl App {
                 }
             }
             Note::FolderRead { root, path, result } => self.files_read_came(root, path, result),
+            Note::Timeline { session, result } => self.timeline_came(session, result),
             Note::WorkspaceChanged { root, changed } => self.files_changed_on_disk(&root, changed),
             Note::Changes(path, found) => {
                 if path != self.workspace {
@@ -15251,6 +15272,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.rate_tick();
             app.run_tick();
             app.helper_tick();
+            app.timeline_tick();
             app.spinner_tick();
             0
         }
@@ -15727,6 +15749,13 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
         let (x, y) = ((message.lParam & 0xFFFF) as i16 as i32, ((message.lParam >> 16) & 0xFFFF) as i16 as i32);
         if WindowFromPoint(POINT { x, y }) == app.steps_view {
             app.steps_wheel(message.wParam);
+            return true;
+        }
+    }
+    if message.message == WM_MOUSEWHEEL && app.timeline_shown() {
+        let (x, y) = ((message.lParam & 0xFFFF) as i16 as i32, ((message.lParam >> 16) & 0xFFFF) as i16 as i32);
+        if WindowFromPoint(POINT { x, y }) == app.timeline.window {
+            app.timeline_wheel(message.wParam);
             return true;
         }
     }
@@ -16608,6 +16637,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             tree_menu_hover: None,
             panel_menu: files_panel::PanelMenu { items: Vec::new(), whose: files_panel::MenuFor::Nothing },
             term: term_panel::TermView::new(window, theme::sidebar()),
+            timeline: timeline_view::TimelineView::new(window),
             right_tab_hits: Vec::new(),
             collapsed: HashSet::new(),
             all_sessions: Vec::new(),
