@@ -15760,10 +15760,10 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             return true;
         }
     }
-    if message.message == WM_MOUSEWHEEL && app.timeline_shown() {
+    if (message.message == WM_MOUSEWHEEL || message.message == WM_MOUSEHWHEEL) && app.timeline_shown() {
         let (x, y) = ((message.lParam & 0xFFFF) as i16 as i32, ((message.lParam >> 16) & 0xFFFF) as i16 as i32);
         if WindowFromPoint(POINT { x, y }) == app.timeline.window {
-            app.timeline_wheel(message.wParam);
+            app.timeline_wheel(message.message == WM_MOUSEHWHEEL, message.wParam, message.lParam);
             return true;
         }
     }

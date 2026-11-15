@@ -84,6 +84,9 @@ pub(super) struct TimelineView {
     follow: bool,
     /// Where on the thumb the pointer holds it.
     pub thumb_grab: Option<i32>,
+    /// The part of each turn's time its band shows, where the person chose one; and a drag across a band under way (its turn, and where it began and is).
+    spans: std::collections::BTreeMap<u64, (u64, u64)>,
+    band_drag: Option<(u64, i32, i32)>,
     /// When the window was last drawn for the clock, and whether more has come since than that has shown.
     ticked: Instant,
     head_dirty: bool,
@@ -124,6 +127,8 @@ impl TimelineView {
             scroll: 0,
             follow: true,
             thumb_grab: None,
+            spans: std::collections::BTreeMap::new(),
+            band_drag: None,
             ticked: Instant::now(),
             head_dirty: false,
         }
@@ -193,7 +198,7 @@ impl App {
         };
         // (the time now, for the band of the turn at work to reach)
         let wall_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
-        path::Inputs { running: self.running, wait, background: self.waiting.commands.len() + self.waiting.waits.len(), wall_ms, query: self.timeline.query.clone() }
+        path::Inputs { running: self.running, wait, background: self.waiting.commands.len() + self.waiting.waits.len(), wall_ms, query: self.timeline.query.clone(), spans: self.timeline.spans.clone() }
     }
 
     /// Nothing of the view is on screen: its window goes, and the keys go back to the composer if it had them.
@@ -244,6 +249,8 @@ impl App {
         self.timeline.timeline = None;
         self.timeline.error = None;
         self.timeline.opened.clear();
+        self.timeline.spans.clear();
+        self.timeline.band_drag = None;
         self.timeline.selected = None;
         self.timeline.serial += 1;
         self.timeline.follow = true;
@@ -402,9 +409,70 @@ impl App {
         InvalidateRect(self.timeline.window, std::ptr::null(), 0);
     }
 
-    pub(super) unsafe fn timeline_wheel(&mut self, wparam: WPARAM) {
-        let notches = i32::from(((wparam >> 16) & 0xFFFF) as u16 as i16) / 120;
-        self.timeline_to(self.timeline.scroll - notches * 3 * scale(self.dpi, ds::size::TEXT_ROW));
+    /// The wheel (`across`: the one that turns sideways) at a point of the screen: the path scrolls; over a turn's band, with Ctrl the band's time is
+    /// drawn out or in around the pointer, and with Shift, or turned sideways, it moves along its turn.
+    pub(super) unsafe fn timeline_wheel(&mut self, across: bool, wparam: WPARAM, lparam: LPARAM) {
+        let notches = f64::from(((wparam >> 16) & 0xFFFF) as u16 as i16) / 120.0;
+        // (MK_SHIFT, MK_CONTROL)
+        let (shift, control) = (wparam & 0x0004 != 0, wparam & 0x0008 != 0);
+        if across || shift || control {
+            let mut at = POINT { x: (lparam & 0xFFFF) as i16 as i32, y: ((lparam >> 16) & 0xFFFF) as i16 as i32 };
+            ScreenToClient(self.timeline.window, &mut at);
+            if let Some(turn) = self.timeline_row_at(at.y).map(|row| &self.timeline.rows[row]).filter(|row| row.kind == path::Kind::Band).map(|row| row.turn) {
+                // (turned sideways, to the right is later)
+                self.timeline_band_wheel(turn, at.x, if across { -notches } else { notches }, control && !across);
+                return;
+            }
+        }
+        if across {
+            return;
+        }
+        self.timeline_to(self.timeline.scroll - (notches * 3.0) as i32 * scale(self.dpi, ds::size::TEXT_ROW));
+    }
+
+    /// Where a band row's band lies across the window: its left and its width (a row's, at its indent).
+    unsafe fn timeline_band_across(&self, indent: u8) -> (i32, i32) {
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(self.timeline.window, &mut client);
+        let level = scale(self.dpi, LEVEL) * i32::from(indent);
+        (scale(self.dpi, PAD) + level, (self.timeline_content_width(client.right) - level).max(1))
+    }
+
+    /// The open turn's band row, and the time under a point across it (milliseconds after the turn began, within what the band shows).
+    unsafe fn timeline_band_time(&self, turn: u64, x: i32) -> Option<(&path::Row, u64)> {
+        let row = self.timeline.rows.iter().find(|row| row.kind == path::Kind::Band && row.turn == turn)?;
+        let (left, width) = self.timeline_band_across(row.indent);
+        let (from, to) = row.span.unwrap_or((0, row.whole));
+        Some((row, from + (f64::from((x - left).clamp(0, width)) / f64::from(width) * (to - from) as f64).round() as u64))
+    }
+
+    /// The band's time drawn out (`zoom`, by the turn of the wheel) around the time under the pointer, or moved along its turn by a fifth of what it shows a notch.
+    unsafe fn timeline_band_wheel(&mut self, turn: u64, x: i32, notches: f64, zoom: bool) {
+        let Some((row, under)) = self.timeline_band_time(turn, x) else { return };
+        let whole = row.whole;
+        let (from, to) = row.span.unwrap_or((0, whole));
+        let shown = (to - from) as f64;
+        let span = if zoom {
+            let length = (shown * 0.8f64.powf(notches)).max(path::SHORTEST_SPAN as f64);
+            let begin = (under as f64 - (under - from) as f64 * length / shown).max(0.0);
+            (begin as u64, (begin + length) as u64)
+        } else {
+            // (the wheel turned up, or sideways to the left, is earlier)
+            let moved = (from as f64 - notches * shown / 5.0).clamp(0.0, (whole - (to - from)) as f64) as u64;
+            (moved, moved + (to - from))
+        };
+        self.timeline_span(turn, path::span_inside(span, whole));
+    }
+
+    /// The part of a turn's time its band shows (all of it, with None), the band staying where it stands in the window.
+    unsafe fn timeline_span(&mut self, turn: u64, span: Option<(u64, u64)>) {
+        let anchor = move |row: &path::Row| row.kind == path::Kind::Band && row.turn == turn;
+        self.timeline_keep(&anchor, &mut |view| {
+            match span {
+                Some(span) => view.spans.insert(turn, span),
+                None => view.spans.remove(&turn),
+            };
+        });
     }
 
     /// Where the row under a point of the window is, if the point is in the path.
@@ -422,10 +490,12 @@ impl App {
         self.timeline_row_at(y).and_then(|at| self.timeline.rows[at].key)
     }
 
-    /// A press on a row that opens: it opens or shuts, and the keys are on it. On a turn's band: the step that ran at that time opens, in view.
+    /// A press of the pointer: on a turn's band it begins a drag across it (`timeline_release` ends it); on a row that opens, that row opens or shuts,
+    /// and the keys are on it.
     pub(super) unsafe fn timeline_click(&mut self, x: i32, y: i32) {
-        if let Some(at) = self.timeline_row_at(y).filter(|at| self.timeline.rows[*at].kind == path::Kind::Band) {
-            self.timeline_band_click(at, x);
+        if let Some(turn) = self.timeline_row_at(y).map(|at| &self.timeline.rows[at]).filter(|row| row.kind == path::Kind::Band).map(|row| row.turn) {
+            SetCapture(self.timeline.window);
+            self.timeline.band_drag = Some((turn, x, x));
             return;
         }
         if let Some(key) = self.timeline_key_at(y) {
@@ -434,39 +504,67 @@ impl App {
         }
     }
 
-    /// From where the wait was to what it was: the time under the pointer, as the band was drawn (its left and its width are a row's at its indent),
-    /// is in a step, which is opened and brought to the top of the view.
-    unsafe fn timeline_band_click(&mut self, at: usize, x: i32) {
-        let row = &self.timeline.rows[at];
-        let (Some(length), turn, indent) = (row.band.as_ref().map(|band| band.length), row.turn, row.indent) else { return };
-        let dpi = self.dpi;
-        let s = |value: i32| scale(dpi, value);
-        let mut client: RECT = std::mem::zeroed();
-        GetClientRect(self.timeline.window, &mut client);
-        let level = s(LEVEL) * i32::from(indent);
-        let (left, width) = (s(PAD) + level, (self.timeline_content_width(client.right) - level).max(1));
-        let ms = (f64::from((x - left).clamp(0, width)) / f64::from(width) * length as f64) as u64;
+    /// The pointer moved with its button down: a drag across a band follows it.
+    pub(super) unsafe fn timeline_drag(&mut self, x: i32) {
+        if let Some((_, _, now)) = self.timeline.band_drag.as_mut() {
+            *now = x;
+            InvalidateRect(self.timeline.window, std::ptr::null(), 0);
+        }
+    }
+
+    /// The button let go: a drag across a band shows the part of its time it went over; a press that hardly moved goes to the step of that time.
+    pub(super) unsafe fn timeline_release(&mut self) {
+        let Some((turn, began, now)) = self.timeline.band_drag.take() else { return };
+        ReleaseCapture();
+        if (now - began).abs() < scale(self.dpi, DRAG_FROM) {
+            self.timeline_band_click(turn, began);
+            return;
+        }
+        let (Some((row, one)), Some((_, other))) = (self.timeline_band_time(turn, began), self.timeline_band_time(turn, now)) else { return };
+        let whole = row.whole;
+        self.timeline_span(turn, path::span_inside((one.min(other), one.max(other)), whole));
+    }
+
+    /// From where the wait was to what it was: the time under the pointer, as the band was drawn, is in a step, which is opened and brought to the top
+    /// of the view.
+    unsafe fn timeline_band_click(&mut self, turn: u64, x: i32) {
+        let Some((_, ms)) = self.timeline_band_time(turn, x) else { return };
         let Some(place) = self.timeline.timeline.as_ref().and_then(|timeline| timeline.turns.iter().find(|path| path.turn == turn)).and_then(|path| path::step_at(path, ms)) else { return };
         let key = Key::Step(turn, place);
         self.timeline.selected = Some(key);
         self.timeline_toggle(key, Some(true));
         if let Some(placed) = self.timeline.rows.iter().position(|row| row.key == Some(key)).and_then(|row| self.timeline.placed.get(row).copied()) {
-            self.timeline_to(placed.top - s(ds::space::S));
+            self.timeline_to(placed.top - scale(self.dpi, ds::space::S));
         }
         InvalidateRect(self.timeline.window, std::ptr::null(), 0);
     }
 
     /// A row opened or shut (`open`: which, or the other of what it is), the row staying where it stands in the window and not the content under it.
+    /// The row under a band that shows a part of its turn's time shows all of it again.
     unsafe fn timeline_toggle(&mut self, key: Key, open: Option<bool>) {
-        let place = |view: &TimelineView| view.rows.iter().position(|row| row.key == Some(key)).and_then(|at| view.placed.get(at).map(|placed| placed.top - view.scroll));
+        if let Key::Whole(turn) = key {
+            if open.is_none() {
+                self.timeline.selected = Some(Key::Turn(turn));
+                self.timeline_span(turn, None);
+            }
+            return;
+        }
         let Some(now_open) = self.timeline.rows.iter().find(|row| row.key == Some(key)).map(|row| row.open) else { return };
         let wanted = open.unwrap_or(!now_open);
         if wanted == now_open {
             return;
         }
+        self.timeline_keep(&|row: &path::Row| row.key == Some(key), &mut |view| {
+            view.opened.insert(key, wanted);
+            view.opened_serial += 1;
+        });
+    }
+
+    /// The rows made again after a choice (`change`), the row `anchor` finds staying where it stands in the window and not the content under it.
+    unsafe fn timeline_keep(&mut self, anchor: &dyn Fn(&path::Row) -> bool, change: &mut dyn FnMut(&mut TimelineView)) {
+        let place = |view: &TimelineView| view.rows.iter().position(|row| anchor(row)).and_then(|at| view.placed.get(at).map(|placed| placed.top - view.scroll));
         let before = place(&self.timeline);
-        self.timeline.opened.insert(key, wanted);
-        self.timeline.opened_serial += 1;
+        change(&mut self.timeline);
         let inputs = self.timeline_inputs();
         self.timeline_rebuild(&inputs, Instant::now());
         let mut client: RECT = std::mem::zeroed();
@@ -830,6 +928,18 @@ impl App {
                 tall
             }
             path::Kind::Band => self.timeline_band(device, row, left, y, room),
+            path::Kind::Span => {
+                // Which part of the turn's time the band over it shows, and at the right the press that shows all of it, as a link is drawn.
+                let tall = s(ds::size::TEXT_LINE) + s(ds::space::XS);
+                if let Some(device) = device {
+                    outline(device, rect(x, y, width, tall));
+                    icon::draw(device, row.icon, rect(left, y, s(MARK), tall), s(ds::size::ICON_SMALL), theme::muted());
+                    let right = text_width(fonts.small, &row.right);
+                    draw_text(device, &row.right, rect(x + width - right - s(ds::space::XS), y, right, tall), fonts.small, theme::accent(), DT_RIGHT | ONE_LINE);
+                    draw_text(device, &row.text, rect(left + s(MARK), y, (room - s(MARK) - right - s(ds::space::M)).max(0), tall), fonts.small, theme::muted(), ONE_LINE);
+                }
+                tall
+            }
         }
     }
 
@@ -872,6 +982,11 @@ impl App {
                 let middle = place(at);
                 fill(device, rect(middle - s(1), top - tick, s(2), tick), theme::muted());
             }
+            // A drag across it under way: the part it has gone over, framed.
+            if let Some((_, began, now)) = self.timeline.band_drag.filter(|(turn, began, now)| *turn == row.turn && (now - began).abs() >= s(DRAG_FROM)) {
+                let (from, to) = (began.min(now).clamp(x, x + width), began.max(now).clamp(x, x + width));
+                rounded(device, rect(from, top - s(ds::space::XS), (to - from).max(s(2)), lanes_tall + 2 * s(ds::space::XS)), s(ds::radius::SMALL), None, Some(theme::accent()));
+            }
         }
         let mut used = top - y + lanes_tall + s(ds::space::S);
         // What the colours are: a chip and its words, as many on a line as fit.
@@ -909,6 +1024,8 @@ const BAND_GAP: i32 = 4;
 const BAND_TICK: i32 = 7;
 const BAND_CHIP: i32 = 10;
 const BAND_STRIPE: i32 = 4;
+/// How far the pointer goes across a band, held down, before it is a drag and not a press.
+const DRAG_FROM: i32 = 4;
 
 /// The colours of the band's parts: three hues that stay apart for every kind of colour vision (blue the prompt read, orange the model thinking, aqua it
 /// writing), a neutral for waiting and for calls, and the status colours, each with its word in the key, for what went wrong or waits for the person.
@@ -986,8 +1103,8 @@ unsafe extern "system" fn timeline_procedure(window: HWND, message: u32, wparam:
             EndPaint(window, &paint);
             0
         }
-        WM_MOUSEWHEEL => {
-            app.timeline_wheel(wparam);
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            app.timeline_wheel(message == WM_MOUSEHWHEEL, wparam, lparam);
             0
         }
         // (the arrows and the page keys come to it for itself)
@@ -1010,6 +1127,11 @@ unsafe extern "system" fn timeline_procedure(window: HWND, message: u32, wparam:
             ScreenToClient(window, &mut at);
             if at.x < client.right - scale(app.dpi, ds::space::M) && app.timeline_key_at(at.y).is_some() {
                 SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
+                return 1;
+            }
+            // (over a band: a part of its time can be chosen by a drag)
+            if at.x < client.right - scale(app.dpi, ds::space::M) && app.timeline_row_at(at.y).is_some_and(|row| app.timeline.rows[row].kind == path::Kind::Band) {
+                SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_CROSS));
                 return 1;
             }
             DefWindowProcW(window, message, wparam, lparam)
@@ -1040,12 +1162,22 @@ unsafe extern "system" fn timeline_procedure(window: HWND, message: u32, wparam:
                 let view = client.bottom - head;
                 let tall = thumb_height(view, view, total, scale(app.dpi, ds::space::XXL));
                 app.timeline_to((i64::from(y - grab - head) * i64::from((total - view).max(0)) / i64::from((view - tall).max(1))) as i32);
+            } else {
+                app.timeline_drag(x);
             }
             0
         }
         WM_LBUTTONUP => {
             if app.timeline.thumb_grab.take().is_some() {
                 ReleaseCapture();
+                InvalidateRect(window, std::ptr::null(), 0);
+            }
+            app.timeline_release();
+            0
+        }
+        // (the pointer taken by another window: a drag across a band ends with nothing chosen)
+        WM_CAPTURECHANGED => {
+            if app.timeline.band_drag.take().is_some() {
                 InvalidateRect(window, std::ptr::null(), 0);
             }
             0
