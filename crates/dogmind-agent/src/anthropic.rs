@@ -421,7 +421,7 @@ mod tests {
             });
             let claude = Anthropic::new(&format!("http://127.0.0.1:{port}/v1"), "k".into()).unwrap();
             let messages = [Message::text("user", "hi")];
-            claude.stream(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None, close_thinking: false }, &AtomicBool::new(false), &mut |_| {})
+            claude.stream(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None }, &AtomicBool::new(false), &mut |_| {})
         };
         let start = [
             json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
@@ -461,7 +461,7 @@ mod tests {
         });
         let claude = Anthropic::new(&format!("http://127.0.0.1:{port}/v1"), "k".into()).unwrap();
         let messages = [Message::text("user", "hi")];
-        claude.stream(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: Some("20261105-120000/4"), close_thinking: false }, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        claude.stream(&Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: Some("20261105-120000/4") }, &AtomicBool::new(false), &mut |_| {}).unwrap();
         let head = heard.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(head.lines().any(|line| line == "x-request-id: 20261105-120000/4") && head.contains("x-api-key: k"), "{head}");
     }
@@ -558,7 +558,7 @@ mod tests {
     fn a_request_is_what_the_current_api_takes() {
         let schemas = crate::tools::schemas();
         let messages = [Message::text("system", "s"), Message::text("user", "hi")];
-        let body = request_body(&Request { model: DEFAULT_MODEL, messages: &messages, tools: Some(&schemas), effort: Some("none"), images: None, japanese_letters: false, request_id: None, close_thinking: false });
+        let body = request_body(&Request { model: DEFAULT_MODEL, messages: &messages, tools: Some(&schemas), effort: Some("none"), images: None, japanese_letters: false, request_id: None });
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "low");
         assert_eq!(body["system"], "s");
@@ -574,7 +574,7 @@ mod tests {
     #[test]
     fn fallbacks_go_with_the_models_that_take_them_and_with_no_other() {
         let messages = [Message::text("user", "hi")];
-        let body = |model: &str| request_body(&Request { model, messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None, close_thinking: false });
+        let body = |model: &str| request_body(&Request { model, messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None });
         let key = || Anthropic::new(DEFAULT_URL, "k".to_string()).unwrap();
         for model in ["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5-5-20261001"] {
             assert_eq!(body(model)["fallbacks"], "default", "{model}");
