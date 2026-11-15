@@ -11,6 +11,7 @@ pub mod baseline;
 #[cfg(windows)]
 pub mod bundled;
 pub mod checkpoint;
+pub mod code_mode;
 pub mod codex;
 pub mod compaction;
 pub mod conversation_key;
