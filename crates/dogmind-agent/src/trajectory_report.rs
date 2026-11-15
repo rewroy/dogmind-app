@@ -15,25 +15,26 @@ use serde_json::Value;
 /// How many failed calls in a row, or how many of one call, is worth a line.
 const FAILED_IN_A_ROW: usize = 3;
 
-struct Line {
-    v: Value,
-    at: Option<DateTime<FixedOffset>>,
+/// One line of a trajectory, and when it was written.
+pub(crate) struct Line {
+    pub(crate) v: Value,
+    pub(crate) at: Option<DateTime<FixedOffset>>,
 }
 
 impl Line {
-    fn ev(&self) -> &str {
+    pub(crate) fn ev(&self) -> &str {
         self.v["ev"].as_str().unwrap_or("")
     }
-    fn s(&self, key: &str) -> &str {
+    pub(crate) fn s(&self, key: &str) -> &str {
         self.v[key].as_str().unwrap_or("")
     }
-    fn u(&self, key: &str) -> Option<u64> {
+    pub(crate) fn u(&self, key: &str) -> Option<u64> {
         self.v[key].as_u64()
     }
-    fn turn(&self) -> u64 {
+    pub(crate) fn turn(&self) -> u64 {
         self.u("turn").unwrap_or(0)
     }
-    fn req(&self) -> &str {
+    pub(crate) fn req(&self) -> &str {
         self.s("req")
     }
     /// A tool call that did not go well: it ended in anything but `ok`, or it was a command that ran and exited with a code that says so.
@@ -132,7 +133,8 @@ fn join<'a>(requests: &[(usize, &Line)], engine: &'a [EngineLine]) -> HashMap<us
     joined
 }
 
-fn load(trajectory: &str) -> (Vec<Line>, usize) {
+/// The lines of a trajectory that can be read, and how many could not.
+pub(crate) fn load(trajectory: &str) -> (Vec<Line>, usize) {
     let mut bad = 0;
     let lines = trajectory.lines().filter(|text| !text.trim().is_empty()).filter_map(|text| match serde_json::from_str::<Value>(text) {
         Ok(v) => {

@@ -7972,6 +7972,40 @@ mod tests {
     }
 
     #[test]
+    fn the_timeline_of_a_real_run_has_its_steps_with_their_calls_and_the_same_without_the_places_the_trajectory_gives() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "content here").unwrap();
+        let (client, _) = server(vec![call_answer("read_file", serde_json::json!({"path": "a.txt"})), text_answer("done. and more")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("read it\nand tell me".into())).unwrap();
+        let session = session_file(&run);
+        until_end(&run, Decision::Reject);
+        let timeline = crate::timeline::read(&session).unwrap();
+        let path = &timeline.turns[0];
+        assert_eq!((path.asked.as_str(), path.woken, path.steps.len()), ("read it", false, 2), "{path:?}");
+        assert!(path.ended.as_ref().is_some_and(|end| !end.cancelled && !end.failed));
+        let (first, last) = (&path.steps[0], &path.steps[1]);
+        // The first step said nothing but its call, and the last said "done" after reasoning.
+        assert_eq!(first.why.as_ref().map(|why| (why.text.as_str(), why.source)), Some(("read_file a.txt", crate::timeline::WhySource::Target)));
+        assert_eq!(last.why.as_ref().map(|why| (why.text.as_str(), why.source)), Some(("done.", crate::timeline::WhySource::Content)));
+        let call = &first.calls[0];
+        assert_eq!((call.id.as_str(), call.name.as_str(), call.outcome.as_str(), call.target.as_deref()), ("call-1", "read_file", "ok", Some("a.txt")));
+        assert!(call.arguments.as_deref().unwrap().contains("a.txt") && call.output.as_deref().unwrap().contains("content here"), "{call:?}");
+        assert_eq!(last.request.as_ref().map(|request| (request.prompt, request.completion, request.end.as_str())), Some((Some(10), Some(2), "stop")));
+        // A trajectory from before the lines said where their messages are gives the same.
+        let beside = trajectory::file_of(&session);
+        let old: String = std::fs::read_to_string(&beside).unwrap().lines().map(|line| {
+            let mut line: Value = serde_json::from_str(line).unwrap();
+            line.as_object_mut().unwrap().remove("message");
+            line.as_object_mut().unwrap().remove("id");
+            format!("{line}\n")
+        }).collect();
+        assert!(!old.contains("\"message\""));
+        let again = crate::timeline::build(&crate::session::read(&session).unwrap(), &old);
+        assert_eq!(again, timeline);
+    }
+
+    #[test]
     fn a_request_asked_again_is_told_to_the_window_and_the_empty_one_made_no_message() {
         let dir = tempfile::tempdir().unwrap();
         let (run, _) = scripted(dir.path(), vec![says(""), says("hello")], Mode::Default);

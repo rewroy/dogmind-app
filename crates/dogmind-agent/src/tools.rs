@@ -1109,29 +1109,36 @@ impl Workbench {
     }
 
     fn todo(&mut self, arguments: &Value) -> Result<String, String> {
-        let items = arguments.get("todos").and_then(Value::as_array).ok_or("todos is required")?;
-        if arguments.get("merge").and_then(Value::as_bool) == Some(false) {
-            self.todos.clear();
-        }
-        for item in items {
-            let id = item.get("id").and_then(Value::as_str).ok_or("each todo needs an id")?;
-            match self.todos.iter_mut().find(|known| known.get("id").and_then(Value::as_str) == Some(id)) {
-                Some(known) => {
-                    for (name, value) in item.as_object().into_iter().flatten() {
-                        known[name] = value.clone();
-                    }
-                }
-                None => {
-                    let mut fresh = item.clone();
-                    if fresh.get("status").is_none() {
-                        fresh["status"] = json!(if self.todos.is_empty() { "doing" } else { "pending" });
-                    }
-                    self.todos.push(fresh);
-                }
-            }
-        }
+        apply_todo(&mut self.todos, arguments)?;
         Ok(self.todos.iter().map(|item| format!("[{}] {}: {}", item["status"].as_str().unwrap_or("pending"), item["id"].as_str().unwrap_or(""), item["text"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"))
     }
+}
+
+/// A `todo` call's arguments applied to a checklist: an item with an id the list has changes the fields it sends, a new one is added (the first of an empty list `doing`, the others `pending`, unless it says),
+/// and `merge: false` begins the list afresh. A call that fails part of the way leaves the items before the failing one in. A list is nothing but its calls, so whoever reads a conversation replays them with this.
+pub fn apply_todo(todos: &mut Vec<Value>, arguments: &Value) -> Result<(), String> {
+    let items = arguments.get("todos").and_then(Value::as_array).ok_or("todos is required")?;
+    if arguments.get("merge").and_then(Value::as_bool) == Some(false) {
+        todos.clear();
+    }
+    for item in items {
+        let id = item.get("id").and_then(Value::as_str).ok_or("each todo needs an id")?;
+        match todos.iter_mut().find(|known| known.get("id").and_then(Value::as_str) == Some(id)) {
+            Some(known) => {
+                for (name, value) in item.as_object().into_iter().flatten() {
+                    known[name] = value.clone();
+                }
+            }
+            None => {
+                let mut fresh = item.clone();
+                if fresh.get("status").is_none() {
+                    fresh["status"] = json!(if todos.is_empty() { "doing" } else { "pending" });
+                }
+                todos.push(fresh);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `new` put in place of each `old` in `text`, its lines ending as the line it is put on ends. (A model writes its lines with LF: one line
@@ -4361,5 +4368,20 @@ mod tests {
         bench.todo(&json!({"todos": [{"id": "a", "text": "first"}, {"id": "b", "text": "second"}]})).unwrap();
         let out = bench.todo(&json!({"todos": [{"id": "a", "status": "done"}]})).unwrap();
         assert_eq!(out, "[done] a: first\n[pending] b: second");
+    }
+
+    #[test]
+    fn a_checklist_is_what_its_calls_leave_when_they_are_replayed() {
+        let mut todos = Vec::new();
+        apply_todo(&mut todos, &json!({"todos": [{"id": "a", "text": "first"}, {"id": "b", "text": "second"}]})).unwrap();
+        apply_todo(&mut todos, &json!({"todos": [{"id": "b", "status": "done"}]})).unwrap();
+        let shown = |todos: &[Value]| todos.iter().map(|item| (item["id"].as_str().unwrap().to_string(), item["status"].as_str().unwrap().to_string())).collect::<Vec<_>>();
+        assert_eq!(shown(&todos), [("a".to_string(), "doing".to_string()), ("b".to_string(), "done".to_string())], "the first of a new list is the one being done");
+        // A call that fails part of the way leaves the items before the failing one in.
+        assert_eq!(apply_todo(&mut todos, &json!({"todos": [{"id": "c"}, {"text": "no id"}]})), Err("each todo needs an id".to_string()));
+        assert_eq!(todos.len(), 3);
+        assert!(apply_todo(&mut todos, &json!({"merge": false})).is_err() && todos.len() == 3, "a call with no list changes none");
+        apply_todo(&mut todos, &json!({"todos": [{"id": "z"}], "merge": false})).unwrap();
+        assert_eq!(shown(&todos), [("z".to_string(), "doing".to_string())]);
     }
 }
