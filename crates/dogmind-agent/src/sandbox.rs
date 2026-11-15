@@ -1627,11 +1627,59 @@ unsafe fn profile_folder(sid: PSID) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Where a command's Python finds `PYTHON_SHIM` as its sitecustomize: a folder of the sandbox's own temp folder, put first on PYTHONPATH.
+const PYTHON_SHIM_FOLDER: &str = "dogmind-python";
+/// The sitecustomize a command's Python starts with, whichever Python it is (a person's own has none of the bundled one's): see its own words.
+const PYTHON_SHIM: &str = r#"# Dogmind's, for a command in its sandbox. On Windows, Python 3.13 and later make a folder of mode 0o700 (tempfile.mkdtemp, TemporaryDirectory,
+# pytest's tmp_path, pip) with a list of only the user, SYSTEM and the administrators on it, which shuts a process under an AppContainer out of
+# the folder it has just made: a test that uses one fails with Permission denied, and the folder cannot be removed. It is made with its parent's
+# list instead, as Python made it before 3.13. The sitecustomize that comes after this one on the path (a bundled Python's, or a project's) runs too.
+import os
+import sys
+
+if os.name == "nt" and not getattr(os.mkdir, "_dogmind_open", False):
+    _dogmind_mkdir = os.mkdir
+
+    def _dogmind_open_mkdir(path, mode=0o777, *, dir_fd=None):
+        return _dogmind_mkdir(path, 0o777 if mode == 0o700 else mode, dir_fd=dir_fd)
+
+    _dogmind_open_mkdir._dogmind_open = True
+    os.mkdir = _dogmind_open_mkdir
+
+
+def _dogmind_next_sitecustomize():
+    import importlib.machinery
+    import importlib.util
+
+    here = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
+    rest = [entry for entry in sys.path if os.path.normcase(os.path.abspath(entry or os.curdir)) != here]
+    spec = importlib.machinery.PathFinder.find_spec("sitecustomize", rest)
+    if spec is not None and spec.loader is not None:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+
+_dogmind_next_sitecustomize()
+"#;
+
+/// `PYTHON_SHIM` in the sandbox's temp folder, written where it is not there as it is. A command can read it there, and nothing a command does to it outlasts the next.
+fn put_python_shim(temp: &str) {
+    if temp.is_empty() {
+        return;
+    }
+    let file = Path::new(temp).join(PYTHON_SHIM_FOLDER).join("sitecustomize.py");
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(PYTHON_SHIM) {
+        let _ = std::fs::create_dir_all(file.parent().expect("a folder"));
+        let _ = std::fs::write(&file, PYTHON_SHIM);
+    }
+}
+
 /// A command's environment, as the block CreateProcess takes. `build_tools` is asked for the compiler's folders only when the app has no `LIB` of its own: the command's start waits for it, so it
 /// is given the time the command has and the person's Stop (see `crate::msvc::found_before`).
 fn environment(temp: Option<&Path>, workspace: &Path, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<u16> {
     let block: Vec<(String, String)> = VARIABLES.iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
     let temp = temp.map(|path| path.display().to_string()).or_else(|| std::env::var("TEMP").ok()).unwrap_or_default();
+    put_python_shim(&temp);
     let block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, build_tools);
     let mut out = Vec::new();
     for (name, value) in block {
@@ -1659,6 +1707,10 @@ fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, t
     }
     // Where git looks for its per-user files: the person's profile is closed to a command, and it would warn on every run.
     block.push(("XDG_CONFIG_HOME".to_string(), temp.clone()));
+    // (its sitecustomize first, for any Python: a folder of mode 0o700 made under the container is one the container cannot open, see PYTHON_SHIM)
+    if !temp.is_empty() {
+        block.push(("PYTHONPATH".to_string(), format!("{temp}\\{PYTHON_SHIM_FOLDER}")));
+    }
     block.push(("TEMP".to_string(), temp.clone()));
     block.push(("TMP".to_string(), temp));
     block.sort_by_key(|(name, _)| name.to_uppercase());
@@ -2937,6 +2989,25 @@ mod tests {
         println!("status {:?}: {}{}", done.status, said.trim(), decode(&done.stderr));
         assert_eq!(done.status, Some(0), "{said} {}", decode(&done.stderr));
         assert_eq!(said.trim(), "1", "{}", decode(&done.stderr));
+    }
+
+    /// A Python test's temporary folder is one the command can use and take away, in the sandbox's temp folder and in the workspace alike: a
+    /// suite's task failed with Permission denied in both, and left folders in the workspace that nothing could remove (Python 3.14, the
+    /// person's own, with no sitecustomize of the bundle's). Where there is no python to run, there is nothing to see.
+    #[test]
+    fn a_python_temporary_folder_is_one_the_command_can_use_and_remove() {
+        let folder = work_folder("python-temp");
+        let script = "import os, shutil, tempfile; made = []\nfor where in (None, os.getcwd()):\n    with tempfile.TemporaryDirectory(dir=where) as d:\n        open(os.path.join(d, 'a.txt'), 'w').write('x')\n        made.append(os.path.basename(d))\nd = tempfile.mkdtemp(dir=os.getcwd()); open(os.path.join(d, 'b.txt'), 'w').write('y'); shutil.rmtree(d)\nprint('ok', len(made))";
+        std::fs::write(folder.join("probe.py"), script).unwrap();
+        let done = command("python probe.py", &folder, false);
+        let (said, errors) = (decode(&done.stdout), decode(&done.stderr));
+        if errors.contains("is not recognized") || errors.contains("was not found") {
+            eprintln!("no python here: {errors}");
+            return;
+        }
+        assert_eq!((done.status, said.trim()), (Some(0), "ok 2"), "{errors}");
+        let left: Vec<String> = std::fs::read_dir(&folder).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name != "probe.py").collect();
+        assert!(left.is_empty(), "left in the workspace: {left:?}");
     }
 
     /// A command's parts are timed: before the process, the process, and after it.
