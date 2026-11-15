@@ -63,6 +63,16 @@ pub fn for_calls_shown_as_written(schemas: &mut Value) {
             tool["function"]["description"] = Value::from(CREATE_FILE_WHOLE);
         }
     }
+    // (a program's declarations say what the tools are as they are offered: made again from them)
+    redeclare_run_code(schemas);
+}
+
+/// `run_code`, where it is offered, made again from the tools offered beside it as they are now.
+fn redeclare_run_code(schemas: &mut Value) {
+    let Some(list) = schemas.as_array_mut() else { return };
+    let Some(at) = list.iter().position(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("run_code")) else { return };
+    let others = Value::Array(list.iter().enumerate().filter(|(index, _)| *index != at).map(|(_, tool)| tool.clone()).collect());
+    list[at] = crate::code_mode::schema(&others);
 }
 
 pub fn schemas() -> Value {
@@ -3226,6 +3236,22 @@ mod tests {
         assert!(description(&schemas).contains("whole in one call") && description(&schemas).contains("append=true"));
         let after: Vec<Value> = schemas.as_array().unwrap().iter().filter(|tool| tool["function"]["name"] != "create_file").cloned().collect();
         assert_eq!(after, others, "nothing else changes");
+    }
+
+    /// A program's declaration of create_file says what create_file is as it is offered, after the provider's own version of it.
+    #[test]
+    fn run_code_declares_create_file_as_it_is_offered() {
+        let declared = |schemas: &Value| {
+            let run_code = schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "run_code").unwrap()["function"]["description"].as_str().unwrap().to_string();
+            run_code.lines().find(|line| line.starts_with("tools.create_file(")).unwrap().to_string()
+        };
+        let mut schemas = schemas_for(false, false, false, Vec::new(), true);
+        let in_parts = declared(&schemas);
+        for_calls_shown_as_written(&mut schemas);
+        let whole = declared(&schemas);
+        assert_ne!(in_parts, whole);
+        assert!(whole.contains("whole in one call"), "{whole}");
+        assert_eq!(schemas.as_array().unwrap().last().unwrap()["function"]["name"], "run_code", "still the last of them");
     }
 
     #[test]
