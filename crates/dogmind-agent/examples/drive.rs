@@ -1,7 +1,8 @@
-//! Drives the agent against a server with no window, to measure a job: `drive --server URL --workspace DIR --data DIR --turns FILE [--mode auto] [--limit SECONDS] [--wake-for SECONDS] [--refuse] [--warm-wait SECONDS] [--between SECONDS [--warm-between]] [--key-file FILE]`; `drive --report TRAJECTORY [--engine-log FILE]` reads a trajectory as `dogmind-app --trajectory` does.
+//! Drives the agent against a server with no window, to measure a job: `drive --server URL --workspace DIR --data DIR --turns FILE [--mode auto] [--limit SECONDS] [--wake-for SECONDS] [--refuse] [--warm-wait SECONDS] [--between SECONDS [--warm-between]] [--key-file FILE] [--code-mode]`; `drive --report TRAJECTORY [--engine-log FILE]` reads a trajectory as `dogmind-app --trajectory` does.
 //!
 //! The turns are the lines of the file (a blank line is skipped), each sent when the one before it has ended. Approvals are given, as a person at the keyboard would who trusts the job;
 //! with `--refuse` every approval is answered no, so that no command runs. A call being written is shown as its pieces come, with the time into the turn.
+//! `--code-mode` offers the model `run_code`, a short program that calls the tools; the calls it makes are lines of the trajectory with the program's call as their `parent`.
 //! `--wake-for` goes on after the last turn for as long as the session has a background command or a wait, up to that many seconds, and shows the turns it wakes itself for.
 //! The session, and the trajectory beside it (`dogmind-app --trajectory`), are in `--data\sessions`. It never touches the app's own data folder.
 
@@ -28,9 +29,12 @@ fn main() {
     let (mut between, mut warm_between) = (0u64, false);
     // `--key-file FILE`: the server's key, read from the file (its first line) and sent as the app sends one; never printed.
     let mut key_file: Option<PathBuf> = None;
+    // `--code-mode`: the model is offered `run_code`.
+    let mut code_mode = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--refuse" => refuse = true,
+            "--code-mode" => code_mode = true,
             "--warm-wait" => warm_wait = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
             "--between" => between = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
             "--warm-between" => warm_between = true,
@@ -87,6 +91,7 @@ fn main() {
         memory: None,
         mcp: None,
         policy: Default::default(),
+        code_mode,
     };
     let handle = agent::start(config_in(&data), sender, Box::new(|| {}));
     let send = |command: Command| {
@@ -212,7 +217,8 @@ fn show(event: Event, tools: &mut u32, approvals: &mut u32, failed: &mut Option<
         Event::Approval(approval) => {
             *approvals += 1;
             let decision = if seen.refuse { Decision::Reject } else { Decision::Approve };
-            println!("  {} {} ({})", if seen.refuse { "refuse" } else { "approve" }, approval.tool, approval.summary.chars().take(80).collect::<String>());
+            let from = approval.program.as_ref().map_or(String::new(), |program| format!(" from a program: {}", program.chars().take(60).collect::<String>()));
+            println!("  {} {} ({}){from}", if seen.refuse { "refuse" } else { "approve" }, approval.tool, approval.summary.chars().take(80).collect::<String>());
             let _ = approval.answer.send((decision, None));
         }
         // (a piece of a call the model is still writing: when it came and how much it was)

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 use rquickjs::context::EvalOptions;
 use rquickjs::{Context, Ctx, Error as EngineError, Function, Promise, Runtime, Value};
+use serde_json::{json, Value as Json};
 
 use crate::tools::cap;
 
@@ -561,6 +562,102 @@ pub fn render(outcome: &Outcome, limits: &Limits) -> String {
     cap(&text, limits.output)
 }
 
+/// What a program cannot call: `run_code` itself, the tools that wait for the person's answer or decision (it has no one to ask), `explore` (a helper of its own) and `wake_at` (the session's
+/// own clock). They are left out of what the model is told, and refused if called.
+pub const NOT_CALLABLE: [&str; 5] = ["run_code", "submit_plan", "ask_user", "explore", "wake_at"];
+
+/// The rules the model reads before the tools it can call from a program.
+const RULES: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Use it when the work needs three or more tool calls whose order can be decided up front (several reads, a search then reads). Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws.";
+/// How much of a tool's first sentence its declaration keeps.
+const ABOUT_MOST: usize = 160;
+
+/// The names of the tools a program may call, of the tools that are offered (a list of schemas as the model is given them).
+pub fn callable(offered: &Json) -> Vec<String> {
+    offered.as_array().into_iter().flatten().filter_map(|tool| tool.pointer("/function/name")?.as_str()).filter(|name| !NOT_CALLABLE.contains(name)).map(str::to_string).collect()
+}
+
+/// The `run_code` tool as the model is offered it: the rules and, for each tool it can call, a line that says how (`tools.read_file({path, start_line?, limit?}) — Read a text file...`), made from
+/// the tools that are offered with it, so that the web, notes and servers' tools are in it only when they are.
+pub fn schema(offered: &Json) -> Json {
+    let mut description = String::from(RULES);
+    for tool in offered.as_array().into_iter().flatten() {
+        if let Some(line) = declaration(tool) {
+            description.push('\n');
+            description.push_str(&line);
+        }
+    }
+    let time = format!("Its own running time in seconds, not counting the calls' waits. Default {}, at most {}.", TIME_DEFAULT.as_secs(), TIME_MOST.as_secs());
+    json!({"type": "function", "function": {"name": "run_code", "description": description, "parameters": {"type": "object", "properties": {
+        "code": {"type": "string", "description": "The body of an async function."},
+        "description": {"type": "string", "description": "One line: what the program does."},
+        "timeout_seconds": {"type": "number", "description": time}
+    }, "required": ["code", "description"]}}})
+}
+
+/// One tool as a program calls it, with the first sentence of what it says it is. None for a tool a program cannot call.
+fn declaration(tool: &Json) -> Option<String> {
+    let function = tool.get("function")?;
+    let name = function.get("name")?.as_str()?;
+    if NOT_CALLABLE.contains(&name) {
+        return None;
+    }
+    let plain = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.starts_with(|c: char| c.is_ascii_digit());
+    let callee = if plain { format!("tools.{name}") } else { format!("tools[{name:?}]") };
+    let arguments = function.get("parameters").map(fields).unwrap_or_default();
+    let about = function.get("description").and_then(Json::as_str).map(first_sentence).unwrap_or_default();
+    Some(if about.is_empty() { format!("{callee}({{{arguments}}})") } else { format!("{callee}({{{arguments}}}) — {about}") })
+}
+
+/// The fields of an object's schema as a program writes them: `path, start_line?, edits: [{path, old_string}]`. A `?` is a field that may be left out; the kind of a field is told when it
+/// is not a plain value.
+fn fields(schema: &Json) -> String {
+    let required: Vec<&str> = schema.get("required").and_then(Json::as_array).into_iter().flatten().filter_map(Json::as_str).collect();
+    let each = schema.get("properties").and_then(Json::as_object).into_iter().flatten().map(|(name, property)| {
+        let mark = if required.contains(&name.as_str()) { "" } else { "?" };
+        match structure(property) {
+            Some(shape) => format!("{name}{mark}: {shape}"),
+            None => format!("{name}{mark}"),
+        }
+    });
+    each.collect::<Vec<_>>().join(", ")
+}
+
+/// What a value is, where a name does not say: the choices of an enumeration, the items of a list, the fields of an object.
+fn structure(schema: &Json) -> Option<String> {
+    if let Some(options) = schema.get("enum").and_then(Json::as_array) {
+        let words: Vec<String> = options.iter().filter_map(Json::as_str).map(|word| format!("\"{word}\"")).collect();
+        return (!words.is_empty()).then(|| words.join("|"));
+    }
+    match schema.get("type").and_then(Json::as_str)? {
+        "array" => Some(format!("[{}]", structure(&schema["items"]).unwrap_or_else(|| plain_kind(&schema["items"])))),
+        "object" if schema.get("properties").is_some() => Some(format!("{{{}}}", fields(schema))),
+        _ => None,
+    }
+}
+
+fn plain_kind(schema: &Json) -> String {
+    match schema.get("type").and_then(Json::as_str) {
+        Some("string") => "string",
+        Some("integer" | "number") => "number",
+        Some("boolean") => "boolean",
+        _ => "any",
+    }
+    .to_string()
+}
+
+/// A description's first sentence, on one line and at most [`ABOUT_MOST`] characters.
+fn first_sentence(text: &str) -> String {
+    let text = text.trim();
+    let end = text.char_indices().find(|(at, c)| (*c == '.' && text[at + 1..].chars().next().is_none_or(char::is_whitespace)) || *c == '。').map_or(text.len(), |(at, c)| at + c.len_utf8());
+    let sentence = text[..end].split_whitespace().collect::<Vec<_>>().join(" ");
+    if sentence.chars().count() <= ABOUT_MOST {
+        return sentence;
+    }
+    let mut cut: String = sentence.chars().take(ABOUT_MOST - 1).collect();
+    cut.push('…');
+    cut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,5 +1062,63 @@ mod tests {
         // A time set past the most is held to it by the run itself.
         let limits = Limits { time: Duration::from_secs(5000), ..limits() };
         assert!(run("return 1;", &[], &limits, &AtomicBool::new(false), &mut |_, _| panic!("no call")).value.is_some());
+    }
+
+    fn tool(name: &str, description: Option<&str>, parameters: serde_json::Value) -> serde_json::Value {
+        let mut function = json!({"name": name, "parameters": parameters});
+        if let Some(description) = description {
+            function["description"] = json!(description);
+        }
+        json!({"type": "function", "function": function})
+    }
+
+    #[test]
+    fn a_tool_is_declared_as_a_program_calls_it_with_the_first_sentence_of_what_it_is() {
+        let offered = json!([
+            tool("read_file", Some("Read a text file.  Then more."), json!({"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]})),
+            tool("todo", Some("A checklist.\nSend only what changed."), json!({"type": "object", "properties": {
+                "todos": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "done"]}}, "required": ["id"]}},
+                "merge": {"type": "boolean"}
+            }, "required": ["todos"]})),
+            tool("show_diff", None, json!({"type": "object", "properties": {"scope": {"type": "string", "enum": ["session", "staged"]}, "paths": {"type": "array", "items": {"type": "string"}}, "depth": {"type": "array", "items": {"type": "integer"}}}, "required": ["scope"]})),
+            tool("mcp__a-b__c.d", Some("Version 1.2 of it is here."), json!({"type": "object", "properties": {}})),
+            tool("mcp__s__t", None, json!(null)),
+        ]);
+        let description = schema(&offered)["function"]["description"].as_str().unwrap().to_string();
+        let lines: Vec<&str> = description.lines().collect();
+        assert!(lines[0].starts_with("Run a short JavaScript program"), "{description}");
+        assert_eq!(lines[1], "tools.read_file({path, limit?}) — Read a text file.");
+        assert_eq!(lines[2], "tools.todo({todos: [{id, status?: \"pending\"|\"done\"}], merge?}) — A checklist.");
+        assert_eq!(lines[3], "tools.show_diff({scope: \"session\"|\"staged\", paths?: [string], depth?: [number]})");
+        assert_eq!(lines[4], "tools[\"mcp__a-b__c.d\"]({}) — Version 1.2 of it is here.");
+        assert_eq!(lines[5], "tools.mcp__s__t({})");
+        assert_eq!(lines.len(), 6);
+    }
+
+    #[test]
+    fn a_program_is_told_of_the_tools_it_can_call_and_not_of_those_it_cannot() {
+        let offered = json!([
+            tool("read_file", Some("Read."), json!({"type": "object", "properties": {}})),
+            tool("ask_user", Some("Ask."), json!({"type": "object", "properties": {}})),
+            tool("run_code", Some("Run."), json!({"type": "object", "properties": {}})),
+            tool("explore", Some("Look."), json!({"type": "object", "properties": {}})),
+            tool("wake_at", Some("Wake."), json!({"type": "object", "properties": {}})),
+            tool("submit_plan", Some("Plan."), json!({"type": "object", "properties": {}})),
+            tool("web_read", Some("Read a page."), json!({"type": "object", "properties": {}})),
+        ]);
+        assert_eq!(callable(&offered), ["read_file", "web_read"]);
+        let description = schema(&offered)["function"]["description"].as_str().unwrap().to_string();
+        assert_eq!(description.lines().skip(1).collect::<Vec<_>>(), ["tools.read_file({}) — Read.", "tools.web_read({}) — Read a page."]);
+        assert!(callable(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn a_first_sentence_is_one_line_and_not_longer_than_it_may_be() {
+        assert_eq!(first_sentence("List a folder. {} is the workspace."), "List a folder.");
+        assert_eq!(first_sentence("Version 1.2 is out, and more."), "Version 1.2 is out, and more.");
+        assert_eq!(first_sentence("No full stop"), "No full stop");
+        assert_eq!(first_sentence("フォルダーを見る。次の文。"), "フォルダーを見る。");
+        assert_eq!(first_sentence(&"x ".repeat(200)).chars().count(), ABOUT_MOST);
+        assert!(first_sentence(&"x ".repeat(200)).ends_with('…'));
     }
 }
