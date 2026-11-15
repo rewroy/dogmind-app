@@ -678,7 +678,8 @@ mod tests {
         // after its first request; 0.1 s at DeepSeek-V4.1's 2,000 tokens a second of a cold prompt on two R9700s, 1 s at the 200 above)
         // (then wake_on and wake_at, with the words that a background command's end wakes the session: some 550 characters, 140 tokens, once a session: without them a
         // build that ends ten minutes later waits for the person to type)
-        assert!(tools.len() < 7_300, "the tools have grown to {} characters", tools.len());
+        // (then present, to put the files of the work before the person as a card: some 380 characters, under 100 tokens once a session)
+        assert!(tools.len() < 7_700, "the tools have grown to {} characters", tools.len());
         assert!(app_facts("2026-11-02 20:01:18 +09:00", Some("Japanese"), &[]).len() < 200, "what rides on every message");
     }
 

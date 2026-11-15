@@ -305,6 +305,8 @@ pub enum Event {
     ModeChanged(Mode),
     Usage { used: u64, window: u64, usage: Usage },
     Todos(Vec<Value>),
+    /// Files of the workspace the model put before the person (present): its call, and the files from the workspace's root.
+    Presented { call: String, files: Vec<String> },
     /// Whether web content is in this conversation, so that a command that gets the network asks.
     WebSeen(bool),
     Turns(Vec<Turn>),
@@ -2900,6 +2902,11 @@ impl Agent {
         if name == "todo" && result.is_ok() {
             self.emit(Event::Todos(self.bench.todos.clone()));
         }
+        if name == "present" && result.is_ok() {
+            if let Ok(files) = crate::tools::present(arguments, &self.workspace) {
+                self.emit(Event::Presented { call: id.to_string(), files });
+            }
+        }
         if matches!(name, "create_file" | "apply_patch") && result.is_ok() {
             self.edited = true;
         }
@@ -4028,7 +4035,7 @@ mod tests {
         assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "so are the tools");
         assert_eq!(second[3]["reasoning_content"], "thinking");
         assert!(bodies[0].get("tool_choice").is_none() && bodies[0].get("max_tokens").is_none());
-        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 16, "Dogmind's ten and the app's six");
+        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 17, "Dogmind's ten and the app's seven");
     }
 
     /// What the person typed goes to the model as it was typed, with nothing around it, and the app's facts (the time, the language, at the first message the workspace)

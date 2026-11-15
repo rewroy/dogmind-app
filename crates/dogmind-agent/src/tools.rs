@@ -114,17 +114,20 @@ pub fn schemas() -> Value {
             "scope": {"type": "string", "enum": ["session", "workspace", "staged", "unstaged"], "description": "session: since this session began. workspace: against HEAD, or outside git as session. staged, unstaged: git's index."},
             "paths": {"type": "array", "items": {"type": "string"}}
         }), &["scope"]),
-        function("ask_user", "Ask the person one question with 2-4 choices, your pick first, only when their answer alone settles what to do. They may answer in their own words. Waits for it.", json!({
+        function("ask_user", "Ask the person one question with 2-4 choices, the first shown as your pick. They may answer in their own words. Waits for the answer.", json!({
             "question": {"type": "string"},
             "options": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "description": {"type": "string"}}, "required": ["label"]}}
         }), &["question", "options"]),
         function("submit_plan", "Plan mode: put the finished plan (Markdown) to the person. Approved, plan mode ends and you carry it out now; if not, you get what to change.", json!({
             "plan": {"type": "string"}
         }), &["plan"]),
-        function("todo", "A checklist, only for work with several separate deliverables. Send only what changed.", json!({
+        function("todo", "A checklist the person sees beside the conversation, each item pending, doing, done or blocked. Items sent are added or changed by their id.", json!({
             "todos": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "doing", "done", "blocked"]}}, "required": ["id"]}},
             "merge": {"type": "boolean", "description": "false: replace the whole list."}
         }), &["todos"]),
+        function("present", "Put files of the workspace before the person: a card in the conversation lists them, and each opens in its own app or is shown in Explorer.", json!({
+            "paths": {"type": "array", "items": {"type": "string"}, "description": "From the workspace's root."}
+        }), &["paths"]),
         function("find_files", "Find files by name with a glob such as `**/*.rs`. Skips what .gitignore skips.", json!({
             "pattern": {"type": "string"},
             "path": {"type": "string"}
@@ -750,6 +753,7 @@ impl Workbench {
             "command_stop" => self.job_stop(arguments),
             "wake_at" => self.wake_at(arguments),
             "todo" => self.todo(arguments),
+            "present" => present(arguments, workspace).map(|files| format!("The person sees a card with {}.", files.join(", "))),
             "skill" => self.read_skill(arguments),
             _ if tool.starts_with("mcp__") => {
                 let hub = self.mcp.as_ref().ok_or("no MCP server is running")?;
@@ -1129,6 +1133,28 @@ impl Workbench {
         apply_todo(&mut self.todos, arguments)?;
         Ok(self.todos.iter().map(|item| format!("[{}] {}: {}", item["status"].as_str().unwrap_or("pending"), item["id"].as_str().unwrap_or(""), item["text"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"))
     }
+}
+
+/// The files a `present` call names, as they are from the workspace's root with forward slashes: each has to be a file inside it.
+pub fn present(arguments: &Value, workspace: &Path) -> Result<Vec<String>, String> {
+    let paths = arguments.get("paths").and_then(Value::as_array).ok_or("paths is required: the files to put before the person")?;
+    let mut files = Vec::new();
+    for path in paths {
+        let path = path.as_str().map(str::trim).filter(|path| !path.is_empty()).ok_or("each path is a file's path, from the workspace's root")?;
+        let file = resolve(workspace, path);
+        let inside = file.strip_prefix(workspace).map_err(|_| format!("{path} is not in the workspace"))?;
+        if !file.is_file() {
+            return Err(format!("{path} is not a file of the workspace"));
+        }
+        let shown = inside.to_string_lossy().replace('\\', "/");
+        if !files.contains(&shown) {
+            files.push(shown);
+        }
+    }
+    if files.is_empty() {
+        return Err("paths is empty: name the files to put before the person".to_string());
+    }
+    Ok(files)
 }
 
 /// A `todo` call's arguments applied to a checklist: an item with an id the list has changes the fields it sends, a new one is added (the first of an empty list `doing`, the others `pending`, unless it says),
@@ -2804,6 +2830,7 @@ pub fn summary(tool: &str, arguments: &Value) -> String {
             files.join(", ")
         }
         "show_diff" => text("scope").to_string(),
+        "present" => arguments.get("paths").and_then(Value::as_array).map_or(String::new(), |paths| paths.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
         "web_read" => text("url").to_string(),
         "find_files" => text("pattern").to_string(),
         "skill" => text("name").to_string(),
@@ -3145,7 +3172,25 @@ mod tests {
     fn every_generated_schema_has_a_tool() {
         let schemas = schemas();
         let names: Vec<&str> = schemas.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "ask_user", "submit_plan", "todo", "find_files", "check_page", "command_status", "command_stop", "wake_at", "explore"]);
+        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "ask_user", "submit_plan", "todo", "present", "find_files", "check_page", "command_status", "command_stop", "wake_at", "explore"]);
+    }
+
+    /// `present` names files of the workspace, each once, from its root with forward slashes; a file that is not there, or a path out of the workspace, is refused, and so is none.
+    #[test]
+    fn present_names_files_of_the_workspace_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("web")).unwrap();
+        std::fs::write(dir.path().join("web/index.html"), "<p>").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "x").unwrap();
+        let files = present(&json!({"paths": ["web/index.html", "./notes.md", "web\\index.html"]}), dir.path()).unwrap();
+        assert_eq!(files, ["web/index.html", "notes.md"]);
+        assert!(present(&json!({"paths": ["gone.txt"]}), dir.path()).unwrap_err().contains("not a file"));
+        assert!(present(&json!({"paths": ["web"]}), dir.path()).is_err(), "a folder is not a file");
+        assert!(present(&json!({"paths": ["../outside.txt"]}), dir.path()).unwrap_err().contains("not in the workspace"));
+        assert!(present(&json!({"paths": []}), dir.path()).is_err());
+        let (_, mut bench, cancel) = bench();
+        let said = bench.run("present", &json!({"paths": ["notes.md"]}), dir.path(), &cancel).unwrap();
+        assert_eq!(said, "The person sees a card with notes.md.");
     }
 
     #[test]

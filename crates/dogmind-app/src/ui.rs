@@ -1031,6 +1031,10 @@ enum CardAct {
     StopHelper(String),
     /// Show the steps of the helper of this call in the panel on the right.
     OpenHelper(String),
+    /// A file of the workspace (from its root) in its own app, or shown in Explorer when it is a program.
+    OpenPath(String),
+    /// A file of the workspace (from its root), shown in Explorer.
+    ShowPath(String),
 }
 
 /// One control of a card, on a row of its room.
@@ -4763,6 +4767,19 @@ impl App {
                 }
                 self.card_room(s(12), Vec::new());
             }
+            Card::Presented { files } => {
+                let count = if files.len() == 1 { t("1 file").to_string() } else { tf("{0} files", &[&files.len()]) };
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                self.card_row(&[&format!("{}  ·  {count}", t("Files for you"))], 8, theme::muted(), 26, false);
+                self.card_room(s(4), Vec::new());
+                for path in files {
+                    let tip = if cards::opens_in_app(path) { t("Open in its app") } else { t("Show in Explorer") };
+                    let file = CardPart { text: path.clone(), kind: ButtonKind::Ghost, act: CardAct::OpenPath(path.clone()), width: 0, tip: tip.to_string() };
+                    let show = CardPart { text: "folder".to_string(), kind: ButtonKind::Icon, act: CardAct::ShowPath(path.clone()), width: s(ds::size::ICON_BUTTON), tip: t("Show in Explorer").to_string() };
+                    self.card_room(s(30), vec![file, show]);
+                }
+                self.card_room(s(12), Vec::new());
+            }
         }
         // (a table that ends the document has its last row drawn apart from the rest: a line after it, which is the room under a card anyway)
         self.append("
@@ -4928,8 +4945,14 @@ impl App {
     /// A file of an answer's card, in its own app, or shown in Explorer when it is a program (which the app does not run), or no longer there.
     unsafe fn open_turn_file(&mut self, turn: u64, at: usize) {
         let Some(path) = self.turn_changes.get(&turn).and_then(|files| files.get(at)).map(|file| file.path.clone()) else { return };
-        let file = self.workspace.join(&path);
-        let (verb, target, arguments) = if file.is_file() && cards::opens_in_app(&path) {
+        self.open_workspace_file(&path, false);
+    }
+
+    /// A file of the workspace, from its root: in its own app, or shown in Explorer when it is a program (which the app does not run) or when `reveal` asks, or, when it is
+    /// no longer there, the folder it was in.
+    unsafe fn open_workspace_file(&mut self, path: &str, reveal: bool) {
+        let file = self.workspace.join(path);
+        let (verb, target, arguments) = if file.is_file() && cards::opens_in_app(path) && !reveal {
             ("open", file.to_string_lossy().replace('/', "\\"), String::new())
         } else if file.is_file() {
             ("open", "explorer.exe".to_string(), format!("/select,\"{}\"", file.to_string_lossy().replace('/', "\\")))
@@ -4959,6 +4982,8 @@ impl App {
             CardAct::None => {}
             CardAct::StopHelper(call) => self.helper_stop_pressed(&call),
             CardAct::OpenHelper(call) => self.steps_open(&call),
+            CardAct::OpenPath(path) => self.open_workspace_file(&path, false),
+            CardAct::ShowPath(path) => self.open_workspace_file(&path, true),
         }
     }
 
@@ -12779,6 +12804,9 @@ impl App {
             Event::WebSeen(on) => {
                 self.web_seen = on;
                 self.layout();
+            }
+            Event::Presented { files, .. } => {
+                self.write_card(&Card::Presented { files });
             }
             Event::Todos(items) => {
                 let lines: Vec<String> = items.iter().map(|item| format!("    {}  {}", task_mark(item["status"].as_str().unwrap_or("")), item["text"].as_str().unwrap_or(""))).collect();
