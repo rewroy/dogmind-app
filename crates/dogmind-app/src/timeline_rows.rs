@@ -4,7 +4,7 @@
 //! Nothing is made up. The model's words are its own, and the person's request is theirs; a line that is neither is the app's (marked as such), or is drawn from the call the model made (and says so).
 //! Every word that comes from a conversation is shown as the conversation shows it: what acts on text and shows nothing is shown as its mark, and keys and tokens are hidden but their beginning.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use dogmind_agent::agent::Event;
@@ -71,7 +71,13 @@ pub struct Inputs {
     pub wall_ms: Option<i64>,
     /// What the person looks for, in small letters: only the turns and steps with it are shown, open. Empty: all of them.
     pub query: String,
+    /// The part of a turn's time the person chose to look at (by the turn, from and to milliseconds after it began): its band shows that part
+    /// across its width, and only the steps that ran in it are shown.
+    pub spans: BTreeMap<u64, (u64, u64)>,
 }
+
+/// The shortest part of a turn's time that can be looked at, in milliseconds.
+pub const SHORTEST_SPAN: u64 = 50;
 
 /// Whether a step has what is looked for (`query`, in small letters): in why it was taken, its calls' tools (as named here and as the model named
 /// them) and what they were on, or what its helper did.
@@ -599,6 +605,8 @@ pub enum Key {
     Step(u64, usize),
     /// The rest of what the server says of a step's request, folded under its first numbers.
     Server(u64, usize),
+    /// A press on it shows the whole of a turn's time again, where a part of it was chosen.
+    Whole(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -620,6 +628,8 @@ pub enum Kind {
     Note,
     /// An open turn's time as a band (`Row::band`), with what its colours are under it.
     Band,
+    /// Which part of the turn's time its band shows, and a press to show all of it (`Key::Whole`).
+    Span,
 }
 
 /// Whose words a row has, or how it came out: the colour of a row.
@@ -666,20 +676,51 @@ pub struct Row {
     pub live_part: Option<BandPart>,
     /// The turn a band row is of: a press on a part of it goes to the step it was of.
     pub turn: u64,
+    /// A band row's whole length, and the part of it the band shows (from and to milliseconds after the turn began), when a part was chosen.
+    pub whole: u64,
+    pub span: Option<(u64, u64)>,
+}
+
+/// When each step of a turn ran, by its place: from and to milliseconds after the turn began, its calls' time being its own.
+fn step_times(turn: &TurnPath) -> Vec<(usize, u64, u64)> {
+    let Some(start) = timeline::millis(&turn.started) else { return Vec::new() };
+    let after = |time: &str| timeline::millis(time).map(|at| (at - start).max(0) as u64);
+    turn.steps.iter().enumerate().filter_map(|(place, step)| {
+        let begin = after(&step.started)?;
+        // (a step lasts while its calls run too: they are its)
+        let calls_end = step.calls.iter().filter_map(|call| after(&call.started).map(|from| from + call.wait_ms.unwrap_or(0) + call.ms)).max().unwrap_or(0);
+        Some((place, begin, (begin + step.ms).max(calls_end).max(begin + 1)))
+    }).collect()
 }
 
 /// The step of a turn a time of its band (milliseconds after it began) was in: the one whose request or calls ran then, else the last that had
 /// begun by then.
 pub fn step_at(turn: &TurnPath, ms: u64) -> Option<usize> {
-    let start = timeline::millis(&turn.started)?;
-    let after = |time: &str| timeline::millis(time).map(|at| (at - start).max(0) as u64);
-    let spans: Vec<(usize, u64, u64)> = turn.steps.iter().enumerate().filter_map(|(place, step)| {
-        let begin = after(&step.started)?;
-        // (a step lasts while its calls run too: they are its)
-        let calls_end = step.calls.iter().filter_map(|call| after(&call.started).map(|from| from + call.wait_ms.unwrap_or(0) + call.ms)).max().unwrap_or(0);
-        Some((place, begin, (begin + step.ms).max(calls_end)))
-    }).collect();
-    spans.iter().find(|(_, begin, end)| (*begin..(*end).max(*begin + 1)).contains(&ms)).or_else(|| spans.iter().filter(|(_, begin, _)| *begin <= ms).last()).map(|(place, ..)| *place)
+    let spans = step_times(turn);
+    spans.iter().find(|(_, begin, end)| (*begin..*end).contains(&ms)).or_else(|| spans.iter().filter(|(_, begin, _)| *begin <= ms).last()).map(|(place, ..)| *place)
+}
+
+/// A band's part from `from` to `to`, laid from its start: its parts and marks in it, cut at its ends.
+fn band_within(band: &Band, from: u64, to: u64) -> Band {
+    Band {
+        length: to - from,
+        parts: band.parts.iter().filter_map(|part| part_within(part, from, to)).collect(),
+        marks: band.marks.iter().filter(|at| (from..=to).contains(*at)).map(|at| at - from).collect(),
+    }
+}
+
+fn part_within(part: &BandPart, from: u64, to: u64) -> Option<BandPart> {
+    (part.to > from && part.from < to).then(|| BandPart { from: part.from.max(from) - from, to: part.to.min(to) - from, ..*part })
+}
+
+/// A chosen part of a turn's time, kept inside the turn as long as it is now and never shorter than the shortest that can be chosen.
+pub fn span_inside(span: (u64, u64), whole: u64) -> Option<(u64, u64)> {
+    let length = (span.1.saturating_sub(span.0)).max(SHORTEST_SPAN);
+    if whole <= length {
+        return None;
+    }
+    let from = span.0.min(whole - length);
+    Some((from, from + length))
 }
 
 /// The parts a band's key names, in the order it names them: those that are in the band, then whether it has the app's own marks.
@@ -723,7 +764,22 @@ fn band_row(turn: &TurnPath, is_live: bool, context: &Context) -> Option<Row> {
             live_part = Some(BandPart { lane, from, to: now, part });
         }
     }
-    (band.length > 0).then(|| Row { kind: Kind::Band, indent: 1, band: Some(band), live_part, turn: turn.turn, ..Row::default() })
+    if band.length == 0 {
+        return None;
+    }
+    let whole = band.length;
+    // (a part of it chosen: that part across the band's width)
+    let span = context.inputs.spans.get(&turn.turn).and_then(|span| span_inside(*span, whole));
+    if let Some((from, to)) = span {
+        band = band_within(&band, from, to);
+        live_part = live_part.and_then(|part| part_within(&part, from, to));
+    }
+    Some(Row { kind: Kind::Band, indent: 1, band: Some(band), live_part, turn: turn.turn, whole, span, ..Row::default() })
+}
+
+/// Under a band that shows a part of its turn's time: which part, and a press to show it all.
+fn span_row(turn: u64, (from, to): (u64, u64)) -> Row {
+    Row { kind: Kind::Span, key: Some(Key::Whole(turn)), indent: 1, icon: "x", tone: Tone::Muted, text: tf("{0} to {1} of the turn", &[&ms_words(from), &ms_words(to)]), right: t("Show all of it").to_string(), right_tone: Tone::Model, turn, ..Row::default() }
 }
 
 /// What the rows are made from besides the files.
@@ -784,13 +840,22 @@ fn turn_rows(out: &mut Vec<Row>, turn: &TurnPath, is_live: bool, latest: bool, c
     let label = if turn.woken { t("Woken by background work") } else { t("This turn's request") };
     out.push(Row { kind: Kind::Turn, key: Some(key), open: true, tone: if turn.woken { Tone::App } else { Tone::Person }, icon: "chevron-down", label: label.to_string(), text: asked, right: result, right_tone: result_tone, ..Row::default() });
     // (its time as a band under the request, where the wait was: the steps under it say what each part was)
-    out.extend(band_row(turn, is_live, context));
+    let band = band_row(turn, is_live, context);
+    // (a part of its time chosen: which, and only the steps that ran in it)
+    let span = band.as_ref().and_then(|band| band.span);
+    out.extend(band);
+    out.extend(span.map(|span| span_row(turn.turn, span)));
+    let times = span.map(|_| step_times(turn)).unwrap_or_default();
+    let in_span = |place: usize| span.is_none_or(|(from, to)| times.iter().any(|(at, begin, end)| *at == place && *begin < to && *end > from));
     // The step whose calls are under way is the one in progress; with none, the step in progress is a row of its own.
     let last_model = turn.steps.iter().rposition(|step| step.kind == StepKind::Model);
     let running_here = is_live && last_model.is_some_and(|at| turn.steps[at].calls.iter().any(|call| context.live.is_running(&call.id)));
     for (place, step) in turn.steps.iter().enumerate() {
         // (looked for: only the steps that have it, unless it is in the turn's request)
         if !query.is_empty() && !turn.asked.to_lowercase().contains(query) && !step_has(step, query) {
+            continue;
+        }
+        if !in_span(place) {
             continue;
         }
         step_rows(out, turn, place, step, is_live, running_here && Some(place) == last_model, context);
@@ -1359,7 +1424,7 @@ mod tests {
         noted(&mut live, &[Event::TurnStarted, Event::RequestStarted], at);
         let (sender, _answers) = std::sync::mpsc::channel();
         live.note(&Event::Question(dogmind_agent::agent::Question { question: "Which one?".into(), options: Vec::new(), answer: sender }), later(at, 2));
-        let asking = |wait| Inputs { running: true, wait: Some(wait), background: 0, wall_ms: None, query: String::new() };
+        let asking = |wait| Inputs { running: true, wait: Some(wait), background: 0, ..Inputs::default() };
         let now = live.now(&asking(PersonWait::Question), later(at, 9));
         assert_eq!((now.who, now.text.as_str(), now.seconds), (Who::Person, "Waiting for your answer", Some(7)));
         assert_eq!(live.now(&asking(PersonWait::Plan), later(at, 9)).text, "Waiting for you to review a plan");
@@ -1610,7 +1675,7 @@ mod tests {
         let at = Instant::now();
         let mut live = Live::new(at);
         noted(&mut live, &[Event::TurnStarted, Event::RequestStarted, Event::AssistantEnded], at);
-        let waiting = Inputs { running: true, wait: Some(PersonWait::Approval { tool: "create_file".into(), summary: "a.rs".into() }), background: 0, wall_ms: None, query: String::new() };
+        let waiting = Inputs { running: true, wait: Some(PersonWait::Approval { tool: "create_file".into(), summary: "a.rs".into() }), background: 0, ..Inputs::default() };
         let rows = rows(None, &live, &waiting, &HashMap::new(), at);
         let last = rows.last().unwrap();
         assert_eq!((last.kind, last.tone, last.label.as_str(), last.text.as_str()), (Kind::Live, Tone::Person, "You", "Waiting for your approval: Write  a.rs"));
@@ -1807,6 +1872,34 @@ mod tests {
         assert_eq!(step_at(&turn, 8000), Some(0), "between: the one begun before");
         assert_eq!(step_at(&turn, 9500), Some(1));
         assert_eq!(step_at(&turn, 500), None, "before any began");
+    }
+
+    /// A part of a turn's time chosen: its band is that part across its width, a row under it says which with a press to show it all, and only the
+    /// steps that ran in it are shown.
+    #[test]
+    fn a_part_of_a_turns_time_chosen_shows_that_part_of_its_band_and_only_the_steps_that_ran_in_it() {
+        let at = |seconds: &str| format!("2026-11-05T10:00:{seconds}+09:00");
+        let request = |started: &str| RequestDetail { started: at(started), first_ms: Some(500), ms: 2000, ..RequestDetail::default() };
+        let step = |started: &str, words: &str| Step { kind: StepKind::Model, started: at(started), ms: 2000, why: Some(Why { text: words.into(), source: WhySource::Content }), request: Some(request(started)), ..Step::default() };
+        let path = TurnPath { turn: 1, asked: "Go".into(), started: at("00.000"), steps: vec![step("01.000", "First."), step("05.000", "Second."), step("09.000", "Third.")], ended: done(11_000), ..TurnPath::default() };
+        let timeline = Timeline { turns: vec![path], heading: None };
+        let shown = |spans: BTreeMap<u64, (u64, u64)>| rows(Some(&timeline), &Live::new(Instant::now()), &Inputs { spans, ..Inputs::default() }, &HashMap::new(), Instant::now());
+        let all = shown(BTreeMap::new());
+        let band = all.iter().find(|row| row.kind == Kind::Band).unwrap();
+        assert_eq!((band.whole, band.span), (11_000, None));
+        assert!(!all.iter().any(|row| row.kind == Kind::Span));
+        // From 4.5 to 8 seconds: the second step only, and the band 3.5 seconds long, its parts laid from 4.5.
+        let part = shown([(1, (4500, 8000))].into_iter().collect());
+        let band = part.iter().find(|row| row.kind == Kind::Band).unwrap();
+        assert_eq!((band.whole, band.span, band.band.as_ref().unwrap().length), (11_000, Some((4500, 8000)), 3500));
+        assert!(band.band.as_ref().unwrap().parts.iter().all(|part| part.to <= 3500 && part.from < part.to));
+        let said = texts(&part);
+        assert!(said.contains(&"Second.".to_string()) && !said.contains(&"First.".to_string()) && !said.contains(&"Third.".to_string()), "{said:#?}");
+        let span = part.iter().find(|row| row.kind == Kind::Span).unwrap();
+        assert_eq!((span.key, span.text.as_str()), (Some(Key::Whole(1)), "4.5 s to 8.0 s of the turn"));
+        // (kept inside the turn, never shorter than the shortest, and all of it is no part of it)
+        assert_eq!(span_inside((10_990, 11_000), 11_000), Some((11_000 - SHORTEST_SPAN, 11_000)));
+        assert_eq!(span_inside((0, 20_000), 11_000), None);
     }
 
     #[test]

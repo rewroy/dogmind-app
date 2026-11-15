@@ -1217,6 +1217,8 @@ const JA: &[(&str, &str)] = &[
     ("Its steps are kept in", "ステップの保存先"),
     ("What the helper did", "ヘルパーがしたこと"),
     ("Search the timeline", "タイムラインを検索"),
+    ("{0} to {1} of the turn", "{0} 〜 {1} を表示中"),
+    ("Show all of it", "全体を表示"),
     ("What the server says ({0} more)", "サーバーの報告(ほか {0} 件)"),
     ("A helper explores: {0}", "ヘルパーが調べています: {0}"),
     ("A helper explores, step {0} of {1}: {2}", "ヘルパーが調べています({0}/{1}): {2}"),
