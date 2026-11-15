@@ -142,6 +142,9 @@ pub struct RequestDetail {
     pub end: String,
     pub reasoning_chars: u64,
     pub content_chars: u64,
+    /// When it began to write a call and its answer, from its start (trajectories from before these were kept have neither).
+    pub writing_ms: Option<u64>,
+    pub answer_ms: Option<u64>,
     /// What the server said of its work, as `trajectory::kept_timings` keeps it (`prefill_seconds`, `ttft_seconds`, `cached_tokens`, `resumed_from`...).
     pub server: BTreeMap<String, Value>,
 }
@@ -559,8 +562,138 @@ fn steps_of(in_turn: &[(usize, &Line)], range: Option<Range<usize>>, messages: &
     items.into_iter().map(|item| item.step).collect()
 }
 
-fn millis(time: &str) -> Option<i64> {
+/// A time as the files give it (`2026-11-05T10:00:03.250+09:00`), in milliseconds since 1970.
+pub fn millis(time: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(time).ok().map(|at| at.timestamp_millis())
+}
+
+/// What a part of a turn's band was: the parts of a request before its first word, as the server tells them, the parts after it, and the calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Part {
+    /// Before the server began on it, or what it does not tell: the way there and back, a queue behind another request.
+    Waiting,
+    /// Another conversation put aside for this one (`park_seconds`).
+    Parking,
+    /// The K/V grown to the prompt (`kv_growth_seconds`).
+    Growing,
+    /// The prompt read: what the server kept gone on from, and the rest read.
+    Reading,
+    /// The prompt read from its start, as nothing the server kept could be gone on from: the wait a person most wants to see.
+    Rereading,
+    /// After the first word, until a call or the answer is being written.
+    Thinking,
+    /// A call or the answer being written.
+    Writing,
+    /// After the first word, of a request kept before the band split it.
+    Generating,
+    /// A call running, one that failed, and the person asked about a call before it ran.
+    Call,
+    CallFailed,
+    Person,
+}
+
+/// The lane of a part: the model's requests, or the calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lane {
+    #[default]
+    Requests,
+    Calls,
+}
+
+/// A turn as a band of time: its parts, each in its lane from and to a number of milliseconds after the turn began, and where the app's own steps were.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Band {
+    /// From the turn's start to its end, or to the end of its last part.
+    pub length: u64,
+    pub parts: Vec<BandPart>,
+    /// Where the app's own steps began: compactions, its interventions, requests asked again, wakes, failures.
+    pub marks: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BandPart {
+    pub lane: Lane,
+    pub from: u64,
+    pub to: u64,
+    pub part: Part,
+}
+
+/// A request that read its prompt from the start is told apart when that took this long: a short prompt read again is nothing to look at.
+const REREAD_MARKED_MS: u64 = 1000;
+
+/// The band of a turn, or none when it has no time to show (no start, nothing in it).
+pub fn band(turn: &TurnPath) -> Option<Band> {
+    let start = millis(&turn.started)?;
+    let after = |time: &str| millis(time).map(|at| (at - start).max(0) as u64);
+    let mut band = Band::default();
+    for step in &turn.steps {
+        match (&step.kind, &step.request) {
+            (StepKind::Model, Some(request)) => {
+                let wrote = !step.calls.is_empty() || request.content_chars > 0;
+                request_parts(&mut band.parts, after(&request.started).unwrap_or(0), request, wrote);
+            }
+            (StepKind::Model, None) => {}
+            _ => band.marks.extend(after(&step.started)),
+        }
+        for call in step.calls.iter().filter(|call| !call.outcome.is_empty()) {
+            let Some(from) = after(&call.started) else { continue };
+            // (the person is asked before it runs, and its own time leaves that wait out)
+            let wait = call.wait_ms.unwrap_or(0);
+            if wait > 0 {
+                band.parts.push(BandPart { lane: Lane::Calls, from, to: from + wait, part: Part::Person });
+            }
+            let part = if call.outcome == "ok" { Part::Call } else { Part::CallFailed };
+            band.parts.push(BandPart { lane: Lane::Calls, from: from + wait, to: from + wait + call.ms.max(1), part });
+        }
+    }
+    let ended = turn.ended.as_ref().map_or(0, |end| end.ms);
+    band.length = band.parts.iter().map(|part| part.to).chain(band.marks.iter().copied()).max().unwrap_or(0).max(ended);
+    (band.length > 0).then_some(band)
+}
+
+/// A request's parts from `from`: the wait to its first word as the server tells its share of it (what it says it spent putting another conversation aside,
+/// growing the K/V and reading, in that order, and the rest of its time to the first token), the rest of that wait before, and after the first word its
+/// thinking and its writing. `wrote`: it made a call or wrote words, which a request kept before the band split it shows as one part.
+fn request_parts(parts: &mut Vec<BandPart>, from: u64, request: &RequestDetail, wrote: bool) {
+    let end = from + request.ms;
+    let first = request.first_ms.unwrap_or(request.ms).min(request.ms);
+    let server_ms = |name: &str| request.server.get(name).and_then(Value::as_f64).map_or(0, |seconds| (seconds.max(0.0) * 1000.0).round() as u64);
+    let mut at = from;
+    let push = |parts: &mut Vec<BandPart>, at: &mut u64, part: Part, ms: u64| {
+        if ms > 0 {
+            parts.push(BandPart { lane: Lane::Requests, from: *at, to: *at + ms, part });
+            *at += ms;
+        }
+    };
+    match request.server.get("ttft_seconds").and_then(Value::as_f64) {
+        Some(ttft) => {
+            let ttft = ((ttft.max(0.0) * 1000.0).round() as u64).min(first);
+            push(parts, &mut at, Part::Waiting, first - ttft);
+            let read = server_ms("resume_seconds") + server_ms("prefill_seconds");
+            let reread = request.server.get("resumed_from").and_then(Value::as_str) == Some("none") && read >= REREAD_MARKED_MS;
+            let mut left = ttft;
+            for (part, ms) in [(Part::Parking, server_ms("park_seconds")), (Part::Growing, server_ms("kv_growth_seconds")), (if reread { Part::Rereading } else { Part::Reading }, read)] {
+                let ms = ms.min(left);
+                push(parts, &mut at, part, ms);
+                left -= ms;
+            }
+            push(parts, &mut at, Part::Waiting, left);
+        }
+        None => push(parts, &mut at, Part::Waiting, first),
+    }
+    let writing = [request.writing_ms, request.answer_ms].into_iter().flatten().map(|ms| (from + ms).clamp(at, end)).min();
+    match writing {
+        Some(writing) => {
+            let thinking = writing - at;
+            push(parts, &mut at, Part::Thinking, thinking);
+            let rest = end - at;
+            push(parts, &mut at, Part::Writing, rest);
+        }
+        None => {
+            let rest = end - at;
+            push(parts, &mut at, if wrote { Part::Generating } else { Part::Thinking }, rest);
+        }
+    }
 }
 
 /// The fields of a line besides those every line has: what a step of the app's holds, for its details.
@@ -594,6 +727,8 @@ fn request_detail(line: &Line) -> RequestDetail {
         end: line.s("end").to_string(),
         reasoning_chars: line.u("reasoning_chars").unwrap_or(0),
         content_chars: line.u("content_chars").unwrap_or(0),
+        writing_ms: line.u("writing_ms"),
+        answer_ms: line.u("answer_ms"),
         server: line.v["server"].as_object().map(|server| server.iter().map(|(name, value)| (name.clone(), value.clone())).collect()).unwrap_or_default(),
     }
 }
@@ -1116,5 +1251,50 @@ mod tests {
         assert_eq!(said.turns[0].asked, "hello there");
         assert_eq!(said.turns[0].steps[0].why.as_ref().map(|why| why.text.as_str()), Some("Hi, I can help."));
         assert!(read(&dir.path().join("none.jsonl")).is_err(), "a session that is not there is an error");
+    }
+
+    fn at(seconds: &str) -> String {
+        format!("2026-11-05T10:00:{seconds}+09:00")
+    }
+
+    /// The wait before the first word is split as the server tells it (the rest of it is waiting), a prompt read from its start for long is told
+    /// apart, after the first word the thinking comes before the writing, a call's wait for the person before its run, and the app's own steps are marks.
+    #[test]
+    fn a_turns_band_splits_each_request_where_the_server_and_the_stream_say_and_puts_the_calls_in_a_lane_of_their_own() {
+        let server: BTreeMap<String, Value> = [("ttft_seconds", 2.5), ("prefill_seconds", 1.2), ("resume_seconds", 0.3), ("kv_growth_seconds", 0.4), ("park_seconds", 0.1)].into_iter()
+            .map(|(name, seconds)| (name.to_string(), serde_json::json!(seconds))).chain([("resumed_from".to_string(), serde_json::json!("none"))]).collect();
+        let request = RequestDetail { started: at("01.000"), first_ms: Some(3000), ms: 5000, writing_ms: Some(4000), server, ..RequestDetail::default() };
+        let call = CallRow { id: "c".into(), name: "execute_command".into(), started: at("06.000"), ms: 800, wait_ms: Some(1200), outcome: "ok".into(), ..CallRow::default() };
+        let model = Step { kind: StepKind::Model, started: at("01.000"), ms: 5000, why: None, request: Some(request), calls: vec![call], fields: Map::new() };
+        let retry = Step { kind: StepKind::Retry { why: "transient".into(), wait_ms: 500 }, started: at("09.000"), ms: 0, why: None, request: None, calls: Vec::new(), fields: Map::new() };
+        let turn = TurnPath { turn: 1, started: at("00.000"), steps: vec![model, retry], ended: Some(TurnEnd { ms: 10_000, cancelled: false, failed: false }), ..TurnPath::default() };
+        let band = band(&turn).expect("a band");
+        let parts: Vec<(Lane, u64, u64, Part)> = band.parts.iter().map(|part| (part.lane, part.from, part.to, part.part)).collect();
+        assert_eq!(parts, [
+            (Lane::Requests, 1000, 1500, Part::Waiting),
+            (Lane::Requests, 1500, 1600, Part::Parking),
+            (Lane::Requests, 1600, 2000, Part::Growing),
+            (Lane::Requests, 2000, 3500, Part::Rereading),
+            (Lane::Requests, 3500, 4000, Part::Waiting),
+            (Lane::Requests, 4000, 5000, Part::Thinking),
+            (Lane::Requests, 5000, 6000, Part::Writing),
+            (Lane::Calls, 6000, 7200, Part::Person),
+            (Lane::Calls, 7200, 8000, Part::Call),
+        ]);
+        assert_eq!((band.marks, band.length), (vec![9000], 10_000));
+    }
+
+    /// A short prompt read again is reading like any other; a request with no server's word waits for its first word as a whole; one kept before the
+    /// stream's marks were is one part after its first word, as is one that only thought.
+    #[test]
+    fn a_band_without_the_servers_word_or_the_streams_marks_shows_what_it_can() {
+        let server: BTreeMap<String, Value> = [("ttft_seconds".to_string(), serde_json::json!(0.5)), ("prefill_seconds".to_string(), serde_json::json!(0.4)), ("resumed_from".to_string(), serde_json::json!("none"))].into_iter().collect();
+        let request = |server: BTreeMap<String, Value>, content_chars: u64| RequestDetail { started: at("00.000"), first_ms: Some(1000), ms: 3000, content_chars, server, ..RequestDetail::default() };
+        let step = |request: RequestDetail| Step { kind: StepKind::Model, started: at("00.000"), ms: 3000, why: None, request: Some(request), calls: Vec::new(), fields: Map::new() };
+        let turn = |steps: Vec<Step>| TurnPath { turn: 1, started: at("00.000"), steps, ..TurnPath::default() };
+        let kinds = |turn: &TurnPath| band(turn).unwrap().parts.iter().map(|part| part.part).collect::<Vec<_>>();
+        assert_eq!(kinds(&turn(vec![step(request(server.clone(), 40))])), [Part::Waiting, Part::Reading, Part::Waiting, Part::Generating]);
+        assert_eq!(kinds(&turn(vec![step(request(BTreeMap::new(), 0))])), [Part::Waiting, Part::Thinking]);
+        assert!(band(&TurnPath { started: "not a time".into(), ..TurnPath::default() }).is_none());
     }
 }

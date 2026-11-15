@@ -2188,11 +2188,13 @@ impl Agent {
                         vec![Event::Reasoning(text.to_string())]
                     }
                     Delta::Content(text) => {
+                        clock.answering();
                         meter.count(text, now);
                         written.push_str(text);
                         vec![Event::Content(text.to_string())]
                     }
                     Delta::Tool(index, name) => {
+                        clock.writing();
                         meter.call(index).name = name.to_string();
                         while calling.len() <= index {
                             calling.push(crate::message::ToolCall::default());
@@ -2201,6 +2203,7 @@ impl Agent {
                         Vec::new()
                     }
                     Delta::Arguments(index, text) => {
+                        clock.writing();
                         meter.count(text, now);
                         meter.call(index).pending.push_str(text);
                         if let Some(call) = calling.get_mut(index) {
@@ -8113,6 +8116,10 @@ mod tests {
         let call = &messages[2].tool_calls.as_ref().unwrap()[0];
         assert_eq!(of_kind(&lines, "tool")[0]["id"], call.id.as_str(), "the call is told by the id the message has for it");
         assert_eq!(messages[3].tool_call_id.as_deref(), Some(call.id.as_str()));
+        // (when each began to write: the call in the first, the answer's words in the second, and not the other)
+        let requests = of_kind(&lines, "request");
+        assert!(requests[0]["writing_ms"].is_u64() && requests[0].get("answer_ms").is_none(), "{}", requests[0]);
+        assert!(requests[1]["answer_ms"].is_u64() && requests[1].get("writing_ms").is_none(), "{}", requests[1]);
     }
 
     #[test]
