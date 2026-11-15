@@ -1186,6 +1186,10 @@ fn resumed_words(from: &str) -> String {
         "turn" => t("the start of this turn"),
         "prior" => t("the turn before"),
         "prefix" => t("a beginning it kept"),
+        // (a point the engine kept in the request before: in its reply, or where its reply began)
+        "step" => t("a point it kept in the last step"),
+        "mark" => t("a point it kept partway through a reply"),
+        "mark_before" => t("the point it kept before the last"),
         "none" => t("nothing: it read it all"),
         other => return other.to_string(),
     }
@@ -1909,5 +1913,9 @@ mod tests {
         let said: Vec<(&str, &str)> = facts.iter().map(|row| (row.label.as_str(), row.text.as_str())).collect();
         assert_eq!(said, [("Tokens that matched what it had", "4483"), ("Writing speed (tokens per second)", "77.7"), ("Went on from", "the system prompt it kept")]);
         assert!(facts.iter().all(|row| !row.label.contains('_')));
+        // (the points an engine keeps in a request, in words too)
+        for kind in ["step", "mark", "mark_before"] {
+            assert_ne!(resumed_words(kind), kind);
+        }
     }
 }
