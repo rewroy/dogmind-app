@@ -1,6 +1,7 @@
-//! Drives the agent against a server with no window, to measure a job: `drive --server URL --workspace DIR --data DIR --turns FILE [--mode auto] [--limit SECONDS] [--wake-for SECONDS]`; `drive --report TRAJECTORY [--engine-log FILE]` reads a trajectory as `dogmind-app --trajectory` does.
+//! Drives the agent against a server with no window, to measure a job: `drive --server URL --workspace DIR --data DIR --turns FILE [--mode auto] [--limit SECONDS] [--wake-for SECONDS] [--refuse]`; `drive --report TRAJECTORY [--engine-log FILE]` reads a trajectory as `dogmind-app --trajectory` does.
 //!
-//! The turns are the lines of the file (a blank line is skipped), each sent when the one before it has ended. Approvals are given, as a person at the keyboard would who trusts the job.
+//! The turns are the lines of the file (a blank line is skipped), each sent when the one before it has ended. Approvals are given, as a person at the keyboard would who trusts the job;
+//! with `--refuse` every approval is answered no, so that no command runs. A call being written is shown as its pieces come, with the time into the turn.
 //! `--wake-for` goes on after the last turn for as long as the session has a background command or a wait, up to that many seconds, and shows the turns it wakes itself for.
 //! The session, and the trajectory beside it (`dogmind-app --trajectory`), are in `--data\sessions`. It never touches the app's own data folder.
 
@@ -18,8 +19,11 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut server, mut workspace, mut data, mut mode, mut turns, mut limit, mut wake_for) = (String::new(), PathBuf::new(), PathBuf::new(), "auto".to_string(), PathBuf::new(), 1800u64, 0u64);
     let (mut report, mut engine_log) = (None, None);
+    // `--refuse`: every approval is answered no, for a job that must run no command (nothing the sandbox starts runs then).
+    let mut refuse = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--refuse" => refuse = true,
             "--report" => report = args.next().map(PathBuf::from),
             "--engine-log" => engine_log = args.next().map(PathBuf::from),
             "--server" => server = args.next().unwrap_or_default(),
@@ -83,6 +87,7 @@ fn main() {
         println!("--- turn {} ({} chars)", at + 1, turn.chars().count());
         send(Command::Send(turn.to_string()));
         let (mut approvals, mut tools, mut failed) = (0, 0, None);
+        let mut seen = Seen { began: turn_began, refuse, ..Seen::default() };
         loop {
             if began.elapsed() > Duration::from_secs(limit) {
                 println!("time limit: stopping");
@@ -91,7 +96,8 @@ fn main() {
                 return;
             }
             let Ok(event) = events.recv_timeout(Duration::from_secs(1)) else { continue };
-            if let Some(cancelled) = show(event, &mut tools, &mut approvals, &mut failed) {
+            if let Some(cancelled) = show(event, &mut tools, &mut approvals, &mut failed, &mut seen) {
+                seen.summary();
                 println!("turn {} ended: {:.1}s, cancelled={cancelled}, tools={tools}, approvals={approvals}, failed={}", at + 1, turn_began.elapsed().as_secs_f64(), failed.is_some());
                 break;
             }
@@ -102,6 +108,7 @@ fn main() {
         let waiting_since = Instant::now();
         let (mut tools, mut approvals, mut failed, mut woken_turns) = (0, 0, None, 0);
         let mut turn_began = Instant::now();
+        let mut seen = Seen { began: turn_began, refuse, ..Seen::default() };
         let mut in_a_turn = false;
         while waiting_since.elapsed() < Duration::from_secs(wake_for) {
             if !in_a_turn && handle.background.snapshot().is_empty() && !handle.background.has_pending() {
@@ -114,8 +121,10 @@ fn main() {
                 woken_turns += 1;
                 turn_began = Instant::now();
                 (tools, approvals, failed) = (0, 0, None);
+                seen = Seen { began: turn_began, refuse, ..Seen::default() };
             }
-            if let Some(cancelled) = show(event, &mut tools, &mut approvals, &mut failed) {
+            if let Some(cancelled) = show(event, &mut tools, &mut approvals, &mut failed, &mut seen) {
+                seen.summary();
                 in_a_turn = false;
                 println!("woken turn {woken_turns} ended: {:.1}s, cancelled={cancelled}, tools={tools}, approvals={approvals}, failed={}", turn_began.elapsed().as_secs_f64(), failed.is_some());
             }
@@ -130,13 +139,74 @@ fn main() {
     }
 }
 
-/// Says what an event is, and answers what asks, as a person who trusts the job would. Some(cancelled) when it is the end of a turn.
-fn show(event: Event, tools: &mut u32, approvals: &mut u32, failed: &mut Option<String>) -> Option<bool> {
+/// What a turn has shown so far of the calls being written: when it began, and the pieces of each call.
+struct Seen {
+    began: Instant,
+    refuse: bool,
+    /// Requests the turn has made so far.
+    requests: usize,
+    /// When the first reasoning or answer text of the request in hand came.
+    first_text: Option<f64>,
+    /// (request, call index, tool, pieces, characters, seconds into the turn of the first and of the last piece)
+    writing: Vec<(usize, usize, String, u32, usize, f64, f64)>,
+}
+
+impl Default for Seen {
+    fn default() -> Seen {
+        Seen { began: Instant::now(), refuse: false, requests: 0, first_text: None, writing: Vec::new() }
+    }
+}
+
+impl Seen {
+    fn at(&self) -> f64 {
+        self.began.elapsed().as_secs_f64()
+    }
+
+    /// One line a call being written: how many pieces came, how much, from when to when.
+    fn summary(&self) {
+        for (request, index, tool, pieces, chars, first, last) in &self.writing {
+            println!("  written in request {request}, call {index} {tool}: {pieces} pieces, {chars} chars, from {first:.1}s to {last:.1}s");
+        }
+    }
+}
+
+/// Says what an event is, and answers what asks, as a person who trusts the job would (or, with `--refuse`, as one who lets nothing
+/// run). Some(cancelled) when it is the end of a turn.
+fn show(event: Event, tools: &mut u32, approvals: &mut u32, failed: &mut Option<String>, seen: &mut Seen) -> Option<bool> {
     match event {
         Event::Approval(approval) => {
             *approvals += 1;
-            println!("  approve {} ({})", approval.tool, approval.summary.chars().take(80).collect::<String>());
-            let _ = approval.answer.send((Decision::Approve, None));
+            let decision = if seen.refuse { Decision::Reject } else { Decision::Approve };
+            println!("  {} {} ({})", if seen.refuse { "refuse" } else { "approve" }, approval.tool, approval.summary.chars().take(80).collect::<String>());
+            let _ = approval.answer.send((decision, None));
+        }
+        // (a piece of a call the model is still writing: when it came and how much it was)
+        Event::ToolWriting { index, tool, piece } => {
+            let (at, request) = (seen.at(), seen.requests);
+            let chars = piece.chars().count();
+            let total = match seen.writing.iter_mut().find(|call| call.0 == request && call.1 == index && call.2 == tool) {
+                Some(call) => {
+                    call.3 += 1;
+                    call.4 += chars;
+                    call.6 = at;
+                    call.4
+                }
+                None => {
+                    seen.writing.push((request, index, tool.clone(), 1, chars, at, at));
+                    chars
+                }
+            };
+            println!("  writing [{at:.1}s] call {index} {tool}: +{chars} chars, {total} in all");
+        }
+        Event::RequestStarted => {
+            seen.requests += 1;
+            seen.first_text = None;
+            println!("  request {} [{:.1}s]", seen.requests, seen.at());
+        }
+        Event::Reasoning(_) | Event::Content(_) if seen.first_text.is_none() => {
+            let at = seen.at();
+            seen.first_text = Some(at);
+            println!("  first text of request {} [{at:.1}s]", seen.requests);
         }
         Event::Question(question) => {
             println!("  question: {}", question.question);
@@ -147,7 +217,7 @@ fn show(event: Event, tools: &mut u32, approvals: &mut u32, failed: &mut Option<
         }
         Event::ToolStarted { id, tool, summary } => {
             *tools += 1;
-            println!("  tool {id} {tool}: {}", summary.chars().take(100).collect::<String>());
+            println!("  tool [{:.1}s] {id} {tool}: {}", seen.at(), summary.chars().take(100).collect::<String>());
         }
         Event::ToolEnded { id, ok, elapsed, output, .. } => println!("  ended {id} ok={ok} {:.1}s {} bytes", elapsed.as_secs_f64(), output.len()),
         Event::Failed(message) => {
