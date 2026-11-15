@@ -1,4 +1,4 @@
-//! Drives the agent against a server with no window, to measure a job: `drive --server URL --workspace DIR --data DIR --turns FILE [--mode auto] [--limit SECONDS] [--wake-for SECONDS] [--refuse] [--warm-wait SECONDS] [--between SECONDS [--warm-between]]`; `drive --report TRAJECTORY [--engine-log FILE]` reads a trajectory as `dogmind-app --trajectory` does.
+//! Drives the agent against a server with no window, to measure a job: `drive --server URL --workspace DIR --data DIR --turns FILE [--mode auto] [--limit SECONDS] [--wake-for SECONDS] [--refuse] [--warm-wait SECONDS] [--between SECONDS [--warm-between]] [--key-file FILE]`; `drive --report TRAJECTORY [--engine-log FILE]` reads a trajectory as `dogmind-app --trajectory` does.
 //!
 //! The turns are the lines of the file (a blank line is skipped), each sent when the one before it has ended. Approvals are given, as a person at the keyboard would who trusts the job;
 //! with `--refuse` every approval is answered no, so that no command runs. A call being written is shown as its pieces come, with the time into the turn.
@@ -26,12 +26,15 @@ fn main() {
     // `--between SECONDS`: before each turn after the first, that long passes, as while the person is in another conversation; with
     // `--warm-between`, another conversation is opened on the same server meanwhile, and warmed as the app warms one it opens.
     let (mut between, mut warm_between) = (0u64, false);
+    // `--key-file FILE`: the server's key, read from the file (its first line) and sent as the app sends one; never printed.
+    let mut key_file: Option<PathBuf> = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--refuse" => refuse = true,
             "--warm-wait" => warm_wait = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
             "--between" => between = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
             "--warm-between" => warm_between = true,
+            "--key-file" => key_file = args.next().map(PathBuf::from),
             "--report" => report = args.next().map(PathBuf::from),
             "--engine-log" => engine_log = args.next().map(PathBuf::from),
             "--server" => server = args.next().unwrap_or_default(),
@@ -56,7 +59,8 @@ fn main() {
         "accept_edits" => Mode::AcceptEdits,
         _ => Mode::Auto,
     };
-    let mut client = Client::new(&server, None).expect("an address");
+    let key = key_file.map(|file| std::fs::read_to_string(&file).expect("the key file").lines().next().unwrap_or("").trim().to_string()).filter(|key| !key.is_empty());
+    let mut client = Client::new(&server, key).expect("an address");
     if let Ok(Health::Loading(_)) = client.health() {
         panic!("the server is loading: wait and run again");
     }
