@@ -706,6 +706,13 @@ fn close_cut_write(raw: &str) -> Option<(String, String, String)> {
 /// In one turn of the person's: after that it has its way, as it would have without this. A real model, asked what got in its way, said the same
 /// note three times in one turn only delayed its first stroke: once is enough, and none once a file is written, when code in its reasoning is planning an edit.
 const MAX_DRAFTS_STOPPED: u32 = 1;
+/// The longest conversation (in tokens, as the next request is reckoned) whose file is written with no thinking after a draft is stopped. DeepSeek-V4.1's
+/// template says the thinking's level at the head of the system prompt, so the request in the other mode reads it all again, and so does the one that
+/// thinks again after it, the file it wrote and all: 4,220 tokens took 4.1 s (1,027 a second), and 10,000 to 14,000 went at 2,100 to 2,200 a second.
+/// What it saves is the thinking over again: some 17 s in one run of a 400-line file (4,973 characters) and 46 s on average in two replays of
+/// another (19,197 and 20,344 characters against none). At 2,100 a second both readings come to the 17 s at some 15,000 tokens, with the 8,000
+/// of a file written between them: past that, a short rethinking costs less than the switch.
+const MOST_READ_TO_WRITE_PLAINLY: u64 = 15_000;
 /// What goes back of what it had thought before a draft, at the most, in characters: a model asked to write with no thinking has this to go by, and a
 /// real one's last 2,500 were the details of its last part, and not the plan of the file (some 1,500 tokens to read, a second or two).
 const MOST_DECIDED: usize = 6000;
@@ -2307,11 +2314,13 @@ impl Agent {
                 generated += meter.tokens;
                 // (what it had come to when it was stopped, and what the stop cost: the tokens that are thrown away)
                 let run = watch.as_ref().map_or(0, DraftWatch::stats);
-                write_plainly = provider.answers_without_thinking();
-                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "next_without_thinking": write_plainly}));
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
                 self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped, watch.as_ref().map(DraftWatch::began_at))));
+                // (in a long conversation, reading it all again into the other mode and back costs more than the thinking it saves)
+                let prompt = self.expected_use();
+                write_plainly = provider.answers_without_thinking() && prompt <= MOST_READ_TO_WRITE_PLAINLY;
+                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "next_without_thinking": write_plainly, "prompt_est": prompt}));
                 drafts_stopped += 1;
                 self.emit(Event::AssistantEnded);
                 continue;
@@ -5211,6 +5220,26 @@ mod tests {
         assert_eq!(efforts, [None, Some(&json!("none")), None], "{efforts:?}");
         let lines = trajectory_of(&run);
         assert_eq!(of_kind(&lines, "intervention")[0]["next_without_thinking"], true);
+    }
+
+    /// In a conversation longer than `MOST_READ_TO_WRITE_PLAINLY`, reading it all again in the other mode and back costs more than the thinking it saves:
+    /// the file is written as the person set it.
+    #[test]
+    fn in_a_long_conversation_the_file_after_a_stopped_draft_is_written_as_the_person_set_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, bodies, _, _went) = thinking_server(1, vec![call_answer("create_file", json!({"path": "a.txt", "content": "a"})), text_answer("written")]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        let long = format!("write it, as this says: {}", "the page has sliders. ".repeat((MOST_READ_TO_WRITE_PLAINLY as usize * CHARS_A_TOKEN) / 20));
+        run.handle.commands.send(Command::Send(long)).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Approve);
+        assert!(!cancelled && log.last().unwrap() == "content:written", "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "the draft was stopped all the same");
+        assert!(bodies.iter().all(|body| body.get("reasoning_effort").is_none()), "{:?}", bodies.iter().map(|body| body.get("reasoning_effort")).collect::<Vec<_>>());
+        let lines = trajectory_of(&run);
+        let stop = of_kind(&lines, "intervention")[0];
+        assert_eq!(stop["next_without_thinking"], false);
+        assert!(stop["prompt_est"].as_u64().unwrap() > MOST_READ_TO_WRITE_PLAINLY, "{stop}");
     }
 
     #[test]
