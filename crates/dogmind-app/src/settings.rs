@@ -42,6 +42,8 @@ pub enum RightView {
     Files,
     /// The person's own shells.
     Terminal,
+    /// What the model and the app are doing now, where the work is heading, and the path the session took.
+    Timeline,
     /// The session's tasks, what waits, the changes and the engine. (A name no version of this app knows is this too: the file is not refused for it.)
     #[default]
     #[serde(other)]
@@ -1092,6 +1094,7 @@ mod tests {
         // (the new key wins over the old when a file somehow has both)
         assert_eq!(loaded(r#"{"right_files": true, "right_view": "terminal"}"#).right_view, RightView::Terminal);
         assert_eq!(loaded(r#"{"right_view": "files"}"#).right_view, RightView::Files);
+        assert_eq!(loaded(r#"{"right_view": "timeline"}"#).right_view, RightView::Timeline);
         // (a view that a later version has is the overview here, and the file is not refused for it)
         let later = loaded(r#"{"right_view": "something_later", "right_panel": false}"#);
         assert_eq!((later.right_view, later.right_panel), (RightView::Overview, false));
