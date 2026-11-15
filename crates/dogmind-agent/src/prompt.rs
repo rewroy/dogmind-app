@@ -199,31 +199,35 @@ pub fn is_written_in_latin(text: &str) -> bool {
     !japanese && text.split_whitespace().filter(|word| word.chars().any(|c| c.is_ascii_alphabetic()) && word.chars().all(|c| c.is_ascii_alphabetic() || ",.!?:;'-".contains(c))).count() >= WORDS
 }
 
-/// A user's message as the model reads it.
-pub fn user_message(text: &str, now: &str) -> String {
-    user_message_in(text, now, has_kana(text).then_some("Japanese"))
+/// The first line of the message the app sends after each message of the person's, with the facts of that moment: the time, the language they write in,
+/// and the notes of the turn (the workspace, at a session's first message; what was attached; a mode). It is the app's, and is never shown as said by the
+/// person ([`is_nudge`] knows it). What the person typed goes on its own, as typed: what the app knows is a fact beside it, not a frame around it.
+pub const APP_FACTS: &str = "[From the app, not the user: facts as of the message above; where they differ from facts given earlier, these hold]";
+
+/// Whether a message is the app's facts that follow a message of the person's ([`app_facts`]).
+pub fn is_app_facts(text: &str) -> bool {
+    text.starts_with(APP_FACTS)
 }
 
-/// Where what was typed begins: on its own under a list of the app's words, a greeting reads as the end of that list, with its request missing.
-const TYPED_MARK: &str = "## The User's Message\n";
-/// A message's first words, when the app wrote it.
-const NOW_MARK: &str = "[Now: ";
-
-/// The line right before what was typed, the last thing a model reads before it answers. For Japanese it is itself Japanese, and says what to write and not what to avoid: the language of
-/// what comes just before an answer pulls harder than a rule about it, and a rule in English naming Chinese is English and Chinese just before an answer. Nothing here names a Chinese word.
-fn language_rule(language: Option<&str>) -> String {
-    match language {
-        Some("Japanese") => "回答はすべて自然な日本語で書いてください。用語は日本で使われている言い方にし、英語のまま書くのは訳語のない用語だけです。考えるときは日本語か英語で。コードと引用はそのままで構いません。このメッセージが別の言語を求めているときは、それに従ってください。\n".to_string(),
-        Some(language) => format!("Answer in {language}. Code and quotations stay as they are.\n"),
-        None => String::new(),
-    }
+/// The language the person writes in, as a fact, when it is known.
+fn language_fact(language: Option<&str>) -> Option<String> {
+    language.map(|language| format!("The user writes in {language}."))
 }
 
-/// In the language given, or the user's own when none is. To the minute: a model has no use for seconds, and they are tokens in every message.
-pub fn user_message_in(text: &str, now: &str, language: Option<&str>) -> String {
+/// The app's facts after a message of the person's: the time to the minute (a model has no use for seconds, and they are tokens in every such message), the
+/// language, and the notes of the turn, each a block of its own.
+pub fn app_facts(now: &str, language: Option<&str>, notes: &[String]) -> String {
     let now = now.split_once(' ').and_then(|(day, rest)| rest.split_once(' ').map(|(time, zone)| format!("{day} {} {zone}", time.get(..5).unwrap_or(time)))).unwrap_or_else(|| now.to_string());
-    format!("{NOW_MARK}{now}]\n{}{TYPED_MARK}{text}", language_rule(language))
+    let mut facts = vec![APP_FACTS.to_string(), format!("- Now: {now}")];
+    facts.extend(language_fact(language).map(|fact| format!("- {fact}")));
+    facts.extend(notes.iter().map(|note| note.trim_end().to_string()).filter(|note| !note.is_empty()));
+    facts.join("\n")
 }
+
+/// Where what was typed began, in a message of a session saved before the app's facts went on their own ([`typed_text`] reads such a message).
+const TYPED_MARK: &str = "## The User's Message\n";
+/// The first words of a message of such a session.
+const NOW_MARK: &str = "[Now: ";
 
 /// The app's word to the model in a user's place: an answer was cut off.
 /// How what goes back to a model stopped from writing code in its reasoning begins.
@@ -255,7 +259,7 @@ pub const HELPER_NO_MORE: &str = "error: not run. There is no more looking: answ
 pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, it would not be worth running, or the user asked you not to run it, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";
 
 /// The app's word after an answer in Japanese with letters in it that no Japanese is written with, which it cannot see for itself. What it has written stays as it is, on the screen and in the
-/// conversation: this asks for the lines again, once, and what comes of it is read as what it is. In Japanese for the same reason as [`language_rule`], and as short as it can be, as it costs a
+/// conversation: this asks for the lines again, once, and what comes of it is read as what it is. In Japanese, as Japanese pulls an answer back to Japanese more than a rule about it would, and as short as it can be, as it costs a
 /// request. It names the letters, as that is what there is to act on.
 pub fn slip_note(letters: &str) -> String {
     format!("{DRAFT_NOTE}今の回答に日本語で使わない字が混ざっています: {letters}。その字を含む行だけを、「訂正:」に続けて日本語の字で書き直してください。ほかの行や説明は要りません。")
@@ -263,7 +267,7 @@ pub fn slip_note(letters: &str) -> String {
 
 /// Whether a user's message was the app's and not the person's: it is not shown as something they said. (A saved session has the check's word as it was, unmarked.)
 pub fn is_nudge(text: &str) -> bool {
-    text == CONTINUE_NUDGE || text.starts_with(DRAFT_NOTE) || Some(text) == CHECK_NUDGE.strip_prefix(DRAFT_NOTE)
+    text == CONTINUE_NUDGE || text.starts_with(DRAFT_NOTE) || is_app_facts(text) || Some(text) == CHECK_NUDGE.strip_prefix(DRAFT_NOTE)
 }
 
 /// What the app says on the screen when a request has made its turn read-only, before anything is refused. The second sentence is the way out: a request that does not say it is followed
@@ -460,20 +464,12 @@ pub fn no_change_made(scratch: &std::path::Path) -> String {
 ", scratch.display())
 }
 
-/// A fact for this turn only, on a message built by [`user_message`], before what was typed and what it is to be answered in.
-pub fn with_note(message: &str, note: &str) -> String {
-    match message.split_once('\n') {
-        Some((now, rest)) if now.starts_with(NOW_MARK) => format!("{now}\n{note}\n{rest}"),
-        _ => format!("{note}\n{message}"),
-    }
-}
-
-/// When a message built by [`user_message`] was said, as its first line has it: how a session from before messages kept their time tells it.
+/// When a message of a session saved before the app's facts went on their own was said, as its first line has it.
 pub fn said_at(message: &str) -> Option<&str> {
     message.strip_prefix(NOW_MARK)?.split_once(']').map(|(at, _)| at)
 }
 
-/// What a person typed, out of a message built by [`user_message`].
+/// What a person typed, out of a message: itself, or, in a session saved before the app's facts went on their own, the part after the app's words.
 pub fn typed_text(message: &str) -> &str {
     // (a session saved before the language moved has this, and perhaps no mark)
     if let Some(at) = message.find("## Response Language\n") {
@@ -641,16 +637,16 @@ mod tests {
         assert_eq!(super::read_only_phrase("Fix it without changing the tests"), None);
     }
 
-    /// Only what the person typed is read: the message the model gets has the app's notes before it, and a note that says no change is made to the files (the app's own, or a skill's) is
-    /// not the request.
+    /// Only what the person typed is read: the app's facts come in a message of their own, and a note there that says no change is made to the files (the app's own,
+    /// or a skill's) is not the request. A message of a session saved with the app's words around what was typed is read for what was typed.
     #[test]
-    fn the_apps_notes_before_what_was_typed_are_not_read_for_it() {
-        let note = "## Plan Mode\nNothing can be changed in this mode. Do not change anything.\n";
-        let message = with_note(&user_message_in("Add a line to a.txt", "2026-11-07 06:00:00 +09:00", None), note);
-        assert!(forbids_changes(&message), "read whole, the note says it");
-        assert!(!forbids_changes(typed_text(&message)), "what was typed does not");
-        let message = with_note(&user_message_in("Do not change anything", "2026-11-07 06:00:00 +09:00", None), "## Skill\nAdd lines to files.\n");
-        assert!(forbids_changes(typed_text(&message)));
+    fn the_apps_facts_are_not_read_for_the_request() {
+        let facts = app_facts("2026-11-07 06:00:00 +09:00", None, &["## Plan Mode\nNothing can be changed in this mode. Do not change anything.".to_string()]);
+        assert!(forbids_changes(&facts), "read whole, the note says it");
+        assert!(!forbids_changes(typed_text("Add a line to a.txt")), "what was typed does not");
+        let old = "[Now: 2026-11-07 06:00 +09:00]\n## Skill\nDo not change anything.\n## The User's Message\nAdd a line to a.txt";
+        assert!(!forbids_changes(typed_text(old)), "nor does what was typed in a session saved before");
+        assert!(forbids_changes(typed_text("Do not change anything")));
     }
 
     use super::*;
@@ -683,7 +679,7 @@ mod tests {
         // (then wake_on and wake_at, with the words that a background command's end wakes the session: some 550 characters, 140 tokens, once a session: without them a
         // build that ends ten minutes later waits for the person to type)
         assert!(tools.len() < 7_300, "the tools have grown to {} characters", tools.len());
-        assert!(user_message_in("x", "2026-11-02 20:01:18 +09:00", None).len() < 60, "what rides on every message");
+        assert!(app_facts("2026-11-02 20:01:18 +09:00", Some("Japanese"), &[]).len() < 200, "what rides on every message");
     }
 
     #[test]
@@ -808,22 +804,19 @@ mod tests {
     }
 
     #[test]
-    fn what_comes_right_before_a_japanese_answer_is_japanese_and_names_no_chinese() {
-        let message = user_message("こんにちは", "now");
-        assert!(!["实", "确", "问", "中国語", "Chinese"].iter().any(|word| message.contains(word)), "{message}");
-        let rule = language_rule(Some("Japanese"));
-        assert!(rule.contains("日本語で書いて") && rule.contains("考えるときは日本語か英語"), "{rule}");
-        assert!(!rule.chars().any(|c| c.is_ascii_alphabetic()), "not a word of English around it: {rule}");
-        assert!(message.ends_with("## The User's Message\nこんにちは"));
+    fn the_language_is_a_fact_and_names_no_chinese() {
+        let facts = app_facts("now", Some("Japanese"), &[]);
+        assert!(facts.contains("- The user writes in Japanese."), "{facts}");
+        assert!(!["实", "确", "问", "中国語", "Chinese"].iter().any(|word| facts.contains(word)), "{facts}");
+        assert!(!facts.contains("回答は"), "a fact, not a rule: {facts}");
+        assert!(!app_facts("now", None, &[]).contains("writes in"), "none when it is not known");
     }
 
     #[test]
-    fn a_message_says_the_time_to_the_minute_and_no_more_than_it_has_to() {
-        let plain = user_message_in("hi", "2026-11-02 20:01:18 +09:00", None);
-        assert_eq!(plain, "[Now: 2026-11-02 20:01 +09:00]\n## The User's Message\nhi");
-        assert_eq!(typed_text(&plain), "hi");
-        assert_eq!(typed_text("## The User's Message\nnot the app's"), "## The User's Message\nnot the app's", "what the person typed, when it did not come through here");
-        assert_eq!(typed_text(&user_message_in("## The User's Message\nmine", "now", None)), "## The User's Message\nmine");
+    fn the_facts_say_the_time_to_the_minute_and_no_more_than_they_have_to() {
+        assert_eq!(app_facts("2026-11-02 20:01:18 +09:00", None, &[]), format!("{APP_FACTS}\n- Now: 2026-11-02 20:01 +09:00"));
+        assert_eq!(typed_text("hi"), "hi");
+        assert_eq!(typed_text("## The User's Message\nnot the app's"), "## The User's Message\nnot the app's", "what the person typed is what they typed");
     }
 
     #[test]
@@ -833,10 +826,10 @@ mod tests {
     }
 
     #[test]
-    fn what_was_typed_is_marked_as_the_message() {
-        let message = user_message_in("こんにちは", "now", Some("Japanese"));
-        assert!(message.ends_with("## The User's Message\nこんにちは"), "{message}");
-        assert_eq!(typed_text(&message), "こんにちは");
+    fn a_session_saved_with_the_apps_words_around_the_message_gives_back_what_was_typed() {
+        let old = "[Now: 2026-11-02 20:01 +09:00]\n回答はすべて自然な日本語で書いてください。\n## The User's Message\nこんにちは";
+        assert_eq!(typed_text(old), "こんにちは");
+        assert_eq!(said_at(old), Some("2026-11-02 20:01 +09:00"));
         assert_eq!(typed_text("## Response Language\n- a rule\nsaved before the mark"), "saved before the mark");
         assert_eq!(typed_text("plain"), "plain");
     }
@@ -854,18 +847,15 @@ mod tests {
         assert!(is_nudge(CONTINUE_NUDGE) && is_nudge(CHECK_NUDGE) && is_nudge(&slip_note("员")));
         assert!(is_nudge(CHECK_NUDGE.strip_prefix(DRAFT_NOTE).unwrap()), "as a session saved before it was marked has it");
         assert!(!is_nudge("continue"));
+        let facts = app_facts("now", None, &[]);
+        assert!(is_nudge(&facts) && is_app_facts(&facts), "the app's facts are the app's");
+        assert!(!is_app_facts(CONTINUE_NUDGE) && !is_app_facts("hi"));
     }
 
     #[test]
-    fn a_message_gives_back_what_was_typed() {
-        let message = user_message("こんにちは\nふたつめ", "2026-10-31 12:00:00");
-        assert!(message.contains("日本語で書いて"));
-        assert!(user_message_in("hello", "now", Some("English")).contains("Answer in English."));
-        assert_eq!(typed_text(&user_message_in("x\ny", "now", None)), "x\ny");
-        assert_eq!(typed_text(&message), "こんにちは\nふたつめ");
-        assert_eq!(typed_text("plain"), "plain");
-        let noted = with_note(&message, "## Files Restored\n- a.txt");
-        assert!(noted.contains("- a.txt"));
-        assert_eq!(typed_text(&noted), "こんにちは\nふたつめ");
+    fn the_facts_hold_the_notes_of_the_turn_each_as_written() {
+        let facts = app_facts("2026-10-31 12:00:00", Some("English"), &["## Files Restored\n- a.txt\n".to_string(), String::new(), "## Plan Mode\nPlan mode is on.".to_string()]);
+        assert_eq!(facts, format!("{APP_FACTS}\n- Now: 2026-10-31 12:00:00\n- The user writes in English.\n## Files Restored\n- a.txt\n## Plan Mode\nPlan mode is on."));
+        assert_eq!(typed_text("x\ny"), "x\ny");
     }
 }

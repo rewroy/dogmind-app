@@ -51,7 +51,7 @@ fn make_session(folder: &Path, workspace: &Path, stamp: &str, bytes: usize, word
     let mut turn = 0;
     while written < bytes {
         turn += 1;
-        let ask = Message::text("user", dogmind_agent::prompt::user_message(&words.text(300), "2026-11-07 12:00:00 +09:00"));
+        let ask = Message::text("user", words.text(300));
         let asking = Message { role: "assistant".into(), tool_calls: Some(vec![call(&format!("c{turn}"))]), ..Message::default() };
         let long = 6000 + (words.next() % 20_000) as usize;
         let read = Message::tool_result(&format!("c{turn}"), words.text(long));

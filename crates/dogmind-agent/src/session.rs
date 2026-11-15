@@ -973,7 +973,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut first = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         first.append(&Message::text("system", "the system prompt mentions Banana")).unwrap();
-        first.append(&Message::text("user", crate::prompt::user_message("ハッシュテーブルの話", "now"))).unwrap();
+        first.append(&Message::text("user", "ハッシュテーブルの話")).unwrap();
         first.append(&Message::text("assistant", "A HashMap keeps Cherry in a bucket")).unwrap();
         first.append(&Message::tool_result("1", "tool output with Plum")).unwrap();
         let mut second = Session::create(dir.path(), Path::new("w"), "now", "2").unwrap();
@@ -1031,7 +1031,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (stamp, text) in [("1", "first"), ("2", "second")] {
             let mut session = Session::create(dir.path(), Path::new("w"), "now", stamp).unwrap();
-            session.append(&Message::text("user", crate::prompt::user_message(text, "now"))).unwrap();
+            session.append(&Message::text("user", text)).unwrap();
         }
         Session::create(dir.path(), Path::new("w"), "now", "3").unwrap();
         let titles: Vec<String> = list(dir.path()).into_iter().map(|summary| summary.title).collect();
@@ -1054,7 +1054,7 @@ mod notice_tests {
     fn a_notice_is_kept_as_one_and_is_not_taken_for_the_persons_words() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
-        session.append(&Message::text("user", crate::prompt::user_message("build it", "now"))).unwrap();
+        session.append(&Message::text("user", "build it")).unwrap();
         session.append(&Message::text("assistant", "started")).unwrap();
         session.append(&notice()).unwrap();
         session.append(&Message::text("assistant", "it passed")).unwrap();

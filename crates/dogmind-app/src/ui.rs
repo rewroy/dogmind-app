@@ -12154,6 +12154,10 @@ impl App {
             match message.role.as_str() {
                 "user" => {
                     if let Some(text) = message.content.as_deref() {
+                        // (the app's facts after a message of the person's are of that message's turn: neither shown nor a place of their own)
+                        if dogmind_agent::prompt::is_app_facts(text) {
+                            continue;
+                        }
                         self.flush_told_calls(&mut told);
                         // (what the turn before it changed has its card here; a turn may begin with what the app said and not the person, which is not shown but is a place)
                         self.turn_slots.push((index, self.shown.len()));
@@ -17658,8 +17662,11 @@ mod tests {
         handle.commands.send(send_command(Outgoing { text: "見て".into(), images: vec![Attached { path: PathBuf::from("pasted.png"), picture }], card: "見て".into() })).unwrap();
         let body = seen.recv_timeout(std::time::Duration::from_secs(30)).expect("the server was asked");
         let request: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let last = request["messages"].as_array().unwrap().last().unwrap();
+        // (the person's message, with the pictures; the app's facts come after it)
+        let messages = request["messages"].as_array().unwrap();
+        let last = &messages[messages.len() - 2];
         assert_eq!(last["role"], "user");
+        assert!(messages.last().unwrap()["content"].as_str().is_some_and(dogmind_agent::prompt::is_app_facts));
         let parts = last["content"].as_array().expect("pictures and words, in parts");
         assert!(parts[0]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,iVBOR"), "{}", parts[0]);
         assert!(parts.last().unwrap()["text"].as_str().unwrap().contains("見て"));

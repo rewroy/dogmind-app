@@ -720,6 +720,9 @@ const PROSE_BETWEEN: usize = 2;
 /// The long side of a picture a model reads back from its own work.
 const OWN_PICTURE_SIDE: u32 = 1024;
 /// Whether a line of reasoning is code, whichever language: sentences do not end in these, in English or in Japanese.
+/// What a turn in plan mode is told with its facts: what the mode is, as a fact.
+const PLAN_MODE_FACTS: &str = "## Plan Mode\nPlan mode is on: the user wants a plan first. The read-only tools work, and nothing can be changed. submit_plan puts a plan to the user; once they approve it, plan mode ends and the changes can be made.";
+
 fn is_code_line(line: &str) -> bool {
     let line = line.trim();
     line.ends_with([';', '{', '}']) || line.ends_with("*/") || line.starts_with("#define ") || line.starts_with("</")
@@ -1662,7 +1665,7 @@ impl Agent {
                 self.emit(Event::Goal(self.goal.clone()));
                 for message in &self.messages {
                     match (message.role.as_str(), message.content.as_deref()) {
-                        ("user", Some(text)) => {
+                        ("user", Some(text)) if !prompt::is_nudge(text) => {
                             self.bench.web.note_typed(prompt::typed_text(text));
                             self.japanese_session |= prompt::has_kana(prompt::typed_text(text));
                         }
@@ -1880,40 +1883,40 @@ impl Agent {
         self.bench.web.note_typed(text);
         let language = self.language_for(text);
         self.bench.in_japanese = language == Some("Japanese");
-        let mut message = prompt::user_message_in(text, &now(), language);
-        // What changes as work goes on rides on a message and stays out of the prefix every session shares.
+        // What the app knows of this moment goes in a message of its own after what was typed, and stays out of the prefix every session shares.
+        let mut notes: Vec<String> = Vec::new();
         if first_message {
-            message = prompt::with_note(&message, &prompt::workspace_state(&self.workspace));
+            notes.push(prompt::workspace_state(&self.workspace));
             // What the person has opened to commands, as the prefix every session shares must not depend on it.
             #[cfg(windows)]
             if let Some(file) = self.rules.parent().map(crate::read_folders::file_in) {
                 let open: Vec<String> = crate::read_folders::open_folders(&file).iter().map(|folder| format!("`{}`", folder.display())).collect();
                 if !open.is_empty() {
-                    message = prompt::with_note(&message, &format!("- Commands can also read these folders, and write in none of them: {}.", open.join(", ")));
+                    notes.push(format!("- Commands can also read these folders, and write in none of them: {}.", open.join(", ")));
                 }
             }
         }
         if std::mem::take(&mut self.web_rules_due) {
-            message = prompt::with_note(&message, prompt::WEB_RULES.trim_end());
+            notes.push(prompt::WEB_RULES.trim_end().to_string());
         }
         if let Some(note) = self.asked_skill(text) {
-            message = prompt::with_note(&message, &note);
+            notes.push(note);
         }
         // A request that plainly asks for no changes to the work makes the turn read-only: the workspace is closed to the write tools and a folder outside it is open for experiments.
         // Each request is judged on its own words, and the turn says so on the screen before anything is refused.
         self.read_only = false;
         self.bench.scratch = None;
         if let Some(note) = self.make_read_only(text) {
-            message = prompt::with_note(&message, &note);
+            notes.push(note);
         }
         // The goal the person set, with the first message after it was set and after each compaction: the history holds it the rest of the time.
         if std::mem::take(&mut self.goal_due) {
             if let Some(goal) = &self.goal {
-                message = prompt::with_note(&message, &format!("## Session Goal\n{goal}\n(Set by the user for this session: keep working toward it across turns, and say when it is met.)"));
+                notes.push(format!("## Session Goal\n{goal}\n(The user set it for this session. It holds across turns until it is met or cleared.)"));
             }
         }
         if self.mode == Mode::Plan {
-            message = prompt::with_note(&message, "## Plan Mode\nThe user wants a plan first. Look as much as you need with the read-only tools, then set out what you would change and why, and put it to the user with submit_plan. Nothing can be changed in this mode: once the user approves the plan, plan mode ends and you carry it out.");
+            notes.push(PLAN_MODE_FACTS.to_string());
         }
         // What was attached, as files: the model sees the pictures, but a page that shows one needs it in the workspace.
         #[cfg(windows)]
@@ -1922,14 +1925,15 @@ impl Agent {
             let copies = images::copies_for_commands(&folder.join("attachments"), &name, &pictures);
             let lines: Vec<String> = copies.iter().zip(&pictures).map(|(path, picture)| format!("- `{}`: {}x{}, {}", path.display(), picture.width, picture.height, picture.media_type)).collect();
             if !lines.is_empty() {
-                message = prompt::with_note(&message, &format!("## Attached Pictures\nThe pictures above as files, which commands can read: copy one into the workspace for a page or a program to use it.\n{}", lines.join("\n")));
+                notes.push(format!("## Attached Pictures\nThe pictures attached to the message above are also these files, which commands can read (a page or a program in the workspace needs a copy of one there):\n{}", lines.join("\n")));
             }
         }
         if !self.rewound.is_empty() {
             let files: Vec<String> = self.rewound.drain(..).map(|path| format!("- {}", path.display())).collect();
-            message = prompt::with_note(&message, &format!("## Files Restored\nThe user put these files back as they were earlier in this conversation. Your earlier edits to them are undone; read them again before relying on them:\n{}", files.join("\n")));
+            notes.push(format!("## Files Restored\nThe user put these files back as they were earlier in this conversation: your earlier edits to them are undone, and what was read of them before may not be what is there now.\n{}", files.join("\n")));
         }
-        self.push(Message { images, ..Message::text("user", message) });
+        self.push(Message { images, ..Message::text("user", text) });
+        self.push(Message::text("user", prompt::app_facts(&now(), language, &notes)));
         // Only now does the file say what the session is, so a list read on this word has its title.
         if let (true, Some(session)) = (new_session, &self.session) {
             let path = session.path.clone();
@@ -1943,7 +1947,10 @@ impl Agent {
     fn finish_turn(&mut self, ended: Ended, turn_began: Instant) {
         let before = self.messages.len();
         // A word to go on with what no one went on with would be read as still standing, after what the person writes next.
-        if matches!(ended, Ended::Failed(_) | Ended::Cancelled) && self.messages.last().is_some_and(|last| last.role == "user" && last.content.as_deref().is_some_and(prompt::is_nudge)) {
+        // (the app's facts after the person's message are not such a word: they stay with that message)
+        if matches!(ended, Ended::Failed(_) | Ended::Cancelled)
+            && self.messages.last().is_some_and(|last| last.role == "user" && last.content.as_deref().is_some_and(|text| prompt::is_nudge(text) && !prompt::is_app_facts(text)))
+        {
             self.messages.pop();
         }
         // Whatever stopped the turn, every call in the conversation keeps a result, or the next request is refused.
@@ -2009,12 +2016,10 @@ impl Agent {
             self.bench.web.note_typed(&text);
             let language = self.language_for(&text);
             self.bench.in_japanese = language == Some("Japanese");
-            let mut message = prompt::user_message_in(&text, &now(), language);
             // (what is added can make the turn read-only; it cannot lift it: that is a request of its own)
-            if let Some(note) = self.make_read_only(&text) {
-                message = prompt::with_note(&message, &note);
-            }
-            self.push(Message::text("user", message));
+            let notes: Vec<String> = self.make_read_only(&text).into_iter().collect();
+            self.push(Message::text("user", text.clone()));
+            self.push(Message::text("user", prompt::app_facts(&now(), language, &notes)));
             self.emit(Event::Interjected(text));
         }
         any
@@ -4021,9 +4026,35 @@ mod tests {
         assert_eq!(second[0], bodies[0]["messages"][0], "the system prompt is frozen");
         assert_eq!(second[1], bodies[0]["messages"][1], "a message once sent is sent again to the byte");
         assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "so are the tools");
-        assert_eq!(second[2]["reasoning_content"], "thinking");
+        assert_eq!(second[3]["reasoning_content"], "thinking");
         assert!(bodies[0].get("tool_choice").is_none() && bodies[0].get("max_tokens").is_none());
         assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 16, "Dogmind's ten and the app's six");
+    }
+
+    /// What the person typed goes to the model as it was typed, with nothing around it, and the app's facts (the time, the language, at the first message the workspace)
+    /// come in a message of their own after it. A later request sends what was sent before to the byte, and adds the next message and its facts at the end.
+    #[test]
+    fn what_was_typed_goes_as_it_is_and_the_apps_facts_come_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
+        let (client, bodies) = server(vec![text_answer("hi"), text_answer("again")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("こんにちは、見てください".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        run.handle.commands.send(Command::Send("next".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let bodies = bodies.lock().unwrap();
+        let first = bodies[0]["messages"].as_array().unwrap();
+        assert_eq!(first.len(), 3, "{first:?}");
+        assert_eq!(first[1]["content"], "こんにちは、見てください", "as it was typed");
+        let facts = first[2]["content"].as_str().unwrap();
+        assert!(prompt::is_app_facts(facts) && facts.contains("marker.txt") && facts.contains("- The user writes in Japanese."), "{facts}");
+        assert!(!facts.contains("回答は"), "a fact, not a rule");
+        let second = bodies[1]["messages"].as_array().unwrap();
+        assert_eq!(second[..3], first[..], "what was sent is sent again to the byte");
+        assert_eq!((second[3]["content"].as_str(), second[4]["content"].as_str()), (Some("hi"), Some("next")));
+        let later = second[5]["content"].as_str().unwrap();
+        assert!(prompt::is_app_facts(later) && !later.contains("marker.txt"), "the workspace is said once: {later}");
     }
 
     #[test]
@@ -4037,8 +4068,8 @@ mod tests {
         assert!(log[0].starts_with("tool:true:false:") && log[0].contains("1|content here"), "{log:?}");
         let bodies = bodies.lock().unwrap();
         let messages = bodies[1]["messages"].as_array().unwrap();
-        assert_eq!(messages[3]["role"], "tool");
-        assert_eq!(messages[3]["tool_call_id"], "call-1");
+        assert_eq!(messages[4]["role"], "tool");
+        assert_eq!(messages[4]["tool_call_id"], "call-1");
     }
 
     /// A look handed to a helper: its own requests, with its own prompt and the looking tools only, and back in the conversation only
@@ -4100,7 +4131,7 @@ mod tests {
         assert_eq!(log[0], "approval:create_file:low");
         assert!(log[1].starts_with("tool:false:true:") && log[1].contains("not that"), "{log:?}");
         assert!(!dir.path().join("x.txt").exists());
-        assert!(bodies.lock().unwrap()[1]["messages"][3]["content"].as_str().unwrap().contains("not that"));
+        assert!(bodies.lock().unwrap()[1]["messages"][4]["content"].as_str().unwrap().contains("not that"));
     }
 
     #[test]
@@ -4256,8 +4287,8 @@ mod tests {
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         let messages = bodies[3]["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 4, "system, first, its answer, after: {messages:?}");
-        assert_eq!(messages[2]["content"], "first answer");
+        assert_eq!(messages.len(), 6, "system, first and its facts, its answer, after and its facts: {messages:?}");
+        assert_eq!(messages[3]["content"], "first answer");
     }
 
     #[test]
@@ -4310,7 +4341,7 @@ mod tests {
     /// What the person typed, as the session's file holds it.
     fn typed_on_disk(path: &Path) -> Vec<String> {
         let (_, _, messages) = Session::open(path).unwrap();
-        messages.iter().filter(|message| message.role == "user").filter_map(|message| message.content.as_deref()).map(|text| prompt::typed_text(text).to_string()).collect()
+        messages.iter().filter(|message| message.role == "user").filter_map(|message| message.content.as_deref()).filter(|text| !prompt::is_nudge(text)).map(|text| prompt::typed_text(text).to_string()).collect()
     }
 
     fn session_file(run: &Run) -> PathBuf {
@@ -4352,6 +4383,7 @@ mod tests {
         assert!(notices.is_empty(), "{notices:?}");
         assert_eq!(bodies.lock().unwrap().len(), 2, "no checkpoint was asked for, and no retry");
         assert_eq!(typed_on_disk(&path), ["first", "second"]);
+        assert_eq!(Session::open(&path).unwrap().2.iter().filter(|message| message.content.as_deref().is_some_and(prompt::is_app_facts)).count(), 2, "a failed turn keeps the facts of its message");
         // The engine back: all of it goes to it, the half answer with it.
         run.handle.commands.send(Command::Send("third".into())).unwrap();
         until_end(&run, Decision::Reject);
@@ -4547,7 +4579,7 @@ mod tests {
         let told = |body: &Value| body["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap().contains("x.txt");
         assert!(told(&bodies[2]));
         assert!(!told(&bodies[3]), "once");
-        assert_eq!(prompt::typed_text(bodies[2]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap()), "next");
+        assert_eq!(prompt::typed_text(bodies[2]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user" && !m["content"].as_str().is_some_and(prompt::is_nudge)).unwrap()["content"].as_str().unwrap()), "next");
     }
 
     #[test]
@@ -5392,9 +5424,9 @@ mod tests {
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         let last_user = |body: &Value| body["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap().to_string();
-        assert!(!last_user(&bodies[0]).contains("日本語"));
-        assert!(last_user(&bodies[1]).contains("日本語で書いて"));
-        assert!(last_user(&bodies[2]).contains("日本語で書いて"), "no kana, and still Japanese");
+        assert!(!last_user(&bodies[0]).contains("writes in Japanese"));
+        assert!(last_user(&bodies[1]).contains("The user writes in Japanese."));
+        assert!(last_user(&bodies[2]).contains("The user writes in Japanese."), "no kana, and still Japanese");
     }
 
     #[test]
@@ -5412,7 +5444,7 @@ mod tests {
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         assert!(bodies[0]["messages"][0]["content"].as_str().unwrap().contains("回答の最後に参考にしたファイルを挙げてください"));
-        assert!(bodies[0]["messages"][1]["content"].as_str().unwrap().contains("日本語で書いて"), "kanji alone, on a Japanese system");
+        assert!(bodies[0]["messages"][2]["content"].as_str().unwrap().contains("The user writes in Japanese."), "kanji alone, on a Japanese system");
     }
 
     #[test]
@@ -5431,9 +5463,10 @@ mod tests {
         let bodies = bodies.lock().unwrap();
         assert!(bodies[0]["messages"][0]["content"].as_str().unwrap().contains("- haiku: Writes haiku"));
         assert!(bodies[0]["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "skill"));
-        let asked = bodies[2]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap().to_string();
-        assert!(asked.contains("Count the morae of 古池."), "{asked}");
-        assert_eq!(prompt::typed_text(&asked), "/haiku 古池");
+        let users: Vec<&str> = bodies[2]["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "user").filter_map(|m| m["content"].as_str()).collect();
+        let facts = users.last().unwrap();
+        assert!(facts.contains("Count the morae of 古池."), "{facts}");
+        assert_eq!(users.iter().rev().find(|text| !prompt::is_nudge(text)).map(|text| prompt::typed_text(text)), Some("/haiku 古池"));
     }
 
     /// Of two skills of a name, the model is offered the one it may start and `/name` starts the one the person may: neither hides the other.
@@ -5485,7 +5518,7 @@ mod tests {
         assert!(!dir.path().join("x.txt").exists());
         assert!(!log.iter().any(|line| line.starts_with("approval:")), "{log:?}");
         assert_eq!(log.iter().filter(|line| line.contains("plan mode")).count(), 2, "{log:?}");
-        assert!(bodies.lock().unwrap()[0]["messages"][1]["content"].as_str().unwrap().contains("## Plan Mode"));
+        assert!(bodies.lock().unwrap()[0]["messages"][2]["content"].as_str().unwrap().contains("## Plan Mode"));
     }
 
     #[test]
@@ -5564,8 +5597,8 @@ mod tests {
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         let messages = bodies[1]["messages"].as_array().unwrap();
-        assert_eq!(messages[2]["content"], "part");
-        assert_eq!(messages[3]["content"], prompt::CONTINUE_NUDGE);
+        assert_eq!(messages[3]["content"], "part");
+        assert_eq!(messages[4]["content"], prompt::CONTINUE_NUDGE);
     }
 
     #[test]
@@ -5757,7 +5790,7 @@ mod tests {
         assert_eq!(warm[0].content, turn[0].content, "the same prompt, or the engine reads it again");
         let tools = provider.seen.lock().unwrap();
         assert_eq!(tools[0].1, tools[1].1, "the same tools, for the same reason");
-        assert_eq!(turn.iter().filter(|message| message.role == "user").count(), 1, "what warmed it is no part of the conversation");
+        assert_eq!(turn.iter().filter(|message| message.role == "user" && !message.content.as_deref().is_some_and(prompt::is_nudge)).count(), 1, "what warmed it is no part of the conversation");
     }
 
     /// A skill another program is writing can be there for the warm-up and gone for the first message a moment later (a desktop app's synced
@@ -5964,11 +5997,11 @@ Body").unwrap();
         until_end(&run, Decision::Reject);
         let opening = provider.messages(0);
         assert!(!user_text(&opening[0]).contains("marker.txt"), "not in the system prompt");
-        assert!(user_text(&opening[1]).contains("marker.txt"));
+        assert!(user_text(&opening[2]).contains("marker.txt"));
         assert_eq!(prompt::typed_text(user_text(&opening[1])), "first");
         run.handle.commands.send(Command::Retry).unwrap();
         until_end(&run, Decision::Reject);
-        assert!(user_text(&provider.messages(1)[1]).contains("marker.txt"));
+        assert!(user_text(&provider.messages(1)[2]).contains("marker.txt"));
         run.handle.commands.send(Command::Send("second".into())).unwrap();
         until_end(&run, Decision::Reject);
         assert!(!user_text(provider.messages(2).last().unwrap()).contains("marker.txt"));
@@ -6355,8 +6388,9 @@ Body").unwrap();
         assert_eq!(line["messages_before"].as_u64(), Some(was.len() as u64));
         let (after, first) = (line["messages_after"].as_u64().unwrap() as usize, line["first_changed"].as_u64().unwrap() as usize);
         assert!(after < was.len(), "{line}");
-        // (the system prompt and the first request stay, which is two messages, and the summary takes the place of the first of the rest: an automatic compaction leaves four in all)
-        assert_eq!((first, after), (2, 4), "{line}");
+        // (the system prompt and the first request with its facts stay, which is three messages, and the summary takes the place of the first of the rest: an automatic
+        // compaction leaves six in all, the latest request and its facts after the summary)
+        assert_eq!((first, after), (3, 6), "{line}");
         let held: usize = was[..first].iter().map(Message::chars).sum();
         assert_eq!(line["unchanged_tokens_est"].as_u64(), Some((held / CHARS_A_TOKEN) as u64), "{line}");
         // The ones it had before: the line still says them.
@@ -6983,7 +7017,7 @@ Body").unwrap();
         let (told, refused) = (said.iter().position(|line| line.starts_with("notice:")).unwrap(), said.iter().position(|line| line.starts_with("ended:false:true:")).unwrap());
         assert!(told < said.iter().position(|line| line.starts_with("started:")).unwrap() && told < refused, "{said:?}");
         assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "before\n");
-        assert!(user_text(&provider.messages(0)[1]).contains("## No Changes"));
+        assert!(user_text(&provider.messages(0)[2]).contains("## No Changes"));
         let lines = trajectory_of(&run);
         let guard: Vec<&Value> = of_kind(&lines, "intervention").into_iter().filter(|line| line["kind"] == "no_change_guard" && line["what"] == "turn_read_only").collect();
         assert_eq!(guard.len(), 1, "{lines:?}");
@@ -7118,7 +7152,7 @@ Body").unwrap();
         until_end(&run, Decision::Reject);
         let (first, second) = (provider.messages(0), provider.messages(1));
         let scratch = scratch_of(run._sessions.path());
-        let noted = user_text(&first[1]);
+        let noted = user_text(&first[2]);
         assert!(noted.contains("## No Changes") && noted.contains(&scratch.display().to_string()), "{noted}");
         assert!(scratch.is_dir(), "made for the turn");
         assert_eq!(second.iter().filter(|message| user_text(message).contains("## No Changes")).count(), 1, "only the turn that asked has it");
@@ -7161,8 +7195,8 @@ Body").unwrap();
             run.handle.commands.send(Command::Send(text.into())).unwrap();
             until_end(&run, Decision::Reject);
         }
-        assert!(user_text(provider.messages(1).last().unwrap()).contains("日本語で書いて"));
-        assert!(!user_text(provider.messages(2).last().unwrap()).contains("日本語"));
+        assert!(user_text(provider.messages(1).last().unwrap()).contains("The user writes in Japanese."));
+        assert!(!user_text(provider.messages(2).last().unwrap()).contains("writes in Japanese"));
     }
 
     /// The JSON of a `create_file` with `lines` numbered lines, cut wherever `upto` says.
@@ -7548,13 +7582,13 @@ Body").unwrap();
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 3, "{log:?}");
         let messages = bodies[1]["messages"].as_array().unwrap();
-        let call = &messages[2]["tool_calls"][0]["function"];
+        let call = &messages[3]["tool_calls"][0]["function"];
         assert_eq!(call["name"], "create_file");
         let sent: &str = call["arguments"].as_str().unwrap();
         assert!(sent.len() < MAX_WRITE_CHARS + 2100 && sent.starts_with(r#"{"path":"web/index.html","content":"line 0 "#), "the bytes as they came: {}", &sent[..80]);
         let kept: Value = serde_json::from_str(sent).expect("whole JSON");
         assert!(kept["content"].as_str().unwrap().ends_with("to something\n"), "at a line's end");
-        let said = messages[3]["content"].as_str().unwrap();
+        let said = messages[4]["content"].as_str().unwrap();
         assert!(said.contains("cut off") && said.contains("Go straight on"), "{said}");
         let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
         assert_eq!(on_disk, format!("{}the rest\n", kept["content"].as_str().unwrap()), "the model left out append, and it went on all the same");
@@ -7606,9 +7640,9 @@ Body").unwrap();
         let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
         assert!(on_disk.starts_with("line 0 ") && on_disk.ends_with("to something\n") && on_disk.lines().count() == 100, "once, and whole");
         let bodies = bodies.lock().unwrap();
-        let call = &bodies[1]["messages"].as_array().unwrap()[2]["tool_calls"][0];
+        let call = &bodies[1]["messages"].as_array().unwrap()[3]["tool_calls"][0];
         assert_eq!((call["function"]["name"].as_str(), call["function"]["arguments"].as_str()), (Some("create_file"), Some(raw.as_str())), "the call as it came whole, and not its pieces");
-        assert_eq!(bodies[1]["messages"].as_array().unwrap()[2]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(bodies[1]["messages"].as_array().unwrap()[3]["tool_calls"].as_array().unwrap().len(), 1);
     }
 
     /// A call too long for one answer is cut off from the pieces Straydog sends, as from a server's own, and goes on from what is on disk.
@@ -7628,13 +7662,13 @@ Body").unwrap();
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 3, "{log:?}");
         let messages = bodies[1]["messages"].as_array().unwrap();
-        let call = &messages[2]["tool_calls"][0]["function"];
+        let call = &messages[3]["tool_calls"][0]["function"];
         assert_eq!(call["name"], "create_file");
         let sent: &str = call["arguments"].as_str().unwrap();
         assert!(sent.len() < MAX_WRITE_CHARS + 2100 && sent.starts_with(r#"{"path": "web/index.html", "content": "line 0 "#), "the bytes as they came: {}", &sent[..80]);
         let kept: Value = serde_json::from_str(sent).expect("whole JSON");
         assert!(kept["content"].as_str().unwrap().ends_with("to something\n"), "at a line's end");
-        let said = messages[3]["content"].as_str().unwrap();
+        let said = messages[4]["content"].as_str().unwrap();
         assert!(said.contains("cut off") && said.contains("Go straight on"), "{said}");
         let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
         assert_eq!(on_disk, format!("{}the rest\n", kept["content"].as_str().unwrap()));
@@ -7715,8 +7749,8 @@ Body").unwrap();
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         let messages = bodies[1]["messages"].as_array().unwrap();
-        assert_eq!(messages[2]["tool_calls"][0]["function"]["name"], "create_file");
-        assert!(messages[3]["content"].as_str().unwrap().contains("the turn stopped while this was being written"), "{}", messages[3]);
+        assert_eq!(messages[3]["tool_calls"][0]["function"]["name"], "create_file");
+        assert!(messages[4]["content"].as_str().unwrap().contains("the turn stopped while this was being written"), "{}", messages[4]);
     }
 
     #[test]
@@ -7876,7 +7910,7 @@ Body").unwrap();
         assert_eq!(bodies[0]["messages"][1]["content"][0]["image_url"]["url"], url);
         assert_eq!(bodies[1]["messages"][1].to_string(), bodies[0]["messages"][1].to_string());
         assert_eq!(prompt::typed_text(bodies[0]["messages"][1]["content"][1]["text"].as_str().unwrap()), "what is this");
-        assert_eq!(bodies[1]["messages"][3]["content"].as_str().map(prompt::typed_text), Some("and now"), "words alone stay a plain string");
+        assert_eq!(bodies[1]["messages"][4]["content"].as_str().map(prompt::typed_text), Some("and now"), "words alone stay a plain string");
     }
 
     #[test]
@@ -8220,12 +8254,12 @@ Body").unwrap();
         let messages = crate::session::read(&session).unwrap();
         let lines = trajectory_of(&run);
         let places: Vec<u64> = of_kind(&lines, "request").iter().map(|line| line["message"].as_u64().expect("a message")).collect();
-        // (the system prompt, the person's words, the answer with its call, the call's result, the last answer)
-        assert_eq!(places, [2, 4], "{lines:?}");
+        // (the system prompt, the person's words, the app's facts, the answer with its call, the call's result, the last answer)
+        assert_eq!(places, [3, 5], "{lines:?}");
         assert!(places.iter().all(|at| messages[*at as usize].role == "assistant"));
-        let call = &messages[2].tool_calls.as_ref().unwrap()[0];
+        let call = &messages[3].tool_calls.as_ref().unwrap()[0];
         assert_eq!(of_kind(&lines, "tool")[0]["id"], call.id.as_str(), "the call is told by the id the message has for it");
-        assert_eq!(messages[3].tool_call_id.as_deref(), Some(call.id.as_str()));
+        assert_eq!(messages[4].tool_call_id.as_deref(), Some(call.id.as_str()));
         // (when each began to write: the call in the first, the answer's words in the second, and not the other)
         let requests = of_kind(&lines, "request");
         assert!(requests[0]["writing_ms"].is_u64() && requests[0].get("answer_ms").is_none(), "{}", requests[0]);
@@ -8284,7 +8318,7 @@ Body").unwrap();
         let requests = of_kind(&lines, "request");
         assert_eq!(requests.len(), 2, "{lines:?}");
         assert!(requests[0].get("message").is_none(), "an answer with nothing in it does not join the conversation: {}", requests[0]);
-        assert_eq!((requests[1]["message"].as_u64(), requests[1]["retry_why"].as_str()), (Some(2), Some("empty")));
+        assert_eq!((requests[1]["message"].as_u64(), requests[1]["retry_why"].as_str()), (Some(3), Some("empty")));
     }
 
     #[test]
