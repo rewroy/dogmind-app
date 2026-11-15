@@ -1,4 +1,4 @@
-//! Drives the agent against a server with no window, to measure a job: `drive --server URL --workspace DIR --data DIR --turns FILE [--mode auto] [--limit SECONDS] [--wake-for SECONDS] [--refuse]`; `drive --report TRAJECTORY [--engine-log FILE]` reads a trajectory as `dogmind-app --trajectory` does.
+//! Drives the agent against a server with no window, to measure a job: `drive --server URL --workspace DIR --data DIR --turns FILE [--mode auto] [--limit SECONDS] [--wake-for SECONDS] [--refuse] [--warm-wait SECONDS] [--between SECONDS [--warm-between]]`; `drive --report TRAJECTORY [--engine-log FILE]` reads a trajectory as `dogmind-app --trajectory` does.
 //!
 //! The turns are the lines of the file (a blank line is skipped), each sent when the one before it has ended. Approvals are given, as a person at the keyboard would who trusts the job;
 //! with `--refuse` every approval is answered no, so that no command runs. A call being written is shown as its pieces come, with the time into the turn.
@@ -21,9 +21,17 @@ fn main() {
     let (mut report, mut engine_log) = (None, None);
     // `--refuse`: every approval is answered no, for a job that must run no command (nothing the sandbox starts runs then).
     let mut refuse = false;
+    // `--warm-wait SECONDS`: the new conversation is warmed as the app warms one it opens, and its first message goes that long after.
+    let mut warm_wait = 0u64;
+    // `--between SECONDS`: before each turn after the first, that long passes, as while the person is in another conversation; with
+    // `--warm-between`, another conversation is opened on the same server meanwhile, and warmed as the app warms one it opens.
+    let (mut between, mut warm_between) = (0u64, false);
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--refuse" => refuse = true,
+            "--warm-wait" => warm_wait = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
+            "--between" => between = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
+            "--warm-between" => warm_between = true,
             "--report" => report = args.next().map(PathBuf::from),
             "--engine-log" => engine_log = args.next().map(PathBuf::from),
             "--server" => server = args.next().unwrap_or_default(),
@@ -60,7 +68,7 @@ fn main() {
     println!("server: model {} window {} straydog {}", info.model, info.context, info.straydog);
 
     let (sender, events) = channel();
-    let config = Config {
+    let config_in = |data: &std::path::Path| Config {
         workspace: workspace.clone(),
         sessions: data.join("sessions"),
         rules: data.join("permissions.json"),
@@ -76,14 +84,36 @@ fn main() {
         mcp: None,
         policy: Default::default(),
     };
-    let handle = agent::start(config, sender, Box::new(|| {}));
+    let handle = agent::start(config_in(&data), sender, Box::new(|| {}));
     let send = |command: Command| {
         let _ = handle.commands.send(command);
     };
-    send(Command::Provider(Arc::new(client), info.model.clone(), info.context));
+    let provider = Arc::new(client);
+    send(Command::Provider(provider.clone(), info.model.clone(), info.context));
     send(Command::NewSession(workspace.clone()));
+    if warm_wait > 0 {
+        send(Command::WarmPrefix);
+        println!("warmed; the first message goes in {warm_wait} s");
+        std::thread::sleep(Duration::from_secs(warm_wait));
+    }
     let began = Instant::now();
     for (at, turn) in std::fs::read_to_string(&turns).unwrap().lines().map(str::trim).filter(|line| !line.is_empty()).enumerate() {
+        if at > 0 && between > 0 {
+            if warm_between {
+                let (other_sender, other_events) = channel();
+                let other = agent::start(config_in(&data.join("between")), other_sender, Box::new(|| {}));
+                let _ = other.commands.send(Command::Provider(provider.clone(), info.model.clone(), info.context));
+                let _ = other.commands.send(Command::NewSession(workspace.clone()));
+                let _ = other.commands.send(Command::WarmPrefix);
+                println!("another conversation opened and warmed; back to this one in {between} s");
+                std::thread::sleep(Duration::from_secs(between));
+                let _ = other.commands.send(Command::Quit);
+                drop(other_events);
+            } else {
+                println!("back to this conversation in {between} s");
+                std::thread::sleep(Duration::from_secs(between));
+            }
+        }
         let turn_began = Instant::now();
         println!("--- turn {} ({} chars)", at + 1, turn.chars().count());
         send(Command::Send(turn.to_string()));

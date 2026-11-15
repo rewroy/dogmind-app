@@ -1695,6 +1695,10 @@ impl Agent {
         if !self.messages.is_empty() {
             return;
         }
+        // (a server reading or writing for another conversation, or another client, is not made to wait for this, nor this for it)
+        if !provider.idle() {
+            return;
+        }
         // (the tools the first message will find, or this was for nothing)
         self.load_extras();
         let messages = [Message::text("system", self.frozen_prompt()), Message::text("user", ".")];
@@ -1704,7 +1708,7 @@ impl Agent {
         self.cancel.store(false, Ordering::Relaxed);
         let mut answered = false;
         let mut clock = Clock::start();
-        let streamed = provider.stream(&request, &self.cancel, &mut |delta| {
+        let streamed = provider.warm(&request, &self.cancel, &mut |delta| {
             // (the prompt being read is no word)
             if matches!(delta, Delta::Prefill(..)) {
                 return;
@@ -5382,6 +5386,8 @@ mod tests {
         tool_pictures: bool,
         /// What the server says of the model's pictures (None: it says nothing).
         reads: Option<bool>,
+        /// The server is reading or writing for someone else.
+        busy: bool,
     }
 
     impl Scripted {
@@ -5406,6 +5412,9 @@ mod tests {
         }
         fn reads_pictures(&self) -> Option<bool> {
             self.reads
+        }
+        fn idle(&self) -> bool {
+            !self.busy
         }
     }
 
@@ -5450,6 +5459,17 @@ mod tests {
             }
             panic!("a warm-up that nothing ended");
         })
+    }
+
+    #[test]
+    fn a_warm_up_is_left_out_while_the_server_answers_someone_else_and_the_message_still_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, provider) = scripted_as(dir.path(), Scripted { steps: Mutex::new(vec![says("ok")].into()), busy: true, ..Scripted::default() }, Mode::Default);
+        run.handle.commands.send(Command::WarmPrefix).unwrap();
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        let (_, cancelled) = until_end(&run, Decision::Approve);
+        assert!(!cancelled);
+        assert_eq!(provider.requests(), 1, "the message's own request, and no warm-up before it");
     }
 
     #[test]
