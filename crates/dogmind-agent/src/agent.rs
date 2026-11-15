@@ -1245,16 +1245,6 @@ enum Ended {
     Failed(String),
 }
 
-/// What ended a stream from outside, short of the person's Stop: the app's own stops (see `iterate`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Stopped {
-    Not,
-    /// Code drafted in the reasoning.
-    Draft,
-    /// A `create_file` cut to get it on disk.
-    CutWrite,
-}
-
 fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string()
 }
@@ -1732,6 +1722,10 @@ impl Agent {
 
     /// A message goes in the conversation and on disk together.
     fn push(&mut self, mut message: Message) {
+        // (an answer's place in the session, for the line of the request that made it)
+        if message.role == "assistant" {
+            self.traj.message_at(self.messages.len());
+        }
         // (when the person said it, and when an answer was given, show beside them)
         if message.at.is_none() && matches!(message.role.as_str(), "user" | "assistant") {
             message.at = Some(crate::message::written_now());
@@ -2269,10 +2263,8 @@ impl Agent {
             let named: Vec<String> = calling.iter().map(|call| call.function.name.clone()).filter(|name| !name.is_empty()).collect();
             let base = self.messages.len();
             let saved = if cuts { cut_answer(&written, &reasoned, &calling, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) } else { None };
-            // (where its message will be, for the trajectory: a reader puts the step beside what the model said. Every message this request makes goes in at `base`.)
-            let stopped = if drafting && stopped_by_the_app { Stopped::Draft } else if cut && stopped_by_the_app { Stopped::CutWrite } else { Stopped::Not };
-            let message = self.makes_a_message(&result, &written, saved.as_ref().map(|(answer, ..)| answer), stopped, transient < TRANSIENT_RETRIES).then_some(base);
-            self.traj.request(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is), helper_file: None, message });
+            // (its line waits for the message it makes, to say where that is in the session: a reader puts the step beside what the model said)
+            self.traj.request_waiting(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is), helper_file: None });
             // Writing a file out in its reasoning: every token of it is typed again in the call. It goes on from what it had decided, in a request of which all but the last few tokens are
             // read already. Whatever it was thinking about before is left to it, however long: only this is stopped, and what it is told is to write. Its connection has closed by now, so
             // the engine is not writing into nothing. (The tokens it wrote were spent all the same.)
@@ -2631,7 +2623,7 @@ impl Agent {
         let (reasoning, content, calls) = result.as_ref().ok().map_or((0, 0, Vec::new()), |completion| (completion.reasoning.chars().count(), completion.content.chars().count(), completion.tool_calls.iter().map(|call| call.function.name.clone()).collect()));
         // (a warm-up is ended by the app at its first word, which is how it is meant to end)
         let end = if role == "warm" && matches!(result, Err(LlmError::Cancelled)) { "stopped_app:warm_up".to_string() } else { trajectory::end_of(result) };
-        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: 0, retry: None, draft_watch: None, helper_file, message: None });
+        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: 0, retry: None, draft_watch: None, helper_file });
     }
 
     /// An intervention of the app's own, in the trajectory, for the request that was made last: the one it ended or follows.
@@ -2695,20 +2687,6 @@ impl Agent {
         let call = answer.tool_calls.last().cloned()?;
         let arguments = serde_json::from_str::<Value>(&call.function.arguments).ok()?;
         self.runs_unasked(&call.function.name, &arguments).then_some((call, arguments))
-    }
-
-    /// Whether the conversation takes an assistant message from a request that ended as `result`. It does from an answer that has a call or a word in it; from one that broke off with words
-    /// written, which `keep_written` puts in; and from a `create_file` cut where its last whole line is (`saved`), which is kept to be gone on with, or run as it is where no one need be asked.
-    /// `may_retry`: the connection may break and the request go again.
-    fn makes_a_message(&self, result: &Result<llm::Completion, LlmError>, written: &str, saved: Option<&llm::Completion>, stopped: Stopped, may_retry: bool) -> bool {
-        match result {
-            Ok(completion) => !completion.tool_calls.is_empty() || !completion.content.trim().is_empty(),
-            Err(LlmError::Cancelled) if stopped == Stopped::Draft => !written.is_empty(),
-            Err(LlmError::Cancelled) if stopped == Stopped::CutWrite && saved.is_some() => true,
-            Err(LlmError::Transient(_)) if saved.is_some() && may_retry => true,
-            Err(LlmError::Overflow(_) | LlmError::NoVision(_)) => !written.is_empty(),
-            Err(_) => !written.is_empty() || saved.is_some_and(|answer| self.cut_write_to_keep(answer).is_some()),
-        }
     }
 
     /// Whether this call would run with no one asked.
