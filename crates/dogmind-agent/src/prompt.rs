@@ -251,7 +251,8 @@ pub const HELPER_ENOUGH: &str = "[From the app] That is as much looking as there
 pub const HELPER_NO_MORE: &str = "error: not run. There is no more looking: answer now, in words, with what you have found, and say what you did not get to.";
 
 /// The app's word to the model: files changed, and nothing has looked at them since. Marked as the app's: a real model took it for the person's, and argued with itself over what they wanted.
-pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, or it would not be worth running, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";
+/// The person's word goes first: a model that had been told "do not run it" ran it on this word for six minutes.
+pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, it would not be worth running, or the user asked you not to run it, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";
 
 /// The app's word after an answer in Japanese with letters in it that no Japanese is written with, which it cannot see for itself. What it has written stays as it is, on the screen and in the
 /// conversation: this asks for the lines again, once, and what comes of it is read as what it is. In Japanese for the same reason as [`language_rule`], and as short as it can be, as it costs a

@@ -950,6 +950,14 @@ fn command_failed(output: &str) -> bool {
     output.rsplit_once("exit_code: ").is_some_and(|(_, code)| code.trim() != "0")
 }
 
+/// Whether the person's message asks for what was written not to be run: then the app does not ask the model to check it (it is the person's call).
+fn asks_not_to_run(text: &str) -> bool {
+    const ENGLISH: [&str; 9] = ["do not run", "don't run", "dont run", "do not execute", "don't execute", "without running", "no need to run", "do not test", "don't test"];
+    const JAPANESE: [&str; 8] = ["実行しない", "実行せず", "実行は不要", "実行不要", "実行はしない", "動かさない", "走らせない", "テストしない"];
+    let lower = text.to_lowercase().replace('\u{2019}', "'");
+    ENGLISH.iter().any(|words| lower.contains(words)) || JAPANESE.iter().any(|words| text.contains(words))
+}
+
 /// Whether code has changed with no command since, after these calls in order. A page or a stylesheet is not among it: nothing here can open one, and the model has been told so.
 fn still_unchecked(mut unchecked: bool, calls: &[crate::message::ToolCall]) -> bool {
     const NOT_CODE: [&str; 17] = ["md", "markdown", "txt", "rst", "log", "csv", "json", "toml", "html", "htm", "css", "svg", "xml", "yaml", "yml", "ini", "cfg"];
@@ -2042,7 +2050,10 @@ impl Agent {
         let mut drafts_stopped = 0u32;
         let (mut generated, mut wrote, mut next_cost_note) = (0u64, false, COST_NOTED_EVERY);
         let mut repeats: HashMap<String, u32> = HashMap::new();
-        let (mut unchecked, mut asked_to_check) = (false, false);
+        // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
+        let not_to_run = self.messages.iter().rev().filter(|message| message.role == "user").map(|message| message.content.as_deref().unwrap_or(""))
+            .find(|text| !text.starts_with("[From the app")).is_some_and(asks_not_to_run);
+        let (mut unchecked, mut asked_to_check) = (false, not_to_run);
         let (mut said, mut asked_about_slips) = (String::new(), false);
         // The request this one repeats, why, and how long it waited, for the trajectory.
         let mut retry: Option<(String, &'static str, u64)> = None;
@@ -5352,6 +5363,19 @@ mod tests {
         assert_eq!(bodies.len(), 3, "asked once, not again");
         let last = bodies[2]["messages"].as_array().unwrap();
         assert_eq!(last.last().unwrap()["content"], prompt::CHECK_NUDGE);
+    }
+
+    #[test]
+    fn code_the_person_said_not_to_run_gets_no_word_about_running_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = sse(&[serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "w", "type": "function", "function": {"name": "create_file", "arguments": "{\"path\":\"a.py\",\"content\":\"x\"}"}}]}, "finish_reason": "tool_calls"}]})]);
+        let (client, bodies) = server(vec![write, text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("Write a.py, then stop. Do not run it.".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        assert_eq!(bodies.lock().unwrap().len(), 2, "no third request: the answer stands");
+        assert!(asks_not_to_run("Don\u{2019}t run the tests") && asks_not_to_run("作ったら実行しないでください") && asks_not_to_run("without running it"));
+        assert!(!asks_not_to_run("Run the tests and fix what fails") && !asks_not_to_run("実行して確認してください"));
     }
 
     #[test]
