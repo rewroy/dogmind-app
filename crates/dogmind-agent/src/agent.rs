@@ -7177,6 +7177,86 @@ mod tests {
         assert_eq!(on_disk, format!("{}the rest\n", kept["content"].as_str().unwrap()), "the model left out append, and it went on all the same");
     }
 
+    /// The same pieces as Straydog sends a call it is writing, when asked to (`"straydog": {"tool_writing": true}`): the name first and alone, then the arguments in a field of the
+    /// delta of its own. The call itself comes whole at the end, in the usual field, if it comes.
+    fn straydog_pieces(raw: &str) -> Vec<Value> {
+        let mut events = vec![serde_json::json!({"choices": [{"delta": {"straydog_tool_writing": [{"index": 0, "name": "create_file", "arguments": ""}]}}]})];
+        events.extend(raw.as_bytes().chunks(2000).map(|piece| serde_json::json!({"choices": [{"delta": {"straydog_tool_writing": [{"index": 0, "arguments": std::str::from_utf8(piece).unwrap()}]}}]})));
+        events
+    }
+
+    /// `write_arguments` the way Straydog writes the JSON of a call: a space after each colon and comma.
+    fn spaced_write_arguments(lines: usize, upto: usize) -> String {
+        write_arguments(lines, upto).replacen(r#""path":"#, r#""path": "#, 1).replacen(r#","content":"#, r#", "content": "#, 1)
+    }
+
+    /// A call Straydog sends as the model writes it is shown as it comes, as any server's pieces are, and the call that comes whole after is the call: written once, and what the
+    /// window was told of it as it was written is no more than the call.
+    #[test]
+    fn a_call_straydog_sends_as_it_is_written_is_shown_and_then_done_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = spaced_write_arguments(100, usize::MAX);
+        assert!(raw.len() > 6000 && raw.len() < MAX_WRITE_CHARS);
+        let mut events = straydog_pieces(&raw);
+        events.push(piece_of_call(&raw, Some("tool_calls")));
+        let (client, bodies) = trickling_server(vec![events, vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        let (mut told, mut tools, mut writes) = (String::new(), Vec::new(), 0);
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::ToolWriting { tool, piece, .. } => {
+                    tools.push(tool);
+                    told.push_str(&piece);
+                    writes += 1;
+                }
+                Event::TurnEnded { cancelled } => {
+                    assert!(!cancelled);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(writes > 0 && tools.iter().all(|tool| tool == "create_file"), "{tools:?}");
+        // (the window was told the call's start as it came, and never more than the call)
+        assert!(raw.starts_with(&told), "told {} bytes of {}", told.len(), raw.len());
+        let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
+        assert!(on_disk.starts_with("line 0 ") && on_disk.ends_with("to something\n") && on_disk.lines().count() == 100, "once, and whole");
+        let bodies = bodies.lock().unwrap();
+        let call = &bodies[1]["messages"].as_array().unwrap()[2]["tool_calls"][0];
+        assert_eq!((call["function"]["name"].as_str(), call["function"]["arguments"].as_str()), (Some("create_file"), Some(raw.as_str())), "the call as it came whole, and not its pieces");
+        assert_eq!(bodies[1]["messages"].as_array().unwrap()[2]["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    /// A call too long for one answer is cut off from the pieces Straydog sends, as from a server's own, and goes on from what is on disk.
+    #[test]
+    fn a_long_write_straydog_sends_in_pieces_is_cut_off_all_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = spaced_write_arguments(1000, usize::MAX);
+        assert!(raw.len() > 2 * MAX_WRITE_CHARS);
+        let mut first = straydog_pieces(&raw);
+        // (a server that is not stopped goes on to send the call whole)
+        first.push(piece_of_call(&raw, Some("tool_calls")));
+        let (client, bodies) = trickling_server(vec![first, whole_call(serde_json::json!({"path": "web/index.html", "content": "the rest\n"})), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled, "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "{log:?}");
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        let call = &messages[2]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "create_file");
+        let sent: &str = call["arguments"].as_str().unwrap();
+        assert!(sent.len() < MAX_WRITE_CHARS + 2100 && sent.starts_with(r#"{"path": "web/index.html", "content": "line 0 "#), "the bytes as they came: {}", &sent[..80]);
+        let kept: Value = serde_json::from_str(sent).expect("whole JSON");
+        assert!(kept["content"].as_str().unwrap().ends_with("to something\n"), "at a line's end");
+        let said = messages[3]["content"].as_str().unwrap();
+        assert!(said.contains("cut off") && said.contains("Go straight on"), "{said}");
+        let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
+        assert_eq!(on_disk, format!("{}the rest\n", kept["content"].as_str().unwrap()));
+    }
+
     #[test]
     fn always_to_a_command_is_not_always_to_it_with_the_network() {
         let (plain, asked, named) = (serde_json::json!({"command": "python x.py"}), serde_json::json!({"command": "python x.py", "network": true}), serde_json::json!({"command": "curl https://x.example"}));
