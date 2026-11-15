@@ -491,6 +491,11 @@ pub trait Provider: Send + Sync {
     fn keeps_cut_writes(&self) -> bool {
         false
     }
+    /// Whether one request can be asked to be answered with no thinking (`reasoning_effort: "none"`), whatever the person's setting is. Another
+    /// service may not know the level, or may refuse it.
+    fn answers_without_thinking(&self) -> bool {
+        false
+    }
     /// Asked after a request was refused or broke off: whether the server is being restarted, and so is worth waiting for. A provider with no such thing to ask says it does not know.
     fn restart(&self, _cancel: &AtomicBool) -> Restart {
         Restart::Unknown
@@ -550,6 +555,11 @@ impl Provider for Client {
 
     fn keeps_cut_writes(&self) -> bool {
         true
+    }
+
+    /// Straydog takes `none` for a model that thinks, as its template's mode without thinking.
+    fn answers_without_thinking(&self) -> bool {
+        self.replay_reasoning
     }
 
     fn restart(&self, cancel: &AtomicBool) -> Restart {

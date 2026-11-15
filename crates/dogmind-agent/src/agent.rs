@@ -706,7 +706,9 @@ fn close_cut_write(raw: &str) -> Option<(String, String, String)> {
 /// In one turn of the person's: after that it has its way, as it would have without this. A real model, asked what got in its way, said the same
 /// note three times in one turn only delayed its first stroke: once is enough, and none once a file is written, when code in its reasoning is planning an edit.
 const MAX_DRAFTS_STOPPED: u32 = 1;
-const MOST_DECIDED: usize = 2500;
+/// What goes back of what it had thought before a draft, at the most, in characters: a model asked to write with no thinking has this to go by, and a
+/// real one's last 2,500 were the details of its last part, and not the plan of the file (some 1,500 tokens to read, a second or two).
+const MOST_DECIDED: usize = 6000;
 /// A draft is this many lines of code of its own in a row, in a fence or out of one, with no more than `PROSE_BETWEEN` lines of anything else between two of them. A review thinks with code
 /// as well (a signature it recalls, a fix it proposes, lines it re-types to trace): in 592 real reasonings none had more than 25 such lines together, and one stopped at 40, in a review
 /// of three files; the drafts of the files that were written next had 111 to 160 (and two small ones, of a patch, 67 and 11). The stop throws away the whole request, which costs minutes
@@ -2156,6 +2158,11 @@ impl Agent {
         let (mut transient, mut overflow, mut failed_calls) = (0u32, 0u32, 0usize);
         let (mut cut_off, mut empties) = (0u32, 0u32);
         let mut drafts_stopped = 0u32;
+        // A draft stopped: the request that follows (and the one that goes on with its file, where that was cut on its way to the disk) is asked to write with
+        // no thinking, where the server can be asked so. Its note has what was decided, and a model asked to write after a stop otherwise decides it all again
+        // (4,973 and 47,201 characters of thinking in two runs of a 400-line file, 17 s and some 150 s of it, against a few seconds for the engine to read the
+        // conversation again in the other mode, and once more back in this one).
+        let mut write_plainly = false;
         let (mut generated, mut wrote, mut next_cost_note) = (0u64, false, COST_NOTED_EVERY);
         let mut repeats: HashMap<String, u32> = HashMap::new();
         // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
@@ -2184,7 +2191,8 @@ impl Agent {
                 self.traj.write("wake", Some(&req_id), fields);
             }
             let folder = self.picture_folder();
-            let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
+            let effort = if write_plainly { Some("none") } else { self.effort.as_deref() };
+            let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort, images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
             let mut written = String::new();
             let (mut reasoned, mut calling) = (String::new(), Vec::<crate::message::ToolCall>::new());
             let cuts = provider.keeps_cut_writes();
@@ -2299,7 +2307,8 @@ impl Agent {
                 generated += meter.tokens;
                 // (what it had come to when it was stopped, and what the stop cost: the tokens that are thrown away)
                 let run = watch.as_ref().map_or(0, DraftWatch::stats);
-                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run}));
+                write_plainly = provider.answers_without_thinking();
+                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "next_without_thinking": write_plainly}));
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
                 self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped, watch.as_ref().map(DraftWatch::began_at))));
@@ -2308,7 +2317,12 @@ impl Agent {
                 continue;
             }
             let mut completion = match result {
-                Ok(completion) => completion,
+                // (the file asked for after a draft was stopped is written: what follows is thought about again as the person set it. A file cut on its way
+                // to the disk, or a request that failed, goes on as it was asked, the engine holding the conversation in that mode)
+                Ok(completion) => {
+                    write_plainly = false;
+                    completion
+                }
                 // Ended here, not by the person: the rest goes on in the next call.
                 Err(LlmError::Cancelled) if cut && stopped_by_the_app && saved.is_some() => {
                     // (an answer cut here has no count of its own, and it is the long ones that come this way)
@@ -5049,7 +5063,7 @@ mod tests {
         assert!(note.contains("in your answer if no file is to be changed"), "{note}");
         assert!(!note.contains("Decide nothing more"), "it may be in the middle of ranking what it found: {note}");
         assert!(prompt::is_nudge(&note), "not shown as something the person said");
-        assert!(draft_stopped_note(&"x".repeat(9000), 0, None).len() < 3000);
+        assert!(draft_stopped_note(&"x".repeat(9000), 0, None).len() < MOST_DECIDED + 500);
         let again = draft_stopped_note("Sliders, then.\n```\nvoid", 1, None);
         assert!(again.contains("Sliders, then.") && again.contains("Write the code now") && !again.contains("void") && !again.contains("tool call"), "{again}");
         assert!(prompt::is_nudge(&again));
@@ -5178,7 +5192,25 @@ mod tests {
         let (first, second) = (bodies[0]["messages"].as_array().unwrap(), bodies[1]["messages"].as_array().unwrap());
         assert_eq!(second[..first.len()], first[..], "the same prefix to the byte");
         assert!(second.last().unwrap()["content"].as_str().unwrap().contains("A page with sliders."));
-        assert_eq!(bodies[1].get("reasoning_effort"), bodies[0].get("reasoning_effort"));
+        assert_eq!(bodies[1]["reasoning_effort"], "none", "it is asked to write, with no thinking");
+        assert_ne!(bodies[0].get("reasoning_effort"), Some(&json!("none")));
+    }
+
+    /// Asked to write with no thinking after its draft was stopped, once: when that request has answered, what follows is asked as the person set it,
+    /// and a server that cannot be asked so is asked as the person set it throughout.
+    #[test]
+    fn after_a_stopped_draft_one_request_writes_with_no_thinking_and_then_it_thinks_as_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, bodies, _, _went) = thinking_server(1, vec![call_answer("create_file", json!({"path": "a.txt", "content": "a"})), text_answer("written")]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("write it".into())).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Approve);
+        assert!(!cancelled && log.last().unwrap() == "content:written", "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let efforts: Vec<Option<&Value>> = bodies.iter().map(|body| body.get("reasoning_effort")).collect();
+        assert_eq!(efforts, [None, Some(&json!("none")), None], "{efforts:?}");
+        let lines = trajectory_of(&run);
+        assert_eq!(of_kind(&lines, "intervention")[0]["next_without_thinking"], true);
     }
 
     #[test]
@@ -7283,7 +7315,8 @@ Body").unwrap();
         let said = note["content"].as_str().unwrap();
         assert!(said.contains("A page with sliders.") && said.contains("Write the code now") && !said.contains("let step_"), "{said}");
         assert!(!messages.iter().any(|message| message["role"] == "assistant"), "what was cut is not in what goes back");
-        assert!(bodies.iter().all(|body| body["reasoning_effort"] != "none"), "the person's effort stays theirs");
+        assert_eq!(bodies[1]["reasoning_effort"], "none", "the file is written with no thinking");
+        assert!(bodies[0].get("reasoning_effort").is_none() && bodies[2].get("reasoning_effort").is_none(), "and after it, the person's setting is theirs again");
         assert!(dir.path().join("index.html").is_file());
     }
 
@@ -7309,7 +7342,8 @@ Body").unwrap();
         let notes = bodies[2]["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "user" && message["content"].as_str().is_some_and(|text| text.starts_with(prompt::DRAFT_NOTE))).count();
         assert_eq!(notes, 1);
         assert!(dir.path().join("index.html").is_file());
-        assert!(bodies.iter().all(|body| body.get("reasoning_effort") == bodies[0].get("reasoning_effort")));
+        let efforts: Vec<Option<&Value>> = bodies.iter().map(|body| body.get("reasoning_effort")).collect();
+        assert_eq!(efforts, [None, Some(&json!("none")), None], "the one request after the note writes with no thinking");
     }
 
     #[test]
