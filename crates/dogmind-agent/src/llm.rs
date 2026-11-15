@@ -473,6 +473,15 @@ pub trait Provider: Send + Sync {
     fn reads_pictures(&self) -> Option<bool> {
         None
     }
+    /// Whether the server is reading or writing for nobody now: a warm-up is sent only then, so that it never waits behind, or delays, a
+    /// request of another conversation or another client. One that cannot tell says yes.
+    fn idle(&self) -> bool {
+        true
+    }
+    /// A warm-up: [`Provider::stream`] for a request no later one goes on from, where the server can be told so.
+    fn warm(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
+        self.stream(request, cancel, on)
+    }
     /// Whether a call it was still writing can join the conversation as far as it had come. A provider with blocks of its own to send back cannot make those up.
     fn keeps_cut_writes(&self) -> bool {
         false
@@ -509,6 +518,19 @@ impl Provider for Client {
 
     fn reads_pictures(&self) -> Option<bool> {
         self.vision
+    }
+
+    /// Straydog's `/slots`: idle where no slot is processing. No answer, or one it cannot read, is not idle: a warm-up can always be left out.
+    fn idle(&self) -> bool {
+        let cancel = AtomicBool::new(false);
+        let Ok((200, slots)) = self.get_json(&self.root("/slots"), &cancel, IDLE_ASK_WITHIN) else { return false };
+        slots.as_array().is_some_and(|slots| slots.iter().all(|slot| slot.get("is_processing").and_then(Value::as_bool) == Some(false)))
+    }
+
+    /// Straydog keeps of a request that says `checkpoint: false` only its system prompt's checkpoint: the checkpoints another
+    /// conversation resumes from (where its last reply began) stay as they were.
+    fn warm(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
+        self.post(&self.warm_body(request), request.request_id, cancel, on)
     }
 
     fn answers(&self) -> bool {
@@ -548,6 +570,9 @@ const WRITING: &str = "straydog_tool_writing";
 /// The most calls one answer's pieces name: a piece for a place beyond is not one.
 const MAX_WRITING_CALLS: u64 = 64;
 
+/// How long a warm-up waits to hear whether the server is busy: a server slower than this to say so is left alone.
+const IDLE_ASK_WITHIN: Duration = Duration::from_secs(2);
+
 /// How long the answer to one of the questions asked of a server (`/health`, the models, `/props`) is waited for, from asking to its last byte. A server that is up answers these at
 /// once, even while it loads a model.
 const ANSWER_WITHIN: Duration = Duration::from_secs(20);
@@ -573,6 +598,18 @@ impl Client {
     }
 
     /// The request a model's turn is sent as, for this server.
+    /// A warm-up's request: Straydog is told that no later request goes on from it (`checkpoint: false`).
+    fn warm_body(&self, request: &Request) -> Value {
+        let mut body = self.body_for(request);
+        if self.replay_reasoning {
+            if !body.get("straydog").is_some_and(Value::is_object) {
+                body["straydog"] = json!({});
+            }
+            body["straydog"]["checkpoint"] = json!(false);
+        }
+        body
+    }
+
     fn body_for(&self, request: &Request) -> Value {
         let mut body = if self.replay_reasoning {
             request_body_in(request.model, request.messages, request.tools, request.effort, request.images)
@@ -890,6 +927,50 @@ mod tests {
         client.vision = None;
         client.replay_reasoning = false;
         assert!(!client.images_in_tool_results(), "a server that is not Straydog, as before");
+    }
+
+    /// A client of a server that answers `GET /slots` with this, and anything else with `{}`.
+    fn answering_slots(slots: &'static str) -> Client {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 4096];
+                    let Ok(count) = stream.read(&mut request) else { return };
+                    let body = if String::from_utf8_lossy(&request[..count]).starts_with("GET /slots") { slots } else { "{}" };
+                    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+                    while matches!(stream.read(&mut request), Ok(count) if count > 0) {}
+                });
+            }
+        });
+        Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap()
+    }
+
+    #[test]
+    fn a_server_is_idle_only_where_it_says_that_no_slot_is_processing() {
+        assert!(answering_slots(r#"[{"id": 0, "is_processing": false}]"#).idle());
+        assert!(!answering_slots(r#"[{"id": 0, "is_processing": true}]"#).idle());
+        assert!(!answering_slots(r#"[{"id": 0, "is_processing": false}, {"id": 1, "is_processing": true}]"#).idle(), "any slot at work");
+        assert!(!answering_slots(r#"[{"id": 0}]"#).idle(), "a slot that does not say");
+        assert!(!answering_slots(r#"{"error": "no"}"#).idle(), "an answer it cannot read");
+        assert!(!Client::new("http://127.0.0.1:1/v1", None).unwrap().idle(), "no answer at all");
+    }
+
+    #[test]
+    fn a_warm_up_asks_straydog_to_keep_only_its_system_prompts_checkpoint() {
+        let tools = json!([{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {}}}}]);
+        let messages = [Message::text("system", "s"), Message::text("user", ".")];
+        let request = Request { model: "m", messages: &messages, tools: Some(&tools), effort: None, images: None, japanese_letters: false, request_id: None };
+        let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        assert_eq!(client.warm_body(&request)["straydog"], json!({"checkpoint": false}));
+        client.tool_writing = true;
+        assert_eq!(client.warm_body(&request)["straydog"], json!({"tool_writing": true, "checkpoint": false}));
+        assert!(client.body_for(&request)["straydog"].get("checkpoint").is_none(), "a request of the conversation keeps its checkpoints");
+        client.replay_reasoning = false;
+        client.tool_writing = false;
+        assert!(client.warm_body(&request).get("straydog").is_none(), "only Straydog takes the field");
     }
 
     /// The head of the request a server is sent by `stream`, as the server reads it, lower-cased.

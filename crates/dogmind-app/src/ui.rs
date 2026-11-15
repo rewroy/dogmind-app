@@ -1183,9 +1183,11 @@ fn drafter_restart_words() -> &'static str {
     t("The faster-writing data is ready. The engine restarts when the work under way ends.")
 }
 
-/// Whether to have the engine read the prompt and the tools now. With a message already waiting that message's own request reads them, once.
-fn warms_on_connect(local: bool, straydog: bool, nothing_waits: bool) -> bool {
-    local && straydog && nothing_waits
+/// Whether to have the engine read the prompt and the tools now: a Straydog, this PC's or a server's (the agent sends it only while that
+/// server answers nobody else, and so that it keeps nothing another conversation resumes from). With a message already waiting that
+/// message's own request reads them, once.
+fn warms_on_connect(straydog: bool, nothing_waits: bool) -> bool {
+    straydog && nothing_waits
 }
 
 /// What the dog says on an empty chat, one to each new chat. In English whatever the display language: it is the dog's own voice, not a label.
@@ -10533,6 +10535,10 @@ impl App {
         self.totals = (0, 0, 0, 0);
         self.rate = None;
         let _ = self.agent.commands.send(Command::NewSession(folder.clone()));
+        // (its first message need not wait for the prompt and the tools: a Straydog reads them now, while the message is written)
+        if self.connected && warms_on_connect(self.straydog, self.queued.is_empty()) {
+            let _ = self.agent.commands.send(Command::WarmPrefix);
+        }
         self.look_at_workspace();
         self.set_panel(Panel::Chat);
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
@@ -12977,9 +12983,8 @@ impl App {
                     self.tell_about_vision();
                 }
                 self.engine_failed_at = None;
-                let local = self.settings.providers.iter().any(|provider| provider.name == self.settings.active && provider.kind == Kind::Embedded);
                 // (the agent looks for itself whether its session has begun: words on the page here may be only an earlier failure)
-                if warms_on_connect(local, straydog, self.queued.is_empty()) {
+                if warms_on_connect(straydog, self.queued.is_empty()) {
                     let _ = self.agent.commands.send(Command::WarmPrefix);
                 }
                 self.flush_queue();
@@ -17554,10 +17559,9 @@ mod tests {
 
     #[test]
     fn the_prompt_is_read_ahead_only_when_no_message_would_read_it_anyway() {
-        assert!(warms_on_connect(true, true, true));
-        assert!(!warms_on_connect(true, true, false), "the message's own request reads it, once");
-        assert!(!warms_on_connect(false, true, true), "a server someone else runs");
-        assert!(!warms_on_connect(true, false, true));
+        assert!(warms_on_connect(true, true));
+        assert!(!warms_on_connect(true, false), "the message's own request reads it, once");
+        assert!(!warms_on_connect(false, true), "a server that is not Straydog keeps prompts its own way, if at all");
     }
 
     #[test]
