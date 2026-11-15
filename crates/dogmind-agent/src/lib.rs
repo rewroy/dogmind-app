@@ -34,6 +34,7 @@ pub mod safety;
 pub mod sandbox;
 pub mod session;
 pub mod skills;
+pub mod timeline;
 pub mod tools;
 pub mod trajectory;
 pub mod trajectory_report;
