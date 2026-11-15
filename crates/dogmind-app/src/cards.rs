@@ -72,6 +72,8 @@ pub enum Card {
     Notice { wakes: Vec<Wake>, at: String },
     /// An `explore` helper: the call it is of, its task as a line, which of the session's helper files holds its steps (none when they were not kept), and where it stands.
     Helper { call: String, task: String, number: Option<u32>, state: HelperState },
+    /// Files of the workspace the model put before the person (`present`), from its root.
+    Presented { files: Vec<String> },
 }
 
 /// How many files a card lists: the rest are counted, and the Changes page has all of them.
@@ -119,7 +121,7 @@ impl Card {
     pub fn id(&self) -> Option<u64> {
         match self {
             Card::Question { id, .. } | Card::Plan { id, .. } => Some(*id),
-            Card::Files { .. } | Card::Notice { .. } | Card::Helper { .. } => None,
+            Card::Files { .. } | Card::Notice { .. } | Card::Helper { .. } | Card::Presented { .. } => None,
         }
     }
 
@@ -221,6 +223,20 @@ impl Card {
                 };
                 Some(Card::Plan { id, plan, state })
             }
+            "present" => {
+                // (a call that failed put nothing before the person)
+                if result?.starts_with("error:") {
+                    return None;
+                }
+                let mut files: Vec<String> = Vec::new();
+                for path in arguments.get("paths").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                    let path = path.trim().replace('\\', "/");
+                    if !path.is_empty() && !files.contains(&path) {
+                        files.push(path);
+                    }
+                }
+                (!files.is_empty()).then_some(Card::Presented { files })
+            }
             _ => None,
         }
     }
@@ -305,7 +321,7 @@ fn options_of(arguments: &Value) -> Vec<(String, String)> {
 
 /// Whether a tool is one whose call is a card of its own, and so has no row among the calls.
 pub fn is_asking(tool: &str) -> bool {
-    matches!(tool, "ask_user" | "submit_plan")
+    matches!(tool, "ask_user" | "submit_plan" | "present")
 }
 
 /// Whether what was typed while a plan waits approves it. Anything else is what to change.
@@ -637,7 +653,12 @@ second")), Some("first line".to_string()));
 
     #[test]
     fn the_two_tools_that_ask_are_cards_and_no_other_is() {
-        assert!(is_asking("ask_user") && is_asking("submit_plan"));
+        assert!(is_asking("ask_user") && is_asking("submit_plan") && is_asking("present"));
+        // (files put before the person are a card of theirs, and a call that failed put nothing there)
+        let paths = serde_json::json!({"paths": ["web/index.html", "web\\index.html", "notes.md"]});
+        assert_eq!(Card::of_call(1, "present", &paths, Some("The person sees a card with web/index.html, notes.md.")), Some(Card::Presented { files: vec!["web/index.html".into(), "notes.md".into()] }));
+        assert_eq!(Card::of_call(1, "present", &paths, Some("error: gone.txt is not a file of the workspace")), None);
+        assert_eq!(Card::of_call(1, "present", &paths, None), None, "a call with no result yet");
         assert!(!is_asking("read_file") && !is_asking("todo"));
     }
 
