@@ -12644,6 +12644,8 @@ impl App {
             // (a look by a helper takes minutes: its card says what it is on, and how long it has gone on)
             Event::HelperStarted { id, task, file, .. } => self.helper_begin(id, task, file),
             Event::HelperStep { id, step, most, tool, summary, tokens, elapsed } => self.helper_step_told(&id, step, most, &tool, &summary, tokens, elapsed),
+            // (a program's call: the timeline has it, above; the conversation shows the program's call as one)
+            Event::ProgramStep { .. } => {}
             Event::HelperEnded { id, how, steps, files, tokens, elapsed, helper } => self.helper_end_told(&id, &how, steps, files, tokens, elapsed, helper.map(|helper| helper.number)),
             Event::ToolEnded { id, .. } if self.tools_running.get(&id).is_some_and(|(tool, _)| cards::is_asking(tool)) => {
                 self.tools_running.remove(&id);
@@ -16108,6 +16110,7 @@ fn hidden_shown(event: Event) -> Event {
         Event::ToolStarted { id, tool, summary } if markdown::has_marks(&summary) => Event::ToolStarted { id, tool, summary: markdown::show_hidden(&summary).into_owned() },
         Event::HelperStarted { id, task, most, file } if markdown::has_marks(&task) => Event::HelperStarted { id, task: markdown::show_hidden(&task).into_owned(), most, file },
         Event::HelperStep { id, step, most, tool, summary, tokens, elapsed } if markdown::has_marks(&summary) => Event::HelperStep { id, step, most, tool, summary: markdown::show_hidden(&summary).into_owned(), tokens, elapsed },
+        Event::ProgramStep { id, call, tool, summary } if markdown::has_marks(&summary) => Event::ProgramStep { id, call, tool, summary: markdown::show_hidden(&summary).into_owned() },
         Event::ToolEnded { id, ok, declined, elapsed, output, images } if markdown::has_marks(&output) => Event::ToolEnded { id, ok, declined, elapsed, output: markdown::show_hidden(&output).into_owned(), images },
         other => other,
     }
@@ -16122,6 +16125,7 @@ fn keys_hidden(event: Event) -> Event {
         Event::ToolStarted { id, tool, summary } => Event::ToolStarted { id, tool, summary: hide(summary) },
         Event::HelperStarted { id, task, most, file } => Event::HelperStarted { id, task: hide(task), most, file },
         Event::HelperStep { id, step, most, tool, summary, tokens, elapsed } => Event::HelperStep { id, step, most, tool, summary: hide(summary), tokens, elapsed },
+        Event::ProgramStep { id, call, tool, summary } => Event::ProgramStep { id, call, tool, summary: hide(summary) },
         Event::HelperEnded { id, how: agent::HelperEnd::Failed(why), steps, files, tokens, elapsed, helper } => Event::HelperEnded { id, how: agent::HelperEnd::Failed(hide(why)), steps, files, tokens, elapsed, helper },
         Event::ToolEnded { id, ok, declined, elapsed, output, images } => Event::ToolEnded { id, ok, declined, elapsed, output: hide(output), images },
         other => other,

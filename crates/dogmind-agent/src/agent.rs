@@ -287,6 +287,9 @@ pub enum Event {
     HelperStep { id: String, step: u32, most: u32, tool: String, summary: String, tokens: u64, elapsed: Duration },
     /// The helper is done, whichever way: `steps` requests that called a tool, `files` different files it read, and what the call's record of it is (`helper`, none when it was not kept).
     HelperEnded { id: String, how: HelperEnd, steps: u32, files: u32, tokens: u64, elapsed: Duration, helper: Option<crate::message::HelperRef> },
+    /// A program that is running (`id` is its `run_code` call's) calls a tool: its `call`-th, the tool, and what it is on. Its calls are not calls of
+    /// the window's own (no `ToolStarted`): they are its program's steps.
+    ProgramStep { id: String, call: u32, tool: String, summary: String },
     /// `images`: what the call opened for the model to see, kept with the session, which the person sees too.
     ToolEnded { id: String, ok: bool, declined: bool, elapsed: Duration, output: String, images: Vec<ImageRef> },
     /// Words written during the turn have reached it, between two of its steps.
@@ -2980,14 +2983,16 @@ impl Agent {
     }
 
     /// A call the running program makes: it goes through the same steps as a direct one ([`Agent::run_call`]) and its result is the program's. It has a line in the trajectory of its own, with the
-    /// program's call as its `parent`, and counts as a call of the turn; nothing of it joins the conversation, and the window is not told of it.
+    /// program's call as its `parent`, and counts as a call of the turn; nothing of it joins the conversation. The window is told of it as a step of the
+    /// program's (`Event::ProgramStep`), and not as a call of its own.
     fn program_call(&mut self, name: &str, arguments: Value) -> Result<String, String> {
         self.read_live();
         let Some(program) = self.program.as_mut() else { return Err("no program is running".into()) };
         program.calls += 1;
-        let (parent, id) = (program.id.clone(), format!("{}.{}", program.id, program.calls));
+        let (parent, call, id) = (program.id.clone(), program.calls, format!("{}.{}", program.id, program.calls));
         let raw = arguments.to_string();
         let started = Instant::now();
+        self.emit(Event::ProgramStep { id: parent.clone(), call, tool: name.to_string(), summary: tools::summary(name, &arguments) });
         self.call_begun(&id, name, Some(&arguments), &raw, 1, Some(&parent));
         let ran = self.run_call(&id, name, &arguments, true);
         let (ok, output) = match &ran.result {

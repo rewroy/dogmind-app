@@ -161,6 +161,16 @@ pub struct Live {
     version: u64,
     /// An explore's helper at work: what it was asked, the step it is on of how many it may take, and what that step calls.
     helper: Option<HelperLive>,
+    /// A program at work (`id` is its `run_code` call's): the call it has come to, the tool and what that is on.
+    program: Option<ProgramLive>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ProgramLive {
+    id: String,
+    call: u32,
+    tool: String,
+    summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -175,7 +185,7 @@ struct HelperLive {
 
 impl Live {
     pub fn new(at: Instant) -> Live {
-        Live { phase: Phase::Idle, since: at, reasoning: String::new(), writing: Vec::new(), tools: Vec::new(), asked_at: None, pending_asked: None, pending_woken: false, begun: None, file_turns: 0, version: 0, helper: None }
+        Live { phase: Phase::Idle, since: at, reasoning: String::new(), writing: Vec::new(), tools: Vec::new(), asked_at: None, pending_asked: None, pending_woken: false, begun: None, file_turns: 0, version: 0, helper: None, program: None }
     }
 
     /// The session on screen is another: nothing of the last is its.
@@ -219,7 +229,7 @@ impl Live {
 
     /// What an event changes. Whether it changed anything the view shows.
     pub fn note(&mut self, event: &Event, at: Instant) -> bool {
-        let before = (self.phase.clone(), self.reasoning.len(), self.writing.iter().map(|writing| writing.bytes).sum::<usize>(), self.tools.len(), self.helper.as_ref().map(|helper| helper.step));
+        let before = (self.phase.clone(), self.reasoning.len(), self.writing.iter().map(|writing| writing.bytes).sum::<usize>(), self.tools.len(), self.helper.as_ref().map(|helper| helper.step), self.program.as_ref().map(|program| program.call));
         match event {
             Event::Woken(_) => self.pending_woken = true,
             Event::HelperStarted { id, task, most, .. } => {
@@ -232,6 +242,13 @@ impl Live {
                     self.version += 1;
                 }
             }
+            // (a program's call is a step of the call that runs it, which is under way)
+            Event::ProgramStep { id, call, tool, summary } => {
+                if self.tools.iter().any(|running| running.id == *id) {
+                    self.program = Some(ProgramLive { id: id.clone(), call: *call, tool: tool.clone(), summary: summary.clone() });
+                    self.version += 1;
+                }
+            }
             Event::HelperEnded { id, .. } => {
                 if self.helper.as_ref().is_some_and(|helper| helper.id == *id) {
                     self.helper = None;
@@ -240,6 +257,7 @@ impl Live {
             }
             Event::TurnStarted => {
                 self.helper = None;
+                self.program = None;
                 self.reasoning.clear();
                 self.writing.clear();
                 self.tools.clear();
@@ -305,6 +323,9 @@ impl Live {
             Event::ToolEnded { id, .. } => {
                 if let Some(place) = self.tools.iter().position(|running| running.id == *id) {
                     self.tools.remove(place);
+                    if self.program.as_ref().is_some_and(|program| program.id == *id) {
+                        self.program = None;
+                    }
                     self.version += 1;
                     if self.tools.is_empty() {
                         self.enter(Phase::Preparing, at);
@@ -322,6 +343,7 @@ impl Live {
                 self.version += 1;
             }
             Event::TurnEnded { .. } => {
+                self.program = None;
                 self.reasoning.clear();
                 self.writing.clear();
                 self.tools.clear();
@@ -331,7 +353,7 @@ impl Live {
             }
             _ => {}
         }
-        before != (self.phase.clone(), self.reasoning.len(), self.writing.iter().map(|writing| writing.bytes).sum::<usize>(), self.tools.len(), self.helper.as_ref().map(|helper| helper.step))
+        before != (self.phase.clone(), self.reasoning.len(), self.writing.iter().map(|writing| writing.bytes).sum::<usize>(), self.tools.len(), self.helper.as_ref().map(|helper| helper.step), self.program.as_ref().map(|program| program.call))
     }
 
     /// Whether a call of this id is under way.
@@ -424,6 +446,16 @@ impl Live {
                     tf("A helper explores, step {0} of {1}: {2}", &[&helper.step, &helper.most, &call_words(&helper.tool, &helper.summary)])
                 };
                 (Who::Model, words, self.tools.iter().map(|running| running.since).min().unwrap_or(self.since))
+            }
+            // (a program at work: what it is, and the call it has come to)
+            Phase::Running if self.program.as_ref().is_some_and(|program| self.tools.iter().any(|running| running.id == program.id)) => {
+                let program = self.program.as_ref().expect("a program");
+                let running = self.tools.iter().find(|running| running.id == program.id).expect("its call");
+                let mut words = tf("A program runs: {0}, call {1}: {2}", &[&running.summary, &program.call, &call_words(&program.tool, &program.summary)]);
+                if self.tools.len() > 1 {
+                    words = format!("{words}  ·  {}", tf("and {0} more", &[&(self.tools.len() - 1)]));
+                }
+                (Who::App, words, self.tools.iter().map(|running| running.since).min().unwrap_or(self.since))
             }
             Phase::Running => {
                 let first = self.tools.first();
@@ -1781,6 +1813,28 @@ mod tests {
         let now = row.live_part.expect("the part going on now");
         assert_eq!((now.lane, now.part, now.from, now.to), (Lane::Requests, Part::Thinking, 6000, 10_000), "from when it began, not from the turn's start");
         assert_eq!(row.band.as_ref().unwrap().length, 10_000);
+    }
+
+    /// A program at work is what goes on now, at the call it has come to; it is its own call's, and ends with it.
+    #[test]
+    fn a_program_at_work_is_shown_now_with_the_call_it_has_come_to() {
+        let at = Instant::now();
+        let mut live = Live::new(at);
+        for event in [Event::TurnStarted, Event::RequestStarted, Event::ToolStarted { id: "p".into(), tool: "run_code".into(), summary: "read both files".into() }] {
+            live.note(&event, at);
+        }
+        let inputs = Inputs { running: true, ..Inputs::default() };
+        assert!(live.now(&inputs, at).text.starts_with("Running"), "before its first call it is the call that runs it");
+        let step = |call: u32, path: &str| Event::ProgramStep { id: "p".into(), call, tool: "read_file".into(), summary: path.into() };
+        assert!(live.note(&step(1, "a.txt"), at), "a call of the program is a change to show");
+        live.note(&step(2, "b.txt"), at);
+        let now = live.now(&inputs, at);
+        assert_eq!((now.who, now.text), (Who::App, format!("A program runs: read both files, call 2: {}", call_words("read_file", "b.txt"))));
+        // (a step of a call that is not under way is no one's)
+        live.note(&Event::ProgramStep { id: "other".into(), call: 9, tool: "read_file".into(), summary: "c.txt".into() }, at);
+        assert!(live.now(&inputs, at).text.contains("call 2"));
+        live.note(&Event::ToolEnded { id: "p".into(), ok: true, declined: false, elapsed: Duration::from_millis(30), output: String::new(), images: Vec::new() }, at);
+        assert!(live.program.is_none(), "it ends with its call");
     }
 
     /// An explore's helper at work is what goes on now, step by step; read from the files, its steps are under its call when the step is open.
