@@ -54,7 +54,7 @@ pub fn schemas() -> Value {
         function("apply_patch", "Edit existing files by exact text replacement. All edits land together or none do. Read a file before editing it. old_string must occur exactly once (or `count` times) and has no line numbers. After a failure the file is unchanged, so correct old_string instead of reading again.", json!({
             "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "count": {"type": "integer"}}, "required": ["path", "old_string", "new_string"]}}
         }), &["edits"]),
-        function("create_file", "Write a file, new or one you have read. Over about 300 lines, write the first part, then add each further part with append=true: what is on disk survives a stop, and a long call is minutes with nothing to show.", json!({
+        function("create_file", "Write a file, new or one you have read, whole in one call: what you write shows as it comes, and of a very long file the app keeps on disk what is written and has you go on. append=true adds to the end of the file.", json!({
             "path": {"type": "string"},
             "content": {"type": "string"},
             "append": {"type": "boolean", "description": "Add to the end of the file."}
