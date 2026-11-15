@@ -27,6 +27,8 @@ struct Told {
     ended: Vec<String>,
     /// The approvals asked, each with its tool and what it said of the program it was a call of.
     approvals: Vec<(String, Option<String>)>,
+    /// The steps of programs it was told of: the call's place in its program, the tool, and what it was on.
+    program_steps: Vec<(u32, String, String)>,
     /// The window was told that web content is in the conversation.
     web_seen: bool,
     cancelled: bool,
@@ -39,6 +41,7 @@ fn the_turn(run: &Run, decision: Decision, feedback: Option<&str>) -> Told {
         match run.events.recv_timeout(Duration::from_secs(30)).expect("the turn ended") {
             Event::ToolStarted { tool, .. } => told.started.push(tool),
             Event::ToolEnded { output, .. } => told.ended.push(output),
+            Event::ProgramStep { call, tool, summary, .. } => told.program_steps.push((call, tool, summary)),
             Event::Approval(approval) => {
                 told.approvals.push((approval.tool.clone(), approval.program.clone()));
                 approval.answer.send((decision, feedback.map(str::to_string))).unwrap();
@@ -131,6 +134,8 @@ fn a_program_that_reads_two_files_gives_both_in_one_result_and_leaves_the_calls_
     let told = the_turn(&run, Decision::Reject, None);
     // The window is told of the one call.
     assert_eq!((told.started.as_slice(), told.ended.len()), (&["run_code".to_string()][..], 1), "{told:?}");
+    // (and of each call the program made, as a step of it)
+    assert_eq!(told.program_steps, [(1, "read_file".to_string(), "a.txt".to_string()), (2, "read_file".to_string(), "b.txt".to_string())]);
     assert!(told.approvals.is_empty());
     // The conversation has the call, and one result with both files.
     let second = provider.messages(1);

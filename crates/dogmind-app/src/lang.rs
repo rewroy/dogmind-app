@@ -1225,6 +1225,7 @@ const JA: &[(&str, &str)] = &[
     ("What the server says ({0} more)", "サーバーの報告(ほか {0} 件)"),
     ("A helper explores: {0}", "ヘルパーが調べています: {0}"),
     ("A helper explores, step {0} of {1}: {2}", "ヘルパーが調べています({0}/{1}): {2}"),
+    ("A program runs: {0}, call {1}: {2}", "プログラムを実行中: {0}({1} 回目の呼び出し: {2})"),
     ("Arguments", "引数"),
     ("Output", "出力"),
     ("Timed out", "時間切れ"),
