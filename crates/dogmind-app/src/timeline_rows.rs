@@ -582,6 +582,8 @@ pub enum Key {
     Turn(u64),
     /// A turn's step, by its place among the turn's steps.
     Step(u64, usize),
+    /// The rest of what the server says of a step's request, folded under its first numbers.
+    Server(u64, usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -811,7 +813,7 @@ fn step_rows(out: &mut Vec<Row>, turn: &TurnPath, place: usize, step: &Step, is_
                     out.push(fact(2, t("Started"), clock_of(&step.started)));
                 }
                 if let Some(request) = &step.request {
-                    out.extend(request_facts(request, 2));
+                    out.extend(request_facts(request, 2, server_fold(turn, place, context)));
                 }
             }
             let ordered = in_calling_order(&step.calls);
@@ -830,7 +832,7 @@ fn step_rows(out: &mut Vec<Row>, turn: &TurnPath, place: usize, step: &Step, is_
                     out.push(fact(2, &field_label(name), safe(&value_words(value))));
                 }
                 if let Some(request) = &step.request {
-                    out.extend(request_facts(request, 2));
+                    out.extend(request_facts(request, 2, server_fold(turn, place, context)));
                 }
             }
         }
@@ -971,8 +973,17 @@ fn code_rows(lines: Vec<String>, indent: u8, tone: Tone) -> Vec<Row> {
     rows
 }
 
-/// A request's own numbers, as facts.
-fn request_facts(request: &RequestDetail, indent: u8) -> Vec<Row> {
+/// The fold of the rest of what the server says of a step's request: its key, and whether it is open.
+fn server_fold(turn: &TurnPath, place: usize, context: &Context) -> (Key, bool) {
+    let key = Key::Server(turn.turn, place);
+    (key, context.opened.get(&key).copied().unwrap_or(false))
+}
+
+/// What the server says of a request that is shown first, in this order: where the wait to the first word went. The rest is folded under them.
+const SERVER_FIRST: [&str; 5] = ["ttft_seconds", "prefill_seconds", "resumed_from", "cached_tokens", "decode_tokens_per_second"];
+
+/// A request's own numbers, as facts; of what the server says, the first numbers, and the rest when `fold` is open.
+fn request_facts(request: &RequestDetail, indent: u8, fold: (Key, bool)) -> Vec<Row> {
     let mut facts = Vec::new();
     if let Some(first) = request.first_ms {
         facts.push(fact(indent, t("Time to the first word"), ms_words(first)));
@@ -999,18 +1010,25 @@ fn request_facts(request: &RequestDetail, indent: u8) -> Vec<Row> {
         facts.push(fact(indent, t("Request"), request.id.clone()));
     }
     if !request.server.is_empty() {
-        facts.push(Row { kind: Kind::Caption, text: t("What the server says").to_string(), indent, ..Row::default() });
-        facts.extend(server_facts(&request.server, indent));
+        let (key, open) = fold;
+        let first: Vec<(&String, &Value)> = SERVER_FIRST.iter().filter_map(|name| request.server.get_key_value(*name)).collect();
+        let rest: Vec<(&String, &Value)> = request.server.iter().filter(|(name, _)| !SERVER_FIRST.contains(&name.as_str())).collect();
+        let caption = if rest.is_empty() || open { t("What the server says").to_string() } else { tf("What the server says ({0} more)", &[&rest.len()]) };
+        facts.push(Row { kind: Kind::Caption, key: (!rest.is_empty()).then_some(key), open: open && !rest.is_empty(), text: caption, indent, ..Row::default() });
+        facts.extend(server_facts(&first, indent));
+        if open {
+            facts.extend(server_facts(&rest, indent));
+        }
     }
     facts
 }
 
-fn server_facts(server: &BTreeMap<String, Value>, indent: u8) -> Vec<Row> {
+fn server_facts(server: &[(&String, &Value)], indent: u8) -> Vec<Row> {
     server.iter().map(|(name, value)| {
         let text = match value.as_f64() {
             Some(seconds) if name.ends_with("_seconds") => tf("{0} s", &[&format!("{seconds:.2}")]),
             Some(rate) if name.ends_with("_per_second") => format!("{rate:.1}"),
-            _ if name == "resumed_from" => resumed_words(value.as_str().unwrap_or("")),
+            _ if name.as_str() == "resumed_from" => resumed_words(value.as_str().unwrap_or("")),
             _ => value_words(value),
         };
         fact(indent, &server_label(name), text)
@@ -1689,9 +1707,28 @@ mod tests {
         assert_eq!(plain_words("2 * 3 is [six"), "2 * 3 is [six", "what is no mark stays");
     }
 
+    /// Of what the server says, where the wait to the first word went is shown first; the rest is folded under it, and opens on its own.
+    #[test]
+    fn the_servers_first_numbers_are_shown_and_the_rest_folded_under_them() {
+        let server: BTreeMap<String, Value> = [("ttft_seconds", serde_json::json!(0.6)), ("prefill_seconds", serde_json::json!(0.5)), ("resumed_from", serde_json::json!("root")),
+            ("draft_tokens", serde_json::json!(65)), ("decode_passes", serde_json::json!(28)), ("agreed_tokens", serde_json::json!(4483))].into_iter().map(|(name, value)| (name.to_string(), value)).collect();
+        let mut step = model(Some(("Reading.", WhySource::Content)), Vec::new());
+        step.request = Some(RequestDetail { id: "s/1".into(), ms: 900, server, ..RequestDetail::default() });
+        let timeline = Timeline { turns: vec![turn(1, "Go", vec![step], done(100))], heading: None };
+        let opened = |extra: Option<Key>| HashMap::from_iter([(Key::Step(1, 0), true)].into_iter().chain(extra.map(|key| (key, true))));
+        let folded = rows_for(&timeline, &Live::new(Instant::now()), &opened(None));
+        let caption = folded.iter().find(|row| row.kind == Kind::Caption).unwrap();
+        assert_eq!((caption.text.as_str(), caption.key, caption.open), ("What the server says (3 more)", Some(Key::Server(1, 0)), false));
+        let shown = texts(&folded);
+        assert!(shown.contains(&"To the first token: 0.60 s".to_string()) && !shown.iter().any(|text| text.starts_with("Drafted tokens")), "{shown:#?}");
+        let all = texts(&rows_for(&timeline, &Live::new(Instant::now()), &opened(Some(Key::Server(1, 0)))));
+        assert!(all.contains(&"Drafted tokens: 65".to_string()) && all.contains(&"What the server says".to_string()), "{all:#?}");
+    }
+
     #[test]
     fn the_servers_numbers_have_names_in_words_and_where_it_went_on_from_is_said() {
-        let facts = server_facts(&[("resumed_from".to_string(), serde_json::json!("root")), ("agreed_tokens".to_string(), serde_json::json!(4483)), ("decode_tokens_per_second".to_string(), serde_json::json!(77.67))].into_iter().collect(), 2);
+        let server: BTreeMap<String, Value> = [("resumed_from".to_string(), serde_json::json!("root")), ("agreed_tokens".to_string(), serde_json::json!(4483)), ("decode_tokens_per_second".to_string(), serde_json::json!(77.67))].into_iter().collect();
+        let facts = server_facts(&server.iter().collect::<Vec<_>>(), 2);
         let said: Vec<(&str, &str)> = facts.iter().map(|row| (row.label.as_str(), row.text.as_str())).collect();
         assert_eq!(said, [("Tokens that matched what it had", "4483"), ("Writing speed (tokens per second)", "77.7"), ("Went on from", "the system prompt it kept")]);
         assert!(facts.iter().all(|row| !row.label.contains('_')));
