@@ -72,6 +72,7 @@ fn main() {
     client.replay_reasoning = info.straydog;
     client.suppresses_letters = info.suppresses_letters;
     client.tool_writing = info.tool_writing;
+    client.reasoning_off = info.reasoning_off;
     client.vision = info.vision;
     println!("server: model {} window {} straydog {}", info.model, info.context, info.straydog);
 

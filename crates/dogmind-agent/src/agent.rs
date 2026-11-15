@@ -1834,7 +1834,7 @@ impl Agent {
         self.warmed = Some(Warmed { workspace: self.workspace.clone(), prompt: prompt.clone(), tools: self.tool_schemas.clone(), skills: self.bench.skills.clone() });
         let messages = [Message::text("system", prompt), Message::text("user", ".")];
         let req_id = self.traj.request_id();
-        let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id) };
+        let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id), close_thinking: false };
         // Its first word is enough, which stops it as Stop does: Stop itself ends it at once, for what was written during it to begin.
         self.cancel.store(false, Ordering::Relaxed);
         let mut answered = false;
@@ -2169,10 +2169,12 @@ impl Agent {
         let (mut cut_off, mut empties) = (0u32, 0u32);
         let mut drafts_stopped = 0u32;
         // A draft stopped: the request that follows (and the one that goes on with its file, where that was cut on its way to the disk) is asked to write with
-        // no thinking, where the server can be asked so. Its note has what was decided, and a model asked to write after a stop otherwise decides it all again
+        // no thinking, where the server can be asked so: its thinking closed at once where the server says it can, and else in the template's other mode. Its note has what was decided, and a model asked to write after a stop otherwise decides it all again
         // (4,973 and 47,201 characters of thinking in two runs of a 400-line file, 17 s and some 150 s of it, against a few seconds for the engine to read the
         // conversation again in the other mode, and once more back in this one).
         let mut write_plainly = false;
+        // (how it can be asked so: its thinking closed, with the prompt as it is, or the template's other mode, which is read again)
+        let plain = provider.plain_writing();
         let (mut generated, mut wrote, mut next_cost_note) = (0u64, false, COST_NOTED_EVERY);
         let mut repeats: HashMap<String, u32> = HashMap::new();
         // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
@@ -2201,8 +2203,8 @@ impl Agent {
                 self.traj.write("wake", Some(&req_id), fields);
             }
             let folder = self.picture_folder();
-            let effort = if write_plainly { Some("none") } else { self.effort.as_deref() };
-            let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort, images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
+            let effort = if write_plainly && plain == llm::PlainWriting::OtherMode { Some("none") } else { self.effort.as_deref() };
+            let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort, images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id), close_thinking: write_plainly && plain == llm::PlainWriting::Closed };
             let mut written = String::new();
             let (mut reasoned, mut calling) = (String::new(), Vec::<crate::message::ToolCall>::new());
             let cuts = provider.keeps_cut_writes();
@@ -2320,10 +2322,19 @@ impl Agent {
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
                 self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped, watch.as_ref().map(DraftWatch::began_at))));
-                // (in a long conversation, reading it all again into the other mode and back costs more than the thinking it saves)
+                // (in a long conversation, reading it all again into the other mode and back costs more than the thinking it saves; closed, nothing is read again)
                 let prompt = self.expected_use();
-                write_plainly = provider.answers_without_thinking() && prompt <= MOST_READ_TO_WRITE_PLAINLY;
-                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "next_without_thinking": write_plainly, "prompt_est": prompt}));
+                write_plainly = match plain {
+                    llm::PlainWriting::Closed => true,
+                    llm::PlainWriting::OtherMode => prompt <= MOST_READ_TO_WRITE_PLAINLY,
+                    llm::PlainWriting::No => false,
+                };
+                let how = match plain {
+                    llm::PlainWriting::Closed => "closed",
+                    llm::PlainWriting::OtherMode => "other_mode",
+                    llm::PlainWriting::No => "no",
+                };
+                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "next_without_thinking": write_plainly, "how": how, "prompt_est": prompt}));
                 drafts_stopped += 1;
                 self.emit(Event::AssistantEnded);
                 continue;
@@ -3106,7 +3117,7 @@ impl Agent {
             // The tools are offered to the end. Not offered, a real model (DeepSeek-V4.1) went on calling one, in its own markup: that came back as
             // the answer, and the agent that asked got that and nothing of what the helper had found.
             let req_id = self.traj.request_id();
-            let request = Request { model: &self.model, messages, tools: Some(schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id) };
+            let request = Request { model: &self.model, messages, tools: Some(schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id), close_thinking: false };
             let mut clock = Clock::start();
             // (the person's Stop on the turn ends it, and so does the one on this helper alone: the stream has a flag of its own that either sets)
             let halt = AtomicBool::new(false);
@@ -3706,7 +3717,7 @@ impl Agent {
         let mut completion = None;
         for asked in 0..2 {
             let req_id = self.traj.request_id();
-            let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false, request_id: Some(&req_id) };
+            let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: false, request_id: Some(&req_id), close_thinking: false };
             let mut clock = Clock::start();
             let streamed = provider.stream(&request, &self.cancel, &mut |delta| match delta {
                 Delta::Prefill(done, total) => self.emit(Event::Reading { done, total }),
@@ -5245,6 +5256,26 @@ mod tests {
         let stop = of_kind(&lines, "intervention")[0];
         assert_eq!(stop["next_without_thinking"], false);
         assert!(stop["prompt_est"].as_u64().unwrap() > MOST_READ_TO_WRITE_PLAINLY, "{stop}");
+    }
+
+    /// A server that can close the thinking is asked to, with the person's level as it is: nothing is read again, so a long conversation is no matter.
+    #[test]
+    fn where_the_server_closes_the_thinking_the_file_after_a_stopped_draft_is_written_so_in_any_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, bodies, _, _went) = thinking_server(1, vec![call_answer("create_file", json!({"path": "a.txt", "content": "a"})), text_answer("written")]);
+        client.reasoning_off = true;
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        let long = format!("write it, as this says: {}", "the page has sliders. ".repeat((MOST_READ_TO_WRITE_PLAINLY as usize * CHARS_A_TOKEN) / 20));
+        run.handle.commands.send(Command::Send(long)).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Approve);
+        assert!(!cancelled && log.last().unwrap() == "content:written", "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        assert!(bodies.iter().all(|body| body.get("reasoning_effort").is_none()), "the level is never changed");
+        let closed: Vec<bool> = bodies.iter().map(|body| body.pointer("/straydog/reasoning") == Some(&json!(false))).collect();
+        assert_eq!(closed, [false, true, false], "the one request after the note, and only it");
+        let lines = trajectory_of(&run);
+        let stop = of_kind(&lines, "intervention")[0];
+        assert_eq!((stop["next_without_thinking"].as_bool(), stop["how"].as_str()), (Some(true), Some("closed")), "{stop}");
     }
 
     #[test]

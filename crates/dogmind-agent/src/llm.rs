@@ -445,6 +445,9 @@ pub struct Request<'a> {
     pub japanese_letters: bool,
     /// What this request is called in the trajectory, which the server is also told, as `X-Request-Id`: `<session id>/<n>`. A provider with no HTTP to carry it leaves it out.
     pub request_id: Option<&'a str>,
+    /// The model's thinking is to be closed before it begins, the prompt as it is (`straydog.reasoning: false`), where the server says it can
+    /// ([`PlainWriting::Closed`]). Another provider leaves it out.
+    pub close_thinking: bool,
 }
 
 /// The header that names a request to the server. What the server logs of it is printable ASCII with no space (0x21 to 0x7E) and at most 64 characters, so that is all that is sent of it:
@@ -455,6 +458,17 @@ pub fn request_id_header(id: &str) -> Option<(String, String)> {
 }
 
 /// What the agent needs of a model. `on` hears the answer as it comes; a provider that only has it at the end says it then.
+/// How a request can be asked to write with no thinking, whatever the person's setting is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainWriting {
+    No,
+    /// `reasoning_effort: "none"`: the template's mode without thinking, which reads the conversation again where the template says the
+    /// level at the head of the prompt (DeepSeek-V4.1's), and again when the mode is back.
+    OtherMode,
+    /// Its thinking closed before it begins (`straydog.reasoning: false`), the prompt and the person's level as they are.
+    Closed,
+}
+
 pub trait Provider: Send + Sync {
     fn stream(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError>;
     /// Whether anyone is there, asked before something is given up that cannot be had back.
@@ -491,10 +505,10 @@ pub trait Provider: Send + Sync {
     fn keeps_cut_writes(&self) -> bool {
         false
     }
-    /// Whether one request can be asked to be answered with no thinking (`reasoning_effort: "none"`), whatever the person's setting is. Another
-    /// service may not know the level, or may refuse it.
-    fn answers_without_thinking(&self) -> bool {
-        false
+    /// How one request can be asked to be answered with no thinking, whatever the person's setting is. Another service may not know the
+    /// level, or may refuse it.
+    fn plain_writing(&self) -> PlainWriting {
+        PlainWriting::No
     }
     /// Asked after a request was refused or broke off: whether the server is being restarted, and so is worth waiting for. A provider with no such thing to ask says it does not know.
     fn restart(&self, _cancel: &AtomicBool) -> Restart {
@@ -557,9 +571,16 @@ impl Provider for Client {
         true
     }
 
-    /// Straydog takes `none` for a model that thinks, as its template's mode without thinking.
-    fn answers_without_thinking(&self) -> bool {
-        self.replay_reasoning
+    /// Straydog closes the thinking where it says so (`reasoning_off`), and takes `none` for a model that thinks, as its template's mode
+    /// without it, everywhere.
+    fn plain_writing(&self) -> PlainWriting {
+        if self.reasoning_off {
+            PlainWriting::Closed
+        } else if self.replay_reasoning {
+            PlainWriting::OtherMode
+        } else {
+            PlainWriting::No
+        }
     }
 
     fn restart(&self, cancel: &AtomicBool) -> Restart {
@@ -611,11 +632,13 @@ pub struct Client {
     pub tool_writing: bool,
     /// Whether the model reads pictures, where the server says (`/props`): a picture is never sent to one that does not.
     pub vision: Option<bool>,
+    /// The server says it can close a model's thinking before it begins (`reasoning_off`): see [`PlainWriting::Closed`].
+    pub reasoning_off: bool,
 }
 
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
-        Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None })
+        Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None, reasoning_off: false })
     }
 
     /// The request a model's turn is sent as, for this server.
@@ -644,6 +667,13 @@ impl Client {
         // (a server that said it can: the calls come as the model writes them, beside the calls themselves, which come whole at the end)
         if self.tool_writing && request.tools.is_some() {
             body["straydog"] = json!({"tool_writing": true});
+        }
+        // (its thinking closed at once, where it can be: the reply comes as words only, and goes back as words only)
+        if request.close_thinking && self.reasoning_off {
+            if !body.get("straydog").is_some_and(Value::is_object) {
+                body["straydog"] = json!({});
+            }
+            body["straydog"]["reasoning"] = json!(false);
         }
         body
     }
@@ -779,7 +809,9 @@ impl Client {
         let vision = props.pointer("/modalities/vision").and_then(Value::as_bool);
         let suppresses_letters = props.get("suppress").and_then(Value::as_array).is_some_and(|names| names.iter().any(|name| name.as_str() == Some(NOT_CP932_HAN)));
         let tool_writing = props.get("tool_writing").and_then(Value::as_bool) == Some(true);
-        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing })
+        // (said in `/props`, and in the model's meta of `/v1/models`)
+        let reasoning_off = props.get("reasoning_off").and_then(Value::as_bool) == Some(true) || models.pointer("/data/0/meta/reasoning_off").and_then(Value::as_bool) == Some(true);
+        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing, reasoning_off })
     }
 }
 
@@ -809,6 +841,8 @@ pub struct ServerInfo {
     pub suppresses_letters: bool,
     /// Whether the server sends the calls as the model writes them.
     pub tool_writing: bool,
+    /// Whether it can close a model's thinking before it begins ([`PlainWriting::Closed`]).
+    pub reasoning_off: bool,
 }
 
 #[cfg(test)]
@@ -916,7 +950,7 @@ mod tests {
         let tools = json!([{"type": "function", "function": {"name": "create_file", "parameters": {"type": "object", "properties": {}}}}]);
         let messages = [Message::text("user", "hi")];
         let asks = |client: &Client, tools: Option<&Value>| {
-            let request = Request { model: "m", messages: &messages, tools, effort: None, images: None, japanese_letters: false, request_id: None };
+            let request = Request { model: "m", messages: &messages, tools, effort: None, images: None, japanese_letters: false, request_id: None, close_thinking: false };
             client.body_for(&request)
         };
         let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
@@ -935,6 +969,35 @@ mod tests {
         assert!(!described(r#"{"tool_writing": false}"#).tool_writing);
         assert!(!described(r#"{"tool_writing": "yes"}"#).tool_writing);
         assert!(!described("{}").tool_writing);
+    }
+
+    /// A server that says it can close a model's thinking (`reasoning_off`) is asked to for a request that wants it, beside what else it is asked;
+    /// one that has not said so is never asked, and is asked with the template's other mode instead.
+    #[test]
+    fn the_thinking_is_closed_only_on_a_server_that_said_it_can() {
+        let tools = json!([{"type": "function", "function": {"name": "create_file", "parameters": {"type": "object", "properties": {}}}}]);
+        let messages = [Message::text("user", "hi")];
+        let asks = |client: &Client, close_thinking: bool| client.body_for(&Request { model: "m", messages: &messages, tools: Some(&tools), effort: Some("high"), images: None, japanese_letters: false, request_id: None, close_thinking });
+        let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        assert!(asks(&client, true).get("straydog").is_none(), "not said: not asked");
+        assert_eq!(client.plain_writing(), PlainWriting::OtherMode);
+        client.reasoning_off = true;
+        client.tool_writing = true;
+        assert_eq!(client.plain_writing(), PlainWriting::Closed);
+        let closed = asks(&client, true);
+        assert_eq!(closed["straydog"], json!({"tool_writing": true, "reasoning": false}));
+        assert_eq!(closed["reasoning_effort"], "high", "the person's level as it is: the prompt is not read again");
+        assert_eq!(asks(&client, false)["straydog"], json!({"tool_writing": true}), "a request that does not want it is as it was");
+        assert_eq!(Client { replay_reasoning: false, reasoning_off: false, ..client }.plain_writing(), PlainWriting::No);
+    }
+
+    #[test]
+    fn a_server_says_in_its_props_or_its_models_that_it_can_close_the_thinking() {
+        assert!(described(r#"{"reasoning_off": true}"#).reasoning_off);
+        assert!(!described(r#"{"reasoning_off": false}"#).reasoning_off);
+        assert!(!described("{}").reasoning_off);
+        let models = described_at("200 OK", r#"{"data": [{"id": "m", "owned_by": "straydog", "meta": {"reasoning_off": true}}]}"#).unwrap();
+        assert!(models.reasoning_off);
     }
 
     #[test]
@@ -997,7 +1060,7 @@ mod tests {
     fn a_warm_up_asks_straydog_to_keep_only_its_system_prompts_checkpoint() {
         let tools = json!([{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {}}}}]);
         let messages = [Message::text("system", "s"), Message::text("user", ".")];
-        let request = Request { model: "m", messages: &messages, tools: Some(&tools), effort: None, images: None, japanese_letters: false, request_id: None };
+        let request = Request { model: "m", messages: &messages, tools: Some(&tools), effort: None, images: None, japanese_letters: false, request_id: None, close_thinking: false };
         let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
         assert_eq!(client.warm_body(&request)["straydog"], json!({"checkpoint": false}));
         client.tool_writing = true;
@@ -1035,7 +1098,7 @@ mod tests {
         });
         let client = Client::new(&format!("http://127.0.0.1:{port}/v1"), Some("key".into())).unwrap();
         let messages = [Message::text("user", "hi")];
-        let request = Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id };
+        let request = Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id, close_thinking: false };
         assert_eq!(client.stream(&request, &AtomicBool::new(false), &mut |_| {}).unwrap().content, "a");
         heard.recv_timeout(Duration::from_secs(5)).unwrap()
     }
@@ -1428,7 +1491,7 @@ mod tests {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let client = Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap();
         let cancel = AtomicBool::new(false);
-        let request = Request { model: "m", messages: &[], tools: None, effort: None, images: None, japanese_letters: false, request_id: None };
+        let request = Request { model: "m", messages: &[], tools: None, effort: None, images: None, japanese_letters: false, request_id: None, close_thinking: false };
         assert!(matches!(client.stream(&request, &cancel, &mut |_| {}), Err(LlmError::Down(_))));
         assert!(!client.answers());
         let said = client.describe().unwrap_err();
