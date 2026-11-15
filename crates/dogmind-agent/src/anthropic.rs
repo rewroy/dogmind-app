@@ -338,6 +338,11 @@ impl Anthropic {
 }
 
 impl Provider for Anthropic {
+    /// The Messages API streams a tool call's input as it is written.
+    fn shows_calls_as_written(&self) -> bool {
+        true
+    }
+
     /// 5 MB as base64 is what it takes of one; past 2000 pixels a request of many pictures is refused.
     fn image_limit(&self) -> ImageLimit {
         ImageLimit { side: 2000, bytes: 3_750_000 }

@@ -473,6 +473,11 @@ pub trait Provider: Send + Sync {
     fn reads_pictures(&self) -> Option<bool> {
         None
     }
+    /// Whether a tool call comes in pieces as the model writes it, which the app shows and with which it cuts a very long file into parts
+    /// on disk. A provider that gives a call only once it is whole says no.
+    fn shows_calls_as_written(&self) -> bool {
+        false
+    }
     /// Whether the server is reading or writing for nobody now: a warm-up is sent only then, so that it never waits behind, or delays, a
     /// request of another conversation or another client. One that cannot tell says yes.
     fn idle(&self) -> bool {
@@ -518,6 +523,12 @@ impl Provider for Client {
 
     fn reads_pictures(&self) -> Option<bool> {
         self.vision
+    }
+
+    /// Straydog where it says it sends the calls as they are written (`tool_writing`); of other servers, OpenAI's own API, which streams
+    /// a call's arguments. Any other may give a call only whole.
+    fn shows_calls_as_written(&self) -> bool {
+        if self.replay_reasoning { self.tool_writing } else { self.base.host.eq_ignore_ascii_case("api.openai.com") }
     }
 
     /// Straydog's `/slots`: idle where no slot is processing. No answer, or one it cannot read, is not idle: a warm-up can always be left out.
@@ -946,6 +957,20 @@ mod tests {
             }
         });
         Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap()
+    }
+
+    #[test]
+    fn a_call_shows_as_it_is_written_from_straydog_that_says_so_and_from_openai() {
+        let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        assert!(!client.shows_calls_as_written(), "a Straydog that does not say tool_writing");
+        client.tool_writing = true;
+        assert!(client.shows_calls_as_written());
+        client.replay_reasoning = false;
+        client.tool_writing = false;
+        assert!(!client.shows_calls_as_written(), "another server");
+        let mut openai = Client::new("https://api.openai.com/v1", None).unwrap();
+        openai.replay_reasoning = false;
+        assert!(openai.shows_calls_as_written());
     }
 
     #[test]

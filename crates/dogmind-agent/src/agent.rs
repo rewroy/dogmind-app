@@ -1464,6 +1464,9 @@ impl Agent {
         let found = skills::without(skills::discover(&self.workspace, self.home.as_deref()), &self.skills_off);
         let servers = self.mcp.as_ref().map_or(Vec::new(), |hub| hub.schemas());
         self.tool_schemas = tools::schemas_for(self.web.enabled, found.iter().any(|skill| skill.for_the_model), self.memory.is_some(), servers);
+        if self.provider.as_ref().is_some_and(|provider| provider.shows_calls_as_written()) {
+            tools::for_calls_shown_as_written(&mut self.tool_schemas);
+        }
         self.bench.skills = found;
         self.bench.memory = self.memory.clone();
         self.bench.policy = self.policy.clone();
@@ -5388,6 +5391,8 @@ mod tests {
         reads: Option<bool>,
         /// The server is reading or writing for someone else.
         busy: bool,
+        /// A call comes in pieces as it is written.
+        streams: bool,
     }
 
     impl Scripted {
@@ -5415,6 +5420,9 @@ mod tests {
         }
         fn idle(&self) -> bool {
             !self.busy
+        }
+        fn shows_calls_as_written(&self) -> bool {
+            self.streams
         }
     }
 
@@ -5459,6 +5467,20 @@ mod tests {
             }
             panic!("a warm-up that nothing ended");
         })
+    }
+
+    #[test]
+    fn create_file_asks_for_a_file_whole_only_of_a_provider_that_shows_a_call_as_it_is_written() {
+        let asked = |streams: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let (run, provider) = scripted_as(dir.path(), Scripted { steps: Mutex::new(vec![says("ok")].into()), streams, ..Scripted::default() }, Mode::Default);
+            run.handle.commands.send(Command::Send("hi".into())).unwrap();
+            until_end(&run, Decision::Approve);
+            let tools = provider.seen.lock().unwrap()[0].1.clone();
+            tools.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "create_file").unwrap()["function"]["description"].as_str().unwrap().to_string()
+        };
+        assert!(asked(true).contains("whole in one call"), "the pieces show, and the app cuts a very long file into parts");
+        assert!(asked(false).contains("Over about 300 lines"), "a call that comes only whole shows nothing while it is written");
     }
 
     #[test]
