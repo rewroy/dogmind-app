@@ -2591,6 +2591,7 @@ fn agent_config(settings: &Settings, folder: &Path, workspace: PathBuf, mode: Mo
         instructions: Some(folder.join("instructions.md")),
         home: std::env::var_os("USERPROFILE").map(PathBuf::from),
         skills_off: settings.skills_off.clone(),
+        skills_on: settings.skills_on.clone(),
         memory: Some(folder.join("memory")),
         mcp: Some(mcp),
         policy,
@@ -5573,12 +5574,13 @@ impl App {
         self.settings.skills_off_for(&foreign)
     }
 
-    /// The agents are told what is off, for a session begun from now on (and one under way keeps its list).
+    /// The agents are told what is off, and what the person turned on (of what needs what this app has not, only those are offered), for a session
+    /// begun from now on (and one under way keeps its list).
     fn send_skills_off(&self) {
-        let off = self.skills_off_now();
-        let _ = self.agent.commands.send(Command::SetSkillsOff(off.clone()));
-        for parked in &self.parked {
-            let _ = parked.agent.commands.send(Command::SetSkillsOff(off.clone()));
+        let (off, on) = (self.skills_off_now(), self.settings.skills_on.clone());
+        for agent in std::iter::once(&self.agent).chain(self.parked.iter().map(|parked| &parked.agent)) {
+            let _ = agent.commands.send(Command::SetSkillsOn(on.clone()));
+            let _ = agent.commands.send(Command::SetSkillsOff(off.clone()));
         }
     }
 

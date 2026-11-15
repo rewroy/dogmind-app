@@ -13,7 +13,7 @@ fn code_run(workspace: &Path, steps: Vec<Step>, mode: Mode, web: bool) -> (Run, 
     let (sender, events) = channel();
     let sessions = tempfile::tempdir().unwrap();
     let web = WebSettings { enabled: web, allow_local: web, ..WebSettings::default() };
-    let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: true }, sender, Box::new(|| {}));
+    let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: true }, sender, Box::new(|| {}));
     let provider = Arc::new(Scripted { steps: Mutex::new(steps.into()), ..Scripted::default() });
     handle.commands.send(Command::Provider(provider.clone(), "model".into(), 100_000)).unwrap();
     (Run { handle, events, _sessions: sessions }, provider)
