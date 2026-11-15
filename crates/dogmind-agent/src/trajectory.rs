@@ -51,16 +51,19 @@ pub fn short_hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().take(6).map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Where a request began and when its first word came: the first of reasoning, content or a call being written.
+/// Where a request began and when its first word came: the first of reasoning, content or a call being written. And when it began to write a
+/// call and its answer, which split the time after the first word between thinking and writing (the timeline's band).
 pub struct Clock {
     pub began: Instant,
     pub at: DateTime<Local>,
     first: Option<Instant>,
+    writing: Option<Instant>,
+    answering: Option<Instant>,
 }
 
 impl Clock {
     pub fn start() -> Clock {
-        Clock { began: Instant::now(), at: Local::now(), first: None }
+        Clock { began: Instant::now(), at: Local::now(), first: None, writing: None, answering: None }
     }
 
     /// Called with each piece that comes; the first one counts.
@@ -68,8 +71,26 @@ impl Clock {
         self.first.get_or_insert_with(Instant::now);
     }
 
+    /// Called with each piece of a call; the first one counts.
+    pub fn writing(&mut self) {
+        self.writing.get_or_insert_with(Instant::now);
+    }
+
+    /// Called with each piece of the answer's words; the first one counts.
+    pub fn answering(&mut self) {
+        self.answering.get_or_insert_with(Instant::now);
+    }
+
     pub fn first_ms(&self) -> Option<u64> {
         self.first.map(|first| first.duration_since(self.began).as_millis() as u64)
+    }
+
+    pub fn writing_ms(&self) -> Option<u64> {
+        self.writing.map(|at| at.duration_since(self.began).as_millis() as u64)
+    }
+
+    pub fn answer_ms(&self) -> Option<u64> {
+        self.answering.map(|at| at.duration_since(self.began).as_millis() as u64)
     }
 
     pub fn ms(&self) -> u64 {
@@ -267,6 +288,13 @@ impl Trajectory {
         }
         if let Some(message) = note.message {
             fields["message"] = json!(message);
+        }
+        // (when it began to write a call and its answer, from its start: what is before them after the first word is thinking)
+        if let Some(writing) = note.clock.writing_ms() {
+            fields["writing_ms"] = json!(writing);
+        }
+        if let Some(answer) = note.clock.answer_ms() {
+            fields["answer_ms"] = json!(answer);
         }
         if let Some((again, why, wait_ms)) = note.retry {
             fields["retry_of"] = json!(again);
