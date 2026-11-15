@@ -138,11 +138,23 @@ pub struct Live {
     file_turns: usize,
     /// Changes when what the rows are made of does (not with each piece of reasoning).
     version: u64,
+    /// An explore's helper at work: what it was asked, the step it is on of how many it may take, and what that step calls.
+    helper: Option<HelperLive>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HelperLive {
+    id: String,
+    task: String,
+    step: u32,
+    most: u32,
+    tool: String,
+    summary: String,
 }
 
 impl Live {
     pub fn new(at: Instant) -> Live {
-        Live { phase: Phase::Idle, since: at, reasoning: String::new(), writing: Vec::new(), tools: Vec::new(), asked_at: None, pending_asked: None, pending_woken: false, begun: None, file_turns: 0, version: 0 }
+        Live { phase: Phase::Idle, since: at, reasoning: String::new(), writing: Vec::new(), tools: Vec::new(), asked_at: None, pending_asked: None, pending_woken: false, begun: None, file_turns: 0, version: 0, helper: None }
     }
 
     /// The session on screen is another: nothing of the last is its.
@@ -186,10 +198,27 @@ impl Live {
 
     /// What an event changes. Whether it changed anything the view shows.
     pub fn note(&mut self, event: &Event, at: Instant) -> bool {
-        let before = (self.phase.clone(), self.reasoning.len(), self.writing.iter().map(|writing| writing.bytes).sum::<usize>(), self.tools.len());
+        let before = (self.phase.clone(), self.reasoning.len(), self.writing.iter().map(|writing| writing.bytes).sum::<usize>(), self.tools.len(), self.helper.as_ref().map(|helper| helper.step));
         match event {
             Event::Woken(_) => self.pending_woken = true,
+            Event::HelperStarted { id, task, most, .. } => {
+                self.helper = Some(HelperLive { id: id.clone(), task: ask_line(task), step: 0, most: *most, tool: String::new(), summary: String::new() });
+                self.version += 1;
+            }
+            Event::HelperStep { id, step, most, tool, summary, .. } => {
+                if let Some(helper) = self.helper.as_mut().filter(|helper| helper.id == *id) {
+                    (helper.step, helper.most, helper.tool, helper.summary) = (*step, *most, tool.clone(), summary.clone());
+                    self.version += 1;
+                }
+            }
+            Event::HelperEnded { id, .. } => {
+                if self.helper.as_ref().is_some_and(|helper| helper.id == *id) {
+                    self.helper = None;
+                    self.version += 1;
+                }
+            }
             Event::TurnStarted => {
+                self.helper = None;
                 self.reasoning.clear();
                 self.writing.clear();
                 self.tools.clear();
@@ -281,7 +310,7 @@ impl Live {
             }
             _ => {}
         }
-        before != (self.phase.clone(), self.reasoning.len(), self.writing.iter().map(|writing| writing.bytes).sum::<usize>(), self.tools.len())
+        before != (self.phase.clone(), self.reasoning.len(), self.writing.iter().map(|writing| writing.bytes).sum::<usize>(), self.tools.len(), self.helper.as_ref().map(|helper| helper.step))
     }
 
     /// Whether a call of this id is under way.
@@ -365,6 +394,16 @@ impl Live {
             }
             Phase::Answering => (Who::Model, t("Writing the answer").to_string(), self.since),
             Phase::Checking => (Who::App, t("Checking the calls").to_string(), self.since),
+            // (an explore's helper at work: its own model, the step it is on, and what that step calls)
+            Phase::Running if self.helper.is_some() => {
+                let helper = self.helper.as_ref().expect("a helper");
+                let words = if helper.step == 0 {
+                    tf("A helper explores: {0}", &[&helper.task])
+                } else {
+                    tf("A helper explores, step {0} of {1}: {2}", &[&helper.step, &helper.most, &call_words(&helper.tool, &helper.summary)])
+                };
+                (Who::Model, words, self.tools.iter().map(|running| running.since).min().unwrap_or(self.since))
+            }
             Phase::Running => {
                 let first = self.tools.first();
                 let mut words = first.map_or(String::new(), |running| tf("Running {0}", &[&call_words(&running.tool, &running.summary)]));
@@ -405,6 +444,46 @@ fn retry_words(why: &str) -> String {
         "server_restart" => t("the server was restarting").to_string(),
         other => other.replace('_', " "),
     }
+}
+
+/// The mark of a tool by what it does: reads, searches, commands, the web, writes, else a tool.
+fn tool_icon(name: &str) -> &'static str {
+    match name {
+        "read_file" | "list_files" | "find_files" => "file",
+        "search_files" => "search",
+        "execute_command" | "command_status" | "command_stop" => "terminal",
+        "web_search" | "web_read" | "check_page" => "globe",
+        "create_file" | "apply_patch" => "pencil",
+        _ => "wrench",
+    }
+}
+
+/// The model's words as one line shows them: a link as its words without its address, code and strong words without their marks. Nothing
+/// else of them changes.
+fn plain_words(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if c == '[' {
+            if let crate::markdown::Link::Whole { text: words, length, .. } = crate::markdown::parse_link(rest) {
+                out.push_str(words);
+                rest = &rest[length.min(rest.len())..];
+                continue;
+            }
+        }
+        // (a pair of stars, or a backtick: marks the conversation does not show as they are)
+        if rest.starts_with("**") || rest.starts_with("__") {
+            rest = &rest[2..];
+            continue;
+        }
+        if c == '`' {
+            rest = &rest[1..];
+            continue;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 /// Words as the conversation shows them.
@@ -716,8 +795,8 @@ fn step_rows(out: &mut Vec<Row>, turn: &TurnPath, place: usize, step: &Step, is_
         StepKind::Model => {
             let (text, tone, tag) = match &step.why {
                 Some(why) => match why.source {
-                    WhySource::Content => (safe(&why.text), Tone::Model, String::new()),
-                    WhySource::Reasoning => (safe(&why.text), Tone::Model, t("from its thinking").to_string()),
+                    WhySource::Content => (safe(&plain_words(&why.text)), Tone::Model, String::new()),
+                    WhySource::Reasoning => (safe(&plain_words(&why.text)), Tone::Model, t("from its thinking").to_string()),
                     // (made from its first call: named as the calls under it are, not by the tool's name in the protocol)
                     WhySource::Target => {
                         let named = step.calls.first().map(|call| call_words(&call.name, call.target.as_deref().unwrap_or("")));
@@ -808,6 +887,18 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
     }
     if let Some(file) = &call.helper_file {
         out.push(fact(inner, t("Its steps are kept in"), file.clone()));
+    }
+    // An explore's helper: each of its steps, why in its own words, and what it called.
+    if !call.helper_steps.is_empty() {
+        out.push(Row { kind: Kind::Caption, text: t("What the helper did").to_string(), indent: inner, ..Row::default() });
+        for step in &call.helper_steps {
+            if let Some(why) = &step.why {
+                out.push(Row { kind: Kind::Call, tone: Tone::Model, icon: "paw-print", text: safe(&plain_words(&why.text)), indent: inner, ..Row::default() });
+            }
+            for (name, target) in &step.calls {
+                out.push(Row { kind: Kind::Call, tone: Tone::Muted, icon: tool_icon(name), label: t(tool_name(name)).to_string(), text: target.as_deref().map(safe).unwrap_or_default(), indent: inner + 1, ..Row::default() });
+            }
+        }
     }
     if let Some(arguments) = call.arguments.as_deref().filter(|arguments| !arguments.trim().is_empty()) {
         out.push(Row { kind: Kind::Caption, text: t("Arguments").to_string(), indent: inner, ..Row::default() });
@@ -1094,7 +1185,7 @@ pub fn keyed(rows: &[Row]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dogmind_agent::timeline::{TodoItem, TurnEnd, Why};
+    use dogmind_agent::timeline::{HelperStep, TodoItem, TurnEnd, Why};
     use std::time::Duration;
 
     fn later(from: Instant, seconds: u64) -> Instant {
@@ -1558,6 +1649,44 @@ mod tests {
         let now = row.live_part.expect("the part going on now");
         assert_eq!((now.lane, now.part, now.from, now.to), (Lane::Requests, Part::Thinking, 6000, 10_000), "from when it began, not from the turn's start");
         assert_eq!(row.band.as_ref().unwrap().length, 10_000);
+    }
+
+    /// An explore's helper at work is what goes on now, step by step; read from the files, its steps are under its call when the step is open.
+    #[test]
+    fn an_explore_helper_is_shown_now_at_its_step_and_after_with_its_steps_under_the_call() {
+        let at = Instant::now();
+        let mut live = Live::new(at);
+        for event in [Event::TurnStarted, Event::RequestStarted, Event::ToolStarted { id: "e1".into(), tool: "explore".into(), summary: "Where is it?".into() },
+                      Event::HelperStarted { id: "e1".into(), task: "Where is it?".into(), most: 12, file: None }] {
+            live.note(&event, at);
+        }
+        let inputs = Inputs { running: true, ..Inputs::default() };
+        assert_eq!(live.now(&inputs, at).text, "A helper explores: Where is it?");
+        let step = Event::HelperStep { id: "e1".into(), step: 2, most: 12, tool: "read_file".into(), summary: "src/a.rs".into(), tokens: 900, elapsed: Duration::from_secs(3) };
+        assert!(live.note(&step, at), "a step of the helper is a change to show");
+        let now = live.now(&inputs, at);
+        assert_eq!((now.who, now.text), (Who::Model, format!("A helper explores, step 2 of 12: {}", call_words("read_file", "src/a.rs"))));
+        let ended = Event::HelperEnded { id: "e1".into(), how: dogmind_agent::agent::HelperEnd::Answered, steps: 2, files: 1, tokens: 900, elapsed: Duration::from_secs(4), helper: None };
+        live.note(&ended, at);
+        assert!(live.now(&inputs, at).text.starts_with("Running"), "the explore call itself, its helper done");
+        // Read from the files: the helper's steps under the call, when the step is open.
+        let mut explore = call("e1", "explore", "Where is it?", "ok");
+        explore.helper_steps = vec![
+            HelperStep { why: Some(Why { text: "I will search for it.".into(), source: WhySource::Content }), calls: vec![("search_files".into(), Some("needle".into()))] },
+            HelperStep { why: None, calls: vec![("read_file".into(), Some("a.txt".into()))] },
+        ];
+        let timeline = Timeline { turns: vec![turn(1, "Go", vec![model(None, vec![explore])], done(100))], heading: None };
+        let shut = texts(&rows_for(&timeline, &Live::new(at), &HashMap::new()));
+        assert!(!shut.iter().any(|text| text.contains("needle")), "not before the step is open");
+        let open = texts(&rows_for(&timeline, &Live::new(at), &HashMap::from([(Key::Step(1, 0), true)])));
+        let from = open.iter().position(|text| text == "What the helper did").expect("its caption");
+        assert!(open[from + 1].contains("I will search for it.") && open[from + 2].contains("needle") && open[from + 3].contains("a.txt"), "{open:#?}");
+    }
+
+    #[test]
+    fn a_reason_in_markdown_reads_as_plain_words() {
+        assert_eq!(plain_words("[a.txt](a.txt) says **Thursday**, see `b.txt`."), "a.txt says Thursday, see b.txt.");
+        assert_eq!(plain_words("2 * 3 is [six"), "2 * 3 is [six", "what is no mark stays");
     }
 
     #[test]
