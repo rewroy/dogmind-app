@@ -48,13 +48,30 @@ pub fn helper_schemas() -> Value {
 
 /// The tools every session has. Dogmind's names and meanings, in as few words as still say them: a local model reads all of this before a new session's first word, some 200 tokens a second, and it has no other use for them than knowing what to call.
 /// `assets/dogmind/tools.json` is what Dogmind itself says, to read when it changes.
+/// What create_file asks of a model whose provider gives a call only once it is whole: a long call shows nothing for minutes, and a
+/// stop loses what it was writing.
+const CREATE_FILE_IN_PARTS: &str = "Write a file, new or one you have read. Over about 300 lines, write the first part, then add each further part with append=true: what is on disk survives a stop, and a long call is minutes with nothing to show.";
+/// What it asks where the call shows as it is written ([`crate::llm::Provider::shows_calls_as_written`]): there the app keeps a very long
+/// file on disk in parts itself, and each part a model wrote by its own choice cost a request and its thinking again (on an RTX 5070 Ti
+/// with Qwen3.8 IQ2_XS, a file of some 400 lines took 174 s in 2 to 4 writes, and 143 s in one).
+const CREATE_FILE_WHOLE: &str = "Write a file, new or one you have read, whole in one call: what you write shows as it comes, and of a very long file the app keeps on disk what is written and has you go on. append=true adds to the end of the file.";
+
+/// The tools' schemas for a provider whose calls show as they are written: create_file asks for a file whole.
+pub fn for_calls_shown_as_written(schemas: &mut Value) {
+    for tool in schemas.as_array_mut().into_iter().flatten() {
+        if tool.pointer("/function/name").and_then(Value::as_str) == Some("create_file") {
+            tool["function"]["description"] = Value::from(CREATE_FILE_WHOLE);
+        }
+    }
+}
+
 pub fn schemas() -> Value {
     let function = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"type": "function", "function": {"name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required}}});
     json!([
         function("apply_patch", "Edit existing files by exact text replacement. All edits land together or none do. Read a file before editing it. old_string must occur exactly once (or `count` times) and has no line numbers. After a failure the file is unchanged, so correct old_string instead of reading again.", json!({
             "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "count": {"type": "integer"}}, "required": ["path", "old_string", "new_string"]}}
         }), &["edits"]),
-        function("create_file", "Write a file, new or one you have read, whole in one call: what you write shows as it comes, and of a very long file the app keeps on disk what is written and has you go on. append=true adds to the end of the file.", json!({
+        function("create_file", CREATE_FILE_IN_PARTS, json!({
             "path": {"type": "string"},
             "content": {"type": "string"},
             "append": {"type": "boolean", "description": "Add to the end of the file."}
@@ -3180,6 +3197,20 @@ mod tests {
             assert!(!text.contains(gone), "{gone}");
         }
         assert!(text.contains("see a picture") && text.contains("append=true"));
+    }
+
+    #[test]
+    fn create_file_asks_for_parts_unless_the_provider_shows_a_call_as_it_is_written() {
+        let description = |schemas: &Value| schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "create_file").unwrap()["function"]["description"].as_str().unwrap().to_string();
+        let mut schemas = schemas_for(true, true, true, Vec::new());
+        assert_eq!(description(&schemas), CREATE_FILE_IN_PARTS);
+        assert!(description(&schemas).contains("Over about 300 lines"));
+        let others: Vec<Value> = schemas.as_array().unwrap().iter().filter(|tool| tool["function"]["name"] != "create_file").cloned().collect();
+        for_calls_shown_as_written(&mut schemas);
+        assert_eq!(description(&schemas), CREATE_FILE_WHOLE);
+        assert!(description(&schemas).contains("whole in one call") && description(&schemas).contains("append=true"));
+        let after: Vec<Value> = schemas.as_array().unwrap().iter().filter(|tool| tool["function"]["name"] != "create_file").cloned().collect();
+        assert_eq!(after, others, "nothing else changes");
     }
 
     #[test]
