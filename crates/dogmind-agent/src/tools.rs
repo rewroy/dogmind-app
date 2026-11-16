@@ -2339,7 +2339,7 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     let root = workspace.to_string_lossy().to_lowercase();
     let outside = line.split(|c: char| c.is_whitespace() || c == '"').any(|word| word.as_bytes().get(1) == Some(&b':') && !word.to_lowercase().starts_with(&root));
     if denied && outside {
-        notes.push_str("note: a command cannot read outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there; for a command to read it, ask the user to name its folder there.\n");
+        notes.push_str(OUTSIDE_READ_NOTE);
     }
     // (a model's habit from elsewhere: cmd says only that it does not know the program, in the language of Windows, or Git's own copy fails at its start and says nothing a model can use)
     let msys = err.contains("NtCreateDirectoryObject");
@@ -2505,6 +2505,11 @@ fn after_cd_to<'a>(line: &'a str, cwd: &Path) -> Option<(&'a str, &'a str)> {
     let same = matches!((std::fs::canonicalize(target), std::fs::canonicalize(cwd)), (Ok(there), Ok(here)) if there == here);
     same.then_some((head, rest))
 }
+
+/// What a command refused outside the workspace is told, in the container, which reads there no more than it writes.
+const OUTSIDE_READ_NOTE: &str = "note: a command cannot read outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there; for a command to read it, ask the user to name its folder there.\n";
+/// The same, for a command run with a restricted token, which reads where the user can.
+const OUTSIDE_WRITE_NOTE: &str = "note: this command could read outside the workspace but not write there: it writes in the workspace alone. Write in the workspace, or tell the user what to put where.\n";
 
 /// Whether a line runs cargo, under the user folder, in a workspace whose manifest (the one cargo would load from `cwd`) names its members by a pattern: cargo expands it by
 /// looking at each folder from the drive's root, and in the container C:\Users is refused, so the pattern finds nothing. Such a command runs with a restricted token.
@@ -2844,7 +2849,9 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
         report.push_str(&format!("note: this reached the {} GiB that commands may use on this machine, and was refused more. It needs to use less at a time.\n", cap >> 30));
     }
     // (with the cause said above, a traceback's middle tells nothing more, and it is read again with every later request)
-    report.push_str(&sandbox_notes(line, &resolve(workspace, "."), done.status, &err));
+    let notes = sandbox_notes(line, &resolve(workspace, "."), done.status, &err);
+    // (a restricted token reads anywhere the user can: what it is refused outside the workspace is a write)
+    report.push_str(&if restricted { notes.replace(OUTSIDE_READ_NOTE, OUTSIDE_WRITE_NOTE) } else { notes });
     let most_err = if no_network.is_some() { MAX_COMMAND_ERR / 6 } else { MAX_COMMAND_ERR };
     let whole = (out.len() > MAX_COMMAND_OUT || err.len() > most_err).then(|| kept_whole(&out, &err)).flatten();
     report.push_str(&format!("stdout:\n{said_by_init}{}\nstderr:\n{}\n", cap_evenly(&out, MAX_COMMAND_OUT, whole.as_deref()), cap_evenly(&err, most_err, whole.as_deref())));
