@@ -3241,6 +3241,11 @@ impl App {
         GetClientRect(edit, &mut client);
         let radius = scale(self.dpi, ds::radius::CARD_CORNER);
         let mut view: Option<ViewPixels> = None;
+        // With text above the view, the view's top rows fade it into the page (as the text view draws them): a card that goes on up past them is
+        // not its own colour there, and is looked for below them.
+        let mut scrolled = POINT { x: 0, y: 0 };
+        SendMessageW(edit, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(scrolled) as LPARAM);
+        let fade = if scrolled.y > 0 && !test_no_fade() { scale(self.dpi, ds::size::TEXT_FADE).min((client.bottom - client.top) / 4) } else { 0 };
         for user_card in self.user_cards.iter_mut().rev() {
             let back = user_card.kind.back();
             let mut point = POINT { x: 0, y: 0 };
@@ -3275,16 +3280,14 @@ impl App {
                         in_view.then_some((card, shape.page))
                     }
                     // (one pixel says when it is above the view, which is where it mostly is by now)
-                    None if GetPixel(device, point.x - 2, point.y.max(client.top)) != back => None,
+                    None if GetPixel(device, point.x - 2, point.y.max(client.top + fade)) != back => None,
                     None if user_card.looked_at.is_some_and(|at| at.elapsed().as_millis() < 250) => None,
                     None => {
                         user_card.looked_at = Some(std::time::Instant::now());
                         let view = view.get_or_insert_with(|| ViewPixels::of(device, client));
-                        find_card(client, point, radius, scale(self.dpi, 3), |x, y| view.at(x, y) == back).map(|mut card| {
+                        find_card(client, point, fade, radius, scale(self.dpi, 3), |x, y| view.at(x, y) == back).map(|mut card| {
                             let page = view.at(card.left - 1, card.top + radius);
                             // With the view at the top of the text, the top of the view is the top of a card that reaches it.
-                            let mut scrolled = POINT { x: 0, y: 0 };
-                            SendMessageW(edit, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(scrolled) as LPARAM);
                             card.top_open = card.top_open && scrolled.y > 0;
                             // (what goes on below where the card was found to end, or above where it begins, in a colour that is not the page's, is the card in the fade at an edge of the view: it is
                             // not rounded there, as its end is not in sight)
@@ -14639,14 +14642,19 @@ struct CardArea {
 }
 
 /// The card around a point just before its text begins. `None`: it is not in view, or what is there is not one card's rectangle.
+/// `fade`: the rows at the top of the view that fade the text above it into the page, where no card is its own colour; a card whose text begins
+/// above them or in them is looked for below them.
 /// `seam`: the most pixels from one that is the card's to the next that is when the rows of a card are walked across (3 design pixels, in this window's scale: the seam between rows is a
 /// fraction of a row's height and grows with the type, as the gap between two cards, which is more than that, does too).
-fn find_card(client: RECT, text: POINT, radius: i32, seam: i32, is_card: impl Fn(i32, i32) -> bool) -> Option<CardArea> {
+fn find_card(client: RECT, text: POINT, fade: i32, radius: i32, seam: i32, is_card: impl Fn(i32, i32) -> bool) -> Option<CardArea> {
     let x = text.x - 2;
     if x <= client.left || x >= client.right || text.y >= client.bottom {
         return None;
     }
-    let from = text.y.max(client.top);
+    let from = text.y.max(client.top + fade);
+    if from >= client.bottom {
+        return None;
+    }
     if !is_card(x, from) {
         return None;
     }
@@ -18055,18 +18063,18 @@ mod tests {
         };
         // (one line, or two, at the foot of the last row: the card is all of it)
         for seam in [150..=150, 150..=151, 120..=121] {
-            let found = find_card(client, text, 6, 3, seamed(seam.clone())).unwrap_or_else(|| panic!("{seam:?}"));
+            let found = find_card(client, text, 0, 6, 3, seamed(seam.clone())).unwrap_or_else(|| panic!("{seam:?}"));
             assert_eq!((found.top, found.bottom), (100, 160), "{seam:?}");
         }
         // (three lines are a gap between two cards)
-        let found = find_card(client, text, 6, 3, seamed(150..=152)).unwrap();
+        let found = find_card(client, text, 0, 6, 3, seamed(150..=152)).unwrap();
         assert_eq!(found.bottom, 149);
         // (at a larger scale of the window the seam between rows is larger, and the gap between cards with it: a seam of four lines, at 175%, is walked across and a gap of five is not)
         let reach = scale(168, 3);
         assert_eq!(reach, 5);
-        let found = find_card(client, text, 6, reach, seamed(150..=153)).unwrap();
+        let found = find_card(client, text, 0, 6, reach, seamed(150..=153)).unwrap();
         assert_eq!(found.bottom, 160);
-        let found = find_card(client, text, 6, reach, seamed(150..=154)).unwrap();
+        let found = find_card(client, text, 0, 6, reach, seamed(150..=154)).unwrap();
         assert_eq!(found.bottom, 149);
     }
 
@@ -18074,15 +18082,31 @@ mod tests {
     fn a_card_is_found_by_its_edges_and_its_ends_out_of_view_stay_square() {
         let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
         let text = POINT { x: 322, y: 110 };
-        let whole = find_card(client, text, 6, 3, card_at(300, 480, 100, 140)).unwrap();
+        let whole = find_card(client, text, 0, 6, 3, card_at(300, 480, 100, 140)).unwrap();
         assert_eq!((whole.left, whole.right, whole.top, whole.bottom), (300, 480, 100, 140));
         assert!(!whole.top_open && !whole.bottom_open);
         // Its text has scrolled above the view; the rest of it is still there.
-        let above = find_card(client, POINT { x: 322, y: -30 }, 6, 3, card_at(300, 480, -40, 20)).unwrap();
+        let above = find_card(client, POINT { x: 322, y: -30 }, 0, 6, 3, card_at(300, 480, -40, 20)).unwrap();
         assert!(above.top_open && !above.bottom_open);
         assert_eq!((above.left, above.right, above.bottom), (300, 480, 20));
-        let below = find_card(client, POINT { x: 322, y: 290 }, 6, 3, card_at(300, 480, 280, 400)).unwrap();
+        let below = find_card(client, POINT { x: 322, y: 290 }, 0, 6, 3, card_at(300, 480, 280, 400)).unwrap();
         assert!(!below.top_open && below.bottom_open);
+    }
+
+    #[test]
+    fn a_card_that_goes_on_up_past_the_fade_at_the_top_of_the_view_is_found_below_it() {
+        // With text above the view, its top 28 rows fade into the page: a card there is not its own colour. Its text began above the view.
+        let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
+        let faded = |x: i32, y: i32| y >= 28 && card_at(300, 480, -60, 120)(x, y);
+        assert!(find_card(client, POINT { x: 322, y: -50 }, 0, 6, 3, faded).is_none(), "looked for in the fade, it is not there");
+        let card = find_card(client, POINT { x: 322, y: -50 }, 28, 6, 3, faded).unwrap();
+        assert_eq!((card.left, card.right, card.top, card.bottom), (300, 480, 28, 120));
+        assert!(!card.bottom_open, "its foot is in view, to be rounded");
+        // (its text begins in the fade: the same)
+        assert_eq!(find_card(client, POINT { x: 322, y: 10 }, 28, 6, 3, faded).map(|card| card.bottom), Some(120));
+        // (all of what is in view of it is in the fade: nothing to round)
+        let short = |x: i32, y: i32| y >= 28 && card_at(300, 480, -60, 20)(x, y);
+        assert!(find_card(client, POINT { x: 322, y: -50 }, 28, 6, 3, short).is_none());
     }
 
     /// The card says the model's purpose with the reason, in the body face, and the command alone is in the monospace one; what has no purpose has the whole of it in the control.
@@ -18103,14 +18127,14 @@ mod tests {
     fn what_is_not_a_card_is_left_alone() {
         let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
         let text = POINT { x: 322, y: 110 };
-        assert!(find_card(client, text, 6, 3, |_, _| false).is_none(), "another colour");
-        assert!(find_card(client, POINT { x: 322, y: 400 }, 6, 3, |_, _| true).is_none(), "below the view");
-        assert!(find_card(client, text, 6, 3, card_at(300, 480, 0, 299)).is_none(), "taller than the view: nothing to round");
+        assert!(find_card(client, text, 0, 6, 3, |_, _| false).is_none(), "another colour");
+        assert!(find_card(client, POINT { x: 322, y: 400 }, 0, 6, 3, |_, _| true).is_none(), "below the view");
+        assert!(find_card(client, text, 0, 6, 3, card_at(300, 480, 0, 299)).is_none(), "taller than the view: nothing to round");
         // Text on the row walked across does not stop it, but an edge that is not straight is no card.
         let lettered = |x: i32, y: i32| card_at(300, 480, 100, 140)(x, y) && !(x == 400 && y == 110);
-        assert_eq!(find_card(client, text, 6, 3, lettered).map(|card| card.right), Some(480));
+        assert_eq!(find_card(client, text, 0, 6, 3, lettered).map(|card| card.right), Some(480));
         let stepped = |x: i32, y: i32| card_at(300, 480, 100, 140)(x, y) && !(x > 460 && y > 120);
-        assert!(find_card(client, text, 6, 3, stepped).is_none());
+        assert!(find_card(client, text, 0, 6, 3, stepped).is_none());
     }
 
     #[test]
