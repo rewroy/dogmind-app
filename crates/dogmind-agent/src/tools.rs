@@ -2318,6 +2318,13 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
             notes.push_str("note: git cannot look above the workspace from the sandbox, so this says only that the workspace is not a git repository. `git init` at the start of a line works.\n");
         }
     }
+    // (cargo expands `members = ["crates/*"]` by looking at each folder from the drive's root, and a container may not look at C:\Users: the pattern then finds nothing and is read as
+    // a name, "failed to read `…\crates\*\Cargo.toml`", and a model goes on trying other options and folders, a crate's own manifest too, which loads the same workspace)
+    if err.contains("failed to load manifest for workspace member") && err.contains('*') {
+        notes.push_str("note: cargo could not expand this workspace's `members` pattern: it looks at each folder from the drive's root, and the sandbox may not look at C:\\Users on the way. \
+                        No cargo command loads this workspace here, with any option, from any of its folders or by a crate's own manifest: this is the sandbox's, not the project's. \
+                        Say what could not be built or run, for the user to run themselves.\n");
+    }
     // (cl, link and nmake are in no PATH of a person's unless they started from a Developer prompt; the app gives a command their folders when it finds them, and says here why it did not)
     if let Some(program) = build_tool_not_found(err) {
         notes.push_str(&build_tools_note(program, crate::msvc::why_not(), crate::msvc::known().is_some()));
@@ -4287,6 +4294,20 @@ mod tests {
         let staged = show_diff(&json!({"scope": "staged"}), &pkg, None).unwrap();
         assert!(staged.contains("+b") && !staged.contains("OTHER-CHANGE"), "{staged}");
         assert!(show_diff(&json!({"scope": "unstaged"}), &pkg, None).unwrap().starts_with("no differences"));
+    }
+
+    /// cargo in the sandbox, a workspace of `members = ["crates/*"]` under the user folder, as it was said in a run.
+    #[cfg(windows)]
+    #[test]
+    fn cargo_that_cannot_expand_a_members_pattern_is_told_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = "error: failed to load manifest for workspace member `C:\\Users\\a\\work\\crates/*`\nreferenced by workspace at `C:\\Users\\a\\work\\Cargo.toml`\n\nCaused by:\n  \
+                   failed to read `C:\\Users\\a\\work\\crates\\*\\Cargo.toml`\n\nCaused by:\n  ファイル名、ディレクトリ名、またはボリューム ラベルの構文が間違っています。 (os error 123)\n";
+        let note = sandbox_notes("cargo test -p app", dir.path(), Some(101), err);
+        assert!(note.contains("`members` pattern") && note.contains("for the user to run themselves"), "{note}");
+        // a member named as it is, which is missing, is the project's own
+        let named = "error: failed to load manifest for workspace member `C:\\Users\\a\\work\\crates\\gone`\n";
+        assert!(!sandbox_notes("cargo build", dir.path(), Some(101), named).contains("`members` pattern"));
     }
 
     #[cfg(windows)]
