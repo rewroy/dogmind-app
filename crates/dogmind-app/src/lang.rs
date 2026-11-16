@@ -685,6 +685,7 @@ const JA: &[(&str, &str)] = &[
     ("{0} files", "{0} 件"),
     ("Open in its app", "既定のアプリで開く"),
     ("Show in Explorer", "エクスプローラーで表示"),
+    ("Show beside the conversation", "会話の横に表示"),
     ("Files for you", "確認してほしいファイル"),
     ("Question", "質問"),
     ("Send", "送信"),
