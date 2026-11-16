@@ -2320,11 +2320,10 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     }
     // (cargo expands `members = ["crates/*"]` by looking at each folder from the drive's root, and a container may not look at C:\Users: the pattern then finds nothing and is read as
     // a name, "failed to read `…\crates\*\Cargo.toml`", and a model goes on trying other options and folders, a crate's own manifest too, which loads the same workspace)
-    // (a command that is cargo itself, in such a workspace, runs with a restricted token where it can: this is cargo started through something else)
     if err.contains("failed to load manifest for workspace member") && err.contains('*') {
         notes.push_str("note: cargo could not expand this workspace's `members` pattern: it looks at each folder from the drive's root, and the sandbox may not look at C:\\Users on the way. \
-                        A command that is cargo itself is run where it can: run cargo directly, not through a script or another program. \
-                        If that cannot be done, say what could not be built or run, for the user to run themselves.\n");
+                        No cargo command loads this workspace here, with any option, from any of its folders or by a crate's own manifest: this is the sandbox's, not the project's. \
+                        Say what could not be built or run, for the user to run themselves.\n");
     }
     // (cl, link and nmake are in no PATH of a person's unless they started from a Developer prompt; the app gives a command their folders when it finds them, and says here why it did not)
     if let Some(program) = build_tool_not_found(err) {
@@ -2339,7 +2338,7 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     let root = workspace.to_string_lossy().to_lowercase();
     let outside = line.split(|c: char| c.is_whitespace() || c == '"').any(|word| word.as_bytes().get(1) == Some(&b':') && !word.to_lowercase().starts_with(&root));
     if denied && outside {
-        notes.push_str(OUTSIDE_READ_NOTE);
+        notes.push_str("note: a command cannot read outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there; for a command to read it, ask the user to name its folder there.\n");
     }
     // (a model's habit from elsewhere: cmd says only that it does not know the program, in the language of Windows, or Git's own copy fails at its start and says nothing a model can use)
     let msys = err.contains("NtCreateDirectoryObject");
@@ -2504,54 +2503,6 @@ fn after_cd_to<'a>(line: &'a str, cwd: &Path) -> Option<(&'a str, &'a str)> {
     }
     let same = matches!((std::fs::canonicalize(target), std::fs::canonicalize(cwd)), (Ok(there), Ok(here)) if there == here);
     same.then_some((head, rest))
-}
-
-/// What a command refused outside the workspace is told, in the container, which reads there no more than it writes.
-const OUTSIDE_READ_NOTE: &str = "note: a command cannot read outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there; for a command to read it, ask the user to name its folder there.\n";
-/// The same, for a command run with a restricted token, which reads where the user can.
-const OUTSIDE_WRITE_NOTE: &str = "note: this command could read outside the workspace but not write there: it writes in the workspace alone. Write in the workspace, or tell the user what to put where.\n";
-
-/// Whether a line runs cargo, under the user folder, in a workspace whose manifest (the one cargo would load from `cwd`) names its members by a pattern: cargo expands it by
-/// looking at each folder from the drive's root, and in the container C:\Users is refused, so the pattern finds nothing. Such a command runs with a restricted token.
-#[cfg(windows)]
-fn cargo_reads_above(line: &str, cwd: &Path, root: &Path, home: Option<&Path>) -> bool {
-    let Some(users) = home.and_then(Path::parent) else { return false };
-    runs_cargo(line) && root.starts_with(users) && cwd.starts_with(root) && members_by_pattern(cwd, root)
-}
-
-/// Whether a command of the line is cargo.
-#[cfg(windows)]
-fn runs_cargo(line: &str) -> bool {
-    line.split(['&', '|']).any(|part| {
-        let word = part.trim_start().trim_start_matches(['(', '@']).split_whitespace().next().unwrap_or("").trim_matches('"');
-        let name = word.rsplit(['\\', '/']).next().unwrap_or(word);
-        name.eq_ignore_ascii_case("cargo") || name.eq_ignore_ascii_case("cargo.exe")
-    })
-}
-
-/// Whether the workspace manifest cargo would load from `cwd`, the nearest `Cargo.toml` with a `[workspace]` table from `cwd` up to `root`, names its members by a
-/// pattern (`crates/*`).
-#[cfg(windows)]
-fn members_by_pattern(cwd: &Path, root: &Path) -> bool {
-    for folder in cwd.ancestors().take_while(|folder| folder.starts_with(root)) {
-        let Ok(text) = std::fs::read_to_string(folder.join("Cargo.toml")) else { continue };
-        let (mut table, mut members, mut in_members, mut workspace) = ("", String::new(), false, false);
-        for line in text.lines() {
-            let line = line.trim();
-            if line.starts_with('[') && !in_members {
-                table = line;
-                workspace |= line == "[workspace]";
-            } else if table == "[workspace]" && (in_members || line.split(['=', ' ']).next() == Some("members")) {
-                let value = if in_members { line } else { line.split_once('=').map_or("", |(_, value)| value) };
-                members.push_str(value);
-                in_members = !value.contains(']');
-            }
-        }
-        if workspace {
-            return members.contains(['*', '?']);
-        }
-    }
-    false
 }
 
 /// What cmd is to be given. It ends a line at its first line break and says nothing: of two commands the second never runs, and `python -c "` with its code on the next lines runs
@@ -2791,24 +2742,14 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let started = Instant::now();
     let before = file_states(&cwd);
     let runs = line_that_runs(line);
-    // cargo under the user folder, in a workspace that names its members by a pattern, which cargo expands looking at each folder from the drive's root: a container may not
-    // look at C:\Users, so this one runs with a restricted token, reading as the person does and writing in the workspace alone (`run_live_restricted`).
-    let root = resolve(workspace, ".");
-    let restricted = cargo_reads_above(&runs, &cwd, &root, home.as_deref());
-    let run = if restricted { crate::sandbox::run_live_restricted } else { crate::sandbox::run_live };
     // Spelled as `cwd` is, or a path with `..` in it would not be seen as holding it.
-    let done = run(&runs, &cwd, &root, network, timeout, cancel, live).map_err(|error| {
+    let done = crate::sandbox::run_live(&runs, &cwd, &resolve(workspace, "."), network, timeout, cancel, live).map_err(|error| {
         // (the app's `git init` has run by then, and what is said is what is there)
         let started = if started_with_init.is_some() { "`git init` ran, and made .git there; the rest of the line was not started" } else { "The command was not started" };
         format!("{error}. {started}; changing its spelling cannot repair this")
     })?;
     let (out, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
     let mut report = String::new();
-    if restricted {
-        report.push_str(&format!("note: cargo ran outside the container, with a restricted token: in the container cargo cannot expand this workspace's `members` pattern under \
-                                  the user folder. It could read what the user can and write only in the workspace{}.\n",
-                                 if network { "" } else { ", and was pointed away from the network (CARGO_NET_OFFLINE and a proxy that is not there)" }));
-    }
     // (said, and not done quietly: the model learns what its words became, and the person reads it in the result)
     if let Some(cd) = cd_left_out {
         report.push_str(&format!("note: `{cd}` was left out: the command runs in that folder already, and in the sandbox `cd` to a full path under the user folder is refused.\n"));
@@ -2849,9 +2790,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
         report.push_str(&format!("note: this reached the {} GiB that commands may use on this machine, and was refused more. It needs to use less at a time.\n", cap >> 30));
     }
     // (with the cause said above, a traceback's middle tells nothing more, and it is read again with every later request)
-    let notes = sandbox_notes(line, &resolve(workspace, "."), done.status, &err);
-    // (a restricted token reads anywhere the user can: what it is refused outside the workspace is a write)
-    report.push_str(&if restricted { notes.replace(OUTSIDE_READ_NOTE, OUTSIDE_WRITE_NOTE) } else { notes });
+    report.push_str(&sandbox_notes(line, &resolve(workspace, "."), done.status, &err));
     let most_err = if no_network.is_some() { MAX_COMMAND_ERR / 6 } else { MAX_COMMAND_ERR };
     let whole = (out.len() > MAX_COMMAND_OUT || err.len() > most_err).then(|| kept_whole(&out, &err)).flatten();
     report.push_str(&format!("stdout:\n{said_by_init}{}\nstderr:\n{}\n", cap_evenly(&out, MAX_COMMAND_OUT, whole.as_deref()), cap_evenly(&err, most_err, whole.as_deref())));
@@ -3213,51 +3152,6 @@ mod change_tests {
                      format!("echo {here} && cd {here}")] {
             assert_eq!(after_cd_to(&kept, dir.path()), None, "{kept}");
         }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn cargo_in_a_workspace_of_member_patterns_under_the_user_folder_runs_restricted() {
-        assert!(runs_cargo("cargo test -p a") && runs_cargo("echo x && \"C:\\x\\cargo.exe\" build") && runs_cargo("(cargo fmt)"));
-        assert!(!runs_cargo("python cargo.py") && !runs_cargo("echo cargo") && !runs_cargo("cargo-nextest run"));
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\n  \"crates/*\",\n]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"0.1.0\"\n").unwrap();
-        std::fs::write(root.join("crates/a/Cargo.toml"), "[package]\nname = \"a\"\nversion = \"0.1.0\"\n").unwrap();
-        assert!(members_by_pattern(root, root) && members_by_pattern(&root.join("crates/a"), root), "from a member's folder too");
-        // (the user folder stood for by the folder above the workspace, wherever the test's folder is)
-        let home = root.parent().unwrap().join("someone");
-        assert!(cargo_reads_above("cargo build", &root.join("crates/a"), root, Some(&home)));
-        assert!(!cargo_reads_above("python x.py", root, root, Some(&home)));
-        assert!(!cargo_reads_above("cargo build", root, root, Some(Path::new(r"Q:\home\someone"))), "not under the user folder");
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/a\"]\nexclude = [\"old/*\"]\n").unwrap();
-        assert!(!members_by_pattern(root, root), "members named one by one");
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[\"crates/*\"]\n").unwrap();
-        assert!(members_by_pattern(root, root), "written without spaces");
-        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"solo\"\n").unwrap();
-        assert!(!members_by_pattern(root, root));
-    }
-
-    /// The case a review run met: `members = ["crates/*"]` under the user folder, which cargo cannot expand in the container.
-    #[cfg(windows)]
-    #[test]
-    fn cargo_loads_a_workspace_of_member_patterns_with_a_restricted_token() {
-        if !std::process::Command::new("cargo").arg("--version").output().is_ok_and(|output| output.status.success()) {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        for name in ["a", "b"] {
-            std::fs::create_dir_all(root.join("crates").join(name).join("src")).unwrap();
-            std::fs::write(root.join("crates").join(name).join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")).unwrap();
-            std::fs::write(root.join("crates").join(name).join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-        }
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n").unwrap();
-        let said = execute_command(&json!({"command": "cargo metadata --offline --no-deps --format-version 1", "cwd": "crates/b"}), root, &AtomicBool::new(false), None).unwrap();
-        assert!(said.contains("exit_code: 0") && said.contains("\"name\":\"a\"") && said.contains("\"name\":\"b\""), "{said}");
-        let under_users = std::env::var_os("USERPROFILE").map(PathBuf::from).and_then(|home| home.parent().map(Path::to_path_buf)).is_some_and(|users| root.starts_with(users));
-        assert_eq!(said.contains("with a restricted token"), under_users, "{said}");
     }
 
     /// Run as the model wrote them, both failed: cmd refuses a `cd` by full path under the user folder ("Access is denied"), and a cwd the command would make is no place to start.
@@ -4410,7 +4304,7 @@ mod tests {
         let err = "error: failed to load manifest for workspace member `C:\\Users\\a\\work\\crates/*`\nreferenced by workspace at `C:\\Users\\a\\work\\Cargo.toml`\n\nCaused by:\n  \
                    failed to read `C:\\Users\\a\\work\\crates\\*\\Cargo.toml`\n\nCaused by:\n  ファイル名、ディレクトリ名、またはボリューム ラベルの構文が間違っています。 (os error 123)\n";
         let note = sandbox_notes("cargo test -p app", dir.path(), Some(101), err);
-        assert!(note.contains("`members` pattern") && note.contains("run cargo directly") && note.contains("for the user to run themselves"), "{note}");
+        assert!(note.contains("`members` pattern") && note.contains("for the user to run themselves"), "{note}");
         // a member named as it is, which is missing, is the project's own
         let named = "error: failed to load manifest for workspace member `C:\\Users\\a\\work\\crates\\gone`\n";
         assert!(!sandbox_notes("cargo build", dir.path(), Some(101), named).contains("`members` pattern"));
