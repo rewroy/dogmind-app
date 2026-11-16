@@ -318,6 +318,8 @@ const JA: &[(&str, &str)] = &[
     (dogmind_agent::safety::REASON_WEB_NOTE, "この会話にはウェブの内容が含まれていて、メモはこの先のすべてのセッションに残ります"),
     (dogmind_agent::safety::REASON_WEB_FORGET, "この会話にはウェブの内容が含まれていて、メモを消すとこの先のすべてのセッションが変わります"),
     (dogmind_agent::safety::REASON_WEB_ASKED, "この会話にはウェブの内容が含まれていて、これはそこから求められたことかもしれません"),
+    (dogmind_agent::safety::REASON_CARGO_OUTSIDE, "このワークスペースはサンドボックスの中の cargo では読めないため、サンドボックスの読み込みの制限を外して実行します。あなたが読めるファイルはすべて読め、ネットワークも止められません"),
+    (dogmind_agent::safety::REASON_CARGO_CONFIG_RUNS, "ここの cargo の設定は {0} も実行し、同じ範囲に届きます"),
     ("Needs tools this app does not have: mcp__{0}__…", "このアプリにないツールが必要です: mcp__{0}__…"),
     ("Needs something of another app that this app does not have: {0}", "このアプリにない、別のアプリの機能が必要です: {0}"),
     ("a connector of another app", "別のアプリのコネクター"),
