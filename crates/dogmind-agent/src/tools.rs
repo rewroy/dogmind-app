@@ -2010,6 +2010,12 @@ fn no_network_note(network: bool, status: Option<i32>, out: &str, err: &str) -> 
     SIGNS.iter().any(|sign| out.contains(sign) || err.contains(sign)).then_some("note: this command failed because it ran with no network, and nothing about the site or the code is known from it. If it needs the network, make the same call with network=true, and the user is asked to approve it.\n")
 }
 
+/// Whether `dir` or a command like it in this line was refused, as either stream says: a line that sends its errors on with `2>&1` says it with its output.
+#[cfg(windows)]
+fn refused_for_the_drive_root(line: &str, out: &str, err: &str, system_words: &str) -> bool {
+    needs_drive_root(line) && (says_access_denied(err, system_words) || says_access_denied(out, system_words))
+}
+
 /// Whether a part of this command line is one of cmd's that fail in the sandbox wherever their file is.
 #[cfg(windows)]
 fn needs_drive_root(line: &str) -> bool {
@@ -2733,7 +2739,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
             report.push_str(&format!("note: the sandbox cannot read these folders on PATH, so what is in them looks absent: {}. They are not missing, and their full paths are closed too: do not try them. Tell the user that /tools opens them to commands, with one Windows prompt.\n", names.join(", ")));
         }
     }
-    if needs_drive_root(line) && says_access_denied(&err, system_access_denied()) {
+    if refused_for_the_drive_root(line, &out, &err, system_access_denied()) {
         report.push_str(&DRIVE_ROOT_NOTE.replace("{}", crate::prompt::NO_DRIVE_ROOT));
     }
     if !done.disarmed.is_empty() {
@@ -3107,6 +3113,16 @@ mod change_tests {
     #[test]
     fn a_refused_dir_does_not_read_as_the_whole_line_failing() {
         assert!(DRIVE_ROOT_NOTE.contains("what ran before it did run"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_del_is_known_by_what_either_stream_says() {
+        // (a line whose `2>&1` sends cmd's refusal on with the output, as a model wrote it)
+        assert!(refused_for_the_drive_root("del \"tests\\_tmp.rs\" 2>&1; cargo test 2>&1", "アクセスが拒否されました。\r\n", "", ""));
+        assert!(refused_for_the_drive_root("dir", "", "Access is denied.\r\n", ""));
+        assert!(!refused_for_the_drive_root("cargo test 2>&1", "Access is denied.\r\n", "", ""), "no dir or del in it");
+        assert!(!refused_for_the_drive_root("del a.txt", "", "", ""), "not refused");
     }
 
     #[test]
