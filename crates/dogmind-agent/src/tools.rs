@@ -2320,11 +2320,10 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     }
     // (cargo expands `members = ["crates/*"]` by looking at each folder from the drive's root, and a container may not look at C:\Users: the pattern then finds nothing and is read as
     // a name, "failed to read `…\crates\*\Cargo.toml`", and a model goes on trying other options and folders, a crate's own manifest too, which loads the same workspace)
-    // (a command that is cargo itself runs from a drive letter that names the workspace, where it can: this is cargo started by another program, or no letter was free)
     if err.contains("failed to load manifest for workspace member") && err.contains('*') {
         notes.push_str("note: cargo could not expand this workspace's `members` pattern: it looks at each folder from the drive's root, and the sandbox may not look at C:\\Users on the way. \
-                        A command that is cargo itself is run from a drive letter that names the workspace, where it can: run cargo directly, not through a script or another program. \
-                        If this was cargo itself, no drive letter was free: say what could not be built or run, for the user to run themselves.\n");
+                        No cargo command loads this workspace here, with any option, from any of its folders or by a crate's own manifest: this is the sandbox's, not the project's. \
+                        Say what could not be built or run, for the user to run themselves.\n");
     }
     // (cl, link and nmake are in no PATH of a person's unless they started from a Developer prompt; the app gives a command their folders when it finds them, and says here why it did not)
     if let Some(program) = build_tool_not_found(err) {
@@ -2504,53 +2503,6 @@ fn after_cd_to<'a>(line: &'a str, cwd: &Path) -> Option<(&'a str, &'a str)> {
     }
     let same = matches!((std::fs::canonicalize(target), std::fs::canonicalize(cwd)), (Ok(there), Ok(here)) if there == here);
     same.then_some((head, rest))
-}
-
-/// Where in the workspace a cargo command runs, when it needs a drive letter to run at all ([`crate::drive_letter`]): the line runs cargo, the workspace is
-/// under the user folder, and the workspace manifest that cargo would load from `cwd` names its members by a pattern.
-#[cfg(windows)]
-fn cargo_needs_a_letter(line: &str, cwd: &Path, root: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    let users = home?.parent()?;
-    if !runs_cargo(line) || !root.starts_with(users) {
-        return None;
-    }
-    let inside = cwd.strip_prefix(root).ok()?.to_path_buf();
-    members_by_pattern(cwd, root).then_some(inside)
-}
-
-/// Whether a command of the line is cargo.
-#[cfg(windows)]
-fn runs_cargo(line: &str) -> bool {
-    line.split(['&', '|']).any(|part| {
-        let word = part.trim_start().trim_start_matches(['(', '@']).split_whitespace().next().unwrap_or("").trim_matches('"');
-        let name = word.rsplit(['\\', '/']).next().unwrap_or(word);
-        name.eq_ignore_ascii_case("cargo") || name.eq_ignore_ascii_case("cargo.exe")
-    })
-}
-
-/// Whether the workspace manifest cargo would load from `cwd`, the nearest `Cargo.toml` with a `[workspace]` table from `cwd` up to `root`, names its
-/// members by a pattern (`crates/*`).
-#[cfg(windows)]
-fn members_by_pattern(cwd: &Path, root: &Path) -> bool {
-    for folder in cwd.ancestors().take_while(|folder| folder.starts_with(root)) {
-        let Ok(text) = std::fs::read_to_string(folder.join("Cargo.toml")) else { continue };
-        let (mut table, mut members, mut in_members, mut workspace) = ("", String::new(), false, false);
-        for line in text.lines() {
-            let line = line.trim();
-            if line.starts_with('[') && !in_members {
-                table = line;
-                workspace |= line == "[workspace]";
-            } else if table == "[workspace]" && (in_members || line.split(['=', ' ']).next() == Some("members")) {
-                let value = if in_members { line } else { line.split_once('=').map_or("", |(_, value)| value) };
-                members.push_str(value);
-                in_members = !value.contains(']');
-            }
-        }
-        if workspace {
-            return members.contains(['*', '?']);
-        }
-    }
-    false
 }
 
 /// What cmd is to be given. It ends a line at its first line break and says nothing: of two commands the second never runs, and `python -c "` with its code on the next lines runs
@@ -2790,24 +2742,14 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let started = Instant::now();
     let before = file_states(&cwd);
     let runs = line_that_runs(line);
-    // cargo under the user folder, in a workspace that names its members by a pattern: run from a drive letter that names the workspace for the
-    // command's time, as nothing else lets cargo expand the pattern in the sandbox (see `drive_letter`). What it says is put back in the workspace's paths.
-    let root = resolve(workspace, ".");
-    let lettered = cargo_needs_a_letter(&runs, &cwd, &root, home.as_deref())
-        .and_then(|inside| crate::drive_letter::name(&root).map(|letter| (format!("cd /d {}:\\{} && {runs}", letter.letter(), inside.display()), letter)));
     // Spelled as `cwd` is, or a path with `..` in it would not be seen as holding it.
-    let done = crate::sandbox::run_live(lettered.as_ref().map_or(&runs, |(line, _)| line), &cwd, &root, network, timeout, cancel, live).map_err(|error| {
+    let done = crate::sandbox::run_live(&runs, &cwd, &resolve(workspace, "."), network, timeout, cancel, live).map_err(|error| {
         // (the app's `git init` has run by then, and what is said is what is there)
         let started = if started_with_init.is_some() { "`git init` ran, and made .git there; the rest of the line was not started" } else { "The command was not started" };
         format!("{error}. {started}; changing its spelling cannot repair this")
     })?;
-    let (mut out, mut err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
+    let (out, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
     let mut report = String::new();
-    if let Some((_, letter)) = lettered {
-        (out, err) = (crate::drive_letter::in_folder_terms(&out, letter.letter(), &root), crate::drive_letter::in_folder_terms(&err, letter.letter(), &root));
-        report.push_str(&format!("note: cargo ran from {}:\\, a drive letter that named the workspace while the command ran: in the sandbox it cannot expand the workspace's \
-                                  `members` pattern from the workspace's own path under the user folder. Paths here are the workspace's.\n", letter.letter()));
-    }
     // (said, and not done quietly: the model learns what its words became, and the person reads it in the result)
     if let Some(cd) = cd_left_out {
         report.push_str(&format!("note: `{cd}` was left out: the command runs in that folder already, and in the sandbox `cd` to a full path under the user folder is refused.\n"));
@@ -3209,55 +3151,6 @@ mod change_tests {
         for kept in [format!("cd {here}\\sub && echo a"), "cd sub && echo a".to_string(), format!("cd {here} & echo a"), format!("cd {here} && "), format!("cd {here}"),
                      format!("echo {here} && cd {here}")] {
             assert_eq!(after_cd_to(&kept, dir.path()), None, "{kept}");
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn cargo_in_a_workspace_of_member_patterns_under_the_user_folder_wants_a_letter() {
-        assert!(runs_cargo("cargo test -p a") && runs_cargo("echo x && \"C:\\x\\cargo.exe\" build") && runs_cargo("(cargo fmt)"));
-        assert!(!runs_cargo("python cargo.py") && !runs_cargo("echo cargo") && !runs_cargo("cargo-nextest run"));
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\n  \"crates/*\",\n]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"0.1.0\"\n").unwrap();
-        std::fs::write(root.join("crates/a/Cargo.toml"), "[package]\nname = \"a\"\nversion = \"0.1.0\"\n").unwrap();
-        assert!(members_by_pattern(root, root) && members_by_pattern(&root.join("crates/a"), root), "from a member's folder too");
-        // (the user folder stood for by the folder above the workspace, wherever the test's folder is)
-        let home = root.parent().unwrap().join("someone");
-        assert_eq!(cargo_needs_a_letter("cargo build", &root.join("crates/a"), root, Some(&home)), Some(PathBuf::from("crates/a")));
-        assert_eq!(cargo_needs_a_letter("python x.py", root, root, Some(&home)), None);
-        assert_eq!(cargo_needs_a_letter("cargo build", root, root, Some(Path::new(r"Q:\home\someone"))), None, "not under the user folder");
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/a\"]\nexclude = [\"old/*\"]\n").unwrap();
-        assert!(!members_by_pattern(root, root), "members named one by one");
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[\"crates/*\"]\n").unwrap();
-        assert!(members_by_pattern(root, root), "written without spaces");
-        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"solo\"\n").unwrap();
-        assert!(!members_by_pattern(root, root));
-    }
-
-    /// The case a review run met: `members = ["crates/*"]` under the user folder, which cargo cannot expand in the sandbox from the workspace's own path.
-    #[cfg(windows)]
-    #[test]
-    fn cargo_loads_a_workspace_of_member_patterns_in_the_sandbox() {
-        if !std::process::Command::new("cargo").arg("--version").output().is_ok_and(|output| output.status.success()) {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        for name in ["a", "b"] {
-            std::fs::create_dir_all(root.join("crates").join(name).join("src")).unwrap();
-            std::fs::write(root.join("crates").join(name).join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")).unwrap();
-            std::fs::write(root.join("crates").join(name).join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-        }
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n").unwrap();
-        let said = execute_command(&json!({"command": "cargo metadata --offline --no-deps --format-version 1", "cwd": "crates/b"}), root, &AtomicBool::new(false), None).unwrap();
-        assert!(said.contains("exit_code: 0") && said.contains("\"name\":\"a\"") && said.contains("\"name\":\"b\""), "{said}");
-        let escaped = root.display().to_string().replace('\\', "\\\\");
-        assert!(said.contains(&format!("{escaped}\\\\crates\\\\a")), "the workspace's own paths: {said}");
-        // (and the letter is gone)
-        if let Some(letter) = said.split("cargo ran from ").nth(1).and_then(|rest| rest.chars().next()) {
-            assert!(!Path::new(&format!("{letter}:\\Cargo.toml")).exists(), "{letter}: is still there");
         }
     }
 
@@ -4411,7 +4304,7 @@ mod tests {
         let err = "error: failed to load manifest for workspace member `C:\\Users\\a\\work\\crates/*`\nreferenced by workspace at `C:\\Users\\a\\work\\Cargo.toml`\n\nCaused by:\n  \
                    failed to read `C:\\Users\\a\\work\\crates\\*\\Cargo.toml`\n\nCaused by:\n  ファイル名、ディレクトリ名、またはボリューム ラベルの構文が間違っています。 (os error 123)\n";
         let note = sandbox_notes("cargo test -p app", dir.path(), Some(101), err);
-        assert!(note.contains("`members` pattern") && note.contains("run cargo directly") && note.contains("for the user to run themselves"), "{note}");
+        assert!(note.contains("`members` pattern") && note.contains("for the user to run themselves"), "{note}");
         // a member named as it is, which is missing, is the project's own
         let named = "error: failed to load manifest for workspace member `C:\\Users\\a\\work\\crates\\gone`\n";
         assert!(!sandbox_notes("cargo build", dir.path(), Some(101), named).contains("`members` pattern"));
