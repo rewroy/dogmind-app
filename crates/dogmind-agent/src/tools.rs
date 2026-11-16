@@ -2481,6 +2481,23 @@ fn opened_on_the_desktop(line: &str, cwd: &Path) -> Option<String> {
     commands.iter().enumerate().filter(|(at, _)| !of_a_for(*at)).find_map(|(_, command)| opens_by_association(command, cwd))
 }
 
+/// A line that begins `cd <folder> && `, with `/d` or not, or `chdir` or `pushd`, where the folder is given by its full path and is `cwd` itself: that first part, and the rest.
+/// None for anything else, a `cd` to another folder or by a relative path included (those are the command's own, and a relative one works in the sandbox).
+#[cfg(windows)]
+fn after_cd_to<'a>(line: &'a str, cwd: &Path) -> Option<(&'a str, &'a str)> {
+    let (head, rest) = line.trim_start().split_once("&&")?;
+    let (head, rest) = (head.trim(), rest.trim_start());
+    let lower = head.to_ascii_lowercase();
+    let after = ["cd ", "chdir ", "pushd "].iter().find(|word| lower.starts_with(*word)).map(|word| head[word.len()..].trim_start())?;
+    let target = if after.get(..2).is_some_and(|switch| switch.eq_ignore_ascii_case("/d")) { after[2..].trim_start() } else { after };
+    let target = target.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')).unwrap_or(target);
+    if rest.is_empty() || target.is_empty() || target.contains('"') || !Path::new(target).is_absolute() {
+        return None;
+    }
+    let same = matches!((std::fs::canonicalize(target), std::fs::canonicalize(cwd)), (Ok(there), Ok(here)) if there == here);
+    same.then_some((head, rest))
+}
+
 /// What cmd is to be given. It ends a line at its first line break and says nothing: of two commands the second never runs, and `python -c "` with its code on the next lines runs
 /// an empty program, with no output and exit code 0, which sent a model looking for what was wrong and then writing the same code into a file left behind in the workspace.
 /// So lines become commands joined by `&`, as they would run in a batch file, and code on several lines given to `python -c` or `node -e` goes as one line that runs the same text.
@@ -2678,6 +2695,17 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     // First: all that follows here looks in that folder as the person, and it may be anywhere, a share on another machine included.
     crate::sandbox::writable_root(&cwd, &resolve(workspace, "."), home.as_deref()).map_err(|error| format!("{error}. The command was not started; changing its spelling cannot repair this"))?;
+    // (else the system's own words, "the directory name is invalid", read as a misspelling: the folder a command would make cannot be the one it starts in)
+    if !cwd.is_dir() {
+        return Err(format!("not run: {} does not exist yet, and a command starts in its cwd. Nothing was started. Run it from a folder that is there (with no cwd: the workspace) \
+                            and let the command make the folder, or make it first", cwd.display()));
+    }
+    // `cd <the folder it runs in> && …`, a habit from shells that start elsewhere: in the sandbox `cd` to a full path under the user folder is refused ("Access is denied"),
+    // as cmd looks at every folder on the way, so that part is left out and said to be.
+    let (line, cd_left_out) = match after_cd_to(line, &cwd) {
+        Some((cd, rest)) => (rest, Some(cd)),
+        None => (line, None),
+    };
     let started_with_init = git_init_first(line);
     // What would be refused is refused before the app makes anything: a refusal says nothing was started, and `.git` would have been.
     let after_init: &str = started_with_init.as_ref().map_or(line, |(_, rest)| rest);
@@ -2716,6 +2744,9 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let (out, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
     let mut report = String::new();
     // (said, and not done quietly: the model learns what its words became, and the person reads it in the result)
+    if let Some(cd) = cd_left_out {
+        report.push_str(&format!("note: `{cd}` was left out: the command runs in that folder already, and in the sandbox `cd` to a full path under the user folder is refused.\n"));
+    }
     if runs != line {
         report.push_str(&format!("note: this ran as `{runs}`: in the sandbox `dir`, `del` and `| head` are replaced by what does the same there.\n"));
     }
@@ -3099,6 +3130,32 @@ mod change_tests {
         ] {
             assert_eq!(opens(line), None, "{line}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_cd_by_full_path_to_the_folder_it_runs_in_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let here = dir.path().display().to_string();
+        assert_eq!(after_cd_to(&format!("cd {here} && python x.py"), dir.path()), Some((format!("cd {here}").as_str(), "python x.py")));
+        assert_eq!(after_cd_to(&format!("CD /D \"{here}\" &&  dir"), dir.path()), Some((format!("CD /D \"{here}\"").as_str(), "dir")));
+        assert_eq!(after_cd_to(&format!("pushd {}\\ && echo a", here.replace('\\', "/")), dir.path()).map(|(_, rest)| rest), Some("echo a"));
+        for kept in [format!("cd {here}\\sub && echo a"), "cd sub && echo a".to_string(), format!("cd {here} & echo a"), format!("cd {here} && "), format!("cd {here}"),
+                     format!("echo {here} && cd {here}")] {
+            assert_eq!(after_cd_to(&kept, dir.path()), None, "{kept}");
+        }
+    }
+
+    /// Run as the model wrote them, both failed: cmd refuses a `cd` by full path under the user folder ("Access is denied"), and a cwd the command would make is no place to start.
+    #[cfg(windows)]
+    #[test]
+    fn a_command_that_cds_to_its_own_folder_runs_and_one_whose_cwd_is_not_there_is_told_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = execute_command(&json!({"command": format!("cd /d \"{}\" && echo ran-here", dir.path().display())}), dir.path(), &AtomicBool::new(false), None).unwrap();
+        assert!(ran.contains("ran-here") && ran.contains("was left out") && ran.contains("exit_code: 0"), "{ran}");
+        let said = execute_command(&json!({"command": "echo x", "cwd": "made-later"}), dir.path(), &AtomicBool::new(false), None).unwrap_err();
+        assert!(said.contains("does not exist yet") && said.contains("Nothing was started"), "{said}");
     }
 
     #[cfg(windows)]
