@@ -4758,8 +4758,10 @@ impl App {
                 let widest = cards::most_changed(rows);
                 for (at, row) in rows.iter().enumerate() {
                     let (green, red) = cards::bar(row.added, row.removed, widest);
-                    // (a file that is gone, or that is a program, is shown in Explorer and not opened)
-                    let (icon, tip) = if cards::opens_in_app(&row.path) && self.workspace.join(&row.path).is_file() { ("external-link", t("Open in its app")) } else { ("folder", t("Show in Explorer")) };
+                    // (a file the preview shows is shown beside the conversation; one that is gone, or that is a program, in Explorer and not opened)
+                    let there = self.workspace.join(&row.path).is_file();
+                    let (icon, tip) = if preview::can_show(&row.path) && there { ("panel-right", t("Show beside the conversation")) }
+                                      else if cards::opens_in_app(&row.path) && there { ("external-link", t("Open in its app")) } else { ("folder", t("Show in Explorer")) };
                     let file = CardPart { text: file_row_text(row.added, row.removed, green, red, &row.path), kind: ButtonKind::FileRow, act: CardAct::OpenDiff(*turn, at), width: 0, tip: String::new() };
                     let open = CardPart { text: icon.to_string(), kind: ButtonKind::Icon, act: CardAct::OpenFile(*turn, at), width: s(ds::size::ICON_BUTTON), tip: tip.to_string() };
                     self.card_room(s(30), vec![file, open]);
@@ -4776,7 +4778,7 @@ impl App {
                 self.card_row(&[&format!("{}  ·  {count}", t("Files for you"))], 8, theme::muted(), 26, false);
                 self.card_room(s(4), Vec::new());
                 for path in files {
-                    let tip = if cards::opens_in_app(path) { t("Open in its app") } else { t("Show in Explorer") };
+                    let tip = if preview::can_show(path) { t("Show beside the conversation") } else if cards::opens_in_app(path) { t("Open in its app") } else { t("Show in Explorer") };
                     let file = CardPart { text: path.clone(), kind: ButtonKind::Ghost, act: CardAct::OpenPath(path.clone()), width: 0, tip: tip.to_string() };
                     let show = CardPart { text: "folder".to_string(), kind: ButtonKind::Icon, act: CardAct::ShowPath(path.clone()), width: s(ds::size::ICON_BUTTON), tip: t("Show in Explorer").to_string() };
                     self.card_room(s(30), vec![file, show]);
@@ -4948,7 +4950,17 @@ impl App {
     /// A file of an answer's card, in its own app, or shown in Explorer when it is a program (which the app does not run), or no longer there.
     unsafe fn open_turn_file(&mut self, turn: u64, at: usize) {
         let Some(path) = self.turn_changes.get(&turn).and_then(|files| files.get(at)).map(|file| file.path.clone()) else { return };
-        self.open_workspace_file(&path, false);
+        self.show_workspace_file(&path);
+    }
+
+    /// A file a card names, pressed: beside the conversation when the preview shows its kind (a page, a picture, a PDF, Markdown, a source
+    /// file) and it is there, as a link to it in the answer is; otherwise as [`Self::open_workspace_file`] opens it.
+    unsafe fn show_workspace_file(&mut self, path: &str) {
+        if preview::can_show(path) && self.workspace.join(path).is_file() {
+            self.open_preview(path);
+        } else {
+            self.open_workspace_file(path, false);
+        }
     }
 
     /// A file of the workspace, from its root: in its own app, or shown in Explorer when it is a program (which the app does not run) or when `reveal` asks, or, when it is
@@ -4985,7 +4997,7 @@ impl App {
             CardAct::None => {}
             CardAct::StopHelper(call) => self.helper_stop_pressed(&call),
             CardAct::OpenHelper(call) => self.steps_open(&call),
-            CardAct::OpenPath(path) => self.open_workspace_file(&path, false),
+            CardAct::OpenPath(path) => self.show_workspace_file(&path),
             CardAct::ShowPath(path) => self.open_workspace_file(&path, true),
         }
     }
