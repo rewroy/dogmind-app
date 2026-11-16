@@ -450,7 +450,7 @@ fn names_the_whole_work(object: &str) -> bool {
 /// The turn's note while the person has asked for no changes to the files: what is closed, and the folder that is open for experiments.
 pub fn no_change_note(scratch: &std::path::Path) -> String {
     format!("## No Changes
-The user asked for no changes to the files. create_file and apply_patch are refused in the workspace, and a command that changes files there is reported to you. For an experiment use the scratch folder `{}`: it is outside the workspace and goes when the session ends. create_file and apply_patch write there, and execute_command runs there with cwd set to it. What you tried there, and that the files are unchanged, go at the end of your answer, in a line.", scratch.display())
+The user asked for no changes to the files. create_file and apply_patch are refused in the workspace, and a command that changes files there is reported to you. For an experiment use the scratch folder `{}`: it is outside the workspace and goes when the session ends. create_file and apply_patch write there, and execute_command runs there with cwd set to it.", scratch.display())
 }
 
 /// The error of a write to the workspace while the person has asked for no changes to the files.
