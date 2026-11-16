@@ -2326,13 +2326,15 @@ mod tests {
         // That these still fail is why the prompt offers the others: they read the drive's root, which a container cannot.
         let refused = command("dir", &folder, false);
         println!("dir: {:?} {:?}", refused.status, decode(&refused.stderr));
-        let listed = command("powershell -NoProfile -Command \"(Get-ChildItem -Recurse -Name) -join ','\"", &folder, false);
+        // What runs instead: `dir` and `del` as a model writes them, with what the app puts in their place, and a plain `rmdir /s /q`. (Not
+        // PowerShell's own listing: it starts at the drive's root in the sandbox, and lists the workspace only where it may read the folders above it.)
+        let listed = command(&crate::tools::line_that_runs("dir /s"), &folder, false);
         let names = decode(&listed.stdout);
         assert!(names.contains("b.txt") && names.contains("a.txt"), "{names} {}", decode(&listed.stderr));
-        let gone = command("powershell -NoProfile -Command \"[IO.File]::Delete('b.txt')\"", &folder, false);
+        let gone = command(&crate::tools::line_that_runs("del b.txt"), &folder, false);
         assert_eq!(gone.status, Some(0), "{}", decode(&gone.stderr));
         assert!(!folder.join("b.txt").exists());
-        let tree = command("powershell -NoProfile -Command \"[IO.Directory]::Delete('sub', $true)\"", &folder, false);
+        let tree = command("rmdir /s /q sub", &folder, false);
         assert_eq!(tree.status, Some(0), "{}", decode(&tree.stderr));
         assert!(!folder.join("sub").exists());
     }
