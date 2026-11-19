@@ -172,11 +172,32 @@ pub fn colored_row(runs: &[(String, u32)], face: &str, points: i32, back: u32, w
     )
 }
 
+/// How a column of a Markdown table lines up, as the line under its heading says: `:--:` in the middle, `--:` to the right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// The way each column lines up, from the line under the heading.
+pub fn table_aligns(rule: &[String]) -> Vec<Align> {
+    rule.iter()
+        .map(|cell| match (cell.starts_with(':'), cell.ends_with(':')) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        })
+        .collect()
+}
+
 /// One row of a Markdown table: a cell for each column, with a line under it.
 pub struct TableRow<'a> {
     pub cells: &'a [String],
     /// Where each column ends, in twips from the left.
     pub ends: &'a [i32],
+    /// How each column lines up; one not given, to the left.
+    pub aligns: &'a [Align],
     pub face: &'a str,
     pub points: i32,
     pub color: u32,
@@ -187,11 +208,24 @@ pub struct TableRow<'a> {
 
 pub fn table_row(row: &TableRow) -> String {
     // (a line between two rows is the upper one's foot and the lower one's head: left unsaid, the head is black and wins)
-    let frames: String = row.ends.iter().map(|end| format!("\\clbrdrt\\brdrs\\brdrw10\\brdrcf3\\clbrdrb\\brdrs\\brdrw10\\brdrcf3\\clcfpat1\\clcbpat1\\clshdng10000\\cellx{end}")).collect();
+    // (a cell of one line beside one of two stands in the middle of the row, as its words belong to the whole row)
+    let frames: String = row.ends.iter().map(|end| format!("\\clvertalc\\clbrdrt\\brdrs\\brdrw10\\brdrcf3\\clbrdrb\\brdrs\\brdrw10\\brdrcf3\\clcfpat1\\clcbpat1\\clshdng10000\\cellx{end}")).collect();
     let empty = String::new();
-    let cells: String = (0..row.ends.len()).map(|at| format!("\\pard\\intbl\\ql\\sl0\\sa0\\sb0\\f0\\fs{}\\cf2{} {}\\cell", half_points(row.points), if row.bold { "\\b" } else { "" }, words(row.cells.get(at).unwrap_or(&empty), 4))).collect();
+    // A cell's lines are as far apart as the body's, and its room above and below is its paragraph's spacing: RichEdit gives a cell's own padding (trpadd) only a few pixels.
+    let scale = crate::ui::text_scale();
+    let (spacing, room) = (row.points * 32 * scale / 100, row.points * 13 * scale / 100);
+    let cells: String = (0..row.ends.len())
+        .map(|at| {
+            let align = match row.aligns.get(at) {
+                Some(Align::Center) => "\\qc",
+                Some(Align::Right) => "\\qr",
+                _ => "\\ql",
+            };
+            format!("\\pard\\intbl{align}\\sl-{spacing}\\slmult0\\sb{room}\\sa{room}\\f0\\fs{}\\cf2{} {}\\cell", half_points(row.points), if row.bold { "\\b" } else { "" }, words(row.cells.get(at).unwrap_or(&empty), 4))
+        })
+        .collect();
     format!(
-        "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{color};{line};{quiet};}}\\trowd\\trgaph120\\trleft0\\trpaddt50\\trpaddb50\\trpaddft3\\trpaddfb3{frames}{cells}\\row}}",
+        "{{\\rtf1\\ansi\\deff0{fonts}{{\\colortbl ;{back};{color};{line};{quiet};}}\\trowd\\trgaph120\\trleft0\\trpaddt0\\trpaddb0\\trpaddft3\\trpaddfb3{frames}{cells}\\row}}",
         fonts = font_table(row.face),
         back = channels(row.back),
         color = channels(row.color),
@@ -247,16 +281,37 @@ fn columns_of(text: &str) -> i32 {
     crate::markdown::show_hidden(text).chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
-/// Where each column of these rows ends: each as wide as it needs, and all of them narrowed in step if the column they stand in is too narrow.
+/// Where each column of these rows ends: each as wide as it needs. When the column they stand in is too narrow, a column that needs no more than an even share
+/// of the room keeps its width, so that a short column is not broken because a long one beside it is; the rest each have a part of what is left, and share the
+/// remainder by how much more they need (shared evenly, a long column was as narrow as a short one and ran to many lines; in proportion alone, a short one
+/// beside a very long one was a character wide).
 pub fn table_ends(rows: &[Vec<String>], points: i32, room: i32) -> Vec<i32> {
     const GAP: i32 = 300; // the cell's own margins and a little air
     let count = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let half_width = points * 13; // twips: a half-width character of the type, at its widest
+    let half_width = points * 13 * crate::ui::text_scale() / 100; // twips: a half-width character of the type, at its widest and at the size the settings chose
     let wanted: Vec<i32> = (0..count).map(|at| rows.iter().filter_map(|row| row.get(at)).map(|cell| columns_of(cell)).max().unwrap_or(0).max(2) * half_width + GAP).collect();
-    let total: i32 = wanted.iter().sum();
+    let mut widths = wanted.clone();
+    if wanted.iter().sum::<i32>() > room {
+        let (mut left, mut open): (i32, Vec<usize>) = (room, (0..count).collect());
+        loop {
+            let share = left / open.len().max(1) as i32;
+            let (fit, rest): (Vec<usize>, Vec<usize>) = open.iter().partition(|at| wanted[**at] <= share);
+            if fit.is_empty() || rest.is_empty() {
+                let least = |at: usize| wanted[at].min(left / (2 * rest.len().max(1)) as i32);
+                let spare = i64::from(left - rest.iter().map(|at| least(*at)).sum::<i32>());
+                let more: i64 = rest.iter().map(|at| i64::from(wanted[*at] - least(*at))).sum();
+                for at in &rest {
+                    widths[*at] = least(*at) + (spare * i64::from(wanted[*at] - least(*at)) / more.max(1)) as i32;
+                }
+                break;
+            }
+            left -= fit.iter().map(|at| wanted[*at]).sum::<i32>();
+            open = rest;
+        }
+    }
     let mut end = 0;
-    wanted.iter().map(|width| {
-        end += if total > room { (i64::from(*width) * i64::from(room) / i64::from(total.max(1))) as i32 } else { *width };
+    widths.iter().map(|width| {
+        end += width;
         end
     }).collect()
 }
@@ -283,14 +338,28 @@ mod tests {
         assert_eq!(ends, vec![18 * 130 + 300, 18 * 130 + 300 + 10 * 130 + 300]);
         let narrow = table_ends(&rows, 10, 2000);
         assert!(*narrow.last().unwrap() <= 2000 && narrow[0] > 0 && narrow[0] < narrow[1], "{narrow:?}");
+        // A short column keeps its width beside a long one that is narrowed, and the long ones share what is left, the longer the more.
+        let rows = vec![vec!["short".to_string(), "x".repeat(200), "y".repeat(100)]];
+        let ends = table_ends(&rows, 10, 9000);
+        assert_eq!(ends[0], 5 * 130 + 300, "{ends:?}");
+        let (long, longer) = (ends[2] - ends[1], ends[1] - ends[0]);
+        assert!(longer > long && ends[2] <= 9000 && ends[2] > 8900, "{ends:?}");
+        // and none of them is narrower than a part of the room, however long the others are
+        let ends = table_ends(&[vec!["x".repeat(30), "y".repeat(3000)]], 10, 6000);
+        assert!(ends[0] >= 6000 / 4 && ends[1] <= 6000, "{ends:?}");
     }
 
     #[test]
     fn a_table_row_has_a_cell_for_each_column() {
         let cells = vec!["a{".to_string(), "あ".to_string()];
-        let text = table_row(&TableRow { cells: &cells, ends: &[1000, 2000], face: "F", points: 10, color: 1, back: 2, line: 3, bold: true });
+        let text = table_row(&TableRow { cells: &cells, ends: &[1000, 2000], aligns: &[Align::Left, Align::Right], face: "F", points: 10, color: 1, back: 2, line: 3, bold: true });
         assert_eq!(text.matches("\\cellx").count(), 2);
         assert!(text.contains("a\\{") && text.contains("{\\f1 \\u12354?}") && text.contains("\\b ") && text.ends_with("\\row}"), "{text}");
+        // Its lines as far apart as the body's (1.6 times the type), room above and below in its paragraph, and each cell in the middle of the row.
+        assert!(text.contains("\\sl-320\\slmult0\\sb130\\sa130") && text.matches("\\clvertalc").count() == 2, "{text}");
+        // Each column lines up as the line under the heading says.
+        assert!(text.contains("\\intbl\\ql\\") && text.contains("\\intbl\\qr\\"), "{text}");
+        assert_eq!(table_aligns(&table_cells("|---|:--:|--:|:--|").unwrap()), [Align::Left, Align::Center, Align::Right, Align::Left]);
     }
 
     #[test]
@@ -324,7 +393,7 @@ mod tests {
         let code = colored_row(&runs, "Consolas", 10, 0x332211, 9000, (0, 0));
         assert!(code.contains("{\\cf4 <U+202E>}") && !code.contains("\\u8238"), "{code}");
         let cells = vec![format!("a{bad}b"), "c".to_string()];
-        let table = table_row(&TableRow { cells: &cells, ends: &[1000, 2000], face: "F", points: 10, color: 1, back: 2, line: 3, bold: false });
+        let table = table_row(&TableRow { cells: &cells, ends: &[1000, 2000], aligns: &[], face: "F", points: 10, color: 1, back: 2, line: 3, bold: false });
         assert!(table.contains("{\\cf4 <U+202E>}") && !table.contains("\\u8238"), "{table}");
         assert_eq!(escape(&format!("a{bad}b")), format!("a{wanted}b"), "and where it is only escaped, it is still not let through");
         // Every one of them, each by its code.

@@ -1770,8 +1770,8 @@ enum Shown {
     Answer(String, String),
     /// A line of code, coloured when it is drawn: `open` is whether a block comment runs into it.
     Code { line: String, language: String, open: bool },
-    /// A Markdown table: its first row is the heading. Drawn afresh each time, as its colours and widths depend on the moment.
-    Table(Vec<Vec<String>>),
+    /// A Markdown table: its first row is the heading, and how each column lines up. Drawn afresh each time, as its colours and widths depend on the moment.
+    Table(Vec<Vec<String>>, Vec<rtf::Align>),
     /// A block of code begins here: all of it, for its copy button.
     Block(String),
     /// The pictures of a message and their sizes, at the top of its card. `alone`: no text under them.
@@ -3497,7 +3497,7 @@ impl App {
                     self.append_row(&rtf::Row { lines: &lines, face, points: *points, color: *color, back: *back, width, right: *right, column: self.text_twips, padding: *padding });
                 }
                 Shown::Answer(text, at) => self.answer_row(text, at),
-                Shown::Table(rows) => self.table_rows(rows),
+                Shown::Table(rows, aligns) => self.table_rows(rows, aligns),
                 Shown::Code { line, language, open } => {
                     self.code_row(line, language, *open);
                 }
@@ -3540,20 +3540,23 @@ impl App {
             }
             return;
         }
+        let aligns = rtf::table_aligns(&parsed[1]);
         let rows: Vec<Vec<String>> = parsed.into_iter().enumerate().filter(|(at, _)| *at != 1).map(|(_, row)| row).collect();
-        self.gap_after_a_block();
+        // (as much room over it as under it, as a block of code has)
+        self.room_over_a_block();
         if !self.replaying {
-            self.shown.push(Shown::Table(rows.clone()));
+            self.shown.push(Shown::Table(rows.clone(), aligns.clone()));
         }
-        self.table_rows(&rows);
+        self.table_rows(&rows, &aligns);
         self.para_next = Some(Para::AfterBlock);
     }
 
-    unsafe fn table_rows(&mut self, rows: &[Vec<String>]) {
-        const POINTS: i32 = 10;
+    unsafe fn table_rows(&mut self, rows: &[Vec<String>], aligns: &[rtf::Align]) {
+        // The body's size: a table is read as part of the answer, not as a note beside it.
+        const POINTS: i32 = 11;
         let ends = rtf::table_ends(rows, POINTS, self.text_twips);
         for (at, cells) in rows.iter().enumerate() {
-            let row = rtf::TableRow { cells, ends: &ends, face: UI_FACE, points: POINTS, color: theme::text(), back: if at == 0 { theme::code_back() } else { theme::background() }, line: theme::line(), bold: at == 0 };
+            let row = rtf::TableRow { cells, ends: &ends, aligns, face: UI_FACE, points: POINTS, color: theme::text(), back: if at == 0 { theme::code_back() } else { theme::background() }, line: theme::line(), bold: at == 0 };
             self.insert_rtf(rtf::table_row(&row), Some(theme::text()));
         }
     }
@@ -3564,18 +3567,11 @@ impl App {
         self.append_row(&rtf::Row { lines: &[shown], face: "Consolas", points, color, back: theme::code_back(), width: self.text_twips, right: false, column: 0, padding: (260, 26) });
     }
 
-    /// Before a block or a table: right after another they would read as one, as rows of a table join.
-    unsafe fn gap_after_a_block(&mut self) {
-        if matches!(self.shown.last(), Some(Shown::Row { .. } | Shown::Code { .. } | Shown::Table(_))) {
-            self.append("\n", Style::Gap);
-        }
-    }
-
-    /// Room over a block of code or of a command's output: after another block, as for a table, and after words too, whose paragraph leaves
-    /// little under it (a list's item hardly any), so that the block stood tight under them. Not under a run of calls, whose output it is.
+    /// Room over a block of code, a command's output or a table: after another block, which it would otherwise read as one with, as rows of a table join, and after words
+    /// too, whose paragraph leaves little under it (a list's item hardly any), so that the block stood tight under them. Not under a run of calls, whose output it is.
     unsafe fn room_over_a_block(&mut self) {
         let room = match self.shown.last() {
-            Some(Shown::Row { .. } | Shown::Code { .. } | Shown::Table(_) | Shown::Link(..)) => true,
+            Some(Shown::Row { .. } | Shown::Code { .. } | Shown::Table(..) | Shown::Link(..)) => true,
             Some(Shown::Text(text, style, _)) => *style != Style::Gap && !text.trim().is_empty(),
             _ => false,
         };

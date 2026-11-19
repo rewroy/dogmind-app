@@ -594,10 +594,10 @@ fn blocks(lines: &[&str], out: &mut String, depth: usize) {
         } else if item_of(line).is_some() {
             at = list(lines, at, out, depth);
         } else if trimmed.starts_with('|') && lines.get(at + 1).and_then(|next| crate::rtf::table_cells(next)).is_some_and(|cells| crate::rtf::is_table_rule(&cells)) {
-            let rule = crate::rtf::table_cells(lines[at + 1]).unwrap_or_default();
-            let aligned = |column: usize| match rule.get(column).map(String::as_str) {
-                Some(cell) if cell.starts_with(':') && cell.ends_with(':') => " style=\"text-align:center\"",
-                Some(cell) if cell.ends_with(':') => " style=\"text-align:right\"",
+            let aligns = crate::rtf::table_aligns(&crate::rtf::table_cells(lines[at + 1]).unwrap_or_default());
+            let aligned = |column: usize| match aligns.get(column) {
+                Some(crate::rtf::Align::Center) => " style=\"text-align:center\"",
+                Some(crate::rtf::Align::Right) => " style=\"text-align:right\"",
                 _ => "",
             };
             out.push_str("<table><thead><tr>");
