@@ -178,7 +178,9 @@ fn last_lines(text: &str, count: usize) -> String {
 pub fn write_report(data: &Path, settings: &Settings, about_this_pc: &str) -> Result<PathBuf, String> {
     let mut text = format!("{}\n", version_line());
     let exe = std::env::current_exe().map_or(String::new(), |exe| exe.display().to_string());
-    text.push_str(&format!("Program: {exe}\nThis PC: {about_this_pc}\nLanguage of Windows: {}\n", if crate::lang::system_is_japanese() { "Japanese" } else { "not Japanese" }));
+    // (under what Straydog says of the GPU and the memory: the CPU, the GPU's PCIe link, memory compression and the page file, which two PCs
+    // with the same GPU differed by fivefold and the report could not tell apart)
+    text.push_str(&format!("Program: {exe}\nThis PC: {about_this_pc}\n{}Language of Windows: {}\n", crate::pc_facts::read(), if crate::lang::system_is_japanese() { "Japanese" } else { "not Japanese" }));
     text.push_str(&format!("Reaching a model by: {}\nEngine's port: {}\n", settings.active_provider().map_or("none", |provider| provider.kind.label()), settings.port));
     if let Some(folder) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
         text.push_str("\nBeside the program:\n");
