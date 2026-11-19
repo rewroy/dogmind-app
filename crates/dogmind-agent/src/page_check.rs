@@ -17,7 +17,8 @@ const LIMIT: Duration = Duration::from_secs(20);
 /// from raising a dialog is the error mode and the job's limit, in `sandbox`.)
 /// `msWindowsTaskManager` is off because Edge's part that tells the Windows Task Manager of its processes (`WindowsTaskManagerHandler::DoTasksUpdated`, in msedge.dll) reads through a
 /// null when the registration it makes fails, which it does in a container: the browser ended with 0xc0000005 in about 6 runs of 10 on this machine, always there, and in none of
-/// 90 with the feature off. A browser that does not know the name (Chrome) ignores it.
+/// 90 with the feature off. A browser that does not know the name (Chrome) ignores it. `DisableLoadExtensionCommandLineSwitch` is off for a branded Chrome, which since 137 loads no
+/// extension from the command line otherwise: the one extension a run loads is that of [`FRAMES`], and every other is off (`extension_flags`).
 /// The flags, with what a debug build is told to add (for a look at what the browser does in the sandbox).
 fn flags() -> String {
     #[cfg(debug_assertions)]
@@ -26,7 +27,19 @@ fn flags() -> String {
     }
     FLAGS.to_string()
 }
-const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-extensions --disable-background-networking --disable-sync --disable-component-update --disable-features=msWindowsTaskManager --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
+const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-background-networking --disable-sync --disable-component-update --disable-features=msWindowsTaskManager,DisableLoadExtensionCommandLineSwitch --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
+
+/// What is added to [`FLAGS`] for the extensions: the frames' alone when its folder is there (`frames_extension`), and none at all when it is not.
+fn extension_flags(frames: Option<&Path>) -> String {
+    match frames {
+        Some(folder) => {
+            let folder = folder.display().to_string();
+            let folder = folder.trim_start_matches("\\\\?\\");
+            format!(" --disable-extensions-except=\"{folder}\" --load-extension=\"{folder}\"")
+        }
+        None => " --disable-extensions".to_string(),
+    }
+}
 
 /// The command line of a run that dumps the page's DOM, as the sandbox's shell is given it: `%TEMP%` is the container's own folder, where the run's profile is.
 fn page_line(program: &Path, flags: &str, wait: u64, profile: &str, address: &str) -> String {
@@ -359,11 +372,38 @@ fn with_script(html: &str, base: &str, script: &str) -> String {
     out
 }
 
+// (the script of [`FRAMES`], which its extension takes as it is)
+macro_rules! frames_js {
+    () => {
+        "(() => { let next = 1; const waiting = new Map(); window.requestAnimationFrame = (callback) => { const id = next++; waiting.set(id, setTimeout(() => { waiting.delete(id); callback(performance.now()); }, 16)); return id; }; window.cancelAnimationFrame = (id) => { clearTimeout(waiting.get(id)); waiting.delete(id); }; })();"
+    };
+}
 /// A browser given a time budget (`--virtual-time-budget`) runs a page's timers on it and draws no frames: `requestAnimationFrame` never calls back,
 /// and every game or animation drawn that way stood at its first frame in a check, its loop never run (a model spent its turn on why `frames=0`).
 /// These two take the page's frames from its timers instead, one every 16 ms of its time, as a screen at 60 a second would, with the time a frame is
 /// given as `requestAnimationFrame` gives it. Before any script of the page's own.
-const FRAMES: &str = "<script>(() => { let next = 1; const waiting = new Map(); window.requestAnimationFrame = (callback) => { const id = next++; waiting.set(id, setTimeout(() => { waiting.delete(id); callback(performance.now()); }, 16)); return id; }; window.cancelAnimationFrame = (id) => { clearTimeout(waiting.get(id)); waiting.delete(id); }; })();</script>";
+/// It is put in every page a run opens, a page of the workspace, a server's and the pictures' frames alike, by an extension of the browser's whose script runs in the page's own world
+/// before anything of the page's (`frames_extension`); and in the copy of a page of the workspace too, for a browser that loads no extension.
+const FRAMES: &str = concat!("<script>", frames_js!(), "</script>");
+const FRAMES_MANIFEST: &str = r#"{"manifest_version": 3, "name": "Dogmind page frames", "version": "1.0", "content_scripts": [{"matches": ["<all_urls>"], "js": ["frames.js"], "run_at": "document_start", "all_frames": true, "match_about_blank": true, "world": "MAIN"}]}"#;
+
+/// The folder of the extension that puts [`FRAMES`] in each page, in the sandbox's folder `temp`, written there if it is not yet: its name has its contents' digest in it, so two copies
+/// of the app with other contents each have theirs. None if it could not be written.
+fn frames_extension(temp: &Path) -> Option<PathBuf> {
+    let digest = FRAMES_MANIFEST.bytes().chain(frames_js!().bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let folder = temp.join(format!("dogmind-frames-{:016x}", digest));
+    for (name, contents) in [("manifest.json", FRAMES_MANIFEST), ("frames.js", frames_js!())] {
+        let file = folder.join(name);
+        if std::fs::read_to_string(&file).ok().as_deref() != Some(contents) {
+            std::fs::create_dir_all(&folder).ok()?;
+            // (another process may be writing the same: what it writes is the same)
+            if std::fs::write(&file, contents).is_err() && std::fs::read_to_string(&file).ok().as_deref() != Some(contents) {
+                return None;
+            }
+        }
+    }
+    Some(folder)
+}
 
 /// The page with [`FRAMES`] first: after `<head>` (or `<html>`, or the doctype), where no script of the page's comes before it, and not before the doctype, which would put the page in quirks mode.
 fn with_frames(html: &str) -> String {
@@ -1105,7 +1145,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     };
     // (the script that reads a plain page's words waits for the page's time to be up, so the browser is given a little more of it than that)
     let run_wait = if steps.is_none() && copy_name.is_some() { wait + READ_MARGIN_MS } else { wait };
-    let browser_flags = flags();
+    let browser_flags = flags() + &extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
     let mut ended_as = EndOfRun::Stopped;
@@ -1719,6 +1759,25 @@ mod tests {
         assert!(both.starts_with("Shows (read at 1280x800; from the page's DOM"), "{both}");
     }
 
+    /// The frames' extension is written once into the folder, under a name of its contents, and is the one extension a run lets in; with none, a run has none at all.
+    #[test]
+    fn the_frames_extension_is_written_once_and_is_the_one_a_run_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = frames_extension(temp.path()).unwrap();
+        assert!(folder.file_name().unwrap().to_string_lossy().starts_with("dogmind-frames-"), "{}", folder.display());
+        assert_eq!(std::fs::read_to_string(folder.join("frames.js")).unwrap(), frames_js!());
+        let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("manifest.json")).unwrap()).unwrap();
+        let scripts = &manifest["content_scripts"][0];
+        assert_eq!((scripts["world"].as_str(), scripts["run_at"].as_str(), scripts["all_frames"].as_bool()), (Some("MAIN"), Some("document_start"), Some(true)));
+        assert_eq!(frames_extension(temp.path()).unwrap(), folder, "the same folder again");
+        assert!(!is_run_leftover(&folder.file_name().unwrap().to_string_lossy()), "it is not a run's to clear");
+        let flags = extension_flags(Some(&folder));
+        assert!(flags.contains(&format!("--disable-extensions-except=\"{}\"", folder.display())) && flags.contains("--load-extension="), "{flags}");
+        assert_eq!(extension_flags(None), " --disable-extensions");
+        assert!(!FLAGS.split(' ').any(|flag| flag == "--disable-extensions"), "which would keep the frames' extension out");
+        assert!(FRAMES.starts_with("<script>(() =>") && FRAMES.ends_with("})();</script>"));
+    }
+
     /// The frames' script goes before any of the page's own, and never before its doctype (quirks mode): after `<head>`, else `<html>`, else the doctype.
     #[test]
     fn the_frames_go_before_the_pages_own_scripts_and_after_its_doctype() {
@@ -1823,6 +1882,26 @@ mod tests {
         assert!(said.contains("module ran: http://127.0.0.1:8765") && said.contains("text: from a module"), "{said}");
         assert!(!said.contains("Permissions-Policy"), "the browser's own words are not the page's: {said}");
         assert!(said.contains("How it looks at desktop"), "{said}");
+    }
+
+    /// With the real browser, in the real sandbox: a page a server gives runs its animation frames too, by the extension, as no copy of it is made.
+    #[test]
+    #[ignore = "starts Edge and a server in the sandbox"]
+    fn a_page_a_local_server_gives_runs_its_animation_frames() {
+        let (dir, _) = page(&[(
+            "index.html",
+            "<!DOCTYPE html><title>served</title><div id=o>start</div><script>let frames = 0; function step() { frames++; document.getElementById('o').textContent = 'frames ' + (frames > 30 ? 'many' : frames); requestAnimationFrame(step); } requestAnimationFrame(step);</script>",
+        )]);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (folder, halt) = (dir.path().to_path_buf(), stop.clone());
+        let server = std::thread::spawn(move || crate::sandbox::run("python -m http.server 8766 --bind 127.0.0.1", &folder, &folder, false, Duration::from_secs(90), &halt));
+        std::thread::sleep(Duration::from_secs(8));
+        let said = check_page(&serde_json::json!({"url": "http://127.0.0.1:8766/index.html"}), dir.path(), &AtomicBool::new(false));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = server.join();
+        let said = said.unwrap();
+        println!("{said}");
+        assert!(said.contains("text: frames many"), "{said}");
     }
 
     /// A run has a limit of its own from the wait it was given, a hang is tried once more and no more, and only a run that was ended by its time is a hang.
