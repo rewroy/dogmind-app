@@ -518,11 +518,30 @@ impl Provider for Client {
 
     /// Straydog's API takes them, and its template shows them inside the tool's response. The services' chat completions take text there.
     fn images_in_tool_results(&self) -> bool {
-        self.replay_reasoning && self.vision != Some(false)
+        self.replay_reasoning && self.reads_pictures() != Some(false)
     }
 
+    /// What the server said when the session connected; where that was no, `/props` is asked again (at most every
+    /// [`VISION_ASKED_AGAIN`]): a Straydog restarted with its vision encoder beside the model reads pictures, and a session connected
+    /// before had refused every picture as "this model reads no pictures" until the app was started again.
     fn reads_pictures(&self) -> Option<bool> {
-        self.vision
+        if self.vision != Some(false) {
+            return self.vision;
+        }
+        let mut asked = self.vision_asked.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((at, said)) = *asked {
+            if at.elapsed() < VISION_ASKED_AGAIN {
+                return said;
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        // (no answer, or none about pictures: what the session was told stands)
+        let said = match self.get_json(&self.root("/props"), &cancel, Duration::from_secs(3)) {
+            Ok((200, props)) => props.pointer("/modalities/vision").and_then(Value::as_bool).or(Some(false)),
+            _ => Some(false),
+        };
+        *asked = Some((std::time::Instant::now(), said));
+        said
     }
 
     /// Straydog where it says it sends the calls as they are written (`tool_writing`); of other servers, OpenAI's own API, which streams
@@ -601,11 +620,18 @@ pub struct Client {
     pub tool_writing: bool,
     /// Whether the model reads pictures, where the server says (`/props`): a picture is never sent to one that does not.
     pub vision: Option<bool>,
+    /// What `/props` said of pictures when asked again, and when ([`Client::reads_pictures`]): a server that read none when the session
+    /// connected may read them after a restart, its vision encoder put beside the model.
+    pub vision_asked: std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Option<bool>)>>>,
 }
+
+/// How long an answer of `/props` that the model reads no pictures holds before it is asked again ([`Client::reads_pictures`]).
+const VISION_ASKED_AGAIN: Duration = Duration::from_secs(10);
 
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
-        Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None })
+        Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None,
+                    vision_asked: Default::default() })
     }
 
     /// The request a model's turn is sent as, for this server.
@@ -938,6 +964,41 @@ mod tests {
         client.vision = None;
         client.replay_reasoning = false;
         assert!(!client.images_in_tool_results(), "a server that is not Straydog, as before");
+    }
+
+    /// A client of a server that answers `GET /props` with this, and anything else with `{}`.
+    fn answering_props(props: &'static str) -> Client {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 4096];
+                    let Ok(count) = stream.read(&mut request) else { return };
+                    let body = if String::from_utf8_lossy(&request[..count]).starts_with("GET /props") { props } else { "{}" };
+                    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+                    while matches!(stream.read(&mut request), Ok(count) if count > 0) {}
+                });
+            }
+        });
+        Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap()
+    }
+
+    /// A session told when it connected that the model reads no pictures asks `/props` again, so that a server restarted with its vision
+    /// encoder is seen without starting the app again; where nothing answers, or the server still says no, the no stands.
+    #[test]
+    fn a_session_told_no_pictures_asks_again_and_sees_a_server_that_reads_them_now() {
+        let mut client = answering_props(r#"{"modalities": {"vision": true, "audio": false}}"#);
+        client.vision = Some(false);
+        assert_eq!(client.reads_pictures(), Some(true));
+        assert!(client.images_in_tool_results());
+        let mut silent = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        silent.vision = Some(false);
+        assert_eq!(silent.reads_pictures(), Some(false), "no answer");
+        let mut still = answering_props(r#"{"modalities": {"vision": false, "audio": false}}"#);
+        still.vision = Some(false);
+        assert_eq!(still.reads_pictures(), Some(false), "the server still says no");
     }
 
     /// A client of a server that answers `GET /slots` with this, and anything else with `{}`.
