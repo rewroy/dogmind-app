@@ -2120,8 +2120,19 @@ fn del_stand_in(words: &[String]) -> Option<String> {
     if files.is_empty() || files.iter().any(|file| file.contains('\'')) {
         return None;
     }
-    let delete = |file: &str| format!("powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('{file}')\"");
-    Some(files.iter().map(|file| if file.contains(['*', '?']) { format!("for %d in (\"{file}\") do @{}", delete("%d")) } else { delete(file) }).collect::<Vec<_>>().join(" & "))
+    // (`[IO.File]::Delete` says nothing of a file that is not there, and a pattern that matches nothing runs no delete: each says so, as `del` does, or a delete outside the
+    // workspace, where the container sees no file, and one of a misspelt name, were told to the model as done. PowerShell started in the container says on its error output that
+    // it could not set up the drives, each time, in the system's language: that line is none of the delete's, and was taken for a failed one; what the delete has to say goes to
+    // the output instead.)
+    let missing = |file: &str| format!("[Console]::Out.WriteLine('Could Not Find {file}'); exit 1");
+    let delete = |file: &str| {
+        format!(
+            "powershell -NoProfile -NonInteractive -Command \"if (-not ([IO.File]::Exists('{file}') -or [IO.Directory]::Exists('{file}'))) {{ {} }} try {{ [IO.File]::Delete('{file}') }} catch {{ [Console]::Out.WriteLine($_.Exception.GetBaseException().Message); exit 1 }}\" 2>nul",
+            missing(file)
+        )
+    };
+    let matched = |file: &str| format!("if exist \"{file}\" (for %d in (\"{file}\") do @{}) else (powershell -NoProfile -NonInteractive -Command \"{}\" 2>nul)", delete("%d"), missing(file));
+    Some(files.iter().map(|file| if file.contains(['*', '?']) { matched(file) } else { delete(file) }).collect::<Vec<_>>().join(" & "))
 }
 
 /// One step of a line, with `dir` or `del` in the forms that say plainly what they want replaced by what does that.
@@ -4354,7 +4365,10 @@ mod tests {
         let line = with_stand_ins("mkdir vendor 2>nul & curl -o vendor/a.js https://x.example/a.js & dir vendor");
         assert!(line.starts_with("mkdir vendor 2>nul & curl -o vendor/a.js https://x.example/a.js & (if exist"), "{line}");
         let del = with_stand_ins("del /q a.txt \"b c.txt\"");
-        assert_eq!(del, "(powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\" & powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('b c.txt')\")");
+        assert!(del.starts_with("(powershell -NoProfile -NonInteractive -Command ") && del.matches("powershell").count() == 2 && !del.contains("del "), "{del}");
+        for file in ["a.txt", "b c.txt"] {
+            assert!(del.contains(&format!("[IO.File]::Delete('{file}')")) && del.contains(&format!("Could Not Find {file}")), "{file}: {del}");
+        }
         assert!(with_stand_ins("erase *.log").contains("for %d in (\"*.log\") do @powershell"));
         let piped = with_stand_ins("dir /b vendor | findstr three");
         assert!(piped.starts_with("((for /d %d in (\"vendor\\*\")") && !piped.contains("if exist") && piped.ends_with("| findstr three"), "{piped}");
@@ -4379,12 +4393,13 @@ mod tests {
         for same in ["echo hi", "python x.py", "if exist x (del x)", "dir > out.txt", "echo a\necho b", "python -c \"print(1)\nprint(2)\""] {
             assert_eq!(line_that_runs(same), same, "joining the lines alone is not told of: {same}");
         }
-        assert_eq!(line_that_runs("del a.txt"), "(powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\")");
+        assert_eq!(line_that_runs("del a.txt"), with_stand_ins("del a.txt"));
+        assert!(line_that_runs("del a.txt").starts_with("(powershell -NoProfile -NonInteractive -Command "));
         assert_eq!(line_that_runs("x | head -60"), "x | findstr \"^\"");
         assert_eq!(line_that_runs("dir /s *.js"), with_stand_ins("dir /s *.js"));
         // Lines are joined before the stand-ins go in, so that a `del` on the second one is replaced too.
         let two = line_that_runs("echo a\ndel a.txt");
-        assert_eq!(two, "echo a & (powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\")", "{two}");
+        assert_eq!(two, format!("echo a & {}", with_stand_ins("del a.txt")), "{two}");
         // A line that is refused is not run, so there is nothing else for it to be.
         assert_eq!(line_that_runs("echo \"a\nb\"\ndel x"), "echo \"a\nb\"\ndel x");
     }

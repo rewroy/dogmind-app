@@ -2556,6 +2556,47 @@ mod tests {
         assert!(!folder.join("sub").exists());
     }
 
+    /// A `del` of what is not there says so, as `del` does: a name the container does not see (outside the workspace, or misspelt) was a delete with nothing said and exit 0.
+    #[test]
+    fn a_del_of_what_is_not_there_says_so_and_one_of_what_is_deletes_it() {
+        let folder = work_folder("del-missing");
+        let outside = work_folder("del-outside");
+        std::fs::write(outside.join("kept.txt"), "a").unwrap();
+        assert_eq!(command("echo a> a.log & echo b> b.log & echo c> c.txt", &folder, false).status, Some(0));
+        let run = |line: &str| command(&crate::tools::line_that_runs(line), &folder, false);
+        let missing = run("del /q nothere.txt");
+        assert_eq!(missing.status, Some(1));
+        assert!(decode(&missing.stdout).contains("Could Not Find nothere.txt"), "{}", decode(&missing.stdout));
+        let none = run("del *.tmp");
+        assert_ne!(none.status, Some(0));
+        assert!(decode(&none.stdout).contains("Could Not Find *.tmp"), "{}", decode(&none.stdout));
+        let elsewhere = format!("{}\\*", outside.display());
+        let refused = run(&format!("del /q {elsewhere}"));
+        assert_ne!(refused.status, Some(0), "{}", decode(&refused.stderr));
+        assert!(decode(&refused.stdout).contains("Could Not Find"), "{}", decode(&refused.stdout));
+        assert!(outside.join("kept.txt").exists());
+        let logs = run("del /q *.log");
+        assert_eq!(logs.status, Some(0), "{}", decode(&logs.stderr));
+        assert!(!folder.join("a.log").exists() && !folder.join("b.log").exists() && folder.join("c.txt").exists());
+        // (nothing on the error output of a delete that went as it should: PowerShell's word of the drives it could not set up is not the delete's)
+        assert_eq!((decode(&logs.stdout), decode(&logs.stderr)), (String::new(), String::new()));
+        let one = run("del c.txt");
+        assert_eq!(one.status, Some(0), "{}", decode(&one.stderr));
+        assert!(!folder.join("c.txt").exists());
+        // One that cannot be deleted says why, as `del` says "Access is denied" of a read-only file.
+        let kept = folder.join("ro.txt");
+        std::fs::write(&kept, "a").unwrap();
+        let mut permissions = std::fs::metadata(&kept).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&kept, permissions.clone()).unwrap();
+        let denied = run("del ro.txt");
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&kept, permissions).unwrap();
+        assert_eq!(denied.status, Some(1));
+        assert!(decode(&denied.stdout).contains("ro.txt") && kept.exists(), "{}", decode(&denied.stdout));
+    }
+
     /// In a temp folder, which goes with the test. The one sandbox test written to run on its own: `--skip sandbox::` leaves it out with the others.
     #[test]
     fn a_command_cannot_plant_what_would_run_outside_the_sandbox_and_git_still_works() {
