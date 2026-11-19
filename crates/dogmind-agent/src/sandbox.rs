@@ -542,6 +542,147 @@ struct Sid(PSID);
 unsafe impl Send for Sid {}
 unsafe impl Sync for Sid {}
 
+/// A SID made from its text, freed with it.
+struct OwnedSid(PSID);
+
+impl OwnedSid {
+    unsafe fn from_text(text: &str) -> Result<OwnedSid, String> {
+        let mut sid: PSID = std::ptr::null_mut();
+        if ConvertStringSidToSidW(wide(text).as_ptr(), &mut sid) == 0 {
+            return Err(last_error("a workspace's SID"));
+        }
+        Ok(OwnedSid(sid))
+    }
+}
+
+impl Drop for OwnedSid {
+    fn drop(&mut self) {
+        // SAFETY: a SID that ConvertStringSidToSidW allocated for this value.
+        unsafe { LocalFree(self.0 as HLOCAL) };
+    }
+}
+
+/// The SID a workspace's commands that run with a restricted token write as ([`restricted_token`]): a random one in the form of a domain account's, made once for
+/// the workspace and kept beside the app's other files, as Codex keeps its own. One workspace's commands cannot write in another's.
+fn workspace_sid_text(root: &Path) -> String {
+    static MADE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    let place = key(&real(root));
+    let file = crate::workspace_grants::data_folder().map(|folder| folder.join("workspace-sids.txt"));
+    let mut made = MADE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let made = made.get_or_insert_with(|| {
+        let text = file.as_ref().and_then(|file| std::fs::read_to_string(file).ok()).unwrap_or_default();
+        text.lines().filter_map(|line| line.split_once('\t')).map(|(sid, place)| (place.to_string(), sid.to_string())).collect()
+    });
+    if let Some(sid) = made.get(&place) {
+        return sid.clone();
+    }
+    let sid = random_sid_text();
+    made.insert(place.clone(), sid.clone());
+    if let Some(file) = file {
+        use std::io::Write;
+        if let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(&file) {
+            let _ = writeln!(out, "{sid}\t{place}");
+        }
+    }
+    sid
+}
+
+fn random_sid_text() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos());
+    let part = |n: u64| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(n);
+        hasher.write_u128(now);
+        hasher.write_u32(std::process::id());
+        hasher.finish() as u32
+    };
+    format!("S-1-5-21-{}-{}-{}-{}", part(1), part(2), part(3), part(4).max(1000))
+}
+
+/// A primary token for a command that reads as the person does and writes only where `writer` may, made as Codex's Windows sandbox makes its own (RestrictedToken):
+/// the person's token with no privilege but going through folders (`DISABLE_MAX_PRIVILEGE`, `LUA_TOKEN`), and `WRITE_RESTRICTED`, so that the restricting SIDs
+/// (`writer`, the logon session's and Everyone) are looked at for writes alone. What it makes with no list of its own can be opened by its logon session only.
+unsafe fn restricted_token(writer: PSID) -> Result<Handle, String> {
+    use windows_sys::Win32::System::SystemServices::SE_GROUP_LOGON_ID;
+    let mut own: HANDLE = std::ptr::null_mut();
+    let rights = TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID | TOKEN_ADJUST_PRIVILEGES;
+    if OpenProcessToken(GetCurrentProcess(), rights, &mut own) == 0 {
+        return Err(last_error("the app's token"));
+    }
+    let own = Handle(own);
+    let mut needed = 0u32;
+    GetTokenInformation(own.0, TokenGroups, std::ptr::null_mut(), 0, &mut needed);
+    // (words, for the alignment of what is read out of it)
+    let mut groups = vec![0usize; needed as usize / std::mem::size_of::<usize>() + 1];
+    if GetTokenInformation(own.0, TokenGroups, groups.as_mut_ptr().cast(), needed, &mut needed) == 0 {
+        return Err(last_error("the app's token's groups"));
+    }
+    let list = &*(groups.as_ptr() as *const TOKEN_GROUPS);
+    let entries = std::slice::from_raw_parts(list.Groups.as_ptr(), list.GroupCount as usize);
+    let logon_flag = SE_GROUP_LOGON_ID as u32;
+    let logon = entries.iter().find(|group| group.Attributes & logon_flag == logon_flag).map(|group| group.Sid).ok_or("the app's token has no logon SID")?;
+    let mut world = [0usize; 12];
+    let mut size = std::mem::size_of_val(&world) as u32;
+    if CreateWellKnownSid(WinWorldSid, std::ptr::null_mut(), world.as_mut_ptr().cast(), &mut size) == 0 {
+        return Err(last_error("the SID of Everyone"));
+    }
+    let restricting = [writer, logon, world.as_mut_ptr().cast()].map(|sid| SID_AND_ATTRIBUTES { Sid: sid, Attributes: 0 });
+    let mut made: HANDLE = std::ptr::null_mut();
+    if CreateRestrictedToken(own.0, DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED, 0, std::ptr::null(), 0, std::ptr::null(), restricting.len() as u32, restricting.as_ptr(), &mut made) == 0 {
+        return Err(last_error("a restricted token"));
+    }
+    let made = Handle(made);
+    // What it makes with no list of its own: its logon session's, and the owner's implicit right to change the list taken away (OWNER RIGHTS: read it only).
+    let owner_rights = OwnedSid::from_text("S-1-3-4")?;
+    let entries = [(logon, GENERIC_ALL), (owner_rights.0, READ_CONTROL)].map(|(sid, rights)| {
+        let mut access: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        access.grfAccessPermissions = rights;
+        access.grfAccessMode = GRANT_ACCESS;
+        access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        access.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+        access.Trustee.ptstrName = sid as *mut u16;
+        access
+    });
+    let mut default: *mut ACL = std::ptr::null_mut();
+    let merged = SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), std::ptr::null(), &mut default);
+    if merged != 0 {
+        return Err(format!("a restricted token's default list could not be made (error {merged})"));
+    }
+    let info = TOKEN_DEFAULT_DACL { DefaultDacl: default };
+    let set = SetTokenInformation(made.0, TokenDefaultDacl, std::ptr::addr_of!(info).cast(), std::mem::size_of_val(&info) as u32);
+    LocalFree(default as HLOCAL);
+    if set == 0 {
+        return Err(last_error("a restricted token's default list"));
+    }
+    let mut luid: LUID = std::mem::zeroed();
+    if LookupPrivilegeValueW(std::ptr::null(), wide("SeChangeNotifyPrivilege").as_ptr(), &mut luid) != 0 {
+        let privileges = TOKEN_PRIVILEGES { PrivilegeCount: 1, Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }] };
+        AdjustTokenPrivileges(made.0, 0, &privileges, 0, std::ptr::null_mut(), std::ptr::null_mut());
+    }
+    drop(groups);
+    Ok(made)
+}
+
+/// What a command run with a restricted token needs before it starts: write for its SID in the workspace and in the temp folder its environment names, and the workspace's
+/// repositories guarded for that SID as for the container's (no new config or hooks). Nothing to read is opened: it reads as the person does.
+unsafe fn prepare_restricted(workspace: &Path, writer: PSID, temp: Option<&Path>, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
+    let began = Instant::now();
+    grant(workspace, writer, READ_WRITE_EXECUTE, true)?;
+    if let Some(temp) = temp {
+        grant(temp, writer, READ_WRITE_EXECUTE, true)?;
+    }
+    times.grant += began.elapsed();
+    let began = Instant::now();
+    let looked = look_after_repositories(workspace, writer, Look::BeforeACommand);
+    times.repos += began.elapsed();
+    *disarmed = looked.said;
+    if let Some(refusal) = looked.refused {
+        return Err(if disarmed.is_empty() { refusal } else { format!("{refusal}. The app also did this, in a repository made since the last command: {}", disarmed.join(" ")) });
+    }
+    Ok(())
+}
+
 static PROFILE_SID: Mutex<Option<Sid>> = Mutex::new(None);
 static GRANTED: Mutex<Option<HashSet<(String, u32, bool)>>> = Mutex::new(None);
 
@@ -901,16 +1042,20 @@ pub(crate) fn restore_dacl_text(path: &Path, text: &str) -> Result<(), String> {
 /// The container's SID in its text form.
 #[cfg(test)]
 pub(crate) fn profile_sid_text() -> String {
-    // SAFETY: the text is the system's to free, and is copied before that.
-    unsafe {
-        let sid = profile_sid().unwrap();
-        let mut text: *mut u16 = std::ptr::null_mut();
-        ConvertSidToStringSidW(sid, &mut text);
-        let length = (0..).take_while(|&at| *text.add(at) != 0).count();
-        let out = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
-        LocalFree(text as HLOCAL);
-        out
+    // SAFETY: the SID lives as long as the process.
+    unsafe { sid_text(profile_sid().unwrap()) }
+}
+
+/// A SID as its text (S-1-...); empty if the system cannot say it.
+unsafe fn sid_text(sid: PSID) -> String {
+    let mut text: *mut u16 = std::ptr::null_mut();
+    if ConvertSidToStringSidW(sid, &mut text) == 0 || text.is_null() {
+        return String::new();
     }
+    let length = (0..).take_while(|&at| *text.add(at) != 0).count();
+    let out = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+    LocalFree(text as HLOCAL);
+    out
 }
 
 /// One of the lists of what was given, whole or not at all, before what it says is done. Flushed first: after a power cut a rename can stand on a file with nothing in it, and a list with
@@ -1474,9 +1619,10 @@ fn memory_cap_from(commit_available: u64, ram: u64, least: u64, left_for_the_res
     commit_available.saturating_sub(left_for_the_rest).min(ram / 4 * 3).max(least)
 }
 
-/// One ACE for the profile, once: propagating it through a tree is what costs, and it persists.
+/// One ACE for the profile, once: propagating it through a tree is what costs, and it persists. (Remembered by the SID too: a restricted command's workspace SID granted a
+/// folder is not the container's grant of it, which a later command of the container would otherwise skip, and start in a folder it may not open.)
 pub(crate) unsafe fn grant(path: &Path, sid: PSID, mask: u32, inherit: bool) -> Result<(), String> {
-    let memo = (key(path), mask, inherit);
+    let memo = (format!("{}|{}", sid_text(sid), key(path)), mask, inherit);
     {
         let mut granted = GRANTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if granted.get_or_insert_with(HashSet::new).contains(&memo) {
@@ -1627,12 +1773,73 @@ unsafe fn profile_folder(sid: PSID) -> Option<PathBuf> {
     Some(path)
 }
 
+/// What points a command that runs with a restricted token away from the network when it was not let reach it, as Codex's own sandbox does: a proxy that is not there for what
+/// honours one, and the offline switches of cargo, npm and pip. Nothing enforces it.
+const OFFLINE: [(&str, &str); 10] = [
+    ("HTTP_PROXY", "http://127.0.0.1:9"), ("HTTPS_PROXY", "http://127.0.0.1:9"), ("ALL_PROXY", "http://127.0.0.1:9"), ("NO_PROXY", "localhost,127.0.0.1,::1"),
+    ("GIT_HTTP_PROXY", "http://127.0.0.1:9"), ("GIT_HTTPS_PROXY", "http://127.0.0.1:9"), ("CARGO_NET_OFFLINE", "true"), ("NPM_CONFIG_OFFLINE", "true"),
+    ("PIP_NO_INDEX", "1"), ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
+];
+
+/// Where a command's Python finds `PYTHON_SHIM` as its sitecustomize: a folder of the sandbox's own temp folder, put first on PYTHONPATH.
+const PYTHON_SHIM_FOLDER: &str = "dogmind-python";
+/// The sitecustomize a command's Python starts with, whichever Python it is (a person's own has none of the bundled one's): see its own words.
+const PYTHON_SHIM: &str = r#"# Dogmind's, for a command in its sandbox. On Windows, Python 3.13 and later make a folder of mode 0o700 (tempfile.mkdtemp, TemporaryDirectory,
+# pytest's tmp_path, pip) with a list of only the user, SYSTEM and the administrators on it, which shuts a process under an AppContainer out of
+# the folder it has just made: a test that uses one fails with Permission denied, and the folder cannot be removed. It is made with its parent's
+# list instead, as Python made it before 3.13. The sitecustomize that comes after this one on the path (a bundled Python's, or a project's) runs too.
+import os
+import sys
+
+if os.name == "nt" and not getattr(os.mkdir, "_dogmind_open", False):
+    _dogmind_mkdir = os.mkdir
+
+    def _dogmind_open_mkdir(path, mode=0o777, *, dir_fd=None):
+        return _dogmind_mkdir(path, 0o777 if mode == 0o700 else mode, dir_fd=dir_fd)
+
+    _dogmind_open_mkdir._dogmind_open = True
+    os.mkdir = _dogmind_open_mkdir
+
+
+def _dogmind_next_sitecustomize():
+    import importlib.machinery
+    import importlib.util
+
+    here = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
+    rest = [entry for entry in sys.path if os.path.normcase(os.path.abspath(entry or os.curdir)) != here]
+    spec = importlib.machinery.PathFinder.find_spec("sitecustomize", rest)
+    if spec is not None and spec.loader is not None:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+
+_dogmind_next_sitecustomize()
+"#;
+
+/// `PYTHON_SHIM` in the sandbox's temp folder, written where it is not there as it is. A command can read it there, and nothing a command does to it outlasts the next.
+fn put_python_shim(temp: &str) {
+    if temp.is_empty() {
+        return;
+    }
+    let file = Path::new(temp).join(PYTHON_SHIM_FOLDER).join("sitecustomize.py");
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(PYTHON_SHIM) {
+        let _ = std::fs::create_dir_all(file.parent().expect("a folder"));
+        let _ = std::fs::write(&file, PYTHON_SHIM);
+    }
+}
+
 /// A command's environment, as the block CreateProcess takes. `build_tools` is asked for the compiler's folders only when the app has no `LIB` of its own: the command's start waits for it, so it
 /// is given the time the command has and the person's Stop (see `crate::msvc::found_before`).
-fn environment(temp: Option<&Path>, workspace: &Path, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<u16> {
+fn environment(temp: Option<&Path>, workspace: &Path, offline: bool, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<u16> {
     let block: Vec<(String, String)> = VARIABLES.iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
     let temp = temp.map(|path| path.display().to_string()).or_else(|| std::env::var("TEMP").ok()).unwrap_or_default();
-    let block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, build_tools);
+    put_python_shim(&temp);
+    let mut block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, build_tools);
+    if offline {
+        block.retain(|(name, _)| !OFFLINE.iter().any(|(set, _)| set.eq_ignore_ascii_case(name)));
+        block.extend(OFFLINE.iter().map(|(name, value)| (name.to_string(), value.to_string())));
+        block.sort_by_key(|(name, _)| name.to_uppercase());
+    }
     let mut out = Vec::new();
     for (name, value) in block {
         out.extend(format!("{name}={value}").encode_utf16());
@@ -1659,6 +1866,10 @@ fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, t
     }
     // Where git looks for its per-user files: the person's profile is closed to a command, and it would warn on every run.
     block.push(("XDG_CONFIG_HOME".to_string(), temp.clone()));
+    // (its sitecustomize first, for any Python: a folder of mode 0o700 made under the container is one the container cannot open, see PYTHON_SHIM)
+    if !temp.is_empty() {
+        block.push(("PYTHONPATH".to_string(), format!("{temp}\\{PYTHON_SHIM_FOLDER}")));
+    }
     block.push(("TEMP".to_string(), temp.clone()));
     block.push(("TMP".to_string(), temp));
     block.sort_by_key(|(name, _)| name.to_uppercase());
@@ -1712,7 +1923,13 @@ pub fn run(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Dur
 
 /// As `run`, with what it prints in `live` as it prints it.
 pub fn run_live(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
-    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live)
+    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, false)
+}
+
+/// As `run_live`, with a restricted token in place of the container ([`restricted_token`]): it reads what the person can, and writes only in the workspace and its temp
+/// folder. For cargo in a workspace whose `members` pattern it expands from the drive's root, looking at C:\Users on the way, which a container may not.
+pub fn run_live_restricted(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
+    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, true)
 }
 
 /// A browser under those limits falls over in most runs, whichever of them is set (0xC0000005, 12 to 19 runs in 20, against none in 20 with none set). Its own window station
@@ -1723,11 +1940,11 @@ pub fn run_live(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout
 /// of the browser's. With no handler to answer, the browser's other processes waited for it in `WaitNamedPipe` (crashpad's registration), and in about one run in three the page was
 /// never opened: no end and no output until the time was up.
 pub fn run_browser(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, cancel: &AtomicBool) -> Result<Output, String> {
-    run_limited(line, cwd, workspace, false, timeout, cancel, 0, None, true, None)
+    run_limited(line, cwd, workspace, false, timeout, cancel, 0, None, true, None, false)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, closed_stdin: bool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
+fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, closed_stdin: bool, live: Option<Arc<crate::tools::Live>>, restricted: bool) -> Result<Output, String> {
     let asked_at = Instant::now();
     // (the build tools are looked for while the folder is made ready below, and the environment then usually finds them ready)
     crate::msvc::look_ahead();
@@ -1742,17 +1959,25 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
     // SAFETY: every pointer below lives until the call that takes it returns, and the attribute list's buffers until the process is started.
     unsafe {
         let sid = profile_sid()?;
+        // (a restricted token's command writes as its workspace's own SID, and is given what it writes and what is guarded as that SID: see `restricted_token`)
+        let writer = if restricted { Some(OwnedSid::from_text(&workspace_sid_text(&root))?) } else { None };
+        let grantee = writer.as_ref().map_or(sid, |writer| writer.0);
+        let temp = profile_folder(sid);
         let mut disarmed = Vec::new();
         let mut times = Timings::default();
         {
             let _one = crate::workspace_grants::before_grant(&root)?;
-            prepare(&root, sid, &mut disarmed, &mut times)?;
-            // (a file held out of a folder commands can read, saved anew since by an editor, inherited what the folder gives: it is held out again before this command can read it)
-            if let Some(folder) = crate::workspace_grants::data_folder() {
-                crate::read_folders::hold_out_again(&crate::read_folders::file_in(&folder));
-            }
-            if let Some(tools) = crate::bundled::root() {
-                crate::bundled::open_to_sandbox(&tools)?;
+            if let Some(writer) = &writer {
+                prepare_restricted(&root, writer.0, temp.as_deref(), &mut disarmed, &mut times)?;
+            } else {
+                prepare(&root, sid, &mut disarmed, &mut times)?;
+                // (a file held out of a folder commands can read, saved anew since by an editor, inherited what the folder gives: it is held out again before this command can read it)
+                if let Some(folder) = crate::workspace_grants::data_folder() {
+                    crate::read_folders::hold_out_again(&crate::read_folders::file_in(&folder));
+                }
+                if let Some(tools) = crate::bundled::root() {
+                    crate::bundled::open_to_sandbox(&tools)?;
+                }
             }
         }
         // (from here to the look after it, a repository that shows up in the workspace may be what it makes)
@@ -1794,10 +2019,10 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         if SetInformationJobObject(job.0, JobObjectBasicUIRestrictions, std::ptr::addr_of!(ui).cast(), std::mem::size_of_val(&ui) as u32) == 0 {
             return Err(last_error("the limits on what it can do to the screen"));
         }
-        let desktop = Desktop::new(sid)?;
+        let desktop = Desktop::new(grantee)?;
 
         let mut capability_sids: Vec<PSID> = Vec::new();
-        if network {
+        if network && writer.is_none() {
             for text in NETWORK_CAPABILITIES {
                 let mut capability: PSID = std::ptr::null_mut();
                 let text = wide(text);
@@ -1812,14 +2037,16 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let handles = [input.0, out_write.0, err_write.0];
         let jobs = [job.0];
 
+        // (a restricted token is not a container's: no capabilities to give it)
+        let count = if writer.is_some() { 2 } else { 3 };
         let mut size = 0usize;
-        InitializeProcThreadAttributeList(std::ptr::null_mut(), 3, 0, &mut size);
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size);
         let mut list_memory = vec![0u8; size];
         let list = list_memory.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-        if InitializeProcThreadAttributeList(list, 3, 0, &mut size) == 0 {
+        if InitializeProcThreadAttributeList(list, count, 0, &mut size) == 0 {
             return Err(last_error("the attribute list"));
         }
-        let attributes_ok = UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize, std::ptr::addr_of!(security).cast(), std::mem::size_of_val(&security), std::ptr::null_mut(), std::ptr::null()) != 0
+        let attributes_ok = (writer.is_some() || UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize, std::ptr::addr_of!(security).cast(), std::mem::size_of_val(&security), std::ptr::null_mut(), std::ptr::null()) != 0)
             && UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, handles.as_ptr().cast(), std::mem::size_of_val(&handles), std::ptr::null_mut(), std::ptr::null()) != 0
             && UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, jobs.as_ptr().cast(), std::mem::size_of_val(&jobs), std::ptr::null_mut(), std::ptr::null()) != 0;
         if !attributes_ok {
@@ -1841,17 +2068,26 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let mut command_line = wide(&format!("\"{shell}\" /d /s /c \"chcp 65001 >nul & {line}\""));
         // (the look for the build tools may still be going on: the command's start waits for it no longer than the command has time, and not past Stop)
         let env_began = Instant::now();
-        let block = environment(profile_folder(sid).as_deref(), &root, || crate::msvc::found_before(asked_at.checked_add(timeout).unwrap_or(asked_at + Duration::from_secs(3600)), cancel));
+        // (with a restricted token nothing stops the network: a command not let reach it is pointed away from it, as Codex points its own)
+        let block = environment(temp.as_deref(), &root, writer.is_some() && !network, || crate::msvc::found_before(asked_at.checked_add(timeout).unwrap_or(asked_at + Duration::from_secs(3600)), cancel));
         times.env = env_began.elapsed();
         let place = wide_path(cwd);
         let mut process: PROCESS_INFORMATION = std::mem::zeroed();
         times.prepare = asked_at.elapsed();
-        let started = CreateProcessW(
-            std::ptr::null(), command_line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            block.as_ptr().cast(), place.as_ptr(), &startup.StartupInfo, &mut process,
-        );
-        let failure = (started == 0).then(|| last_error("the command did not start in its AppContainer"));
+        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+        let failure = match &writer {
+            Some(writer) => match restricted_token(writer.0) {
+                Ok(token) => {
+                    let started = CreateProcessAsUserW(token.0, std::ptr::null(), command_line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, flags, block.as_ptr().cast(), place.as_ptr(), &startup.StartupInfo, &mut process);
+                    (started == 0).then(|| last_error("the command did not start with its restricted token"))
+                }
+                Err(error) => Some(error),
+            },
+            None => {
+                let started = CreateProcessW(std::ptr::null(), command_line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, flags, block.as_ptr().cast(), place.as_ptr(), &startup.StartupInfo, &mut process);
+                (started == 0).then(|| last_error("the command did not start in its AppContainer"))
+            }
+        };
         DeleteProcThreadAttributeList(list);
         for capability in capability_sids {
             LocalFree(capability as HLOCAL);
@@ -1915,7 +2151,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         // What it made, with nothing of its own left running to go on making it. (Not being able to guard this does not take back what has already run: the next command is what is refused, for what is
         // found again before it, and it is said now in what this one returns.)
         let after_began = Instant::now();
-        let looked = look_after_repositories(&root, sid, Look::AfterACommand);
+        let looked = look_after_repositories(&root, grantee, Look::AfterACommand);
         times.after = after_began.elapsed();
         TIMINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(times);
         disarmed.extend(looked.said);
@@ -1972,6 +2208,39 @@ mod tests {
         let said = String::from_utf8(kept).unwrap();
         assert!(said.starts_with("BEGIN") && said.ends_with("END") && said.contains("858 bytes in the middle of this output were not kept"), "{said}");
         assert_eq!(kept_of(&mut std::io::Cursor::new(b"short".to_vec()), 100, 50, None), b"short");
+    }
+
+    /// The restricted token's command: it reads as the person does (a folder of the person's that no grant names), writes in its workspace, and cannot write in another
+    /// folder of the person's, nor in another workspace's; a command not let reach the network is pointed away from it.
+    #[test]
+    fn a_restricted_command_reads_as_the_person_and_writes_in_its_workspace_alone() {
+        let (work, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(elsewhere.path().join("theirs.txt"), "theirs").unwrap();
+        let (cancel, time) = (AtomicBool::new(false), Duration::from_secs(60));
+        let run = |line: &str, network: bool| run_live_restricted(line, work.path(), work.path(), network, time, &cancel, None).unwrap();
+        let read = run(&format!("type \"{}\"", elsewhere.path().join("theirs.txt").display()), false);
+        assert_eq!(read.status, Some(0), "{}", String::from_utf8_lossy(&read.stderr));
+        assert!(String::from_utf8_lossy(&read.stdout).contains("theirs"));
+        let written = run("echo ours> ours.txt", false);
+        assert_eq!(written.status, Some(0), "{}", String::from_utf8_lossy(&written.stderr));
+        assert!(work.path().join("ours.txt").is_file());
+        let outside = run(&format!("echo no> \"{}\"", elsewhere.path().join("planted.txt").display()), false);
+        assert_ne!(outside.status, Some(0));
+        assert!(!elsewhere.path().join("planted.txt").exists(), "it wrote outside its workspace");
+        let offline = run("set CARGO_NET_OFFLINE & set HTTPS_PROXY", false);
+        let said = String::from_utf8_lossy(&offline.stdout);
+        assert!(said.contains("CARGO_NET_OFFLINE=true") && said.contains("HTTPS_PROXY=http://127.0.0.1:9"), "{said}");
+        let online = run("set CARGO_NET_OFFLINE", true);
+        assert!(!String::from_utf8_lossy(&online.stdout).contains("CARGO_NET_OFFLINE=true"), "let reach the network, it is not pointed away");
+        // another workspace's restricted command cannot write here either
+        let other = tempfile::tempdir().unwrap();
+        let across = run_live_restricted(&format!("echo no> \"{}\"", work.path().join("from-other.txt").display()), other.path(), other.path(), false, time, &cancel, None).unwrap();
+        assert_ne!(across.status, Some(0));
+        assert!(!work.path().join("from-other.txt").exists(), "one workspace's command wrote in another's");
+        // the container's command after them still has its own grant of the workspace (its grant was once taken for the restricted SID's, and skipped)
+        let after = run_live("echo in-the-container> after.txt", work.path(), work.path(), false, time, &cancel, None).unwrap();
+        assert_eq!(after.status, Some(0), "{}", String::from_utf8_lossy(&after.stderr));
+        assert!(work.path().join("after.txt").is_file());
     }
 
     #[test]
@@ -2274,13 +2543,15 @@ mod tests {
         // That these still fail is why the prompt offers the others: they read the drive's root, which a container cannot.
         let refused = command("dir", &folder, false);
         println!("dir: {:?} {:?}", refused.status, decode(&refused.stderr));
-        let listed = command("powershell -NoProfile -Command \"(Get-ChildItem -Recurse -Name) -join ','\"", &folder, false);
+        // What runs instead: `dir` and `del` as a model writes them, with what the app puts in their place, and a plain `rmdir /s /q`. (Not
+        // PowerShell's own listing: it starts at the drive's root in the sandbox, and lists the workspace only where it may read the folders above it.)
+        let listed = command(&crate::tools::line_that_runs("dir /s"), &folder, false);
         let names = decode(&listed.stdout);
         assert!(names.contains("b.txt") && names.contains("a.txt"), "{names} {}", decode(&listed.stderr));
-        let gone = command("powershell -NoProfile -Command \"[IO.File]::Delete('b.txt')\"", &folder, false);
+        let gone = command(&crate::tools::line_that_runs("del b.txt"), &folder, false);
         assert_eq!(gone.status, Some(0), "{}", decode(&gone.stderr));
         assert!(!folder.join("b.txt").exists());
-        let tree = command("powershell -NoProfile -Command \"[IO.Directory]::Delete('sub', $true)\"", &folder, false);
+        let tree = command("rmdir /s /q sub", &folder, false);
         assert_eq!(tree.status, Some(0), "{}", decode(&tree.stderr));
         assert!(!folder.join("sub").exists());
     }
@@ -2863,18 +3134,18 @@ mod tests {
         std::fs::create_dir_all(&place).unwrap();
         let cap = 300u64 << 20;
         let greedy = "powershell -NoProfile -Command \"try { $a = [Runtime.InteropServices.Marshal]::AllocHGlobal(800000000); 'allocated' } catch { 'refused'; exit 7 }\"";
-        let done = run_limited(greedy, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None).unwrap();
+        let done = run_limited(greedy, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None, false).unwrap();
         eprintln!("status {:?}, out_of_memory {:?}, out {} err {}", done.status, done.out_of_memory, decode(&done.stdout).trim(), decode(&done.stderr));
         assert!(decode(&done.stdout).contains("refused") && done.status == Some(7), "{}", decode(&done.stdout));
         // Bit by bit, as a leak goes: it is said to have been stopped.
         let leak = "powershell -NoProfile -Command \"try { while ($true) { $null = [Runtime.InteropServices.Marshal]::AllocHGlobal(5000000) } } catch { 'refused'; exit 7 }\"";
-        let leaked = run_limited(leak, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None).unwrap();
+        let leaked = run_limited(leak, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None, false).unwrap();
         // (What a process does at the end of its memory is its own. PowerShell catches the refusal and ends with 7, or falls over in the middle of it, which it does in about
         // one run in three, and not with one code: 0xC0000005, 0xC00000FD when the stack cannot grow by a page, 0xC0000409, or the runtime's own 0xE0434352 or 0x80131523, as
         // what it has left to run its handler with is not the same twice. Which of them is no business of the sandbox. It is stopped all the same: it ended by itself, and not
         // well, and it is said to have used all it was allowed.)
         assert!(leaked.ended.is_empty() && leaked.status.is_some_and(|status| status != 0) && leaked.out_of_memory == Some(cap), "{:?} {:?} {:?}", leaked.status, leaked.ended, leaked.out_of_memory);
-        let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None).unwrap();
+        let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None, false).unwrap();
         assert!(decode(&fine.stdout).contains("fine") && fine.out_of_memory.is_none());
         drop(holder);
     }
@@ -2887,7 +3158,7 @@ mod tests {
         // Each alone fits under the cap; four together do not.
         let one = "try { $a = [Runtime.InteropServices.Marshal]::AllocHGlobal(500000000); Write-Output held; Start-Sleep 8 } catch { Write-Output refused }";
         let line = format!("powershell -NoProfile -Command \"$p = 1..4 | ForEach-Object {{ $i = New-Object Diagnostics.ProcessStartInfo 'powershell.exe', '-NoProfile -Command {}'; $i.UseShellExecute = $false; [Diagnostics.Process]::Start($i) }}; $p | ForEach-Object {{ $_.WaitForExit() }}\"", one);
-        let done = run_limited(&line, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(1200u64 << 20), false, None).unwrap();
+        let done = run_limited(&line, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(1200u64 << 20), false, None, false).unwrap();
         let said = decode(&done.stdout);
         eprintln!("status {:?} out {} err {}", done.status, said.trim(), decode(&done.stderr).trim());
         assert!(said.contains("held"), "one fits: {said}");
@@ -2937,6 +3208,25 @@ mod tests {
         println!("status {:?}: {}{}", done.status, said.trim(), decode(&done.stderr));
         assert_eq!(done.status, Some(0), "{said} {}", decode(&done.stderr));
         assert_eq!(said.trim(), "1", "{}", decode(&done.stderr));
+    }
+
+    /// A Python test's temporary folder is one the command can use and take away, in the sandbox's temp folder and in the workspace alike: a
+    /// suite's task failed with Permission denied in both, and left folders in the workspace that nothing could remove (Python 3.14, the
+    /// person's own, with no sitecustomize of the bundle's). Where there is no python to run, there is nothing to see.
+    #[test]
+    fn a_python_temporary_folder_is_one_the_command_can_use_and_remove() {
+        let folder = work_folder("python-temp");
+        let script = "import os, shutil, tempfile; made = []\nfor where in (None, os.getcwd()):\n    with tempfile.TemporaryDirectory(dir=where) as d:\n        open(os.path.join(d, 'a.txt'), 'w').write('x')\n        made.append(os.path.basename(d))\nd = tempfile.mkdtemp(dir=os.getcwd()); open(os.path.join(d, 'b.txt'), 'w').write('y'); shutil.rmtree(d)\nprint('ok', len(made))";
+        std::fs::write(folder.join("probe.py"), script).unwrap();
+        let done = command("python probe.py", &folder, false);
+        let (said, errors) = (decode(&done.stdout), decode(&done.stderr));
+        if errors.contains("is not recognized") || errors.contains("was not found") {
+            eprintln!("no python here: {errors}");
+            return;
+        }
+        assert_eq!((done.status, said.trim()), (Some(0), "ok 2"), "{errors}");
+        let left: Vec<String> = std::fs::read_dir(&folder).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name != "probe.py").collect();
+        assert!(left.is_empty(), "left in the workspace: {left:?}");
     }
 
     /// A command's parts are timed: before the process, the process, and after it.

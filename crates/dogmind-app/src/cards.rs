@@ -72,6 +72,8 @@ pub enum Card {
     Notice { wakes: Vec<Wake>, at: String },
     /// An `explore` helper: the call it is of, its task as a line, which of the session's helper files holds its steps (none when they were not kept), and where it stands.
     Helper { call: String, task: String, number: Option<u32>, state: HelperState },
+    /// Files of the workspace the model put before the person (`present`), from its root.
+    Presented { files: Vec<String> },
 }
 
 /// How many files a card lists: the rest are counted, and the Changes page has all of them.
@@ -119,7 +121,7 @@ impl Card {
     pub fn id(&self) -> Option<u64> {
         match self {
             Card::Question { id, .. } | Card::Plan { id, .. } => Some(*id),
-            Card::Files { .. } | Card::Notice { .. } | Card::Helper { .. } => None,
+            Card::Files { .. } | Card::Notice { .. } | Card::Helper { .. } | Card::Presented { .. } => None,
         }
     }
 
@@ -221,6 +223,20 @@ impl Card {
                 };
                 Some(Card::Plan { id, plan, state })
             }
+            "present" => {
+                // (a call that failed put nothing before the person)
+                if result?.starts_with("error:") {
+                    return None;
+                }
+                let mut files: Vec<String> = Vec::new();
+                for path in arguments.get("paths").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                    let path = path.trim().replace('\\', "/");
+                    if !path.is_empty() && !files.contains(&path) {
+                        files.push(path);
+                    }
+                }
+                (!files.is_empty()).then_some(Card::Presented { files })
+            }
             _ => None,
         }
     }
@@ -305,7 +321,7 @@ fn options_of(arguments: &Value) -> Vec<(String, String)> {
 
 /// Whether a tool is one whose call is a card of its own, and so has no row among the calls.
 pub fn is_asking(tool: &str) -> bool {
-    matches!(tool, "ask_user" | "submit_plan")
+    matches!(tool, "ask_user" | "submit_plan" | "present")
 }
 
 /// Whether what was typed while a plan waits approves it. Anything else is what to change.
@@ -374,13 +390,17 @@ pub fn most_changed(rows: &[FileRow]) -> usize {
     rows.iter().map(|row| row.added + row.removed).max().unwrap_or(0)
 }
 
-/// Whether a file of the card is opened with its own app. What is a program or a script is not: opened, it would run, and what the agent wrote is not for that. These are shown in Explorer.
+/// Whether a file of a card is opened with its own app: only a kind that is read or looked at, a document, a picture, a table, a page, sound or film, or text. Anything
+/// else is shown in Explorer: Windows runs more kinds when they are opened than any list of them would name (a console snap-in, an application manifest, a help file, a
+/// setup file, a shell command file), and what the agent wrote is not to be run by a press on a card.
 pub fn opens_in_app(path: &str) -> bool {
-    const RUNS: [&str; 30] = [
-        "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp", "scr", "lnk", "url", "reg", "hta", "cpl", "jar", "pif", "appx", "msix", "dll", "sys", "py", "pyw", "sh", "gadget",
+    const OPENS: [&str; 52] = [
+        "txt", "md", "markdown", "csv", "tsv", "json", "xml", "yaml", "yml", "toml", "ini", "log", "html", "htm", "css", "svg", "png", "jpg", "jpeg", "gif", "webp", "bmp",
+        "ico", "tif", "tiff", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "mp3", "wav", "ogg", "flac", "m4a", "mp4", "webm", "mov",
+        "mkv", "rs", "c", "h", "cpp", "hpp", "go", "java",
     ];
     let extension = path.rsplit(['/', '\\']).next().and_then(|name| name.rsplit_once('.')).map_or(String::new(), |(_, extension)| extension.to_lowercase());
-    !RUNS.contains(&extension.as_str())
+    OPENS.contains(&extension.as_str())
 }
 
 /// The words of the bar under the session's title: its goal's first line. None when there is no goal, and no bar.
@@ -535,11 +555,15 @@ mod tests {
 
     #[test]
     fn a_program_the_agent_wrote_is_shown_in_explorer_and_not_run() {
-        for safe in ["notes.md", "src/app.rs", "logo.PNG", "data.csv", "README", "dir\\report.pdf"] {
+        for safe in ["notes.md", "src/app.rs", "logo.PNG", "data.csv", "dir\\report.pdf", "web/index.html", "report.docx", "sheet.xlsx", "clip.mp4"] {
             assert!(opens_in_app(safe), "{safe}");
         }
         for risky in ["setup.exe", "run.BAT", "tools\\x.ps1", "a.vbs", "a.js", "a.lnk", "build.cmd", "pkg.msi", "x.dll", "run.py", "go.sh"] {
             assert!(!opens_in_app(risky), "{risky}");
+        }
+        // (kinds a list of what runs would leave out: only what is named as safe opens, and anything else, or no kind at all, is shown)
+        for unnamed in ["console.msc", "types.ps1xml", "tool.application", "tool.appref-ms", "x.settingcontent-ms", "help.chm", "setup.inf", "desktop.scf", "a.ws", "lib.library-ms", "README", "a.rb", "a.unknown"] {
+            assert!(!opens_in_app(unnamed), "{unnamed}");
         }
     }
 
@@ -637,7 +661,12 @@ second")), Some("first line".to_string()));
 
     #[test]
     fn the_two_tools_that_ask_are_cards_and_no_other_is() {
-        assert!(is_asking("ask_user") && is_asking("submit_plan"));
+        assert!(is_asking("ask_user") && is_asking("submit_plan") && is_asking("present"));
+        // (files put before the person are a card of theirs, and a call that failed put nothing there)
+        let paths = serde_json::json!({"paths": ["web/index.html", "web\\index.html", "notes.md"]});
+        assert_eq!(Card::of_call(1, "present", &paths, Some("The person sees a card with web/index.html, notes.md.")), Some(Card::Presented { files: vec!["web/index.html".into(), "notes.md".into()] }));
+        assert_eq!(Card::of_call(1, "present", &paths, Some("error: gone.txt is not a file of the workspace")), None);
+        assert_eq!(Card::of_call(1, "present", &paths, None), None, "a call with no result yet");
         assert!(!is_asking("read_file") && !is_asking("todo"));
     }
 

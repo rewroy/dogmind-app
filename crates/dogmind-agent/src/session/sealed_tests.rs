@@ -29,7 +29,7 @@ fn sealed_session(dir: &Path, stamp: &str) -> (Session, Arc<Cipher>) {
     let mut session = Session::create_with(dir, Path::new("C:/work"), "now", stamp, Some(&key)).unwrap();
     session.set_tools(&serde_json::json!([{"function": {"name": "read_file"}}])).unwrap();
     session.append(&Message::text("system", "the system prompt")).unwrap();
-    session.append(&Message::text("user", crate::prompt::user_message("ハッシュテーブルの話をして", "now"))).unwrap();
+    session.append(&Message::text("user", "ハッシュテーブルの話をして")).unwrap();
     session.append(&Message::text("assistant", "A HashMap keeps Cherry in a bucket")).unwrap();
     (session, key)
 }

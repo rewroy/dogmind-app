@@ -5,7 +5,8 @@
 //! event ends, whole and in one write, so a run that is killed loses at most the event in flight. Nothing is buffered across events.
 //!
 //! It holds names, sizes, counts, times, ids, outcomes and short hashes, and never what was said: no message, no reasoning, no file content, no command. The session file has those, and
-//! a request id (`<session id>/<n>`) says which of its messages a line is about. The one exception is a `failed` line, which holds the one line a server said of its failure (cut, and with its
+//! a request id (`<session id>/<n>`) says which of its messages a line is about: a request line says, as `message`, the place of the assistant message it made among the session's messages, and a
+//! tool line the id of its call as `id`, which is the call's in that message. The one exception is a `failed` line, which holds the one line a server said of its failure (cut, and with its
 //! keys and headers hidden): it is the server's own error, and what a person who sends the trajectory is asked for.
 
 use std::fs::{self, File, OpenOptions};
@@ -50,16 +51,19 @@ pub fn short_hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().take(6).map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Where a request began and when its first word came: the first of reasoning, content or a call being written.
+/// Where a request began and when its first word came: the first of reasoning, content or a call being written. And when it began to write a
+/// call and its answer, which split the time after the first word between thinking and writing (the timeline's band).
 pub struct Clock {
     pub began: Instant,
     pub at: DateTime<Local>,
     first: Option<Instant>,
+    writing: Option<Instant>,
+    answering: Option<Instant>,
 }
 
 impl Clock {
     pub fn start() -> Clock {
-        Clock { began: Instant::now(), at: Local::now(), first: None }
+        Clock { began: Instant::now(), at: Local::now(), first: None, writing: None, answering: None }
     }
 
     /// Called with each piece that comes; the first one counts.
@@ -67,8 +71,26 @@ impl Clock {
         self.first.get_or_insert_with(Instant::now);
     }
 
+    /// Called with each piece of a call; the first one counts.
+    pub fn writing(&mut self) {
+        self.writing.get_or_insert_with(Instant::now);
+    }
+
+    /// Called with each piece of the answer's words; the first one counts.
+    pub fn answering(&mut self) {
+        self.answering.get_or_insert_with(Instant::now);
+    }
+
     pub fn first_ms(&self) -> Option<u64> {
         self.first.map(|first| first.duration_since(self.began).as_millis() as u64)
+    }
+
+    pub fn writing_ms(&self) -> Option<u64> {
+        self.writing.map(|at| at.duration_since(self.began).as_millis() as u64)
+    }
+
+    pub fn answer_ms(&self) -> Option<u64> {
+        self.answering.map(|at| at.duration_since(self.began).as_millis() as u64)
     }
 
     pub fn ms(&self) -> u64 {
@@ -132,6 +154,8 @@ pub struct Trajectory {
     /// This turn's requests and tools, for its end.
     pub turn_requests: u64,
     pub turn_tools: u64,
+    /// A request's line that waits for the message it made ([`Trajectory::message_at`]): written with it, or as it is before whatever line comes next.
+    waiting: Option<(String, Value)>,
 }
 
 impl Default for Trajectory {
@@ -145,7 +169,7 @@ const HELD_MOST: usize = 64;
 
 impl Trajectory {
     pub fn new() -> Trajectory {
-        Trajectory { file: None, session_id: String::new(), turn: 0, requests: 0, warm: 0, held: Vec::new(), turn_requests: 0, turn_tools: 0 }
+        Trajectory { file: None, session_id: String::new(), turn: 0, requests: 0, warm: 0, held: Vec::new(), turn_requests: 0, turn_tools: 0, waiting: None }
     }
 
     /// Begins writing beside this session. A session that is opened again goes on where its file left off: its turns and its requests keep counting.
@@ -178,6 +202,7 @@ impl Trajectory {
 
     /// No session: what follows waits for the next.
     pub fn close(&mut self) {
+        self.write_waiting();
         self.file = None;
         self.session_id.clear();
         (self.turn, self.requests, self.turn_requests, self.turn_tools) = (0, 0, 0, 0);
@@ -214,6 +239,12 @@ impl Trajectory {
 
     /// One line: its kind, the time, the turn, and the request it belongs to when it does, then its own fields.
     pub fn write(&mut self, ev: &str, req: Option<&str>, fields: Value) {
+        // (a request's line that waits for its message is written first, as it is: it made none, and the order of the lines is the order of what happened)
+        self.write_waiting();
+        self.write_line(ev, req, fields);
+    }
+
+    fn write_line(&mut self, ev: &str, req: Option<&str>, fields: Value) {
         let mut line = Map::new();
         line.insert("t".into(), json!(now()));
         line.insert("ev".into(), json!(ev));
@@ -234,6 +265,34 @@ impl Trajectory {
     }
 
     pub fn request(&mut self, note: RequestNote) {
+        let id = note.id.to_string();
+        let fields = self.request_fields(note);
+        self.write("request", Some(&id), fields);
+    }
+
+    /// A request whose line says where the message it made is in the session: it waits for [`Trajectory::message_at`], or for the next line
+    /// to be written (it made none). Said once the message is in, where it is cannot be wrong: the reader no longer has to guess which it was.
+    pub fn request_waiting(&mut self, note: RequestNote) {
+        self.write_waiting();
+        let id = note.id.to_string();
+        self.waiting = Some((id, self.request_fields(note)));
+    }
+
+    /// The message the request that waits made is at `index` of the session's messages: its line is written with that.
+    pub fn message_at(&mut self, index: usize) {
+        if let Some((id, mut fields)) = self.waiting.take() {
+            fields["message"] = json!(index);
+            self.write_line("request", Some(&id), fields);
+        }
+    }
+
+    fn write_waiting(&mut self) {
+        if let Some((id, fields)) = self.waiting.take() {
+            self.write_line("request", Some(&id), fields);
+        }
+    }
+
+    fn request_fields(&mut self, note: RequestNote) -> Value {
         if note.role != "warm" {
             self.turn_requests += 1;
         }
@@ -262,6 +321,13 @@ impl Trajectory {
         if let Some(file) = note.helper_file {
             fields["helper_file"] = json!(file);
         }
+        // (when it began to write a call and its answer, from its start: what is before them after the first word is thinking)
+        if let Some(writing) = note.clock.writing_ms() {
+            fields["writing_ms"] = json!(writing);
+        }
+        if let Some(answer) = note.clock.answer_ms() {
+            fields["answer_ms"] = json!(answer);
+        }
         if let Some((again, why, wait_ms)) = note.retry {
             fields["retry_of"] = json!(again);
             fields["retry_why"] = json!(why);
@@ -270,7 +336,7 @@ impl Trajectory {
         if let Some(server) = note.timings.and_then(kept_timings) {
             fields["server"] = server;
         }
-        self.write("request", Some(note.id), fields);
+        fields
     }
 
     /// An intervention of the app's own, with what it came to. `req`: the request it ended or followed.
@@ -341,6 +407,25 @@ mod tests {
         assert_eq!(kept, json!({"ttft_seconds": 1.5, "resumed_from": "live", "images": 2}));
         assert_eq!(kept_timings(&json!({"a": [1]})), None);
         assert_eq!(kept_timings(&Value::Null), None);
+    }
+
+    #[test]
+    fn a_request_says_where_the_message_it_made_is_and_a_request_that_made_none_says_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("s.jsonl");
+        let mut traj = Trajectory::new();
+        traj.open(&session);
+        let clock = Clock::start();
+        let note = |id: &'static str| RequestNote { id, role: "main", clock: &clock, end: "tool_calls".into(), usage: None, timings: None, reasoning_chars: 0, content_chars: 0, calls: vec!["read_file".into()], tokens_est: 0, retry: None, draft_watch: None, helper_file: None };
+        traj.request_waiting(note("s/1"));
+        traj.message_at(2);
+        // (the second makes none: the next line writes it as it is, before itself)
+        traj.request_waiting(note("s/2"));
+        traj.write("turn_end", None, json!({}));
+        let lines: Vec<Value> = fs::read_to_string(file_of(&session)).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(lines[0]["message"], 2);
+        assert!(lines[1].get("message").is_none(), "{}", lines[1]);
+        assert_eq!((lines[1]["ev"].as_str(), lines[2]["ev"].as_str()), (Some("request"), Some("turn_end")), "in the order they happened");
     }
 
     #[test]

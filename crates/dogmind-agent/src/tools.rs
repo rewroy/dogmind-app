@@ -48,13 +48,40 @@ pub fn helper_schemas() -> Value {
 
 /// The tools every session has. Dogmind's names and meanings, in as few words as still say them: a local model reads all of this before a new session's first word, some 200 tokens a second, and it has no other use for them than knowing what to call.
 /// `assets/dogmind/tools.json` is what Dogmind itself says, to read when it changes.
+/// What create_file asks of a model whose provider gives a call only once it is whole: a long call shows nothing for minutes, and a
+/// stop loses what it was writing.
+const CREATE_FILE_IN_PARTS: &str = "Write a file, new or one you have read. Over about 300 lines, write the first part, then add each further part with append=true: what is on disk survives a stop, and a long call is minutes with nothing to show.";
+/// What it asks where the call shows as it is written ([`crate::llm::Provider::shows_calls_as_written`]): there the app keeps a very long
+/// file on disk in parts itself, and each part a model wrote by its own choice cost a request and its thinking again (on an RTX 5070 Ti
+/// with Qwen3.8 IQ2_XS, a file of some 400 lines took 174 s in 2 to 4 writes, and 143 s in one).
+const CREATE_FILE_WHOLE: &str = "Write a file, new or one you have read, whole in one call: what you write shows as it comes, and of a very long file the app keeps on disk what is written and has you go on. append=true adds to the end of the file.";
+
+/// The tools' schemas for a provider whose calls show as they are written: create_file asks for a file whole.
+pub fn for_calls_shown_as_written(schemas: &mut Value) {
+    for tool in schemas.as_array_mut().into_iter().flatten() {
+        if tool.pointer("/function/name").and_then(Value::as_str) == Some("create_file") {
+            tool["function"]["description"] = Value::from(CREATE_FILE_WHOLE);
+        }
+    }
+    // (a program's declarations say what the tools are as they are offered: made again from them)
+    redeclare_run_code(schemas);
+}
+
+/// `run_code`, where it is offered, made again from the tools offered beside it as they are now.
+fn redeclare_run_code(schemas: &mut Value) {
+    let Some(list) = schemas.as_array_mut() else { return };
+    let Some(at) = list.iter().position(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("run_code")) else { return };
+    let others = Value::Array(list.iter().enumerate().filter(|(index, _)| *index != at).map(|(_, tool)| tool.clone()).collect());
+    list[at] = crate::code_mode::schema(&others);
+}
+
 pub fn schemas() -> Value {
     let function = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"type": "function", "function": {"name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required}}});
     json!([
         function("apply_patch", "Edit existing files by exact text replacement. All edits land together or none do. Read a file before editing it. old_string must occur exactly once (or `count` times) and has no line numbers. After a failure the file is unchanged, so correct old_string instead of reading again.", json!({
             "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "count": {"type": "integer"}}, "required": ["path", "old_string", "new_string"]}}
         }), &["edits"]),
-        function("create_file", "Write a file, new or one you have read. Over about 300 lines, write the first part, then add each further part with append=true: what is on disk survives a stop, and a long call is minutes with nothing to show.", json!({
+        function("create_file", CREATE_FILE_IN_PARTS, json!({
             "path": {"type": "string"},
             "content": {"type": "string"},
             "append": {"type": "boolean", "description": "Add to the end of the file."}
@@ -87,17 +114,20 @@ pub fn schemas() -> Value {
             "scope": {"type": "string", "enum": ["session", "workspace", "staged", "unstaged"], "description": "session: since this session began. workspace: against HEAD, or outside git as session. staged, unstaged: git's index."},
             "paths": {"type": "array", "items": {"type": "string"}}
         }), &["scope"]),
-        function("ask_user", "Ask the person one question with 2-4 choices, your pick first, only when their answer alone settles what to do. They may answer in their own words. Waits for it.", json!({
+        function("ask_user", "Ask the person one question with 2-4 choices, the first shown as your pick. They may answer in their own words. Waits for the answer.", json!({
             "question": {"type": "string"},
             "options": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "description": {"type": "string"}}, "required": ["label"]}}
         }), &["question", "options"]),
         function("submit_plan", "Plan mode: put the finished plan (Markdown) to the person. Approved, plan mode ends and you carry it out now; if not, you get what to change.", json!({
             "plan": {"type": "string"}
         }), &["plan"]),
-        function("todo", "A checklist, only for work with several separate deliverables. Send only what changed.", json!({
+        function("todo", "A checklist the person sees beside the conversation, each item pending, doing, done or blocked. Items sent are added or changed by their id.", json!({
             "todos": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "doing", "done", "blocked"]}}, "required": ["id"]}},
             "merge": {"type": "boolean", "description": "false: replace the whole list."}
         }), &["todos"]),
+        function("present", "Put files of the workspace before the person: a card in the conversation lists them, and each opens in its own app or is shown in Explorer.", json!({
+            "paths": {"type": "array", "items": {"type": "string"}, "description": "From the workspace's root."}
+        }), &["paths"]),
         function("find_files", "Find files by name with a glob such as `**/*.rs`. Skips what .gitignore skips.", json!({
             "pattern": {"type": "string"},
             "path": {"type": "string"}
@@ -115,12 +145,12 @@ pub fn schemas() -> Value {
             "delay_seconds": {"type": "integer", "description": "60 to 86400."},
             "note": {"type": "string"}
         }), &["delay_seconds", "note"]),
-        function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
+        function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads. Not for one file: read that file yourself.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
     ])
 }
 
 /// All the tools of a session: those every session has, and those that depend on what is on.
-pub fn schemas_for(web: bool, skills: bool, memory: bool, mcp: Vec<Value>) -> Value {
+pub fn schemas_for(web: bool, skills: bool, memory: bool, mcp: Vec<Value>, code_mode: bool) -> Value {
     let mut all = schemas();
     let Some(list) = all.as_array_mut() else { return all };
     let mut add = |more: Value| {
@@ -138,6 +168,13 @@ pub fn schemas_for(web: bool, skills: bool, memory: bool, mcp: Vec<Value>) -> Va
         add(crate::memory::schemas());
     }
     add(Value::Array(mcp));
+    // (last, as it tells what the others are)
+    if code_mode {
+        let run_code = crate::code_mode::schema(&all);
+        if let Some(list) = all.as_array_mut() {
+            list.push(run_code);
+        }
+    }
     all
 }
 
@@ -716,6 +753,7 @@ impl Workbench {
             "command_stop" => self.job_stop(arguments),
             "wake_at" => self.wake_at(arguments),
             "todo" => self.todo(arguments),
+            "present" => present(arguments, workspace).map(|files| format!("The person sees a card with {}.", files.join(", "))),
             "skill" => self.read_skill(arguments),
             _ if tool.starts_with("mcp__") => {
                 let hub = self.mcp.as_ref().ok_or("no MCP server is running")?;
@@ -1092,29 +1130,58 @@ impl Workbench {
     }
 
     fn todo(&mut self, arguments: &Value) -> Result<String, String> {
-        let items = arguments.get("todos").and_then(Value::as_array).ok_or("todos is required")?;
-        if arguments.get("merge").and_then(Value::as_bool) == Some(false) {
-            self.todos.clear();
-        }
-        for item in items {
-            let id = item.get("id").and_then(Value::as_str).ok_or("each todo needs an id")?;
-            match self.todos.iter_mut().find(|known| known.get("id").and_then(Value::as_str) == Some(id)) {
-                Some(known) => {
-                    for (name, value) in item.as_object().into_iter().flatten() {
-                        known[name] = value.clone();
-                    }
-                }
-                None => {
-                    let mut fresh = item.clone();
-                    if fresh.get("status").is_none() {
-                        fresh["status"] = json!(if self.todos.is_empty() { "doing" } else { "pending" });
-                    }
-                    self.todos.push(fresh);
-                }
-            }
-        }
+        apply_todo(&mut self.todos, arguments)?;
         Ok(self.todos.iter().map(|item| format!("[{}] {}: {}", item["status"].as_str().unwrap_or("pending"), item["id"].as_str().unwrap_or(""), item["text"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"))
     }
+}
+
+/// The files a `present` call names, as they are from the workspace's root with forward slashes: each has to be a file inside it.
+pub fn present(arguments: &Value, workspace: &Path) -> Result<Vec<String>, String> {
+    let paths = arguments.get("paths").and_then(Value::as_array).ok_or("paths is required: the files to put before the person")?;
+    let mut files = Vec::new();
+    for path in paths {
+        let path = path.as_str().map(str::trim).filter(|path| !path.is_empty()).ok_or("each path is a file's path, from the workspace's root")?;
+        let file = resolve(workspace, path);
+        let inside = file.strip_prefix(workspace).map_err(|_| format!("{path} is not in the workspace"))?;
+        if !file.is_file() {
+            return Err(format!("{path} is not a file of the workspace"));
+        }
+        let shown = inside.to_string_lossy().replace('\\', "/");
+        if !files.contains(&shown) {
+            files.push(shown);
+        }
+    }
+    if files.is_empty() {
+        return Err("paths is empty: name the files to put before the person".to_string());
+    }
+    Ok(files)
+}
+
+/// A `todo` call's arguments applied to a checklist: an item with an id the list has changes the fields it sends, a new one is added (the first of an empty list `doing`, the others `pending`, unless it says),
+/// and `merge: false` begins the list afresh. A call that fails part of the way leaves the items before the failing one in. A list is nothing but its calls, so whoever reads a conversation replays them with this.
+pub fn apply_todo(todos: &mut Vec<Value>, arguments: &Value) -> Result<(), String> {
+    let items = arguments.get("todos").and_then(Value::as_array).ok_or("todos is required")?;
+    if arguments.get("merge").and_then(Value::as_bool) == Some(false) {
+        todos.clear();
+    }
+    for item in items {
+        let id = item.get("id").and_then(Value::as_str).ok_or("each todo needs an id")?;
+        match todos.iter_mut().find(|known| known.get("id").and_then(Value::as_str) == Some(id)) {
+            Some(known) => {
+                for (name, value) in item.as_object().into_iter().flatten() {
+                    known[name] = value.clone();
+                }
+            }
+            None => {
+                let mut fresh = item.clone();
+                if fresh.get("status").is_none() {
+                    fresh["status"] = json!(if todos.is_empty() { "doing" } else { "pending" });
+                }
+                todos.push(fresh);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `new` put in place of each `old` in `text`, its lines ending as the line it is put on ends. (A model writes its lines with LF: one line
@@ -1334,7 +1401,14 @@ fn outline(lines: &[&str]) -> Vec<(usize, usize)> {
 /// A large file, as its head and its outline: each part's first line with its number, to read with `start_line` and `limit`.
 fn outlined(lines: &[&str], parts: &[(usize, usize)], size: u64) -> String {
     let shown = |line: &str| -> String { if line.len() > 160 { format!("{}…", &line[..line.floor_char_boundary(160)]) } else { line.to_string() } };
-    let mut out = format!("--- {} lines, {} KB: more than to read whole. Its first lines, then where its parts begin ---\n", lines.len(), size / 1024);
+    // (and the way to all of it, for a task that needs all of it, such as summing a document up: a model given only the outline once took
+    // the long way round, a helper that read it all again, 105 s of a 186-s task)
+    let reads = lines.len().div_ceil(500).max((size as usize).div_ceil(MAX_READ));
+    let mut out = format!(
+        "--- {} lines, {} KB: more than to read whole at once. Its first lines, then where its parts begin. All of it is {reads} reads: read_file with start_line=1, then from where each one says to go on ---\n",
+        lines.len(),
+        size / 1024
+    );
     for (at, line) in lines.iter().enumerate().take(OUTLINE_HEAD) {
         out.push_str(&format!("{}|{}\n", at + 1, shown(line)));
     }
@@ -1936,6 +2010,12 @@ fn no_network_note(network: bool, status: Option<i32>, out: &str, err: &str) -> 
     SIGNS.iter().any(|sign| out.contains(sign) || err.contains(sign)).then_some("note: this command failed because it ran with no network, and nothing about the site or the code is known from it. If it needs the network, make the same call with network=true, and the user is asked to approve it.\n")
 }
 
+/// Whether `dir` or a command like it in this line was refused, as either stream says: a line that sends its errors on with `2>&1` says it with its output.
+#[cfg(windows)]
+fn refused_for_the_drive_root(line: &str, out: &str, err: &str, system_words: &str) -> bool {
+    needs_drive_root(line) && (says_access_denied(err, system_words) || says_access_denied(out, system_words))
+}
+
 /// Whether a part of this command line is one of cmd's that fail in the sandbox wherever their file is.
 #[cfg(windows)]
 fn needs_drive_root(line: &str) -> bool {
@@ -2238,6 +2318,14 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
             notes.push_str("note: git cannot look above the workspace from the sandbox, so this says only that the workspace is not a git repository. `git init` at the start of a line works.\n");
         }
     }
+    // (cargo expands `members = ["crates/*"]` by looking at each folder from the drive's root, and a container may not look at C:\Users: the pattern then finds nothing and is read as
+    // a name, "failed to read `…\crates\*\Cargo.toml`", and a model goes on trying other options and folders, a crate's own manifest too, which loads the same workspace)
+    // (a command that is cargo itself, in such a workspace, runs with a restricted token where it can: this is cargo started through something else)
+    if err.contains("failed to load manifest for workspace member") && err.contains('*') {
+        notes.push_str("note: cargo could not expand this workspace's `members` pattern: it looks at each folder from the drive's root, and the sandbox may not look at C:\\Users on the way. \
+                        A command that is cargo itself is run where it can: run cargo directly, not through a script or another program. \
+                        If that cannot be done, say what could not be built or run, for the user to run themselves.\n");
+    }
     // (cl, link and nmake are in no PATH of a person's unless they started from a Developer prompt; the app gives a command their folders when it finds them, and says here why it did not)
     if let Some(program) = build_tool_not_found(err) {
         notes.push_str(&build_tools_note(program, crate::msvc::why_not(), crate::msvc::known().is_some()));
@@ -2251,7 +2339,7 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     let root = workspace.to_string_lossy().to_lowercase();
     let outside = line.split(|c: char| c.is_whitespace() || c == '"').any(|word| word.as_bytes().get(1) == Some(&b':') && !word.to_lowercase().starts_with(&root));
     if denied && outside {
-        notes.push_str("note: a command cannot read outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there; for a command to read it, ask the user to name its folder there.\n");
+        notes.push_str(OUTSIDE_READ_NOTE);
     }
     // (a model's habit from elsewhere: cmd says only that it does not know the program, in the language of Windows, or Git's own copy fails at its start and says nothing a model can use)
     let msys = err.contains("NtCreateDirectoryObject");
@@ -2399,6 +2487,101 @@ fn opened_on_the_desktop(line: &str, cwd: &Path) -> Option<String> {
         before.starts_with("for ") && before.ends_with(" in")
     };
     commands.iter().enumerate().filter(|(at, _)| !of_a_for(*at)).find_map(|(_, command)| opens_by_association(command, cwd))
+}
+
+/// A line that begins `cd <folder> && `, with `/d` or not, or `chdir` or `pushd`, where the folder is given by its full path and is `cwd` itself: that first part, and the rest.
+/// None for anything else, a `cd` to another folder or by a relative path included (those are the command's own, and a relative one works in the sandbox).
+#[cfg(windows)]
+fn after_cd_to<'a>(line: &'a str, cwd: &Path) -> Option<(&'a str, &'a str)> {
+    let (head, rest) = line.trim_start().split_once("&&")?;
+    let (head, rest) = (head.trim(), rest.trim_start());
+    let lower = head.to_ascii_lowercase();
+    let after = ["cd ", "chdir ", "pushd "].iter().find(|word| lower.starts_with(*word)).map(|word| head[word.len()..].trim_start())?;
+    let target = if after.get(..2).is_some_and(|switch| switch.eq_ignore_ascii_case("/d")) { after[2..].trim_start() } else { after };
+    let target = target.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')).unwrap_or(target);
+    if rest.is_empty() || target.is_empty() || target.contains('"') || !Path::new(target).is_absolute() {
+        return None;
+    }
+    let same = matches!((std::fs::canonicalize(target), std::fs::canonicalize(cwd)), (Ok(there), Ok(here)) if there == here);
+    same.then_some((head, rest))
+}
+
+/// What a command refused outside the workspace is told, in the container, which reads there no more than it writes.
+const OUTSIDE_READ_NOTE: &str = "note: a command cannot read outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there; for a command to read it, ask the user to name its folder there.\n";
+/// The same, for a command run with a restricted token, which reads where the user can.
+const OUTSIDE_WRITE_NOTE: &str = "note: this command could read outside the workspace but not write there: it writes in the workspace alone. Write in the workspace, or tell the user what to put where.\n";
+
+/// Whether a line is one cargo command, under the user folder, in a workspace whose manifest (the one cargo would load from `cwd`) names its members by a pattern: cargo
+/// expands it by looking at each folder from the drive's root, and in the container C:\Users is refused, so the pattern finds nothing. Such a command, once the person has
+/// allowed it (the gate asks with `REASON_CARGO_OUTSIDE`, which no rule, "always" or mode answers), runs with a restricted token.
+#[cfg(windows)]
+pub(crate) fn cargo_reads_above(line: &str, cwd: &Path, root: &Path, home: Option<&Path>) -> bool {
+    let Some(users) = home.and_then(Path::parent) else { return false };
+    one_cargo_command(line) && root.starts_with(users) && cwd.starts_with(root) && members_by_pattern(cwd, root)
+}
+
+/// Whether the line is cargo and nothing else: its first word names cargo, and it has none of what lets cmd run more than one program or put something else in its words
+/// (`& | ( ) < > ^ % ! ;`, a line break). A line of more, as `cargo build & del x`, would run all of it with what cargo is given, and is the container's.
+#[cfg(windows)]
+pub(crate) fn one_cargo_command(line: &str) -> bool {
+    let line = line.trim();
+    if line.contains(['&', '|', '(', ')', '<', '>', '^', '%', '!', ';', '\n', '\r', '`']) {
+        return false;
+    }
+    let word = match line.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next().unwrap_or(""),
+        None => line.split_whitespace().next().unwrap_or(""),
+    };
+    let name = word.rsplit(['\\', '/']).next().unwrap_or(word);
+    name.eq_ignore_ascii_case("cargo") || name.eq_ignore_ascii_case("cargo.exe")
+}
+
+/// What cargo's config in the workspace or above it, up to the user folder, runs besides cargo and the compiler: a wrapper of rustc, a runner or a linker it names. They run with what
+/// the command is given, so the person is told of them with it.
+#[cfg(windows)]
+pub(crate) fn cargo_config_programs(cwd: &Path, home: Option<&Path>) -> Vec<String> {
+    let mut found = Vec::new();
+    for folder in cwd.ancestors().take_while(|folder| home.is_none_or(|home| folder.starts_with(home))) {
+        for name in ["config.toml", "config"] {
+            let Ok(text) = std::fs::read_to_string(folder.join(".cargo").join(name)) else { continue };
+            for line in text.lines().map(str::trim).filter(|line| !line.starts_with('#')) {
+                let Some((key, value)) = line.split_once('=') else { continue };
+                let key = key.trim().trim_matches('"').to_ascii_lowercase();
+                if key.ends_with("wrapper") || key == "runner" || key == "linker" {
+                    let value = value.trim().trim_matches(['"', '\'']).to_string();
+                    if !value.is_empty() && !found.contains(&value) {
+                        found.push(value);
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Whether the workspace manifest cargo would load from `cwd`, the nearest `Cargo.toml` with a `[workspace]` table from `cwd` up to `root`, names its members by a
+/// pattern (`crates/*`).
+#[cfg(windows)]
+fn members_by_pattern(cwd: &Path, root: &Path) -> bool {
+    for folder in cwd.ancestors().take_while(|folder| folder.starts_with(root)) {
+        let Ok(text) = std::fs::read_to_string(folder.join("Cargo.toml")) else { continue };
+        let (mut table, mut members, mut in_members, mut workspace) = ("", String::new(), false, false);
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('[') && !in_members {
+                table = line;
+                workspace |= line == "[workspace]";
+            } else if table == "[workspace]" && (in_members || line.split(['=', ' ']).next() == Some("members")) {
+                let value = if in_members { line } else { line.split_once('=').map_or("", |(_, value)| value) };
+                members.push_str(value);
+                in_members = !value.contains(']');
+            }
+        }
+        if workspace {
+            return members.contains(['*', '?']);
+        }
+    }
+    false
 }
 
 /// What cmd is to be given. It ends a line at its first line break and says nothing: of two commands the second never runs, and `python -c "` with its code on the next lines runs
@@ -2598,6 +2781,17 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     // First: all that follows here looks in that folder as the person, and it may be anywhere, a share on another machine included.
     crate::sandbox::writable_root(&cwd, &resolve(workspace, "."), home.as_deref()).map_err(|error| format!("{error}. The command was not started; changing its spelling cannot repair this"))?;
+    // (else the system's own words, "the directory name is invalid", read as a misspelling: the folder a command would make cannot be the one it starts in)
+    if !cwd.is_dir() {
+        return Err(format!("not run: {} does not exist yet, and a command starts in its cwd. Nothing was started. Run it from a folder that is there (with no cwd: the workspace) \
+                            and let the command make the folder, or make it first", cwd.display()));
+    }
+    // `cd <the folder it runs in> && …`, a habit from shells that start elsewhere: in the sandbox `cd` to a full path under the user folder is refused ("Access is denied"),
+    // as cmd looks at every folder on the way, so that part is left out and said to be.
+    let (line, cd_left_out) = match after_cd_to(line, &cwd) {
+        Some((cd, rest)) => (rest, Some(cd)),
+        None => (line, None),
+    };
     let started_with_init = git_init_first(line);
     // What would be refused is refused before the app makes anything: a refusal says nothing was started, and `.git` would have been.
     let after_init: &str = started_with_init.as_ref().map_or(line, |(_, rest)| rest);
@@ -2627,15 +2821,29 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let started = Instant::now();
     let before = file_states(&cwd);
     let runs = line_that_runs(line);
+    // One cargo command under the user folder, in a workspace that names its members by a pattern, which cargo expands looking at each folder from the drive's root: a
+    // container may not look at C:\Users, so this one runs with a restricted token, reading as the person does and writing in the workspace alone (`run_live_restricted`).
+    // Judged on the line as the model wrote it, which is what the gate judged and the person allowed (`REASON_CARGO_OUTSIDE`), and on what runs, which must be that line.
+    let root = resolve(workspace, ".");
+    let restricted = cargo_reads_above(text_arg(arguments, "command")?, &cwd, &root, home.as_deref()) && cargo_reads_above(&runs, &cwd, &root, home.as_deref());
+    let run = if restricted { crate::sandbox::run_live_restricted } else { crate::sandbox::run_live };
     // Spelled as `cwd` is, or a path with `..` in it would not be seen as holding it.
-    let done = crate::sandbox::run_live(&runs, &cwd, &resolve(workspace, "."), network, timeout, cancel, live).map_err(|error| {
+    let done = run(&runs, &cwd, &root, network, timeout, cancel, live).map_err(|error| {
         // (the app's `git init` has run by then, and what is said is what is there)
         let started = if started_with_init.is_some() { "`git init` ran, and made .git there; the rest of the line was not started" } else { "The command was not started" };
         format!("{error}. {started}; changing its spelling cannot repair this")
     })?;
     let (out, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
     let mut report = String::new();
+    if restricted {
+        report.push_str(&format!("note: cargo ran outside the container, with a restricted token: in the container cargo cannot expand this workspace's `members` pattern under \
+                                  the user folder. It could read what the user can and write only in the workspace{}.\n",
+                                 if network { "" } else { ", and was pointed away from the network (CARGO_NET_OFFLINE and a proxy that is not there)" }));
+    }
     // (said, and not done quietly: the model learns what its words became, and the person reads it in the result)
+    if let Some(cd) = cd_left_out {
+        report.push_str(&format!("note: `{cd}` was left out: the command runs in that folder already, and in the sandbox `cd` to a full path under the user folder is refused.\n"));
+    }
     if runs != line {
         report.push_str(&format!("note: this ran as `{runs}`: in the sandbox `dir`, `del` and `| head` are replaced by what does the same there.\n"));
     }
@@ -2659,7 +2867,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
             report.push_str(&format!("note: the sandbox cannot read these folders on PATH, so what is in them looks absent: {}. They are not missing, and their full paths are closed too: do not try them. Tell the user that /tools opens them to commands, with one Windows prompt.\n", names.join(", ")));
         }
     }
-    if needs_drive_root(line) && says_access_denied(&err, system_access_denied()) {
+    if refused_for_the_drive_root(line, &out, &err, system_access_denied()) {
         report.push_str(&DRIVE_ROOT_NOTE.replace("{}", crate::prompt::NO_DRIVE_ROOT));
     }
     if !done.disarmed.is_empty() {
@@ -2672,7 +2880,9 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
         report.push_str(&format!("note: this reached the {} GiB that commands may use on this machine, and was refused more. It needs to use less at a time.\n", cap >> 30));
     }
     // (with the cause said above, a traceback's middle tells nothing more, and it is read again with every later request)
-    report.push_str(&sandbox_notes(line, &resolve(workspace, "."), done.status, &err));
+    let notes = sandbox_notes(line, &resolve(workspace, "."), done.status, &err);
+    // (a restricted token reads anywhere the user can: what it is refused outside the workspace is a write)
+    report.push_str(&if restricted { notes.replace(OUTSIDE_READ_NOTE, OUTSIDE_WRITE_NOTE) } else { notes });
     let most_err = if no_network.is_some() { MAX_COMMAND_ERR / 6 } else { MAX_COMMAND_ERR };
     let whole = (out.len() > MAX_COMMAND_OUT || err.len() > most_err).then(|| kept_whole(&out, &err)).flatten();
     report.push_str(&format!("stdout:\n{said_by_init}{}\nstderr:\n{}\n", cap_evenly(&out, MAX_COMMAND_OUT, whole.as_deref()), cap_evenly(&err, most_err, whole.as_deref())));
@@ -2756,6 +2966,7 @@ pub fn summary(tool: &str, arguments: &Value) -> String {
             files.join(", ")
         }
         "show_diff" => text("scope").to_string(),
+        "present" => arguments.get("paths").and_then(Value::as_array).map_or(String::new(), |paths| paths.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
         "web_read" => text("url").to_string(),
         "find_files" => text("pattern").to_string(),
         "skill" => text("name").to_string(),
@@ -2764,6 +2975,7 @@ pub fn summary(tool: &str, arguments: &Value) -> String {
         "command_status" | "command_stop" => text("id").to_string(),
         "wake_at" => format!("{}: {}", arguments.get("delay_seconds").and_then(Value::as_u64).map_or(String::new(), |seconds| format!("{seconds} s")), text("note").chars().take(100).collect::<String>()),
         "explore" => text("task").lines().next().unwrap_or("").chars().take(100).collect(),
+        "run_code" => text("description").lines().next().unwrap_or("").chars().take(100).collect(),
         _ if tool.starts_with("mcp__") => arguments.to_string().chars().take(120).collect(),
         "web_search" => arguments.get("queries").and_then(Value::as_array).map_or(String::new(), |queries| queries.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
         _ => String::new(),
@@ -2798,14 +3010,14 @@ mod power_tests {
     #[test]
     fn the_tools_of_a_session_depend_on_what_is_on() {
         let names = |value: Value| value.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
-        let plain = names(schemas_for(false, false, false, Vec::new()));
+        let plain = names(schemas_for(false, false, false, Vec::new(), false));
         assert!(plain.contains(&"find_files".to_string()) && !plain.contains(&"skill".to_string()) && !plain.contains(&"web_read".to_string()) && !plain.contains(&"remember".to_string()));
-        let all = names(schemas_for(true, true, true, vec![json!({"type": "function", "function": {"name": "mcp__s__t"}})]));
+        let all = names(schemas_for(true, true, true, vec![json!({"type": "function", "function": {"name": "mcp__s__t"}})], false));
         assert!(all.contains(&"mcp__s__t".to_string()));
         for tool in ["skill", "web_read", "remember", "forget", "command_status"] {
             assert!(all.contains(&tool.to_string()), "{tool}");
         }
-        let schemas = schemas_for(false, false, false, Vec::new());
+        let schemas = schemas_for(false, false, false, Vec::new(), false);
         let command = schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "execute_command").unwrap();
         assert!(command["function"]["parameters"]["properties"].get("background").is_some());
     }
@@ -3021,6 +3233,81 @@ mod change_tests {
 
     #[cfg(windows)]
     #[test]
+    fn a_cd_by_full_path_to_the_folder_it_runs_in_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let here = dir.path().display().to_string();
+        assert_eq!(after_cd_to(&format!("cd {here} && python x.py"), dir.path()), Some((format!("cd {here}").as_str(), "python x.py")));
+        assert_eq!(after_cd_to(&format!("CD /D \"{here}\" &&  dir"), dir.path()), Some((format!("CD /D \"{here}\"").as_str(), "dir")));
+        assert_eq!(after_cd_to(&format!("pushd {}\\ && echo a", here.replace('\\', "/")), dir.path()).map(|(_, rest)| rest), Some("echo a"));
+        for kept in [format!("cd {here}\\sub && echo a"), "cd sub && echo a".to_string(), format!("cd {here} & echo a"), format!("cd {here} && "), format!("cd {here}"),
+                     format!("echo {here} && cd {here}")] {
+            assert_eq!(after_cd_to(&kept, dir.path()), None, "{kept}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cargo_in_a_workspace_of_member_patterns_under_the_user_folder_runs_restricted() {
+        assert!(one_cargo_command("cargo test -p a") && one_cargo_command("  cargo.exe build --release ") && one_cargo_command("\"C:\\Program Files\\x\\cargo.exe\" test -- --nocapture"));
+        // (a line of more than cargo would run all of it with what cargo is given: never)
+        for more in ["cargo build & echo x", "cargo build && del x", "cargo test | more", "echo x && cargo build", "(cargo fmt)", "cargo build > out.txt", "cargo build ^& x",
+                     "cargo run %PATH%", "cargo run !x!", "cargo build; x", "cargo build\necho x", "python cargo.py", "echo cargo", "cargo-nextest run"] {
+            assert!(!one_cargo_command(more), "{more}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\n  \"crates/*\",\n]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(root.join("crates/a/Cargo.toml"), "[package]\nname = \"a\"\nversion = \"0.1.0\"\n").unwrap();
+        assert!(members_by_pattern(root, root) && members_by_pattern(&root.join("crates/a"), root), "from a member's folder too");
+        // (the user folder stood for by the folder above the workspace, wherever the test's folder is)
+        let home = root.parent().unwrap().join("someone");
+        assert!(cargo_reads_above("cargo build", &root.join("crates/a"), root, Some(&home)));
+        assert!(!cargo_reads_above("python x.py", root, root, Some(&home)));
+        assert!(!cargo_reads_above("cargo build", root, root, Some(Path::new(r"Q:\home\someone"))), "not under the user folder");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/a\"]\nexclude = [\"old/*\"]\n").unwrap();
+        assert!(!members_by_pattern(root, root), "members named one by one");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[\"crates/*\"]\n").unwrap();
+        assert!(members_by_pattern(root, root), "written without spaces");
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"solo\"\n").unwrap();
+        assert!(!members_by_pattern(root, root));
+    }
+
+    /// The case a review run met: `members = ["crates/*"]` under the user folder, which cargo cannot expand in the container.
+    #[cfg(windows)]
+    #[test]
+    fn cargo_loads_a_workspace_of_member_patterns_with_a_restricted_token() {
+        if !std::process::Command::new("cargo").arg("--version").output().is_ok_and(|output| output.status.success()) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(root.join("crates").join(name).join("src")).unwrap();
+            std::fs::write(root.join("crates").join(name).join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")).unwrap();
+            std::fs::write(root.join("crates").join(name).join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        }
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n").unwrap();
+        let said = execute_command(&json!({"command": "cargo metadata --offline --no-deps --format-version 1", "cwd": "crates/b"}), root, &AtomicBool::new(false), None).unwrap();
+        assert!(said.contains("exit_code: 0") && said.contains("\"name\":\"a\"") && said.contains("\"name\":\"b\""), "{said}");
+        let under_users = std::env::var_os("USERPROFILE").map(PathBuf::from).and_then(|home| home.parent().map(Path::to_path_buf)).is_some_and(|users| root.starts_with(users));
+        assert_eq!(said.contains("with a restricted token"), under_users, "{said}");
+    }
+
+    /// Run as the model wrote them, both failed: cmd refuses a `cd` by full path under the user folder ("Access is denied"), and a cwd the command would make is no place to start.
+    #[cfg(windows)]
+    #[test]
+    fn a_command_that_cds_to_its_own_folder_runs_and_one_whose_cwd_is_not_there_is_told_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = execute_command(&json!({"command": format!("cd /d \"{}\" && echo ran-here", dir.path().display())}), dir.path(), &AtomicBool::new(false), None).unwrap();
+        assert!(ran.contains("ran-here") && ran.contains("was left out") && ran.contains("exit_code: 0"), "{ran}");
+        let said = execute_command(&json!({"command": "echo x", "cwd": "made-later"}), dir.path(), &AtomicBool::new(false), None).unwrap_err();
+        assert!(said.contains("does not exist yet") && said.contains("Nothing was started"), "{said}");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn a_line_that_would_open_a_dialog_is_refused_before_any_sandbox_is_made() {
         let dir = tempfile::tempdir().unwrap();
         let said = execute_command(&json!({"command": "x.py"}), dir.path(), &AtomicBool::new(false), None).unwrap_err();
@@ -3033,9 +3320,19 @@ mod change_tests {
         assert!(DRIVE_ROOT_NOTE.contains("what ran before it did run"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_del_is_known_by_what_either_stream_says() {
+        // (a line whose `2>&1` sends cmd's refusal on with the output, as a model wrote it)
+        assert!(refused_for_the_drive_root("del \"tests\\_tmp.rs\" 2>&1; cargo test 2>&1", "アクセスが拒否されました。\r\n", "", ""));
+        assert!(refused_for_the_drive_root("dir", "", "Access is denied.\r\n", ""));
+        assert!(!refused_for_the_drive_root("cargo test 2>&1", "Access is denied.\r\n", "", ""), "no dir or del in it");
+        assert!(!refused_for_the_drive_root("del a.txt", "", "", ""), "not refused");
+    }
+
     #[test]
     fn a_session_is_told_of_the_network_as_a_thing_to_ask_for() {
-        let schemas = schemas_for(false, false, false, Vec::new());
+        let schemas = schemas_for(false, false, false, Vec::new(), false);
         let command = schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "execute_command").unwrap();
         assert!(command["function"]["parameters"]["properties"].get("network").is_some());
         assert!(command["function"]["parameters"]["properties"]["network"]["description"].as_str().unwrap().contains("Asks the user"));
@@ -3096,7 +3393,25 @@ mod tests {
     fn every_generated_schema_has_a_tool() {
         let schemas = schemas();
         let names: Vec<&str> = schemas.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "ask_user", "submit_plan", "todo", "find_files", "check_page", "command_status", "command_stop", "wake_at", "explore"]);
+        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "ask_user", "submit_plan", "todo", "present", "find_files", "check_page", "command_status", "command_stop", "wake_at", "explore"]);
+    }
+
+    /// `present` names files of the workspace, each once, from its root with forward slashes; a file that is not there, or a path out of the workspace, is refused, and so is none.
+    #[test]
+    fn present_names_files_of_the_workspace_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("web")).unwrap();
+        std::fs::write(dir.path().join("web/index.html"), "<p>").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "x").unwrap();
+        let files = present(&json!({"paths": ["web/index.html", "./notes.md", "web\\index.html"]}), dir.path()).unwrap();
+        assert_eq!(files, ["web/index.html", "notes.md"]);
+        assert!(present(&json!({"paths": ["gone.txt"]}), dir.path()).unwrap_err().contains("not a file"));
+        assert!(present(&json!({"paths": ["web"]}), dir.path()).is_err(), "a folder is not a file");
+        assert!(present(&json!({"paths": ["../outside.txt"]}), dir.path()).unwrap_err().contains("not in the workspace"));
+        assert!(present(&json!({"paths": []}), dir.path()).is_err());
+        let (_, mut bench, cancel) = bench();
+        let said = bench.run("present", &json!({"paths": ["notes.md"]}), dir.path(), &cancel).unwrap();
+        assert_eq!(said, "The person sees a card with notes.md.");
     }
 
     #[test]
@@ -3180,6 +3495,36 @@ mod tests {
             assert!(!text.contains(gone), "{gone}");
         }
         assert!(text.contains("see a picture") && text.contains("append=true"));
+    }
+
+    #[test]
+    fn create_file_asks_for_parts_unless_the_provider_shows_a_call_as_it_is_written() {
+        let description = |schemas: &Value| schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "create_file").unwrap()["function"]["description"].as_str().unwrap().to_string();
+        let mut schemas = schemas_for(true, true, true, Vec::new(), false);
+        assert_eq!(description(&schemas), CREATE_FILE_IN_PARTS);
+        assert!(description(&schemas).contains("Over about 300 lines"));
+        let others: Vec<Value> = schemas.as_array().unwrap().iter().filter(|tool| tool["function"]["name"] != "create_file").cloned().collect();
+        for_calls_shown_as_written(&mut schemas);
+        assert_eq!(description(&schemas), CREATE_FILE_WHOLE);
+        assert!(description(&schemas).contains("whole in one call") && description(&schemas).contains("append=true"));
+        let after: Vec<Value> = schemas.as_array().unwrap().iter().filter(|tool| tool["function"]["name"] != "create_file").cloned().collect();
+        assert_eq!(after, others, "nothing else changes");
+    }
+
+    /// A program's declaration of create_file says what create_file is as it is offered, after the provider's own version of it.
+    #[test]
+    fn run_code_declares_create_file_as_it_is_offered() {
+        let declared = |schemas: &Value| {
+            let run_code = schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "run_code").unwrap()["function"]["description"].as_str().unwrap().to_string();
+            run_code.lines().find(|line| line.starts_with("tools.create_file(")).unwrap().to_string()
+        };
+        let mut schemas = schemas_for(false, false, false, Vec::new(), true);
+        let in_parts = declared(&schemas);
+        for_calls_shown_as_written(&mut schemas);
+        let whole = declared(&schemas);
+        assert_ne!(in_parts, whole);
+        assert!(whole.contains("whole in one call"), "{whole}");
+        assert_eq!(schemas.as_array().unwrap().last().unwrap()["function"]["name"], "run_code", "still the last of them");
     }
 
     #[test]
@@ -3591,6 +3936,9 @@ mod tests {
         assert!(out.starts_with("--- ") && out.contains("--- outline ---") && out.contains("|pub fn part_59(x: u32) -> u32 {") && out.contains("start_line and limit"), "{}", &out[..out.len().min(600)]);
         assert!(!out.contains("let v7 = x + 59;"), "the bodies are not in it");
         assert!(out.len() < 8000, "{}", out.len());
+        // (and how to read all of it, where all of it is wanted: its lines in reads of 500)
+        let reads = source.lines().count().div_ceil(500);
+        assert!(out.lines().next().unwrap().contains(&format!("All of it is {reads} reads: read_file with start_line=1")), "{}", out.lines().next().unwrap());
         // A place asked for is read as it was.
         let part = bench.run("read_file", &json!({"path": "big.rs", "start_line": 100, "limit": 5}), dir.path(), &cancel).unwrap();
         assert!(part.starts_with("100|") && !part.contains("outline"), "{part}");
@@ -4089,6 +4437,20 @@ mod tests {
         assert!(show_diff(&json!({"scope": "unstaged"}), &pkg, None).unwrap().starts_with("no differences"));
     }
 
+    /// cargo in the sandbox, a workspace of `members = ["crates/*"]` under the user folder, as it was said in a run.
+    #[cfg(windows)]
+    #[test]
+    fn cargo_that_cannot_expand_a_members_pattern_is_told_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = "error: failed to load manifest for workspace member `C:\\Users\\a\\work\\crates/*`\nreferenced by workspace at `C:\\Users\\a\\work\\Cargo.toml`\n\nCaused by:\n  \
+                   failed to read `C:\\Users\\a\\work\\crates\\*\\Cargo.toml`\n\nCaused by:\n  ファイル名、ディレクトリ名、またはボリューム ラベルの構文が間違っています。 (os error 123)\n";
+        let note = sandbox_notes("cargo test -p app", dir.path(), Some(101), err);
+        assert!(note.contains("`members` pattern") && note.contains("run cargo directly") && note.contains("for the user to run themselves"), "{note}");
+        // a member named as it is, which is missing, is the project's own
+        let named = "error: failed to load manifest for workspace member `C:\\Users\\a\\work\\crates\\gone`\n";
+        assert!(!sandbox_notes("cargo build", dir.path(), Some(101), named).contains("`members` pattern"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn git_failing_in_a_folder_of_a_repository_says_whose_repository_it_is() {
@@ -4330,5 +4692,20 @@ mod tests {
         bench.todo(&json!({"todos": [{"id": "a", "text": "first"}, {"id": "b", "text": "second"}]})).unwrap();
         let out = bench.todo(&json!({"todos": [{"id": "a", "status": "done"}]})).unwrap();
         assert_eq!(out, "[done] a: first\n[pending] b: second");
+    }
+
+    #[test]
+    fn a_checklist_is_what_its_calls_leave_when_they_are_replayed() {
+        let mut todos = Vec::new();
+        apply_todo(&mut todos, &json!({"todos": [{"id": "a", "text": "first"}, {"id": "b", "text": "second"}]})).unwrap();
+        apply_todo(&mut todos, &json!({"todos": [{"id": "b", "status": "done"}]})).unwrap();
+        let shown = |todos: &[Value]| todos.iter().map(|item| (item["id"].as_str().unwrap().to_string(), item["status"].as_str().unwrap().to_string())).collect::<Vec<_>>();
+        assert_eq!(shown(&todos), [("a".to_string(), "doing".to_string()), ("b".to_string(), "done".to_string())], "the first of a new list is the one being done");
+        // A call that fails part of the way leaves the items before the failing one in.
+        assert_eq!(apply_todo(&mut todos, &json!({"todos": [{"id": "c"}, {"text": "no id"}]})), Err("each todo needs an id".to_string()));
+        assert_eq!(todos.len(), 3);
+        assert!(apply_todo(&mut todos, &json!({"merge": false})).is_err() && todos.len() == 3, "a call with no list changes none");
+        apply_todo(&mut todos, &json!({"todos": [{"id": "z"}], "merge": false})).unwrap();
+        assert_eq!(shown(&todos), [("z".to_string(), "doing".to_string())]);
     }
 }

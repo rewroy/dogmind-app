@@ -8,7 +8,7 @@ use crate::session::{self, helper_file_of, helpers_of, is_helper};
 fn run_under(workspace: &Path, client: Client, policy: Arc<Policy>) -> Run {
     let (sender, events) = channel();
     let sessions = tempfile::tempdir().unwrap();
-    let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy }, sender, Box::new(|| {}));
+    let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy, code_mode: false }, sender, Box::new(|| {}));
     handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
     Run { handle, events, _sessions: sessions }
 }

@@ -114,12 +114,33 @@ pub const REASON_WEB_UNKNOWN_ADDRESS: &str = "this address is not from your mess
 pub const REASON_WEB_NOTE: &str = "web content is in this conversation, and a note reaches every later session";
 pub const REASON_WEB_FORGET: &str = "web content is in this conversation, and forgetting a note changes every later session";
 pub const REASON_WEB_ASKED: &str = "web content is in this conversation, and it may have asked for this";
+pub const REASON_CARGO_OUTSIDE: &str = "cargo cannot read this workspace inside the sandbox, so it would run with the sandbox's read limits lifted: it can read every file you can, and its network cannot be stopped";
+pub const REASON_CARGO_CONFIG_RUNS: &str = "cargo's config here also runs {0}, with the same reach";
 
 /// Every reason a card can give, for the test that each has its Japanese in the app.
-pub const REASONS: [&str; 15] = [
+pub const REASONS: [&str; 17] = [
     REASON_OFF_THIS_PC, REASON_SECRET_READ, REASON_RUNS_OFF_THIS_PC, REASON_PLANTED, REASON_NETWORK, REASON_OUTSIDE_AND_OFF_THIS_PC, REASON_OUTSIDE, REASON_GIT_FOLDER, REASON_LONG_QUERY,
-    REASON_PRIVATE_QUERY, REASON_WEB_ADDRESS_PATH, REASON_WEB_UNKNOWN_ADDRESS, REASON_WEB_NOTE, REASON_WEB_FORGET, REASON_WEB_ASKED,
+    REASON_PRIVATE_QUERY, REASON_WEB_ADDRESS_PATH, REASON_WEB_UNKNOWN_ADDRESS, REASON_WEB_NOTE, REASON_WEB_FORGET, REASON_WEB_ASKED, REASON_CARGO_OUTSIDE, REASON_CARGO_CONFIG_RUNS,
 ];
+
+/// The reasons to ask about a command that would run with the sandbox's read limits lifted (`crate::tools::cargo_reads_above`): that, and what cargo's config runs besides. None for
+/// any other.
+fn cargo_lifted(command: &str, cwd: &Path, workspace: &Path) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        if !crate::tools::cargo_reads_above(command, cwd, workspace, home.as_deref()) {
+            return Vec::new();
+        }
+        let programs = crate::tools::cargo_config_programs(cwd, home.as_deref());
+        std::iter::once(REASON_CARGO_OUTSIDE.to_string()).chain((!programs.is_empty()).then(|| reason_of(REASON_CARGO_CONFIG_RUNS, &[&programs.join(", ")]))).collect()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (command, cwd, workspace);
+        Vec::new()
+    }
+}
 
 /// A reason from its template: `{0}` and `{1}` are what the call adds.
 pub fn reason_of(template: &str, parts: &[&str]) -> String {
@@ -505,6 +526,8 @@ pub struct Gate {
     wide_read: Regex,
     /// The folders a command's programs are found in besides the one it runs in. None: the PATH a command starts with.
     pub path: Option<Vec<PathBuf>>,
+    /// Code Mode is on: `run_code` is a tool. Off, it is none, as any name the gate does not know.
+    pub code_mode: bool,
 }
 
 impl Default for Gate {
@@ -556,6 +579,7 @@ impl Gate {
             // Words that read many files, of which the keys are some: what names them one by one is looked at, and this is not.
             wide_read: Regex::new(r"(?i)^\s*((type|findstr)\b.*[*?]|findstr\b.*\s/[sfgd])").expect("the pattern is valid"),
             path: None,
+            code_mode: false,
         }
     }
 
@@ -652,9 +676,11 @@ impl Gate {
                 }
             }
             // (it runs a page's scripts in the sandbox with no network, where they can read and print and little else: it stays in the workspace itself)
-            "show_diff" | "todo" | "skill" | "remember" | "forget" | "command_status" | "command_stop" | "wake_at" | "check_page" | "ask_user" | "submit_plan" => Verdict::Allow,
+            "show_diff" | "todo" | "present" | "skill" | "remember" | "forget" | "command_status" | "command_stop" | "wake_at" | "check_page" | "ask_user" | "submit_plan" => Verdict::Allow,
             // (its own calls are each through this gate, and it has only the looking ones)
             "explore" => Verdict::Allow,
+            // (so are a program's: it does nothing but call tools, and each call is judged on its own)
+            "run_code" if self.code_mode => Verdict::Allow,
             "web_read" => Verdict::Allow,
             "web_search" => match crate::web::query_problem(arguments) {
                 Some(problem) => Verdict::Ask { risk: Risk::Medium, reason: Some(problem) },
@@ -684,7 +710,9 @@ impl Gate {
                 let planted = self.planted_here(&answered, &cwd);
                 // (a look that names one is no look, as `command_risk` has it, and what is asked says why, as for `read_file`: the reason keeps a rule, "always" and a mode from answering for it)
                 let off_this_pc = names_a_place_off_this_pc(command).map(|word| leads_off_this_pc(&word));
-                if self.is_look(command) && !wants_network(arguments) && within(workspace, &cwd) && answered.is_empty() {
+                // (one cargo command that cannot run in the container here, and would run with its read limits lifted: always the person's to allow, with what its config runs too)
+                let lifted = cargo_lifted(command, &cwd, workspace);
+                if self.is_look(command) && !wants_network(arguments) && within(workspace, &cwd) && answered.is_empty() && lifted.is_empty() {
                     return Verdict::Allow;
                 }
                 match self.command_risk(command, stated) {
@@ -692,7 +720,7 @@ impl Gate {
                         // (what is safe is safe by the name of a program the list knows, and a file here that answers to the name runs the project's code instead. Safe and low are what the setting for safe
                         // commands lets through, so this is more than low: it asks)
                         let risk = if risk == Risk::Safe && !answered.is_empty() { Risk::Medium } else { risk };
-                        let reasons: Vec<String> = planted.into_iter().chain(off_this_pc).chain(wants_network(arguments).then(|| REASON_NETWORK.to_string())).collect();
+                        let reasons: Vec<String> = planted.into_iter().chain(off_this_pc).chain(wants_network(arguments).then(|| REASON_NETWORK.to_string())).chain(lifted).collect();
                         Verdict::Ask { risk, reason: (!reasons.is_empty()).then(|| reasons.join("; ")) }
                     }
                     Err(reason) => Verdict::Deny(reason),
@@ -900,6 +928,15 @@ mod network_words {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn run_code_is_a_tool_to_the_gate_only_with_code_mode_on_and_then_asks_no_one() {
+        let mut gate = Gate::new();
+        let work = Path::new("C:/work");
+        assert_eq!(gate.check("run_code", &json!({"code": "return 1;"}), work), Verdict::Deny("no such tool: run_code".into()));
+        gate.code_mode = true;
+        assert_eq!(gate.check("run_code", &json!({"code": "return 1;"}), work), Verdict::Allow);
+    }
 
     #[test]
     fn what_destroys_the_system_is_denied_in_every_spelling() {
@@ -1326,6 +1363,37 @@ mod tests {
         for path in [".env", ".env.production", "C:\\Users\\me\\.cargo\\credentials.toml", "credentials.json", "C:\\Users\\me\\.aws\\credentials"] {
             assert!(matches!(read_verdict(&gate, path, root), Verdict::Ask { .. }), "{path}");
         }
+    }
+
+    /// One cargo command in a `crates/*` workspace under the user folder would run with the sandbox's read limits lifted: the person is asked, with a reason no mode answers, and
+    /// told what cargo's config runs besides. A line of more is the container's, and is not asked about this.
+    #[cfg(windows)]
+    #[test]
+    fn cargo_that_would_run_with_its_read_limits_lifted_is_asked_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let under_users = std::env::var_os("USERPROFILE").map(PathBuf::from).and_then(|home| home.parent().map(Path::to_path_buf)).is_some_and(|users| root.starts_with(users));
+        if !under_users {
+            return;
+        }
+        std::fs::create_dir_all(root.join("crates/a")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/*\"]\n").unwrap();
+        let gate = Gate::new();
+        let reason = |line: &str| match gate.check("execute_command", &json!({"command": line}), root) {
+            Verdict::Ask { reason, .. } => reason.unwrap_or_default(),
+            _ => String::new(),
+        };
+        assert!(reason("cargo build").contains(REASON_CARGO_OUTSIDE), "{}", reason("cargo build"));
+        assert!(reason("cargo --version").contains(REASON_CARGO_OUTSIDE), "a look is asked about too");
+        for more in ["cargo build & echo x", "cargo test | more", "echo x && cargo build"] {
+            assert!(!reason(more).contains(REASON_CARGO_OUTSIDE), "{more}");
+        }
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(root.join(".cargo/config.toml"), "[build]\nrustc-wrapper = \"sccache\"\n[target.x86_64-pc-windows-msvc]\nrunner = \"run-me.cmd\"\n").unwrap();
+        let said = reason("cargo test");
+        assert!(said.contains(REASON_CARGO_OUTSIDE) && said.contains("also runs sccache, run-me.cmd"), "{said}");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/a\"]\n").unwrap();
+        assert!(!reason("cargo build").contains(REASON_CARGO_OUTSIDE), "members named one by one run in the container");
     }
 
     #[test]

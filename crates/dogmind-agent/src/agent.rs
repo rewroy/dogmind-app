@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 use crate::background::{self, Background, Waiting};
 use crate::checkpoint::{Checkpoints, Restored, Turn};
+use crate::code_mode;
 use crate::compaction;
 use crate::llm::{self, Delta, LlmError, Provider, Request, Usage};
 use crate::images::{self, Attachment, ImageLimit};
@@ -133,9 +134,14 @@ pub enum Command {
     SetEffort(Option<String>),
     SetSafeCommands(bool),
     SetWeb(WebSettings),
+    /// Code Mode on or off: a conversation that has begun keeps the tools it began with.
+    SetCodeMode(bool),
     SetLanguage(String),
     /// The skills turned off, by name. A session already begun keeps the list its prompt was written with, but cannot read one that is off.
     SetSkillsOff(Vec<String>),
+    /// The skills the person turned on, by name: one that needs what this app has not (a server not configured, another app's feature) is offered
+    /// only so. As [`Command::SetSkillsOff`] for a session already begun.
+    SetSkillsOn(Vec<String>),
     /// Files that hold keys, as the settings name them: reading one asks, as for any other place secrets are kept.
     SetSecrets(Vec<PathBuf>),
     /// Have a local engine read what every new session begins with, before the first message needs it.
@@ -167,6 +173,8 @@ pub struct Approval {
     pub rule: Option<Rule>,
     /// What `Always` would allow for this session instead: a file, or folders. With neither of these, this exact call.
     pub scope: Option<AlwaysScope>,
+    /// The call is one a program makes (`run_code`) in the middle of its run: what the program says it does.
+    pub program: Option<String>,
     pub answer: Sender<(Decision, Option<String>)>,
 }
 
@@ -263,6 +271,9 @@ pub enum Event {
     RequestStarted,
     /// The session is being made shorter, which can be minutes of the model summing it up: till the next request, or the turn's end.
     Compacting,
+    /// The last request is to be made again, after `wait_ms` of waiting (told as the wait begins, or, for a server that was restarting, with what has been waited): `why` is as the trajectory says it
+    /// (`overflow`, `transient`, `server_restart`, `empty`). [`Event::RequestStarted`] follows.
+    Retrying { why: String, wait_ms: u64 },
     /// The server is reading the prompt, before the answer's first word: `done` of `total` tokens. Told about once a second while it reads
     /// (Straydog); after a compaction, or on a small GPU, that can be minutes.
     Reading { done: u64, total: u64 },
@@ -276,6 +287,9 @@ pub enum Event {
     HelperStep { id: String, step: u32, most: u32, tool: String, summary: String, tokens: u64, elapsed: Duration },
     /// The helper is done, whichever way: `steps` requests that called a tool, `files` different files it read, and what the call's record of it is (`helper`, none when it was not kept).
     HelperEnded { id: String, how: HelperEnd, steps: u32, files: u32, tokens: u64, elapsed: Duration, helper: Option<crate::message::HelperRef> },
+    /// A program that is running (`id` is its `run_code` call's) calls a tool: its `call`-th, the tool, and what it is on. Its calls are not calls of
+    /// the window's own (no `ToolStarted`): they are its program's steps.
+    ProgramStep { id: String, call: u32, tool: String, summary: String },
     /// `images`: what the call opened for the model to see, kept with the session, which the person sees too.
     ToolEnded { id: String, ok: bool, declined: bool, elapsed: Duration, output: String, images: Vec<ImageRef> },
     /// Words written during the turn have reached it, between two of its steps.
@@ -291,6 +305,8 @@ pub enum Event {
     ModeChanged(Mode),
     Usage { used: u64, window: u64, usage: Usage },
     Todos(Vec<Value>),
+    /// Files of the workspace the model put before the person (present): its call, and the files from the workspace's root.
+    Presented { call: String, files: Vec<String> },
     /// Whether web content is in this conversation, so that a command that gets the network asks.
     WebSeen(bool),
     Turns(Vec<Turn>),
@@ -428,12 +444,16 @@ pub struct Config {
     pub home: Option<PathBuf>,
     /// The skills the person has turned off, by name: neither offered to the model nor started by `/name`.
     pub skills_off: Vec<String>,
+    /// The skills the person turned on: of those that need what this app has not, only these are offered.
+    pub skills_on: Vec<String>,
     /// The folder of the notes kept between sessions. None: no notes are kept.
     pub memory: Option<PathBuf>,
     /// The MCP servers, shared by every session.
     pub mcp: Option<Arc<mcp::Hub>>,
     /// Whether conversations are written encrypted, shared with the window and the other agents: while it waits for the key, no session is opened or written.
     pub policy: Arc<crate::conversation_key::Policy>,
+    /// Code Mode: the model may run a short program that calls the tools (`run_code`) instead of calling them one at a time.
+    pub code_mode: bool,
 }
 
 /// Starts the agent. `wake` is called after every event, for a UI that sleeps until it has something to draw.
@@ -701,14 +721,10 @@ const DRAFT_LINES: usize = 100;
 const PROSE_BETWEEN: usize = 2;
 /// The long side of a picture a model reads back from its own work.
 const OWN_PICTURE_SIDE: u32 = 1024;
-/// What a request is told it has cost, each time this much more has gone by with something written: on a slow model, this is over three minutes.
-const COST_NOTED_EVERY: u64 = 8000;
-
-fn cost_note(generated: u64) -> String {
-    format!("{}This request has cost {generated} tokens so far, about 40 a second. If what was asked for now exists, end your turn now with the result and what has not been run. Do not polish it or check it further.", prompt::DRAFT_NOTE)
-}
-
 /// Whether a line of reasoning is code, whichever language: sentences do not end in these, in English or in Japanese.
+/// What a turn in plan mode is told with its facts: what the mode is, as a fact.
+const PLAN_MODE_FACTS: &str = "## Plan Mode\nPlan mode is on: the user wants a plan first. The read-only tools work, and nothing can be changed. submit_plan puts a plan to the user; once they approve it, plan mode ends and the changes can be made.";
+
 fn is_code_line(line: &str) -> bool {
     let line = line.trim();
     line.ends_with([';', '{', '}']) || line.ends_with("*/") || line.starts_with("#define ") || line.starts_with("</")
@@ -950,6 +966,14 @@ fn command_failed(output: &str) -> bool {
     output.rsplit_once("exit_code: ").is_some_and(|(_, code)| code.trim() != "0")
 }
 
+/// Whether the person's message asks for what was written not to be run: then the app does not ask the model to check it (it is the person's call).
+fn asks_not_to_run(text: &str) -> bool {
+    const ENGLISH: [&str; 9] = ["do not run", "don't run", "dont run", "do not execute", "don't execute", "without running", "no need to run", "do not test", "don't test"];
+    const JAPANESE: [&str; 8] = ["実行しない", "実行せず", "実行は不要", "実行不要", "実行はしない", "動かさない", "走らせない", "テストしない"];
+    let lower = text.to_lowercase().replace('\u{2019}', "'");
+    ENGLISH.iter().any(|words| lower.contains(words)) || JAPANESE.iter().any(|words| text.contains(words))
+}
+
 /// Whether code has changed with no command since, after these calls in order. A page or a stylesheet is not among it: nothing here can open one, and the model has been told so.
 fn still_unchecked(mut unchecked: bool, calls: &[crate::message::ToolCall]) -> bool {
     const NOT_CODE: [&str; 17] = ["md", "markdown", "txt", "rst", "log", "csv", "json", "toml", "html", "htm", "css", "svg", "xml", "yaml", "yml", "ini", "cfg"];
@@ -998,6 +1022,7 @@ struct Agent {
     home: Option<PathBuf>,
     /// The skills the person has turned off, by name.
     skills_off: Vec<String>,
+    skills_on: Vec<String>,
     memory: Option<PathBuf>,
     mcp: Option<Arc<mcp::Hub>>,
     policy: Arc<crate::conversation_key::Policy>,
@@ -1057,6 +1082,22 @@ struct Agent {
     helper_stop: Arc<HelperStop>,
     /// What a helper's call is to record in its result, by the call's id, until the result is written.
     helper_refs: HashMap<String, crate::message::HelperRef>,
+    /// Code Mode is on: `run_code` is a tool.
+    code_mode: bool,
+    /// The program at work (a `run_code` call), for the calls it makes.
+    program: Option<Program>,
+    /// The calls the programs of this response have made, as the model would have written them: what is checked after the response looks at them as it does at the model's own.
+    program_calls: Vec<crate::message::ToolCall>,
+    /// What the last warm-up sent, for the conversation that begins next (see [`Agent::ensure_session`]).
+    warmed: Option<Warmed>,
+}
+
+/// The prefix a warm-up had the engine read: its folder, its system prompt, its tools, and the skills they were made with.
+struct Warmed {
+    workspace: PathBuf,
+    prompt: String,
+    tools: Value,
+    skills: Vec<skills::Skill>,
 }
 
 /// A session's scratch folder: outside the workspace, in the sandbox's own temp area, which is the one place besides a workspace where a command may write. Named for the session's file.
@@ -1116,6 +1157,23 @@ struct ToolMeta {
     edited: Vec<PathBuf>,
     parallel: usize,
     req: Option<String>,
+    /// The call of a program (`run_code`) that made this one.
+    parent: Option<String>,
+    /// For a `run_code` call: how many calls its program made, and its own running time in milliseconds.
+    program: Option<(usize, u64)>,
+}
+
+/// A program at work (a `run_code` call).
+struct Program {
+    id: String,
+    /// What it says it does, for the person who is asked about one of its calls.
+    description: String,
+    /// The calls it has made so far.
+    calls: u32,
+    /// How long the person was waited for in them.
+    waited: Duration,
+    /// One of them was from a stranger (the web, a server not trusted): what the program returns may hold what a stranger wrote.
+    stranger: bool,
 }
 
 /// A path as the trajectory says it: from the workspace when it is in it, and as its file name only when it is not (a picture a check made in the sandbox's folder: where that is says
@@ -1127,7 +1185,7 @@ fn path_for_trajectory(path: &str, workspace: &Path) -> String {
 
 /// The first word of a command, and no more: a program's name, never its arguments, which can hold a key or a person's words. A first word with an `=` in it is an assignment
 /// (`KEY=value cmd`), and says nothing.
-fn first_word_of(command: &str) -> Option<String> {
+pub(crate) fn first_word_of(command: &str) -> Option<String> {
     let word = command.split_whitespace().next()?.trim_matches(|c| c == '"' || c == '\'' || c == '&' || c == '.');
     if word.contains('=') || word.contains('$') {
         return Some("(assignment)".to_string());
@@ -1205,15 +1263,17 @@ impl Agent {
         // The app's own folder: the sessions and the rules are there, and what keeps its keys.
         let mut gate = Gate::new();
         gate.secrets.extend(config.rules.parent().map(Path::to_path_buf));
+        gate.code_mode = config.code_mode;
         // (Visual Studio's build tools are looked for from here, in the background: the gate weighs a command without waiting for them, and its environment then usually finds them ready)
         #[cfg(windows)]
         crate::msvc::look_ahead();
         let background = Arc::new(Background::default());
         bench.background = background.clone();
         Agent {
-            tool_schemas: tools::schemas_for(config.web.enabled, false, false, Vec::new()),
+            tool_schemas: tools::schemas_for(config.web.enabled, false, false, Vec::new(), config.code_mode),
             home: config.home,
             skills_off: config.skills_off,
+            skills_on: config.skills_on,
             memory: config.memory,
             mcp: config.mcp,
             policy: config.policy,
@@ -1273,6 +1333,10 @@ impl Agent {
             wake_lines: Vec::new(),
             helper_stop: Arc::default(),
             helper_refs: HashMap::new(),
+            code_mode: config.code_mode,
+            program: None,
+            program_calls: Vec::new(),
+            warmed: None,
         }
     }
 
@@ -1334,18 +1398,18 @@ impl Agent {
                 Command::SetLanguage(language) => self.language = language,
                 Command::SetSkillsOff(names) => {
                     self.skills_off = names;
-                    if self.messages.is_empty() {
-                        self.load_extras();
-                    } else {
-                        // (its prompt and its tools are the engine's kept prefix: only what may be read changes)
-                        self.bench.skills = skills::without(skills::discover(&self.workspace, self.home.as_deref()), &self.skills_off);
-                    }
+                    self.skills_changed();
+                }
+                Command::SetSkillsOn(names) => {
+                    self.skills_on = names;
+                    self.skills_changed();
                 }
                 Command::SetSecrets(files) => {
                     self.gate.secrets.truncate(1);
                     self.gate.secrets.extend(files);
                 }
                 Command::SetWeb(web) => self.set_web(web),
+                Command::SetCodeMode(on) => self.set_code_mode(on),
                 Command::NewSession(workspace) => self.new_session(workspace),
                 Command::WarmPrefix => self.warm_prefix(),
                 Command::Resume(path) => self.resume(&path),
@@ -1461,9 +1525,36 @@ impl Agent {
 
     /// What depends on the workspace and the settings: its skills, the notes' folder, and so the tools on offer.
     fn load_extras(&mut self) {
-        let found = skills::without(skills::discover(&self.workspace, self.home.as_deref()), &self.skills_off);
+        let found = self.allowed(skills::discover(&self.workspace, self.home.as_deref()));
+        self.extras_with(found);
+    }
+
+    /// The skills the model may be told of and start: not one the person turned off, nor one that needs what this app has not (a server not
+    /// configured, another app's feature) unless they turned it on. The window decides the same for what it shows; this holds before it has said
+    /// (a warm-up as a conversation begins), and where there is no window.
+    fn allowed(&self, found: Vec<skills::Skill>) -> Vec<skills::Skill> {
+        let servers = self.mcp.as_ref().map_or(Vec::new(), |hub| hub.server_parts());
+        let named = |list: &[String], skill: &skills::Skill| list.iter().any(|name| name.eq_ignore_ascii_case(&skill.name));
+        found.into_iter().filter(|skill| !named(&self.skills_off, skill) && (named(&self.skills_on, skill) || skill.needs_what_is_not_here(&servers).is_none())).collect()
+    }
+
+    /// What the person turned on or off: with no conversation yet, what one begins with; in one, only what may be read (its prompt and its tools
+    /// are the engine's kept prefix).
+    fn skills_changed(&mut self) {
+        if self.messages.is_empty() {
+            self.load_extras();
+        } else {
+            self.bench.skills = self.allowed(skills::discover(&self.workspace, self.home.as_deref()));
+        }
+    }
+
+    /// The tools and what the bench holds, with these skills.
+    fn extras_with(&mut self, found: Vec<skills::Skill>) {
         let servers = self.mcp.as_ref().map_or(Vec::new(), |hub| hub.schemas());
-        self.tool_schemas = tools::schemas_for(self.web.enabled, found.iter().any(|skill| skill.for_the_model), self.memory.is_some(), servers);
+        self.tool_schemas = tools::schemas_for(self.web.enabled, found.iter().any(|skill| skill.for_the_model), self.memory.is_some(), servers, self.code_mode);
+        if self.provider.as_ref().is_some_and(|provider| provider.shows_calls_as_written()) {
+            tools::for_calls_shown_as_written(&mut self.tool_schemas);
+        }
         self.bench.skills = found;
         self.bench.memory = self.memory.clone();
         self.bench.policy = self.policy.clone();
@@ -1490,6 +1581,16 @@ impl Agent {
             if let Some(session) = &mut self.session {
                 let _ = session.set_tools(&tools);
             }
+        }
+    }
+
+    /// With no conversation yet it decides what one will begin with. In one, its tools are part of its prefix, so they stay: turned off, a call to `run_code` is answered as a call to a tool there
+    /// is none of; turned on, it is offered from the next conversation.
+    fn set_code_mode(&mut self, on: bool) {
+        self.code_mode = on;
+        self.gate.code_mode = on;
+        if self.messages.is_empty() {
+            self.load_extras();
         }
     }
 
@@ -1566,7 +1667,7 @@ impl Agent {
                 self.emit(Event::Goal(self.goal.clone()));
                 for message in &self.messages {
                     match (message.role.as_str(), message.content.as_deref()) {
-                        ("user", Some(text)) => {
+                        ("user", Some(text)) if !prompt::is_nudge(text) => {
                             self.bench.web.note_typed(prompt::typed_text(text));
                             self.japanese_session |= prompt::has_kana(prompt::typed_text(text));
                         }
@@ -1647,6 +1748,10 @@ impl Agent {
 
     /// A message goes in the conversation and on disk together.
     fn push(&mut self, mut message: Message) {
+        // (an answer's place in the session, for the line of the request that made it)
+        if message.role == "assistant" {
+            self.traj.message_at(self.messages.len());
+        }
         // (when the person said it, and when an answer was given, show beside them)
         if message.at.is_none() && matches!(message.role.as_str(), "user" | "assistant") {
             message.at = Some(crate::message::written_now());
@@ -1663,6 +1768,19 @@ impl Agent {
         if self.messages.is_empty() {
             // What has come up since the last session ended is here for this one.
             self.load_extras();
+            // The skills the warm-up was made with, where nothing else has changed since: a folder another program keeps in step with its own (a
+            // desktop app's synced skills) can be found half written, and a list that differs from the warm-up's by them had the engine read the
+            // whole prefix again (4.6K tokens, 3.6 s on DeepSeek) where it had just read it.
+            if let Some(warmed) = self.warmed.take().filter(|warmed| warmed.workspace == self.workspace) {
+                let fresh = std::mem::take(&mut self.bench.skills);
+                // (what the person has turned off since, or on, counts: the warm-up's are taken as they would be found now)
+                let kept = self.allowed(warmed.skills);
+                self.extras_with(kept);
+                if self.frozen_prompt() != warmed.prompt || self.tool_schemas != warmed.tools {
+                    // (the person's settings, notes or instructions have changed since: the conversation begins with them)
+                    self.extras_with(fresh);
+                }
+            }
             let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
             let mut session = Session::create_under(&self.policy, &self.sessions, &self.workspace, &now(), &stamp)?;
             let path = session.path.clone();
@@ -1695,16 +1813,22 @@ impl Agent {
         if !self.messages.is_empty() {
             return;
         }
+        // (a server reading or writing for another conversation, or another client, is not made to wait for this, nor this for it)
+        if !provider.idle() {
+            return;
+        }
         // (the tools the first message will find, or this was for nothing)
         self.load_extras();
-        let messages = [Message::text("system", self.frozen_prompt()), Message::text("user", ".")];
+        let prompt = self.frozen_prompt();
+        self.warmed = Some(Warmed { workspace: self.workspace.clone(), prompt: prompt.clone(), tools: self.tool_schemas.clone(), skills: self.bench.skills.clone() });
+        let messages = [Message::text("system", prompt), Message::text("user", ".")];
         let req_id = self.traj.request_id();
         let request = Request { model: &self.model, messages: &messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id) };
         // Its first word is enough, which stops it as Stop does: Stop itself ends it at once, for what was written during it to begin.
         self.cancel.store(false, Ordering::Relaxed);
         let mut answered = false;
         let mut clock = Clock::start();
-        let streamed = provider.stream(&request, &self.cancel, &mut |delta| {
+        let streamed = provider.warm(&request, &self.cancel, &mut |delta| {
             // (the prompt being read is no word)
             if matches!(delta, Delta::Prefill(..)) {
                 return;
@@ -1761,40 +1885,40 @@ impl Agent {
         self.bench.web.note_typed(text);
         let language = self.language_for(text);
         self.bench.in_japanese = language == Some("Japanese");
-        let mut message = prompt::user_message_in(text, &now(), language);
-        // What changes as work goes on rides on a message and stays out of the prefix every session shares.
+        // What the app knows of this moment goes in a message of its own after what was typed, and stays out of the prefix every session shares.
+        let mut notes: Vec<String> = Vec::new();
         if first_message {
-            message = prompt::with_note(&message, &prompt::workspace_state(&self.workspace));
+            notes.push(prompt::workspace_state(&self.workspace));
             // What the person has opened to commands, as the prefix every session shares must not depend on it.
             #[cfg(windows)]
             if let Some(file) = self.rules.parent().map(crate::read_folders::file_in) {
                 let open: Vec<String> = crate::read_folders::open_folders(&file).iter().map(|folder| format!("`{}`", folder.display())).collect();
                 if !open.is_empty() {
-                    message = prompt::with_note(&message, &format!("- Commands can also read these folders, and write in none of them: {}.", open.join(", ")));
+                    notes.push(format!("- Commands can also read these folders, and write in none of them: {}.", open.join(", ")));
                 }
             }
         }
         if std::mem::take(&mut self.web_rules_due) {
-            message = prompt::with_note(&message, prompt::WEB_RULES.trim_end());
+            notes.push(prompt::WEB_RULES.trim_end().to_string());
         }
         if let Some(note) = self.asked_skill(text) {
-            message = prompt::with_note(&message, &note);
+            notes.push(note);
         }
         // A request that plainly asks for no changes to the work makes the turn read-only: the workspace is closed to the write tools and a folder outside it is open for experiments.
         // Each request is judged on its own words, and the turn says so on the screen before anything is refused.
         self.read_only = false;
         self.bench.scratch = None;
         if let Some(note) = self.make_read_only(text) {
-            message = prompt::with_note(&message, &note);
+            notes.push(note);
         }
         // The goal the person set, with the first message after it was set and after each compaction: the history holds it the rest of the time.
         if std::mem::take(&mut self.goal_due) {
             if let Some(goal) = &self.goal {
-                message = prompt::with_note(&message, &format!("## Session Goal\n{goal}\n(Set by the user for this session: keep working toward it across turns, and say when it is met.)"));
+                notes.push(format!("## Session Goal\n{goal}\n(The user set it for this session. It holds across turns until it is met or cleared.)"));
             }
         }
         if self.mode == Mode::Plan {
-            message = prompt::with_note(&message, "## Plan Mode\nThe user wants a plan first. Look as much as you need with the read-only tools, then set out what you would change and why, and put it to the user with submit_plan. Nothing can be changed in this mode: once the user approves the plan, plan mode ends and you carry it out.");
+            notes.push(PLAN_MODE_FACTS.to_string());
         }
         // What was attached, as files: the model sees the pictures, but a page that shows one needs it in the workspace.
         #[cfg(windows)]
@@ -1803,14 +1927,15 @@ impl Agent {
             let copies = images::copies_for_commands(&folder.join("attachments"), &name, &pictures);
             let lines: Vec<String> = copies.iter().zip(&pictures).map(|(path, picture)| format!("- `{}`: {}x{}, {}", path.display(), picture.width, picture.height, picture.media_type)).collect();
             if !lines.is_empty() {
-                message = prompt::with_note(&message, &format!("## Attached Pictures\nThe pictures above as files, which commands can read: copy one into the workspace for a page or a program to use it.\n{}", lines.join("\n")));
+                notes.push(format!("## Attached Pictures\nThe pictures attached to the message above are also these files, which commands can read (a page or a program in the workspace needs a copy of one there):\n{}", lines.join("\n")));
             }
         }
         if !self.rewound.is_empty() {
             let files: Vec<String> = self.rewound.drain(..).map(|path| format!("- {}", path.display())).collect();
-            message = prompt::with_note(&message, &format!("## Files Restored\nThe user put these files back as they were earlier in this conversation. Your earlier edits to them are undone; read them again before relying on them:\n{}", files.join("\n")));
+            notes.push(format!("## Files Restored\nThe user put these files back as they were earlier in this conversation: your earlier edits to them are undone, and what was read of them before may not be what is there now.\n{}", files.join("\n")));
         }
-        self.push(Message { images, ..Message::text("user", message) });
+        self.push(Message { images, ..Message::text("user", text) });
+        self.push(Message::text("user", prompt::app_facts(&now(), language, &notes)));
         // Only now does the file say what the session is, so a list read on this word has its title.
         if let (true, Some(session)) = (new_session, &self.session) {
             let path = session.path.clone();
@@ -1824,7 +1949,10 @@ impl Agent {
     fn finish_turn(&mut self, ended: Ended, turn_began: Instant) {
         let before = self.messages.len();
         // A word to go on with what no one went on with would be read as still standing, after what the person writes next.
-        if matches!(ended, Ended::Failed(_) | Ended::Cancelled) && self.messages.last().is_some_and(|last| last.role == "user" && last.content.as_deref().is_some_and(prompt::is_nudge)) {
+        // (the app's facts after the person's message are not such a word: they stay with that message)
+        if matches!(ended, Ended::Failed(_) | Ended::Cancelled)
+            && self.messages.last().is_some_and(|last| last.role == "user" && last.content.as_deref().is_some_and(|text| prompt::is_nudge(text) && !prompt::is_app_facts(text)))
+        {
             self.messages.pop();
         }
         // Whatever stopped the turn, every call in the conversation keeps a result, or the next request is refused.
@@ -1890,12 +2018,10 @@ impl Agent {
             self.bench.web.note_typed(&text);
             let language = self.language_for(&text);
             self.bench.in_japanese = language == Some("Japanese");
-            let mut message = prompt::user_message_in(&text, &now(), language);
             // (what is added can make the turn read-only; it cannot lift it: that is a request of its own)
-            if let Some(note) = self.make_read_only(&text) {
-                message = prompt::with_note(&message, &note);
-            }
-            self.push(Message::text("user", message));
+            let notes: Vec<String> = self.make_read_only(&text).into_iter().collect();
+            self.push(Message::text("user", text.clone()));
+            self.push(Message::text("user", prompt::app_facts(&now(), language, &notes)));
             self.emit(Event::Interjected(text));
         }
         any
@@ -2033,9 +2159,12 @@ impl Agent {
         let (mut transient, mut overflow, mut failed_calls) = (0u32, 0u32, 0usize);
         let (mut cut_off, mut empties) = (0u32, 0u32);
         let mut drafts_stopped = 0u32;
-        let (mut generated, mut wrote, mut next_cost_note) = (0u64, false, COST_NOTED_EVERY);
+        let mut wrote = false;
         let mut repeats: HashMap<String, u32> = HashMap::new();
-        let (mut unchecked, mut asked_to_check) = (false, false);
+        // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
+        let not_to_run = self.messages.iter().rev().filter(|message| message.role == "user").map(|message| message.content.as_deref().unwrap_or(""))
+            .find(|text| !text.starts_with("[From the app")).is_some_and(asks_not_to_run);
+        let (mut unchecked, mut asked_to_check) = (false, not_to_run);
         let (mut said, mut asked_about_slips) = (String::new(), false);
         // The request this one repeats, why, and how long it waited, for the trajectory.
         let mut retry: Option<(String, &'static str, u64)> = None;
@@ -2112,11 +2241,13 @@ impl Agent {
                         vec![Event::Reasoning(text.to_string())]
                     }
                     Delta::Content(text) => {
+                        clock.answering();
                         meter.count(text, now);
                         written.push_str(text);
                         vec![Event::Content(text.to_string())]
                     }
                     Delta::Tool(index, name) => {
+                        clock.writing();
                         meter.call(index).name = name.to_string();
                         while calling.len() <= index {
                             calling.push(crate::message::ToolCall::default());
@@ -2125,6 +2256,7 @@ impl Agent {
                         Vec::new()
                     }
                     Delta::Arguments(index, text) => {
+                        clock.writing();
                         meter.count(text, now);
                         meter.call(index).pending.push_str(text);
                         if let Some(call) = calling.get_mut(index) {
@@ -2159,14 +2291,14 @@ impl Agent {
             };
             let (usage, timings) = result.as_ref().ok().map_or((None, None), |completion| (completion.usage.as_ref(), completion.timings.as_ref()));
             let named: Vec<String> = calling.iter().map(|call| call.function.name.clone()).filter(|name| !name.is_empty()).collect();
-            self.traj.request(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is), helper_file: None });
             let base = self.messages.len();
             let saved = if cuts { cut_answer(&written, &reasoned, &calling, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) } else { None };
+            // (its line waits for the message it makes, to say where that is in the session: a reader puts the step beside what the model said)
+            self.traj.request_waiting(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is), helper_file: None });
             // Writing a file out in its reasoning: every token of it is typed again in the call. It goes on from what it had decided, in a request of which all but the last few tokens are
             // read already. Whatever it was thinking about before is left to it, however long: only this is stopped, and what it is told is to write. Its connection has closed by now, so
             // the engine is not writing into nothing. (The tokens it wrote were spent all the same.)
             if drafting && stopped_by_the_app && matches!(result, Err(LlmError::Cancelled)) {
-                generated += meter.tokens;
                 // (what it had come to when it was stopped, and what the stop cost: the tokens that are thrown away)
                 let run = watch.as_ref().map_or(0, DraftWatch::stats);
                 self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run}));
@@ -2182,7 +2314,6 @@ impl Agent {
                 // Ended here, not by the person: the rest goes on in the next call.
                 Err(LlmError::Cancelled) if cut && stopped_by_the_app && saved.is_some() => {
                     // (an answer cut here has no count of its own, and it is the long ones that come this way)
-                    generated += meter.tokens;
                     let (answer, path, tail) = saved.expect("just looked at");
                     self.cut_write_noted("size", &answer, &path, meter.tokens);
                     self.note_cut_write(&answer, path, tail);
@@ -2209,6 +2340,7 @@ impl Agent {
                         self.intervened("continue_nudge", json!({"why": "overflow"}));
                         self.push(Message::text("user", prompt::CONTINUE_NUDGE));
                     }
+                    self.emit(Event::Retrying { why: "overflow".into(), wait_ms: 0 });
                     retry = Some((req_id.clone(), "overflow", 0));
                     continue;
                 }
@@ -2216,9 +2348,10 @@ impl Agent {
                 Err(LlmError::Transient(message)) if saved.is_some() && transient < TRANSIENT_RETRIES => {
                     transient += 1;
                     self.emit(Event::Notice(llm::BROKE_OFF.into()));
-                    let waited = self.wait_to_retry(retry_pause(transient, &message));
+                    let pause = retry_pause(transient, &message);
+                    self.emit(Event::Retrying { why: "transient".into(), wait_ms: pause.as_millis() as u64 });
+                    let waited = self.wait_to_retry(pause);
                     retry = Some((req_id.clone(), "transient", waited));
-                    generated += meter.tokens;
                     let (answer, path, tail) = saved.expect("just looked at");
                     self.cut_write_noted("broken_connection", &answer, &path, meter.tokens);
                     self.note_cut_write(&answer, path, tail);
@@ -2266,7 +2399,18 @@ impl Agent {
                         }
                         self.push(Message::text("user", if begun.is_empty() { prompt::CONTINUE_NUDGE.to_string() } else { prompt::calls_broken_off(&begun) }));
                     }
-                    let waited = waited_for_restart.unwrap_or_else(|| self.wait_to_retry(retry_pause(transient, &message)));
+                    // (a server that was restarting has been waited for already: what is told is that wait. The other is told as it begins.)
+                    let waited = match waited_for_restart {
+                        Some(waited) => {
+                            self.emit(Event::Retrying { why: "server_restart".into(), wait_ms: waited });
+                            waited
+                        }
+                        None => {
+                            let pause = retry_pause(transient, &message);
+                            self.emit(Event::Retrying { why: "transient".into(), wait_ms: pause.as_millis() as u64 });
+                            self.wait_to_retry(pause)
+                        }
+                    };
                     retry = Some((req_id.clone(), if waited_for_restart.is_some() { "server_restart" } else { "transient" }, waited));
                     continue;
                 }
@@ -2298,7 +2442,6 @@ impl Agent {
                 }
             }
             if let Some(usage) = &completion.usage {
-                generated += usage.completion as u64;
                 self.used = usage.prompt + usage.completion;
                 self.window = usage.window.unwrap_or(self.window);
                 self.report_usage(Some(usage.clone()));
@@ -2314,6 +2457,7 @@ impl Agent {
                 if empties > EMPTY_RETRIES {
                     return Ended::Failed(llm::UNFINISHED.into());
                 }
+                self.emit(Event::Retrying { why: "empty".into(), wait_ms: 0 });
                 retry = Some((req_id.clone(), "empty", 0));
                 continue;
             }
@@ -2330,6 +2474,7 @@ impl Agent {
                 let calls = one_shape_for_edits(&completion.tool_calls);
                 let most = note_repeats(&calls, &self.workspace, &mut repeats, &mut self.repeated);
                 let failures = self.run_tools(&calls);
+                let nested = std::mem::take(&mut self.program_calls);
                 failed_calls = if failures == calls.len() { failed_calls + failures } else { 0 };
                 let edited = std::mem::take(&mut self.edited);
                 // What a command wrote counts as an edit for the calls that look: what they would answer now is not what they did. (Not for what the model wrote: the draft watch is for that.)
@@ -2349,13 +2494,7 @@ impl Agent {
                 if most >= REPEATS_STOPPED && !edited && !changed {
                     return Ended::Failed(format!("the model made the same call {most} times with nothing edited in between: stopped so that you can look"));
                 }
-                unchecked = still_unchecked(unchecked, &calls);
-                // (a local model's: what a service costs is not minutes of someone's waiting. It goes on if the work is not done.)
-                if cuts && wrote && generated >= next_cost_note {
-                    next_cost_note = generated + COST_NOTED_EVERY;
-                    self.intervened("cost_note", json!({"generated": generated}));
-                    self.push(Message::text("user", cost_note(generated)));
-                }
+                unchecked = still_unchecked(unchecked, &[calls.as_slice(), nested.as_slice()].concat());
                 continue;
             }
             if completion.finish == "length" {
@@ -2546,11 +2685,7 @@ impl Agent {
     /// The turn is over with a file half written, by the person or by a server that has gone: what is there of it stays on disk if that needs no one's word, as nobody is there to ask.
     /// True if it did.
     fn keep_cut_write(&mut self, answer: llm::Completion) -> bool {
-        let Some(call) = answer.tool_calls.last().cloned() else { return false };
-        let Ok(arguments) = serde_json::from_str::<Value>(&call.function.arguments) else { return false };
-        if !self.runs_unasked(&call.function.name, &arguments) {
-            return false;
-        }
+        let Some((call, arguments)) = self.cut_write_to_keep(&answer) else { return false };
         self.push(answer.message());
         self.emit(Event::AssistantEnded);
         self.tool_started(&call.id, &call.function.name, Some(&arguments), &call.function.arguments, 1);
@@ -2565,6 +2700,13 @@ impl Agent {
         }
         self.finish_call(&call.id, result, false, started.elapsed());
         true
+    }
+
+    /// The call at the end of an answer that was cut, with its arguments, when `keep_cut_write` would keep it: they are JSON, and it would run with no one asked.
+    fn cut_write_to_keep(&self, answer: &llm::Completion) -> Option<(crate::message::ToolCall, Value)> {
+        let call = answer.tool_calls.last().cloned()?;
+        let arguments = serde_json::from_str::<Value>(&call.function.arguments).ok()?;
+        self.runs_unasked(&call.function.name, &arguments).then_some((call, arguments))
     }
 
     /// Whether this call would run with no one asked.
@@ -2695,54 +2837,59 @@ impl Agent {
             }
         };
         self.tool_started(&call.id, name, Some(&arguments), &call.function.arguments, 1);
-        match self.permission(name, &arguments) {
+        let ran = self.run_call(&call.id, name, &arguments, false);
+        self.finish_call_with(&call.id, ran.result, ran.declined, started.elapsed(), ran.images);
+        ran.failed
+    }
+
+    /// A call that has begun, run: the gate first (the rules, the person's approval, plan mode's limits), then the tool, and what follows from its result. A call of the model's own and one a program
+    /// makes (`nested`) go through this alike; what is done with the result is for the caller to do: the first puts it in the conversation, the second gives it to the program.
+    fn run_call(&mut self, id: &str, name: &str, arguments: &Value, nested: bool) -> Ran {
+        if nested && code_mode::NOT_CALLABLE.contains(&name) {
+            self.refusal = Some("refused_gate");
+            return Ran::turned_down(format!("{name} cannot be called from a program: call it directly"), 1);
+        }
+        match self.permission(name, arguments) {
             Permission::Run => {}
             Permission::Refused(message, how) => {
                 self.refusal = Some(how);
-                self.finish_call(&call.id, Err(message), true, started.elapsed());
-                return 0;
+                return Ran::turned_down(message, 0);
             }
             // (a tool that does not exist, again and again, is a model that gets nowhere; a person's no is not)
             Permission::Denied(message) => {
                 self.refusal = Some("refused_gate");
-                self.finish_call(&call.id, Err(message), true, started.elapsed());
-                return 1;
+                return Ran::turned_down(message, 1);
             }
         }
         if name == "read_file" {
-            if let Some(path) = self.picture_at(&arguments) {
+            if let Some(path) = self.picture_at(arguments) {
+                if nested {
+                    return Ran::done(Ok(format!("{}: a picture, and a picture cannot be read from a program: read it with read_file directly", path.display())), 0);
+                }
                 let (result, pictures) = self.read_picture(&path);
                 let failed = usize::from(result.is_err());
-                self.finish_call_with(&call.id, result, false, started.elapsed(), pictures);
-                return failed;
+                return Ran { images: pictures, ..Ran::done(result, failed) };
             }
         }
-        if name == "submit_plan" {
-            let result = self.submit_plan(&arguments);
+        let special = match name {
+            "submit_plan" => Some(self.submit_plan(arguments)),
+            "ask_user" => Some(self.ask_user(arguments)),
+            "explore" => Some(self.explore(id, arguments)),
+            "run_code" => Some(self.run_program(id, arguments)),
+            _ => None,
+        };
+        if let Some(result) = special {
             let failed = usize::from(result.is_err());
-            self.finish_call(&call.id, result, false, started.elapsed());
-            return failed;
+            return Ran::done(result, failed);
         }
-        if name == "ask_user" {
-            let result = self.ask_user(&arguments);
-            let failed = usize::from(result.is_err());
-            self.finish_call(&call.id, result, false, started.elapsed());
-            return failed;
-        }
-        if name == "explore" {
-            let result = self.explore(&call.id, &arguments);
-            let failed = usize::from(result.is_err());
-            self.finish_call(&call.id, result, false, started.elapsed());
-            return failed;
-        }
-        let edited = edited_paths(name, &arguments, &self.workspace);
+        let edited = edited_paths(name, arguments, &self.workspace);
         if !edited.is_empty() {
             if let Some(Err(error)) = self.marks.as_mut().map(|marks| marks.before_edit(&edited)) {
                 self.emit(Event::Notice(format!("a rewind will not bring this edit back: {error}")));
             }
         }
         self.bench.secrets.clone_from(&self.gate.secrets);
-        let result = self.bench.run(name, &arguments, &self.workspace, &self.cancel);
+        let result = self.bench.run(name, arguments, &self.workspace, &self.cancel);
         // A server's answer is as much a stranger's as a page: it may have come from one.
         let from_a_stranger = matches!(name, "web_search" | "web_read") || (name.starts_with("mcp__") && !self.mcp.as_ref().is_some_and(|hub| hub.trusts_tool(name)));
         if from_a_stranger && result.is_ok() && !self.web_seen {
@@ -2755,6 +2902,11 @@ impl Agent {
         if name == "todo" && result.is_ok() {
             self.emit(Event::Todos(self.bench.todos.clone()));
         }
+        if name == "present" && result.is_ok() {
+            if let Ok(files) = crate::tools::present(arguments, &self.workspace) {
+                self.emit(Event::Presented { call: id.to_string(), files });
+            }
+        }
         if matches!(name, "create_file" | "apply_patch") && result.is_ok() {
             self.edited = true;
         }
@@ -2764,11 +2916,70 @@ impl Agent {
             self.changed_by_commands = true;
             self.repeated.clear();
         }
-        let result = self.with_changes_noted(name, &arguments, result);
+        let result = self.with_changes_noted(name, arguments, result);
         // (a command that ran and failed is a failure too: a model can spend an hour on those with nothing being wrong with a call)
         let failed = usize::from(result.as_ref().map_or(true, |output| name == "execute_command" && command_failed(output)));
-        self.finish_call(&call.id, result, false, started.elapsed());
-        failed
+        Ran { stranger: from_a_stranger && result.is_ok(), ..Ran::done(result, failed) }
+    }
+
+    /// A `run_code` call: its program runs in the embedded engine, and each tool it calls goes through [`Agent::program_call`]. What comes back is what the program returned, what it logged and how
+    /// it ended; an error that was not caught, or a stop, is a failed call. A program that called a stranger's tool (the web, a server not trusted) is given back marked as the web's text is.
+    fn run_program(&mut self, id: &str, arguments: &Value) -> Result<String, String> {
+        let Some(code) = arguments.get("code").and_then(Value::as_str).filter(|code| !code.trim().is_empty()) else {
+            return Err("code is required: the body of an async function, in plain JavaScript".into());
+        };
+        let said = arguments.get("description").and_then(Value::as_str).map(str::trim).filter(|said| !said.is_empty());
+        // (a model that left it out is still told to the person: the program's first line)
+        let description = said.map_or_else(|| code.trim().lines().next().unwrap_or("").chars().take(80).collect(), str::to_string);
+        let limits = code_mode::Limits::default().with_timeout_seconds(arguments.get("timeout_seconds").and_then(Value::as_f64));
+        let offered = code_mode::callable(&self.tool_schemas);
+        let names: Vec<&str> = offered.iter().map(String::as_str).collect();
+        self.program = Some(Program { id: id.to_string(), description, calls: 0, waited: Duration::ZERO, stranger: false });
+        let cancel = self.cancel.clone();
+        let outcome = code_mode::run(code, &names, &limits, &cancel, &mut |tool, args| self.program_call(tool, args));
+        let (waited, stranger) = self.program.take().map_or((Duration::ZERO, false), |program| (program.waited, program.stranger));
+        // (the people waited for in its calls are this call's wait, as for any call)
+        self.approval_wait = (!waited.is_zero()).then_some(waited);
+        if let Some(meta) = self.running.get_mut(id) {
+            meta.program = Some((outcome.calls.len(), outcome.ms));
+        }
+        let mut text = code_mode::render(&outcome, &limits);
+        if stranger {
+            text = crate::web::envelope("run_code", &text);
+        }
+        if outcome.error.is_some() || outcome.stopped.is_some() {
+            Err(text)
+        } else {
+            Ok(text)
+        }
+    }
+
+    /// A call the running program makes: it goes through the same steps as a direct one ([`Agent::run_call`]) and its result is the program's. It has a line in the trajectory of its own, with the
+    /// program's call as its `parent`, and counts as a call of the turn; nothing of it joins the conversation. The window is told of it as a step of the
+    /// program's (`Event::ProgramStep`), and not as a call of its own.
+    fn program_call(&mut self, name: &str, arguments: Value) -> Result<String, String> {
+        self.read_live();
+        let Some(program) = self.program.as_mut() else { return Err("no program is running".into()) };
+        program.calls += 1;
+        let (parent, call, id) = (program.id.clone(), program.calls, format!("{}.{}", program.id, program.calls));
+        let raw = arguments.to_string();
+        let started = Instant::now();
+        self.emit(Event::ProgramStep { id: parent.clone(), call, tool: name.to_string(), summary: tools::summary(name, &arguments) });
+        self.call_begun(&id, name, Some(&arguments), &raw, 1, Some(&parent));
+        let ran = self.run_call(&id, name, &arguments, true);
+        let (ok, output) = match &ran.result {
+            Ok(output) => (true, output.clone()),
+            Err(error) => (false, format!("error: {error}")),
+        };
+        if let Some(program) = self.program.as_mut() {
+            program.waited += self.approval_wait.unwrap_or_default();
+            program.stranger |= ran.stranger;
+        }
+        self.tool_ended(&id, ok, ran.declined, &output, started.elapsed());
+        self.program_calls.push(crate::message::ToolCall { id, kind: "function".into(), function: crate::message::FunctionCall { name: name.to_string(), arguments: raw } });
+        // (a command may have been started, ended or stopped by this call, or a wait set)
+        self.tell_waiting();
+        ran.result
     }
 
     /// A look across many files, by a helper with a context of its own (`explore`), as Deepseek Harness's subagents do: what it reads fills
@@ -2933,6 +3144,10 @@ impl Agent {
     /// A picture for the model to see, where a tool's result can hold one. Copied to the session's folder as one the person attached.
     fn read_picture(&mut self, path: &Path) -> (Result<String, String>, Vec<ImageRef>) {
         let shown = path.display();
+        // (a model whose server says it reads no pictures would refuse the next request for it: told now, with nothing sent)
+        if self.provider.as_ref().and_then(|provider| provider.reads_pictures()) == Some(false) {
+            return (Err(format!("{shown} is a picture, and this model reads no pictures. Say so, and go on without it.")), Vec::new());
+        }
         if !self.provider.as_ref().is_some_and(|provider| provider.images_in_tool_results()) {
             return (Err(format!("{shown} is a picture, and this model cannot be shown one by a tool. Say so, and ask the user to attach it to a message.")), Vec::new());
         }
@@ -2960,6 +3175,11 @@ impl Agent {
     fn tool_started(&mut self, id: &str, name: &str, arguments: Option<&Value>, raw: &str, parallel: usize) {
         let summary = arguments.map_or(String::new(), |arguments| tools::summary(name, arguments));
         self.emit(Event::ToolStarted { id: id.to_string(), tool: name.to_string(), summary });
+        self.call_begun(id, name, arguments, raw, parallel, None);
+    }
+
+    /// A call's line in the trajectory is begun, with no word to the window (a program's calls are told to it by their program's: `parent` is the call of that program).
+    fn call_begun(&mut self, id: &str, name: &str, arguments: Option<&Value>, raw: &str, parallel: usize, parent: Option<&str>) {
         let path = arguments.and_then(|arguments| {
             let named = arguments.get("path").and_then(Value::as_str).or_else(|| arguments.pointer("/edits/0/path").and_then(Value::as_str)).or_else(|| arguments.pointer("/expected_files/0").and_then(Value::as_str));
             named.map(|path| path_for_trajectory(path, &self.workspace))
@@ -2976,7 +3196,7 @@ impl Agent {
         }
         self.approval_wait = None;
         self.refusal = None;
-        self.running.insert(id.to_string(), ToolMeta { name: name.to_string(), at: chrono::Local::now(), path, cmd0, args_bytes: raw.len(), args_hash: trajectory::short_hash(raw.as_bytes()), edited, parallel, req: self.last_req.clone() });
+        self.running.insert(id.to_string(), ToolMeta { name: name.to_string(), at: chrono::Local::now(), path, cmd0, args_bytes: raw.len(), args_hash: trajectory::short_hash(raw.as_bytes()), edited, parallel, req: self.last_req.clone(), parent: parent.map(str::to_string), program: None });
     }
 
     /// The call's line: how it ended and how long it ran, without the wait for the person (which has its own).
@@ -3009,6 +3229,13 @@ impl Agent {
         }
         if meta.parallel > 1 {
             line["parallel"] = json!(meta.parallel);
+        }
+        if let Some(parent) = &meta.parent {
+            line["parent"] = json!(parent);
+        }
+        if let Some((calls, ms)) = meta.program {
+            line["nested"] = json!(calls);
+            line["program_ms"] = json!(ms);
         }
         if meta.name == "execute_command" && ok {
             if let Some((_, code)) = output.rsplit_once("exit_code: ") {
@@ -3162,6 +3389,7 @@ impl Agent {
             always_allowed: offered,
             rule: rule.clone(),
             scope: scope.clone(),
+            program: self.program.as_ref().map(|program| program.description.clone()),
             answer,
         }));
         // (whichever way it ends, the wait is recorded: what the person was waited for is time of the run that no model or tool had)
@@ -3218,7 +3446,11 @@ impl Agent {
         let wait = asked.elapsed();
         self.approval_wait = Some(wait);
         let req = self.last_req.clone();
-        self.traj.write("approval", req.as_deref(), json!({"tool": tool, "risk": risk_name, "asked": trajectory::stamp(asked_at), "answered": trajectory::now(), "wait_ms": wait.as_millis() as u64, "decision": decision}));
+        let mut line = json!({"tool": tool, "risk": risk_name, "asked": trajectory::stamp(asked_at), "answered": trajectory::now(), "wait_ms": wait.as_millis() as u64, "decision": decision});
+        if let Some(program) = &self.program {
+            line["parent"] = json!(program.id);
+        }
+        self.traj.write("approval", req.as_deref(), line);
         permission
     }
 
@@ -3483,6 +3715,25 @@ impl Agent {
     }
 }
 
+/// What a call came to: its result, whether the person or a mode turned it down, how many failures it counts for, the pictures it opened, and whether its text may hold what a stranger wrote.
+struct Ran {
+    result: Result<String, String>,
+    declined: bool,
+    failed: usize,
+    images: Vec<ImageRef>,
+    stranger: bool,
+}
+
+impl Ran {
+    fn done(result: Result<String, String>, failed: usize) -> Ran {
+        Ran { result, declined: false, failed, images: Vec::new(), stranger: false }
+    }
+
+    fn turned_down(message: String, failed: usize) -> Ran {
+        Ran { declined: true, ..Ran::done(Err(message), failed) }
+    }
+}
+
 enum Permission {
     Run,
     /// By a person, or by a mode they chose; and which: `declined_person`, `refused_gate` (the mode, or the app) or `cancelled` (the turn stopped while it was asked).
@@ -3588,7 +3839,7 @@ mod tests {
     fn run_agent(workspace: &Path, client: Client, mode: Mode) -> Run {
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         Run { handle, events, _sessions: sessions }
     }
@@ -3782,9 +4033,35 @@ mod tests {
         assert_eq!(second[0], bodies[0]["messages"][0], "the system prompt is frozen");
         assert_eq!(second[1], bodies[0]["messages"][1], "a message once sent is sent again to the byte");
         assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "so are the tools");
-        assert_eq!(second[2]["reasoning_content"], "thinking");
+        assert_eq!(second[3]["reasoning_content"], "thinking");
         assert!(bodies[0].get("tool_choice").is_none() && bodies[0].get("max_tokens").is_none());
-        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 16, "Dogmind's ten and the app's six");
+        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 17, "Dogmind's ten and the app's seven");
+    }
+
+    /// What the person typed goes to the model as it was typed, with nothing around it, and the app's facts (the time, the language, at the first message the workspace)
+    /// come in a message of their own after it. A later request sends what was sent before to the byte, and adds the next message and its facts at the end.
+    #[test]
+    fn what_was_typed_goes_as_it_is_and_the_apps_facts_come_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
+        let (client, bodies) = server(vec![text_answer("hi"), text_answer("again")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("こんにちは、見てください".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        run.handle.commands.send(Command::Send("next".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let bodies = bodies.lock().unwrap();
+        let first = bodies[0]["messages"].as_array().unwrap();
+        assert_eq!(first.len(), 3, "{first:?}");
+        assert_eq!(first[1]["content"], "こんにちは、見てください", "as it was typed");
+        let facts = first[2]["content"].as_str().unwrap();
+        assert!(prompt::is_app_facts(facts) && facts.contains("marker.txt") && facts.contains("- The user writes in Japanese."), "{facts}");
+        assert!(!facts.contains("回答は"), "a fact, not a rule");
+        let second = bodies[1]["messages"].as_array().unwrap();
+        assert_eq!(second[..3], first[..], "what was sent is sent again to the byte");
+        assert_eq!((second[3]["content"].as_str(), second[4]["content"].as_str()), (Some("hi"), Some("next")));
+        let later = second[5]["content"].as_str().unwrap();
+        assert!(prompt::is_app_facts(later) && !later.contains("marker.txt"), "the workspace is said once: {later}");
     }
 
     #[test]
@@ -3798,8 +4075,8 @@ mod tests {
         assert!(log[0].starts_with("tool:true:false:") && log[0].contains("1|content here"), "{log:?}");
         let bodies = bodies.lock().unwrap();
         let messages = bodies[1]["messages"].as_array().unwrap();
-        assert_eq!(messages[3]["role"], "tool");
-        assert_eq!(messages[3]["tool_call_id"], "call-1");
+        assert_eq!(messages[4]["role"], "tool");
+        assert_eq!(messages[4]["tool_call_id"], "call-1");
     }
 
     /// A look handed to a helper: its own requests, with its own prompt and the looking tools only, and back in the conversation only
@@ -3861,7 +4138,7 @@ mod tests {
         assert_eq!(log[0], "approval:create_file:low");
         assert!(log[1].starts_with("tool:false:true:") && log[1].contains("not that"), "{log:?}");
         assert!(!dir.path().join("x.txt").exists());
-        assert!(bodies.lock().unwrap()[1]["messages"][3]["content"].as_str().unwrap().contains("not that"));
+        assert!(bodies.lock().unwrap()[1]["messages"][4]["content"].as_str().unwrap().contains("not that"));
     }
 
     #[test]
@@ -4017,8 +4294,8 @@ mod tests {
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         let messages = bodies[3]["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 4, "system, first, its answer, after: {messages:?}");
-        assert_eq!(messages[2]["content"], "first answer");
+        assert_eq!(messages.len(), 6, "system, first and its facts, its answer, after and its facts: {messages:?}");
+        assert_eq!(messages[3]["content"], "first answer");
     }
 
     #[test]
@@ -4036,6 +4313,9 @@ mod tests {
         let kept = messages.iter().position(|message| message["role"] == "assistant").unwrap();
         assert_eq!(messages[kept]["content"], "half an");
         assert!(messages[kept + 1]["content"].as_str().unwrap().contains("second"));
+        // The half answer is the message that request made, and the trajectory says where it is.
+        let first = of_kind(&trajectory_of(&run), "request")[0].clone();
+        assert_eq!(first["message"].as_u64(), Some(kept as u64), "{first}");
     }
 
     /// What Straydog sends when its worker reports a fatal error, in words that read like a full context.
@@ -4068,7 +4348,7 @@ mod tests {
     /// What the person typed, as the session's file holds it.
     fn typed_on_disk(path: &Path) -> Vec<String> {
         let (_, _, messages) = Session::open(path).unwrap();
-        messages.iter().filter(|message| message.role == "user").filter_map(|message| message.content.as_deref()).map(|text| prompt::typed_text(text).to_string()).collect()
+        messages.iter().filter(|message| message.role == "user").filter_map(|message| message.content.as_deref()).filter(|text| !prompt::is_nudge(text)).map(|text| prompt::typed_text(text).to_string()).collect()
     }
 
     fn session_file(run: &Run) -> PathBuf {
@@ -4110,6 +4390,7 @@ mod tests {
         assert!(notices.is_empty(), "{notices:?}");
         assert_eq!(bodies.lock().unwrap().len(), 2, "no checkpoint was asked for, and no retry");
         assert_eq!(typed_on_disk(&path), ["first", "second"]);
+        assert_eq!(Session::open(&path).unwrap().2.iter().filter(|message| message.content.as_deref().is_some_and(prompt::is_app_facts)).count(), 2, "a failed turn keeps the facts of its message");
         // The engine back: all of it goes to it, the half answer with it.
         run.handle.commands.send(Command::Send("third".into())).unwrap();
         until_end(&run, Decision::Reject);
@@ -4305,7 +4586,7 @@ mod tests {
         let told = |body: &Value| body["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap().contains("x.txt");
         assert!(told(&bodies[2]));
         assert!(!told(&bodies[3]), "once");
-        assert_eq!(prompt::typed_text(bodies[2]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap()), "next");
+        assert_eq!(prompt::typed_text(bodies[2]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user" && !m["content"].as_str().is_some_and(prompt::is_nudge)).unwrap()["content"].as_str().unwrap()), "next");
     }
 
     #[test]
@@ -4642,7 +4923,7 @@ mod tests {
         ]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send("go".into())).unwrap();
@@ -4764,7 +5045,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_request_with_something_written_is_told_what_it_has_cost_and_a_short_one_is_not() {
+    fn a_long_request_with_something_written_is_not_told_what_it_has_cost() {
         let answer = |tokens: u64| sse(&[
             serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-1", "function": {"name": "create_file", "arguments": serde_json::json!({"path": "a.html", "content": "x\n"}).to_string()}}]}, "finish_reason": "tool_calls"}]}),
             serde_json::json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": tokens}, "timings": {"predicted_per_second": 40.0}}),
@@ -4778,11 +5059,8 @@ mod tests {
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 3, "{log:?}");
         let last = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap().clone();
-        assert_eq!(last(1)["role"], "tool", "not yet");
-        assert_eq!(last(2)["role"], "user");
-        let said = last(2)["content"].as_str().unwrap().to_string();
-        assert!(said.contains("9500 tokens") && said.contains("end your turn"), "{said}");
-        assert!(prompt::is_nudge(&said), "not shown as something the person said");
+        assert_eq!(last(1)["role"], "tool");
+        assert_eq!(last(2)["role"], "tool", "after 9,500 tokens the work goes on from the tool's result, with no word from the app to end the turn");
     }
 
     #[test]
@@ -5153,9 +5431,9 @@ mod tests {
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         let last_user = |body: &Value| body["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap().to_string();
-        assert!(!last_user(&bodies[0]).contains("日本語"));
-        assert!(last_user(&bodies[1]).contains("日本語で書いて"));
-        assert!(last_user(&bodies[2]).contains("日本語で書いて"), "no kana, and still Japanese");
+        assert!(!last_user(&bodies[0]).contains("writes in Japanese"));
+        assert!(last_user(&bodies[1]).contains("The user writes in Japanese."));
+        assert!(last_user(&bodies[2]).contains("The user writes in Japanese."), "no kana, and still Japanese");
     }
 
     #[test]
@@ -5166,14 +5444,14 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let file = sessions.path().join("instructions.md");
         std::fs::write(&file, "回答の最後に参考にしたファイルを挙げてください").unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: true, instructions: Some(file), home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: true, instructions: Some(file), home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send("修正".into())).unwrap();
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         assert!(bodies[0]["messages"][0]["content"].as_str().unwrap().contains("回答の最後に参考にしたファイルを挙げてください"));
-        assert!(bodies[0]["messages"][1]["content"].as_str().unwrap().contains("日本語で書いて"), "kanji alone, on a Japanese system");
+        assert!(bodies[0]["messages"][2]["content"].as_str().unwrap().contains("The user writes in Japanese."), "kanji alone, on a Japanese system");
     }
 
     #[test]
@@ -5192,9 +5470,10 @@ mod tests {
         let bodies = bodies.lock().unwrap();
         assert!(bodies[0]["messages"][0]["content"].as_str().unwrap().contains("- haiku: Writes haiku"));
         assert!(bodies[0]["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "skill"));
-        let asked = bodies[2]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap().to_string();
-        assert!(asked.contains("Count the morae of 古池."), "{asked}");
-        assert_eq!(prompt::typed_text(&asked), "/haiku 古池");
+        let users: Vec<&str> = bodies[2]["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "user").filter_map(|m| m["content"].as_str()).collect();
+        let facts = users.last().unwrap();
+        assert!(facts.contains("Count the morae of 古池."), "{facts}");
+        assert_eq!(users.iter().rev().find(|text| !prompt::is_nudge(text)).map(|text| prompt::typed_text(text)), Some("/haiku 古池"));
     }
 
     /// Of two skills of a name, the model is offered the one it may start and `/name` starts the one the person may: neither hides the other.
@@ -5214,7 +5493,7 @@ mod tests {
         let (client, bodies) = server(vec![call_answer("skill", serde_json::json!({"name": "pdf"})), text_answer("read it"), text_answer("started")]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: work.clone(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: Some(home), skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: work.clone(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: Some(home), skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send("convert it".into())).unwrap();
@@ -5246,7 +5525,7 @@ mod tests {
         assert!(!dir.path().join("x.txt").exists());
         assert!(!log.iter().any(|line| line.starts_with("approval:")), "{log:?}");
         assert_eq!(log.iter().filter(|line| line.contains("plan mode")).count(), 2, "{log:?}");
-        assert!(bodies.lock().unwrap()[0]["messages"][1]["content"].as_str().unwrap().contains("## Plan Mode"));
+        assert!(bodies.lock().unwrap()[0]["messages"][2]["content"].as_str().unwrap().contains("## Plan Mode"));
     }
 
     #[test]
@@ -5278,7 +5557,7 @@ mod tests {
         ]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send(format!("read {page}"))).unwrap();
@@ -5304,7 +5583,7 @@ mod tests {
         ]);
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings { enabled: true, allow_local: true, ..WebSettings::default() }, language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: Some(notes.path().to_path_buf()), mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send(format!("read {page}"))).unwrap();
@@ -5325,8 +5604,8 @@ mod tests {
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         let messages = bodies[1]["messages"].as_array().unwrap();
-        assert_eq!(messages[2]["content"], "part");
-        assert_eq!(messages[3]["content"], prompt::CONTINUE_NUDGE);
+        assert_eq!(messages[3]["content"], "part");
+        assert_eq!(messages[4]["content"], prompt::CONTINUE_NUDGE);
     }
 
     #[test]
@@ -5341,6 +5620,19 @@ mod tests {
         assert_eq!(bodies.len(), 3, "asked once, not again");
         let last = bodies[2]["messages"].as_array().unwrap();
         assert_eq!(last.last().unwrap()["content"], prompt::CHECK_NUDGE);
+    }
+
+    #[test]
+    fn code_the_person_said_not_to_run_gets_no_word_about_running_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = sse(&[serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "w", "type": "function", "function": {"name": "create_file", "arguments": "{\"path\":\"a.py\",\"content\":\"x\"}"}}]}, "finish_reason": "tool_calls"}]})]);
+        let (client, bodies) = server(vec![write, text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("Write a.py, then stop. Do not run it.".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        assert_eq!(bodies.lock().unwrap().len(), 2, "no third request: the answer stands");
+        assert!(asks_not_to_run("Don\u{2019}t run the tests") && asks_not_to_run("作ったら実行しないでください") && asks_not_to_run("without running it"));
+        assert!(!asks_not_to_run("Run the tests and fix what fails") && !asks_not_to_run("実行して確認してください"));
     }
 
     #[test]
@@ -5376,6 +5668,12 @@ mod tests {
         steps: Mutex<std::collections::VecDeque<Step>>,
         seen: Mutex<Vec<(Vec<Message>, Value)>>,
         tool_pictures: bool,
+        /// What the server says of the model's pictures (None: it says nothing).
+        reads: Option<bool>,
+        /// The server is reading or writing for someone else.
+        busy: bool,
+        /// A call comes in pieces as it is written.
+        streams: bool,
     }
 
     impl Scripted {
@@ -5397,6 +5695,15 @@ mod tests {
         }
         fn images_in_tool_results(&self) -> bool {
             self.tool_pictures
+        }
+        fn reads_pictures(&self) -> Option<bool> {
+            self.reads
+        }
+        fn idle(&self) -> bool {
+            !self.busy
+        }
+        fn shows_calls_as_written(&self) -> bool {
+            self.streams
         }
     }
 
@@ -5444,6 +5751,31 @@ mod tests {
     }
 
     #[test]
+    fn create_file_asks_for_a_file_whole_only_of_a_provider_that_shows_a_call_as_it_is_written() {
+        let asked = |streams: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let (run, provider) = scripted_as(dir.path(), Scripted { steps: Mutex::new(vec![says("ok")].into()), streams, ..Scripted::default() }, Mode::Default);
+            run.handle.commands.send(Command::Send("hi".into())).unwrap();
+            until_end(&run, Decision::Approve);
+            let tools = provider.seen.lock().unwrap()[0].1.clone();
+            tools.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "create_file").unwrap()["function"]["description"].as_str().unwrap().to_string()
+        };
+        assert!(asked(true).contains("whole in one call"), "the pieces show, and the app cuts a very long file into parts");
+        assert!(asked(false).contains("Over about 300 lines"), "a call that comes only whole shows nothing while it is written");
+    }
+
+    #[test]
+    fn a_warm_up_is_left_out_while_the_server_answers_someone_else_and_the_message_still_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, provider) = scripted_as(dir.path(), Scripted { steps: Mutex::new(vec![says("ok")].into()), busy: true, ..Scripted::default() }, Mode::Default);
+        run.handle.commands.send(Command::WarmPrefix).unwrap();
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        let (_, cancelled) = until_end(&run, Decision::Approve);
+        assert!(!cancelled);
+        assert_eq!(provider.requests(), 1, "the message's own request, and no warm-up before it");
+    }
+
+    #[test]
     fn a_message_sent_during_a_warm_up_waits_for_it_and_reads_on_from_what_it_read() {
         let dir = tempfile::tempdir().unwrap();
         let go = Arc::new(AtomicBool::new(false));
@@ -5465,7 +5797,98 @@ mod tests {
         assert_eq!(warm[0].content, turn[0].content, "the same prompt, or the engine reads it again");
         let tools = provider.seen.lock().unwrap();
         assert_eq!(tools[0].1, tools[1].1, "the same tools, for the same reason");
-        assert_eq!(turn.iter().filter(|message| message.role == "user").count(), 1, "what warmed it is no part of the conversation");
+        assert_eq!(turn.iter().filter(|message| message.role == "user" && !message.content.as_deref().is_some_and(prompt::is_nudge)).count(), 1, "what warmed it is no part of the conversation");
+    }
+
+    /// A skill another program is writing can be there for the warm-up and gone for the first message a moment later (a desktop app's synced
+    /// skills, found half written): the first message keeps the prefix the engine has just read. What the person changes in between still counts.
+    #[test]
+    fn a_skill_gone_between_the_warm_up_and_the_first_message_leaves_the_prefix_as_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(".claude/skills/synced/haiku");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("SKILL.md"), "---\nname: haiku\ndescription: Writes haiku\n---\nBody").unwrap();
+        let (run, provider) = scripted(dir.path(), vec![says("warm"), says("ok")], Mode::Default);
+        run.handle.commands.send(Command::WarmPrefix).unwrap();
+        while provider.requests() == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_dir_all(&folder).unwrap();
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let (warm, turn) = (provider.messages(0), provider.messages(1));
+        assert!(warm[0].content.as_deref().unwrap_or("").contains("haiku"), "the warm-up had the skill");
+        assert_eq!(warm[0].content, turn[0].content, "the prefix the engine read, not one without the skill");
+        let tools = provider.seen.lock().unwrap();
+        assert_eq!(tools[0].1, tools[1].1);
+    }
+
+    /// A skill that needs what this app has not (here a server's tools) is not offered from the warm-up on, before the window has said anything;
+    /// one the person turned on is; and one the person turns off after the warm-up is not brought back by it.
+    #[test]
+    fn a_skill_that_cannot_work_here_is_left_out_from_the_warm_up_on_and_one_turned_off_after_it_stays_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, description: &str| {
+            let folder = dir.path().join(".claude/skills").join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("SKILL.md"), format!("---
+name: {name}
+description: {description}
+---
+Body")).unwrap();
+        };
+        write("browser", "Drives a browser through mcp__Claude_Browser__tabs.");
+        write("haiku", "Writes haiku");
+        write("limerick", "Writes limericks");
+        let (run, provider) = scripted(dir.path(), vec![says("warm"), says("ok")], Mode::Default);
+        run.handle.commands.send(Command::WarmPrefix).unwrap();
+        while provider.requests() == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        run.handle.commands.send(Command::SetSkillsOff(vec!["limerick".into()])).unwrap();
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let prompt = |at: usize| provider.messages(at)[0].content.clone().unwrap_or_default();
+        assert!(!prompt(0).contains("- browser:") && prompt(0).contains("- haiku:") && prompt(0).contains("- limerick:"), "{}", prompt(0));
+        assert!(!prompt(1).contains("- browser:") && prompt(1).contains("- haiku:"), "{}", prompt(1));
+        assert!(!prompt(1).contains("- limerick:"), "turned off after the warm-up, and not brought back by it");
+        // One written for another app's feature, turned on by the person, is offered, warm-up and all (one whose server's tools are not here is
+        // not listed whatever the person says: there is nothing to call).
+        let other = tempfile::tempdir().unwrap();
+        let folder = other.path().join(".claude/skills/research");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("SKILL.md"), "---
+name: research
+description: This skill coordinates research subagents, so use it only with a tool for spawning them.
+---
+Body").unwrap();
+        let listed = |on: Vec<String>| {
+            let (run, provider) = scripted(other.path(), vec![says("warm"), says("ok")], Mode::Default);
+            run.handle.commands.send(Command::SetSkillsOn(on)).unwrap();
+            run.handle.commands.send(Command::WarmPrefix).unwrap();
+            run.handle.commands.send(Command::Send("hi".into())).unwrap();
+            until_end(&run, Decision::Approve);
+            assert_eq!(provider.messages(0)[0].content, provider.messages(1)[0].content);
+            provider.messages(1)[0].content.as_deref().unwrap_or("").contains("- research:")
+        };
+        assert!(!listed(Vec::new()), "off until the person says");
+        assert!(listed(vec!["research".into()]));
+    }
+
+    #[test]
+    fn what_the_person_turns_on_between_the_warm_up_and_the_first_message_is_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, provider) = scripted(dir.path(), vec![says("warm"), says("ok")], Mode::Default);
+        run.handle.commands.send(Command::WarmPrefix).unwrap();
+        while provider.requests() == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        web_on(&run);
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let tools = provider.seen.lock().unwrap();
+        let has_web = |at: usize| tools[at].1.as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "web_read");
+        assert!(!has_web(0) && has_web(1), "the web the person turned on, though the warm-up was read without it");
     }
 
     #[test]
@@ -5562,7 +5985,7 @@ mod tests {
     /// The same, with the folder of the sessions made by the test: a step that must know where the session's own files are can then look.
     fn scripted_with(workspace: &Path, sessions: tempfile::TempDir, provider: Scripted, mode: Mode) -> (Run, Arc<Scripted>) {
         let (sender, events) = channel();
-        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         let provider = Arc::new(provider);
         handle.commands.send(Command::Provider(provider.clone(), "model".into(), 100_000)).unwrap();
         (Run { handle, events, _sessions: sessions }, provider)
@@ -5581,11 +6004,11 @@ mod tests {
         until_end(&run, Decision::Reject);
         let opening = provider.messages(0);
         assert!(!user_text(&opening[0]).contains("marker.txt"), "not in the system prompt");
-        assert!(user_text(&opening[1]).contains("marker.txt"));
+        assert!(user_text(&opening[2]).contains("marker.txt"));
         assert_eq!(prompt::typed_text(user_text(&opening[1])), "first");
         run.handle.commands.send(Command::Retry).unwrap();
         until_end(&run, Decision::Reject);
-        assert!(user_text(&provider.messages(1)[1]).contains("marker.txt"));
+        assert!(user_text(&provider.messages(1)[2]).contains("marker.txt"));
         run.handle.commands.send(Command::Send("second".into())).unwrap();
         until_end(&run, Decision::Reject);
         assert!(!user_text(provider.messages(2).last().unwrap()).contains("marker.txt"));
@@ -5723,7 +6146,7 @@ mod tests {
     fn agent_holding(messages: Vec<Message>, window: u64, steps: Vec<Step>) -> (Agent, Arc<Scripted>, Receiver<Event>, [tempfile::TempDir; 2]) {
         let (dir, sessions) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (sender, events) = channel();
-        let config = Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() };
+        let config = Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false };
         let mut agent = Agent::new(config, sender, Box::new(|| {}), Arc::new(AtomicBool::new(false)));
         let provider = Arc::new(Scripted { steps: Mutex::new(steps.into()), ..Scripted::default() });
         agent.provider = Some(provider.clone());
@@ -5972,8 +6395,9 @@ mod tests {
         assert_eq!(line["messages_before"].as_u64(), Some(was.len() as u64));
         let (after, first) = (line["messages_after"].as_u64().unwrap() as usize, line["first_changed"].as_u64().unwrap() as usize);
         assert!(after < was.len(), "{line}");
-        // (the system prompt and the first request stay, which is two messages, and the summary takes the place of the first of the rest: an automatic compaction leaves four in all)
-        assert_eq!((first, after), (2, 4), "{line}");
+        // (the system prompt and the first request with its facts stay, which is three messages, and the summary takes the place of the first of the rest: an automatic
+        // compaction leaves six in all, the latest request and its facts after the summary)
+        assert_eq!((first, after), (3, 6), "{line}");
         let held: usize = was[..first].iter().map(Message::chars).sum();
         assert_eq!(line["unchanged_tokens_est"].as_u64(), Some((held / CHARS_A_TOKEN) as u64), "{line}");
         // The ones it had before: the line still says them.
@@ -6600,7 +7024,7 @@ mod tests {
         let (told, refused) = (said.iter().position(|line| line.starts_with("notice:")).unwrap(), said.iter().position(|line| line.starts_with("ended:false:true:")).unwrap());
         assert!(told < said.iter().position(|line| line.starts_with("started:")).unwrap() && told < refused, "{said:?}");
         assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "before\n");
-        assert!(user_text(&provider.messages(0)[1]).contains("## No Changes"));
+        assert!(user_text(&provider.messages(0)[2]).contains("## No Changes"));
         let lines = trajectory_of(&run);
         let guard: Vec<&Value> = of_kind(&lines, "intervention").into_iter().filter(|line| line["kind"] == "no_change_guard" && line["what"] == "turn_read_only").collect();
         assert_eq!(guard.len(), 1, "{lines:?}");
@@ -6735,7 +7159,7 @@ mod tests {
         until_end(&run, Decision::Reject);
         let (first, second) = (provider.messages(0), provider.messages(1));
         let scratch = scratch_of(run._sessions.path());
-        let noted = user_text(&first[1]);
+        let noted = user_text(&first[2]);
         assert!(noted.contains("## No Changes") && noted.contains(&scratch.display().to_string()), "{noted}");
         assert!(scratch.is_dir(), "made for the turn");
         assert_eq!(second.iter().filter(|message| user_text(message).contains("## No Changes")).count(), 1, "only the turn that asked has it");
@@ -6778,8 +7202,8 @@ mod tests {
             run.handle.commands.send(Command::Send(text.into())).unwrap();
             until_end(&run, Decision::Reject);
         }
-        assert!(user_text(provider.messages(1).last().unwrap()).contains("日本語で書いて"));
-        assert!(!user_text(provider.messages(2).last().unwrap()).contains("日本語"));
+        assert!(user_text(provider.messages(1).last().unwrap()).contains("The user writes in Japanese."));
+        assert!(!user_text(provider.messages(2).last().unwrap()).contains("writes in Japanese"));
     }
 
     /// The JSON of a `create_file` with `lines` numbered lines, cut wherever `upto` says.
@@ -7165,16 +7589,96 @@ mod tests {
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 3, "{log:?}");
         let messages = bodies[1]["messages"].as_array().unwrap();
-        let call = &messages[2]["tool_calls"][0]["function"];
+        let call = &messages[3]["tool_calls"][0]["function"];
         assert_eq!(call["name"], "create_file");
         let sent: &str = call["arguments"].as_str().unwrap();
         assert!(sent.len() < MAX_WRITE_CHARS + 2100 && sent.starts_with(r#"{"path":"web/index.html","content":"line 0 "#), "the bytes as they came: {}", &sent[..80]);
         let kept: Value = serde_json::from_str(sent).expect("whole JSON");
         assert!(kept["content"].as_str().unwrap().ends_with("to something\n"), "at a line's end");
-        let said = messages[3]["content"].as_str().unwrap();
+        let said = messages[4]["content"].as_str().unwrap();
         assert!(said.contains("cut off") && said.contains("Go straight on"), "{said}");
         let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
         assert_eq!(on_disk, format!("{}the rest\n", kept["content"].as_str().unwrap()), "the model left out append, and it went on all the same");
+    }
+
+    /// The same pieces as Straydog sends a call it is writing, when asked to (`"straydog": {"tool_writing": true}`): the name first and alone, then the arguments in a field of the
+    /// delta of its own. The call itself comes whole at the end, in the usual field, if it comes.
+    fn straydog_pieces(raw: &str) -> Vec<Value> {
+        let mut events = vec![serde_json::json!({"choices": [{"delta": {"straydog_tool_writing": [{"index": 0, "name": "create_file", "arguments": ""}]}}]})];
+        events.extend(raw.as_bytes().chunks(2000).map(|piece| serde_json::json!({"choices": [{"delta": {"straydog_tool_writing": [{"index": 0, "arguments": std::str::from_utf8(piece).unwrap()}]}}]})));
+        events
+    }
+
+    /// `write_arguments` the way Straydog writes the JSON of a call: a space after each colon and comma.
+    fn spaced_write_arguments(lines: usize, upto: usize) -> String {
+        write_arguments(lines, upto).replacen(r#""path":"#, r#""path": "#, 1).replacen(r#","content":"#, r#", "content": "#, 1)
+    }
+
+    /// A call Straydog sends as the model writes it is shown as it comes, as any server's pieces are, and the call that comes whole after is the call: written once, and what the
+    /// window was told of it as it was written is no more than the call.
+    #[test]
+    fn a_call_straydog_sends_as_it_is_written_is_shown_and_then_done_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = spaced_write_arguments(100, usize::MAX);
+        assert!(raw.len() > 6000 && raw.len() < MAX_WRITE_CHARS);
+        let mut events = straydog_pieces(&raw);
+        events.push(piece_of_call(&raw, Some("tool_calls")));
+        let (client, bodies) = trickling_server(vec![events, vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        let (mut told, mut tools, mut writes) = (String::new(), Vec::new(), 0);
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::ToolWriting { tool, piece, .. } => {
+                    tools.push(tool);
+                    told.push_str(&piece);
+                    writes += 1;
+                }
+                Event::TurnEnded { cancelled } => {
+                    assert!(!cancelled);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(writes > 0 && tools.iter().all(|tool| tool == "create_file"), "{tools:?}");
+        // (the window was told the call's start as it came, and never more than the call)
+        assert!(raw.starts_with(&told), "told {} bytes of {}", told.len(), raw.len());
+        let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
+        assert!(on_disk.starts_with("line 0 ") && on_disk.ends_with("to something\n") && on_disk.lines().count() == 100, "once, and whole");
+        let bodies = bodies.lock().unwrap();
+        let call = &bodies[1]["messages"].as_array().unwrap()[3]["tool_calls"][0];
+        assert_eq!((call["function"]["name"].as_str(), call["function"]["arguments"].as_str()), (Some("create_file"), Some(raw.as_str())), "the call as it came whole, and not its pieces");
+        assert_eq!(bodies[1]["messages"].as_array().unwrap()[3]["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    /// A call too long for one answer is cut off from the pieces Straydog sends, as from a server's own, and goes on from what is on disk.
+    #[test]
+    fn a_long_write_straydog_sends_in_pieces_is_cut_off_all_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = spaced_write_arguments(1000, usize::MAX);
+        assert!(raw.len() > 2 * MAX_WRITE_CHARS);
+        let mut first = straydog_pieces(&raw);
+        // (a server that is not stopped goes on to send the call whole)
+        first.push(piece_of_call(&raw, Some("tool_calls")));
+        let (client, bodies) = trickling_server(vec![first, whole_call(serde_json::json!({"path": "web/index.html", "content": "the rest\n"})), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled, "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "{log:?}");
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        let call = &messages[3]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "create_file");
+        let sent: &str = call["arguments"].as_str().unwrap();
+        assert!(sent.len() < MAX_WRITE_CHARS + 2100 && sent.starts_with(r#"{"path": "web/index.html", "content": "line 0 "#), "the bytes as they came: {}", &sent[..80]);
+        let kept: Value = serde_json::from_str(sent).expect("whole JSON");
+        assert!(kept["content"].as_str().unwrap().ends_with("to something\n"), "at a line's end");
+        let said = messages[4]["content"].as_str().unwrap();
+        assert!(said.contains("cut off") && said.contains("Go straight on"), "{said}");
+        let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
+        assert_eq!(on_disk, format!("{}the rest\n", kept["content"].as_str().unwrap()));
     }
 
     #[test]
@@ -7204,9 +7708,9 @@ mod tests {
     }
 
     #[test]
-    fn a_write_cut_off_counts_for_what_it_cost() {
+    fn a_long_write_is_not_told_what_it_has_cost() {
         let dir = tempfile::tempdir().unwrap();
-        // Each cut comes at some 3000 tokens as they are counted: three cuts are past where a note is due.
+        // Each cut comes at some 3000 tokens as they are counted: three cuts were past where a note of the cost was due, when the app sent one.
         let script = || pieces(&write_arguments(1000, usize::MAX));
         let (client, bodies) = trickling_server(vec![script(), script(), script(), script(), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
@@ -7214,7 +7718,7 @@ mod tests {
         let (log, _) = until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         let told = bodies.iter().flat_map(|body| body["messages"].as_array().unwrap().iter()).filter_map(|message| message["content"].as_str()).any(|said| said.contains("This request has cost"));
-        assert!(told, "{log:?}");
+        assert!(!told, "nothing tells the model to end its turn over what it has written: {log:?}");
     }
 
     #[test]
@@ -7252,8 +7756,8 @@ mod tests {
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
         let messages = bodies[1]["messages"].as_array().unwrap();
-        assert_eq!(messages[2]["tool_calls"][0]["function"]["name"], "create_file");
-        assert!(messages[3]["content"].as_str().unwrap().contains("the turn stopped while this was being written"), "{}", messages[3]);
+        assert_eq!(messages[3]["tool_calls"][0]["function"]["name"], "create_file");
+        assert!(messages[4]["content"].as_str().unwrap().contains("the turn stopped while this was being written"), "{}", messages[4]);
     }
 
     #[test]
@@ -7315,7 +7819,7 @@ mod tests {
             let (client, bodies) = server(vec![call_answer("mcp__srv__t", serde_json::json!({})), text_answer("done")]);
             let (sender, events) = channel();
             let sessions = tempfile::tempdir().unwrap();
-            let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default() }, sender, Box::new(|| {}));
+            let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
             handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
             let run = Run { handle, events, _sessions: sessions };
             run.handle.commands.send(Command::Send("go".into())).unwrap();
@@ -7413,7 +7917,7 @@ mod tests {
         assert_eq!(bodies[0]["messages"][1]["content"][0]["image_url"]["url"], url);
         assert_eq!(bodies[1]["messages"][1].to_string(), bodies[0]["messages"][1].to_string());
         assert_eq!(prompt::typed_text(bodies[0]["messages"][1]["content"][1]["text"].as_str().unwrap()), "what is this");
-        assert_eq!(bodies[1]["messages"][3]["content"].as_str().map(prompt::typed_text), Some("and now"), "words alone stay a plain string");
+        assert_eq!(bodies[1]["messages"][4]["content"].as_str().map(prompt::typed_text), Some("and now"), "words alone stay a plain string");
     }
 
     #[test]
@@ -7458,6 +7962,20 @@ mod tests {
         let (failed, _) = turn_said(&run);
         assert_eq!(failed, [llm::NO_VISION]);
         assert_eq!(provider.requests(), 1);
+    }
+
+    #[test]
+    fn a_picture_opened_for_a_model_that_reads_none_is_refused_with_no_request_spent_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), images::tests::encoded(16, 16, image::ImageFormat::Png)).unwrap();
+        let read = || calls(&[("read_file", serde_json::json!({"path": "shot.png"}))]);
+        // (a server whose tool results could hold one, and which says this model reads none)
+        let (run, provider) = scripted_as(dir.path(), Scripted { steps: Mutex::new(vec![read(), says("no picture then")].into()), tool_pictures: true, reads: Some(false), ..Scripted::default() }, Mode::Default);
+        run.handle.commands.send(Command::Send("look".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log[0].starts_with("tool:false:") && log[0].contains("reads no pictures"), "{log:?}");
+        assert_eq!(provider.requests(), 2, "the answer after the tool is the second request, and no refused one is between");
+        assert!(provider.messages(1).iter().all(|message| message.images.is_empty()));
     }
 
     #[test]
@@ -7674,7 +8192,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (sender, events) = channel();
         let sessions = tempfile::tempdir().unwrap();
-        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), memory: None, mcp: None, policy: Default::default() }, sender, Box::new(|| {}));
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
         handle.commands.send(Command::Send("hi".into())).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         let (log, _) = until_end(&run, Decision::Reject);
@@ -7732,6 +8250,85 @@ mod tests {
     }
 
     #[test]
+    fn a_request_says_where_its_message_is_in_the_session_and_a_tool_says_which_call_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "content here").unwrap();
+        let (client, _) = server(vec![call_answer("read_file", serde_json::json!({"path": "a.txt"})), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("read it".into())).unwrap();
+        let session = session_file(&run);
+        until_end(&run, Decision::Reject);
+        let messages = crate::session::read(&session).unwrap();
+        let lines = trajectory_of(&run);
+        let places: Vec<u64> = of_kind(&lines, "request").iter().map(|line| line["message"].as_u64().expect("a message")).collect();
+        // (the system prompt, the person's words, the app's facts, the answer with its call, the call's result, the last answer)
+        assert_eq!(places, [3, 5], "{lines:?}");
+        assert!(places.iter().all(|at| messages[*at as usize].role == "assistant"));
+        let call = &messages[3].tool_calls.as_ref().unwrap()[0];
+        assert_eq!(of_kind(&lines, "tool")[0]["id"], call.id.as_str(), "the call is told by the id the message has for it");
+        assert_eq!(messages[4].tool_call_id.as_deref(), Some(call.id.as_str()));
+        // (when each began to write: the call in the first, the answer's words in the second, and not the other)
+        let requests = of_kind(&lines, "request");
+        assert!(requests[0]["writing_ms"].is_u64() && requests[0].get("answer_ms").is_none(), "{}", requests[0]);
+        assert!(requests[1]["answer_ms"].is_u64() && requests[1].get("writing_ms").is_none(), "{}", requests[1]);
+    }
+
+    #[test]
+    fn the_timeline_of_a_real_run_has_its_steps_with_their_calls_and_the_same_without_the_places_the_trajectory_gives() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "content here").unwrap();
+        let (client, _) = server(vec![call_answer("read_file", serde_json::json!({"path": "a.txt"})), text_answer("done. and more")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("read it\nand tell me".into())).unwrap();
+        let session = session_file(&run);
+        until_end(&run, Decision::Reject);
+        let timeline = crate::timeline::read(&session).unwrap();
+        let path = &timeline.turns[0];
+        assert_eq!((path.asked.as_str(), path.woken, path.steps.len()), ("read it", false, 2), "{path:?}");
+        assert!(path.ended.as_ref().is_some_and(|end| !end.cancelled && !end.failed));
+        let (first, last) = (&path.steps[0], &path.steps[1]);
+        // The first step said nothing but its call, and the last said "done" after reasoning.
+        assert_eq!(first.why.as_ref().map(|why| (why.text.as_str(), why.source)), Some(("read_file a.txt", crate::timeline::WhySource::Target)));
+        assert_eq!(last.why.as_ref().map(|why| (why.text.as_str(), why.source)), Some(("done.", crate::timeline::WhySource::Content)));
+        let call = &first.calls[0];
+        assert_eq!((call.id.as_str(), call.name.as_str(), call.outcome.as_str(), call.target.as_deref()), ("call-1", "read_file", "ok", Some("a.txt")));
+        assert!(call.arguments.as_deref().unwrap().contains("a.txt") && call.output.as_deref().unwrap().contains("content here"), "{call:?}");
+        assert_eq!(last.request.as_ref().map(|request| (request.prompt, request.completion, request.end.as_str())), Some((Some(10), Some(2), "stop")));
+        // A trajectory from before the lines said where their messages are gives the same.
+        let beside = trajectory::file_of(&session);
+        let old: String = std::fs::read_to_string(&beside).unwrap().lines().map(|line| {
+            let mut line: Value = serde_json::from_str(line).unwrap();
+            line.as_object_mut().unwrap().remove("message");
+            line.as_object_mut().unwrap().remove("id");
+            format!("{line}\n")
+        }).collect();
+        assert!(!old.contains("\"message\""));
+        let again = crate::timeline::build(&crate::session::read(&session).unwrap(), &old);
+        assert_eq!(again, timeline);
+    }
+
+    #[test]
+    fn a_request_asked_again_is_told_to_the_window_and_the_empty_one_made_no_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, _) = scripted(dir.path(), vec![says(""), says("hello")], Mode::Default);
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        let mut retries = Vec::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::Retrying { why, wait_ms } => retries.push((why, wait_ms)),
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(retries, [("empty".to_string(), 0)]);
+        let lines = trajectory_of(&run);
+        let requests = of_kind(&lines, "request");
+        assert_eq!(requests.len(), 2, "{lines:?}");
+        assert!(requests[0].get("message").is_none(), "an answer with nothing in it does not join the conversation: {}", requests[0]);
+        assert_eq!((requests[1]["message"].as_u64(), requests[1]["retry_why"].as_str()), (Some(3), Some("empty")));
+    }
+
+    #[test]
     fn a_stop_of_the_persons_and_a_stop_of_the_apps_are_recorded_as_each() {
         // The person's.
         let dir = tempfile::tempdir().unwrap();
@@ -7769,6 +8366,8 @@ mod tests {
         assert!(stop["tokens_before"].as_u64().unwrap() > 0 && stop["run"].as_u64().unwrap() >= DRAFT_LINES as u64, "{stop}");
         assert_eq!(lines[3]["end"], "stop");
         assert_eq!(of_kind(&lines, "turn_end")[0]["cancelled"], false);
+        // The draft stopped made no message (nothing was said); the request that went on from it did.
+        assert!(lines[1].get("message").is_none() && lines[3]["message"].is_u64(), "{lines:?}");
     }
 
     #[test]
@@ -7958,4 +8557,7 @@ mod tests {
 
     /// An `explore` helper's conversation: kept, sealed, told, stopped, branched and deleted with the session.
     mod helper;
+
+    /// Code Mode: a program that calls the tools (`run_code`), its calls through the gate, and what is kept of them.
+    mod run_code;
 }

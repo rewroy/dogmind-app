@@ -247,6 +247,8 @@ impl Completion {
 struct Assembly {
     completion: Completion,
     rate: Option<f64>,
+    /// Per call, what Straydog's pieces of it told as it was written (see [`WRITING`]). They are display, never part of the call.
+    written: Vec<String>,
 }
 
 impl Assembly {
@@ -292,6 +294,21 @@ impl Assembly {
             self.completion.finish = finish.to_string();
         }
         let Some(delta) = choice.get("delta") else { return Ok(()) };
+        // Pieces of the calls being written are told as they come and held to nothing more: a piece that is not as expected is not one, and no call is read from them.
+        for piece in delta.get(WRITING).and_then(Value::as_array).into_iter().flatten() {
+            let Some(index) = piece.get("index").and_then(Value::as_u64).filter(|index| *index < MAX_WRITING_CALLS) else { continue };
+            let index = index as usize;
+            if let Some(name) = piece.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()) {
+                on(Delta::Tool(index, name));
+            }
+            if let Some(text) = piece.get("arguments").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+                while self.written.len() <= index {
+                    self.written.push(String::new());
+                }
+                self.written[index].push_str(text);
+                on(Delta::Arguments(index, text));
+            }
+        }
         if let Some(text) = delta.get("reasoning_content").or_else(|| delta.get("reasoning")).and_then(Value::as_str) {
             self.completion.reasoning.push_str(text);
             on(Delta::Reasoning(text));
@@ -319,8 +336,11 @@ impl Assembly {
             }
             if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str) {
                 slot.function.arguments.push_str(arguments);
-                if !arguments.is_empty() {
-                    on(Delta::Arguments(index, arguments));
+                // What was told as it was written is not told again: of the call as it comes whole, what it adds to that (none where that is not the start of it).
+                let told = self.written.get_mut(index).map(std::mem::take).unwrap_or_default();
+                let new = if told.is_empty() { arguments } else { arguments.strip_prefix(told.as_str()).unwrap_or("") };
+                if !new.is_empty() {
+                    on(Delta::Arguments(index, new));
                 }
             }
         }
@@ -449,6 +469,24 @@ pub trait Provider: Send + Sync {
     fn images_in_tool_results(&self) -> bool {
         false
     }
+    /// Whether the model reads pictures at all, where its server says: Some(false) is one a picture would only be refused by.
+    fn reads_pictures(&self) -> Option<bool> {
+        None
+    }
+    /// Whether a tool call comes in pieces as the model writes it, which the app shows and with which it cuts a very long file into parts
+    /// on disk. A provider that gives a call only once it is whole says no.
+    fn shows_calls_as_written(&self) -> bool {
+        false
+    }
+    /// Whether the server is reading or writing for nobody now: a warm-up is sent only then, so that it never waits behind, or delays, a
+    /// request of another conversation or another client. One that cannot tell says yes.
+    fn idle(&self) -> bool {
+        true
+    }
+    /// A warm-up: [`Provider::stream`] for a request no later one goes on from, where the server can be told so.
+    fn warm(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
+        self.stream(request, cancel, on)
+    }
     /// Whether a call it was still writing can join the conversation as far as it had come. A provider with blocks of its own to send back cannot make those up.
     fn keeps_cut_writes(&self) -> bool {
         false
@@ -475,21 +513,35 @@ pub enum Restart {
 
 impl Provider for Client {
     fn stream(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
-        let mut body = if self.replay_reasoning {
-            request_body_in(request.model, request.messages, request.tools, request.effort, request.images)
-        } else {
-            let messages: Vec<Message> = request.messages.iter().map(|message| Message { reasoning_content: None, ..message.clone() }).collect();
-            request_body_in(request.model, &messages, request.tools, request.effort, request.images)
-        };
-        if request.japanese_letters && self.suppresses_letters {
-            body["suppress"] = json!(NOT_CP932_HAN);
-        }
-        self.post(&body, request.request_id, cancel, on)
+        self.post(&self.body_for(request), request.request_id, cancel, on)
     }
 
     /// Straydog's API takes them, and its template shows them inside the tool's response. The services' chat completions take text there.
     fn images_in_tool_results(&self) -> bool {
-        self.replay_reasoning
+        self.replay_reasoning && self.vision != Some(false)
+    }
+
+    fn reads_pictures(&self) -> Option<bool> {
+        self.vision
+    }
+
+    /// Straydog where it says it sends the calls as they are written (`tool_writing`); of other servers, OpenAI's own API, which streams
+    /// a call's arguments. Any other may give a call only whole.
+    fn shows_calls_as_written(&self) -> bool {
+        if self.replay_reasoning { self.tool_writing } else { self.base.host.eq_ignore_ascii_case("api.openai.com") }
+    }
+
+    /// Straydog's `/slots`: idle where no slot is processing. No answer, or one it cannot read, is not idle: a warm-up can always be left out.
+    fn idle(&self) -> bool {
+        let cancel = AtomicBool::new(false);
+        let Ok((200, slots)) = self.get_json(&self.root("/slots"), &cancel, IDLE_ASK_WITHIN) else { return false };
+        slots.as_array().is_some_and(|slots| slots.iter().all(|slot| slot.get("is_processing").and_then(Value::as_bool) == Some(false)))
+    }
+
+    /// Straydog keeps of a request that says `checkpoint: false` only its system prompt's checkpoint: the checkpoints another
+    /// conversation resumes from (where its last reply began) stay as they were.
+    fn warm(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
+        self.post(&self.warm_body(request), request.request_id, cancel, on)
     }
 
     fn answers(&self) -> bool {
@@ -520,6 +572,18 @@ const RESTART_ASK_WITHIN: Duration = Duration::from_secs(8);
 /// What a Straydog request names to have Han letters with no CP932 form refused.
 const NOT_CP932_HAN: &str = "not_cp932_han";
 
+/// The field of a streamed delta in which Straydog, asked to (`"straydog": {"tool_writing": true}`), sends the pieces of the tool calls the model is writing, which it holds back
+/// and sends whole at the end: `[{"index": 0, "name": "create_file", "arguments": "{\"path\": \"a.rs"}]`, the name on a call's first piece only. The pieces are the start of the
+/// call's arguments as far as the markup has come, and need not be JSON; only the call that comes whole is the call. They are for the person to see and for the app's cut of a
+/// file too long, and nothing is parsed from them.
+const WRITING: &str = "straydog_tool_writing";
+
+/// The most calls one answer's pieces name: a piece for a place beyond is not one.
+const MAX_WRITING_CALLS: u64 = 64;
+
+/// How long a warm-up waits to hear whether the server is busy: a server slower than this to say so is left alone.
+const IDLE_ASK_WITHIN: Duration = Duration::from_secs(2);
+
 /// How long the answer to one of the questions asked of a server (`/health`, the models, `/props`) is waited for, from asking to its last byte. A server that is up answers these at
 /// once, even while it loads a model.
 const ANSWER_WITHIN: Duration = Duration::from_secs(20);
@@ -533,11 +597,45 @@ pub struct Client {
     pub replay_reasoning: bool,
     /// The server says it can refuse those letters: another version, or another server, may turn the field down.
     pub suppresses_letters: bool,
+    /// The server says it can send the calls as the model writes them (see [`WRITING`]): an older one refuses the request that asks.
+    pub tool_writing: bool,
+    /// Whether the model reads pictures, where the server says (`/props`): a picture is never sent to one that does not.
+    pub vision: Option<bool>,
 }
 
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
-        Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false })
+        Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None })
+    }
+
+    /// The request a model's turn is sent as, for this server.
+    /// A warm-up's request: Straydog is told that no later request goes on from it (`checkpoint: false`).
+    fn warm_body(&self, request: &Request) -> Value {
+        let mut body = self.body_for(request);
+        if self.replay_reasoning {
+            if !body.get("straydog").is_some_and(Value::is_object) {
+                body["straydog"] = json!({});
+            }
+            body["straydog"]["checkpoint"] = json!(false);
+        }
+        body
+    }
+
+    fn body_for(&self, request: &Request) -> Value {
+        let mut body = if self.replay_reasoning {
+            request_body_in(request.model, request.messages, request.tools, request.effort, request.images)
+        } else {
+            let messages: Vec<Message> = request.messages.iter().map(|message| Message { reasoning_content: None, ..message.clone() }).collect();
+            request_body_in(request.model, &messages, request.tools, request.effort, request.images)
+        };
+        if request.japanese_letters && self.suppresses_letters {
+            body["suppress"] = json!(NOT_CP932_HAN);
+        }
+        // (a server that said it can: the calls come as the model writes them, beside the calls themselves, which come whole at the end)
+        if self.tool_writing && request.tools.is_some() {
+            body["straydog"] = json!({"tool_writing": true});
+        }
+        body
     }
 
     fn headers(&self) -> Vec<(String, String)> {
@@ -670,7 +768,8 @@ impl Client {
             || models.pointer("/data/0/owned_by").and_then(Value::as_str) == Some("straydog");
         let vision = props.pointer("/modalities/vision").and_then(Value::as_bool);
         let suppresses_letters = props.get("suppress").and_then(Value::as_array).is_some_and(|names| names.iter().any(|name| name.as_str() == Some(NOT_CP932_HAN)));
-        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters })
+        let tool_writing = props.get("tool_writing").and_then(Value::as_bool) == Some(true);
+        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing })
     }
 }
 
@@ -698,6 +797,8 @@ pub struct ServerInfo {
     /// Whether the model reads pictures, where the server says: none where it does not, and then only a request can tell.
     pub vision: Option<bool>,
     pub suppresses_letters: bool,
+    /// Whether the server sends the calls as the model writes them.
+    pub tool_writing: bool,
 }
 
 #[cfg(test)]
@@ -742,6 +843,159 @@ mod tests {
         assert_eq!(completion.finish, "tool_calls");
         let usage = completion.usage.unwrap();
         assert_eq!((usage.prompt, usage.cached, usage.completion, usage.tokens_per_second), (7, 5, 3, Some(41.5)));
+    }
+
+    /// What Straydog sends of a call being written is told as it comes (the name once, the arguments in pieces), and the call that comes whole after is the call: its name, and only
+    /// what the pieces had not told of its arguments, are told again. The pieces are in no call.
+    #[test]
+    fn a_call_straydog_writes_is_told_as_it_comes_and_its_whole_is_not_told_again() {
+        let (completion, seen) = feed(&[
+            r#"{"choices":[{"delta":{"reasoning_content":"hm"}}]}"#,
+            r#"{"choices":[{"delta":{"straydog_tool_writing":[{"index":0,"name":"create_file","arguments":""},{"index":0,"arguments":"{\"path\": \"a"}]}}]}"#,
+            r#"{"choices":[{"delta":{"straydog_tool_writing":[{"index":0,"arguments":"b.rs\", \"content\": \"x"}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"create_file","arguments":"{\"path\": \"ab.rs\", \"content\": \"xy\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        assert_eq!(seen, ["r:hm", "t:create_file", "a0:{\"path\": \"a", "a0:b.rs\", \"content\": \"x", "t:create_file", "a0:y\"}"]);
+        assert_eq!(completion.tool_calls.len(), 1);
+        assert_eq!(completion.tool_calls[0].function.arguments, r#"{"path": "ab.rs", "content": "xy"}"#);
+        assert_eq!((completion.tool_calls[0].id.as_str(), completion.finish.as_str()), ("call_1", "tool_calls"));
+        // Two calls: each one's own.
+        let (completion, seen) = feed(&[
+            r#"{"choices":[{"delta":{"straydog_tool_writing":[{"index":0,"name":"read_file","arguments":""},{"index":0,"arguments":"{\"path\": \"a\"}"},{"index":1,"name":"read_file","arguments":""},{"index":1,"arguments":"{\"path\": \"b"}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"read_file","arguments":"{\"path\": \"a\"}"}},{"index":1,"id":"c1","function":{"name":"read_file","arguments":"{\"path\": \"b\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        assert_eq!(seen, ["t:read_file", "a0:{\"path\": \"a\"}", "t:read_file", "a1:{\"path\": \"b", "t:read_file", "t:read_file", "a1:\"}"]);
+        assert_eq!(completion.tool_calls.iter().map(|call| call.function.arguments.as_str()).collect::<Vec<_>>(), [r#"{"path": "a"}"#, r#"{"path": "b"}"#]);
+    }
+
+    /// The pieces are a partial string: a call that never comes whole (the server released the markup as text) is no call, a final call that is not what the pieces began is told
+    /// in no part twice, and a piece that is not one is nothing and no error.
+    #[test]
+    fn pieces_make_no_call_and_a_piece_that_is_not_one_is_nothing() {
+        let (completion, seen) = feed(&[
+            r#"{"choices":[{"delta":{"straydog_tool_writing":[{"index":0,"name":"create_file","arguments":""},{"index":0,"arguments":"{\"path\": \"a"}]}}]}"#,
+            r#"{"choices":[{"delta":{"content":"text after all"},"finish_reason":"stop"}]}"#,
+        ]);
+        assert_eq!(seen, ["t:create_file", "a0:{\"path\": \"a", "c:text after all"]);
+        assert!(completion.tool_calls.is_empty());
+        assert_eq!(completion.content, "text after all");
+
+        let (completion, seen) = feed(&[
+            r#"{"choices":[{"delta":{"straydog_tool_writing":[{"index":0,"name":"create_file","arguments":""},{"index":0,"arguments":"{\"path\": \"a"}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"create_file","arguments":"{\"file\": \"other\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        assert_eq!(seen, ["t:create_file", "a0:{\"path\": \"a", "t:create_file"], "what does not go on from the pieces is not told over them");
+        assert_eq!(completion.tool_calls[0].function.arguments, r#"{"file": "other"}"#);
+
+        // Not a list, not objects, no index, a place beyond the most, a name or arguments that are not text, empty ones: told as nothing, and the stream goes on.
+        let (completion, seen) = feed(&[
+            r#"{"choices":[{"delta":{"straydog_tool_writing":"x"}}]}"#,
+            r#"{"choices":[{"delta":{"straydog_tool_writing":{"index":0,"name":"a"}}}]}"#,
+            r#"{"choices":[{"delta":{"straydog_tool_writing":[1,null,"s",[],{},{"name":"a","arguments":"b"},{"index":"0","name":"a"},{"index":-1,"name":"a"},{"index":1000000000,"name":"a","arguments":"b"},{"index":0,"name":5,"arguments":7},{"index":0,"name":"","arguments":""}]}}]}"#,
+            r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        ]);
+        assert_eq!(seen, ["c:ok"]);
+        assert!(completion.tool_calls.is_empty());
+        assert_eq!(completion.finish, "stop");
+    }
+
+    /// The request asks for the pieces only when the server said it sends them, and the request has tools; a request that does not ask is the request it always was.
+    #[test]
+    fn the_request_asks_for_a_calls_pieces_only_of_a_server_that_sends_them() {
+        let tools = json!([{"type": "function", "function": {"name": "create_file", "parameters": {"type": "object", "properties": {}}}}]);
+        let messages = [Message::text("user", "hi")];
+        let asks = |client: &Client, tools: Option<&Value>| {
+            let request = Request { model: "m", messages: &messages, tools, effort: None, images: None, japanese_letters: false, request_id: None };
+            client.body_for(&request)
+        };
+        let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        assert!(asks(&client, Some(&tools)).get("straydog").is_none(), "a server that has not said it can is not asked");
+        client.tool_writing = true;
+        assert_eq!(asks(&client, Some(&tools))["straydog"], json!({"tool_writing": true}));
+        assert!(asks(&client, None).get("straydog").is_none(), "nothing to write without tools");
+        assert_eq!(asks(&client, None), request_body("m", &messages, None, None));
+        assert_eq!(asks(&Client { tool_writing: false, ..client }, Some(&tools)), request_body("m", &messages, Some(&tools), None));
+    }
+
+    /// `/props` lists what a server can do; one that does not list this is not asked.
+    #[test]
+    fn a_server_says_in_its_props_that_it_sends_a_calls_pieces() {
+        assert!(described(r#"{"tool_writing": true, "suppress": ["not_cp932_han"]}"#).tool_writing);
+        assert!(!described(r#"{"tool_writing": false}"#).tool_writing);
+        assert!(!described(r#"{"tool_writing": "yes"}"#).tool_writing);
+        assert!(!described("{}").tool_writing);
+    }
+
+    #[test]
+    fn a_tool_result_holds_a_picture_only_for_a_model_that_is_not_said_to_read_none() {
+        let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        assert!(client.images_in_tool_results() && client.reads_pictures().is_none(), "a server that says nothing");
+        client.vision = Some(true);
+        assert!(client.images_in_tool_results());
+        client.vision = Some(false);
+        assert!(!client.images_in_tool_results() && client.reads_pictures() == Some(false));
+        client.vision = None;
+        client.replay_reasoning = false;
+        assert!(!client.images_in_tool_results(), "a server that is not Straydog, as before");
+    }
+
+    /// A client of a server that answers `GET /slots` with this, and anything else with `{}`.
+    fn answering_slots(slots: &'static str) -> Client {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 4096];
+                    let Ok(count) = stream.read(&mut request) else { return };
+                    let body = if String::from_utf8_lossy(&request[..count]).starts_with("GET /slots") { slots } else { "{}" };
+                    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+                    while matches!(stream.read(&mut request), Ok(count) if count > 0) {}
+                });
+            }
+        });
+        Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap()
+    }
+
+    #[test]
+    fn a_call_shows_as_it_is_written_from_straydog_that_says_so_and_from_openai() {
+        let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        assert!(!client.shows_calls_as_written(), "a Straydog that does not say tool_writing");
+        client.tool_writing = true;
+        assert!(client.shows_calls_as_written());
+        client.replay_reasoning = false;
+        client.tool_writing = false;
+        assert!(!client.shows_calls_as_written(), "another server");
+        let mut openai = Client::new("https://api.openai.com/v1", None).unwrap();
+        openai.replay_reasoning = false;
+        assert!(openai.shows_calls_as_written());
+    }
+
+    #[test]
+    fn a_server_is_idle_only_where_it_says_that_no_slot_is_processing() {
+        assert!(answering_slots(r#"[{"id": 0, "is_processing": false}]"#).idle());
+        assert!(!answering_slots(r#"[{"id": 0, "is_processing": true}]"#).idle());
+        assert!(!answering_slots(r#"[{"id": 0, "is_processing": false}, {"id": 1, "is_processing": true}]"#).idle(), "any slot at work");
+        assert!(!answering_slots(r#"[{"id": 0}]"#).idle(), "a slot that does not say");
+        assert!(!answering_slots(r#"{"error": "no"}"#).idle(), "an answer it cannot read");
+        assert!(!Client::new("http://127.0.0.1:1/v1", None).unwrap().idle(), "no answer at all");
+    }
+
+    #[test]
+    fn a_warm_up_asks_straydog_to_keep_only_its_system_prompts_checkpoint() {
+        let tools = json!([{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {}}}}]);
+        let messages = [Message::text("system", "s"), Message::text("user", ".")];
+        let request = Request { model: "m", messages: &messages, tools: Some(&tools), effort: None, images: None, japanese_letters: false, request_id: None };
+        let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        assert_eq!(client.warm_body(&request)["straydog"], json!({"checkpoint": false}));
+        client.tool_writing = true;
+        assert_eq!(client.warm_body(&request)["straydog"], json!({"tool_writing": true, "checkpoint": false}));
+        assert!(client.body_for(&request)["straydog"].get("checkpoint").is_none(), "a request of the conversation keeps its checkpoints");
+        client.replay_reasoning = false;
+        client.tool_writing = false;
+        assert!(client.warm_body(&request).get("straydog").is_none(), "only Straydog takes the field");
     }
 
     /// The head of the request a server is sent by `stream`, as the server reads it, lower-cased.

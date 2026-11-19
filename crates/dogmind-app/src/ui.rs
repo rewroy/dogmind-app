@@ -65,6 +65,7 @@ use crate::settings::{self, Kind, ProviderConfig, Settings, TEXT_SIZES};
 mod files_panel;
 mod helper_view;
 mod term_panel;
+mod timeline_view;
 
 use helper_view::{HelperLive, StepsView};
 
@@ -236,6 +237,7 @@ const ID_FIND_NEXT: isize = 42;
 const ID_FIND_CLOSE: isize = 43;
 const ID_PANEL_TOGGLE: isize = 44;
 const ID_TOGGLE_WEB: isize = 45;
+const ID_TOGGLE_CODE_MODE: isize = 9915;
 const ID_TOGGLE_COMPACT: isize = 9056;
 const ID_TOGGLE_LANGUAGE: isize = 46;
 const ID_PREVIEW_RELOAD: isize = 9047;
@@ -782,6 +784,8 @@ enum Note {
     Changes(PathBuf, Result<Vec<FileChange>, String>),
     /// A folder of the Files view has been read (`path`: from the workspace, with `/`), or why not.
     FolderRead { root: PathBuf, path: String, result: Result<Vec<files::Entry>, String> },
+    /// The path of a session has been read from its files (the Timeline view), or why not.
+    Timeline { session: PathBuf, result: Result<dogmind_agent::timeline::Timeline, String> },
     /// The disk says these folders of the workspace have changed.
     WorkspaceChanged { root: PathBuf, changed: files::Changed },
     Found(u64, Vec<session::Hit>),
@@ -1027,6 +1031,10 @@ enum CardAct {
     StopHelper(String),
     /// Show the steps of the helper of this call in the panel on the right.
     OpenHelper(String),
+    /// A file of the workspace (from its root) in its own app, or shown in Explorer when it is a program.
+    OpenPath(String),
+    /// A file of the workspace (from its root), shown in Explorer.
+    ShowPath(String),
 }
 
 /// One control of a card, on a row of its room.
@@ -1183,9 +1191,11 @@ fn drafter_restart_words() -> &'static str {
     t("The faster-writing data is ready. The engine restarts when the work under way ends.")
 }
 
-/// Whether to have the engine read the prompt and the tools now. With a message already waiting that message's own request reads them, once.
-fn warms_on_connect(local: bool, straydog: bool, nothing_waits: bool) -> bool {
-    local && straydog && nothing_waits
+/// Whether to have the engine read the prompt and the tools now: a Straydog, this PC's or a server's (the agent sends it only while that
+/// server answers nobody else, and so that it keeps nothing another conversation resumes from). With a message already waiting that
+/// message's own request reads them, once.
+fn warms_on_connect(straydog: bool, nothing_waits: bool) -> bool {
+    straydog && nothing_waits
 }
 
 /// What the dog says on an empty chat, one to each new chat. In English whatever the display language: it is the dog's own voice, not a label.
@@ -1910,6 +1920,8 @@ struct App {
     panel_menu: files_panel::PanelMenu,
     /// The Terminal view of the panel on the right (`term_panel`): its windows and its terminals.
     term: term_panel::TermView,
+    /// The Timeline view of the panel on the right (`timeline_view`): its window, the session's path read from its files, and what the events say between two reads.
+    timeline: timeline_view::TimelineView,
     /// The words over the panel on the right, where a press goes to the view each names.
     right_tab_hits: Vec<(RECT, RightView)>,
     collapsed: HashSet<String>,
@@ -2176,6 +2188,7 @@ struct App {
     /// Web content is in this conversation, so a command that gets the network asks.
     web_seen: bool,
     toggle_web: HWND,
+    toggle_code_mode: HWND,
     toggle_compact: HWND,
     context_follows_model: bool,
     vram_slider: HWND,
@@ -2582,9 +2595,11 @@ fn agent_config(settings: &Settings, folder: &Path, workspace: PathBuf, mode: Mo
         instructions: Some(folder.join("instructions.md")),
         home: std::env::var_os("USERPROFILE").map(PathBuf::from),
         skills_off: settings.skills_off.clone(),
+        skills_on: settings.skills_on.clone(),
         memory: Some(folder.join("memory")),
         mcp: Some(mcp),
         policy,
+        code_mode: settings.code_mode,
     }
 }
 
@@ -3226,6 +3241,11 @@ impl App {
         GetClientRect(edit, &mut client);
         let radius = scale(self.dpi, ds::radius::CARD_CORNER);
         let mut view: Option<ViewPixels> = None;
+        // With text above the view, the view's top rows fade it into the page (as the text view draws them): a card that goes on up past them is
+        // not its own colour there, and is looked for below them.
+        let mut scrolled = POINT { x: 0, y: 0 };
+        SendMessageW(edit, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(scrolled) as LPARAM);
+        let fade = if scrolled.y > 0 && !test_no_fade() { scale(self.dpi, ds::size::TEXT_FADE).min((client.bottom - client.top) / 4) } else { 0 };
         for user_card in self.user_cards.iter_mut().rev() {
             let back = user_card.kind.back();
             let mut point = POINT { x: 0, y: 0 };
@@ -3260,16 +3280,14 @@ impl App {
                         in_view.then_some((card, shape.page))
                     }
                     // (one pixel says when it is above the view, which is where it mostly is by now)
-                    None if GetPixel(device, point.x - 2, point.y.max(client.top)) != back => None,
+                    None if GetPixel(device, point.x - 2, point.y.max(client.top + fade)) != back => None,
                     None if user_card.looked_at.is_some_and(|at| at.elapsed().as_millis() < 250) => None,
                     None => {
                         user_card.looked_at = Some(std::time::Instant::now());
                         let view = view.get_or_insert_with(|| ViewPixels::of(device, client));
-                        find_card(client, point, radius, scale(self.dpi, 3), |x, y| view.at(x, y) == back).map(|mut card| {
+                        find_card(client, point, fade, radius, scale(self.dpi, 3), |x, y| view.at(x, y) == back).map(|mut card| {
                             let page = view.at(card.left - 1, card.top + radius);
                             // With the view at the top of the text, the top of the view is the top of a card that reaches it.
-                            let mut scrolled = POINT { x: 0, y: 0 };
-                            SendMessageW(edit, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(scrolled) as LPARAM);
                             card.top_open = card.top_open && scrolled.y > 0;
                             // (what goes on below where the card was found to end, or above where it begins, in a colour that is not the page's, is the card in the fade at an edge of the view: it is
                             // not rounded there, as its end is not in sight)
@@ -4585,6 +4603,10 @@ impl App {
                 }
             }
         }
+        // (the timeline's rows of pictures ask for theirs as they are drawn: the next drawing has it)
+        if self.timeline_shown() {
+            InvalidateRect(self.timeline.window, std::ptr::null(), 0);
+        }
     }
 
     /// Whether the model waits for the person: for an approval, an answer to its question, or a decision on its plan.
@@ -4736,8 +4758,10 @@ impl App {
                 let widest = cards::most_changed(rows);
                 for (at, row) in rows.iter().enumerate() {
                     let (green, red) = cards::bar(row.added, row.removed, widest);
-                    // (a file that is gone, or that is a program, is shown in Explorer and not opened)
-                    let (icon, tip) = if cards::opens_in_app(&row.path) && self.workspace.join(&row.path).is_file() { ("external-link", t("Open in its app")) } else { ("folder", t("Show in Explorer")) };
+                    // (a file the preview shows is shown beside the conversation; one that is gone, or that is a program, in Explorer and not opened)
+                    let there = self.workspace.join(&row.path).is_file();
+                    let (icon, tip) = if preview::can_show(&row.path) && there { ("panel-right", t("Show beside the conversation")) }
+                                      else if cards::opens_in_app(&row.path) && there { ("external-link", t("Open in its app")) } else { ("folder", t("Show in Explorer")) };
                     let file = CardPart { text: file_row_text(row.added, row.removed, green, red, &row.path), kind: ButtonKind::FileRow, act: CardAct::OpenDiff(*turn, at), width: 0, tip: String::new() };
                     let open = CardPart { text: icon.to_string(), kind: ButtonKind::Icon, act: CardAct::OpenFile(*turn, at), width: s(ds::size::ICON_BUTTON), tip: tip.to_string() };
                     self.card_room(s(30), vec![file, open]);
@@ -4745,6 +4769,19 @@ impl App {
                 if *more > 0 {
                     let rest = CardPart { text: tf("and {0} more", &[more]), kind: ButtonKind::Ghost, act: CardAct::MoreFiles(*turn), width: 0, tip: String::new() };
                     self.card_room(s(28), vec![rest]);
+                }
+                self.card_room(s(12), Vec::new());
+            }
+            Card::Presented { files } => {
+                let count = if files.len() == 1 { t("1 file").to_string() } else { tf("{0} files", &[&files.len()]) };
+                self.card_row(&[" "], 6, theme::muted(), 80, true);
+                self.card_row(&[&format!("{}  ·  {count}", t("Files for you"))], 8, theme::muted(), 26, false);
+                self.card_room(s(4), Vec::new());
+                for path in files {
+                    let tip = if preview::can_show(path) { t("Show beside the conversation") } else if cards::opens_in_app(path) { t("Open in its app") } else { t("Show in Explorer") };
+                    let file = CardPart { text: path.clone(), kind: ButtonKind::Ghost, act: CardAct::OpenPath(path.clone()), width: 0, tip: tip.to_string() };
+                    let show = CardPart { text: "folder".to_string(), kind: ButtonKind::Icon, act: CardAct::ShowPath(path.clone()), width: s(ds::size::ICON_BUTTON), tip: t("Show in Explorer").to_string() };
+                    self.card_room(s(30), vec![file, show]);
                 }
                 self.card_room(s(12), Vec::new());
             }
@@ -4913,8 +4950,24 @@ impl App {
     /// A file of an answer's card, in its own app, or shown in Explorer when it is a program (which the app does not run), or no longer there.
     unsafe fn open_turn_file(&mut self, turn: u64, at: usize) {
         let Some(path) = self.turn_changes.get(&turn).and_then(|files| files.get(at)).map(|file| file.path.clone()) else { return };
-        let file = self.workspace.join(&path);
-        let (verb, target, arguments) = if file.is_file() && cards::opens_in_app(&path) {
+        self.show_workspace_file(&path);
+    }
+
+    /// A file a card names, pressed: beside the conversation when the preview shows its kind (a page, a picture, a PDF, Markdown, a source
+    /// file) and it is there, as a link to it in the answer is; otherwise as [`Self::open_workspace_file`] opens it.
+    unsafe fn show_workspace_file(&mut self, path: &str) {
+        if preview::can_show(path) && self.workspace.join(path).is_file() {
+            self.open_preview(path);
+        } else {
+            self.open_workspace_file(path, false);
+        }
+    }
+
+    /// A file of the workspace, from its root: in its own app, or shown in Explorer when it is a program (which the app does not run) or when `reveal` asks, or, when it is
+    /// no longer there, the folder it was in.
+    unsafe fn open_workspace_file(&mut self, path: &str, reveal: bool) {
+        let file = self.workspace.join(path);
+        let (verb, target, arguments) = if file.is_file() && cards::opens_in_app(path) && !reveal {
             ("open", file.to_string_lossy().replace('/', "\\"), String::new())
         } else if file.is_file() {
             ("open", "explorer.exe".to_string(), format!("/select,\"{}\"", file.to_string_lossy().replace('/', "\\")))
@@ -4944,6 +4997,8 @@ impl App {
             CardAct::None => {}
             CardAct::StopHelper(call) => self.helper_stop_pressed(&call),
             CardAct::OpenHelper(call) => self.steps_open(&call),
+            CardAct::OpenPath(path) => self.show_workspace_file(&path),
+            CardAct::ShowPath(path) => self.open_workspace_file(&path, true),
         }
     }
 
@@ -5563,12 +5618,13 @@ impl App {
         self.settings.skills_off_for(&foreign)
     }
 
-    /// The agents are told what is off, for a session begun from now on (and one under way keeps its list).
+    /// The agents are told what is off, and what the person turned on (of what needs what this app has not, only those are offered), for a session
+    /// begun from now on (and one under way keeps its list).
     fn send_skills_off(&self) {
-        let off = self.skills_off_now();
-        let _ = self.agent.commands.send(Command::SetSkillsOff(off.clone()));
-        for parked in &self.parked {
-            let _ = parked.agent.commands.send(Command::SetSkillsOff(off.clone()));
+        let (off, on) = (self.skills_off_now(), self.settings.skills_on.clone());
+        for agent in std::iter::once(&self.agent).chain(self.parked.iter().map(|parked| &parked.agent)) {
+            let _ = agent.commands.send(Command::SetSkillsOn(on.clone()));
+            let _ = agent.commands.send(Command::SetSkillsOff(off.clone()));
         }
     }
 
@@ -5979,7 +6035,7 @@ impl App {
             (room / 2).max(s(380))
         } else if self.preview_file.is_none() && (self.settings.right_panel || self.steps.is_some()) && room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS) {
             // (a terminal wants columns: nearly half of what the sidebar leaves, as far as the conversation can spare it)
-            let wanted = if self.settings.right_view == RightView::Terminal { (room * 45 / 100).clamp(s(ds::size::RIGHT_PANEL), s(TERMINAL_PANEL_MOST)) } else { s(ds::size::RIGHT_PANEL) };
+            let wanted = if matches!(self.settings.right_view, RightView::Terminal | RightView::Timeline) { (room * 45 / 100).clamp(s(ds::size::RIGHT_PANEL), s(TERMINAL_PANEL_MOST)) } else { s(ds::size::RIGHT_PANEL) };
             wanted.min(room - s(RIGHT_NEEDS))
         } else {
             0
@@ -5996,6 +6052,9 @@ impl App {
         }
         if !self.terminal_shown() {
             self.terminal_hidden();
+        }
+        if !self.timeline_shown() {
+            self.timeline_hidden();
         }
         if self.preview_file.is_none() || right == 0 {
             if let Some(shown) = &self.preview {
@@ -6629,7 +6688,7 @@ impl App {
         all.push(self.vision_delete);
         all.extend(self.read_folder_remove.iter().copied());
         all.extend([self.read_folder_add, self.read_folder_stop]);
-        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_compact, self.toggle_updates, self.toggle_straydog_updates, self.toggle_remember, self.toggle_keep, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
+        all.extend([self.toggle_thinking, self.toggle_safe, self.toggle_web, self.toggle_code_mode, self.toggle_compact, self.toggle_updates, self.toggle_straydog_updates, self.toggle_remember, self.toggle_keep, self.toggle_language, self.mode_select, self.key_replace, self.key_remove, self.advanced_button, self.variable_toggle, self.mcp_import, self.setup_again, self.remove_all]);
         all
     }
 
@@ -7043,6 +7102,7 @@ impl App {
             }
             Panel::Tools => {
                 form.toggle(t("Web search and reading"), self.toggle_web);
+                form.toggle(t("Code Mode: let the model run a short program that calls several tools at once"), self.toggle_code_mode);
                 let setting = self.settings.search_key.clone();
                 self.key_rows(form, &setting, t("Brave Search key"));
                 form.section(t("MCP servers"));
@@ -7705,15 +7765,18 @@ impl App {
         // The views of the panel, as words over it (level with the session's name): the one shown is underlined.
         let words_top = (s(ds::size::TITLE_STRIP) - s(ds::space::XL)) / 2;
         let mut across_to = x;
-        for (words, view) in [(t("Overview"), RightView::Overview), (t("Files"), RightView::Files), (t("Terminal"), RightView::Terminal)] {
-            let across = text_width(self.fonts.strong, words);
+        let views = [(t("Overview"), RightView::Overview), (t("Files"), RightView::Files), (t("Terminal"), RightView::Terminal), (t("Timeline"), RightView::Timeline)];
+        let widths: Vec<i32> = views.iter().map(|(words, _)| text_width(self.fonts.strong, words)).collect();
+        // (four words in a panel as narrow as this one: the room between them gives way before the words do)
+        let gap = ((width - widths.iter().sum::<i32>()) / (views.len() as i32 - 1)).clamp(s(ds::space::S), s(ds::space::XL));
+        for ((words, view), across) in views.into_iter().zip(widths) {
             let on = self.settings.right_view == view;
             shapes.push(Shape::Text { area: rect(across_to, words_top, across, s(ds::space::XL)), text: words.to_string(), font: FontKind::Strong, color: if on { theme::text() } else { theme::muted() }, flags: ONE_LINE });
             if on {
                 shapes.push(Shape::Fill { area: rect(across_to, words_top + s(ds::space::XL) + s(ds::space::HAIR), across, s(ds::space::HAIR)), color: theme::accent() });
             }
-            self.right_tab_hits.push((rect(across_to - s(ds::space::S), words_top - s(ds::space::XS), across + 2 * s(ds::space::S), s(ds::space::XL) + s(ds::space::M)), view));
-            across_to += across + s(ds::space::XL);
+            self.right_tab_hits.push((rect(across_to - gap / 2, words_top - s(ds::space::XS), across + gap, s(ds::space::XL) + s(ds::space::M)), view));
+            across_to += across + gap;
         }
         // (what is under them begins past the strip the session's name has)
         let mut y = s(ds::size::TITLE_STRIP) + s(ds::space::S);
@@ -7730,6 +7793,12 @@ impl App {
         if self.settings.right_view == RightView::Terminal {
             self.dashboard_hit = None;
             self.layout_terminal_view(shapes, x, width, s(ds::size::TITLE_STRIP), height);
+            return;
+        }
+        // The timeline has the panel to the foot of the window too: the path is long.
+        if self.settings.right_view == RightView::Timeline {
+            self.dashboard_hit = None;
+            self.layout_timeline_view(shapes, x, width, s(ds::size::TITLE_STRIP), height);
             return;
         }
         // The engine, at the foot: what it is and the way to its dashboard.
@@ -8290,6 +8359,17 @@ impl App {
         for handle in std::iter::once(&self.agent).chain(self.parked.iter().map(|parked| &parked.agent)) {
             change(&mut handle.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         }
+    }
+
+    /// The Tools page's switch for Code Mode: every agent is told, and a conversation that has begun keeps the tools it began with.
+    unsafe fn code_mode_switched(&mut self) {
+        self.settings.code_mode = !self.settings.code_mode;
+        self.save();
+        let _ = self.agent.commands.send(Command::SetCodeMode(self.settings.code_mode));
+        for parked in &self.parked {
+            let _ = parked.agent.commands.send(Command::SetCodeMode(self.settings.code_mode));
+        }
+        self.update_toggles();
     }
 
     /// To every agent, as the settings have changed.
@@ -9260,7 +9340,7 @@ impl App {
     }
 
     unsafe fn update_toggles(&self) {
-        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_updates, self.settings.check_for_updates), (self.toggle_straydog_updates, self.settings.check_straydog_updates), (self.toggle_remember, self.crypt.remember), (self.toggle_keep, self.keep_conversation_on())] {
+        for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands), (self.toggle_web, self.settings.web_tools), (self.toggle_code_mode, self.settings.code_mode), (self.toggle_updates, self.settings.check_for_updates), (self.toggle_straydog_updates, self.settings.check_straydog_updates), (self.toggle_remember, self.crypt.remember), (self.toggle_keep, self.keep_conversation_on())] {
             set_button_style(toggle, if on { ButtonKind::ToggleOn } else { ButtonKind::Toggle }, theme::background());
         }
         // (where the encryption does not allow it, the switch cannot be turned on: the line under it says why)
@@ -10533,6 +10613,10 @@ impl App {
         self.totals = (0, 0, 0, 0);
         self.rate = None;
         let _ = self.agent.commands.send(Command::NewSession(folder.clone()));
+        // (its first message need not wait for the prompt and the tools: a Straydog reads them now, while the message is written)
+        if self.connected && warms_on_connect(self.straydog, self.queued.is_empty()) {
+            let _ = self.agent.commands.send(Command::WarmPrefix);
+        }
         self.look_at_workspace();
         self.set_panel(Panel::Chat);
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
@@ -11797,6 +11881,8 @@ impl App {
                     let result = engine::wait_ready(&client, &current, &mut say).and_then(|()| client.describe());
                     if let Ok(info) = &result {
                         client.suppresses_letters = info.suppresses_letters;
+                        client.tool_writing = info.tool_writing;
+                        client.vision = info.vision;
                     }
                     poster.send(match result {
                         Ok(info) => Note::Connected { generation, model: if provider.model.is_empty() { info.model } else { provider.model }, window: info.context, straydog: info.straydog, vision: info.vision, provider: Arc::new(client) },
@@ -11816,6 +11902,8 @@ impl App {
                         let info = client.describe()?;
                         client.replay_reasoning = info.straydog;
                         client.suppresses_letters = info.suppresses_letters;
+                        client.tool_writing = info.tool_writing;
+                        client.vision = info.vision;
                         Ok::<_, String>((client, info))
                     })();
                     poster.send(match result {
@@ -11932,6 +12020,7 @@ impl App {
         self.show_user(&out.card, &shown, &clock_now());
         // (from now: behind a warm-up its turn may not begin for most of a minute)
         self.set_activity(t("Thinking…").into());
+        self.timeline_will_ask(&out.card);
         self.running = true;
         self.stop_asked = false;
         self.update_buttons();
@@ -12051,6 +12140,7 @@ impl App {
         set_text(self.transcript, "");
         // (what the panel on the right showed of the session before is of it)
         self.steps = None;
+        self.timeline_session_changed();
         self.helpers_live.clear();
         self.shown.clear();
         self.answers.clear();
@@ -12104,6 +12194,10 @@ impl App {
             match message.role.as_str() {
                 "user" => {
                     if let Some(text) = message.content.as_deref() {
+                        // (the app's facts after a message of the person's are of that message's turn: neither shown nor a place of their own)
+                        if dogmind_agent::prompt::is_app_facts(text) {
+                            continue;
+                        }
                         self.flush_told_calls(&mut told);
                         // (what the turn before it changed has its card here; a turn may begin with what the app said and not the person, which is not shown but is a place)
                         self.turn_slots.push((index, self.shown.len()));
@@ -12450,6 +12544,7 @@ impl App {
 
     unsafe fn on_event(&mut self, event: Event) {
         let event = hidden_shown(event);
+        self.timeline_event(&event);
         let live_report = matches!(&event, Event::Usage { usage, .. } if usage.prompt == 0 && usage.completion == 0);
         if !matches!(event, Event::Content(_) | Event::RequestStarted) && !live_report {
             self.flush_reveal();
@@ -12535,6 +12630,8 @@ impl App {
             }
             // (what a long session is waiting for, which is not the model thinking: it is asked to sum the session up, and nothing of that shows)
             Event::Compacting => self.set_activity(t("Compacting the session…").into()),
+            // (the request goes again, after a connection that broke, an answer with nothing in it or a conversation that was too long; the next request's start puts "Thinking…" back)
+            Event::Retrying { .. } => self.set_activity(t("Retrying the request…").into()),
             // (the engine reading the prompt before the first word, which after a compaction or on a small GPU can be minutes)
             Event::Reading { done, total } => {
                 let percent = (done * 100).checked_div(total).unwrap_or(0);
@@ -12546,7 +12643,7 @@ impl App {
                 self.set_activity(waiting);
             }
             Event::RequestStarted => {
-                if self.activity == t("Compacting the session…") || self.activity == t("Waiting for the server to restart…") || self.activity.starts_with(&tf("Waiting for the server: {0}", &[&""])) {
+                if self.activity == t("Compacting the session…") || self.activity == t("Retrying the request…") || self.activity == t("Waiting for the server to restart…") || self.activity.starts_with(&tf("Waiting for the server: {0}", &[&""])) {
                     self.set_activity(t("Thinking…").into());
                 }
                 // (the next answer does not start at the speed the last one ended)
@@ -12595,6 +12692,8 @@ impl App {
             // (a look by a helper takes minutes: its card says what it is on, and how long it has gone on)
             Event::HelperStarted { id, task, file, .. } => self.helper_begin(id, task, file),
             Event::HelperStep { id, step, most, tool, summary, tokens, elapsed } => self.helper_step_told(&id, step, most, &tool, &summary, tokens, elapsed),
+            // (a program's call: the timeline has it, above; the conversation shows the program's call as one)
+            Event::ProgramStep { .. } => {}
             Event::HelperEnded { id, how, steps, files, tokens, elapsed, helper } => self.helper_end_told(&id, &how, steps, files, tokens, elapsed, helper.map(|helper| helper.number)),
             Event::ToolEnded { id, .. } if self.tools_running.get(&id).is_some_and(|(tool, _)| cards::is_asking(tool)) => {
                 self.tools_running.remove(&id);
@@ -12669,7 +12768,8 @@ impl App {
                 self.always_line = always;
                 // The sentences (why it asks, what the model says it is for) are in the body face above; what is run or written is in the control, in a monospace face with room between its lines.
                 let (purpose, code) = approval_parts(&approval.tool, &approval.summary, &approval.details);
-                self.approval_head = markdown::show_hidden(&[reason, purpose].iter().filter(|part| !part.is_empty()).cloned().collect::<Vec<String>>().join("\n")).into_owned();
+                let from_program = approval.program.as_ref().map_or(String::new(), |program| tf("From a program: {0}", &[program]));
+                self.approval_head = markdown::show_hidden(&[reason, from_program, purpose].iter().filter(|part| !part.is_empty()).cloned().collect::<Vec<String>>().join("\n")).into_owned();
                 // (a line at its end with nothing on it would have it scroll for nothing)
                 // (a command is read from its first character: what hides in it is shown as its mark)
                 self.show_command(&markdown::show_hidden(&code).trim_end().replace('\n', "\r\n"));
@@ -12719,6 +12819,9 @@ impl App {
             Event::WebSeen(on) => {
                 self.web_seen = on;
                 self.layout();
+            }
+            Event::Presented { files, .. } => {
+                self.write_card(&Card::Presented { files });
             }
             Event::Todos(items) => {
                 let lines: Vec<String> = items.iter().map(|item| format!("    {}  {}", task_mark(item["status"].as_str().unwrap_or("")), item["text"].as_str().unwrap_or(""))).collect();
@@ -12973,9 +13076,8 @@ impl App {
                     self.tell_about_vision();
                 }
                 self.engine_failed_at = None;
-                let local = self.settings.providers.iter().any(|provider| provider.name == self.settings.active && provider.kind == Kind::Embedded);
                 // (the agent looks for itself whether its session has begun: words on the page here may be only an earlier failure)
-                if warms_on_connect(local, straydog, self.queued.is_empty()) {
+                if warms_on_connect(straydog, self.queued.is_empty()) {
                     let _ = self.agent.commands.send(Command::WarmPrefix);
                 }
                 self.flush_queue();
@@ -13087,6 +13189,7 @@ impl App {
                 }
             }
             Note::FolderRead { root, path, result } => self.files_read_came(root, path, result),
+            Note::Timeline { session, result } => self.timeline_came(session, result),
             Note::WorkspaceChanged { root, changed } => self.files_changed_on_disk(&root, changed),
             Note::Changes(path, found) => {
                 if path != self.workspace {
@@ -13881,7 +13984,7 @@ impl App {
         ] {
             set_text(window, t(words));
         }
-        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.find_field, "Find in this conversation"), (self.side_search, "Search sessions")] {
+        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.find_field, "Find in this conversation"), (self.side_search, "Search sessions"), (self.timeline.search, "Search the timeline")] {
             let cue = wide(t(words));
             SendMessageW(edit, EM_SETCUEBANNER, 0, cue.as_ptr() as LPARAM);
         }
@@ -14551,14 +14654,19 @@ struct CardArea {
 }
 
 /// The card around a point just before its text begins. `None`: it is not in view, or what is there is not one card's rectangle.
+/// `fade`: the rows at the top of the view that fade the text above it into the page, where no card is its own colour; a card whose text begins
+/// above them or in them is looked for below them.
 /// `seam`: the most pixels from one that is the card's to the next that is when the rows of a card are walked across (3 design pixels, in this window's scale: the seam between rows is a
 /// fraction of a row's height and grows with the type, as the gap between two cards, which is more than that, does too).
-fn find_card(client: RECT, text: POINT, radius: i32, seam: i32, is_card: impl Fn(i32, i32) -> bool) -> Option<CardArea> {
+fn find_card(client: RECT, text: POINT, fade: i32, radius: i32, seam: i32, is_card: impl Fn(i32, i32) -> bool) -> Option<CardArea> {
     let x = text.x - 2;
     if x <= client.left || x >= client.right || text.y >= client.bottom {
         return None;
     }
-    let from = text.y.max(client.top);
+    let from = text.y.max(client.top + fade);
+    if from >= client.bottom {
+        return None;
+    }
     if !is_card(x, from) {
         return None;
     }
@@ -14990,7 +15098,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
             set_button_fonts(app.fonts);
-            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.term.rename_field]) {
+            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.term.rename_field, app.timeline.search]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
             }
             // (the command's own size follows the screen's: it is set again when it is next shown, and this one keeps what it has)
@@ -15224,6 +15332,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.rate_tick();
             app.run_tick();
             app.helper_tick();
+            app.timeline_tick();
             app.spinner_tick();
             0
         }
@@ -15319,6 +15428,12 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             if lparam as HWND == app.term.rename_field {
                 if code == EN_KILLFOCUS as usize {
                     app.terminal_rename_end(true);
+                }
+                return 0;
+            }
+            if lparam as HWND == app.timeline.search {
+                if code == EN_CHANGE as usize {
+                    app.timeline_query_changed();
                 }
                 return 0;
             }
@@ -15550,6 +15665,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_PROVIDER_DOWN => app.move_provider(1),
                 ID_TOGGLE_COMPACT => app.on_menu(M_COMPACT_CHOICE + usize::from(app.settings.compact_tools)),
                 ID_TOGGLE_WEB => app.on_menu(M_WEB_CHOICE + usize::from(app.settings.web_tools)),
+                ID_TOGGLE_CODE_MODE => app.code_mode_switched(),
                 ID_FILES => {
                     if code == LBN_SELCHANGE as usize {
                         app.files_selection_changed();
@@ -15702,6 +15818,13 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             return true;
         }
     }
+    if (message.message == WM_MOUSEWHEEL || message.message == WM_MOUSEHWHEEL) && app.timeline_shown() {
+        let (x, y) = ((message.lParam & 0xFFFF) as i16 as i32, ((message.lParam >> 16) & 0xFFFF) as i16 as i32);
+        if WindowFromPoint(POINT { x, y }) == app.timeline.window {
+            app.timeline_wheel(message.message == WM_MOUSEHWHEEL, message.wParam, message.lParam);
+            return true;
+        }
+    }
     if message.message == WM_MOUSEWHEEL && app.panel == Panel::Diff {
         let (x, y) = ((message.lParam & 0xFFFF) as i16 as i32, ((message.lParam >> 16) & 0xFFFF) as i16 as i32);
         if WindowFromPoint(POINT { x, y }) == app.diff_view {
@@ -15782,6 +15905,15 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             }
             _ => {}
         }
+    }
+    // In the timeline's search: Escape lets go of what is looked for, Enter and Down go to the path.
+    if message.hwnd == app.timeline.search && matches!(key, VK_ESCAPE | VK_RETURN | VK_DOWN) {
+        if key == VK_ESCAPE {
+            set_text(app.timeline.search, "");
+            app.timeline_query_changed();
+        }
+        SetFocus(app.timeline.window);
+        return true;
     }
     if message.hwnd == app.side_search {
         match key {
@@ -16034,6 +16166,7 @@ fn hidden_shown(event: Event) -> Event {
         Event::ToolStarted { id, tool, summary } if markdown::has_marks(&summary) => Event::ToolStarted { id, tool, summary: markdown::show_hidden(&summary).into_owned() },
         Event::HelperStarted { id, task, most, file } if markdown::has_marks(&task) => Event::HelperStarted { id, task: markdown::show_hidden(&task).into_owned(), most, file },
         Event::HelperStep { id, step, most, tool, summary, tokens, elapsed } if markdown::has_marks(&summary) => Event::HelperStep { id, step, most, tool, summary: markdown::show_hidden(&summary).into_owned(), tokens, elapsed },
+        Event::ProgramStep { id, call, tool, summary } if markdown::has_marks(&summary) => Event::ProgramStep { id, call, tool, summary: markdown::show_hidden(&summary).into_owned() },
         Event::ToolEnded { id, ok, declined, elapsed, output, images } if markdown::has_marks(&output) => Event::ToolEnded { id, ok, declined, elapsed, output: markdown::show_hidden(&output).into_owned(), images },
         other => other,
     }
@@ -16048,6 +16181,7 @@ fn keys_hidden(event: Event) -> Event {
         Event::ToolStarted { id, tool, summary } => Event::ToolStarted { id, tool, summary: hide(summary) },
         Event::HelperStarted { id, task, most, file } => Event::HelperStarted { id, task: hide(task), most, file },
         Event::HelperStep { id, step, most, tool, summary, tokens, elapsed } => Event::HelperStep { id, step, most, tool, summary: hide(summary), tokens, elapsed },
+        Event::ProgramStep { id, call, tool, summary } => Event::ProgramStep { id, call, tool, summary: hide(summary) },
         Event::HelperEnded { id, how: agent::HelperEnd::Failed(why), steps, files, tokens, elapsed, helper } => Event::HelperEnded { id, how: agent::HelperEnd::Failed(hide(why)), steps, files, tokens, elapsed, helper },
         Event::ToolEnded { id, ok, declined, elapsed, output, images } => Event::ToolEnded { id, ok, declined, elapsed, output: hide(output), images },
         other => other,
@@ -16184,6 +16318,7 @@ pub(crate) fn tool_name(tool: &str) -> &str {
         "web_read" => "Read the web",
         "check_page" => "Check a page",
         "explore" => "Look into",
+        "run_code" => "Run a program",
         other => other,
     }
 }
@@ -16579,6 +16714,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             tree_menu_hover: None,
             panel_menu: files_panel::PanelMenu { items: Vec::new(), whose: files_panel::MenuFor::Nothing },
             term: term_panel::TermView::new(window, theme::sidebar()),
+            timeline: timeline_view::TimelineView::new(window),
             right_tab_hits: Vec::new(),
             collapsed: HashSet::new(),
             all_sessions: Vec::new(),
@@ -16769,6 +16905,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             git: None,
             web_seen: false,
             toggle_web: make_button(pane, ID_TOGGLE_WEB, "", ButtonKind::Toggle, theme::background()),
+            toggle_code_mode: make_button(pane, ID_TOGGLE_CODE_MODE, "", ButtonKind::Toggle, theme::background()),
             toggle_compact: make_button(pane, ID_TOGGLE_COMPACT, "", ButtonKind::Toggle, theme::background()),
             context_follows_model: false,
             vram_slider,
@@ -16963,7 +17100,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let app = &mut *APP.load(Ordering::Relaxed);
         SendMessageW(app.composer, EM_SETEVENTMASK, 0, ENM_CHANGE as LPARAM);
         SendMessageW(app.note, EM_SETMARGINS, 3, 0); // EC_LEFTMARGIN | EC_RIGHTMARGIN
-        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search]) {
+        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.timeline.search]) {
             SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
         }
         app.list_procedure = SetWindowLongPtrW(app.side, GWLP_WNDPROC, list_subclass as *const () as isize);
@@ -17294,7 +17431,7 @@ mod tests {
     #[test]
     fn every_constant_word_has_its_japanese() {
         let mut words: Vec<&str> = COMMANDS.iter().map(|(_, about)| *about).collect();
-        words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "wake_at", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page", "explore"].map(tool_name));
+        words.extend(["read_file", "list_files", "find_files", "search_files", "show_diff", "apply_patch", "create_file", "execute_command", "command_status", "command_stop", "wake_at", "todo", "skill", "remember", "forget", "web_search", "web_read", "check_page", "explore", "run_code"].map(tool_name));
         words.extend(EFFORTS.iter().map(|(_, name)| *name));
         words.extend(efforts_for("DeepSeek-V4.1").iter().map(|(_, name)| *name));
         words.extend(MODES.iter().map(|(_, name)| *name));
@@ -17550,10 +17687,9 @@ mod tests {
 
     #[test]
     fn the_prompt_is_read_ahead_only_when_no_message_would_read_it_anyway() {
-        assert!(warms_on_connect(true, true, true));
-        assert!(!warms_on_connect(true, true, false), "the message's own request reads it, once");
-        assert!(!warms_on_connect(false, true, true), "a server someone else runs");
-        assert!(!warms_on_connect(true, false, true));
+        assert!(warms_on_connect(true, true));
+        assert!(!warms_on_connect(true, false), "the message's own request reads it, once");
+        assert!(!warms_on_connect(false, true), "a server that is not Straydog keeps prompts its own way, if at all");
     }
 
     #[test]
@@ -17574,8 +17710,11 @@ mod tests {
         handle.commands.send(send_command(Outgoing { text: "見て".into(), images: vec![Attached { path: PathBuf::from("pasted.png"), picture }], card: "見て".into() })).unwrap();
         let body = seen.recv_timeout(std::time::Duration::from_secs(30)).expect("the server was asked");
         let request: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let last = request["messages"].as_array().unwrap().last().unwrap();
+        // (the person's message, with the pictures; the app's facts come after it)
+        let messages = request["messages"].as_array().unwrap();
+        let last = &messages[messages.len() - 2];
         assert_eq!(last["role"], "user");
+        assert!(messages.last().unwrap()["content"].as_str().is_some_and(dogmind_agent::prompt::is_app_facts));
         let parts = last["content"].as_array().expect("pictures and words, in parts");
         assert!(parts[0]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,iVBOR"), "{}", parts[0]);
         assert!(parts.last().unwrap()["text"].as_str().unwrap().contains("見て"));
@@ -17936,18 +18075,18 @@ mod tests {
         };
         // (one line, or two, at the foot of the last row: the card is all of it)
         for seam in [150..=150, 150..=151, 120..=121] {
-            let found = find_card(client, text, 6, 3, seamed(seam.clone())).unwrap_or_else(|| panic!("{seam:?}"));
+            let found = find_card(client, text, 0, 6, 3, seamed(seam.clone())).unwrap_or_else(|| panic!("{seam:?}"));
             assert_eq!((found.top, found.bottom), (100, 160), "{seam:?}");
         }
         // (three lines are a gap between two cards)
-        let found = find_card(client, text, 6, 3, seamed(150..=152)).unwrap();
+        let found = find_card(client, text, 0, 6, 3, seamed(150..=152)).unwrap();
         assert_eq!(found.bottom, 149);
         // (at a larger scale of the window the seam between rows is larger, and the gap between cards with it: a seam of four lines, at 175%, is walked across and a gap of five is not)
         let reach = scale(168, 3);
         assert_eq!(reach, 5);
-        let found = find_card(client, text, 6, reach, seamed(150..=153)).unwrap();
+        let found = find_card(client, text, 0, 6, reach, seamed(150..=153)).unwrap();
         assert_eq!(found.bottom, 160);
-        let found = find_card(client, text, 6, reach, seamed(150..=154)).unwrap();
+        let found = find_card(client, text, 0, 6, reach, seamed(150..=154)).unwrap();
         assert_eq!(found.bottom, 149);
     }
 
@@ -17955,15 +18094,31 @@ mod tests {
     fn a_card_is_found_by_its_edges_and_its_ends_out_of_view_stay_square() {
         let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
         let text = POINT { x: 322, y: 110 };
-        let whole = find_card(client, text, 6, 3, card_at(300, 480, 100, 140)).unwrap();
+        let whole = find_card(client, text, 0, 6, 3, card_at(300, 480, 100, 140)).unwrap();
         assert_eq!((whole.left, whole.right, whole.top, whole.bottom), (300, 480, 100, 140));
         assert!(!whole.top_open && !whole.bottom_open);
         // Its text has scrolled above the view; the rest of it is still there.
-        let above = find_card(client, POINT { x: 322, y: -30 }, 6, 3, card_at(300, 480, -40, 20)).unwrap();
+        let above = find_card(client, POINT { x: 322, y: -30 }, 0, 6, 3, card_at(300, 480, -40, 20)).unwrap();
         assert!(above.top_open && !above.bottom_open);
         assert_eq!((above.left, above.right, above.bottom), (300, 480, 20));
-        let below = find_card(client, POINT { x: 322, y: 290 }, 6, 3, card_at(300, 480, 280, 400)).unwrap();
+        let below = find_card(client, POINT { x: 322, y: 290 }, 0, 6, 3, card_at(300, 480, 280, 400)).unwrap();
         assert!(!below.top_open && below.bottom_open);
+    }
+
+    #[test]
+    fn a_card_that_goes_on_up_past_the_fade_at_the_top_of_the_view_is_found_below_it() {
+        // With text above the view, its top 28 rows fade into the page: a card there is not its own colour. Its text began above the view.
+        let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
+        let faded = |x: i32, y: i32| y >= 28 && card_at(300, 480, -60, 120)(x, y);
+        assert!(find_card(client, POINT { x: 322, y: -50 }, 0, 6, 3, faded).is_none(), "looked for in the fade, it is not there");
+        let card = find_card(client, POINT { x: 322, y: -50 }, 28, 6, 3, faded).unwrap();
+        assert_eq!((card.left, card.right, card.top, card.bottom), (300, 480, 28, 120));
+        assert!(!card.bottom_open, "its foot is in view, to be rounded");
+        // (its text begins in the fade: the same)
+        assert_eq!(find_card(client, POINT { x: 322, y: 10 }, 28, 6, 3, faded).map(|card| card.bottom), Some(120));
+        // (all of what is in view of it is in the fade: nothing to round)
+        let short = |x: i32, y: i32| y >= 28 && card_at(300, 480, -60, 20)(x, y);
+        assert!(find_card(client, POINT { x: 322, y: -50 }, 28, 6, 3, short).is_none());
     }
 
     /// The card says the model's purpose with the reason, in the body face, and the command alone is in the monospace one; what has no purpose has the whole of it in the control.
@@ -17984,14 +18139,14 @@ mod tests {
     fn what_is_not_a_card_is_left_alone() {
         let client = RECT { left: 0, top: 0, right: 500, bottom: 300 };
         let text = POINT { x: 322, y: 110 };
-        assert!(find_card(client, text, 6, 3, |_, _| false).is_none(), "another colour");
-        assert!(find_card(client, POINT { x: 322, y: 400 }, 6, 3, |_, _| true).is_none(), "below the view");
-        assert!(find_card(client, text, 6, 3, card_at(300, 480, 0, 299)).is_none(), "taller than the view: nothing to round");
+        assert!(find_card(client, text, 0, 6, 3, |_, _| false).is_none(), "another colour");
+        assert!(find_card(client, POINT { x: 322, y: 400 }, 0, 6, 3, |_, _| true).is_none(), "below the view");
+        assert!(find_card(client, text, 0, 6, 3, card_at(300, 480, 0, 299)).is_none(), "taller than the view: nothing to round");
         // Text on the row walked across does not stop it, but an edge that is not straight is no card.
         let lettered = |x: i32, y: i32| card_at(300, 480, 100, 140)(x, y) && !(x == 400 && y == 110);
-        assert_eq!(find_card(client, text, 6, 3, lettered).map(|card| card.right), Some(480));
+        assert_eq!(find_card(client, text, 0, 6, 3, lettered).map(|card| card.right), Some(480));
         let stepped = |x: i32, y: i32| card_at(300, 480, 100, 140)(x, y) && !(x > 460 && y > 120);
-        assert!(find_card(client, text, 6, 3, stepped).is_none());
+        assert!(find_card(client, text, 0, 6, 3, stepped).is_none());
     }
 
     #[test]

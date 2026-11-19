@@ -11,6 +11,7 @@ pub mod baseline;
 #[cfg(windows)]
 pub mod bundled;
 pub mod checkpoint;
+pub mod code_mode;
 pub mod codex;
 pub mod compaction;
 pub mod conversation_key;
@@ -34,6 +35,7 @@ pub mod safety;
 pub mod sandbox;
 pub mod session;
 pub mod skills;
+pub mod timeline;
 pub mod tools;
 pub mod trajectory;
 pub mod trajectory_report;
