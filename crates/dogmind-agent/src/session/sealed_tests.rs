@@ -1,6 +1,7 @@
 //! Sessions encrypted at rest: what is in the file, what comes back, and what is damage.
 
 use super::*;
+use crate::conversation_key::b64d;
 use crate::message::ImageRef;
 
 fn cipher() -> Arc<Cipher> {

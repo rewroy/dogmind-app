@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::conversation_key::{self, b64d, b64d_bytes, b64e, from_hex, hex, random_bytes, Cipher, Policy};
+use crate::conversation_key::{self, b64d_bytes, b64e, from_hex, hex, random_bytes, Cipher, Policy};
 use crate::message::Message;
 use crate::prompt::typed_text;
 
