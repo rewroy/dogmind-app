@@ -715,6 +715,34 @@ fn crash_repeats(before: &mut Option<Vec<String>>, err: &str) -> bool {
 }
 
 /// What the page printed and threw, from all the browser says of itself. Long paths to the workspace go, and every line a browser's own extension or service prints.
+/// The lines of a console, each once, in the order they first came, with how many times one came when it came more than once: a page that warns on each
+/// sound it makes said the same line of the browser's eight times in a check, and a game's checks spent thousands of words of the conversation on it.
+fn counted(lines: &[String]) -> Vec<String> {
+    distinct(lines)
+        .into_iter()
+        .map(|line| match lines.iter().filter(|other| *other == line).count() {
+            1 => line.clone(),
+            times => format!("{line} ({times} times)"),
+        })
+        .collect()
+}
+
+/// The lines, each once, in the order they first came.
+fn distinct(lines: &[String]) -> Vec<&String> {
+    let mut seen = Vec::new();
+    for line in lines {
+        if !seen.contains(&line) {
+            seen.push(line);
+        }
+    }
+    seen
+}
+
+/// The browser's line for sound a page asked for before a person's gesture, and what is said of it: the clicks and keys of steps are no person's to the browser, so
+/// the line comes however the page starts its sound, and a model chased it in check after check.
+const NO_SOUND_YET: &str = "The AudioContext was not allowed to start";
+const SOUND_NOTE: &str = "(The AudioContext line is the browser's rule that sound waits for a person's tap, click or key. Those of steps are not a person's to the browser, so it comes whatever the page does: a page that creates or resumes its AudioContext in a handler of a person's input plays in a real browser.)\n";
+
 fn console_lines(err: &str, folder_url: &str) -> Vec<String> {
     let start = Regex::new(r#"INFO:CONSOLE:\d+\] "(.*)"#).expect("the pattern is valid");
     let end = Regex::new(r#"^(.*)", source: (.*) \((\d+)\)\s*$"#).expect("the pattern is valid");
@@ -1041,11 +1069,15 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
         out.push_str(&if needs.remote.is_empty() && finished { format!("{head}: nothing, so no errors.\n") } else { format!("{head}: nothing, which says little with that not loaded.\n") });
     } else {
         out.push_str(&format!("{head}:\n"));
-        for line in console.iter().take(MOST_LINES) {
+        let lines = counted(console);
+        for line in lines.iter().take(MOST_LINES) {
             out.push_str(&format!("- {line}\n"));
         }
-        if console.len() > MOST_LINES {
-            out.push_str(&format!("- and {} more\n", console.len() - MOST_LINES));
+        if lines.len() > MOST_LINES {
+            out.push_str(&format!("- and {} more\n", lines.len() - MOST_LINES));
+        }
+        if console.iter().any(|line| line.contains(NO_SOUND_YET)) {
+            out.push_str(SOUND_NOTE);
         }
     }
     if finished {
@@ -1311,9 +1343,9 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         });
         // What the page said at this size, where it says other than above: the console above is of the desktop's width, and a model that
         // measured a phone's layout from a script was given the desktop's numbers.
-        if taken && !said_there.is_empty() && said_there != console {
+        if taken && !said_there.is_empty() && distinct(&said_there) != distinct(&console) {
             out.push_str(&format!("Console at {}:\n", view.label));
-            for said in said_there.iter().take(MOST_LINES) {
+            for said in counted(&said_there).iter().take(MOST_LINES) {
                 out.push_str(&format!("  {said}\n"));
             }
         }
@@ -1785,6 +1817,15 @@ mod tests {
         assert_eq!(extension_flags(None), " --disable-extensions");
         assert!(!FLAGS.split(' ').any(|flag| flag == "--disable-extensions"), "which would keep the frames' extension out");
         assert!(FRAMES.starts_with("<script>(() =>") && FRAMES.ends_with("})();</script>"));
+    }
+
+    #[test]
+    fn a_line_said_again_and_again_is_shown_once_with_its_count() {
+        let lines: Vec<String> = ["a:1: x", "a:2: y", "a:1: x", "a:1: x"].iter().map(|line| line.to_string()).collect();
+        assert_eq!(counted(&lines), ["a:1: x (3 times)", "a:2: y"]);
+        let same: Vec<String> = ["a:2: y", "a:1: x"].iter().map(|line| line.to_string()).collect();
+        assert_eq!(distinct(&lines), distinct(&[same[1].clone(), same[0].clone(), same[1].clone()]), "the same lines, counted otherwise, are the same console");
+        assert_ne!(distinct(&lines), distinct(&same), "and in another order they are not");
     }
 
     #[test]
