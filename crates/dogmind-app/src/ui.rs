@@ -249,6 +249,13 @@ const ID_PROVIDER_UP: isize = 9050;
 const ID_FOLDER_CHIP: isize = 9052;
 /// Under the dog of a session not begun yet: the button that switches the session's workspace.
 const ID_START_FOLDER: isize = 9053;
+/// The row of the card under the dog that names the workspace, over its "Choose a workspace".
+const START_NAME_ROW: i32 = 44;
+/// The workspace picker that button opens: its search field and its list.
+const ID_PICKER_SEARCH: isize = 9057;
+const ID_PICKER_LIST: isize = 9058;
+/// The most folders the workspace picker lists, the latest first (its search looks through these).
+const PICKER_MOST: usize = 40;
 const ID_TOGGLE_DISPLAY: isize = 9054;
 const ID_ATTACH: isize = 9055;
 const ID_ATTACHED: isize = 9060; // ..+ attach::MOST_IMAGES
@@ -1856,6 +1863,47 @@ enum FontKind {
     Greeting,
 }
 
+/// A row of the workspace picker under the dog of a session not begun yet ([`picker_rows`]).
+#[derive(Clone, Debug, PartialEq)]
+enum PickerRow {
+    /// The name over a group of rows.
+    Heading(String),
+    /// A folder worked in before: its name, and where it is under it.
+    Folder { path: PathBuf, name: String },
+    /// No folder has the words searched for.
+    Nothing,
+    /// The line between groups.
+    Line,
+    /// Any other folder, from the system's chooser.
+    Choose,
+}
+
+impl PickerRow {
+    /// Whether the keys and the pointer can choose it.
+    fn chosen_by_hand(&self) -> bool {
+        matches!(self, PickerRow::Folder { .. } | PickerRow::Choose)
+    }
+}
+
+/// The workspace picker's rows for `query`: the `folders` worked in before whose path has it (all of them for none), ignoring case, under their
+/// heading, then a line and the way to any other folder.
+fn picker_rows(folders: &[PathBuf], query: &str) -> Vec<PickerRow> {
+    let query = query.trim().to_lowercase();
+    let found: Vec<PickerRow> = folders.iter()
+        .filter(|folder| query.is_empty() || folder.display().to_string().to_lowercase().contains(&query))
+        .map(|folder| PickerRow::Folder { path: folder.clone(), name: folder.file_name().map_or_else(|| folder.display().to_string(), |name| name.to_string_lossy().into_owned()) })
+        .collect();
+    let mut rows = vec![PickerRow::Heading(t("Recent workspaces").to_string())];
+    if found.is_empty() {
+        rows.push(PickerRow::Nothing);
+    } else {
+        rows.extend(found);
+    }
+    rows.push(PickerRow::Line);
+    rows.push(PickerRow::Choose);
+    rows
+}
+
 #[derive(Clone)]
 enum SideRow {
     Workspace { path: PathBuf, name: String, collapsed: bool },
@@ -1990,6 +2038,19 @@ struct App {
     folder_chip: HWND,
     /// Under the dog of a session not begun yet, beside the workspace's name: what switches it, where it is seen first.
     start_folder: HWND,
+    /// The workspace picker `start_folder` opens, as Claude Code's environment picker: a panel over what lies below it (a child window on top
+    /// of the others, `picker_procedure`), with a search field over the folders worked in before ([`picker_rows`]). Shown while `picker_open`;
+    /// `picker_selected` is the row the keys are on, `picker_hover` the one under the pointer.
+    picker: HWND,
+    picker_search: HWND,
+    picker_list: HWND,
+    picker_rows: Vec<PickerRow>,
+    picker_selected: Option<usize>,
+    picker_hover: Option<usize>,
+    picker_open: bool,
+    /// Where the picker goes, from this layout's card: its left, the card's top and bottom, its width and the window's foot. Placed when the
+    /// layout ends, so that it lies over every control the layout raised.
+    picker_at: Option<(i32, i32, i32, i32, i32)>,
     /// How many lines the composer last had: the card grows with them.
     composer_lines: i32,
     provider_up: HWND,
@@ -6009,7 +6070,13 @@ impl App {
                 self.say(if self.settings.safe_commands { t("Safe commands run without asking.") } else { t("Every command asks.") });
             }
             // (beside the button under the dog where a session not begun shows it, otherwise the chip under the composer)
-            "workspace" => self.folder_menu(if IsWindowVisible(self.start_folder) != 0 { self.start_folder } else { self.folder_chip }),
+            "workspace" => {
+                if IsWindowVisible(self.start_folder) != 0 {
+                    self.open_picker();
+                } else {
+                    self.folder_menu(self.folder_chip);
+                }
+            }
             "providers" => self.set_panel(Panel::Providers),
             "models" => self.set_panel(Panel::Models),
             "settings" => self.set_panel(Panel::General),
@@ -6165,6 +6232,7 @@ impl App {
         show(self.folder_chip, chat && !bare);
         if !chat {
             show(self.start_folder, false);
+            self.close_picker();
         }
 
         // The column the content keeps to, however wide the window.
@@ -6235,44 +6303,55 @@ impl App {
             let dog_bottom = dog * 91 / 100;
             // Under the name, the workspace the session will work in and the button that switches it: the chip under the composer says the
             // same, but a session not begun yet is where the folder is chosen, and the eye is on the dog there.
-            let folder_row = s(ds::space::L) + s(ds::size::CONTROL) + s(ds::space::XS) + s(ds::size::TEXT_LINE);
+            let folder_row = s(ds::space::L) + s(START_NAME_ROW) + s(ds::size::CONTROL) + s(ds::space::XS);
             let greeting_height = bubble_height + dog_gap + dog_bottom + mark_height + folder_row + s(ds::space::XL);
             let mut greeting_folder = false;
             let card_top = foot;
             let status_top = card_top + card_height + s(ds::space::XS);
             let above = card_top - waiting_height;
-            if !self.has_messages && above - greeting_height >= s(40) + notice_room {
-                let title = GREETINGS[self.greeting];
-                let bubble_top = s(40) + notice_room + (above - s(40) - notice_room - greeting_height) / 2;
-                let bubble_width = (text_width(self.fonts.greeting, title) + s(60)).min(column);
-                let area = rect(left + (column - bubble_width) / 2, bubble_top, bubble_width, bubble_height);
+            // (where all of it does not fit, the dog's words give way first: the workspace's card under its name is what a new session is for)
+            let room = above - s(40) - notice_room;
+            let unsaid = greeting_height - bubble_height - dog_gap;
+            if !self.has_messages && room >= unsaid {
+                let said = room >= greeting_height;
+                let shown = if said { greeting_height } else { unsaid };
+                let top = s(40) + notice_room + (room - shown) / 2;
                 // The drawing fills its square's width, and is about 0.82 of it high, centred. Its line is about 5% of its width.
-                let (dog_x, dog_top) = (left + (column - dog) / 2, bubble_top + bubble_height + dog_gap);
-                let tip = (dog_x + dog * 11 / 100 - s(ds::space::XL), bubble_top + bubble_height + s(13));
-                shapes.push(Shape::Bubble { area, radius: s(26), tip, fill: theme::background(), line: theme::text(), thickness: dog as f32 * 0.05 });
-                shapes.push(Shape::Text { area, text: title.into(), font: FontKind::Greeting, color: theme::text(), flags: DT_CENTER | ONE_LINE });
+                let (dog_x, dog_top) = (left + (column - dog) / 2, if said { top + bubble_height + dog_gap } else { top });
+                if said {
+                    let title = GREETINGS[self.greeting];
+                    let bubble_width = (text_width(self.fonts.greeting, title) + s(60)).min(column);
+                    let area = rect(left + (column - bubble_width) / 2, top, bubble_width, bubble_height);
+                    let tip = (dog_x + dog * 11 / 100 - s(ds::space::XL), top + bubble_height + s(13));
+                    shapes.push(Shape::Bubble { area, radius: s(26), tip, fill: theme::background(), line: theme::text(), thickness: dog as f32 * 0.05 });
+                    shapes.push(Shape::Text { area, text: title.into(), font: FontKind::Greeting, color: theme::text(), flags: DT_CENTER | ONE_LINE });
+                }
                 shapes.push(Shape::Logo { x: dog_x, y: dog_top, size: dog });
                 shapes.push(Shape::TitleMark { x: left + (column - mark_width) / 2, y: dog_top + dog_bottom, width: mark_width });
                 if !bare {
-                    let row_top = dog_top + dog_bottom + mark_height + s(ds::space::L);
-                    let row = s(ds::size::CONTROL);
-                    let name = self.workspace.file_name().map_or_else(|| self.workspace.display().to_string(), |name| name.to_string_lossy().into_owned());
-                    set_text_if_changed(self.start_folder, t("Switch workspace"));
-                    let button = text_width(self.fonts.strong, &get_text(self.start_folder)) + s(ds::size::BUTTON_PADDING);
-                    let icon = s(ds::size::ICON) + s(ds::space::XS);
-                    let name_width = text_width(self.fonts.strong, &name).min((column - button - icon - s(ds::space::M)).max(s(60)));
-                    let across = icon + name_width + s(ds::space::M) + button;
+                    // A card, as Claude Code's environment picker has: the folder and a check, and under them the choice that opens the
+                    // picker over what lies below (`place_picker`).
+                    let across = s(420).min(column);
                     let x = left + (column - across) / 2;
-                    shapes.push(Shape::Icon { name: "folder", area: rect(x, row_top, s(ds::size::ICON), row), size: s(ds::size::ICON), color: theme::muted() });
-                    shapes.push(Shape::Text { area: rect(x + icon, row_top, name_width, row), text: name, font: FontKind::Strong, color: theme::text(), flags: ONE_LINE });
-                    place(self.start_folder, x + icon + name_width + s(ds::space::M), row_top, button, row);
-                    // (the whole path under it, for two folders of one name: cut in its middle, so that its last folders stay)
-                    shapes.push(Shape::Text { area: rect(left, row_top + row + s(ds::space::XS), column, s(ds::size::TEXT_LINE)), text: self.workspace.display().to_string(),
-                                              font: FontKind::Small, color: theme::faint(), flags: DT_CENTER | (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
+                    let top = dog_top + dog_bottom + mark_height + s(ds::space::L);
+                    let (named, inset, choice) = (s(START_NAME_ROW), s(ds::space::XS), s(ds::size::CONTROL));
+                    let card = rect(x, top, across, named + choice + inset);
+                    shapes.push(Shape::Round { area: card, radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
+                    let name = self.workspace.file_name().map_or_else(|| self.workspace.display().to_string(), |name| name.to_string_lossy().into_owned());
+                    let icon = s(ds::size::ICON);
+                    shapes.push(Shape::Icon { name: "folder", area: rect(x + s(ds::space::M), top, icon, named), size: icon, color: theme::text() });
+                    shapes.push(Shape::Text { area: rect(x + s(ds::space::M) + icon + s(ds::space::S), top, across - 2 * s(ds::space::M) - 2 * icon - 2 * s(ds::space::S), named), text: name, font: FontKind::Body, color: theme::text(), flags: ONE_LINE });
+                    shapes.push(Shape::Icon { name: "check", area: rect(x + across - s(ds::space::M) - icon, top, icon, named), size: icon, color: theme::text() });
+                    set_text_if_changed(self.start_folder, t("Choose a workspace"));
+                    place(self.start_folder, x + inset, top + named, across - 2 * inset, choice);
+                    self.picker_at = Some((x, top, card.bottom, across, height));
                     greeting_folder = true;
                 }
             }
             show(self.start_folder, greeting_folder);
+            if !greeting_folder {
+                self.close_picker();
+            }
             shapes.push(Shape::Round { area: rect(left, card_top, column, card_height), radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
             if strip > 0 {
                 let gap = s(ds::space::S);
@@ -6776,6 +6855,10 @@ impl App {
             if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.right_tab_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).chain(self.waiting_hits.iter().map(|(area, _)| area)).any(|area| same_rect(area, &row)) {
                 self.hover_row = None;
             }
+        }
+        // (last, over the composer's controls the layout raised)
+        if let Some((x, card_top, card_bottom, width, bottom)) = self.picker_at.take().filter(|_| self.picker_open) {
+            self.place_picker(x, card_top, card_bottom, width, bottom);
         }
         self.shapes = shapes;
         InvalidateRect(self.window, std::ptr::null(), 0);
@@ -9767,6 +9850,115 @@ impl App {
         }
     }
 
+    /// The workspace picker opens under its card, its search field empty and with the keys, the first folder chosen for Enter.
+    unsafe fn open_picker(&mut self) {
+        self.picker_open = true;
+        set_text(self.picker_search, "");
+        self.fill_picker();
+        self.layout();
+        SetFocus(self.picker_search);
+    }
+
+    /// The workspace picker goes, and the keys it had go back to the composer.
+    unsafe fn close_picker(&mut self) {
+        if !self.picker_open {
+            return;
+        }
+        self.picker_open = false;
+        let had_the_keys = [self.picker_search, self.picker_list].contains(&GetFocus());
+        show(self.picker, false);
+        if had_the_keys {
+            SetFocus(self.composer);
+        }
+    }
+
+    /// The keys went somewhere else than the picker's field or list: it goes.
+    unsafe fn picker_focus_left(&mut self) {
+        let now = GetFocus();
+        if now != self.picker_search && now != self.picker_list {
+            self.close_picker();
+        }
+    }
+
+    /// The picker's rows for what its search field says: the folders worked in before that are still there.
+    unsafe fn fill_picker(&mut self) {
+        let folders: Vec<PathBuf> = self.settings.workspaces.iter().filter(|folder| folder.is_dir()).take(PICKER_MOST).cloned().collect();
+        self.picker_rows = picker_rows(&folders, &get_text(self.picker_search));
+        self.picker_selected = self.picker_rows.iter().position(PickerRow::chosen_by_hand);
+        self.picker_hover = None;
+        SendMessageW(self.picker_list, WM_SETREDRAW, 0, 0);
+        SendMessageW(self.picker_list, LB_RESETCONTENT, 0, 0);
+        for _ in &self.picker_rows {
+            SendMessageW(self.picker_list, LB_ADDSTRING, 0, 0);
+        }
+        SendMessageW(self.picker_list, WM_SETREDRAW, 1, 0);
+        InvalidateRect(self.picker_list, std::ptr::null(), 1);
+        if self.picker_open {
+            self.layout();
+        }
+    }
+
+    /// The keys' row moves `step` rows that can be chosen, and stays in sight.
+    unsafe fn move_picker(&mut self, step: isize) {
+        let rows: Vec<usize> = self.picker_rows.iter().enumerate().filter(|(_, row)| row.chosen_by_hand()).map(|(at, _)| at).collect();
+        if rows.is_empty() {
+            return;
+        }
+        let now = self.picker_selected.and_then(|at| rows.iter().position(|row| *row == at));
+        let next = now.map_or(0, |place| (place as isize + step).clamp(0, rows.len() as isize - 1) as usize);
+        self.picker_selected = Some(rows[next]);
+        self.picker_hover = None;
+        SendMessageW(self.picker_list, LB_SETCARETINDEX, rows[next], 0);
+        InvalidateRect(self.picker_list, std::ptr::null(), 0);
+    }
+
+    /// A row of the picker taken: a folder starts a session there (where it is not this one's already), the last row asks the system's chooser.
+    unsafe fn choose_picker_row(&mut self, at: usize) {
+        match self.picker_rows.get(at).cloned() {
+            Some(PickerRow::Folder { path, .. }) => {
+                self.close_picker();
+                self.go_to_folder(path);
+            }
+            Some(PickerRow::Choose) => {
+                self.close_picker();
+                if let Some(folder) = self.browse_folder() {
+                    self.go_to_folder(folder);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// How tall a row of the picker is: a folder has its path under its name.
+    fn picker_row_height(&self, at: usize) -> i32 {
+        let s = |value: i32| scale(self.dpi, value);
+        match self.picker_rows.get(at) {
+            Some(PickerRow::Heading(_)) => s(26),
+            Some(PickerRow::Folder { .. }) => s(46),
+            Some(PickerRow::Line) => s(ds::space::M),
+            _ => s(ds::size::MENU_ROW),
+        }
+    }
+
+    /// The picker beside its card (`card_top`, `card_bottom`), as tall as its rows, short of the window's top or foot (`bottom`), where its list
+    /// scrolls: under the card, as Claude Code's opens, unless its rows do not fit there and there is more room over it.
+    unsafe fn place_picker(&mut self, x: i32, card_top: i32, card_bottom: i32, width: i32, bottom: i32) {
+        let s = |value: i32| scale(self.dpi, value);
+        let (search, pad, gap) = (s(PICKER_SEARCH_ROW), s(ds::space::XS), s(ds::space::XS));
+        let rows: i32 = (0..self.picker_rows.len()).map(|at| self.picker_row_height(at)).sum();
+        let wanted = search + 1 + pad + rows + pad;
+        let (below, over) = (bottom - card_bottom - gap - s(ds::space::M), card_top - gap - s(ds::space::M));
+        let (top, height) = if wanted <= below || below >= over {
+            (card_bottom + gap, wanted.min(below).max(search + s(60)))
+        } else {
+            let height = wanted.min(over);
+            (card_top - gap - height, height)
+        };
+        SetWindowPos(self.picker, HWND_TOP, x, top, width, height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        SetWindowPos(self.picker_search, std::ptr::null_mut(), s(ds::space::L), (search - s(ds::size::FIELD_TEXT)) / 2, width - 2 * s(ds::space::L), s(ds::size::FIELD_TEXT), SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(self.picker_list, std::ptr::null_mut(), pad, search + 1 + pad, width - 2 * pad, height - search - 1 - 2 * pad, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
     /// A new session in this folder. The folder it is in already stays as it is.
     unsafe fn go_to_folder(&mut self, folder: PathBuf) {
         if folder != self.workspace {
@@ -11541,6 +11733,44 @@ impl App {
         let split = s(180);
         draw_text(device, &row.title, RECT { left: area.left + s(ds::space::M), right: if row.detail.is_empty() { area.right - s(ds::space::M) } else { area.left + split }, ..area }, self.fonts.body, theme::text(), ONE_LINE);
         draw_text(device, &row.detail, RECT { left: area.left + split, right: area.right - s(ds::space::M), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+    }
+
+    /// A row of the workspace picker: a heading, a folder (its name over where it is, a check on the one this session works in), the line, or
+    /// the way to any other folder; the row under the pointer, or else the keys' row, raised.
+    unsafe fn draw_picker_row(&self, item: &DRAWITEMSTRUCT) {
+        let device = item.hDC;
+        FillRect(device, &item.rcItem, self.brushes[2]);
+        let at = item.itemID as usize;
+        let Some(row) = self.picker_rows.get(at) else { return };
+        let area = item.rcItem;
+        let s = |value: i32| scale(self.dpi, value);
+        if row.chosen_by_hand() && self.picker_hover.map_or(self.picker_selected == Some(at), |hover| hover == at) {
+            rounded(device, RECT { left: area.left + s(ds::space::HAIR), right: area.right - s(ds::space::HAIR), top: area.top + s(ds::space::PIXEL), bottom: area.bottom - s(ds::space::PIXEL) }, s(ds::radius::CONTROL), Some(theme::raised()), None);
+        }
+        let inner = RECT { left: area.left + s(ds::space::M), right: area.right - s(ds::space::M), ..area };
+        match row {
+            PickerRow::Heading(words) => draw_text(device, words, RECT { top: area.top + s(ds::space::S), ..inner }, self.fonts.small, theme::muted(), ONE_LINE),
+            PickerRow::Folder { path, name } => {
+                let check = s(ds::size::ICON) + s(ds::space::S);
+                let middle = (area.top + area.bottom) / 2;
+                draw_text(device, name, RECT { right: inner.right - check, top: area.top + s(ds::space::XS), bottom: middle + s(ds::space::PIXEL), ..inner }, self.fonts.body, theme::text(), DT_SINGLELINE | DT_BOTTOM | DT_END_ELLIPSIS);
+                draw_text(device, &path.display().to_string(), RECT { right: inner.right - check, top: middle + s(ds::space::PIXEL), bottom: area.bottom - s(ds::space::XS), ..inner }, self.fonts.small, theme::muted(), DT_SINGLELINE | DT_PATH_ELLIPSIS);
+                if *path == self.workspace {
+                    icon::draw(device, "check", RECT { left: inner.right - s(ds::size::ICON), ..inner }, s(ds::size::ICON), theme::accent());
+                }
+            }
+            PickerRow::Nothing => draw_text(device, t("No workspace matches"), inner, self.fonts.body, theme::muted(), ONE_LINE),
+            PickerRow::Line => {
+                let line = CreateSolidBrush(theme::line());
+                let middle = (area.top + area.bottom) / 2;
+                FillRect(device, &RECT { left: area.left + s(ds::space::S), right: area.right - s(ds::space::S), top: middle, bottom: middle + 1 }, line);
+                DeleteObject(line);
+            }
+            PickerRow::Choose => {
+                icon::draw(device, "plus", RECT { right: inner.left + s(ds::size::ICON), ..inner }, s(ds::size::ICON), theme::text());
+                draw_text(device, t("Choose a folder..."), RECT { left: inner.left + s(ds::size::ICON) + s(ds::space::S), ..inner }, self.fonts.body, theme::text(), ONE_LINE);
+            }
+        }
     }
 
     unsafe fn draw_side_row(&self, item: &DRAWITEMSTRUCT) {
@@ -14106,6 +14336,9 @@ impl App {
             let cue = wide(t(words));
             SendMessageW(edit, EM_SETCUEBANNER, 0, cue.as_ptr() as LPARAM);
         }
+        // (the workspace picker's field has the keys whenever it is seen: its words stay while it does)
+        let cue = wide(t("Search workspaces"));
+        SendMessageW(self.picker_search, EM_SETCUEBANNER, 1, cue.as_ptr() as LPARAM);
         // What has only an icon says what it is when the pointer rests on it.
         for (window, words) in [
             (self.help_button, t("Help")),
@@ -14849,7 +15082,7 @@ unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPAR
             }
             let found = if message == WM_MOUSEMOVE { SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam) } else { 0x10000 };
             let hover = ((found >> 16) & 0xFFFF == 0).then_some((found & 0xFFFF) as usize);
-            let slot = if is_side { &mut app.side_hover } else if is_tree { &mut app.tree_hover } else if window == app.suggest { &mut app.suggest_hover } else { &mut app.list_hover };
+            let slot = if is_side { &mut app.side_hover } else if is_tree { &mut app.tree_hover } else if window == app.suggest { &mut app.suggest_hover } else if window == app.picker_list { &mut app.picker_hover } else { &mut app.list_hover };
             if *slot != hover {
                 for index in [*slot, hover].into_iter().flatten() {
                     let mut area: RECT = std::mem::zeroed();
@@ -15080,6 +15313,44 @@ unsafe extern "system" fn diff_procedure(window: HWND, message: u32, wparam: WPA
 }
 
 /// A dialog's backdrop and its pane. What their controls say goes to the main window, as it does from any control; they draw what `layout_modal` has set out.
+/// The workspace picker's panel: its rounded face and the line under its search field. What its field and its list tell their parent goes to
+/// the window's own procedure, as the modal's does.
+unsafe extern "system" fn picker_procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let Some(app) = app() else { return DefWindowProcW(window, message, wparam, lparam) };
+    match message {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            let mut paint: PAINTSTRUCT = std::mem::zeroed();
+            let target = BeginPaint(window, &mut paint);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            if client.right > 0 && client.bottom > 0 {
+                let device = CreateCompatibleDC(target);
+                let bitmap = CreateCompatibleBitmap(target, client.right, client.bottom);
+                let previous = SelectObject(device, bitmap);
+                FillRect(device, &client, app.brushes[0]);
+                let s = |value: i32| scale(app.dpi, value);
+                rounded(device, client, s(ds::radius::CARD), Some(theme::surface()), Some(theme::line()));
+                let line = CreateSolidBrush(theme::line());
+                let under = s(PICKER_SEARCH_ROW);
+                FillRect(device, &RECT { left: 1, right: client.right - 1, top: under, bottom: under + 1 }, line);
+                DeleteObject(line);
+                BitBlt(target, 0, 0, client.right, client.bottom, device, 0, 0, SRCCOPY);
+                SelectObject(device, previous);
+                DeleteObject(bitmap);
+                DeleteDC(device);
+            }
+            EndPaint(window, &paint);
+            0
+        }
+        WM_COMMAND | WM_CTLCOLORLISTBOX | WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_MEASUREITEM | WM_DRAWITEM => procedure(app.window, message, wparam, lparam),
+        _ => DefWindowProcW(window, message, wparam, lparam),
+    }
+}
+
+/// The height of the workspace picker's search row, over the line under it.
+const PICKER_SEARCH_ROW: i32 = 46;
+
 unsafe extern "system" fn modal_procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let Some(app) = app() else { return DefWindowProcW(window, message, wparam, lparam) };
     let within_card = |lparam: LPARAM| {
@@ -15216,7 +15487,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
             set_button_fonts(app.fonts);
-            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.term.rename_field, app.timeline.search]) {
+            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.term.rename_field, app.timeline.search, app.picker_search]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
             }
             // (the command's own size follows the screen's: it is set again when it is next shown, and this one keeps what it has)
@@ -15338,6 +15609,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             if app.panel != Panel::Diff {
                 app.refresh_changes();
             }
+            0
+        }
+        // (a press anywhere else in the window puts the workspace picker away)
+        WM_LBUTTONDOWN if app.picker_open => {
+            app.close_picker();
             0
         }
         WM_LBUTTONDOWN if app.panel == Panel::Chat && app.has_messages => {
@@ -15474,6 +15750,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             let item = &mut *(lparam as *mut MEASUREITEMSTRUCT);
             item.itemHeight = if item.CtlID as isize == ID_SUGGEST {
                 scale(app.dpi, ds::size::MENU_ROW) as u32
+            } else if item.CtlID as isize == ID_PICKER_LIST {
+                app.picker_row_height(item.itemID as usize) as u32
             } else if item.CtlID as isize == ID_FILES {
                 scale(app.dpi, ds::size::TEXT_ROW) as u32
             } else if item.CtlID as isize == ID_FILES_MENU {
@@ -15507,6 +15785,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     app.draw_menu_row(item);
                 } else if item.hwndItem == app.suggest {
                     app.draw_suggestion(item);
+                } else if item.hwndItem == app.picker_list {
+                    app.draw_picker_row(item);
                 } else if item.hwndItem == app.list {
                     app.draw_list_row(item);
                 }
@@ -15785,7 +16065,13 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     app.choices(app.toggle_display, M_DISPLAY, &names, chosen);
                 }
                 ID_FOLDER_CHIP => app.folder_menu(app.folder_chip),
-                ID_START_FOLDER => app.folder_menu(app.start_folder),
+                ID_START_FOLDER => {
+                    if app.picker_open {
+                        app.close_picker();
+                    } else {
+                        app.open_picker();
+                    }
+                }
                 ID_PROVIDER_UP => app.move_provider(-1),
                 ID_PROVIDER_DOWN => app.move_provider(1),
                 ID_TOGGLE_COMPACT => app.on_menu(M_COMPACT_CHOICE + usize::from(app.settings.compact_tools)),
@@ -15794,6 +16080,17 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_FILES => {
                     if code == LBN_SELCHANGE as usize {
                         app.files_selection_changed();
+                    }
+                }
+                ID_PICKER_SEARCH if code == EN_CHANGE as usize => app.fill_picker(),
+                ID_PICKER_SEARCH if code == EN_KILLFOCUS as usize => app.picker_focus_left(),
+                ID_PICKER_LIST if code == LBN_KILLFOCUS as usize => app.picker_focus_left(),
+                // (a press on a row: the list takes the keys for it, and its selection says which)
+                ID_PICKER_LIST if code == LBN_SELCHANGE as usize => {
+                    let at = SendMessageW(app.picker_list, LB_GETCURSEL, 0, 0);
+                    SendMessageW(app.picker_list, LB_SETCURSEL, usize::MAX, 0);
+                    if at >= 0 && GetFocus() == app.picker_list {
+                        app.choose_picker_row(at as usize);
                     }
                 }
                 ID_SUGGEST => {
@@ -15922,6 +16219,26 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             term_panel::TermKey::Taken => return true,
             term_panel::TermKey::Dispatch => return false,
             term_panel::TermKey::Pass => {}
+        }
+    }
+    // The workspace picker: the arrows go through its rows, Enter takes the one they are on, Esc puts it away.
+    if message.message == WM_KEYDOWN && app.picker_open && (message.hwnd == app.picker_search || message.hwnd == app.picker_list) {
+        match message.wParam as u16 {
+            VK_ESCAPE => {
+                app.close_picker();
+                return true;
+            }
+            VK_DOWN | VK_UP => {
+                app.move_picker(if message.wParam as u16 == VK_DOWN { 1 } else { -1 });
+                return true;
+            }
+            VK_RETURN => {
+                if let Some(at) = app.picker_selected {
+                    app.choose_picker_row(at);
+                }
+                return true;
+            }
+            _ => {}
         }
     }
     // A tab being renamed: Enter keeps the name and Esc leaves it.
@@ -16786,6 +17103,14 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let pane = CreateWindowExW(0, pane_class.as_ptr(), nothing.as_ptr(), WS_CHILD | WS_CLIPCHILDREN | WS_VISIBLE, 0, 0, 0, 0, modal, std::ptr::null_mut(), instance, std::ptr::null());
         let list_style = WS_VSCROLL | WS_CLIPSIBLINGS | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWVARIABLE) as u32;
         let edit_style = WS_TABSTOP | ES_AUTOHSCROLL as u32;
+        let picker_class = wide("DogPicker");
+        let class = WNDCLASSW { lpfnWndProc: Some(picker_procedure), hInstance: instance, lpszClassName: picker_class.as_ptr(), hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW), ..std::mem::zeroed() };
+        RegisterClassW(&class);
+        let picker = CreateWindowExW(0, picker_class.as_ptr(), nothing.as_ptr(), WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, 0, 0, window, std::ptr::null_mut(), instance, std::ptr::null());
+        let picker_search = control(picker, "EDIT", "", edit_style, 0, ID_PICKER_SEARCH);
+        let picker_list = control(picker, "LISTBOX", "", list_style, 0, ID_PICKER_LIST);
+        ShowWindow(picker_search, SW_SHOWNOACTIVATE);
+        ShowWindow(picker_list, SW_SHOWNOACTIVATE);
         // What is found stays selected while the focus is in the find field.
         crate::textview::register(instance);
         let transcript_class = if crate::textview::wanted() { crate::textview::CLASS } else { "RICHEDIT50W" };
@@ -16950,7 +17275,15 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             toggle_language: make_button(pane, ID_TOGGLE_LANGUAGE, "", ButtonKind::Select, theme::background()),
             toggle_display: make_button(window, ID_TOGGLE_DISPLAY, "", ButtonKind::Select, theme::background()),
             folder_chip: make_button(window, ID_FOLDER_CHIP, "", ButtonKind::Chip, theme::background()),
-            start_folder: make_button(window, ID_START_FOLDER, t("Switch workspace"), ButtonKind::Secondary, theme::background()),
+            start_folder: make_button(window, ID_START_FOLDER, t("Choose a workspace"), ButtonKind::Select, theme::surface()),
+            picker,
+            picker_search,
+            picker_list,
+            picker_rows: Vec::new(),
+            picker_selected: None,
+            picker_hover: None,
+            picker_open: false,
+            picker_at: None,
             composer_lines: 1,
             provider_up: make_button(window, ID_PROVIDER_UP, "chevron-up", ButtonKind::Icon, theme::background()),
             provider_down: make_button(window, ID_PROVIDER_DOWN, "chevron-down", ButtonKind::Icon, theme::background()),
@@ -17233,13 +17566,14 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let app = &mut *APP.load(Ordering::Relaxed);
         SendMessageW(app.composer, EM_SETEVENTMASK, 0, ENM_CHANGE as LPARAM);
         SendMessageW(app.note, EM_SETMARGINS, 3, 0); // EC_LEFTMARGIN | EC_RIGHTMARGIN
-        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.timeline.search]) {
+        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.timeline.search, app.picker_search]) {
             SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
         }
         app.list_procedure = SetWindowLongPtrW(app.side, GWLP_WNDPROC, list_subclass as *const () as isize);
         SetWindowLongPtrW(app.list, GWLP_WNDPROC, list_subclass as *const () as isize);
         app.composer_procedure = SetWindowLongPtrW(app.composer, GWLP_WNDPROC, composer_subclass as *const () as isize);
         SetWindowLongPtrW(app.suggest, GWLP_WNDPROC, list_subclass as *const () as isize);
+        SetWindowLongPtrW(app.picker_list, GWLP_WNDPROC, list_subclass as *const () as isize);
         SetWindowLongPtrW(app.tree_list, GWLP_WNDPROC, list_subclass as *const () as isize);
         SetWindowLongPtrW(app.tree_menu, GWLP_WNDPROC, files_panel::menu_subclass as *const () as isize);
         // (what a reader says of the list: its own name)
@@ -17679,6 +18013,21 @@ mod tests {
         keep_server_line(dir.path(), &Leaving::No, &text);
         let report = std::fs::read_to_string(crate::crash::write_report(dir.path(), &Settings::default(), "RTX").unwrap()).unwrap();
         assert!(report.contains("--- the last engine error ---\n") && report.contains("  GPU fault\n"), "{report}");
+    }
+
+    /// The workspace picker lists the folders worked in before under their heading, those whose path has what is searched for (in any case), or
+    /// that none has it; then a line and the way to any other folder, the only rows besides the folders that can be chosen.
+    #[test]
+    fn the_workspace_picker_lists_the_folders_that_have_what_is_searched_for() {
+        let folders = [PathBuf::from(r"C:\work\my-website"), PathBuf::from(r"C:\work\Notes"), PathBuf::from(r"D:\site-tools")];
+        let folder = |at: usize| PickerRow::Folder { path: folders[at].clone(), name: folders[at].file_name().unwrap().to_string_lossy().into_owned() };
+        let heading = PickerRow::Heading(t("Recent workspaces").to_string());
+        assert_eq!(picker_rows(&folders, ""), vec![heading.clone(), folder(0), folder(1), folder(2), PickerRow::Line, PickerRow::Choose]);
+        assert_eq!(picker_rows(&folders, " SITE "), vec![heading.clone(), folder(0), folder(2), PickerRow::Line, PickerRow::Choose], "the path, any case");
+        assert_eq!(picker_rows(&folders, "work\\n"), vec![heading.clone(), folder(1), PickerRow::Line, PickerRow::Choose]);
+        assert_eq!(picker_rows(&folders, "nowhere"), vec![heading, PickerRow::Nothing, PickerRow::Line, PickerRow::Choose]);
+        let chosen: Vec<bool> = picker_rows(&folders, "").iter().map(PickerRow::chosen_by_hand).collect();
+        assert_eq!(chosen, [false, true, true, true, false, true]);
     }
 
     #[test]

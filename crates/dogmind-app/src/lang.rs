@@ -749,7 +749,10 @@ const JA: &[(&str, &str)] = &[
     // The folder.
     ("Choose a folder...", "フォルダーを選択..."),
     ("Choose a folder", "フォルダーを選択"),
-    ("Switch workspace", "ワークスペースを切り替え"),
+    ("Choose a workspace", "ワークスペースを選択"),
+    ("Search workspaces", "ワークスペースを検索"),
+    ("Recent workspaces", "最近のワークスペース"),
+    ("No workspace matches", "一致するワークスペースはありません"),
     ("New session here", "ここで新しいセッション"),
     // Text menus.
     ("Cut", "切り取り"),
