@@ -523,6 +523,8 @@ pub struct Workbench {
     pub secrets: Vec<PathBuf>,
     /// While the person has asked for no changes to the files: the folder outside the workspace where a command may run, and where the write tools may write.
     pub scratch: Option<PathBuf>,
+    /// A `run_code` program is making the calls: what they read goes to the program, not into the conversation.
+    pub in_program: bool,
 }
 
 fn sha16(bytes: &[u8]) -> String {
@@ -919,6 +921,12 @@ impl Workbench {
     pub fn after_read(&mut self, arguments: &Value, path: PathBuf, hash: String, result: Result<String, String>) -> Result<String, String> {
         if self.seen.insert(path.clone(), hash.clone()).is_some_and(|before| before != hash) {
             self.covered.remove(&path);
+        }
+        // A program's read: the file as it is now has been read (an edit may follow), but nothing of it is in the conversation, so it is not
+        // what the conversation was shown, nor counted as read into it, and the program always has the text. (A program that read two files
+        // again was given "already in the conversation" in their place each time, did nothing with them, and the model ran it six times.)
+        if self.in_program {
+            return result;
         }
         if let Ok(text) = &result {
             // (the lines shown in a row from where what was seen ends: an outline's head counts, and its parts after a gap do not)

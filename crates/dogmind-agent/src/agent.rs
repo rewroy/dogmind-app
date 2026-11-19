@@ -2973,7 +2973,9 @@ impl Agent {
         let started = Instant::now();
         self.emit(Event::ProgramStep { id: parent.clone(), call, tool: name.to_string(), summary: tools::summary(name, &arguments) });
         self.call_begun(&id, name, Some(&arguments), &raw, 1, Some(&parent));
+        self.bench.in_program = true;
         let ran = self.run_call(&id, name, &arguments, true);
+        self.bench.in_program = false;
         let (ok, output) = match &ran.result {
             Ok(output) => (true, output.clone()),
             Err(error) => (false, format!("error: {error}")),

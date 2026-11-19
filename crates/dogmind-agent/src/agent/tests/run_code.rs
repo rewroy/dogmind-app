@@ -161,6 +161,28 @@ fn a_program_that_reads_two_files_gives_both_in_one_result_and_leaves_the_calls_
     assert_eq!(of_kind(&lines, "turn_end")[0]["tools"].as_u64(), Some(3));
 }
 
+/// A program has the file each time it reads it, as it is not shown to the conversation, and a direct read after it is the file and not "above".
+/// (A program that read two files again was given "already in the conversation" in their place each time, and the model ran it six times.)
+#[test]
+fn a_program_that_reads_a_file_again_has_it_again_and_so_does_a_direct_read_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    let code = "const a = await tools.read_file({ path: 'a.txt' });\nconst again = await tools.read_file({ path: 'a.txt' });\nreturn a.length + ' ' + again.length + ' ' + again;";
+    let steps = vec![a_program(code, "read it twice"), a_program(code, "and again"), calls(&[("read_file", serde_json::json!({"path": "a.txt"}))]), says("done")];
+    let (run, provider) = code_run(dir.path(), steps, Mode::Default, false);
+    run.handle.commands.send(Command::Send("read it".into())).unwrap();
+    the_turn(&run, Decision::Reject, None);
+    for request in [1, 2] {
+        let messages = provider.messages(request);
+        let results = results_in(&messages);
+        let last = results.last().unwrap();
+        assert!(last.contains("1|alpha") && !last.contains("not repeated"), "request {request}: {last}");
+    }
+    let messages = provider.messages(3);
+    let direct = results_in(&messages);
+    assert!(direct.last().unwrap().contains("1|alpha"), "the conversation had only the programs' results: {direct:?}");
+}
+
 #[test]
 fn a_call_a_program_makes_asks_the_person_as_a_direct_one_does_and_says_whose_it_is() {
     let dir = tempfile::tempdir().unwrap();
