@@ -3609,7 +3609,13 @@ impl App {
         let shown = if label.is_empty() { " " } else { label };
         let points = if label.is_empty() { 6 } else { 8 };
         // (room enough over and under the lines, which the rounded corners also take some of)
-        self.append_row(&rtf::Row { lines: &[shown], face: UI_FACE, points, color: theme::muted(), back: theme::code_back(), width: self.text_twips, right: false, column: 0, padding: (260, 80) });
+        let width = self.text_twips;
+        let row = |lines, points| rtf::Row { lines, face: UI_FACE, points, color: theme::muted(), back: theme::code_back(), width, right: false, column: 0, padding: (260, 80) };
+        if !label.is_empty() {
+            // A label has room over it as the end of a block has under its last line: a row's own padding is not given it, and it stood against the top edge.
+            self.append_row(&row(&[" "], 3));
+        }
+        self.append_row(&row(&[shown], points));
     }
 
     /// A line of code in an answer; a diff in its colours.
