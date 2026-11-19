@@ -29,7 +29,7 @@ use dogmind_agent::web::{WebSettings, WARNING_MARK};
 use crate::design as ds;
 use crate::machine::readable_build;
 use crate::diffview::{self, RowKind};
-use crate::settings::{KeySource, RightView};
+use crate::settings::{CenterView, KeySource, RightView};
 use crate::toolrun::{self, LineKind, RunEntry, Tone, ToolRun};
 use crate::cards::{self, AnswerState, Card, PlanState};
 use crate::notice;
@@ -347,12 +347,11 @@ const TIMER_UPDATE: usize = 8;
 /// Whether it is time to ask GitHub for a newer release: the first time a little after the start, then once an hour (it asks only when six hours have gone by since the last
 /// answer; and when the window comes back from the tray, an hour: Self::tray_open).
 const TIMER_RELEASES: usize = 9;
+const TIMER_SKILL_SCROLL: usize = 10;
 const FIRST_RELEASE_LOOK_MS: u32 = 30_000;
 const RELEASE_LOOK_MS: u32 = 60 * 60 * 1000;
 /// The conversation's width below which the panel on the right gives way, at 96 dpi.
 const RIGHT_NEEDS: i32 = 480;
-/// The panel on the right is no wider than this while it shows a terminal.
-const TERMINAL_PANEL_MOST: i32 = 720;
 /// How many commands, and as many waits, the panel on the right lists of what waits in the background: a session has five waits at most, and few commands.
 const WAITING_LISTED: usize = 6;
 /// How often a server that cannot be reached is tried again, while something waits to be sent to it.
@@ -522,7 +521,7 @@ const COMMANDS: [(&str, &str); 47] = [
     ("/panel", "Show or hide the panel on the right"),
     ("/preview", "Show a web page or picture of the folder beside the conversation"),
     ("/files", "Show the files of the folder in the panel on the right"),
-    ("/terminal", "Show a terminal in the panel on the right, or open one"),
+    ("/terminal", "Switch to Terminal or open a shell"),
     ("/theme", "As Windows is set, dark, or light: the next of them"),
     ("/safe", "Allow safe commands without asking, or not"),
     ("/workspace", "Start a session in another folder"),
@@ -1510,6 +1509,7 @@ struct Form {
     shapes: Vec<Shape>,
     /// What this page shows.
     used: Vec<HWND>,
+    end_toggles: Vec<(HWND, RECT)>,
     y: i32,
     width: i32,
     stacked: bool,
@@ -1525,7 +1525,7 @@ impl Form {
     fn new(width: i32, top: i32, fonts: Fonts, dpi: u32) -> Form {
         let stacked = width < scale(dpi, ds::size::STACK_BELOW);
         let label = scale(dpi, ds::size::LABEL_WIDTH).min(width * 42 / 100);
-        Form { shapes: Vec::new(), used: Vec::new(), y: top, width, stacked, label, fonts, dpi, first_section: true, extra: 0 }
+        Form { shapes: Vec::new(), used: Vec::new(), end_toggles: Vec::new(), y: top, width, stacked, label, fonts, dpi, first_section: true, extra: 0 }
     }
 
     fn s(&self, value: i32) -> i32 {
@@ -1653,7 +1653,7 @@ impl Form {
         let state_x = switch_x - self.s(ds::space::S) - state_width;
         self.shapes.push(Shape::Text { area: rect(0, self.y, (state_x - self.s(ds::space::M)).max(0), height), text: words.to_string(), font: FontKind::Body, color: theme::text(), flags: ONE_LINE });
         self.shapes.push(Shape::Text { area: rect(state_x, self.y, state_width, height), text: state.to_string(), font: FontKind::Small, color: theme::muted(), flags: ONE_LINE | DT_RIGHT });
-        place(window, switch_x, self.y + (height - tall) / 2, across, tall);
+        self.end_toggles.push((window, rect(switch_x, self.y + (height - tall) / 2, across, tall)));
         self.used.push(window);
         self.end_row(height);
     }
@@ -1928,6 +1928,18 @@ struct Suggestion {
     insert: String,
 }
 
+#[derive(Clone, Copy)]
+enum PanelTab {
+    Center(CenterView),
+    Right(RightView),
+}
+
+struct SkillScroll {
+    from: i32,
+    to: i32,
+    began: std::time::Instant,
+}
+
 struct App {
     window: HWND,
     folder: PathBuf,
@@ -1971,10 +1983,10 @@ struct App {
     panel_menu: files_panel::PanelMenu,
     /// The Terminal view of the panel on the right (`term_panel`): its windows and its terminals.
     term: term_panel::TermView,
-    /// The Timeline view of the panel on the right (`timeline_view`): its window, the session's path read from its files, and what the events say between two reads.
+    /// The central Timeline view (`timeline_view`): its window, the session's path read from its files, and what the events say between two reads.
     timeline: timeline_view::TimelineView,
-    /// The words over the panel on the right, where a press goes to the view each names.
-    right_tab_hits: Vec<(RECT, RightView)>,
+    /// The hit areas of the central and right panel tabs.
+    tab_hits: Vec<(RECT, PanelTab)>,
     collapsed: HashSet<String>,
     all_sessions: Vec<session::Summary>,
     /// The session on screen, once it has a file.
@@ -2086,6 +2098,8 @@ struct App {
     size_segments: [HWND; TEXT_SIZES.len()],
     /// A switch for each skill found, made when the Skills page first needs it.
     skill_toggles: Vec<HWND>,
+    skill_toggle_areas: Vec<(HWND, RECT)>,
+    skill_scroll: Option<SkillScroll>,
     /// What the model keeps between sessions, as the Memory page last read it, and a button to take out each.
     memory_notes: Vec<(&'static str, String)>,
     memory_remove: Vec<HWND>,
@@ -3658,7 +3672,7 @@ impl App {
     /// The caret stays out of the composer's way: its hint lies over the first line, and what an IME is composing goes there.
     unsafe fn update_composer_cue(&self) {
         let empty = GetWindowTextLengthW(self.composer) == 0;
-        show(self.composer_cue, self.panel == Panel::Chat && empty && !self.composing);
+        show(self.composer_cue, self.conversation_shown() && empty && !self.composing);
     }
 
     /// An answer as it streams, with its Markdown rendered: what a marker means is known once the line has begun, so a
@@ -5807,7 +5821,7 @@ impl App {
         if !same_size {
             self.layout();
         }
-        show(self.composer_cue, self.panel == Panel::Chat && text.is_empty());
+        show(self.composer_cue, self.conversation_shown() && text.is_empty());
     }
 
     /// The offered word in place of what was being typed.
@@ -6149,6 +6163,7 @@ impl App {
         let s = |value: i32| scale(dpi, value);
         let mut shapes = Vec::new();
         let chat = self.panel == Panel::Chat;
+        let conversation = self.conversation_shown();
 
         // The sidebar.
         let bare = self.onboarding;
@@ -6188,15 +6203,13 @@ impl App {
         } else if (self.preview_file.is_some() || self.steps.is_some()) && room >= s(760) {
             (room / 2).max(s(380))
         } else if self.preview_file.is_none() && (self.settings.right_panel || self.steps.is_some()) && room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS) {
-            // (a terminal wants columns: nearly half of what the sidebar leaves, as far as the conversation can spare it)
-            let wanted = if matches!(self.settings.right_view, RightView::Terminal | RightView::Timeline) { (room * 45 / 100).clamp(s(ds::size::RIGHT_PANEL), s(TERMINAL_PANEL_MOST)) } else { s(ds::size::RIGHT_PANEL) };
-            wanted.min(room - s(RIGHT_NEEDS))
+            s(ds::size::RIGHT_PANEL)
         } else {
             0
         };
         self.right_width = right;
         self.right_hits.clear();
-        self.right_tab_hits.clear();
+        self.tab_hits.clear();
         self.preview_hits.clear();
         self.waiting_hits.clear();
         self.waiting_times.clear();
@@ -6229,8 +6242,8 @@ impl App {
         // (no switch for what could not show)
         let toggles = chat && !bare && (self.preview_file.is_some() || self.steps.is_some() || room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS));
         show(self.right_toggle, toggles);
-        show(self.folder_chip, chat && !bare);
-        if !chat {
+        show(self.folder_chip, conversation && !bare);
+        if !conversation {
             show(self.start_folder, false);
             self.close_picker();
         }
@@ -6241,18 +6254,56 @@ impl App {
         let column = main_width.min(if bare { s(ds::size::COLUMN_FIRST_RUN) } else { s(ds::size::COLUMN) }) - s(48);
         let left = main_left + (main_width - column) / 2;
 
+        let strip = s(ds::size::TITLE_STRIP);
+        let mut content_top = strip;
+        if chat {
+            // The session's name, as it scrolls under nothing: at a glance, which one this is.
+            let toggle = s(ds::size::ICON_BUTTON);
+            // (at the right end of the conversation's own area, beside the panel it opens, not at the end of the column the words keep to)
+            let toggle_x = main_left + main_width - toggle - s(ds::space::M);
+            place(self.right_toggle, toggle_x, (strip - toggle) / 2, toggle, toggle);
+            // (an empty session has no name to tell it by, and the dog says what it is)
+            let (name, color) = if !self.session_title.is_empty() { (self.session_title.clone(), theme::text()) } else if self.has_messages { (t("New session").to_string(), theme::faint()) } else { (String::new(), theme::faint()) };
+            let title_room = if toggles { column.min(toggle_x - s(ds::space::S) - left) } else { column };
+            self.title_area = rect(left, 0, title_room, strip);
+            shapes.push(Shape::Text { area: self.title_area, text: name, font: FontKind::Strong, color, flags: ONE_LINE });
+            if !bare {
+                let tabs = [
+                    (t("Conversation"), PanelTab::Center(CenterView::Conversation)),
+                    (t("Terminal"), PanelTab::Center(CenterView::Terminal)),
+                    (t("Timeline"), PanelTab::Center(CenterView::Timeline)),
+                ];
+                self.layout_tabs(&mut shapes, left, column, strip, FontKind::Small, &tabs);
+                content_top += s(ds::size::NAV_ROW);
+                shapes.push(Shape::Fill { area: rect(main_left, content_top - s(ds::space::PIXEL), main_width, s(ds::space::PIXEL)), color: theme::line() });
+            }
+        }
+        if !conversation {
+            self.queue_hits.clear();
+            self.rail_hits.clear();
+            self.vision_offer_close = None;
+            self.activity_area = rect(0, 0, 0, 0);
+            self.status_area = rect(0, 0, 0, 0);
+        }
+        let margin = s(ds::size::RIGHT_GAP);
+        if self.terminal_shown() {
+            self.layout_terminal_view(&mut shapes, main_left + margin, main_width - 2 * margin, content_top, height);
+        } else if self.timeline_shown() {
+            self.layout_timeline_view(&mut shapes, main_left + margin, main_width - 2 * margin, content_top, height);
+        }
+
         for window in [self.composer, self.send, self.attach_button, self.model_chip, self.mode_chip, self.effort_chip] {
-            show(window, chat);
+            show(window, conversation);
         }
         // The notice of a newer version, on the pages that have it; what is not there is hidden, once, and not hidden and shown again by every layout.
-        let notice = if notice::is_on_page(chat, looking_at_changes, bare) { self.notice() } else { None };
+        let notice = if notice::is_on_page(conversation, looking_at_changes, bare) { self.notice() } else { None };
         if notice.is_none() {
             for window in [self.update_offer_button, self.release_offer_button, self.notice_later] {
                 show(window, false);
             }
         }
         let notice_room = if notice.is_some() { self.notice_height() + s(ds::space::S) } else { 0 };
-        if !chat {
+        if !conversation {
             for window in &self.attached_windows {
                 show(*window, false);
             }
@@ -6260,23 +6311,23 @@ impl App {
             show(self.goal_clear, false);
         }
         show(self.help_button, !bare && !squeezed);
-        show(self.suggest, chat && !self.suggestions.is_empty());
-        if !chat {
+        show(self.suggest, conversation && !self.suggestions.is_empty());
+        if !conversation {
             show(self.composer_cue, false);
         }
-        let band = chat && self.pending.is_some();
+        let band = conversation && self.pending.is_some();
         for window in [self.note, self.approve, self.always, self.reject, self.feedback] {
             show(window, band);
         }
-        show(self.transcript, chat && self.has_messages);
-        if !(chat && self.has_messages) {
+        show(self.transcript, conversation && self.has_messages);
+        if !(conversation && self.has_messages) {
             self.hide_card_field();
         }
-        let finding = chat && self.has_messages && self.find_open;
+        let finding = conversation && self.has_messages && self.find_open;
         for window in [self.find_field, self.find_previous, self.find_next, self.find_close] {
             show(window, finding);
         }
-        if chat {
+        if conversation {
             let status_height = s(ds::size::STATUS);
             let inner = s(ds::size::COMPOSER_INSET);
             // Two lines' room to begin with; it grows with what is typed, up to about half the window, and then scrolls.
@@ -6310,12 +6361,12 @@ impl App {
             let status_top = card_top + card_height + s(ds::space::XS);
             let above = card_top - waiting_height;
             // (where all of it does not fit, the dog's words give way first: the workspace's card under its name is what a new session is for)
-            let room = above - s(40) - notice_room;
+            let room = above - content_top - notice_room;
             let unsaid = greeting_height - bubble_height - dog_gap;
             if !self.has_messages && room >= unsaid {
                 let said = room >= greeting_height;
                 let shown = if said { greeting_height } else { unsaid };
-                let top = s(40) + notice_room + (room - shown) / 2;
+                let top = content_top + notice_room + (room - shown) / 2;
                 // The drawing fills its square's width, and is about 0.82 of it high, centred. Its line is about 5% of its width.
                 let (dog_x, dog_top) = (left + (column - dog) / 2, if said { top + bubble_height + dog_gap } else { top });
                 if said {
@@ -6391,21 +6442,6 @@ impl App {
                 shapes.push(Shape::Round { area: rect(left, top, column, list_height + s(ds::space::M)), radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
                 place(self.suggest, left + s(6), top + s(6), column - s(ds::space::M), list_height);
                 SetWindowPos(self.suggest, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            }
-            // The session's name, as it scrolls under nothing: at a glance, which one this is.
-            let strip = s(ds::size::TITLE_STRIP);
-            let toggle = s(ds::size::ICON_BUTTON);
-            // (at the right end of the conversation's own area, beside the panel it opens, not at the end of the column the words keep to)
-            let toggle_x = main_left + main_width - toggle - s(ds::space::M);
-            place(self.right_toggle, toggle_x, (strip - toggle) / 2, toggle, toggle);
-            // (an empty session has no name to tell it by, and the dog says what it is)
-            let (name, color) = if !self.session_title.is_empty() { (self.session_title.clone(), theme::text()) } else if self.has_messages { (t("New session").to_string(), theme::faint()) } else { (String::new(), theme::faint()) };
-            let title_room = if toggles { column.min(toggle_x - s(ds::space::S) - left) } else { column };
-            self.title_area = rect(left, 0, title_room, strip);
-            shapes.push(Shape::Text { area: self.title_area, text: name, font: FontKind::Body, color, flags: ONE_LINE });
-            // (what scrolls goes under an edge, and not into the name)
-            if self.has_messages {
-                shapes.push(Shape::Fill { area: rect(main_left, strip - s(ds::space::PIXEL), main_width, s(ds::space::PIXEL)), color: theme::line() });
             }
             let name = self.workspace.file_name().map_or_else(|| self.workspace.display().to_string(), |name| name.to_string_lossy().into_owned());
             let chip_width = (text_width(self.fonts.small, &name) + s(66)).clamp(s(90), s(280));
@@ -6548,7 +6584,7 @@ impl App {
                     SetTimer(self.window, TIMER_REFLOW, 150, None);
                 }
             }
-            let mut top = strip;
+            let mut top = content_top;
             // The session's goal, as a thin bar under its name, with a cross that clears it.
             show(self.goal_clear, cards::goal_bar(self.goal.as_deref()).is_some());
             if let Some(goal) = cards::goal_bar(self.goal.as_deref()) {
@@ -6852,7 +6888,7 @@ impl App {
         show(self.doc, false);
         // A row kept lit is one that is still there.
         if let Some(row) = self.hover_row {
-            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.right_tab_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).chain(self.waiting_hits.iter().map(|(area, _)| area)).any(|area| same_rect(area, &row)) {
+            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.tab_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).chain(self.waiting_hits.iter().map(|(area, _)| area)).any(|area| same_rect(area, &row)) {
                 self.hover_row = None;
             }
         }
@@ -6935,11 +6971,17 @@ impl App {
     /// What a dialog's window draws.
     unsafe fn paint_modal(&self, window: HWND, device: HDC, client: RECT) {
         if window == self.pane {
-            let brush = CreateSolidBrush(theme::background());
-            FillRect(device, &client, brush);
-            DeleteObject(brush);
-            for shape in &self.pane_shapes {
+            FillRect(device, &client, self.brushes[0]);
+            let scroll = if self.panel == Panel::Skills { self.panel_scroll } else { 0 };
+            let view = RECT { top: scroll, bottom: client.bottom + scroll, ..client };
+            OffsetViewportOrgEx(device, 0, -scroll, std::ptr::null_mut());
+            for shape in self.pane_shapes.iter().filter(|shape| overlaps(&shape.bounds(), &view)) {
                 self.draw_shape(device, shape);
+            }
+            OffsetViewportOrgEx(device, 0, scroll, std::ptr::null_mut());
+            if let Some((thumb, _, _)) = self.pane_thumb {
+                let color = if self.pane_thumb_grab.is_some() { theme::muted() } else { theme::line() };
+                rounded(device, thumb, scale(self.dpi, ds::size::THUMB) / 2, Some(color), None);
             }
             return;
         }
@@ -7002,9 +7044,10 @@ impl App {
             self.settings_cues();
         }
         let view = (wanted_height - head - foot).max(0);
-        let mut form = Form::new(content, -self.panel_scroll, self.fonts, dpi);
+        let top = if self.panel == Panel::Skills { 0 } else { -self.panel_scroll };
+        let mut form = Form::new(content, top, self.fonts, dpi);
         self.build_page(&mut form, view);
-        let extent = form.y + self.panel_scroll + s(ds::space::XS);
+        let extent = form.y - top + s(ds::space::XS);
         let card_height = if wanted_height > 0 { wanted_height } else { (extent + head + foot).min(height - 2 * margin) };
         let view = (card_height - head - foot).max(0);
         // Scrolled past what there now is.
@@ -7051,6 +7094,10 @@ impl App {
         }
         // (it reaches to the dialog's edge, for the thumb to stand there)
         place(self.pane, card.left + pane_x, card.top + head, card_width - pane_x - s(ds::space::HAIR), view);
+        self.skill_toggle_areas = form.end_toggles;
+        for &(window, area) in &self.skill_toggle_areas {
+            place(window, area.left, area.top - self.panel_scroll, area.right - area.left, area.bottom - area.top);
+        }
         for control in self.pane_controls() {
             show(control, form.used.contains(&control));
         }
@@ -7059,8 +7106,6 @@ impl App {
             let tall = thumb_height(view, view, extent, s(ds::space::XXL));
             let at = thumb_offset(view - tall, self.panel_scroll, most);
             let thumb = rect(card_width - pane_x - s(11), at, s(ds::size::THUMB), tall);
-            let held = self.pane_thumb_grab.is_some();
-            form.shapes.push(Shape::Round { area: thumb, radius: s(ds::size::THUMB) / 2, fill: Some(if held { theme::muted() } else { theme::line() }), border: None });
             self.pane_thumb = Some((thumb, view, most));
         }
         self.pane_shapes = form.shapes;
@@ -7949,6 +7994,46 @@ impl App {
         self.layout();
     }
 
+    unsafe fn layout_tabs(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32, font: FontKind, views: &[(&str, PanelTab)]) {
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let words_top = top + s(ds::space::XS);
+        let mut across_to = x;
+        let face = self.font(font);
+        let widths: Vec<i32> = views.iter().map(|(words, _)| text_width(face, words)).collect();
+        let gap = ((width - widths.iter().sum::<i32>()) / (views.len() as i32 - 1)).clamp(s(ds::space::S), s(ds::space::XL));
+        for ((words, view), across) in views.iter().copied().zip(widths) {
+            let on = match view {
+                PanelTab::Center(view) => self.settings.center_view == view,
+                PanelTab::Right(view) => self.settings.right_view == view,
+            };
+            shapes.push(Shape::Text { area: rect(across_to, words_top, across, s(ds::space::XL)), text: words.to_string(), font, color: if on { theme::text() } else { theme::muted() }, flags: ONE_LINE });
+            if on {
+                shapes.push(Shape::Fill { area: rect(across_to, words_top + s(ds::space::XL) + s(ds::space::HAIR), across, s(ds::space::HAIR)), color: theme::accent() });
+            }
+            self.tab_hits.push((rect(across_to - gap / 2, top, across + gap, s(ds::size::NAV_ROW)), view));
+            across_to += across + gap;
+        }
+    }
+
+    fn conversation_shown(&self) -> bool {
+        self.panel == Panel::Chat && (self.onboarding || self.settings.center_view == CenterView::Conversation)
+    }
+
+    unsafe fn set_center_view(&mut self, view: CenterView) {
+        if self.settings.center_view == view {
+            return;
+        }
+        self.settings.center_view = view;
+        self.save();
+        self.layout();
+        if self.timeline_shown() {
+            SetFocus(self.timeline.window);
+        } else if self.conversation_shown() {
+            self.focus_composer();
+        }
+    }
+
     unsafe fn layout_right(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, height: i32) {
         if self.preview_file.is_some() {
             self.layout_preview(shapes, x, width, height);
@@ -7961,22 +8046,9 @@ impl App {
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let row = s(ds::size::TEXT_ROW);
-        // The views of the panel, as words over it (level with the session's name): the one shown is underlined.
-        let words_top = (s(ds::size::TITLE_STRIP) - s(ds::space::XL)) / 2;
-        let mut across_to = x;
-        let views = [(t("Overview"), RightView::Overview), (t("Files"), RightView::Files), (t("Terminal"), RightView::Terminal), (t("Timeline"), RightView::Timeline)];
-        let widths: Vec<i32> = views.iter().map(|(words, _)| text_width(self.fonts.strong, words)).collect();
-        // (four words in a panel as narrow as this one: the room between them gives way before the words do)
-        let gap = ((width - widths.iter().sum::<i32>()) / (views.len() as i32 - 1)).clamp(s(ds::space::S), s(ds::space::XL));
-        for ((words, view), across) in views.into_iter().zip(widths) {
-            let on = self.settings.right_view == view;
-            shapes.push(Shape::Text { area: rect(across_to, words_top, across, s(ds::space::XL)), text: words.to_string(), font: FontKind::Strong, color: if on { theme::text() } else { theme::muted() }, flags: ONE_LINE });
-            if on {
-                shapes.push(Shape::Fill { area: rect(across_to, words_top + s(ds::space::XL) + s(ds::space::HAIR), across, s(ds::space::HAIR)), color: theme::accent() });
-            }
-            self.right_tab_hits.push((rect(across_to - gap / 2, words_top - s(ds::space::XS), across + gap, s(ds::space::XL) + s(ds::space::M)), view));
-            across_to += across + gap;
-        }
+        let tabs_top = (s(ds::size::TITLE_STRIP) - s(ds::size::NAV_ROW)) / 2;
+        let tabs = [(t("Overview"), PanelTab::Right(RightView::Overview)), (t("Files"), PanelTab::Right(RightView::Files))];
+        self.layout_tabs(shapes, x, width, tabs_top, FontKind::Strong, &tabs);
         // (what is under them begins past the strip the session's name has)
         let mut y = s(ds::size::TITLE_STRIP) + s(ds::space::S);
         let heading = |shapes: &mut Vec<Shape>, y: &mut i32, text: String| {
@@ -7988,18 +8060,6 @@ impl App {
             *y += s(ds::space::XL);
         };
 
-        // The terminal has the panel to the foot of the window: no engine line under it.
-        if self.settings.right_view == RightView::Terminal {
-            self.dashboard_hit = None;
-            self.layout_terminal_view(shapes, x, width, s(ds::size::TITLE_STRIP), height);
-            return;
-        }
-        // The timeline has the panel to the foot of the window too: the path is long.
-        if self.settings.right_view == RightView::Timeline {
-            self.dashboard_hit = None;
-            self.layout_timeline_view(shapes, x, width, s(ds::size::TITLE_STRIP), height);
-            return;
-        }
         // The engine, at the foot: what it is and the way to its dashboard.
         self.dashboard_hit = None;
         let foot = height - s(ds::space::L);
@@ -8195,7 +8255,7 @@ impl App {
                 }
             }
         }
-        if self.panel == Panel::Chat {
+        if self.conversation_shown() {
             if !self.activity.is_empty() && !self.waits_for_person() {
                 let area = self.activity_area;
                 let elapsed = self.activity_since.map_or(0.0, |since| since.elapsed().as_secs_f32());
@@ -8617,6 +8677,7 @@ impl App {
         EnableWindow(self.buttons[1], 1);
         self.panel_log.clear();
         self.panel_problem = false;
+        self.stop_skill_scroll();
         self.panel_scroll = 0;
         self.machine_line.clear();
         self.refusal = None;
@@ -9968,6 +10029,7 @@ impl App {
 
     /// A new conversation, straight away, in the folder of the last one. Clicking the folder in the header chooses another.
     unsafe fn new_session(&mut self) {
+        self.settings.center_view = CenterView::Conversation;
         let on_screen = Some(self.workspace.clone()).filter(|folder| folder.is_dir());
         match on_screen.or_else(|| self.settings.workspace.clone().filter(|folder| folder.is_dir())) {
             Some(folder) => self.start_session(folder),
@@ -11212,6 +11274,7 @@ impl App {
             self.say(t("There is nothing to find in yet."));
             return;
         }
+        self.set_center_view(CenterView::Conversation);
         self.find_open = true;
         self.layout();
         SetFocus(self.find_field);
@@ -11615,13 +11678,20 @@ impl App {
                 }
             }
         }
+        let visible = IsWindowVisible(self.side) != 0;
+        if visible {
+            SendMessageW(self.side, WM_SETREDRAW, 0, 0);
+        }
         self.side_rows = rows;
         SendMessageW(self.side, LB_RESETCONTENT, 0, 0);
         for _ in &self.side_rows {
             SendMessageW(self.side, LB_ADDSTRING, 0, 0);
         }
         SendMessageW(self.side, LB_SETTOPINDEX, top.max(0) as WPARAM, 0);
-        InvalidateRect(self.side, std::ptr::null(), 1);
+        if visible {
+            SendMessageW(self.side, WM_SETREDRAW, 1, 0);
+        }
+        InvalidateRect(self.side, std::ptr::null(), 0);
     }
 
     /// A click in the sidebar: a session opens, a workspace folds, and the plus at its end starts a new session there.
@@ -12002,18 +12072,84 @@ impl App {
     /// The same, to a place. A dialog's page is laid out again alone: the window behind it does not change as it scrolls, and laying all of
     /// it out again for every notch of the wheel made the page slow to follow.
     unsafe fn scroll_panel_to(&mut self, to: i32) {
+        self.stop_skill_scroll();
+        self.move_panel_scroll(to);
+    }
+
+    unsafe fn move_panel_scroll(&mut self, to: i32) {
         let most = (self.panel_extent - self.panel_view()).max(0);
         let to = to.clamp(0, most);
         if to == self.panel_scroll {
             return;
         }
         self.panel_scroll = to;
-        if self.modal_open {
+        if self.modal_open && self.panel == Panel::Skills {
+            self.scroll_skill_pane();
+        } else if self.modal_open {
             let mut client: RECT = std::mem::zeroed();
             GetClientRect(self.window, &mut client);
             self.layout_modal(client.right, client.bottom);
         } else {
             self.layout();
+        }
+    }
+
+    unsafe fn scroll_skill_pane(&mut self) {
+        let mut batch = BeginDeferWindowPos(self.skill_toggle_areas.len() as i32);
+        for &(window, area) in &self.skill_toggle_areas {
+            if batch.is_null() {
+                break;
+            }
+            batch = DeferWindowPos(batch, window, std::ptr::null_mut(), area.left, area.top - self.panel_scroll, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+        }
+        if batch.is_null() || EndDeferWindowPos(batch) == 0 {
+            for &(window, area) in &self.skill_toggle_areas {
+                place(window, area.left, area.top - self.panel_scroll, area.right - area.left, area.bottom - area.top);
+            }
+        }
+        if let Some((thumb, view, most)) = &mut self.pane_thumb {
+            let tall = thumb.bottom - thumb.top;
+            thumb.top = thumb_offset(*view - tall, self.panel_scroll, *most);
+            thumb.bottom = thumb.top + tall;
+        }
+        // Paint while the pointer is still moving, including the child controls at their new positions.
+        RedrawWindow(self.pane, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
+
+    unsafe fn wheel_skill_scroll(&mut self, by: i32) {
+        if self.pane_thumb_grab.is_some() || by == 0 {
+            return;
+        }
+        let most = (self.panel_extent - self.panel_view()).max(0);
+        let to = (self.skill_scroll.as_ref().map_or(self.panel_scroll, |scroll| scroll.to) + by).clamp(0, most);
+        if to == self.panel_scroll {
+            self.stop_skill_scroll();
+            return;
+        }
+        let mut animate = 1i32;
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, std::ptr::addr_of_mut!(animate).cast(), 0);
+        if animate == 0 || (self.skill_scroll.is_none() && SetTimer(self.window, TIMER_SKILL_SCROLL, 16, None) == 0) {
+            self.scroll_panel_to(to);
+            return;
+        }
+        self.skill_scroll = Some(SkillScroll { from: self.panel_scroll, to, began: std::time::Instant::now() });
+    }
+
+    unsafe fn tick_skill_scroll(&mut self) {
+        let Some(scroll) = &self.skill_scroll else { return };
+        let elapsed = (scroll.began.elapsed().as_secs_f64() / 0.12).min(1.0);
+        let step = 1.0 - (1.0 - elapsed).powi(3);
+        let to = scroll.from + (f64::from(scroll.to - scroll.from) * step).round() as i32;
+        self.move_panel_scroll(to);
+        if elapsed == 1.0 {
+            self.stop_skill_scroll();
+        }
+    }
+
+    unsafe fn stop_skill_scroll(&mut self) {
+        if self.skill_scroll.take().is_some() {
+            KillTimer(self.window, TIMER_SKILL_SCROLL);
         }
     }
 
@@ -12451,7 +12587,7 @@ impl App {
 
     /// Back to what is being written, unless a dialog is open: its keys stay with it.
     unsafe fn focus_composer(&self) {
-        if !self.modal_open {
+        if !self.modal_open && self.conversation_shown() {
             SetFocus(self.composer);
         }
     }
@@ -14600,6 +14736,9 @@ unsafe fn with_thin_bar(app: &mut App, window: HWND, base: WNDPROC, message: u32
                 SetCapture(window);
                 return 0;
             }
+            if window == app.side && side_row_at(window, lparam).is_none() {
+                return 0;
+            }
         }
         WM_MOUSEMOVE if grabbed.is_some() => {
             let mut bar: SCROLLINFO = std::mem::zeroed();
@@ -15068,6 +15207,26 @@ fn mix(under: u32, over: u32, cover: f32) -> u32 {
     channel(0) | channel(8) | channel(16)
 }
 
+/// LB_ITEMFROMPOINT returns the nearest row even in the empty space below it.
+unsafe fn side_row_at(window: HWND, position: LPARAM) -> Option<usize> {
+    let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, position);
+    if (found >> 16) & 0xFFFF != 0 {
+        return None;
+    }
+    let index = (found & 0xFFFF) as usize;
+    let mut area: RECT = std::mem::zeroed();
+    if SendMessageW(window, LB_GETITEMRECT, index, std::ptr::addr_of_mut!(area) as LPARAM) == -1 {
+        return None;
+    }
+    let point = POINT { x: (position & 0xFFFF) as i16 as i32, y: (position >> 16) as i16 as i32 };
+    (PtInRect(&area, point) != 0).then_some(index)
+}
+
+unsafe fn paint_side_list(app: &mut App, window: HWND, base: WNDPROC, device: HDC, client: RECT) {
+    FillRect(device, &client, app.brushes[1]);
+    with_thin_bar(app, window, base, WM_PRINTCLIENT, device as WPARAM, PRF_CLIENT as LPARAM);
+}
+
 /// The list boxes, with hover and, in the sidebar, a click that knows where it fell.
 unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let Some(app) = app() else { return DefWindowProcW(window, message, wparam, lparam) };
@@ -15075,13 +15234,48 @@ unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPAR
     let is_side = window == app.side;
     let is_tree = window == app.tree_list;
     match message {
+        WM_ERASEBKGND if is_side => 1,
+        WM_PRINTCLIENT if is_side => {
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            paint_side_list(app, window, base, wparam as HDC, client);
+            0
+        }
+        WM_PAINT if is_side => {
+            let mut paint: PAINTSTRUCT = std::mem::zeroed();
+            let target = BeginPaint(window, &mut paint);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            if client.right > 0 && client.bottom > 0 {
+                let device = CreateCompatibleDC(target);
+                let bitmap = CreateCompatibleBitmap(target, client.right, client.bottom);
+                if !device.is_null() && !bitmap.is_null() {
+                    let previous = SelectObject(device, bitmap);
+                    paint_side_list(app, window, base, device, client);
+                    BitBlt(target, 0, 0, client.right, client.bottom, device, 0, 0, SRCCOPY);
+                    SelectObject(device, previous);
+                } else {
+                    paint_side_list(app, window, base, target, client);
+                }
+                DeleteObject(bitmap);
+                DeleteDC(device);
+            }
+            EndPaint(window, &paint);
+            0
+        }
         WM_MOUSEMOVE | WM_MOUSELEAVE => {
             // (a test that has no pointer of its own: the leave the system sends is not the pointer leaving)
             if message == WM_MOUSELEAVE && is_tree && test_pointer_stays() {
                 return 0;
             }
-            let found = if message == WM_MOUSEMOVE { SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam) } else { 0x10000 };
-            let hover = ((found >> 16) & 0xFFFF == 0).then_some((found & 0xFFFF) as usize);
+            let hover = if message == WM_MOUSELEAVE {
+                None
+            } else if is_side {
+                side_row_at(window, lparam)
+            } else {
+                let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
+                ((found >> 16) & 0xFFFF == 0).then_some((found & 0xFFFF) as usize)
+            };
             let slot = if is_side { &mut app.side_hover } else if is_tree { &mut app.tree_hover } else if window == app.suggest { &mut app.suggest_hover } else if window == app.picker_list { &mut app.picker_hover } else { &mut app.list_hover };
             if *slot != hover {
                 for index in [*slot, hover].into_iter().flatten() {
@@ -15129,18 +15323,20 @@ unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPAR
         }
         WM_KEYDOWN if is_tree && app.files_key(wparam as u16) => 0,
         WM_RBUTTONUP if is_side => {
-            let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
-            if (found >> 16) & 0xFFFF == 0 {
-                app.on_side_menu((found & 0xFFFF) as usize);
+            if let Some(index) = side_row_at(window, lparam) {
+                app.on_side_menu(index);
             }
             0
         }
+        WM_LBUTTONDBLCLK if is_side && side_row_at(window, lparam).is_none() => 0,
         WM_LBUTTONUP if is_side && app.bar_grab.is_none() => {
+            let index = side_row_at(window, lparam);
+            if index.is_none() && GetCapture() != window {
+                return 0;
+            }
             let result = CallWindowProcW(base, window, message, wparam, lparam);
-            let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
-            if (found >> 16) & 0xFFFF == 0 {
+            if let Some(index) = index {
                 let x = (lparam & 0xFFFF) as i16 as i32;
-                let index = (found & 0xFFFF) as usize;
                 // It may rebuild this very list: after the control has finished with the click.
                 app.on_side_click(index, x);
             }
@@ -15392,6 +15588,7 @@ unsafe extern "system" fn modal_procedure(window: HWND, message: u32, wparam: WP
                 app.pane_thumb_grab = Some(grab);
                 SetCapture(window);
                 app.drag_pane_thumb(y);
+                InvalidateRect(window, &thumb, 0);
             }
             0
         }
@@ -15405,9 +15602,9 @@ unsafe extern "system" fn modal_procedure(window: HWND, message: u32, wparam: WP
         }
         WM_CAPTURECHANGED if window == app.pane && app.pane_thumb_grab.is_some() => {
             app.pane_thumb_grab = None;
-            let mut client: RECT = std::mem::zeroed();
-            GetClientRect(app.window, &mut client);
-            app.layout_modal(client.right, client.bottom);
+            if let Some((thumb, _, _)) = app.pane_thumb {
+                InvalidateRect(window, &thumb, 0);
+            }
             0
         }
         WM_LBUTTONUP if window == app.modal => {
@@ -15655,15 +15852,18 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_MOUSEWHEEL if app.panel != Panel::Chat => {
-            // (a notch is 120: about three lines of a page, as a browser goes)
-            let notches = ((wparam >> 16) & 0xFFFF) as u16 as i16 as i32;
-            app.scroll_panel(-notches * scale(app.dpi, 120) / 120);
+            let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+            if app.modal_open && app.panel == Panel::Skills {
+                app.wheel_skill_scroll(-delta * scale(app.dpi, 240) / 120);
+            } else {
+                app.scroll_panel(-delta * scale(app.dpi, 120) / 120);
+            }
             0
         }
         WM_MOUSEMOVE if app.panel == Panel::Chat => {
             let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
             let within = |area: &RECT| x >= area.left && x < area.right && y >= area.top && y < area.bottom;
-            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.right_tab_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.waiting_hits.iter().map(|(area, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
+            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.tab_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.waiting_hits.iter().map(|(area, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
             app.hover_on(found);
             app.rail_hover_at(x, y);
             0
@@ -15677,7 +15877,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
             1
         }
-        WM_MOUSEWHEEL if app.panel == Panel::Chat && app.has_messages => {
+        WM_MOUSEWHEEL if app.conversation_shown() && app.has_messages => {
             // Over the strip the wheel reaches this window: the control would have taken it.
             SendMessageW(app.transcript, message, wparam, lparam)
         }
@@ -15700,8 +15900,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.layout();
                 return 0;
             }
-            if let Some(view) = app.right_tab_at(x, y) {
-                app.set_right_view(view);
+            if let Some((_, tab)) = app.tab_hits.iter().find(|(area, _)| within(area)) {
+                match *tab {
+                    PanelTab::Center(view) => app.set_center_view(view),
+                    PanelTab::Right(view) => app.set_right_view(view),
+                }
             } else if let Some((at, act)) = app.queue_hits.iter().find(|(area, _, _)| within(area)).map(|(_, at, act)| (*at, *act)) {
                 app.queue_act(at, act);
             } else if let Some(at) = app.rail_hits.iter().find(|(area, _)| within(area)).map(|(_, at)| *at) {
@@ -15728,6 +15931,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.helper_tick();
             app.timeline_tick();
             app.spinner_tick();
+            0
+        }
+        WM_TIMER if wparam == TIMER_SKILL_SCROLL => {
+            app.tick_skill_scroll();
             0
         }
         WM_CTLCOLORLISTBOX => {
@@ -17170,7 +17377,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             panel_menu: files_panel::PanelMenu { items: Vec::new(), whose: files_panel::MenuFor::Nothing },
             term: term_panel::TermView::new(window, theme::sidebar()),
             timeline: timeline_view::TimelineView::new(window),
-            right_tab_hits: Vec::new(),
+            tab_hits: Vec::new(),
             collapsed: HashSet::new(),
             all_sessions: Vec::new(),
             current_session: None,
@@ -17235,6 +17442,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             mcp_trust: Vec::new(),
             size_segments: std::array::from_fn(|at| make_button(pane, ID_TEXT_SIZE + at as isize, "", ButtonKind::Segment, theme::surface())),
             skill_toggles: Vec::new(),
+            skill_toggle_areas: Vec::new(),
+            skill_scroll: None,
             memory_notes: Vec::new(),
             memory_remove: Vec::new(),
             builds: Vec::new(),

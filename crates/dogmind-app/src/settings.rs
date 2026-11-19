@@ -40,14 +40,21 @@ impl Kind {
 pub enum RightView {
     /// The folder's files as a tree.
     Files,
-    /// The person's own shells.
-    Terminal,
-    /// What the model and the app are doing now, where the work is heading, and the path the session took.
-    Timeline,
     /// The session's tasks, what waits, the changes and the engine. (A name no version of this app knows is this too: the file is not refused for it.)
     #[default]
     #[serde(other)]
     Overview,
+}
+
+/// What the central panel shows within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CenterView {
+    Terminal,
+    Timeline,
+    #[default]
+    #[serde(other)]
+    Conversation,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,6 +263,7 @@ pub struct Settings {
     pub right_panel: bool,
     /// What it shows. (Before the Terminal view the choice was `right_files`, true for the files: `Settings::load` reads that key where it is, see `migrate`.)
     pub right_view: RightView,
+    pub center_view: CenterView,
     /// The shell the last new terminal was started with, by its name in `term::shells` (`pwsh`, `powershell`, `cmd`, `git-bash`); empty before one was chosen.
     pub terminal_shell: String,
     pub web_tools: bool,
@@ -360,6 +368,7 @@ impl Default for Settings {
             set_up: false,
             right_panel: true,
             right_view: RightView::Overview,
+            center_view: CenterView::Conversation,
             terminal_shell: String::new(),
             web_tools: true,
             code_mode: false,
@@ -389,6 +398,11 @@ fn migrate(mut file: serde_json::Value) -> serde_json::Value {
             if !map.contains_key("right_view") {
                 map.insert("right_view".into(), if old == serde_json::Value::Bool(true) { "files" } else { "overview" }.into());
             }
+        }
+        if let Some(view @ ("terminal" | "timeline")) = map.get("right_view").and_then(serde_json::Value::as_str) {
+            let view = serde_json::Value::from(view);
+            map.entry("center_view").or_insert(view);
+            map.insert("right_view".into(), "overview".into());
         }
     }
     file
@@ -1092,9 +1106,9 @@ mod tests {
         assert_eq!(loaded(r#"{"right_files": false}"#).right_view, RightView::Overview);
         assert_eq!(loaded("{}").right_view, RightView::Overview);
         // (the new key wins over the old when a file somehow has both)
-        assert_eq!(loaded(r#"{"right_files": true, "right_view": "terminal"}"#).right_view, RightView::Terminal);
+        assert_eq!(loaded(r#"{"right_files": true, "right_view": "terminal"}"#).center_view, CenterView::Terminal);
         assert_eq!(loaded(r#"{"right_view": "files"}"#).right_view, RightView::Files);
-        assert_eq!(loaded(r#"{"right_view": "timeline"}"#).right_view, RightView::Timeline);
+        assert_eq!(loaded(r#"{"right_view": "timeline"}"#).center_view, CenterView::Timeline);
         // (a view that a later version has is the overview here, and the file is not refused for it)
         let later = loaded(r#"{"right_view": "something_later", "right_panel": false}"#);
         assert_eq!((later.right_view, later.right_panel), (RightView::Overview, false));
@@ -1114,9 +1128,9 @@ mod tests {
         let mut settings = Settings::default();
         assert_eq!(settings.terminal_shell, "");
         settings.terminal_shell = "git-bash".into();
-        settings.right_view = RightView::Terminal;
+        settings.center_view = CenterView::Terminal;
         settings.save(&path).unwrap();
         let back = Settings::load(&path);
-        assert_eq!((back.terminal_shell.as_str(), back.right_view), ("git-bash", RightView::Terminal));
+        assert_eq!((back.terminal_shell.as_str(), back.center_view), ("git-bash", CenterView::Terminal));
     }
 }

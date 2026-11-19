@@ -1,4 +1,4 @@
-//! The Timeline view of the panel on the right, drawn and driven: at the top, always in view, what the model and the app are doing now and where the work is heading; under it the path the session
+//! The central Timeline view, drawn and driven: at the top, always in view, what the model and the app are doing now and where the work is heading; under it the path the session
 //! took, turn by turn, in rows that scroll. What it says is decided in `timeline_rows` without a window; here the session's files are read (on another thread: a long session takes a while), the
 //! rows are measured and drawn, and the pointer and the keys are answered.
 //!
@@ -184,7 +184,7 @@ unsafe fn fill(device: HDC, area: RECT, color: u32) {
 impl App {
     /// The panel shows the Timeline view.
     pub(super) fn timeline_shown(&self) -> bool {
-        self.view_shown(RightView::Timeline) && self.steps.is_none()
+        self.panel == Panel::Chat && !self.onboarding && self.settings.center_view == CenterView::Timeline
     }
 
     /// What the window knows of the present besides the events: whether a turn is at work, what the person is asked, and how much waits in the background.
@@ -690,21 +690,9 @@ impl App {
         let fonts = &self.fonts;
         let (line, mark) = (s(ds::size::TEXT_LINE), s(MARK + 4));
         let mut used = s(ds::space::S);
-        // Now: its name, whose it is and for how long, and under them what it is.
-        if let Some(device) = device {
-            let caption = t("Now");
-            draw_text(device, caption, rect(x, y + used, width, line), fonts.strong, theme::muted(), ONE_LINE);
-            let who = now.who.word();
-            if !who.is_empty() {
-                let across = text_width(fonts.strong, caption) + s(ds::space::S);
-                draw_text(device, who, rect(x + across, y + used, width - across, line), fonts.small, theme::muted(), ONE_LINE);
-            }
-            if let Some(seconds) = now.seconds.filter(|seconds| *seconds >= path::SECONDS_SHOWN_FROM) {
-                draw_text(device, &crate::cards::duration_words(seconds), rect(x, y + used, width, line), fonts.small, theme::muted(), DT_RIGHT | ONE_LINE);
-            }
-        }
-        used += line;
-        let text_width_in = width - mark;
+        let elapsed = now.seconds.filter(|seconds| *seconds >= path::SECONDS_SHOWN_FROM).map(crate::cards::duration_words);
+        let elapsed_width = elapsed.as_deref().map_or(0, |words| text_width(fonts.small, words) + s(ds::space::M));
+        let text_width_in = (width - mark - elapsed_width).max(1);
         let one = text_height(fonts.body, "A", text_width_in).max(1);
         // (two lines at the most, cut with an ellipsis: a long command is the rest of a line, not the panel's height)
         let words = within_lines(fonts.body, &now.text, text_width_in, one * NOW_LINES);
@@ -712,6 +700,9 @@ impl App {
         if let Some(device) = device {
             icon::draw(device, who_icon(now.who), rect(x, y + used, s(MARK), one), s(ds::size::ICON), if now.who == path::Who::Idle { theme::faint() } else { mark_color(who_tone(now.who)) });
             draw_text(device, &words, rect(x + mark, y + used, text_width_in, tall), fonts.body, theme::text(), DT_WORDBREAK);
+            if let Some(elapsed) = elapsed {
+                draw_text(device, &elapsed, rect(x + width - elapsed_width, y + used, elapsed_width, one), fonts.small, theme::muted(), DT_RIGHT | ONE_LINE);
+            }
         }
         used += tall + s(ds::space::S);
         let Some(heading) = heading else { return used + s(ds::space::XS) };

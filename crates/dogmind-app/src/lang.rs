@@ -1140,9 +1140,8 @@ const JA: &[(&str, &str)] = &[
     ("{0}, changed by this session: {1} lines added, {2} removed", "{0}、このセッションで変更: {1} 行追加、{2} 行削除"),
     ("Copy the path", "パスをコピー"),
     ("Mention in the message", "メッセージで参照する"),
-    // The timeline, in the panel on the right: what is going on now, where the work is heading, and the path the session took.
+    // The central timeline: what is going on now, where the work is heading, and the path the session took.
     ("Timeline", "タイムライン"),
-    ("Now", "今"),
     ("Heading to", "向かう先"),
     ("{0} earlier", "これより前 {0} 件"),
     ("The approved plan", "承認された計画"),
@@ -1306,12 +1305,12 @@ const JA: &[(&str, &str)] = &[
     ("the model cannot read pictures", "モデルが画像を読めない"),
     ("the model gave no answer", "モデルが回答しなかった"),
     ("the server answered with an error", "サーバーがエラーを返した"),
-    // The terminal, in the panel on the right.
+    // The central terminal.
     ("Terminal", "ターミナル"),
     ("New terminal", "新しいターミナル"),
     ("Choose a shell", "シェルを選ぶ"),
     ("Close the terminal", "ターミナルを閉じる"),
-    ("Show a terminal in the panel on the right, or open one", "右のパネルにターミナルを表示します。なければ開きます"),
+    ("Switch to Terminal or open a shell", "ターミナルに切り替えます。シェルがなければ開きます"),
     ("Exited with code {0}", "終了コード {0} で終了しました"),
     ("Exited with code 0x{0}", "終了コード 0x{0} で終了しました"),
     ("{0} terminals are open: close one to open another.", "ターミナルが {0} 個開いています。新しく開くには、どれかを閉じてください。"),
