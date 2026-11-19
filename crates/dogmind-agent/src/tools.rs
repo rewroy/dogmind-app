@@ -811,8 +811,6 @@ impl Workbench {
         }
         let skill = self.skills.iter().find(|skill| skill.name.eq_ignore_ascii_case(name) && skill.for_the_model)
             .ok_or_else(|| format!("no skill is called {name}: the Skills list has the names"))?;
-        #[cfg(windows)]
-        crate::sandbox::also_readable(&skill.folder);
         crate::skills::instructions(skill)
     }
 

@@ -16,14 +16,16 @@ const MAX_LIST: usize = 1400;
 const MAX_DESCRIPTION: usize = 60;
 /// Under a project and under the home alike. Claude's and the shared form come first, then Codex's, then Dogmind's own.
 const FOLDERS: [&str; 4] = [".claude/skills", ".agents/skills", ".codex/skills", ".dogmind/skills"];
+const MODERN_WEB_GUIDANCE: &str = include_str!("../../../assets/skills/modern-web-guidance/SKILL.md");
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub folder: PathBuf,
-    /// `project` or `user`.
+    /// `project`, `user` or `builtin`.
     pub scope: &'static str,
+    pub(crate) embedded: Option<&'static str>,
     /// `disable-model-invocation: true`: only the person starts it.
     pub for_the_model: bool,
     /// `user-invocable: false`: only the model starts it.
@@ -134,16 +136,19 @@ pub fn frontmatter(text: &str) -> (Vec<(String, String)>, &str) {
 
 fn read_skill(file: &Path, scope: &'static str) -> Option<Skill> {
     let text = std::fs::read_to_string(file).ok()?;
-    let (fields, _) = frontmatter(&text);
+    parse_skill(&text, file.parent()?.to_path_buf(), scope, None)
+}
+
+fn parse_skill(text: &str, folder: PathBuf, scope: &'static str, embedded: Option<&'static str>) -> Option<Skill> {
+    let (fields, _) = frontmatter(text);
     let field = |name: &str| fields.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
     let description = field("description").filter(|description| !description.trim().is_empty())?.trim().to_string();
-    let folder = file.parent()?.to_path_buf();
     let name = field("name").map(str::trim).filter(|name| !name.is_empty()).map(str::to_string)
         .or_else(|| folder.file_name().map(|name| name.to_string_lossy().into_owned()))?;
     let yes = |name: &str, default: bool| field(name).map_or(default, |value| value.trim().eq_ignore_ascii_case("true"));
     let (lower, lower_description) = (text.to_lowercase(), description.to_lowercase());
     let other_app = OTHER_APP.iter().find(|(in_description, words, _)| if *in_description { lower_description.contains(words) } else { lower.contains(words) }).map(|(_, _, meaning)| *meaning);
-    Some(Skill { name, description, folder, scope, for_the_model: !yes("disable-model-invocation", false), for_the_person: yes("user-invocable", true), mcp_servers: servers_named(&text), other_app })
+    Some(Skill { name, description, folder, scope, embedded, for_the_model: !yes("disable-model-invocation", false), for_the_person: yes("user-invocable", true), mcp_servers: servers_named(text), other_app })
 }
 
 fn walk(folder: &Path, depth: usize, scope: &'static str, found: &mut Vec<Skill>) {
@@ -171,7 +176,7 @@ fn under(folder: &Path, place: &str) -> PathBuf {
 
 /// A project's skills, from the workspace up to its root, and then the person's, all of them, in the order that decides between two of a name: the project's before the person's, and the nearer
 /// folder's before the farther. Which of two of a name is used depends on who starts it (see `the_model_may_start` and `one_each`): a project's `pdf` that only the person may start must not hide
-/// the person's own that the model may.
+/// the person's own that the model may. Built-in skills are last in the lookup order.
 pub fn discover(workspace: &Path, home: Option<&Path>) -> Vec<Skill> {
     let mut found = Vec::new();
     let root = workspace.ancestors().find(|folder| folder.join(".git").exists()).unwrap_or(workspace);
@@ -189,6 +194,7 @@ pub fn discover(workspace: &Path, home: Option<&Path>) -> Vec<Skill> {
             walk(&under(home, place), 0, "user", &mut found);
         }
     }
+    found.extend(parse_skill(MODERN_WEB_GUIDANCE, PathBuf::new(), "builtin", Some(MODERN_WEB_GUIDANCE)));
     found
 }
 
@@ -227,7 +233,9 @@ fn for_tools_not_here(skill: &Skill, tools: &[String]) -> bool {
 /// What the model is told of them, every request: enough to know when one applies. `tools`: what this session has, by name.
 pub fn prompt_section(skills: &[Skill], tools: &[String]) -> String {
     let (mut list, mut more) = (String::new(), 0);
-    for skill in the_model_may_start(skills).into_iter().filter(|skill| !for_tools_not_here(skill, tools)) {
+    let mut chosen = the_model_may_start(skills);
+    chosen.sort_by_key(|skill| skill.embedded.is_none());
+    for skill in chosen.into_iter().filter(|skill| !for_tools_not_here(skill, tools)) {
         let about: String = skill.description.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MAX_DESCRIPTION).collect();
         let line = format!("- {}: {about}\n", skill.name);
         if list.len() + line.len() > MAX_LIST {
@@ -250,8 +258,14 @@ pub fn listing(skills: &[Skill]) -> String {
 
 /// A skill's instructions, as the model reads them: where it is, as what it names is relative to that.
 pub fn instructions(skill: &Skill) -> Result<String, String> {
+    if let Some(text) = skill.embedded {
+        let (_, body) = frontmatter(text);
+        return Ok(format!("Built-in skill `{}`. Run its commands in the current workspace.\n\n{body}", skill.name));
+    }
     let file = skill.folder.join("SKILL.md");
     let text = std::fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+    #[cfg(windows)]
+    crate::sandbox::also_readable(&skill.folder);
     let (_, body) = frontmatter(&text);
     let body: String = if body.len() > MAX_BODY {
         let mut cut = MAX_BODY;
@@ -387,6 +401,25 @@ mod tests {
     }
 
     #[test]
+    fn modern_web_guidance_is_available_and_a_project_can_override_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "modern-web-guidance";
+        let skills = discover(dir.path(), None);
+        assert!(prompt_section(&skills, &[]).contains(name));
+        let skill = skills.iter().find(|skill| skill.name == name).unwrap();
+        assert_eq!(skill.scope, "builtin");
+        assert!(skill.for_the_person && skill.needs_what_is_not_here(&[]).is_none());
+        let body = instructions(skill).unwrap();
+        assert!(body.contains("modern-web-guidance@1.0.1 search") && body.contains("DISABLE_TELEMETRY"));
+        assert!(without(skills, &[name.into()]).is_empty());
+
+        write(&dir.path().join(".dogmind/skills/modern-web-guidance"), "---\ndescription: project guidance\n---\nProject instructions.");
+        let skills = discover(dir.path(), None);
+        assert_eq!(the_model_may_start(&skills)[0].scope, "project");
+        assert_eq!(one_each(skills)[0].scope, "project");
+    }
+
+    #[test]
     fn who_may_start_a_skill_is_respected() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join(".claude/skills/manual"), "---\nname: manual\ndescription: d\ndisable-model-invocation: true\n---\nb");
@@ -413,16 +446,16 @@ mod tests {
         let skills = discover(&work, Some(&home));
         let scope_of = |chosen: &[&Skill], name: &str| chosen.iter().find(|skill| skill.name == name).unwrap().scope;
         let model = the_model_may_start(&skills);
-        assert_eq!(model.len(), 3, "{model:?}");
+        assert_eq!(model.len(), 4, "{model:?}");
         assert_eq!((scope_of(&model, "pdf"), scope_of(&model, "csv"), scope_of(&model, "both")), ("user", "project", "project"));
         let section = prompt_section(&skills, &[]);
         assert!(section.contains("- pdf: from the home, for the model") && section.contains("- csv: from the project, for the model") && section.contains("- both: from the project"), "{section}");
         assert!(!section.contains("from the project, for the person") && !section.contains("from the home, for the person") && !section.contains("from the home\n"), "{section}");
         let listed = listing(&skills);
-        assert_eq!(listed.lines().count(), 3, "{listed}");
+        assert_eq!(listed.lines().count(), 4, "{listed}");
         let person = one_each(skills);
         let scope_of = |name: &str| person.iter().find(|skill| skill.name == name).unwrap().scope;
-        assert_eq!(person.len(), 3);
+        assert_eq!(person.len(), 4);
         assert_eq!((scope_of("pdf"), scope_of("csv"), scope_of("both")), ("project", "user", "project"));
         assert!(person.iter().all(|skill| skill.for_the_person));
     }
@@ -432,8 +465,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join(".claude/skills/hidden"), "---\nname: Hidden\ndescription: d\nuser-invocable: false\n---\nb");
         let one = one_each(discover(dir.path(), None));
-        assert_eq!(one.len(), 1);
-        assert!(!one[0].for_the_person);
+        let mut hidden = one.iter().filter(|skill| skill.name == "Hidden");
+        assert!(!hidden.next().unwrap().for_the_person);
+        assert!(hidden.next().is_none());
     }
 
     #[test]
@@ -478,12 +512,12 @@ mod tests {
         write(&dir.path().join(".claude/skills/pdf"), "---\nname: PDF\ndescription: d\n---\nb");
         write(&dir.path().join(".claude/skills/xlsx"), "---\nname: xlsx\ndescription: d\n---\nb");
         let left = without(discover(dir.path(), None), &["pdf".to_string()]);
-        assert_eq!(left.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(), ["xlsx"]);
+        assert_eq!(left.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(), ["xlsx", "modern-web-guidance"]);
         // (both of a name in the project and in the home go: it is one skill to them)
         let home = dir.path().join("me");
         write(&home.join(".claude/skills/pdf"), "---\nname: pdf\ndescription: d\n---\nb");
         assert!(without(discover(dir.path(), Some(&home)), &["pdf".to_string()]).iter().all(|skill| !skill.name.eq_ignore_ascii_case("pdf")));
-        assert_eq!(without(discover(dir.path(), None), &[]).len(), 2);
+        assert_eq!(without(discover(dir.path(), None), &[]).len(), 3);
     }
 
     #[test]

@@ -2011,8 +2011,6 @@ impl Agent {
         let rest = text.strip_prefix('/')?;
         let (name, arguments) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(name, arguments)| (name, arguments.trim()));
         let skill = self.bench.skills.iter().find(|skill| skill.name.eq_ignore_ascii_case(name) && skill.for_the_person)?;
-        #[cfg(windows)]
-        crate::sandbox::also_readable(&skill.folder);
         let body = skills::instructions(skill).ok()?;
         Some(format!("## The Skill The User Asked For\n{}", skills::with_arguments(&body, arguments)))
     }
@@ -4046,7 +4044,9 @@ mod tests {
         assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "so are the tools");
         assert_eq!(second[3]["reasoning_content"], "thinking");
         assert!(bodies[0].get("tool_choice").is_none() && bodies[0].get("max_tokens").is_none());
-        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 17, "Dogmind's ten and the app's seven");
+        let tools = bodies[0]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 18, "the usual seventeen and the built-in skill tool");
+        assert!(tools.iter().any(|tool| tool["function"]["name"] == "skill"));
     }
 
     /// What the person typed goes to the model as it was typed, with nothing around it, and the app's facts (the time, the language, at the first message the workspace)
