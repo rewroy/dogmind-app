@@ -2308,7 +2308,9 @@ impl Agent {
             if drafting && stopped_by_the_app && matches!(result, Err(LlmError::Cancelled)) {
                 // (what it had come to when it was stopped, and what the stop cost: the tokens that are thrown away)
                 let run = watch.as_ref().map_or(0, DraftWatch::stats);
-                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run}));
+                // (DOGMIND_DRAFT_PLAIN=1, for the comparison: the request that writes after the stop has its thinking closed, where the server can)
+                let plain = std::env::var("DOGMIND_DRAFT_PLAIN").is_ok_and(|value| value == "1") && provider.close_thinking_once();
+                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "next_without_thinking": plain}));
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
                 self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped, watch.as_ref().map(DraftWatch::began_at))));

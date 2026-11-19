@@ -494,6 +494,11 @@ pub trait Provider: Send + Sync {
     fn warm(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
         self.stream(request, cancel, on)
     }
+    /// The next request is to be answered with its thinking closed, where the server can be asked so (Straydog's `straydog.reasoning`):
+    /// whether it will be. For the comparison of what follows a stopped draft (`DOGMIND_DRAFT_PLAIN`), not a setting of anyone's.
+    fn close_thinking_once(&self) -> bool {
+        false
+    }
     /// Whether a call it was still writing can join the conversation as far as it had come. A provider with blocks of its own to send back cannot make those up.
     fn keeps_cut_writes(&self) -> bool {
         false
@@ -521,6 +526,14 @@ pub enum Restart {
 impl Provider for Client {
     fn stream(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
         self.post(&self.body_for(request), request.request_id, cancel, on)
+    }
+
+    /// Straydog's: its body's `straydog.reasoning`, which a server that cannot close the thinking ignores.
+    fn close_thinking_once(&self) -> bool {
+        if self.replay_reasoning {
+            self.close_next.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.replay_reasoning
     }
 
     /// Straydog's API takes them, and its template shows them inside the tool's response. The services' chat completions take text there.
@@ -630,6 +643,8 @@ pub struct Client {
     /// What `/props` said of pictures when asked again, and when ([`Client::reads_pictures`]): a server that read none when the session
     /// connected may read them after a restart, its vision encoder put beside the model.
     pub vision_asked: std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Option<bool>)>>>,
+    /// The next request's thinking is to be closed ([`Provider::close_thinking_once`]).
+    pub close_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How long an answer of `/props` that the model reads no pictures holds before it is asked again ([`Client::reads_pictures`]).
@@ -638,7 +653,7 @@ const VISION_ASKED_AGAIN: Duration = Duration::from_secs(10);
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
         Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None,
-                    vision_asked: Default::default() })
+                    vision_asked: Default::default(), close_next: Default::default() })
     }
 
     /// The request a model's turn is sent as, for this server.
@@ -667,6 +682,12 @@ impl Client {
         // (a server that said it can: the calls come as the model writes them, beside the calls themselves, which come whole at the end)
         if self.tool_writing && request.tools.is_some() {
             body["straydog"] = json!({"tool_writing": true});
+        }
+        if self.close_next.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if !body.get("straydog").is_some_and(Value::is_object) {
+                body["straydog"] = json!({});
+            }
+            body["straydog"]["reasoning"] = json!(false);
         }
         body
     }
@@ -1049,6 +1070,23 @@ mod tests {
         assert!(!answering_slots(r#"[{"id": 0}]"#).idle(), "a slot that does not say");
         assert!(!answering_slots(r#"{"error": "no"}"#).idle(), "an answer it cannot read");
         assert!(!Client::new("http://127.0.0.1:1/v1", None).unwrap().idle(), "no answer at all");
+    }
+
+    /// Asked once to close the thinking, Straydog's next request has `straydog.reasoning` false, beside what else it asks, and the one after it does not.
+    /// A service's never has the field.
+    #[test]
+    fn a_thinking_closed_once_is_the_next_requests_alone() {
+        let tools = json!([{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {}}}}]);
+        let messages = [Message::text("user", "write it")];
+        let request = Request { model: "m", messages: &messages, tools: Some(&tools), effort: None, images: None, japanese_letters: false, request_id: None };
+        let mut client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        client.tool_writing = true;
+        assert!(client.close_thinking_once());
+        assert_eq!(client.body_for(&request)["straydog"], json!({"tool_writing": true, "reasoning": false}));
+        assert_eq!(client.body_for(&request)["straydog"], json!({"tool_writing": true}));
+        client.replay_reasoning = false;
+        assert!(!client.close_thinking_once());
+        assert!(client.body_for(&request)["straydog"].get("reasoning").is_none());
     }
 
     #[test]
