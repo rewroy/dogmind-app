@@ -17,7 +17,7 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows_numerics::Vector2;
 use windows_sys::Win32::Foundation::RECT;
-use windows_sys::Win32::Graphics::Gdi::{GetObjectW, DT_BOTTOM, DT_CENTER, DT_END_ELLIPSIS, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HDC, HFONT, LOGFONTW};
+use windows_sys::Win32::Graphics::Gdi::{GetObjectW, DT_BOTTOM, DT_CENTER, DT_END_ELLIPSIS, DT_PATH_ELLIPSIS, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HDC, HFONT, LOGFONTW};
 
 /// A face as DirectWrite names it: its family, weight and size in pixels (the target is at 96 dots an inch, so a DIP is a pixel).
 #[derive(Clone, Debug, PartialEq)]
@@ -213,10 +213,39 @@ unsafe fn layout(engine: &mut Engine, text: &str, font: HFONT, width: f32, heigh
     Ok(layout)
 }
 
+/// A path too wide for its line, as GDI's `DT_PATH_ELLIPSIS` cuts it (and paint's `draw_mixed`): its last name stays whole, and what comes
+/// before it gives way from its end to "..." (`fits`: whether a text fits the line). The text as it is where it fits.
+pub fn cut_path(text: &str, fits: &mut dyn FnMut(&str) -> bool) -> String {
+    if fits(text) {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let tail = chars.iter().rposition(|&c| c == '\\' || c == '/').unwrap_or(0);
+    let mut head = tail;
+    loop {
+        let tried: String = chars[..head].iter().copied().chain("...".chars()).chain(chars[tail..].iter().copied()).collect();
+        if head == 0 || fits(&tried) {
+            return tried;
+        }
+        head -= 1;
+    }
+}
+
 /// `text` in `area`, as GDI's `DrawTextW` would put it with these flags, in colour where the font has colour (emoji). False: not drawn.
 pub unsafe fn text(device: HDC, text: &str, area: RECT, font: HFONT, color: u32, flags: u32) -> bool {
     with_engine(|engine| {
         let (width, height) = ((area.right - area.left) as f32, (area.bottom - area.top) as f32);
+        // (a path on one line is cut in its middle, as DrawTextW does: DirectWrite trims only at an end)
+        let cut;
+        let text = if flags & DT_PATH_ELLIPSIS != 0 && flags & DT_SINGLELINE != 0 {
+            cut = cut_path(text, &mut |tried| {
+                let mut metrics = DWRITE_TEXT_METRICS::default();
+                layout(engine, tried, font, 1.0e6, height, DT_SINGLELINE).and_then(|laid| laid.GetMetrics(&mut metrics)).map_or(true, |()| metrics.width <= width)
+            });
+            cut.as_str()
+        } else {
+            text
+        };
         let laid = layout(engine, text, font, width, height, flags)?;
         engine.draw(device, area, |target, _| {
             let brush = target.CreateSolidColorBrush(&self::color(color), None)?;
@@ -642,6 +671,18 @@ pub unsafe fn terminal(device: HDC, area: RECT, font: &TermFont, scene: &TermSce
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A path too long for its line keeps its last name and its beginning, "..." between, as DrawTextW's DT_PATH_ELLIPSIS does; one that
+    /// fits stays as it is.
+    #[test]
+    fn a_path_too_long_is_cut_in_its_middle_and_keeps_its_last_name() {
+        let path = r"C:\Users\someone\projects\client\my-website";
+        let within = |most: usize| move |tried: &str| tried.chars().count() <= most;
+        assert_eq!(cut_path(path, &mut within(100)), path);
+        assert_eq!(cut_path(path, &mut within(26)), r"C:\Users\som...\my-website");
+        // (no room even for the name: it stays whole, the rest gone)
+        assert_eq!(cut_path(path, &mut within(5)), r"...\my-website");
+    }
 
     /// A terminal's face makes a character a whole number of pixels wide, at each scale a screen has, and a line of them as wide as its cells.
     #[test]

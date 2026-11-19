@@ -247,6 +247,8 @@ const ID_PREVIEW_CLOSE: isize = 9049;
 const ID_STEPS_CLOSE: isize = 9072;
 const ID_PROVIDER_UP: isize = 9050;
 const ID_FOLDER_CHIP: isize = 9052;
+/// Under the dog of a session not begun yet: the button that switches the session's workspace.
+const ID_START_FOLDER: isize = 9053;
 const ID_TOGGLE_DISPLAY: isize = 9054;
 const ID_ATTACH: isize = 9055;
 const ID_ATTACHED: isize = 9060; // ..+ attach::MOST_IMAGES
@@ -1985,6 +1987,8 @@ struct App {
     toggle_language: HWND,
     toggle_display: HWND,
     folder_chip: HWND,
+    /// Under the dog of a session not begun yet, beside the workspace's name: what switches it, where it is seen first.
+    start_folder: HWND,
     /// How many lines the composer last had: the card grows with them.
     composer_lines: i32,
     provider_up: HWND,
@@ -6003,7 +6007,8 @@ impl App {
                 self.on_menu(M_SAFE);
                 self.say(if self.settings.safe_commands { t("Safe commands run without asking.") } else { t("Every command asks.") });
             }
-            "workspace" => self.folder_menu(),
+            // (beside the button under the dog where a session not begun shows it, otherwise the chip under the composer)
+            "workspace" => self.folder_menu(if IsWindowVisible(self.start_folder) != 0 { self.start_folder } else { self.folder_chip }),
             "providers" => self.set_panel(Panel::Providers),
             "models" => self.set_panel(Panel::Models),
             "settings" => self.set_panel(Panel::General),
@@ -6157,6 +6162,9 @@ impl App {
         let toggles = chat && !bare && (self.preview_file.is_some() || self.steps.is_some() || room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS));
         show(self.right_toggle, toggles);
         show(self.folder_chip, chat && !bare);
+        if !chat {
+            show(self.start_folder, false);
+        }
 
         // The column the content keeps to, however wide the window.
         let main_left = sidebar;
@@ -6224,7 +6232,11 @@ impl App {
             let (bubble_height, dog_gap, mark_width) = (s(72), s(3), s(150));
             let mark_height = title_height(mark_width);
             let dog_bottom = dog * 91 / 100;
-            let greeting_height = bubble_height + dog_gap + dog_bottom + mark_height + s(ds::space::XL);
+            // Under the name, the workspace the session will work in and the button that switches it: the chip under the composer says the
+            // same, but a session not begun yet is where the folder is chosen, and the eye is on the dog there.
+            let folder_row = s(ds::space::L) + s(ds::size::CONTROL) + s(ds::space::XS) + s(ds::size::TEXT_LINE);
+            let greeting_height = bubble_height + dog_gap + dog_bottom + mark_height + folder_row + s(ds::space::XL);
+            let mut greeting_folder = false;
             let card_top = foot;
             let status_top = card_top + card_height + s(ds::space::XS);
             let above = card_top - waiting_height;
@@ -6240,7 +6252,26 @@ impl App {
                 shapes.push(Shape::Text { area, text: title.into(), font: FontKind::Greeting, color: theme::text(), flags: DT_CENTER | ONE_LINE });
                 shapes.push(Shape::Logo { x: dog_x, y: dog_top, size: dog });
                 shapes.push(Shape::TitleMark { x: left + (column - mark_width) / 2, y: dog_top + dog_bottom, width: mark_width });
+                if !bare {
+                    let row_top = dog_top + dog_bottom + mark_height + s(ds::space::L);
+                    let row = s(ds::size::CONTROL);
+                    let name = self.workspace.file_name().map_or_else(|| self.workspace.display().to_string(), |name| name.to_string_lossy().into_owned());
+                    set_text_if_changed(self.start_folder, t("Switch workspace"));
+                    let button = text_width(self.fonts.strong, &get_text(self.start_folder)) + s(ds::size::BUTTON_PADDING);
+                    let icon = s(ds::size::ICON) + s(ds::space::XS);
+                    let name_width = text_width(self.fonts.strong, &name).min((column - button - icon - s(ds::space::M)).max(s(60)));
+                    let across = icon + name_width + s(ds::space::M) + button;
+                    let x = left + (column - across) / 2;
+                    shapes.push(Shape::Icon { name: "folder", area: rect(x, row_top, s(ds::size::ICON), row), size: s(ds::size::ICON), color: theme::muted() });
+                    shapes.push(Shape::Text { area: rect(x + icon, row_top, name_width, row), text: name, font: FontKind::Strong, color: theme::text(), flags: ONE_LINE });
+                    place(self.start_folder, x + icon + name_width + s(ds::space::M), row_top, button, row);
+                    // (the whole path under it, for two folders of one name: cut in its middle, so that its last folders stay)
+                    shapes.push(Shape::Text { area: rect(left, row_top + row + s(ds::space::XS), column, s(ds::size::TEXT_LINE)), text: self.workspace.display().to_string(),
+                                              font: FontKind::Small, color: theme::faint(), flags: DT_CENTER | (ONE_LINE & !DT_END_ELLIPSIS) | DT_PATH_ELLIPSIS });
+                    greeting_folder = true;
+                }
             }
+            show(self.start_folder, greeting_folder);
             shapes.push(Shape::Round { area: rect(left, card_top, column, card_height), radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
             if strip > 0 {
                 let gap = s(ds::space::S);
@@ -9714,8 +9745,9 @@ impl App {
         }
     }
 
-    /// Where this session works, as a list: the folders used before and a way to any other. Beside the chip, on the side with room.
-    unsafe fn folder_menu(&mut self) {
+    /// Where this session works, as a list: the folders used before and a way to any other. Beside `anchor` (the chip under the composer, or
+    /// the button under the dog), on the side with room.
+    unsafe fn folder_menu(&mut self, anchor: HWND) {
         let mut items: Vec<(usize, String, bool)> = Vec::new();
         for (at, folder) in self.settings.workspaces.iter().filter(|folder| folder.is_dir()).take(FOLDERS_SHOWN).enumerate() {
             let name = folder.file_name().map_or_else(|| folder.display().to_string(), |name| name.to_string_lossy().into_owned());
@@ -9726,10 +9758,10 @@ impl App {
         }
         items.push((M_FOLDER_CHOOSE, t("Choose a folder...").to_string(), false));
         if self.has_messages {
-            self.popup(self.folder_chip, &items);
+            self.popup(anchor, &items);
         } else {
             let mut area: RECT = std::mem::zeroed();
-            GetWindowRect(self.folder_chip, &mut area);
+            GetWindowRect(anchor, &mut area);
             self.popup_at(area.left, area.bottom + 2, TPM_TOPALIGN, &items);
         }
     }
@@ -15751,7 +15783,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     let names = DISPLAY_LANGUAGES.map(|(_, name)| name);
                     app.choices(app.toggle_display, M_DISPLAY, &names, chosen);
                 }
-                ID_FOLDER_CHIP => app.folder_menu(),
+                ID_FOLDER_CHIP => app.folder_menu(app.folder_chip),
+                ID_START_FOLDER => app.folder_menu(app.start_folder),
                 ID_PROVIDER_UP => app.move_provider(-1),
                 ID_PROVIDER_DOWN => app.move_provider(1),
                 ID_TOGGLE_COMPACT => app.on_menu(M_COMPACT_CHOICE + usize::from(app.settings.compact_tools)),
@@ -16916,6 +16949,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             toggle_language: make_button(pane, ID_TOGGLE_LANGUAGE, "", ButtonKind::Select, theme::background()),
             toggle_display: make_button(window, ID_TOGGLE_DISPLAY, "", ButtonKind::Select, theme::background()),
             folder_chip: make_button(window, ID_FOLDER_CHIP, "", ButtonKind::Chip, theme::background()),
+            start_folder: make_button(window, ID_START_FOLDER, t("Switch workspace"), ButtonKind::Secondary, theme::background()),
             composer_lines: 1,
             provider_up: make_button(window, ID_PROVIDER_UP, "chevron-up", ButtonKind::Icon, theme::background()),
             provider_down: make_button(window, ID_PROVIDER_DOWN, "chevron-down", ButtonKind::Icon, theme::background()),
