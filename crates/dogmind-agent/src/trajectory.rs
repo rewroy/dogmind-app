@@ -46,6 +46,11 @@ pub fn now() -> String {
     stamp(Local::now())
 }
 
+/// A time as a file gives it (RFC 3339: an engine's log says its times in UTC), in this PC's zone as [`now`] writes it. None: not such a time.
+pub fn local(time: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(time).ok().map(|at| stamp(at.with_timezone(&Local)))
+}
+
 /// A short hash of a file's bytes, to tell whether a file has come back to a state it had: twelve hex digits, which say nothing of what it holds.
 pub fn short_hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().take(6).map(|byte| format!("{byte:02x}")).collect()

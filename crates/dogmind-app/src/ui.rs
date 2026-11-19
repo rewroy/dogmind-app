@@ -1220,9 +1220,10 @@ fn next_greeting(last: usize, seed: u64) -> usize {
     (last + 1 + (seed % (GREETINGS.len() as u64 - 1)) as usize) % GREETINGS.len()
 }
 
-/// The line the engine or a server said of a failure, under the app's sentence in `text`, goes to the report (`/report`). Not while the app is taking itself off this PC: nothing is written then.
+/// The line the engine or a server said of a failure, under the app's sentence in `text` or in it ([`llm::server_said`]), goes to the report
+/// (`/report`). Not while the app is taking itself off this PC: nothing is written then.
 fn keep_server_line(folder: &Path, leaving: &Leaving, text: &str) {
-    if let (Leaving::No, Some(line)) = (leaving, llm::line_under(text)) {
+    if let (Leaving::No, Some(line)) = (leaving, llm::server_said(text)) {
         crate::crash::note_engine_error(folder, line);
     }
 }

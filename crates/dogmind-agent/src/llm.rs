@@ -144,6 +144,13 @@ pub fn line_under(text: &str) -> Option<&str> {
     split(text).1
 }
 
+/// What the server said of a failure in a message: its line under one of [`WORDS`], or its words after [`REFUSED`] or [`SERVER_ERROR`], which
+/// carry them in the sentence ([`NO_ANSWER`] carries an address, never kept). A Straydog's GPU wait timeout is a refusal (it says the request
+/// can be sent again), and so was never kept for a report.
+pub fn server_said(text: &str) -> Option<&str> {
+    line_under(text).or_else(|| [REFUSED, SERVER_ERROR].iter().find_map(|opening| text.strip_prefix(opening)).map(str::trim).filter(|said| !said.is_empty()))
+}
+
 impl LlmError {
     /// The same error with a secret that is known (the key this request was sent with) hidden in its words: a server may say back what it was sent. A word too short to be told from the
     /// rest of the words is left.

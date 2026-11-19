@@ -109,13 +109,50 @@ pub fn note_engine_error(data: &Path, line: &str) {
     let _ = std::fs::write(data.join(ENGINE_ERROR_FILE), format!("{}\n{line}\n", dogmind_agent::trajectory::now()));
 }
 
-/// The report's section for the last engine error: when, and the line, or that none was told.
-fn last_engine_error(data: &Path) -> String {
+/// A log's line without the colours a terminal would show (`ESC [ ... m`).
+fn plain(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // (to the letter that ends the sequence)
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The engine's current start, from the last "Straydog starting:" line of its `log`: its time, as the log says it, and what started, as the
+/// line names it ("CUDA 0.1.14 (ab49135)"). None: no start in the log.
+fn engine_start(log: &str) -> Option<(String, String)> {
+    let line = log.lines().rev().map(plain).find(|line| line.contains("Straydog starting: "))?;
+    let time = line.split_whitespace().next()?.to_string();
+    let what = line.split_once("Straydog starting: ")?.1.split(", ").next()?.trim().to_string();
+    Some((time, what))
+}
+
+/// The report's section for the last engine error: when, and the line, or that none was told. An error from before the engine's current start
+/// (the last "Straydog starting:" of its `log`) says so, with that start's time and build: kept until another is told, it may be days old and of
+/// another version (an RTX 4060 PC's report from 0.1.14 showed 0.1.12's out-of-memory of the day before as its last error).
+fn last_engine_error(data: &Path, log: &str) -> String {
     let text = std::fs::read_to_string(data.join(ENGINE_ERROR_FILE)).unwrap_or_default();
     let mut lines = text.lines();
-    match (lines.next(), lines.next().and_then(dogmind_agent::llm::line_of)) {
-        (Some(time), Some(line)) => format!("{time}  {line}"),
-        _ => "(none recorded)".to_string(),
+    let (Some(time), Some(line)) = (lines.next(), lines.next().and_then(dogmind_agent::llm::line_of)) else {
+        return "(none recorded)".to_string();
+    };
+    let millis = dogmind_agent::timeline::millis;
+    match engine_start(log).filter(|(start, _)| matches!((millis(time), millis(start)), (Some(told), Some(started)) if told < started)) {
+        Some((start, what)) => {
+            let start = dogmind_agent::trajectory::local(&start).unwrap_or(start);
+            format!("{time}  {line}\n(before the engine's current start at {start}, Straydog {what})")
+        }
+        None => format!("{time}  {line}"),
     }
 }
 
@@ -155,8 +192,8 @@ pub fn write_report(data: &Path, settings: &Settings, about_this_pc: &str) -> Re
     for crash in crashes.iter().rev().take(3).rev() {
         text.push_str(&format!("\n--- {} ---\n{}\n", crash.file_name().map_or(String::new(), |name| name.to_string_lossy().into_owned()), std::fs::read_to_string(crash).unwrap_or_default()));
     }
-    text.push_str(&format!("\n--- the last engine error ---\n{}\n", last_engine_error(data)));
     let log = std::fs::read(crate::engine::log_path(data)).map_or(String::new(), |bytes| String::from_utf8_lossy(&bytes).into_owned());
+    text.push_str(&format!("\n--- the last engine error ---\n{}\n", last_engine_error(data, &log)));
     text.push_str(&format!("\n--- the last of the engine's log ---\n{}\n", last_lines(&log, MOST_LOG_LINES)));
     let text = without_the_person(&text, std::env::var("USERPROFILE").ok().as_deref(), std::env::var("USERNAME").ok().as_deref());
     let path = data.join("report.txt");
@@ -241,6 +278,58 @@ mod tests {
                 assert!(said.contains("%USERPROFILE%\\models\\x.gguf") && !said.contains(&home), "{said}");
             }
         }
+    }
+
+    /// A kept error from before the engine's current start says so, with that start's time and build; one from after it does not. The start is the
+    /// log's last "Straydog starting:" line, with or without a terminal's colours.
+    #[test]
+    fn an_engine_error_from_before_the_engines_current_start_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = |text: &str| -> String {
+            let (_, after) = text.split_once("\n--- the last engine error ---\n").expect("the section is there");
+            after.split_once("\n--- the last of the engine's log ---").expect("and before the engine's log").0.trim_end().to_string()
+        };
+        let report = || std::fs::read_to_string(write_report(dir.path(), &Settings::default(), "RTX 4060 (8 GB)").unwrap()).unwrap();
+        let oom = "Straydog reported a fatal inference error: The engine could not reset after this request failed: Straydog GPU: out of memory (kernels.cpp:4802, code 2). Restart it before retrying.; restart the server";
+        std::fs::write(dir.path().join(ENGINE_ERROR_FILE), format!("2026-11-18T18:12:38.837+09:00\n{oom}\n")).unwrap();
+        let log = [
+            "2026-11-18T09:12:45.259438Z  INFO Straydog starting: CUDA 0.1.12 (ec78110), Qwen3.8-Flash-Next / Unsloth / UD-IQ1_M from x, GPU 0",
+            "2026-11-18T09:12:46.229617Z  INFO Straydog listening on http://127.0.0.1:18480",
+            "\u{1b}[2m2026-11-19T09:08:05.447697Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m Straydog starting: CUDA 0.1.14 (ab49135), Qwen3.8-Flash-Next / Unsloth / UD-IQ1_M from x, GPU 0",
+            "2026-11-19T09:08:10.105452Z  INFO Straydog ready: UD-IQ1_M",
+        ].join("\n");
+        std::fs::write(crate::engine::log_path(dir.path()), log).unwrap();
+        let said = section(&report());
+        let (first, note) = said.split_once('\n').expect("the line, then the note");
+        assert!(first.starts_with("2026-11-18T18:12:38.837+09:00  ") && first.ends_with("restart the server"), "{first}");
+        let start = dogmind_agent::trajectory::local("2026-11-19T09:08:05.447697Z").unwrap();
+        assert_eq!(note, format!("(before the engine's current start at {start}, Straydog CUDA 0.1.14 (ab49135))"));
+        // (an error after the start is this run's: nothing more is said)
+        std::fs::write(dir.path().join(ENGINE_ERROR_FILE), format!("2026-11-19T18:30:00.000+09:00\n{oom}\n")).unwrap();
+        assert!(!section(&report()).contains("before the engine's current start"), "{}", section(&report()));
+        // (no start in the log: none said)
+        std::fs::write(crate::engine::log_path(dir.path()), "2026-11-19T09:08:10.105452Z  INFO Straydog ready: UD-IQ1_M\n").unwrap();
+        std::fs::write(dir.path().join(ENGINE_ERROR_FILE), format!("2026-11-18T18:12:38.837+09:00\n{oom}\n")).unwrap();
+        assert!(!section(&report()).contains("before the engine's current start"));
+    }
+
+    /// A GPU wait timeout comes as a refusal, the server's words in the sentence and not under it: kept for the report all the same. None
+    /// of the five an RTX 4060 PC had in a day was.
+    #[test]
+    fn a_gpu_wait_timeout_refused_is_kept_for_the_report() {
+        use dogmind_agent::llm;
+        let dir = tempfile::tempdir().unwrap();
+        let wait = "The GPU wait exceeded its limit. The memory budget was lowered and this request was stopped. You can retry with the next request.";
+        let told = format!("{}{wait}", llm::REFUSED);
+        assert_eq!(llm::line_under(&told), None, "not a line under a sentence");
+        assert_eq!(llm::server_said(&told), Some(wait));
+        assert_eq!(llm::server_said(&format!("{}an error", llm::SERVER_ERROR)), Some("an error"));
+        assert_eq!(llm::server_said(&llm::with_line(llm::SERVER_GONE, "GPU fault")), Some("GPU fault"));
+        assert_eq!(llm::server_said(&format!("{}http://192.168.7.7:8080", llm::NO_ANSWER)), None, "an address is not what a server said");
+        assert_eq!(llm::server_said(llm::REFUSED), None, "nothing after it: nothing");
+        note_engine_error(dir.path(), llm::server_said(&told).unwrap());
+        let report = std::fs::read_to_string(write_report(dir.path(), &Settings::default(), "RTX 4060 (8 GB)").unwrap()).unwrap();
+        assert!(report.contains(&format!("  {wait}\n")), "{report}");
     }
 
     #[test]
