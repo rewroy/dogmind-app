@@ -1939,7 +1939,7 @@ pub fn run_live_restricted(line: &str, cwd: &Path, workspace: &Path, network: bo
 }
 
 /// As `run_live`, as the person, outside the sandbox: what they asked to have done outside the workspace, once they have allowed it (the gate asks with `REASON_OUTSIDE_SANDBOX`,
-/// which no rule, "always" or mode answers), as Codex runs a command it is let escalate. It reads and writes what the person can and has the network. It is still a job that ends
+/// which no rule, "always" or mode answers): what the person asked for there could not be done at all in the sandbox. It reads and writes what the person can and has the network. It is still a job that ends
 /// with the app, on a desktop nobody sees, under the same time and memory limits.
 pub fn run_live_as_person(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, cancel: &AtomicBool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
     run_limited(line, cwd, workspace, true, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, Token::Person)
