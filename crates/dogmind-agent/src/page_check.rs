@@ -55,6 +55,12 @@ fn shot_line(program: &Path, flags: &str, window: (u32, u32), wait: u64, profile
 const WAIT_MS: u64 = 1500;
 const MOST_WAIT_MS: u64 = 10_000;
 
+/// What is said of a longer wait than [`MOST_WAIT_MS`] asked for: that it was cut. A model that is not told asks for more and more of it, as one did up to 30000 in eight checks
+/// of a game that stood still.
+fn wait_cut(asked: Option<u64>) -> String {
+    asked.filter(|asked| *asked > MOST_WAIT_MS).map(|asked| format!("wait_ms is at most {MOST_WAIT_MS}: the {asked} asked for was cut to it.\n")).unwrap_or_default()
+}
+
 /// A size to look at a page at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct View {
@@ -1103,7 +1109,9 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     // (steps take time of their own, as their waits count in it)
     let (parts, more_parts) = steps.map_or((Vec::new(), 0), step_parts);
     // (each load after the first costs time of its own: a page's own, as a plain page is given)
-    let wait = arguments.get("wait_ms").and_then(Value::as_u64).unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS) + parts.len().saturating_sub(1) as u64 * WAIT_MS;
+    let asked_wait = arguments.get("wait_ms").and_then(Value::as_u64);
+    let wait = asked_wait.unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS) + parts.len().saturating_sub(1) as u64 * WAIT_MS;
+    let wait_cut = wait_cut(asked_wait);
     let cwd = page.as_deref().and_then(Path::parent).unwrap_or(workspace).to_path_buf();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp = crate::sandbox::temp_folder();
@@ -1205,7 +1213,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
                 (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
                 (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
                 (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
-                (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms.\n"),
+                (false, None, None) if asked_wait.unwrap_or(0) >= MOST_WAIT_MS => format!("Steps: they had not ended when the page was read, after {wait} ms of its time, the longest a check gives: shorten the waits in them, or check a part of them at a time.\n"),
+                (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms (at most {MOST_WAIT_MS}).\n"),
             };
             let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
             steps_said.push_str(&more_note);
@@ -1230,7 +1239,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     // (the words that the page the steps left said at their end are not of the page that is shown)
     let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
     let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen };
-    let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
+    let said = format!("{}{wait_cut}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
     }
@@ -1776,6 +1785,13 @@ mod tests {
         assert_eq!(extension_flags(None), " --disable-extensions");
         assert!(!FLAGS.split(' ').any(|flag| flag == "--disable-extensions"), "which would keep the frames' extension out");
         assert!(FRAMES.starts_with("<script>(() =>") && FRAMES.ends_with("})();</script>"));
+    }
+
+    #[test]
+    fn a_longer_wait_than_a_check_gives_is_said_to_be_cut() {
+        assert_eq!(wait_cut(Some(30_000)), "wait_ms is at most 10000: the 30000 asked for was cut to it.\n");
+        assert_eq!(wait_cut(Some(MOST_WAIT_MS)), "");
+        assert_eq!(wait_cut(None), "");
     }
 
     /// The frames' script goes before any of the page's own, and never before its doctype (quirks mode): after `<head>`, else `<html>`, else the doctype.
