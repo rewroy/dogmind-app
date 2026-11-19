@@ -92,6 +92,7 @@ pub fn schemas() -> Value {
             "timeout_seconds": {"type": "integer", "description": "How long to wait for it, default 180. Past that it goes on in the background."},
             "purpose": {"type": "string", "description": "A few words on why, for the user when they are asked."},
             "network": {"type": "boolean", "description": "Needs the network, and is not curl, a package install or remote git, which get it anyway. Asks the user."},
+            "outside_sandbox": {"type": "boolean", "description": "Run as the user, outside the sandbox: for what the user asked to read or change outside the workspace. Asks the user each time."},
             "background": {"type": "boolean", "description": "Start it and go on, for what takes minutes. Gives an id for command_status; its end wakes you."},
             "wake_on": {"type": "string", "description": "With background: a regex. The first line it prints that matches wakes you, once. A server: \"Listening on\"."}
         }), &["command"]),
@@ -738,6 +739,10 @@ impl Workbench {
             "execute_command" => {
                 // A command whose folder is the scratch folder runs there as it would in a workspace: that folder is the only one it may write in.
                 let place = self.scratch_for(arguments).unwrap_or_else(|| workspace.to_path_buf());
+                // (the person has asked for no changes: outside the sandbox nothing would keep a command to the scratch folder)
+                if self.scratch.is_some() && crate::safety::outside_sandbox(arguments) {
+                    return Err("not run: the user has asked for no changes to the files, and outside the sandbox a command could change anything. Nothing was started.".to_string());
+                }
                 if arguments.get("background").and_then(Value::as_bool) == Some(true) {
                     self.start_job(arguments, &place)
                 } else if arguments.get("wake_on").and_then(Value::as_str).is_some_and(|pattern| !pattern.trim().is_empty()) {
@@ -2347,9 +2352,7 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     if lower_err.contains("config file") || (denied && in_git) || (in_git && lower_err.contains("permission denied")) {
         notes.push_str("note: the sandbox refuses changes to `.git\\config` and `.git\\hooks`, as what is written there would run outside it the next time git is used. Tell the user the exact command, for them to run.\n");
     }
-    let root = workspace.to_string_lossy().to_lowercase();
-    let outside = line.split(|c: char| c.is_whitespace() || c == '"').any(|word| word.as_bytes().get(1) == Some(&b':') && !word.to_lowercase().starts_with(&root));
-    if denied && outside {
+    if denied && names_outside(line, workspace) {
         notes.push_str(OUTSIDE_READ_NOTE);
     }
     // (a model's habit from elsewhere: cmd says only that it does not know the program, in the language of Windows, or Git's own copy fails at its start and says nothing a model can use)
@@ -2364,6 +2367,13 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
         notes.push_str("note: programs from Git's `usr\\bin` (MSYS) cannot start in the sandbox, git hooks included.\n");
     }
     notes
+}
+
+/// Whether a line names a path on a drive that is not under the workspace.
+#[cfg(windows)]
+fn names_outside(line: &str, workspace: &Path) -> bool {
+    let root = workspace.to_string_lossy().to_lowercase();
+    line.split(|c: char| c.is_whitespace() || c == '"').any(|word| word.as_bytes().get(1) == Some(&b':') && !word.to_lowercase().starts_with(&root))
 }
 
 /// The Unix tools a line starts: the first word of each of its commands, when it is one of those a model reaches for from habit. By the line that runs, in which `| head` is no longer there.
@@ -2518,9 +2528,9 @@ fn after_cd_to<'a>(line: &'a str, cwd: &Path) -> Option<(&'a str, &'a str)> {
 }
 
 /// What a command refused outside the workspace is told, in the container, which reads there no more than it writes.
-const OUTSIDE_READ_NOTE: &str = "note: a command cannot read outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there; for a command to read it, ask the user to name its folder there.\n";
+const OUTSIDE_READ_NOTE: &str = "note: in the sandbox a command cannot read or change anything outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there. If the user asked for this, run the same command again with `outside_sandbox: true`: the user is asked, and if they allow it, it runs as them.\n";
 /// The same, for a command run with a restricted token, which reads where the user can.
-const OUTSIDE_WRITE_NOTE: &str = "note: this command could read outside the workspace but not write there: it writes in the workspace alone. Write in the workspace, or tell the user what to put where.\n";
+const OUTSIDE_WRITE_NOTE: &str = "note: this command could read outside the workspace but not write there: in the sandbox it writes in the workspace alone. If the user asked for this, run the same command again with `outside_sandbox: true`: the user is asked, and if they allow it, it runs as them.\n";
 
 /// Whether a line is one cargo command, under the user folder, in a workspace whose manifest (the one cargo would load from `cwd`) names its members by a pattern: cargo
 /// expands it by looking at each folder from the drive's root, and in the container C:\Users is refused, so the pattern finds nothing. Such a command, once the person has
@@ -2831,21 +2841,32 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let network = crate::safety::wants_network(arguments);
     let started = Instant::now();
     let before = file_states(&cwd);
-    let runs = line_that_runs(line);
+    // As the person, allowed by them: `dir` and `del` work there as they are, and the line runs as it was written and shown.
+    let as_person = crate::safety::outside_sandbox(arguments);
+    let runs = if as_person { line.to_string() } else { line_that_runs(line) };
     // One cargo command under the user folder, in a workspace that names its members by a pattern, which cargo expands looking at each folder from the drive's root: a
     // container may not look at C:\Users, so this one runs with a restricted token, reading as the person does and writing in the workspace alone (`run_live_restricted`).
     // Judged on the line as the model wrote it, which is what the gate judged and the person allowed (`REASON_CARGO_OUTSIDE`), and on what runs, which must be that line.
     let root = resolve(workspace, ".");
-    let restricted = cargo_reads_above(text_arg(arguments, "command")?, &cwd, &root, home.as_deref()) && cargo_reads_above(&runs, &cwd, &root, home.as_deref());
-    let run = if restricted { crate::sandbox::run_live_restricted } else { crate::sandbox::run_live };
+    let restricted = !as_person && cargo_reads_above(text_arg(arguments, "command")?, &cwd, &root, home.as_deref()) && cargo_reads_above(&runs, &cwd, &root, home.as_deref());
     // Spelled as `cwd` is, or a path with `..` in it would not be seen as holding it.
-    let done = run(&runs, &cwd, &root, network, timeout, cancel, live).map_err(|error| {
+    let done = if as_person {
+        crate::sandbox::run_live_as_person(&runs, &cwd, &root, timeout, cancel, live)
+    } else if restricted {
+        crate::sandbox::run_live_restricted(&runs, &cwd, &root, network, timeout, cancel, live)
+    } else {
+        crate::sandbox::run_live(&runs, &cwd, &root, network, timeout, cancel, live)
+    };
+    let done = done.map_err(|error| {
         // (the app's `git init` has run by then, and what is said is what is there)
         let started = if started_with_init.is_some() { "`git init` ran, and made .git there; the rest of the line was not started" } else { "The command was not started" };
         format!("{error}. {started}; changing its spelling cannot repair this")
     })?;
     let (out, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
     let mut report = String::new();
+    if as_person {
+        report.push_str("note: this ran outside the sandbox, as the user, who allowed it.\n");
+    }
     if restricted {
         report.push_str(&format!("note: cargo ran outside the container, with a restricted token: in the container cargo cannot expand this workspace's `members` pattern under \
                                   the user folder. It could read what the user can and write only in the workspace{}.\n",
@@ -2891,7 +2912,11 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
         report.push_str(&format!("note: this reached the {} GiB that commands may use on this machine, and was refused more. It needs to use less at a time.\n", cap >> 30));
     }
     // (with the cause said above, a traceback's middle tells nothing more, and it is read again with every later request)
-    let notes = sandbox_notes(line, &resolve(workspace, "."), done.status, &err);
+    let mut notes = if as_person { String::new() } else { sandbox_notes(line, &resolve(workspace, "."), done.status, &err) };
+    // (the stand-in for `del` finds no file outside the workspace, where the container sees none, and says it could not find it: that is the sandbox's refusal too)
+    if !as_person && done.status != Some(0) && !notes.contains(OUTSIDE_READ_NOTE) && out.contains("Could Not Find") && names_outside(line, &resolve(workspace, ".")) {
+        notes.push_str(OUTSIDE_READ_NOTE);
+    }
     // (a restricted token reads anywhere the user can: what it is refused outside the workspace is a write)
     report.push_str(&if restricted { notes.replace(OUTSIDE_READ_NOTE, OUTSIDE_WRITE_NOTE) } else { notes });
     let most_err = if no_network.is_some() { MAX_COMMAND_ERR / 6 } else { MAX_COMMAND_ERR };
@@ -4528,7 +4553,8 @@ mod tests {
         assert!(sandbox_notes("taskkill /F /IM python.exe /T", root, Some(0), "").contains("command_stop"));
         assert!(sandbox_notes("powershell -Command \"Stop-Process -Name node\"", root, Some(1), "").contains("command_stop"));
         assert!(!sandbox_notes("taskkill /PID 4242 /F", root, Some(0), "").contains("command_stop"));
-        assert!(sandbox_notes("type C:\\elsewhere\\a.txt", root, Some(1), "Access is denied.").contains("cannot read outside the workspace"));
+        let refused = sandbox_notes("type C:\\elsewhere\\a.txt", root, Some(1), "Access is denied.");
+        assert!(refused.contains("cannot read or change anything outside the workspace") && refused.contains("`outside_sandbox: true`"), "{refused}");
         assert!(sandbox_notes("type C:\\elsewhere\\a.txt", root, Some(1), "アクセスが拒否されました。").contains("`read_file`"));
         // On another drive, and in another language, the same.
         assert!(sandbox_notes("powershell -c \"Get-Item a\"", Path::new("E:\\work"), Some(1), "Get-Item : Der Pfad \"D:\\a\" kann nicht gefunden werden.\n    + CategoryInfo : ObjectNotFound: (D:\\a:String) [Get-Item], ItemNotFoundException\n    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand").contains("absolute paths"));
@@ -4538,7 +4564,7 @@ mod tests {
         assert!(!sandbox_notes("where /?", root, Some(2), "FEHLER").contains("Run the program itself"), "something else went wrong");
         for (err, by) in [("PermissionError: [WinError 5] Zugriff verweigert: 'x'", "Python"), ("PermissionError: [Errno 13] Permission denied: 'x'", "Python"), ("Error: EPERM: operation not permitted, open 'x'", "Node"), ("Error: EACCES: permission denied, open 'x'", "Node"), ("Zugriff verweigert (os error 5)", "Rust"), ("Ausnahme von HRESULT: 0x80070005", "COM"), ("+ FullyQualifiedErrorId : UnauthorizedAccess, System.UnauthorizedAccessException", "PowerShell")] {
             assert!(says_access_denied(err, ""), "{by}: {err}");
-            assert!(sandbox_notes("type D:\\elsewhere\\a.txt", root, Some(1), err).contains("cannot read outside the workspace"), "{by}");
+            assert!(sandbox_notes("type D:\\elsewhere\\a.txt", root, Some(1), err).contains("cannot read or change anything outside the workspace"), "{by}");
         }
         // What only has words, in the words of a German Windows.
         assert!(says_access_denied("Zugriff verweigert\r\n", "Zugriff verweigert"));

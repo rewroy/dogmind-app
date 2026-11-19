@@ -550,7 +550,8 @@ fn retry_pause(attempt: u32, said: &str) -> Duration {
 /// A command call as the sandbox will run it: its arguments with the line that runs in place of the line as written. None for any other call, and for a command
 /// that runs as it was written.
 fn as_run(tool: &str, arguments: &Value) -> Option<Value> {
-    if tool != "execute_command" {
+    // (outside the sandbox the line runs as it was written)
+    if tool != "execute_command" || safety::outside_sandbox(arguments) {
         return None;
     }
     let written = arguments.get("command")?.as_str()?;
@@ -588,7 +589,13 @@ fn both_weighed(written: Verdict, runs: Verdict) -> Verdict {
 fn always_key(tool: &str, arguments: &Value) -> String {
     match tool {
         // (the network too: "always" to a command is not to the same command with the network, which asks a person each time)
-        "execute_command" => format!("{tool}\n{}\n{}\n{}", arguments.get("command").and_then(Value::as_str).unwrap_or(""), arguments.get("cwd").and_then(Value::as_str).unwrap_or("."), safety::wants_network(arguments)),
+        "execute_command" => format!(
+            "{tool}\n{}\n{}\n{}\n{}",
+            arguments.get("command").and_then(Value::as_str).unwrap_or(""),
+            arguments.get("cwd").and_then(Value::as_str).unwrap_or("."),
+            safety::wants_network(arguments),
+            safety::outside_sandbox(arguments)
+        ),
         _ if tool.starts_with("mcp__") => format!("{tool}\n{arguments}"),
         _ => format!("{tool}\n{}", tools::summary(tool, arguments)),
     }

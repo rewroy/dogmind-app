@@ -1830,11 +1830,17 @@ fn put_python_shim(temp: &str) {
 
 /// A command's environment, as the block CreateProcess takes. `build_tools` is asked for the compiler's folders only when the app has no `LIB` of its own: the command's start waits for it, so it
 /// is given the time the command has and the person's Stop (see `crate::msvc::found_before`).
-fn environment(temp: Option<&Path>, workspace: &Path, offline: bool, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<u16> {
+fn environment(temp: Option<&Path>, workspace: &Path, offline: bool, as_person: bool, build_tools: impl FnOnce() -> Option<crate::msvc::BuildTools>) -> Vec<u16> {
     let block: Vec<(String, String)> = VARIABLES.iter().filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value))).collect();
     let temp = temp.map(|path| path.display().to_string()).or_else(|| std::env::var("TEMP").ok()).unwrap_or_default();
-    put_python_shim(&temp);
+    if !as_person {
+        put_python_shim(&temp);
+    }
     let mut block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, build_tools);
+    // (as the person, git reads their own settings and Python starts as it does for them: what stands in for those in the sandbox is not for them)
+    if as_person {
+        block.retain(|(name, _)| !name.eq_ignore_ascii_case("XDG_CONFIG_HOME") && !name.eq_ignore_ascii_case("PYTHONPATH"));
+    }
     if offline {
         block.retain(|(name, _)| !OFFLINE.iter().any(|(set, _)| set.eq_ignore_ascii_case(name)));
         block.extend(OFFLINE.iter().map(|(name, value)| (name.to_string(), value.to_string())));
@@ -1923,13 +1929,31 @@ pub fn run(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Dur
 
 /// As `run`, with what it prints in `live` as it prints it.
 pub fn run_live(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
-    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, false)
+    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, Token::Container)
 }
 
 /// As `run_live`, with a restricted token in place of the container ([`restricted_token`]): it reads what the person can, and writes only in the workspace and its temp
 /// folder. For cargo in a workspace whose `members` pattern it expands from the drive's root, looking at C:\Users on the way, which a container may not.
 pub fn run_live_restricted(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
-    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, true)
+    run_limited(line, cwd, workspace, network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, Token::Restricted)
+}
+
+/// As `run_live`, as the person, outside the sandbox: what they asked to have done outside the workspace, once they have allowed it (the gate asks with `REASON_OUTSIDE_SANDBOX`,
+/// which no rule, "always" or mode answers), as Codex runs a command it is let escalate. It reads and writes what the person can and has the network. It is still a job that ends
+/// with the app, on a desktop nobody sees, under the same time and memory limits.
+pub fn run_live_as_person(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, cancel: &AtomicBool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
+    run_limited(line, cwd, workspace, true, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, Token::Person)
+}
+
+/// What a command runs as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Token {
+    /// In the AppContainer: it reads and writes the workspace, and what the person has opened to commands.
+    Container,
+    /// With a restricted token: it reads what the person can, and writes in the workspace alone.
+    Restricted,
+    /// As the person, with nothing taken away.
+    Person,
 }
 
 /// A browser under those limits falls over in most runs, whichever of them is set (0xC0000005, 12 to 19 runs in 20, against none in 20 with none set). Its own window station
@@ -1940,11 +1964,11 @@ pub fn run_live_restricted(line: &str, cwd: &Path, workspace: &Path, network: bo
 /// of the browser's. With no handler to answer, the browser's other processes waited for it in `WaitNamedPipe` (crashpad's registration), and in about one run in three the page was
 /// never opened: no end and no output until the time was up.
 pub fn run_browser(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, cancel: &AtomicBool) -> Result<Output, String> {
-    run_limited(line, cwd, workspace, false, timeout, cancel, 0, None, true, None, false)
+    run_limited(line, cwd, workspace, false, timeout, cancel, 0, None, true, None, Token::Container)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, closed_stdin: bool, live: Option<Arc<crate::tools::Live>>, restricted: bool) -> Result<Output, String> {
+fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, closed_stdin: bool, live: Option<Arc<crate::tools::Live>>, token: Token) -> Result<Output, String> {
     let asked_at = Instant::now();
     // (the build tools are looked for while the folder is made ready below, and the environment then usually finds them ready)
     crate::msvc::look_ahead();
@@ -1960,12 +1984,13 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
     unsafe {
         let sid = profile_sid()?;
         // (a restricted token's command writes as its workspace's own SID, and is given what it writes and what is guarded as that SID: see `restricted_token`)
-        let writer = if restricted { Some(OwnedSid::from_text(&workspace_sid_text(&root))?) } else { None };
+        let writer = if token == Token::Restricted { Some(OwnedSid::from_text(&workspace_sid_text(&root))?) } else { None };
         let grantee = writer.as_ref().map_or(sid, |writer| writer.0);
         let temp = profile_folder(sid);
         let mut disarmed = Vec::new();
         let mut times = Timings::default();
-        {
+        // (as the person, nothing is to be granted: it can do what they can)
+        if token != Token::Person {
             let _one = crate::workspace_grants::before_grant(&root)?;
             if let Some(writer) = &writer {
                 prepare_restricted(&root, writer.0, temp.as_deref(), &mut disarmed, &mut times)?;
@@ -2022,7 +2047,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let desktop = Desktop::new(grantee)?;
 
         let mut capability_sids: Vec<PSID> = Vec::new();
-        if network && writer.is_none() {
+        if network && token == Token::Container {
             for text in NETWORK_CAPABILITIES {
                 let mut capability: PSID = std::ptr::null_mut();
                 let text = wide(text);
@@ -2037,8 +2062,8 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let handles = [input.0, out_write.0, err_write.0];
         let jobs = [job.0];
 
-        // (a restricted token is not a container's: no capabilities to give it)
-        let count = if writer.is_some() { 2 } else { 3 };
+        // (a restricted token, or the person's own, is not a container's: no capabilities to give it)
+        let count = if token == Token::Container { 3 } else { 2 };
         let mut size = 0usize;
         InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size);
         let mut list_memory = vec![0u8; size];
@@ -2046,7 +2071,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         if InitializeProcThreadAttributeList(list, count, 0, &mut size) == 0 {
             return Err(last_error("the attribute list"));
         }
-        let attributes_ok = (writer.is_some() || UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize, std::ptr::addr_of!(security).cast(), std::mem::size_of_val(&security), std::ptr::null_mut(), std::ptr::null()) != 0)
+        let attributes_ok = (token != Token::Container || UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize, std::ptr::addr_of!(security).cast(), std::mem::size_of_val(&security), std::ptr::null_mut(), std::ptr::null()) != 0)
             && UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, handles.as_ptr().cast(), std::mem::size_of_val(&handles), std::ptr::null_mut(), std::ptr::null()) != 0
             && UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, jobs.as_ptr().cast(), std::mem::size_of_val(&jobs), std::ptr::null_mut(), std::ptr::null()) != 0;
         if !attributes_ok {
@@ -2069,7 +2094,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         // (the look for the build tools may still be going on: the command's start waits for it no longer than the command has time, and not past Stop)
         let env_began = Instant::now();
         // (with a restricted token nothing stops the network: a command not let reach it is pointed away from it, as Codex points its own)
-        let block = environment(temp.as_deref(), &root, writer.is_some() && !network, || crate::msvc::found_before(asked_at.checked_add(timeout).unwrap_or(asked_at + Duration::from_secs(3600)), cancel));
+        let block = environment(temp.as_deref().filter(|_| token != Token::Person), &root, writer.is_some() && !network, token == Token::Person, || crate::msvc::found_before(asked_at.checked_add(timeout).unwrap_or(asked_at + Duration::from_secs(3600)), cancel));
         times.env = env_began.elapsed();
         let place = wide_path(cwd);
         let mut process: PROCESS_INFORMATION = std::mem::zeroed();
@@ -2554,6 +2579,25 @@ mod tests {
         let tree = command("rmdir /s /q sub", &folder, false);
         assert_eq!(tree.status, Some(0), "{}", decode(&tree.stderr));
         assert!(!folder.join("sub").exists());
+    }
+
+    /// What the person asked to have done outside the workspace, and allowed: as them it is done, where the container is refused.
+    #[test]
+    fn a_command_run_as_the_person_changes_what_is_outside_the_workspace_and_one_in_the_container_cannot() {
+        let folder = work_folder("as-person");
+        let outside = work_folder("as-person-outside");
+        std::fs::write(outside.join("old.txt"), "a").unwrap();
+        let line = format!("del /q \"{}\"", outside.join("old.txt").display());
+        let time = Duration::from_secs(60);
+        let contained = run_live(&line, &folder, &folder, false, time, &AtomicBool::new(false), None).unwrap();
+        assert!(outside.join("old.txt").exists(), "the container cannot: {:?} {}", contained.status, decode(&contained.stderr));
+        let done = run_live_as_person(&line, &folder, &folder, time, &AtomicBool::new(false), None).unwrap();
+        assert_eq!(done.status, Some(0), "{}", decode(&done.stderr));
+        assert!(!outside.join("old.txt").exists());
+        // (and it starts in the workspace, with the person's own git settings and Python, not the sandbox's)
+        let said = run_live_as_person("cd & set XDG_CONFIG_HOME & set PYTHONPATH", &folder, &folder, time, &AtomicBool::new(false), None).unwrap();
+        let out = decode(&said.stdout);
+        assert!(out.to_lowercase().contains(&folder.display().to_string().to_lowercase()) && !out.contains("XDG_CONFIG_HOME=") && !out.contains("PYTHONPATH="), "{out}");
     }
 
     /// A `del` of what is not there says so, as `del` does: a name the container does not see (outside the workspace, or misspelt) was a delete with nothing said and exit 0.
@@ -3175,18 +3219,18 @@ mod tests {
         std::fs::create_dir_all(&place).unwrap();
         let cap = 300u64 << 20;
         let greedy = "powershell -NoProfile -Command \"try { $a = [Runtime.InteropServices.Marshal]::AllocHGlobal(800000000); 'allocated' } catch { 'refused'; exit 7 }\"";
-        let done = run_limited(greedy, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None, false).unwrap();
+        let done = run_limited(greedy, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None, Token::Container).unwrap();
         eprintln!("status {:?}, out_of_memory {:?}, out {} err {}", done.status, done.out_of_memory, decode(&done.stdout).trim(), decode(&done.stderr));
         assert!(decode(&done.stdout).contains("refused") && done.status == Some(7), "{}", decode(&done.stdout));
         // Bit by bit, as a leak goes: it is said to have been stopped.
         let leak = "powershell -NoProfile -Command \"try { while ($true) { $null = [Runtime.InteropServices.Marshal]::AllocHGlobal(5000000) } } catch { 'refused'; exit 7 }\"";
-        let leaked = run_limited(leak, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None, false).unwrap();
+        let leaked = run_limited(leak, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None, Token::Container).unwrap();
         // (What a process does at the end of its memory is its own. PowerShell catches the refusal and ends with 7, or falls over in the middle of it, which it does in about
         // one run in three, and not with one code: 0xC0000005, 0xC00000FD when the stack cannot grow by a page, 0xC0000409, or the runtime's own 0xE0434352 or 0x80131523, as
         // what it has left to run its handler with is not the same twice. Which of them is no business of the sandbox. It is stopped all the same: it ended by itself, and not
         // well, and it is said to have used all it was allowed.)
         assert!(leaked.ended.is_empty() && leaked.status.is_some_and(|status| status != 0) && leaked.out_of_memory == Some(cap), "{:?} {:?} {:?}", leaked.status, leaked.ended, leaked.out_of_memory);
-        let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None, false).unwrap();
+        let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None, Token::Container).unwrap();
         assert!(decode(&fine.stdout).contains("fine") && fine.out_of_memory.is_none());
         drop(holder);
     }
@@ -3199,7 +3243,7 @@ mod tests {
         // Each alone fits under the cap; four together do not.
         let one = "try { $a = [Runtime.InteropServices.Marshal]::AllocHGlobal(500000000); Write-Output held; Start-Sleep 8 } catch { Write-Output refused }";
         let line = format!("powershell -NoProfile -Command \"$p = 1..4 | ForEach-Object {{ $i = New-Object Diagnostics.ProcessStartInfo 'powershell.exe', '-NoProfile -Command {}'; $i.UseShellExecute = $false; [Diagnostics.Process]::Start($i) }}; $p | ForEach-Object {{ $_.WaitForExit() }}\"", one);
-        let done = run_limited(&line, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(1200u64 << 20), false, None, false).unwrap();
+        let done = run_limited(&line, &place, &place, false, Duration::from_secs(120), &AtomicBool::new(false), UI_LIMITS, Some(1200u64 << 20), false, None, Token::Container).unwrap();
         let said = decode(&done.stdout);
         eprintln!("status {:?} out {} err {}", done.status, said.trim(), decode(&done.stderr).trim());
         assert!(said.contains("held"), "one fits: {said}");

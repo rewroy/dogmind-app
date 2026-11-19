@@ -116,12 +116,20 @@ pub const REASON_WEB_FORGET: &str = "web content is in this conversation, and fo
 pub const REASON_WEB_ASKED: &str = "web content is in this conversation, and it may have asked for this";
 pub const REASON_CARGO_OUTSIDE: &str = "cargo cannot read this workspace inside the sandbox, so it would run with the sandbox's read limits lifted: it can read every file you can, and its network cannot be stopped";
 pub const REASON_CARGO_CONFIG_RUNS: &str = "cargo's config here also runs {0}, with the same reach";
+pub const REASON_OUTSIDE_SANDBOX: &str = "this runs outside the sandbox, as you: it can read and change every file you can, and reach the network";
 
 /// Every reason a card can give, for the test that each has its Japanese in the app.
-pub const REASONS: [&str; 17] = [
+pub const REASONS: [&str; 18] = [
     REASON_OFF_THIS_PC, REASON_SECRET_READ, REASON_RUNS_OFF_THIS_PC, REASON_PLANTED, REASON_NETWORK, REASON_OUTSIDE_AND_OFF_THIS_PC, REASON_OUTSIDE, REASON_GIT_FOLDER, REASON_LONG_QUERY,
     REASON_PRIVATE_QUERY, REASON_WEB_ADDRESS_PATH, REASON_WEB_UNKNOWN_ADDRESS, REASON_WEB_NOTE, REASON_WEB_FORGET, REASON_WEB_ASKED, REASON_CARGO_OUTSIDE, REASON_CARGO_CONFIG_RUNS,
+    REASON_OUTSIDE_SANDBOX,
 ];
+
+/// Whether this call of `execute_command` asks to run as the person, outside the sandbox: for what they asked to have read or changed outside the workspace, which the sandbox
+/// refuses. The person is asked each time, with [`REASON_OUTSIDE_SANDBOX`], which no rule, "always" or mode answers.
+pub fn outside_sandbox(arguments: &Value) -> bool {
+    arguments.get("outside_sandbox").and_then(Value::as_bool) == Some(true)
+}
 
 /// The reasons to ask about a command that would run with the sandbox's read limits lifted (`crate::tools::cargo_reads_above`): that, and what cargo's config runs besides. None for
 /// any other.
@@ -714,7 +722,8 @@ impl Gate {
                 let off_this_pc = names_a_place_off_this_pc(command).map(|word| leads_off_this_pc(&word));
                 // (one cargo command that cannot run in the container here, and would run with its read limits lifted: always the person's to allow, with what its config runs too)
                 let lifted = cargo_lifted(command, &cwd, workspace);
-                if self.is_look(command) && !wants_network(arguments) && within(workspace, &cwd) && answered.is_empty() && lifted.is_empty() {
+                let outside = outside_sandbox(arguments);
+                if self.is_look(command) && !wants_network(arguments) && within(workspace, &cwd) && answered.is_empty() && lifted.is_empty() && !outside {
                     return Verdict::Allow;
                 }
                 match self.command_risk(command, stated) {
@@ -722,7 +731,11 @@ impl Gate {
                         // (what is safe is safe by the name of a program the list knows, and a file here that answers to the name runs the project's code instead. Safe and low are what the setting for safe
                         // commands lets through, so this is more than low: it asks)
                         let risk = if risk == Risk::Safe && !answered.is_empty() { Risk::Medium } else { risk };
-                        let reasons: Vec<String> = planted.into_iter().chain(off_this_pc).chain(wants_network(arguments).then(|| REASON_NETWORK.to_string())).chain(lifted).collect();
+                        // (outside the sandbox it has the network and all the person's files: that is the one reason, and what else there is to say of it is said too)
+                        let risk = if outside { Risk::High } else { risk };
+                        let network = (wants_network(arguments) && !outside).then(|| REASON_NETWORK.to_string());
+                        let reasons: Vec<String> =
+                            outside.then(|| REASON_OUTSIDE_SANDBOX.to_string()).into_iter().chain(planted).chain(off_this_pc).chain(network).chain(lifted).collect();
                         Verdict::Ask { risk, reason: (!reasons.is_empty()).then(|| reasons.join("; ")) }
                     }
                     Err(reason) => Verdict::Deny(reason),
@@ -949,6 +962,27 @@ mod tests {
         for command in ["del C:\\", "del /s/q C:\\*.*", "del /a:h /q C:\\*", "erase /s c:\\*", "del \\", "del C:\\* /s /q", "del \"C:\\\"", "del C:"] {
             assert!(gate.command_risk(command, None).is_err(), "{command}");
         }
+    }
+
+    #[test]
+    fn a_command_outside_the_sandbox_asks_the_person_each_time_and_what_destroys_the_system_is_still_denied() {
+        let gate = Gate::new();
+        let work = Path::new("C:\\work");
+        let outside = |command: &str| json!({"command": command, "outside_sandbox": true});
+        for command in ["del /q C:\\Users\\me\\Documents\\old\\*", "dir", "git status", "python x.py"] {
+            match gate.check("execute_command", &outside(command), work) {
+                Verdict::Ask { risk, reason } => {
+                    assert_eq!(risk, Risk::High, "{command}");
+                    let reason = reason.unwrap_or_default();
+                    assert!(reason.starts_with(REASON_OUTSIDE_SANDBOX), "{command}: {reason}");
+                    assert!(!delegated(Mode::Auto, "execute_command", risk, Some(&reason), true), "no mode answers for it");
+                }
+                other => panic!("{command}: {other:?}"),
+            }
+        }
+        assert!(matches!(gate.check("execute_command", &outside("format c:"), work), Verdict::Deny(_)));
+        assert!(matches!(gate.check("execute_command", &json!({"command": "dir"}), work), Verdict::Allow), "in the sandbox a look is still a look");
+        assert!(!outside_sandbox(&json!({"command": "dir", "outside_sandbox": false})) && !outside_sandbox(&json!({"command": "dir"})));
     }
 
     #[test]
