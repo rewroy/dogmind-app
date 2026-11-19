@@ -2085,6 +2085,10 @@ struct App {
     // Finding in the conversation.
     find_open: bool,
     find_field: HWND,
+    /// The field of the card of the question that waits, over its frame where all of that is in view (`place_card_field`): an answer of the person's own is written there and sent
+    /// by Enter or the card's Send. Where it is placed now, in the window: none while it is hidden.
+    card_field: HWND,
+    card_field_at: Option<(i32, i32, i32, i32)>,
     find_previous: HWND,
     find_next: HWND,
     find_close: HWND,
@@ -2607,6 +2611,17 @@ fn agent_config(settings: &Settings, folder: &Path, workspace: PathBuf, mode: Mo
 fn web_settings(settings: &Settings) -> WebSettings {
     let holder = ProviderConfig { name: "Search key".into(), kind: Kind::Server, base_url: String::new(), model: String::new(), api_key: settings.search_key.trim().to_string() };
     WebSettings { enabled: settings.web_tools, search_key: holder.key().ok().flatten().filter(|key| !key.is_empty()), allow_local: false }
+}
+
+/// The height of a line of `font` in an edit control: its text's height, with a pixel above and below.
+unsafe fn field_line_height(window: HWND, font: HFONT) -> i32 {
+    let device = GetDC(window);
+    let previous = SelectObject(device, font);
+    let mut metrics: TEXTMETRICW = std::mem::zeroed();
+    GetTextMetricsW(device, &mut metrics);
+    SelectObject(device, previous);
+    ReleaseDC(window, device);
+    metrics.tmHeight + 2
 }
 
 unsafe fn control(parent: HWND, class: &str, text: &str, style: u32, ex: u32, id: isize) -> HWND {
@@ -4842,6 +4857,8 @@ impl App {
     unsafe fn answer_question(&mut self, words: &str) -> bool {
         let Some(asked) = self.question.take() else { return false };
         let words = words.trim().to_string();
+        set_text(self.card_field, "");
+        self.hide_card_field();
         self.reset_composer_cue();
         let said = words.clone();
         self.settle_card(asked.card, |card| {
@@ -4893,15 +4910,78 @@ impl App {
         set_text(self.composer_cue, t("Message Dogmind"));
     }
 
-    /// What was written in the composer, as the answer; with nothing written it is where to write it.
+    /// What was written in the card's field, or else in the composer, as the answer (`cards::own_answer`); with nothing written in either, the card's field is where to write it.
     unsafe fn card_pressed_own(&mut self) {
-        let words = get_text(self.composer);
-        if words.trim().is_empty() {
-            self.focus_composer();
+        let (field, composer) = (get_text(self.card_field), get_text(self.composer));
+        match cards::own_answer(&field, &composer) {
+            Some(cards::OwnAnswer::Field(words)) => {
+                let words = words.to_string();
+                set_text(self.card_field, "");
+                self.answer_question(&words);
+            }
+            Some(cards::OwnAnswer::Composer(words)) => {
+                let words = words.to_string();
+                set_text(self.composer, "");
+                self.composer_typed_at = None;
+                self.answer_question(&words);
+            }
+            None => self.focus_card_field(),
+        }
+    }
+
+    /// The keys to the card's field, where it is shown; else to the composer, which takes an answer too.
+    unsafe fn focus_card_field(&self) {
+        if self.modal_open {
+            return;
+        }
+        if IsWindowVisible(self.card_field) != 0 {
+            SetFocus(self.card_field);
         } else {
-            set_text(self.composer, "");
-            self.composer_typed_at = None;
-            self.answer_question(&words);
+            self.focus_composer();
+        }
+    }
+
+    /// The card's field over the frame of the card of the question that waits, where all of the frame is in the transcript's view (an edit is a window of its own, which the
+    /// transcript's edges would not cut): placed as the transcript's paint finds the frame, so that it follows a scroll. Hidden where no question waits or the frame is not in view
+    /// whole; what was written in it stays for when it is shown again, and the keys go to the composer if it had them.
+    unsafe fn place_card_field(&mut self) {
+        let frame = if self.question.is_some() {
+            self.overlay_hits.iter().find(|hit| match hit.key {
+                OverlayKey::Card(slot, part) => self.card_slots.get(slot).and_then(|room| room.parts.get(part)).is_some_and(|part| matches!(part.act, CardAct::FocusField)),
+                _ => false,
+            }).map(|hit| hit.area)
+        } else {
+            None
+        };
+        let mut view: RECT = std::mem::zeroed();
+        GetClientRect(self.transcript, &mut view);
+        let place = frame.filter(|area| area.top >= view.top && area.bottom <= view.bottom && area.left >= view.left && area.right <= view.right).map(|area| {
+            // (inside the frame's edge, where its words begin; a line of its font tall, in the middle of the frame, so that what is written stands where the frame's words did)
+            let inset = scale(self.dpi, ds::space::M);
+            let tall = field_line_height(self.window, self.fonts.field).min(area.bottom - area.top);
+            let mut corner = POINT { x: area.left + inset, y: area.top + (area.bottom - area.top - tall) / 2 };
+            MapWindowPoints(self.transcript, self.window, &mut corner, 1);
+            (corner.x, corner.y, (area.right - area.left - 2 * inset).max(1), tall)
+        });
+        if place == self.card_field_at {
+            return;
+        }
+        self.card_field_at = place;
+        match place {
+            Some((x, y, width, height)) => {
+                SetWindowPos(self.card_field, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+            }
+            None => self.hide_card_field(),
+        }
+    }
+
+    /// The card's field out of sight, the keys going to the composer if it had them.
+    unsafe fn hide_card_field(&mut self) {
+        self.card_field_at = None;
+        let had_the_keys = GetFocus() == self.card_field;
+        show(self.card_field, false);
+        if had_the_keys {
+            self.focus_composer();
         }
     }
 
@@ -4986,7 +5066,7 @@ impl App {
                 self.answer_question(&label);
             }
             CardAct::SendOwn => self.card_pressed_own(),
-            CardAct::FocusField => self.focus_composer(),
+            CardAct::FocusField => self.focus_card_field(),
             CardAct::Carry => {
                 self.decide_plan(Ok(()));
             }
@@ -5148,6 +5228,7 @@ impl App {
     /// `dx`, `dy`: where the transcript's own pixels are in `device` (the bitmap of the area drawn, or the window itself).
     unsafe fn paint_overlay_icons(&mut self, device: HDC, dx: i32, dy: i32) {
         self.overlay_hits = self.overlays_in_view();
+        self.place_card_field();
         let dpi = self.dpi;
         let focused = {
             let focus = GetFocus();
@@ -5163,8 +5244,8 @@ impl App {
             let lit = self.overlay_hover == Some(key);
             if let OverlayKey::Card(slot, part) = key {
                 if let Some(part) = self.card_slots.get(slot).and_then(|room| room.parts.get(part)) {
-                    // (the card's field is the composer: its frame is lit while the composer has the focus and the question waits for what is written in it)
-                    let composer = part.kind == ButtonKind::Frame && self.question.is_some() && GetFocus() == self.composer;
+                    // (its frame is lit while the card's field or the composer has the focus and the question waits for what is written there)
+                    let composer = part.kind == ButtonKind::Frame && self.question.is_some() && [self.composer, self.card_field].contains(&GetFocus());
                     paint_button(device, area, part.kind, &part.text, theme::code_back(), lit || composer, pressed, ring && focused == Some(key));
                 }
                 continue;
@@ -6111,6 +6192,9 @@ impl App {
             show(window, band);
         }
         show(self.transcript, chat && self.has_messages);
+        if !(chat && self.has_messages) {
+            self.hide_card_field();
+        }
         let finding = chat && self.has_messages && self.find_open;
         for window in [self.find_field, self.find_previous, self.find_next, self.find_close] {
             show(window, finding);
@@ -12858,13 +12942,14 @@ impl App {
                 let id = self.card_next;
                 self.write_card(&Card::Question { id, question: question.question.clone(), options: question.options.clone(), state: AnswerState::Waiting });
                 let words: String = question.question.lines().next().unwrap_or("").chars().take(120).collect();
+                set_text(self.card_field, "");
                 self.question = Some(AskedQuestion { answer: question.answer, question: question.question, options: question.options, card: id });
                 self.set_activity(String::new());
                 self.update_buttons();
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.tray_note(t("Dogmind is waiting for you"), &words);
                 self.flash_for_attention(self.woken_turn);
-                // (the card's field is the composer: what is written in it is the answer)
+                // (what is written in the composer is an answer too, as is what is written in the card's field)
                 set_text(self.composer_cue, t("Write your own answer…"));
                 self.update_composer_cue();
                 self.focus_composer();
@@ -13984,7 +14069,7 @@ impl App {
         ] {
             set_text(window, t(words));
         }
-        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.find_field, "Find in this conversation"), (self.side_search, "Search sessions"), (self.timeline.search, "Search the timeline")] {
+        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.find_field, "Find in this conversation"), (self.card_field, "Write your own answer…"), (self.side_search, "Search sessions"), (self.timeline.search, "Search the timeline")] {
             let cue = wide(t(words));
             SendMessageW(edit, EM_SETCUEBANNER, 0, cue.as_ptr() as LPARAM);
         }
@@ -15098,7 +15183,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
             set_button_fonts(app.fonts);
-            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.term.rename_field, app.timeline.search]) {
+            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.term.rename_field, app.timeline.search]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
             }
             // (the command's own size follows the screen's: it is set again when it is next shown, and this one keeps what it has)
@@ -15416,6 +15501,12 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             if app.fields.contains(&(lparam as HWND)) {
                 if code == EN_SETFOCUS as usize || code == EN_KILLFOCUS as usize {
                     app.layout();
+                }
+                return 0;
+            }
+            if lparam as HWND == app.card_field {
+                if code == EN_SETFOCUS as usize || code == EN_KILLFOCUS as usize {
+                    InvalidateRect(app.transcript, std::ptr::null(), 0);
                 }
                 return 0;
             }
@@ -15892,6 +15983,11 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
     if message.hwnd == app.composer && key == VK_PROCESSKEY {
         // A key an IME took: composing is about to begin, whichever way this IME says so.
         show(app.composer_cue, false);
+    }
+    // In the card's field: Enter sends what is written there as the answer to the question.
+    if message.hwnd == app.card_field && key == VK_RETURN && !shift {
+        app.card_pressed_own();
+        return true;
     }
     if message.hwnd == app.find_field {
         match key {
@@ -16825,6 +16921,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             provider_down: make_button(window, ID_PROVIDER_DOWN, "chevron-down", ButtonKind::Icon, theme::background()),
             find_open: false,
             find_field: control(window, "EDIT", "", edit_style, 0, 0),
+            card_field: control(window, "EDIT", "", edit_style, 0, 0),
+            card_field_at: None,
             find_previous: make_button(window, ID_FIND_PREVIOUS, "chevron-up", ButtonKind::Icon, theme::surface()),
             find_next: make_button(window, ID_FIND_NEXT, "chevron-down", ButtonKind::Icon, theme::surface()),
             find_close: make_button(window, ID_FIND_CLOSE, "x", ButtonKind::Icon, theme::surface()),
@@ -17100,7 +17198,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let app = &mut *APP.load(Ordering::Relaxed);
         SendMessageW(app.composer, EM_SETEVENTMASK, 0, ENM_CHANGE as LPARAM);
         SendMessageW(app.note, EM_SETMARGINS, 3, 0); // EC_LEFTMARGIN | EC_RIGHTMARGIN
-        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.timeline.search]) {
+        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.timeline.search]) {
             SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
         }
         app.list_procedure = SetWindowLongPtrW(app.side, GWLP_WNDPROC, list_subclass as *const () as isize);
