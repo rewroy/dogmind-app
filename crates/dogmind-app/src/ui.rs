@@ -3172,7 +3172,8 @@ impl App {
                 row.tabs[0] = ANSWERED_AT_TAB;
                 row
             }
-            Style::Title => para_format(15, 0, 160, 100),
+            // (as much room over `#` as over `##`: less, a title in the middle of an answer stood closer to what is above it than a heading under it does)
+            Style::Title => para_format(15, 0, 240, 100),
             Style::Gap => para_format(6, 0, 0, 0),
             Style::Heading => para_format(13, 0, 240, 80),
             Style::Subheading => para_format(12, 0, 180, 60),
