@@ -2870,7 +2870,8 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let (out, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
     let mut report = String::new();
     if as_person {
-        report.push_str("note: this ran outside the sandbox, as the user, who allowed it.\n");
+        // (a model that checked what it did with another command there asked the person again for a look: `dir` and `type` are let through, `if exist … (echo …)` is not)
+        report.push_str("note: this ran outside the sandbox, as the user, who allowed it. To see what it did there, use `list_files` or `read_file`, which look anywhere with no one asked.\n");
     }
     if restricted {
         report.push_str(&format!("note: cargo ran outside the container, with a restricted token: in the container cargo cannot expand this workspace's `members` pattern under \

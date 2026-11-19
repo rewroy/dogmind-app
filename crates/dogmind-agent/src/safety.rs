@@ -125,6 +125,13 @@ pub const REASONS: [&str; 18] = [
     REASON_OUTSIDE_SANDBOX,
 ];
 
+/// `dir` or `type`, which cmd runs itself: nothing else is started.
+fn cmd_own_look(command: &str) -> bool {
+    let first = as_cmd_reads(command).split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    let name = first.split('/').next().unwrap_or("");
+    matches!(name, "dir" | "type")
+}
+
 /// Whether this call of `execute_command` asks to run as the person, outside the sandbox: for what they asked to have read or changed outside the workspace, which the sandbox
 /// refuses. The person is asked each time, with [`REASON_OUTSIDE_SANDBOX`], which no rule, "always" or mode answers.
 pub fn outside_sandbox(arguments: &Value) -> bool {
@@ -723,7 +730,10 @@ impl Gate {
                 // (one cargo command that cannot run in the container here, and would run with its read limits lifted: always the person's to allow, with what its config runs too)
                 let lifted = cargo_lifted(command, &cwd, workspace);
                 let outside = outside_sandbox(arguments);
-                if self.is_look(command) && !wants_network(arguments) && within(workspace, &cwd) && answered.is_empty() && lifted.is_empty() && !outside {
+                // (outside the sandbox only cmd's own `dir` and `type` are a look, as `list_files` and `read_file` are, which look anywhere unasked: any other program
+                // run there as the person, `git status` with a repository's fsmonitor included, can do more than it says)
+                let look = self.is_look(command) && (!outside || cmd_own_look(command));
+                if look && !wants_network(arguments) && within(workspace, &cwd) && answered.is_empty() && lifted.is_empty() {
                     return Verdict::Allow;
                 }
                 match self.command_risk(command, stated) {
@@ -969,7 +979,7 @@ mod tests {
         let gate = Gate::new();
         let work = Path::new("C:\\work");
         let outside = |command: &str| json!({"command": command, "outside_sandbox": true});
-        for command in ["del /q C:\\Users\\me\\Documents\\old\\*", "dir", "git status", "python x.py"] {
+        for command in ["del /q C:\\Users\\me\\Documents\\old\\*", "git status", "where python", "python x.py", "dir & del x"] {
             match gate.check("execute_command", &outside(command), work) {
                 Verdict::Ask { risk, reason } => {
                     assert_eq!(risk, Risk::High, "{command}");
@@ -981,6 +991,11 @@ mod tests {
             }
         }
         assert!(matches!(gate.check("execute_command", &outside("format c:"), work), Verdict::Deny(_)));
+        // (a look there is one, as `list_files` and `read_file` look anywhere unasked; one at keys is not)
+        for command in ["dir /b \"C:\\Users\\me\\Documents\\old\"", "type C:\\Users\\me\\notes.txt", "DIR/b C:\\x"] {
+            assert_eq!(gate.check("execute_command", &outside(command), work), Verdict::Allow, "{command}");
+        }
+        assert!(matches!(gate.check("execute_command", &outside("type C:\\Users\\me\\.ssh\\id_rsa"), work), Verdict::Ask { risk: Risk::High, .. }));
         assert!(matches!(gate.check("execute_command", &json!({"command": "dir"}), work), Verdict::Allow), "in the sandbox a look is still a look");
         assert!(!outside_sandbox(&json!({"command": "dir", "outside_sandbox": false})) && !outside_sandbox(&json!({"command": "dir"})));
     }
