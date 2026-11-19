@@ -2306,8 +2306,10 @@ impl Agent {
             if drafting && stopped_by_the_app && matches!(result, Err(LlmError::Cancelled)) {
                 // (what it had come to when it was stopped, and what the stop cost: the tokens that are thrown away)
                 let run = watch.as_ref().map_or(0, DraftWatch::stats);
-                // (DOGMIND_DRAFT_PLAIN=1, for the comparison: the request that writes after the stop has its thinking closed, where the server can)
-                let plain = std::env::var("DOGMIND_DRAFT_PLAIN").is_ok_and(|value| value == "1") && provider.close_thinking_once();
+                // The request that writes after the stop has its thinking closed, where the server can: it has decided already, and what it was told is to write. Left open, it
+                // thought again for 16,000 to 36,000 characters (97 to 256 s) in each of three stops, before writing what it had, with no better result than the two closed
+                // ones, which wrote at once (27 and 95 s); one request alone, and the next thinks as before.
+                let plain = provider.close_thinking_once();
                 self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "next_without_thinking": plain}));
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
@@ -8360,9 +8362,9 @@ Body").unwrap();
         assert!(requests[0]["first_ms"].is_u64() && requests[0]["reasoning_chars"].as_u64().unwrap() > 0);
         assert_eq!(of_kind(&lines, "turn_end")[0]["cancelled"], true);
         assert!(of_kind(&lines, "intervention").is_empty());
-        // The app's: a draft stopped, which goes on in a request that ends as any does.
+        // The app's: a draft stopped, which goes on in a request that ends as any does, with its thinking closed.
         let dir = tempfile::tempdir().unwrap();
-        let (client, _, _, _) = thinking_server(3, vec![text_answer("written")]);
+        let (client, bodies, _, _) = thinking_server(3, vec![text_answer("written")]);
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Send("write it".into())).unwrap();
         let (_, cancelled) = until_end(&run, Decision::Reject);
@@ -8379,6 +8381,12 @@ Body").unwrap();
         assert_eq!(of_kind(&lines, "turn_end")[0]["cancelled"], false);
         // The draft stopped made no message (nothing was said); the request that went on from it did.
         assert!(lines[1].get("message").is_none() && lines[3]["message"].is_u64(), "{lines:?}");
+        // That request alone is asked to write without thinking first, and it is recorded so.
+        assert_eq!(stop["next_without_thinking"], true, "{stop}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].pointer("/straydog/reasoning").is_none(), "{}", bodies[0]);
+        assert_eq!(bodies[1].pointer("/straydog/reasoning"), Some(&serde_json::json!(false)), "{}", bodies[1]);
     }
 
     #[test]

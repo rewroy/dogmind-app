@@ -495,7 +495,7 @@ pub trait Provider: Send + Sync {
         self.stream(request, cancel, on)
     }
     /// The next request is to be answered with its thinking closed, where the server can be asked so (Straydog's `straydog.reasoning`):
-    /// whether it will be. For the comparison of what follows a stopped draft (`DOGMIND_DRAFT_PLAIN`), not a setting of anyone's.
+    /// whether it will be. The request that writes after a stopped draft is one.
     fn close_thinking_once(&self) -> bool {
         false
     }
