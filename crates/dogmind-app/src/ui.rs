@@ -2860,8 +2860,9 @@ fn char_format(color: u32, effects: u32, face: &str, points: i32, back: Option<u
 #[derive(Clone, Copy, PartialEq)]
 enum Para {
     Normal,
-    /// An item of a list, this far in: its lines keep to its text, and the items stay together.
-    Item(i32),
+    /// An item of a list, this far in, and the room over it: its lines keep to its text, and the items stay together, unless a blank line or a block
+    /// is between two (a list after another, or a list's items written apart).
+    Item(i32, i32),
     AfterList,
     AfterBlock,
     Quote,
@@ -3182,10 +3183,10 @@ impl App {
                 Para::AfterList => para_format(11, 0, 80, 120),
                 Para::AfterBlock => para_format(11, 0, 300, 120),
                 Para::Quote => para_format(11, 280, 40, 40),
-                Para::Item(indent) => {
+                Para::Item(indent, before) => {
                     const TEXT_AT: i32 = 280;
                     let start = indent * 130;
-                    let mut item = para_format(11, start, 0, 40);
+                    let mut item = para_format(11, start, before, 40);
                     item.mask |= PFM_OFFSET | PFM_TABSTOPS;
                     item.offset = TEXT_AT;
                     item.tab_count = 1;
@@ -3691,6 +3692,10 @@ impl App {
                     self.flush_table();
                 }
                 if !self.in_code && pending.starts_with('\n') {
+                    // (a blank line after an item: what follows, an item too, keeps a little away)
+                    if matches!(self.para, Para::Item(..)) && self.para_next.is_none() {
+                        self.para_next = Some(Para::AfterList);
+                    }
                     self.pending_text = pending[1..].to_string();
                     continue;
                 }
@@ -3756,7 +3761,7 @@ impl App {
                     let marker = list_marker(trimmed);
                     if marker.is_none() {
                         // What follows a list or a block keeps a little away from it, for this one paragraph.
-                        self.para = self.para_next.take().unwrap_or(if matches!(self.para, Para::Item(_)) { Para::AfterList } else { Para::Normal });
+                        self.para = self.para_next.take().unwrap_or(if matches!(self.para, Para::Item(..)) { Para::AfterList } else { Para::Normal });
                     }
                     if let Some(level) = markdown::heading_level(trimmed) {
                         self.heading = level;
@@ -3774,8 +3779,13 @@ impl App {
                         continue;
                     }
                     if let Some((shown, length)) = marker {
-                        self.para_next = None;
-                        self.para = Para::Item(indent as i32);
+                        // As far from what is over it as a paragraph would be: a block, a quote, or items a blank line parts.
+                        let before = match self.para_next.take() {
+                            Some(Para::AfterBlock) => 300,
+                            Some(Para::AfterList) => 80,
+                            _ => 0,
+                        };
+                        self.para = Para::Item(indent as i32, before);
                         self.append(&format!("{shown}\t"), Style::Body);
                         self.pending_text = pending[indent + length..].to_string();
                         continue;
