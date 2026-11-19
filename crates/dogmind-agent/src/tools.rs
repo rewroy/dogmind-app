@@ -2352,7 +2352,8 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     if lower_err.contains("config file") || (denied && in_git) || (in_git && lower_err.contains("permission denied")) {
         notes.push_str("note: the sandbox refuses changes to `.git\\config` and `.git\\hooks`, as what is written there would run outside it the next time git is used. Tell the user the exact command, for them to run.\n");
     }
-    if denied && names_outside(line, workspace) {
+    // (the line may name no path, as `python clean.py` does: then the refusal's own line says where)
+    if denied && (names_outside(line, workspace) || err.lines().any(|said| says_access_denied(said, system_access_denied()) && names_outside(said, workspace))) {
         notes.push_str(OUTSIDE_READ_NOTE);
     }
     // (a model's habit from elsewhere: cmd says only that it does not know the program, in the language of Windows, or Git's own copy fails at its start and says nothing a model can use)
@@ -2371,9 +2372,13 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
 
 /// Whether a line names a path on a drive that is not under the workspace.
 #[cfg(windows)]
+/// A program's own words count too: Python's `'C:\\Users\\me\\a.txt'`, in quotes and with its backslashes doubled.
 fn names_outside(line: &str, workspace: &Path) -> bool {
     let root = workspace.to_string_lossy().to_lowercase();
-    line.split(|c: char| c.is_whitespace() || c == '"').any(|word| word.as_bytes().get(1) == Some(&b':') && !word.to_lowercase().starts_with(&root))
+    line.split(|c: char| c.is_whitespace() || c == '"').any(|word| {
+        let word = word.trim_matches(|c: char| matches!(c, '\'' | '(' | ')' | '[' | ']' | ',' | ';')).replace("\\\\", "\\").to_lowercase();
+        word.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) && word.as_bytes().get(1) == Some(&b':') && !word.starts_with(&root)
+    })
 }
 
 /// The Unix tools a line starts: the first word of each of its commands, when it is one of those a model reaches for from habit. By the line that runs, in which `| head` is no longer there.
@@ -4540,6 +4545,10 @@ mod tests {
     #[test]
     fn a_sandboxs_answer_that_reads_as_something_else_is_explained() {
         let root = Path::new("C:\\work");
+        // A program that names no path, refused one outside the workspace, in its own words: the note says how to ask for it; refused one inside, it does not.
+        let python = |path: &str| sandbox_notes("python clean.py", root, Some(1), &format!("Traceback (most recent call last):\n  File \"C:\\work\\clean.py\", line 2\nPermissionError: [WinError 5] Access is denied: '{path}'"));
+        assert!(python("C:\\\\Users\\\\me\\\\old.txt").contains("`outside_sandbox: true`"));
+        assert!(!python("C:\\\\work\\\\out\\\\a.txt").contains("`outside_sandbox: true`"));
         assert!(sandbox_notes("where python", root, Some(1), "INFO: Could not find files for the given pattern(s).").contains("does not say the program is missing"));
         assert!(sandbox_notes("powershell -NoProfile -Command \"Get-Item a\"", root, Some(1), "Get-Item : Cannot find path 'C:\\a' because it does not exist.").contains("absolute paths"));
         assert!(sandbox_notes("powershell -NoProfile -Command \"Get-ChildItem\"", root, Some(1), "PermissionDenied: (C:\\:String) [Get-ChildItem]").contains("absolute paths"));
