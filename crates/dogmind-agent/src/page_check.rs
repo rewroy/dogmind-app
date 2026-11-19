@@ -343,8 +343,9 @@ fn utf8_declared(html: &str) -> String {
 
 /// The page with a script of ours at its end and its folder as its base, so that what it names by a relative path is what it would have had.
 fn with_script(html: &str, base: &str, script: &str) -> String {
+    let html = with_frames(html);
     let lower = html.to_ascii_lowercase();
-    let mut out = html.to_string();
+    let mut out = html.clone();
     // (one with a base of its own keeps it)
     if !lower.contains("<base") {
         let tag = format!("<base href=\"{base}\">");
@@ -355,6 +356,22 @@ fn with_script(html: &str, base: &str, script: &str) -> String {
         Some(at) => out.insert_str(at, script),
         None => out.push_str(script),
     }
+    out
+}
+
+/// A browser given a time budget (`--virtual-time-budget`) runs a page's timers on it and draws no frames: `requestAnimationFrame` never calls back,
+/// and every game or animation drawn that way stood at its first frame in a check, its loop never run (a model spent its turn on why `frames=0`).
+/// These two take the page's frames from its timers instead, one every 16 ms of its time, as a screen at 60 a second would, with the time a frame is
+/// given as `requestAnimationFrame` gives it. Before any script of the page's own.
+const FRAMES: &str = "<script>(() => { let next = 1; const waiting = new Map(); window.requestAnimationFrame = (callback) => { const id = next++; waiting.set(id, setTimeout(() => { waiting.delete(id); callback(performance.now()); }, 16)); return id; }; window.cancelAnimationFrame = (id) => { clearTimeout(waiting.get(id)); waiting.delete(id); }; })();</script>";
+
+/// The page with [`FRAMES`] first: after `<head>` (or `<html>`, or the doctype), where no script of the page's comes before it, and not before the doctype, which would put the page in quirks mode.
+fn with_frames(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let after = |tag: &str| lower.find(tag).and_then(|at| lower[at..].find('>').map(|end| at + end + 1));
+    let at = after("<head").or_else(|| after("<html")).or_else(|| after("<!doctype")).unwrap_or(0);
+    let mut out = html.to_string();
+    out.insert_str(at, FRAMES);
     out
 }
 
@@ -1081,9 +1098,9 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             }
         }
     }
-    // What the browser is given, on its command line and in the pictures' frame (the pictures of a plain page are of the page itself, not of its copy).
+    // What the browser is given, on its command line and in the pictures' frame: the copy where there is one, whose frames run (`FRAMES`).
     let (address, src) = match &opened {
-        Some(file) => (plain(file), file_url(if steps.is_some() { file } else { page.as_deref().unwrap_or(file) })),
+        Some(file) => (plain(file), file_url(if copy_name.is_some() { file } else { page.as_deref().unwrap_or(file) })),
         None => (name.clone(), name.clone()),
     };
     // (the script that reads a plain page's words waits for the page's time to be up, so the browser is given a little more of it than that)
@@ -1634,7 +1651,7 @@ mod tests {
 
     #[test]
     fn steps_cannot_end_their_script_whatever_the_case_of_the_end_tag() {
-        let page = with_steps("<body></body>", "file:///C:/w/", "console.log('</script>', '</SCRIPT>', '</Script >', '</sCrIpT'); await wait(1)", "k");
+        let page = with_steps("<body></body>", "file:///C:/w/", "console.log('</script>', '</SCRIPT>', '</Script >', '</sCrIpT'); await wait(1)", "k").replace(FRAMES, "");
         let ends = Regex::new(r"(?i)</script").unwrap().find_iter(&page).count();
         assert_eq!(ends, 1, "only the script's own end: {page}");
         assert!(page.contains("<\\/Script >") && page.contains("<\\/sCrIpT'") && page.contains("<\\/script>"), "{page}");
@@ -1702,9 +1719,22 @@ mod tests {
         assert!(both.starts_with("Shows (read at 1280x800; from the page's DOM"), "{both}");
     }
 
+    /// The frames' script goes before any of the page's own, and never before its doctype (quirks mode): after `<head>`, else `<html>`, else the doctype.
+    #[test]
+    fn the_frames_go_before_the_pages_own_scripts_and_after_its_doctype() {
+        let head = with_frames("<!doctype html><html lang=ja><head><script>requestAnimationFrame(f)</script></head></html>");
+        assert!(head.starts_with(&format!("<!doctype html><html lang=ja><head>{FRAMES}<script>requestAnimationFrame")), "{head}");
+        assert!(with_frames("<!DOCTYPE html><script>x</script>").starts_with(&format!("<!DOCTYPE html>{FRAMES}<script>x")));
+        assert!(with_frames("<canvas></canvas><script>x</script>").starts_with(FRAMES));
+        assert!(FRAMES.contains("window.requestAnimationFrame") && FRAMES.contains("setTimeout") && FRAMES.contains("cancelAnimationFrame"));
+    }
+
     #[test]
     fn a_plain_page_is_given_a_script_that_says_its_words_and_nothing_else() {
         let page = with_script("<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>", "file:///C:/w/", &reading_script(1500));
+        // (the frames' script first, in the head; what follows is said of the page without it)
+        assert!(page.contains(&format!("<head><base href=\"file:///C:/w/\">{FRAMES}<title>")), "{page}");
+        let page = page.replace(FRAMES, "");
         assert!(page.contains("<head><base href=\"file:///C:/w/\"><title>"), "{page}");
         let (script_at, body_end) = (page.find("setTimeout(done, 1500)").unwrap(), page.rfind("</body>").unwrap());
         assert!(page.find("<p>x</p>").unwrap() < script_at && script_at < body_end, "{page}");
@@ -1861,6 +1891,26 @@ mod tests {
         assert!(!served.load(std::sync::atomic::Ordering::Relaxed), "the browser reached a server outside the sandbox");
     }
 
+    /// With the real browser, in the real sandbox: a page drawn by `requestAnimationFrame` runs its frames in the check, in what is read of it and in its picture
+    /// (which, with the browser's time budget alone, stood at its first frame: `frames=0`, and the canvas never drawn).
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn a_page_drawn_by_animation_frames_runs_them_in_the_check() {
+        let html = "<!DOCTYPE html><title>a</title><style>body{margin:0}</style><div id=o>start</div><canvas id=c width=200 height=100></canvas><script>\
+            let frames = 0; const ctx = document.getElementById('c').getContext('2d');\
+            function step(t) { frames++; document.getElementById('o').textContent = 'frames ' + (frames > 30 ? 'many' : frames); if (frames > 30) { ctx.fillStyle = '#22aa44'; ctx.fillRect(0, 0, 200, 100); } requestAnimationFrame(step); }\
+            requestAnimationFrame(step);</script>";
+        let (dir, _) = page(&[("index.html", html)]);
+        let said = check_page(&serde_json::json!({"path": "index.html"}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        assert!(said.contains("frames many"), "{said}");
+        let path = said.lines().find(|line| line.starts_with("How it looks at desktop ")).and_then(|line| line.split("`read_file` ").nth(1)).map(PathBuf::from).unwrap_or_else(|| panic!("{said}"));
+        let picture = image::open(path).unwrap().to_rgb8();
+        // (the canvas is below the line of text: drawn green once its frames have run)
+        let green = (0..picture.height().min(200)).any(|y| picture.get_pixel(100, y).0 == [0x22, 0xaa, 0x44]);
+        assert!(green, "the canvas was drawn in the picture");
+    }
+
     /// With the real browser, in the real sandbox: a phone's width is the width the page is laid out at, not the browser window's least.
     #[test]
     #[ignore = "starts Edge in the sandbox"]
@@ -2005,7 +2055,7 @@ mod tests {
 
     #[test]
     fn steps_go_at_the_end_of_the_page_with_its_folder_as_base_and_cannot_end_their_script() {
-        let page = with_steps("<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>", "file:///C:/w/", "await click('#a'); console.log('</script>')", "k");
+        let page = with_steps("<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>", "file:///C:/w/", "await click('#a'); console.log('</script>')", "k").replace(FRAMES, "");
         assert!(page.contains("<head><base href=\"file:///C:/w/\"><title>"), "{page}");
         let (steps_at, body_end) = (page.find("click('#a')").unwrap(), page.rfind("</body>").unwrap());
         assert!(page.find("<p>x</p>").unwrap() < steps_at && steps_at < body_end, "{page}");
