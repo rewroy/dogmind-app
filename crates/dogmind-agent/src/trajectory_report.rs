@@ -376,6 +376,18 @@ fn tool_notes(line: &Line) -> Vec<String> {
     more
 }
 
+/// 3rd, 4th, 21st: the count as an English ordinal.
+fn ordinal(count: usize) -> String {
+    let suffix = match (count % 10, count % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{count}{suffix}")
+}
+
 /// Where the time of some lines went.
 #[derive(Default)]
 struct Spent {
@@ -500,8 +512,9 @@ fn circles(out: &mut String, lines: &[Line]) {
             history.push((hash, short(line.req())));
         }
     }
-    // The same call again: the same tool with the same arguments (by their hash), where nothing was edited since the call before it.
-    let mut since_edit: HashMap<(String, String), usize> = HashMap::new();
+    // The same call again: the same tool with the same arguments (by their hash), where nothing was edited since the call before it. A program's calls of one run
+    // are its loop's, which the model wrote once (a benchmark of a page, each file of a list): only a call again from another of its steps is going round.
+    let mut since_edit: HashMap<(String, String), (usize, Option<String>)> = HashMap::new();
     let mut shown = std::collections::HashSet::new();
     for line in &tools {
         if matches!(line.s("name"), "create_file" | "apply_patch") && !line.failed() {
@@ -509,14 +522,20 @@ fn circles(out: &mut String, lines: &[Line]) {
             continue;
         }
         let Some(hash) = line.v["args_hash"].as_str() else { continue };
-        let count = since_edit.entry((line.s("name").to_string(), hash.to_string())).or_default();
+        let parent = line.v["parent"].as_str().map(str::to_string);
+        let (count, last) = since_edit.entry((line.s("name").to_string(), hash.to_string())).or_default();
+        if parent.is_some() && *last == parent {
+            continue;
+        }
         *count += 1;
-        if *count >= 2 && shown.insert((line.s("name").to_string(), hash.to_string())) {
+        *last = parent;
+        let count = *count;
+        if count >= 2 && shown.insert((line.s("name").to_string(), hash.to_string())) {
             found = true;
             let _ = writeln!(out, "  {} called again with the same arguments (hash {hash}), nothing edited between: at {}", line.s("name"), short(line.req()));
-        } else if *count >= 3 {
+        } else if count >= 3 {
             found = true;
-            let _ = writeln!(out, "  ... and a {count}th time at {}", short(line.req()));
+            let _ = writeln!(out, "  ... and a {} time at {}", ordinal(count), short(line.req()));
         }
     }
     // Failed calls one after another.
@@ -848,6 +867,25 @@ mod tests {
         assert!(said.contains("read_file called again with the same arguments (hash same), nothing edited between: at /7"), "{said}");
         assert!(said.contains("3 failed calls in a row, the longest run ending at /12"), "{said}");
         assert!(said.contains("the run ended here: no turn_end"), "{said}");
+    }
+
+    /// A program's loop calls a tool again by design (here a page timed four times): that is not going round. A call again from the model's next step is.
+    #[test]
+    fn a_programs_own_calls_again_are_not_going_round_and_one_from_another_step_is() {
+        let nested = |req: u32, id: &str, parent: &str| {
+            json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "tool", "turn": 1, "req": format!("s/{req}"), "id": id, "name": "check_page", "ms": 1500, "outcome": "ok", "args_hash": "page", "parent": parent})
+        };
+        let lines = [
+            json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 4, "images": 0}),
+            nested(9, "a.1", "a"), nested(9, "a.2", "a"), nested(9, "a.3", "a"), nested(9, "a.4", "a"),
+        ];
+        let said = report(&text(&lines), None);
+        assert!(!said.contains("called again"), "{said}");
+        let mut more = lines.to_vec();
+        more.extend([nested(10, "b.1", "b"), nested(11, "c.1", "c")]);
+        let said = report(&text(&more), None);
+        assert!(said.contains("check_page called again with the same arguments (hash page), nothing edited between: at /10"), "{said}");
+        assert!(said.contains("... and a 3rd time at /11"), "{said}");
     }
 
     #[test]
