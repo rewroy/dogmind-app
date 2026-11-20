@@ -12294,10 +12294,12 @@ impl App {
                 return false;
             }
         };
-        // (the person's word on what it returns goes with it, under a new name too)
-        let trusted = before.as_ref().and_then(|before| configs.iter().find(|(known, _)| known == before)).is_some_and(|(_, config)| config.trusted);
+        // (the person's word on what it returns goes with it, under a new name too; and one of the older transport stays one, its stream asked for first)
+        let was = before.as_ref().and_then(|before| configs.iter().find(|(known, _)| known == before)).map(|(_, config)| config);
+        let trusted = was.is_some_and(|config| config.trusted);
+        let kind = if was.is_some_and(|config| config.kind == "sse") { "sse" } else { "http" };
         let config = match url {
-            Some(url) => mcp::ServerConfig { kind: "http".into(), url, headers: pairs, trusted, ..Default::default() },
+            Some(url) => mcp::ServerConfig { kind: kind.into(), url, headers: pairs, trusted, ..Default::default() },
             None => mcp::ServerConfig { command: target, args: mcp::args_of_line(&args), env: pairs, trusted, ..Default::default() },
         };
         if let Err(error) = mcp::save_server(&self.folder.join("mcp.json"), before.as_deref(), &name, config) {
