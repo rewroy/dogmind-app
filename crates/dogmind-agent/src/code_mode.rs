@@ -590,6 +590,11 @@ pub fn callable(offered: &Json) -> Vec<String> {
     offered.as_array().into_iter().flatten().filter_map(|tool| tool.pointer("/function/name")?.as_str()).filter(|name| !NOT_CALLABLE.contains(name)).map(str::to_string).collect()
 }
 
+/// How a program calls each of these tools (a list of schemas), a line each, as `run_code` declares those it is offered with.
+pub fn declarations(tools: &Json) -> Vec<String> {
+    tools.as_array().into_iter().flatten().filter_map(declaration).collect()
+}
+
 /// The `run_code` tool as the model is offered it: the rules and, for each tool it can call, a line that says how (`tools.read_file({path, start_line?, limit?}) — Read a text file...`), made from
 /// the tools that are offered with it, so that the web, notes and servers' tools are in it only when they are.
 pub fn schema(offered: &Json) -> Json {

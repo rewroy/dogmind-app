@@ -36,6 +36,8 @@ enum Line {
     Tools { tools: serde_json::Value },
     /// What the session works toward, as the person set it (/goal), the last of these lines counting; none: cleared.
     Goal { goal: Option<String> },
+    /// The tools the conversation was told of after it began, callable as those it is offered (which stay as they were), the last of these lines counting.
+    Added { tools: serde_json::Value },
 }
 
 /// The plain first line of an encrypted session.
@@ -380,7 +382,7 @@ fn load(path: &Path) -> Result<Loaded, String> {
                 Ok(Line::Meta { workspace: place, .. }) => workspace = place,
                 Ok(Line::Message { message }) => messages.push(message),
                 Ok(Line::Snapshot { messages: all }) => messages = all,
-                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. } | Line::Goal { .. }) => {}
+                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. }) => {}
                 Err(_) => {} // a line cut short by a crash, or of a kind that is not known
             },
         }
@@ -542,6 +544,11 @@ impl Session {
         self.write(&Line::Tools { tools: tools.clone() })
     }
 
+    /// All the tools the conversation has been told of after it began, by now.
+    pub fn set_added(&mut self, tools: &serde_json::Value) -> Result<(), String> {
+        self.write(&Line::Added { tools: tools.clone() })
+    }
+
     pub fn snapshot(&mut self, messages: &[Message]) -> Result<(), String> {
         self.write(&Line::Snapshot { messages: messages.to_vec() })
     }
@@ -578,6 +585,14 @@ pub fn goal_of(path: &Path) -> Option<String> {
 pub fn tools_of(path: &Path) -> Option<serde_json::Value> {
     lines_of(path).ok()?.filter(|line| line.starts_with("{\"kind\":\"tools\"")).filter_map(|line| match serde_json::from_str(&line) {
         Ok(Line::Tools { tools }) => Some(tools),
+        _ => None,
+    }).last()
+}
+
+/// The tools a session was told of after it began; none if it was told of none.
+pub fn added_of(path: &Path) -> Option<serde_json::Value> {
+    lines_of(path).ok()?.filter(|line| line.starts_with("{\"kind\":\"added\"")).filter_map(|line| match serde_json::from_str(&line) {
+        Ok(Line::Added { tools }) => Some(tools),
         _ => None,
     }).last()
 }
@@ -697,6 +712,9 @@ pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf,
     let mut copy = Session::create_with(folder, &workspace, &now.format("%Y-%m-%d %H:%M:%S %:z").to_string(), &now.format("%Y%m%d-%H%M%S").to_string(), writer.as_ref())?;
     if let Some(tools) = tools_of(path) {
         copy.set_tools(&tools)?;
+    }
+    if let Some(tools) = added_of(path) {
+        copy.set_added(&tools)?;
     }
     if web_seen(path) {
         copy.mark_web_seen()?;
@@ -930,6 +948,12 @@ mod tests {
         assert_eq!(tools_of(&session.path).unwrap().to_string(), tools.to_string());
         let (_, _, messages) = Session::open(&session.path).unwrap();
         assert_eq!(messages.len(), 1, "a line of tools is no message");
+        assert_eq!(added_of(&session.path), None);
+        session.set_added(&serde_json::json!([{"a": 1}])).unwrap();
+        session.set_added(&tools).unwrap();
+        assert_eq!(added_of(&session.path).unwrap().to_string(), tools.to_string());
+        assert_eq!(tools_of(&session.path).unwrap().to_string(), tools.to_string(), "the tools offered stay as they were");
+        assert_eq!(Session::open(&session.path).unwrap().2.len(), 1, "nor is a line of the tools told of");
     }
 
     #[test]

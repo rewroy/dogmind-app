@@ -218,6 +218,23 @@ fn language_fact(language: Option<&str>) -> Option<String> {
 
 /// The app's facts after a message of the person's: the time to the minute (a model has no use for seconds, and they are tokens in every such message), the
 /// language, and the notes of the turn, each a block of its own.
+/// The tools that came after a conversation began, as the model is told of them where the conversation is: each with what its server says it is and
+/// its arguments' schema, and, with run_code, as a program calls it.
+pub fn tools_added(tools: &[serde_json::Value], code_mode: bool) -> String {
+    let mut text = String::from("## Tools Added\nThese tools came after this conversation began. They are not in your list of tools, which stays as it was, and are called the same way:");
+    for tool in tools {
+        let function = &tool["function"];
+        let about = function["description"].as_str().unwrap_or("").trim();
+        text.push_str(&format!("\n- `{}`: {about} Arguments (JSON Schema): {}", function["name"].as_str().unwrap_or(""), function["parameters"]));
+    }
+    let calls = crate::code_mode::declarations(&serde_json::Value::Array(tools.to_vec()));
+    if code_mode && !calls.is_empty() {
+        text.push_str("\nIn run_code, a program calls them as:\n");
+        text.push_str(&calls.join("\n"));
+    }
+    text
+}
+
 pub fn app_facts(now: &str, language: Option<&str>, notes: &[String]) -> String {
     let now = now.split_once(' ').and_then(|(day, rest)| rest.split_once(' ').map(|(time, zone)| format!("{day} {} {zone}", time.get(..5).unwrap_or(time)))).unwrap_or_else(|| now.to_string());
     let mut facts = vec![APP_FACTS.to_string(), format!("- Now: {now}")];

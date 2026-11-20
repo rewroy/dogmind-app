@@ -1015,6 +1015,10 @@ struct Agent {
     safe_commands: bool,
     gate: Gate,
     tool_schemas: Value,
+    /// The tools of MCP servers the conversation was told of after it began (see `servers_caught_up`): callable as those it is offered.
+    added_tools: Vec<Value>,
+    /// They are to be told of again, as a compaction may have left out where they were.
+    added_due: bool,
     bench: Workbench,
     messages: Vec<Message>,
     session: Option<Session>,
@@ -1325,6 +1329,8 @@ impl Agent {
             read_only: false,
             turn_began: std::time::SystemTime::now(),
             web_rules_due: false,
+            added_tools: Vec::new(),
+            added_due: false,
             events,
             wake,
             cancel,
@@ -1534,6 +1540,8 @@ impl Agent {
     fn load_extras(&mut self) {
         let found = self.allowed(skills::discover(&self.workspace, self.home.as_deref()));
         self.extras_with(found);
+        // (a conversation that begins is offered every server's tools)
+        (self.added_tools, self.added_due) = (Vec::new(), false);
     }
 
     /// The skills the model may be told of and start: not one the person turned off, nor one that needs what this app has not (a server not
@@ -1591,29 +1599,34 @@ impl Agent {
         }
     }
 
-    /// The tools of MCP servers that came up after the conversation began (one the person added or changed in Settings, or one slow to start), and
-    /// those a server listed again as it said its tools changed: offered from this turn, or from the next request of it after a call that changed
-    /// them, before `run_code`, which is declared again with them. The engine reads the prefix again once, as for the web turned
-    /// on; a tool whose server has gone stays offered, and a call to it says so.
-    fn servers_caught_up(&mut self) {
-        let Some(hub) = &self.mcp else { return };
+    /// The tools of MCP servers that are new to the conversation: one the person added or changed in Settings, one slow to start, or one a server listed
+    /// as it said its tools changed. The tools it is offered are the start of what the engine keeps of it, and a change there has the engine read the whole
+    /// conversation again (most of 2 minutes at 100K tokens on the Homelab's DeepSeek): they stay as they were, and the new ones are told of where the
+    /// conversation is, callable as the others are, directly and from a program. What to tell, if there are any. A tool whose server has gone stays
+    /// callable, and a call to it says so.
+    fn servers_caught_up(&mut self) -> Option<String> {
+        let hub = self.mcp.clone()?;
         let name = |tool: &Value| tool.pointer("/function/name").and_then(Value::as_str).map(str::to_string);
-        let Some(list) = self.tool_schemas.as_array() else { return };
-        let offered: std::collections::HashSet<String> = list.iter().filter_map(name).collect();
-        let more: Vec<Value> = hub.schemas().into_iter().filter(|tool| name(tool).is_some_and(|known| !offered.contains(&known))).collect();
+        let known: std::collections::HashSet<String> = self.tool_schemas.as_array().into_iter().flatten().chain(&self.added_tools).filter_map(name).collect();
+        let more: Vec<Value> = hub.schemas().into_iter().filter(|tool| name(tool).is_some_and(|it| !known.contains(&it))).collect();
         if more.is_empty() {
-            return;
+            return None;
         }
-        let names: Vec<String> = more.iter().filter_map(name).collect();
-        let Some(list) = self.tool_schemas.as_array_mut() else { return };
-        let at = list.iter().position(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("run_code")).unwrap_or(list.len());
-        list.splice(at..at, more);
-        tools::redeclare_run_code(&mut self.tool_schemas);
-        let tools = self.tool_schemas.clone();
+        self.added_tools.extend(more.iter().cloned());
+        let added = Value::Array(self.added_tools.clone());
         if let Some(session) = &mut self.session {
-            let _ = session.set_tools(&tools);
+            let _ = session.set_added(&added);
         }
-        self.traj.write("tools_added", None, json!({"names": names}));
+        self.traj.write("tools_added", None, json!({"names": more.iter().filter_map(name).collect::<Vec<_>>(), "told": true}));
+        Some(prompt::tools_added(&more, self.code_mode))
+    }
+
+    /// All the tools told of after the conversation began, told of again in a message of the app's: after a compaction, which may have left out where they were.
+    fn tell_added_again(&mut self) {
+        if std::mem::take(&mut self.added_due) && !self.added_tools.is_empty() {
+            let note = prompt::tools_added(&self.added_tools, self.code_mode);
+            self.push(Message::text("user", prompt::app_facts(&now(), None, &[note])));
+        }
     }
 
     /// With no conversation yet it decides what one will begin with. In one, its tools are part of its prefix, so they stay: turned off, a call to `run_code` is answered as a call to a tool there
@@ -1688,6 +1701,7 @@ impl Agent {
                 if let Some(tools) = crate::session::tools_of(path) {
                     self.tool_schemas = tools;
                 }
+                self.added_tools = crate::session::added_of(path).and_then(|tools| tools.as_array().cloned()).unwrap_or_default();
                 self.messages = messages;
                 self.web_rules_due = false;
                 self.japanese_session = false;
@@ -1893,9 +1907,7 @@ impl Agent {
         }
         self.traj.begin_turn();
         self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": pictures.len() + kept.len(), "first": new_session}));
-        if !new_session {
-            self.servers_caught_up();
-        }
+        let added = if new_session { None } else { self.servers_caught_up() };
         let mut images = kept;
         if let Some(session) = self.session.as_ref().map(|session| session.path.clone()) {
             let limit = self.image_limit();
@@ -1936,6 +1948,12 @@ impl Agent {
         }
         if std::mem::take(&mut self.web_rules_due) {
             notes.push(prompt::WEB_RULES.trim_end().to_string());
+        }
+        // (all of them after a compaction, and the new ones otherwise)
+        if std::mem::take(&mut self.added_due) && !self.added_tools.is_empty() {
+            notes.push(prompt::tools_added(&self.added_tools, self.code_mode));
+        } else if let Some(note) = added {
+            notes.push(note);
         }
         if let Some(note) = self.asked_skill(text) {
             notes.push(note);
@@ -2214,6 +2232,7 @@ impl Agent {
                 if let Err(error) = self.compact(false, false) {
                     return if self.cancelled() { Ended::Cancelled } else { Ended::Failed(error) };
                 }
+                self.tell_added_again();
             }
             let req_id = self.traj.request_id();
             self.last_req = Some(req_id.clone());
@@ -2515,7 +2534,9 @@ impl Agent {
                 let nested = std::mem::take(&mut self.program_calls);
                 // (a server may have tools now that it had not, as one does that adds them on request: the model may call them in this turn)
                 if calls.iter().chain(&nested).any(|call| call.function.name.starts_with("mcp__")) {
-                    self.servers_caught_up();
+                    if let Some(note) = self.servers_caught_up() {
+                        self.push(Message::text("user", prompt::app_facts(&now(), None, &[note])));
+                    }
                 }
                 failed_calls = if failures == calls.len() { failed_calls + failures } else { 0 };
                 let edited = std::mem::take(&mut self.edited);
@@ -2996,7 +3017,8 @@ impl Agent {
         // (a model that left it out is still told to the person: the program's first line)
         let description = said.map_or_else(|| code.trim().lines().next().unwrap_or("").chars().take(80).collect(), str::to_string);
         let limits = code_mode::Limits::default().with_timeout_seconds(arguments.get("timeout_seconds").and_then(Value::as_f64));
-        let offered = code_mode::callable(&self.tool_schemas);
+        let mut offered = code_mode::callable(&self.tool_schemas);
+        offered.extend(code_mode::callable(&Value::Array(self.added_tools.clone())));
         let names: Vec<&str> = offered.iter().map(String::as_str).collect();
         self.program = Some(Program { id: id.to_string(), description, calls: 0, waited: Duration::ZERO, stranger: false });
         let cancel = self.cancel.clone();
@@ -3530,8 +3552,9 @@ impl Agent {
         if self.messages.is_empty() {
             return Ok(());
         }
-        // (what a compaction leaves may not hold the goal: it is said again with the next message)
+        // (what a compaction leaves may not hold the goal, nor the tools told of: they are said again with the next message)
         self.goal_due |= self.goal.is_some();
+        self.added_due |= !self.added_tools.is_empty();
         let (before, began) = (self.expected_use(), Instant::now());
         // (as it was: the engine reads again everything from the first message that differs, and that is what a compaction costs it)
         let was = self.messages.clone();
@@ -7877,9 +7900,10 @@ Body").unwrap();
         assert!(messages.last().unwrap()["content"].as_str().unwrap().contains("cut off"), "{:?}", messages.last());
     }
 
-    /// A server that says in a call that it has a new tool has it offered from the next request of the same turn, which calls it.
+    /// A server that says in a call that it has a new tool has it told of before the next request of the same turn, which calls it: the tools offered
+    /// stay as they were.
     #[test]
-    fn a_tool_a_server_adds_in_a_call_is_offered_in_the_same_turn() {
+    fn a_tool_a_server_adds_in_a_call_is_told_of_and_called_in_the_same_turn() {
         let dir = tempfile::tempdir().unwrap();
         let tool = |name: &str| serde_json::json!({"name": name, "description": "d", "inputSchema": {"type": "object"}});
         // (what the server says in the call, and as it is asked for its tools and called again)
@@ -7900,14 +7924,16 @@ Body").unwrap();
         assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("the new one answered")), "{log:?}");
         let bodies = bodies.lock().unwrap();
         let names = |body: &Value| body["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
-        let (first, second) = (names(&bodies[0]), names(&bodies[1]));
-        assert!(!first.contains(&"mcp__srv__u".to_string()), "{first:?}");
-        assert_eq!(second[first.len() - 1..], ["mcp__srv__u", "run_code"], "offered from the next request, before run_code");
+        assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "the tools offered stay as they were");
+        assert!(!names(&bodies[0]).contains(&"mcp__srv__u".to_string()));
+        let told = bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+        assert!(told.contains("## Tools Added") && told.contains("`mcp__srv__u`") && told.contains("tools.mcp__srv__u({})"), "{told}");
     }
 
-    /// A server the person adds while a conversation goes on is offered from their next turn, and its tool is called there.
+    /// A server the person adds while a conversation goes on is told of in their next turn, whose tools offered stay as they were, and its tool is called
+    /// there.
     #[test]
-    fn a_server_added_in_a_conversation_is_offered_from_the_next_turn() {
+    fn a_server_added_in_a_conversation_is_told_of_in_the_next_turn() {
         let dir = tempfile::tempdir().unwrap();
         let tool = |name: &str| [serde_json::json!({"name": name, "description": "d", "inputSchema": {"type": "object"}})];
         let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "the late one answered"}]}});
@@ -7926,12 +7952,12 @@ Body").unwrap();
         assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("the late one answered")), "{log:?}");
         let bodies = bodies.lock().unwrap();
         let names = |body: &Value| body["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
-        let (first, second) = (names(&bodies[0]), names(&bodies[1]));
+        let first = names(&bodies[0]);
         assert!(first.contains(&"mcp__srv__t".to_string()) && !first.contains(&"mcp__late__u".to_string()), "{first:?}");
-        assert_eq!(second[..first.len() - 1], first[..first.len() - 1], "what was offered stays as it was, in its order");
-        assert_eq!(second[first.len() - 1..], ["mcp__late__u", "run_code"], "the new one comes before run_code, which stays last");
-        let declared = bodies[1]["tools"].as_array().unwrap().last().unwrap().to_string();
-        assert!(declared.contains("mcp__late__u"), "run_code is declared again with it");
+        assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "the tools offered stay as they were");
+        let told: Vec<String> = bodies[1]["messages"].as_array().unwrap().iter().filter_map(|message| message["content"].as_str()).filter(|text| text.contains("## Tools Added")).map(str::to_string).collect();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("`mcp__late__u`") && told[0].contains("From the MCP server late."), "{}", told[0]);
     }
 
     #[test]
