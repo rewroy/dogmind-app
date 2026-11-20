@@ -6118,6 +6118,8 @@ impl App {
                 if argument.eq_ignore_ascii_case("import") {
                     let said = self.mcp_servers_imported();
                     self.say(&said);
+                } else if let Some(why) = self.mcp.unreadable() {
+                    self.say(&tf("The list of servers could not be read, and none was started: {0}", &[&why]));
                 } else {
                     let lines = self.mcp.status();
                     self.say(&if lines.is_empty() { tf("No server yet. {0} lists them, and /mcp import copies Claude's and Codex's in.", &[&file.display()]) } else { lines.join("\n") });
@@ -7421,6 +7423,9 @@ impl App {
                 let setting = self.settings.search_key.clone();
                 self.key_rows(form, &setting, t("Brave Search key"));
                 form.section(t("MCP servers"));
+                if let Some(why) = self.mcp.unreadable() {
+                    form.note(&tf("The list of servers could not be read, and none was started: {0}", &[&why]), theme::bad());
+                }
                 let (states, configs, servers) = (self.mcp.states(), self.mcp.configs(), self.mcp.trust());
                 for (at, (name, _)) in servers.iter().enumerate() {
                     let (Some(toggle), Some(edit)) = (self.mcp_trust.get(at), self.mcp_edit.get(at)) else { break };

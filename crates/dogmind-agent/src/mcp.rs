@@ -758,6 +758,8 @@ pub struct Hub {
     slots: Arc<Mutex<Vec<Slot>>>,
     /// The file the servers were listed in.
     file: Mutex<Option<PathBuf>>,
+    /// Why that file could not be read, the last time it was.
+    unreadable: Mutex<Option<String>>,
 }
 
 fn start_server(config: &ServerConfig) -> Result<Running, String> {
@@ -862,7 +864,10 @@ impl Hub {
     /// again with it; one that did not change goes on as it was (its trust as the file now says). Says the names of those started.
     pub fn reload(&self) -> Vec<String> {
         let Some(file) = self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else { return Vec::new() };
-        let servers = load_config(&file).servers;
+        // (a file that cannot be read, as one written by hand can be, starts nothing and ends nothing: it is said, for the person to mend)
+        let read = readable_config(&file);
+        *self.unreadable.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = read.as_ref().err().cloned();
+        let Ok(Config { servers }) = read else { return Vec::new() };
         let parts = name_parts(servers.keys());
         let mut started = Vec::new();
         let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -921,6 +926,11 @@ impl Hub {
     /// The file the servers are listed in.
     pub fn file(&self) -> Option<PathBuf> {
         self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    /// Why the file could not be read, if it could not when it was last: then none of what it lists was started.
+    pub fn unreadable(&self) -> Option<String> {
+        self.unreadable.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
     /// The tools of the servers up by now. A session that began before one was up is offered its tools from the next turn the person starts.
@@ -1116,6 +1126,20 @@ mod tests {
         let said = import(&file, BTreeMap::from([("c".to_string(), one("fourth"))])).unwrap_err();
         assert!(said.contains("mcp.json"), "{said}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), mine);
+    }
+
+    /// A file written by hand with a mistake in it: the hub says why, and starts nothing; mended, it starts what it lists.
+    #[test]
+    fn a_file_that_cannot_be_read_is_said_and_starts_nothing_until_it_can() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        std::fs::write(&file, "{\"mcpServers\": {\"a\": {\"command\": \"no-such-program-here\"},}}").unwrap();
+        let hub = Hub::start(&file);
+        assert!(hub.configs().is_empty() && hub.states().is_empty());
+        assert!(hub.unreadable().is_some_and(|why| why.contains("mcp.json")), "{:?}", hub.unreadable());
+        std::fs::write(&file, "{\"mcpServers\": {\"a\": {\"command\": \"no-such-program-here\"}}}").unwrap();
+        assert_eq!(hub.reload(), ["a"]);
+        assert_eq!(hub.unreadable(), None);
     }
 
     /// A server of Streamable HTTP for the tests, on this machine: it answers `initialize` in JSON with a session's id, a notification with 202, `tools/list` in an
