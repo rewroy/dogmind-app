@@ -125,7 +125,10 @@ fn folder_of(session: &Path) -> PathBuf {
 /// failed on the way (a full disk, the app ended) left the file cut or empty.
 fn put_back(copy: &Path, path: &Path) -> std::io::Result<()> {
     let beside = crate::tools::written_beside(path);
-    let done = std::fs::copy(copy, &beside).and_then(|_| if path.exists() { crate::tools::take_the_place(&beside, path) } else { std::fs::rename(&beside, path) });
+    // (on the disk before it takes the place: a power cut just after would otherwise leave the person's file as zeros)
+    let done = std::fs::copy(copy, &beside)
+        .and_then(|_| std::fs::OpenOptions::new().write(true).open(&beside)?.sync_all())
+        .and_then(|()| if path.exists() { crate::tools::take_the_place(&beside, path) } else { std::fs::rename(&beside, path) });
     if done.is_err() {
         let _ = std::fs::remove_file(&beside);
     }
@@ -173,11 +176,30 @@ fn same_bytes(a: &Path, b: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Whether a kept copy is what a power cut leaves of a file written just before it: its length, and only zeros. A block at a time, as a copy may be large.
+fn left_as_zeros(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut block = vec![0u8; 64 * 1024];
+    let mut any = false;
+    loop {
+        let count = file.read(&mut block)?;
+        if count == 0 {
+            return Ok(any);
+        }
+        if block[..count].iter().any(|&byte| byte != 0) {
+            return Ok(false);
+        }
+        any = true;
+    }
+}
+
 /// `from` as a new file at `to`, streamed, and never over one that is there: a copy that was kept is the only one there is of what it held.
 fn copy_new(from: &Path, to: &Path) -> std::io::Result<u64> {
     let mut source = std::fs::File::open(from)?;
     let mut copy = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
-    let written = std::io::copy(&mut source, &mut copy);
+    // (on the disk before the index, which is flushed, names it: a power cut would otherwise leave a copy of zeros that a rewind puts back)
+    let written = std::io::copy(&mut source, &mut copy).and_then(|count| copy.sync_all().map(|()| count));
     if written.is_err() {
         drop(copy);
         let _ = std::fs::remove_file(to);
@@ -400,6 +422,11 @@ impl Checkpoints {
             }
             match &saved.copy {
                 Some(copy) => {
+                    // (zeros put back would be the person's file lost: it is left as it is, and said)
+                    if left_as_zeros(&self.folder.join(copy)).unwrap_or(false) {
+                        restored.failed.push(format!("{}: the copy kept of it is only zeros, as a power cut leaves a file written just before it, so it was left as it is", saved.path.display()));
+                        continue;
+                    }
                     if let Some(parent) = saved.path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -678,6 +705,23 @@ mod tests {
         assert_eq!((read(&f.file), restored.failed.len()), ("after".to_string(), 1), "{:?}", restored.failed);
         let left: Vec<String> = std::fs::read_dir(f.file.parent().unwrap()).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.contains("dogmind-edit")).collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A kept copy that a power cut left as zeros is not put back: the file stays as it is, and the rewind says why.
+    #[test]
+    fn a_copy_a_power_cut_left_as_zeros_is_not_put_back() {
+        let mut f = fixture();
+        std::fs::write(&f.file, "before").unwrap();
+        f.marks.begin("one", "t", Some(1)).unwrap();
+        f.marks.before_edit(&[f.file.clone()]).unwrap();
+        std::fs::write(&f.file, "after").unwrap();
+        let copy = f.marks.folder.join("0.bin");
+        assert_eq!(read(&copy), "before");
+        std::fs::write(&copy, vec![0u8; "before".len()]).unwrap();
+        let restored = f.marks.restore(1, "t");
+        assert_eq!(read(&f.file), "after");
+        assert!(restored.written.is_empty() && restored.failed.len() == 1 && restored.failed[0].contains("only zeros"), "{:?}", restored.failed);
+        assert!(!left_as_zeros(&f.file).unwrap() && !left_as_zeros(&f.marks.folder.join("index.json")).unwrap());
     }
 
     #[test]
