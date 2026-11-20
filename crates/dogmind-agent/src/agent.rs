@@ -944,20 +944,58 @@ fn one_shape_for_edits(calls: &[crate::message::ToolCall]) -> Vec<crate::message
     for call in calls.iter_mut().filter(|call| call.function.name == "apply_patch") {
         let Ok(mut arguments) = serde_json::from_str::<Value>(&call.function.arguments) else { continue };
         let Some(all) = arguments.as_object_mut() else { continue };
+        let mut changed = false;
+        // (the list given as its text, in a string: the Homelab's DeepSeek sent 13 edits so, 4,126 characters, and the 68 s it took to write them went for nothing)
+        if let Some(list) = all.get("edits").and_then(Value::as_str).and_then(list_of_text) {
+            all.insert("edits".to_string(), list);
+            changed = true;
+        }
         if !all.contains_key("edits") && all.contains_key("old_string") && all.contains_key("new_string") {
             let one: serde_json::Map<String, Value> = ["path", "old_string", "new_string", "count"].iter().filter_map(|field| Some((field.to_string(), all.remove(*field)?))).collect();
             all.insert("edits".to_string(), Value::Array(vec![Value::Object(one)]));
+            changed = true;
+        } else if all.get("edits").is_some_and(Value::is_array) {
+            if let Some(path) = all.remove("path") {
+                for edit in all.get_mut("edits").and_then(Value::as_array_mut).into_iter().flatten().filter_map(Value::as_object_mut) {
+                    edit.entry("path").or_insert_with(|| path.clone());
+                }
+                changed = true;
+            }
+        }
+        if changed {
             call.function.arguments = arguments.to_string();
-            continue;
         }
-        let Some(path) = all.remove("path") else { continue };
-        let Some(edits) = arguments.get_mut("edits").and_then(Value::as_array_mut) else { continue };
-        for edit in edits.iter_mut().filter_map(Value::as_object_mut) {
-            edit.entry("path").or_insert_with(|| path.clone());
-        }
-        call.function.arguments = arguments.to_string();
     }
     calls
+}
+
+/// The list a string's text writes, or one edit there as a list of it; the line breaks typed as they are inside its strings, which JSON does not allow, taken as the ones
+/// they stand for (the DeepSeek call had five, in the middle of its code).
+fn list_of_text(text: &str) -> Option<Value> {
+    let mut escaped = String::with_capacity(text.len());
+    let (mut in_string, mut after_backslash) = (false, false);
+    for c in text.chars() {
+        if in_string && c < ' ' {
+            escaped.push_str(&format!("\\u{:04x}", c as u32));
+            after_backslash = false;
+            continue;
+        }
+        escaped.push(c);
+        if !in_string {
+            in_string = c == '"';
+        } else if after_backslash {
+            after_backslash = false;
+        } else if c == '\\' {
+            after_backslash = true;
+        } else if c == '"' {
+            in_string = false;
+        }
+    }
+    match serde_json::from_str::<Value>(&escaped).ok()? {
+        list @ Value::Array(_) => Some(list),
+        one @ Value::Object(_) => Some(Value::Array(vec![one])),
+        _ => None,
+    }
 }
 
 /// An answer that stopped in a `create_file`, as if it had ended where that file's last whole line does. The calls before it stand; what comes of the last is said in `cut_write`.
@@ -5521,6 +5559,40 @@ mod tests {
         assert_eq!((&made["edits"][0]["path"], &made["edits"][0]["old_string"], &made["edits"][0]["new_string"]), (&json_str("../outside.txt"), &json_str("a"), &json_str("b")));
         assert!(made.get("path").is_none() && made.get("old_string").is_none());
         assert!(matches!(gate.check("apply_patch", &made, Path::new("C:\\work")), crate::safety::Verdict::Ask { risk: crate::safety::Risk::High, .. }), "and what it would write outside is seen in this shape too");
+    }
+
+    /// The list of edits given as its text in a string, as the Homelab's DeepSeek sent it (the call's arguments as they came, 13 edits in 4,126 characters, five line
+    /// breaks typed inside its strings): the gate and the tool see the list, and the conversation keeps what the model wrote.
+    #[test]
+    fn edits_given_as_the_text_of_a_list_are_taken_as_the_list() {
+        let raw = include_str!("agent/tests/edits_as_text.json").trim_end();
+        let given = crate::message::ToolCall { id: "p".into(), kind: "function".into(), function: crate::message::FunctionCall { name: "apply_patch".into(), arguments: raw.to_string() } };
+        let text = serde_json::from_str::<Value>(raw).unwrap()["edits"].as_str().unwrap().to_string();
+        assert_eq!(text.chars().count(), 4126);
+        assert!(serde_json::from_str::<Value>(&text).is_err(), "not JSON as it stands");
+        let made: Value = serde_json::from_str(&one_shape_for_edits(std::slice::from_ref(&given))[0].function.arguments).unwrap();
+        let edits = made["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 13);
+        assert!(edits.iter().all(|edit| edit["path"] == "game.html" && edit["old_string"].is_string() && edit["new_string"].is_string()));
+        assert_eq!(edits[0]["old_string"], "        damageBrick(b, 1, pb.x + pb.w / 2, pb.y);\n        brickAt(pb);\n        burst(pb.x, pb.y, 4, levelHue, 120);");
+        let broken = edits.iter().find_map(|edit| edit["new_string"].as_str().filter(|new| new.contains("ALL STAGE CLEAR!"))).unwrap();
+        assert!(broken.contains("' +\n      '<div class=\"scoreline\">"), "a line break typed in a string is the line break: {broken}");
+        // The tool takes them, on the file they were written for.
+        let dir = tempfile::tempdir().unwrap();
+        let before: String = edits.iter().map(|edit| format!("{}\n", edit["old_string"].as_str().unwrap())).collect();
+        std::fs::write(dir.path().join("game.html"), &before).unwrap();
+        let (mut bench, cancel) = (tools::Workbench::new(dir.path()), AtomicBool::new(false));
+        bench.run("read_file", &serde_json::json!({"path": "game.html"}), dir.path(), &cancel).unwrap();
+        let done = bench.run("apply_patch", &made, dir.path(), &cancel);
+        assert!(done.is_ok(), "{done:?}");
+        let after = std::fs::read_to_string(dir.path().join("game.html")).unwrap();
+        assert!(after.contains("ALL STAGE CLEAR!") && !after.contains("        brickAt(pb);\n"));
+        // An edit given alone as text is a list of one; a string that is no list is left as it was, to fail as it would.
+        let call_of = |arguments: Value| crate::message::ToolCall { id: "p".into(), kind: "function".into(), function: crate::message::FunctionCall { name: "apply_patch".into(), arguments: arguments.to_string() } };
+        let one = one_shape_for_edits(&[call_of(serde_json::json!({"edits": r#"{"path": "a.txt", "old_string": "x", "new_string": "y"}"#}))]);
+        assert_eq!(serde_json::from_str::<Value>(&one[0].function.arguments).unwrap()["edits"][0]["path"], "a.txt");
+        let not = call_of(serde_json::json!({"edits": "change x to y"}));
+        assert_eq!(one_shape_for_edits(std::slice::from_ref(&not))[0].function.arguments, not.function.arguments);
     }
 
     fn json_str(text: &str) -> Value {
