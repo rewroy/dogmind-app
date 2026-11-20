@@ -494,6 +494,9 @@ fn wait_for_command(result: &CommandResult, stop: &AtomicBool, cancel: &AtomicBo
 pub struct Workbench {
     /// The conversation is in Japanese, so what it writes is looked at for what is not.
     pub in_japanese: bool,
+    /// The next MCP call is to take the pictures its result holds (where the model reads pictures in a tool's result), into `mcp_pictures`.
+    pub mcp_pictures_wanted: bool,
+    pub mcp_pictures: Vec<crate::mcp::Picture>,
     /// The hash of each file as this session last saw it: an edit needs a read of what is there now.
     seen: HashMap<PathBuf, String>,
     pub todos: Vec<Value>,
@@ -765,7 +768,9 @@ impl Workbench {
             _ if tool.starts_with("mcp__") => {
                 let hub = self.mcp.as_ref().ok_or("no MCP server is running")?;
                 // What a server says may come from anywhere: it is data, as a page is.
-                hub.call(tool, arguments, cancel).map(|text| crate::web::envelope(tool, &format!("{text}\n")))
+                let (text, pictures) = hub.call_with_pictures(tool, arguments, cancel, std::mem::take(&mut self.mcp_pictures_wanted))?;
+                self.mcp_pictures = pictures;
+                Ok(crate::web::envelope(tool, &format!("{text}\n")))
             }
             "remember" | "forget" => {
                 let folder = self.memory.as_deref().ok_or("notes are not kept here")?;

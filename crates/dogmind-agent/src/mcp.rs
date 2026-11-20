@@ -870,11 +870,34 @@ fn hello() -> Value {
 
 /// A tool's result as text: what it says in words, and a word for what it says otherwise.
 /// A resource it holds is read as its text, with its URI (a file's contents come so from GitHub's server); one of bytes, and a link to one, by what they
-/// are.
+/// are. (The tests' word for `result_parts` with no pictures.)
+#[cfg(test)]
 fn result_text(result: &Value) -> String {
+    result_parts(result, false).0
+}
+
+/// A picture a tool returned, as its bytes.
+pub struct Picture {
+    pub bytes: Vec<u8>,
+}
+
+/// A tool's result as text (see `result_text`), and with `pictures` the pictures in it, each said in the text where it was: one whose data is not
+/// base64 is not shown, and is said so.
+fn result_parts(result: &Value, pictures: bool) -> (String, Vec<Picture>) {
     let said = |part: &Value, field: &str| part.get(field).and_then(Value::as_str).unwrap_or("").to_string();
+    let mut taken = Vec::new();
     let parts: Vec<String> = result.get("content").and_then(Value::as_array).into_iter().flatten().map(|part| match part.get("type").and_then(Value::as_str) {
         Some("text") => said(part, "text"),
+        Some("image") if pictures => {
+            let data: String = said(part, "data").chars().filter(|c| !c.is_whitespace()).collect();
+            match crate::conversation_key::b64d(&data) {
+                Some(bytes) => {
+                    taken.push(Picture { bytes });
+                    format!("[picture {} ({}): shown with this result]", taken.len(), said(part, "mimeType"))
+                }
+                None => "[image content is not shown: its data is not base64]".to_string(),
+            }
+        }
         Some("resource") => {
             let resource = part.get("resource").unwrap_or(&Value::Null);
             match resource.get("text").and_then(Value::as_str) {
@@ -890,7 +913,7 @@ fn result_text(result: &Value) -> String {
         None => part.to_string(),
     }).collect();
     let text = if parts.is_empty() { result.get("structuredContent").map_or(String::new(), Value::to_string) } else { parts.join("\n") };
-    crate::tools::spill("mcp", &text, MAX_RESULT)
+    (crate::tools::spill("mcp", &text, MAX_RESULT), taken)
 }
 
 /// A name the model's API takes: letters, digits, `_` and `-`, 64 at most.
@@ -1298,6 +1321,11 @@ impl Hub {
     }
 
     pub fn call(&self, tool: &str, arguments: &Value, cancel: &AtomicBool) -> Result<String, String> {
+        self.call_with_pictures(tool, arguments, cancel, false).map(|(text, _)| text)
+    }
+
+    /// A call, and with `pictures` the pictures its result holds, said where they were in its text.
+    pub fn call_with_pictures(&self, tool: &str, arguments: &Value, cancel: &AtomicBool, pictures: bool) -> Result<(String, Vec<Picture>), String> {
         let running = {
             let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let up = slots.iter().filter_map(|slot| slot.running.clone()).find(|running| running.names.contains_key(tool));
@@ -1333,11 +1361,11 @@ impl Hub {
             Err(error) if error == ENDED || error.starts_with(PIPE) => return Err(self.start_again(running, error)),
             Err(error) => return Err(error),
         };
-        let text = result_text(&result);
+        let (text, taken) = result_parts(&result, pictures);
         if result.get("isError").and_then(Value::as_bool) == Some(true) {
             return Err(text);
         }
-        Ok(text)
+        Ok((text, taken))
     }
 
     /// What a server that said its tools changed lists now, in place of what it listed: for calls at once, and offered to a session from its next request.
@@ -2025,6 +2053,17 @@ mod tests {
         let started = Instant::now();
         let said = rpc.call("tools/call", json!({}), Duration::from_secs(30), None).unwrap_err();
         assert!(said.starts_with("the server's answer could not be read") && started.elapsed() < Duration::from_secs(5), "{said}");
+    }
+
+    /// A tool's pictures are taken where they are asked for, and said where they were; data that is not base64 is said so.
+    #[test]
+    fn a_results_pictures_are_taken_and_said_where_they_were() {
+        let result = json!({"content": [{"type": "text", "text": "look"}, {"type": "image", "mimeType": "image/png", "data": "iVBO\nRw0K"}, {"type": "image", "data": "*"}]});
+        let (text, pictures) = result_parts(&result, true);
+        assert_eq!(text, "look\n[picture 1 (image/png): shown with this result]\n[image content is not shown: its data is not base64]");
+        assert_eq!(pictures.iter().map(|picture| picture.bytes.clone()).collect::<Vec<_>>(), [vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]]);
+        let (plain, none) = result_parts(&result, false);
+        assert!(none.is_empty() && plain == result_text(&result) && plain.contains("[image content is not shown]"), "{plain}");
     }
 
     #[test]

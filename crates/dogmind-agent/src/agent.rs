@@ -2931,7 +2931,13 @@ impl Agent {
             }
         }
         self.bench.secrets.clone_from(&self.gate.secrets);
+        // (what a server's tool shows, the model is shown too, as a picture read with read_file is: where it reads pictures in a tool's result)
+        self.bench.mcp_pictures_wanted = !nested && name.starts_with("mcp__") && self.session.is_some()
+            && self.provider.as_ref().is_some_and(|provider| provider.images_in_tool_results() && provider.reads_pictures() != Some(false));
         let result = self.bench.run(name, arguments, &self.workspace, &self.cancel);
+        self.bench.mcp_pictures_wanted = false;
+        let pictures = std::mem::take(&mut self.bench.mcp_pictures);
+        let (result, images) = self.shown_pictures(result, pictures);
         // A server's answer is as much a stranger's as a page: it may have come from one.
         let from_a_stranger = matches!(name, "web_search" | "web_read") || (name.starts_with("mcp__") && !self.mcp.as_ref().is_some_and(|hub| hub.trusts_tool(name)));
         if from_a_stranger && result.is_ok() && !self.web_seen {
@@ -2961,7 +2967,23 @@ impl Agent {
         let result = self.with_changes_noted(name, arguments, result);
         // (a command that ran and failed is a failure too: a model can spend an hour on those with nothing being wrong with a call)
         let failed = usize::from(result.as_ref().map_or(true, |output| name == "execute_command" && command_failed(output)));
-        Ran { stranger: from_a_stranger && result.is_ok(), ..Ran::done(result, failed) }
+        Ran { stranger: from_a_stranger && result.is_ok(), images, ..Ran::done(result, failed) }
+    }
+
+    /// The pictures a server's tool returned, kept with the conversation as a picture read with read_file is (see `read_picture`), to go with its result;
+    /// one that cannot be is said so in it, by the number its text gave it.
+    fn shown_pictures(&mut self, result: Result<String, String>, pictures: Vec<crate::mcp::Picture>) -> (Result<String, String>, Vec<ImageRef>) {
+        let Some(session) = self.session.as_ref().map(|session| session.path.clone()).filter(|_| !pictures.is_empty()) else { return (result, Vec::new()) };
+        let limit = self.image_limit();
+        let (mut kept, mut lost) = (Vec::new(), Vec::new());
+        for (at, picture) in pictures.into_iter().enumerate() {
+            match images::attach_bytes(&format!("picture-{}", at + 1), picture.bytes).and_then(|attached| images::save(&session, &attached, limit)) {
+                Ok(image) => kept.push(image),
+                Err(error) => lost.push(format!("picture {} could not be shown: {error}", at + 1)),
+            }
+        }
+        let result = if lost.is_empty() { result } else { result.map(|text| format!("{text}\n({})", lost.join("; "))) };
+        (result, kept)
     }
 
     /// A `run_code` call: its program runs in the embedded engine, and each tool it calls goes through [`Agent::program_call`]. What comes back is what the program returned, what it logged and how
@@ -8079,6 +8101,36 @@ Body").unwrap();
         assert!(log[0].starts_with("tool:false:") && log[0].contains("reads no pictures"), "{log:?}");
         assert_eq!(provider.requests(), 2, "the answer after the tool is the second request, and no refused one is between");
         assert!(provider.messages(1).iter().all(|message| message.images.is_empty()));
+    }
+
+    /// A picture a server's tool returns goes with its result where the model reads pictures in one, and is said not shown where it does not.
+    #[test]
+    fn a_picture_a_servers_tool_returns_is_shown_where_a_tool_can_show_one() {
+        for (tool_pictures, shown) in [(true, 1), (false, 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let png = images::base64(&images::tests::encoded(16, 16, image::ImageFormat::Png));
+            let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "the page"}, {"type": "image", "mimeType": "image/png", "data": png}]}});
+            let hub = mcp::Hub::scripted("web", &[serde_json::json!({"name": "shot", "inputSchema": {"type": "object"}})], &[answer], true);
+            let steps = vec![calls(&[("mcp__web__shot", serde_json::json!({}))]), says("a page")];
+            let (sender, events) = channel();
+            let sessions = tempfile::tempdir().unwrap();
+            let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+            let provider = Arc::new(Scripted { steps: Mutex::new(steps.into()), tool_pictures, ..Scripted::default() });
+            handle.commands.send(Command::Provider(provider.clone(), "model".into(), 100_000)).unwrap();
+            let run = Run { handle, events, _sessions: sessions };
+            run.handle.commands.send(Command::Send("look".into())).unwrap();
+            let (log, _) = until_end(&run, Decision::Reject);
+            let said = log.iter().find(|line| line.starts_with("tool:")).cloned().unwrap_or_default();
+            let result = provider.messages(1).last().cloned().unwrap();
+            assert_eq!(result.images.len(), shown, "{log:?}");
+            let text = user_text(&result).to_string();
+            if shown == 1 {
+                assert!(text.contains("[picture 1 (image/png): shown with this result]"), "{text}");
+            } else {
+                assert!(text.contains("[image content is not shown]"), "{text}");
+            }
+            assert!(said.starts_with("tool:true:"), "{said}");
+        }
     }
 
     #[test]
