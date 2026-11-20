@@ -354,7 +354,7 @@ impl Events {
             let event: Vec<u8> = self.pending.drain(..at + length).collect();
             let text = String::from_utf8_lossy(&event).replace("\r\n", "\n");
             let data: Vec<&str> = text.lines().filter_map(|line| line.strip_prefix("data:")).map(|data| data.strip_prefix(' ').unwrap_or(data)).collect();
-            if let Ok(message) = serde_json::from_str::<Value>(&data.join("\n")) {
+            if let Ok(message) = message_of(&data.join("\n")) {
                 messages.push(message);
             }
         }
@@ -500,7 +500,7 @@ impl HttpLink {
         let is_ours = |message: &Value| message.get("id").and_then(Value::as_u64) == id && message.get("method").is_none();
         if !streamed {
             let text = response.text().map_err(|error| error.to_string())?;
-            let answer: Value = serde_json::from_str(&text).map_err(|error| format!("the server's answer is not JSON: {error}"))?;
+            let answer: Value = message_of(&text).map_err(|error| format!("the server's answer is not JSON: {error}"))?;
             let found = match answer {
                 Value::Array(messages) => messages.into_iter().find(is_ours),
                 message => Some(message).filter(is_ours),
@@ -552,7 +552,15 @@ impl Rpc {
                 if matches!(reader.read_until(b'\n', &mut line), Ok(0) | Err(_)) {
                     return;
                 }
-                let Ok(message) = serde_json::from_str::<Value>(&String::from_utf8_lossy(&line)) else { continue };
+                let text = String::from_utf8_lossy(&line);
+                let message = match message_of(&text) {
+                    Ok(message) => message,
+                    // (an answer that cannot be read is said to the call that waits for it, which would otherwise wait out its limit, ten minutes)
+                    Err(error) => match answer_id_in(&text) {
+                        Some(id) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32700, "message": format!("the server's answer could not be read: {error}")}}),
+                        None => continue,
+                    },
+                };
                 if let Some(reply) = answer_to_server(&message) {
                     let mut out = replies.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let _ = writeln!(out, "{reply}").and_then(|()| out.flush());
@@ -684,6 +692,51 @@ impl Rpc {
         }
         Ok(tools)
     }
+}
+
+/// A server's message as it is written, or with what JSON cannot hold mended. Python's `json.dumps` writes a byte it could not decode as half of a
+/// surrogate pair alone (`\udc94`), as a Python server on a Japanese Windows does with the UTF-8 it reads as cp932; JSON readers refuse that, and
+/// the answer it was in was lost. Each such half is read as U+FFFD.
+fn message_of(text: &str) -> Result<Value, serde_json::Error> {
+    serde_json::from_str(text).or_else(|error| match lone_halves_mended(text) {
+        Some(mended) => serde_json::from_str(&mended),
+        None => Err(error),
+    })
+}
+
+/// `text` with each `\u` escape of half a surrogate pair that has not its other half after it written as `\ufffd`; none if it had none.
+fn lone_halves_mended(text: &str) -> Option<String> {
+    let code = |at: &str| at.strip_prefix("\\u").and_then(|hex| hex.get(..4)).and_then(|hex| u16::from_str_radix(hex, 16).ok());
+    let (mut mended, mut rest, mut changed) = (String::with_capacity(text.len()), text, false);
+    while let Some(at) = rest.find('\\') {
+        mended.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let taken = match code(rest) {
+            Some(0xD800..=0xDBFF) if code(&rest[6..]).is_some_and(|low| (0xDC00..=0xDFFF).contains(&low)) => 12,
+            Some(0xD800..=0xDFFF) => {
+                mended.push_str("\\ufffd");
+                changed = true;
+                rest = &rest[6..];
+                continue;
+            }
+            Some(_) => 6,
+            // (an escape of one character, `\\` among them, whose second is no start of another)
+            None => 1 + rest[1..].chars().next().map_or(0, char::len_utf8),
+        };
+        mended.push_str(&rest[..taken]);
+        rest = &rest[taken..];
+    }
+    mended.push_str(rest);
+    changed.then_some(mended)
+}
+
+/// The id of the answer a line that cannot be read was meant to be, as far as it can be told: a number after `"id":`, in a line that is not a request.
+fn answer_id_in(line: &str) -> Option<u64> {
+    if line.contains("\"method\"") {
+        return None;
+    }
+    let after = line.split_once("\"id\"")?.1.trim_start().strip_prefix(':')?.trim_start();
+    after[..after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len())].parse().ok()
 }
 
 /// This side's answer to a request the server makes of it, none for what is not a request. A ping is answered. Anything else (the person's folders, a model's
@@ -934,6 +987,9 @@ fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Res
     if let Some(path) = crate::bundled::path_for_programs() {
         command.env("PATH", path);
     }
+    // (the protocol's messages are UTF-8: a Python server reads and writes its pipes in the machine's own code page otherwise, cp932 on a Japanese
+    // Windows, and Japanese in a call came to it garbled; what the configuration says comes after, and wins)
+    command.env("PYTHONIOENCODING", "utf-8");
     command.args(&config.args).envs(&config.env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)]
     {
@@ -1509,6 +1565,8 @@ mod tests {
                     };
                     drop(known);
                     let _ = stream.write_all(reply.as_bytes());
+                    // (the client closes first, as with a keep-alive server: one that closes first can have Windows reset the answer the client has not read)
+                    let _ = stream.read(&mut block);
                 });
             }
         });
@@ -1706,6 +1764,28 @@ mod tests {
     fn names_are_what_a_model_api_takes() {
         assert_eq!(tool_name("my server", "do.it"), "mcp__my_server__do_it");
         assert_eq!(tool_name(&"s".repeat(80), "t").len(), 64);
+    }
+
+    /// A lone half of a surrogate pair, as Python writes a byte it could not decode, is read as U+FFFD; a pair, and an escaped backslash before a `u`,
+    /// as they are.
+    #[test]
+    fn lone_halves_of_surrogate_pairs_are_read_as_replacement_characters() {
+        let line = r#"{"id":3,"result":{"text":"a\udc94b \ud83d\ude00 \\udc94 \ud800"}}"#;
+        assert!(serde_json::from_str::<Value>(line).is_err());
+        assert_eq!(message_of(line).unwrap()["result"]["text"], "a\u{fffd}b \u{1f600} \\udc94 \u{fffd}");
+        assert_eq!(lone_halves_mended(r#"{"a":"\ud83d\ude00 \n"}"#), None, "nothing to mend");
+        assert_eq!((answer_id_in(r#"{"jsonrpc":"2.0","id": 42,"result":"#), answer_id_in(r#"{"id":7,"method":"x"#)), (Some(42), None));
+    }
+
+    /// An answer over pipes that cannot be read at all ends the call that waits for it at once, with why; one with a lone half is read.
+    #[test]
+    fn an_answer_that_cannot_be_read_ends_its_call_at_once() {
+        let lines = format!("{}\n{}\n", r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"x\udc94"}]}}"#, r#"{"jsonrpc":"2.0","id":2,"result":{]}"#);
+        let mut rpc = Rpc::over(Box::new(std::io::sink()), Cursor::new(lines.into_bytes()));
+        assert_eq!(result_text(&rpc.call("tools/call", json!({}), Duration::from_secs(30), None).unwrap()), "x\u{fffd}");
+        let started = Instant::now();
+        let said = rpc.call("tools/call", json!({}), Duration::from_secs(30), None).unwrap_err();
+        assert!(said.starts_with("the server's answer could not be read") && started.elapsed() < Duration::from_secs(5), "{said}");
     }
 
     #[test]
