@@ -33,7 +33,8 @@ const PIPE: &str = "the server's pipe";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// `http` for a server at `url` (Streamable HTTP); none, or `stdio`, for a program.
+    /// `http` for a server at `url` (Streamable HTTP, or the older transport if it answers as one of those), `sse` for one of the older transport (HTTP
+    /// with server-sent events, before Streamable HTTP); none, or `stdio`, for a program.
     #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -85,9 +86,6 @@ pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
     let mut found = BTreeMap::new();
     for (name, server) in value.get("mcpServers").and_then(Value::as_object).into_iter().flatten() {
         if let Ok(mut config) = serde_json::from_value::<ServerConfig>(server.clone()) {
-            if config.kind == "sse" {
-                continue;
-            }
             if config.kind == "stdio" {
                 config.kind.clear();
             }
@@ -347,18 +345,133 @@ struct Events {
 
 impl Events {
     fn read(&mut self, bytes: &[u8]) -> Vec<Value> {
+        self.read_named(bytes).into_iter().filter_map(|(_, data)| message_of(&data).ok()).collect()
+    }
+
+    /// Each whole event's name (`message`, when it gives none) and data, of those that have data.
+    fn read_named(&mut self, bytes: &[u8]) -> Vec<(String, String)> {
         self.pending.extend_from_slice(bytes);
         let find = |bytes: &[u8], what: &[u8]| bytes.windows(what.len()).position(|window| window == what).map(|at| (at, what.len()));
-        let mut messages = Vec::new();
+        let mut events = Vec::new();
         while let Some((at, length)) = [find(&self.pending, b"\n\n"), find(&self.pending, b"\r\n\r\n")].into_iter().flatten().min() {
             let event: Vec<u8> = self.pending.drain(..at + length).collect();
             let text = String::from_utf8_lossy(&event).replace("\r\n", "\n");
-            let data: Vec<&str> = text.lines().filter_map(|line| line.strip_prefix("data:")).map(|data| data.strip_prefix(' ').unwrap_or(data)).collect();
-            if let Ok(message) = message_of(&data.join("\n")) {
-                messages.push(message);
+            let field = |name: &str| text.lines().filter_map(|line| line.strip_prefix(name)).map(|value| value.strip_prefix(' ').unwrap_or(value)).collect::<Vec<_>>();
+            let data = field("data:");
+            if data.is_empty() {
+                continue;
+            }
+            let name = field("event:").first().map_or("message", |name| name.trim()).to_string();
+            events.push((name, data.join("\n")));
+        }
+        events
+    }
+}
+
+/// A server of the older transport (HTTP with server-sent events, before Streamable HTTP): a stream (a GET of its URL) that says first where to post, then
+/// carries every answer; each message is posted there. Its JSON-RPC is that of a program's pipes (`Rpc::over`): the stream's messages are its lines, and a
+/// line written is posted. `limit` is how long the stream is given to say where to post.
+fn older_transport(url: &str, headers: &BTreeMap<String, String>, limit: Duration) -> Result<Rpc, String> {
+    let stream = crate::http::Url::parse(url)?;
+    let headers: Vec<(String, String)> = headers.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (said, heard) = channel();
+    let (told, where_to) = channel();
+    {
+        let (stream, headers, stop) = (stream.clone(), headers.clone(), stop.clone());
+        std::thread::spawn(move || read_older_stream(&stream, &headers, &stop, &told, &said));
+    }
+    let endpoint = where_to.recv_timeout(limit).unwrap_or_else(|_| Err(format!("{} said nowhere to post within {} s", stream.host, limit.as_secs())));
+    let endpoint = endpoint.inspect_err(|_| stop.store(true, Ordering::Relaxed))?;
+    let writer = Posting { url: endpoint, headers, stop, written: Vec::new() };
+    Ok(Rpc::over(Box::new(writer), BufReader::new(Heard { from: heard, pending: Vec::new() })))
+}
+
+/// The older transport's stream, read until `stop`: where to post, told once; each message after it, a line for `Rpc::over`'s reader. Its end ends the
+/// server, as a program's pipe does.
+fn read_older_stream(stream: &crate::http::Url, headers: &[(String, String)], stop: &AtomicBool, told: &std::sync::mpsc::Sender<Result<crate::http::Url, String>>, said: &std::sync::mpsc::Sender<Vec<u8>>) {
+    let mut asking = headers.to_vec();
+    asking.push(("Accept".into(), "text/event-stream".into()));
+    let mut response = match crate::http::request("GET", stream, &asking, None, HTTP_CONNECT, stop) {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = told.send(Err(format!("{}: {error}", stream.host)));
+            return;
+        }
+    };
+    let streamed = response.header("content-type").is_some_and(|kind| kind.to_ascii_lowercase().starts_with("text/event-stream"));
+    if response.status != 200 || !streamed {
+        let _ = told.send(Err(format!("the server answered {} to a GET of its stream", response.status)));
+        return;
+    }
+    let mut events = Events::default();
+    while let Ok(Some(bytes)) = response.next() {
+        for (name, data) in events.read_named(&bytes) {
+            if name == "endpoint" {
+                let _ = told.send(endpoint_of(stream, &data));
+            } else if let Ok(message) = message_of(&data) {
+                if said.send(format!("{message}\n").into_bytes()).is_err() {
+                    return;
+                }
             }
         }
-        messages
+    }
+}
+
+/// Where the older transport's stream says to post, as a URL: a path, or a whole URL of the stream's own origin, as what goes there carries the headers.
+fn endpoint_of(stream: &crate::http::Url, said: &str) -> Result<crate::http::Url, String> {
+    let said = said.trim();
+    let url = if said.starts_with("http://") || said.starts_with("https://") {
+        crate::http::Url::parse(said)?
+    } else if said.starts_with('/') {
+        crate::http::Url { path: said.to_string(), ..stream.clone() }
+    } else {
+        let path = stream.path.split('?').next().unwrap_or("/");
+        crate::http::Url { path: format!("{}{said}", &path[..path.rfind('/').map_or(0, |at| at + 1)]), ..stream.clone() }
+    };
+    if (url.tls, &url.host, url.port) != (stream.tls, &stream.host, stream.port) {
+        return Err(format!("the server said to post to {said}, which is not where its stream is"));
+    }
+    Ok(url)
+}
+
+/// The older transport's side that is written to: each line, a message, posted where the stream said. A post that fails is a pipe that broke.
+struct Posting {
+    url: crate::http::Url,
+    headers: Vec<(String, String)>,
+    /// The stream's: it ends as this goes.
+    stop: Arc<AtomicBool>,
+    written: Vec<u8>,
+}
+
+impl Write for Posting {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.written.extend_from_slice(bytes);
+        while let Some(end) = self.written.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.written.drain(..=end).collect();
+            let body = String::from_utf8_lossy(&line).trim().to_string();
+            if body.is_empty() {
+                continue;
+            }
+            let mut headers = self.headers.clone();
+            headers.push(("Content-Type".into(), "application/json".into()));
+            let mut response = crate::http::request("POST", &self.url, &headers, Some(&body), HTTP_CONNECT, &self.stop).map_err(|error| std::io::Error::other(error.to_string()))?;
+            let _ = response.text();
+            if response.status >= 300 {
+                return Err(std::io::Error::other(format!("the server answered {}", response.status)));
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for Posting {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -970,9 +1083,22 @@ fn start_server(config: &ServerConfig) -> Result<Running, String> {
 /// Starts a server, each step of its handshake given `limit` to answer. A job holds it unless `job` is false (for a test of a server that none does).
 fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Result<Running, String> {
     if config.is_http() {
+        if config.kind == "sse" {
+            let mut rpc = older_transport(&config.url, &config.headers, limit)?;
+            let tools = rpc.start(limit)?;
+            return Ok(Running::new(rpc, tools, None));
+        }
         let mut rpc = Rpc::http(HttpLink::new(&config.url, &config.headers)?);
-        let tools = rpc.start(limit)?;
-        return Ok(Running::new(rpc, tools, None));
+        return match rpc.start(limit) {
+            Ok(tools) => Ok(Running::new(rpc, tools, None)),
+            // (one of the older transport answers a POST to its URL so, 405 or 404: the protocol has a client that would reach both try a GET of it next;
+            // what is said if that fails too is why the POST did)
+            Err(error) if error.starts_with("the server answered 4") => {
+                let older = older_transport(&config.url, &config.headers, limit).and_then(|mut older| older.start(limit).map(|tools| (older, tools)));
+                older.map(|(older, tools)| Running::new(older, tools, None)).map_err(|_| error)
+            }
+            Err(error) => Err(error),
+        };
     }
     let (path, script) = program(&config.command);
     let mut command = if script {
@@ -1375,14 +1501,13 @@ impl Write for Turns {
     }
 }
 
-/// The side of it that is read: what it says, as it says it; its end as the other side goes.
-#[cfg(test)]
+/// What a server says, as it says it, read as a program's output is: its end as the other side goes. The older transport's stream (see `older_transport`),
+/// and `Hub::answering`'s server.
 struct Heard {
     from: Receiver<Vec<u8>>,
     pending: Vec<u8>,
 }
 
-#[cfg(test)]
 impl std::io::Read for Heard {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if self.pending.is_empty() {
@@ -1407,7 +1532,8 @@ mod tests {
     fn claudes_file_is_read_as_it_is() {
         let text = r#"{"numStartups": 3, "mcpServers": {"files": {"type": "stdio", "command": "npx", "args": ["-y", "server"], "env": {"K": "v"}}, "remote": {"type": "http", "url": "https://x", "headers": {"Authorization": "Bearer t"}}, "old": {"type": "sse", "url": "https://y"}}}"#;
         let found = servers_of_claude(text);
-        assert_eq!(found.keys().collect::<Vec<_>>(), ["files", "remote"], "an SSE server, of the older transport, is left out");
+        assert_eq!(found.keys().collect::<Vec<_>>(), ["files", "old", "remote"]);
+        assert!(found["old"].is_http() && found["old"].kind == "sse", "one of the older transport is read, as that");
         assert_eq!(found["files"].args, ["-y", "server"]);
         assert_eq!(found["files"].env["K"], "v");
         assert!(!found["files"].is_http() && found["files"].kind.is_empty());
@@ -1464,6 +1590,102 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(hub.status(), [format!("a: did not start: no-such-program-here: {NOT_FOUND}")]);
+    }
+
+    /// A request as a test server reads it: its head, and its body, as long as its length says.
+    fn request_of(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
+        use std::io::Read;
+        let (mut data, mut block) = (Vec::new(), [0u8; 4096]);
+        loop {
+            let count = stream.read(&mut block).ok().filter(|count| *count > 0)?;
+            data.extend_from_slice(&block[..count]);
+            if let Some(at) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&data[..at]).to_string();
+                let length: usize = head.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|value| value.trim().parse().ok())).unwrap_or(0);
+                while data.len() < at + 4 + length {
+                    let count = stream.read(&mut block).ok().filter(|count| *count > 0)?;
+                    data.extend_from_slice(&block[..count]);
+                }
+                return Some((head, String::from_utf8_lossy(&data[at + 4..]).to_string()));
+            }
+        }
+    }
+
+    /// A server of the older transport for the tests, at `/sse`: a GET of it opens the stream, which says first to post to `/messages?session=1` (as the
+    /// official SDK says it) and then carries each answer; a POST to `/sse` is answered 405, as such a server answers one of Streamable HTTP. Its one tool,
+    /// `echo`, says what it was given. What each request carried is kept.
+    fn older_server() -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/sse", listener.local_addr().unwrap().port());
+        let (seen, out) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None::<std::net::TcpStream>)));
+        let kept = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let (kept, out) = (kept.clone(), out.clone());
+                std::thread::spawn(move || {
+                    let Some((head, body)) = request_of(&mut stream) else { return };
+                    let message: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    kept.lock().unwrap().push((head.clone(), message.clone()));
+                    if head.starts_with("GET /sse") {
+                        // (where answers go before where to post is said: a post can follow at once)
+                        *out.lock().unwrap() = stream.try_clone().ok();
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /messages?session=1\n\n");
+                        let _ = stream.read(&mut [0u8; 16]);
+                        return;
+                    }
+                    if !head.starts_with("POST /messages?session=1 ") {
+                        let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
+                        let _ = stream.read(&mut [0u8; 16]);
+                        return;
+                    }
+                    let result = match message["method"].as_str() {
+                        Some("initialize") => Some(json!({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}})),
+                        Some("tools/list") => Some(json!({"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]})),
+                        Some("tools/call") => Some(json!({"content": [{"type": "text", "text": format!("{} over the older transport", message["params"]["arguments"])}]})),
+                        _ => None,
+                    };
+                    let _ = stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
+                    if let (Some(result), Some(out)) = (result, out.lock().unwrap().as_mut()) {
+                        let _ = out.write_all(format!("event: message\ndata: {}\n\n", json!({"jsonrpc": "2.0", "id": message["id"], "result": result})).as_bytes());
+                    }
+                    let _ = stream.read(&mut [0u8; 16]);
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    /// A server of the older transport is reached as its configuration says (`sse`), or as its URL answers a POST of Streamable HTTP (405): its stream
+    /// says where to post, each message is posted there with the headers, and the answers come on the stream.
+    #[test]
+    fn a_server_of_the_older_transport_is_reached_as_its_configuration_says_or_as_its_url_answers() {
+        for kind in ["sse", "http"] {
+            let (url, seen) = older_server();
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("mcp.json");
+            let headers = BTreeMap::from([("Authorization".to_string(), "Bearer t".to_string())]);
+            save_server(&file, None, "old", ServerConfig { url, kind: kind.into(), headers, ..ServerConfig::default() }).unwrap();
+            let hub = Hub::start(&file);
+            waited("the server to be up", || !hub.schemas().is_empty() || hub.status().iter().any(|line| line.contains("did not start")));
+            assert_eq!(hub.call("mcp__old__echo", &json!({"a": 1}), &AtomicBool::new(false)), Ok(r#"{"a":1} over the older transport"#.to_string()), "{kind}: {:?}", hub.status());
+            let seen = seen.lock().unwrap();
+            let posted: Vec<&String> = seen.iter().filter(|(head, _)| head.starts_with("POST /messages")).map(|(head, _)| head).collect();
+            assert!(posted.len() >= 4 && posted.iter().all(|head| head.to_ascii_lowercase().contains("authorization: bearer t")), "{kind}: {posted:?}");
+            assert_eq!(seen.iter().any(|(head, _)| head.starts_with("POST /sse")), kind == "http", "{kind}: a POST to its URL first only when the configuration does not say");
+        }
+    }
+
+    /// Where the older transport says to post is of its stream's origin, whichever way it is written.
+    #[test]
+    fn where_the_older_transport_says_to_post_is_of_its_own_origin() {
+        let stream = crate::http::Url::parse("http://127.0.0.1:9/mcp/sse?x=1").unwrap();
+        assert_eq!(endpoint_of(&stream, "/messages?sessionId=a").unwrap().path, "/messages?sessionId=a");
+        assert_eq!(endpoint_of(&stream, " messages?s=1\n").unwrap().path, "/mcp/messages?s=1");
+        assert_eq!(endpoint_of(&stream, "http://127.0.0.1:9/m").unwrap().path, "/m");
+        assert!(endpoint_of(&stream, "http://example.com/m").is_err());
+        assert!(endpoint_of(&stream, "https://127.0.0.1:9/m").is_err());
     }
 
     /// A server of Streamable HTTP for the tests, on this machine: it answers `initialize` in JSON with a session's id, a notification with 202, `tools/list` in an
