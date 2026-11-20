@@ -1621,6 +1621,12 @@ impl Agent {
         Some(prompt::tools_added(&more, self.code_mode))
     }
 
+    /// Whether a tool told of after the conversation began is no longer told of in it: a rewind, or a fork, cut where it was.
+    fn added_untold(&self) -> bool {
+        let told: Vec<&str> = self.messages.iter().filter_map(|message| message.content.as_deref()).filter(|text| text.contains(prompt::TOOLS_ADDED)).collect();
+        self.added_tools.iter().filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str)).any(|name| !told.iter().any(|text| text.contains(&format!("`{name}`"))))
+    }
+
     /// All the tools told of after the conversation began, told of again in a message of the app's: after a compaction, which may have left out where they were.
     fn tell_added_again(&mut self) {
         if std::mem::take(&mut self.added_due) && !self.added_tools.is_empty() {
@@ -1703,6 +1709,8 @@ impl Agent {
                 }
                 self.added_tools = crate::session::added_of(path).and_then(|tools| tools.as_array().cloned()).unwrap_or_default();
                 self.messages = messages;
+                // (a fork keeps the tools told of in the one it came from, and maybe not where they were told of)
+                self.added_due = self.added_untold();
                 self.web_rules_due = false;
                 self.japanese_session = false;
                 self.rewound.clear();
@@ -2135,6 +2143,7 @@ impl Agent {
                     typed = Some(prompt::typed_text(self.messages[at].content.as_deref().unwrap_or("")).to_string());
                     self.messages.truncate(at);
                     marks.conversation_cut(at);
+                    self.added_due |= self.added_untold();
                     self.use_estimate();
                     self.save_snapshot();
                     let (path, workspace) = (self.session.as_ref().map_or(PathBuf::new(), |session| session.path.clone()), self.workspace.clone());
@@ -7928,6 +7937,36 @@ Body").unwrap();
         assert!(!names(&bodies[0]).contains(&"mcp__srv__u".to_string()));
         let told = bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
         assert!(told.contains("## Tools Added") && told.contains("`mcp__srv__u`") && told.contains("tools.mcp__srv__u({})"), "{told}");
+    }
+
+    /// A fork of the conversation cut before an added server's tools were told of tells of them again in its next turn, and once.
+    #[test]
+    fn a_fork_cut_before_the_tools_were_told_of_tells_of_them_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = |name: &str| [serde_json::json!({"name": name, "description": "d", "inputSchema": {"type": "object"}})];
+        let hub = mcp::Hub::scripted("srv", &tool("t"), &[], true);
+        let (client, bodies) = server(vec![text_answer("one"), text_answer("two"), text_answer("three"), text_answer("four")]);
+        let (sender, events) = channel();
+        let sessions = tempfile::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub.clone()), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        let path = session_file(&run);
+        until_end(&run, Decision::Reject);
+        hub.add_scripted("late", &tool("u"), &[], true);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        // (the first turn's message and its facts, and its answer: a fork through it has none of the second turn's)
+        let fork = crate::session::fork(&path, 2, None).unwrap();
+        run.handle.commands.send(Command::Resume(fork)).unwrap();
+        for text in ["again", "and again"] {
+            run.handle.commands.send(Command::Send(text.into())).unwrap();
+            until_end(&run, Decision::Reject);
+        }
+        let bodies = bodies.lock().unwrap();
+        let told = |body: &Value| body["messages"].as_array().unwrap().iter().filter(|message| message["content"].as_str().is_some_and(|text| text.contains("`mcp__late__u`"))).count();
+        assert_eq!((told(&bodies[1]), told(&bodies[2]), told(&bodies[3])), (1, 1, 1), "told in the second turn, again in the fork's first, and not a third time");
     }
 
     /// A server the person adds while a conversation goes on is told of in their next turn, whose tools offered stay as they were, and its tool is called

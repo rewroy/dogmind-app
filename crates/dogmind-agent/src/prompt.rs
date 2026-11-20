@@ -218,10 +218,13 @@ fn language_fact(language: Option<&str>) -> Option<String> {
 
 /// The app's facts after a message of the person's: the time to the minute (a model has no use for seconds, and they are tokens in every such message), the
 /// language, and the notes of the turn, each a block of its own.
+/// The heading the tools that came after a conversation began are told of under (see `tools_added`).
+pub const TOOLS_ADDED: &str = "## Tools Added";
+
 /// The tools that came after a conversation began, as the model is told of them where the conversation is: each with what its server says it is and
 /// its arguments' schema, and, with run_code, as a program calls it.
 pub fn tools_added(tools: &[serde_json::Value], code_mode: bool) -> String {
-    let mut text = String::from("## Tools Added\nThese tools came after this conversation began. They are not in your list of tools, which stays as it was, and are called the same way:");
+    let mut text = format!("{TOOLS_ADDED}\nThese tools came after this conversation began. They are not in your list of tools, which stays as it was, and are called the same way:");
     for tool in tools {
         let function = &tool["function"];
         let about = function["description"].as_str().unwrap_or("").trim();
