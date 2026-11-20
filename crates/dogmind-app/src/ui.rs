@@ -2772,6 +2772,18 @@ fn mcp_runs(config: &dogmind_agent::mcp::ServerConfig) -> String {
 }
 
 /// What was typed as a server's URL, with its scheme as the protocol writes it; none for what is not one.
+/// The server the Settings form says, as mcp.json keeps it, `was` the one it edits. The person's word on what it returns goes with it, under a new name too; and
+/// one of the older transport stays one, its stream asked for first: saved as `http`, it was asked with a POST of Streamable HTTP first, as a new one is.
+fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Option<String>, target: String, args: &str, pairs: std::collections::BTreeMap<String, String>) -> dogmind_agent::mcp::ServerConfig {
+    use dogmind_agent::mcp;
+    let trusted = was.is_some_and(|config| config.trusted);
+    let kind = if was.is_some_and(|config| config.kind == "sse") { "sse" } else { "http" };
+    match url {
+        Some(url) => mcp::ServerConfig { kind: kind.into(), url, headers: pairs, trusted, ..Default::default() },
+        None => mcp::ServerConfig { command: target, args: mcp::args_of_line(args), env: pairs, trusted, ..Default::default() },
+    }
+}
+
 fn mcp_url(typed: &str) -> Option<String> {
     let lower = typed.to_ascii_lowercase();
     ["http://", "https://"].into_iter().find(|scheme| lower.starts_with(scheme)).map(|scheme| format!("{scheme}{}", &typed[scheme.len()..]))
@@ -12294,14 +12306,8 @@ impl App {
                 return false;
             }
         };
-        // (the person's word on what it returns goes with it, under a new name too; and one of the older transport stays one, its stream asked for first)
         let was = before.as_ref().and_then(|before| configs.iter().find(|(known, _)| known == before)).map(|(_, config)| config);
-        let trusted = was.is_some_and(|config| config.trusted);
-        let kind = if was.is_some_and(|config| config.kind == "sse") { "sse" } else { "http" };
-        let config = match url {
-            Some(url) => mcp::ServerConfig { kind: kind.into(), url, headers: pairs, trusted, ..Default::default() },
-            None => mcp::ServerConfig { command: target, args: mcp::args_of_line(&args), env: pairs, trusted, ..Default::default() },
-        };
+        let config = mcp_config_of_form(was, url, target, &args, pairs);
         if let Err(error) = mcp::save_server(&self.folder.join("mcp.json"), before.as_deref(), &name, config) {
             self.problem_in_panel(&error);
             return false;
@@ -18248,6 +18254,24 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server of the older transport edited in Settings stays one, and the person's word on it goes with it: saved as `http`, it was asked with a POST of
+    /// Streamable HTTP first. A new server at a URL, and one that was `http`, are `http`; a program is a program.
+    #[test]
+    fn a_server_of_the_older_transport_edited_in_settings_stays_one() {
+        use dogmind_agent::mcp::ServerConfig;
+        let at = |url: &str| (Some(url.to_string()), url.to_string());
+        let older = ServerConfig { kind: "sse".into(), url: "http://127.0.0.1:9/sse".into(), trusted: true, ..Default::default() };
+        let (url, target) = at("http://127.0.0.1:9/sse");
+        let edited = mcp_config_of_form(Some(&older), url, target, "", Default::default());
+        assert_eq!((edited.kind.as_str(), edited.url.as_str(), edited.trusted), ("sse", "http://127.0.0.1:9/sse", true));
+        let newer = ServerConfig { kind: "http".into(), url: "http://127.0.0.1:9/mcp".into(), ..Default::default() };
+        let (url, target) = at("http://127.0.0.1:9/mcp");
+        assert_eq!(mcp_config_of_form(Some(&newer), url.clone(), target.clone(), "", Default::default()).kind, "http");
+        assert_eq!(mcp_config_of_form(None, url, target, "", Default::default()).kind, "http", "a new one");
+        let program = mcp_config_of_form(Some(&older), None, "node".into(), "server.js --port 1", Default::default());
+        assert_eq!((program.command.as_str(), program.args.join(" "), program.kind.as_str(), program.trusted), ("node", "server.js --port 1".to_string(), "", true));
+    }
 
     #[test]
     fn model_sliders_use_card_memory_and_engine_limits() {
