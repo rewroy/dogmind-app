@@ -105,9 +105,20 @@ fn window_with(provided: u64, asked: Option<u64>) -> (u64, &'static str) {
 const REPEATS_NOTED: u32 = 2;
 const REPEATS_STOPPED: u32 = 5;
 const REPEAT_NOTE: &str = "\nnote: this exact call has run before with nothing edited in between, so its answer will not change. Try something different, or tell the user what is blocking you.";
-/// One `create_file` this long is cut off and goes on in another: some 3 minutes of a local model's writing, which is as much as it should risk with nothing on disk.
-/// A file of this size or more had taken 14 minutes in one call, and a stop or a crash in that time lost all of it.
+/// One `create_file` this long, written for longer than `MAX_WRITE_TIME`, is cut off and goes on in another: some 3 minutes of a local model's writing, which is as much as it
+/// should risk with nothing on disk. A file of this size or more had taken 14 minutes in one call, and a stop or a crash in that time lost all of it.
 const MAX_WRITE_CHARS: usize = 24_000;
+/// ... and the time it must have been written for, so that a fast model is not cut where a slow one is: the Homelab's DeepSeek wrote 24,000 characters of a game in
+/// 132 s, and after the cut gave the rest as its answer's text, its page cut short. A slow model is cut as before.
+const MAX_WRITE_TIME: Duration = Duration::from_secs(180);
+
+/// `MAX_WRITE_TIME`, which the tests of a cut set to nothing (`write_time_for_tests`), as their writes come at once.
+fn max_write_time() -> Duration {
+    #[cfg(test)]
+    return Duration::from_millis(tests::WRITE_TIME_MS.load(Ordering::Relaxed));
+    #[cfg(not(test))]
+    MAX_WRITE_TIME
+}
 
 pub enum Command {
     Send(String),
@@ -2254,6 +2265,8 @@ impl Agent {
             let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
             let mut written = String::new();
             let (mut reasoned, mut calling) = (String::new(), Vec::<crate::message::ToolCall>::new());
+            // (when each call began to be written, by its index: a long write is cut only once it has taken long)
+            let mut writes_began: Vec<Instant> = Vec::new();
             let cuts = provider.keeps_cut_writes();
             let mut cut = false;
             let mut drafting = false;
@@ -2313,6 +2326,10 @@ impl Agent {
                     Delta::Tool(index, name) => {
                         clock.writing();
                         meter.call(index).name = name.to_string();
+                        while writes_began.len() <= index {
+                            writes_began.push(now);
+                        }
+                        writes_began[index] = now;
                         while calling.len() <= index {
                             calling.push(crate::message::ToolCall::default());
                         }
@@ -2327,7 +2344,8 @@ impl Agent {
                             let before = call.function.arguments.len() / 1024;
                             call.function.arguments.push_str(text);
                             // (looked at each kilobyte: what it looks through is long by then)
-                            if cuts && !cut && call.function.name == "create_file" && call.function.arguments.len() >= MAX_WRITE_CHARS && call.function.arguments.len() / 1024 != before && close_cut_write(&call.function.arguments).is_some_and(|(closed, path, _)| !cut_would_lose(&closed, &path, workspace, bench)) {
+                            let long_written = writes_began.get(index).is_some_and(|began| now.duration_since(*began) >= max_write_time());
+                            if cuts && !cut && call.function.name == "create_file" && call.function.arguments.len() >= MAX_WRITE_CHARS && long_written && call.function.arguments.len() / 1024 != before && close_cut_write(&call.function.arguments).is_some_and(|(closed, path, _)| !cut_would_lose(&closed, &path, workspace, bench)) {
                                 cut = true;
                                 cancel.store(true, Ordering::Relaxed);
                             }
@@ -7688,8 +7706,45 @@ Body").unwrap();
         assert!(!streamed(&mut watching_totals(), &long), "forty times as much of the same is still not a run");
     }
 
+    /// The time a write must have taken to be cut, in the tests: none unless a test that holds `write_time_for_tests` sets it.
+    pub(super) static WRITE_TIME_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static WRITE_TIME_HELD: Mutex<()> = Mutex::new(());
+
+    /// While this is held, a write must have taken `time` to be cut; the tests that write long hold it, so that one that sets another time does not run beside them.
+    fn write_time_for_tests(time: Duration) -> impl Drop {
+        struct Held {
+            _held: std::sync::MutexGuard<'static, ()>,
+        }
+        impl Drop for Held {
+            fn drop(&mut self) {
+                WRITE_TIME_MS.store(0, Ordering::Relaxed);
+            }
+        }
+        let held = Held { _held: WRITE_TIME_HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) };
+        WRITE_TIME_MS.store(time.as_millis() as u64, Ordering::Relaxed);
+        held
+    }
+
+    /// A long write that has not taken long is not cut: a fast model writes its file in one call.
+    #[test]
+    fn a_long_write_that_came_fast_is_not_cut() {
+        let _time = write_time_for_tests(MAX_WRITE_TIME);
+        let dir = tempfile::tempdir().unwrap();
+        let raw = write_arguments(1000, usize::MAX);
+        let (client, bodies) = trickling_server(vec![pieces(&raw), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "{log:?}");
+        let sent = bodies[1]["messages"].as_array().unwrap()[3]["tool_calls"][0]["function"]["arguments"].as_str().unwrap().to_string();
+        assert_eq!(sent.len(), raw.len(), "written whole, in one call");
+        assert!(!bodies[1].to_string().contains("cut off"));
+    }
+
     #[test]
     fn a_long_write_is_cut_off_on_disk_and_goes_on_from_there_with_or_without_append() {
+        let _time = write_time_for_tests(Duration::ZERO);
         let dir = tempfile::tempdir().unwrap();
         let raw = write_arguments(1000, usize::MAX);
         assert!(raw.len() > 2 * MAX_WRITE_CHARS);
@@ -7767,6 +7822,7 @@ Body").unwrap();
     /// A call too long for one answer is cut off from the pieces Straydog sends, as from a server's own, and goes on from what is on disk.
     #[test]
     fn a_long_write_straydog_sends_in_pieces_is_cut_off_all_the_same() {
+        let _time = write_time_for_tests(Duration::ZERO);
         let dir = tempfile::tempdir().unwrap();
         let raw = spaced_write_arguments(1000, usize::MAX);
         assert!(raw.len() > 2 * MAX_WRITE_CHARS);
@@ -7802,6 +7858,7 @@ Body").unwrap();
 
     #[test]
     fn a_long_write_over_a_file_that_is_there_is_not_cut_and_a_stop_leaves_the_file_whole() {
+        let _time = write_time_for_tests(Duration::ZERO);
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("web")).unwrap();
         let existing = "the person's page\n".repeat(50);
@@ -7821,6 +7878,7 @@ Body").unwrap();
 
     #[test]
     fn a_long_write_is_not_told_what_it_has_cost() {
+        let _time = write_time_for_tests(Duration::ZERO);
         let dir = tempfile::tempdir().unwrap();
         // Each cut comes at some 3000 tokens as they are counted: three cuts were past where a note of the cost was due, when the app sent one.
         let script = || pieces(&write_arguments(1000, usize::MAX));
@@ -7835,6 +7893,7 @@ Body").unwrap();
 
     #[test]
     fn a_long_write_asks_as_any_write_does_and_a_no_keeps_nothing() {
+        let _time = write_time_for_tests(Duration::ZERO);
         let dir = tempfile::tempdir().unwrap();
         let (client, _) = trickling_server(vec![pieces(&write_arguments(1000, usize::MAX)), vec![serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]})]]);
         let run = run_agent(dir.path(), client, Mode::Default);
