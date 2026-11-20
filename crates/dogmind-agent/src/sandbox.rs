@@ -1504,9 +1504,11 @@ fn disarm_folder(folder: &Path, taken: &mut Taken) {
     if gone.is_empty() {
         return;
     }
-    // The config as it was, byte for byte, before it is written again.
-    let saved = room_for(taken).is_some_and(|room| std::fs::write(room.join("config"), &bytes).is_ok());
-    if std::fs::write(&config, kept).is_ok() {
+    // The config as it was, byte for byte, on the disk before it is written again; and the new one whole, as a power cut leaves the old or the new, and never zeros.
+    let saved = room_for(taken).is_some_and(|room| {
+        File::create(room.join("config")).and_then(|mut out| std::io::Write::write_all(&mut out, &bytes).and_then(|()| out.sync_all())).is_ok()
+    });
+    if write_list(&config, &kept).is_ok() {
         if saved {
             taken.names.extend(gone);
         } else {

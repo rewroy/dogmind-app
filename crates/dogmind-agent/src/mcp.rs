@@ -288,17 +288,17 @@ fn write_config(file: &Path, config: &Config) -> Result<(), String> {
 
 /// Adds what is not there yet, and says how many.
 pub fn import(file: &Path, more: BTreeMap<String, ServerConfig>) -> Result<usize, String> {
-    let mut config = load_config(file);
+    // (a file that cannot be read is the person's to mend: written over, it would keep only what came in)
+    let mut config = readable_config(file)?;
     let before = config.servers.len();
     for (name, server) in more {
         config.servers.entry(name).or_insert(server);
     }
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    let added = config.servers.len() - before;
+    if added > 0 {
+        write_config(file, &config)?;
     }
-    let text = serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?;
-    std::fs::write(file, text).map_err(|error| format!("{}: {error}", file.display()))?;
-    Ok(config.servers.len() - before)
+    Ok(added)
 }
 
 /// The JSON-RPC of one server, whichever pipes it runs over; or, for a server at a URL, over HTTP (`http`), where the pipes are not used.
@@ -1110,6 +1110,12 @@ mod tests {
         let config = load_config(&file);
         assert_eq!(config.servers["a"].command, "first");
         assert_eq!(config.servers["b"].command, "third");
+        // A file the person wrote by hand, with a comma too many: it is said, and left as it was.
+        let mine = "{\"mcpServers\": {\"mine\": {\"command\": \"x\"},}}";
+        std::fs::write(&file, mine).unwrap();
+        let said = import(&file, BTreeMap::from([("c".to_string(), one("fourth"))])).unwrap_err();
+        assert!(said.contains("mcp.json"), "{said}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), mine);
     }
 
     /// A server of Streamable HTTP for the tests, on this machine: it answers `initialize` in JSON with a session's id, a notification with 202, `tools/list` in an

@@ -110,7 +110,7 @@ pub fn switch(config_file: &Path, on: bool) -> Result<bool, String> {
     if config.lines().any(|line| line.trim_start().trim_start_matches('#').trim_start().split_once('=').is_some_and(|(name, _)| name.trim() == "model_vision")) {
         let written = with_key(&config, on);
         if written.trim_end() != config.trim_end() {
-            std::fs::write(config_file, written).map_err(|error| format!("{}: {error}", config_file.display()))?;
+            crate::settings::write_whole(config_file, written.as_bytes())?;
             changed = true;
         }
     }

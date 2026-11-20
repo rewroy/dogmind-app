@@ -78,7 +78,7 @@ pub fn turn_on(config_file: &Path, directory: &Path) -> Result<bool, String> {
     if written.trim_end() == config.trim_end() {
         return Ok(false);
     }
-    std::fs::write(config_file, written).map_err(|error| format!("{}: {error}", config_file.display()))?;
+    crate::settings::write_whole(config_file, written.as_bytes())?;
     Ok(true)
 }
 
@@ -88,7 +88,7 @@ pub fn turn_off(config_file: &Path) -> Result<bool, String> {
     if !config.lines().any(|line| is_key(line, false)) {
         return Ok(false);
     }
-    std::fs::write(config_file, without_drafter(&config)).map_err(|error| format!("{}: {error}", config_file.display()))?;
+    crate::settings::write_whole(config_file, without_drafter(&config).as_bytes())?;
     Ok(true)
 }
 
