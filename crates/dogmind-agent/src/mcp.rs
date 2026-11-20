@@ -1,5 +1,6 @@
-//! MCP servers over stdio, as the same `mcpServers` file Claude Code reads describes them: a command, its arguments and its
-//! environment. They start with the app and their tools join the session's as `mcp__server__tool`.
+//! MCP servers, listed in this app's own `mcp.json` (in the `mcpServers` form other apps use too, so that theirs can be imported): a program run over
+//! stdio, with its arguments and its environment, or a server at a URL that speaks Streamable HTTP, with the headers it is sent. They start with the
+//! app, start again when the person changes them in Settings, and their tools join the session's as `mcp__server__tool`.
 //!
 //! A server is a program the person chose to run, so it is not in the sandbox, and its tools ask like commands do. What one
 //! returns may come from anywhere, so it goes to the model marked as data, as a web page does. A server the person says they trust
@@ -32,14 +33,40 @@ const PIPE: &str = "the server's pipe";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// `http` for a server at `url` (Streamable HTTP); none, or `stdio`, for a program.
+    #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// Sent with every request to `url`: an `Authorization` among them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     /// The person's word that what this server returns is not a stranger's. In this app's own file, which neither a model's tools nor a command can write.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trusted: bool,
+}
+
+impl ServerConfig {
+    /// A server at a URL, and not a program.
+    pub fn is_http(&self) -> bool {
+        !self.url.is_empty() && self.command.is_empty()
+    }
+
+    /// What is wrong with it as the person gave it, if anything.
+    pub fn problem(&self) -> Option<String> {
+        match (self.command.trim().is_empty(), self.url.trim().is_empty()) {
+            (true, true) => Some("a command to run, or the URL of a server, is needed".to_string()),
+            (false, false) => Some("a command or a URL, not both".to_string()),
+            (true, false) if !(self.url.starts_with("http://") || self.url.starts_with("https://")) => Some(format!("{}: a URL begins with http:// or https://", self.url)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -52,13 +79,19 @@ pub fn load_config(file: &Path) -> Config {
     std::fs::read_to_string(file).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }
 
-/// Claude Code's own list of servers: the `mcpServers` of `~/.claude.json`. Those with no command (HTTP ones) are left out.
+/// Claude Code's own list of servers: the `mcpServers` of `~/.claude.json`, programs and HTTP ones (an SSE one, of the protocol's older transport, is left out).
 pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
     let value: Value = serde_json::from_str(text).unwrap_or(Value::Null);
     let mut found = BTreeMap::new();
     for (name, server) in value.get("mcpServers").and_then(Value::as_object).into_iter().flatten() {
-        if let Ok(config) = serde_json::from_value::<ServerConfig>(server.clone()) {
-            if !config.command.is_empty() {
+        if let Ok(mut config) = serde_json::from_value::<ServerConfig>(server.clone()) {
+            if config.kind == "sse" {
+                continue;
+            }
+            if config.kind == "stdio" {
+                config.kind.clear();
+            }
+            if config.problem().is_none() {
                 found.insert(name.clone(), config);
             }
         }
@@ -70,16 +103,17 @@ pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
 pub fn servers_of_codex(text: &str) -> BTreeMap<String, ServerConfig> {
     let unquote = |value: &str| value.trim().trim_matches('"').replace("\\\\", "\\").replace("\\\"", "\"");
     let mut found: BTreeMap<String, ServerConfig> = BTreeMap::new();
-    let (mut current, mut in_env) = (None, false);
+    let (mut current, mut in_env, mut in_headers) = (None, false, false);
     for line in text.lines().map(str::trim) {
         if let Some(table) = line.strip_prefix('[').and_then(|line| line.strip_suffix(']')) {
-            (current, in_env) = match table.strip_prefix("mcp_servers.") {
-                Some(rest) => match rest.strip_suffix(".env") {
-                    Some(name) => (Some(name.trim_matches('"').to_string()), true),
-                    None if rest.contains('.') => (None, false),
-                    None => (Some(rest.trim_matches('"').to_string()), false),
+            (current, in_env, in_headers) = match table.strip_prefix("mcp_servers.") {
+                Some(rest) => match (rest.strip_suffix(".env"), rest.strip_suffix(".http_headers")) {
+                    (Some(name), _) => (Some(name.trim_matches('"').to_string()), true, false),
+                    (_, Some(name)) => (Some(name.trim_matches('"').to_string()), false, true),
+                    _ if rest.contains('.') => (None, false, false),
+                    _ => (Some(rest.trim_matches('"').to_string()), false, false),
                 },
-                None => (None, false),
+                None => (None, false, false),
             };
             continue;
         }
@@ -88,6 +122,10 @@ pub fn servers_of_codex(text: &str) -> BTreeMap<String, ServerConfig> {
         let server = found.entry(name.clone()).or_default();
         if in_env {
             server.env.insert(key.to_string(), unquote(value));
+        } else if in_headers {
+            server.headers.insert(key.trim_matches('"').to_string(), unquote(value));
+        } else if key == "url" {
+            server.url = unquote(value);
         } else if key == "command" {
             server.command = unquote(value);
         } else if key == "args" {
@@ -95,8 +133,153 @@ pub fn servers_of_codex(text: &str) -> BTreeMap<String, ServerConfig> {
             server.args = inner.split("\",").map(unquote).filter(|arg| !arg.is_empty()).collect();
         }
     }
-    found.retain(|_, server| !server.command.is_empty());
+    found.retain(|_, server| server.problem().is_none());
     found
+}
+
+/// The person's server, as they gave it in Settings, in place of the one called `before` (none for a new one). The file is written whole, through a partial one, so
+/// that it is never left half written; one that cannot be read is not written over with less in it.
+pub fn save_server(file: &Path, before: Option<&str>, name: &str, server: ServerConfig) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a name is needed".to_string());
+    }
+    if let Some(problem) = server.problem() {
+        return Err(problem);
+    }
+    let mut config = readable_config(file)?;
+    if before != Some(name) && config.servers.contains_key(name) {
+        return Err(format!("there is a server called {name} already"));
+    }
+    if let Some(before) = before {
+        config.servers.remove(before);
+    }
+    config.servers.insert(name.to_string(), server);
+    write_config(file, &config)
+}
+
+/// Arguments as one line for a person to read and change: one with a space or a quote in it is quoted, as Windows reads a command line, so that
+/// [`args_of_line`] gives them back as they were.
+pub fn line_of_args(args: &[String]) -> String {
+    args.iter().map(|arg| quoted_arg(arg)).collect::<Vec<_>>().join(" ")
+}
+
+fn quoted_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| c.is_whitespace() || c == '"') {
+        return arg.to_string();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else {
+            if c == '"' {
+                out.extend(std::iter::repeat_n('\\', backslashes + 1));
+            }
+            backslashes = 0;
+        }
+        out.push(c);
+    }
+    out.extend(std::iter::repeat_n('\\', backslashes));
+    out.push('"');
+    out
+}
+
+/// A line of arguments read as Windows reads a program's: separated by spaces, a quoted one kept whole, and a backslash literal unless quotes follow it.
+pub fn args_of_line(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            return args;
+        }
+        let (mut arg, mut quoted) = (String::new(), false);
+        while let Some(c) = chars.peek().copied() {
+            if !quoted && c.is_whitespace() {
+                break;
+            }
+            chars.next();
+            match c {
+                '\\' => {
+                    let mut count = 1;
+                    while chars.peek() == Some(&'\\') {
+                        chars.next();
+                        count += 1;
+                    }
+                    if chars.peek() == Some(&'"') {
+                        arg.extend(std::iter::repeat_n('\\', count / 2));
+                        if count % 2 == 1 {
+                            chars.next();
+                            arg.push('"');
+                        }
+                    } else {
+                        arg.extend(std::iter::repeat_n('\\', count));
+                    }
+                }
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    chars.next();
+                    arg.push('"');
+                }
+                '"' => quoted = !quoted,
+                c => arg.push(c),
+            }
+        }
+        args.push(arg);
+    }
+}
+
+/// Names and values a line each, `NAME=value` for a program's environment or `Name: value` for a server's headers, as Settings shows them.
+pub fn lines_of_pairs(pairs: &BTreeMap<String, String>, separator: char) -> String {
+    let between = if separator == ':' { ": " } else { "=" };
+    pairs.iter().map(|(name, value)| format!("{name}{between}{value}")).collect::<Vec<_>>().join("\r\n")
+}
+
+/// The same lines read back. A line with no separator, or with no name before it, is the error: its number (from 1) and what it says.
+pub fn pairs_of_lines(text: &str, separator: char) -> Result<BTreeMap<String, String>, (usize, String)> {
+    let mut pairs = BTreeMap::new();
+    for (at, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line.split_once(separator) {
+            Some((name, value)) if !name.trim().is_empty() => {
+                pairs.insert(name.trim().to_string(), value.trim().to_string());
+            }
+            _ => return Err((at + 1, line.to_string())),
+        }
+    }
+    Ok(pairs)
+}
+
+/// The server called `name`, gone from the file.
+pub fn remove_server(file: &Path, name: &str) -> Result<(), String> {
+    let mut config = readable_config(file)?;
+    config.servers.remove(name).ok_or_else(|| format!("{}: lists no server {name}", file.display()))?;
+    write_config(file, &config)
+}
+
+/// The file's servers; a file that is there and cannot be read is an error, so that nothing is written over it.
+fn readable_config(file: &Path) -> Result<Config, String> {
+    match std::fs::read_to_string(file) {
+        Ok(text) => serde_json::from_str(&text).map_err(|error| format!("{}: {error}", file.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(error) => Err(format!("{}: {error}", file.display())),
+    }
+}
+
+fn write_config(file: &Path, config: &Config) -> Result<(), String> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(config).map_err(|error| error.to_string())?;
+    let partial = file.with_extension("partial");
+    std::fs::write(&partial, text).map_err(|error| format!("{}: {error}", partial.display()))?;
+    std::fs::rename(&partial, file).map_err(|error| format!("{}: {error}", file.display()))
 }
 
 /// Adds what is not there yet, and says how many.
@@ -114,11 +297,133 @@ pub fn import(file: &Path, more: BTreeMap<String, ServerConfig>) -> Result<usize
     Ok(config.servers.len() - before)
 }
 
-/// The JSON-RPC of one server, whichever pipes it runs over.
+/// The JSON-RPC of one server, whichever pipes it runs over; or, for a server at a URL, over HTTP (`http`), where the pipes are not used.
 struct Rpc {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     answers: Receiver<Value>,
     next: u64,
+    http: Option<Mutex<HttpLink>>,
+}
+
+/// A server at a URL, as Streamable HTTP has it: each message a POST, answered in JSON or in an event stream that carries the answer; the session's id the
+/// server gave in its answer to `initialize`, sent back with each request after it.
+struct HttpLink {
+    url: crate::http::Url,
+    headers: Vec<(String, String)>,
+    session: Option<String>,
+    initialized: bool,
+}
+
+/// How long a connection to a server at a URL is waited for.
+const HTTP_CONNECT: Duration = Duration::from_secs(10);
+
+impl HttpLink {
+    fn new(url: &str, headers: &BTreeMap<String, String>) -> Result<HttpLink, String> {
+        let url = crate::http::Url::parse(url)?;
+        Ok(HttpLink { url, headers: headers.iter().map(|(name, value)| (name.clone(), value.clone())).collect(), session: None, initialized: false })
+    }
+
+    /// Posts one message; its answer when it has an `id` (a request), none for a notification. Gives up at `limit`, or when `cancel` is set.
+    fn post(&mut self, message: &Value, limit: Duration, cancel: Option<&AtomicBool>) -> Result<Option<Value>, String> {
+        let id = message.get("id").and_then(Value::as_u64);
+        let method = message.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        let mut headers = self.headers.clone();
+        headers.push(("Content-Type".into(), "application/json".into()));
+        headers.push(("Accept".into(), "application/json, text/event-stream".into()));
+        if self.initialized {
+            headers.push(("MCP-Protocol-Version".into(), PROTOCOL.into()));
+        }
+        if let Some(session) = &self.session {
+            headers.push(("Mcp-Session-Id".into(), session.clone()));
+        }
+        // (the request's own flag: set by the person's stop, or once the limit is past, by a watcher of both that ends with the request)
+        let give_up = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let person = cancel.map(|flag| flag as *const AtomicBool as usize);
+        {
+            let (give_up, done) = (give_up.clone(), done.clone());
+            let started = Instant::now();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    // SAFETY: the flag outlives this request, which `done` ends this watch before returning from.
+                    let stopped = person.is_some_and(|flag| unsafe { (*(flag as *const AtomicBool)).load(Ordering::Relaxed) });
+                    if stopped || started.elapsed() > limit {
+                        give_up.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
+        let outcome = self.exchange(&message.to_string(), &headers, id, &give_up);
+        done.store(true, Ordering::Relaxed);
+        // (the watcher may still read the person's flag for one more look: it is told first, and the flag is not read after this)
+        std::thread::sleep(Duration::from_millis(60));
+        match outcome {
+            Err(_) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => Err("stopped".to_string()),
+            Err(_) if give_up.load(Ordering::Relaxed) => Err(format!("no answer to {method} within {} s", limit.as_secs())),
+            Err(error) => Err(error),
+            Ok(answer) => {
+                if method == "initialize" {
+                    self.initialized = true;
+                }
+                Ok(answer)
+            }
+        }
+    }
+
+    fn exchange(&mut self, body: &str, headers: &[(String, String)], id: Option<u64>, give_up: &AtomicBool) -> Result<Option<Value>, String> {
+        let mut response = crate::http::request("POST", &self.url, headers, Some(body), HTTP_CONNECT, give_up).map_err(|error| format!("{}: {error}", self.url.host))?;
+        if let Some(session) = response.header("mcp-session-id") {
+            self.session = Some(session.to_string());
+        }
+        if response.status == 202 || id.is_none() {
+            return if response.status < 300 { Ok(None) } else { Err(format!("the server answered {}", response.status)) };
+        }
+        if response.status >= 300 {
+            let text: String = response.text().unwrap_or_default().chars().take(300).collect();
+            return Err(format!("the server answered {}: {}", response.status, text.trim()));
+        }
+        let streamed = response.header("content-type").is_some_and(|kind| kind.to_ascii_lowercase().starts_with("text/event-stream"));
+        let is_ours = |message: &Value| message.get("id").and_then(Value::as_u64) == id && message.get("method").is_none();
+        if !streamed {
+            let text = response.text().map_err(|error| error.to_string())?;
+            let answer: Value = serde_json::from_str(&text).map_err(|error| format!("the server's answer is not JSON: {error}"))?;
+            let found = match answer {
+                Value::Array(messages) => messages.into_iter().find(is_ours),
+                message => Some(message).filter(is_ours),
+            };
+            return found.map(Some).ok_or_else(|| "the server's answer was not to this request".to_string());
+        }
+        // An event stream: its events' data, until the answer to this request is among them.
+        let mut pending = String::new();
+        loop {
+            let Some(bytes) = response.next().map_err(|error| error.to_string())? else {
+                return Err("the server's event stream ended with no answer to this request".to_string());
+            };
+            pending.push_str(&String::from_utf8_lossy(&bytes).replace("\r\n", "\n"));
+            while let Some(end) = pending.find("\n\n") {
+                let event: String = pending.drain(..end + 2).collect();
+                let data: Vec<&str> = event.lines().filter_map(|line| line.strip_prefix("data:")).map(|data| data.strip_prefix(' ').unwrap_or(data)).collect();
+                if let Ok(message) = serde_json::from_str::<Value>(&data.join("\n")) {
+                    if is_ours(&message) {
+                        return Ok(Some(message));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for HttpLink {
+    /// The session ends with this side of it, as the protocol asks of a client that is done.
+    fn drop(&mut self) {
+        let Some(session) = self.session.take() else { return };
+        let mut headers = self.headers.clone();
+        headers.push(("Mcp-Session-Id".into(), session));
+        let never = AtomicBool::new(false);
+        let _ = crate::http::request_within("DELETE", &self.url, &headers, Duration::from_secs(2), &never, Duration::from_secs(3));
+    }
 }
 
 impl Rpc {
@@ -150,10 +455,19 @@ impl Rpc {
                 }
             }
         });
-        Rpc { writer, answers, next: 1 }
+        Rpc { writer, answers, next: 1, http: None }
+    }
+
+    /// For a server at a URL: its messages go by HTTP, and the pipes are none.
+    fn http(link: HttpLink) -> Rpc {
+        let (_, answers) = channel();
+        Rpc { writer: Arc::new(Mutex::new(Box::new(std::io::sink()))), answers, next: 1, http: Some(Mutex::new(link)) }
     }
 
     fn send(&self, message: &Value) -> Result<(), String> {
+        if let Some(http) = &self.http {
+            return http.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).post(message, Duration::from_secs(30), None).map(|_| ());
+        }
         let mut out = self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         writeln!(out, "{message}").and_then(|()| out.flush()).map_err(|error| format!("{PIPE}: {error}"))
     }
@@ -165,6 +479,23 @@ impl Rpc {
     fn call(&mut self, method: &str, params: Value, limit: Duration, cancel: Option<&AtomicBool>) -> Result<Value, String> {
         let id = self.next;
         self.next += 1;
+        if let Some(http) = &self.http {
+            let asked = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+            let outcome = http.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).post(&asked, limit, cancel);
+            return match outcome {
+                Ok(Some(answer)) => match answer.get("error") {
+                    Some(error) => Err(error.get("message").and_then(Value::as_str).map_or_else(|| error.to_string(), str::to_string)),
+                    None => Ok(answer.get("result").cloned().unwrap_or(Value::Null)),
+                },
+                Ok(None) => Err(format!("no answer to {method}")),
+                Err(error) => {
+                    if method != "initialize" && (error == "stopped" || error.starts_with("no answer")) {
+                        self.ask_to_stop(id);
+                    }
+                    Err(error)
+                }
+            };
+        }
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
         let started = Instant::now();
         loop {
@@ -375,6 +706,19 @@ struct Slot {
     restarting: bool,
     failed: Option<String>,
     trusted: bool,
+    /// What it was started from, and its part of its tools' names: a change of either starts it again.
+    config: Option<ServerConfig>,
+    part: String,
+}
+
+/// How a server is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum State {
+    Starting,
+    /// Up, with this many tools.
+    Up(usize),
+    /// It did not start, or did not start again, and why.
+    Failed(String),
 }
 
 /// The servers, shared by every session.
@@ -391,6 +735,11 @@ fn start_server(config: &ServerConfig) -> Result<Running, String> {
 
 /// Starts a server, each step of its handshake given `limit` to answer. A job holds it unless `job` is false (for a test of a server that none does).
 fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Result<Running, String> {
+    if config.is_http() {
+        let mut rpc = Rpc::http(HttpLink::new(&config.url, &config.headers)?);
+        let tools = rpc.start(limit)?;
+        return Ok(Running { rpc: Mutex::new(rpc), names: BTreeMap::new(), schemas: tools, _process: None });
+    }
     let (path, script) = program(&config.command);
     let mut command = if script {
         let mut shell = Command::new("cmd.exe");
@@ -474,20 +823,47 @@ impl Hub {
     pub fn start(file: &Path) -> Arc<Hub> {
         let hub = Arc::new(Hub::default());
         *hub.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(file.to_path_buf());
-        let servers = load_config(file).servers;
+        hub.reload();
+        hub
+    }
+
+    /// The file read again, as the person changed it in Settings: a server no longer there ends, a new one starts, and one whose configuration changed starts
+    /// again with it; one that did not change goes on as it was (its trust as the file now says). Says the names of those started.
+    pub fn reload(&self) -> Vec<String> {
+        let Some(file) = self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else { return Vec::new() };
+        let servers = load_config(&file).servers;
         let parts = name_parts(servers.keys());
+        let mut started = Vec::new();
+        let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // (one that is gone ends as its last call is done with it: its process with the last hold on it)
+        slots.retain(|slot| servers.contains_key(&slot.name));
         for ((name, config), part) in servers.into_iter().zip(parts) {
-            let trusted = config.trusted;
+            let at = slots.iter().position(|slot| slot.name == name);
+            if let Some(slot) = at.map(|at| &mut slots[at]) {
+                let mut same = config.clone();
+                same.trusted = slot.config.as_ref().map_or(config.trusted, |was| was.trusted);
+                if slot.config.as_ref() == Some(&same) && slot.part == part {
+                    slot.trusted = config.trusted;
+                    slot.config = Some(config);
+                    continue;
+                }
+            }
             let start: Starter = {
-                let name = name.clone();
+                let (name, part, config) = (name.clone(), part.clone(), config.clone());
                 Arc::new(move || ready(&name, &part, &config))
             };
-            hub.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(Slot { name: name.clone(), start: Some(start.clone()), trusted, ..Slot::default() });
-            let hub = hub.clone();
+            let slot = Slot { name: name.clone(), start: Some(start.clone()), trusted: config.trusted, config: Some(config), part, ..Slot::default() };
+            match at {
+                Some(at) => slots[at] = slot,
+                None => slots.push(slot),
+            }
+            started.push(name.clone());
+            let shared = self.slots.clone();
             std::thread::spawn(move || {
                 let outcome = start();
-                let mut slots = hub.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(slot) = slots.iter_mut().find(|slot| slot.name == name) {
+                let mut slots = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // (the slot this start is for, and not one that took its name since: a change made while it started has started another)
+                if let Some(slot) = slots.iter_mut().find(|slot| slot.start.as_ref().is_some_and(|known| Arc::ptr_eq(known, &start))) {
                     match outcome {
                         Ok(running) => slot.running = Some(running),
                         Err(error) => slot.failed = Some(error),
@@ -495,10 +871,28 @@ impl Hub {
                 }
             });
         }
-        hub
+        // (in the order of the file, as the tools' names are given)
+        let order = load_config(&file).servers.into_keys().collect::<Vec<_>>();
+        slots.sort_by_key(|slot| order.iter().position(|name| *name == slot.name).unwrap_or(usize::MAX));
+        started
     }
 
-    /// The tools of the servers up by now. A session started before one was up gets its tools in the next session.
+    /// What each server is, as the file gives it, in the order of the slots: for the person's Settings.
+    pub fn configs(&self) -> Vec<(String, ServerConfig)> {
+        let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // (its trust as the person last set it, which is the slot's)
+        slots.iter().filter_map(|slot| slot.config.clone().map(|mut config| {
+            config.trusted = slot.trusted;
+            (slot.name.clone(), config)
+        })).collect()
+    }
+
+    /// The file the servers are listed in.
+    pub fn file(&self) -> Option<PathBuf> {
+        self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    /// The tools of the servers up by now. A session that began before one was up is offered its tools from the next turn the person starts.
     pub fn schemas(&self) -> Vec<Value> {
         let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         slots.iter().filter_map(|slot| slot.running.as_ref()).flat_map(|running| running.schemas.iter().cloned()).collect()
@@ -594,14 +988,14 @@ impl Hub {
     /// The person's word on a server, from now on and in its file. Nothing is written unless the file lists it: one that cannot be read must not be replaced by one with less in it.
     pub fn set_trusted(&self, server: &str, trusted: bool) -> Result<(), String> {
         let file = self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone().ok_or("no file lists the servers")?;
-        let mut config = load_config(&file);
+        let mut config = readable_config(&file)?;
         config.servers.get_mut(server).ok_or_else(|| format!("{}: lists no server {server}", file.display()))?.trusted = trusted;
-        let text = serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?;
-        let partial = file.with_extension("partial");
-        std::fs::write(&partial, text).map_err(|error| format!("{}: {error}", partial.display()))?;
-        std::fs::rename(&partial, &file).map_err(|error| format!("{}: {error}", file.display()))?;
+        write_config(&file, &config)?;
         if let Some(slot) = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter_mut().find(|slot| slot.name == server) {
             slot.trusted = trusted;
+            if let Some(config) = &mut slot.config {
+                config.trusted = trusted;
+            }
         }
         Ok(())
     }
@@ -609,20 +1003,38 @@ impl Hub {
     /// A server that answers from a script and is already up, for the agent's tests.
     #[cfg(test)]
     pub(crate) fn scripted(server: &str, tools: &[Value], lines: &[Value], trusted: bool) -> Arc<Hub> {
+        let hub = Arc::new(Hub::default());
+        hub.add_scripted(server, tools, lines, trusted);
+        hub
+    }
+
+    /// One more server, up with these tools, that answers with these lines: as one the person added while a session went on.
+    #[cfg(test)]
+    pub(crate) fn add_scripted(&self, server: &str, tools: &[Value], lines: &[Value], trusted: bool) {
         let script: String = lines.iter().map(|line| format!("{line}\n")).collect();
         let (names, schemas) = place_tools(server, &name_part(server), tools);
         let running = Arc::new(Running { rpc: Mutex::new(Rpc::over(Box::new(std::io::sink()), std::io::Cursor::new(script.into_bytes()))), names, schemas, _process: None });
-        let hub = Arc::new(Hub::default());
-        hub.slots.lock().unwrap().push(Slot { name: server.into(), running: Some(running), trusted, ..Slot::default() });
-        hub
+        self.slots.lock().unwrap().push(Slot { name: server.into(), running: Some(running), trusted, ..Slot::default() });
     }
 
     /// One line a server, for the person.
     pub fn status(&self) -> Vec<String> {
-        self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().map(|slot| match (&slot.running, &slot.failed) {
-            (Some(running), _) => format!("{}: {} tools", slot.name, running.names.len()),
-            (_, Some(error)) => format!("{}: did not start: {error}", slot.name),
-            _ => format!("{}: starting", slot.name),
+        self.states().into_iter().map(|(name, state)| match state {
+            State::Up(tools) => format!("{name}: {tools} tools"),
+            State::Failed(error) => format!("{name}: did not start: {error}"),
+            State::Starting => format!("{name}: starting"),
+        }).collect()
+    }
+
+    /// How each server is, in the order of the slots.
+    pub fn states(&self) -> Vec<(String, State)> {
+        self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().map(|slot| {
+            let state = match (&slot.running, &slot.failed) {
+                (Some(running), _) => State::Up(running.names.len()),
+                (_, Some(error)) => State::Failed(error.clone()),
+                _ => State::Starting,
+            };
+            (slot.name.clone(), state)
         }).collect()
     }
 }
@@ -634,19 +1046,24 @@ mod tests {
 
     #[test]
     fn claudes_file_is_read_as_it_is() {
-        let text = r#"{"numStartups": 3, "mcpServers": {"files": {"type": "stdio", "command": "npx", "args": ["-y", "server"], "env": {"K": "v"}}, "remote": {"type": "http", "url": "https://x"}}}"#;
+        let text = r#"{"numStartups": 3, "mcpServers": {"files": {"type": "stdio", "command": "npx", "args": ["-y", "server"], "env": {"K": "v"}}, "remote": {"type": "http", "url": "https://x", "headers": {"Authorization": "Bearer t"}}, "old": {"type": "sse", "url": "https://y"}}}"#;
         let found = servers_of_claude(text);
-        assert_eq!(found.keys().collect::<Vec<_>>(), ["files"]);
+        assert_eq!(found.keys().collect::<Vec<_>>(), ["files", "remote"], "an SSE server, of the older transport, is left out");
         assert_eq!(found["files"].args, ["-y", "server"]);
         assert_eq!(found["files"].env["K"], "v");
+        assert!(!found["files"].is_http() && found["files"].kind.is_empty());
+        assert!(found["remote"].is_http());
+        assert_eq!(found["remote"].headers["Authorization"], "Bearer t");
         assert!(servers_of_claude("not json").is_empty());
     }
 
     #[test]
     fn codexs_tables_are_read_as_they_are() {
-        let text = "model = \"x\"\n[mcp_servers.unity_mcp]\ncommand = \"C:\\\\tools\\\\unity.exe\"\nargs = [\"--stdio\", \"--port\", \"6400\"]\n[mcp_servers.unity_mcp.env]\nKEY = \"value\"\n[mcp_servers.url_only]\nurl = \"https://x\"\n[other]\ncommand = \"no\"\n";
+        let text = "model = \"x\"\n[mcp_servers.unity_mcp]\ncommand = \"C:\\\\tools\\\\unity.exe\"\nargs = [\"--stdio\", \"--port\", \"6400\"]\n[mcp_servers.unity_mcp.env]\nKEY = \"value\"\n[mcp_servers.url_only]\nurl = \"https://x\"\n[mcp_servers.url_only.http_headers]\n\"X-Key\" = \"k\"\n[other]\ncommand = \"no\"\n";
         let found = servers_of_codex(text);
-        assert_eq!(found.keys().collect::<Vec<_>>(), ["unity_mcp"]);
+        assert_eq!(found.keys().collect::<Vec<_>>(), ["unity_mcp", "url_only"]);
+        assert!(found["url_only"].is_http());
+        assert_eq!(found["url_only"].headers["X-Key"], "k");
         assert_eq!(found["unity_mcp"].command, "C:\\tools\\unity.exe");
         assert_eq!(found["unity_mcp"].args, ["--stdio", "--port", "6400"]);
         assert_eq!(found["unity_mcp"].env["KEY"], "value");
@@ -662,6 +1079,162 @@ mod tests {
         let config = load_config(&file);
         assert_eq!(config.servers["a"].command, "first");
         assert_eq!(config.servers["b"].command, "third");
+    }
+
+    /// A server of Streamable HTTP for the tests, on this machine: it answers `initialize` in JSON with a session's id, a notification with 202, `tools/list` in an
+    /// event stream (a notification first, then the answer), and `tools/call` in JSON with what it was asked and the headers it was sent. What each request carried
+    /// is kept, to be read back.
+    fn http_server(tool: &'static str) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/mcp", listener.local_addr().unwrap().port());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let kept = kept.clone();
+                std::thread::spawn(move || {
+                    let mut data = Vec::new();
+                    let mut block = [0u8; 4096];
+                    let (head, body) = loop {
+                        let count = stream.read(&mut block).unwrap_or(0);
+                        if count == 0 {
+                            return;
+                        }
+                        data.extend_from_slice(&block[..count]);
+                        if let Some(at) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&data[..at]).to_string();
+                            let length: usize = head.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|value| value.trim().parse().ok())).unwrap_or(0);
+                            while data.len() < at + 4 + length {
+                                let count = stream.read(&mut block).unwrap_or(0);
+                                if count == 0 {
+                                    break;
+                                }
+                                data.extend_from_slice(&block[..count]);
+                            }
+                            break (head, String::from_utf8_lossy(&data[at + 4..]).to_string());
+                        }
+                    };
+                    let message: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    kept.lock().unwrap().push((head.clone(), message.clone()));
+                    let headers: Vec<String> = head.lines().skip(1).map(str::to_string).collect();
+                    let answer = |result: Value| json!({"jsonrpc": "2.0", "id": message["id"], "result": result}).to_string();
+                    let reply = match message["method"].as_str() {
+                        _ if head.starts_with("DELETE") => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+                        Some("initialize") => {
+                            let body = answer(json!({"protocolVersion": PROTOCOL, "capabilities": {"tools": {}}}));
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: s-1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                        }
+                        Some("tools/list") => {
+                            let note = json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {}});
+                            let body = format!("event: message\r\ndata: {note}\r\n\r\nevent: message\r\ndata: {}\r\n\r\n", answer(json!({"tools": [{"name": tool, "inputSchema": {"type": "object"}}]})));
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                        }
+                        Some("tools/call") => {
+                            let said = format!("{} with {}", message["params"]["arguments"], headers.join(" | "));
+                            let body = answer(json!({"content": [{"type": "text", "text": said}]}));
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                        }
+                        _ => "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n".to_string(),
+                    };
+                    let _ = stream.write_all(reply.as_bytes());
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    /// A server at a URL is started and called over Streamable HTTP: its session's id and its headers go with each request after the handshake, and its tools are the session's.
+    #[test]
+    fn a_server_at_a_url_is_called_over_streamable_http_with_its_headers() {
+        let (url, seen) = http_server("echo");
+        let config = ServerConfig { url: url.clone(), kind: "http".into(), headers: BTreeMap::from([("Authorization".to_string(), "Bearer secret".to_string())]), ..ServerConfig::default() };
+        assert!(config.is_http() && config.problem().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        save_server(&file, None, "remote", config).unwrap();
+        let hub = Hub::start(&file);
+        let started = Instant::now();
+        while hub.schemas().is_empty() && started.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(hub.schemas()[0]["function"]["name"], "mcp__remote__echo", "{:?}", hub.status());
+        let said = hub.call("mcp__remote__echo", &json!({"a": 1}), &AtomicBool::new(false)).unwrap();
+        assert!(said.starts_with(r#"{"a":1} with"#), "{said}");
+        let lower = said.to_ascii_lowercase();
+        assert!(lower.contains("authorization: bearer secret") && lower.contains("mcp-session-id: s-1") && lower.contains(&format!("mcp-protocol-version: {PROTOCOL}")), "{said}");
+        let seen = seen.lock().unwrap();
+        let methods: Vec<&str> = seen.iter().filter_map(|(_, message)| message["method"].as_str()).collect();
+        assert_eq!(methods, ["initialize", "notifications/initialized", "tools/list", "tools/call"]);
+        assert!(!seen[0].0.to_ascii_lowercase().contains("mcp-session-id"), "the first request has no session yet");
+    }
+
+    /// A change to the file, as Settings makes one, starts what is new and what changed again, ends what is gone, and leaves the rest as it was.
+    #[test]
+    fn a_change_to_the_servers_starts_and_ends_only_what_changed() {
+        let ((one, _), (two, _)) = (http_server("first"), http_server("second"));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        let at = |url: &str| ServerConfig { url: url.to_string(), ..ServerConfig::default() };
+        save_server(&file, None, "a", at(&one)).unwrap();
+        let hub = Hub::start(&file);
+        let tools = |hub: &Hub, want: usize| {
+            let started = Instant::now();
+            while hub.schemas().len() != want && started.elapsed() < Duration::from_secs(20) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let mut names: Vec<String> = hub.schemas().iter().map(|schema| schema["function"]["name"].as_str().unwrap().to_string()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(tools(&hub, 1), ["mcp__a__first"]);
+        save_server(&file, None, "b", at(&two)).unwrap();
+        assert_eq!(hub.reload(), ["b"], "only the new one starts");
+        assert_eq!(tools(&hub, 2), ["mcp__a__first", "mcp__b__second"]);
+        assert!(save_server(&file, None, "b", at(&one)).unwrap_err().contains("already"), "a name is one server's");
+        save_server(&file, Some("b"), "c", at(&two)).unwrap();
+        assert_eq!(hub.reload(), ["c"], "a renamed one is a new one, and the old name ends");
+        assert_eq!(tools(&hub, 2), ["mcp__a__first", "mcp__c__second"]);
+        let mut trusted = at(&one);
+        trusted.trusted = true;
+        save_server(&file, Some("a"), "a", trusted).unwrap();
+        assert!(hub.reload().is_empty(), "trust alone starts nothing again");
+        assert!(hub.trust().contains(&("a".to_string(), true)));
+        remove_server(&file, "a").unwrap();
+        hub.reload();
+        assert_eq!(tools(&hub, 1), ["mcp__c__second"]);
+        assert_eq!(hub.configs().len(), 1);
+        hub.set_trusted("c", true).unwrap();
+        assert!(hub.configs()[0].1.trusted, "Settings reads the trust back as the switch set it, so that a change made after keeps it");
+        assert!(hub.reload().is_empty());
+        assert!(save_server(&file, None, "x", ServerConfig::default()).unwrap_err().contains("needed"));
+        assert!(save_server(&file, None, "x", at("ftp://x")).unwrap_err().contains("http"));
+    }
+
+    /// Arguments go to a line and back as they were, as Windows quotes them; a line typed by hand is read the same way.
+    #[test]
+    fn arguments_go_to_a_line_and_back_as_they_were() {
+        let args: Vec<String> = ["-y", "@scope/server", "C:\\my files\\", "say \"hi\"", "", "a\\\\b", "plain\\"].iter().map(|arg| arg.to_string()).collect();
+        let line = line_of_args(&args);
+        assert_eq!(line, r#"-y @scope/server "C:\my files\\" "say \"hi\"" "" a\\b plain\"#);
+        assert_eq!(args_of_line(&line), args);
+        assert_eq!(args_of_line(r#"  --root "C:\Program Files\x"  --port 6400 "#), ["--root", r"C:\Program Files\x", "--port", "6400"]);
+        assert!(args_of_line("   ").is_empty());
+    }
+
+    /// Variables and headers are a line each, and a line that is neither says which it is.
+    #[test]
+    fn variables_and_headers_are_a_line_each() {
+        let headers = BTreeMap::from([("Authorization".to_string(), "Bearer a:b".to_string()), ("X-Key".to_string(), "k".to_string())]);
+        let text = lines_of_pairs(&headers, ':');
+        assert_eq!(text, "Authorization: Bearer a:b\r\nX-Key: k");
+        assert_eq!(pairs_of_lines(&text, ':').unwrap(), headers);
+        let env = pairs_of_lines("KEY=a=b\n\n  OTHER = x \n", '=').unwrap();
+        assert_eq!(env, BTreeMap::from([("KEY".to_string(), "a=b".to_string()), ("OTHER".to_string(), "x".to_string())]));
+        assert_eq!(lines_of_pairs(&env, '='), "KEY=a=b\r\nOTHER=x");
+        assert_eq!(pairs_of_lines("A=1\nno separator", '=').unwrap_err(), (2, "no separator".to_string()));
+        assert_eq!(pairs_of_lines("=1", '=').unwrap_err(), (1, "=1".to_string()));
     }
 
     #[test]

@@ -68,7 +68,7 @@ pub fn for_calls_shown_as_written(schemas: &mut Value) {
 }
 
 /// `run_code`, where it is offered, made again from the tools offered beside it as they are now.
-fn redeclare_run_code(schemas: &mut Value) {
+pub(crate) fn redeclare_run_code(schemas: &mut Value) {
     let Some(list) = schemas.as_array_mut() else { return };
     let Some(at) = list.iter().position(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("run_code")) else { return };
     let others = Value::Array(list.iter().enumerate().filter(|(index, _)| *index != at).map(|(_, tool)| tool.clone()).collect());

@@ -1591,6 +1591,30 @@ impl Agent {
         }
     }
 
+    /// The tools of MCP servers that came up after the conversation began (one the person added or changed in Settings, or one slow to start):
+    /// offered from this turn, before `run_code`, which is declared again with them. The engine reads the prefix again once, as for the web turned
+    /// on; a tool whose server has gone stays offered, and a call to it says so.
+    fn servers_caught_up(&mut self) {
+        let Some(hub) = &self.mcp else { return };
+        let name = |tool: &Value| tool.pointer("/function/name").and_then(Value::as_str).map(str::to_string);
+        let Some(list) = self.tool_schemas.as_array() else { return };
+        let offered: std::collections::HashSet<String> = list.iter().filter_map(name).collect();
+        let more: Vec<Value> = hub.schemas().into_iter().filter(|tool| name(tool).is_some_and(|known| !offered.contains(&known))).collect();
+        if more.is_empty() {
+            return;
+        }
+        let names: Vec<String> = more.iter().filter_map(name).collect();
+        let Some(list) = self.tool_schemas.as_array_mut() else { return };
+        let at = list.iter().position(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("run_code")).unwrap_or(list.len());
+        list.splice(at..at, more);
+        tools::redeclare_run_code(&mut self.tool_schemas);
+        let tools = self.tool_schemas.clone();
+        if let Some(session) = &mut self.session {
+            let _ = session.set_tools(&tools);
+        }
+        self.traj.write("tools_added", None, json!({"names": names}));
+    }
+
     /// With no conversation yet it decides what one will begin with. In one, its tools are part of its prefix, so they stay: turned off, a call to `run_code` is answered as a call to a tool there
     /// is none of; turned on, it is offered from the next conversation.
     fn set_code_mode(&mut self, on: bool) {
@@ -1867,6 +1891,9 @@ impl Agent {
         }
         self.traj.begin_turn();
         self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": pictures.len() + kept.len(), "first": new_session}));
+        if !new_session {
+            self.servers_caught_up();
+        }
         let mut images = kept;
         if let Some(session) = self.session.as_ref().map(|session| session.path.clone()) {
             let limit = self.image_limit();
@@ -7820,6 +7847,35 @@ Body").unwrap();
         let bodies = bodies.lock().unwrap();
         let messages = bodies[1]["messages"].as_array().unwrap();
         assert!(messages.last().unwrap()["content"].as_str().unwrap().contains("cut off"), "{:?}", messages.last());
+    }
+
+    /// A server the person adds while a conversation goes on is offered from their next turn, and its tool is called there.
+    #[test]
+    fn a_server_added_in_a_conversation_is_offered_from_the_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = |name: &str| [serde_json::json!({"name": name, "description": "d", "inputSchema": {"type": "object"}})];
+        let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "the late one answered"}]}});
+        let hub = mcp::Hub::scripted("srv", &tool("t"), &[], true);
+        let (client, bodies) = server(vec![text_answer("one"), call_answer("mcp__late__u", serde_json::json!({})), text_answer("done")]);
+        let (sender, events) = channel();
+        let sessions = tempfile::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub.clone()), policy: Default::default(), code_mode: true }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        hub.add_scripted("late", &tool("u"), &[answer], true);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("the late one answered")), "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let names = |body: &Value| body["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let (first, second) = (names(&bodies[0]), names(&bodies[1]));
+        assert!(first.contains(&"mcp__srv__t".to_string()) && !first.contains(&"mcp__late__u".to_string()), "{first:?}");
+        assert_eq!(second[..first.len() - 1], first[..first.len() - 1], "what was offered stays as it was, in its order");
+        assert_eq!(second[first.len() - 1..], ["mcp__late__u", "run_code"], "the new one comes before run_code, which stays last");
+        let declared = bodies[1]["tools"].as_array().unwrap().last().unwrap().to_string();
+        assert!(declared.contains("mcp__late__u"), "run_code is declared again with it");
     }
 
     #[test]
