@@ -307,7 +307,15 @@ struct Rpc {
     answers: Receiver<Value>,
     next: u64,
     http: Option<Mutex<HttpLink>>,
+    /// Set as the server says its list of tools changed (`LIST_CHANGED`), whenever it says it.
+    changed: Arc<AtomicBool>,
 }
+
+/// What a server says when it has tools it did not have, or no longer has some: as one does that adds tools on request.
+const LIST_CHANGED: &str = "notifications/tools/list_changed";
+
+/// How long a server is given to list its tools again, each page.
+const LIST_LIMIT: Duration = Duration::from_secs(10);
 
 /// A server at a URL, as Streamable HTTP has it: each message a POST, answered in JSON or in an event stream that carries the answer; the session's id the
 /// server gave in its answer to `initialize`, sent back with each request after it.
@@ -316,6 +324,8 @@ struct HttpLink {
     headers: Vec<(String, String)>,
     session: Option<String>,
     initialized: bool,
+    /// The connection's `Rpc::changed`: the server says it in a request's event stream.
+    changed: Arc<AtomicBool>,
 }
 
 /// How long a connection to a server at a URL is waited for.
@@ -330,7 +340,8 @@ const SESSION_GONE: &str = "the server no longer knows this session";
 impl HttpLink {
     fn new(url: &str, headers: &BTreeMap<String, String>) -> Result<HttpLink, String> {
         let url = crate::http::Url::parse(url)?;
-        Ok(HttpLink { url, headers: headers.iter().map(|(name, value)| (name.clone(), value.clone())).collect(), session: None, initialized: false })
+        let headers = headers.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+        Ok(HttpLink { url, headers, session: None, initialized: false, changed: Arc::new(AtomicBool::new(false)) })
     }
 
     /// Posts one message; its answer when it has an `id` (a request), none for a notification. Gives up at `limit`, or when `cancel` is set.
@@ -421,6 +432,9 @@ impl HttpLink {
                     if let Some(reply) = answer_to_server(&message) {
                         let _ = crate::http::request("POST", &self.url, headers, Some(&reply.to_string()), HTTP_CONNECT, give_up).and_then(|mut answered| answered.text());
                     }
+                    if message.get("method").and_then(Value::as_str) == Some(LIST_CHANGED) {
+                        self.changed.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -444,6 +458,8 @@ impl Rpc {
         let writer = Arc::new(Mutex::new(writer));
         let (sender, answers) = channel();
         let replies = writer.clone();
+        let changed = Arc::new(AtomicBool::new(false));
+        let told = changed.clone();
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut line = Vec::new();
@@ -459,18 +475,24 @@ impl Rpc {
                     let _ = writeln!(out, "{reply}").and_then(|()| out.flush());
                     continue;
                 }
+                // (before an answer that follows it is passed on: the call it came in asks for the list again as it ends)
+                if message.get("method").and_then(Value::as_str) == Some(LIST_CHANGED) {
+                    told.store(true, Ordering::Relaxed);
+                    continue;
+                }
                 if message.get("id").is_some() && message.get("method").is_none() && sender.send(message).is_err() {
                     return;
                 }
             }
         });
-        Rpc { writer, answers, next: 1, http: None }
+        Rpc { writer, answers, next: 1, http: None, changed }
     }
 
     /// For a server at a URL: its messages go by HTTP, and the pipes are none.
     fn http(link: HttpLink) -> Rpc {
         let (_, answers) = channel();
-        Rpc { writer: Arc::new(Mutex::new(Box::new(std::io::sink()))), answers, next: 1, http: Some(Mutex::new(link)) }
+        let changed = link.changed.clone();
+        Rpc { writer: Arc::new(Mutex::new(Box::new(std::io::sink()))), answers, next: 1, http: Some(Mutex::new(link)), changed }
     }
 
     fn send(&self, message: &Value) -> Result<(), String> {
@@ -559,11 +581,17 @@ impl Rpc {
     fn start(&mut self, limit: Duration) -> Result<Vec<Value>, String> {
         self.call("initialize", hello(), limit, None)?;
         self.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
+        self.list_tools(limit, None)
+    }
+
+    /// What tools the server has, across its pages, each given `limit` to answer. What it said of its list before this is answered by it.
+    fn list_tools(&mut self, limit: Duration, cancel: Option<&AtomicBool>) -> Result<Vec<Value>, String> {
+        self.changed.store(false, Ordering::Relaxed);
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         for page_number in 1.. {
             let params = cursor.as_ref().map_or(json!({}), |cursor| json!({"cursor": cursor}));
-            let page = self.call("tools/list", params, limit, None)?;
+            let page = self.call("tools/list", params, limit, cancel)?;
             tools.extend(page.get("tools").and_then(Value::as_array).cloned().unwrap_or_default());
             cursor = page.get("nextCursor").and_then(Value::as_str).map(str::to_string);
             // (a server that goes on past this keeps what it has given, and does not fail over the rest)
@@ -729,12 +757,32 @@ impl Drop for Process {
     }
 }
 
+/// A server that is up, with its tools as it last listed them. One that lists them again (see `Hub::relisted`) is another of these, on the same connection
+/// and process, which end with the last that has them.
 struct Running {
-    rpc: Mutex<Rpc>,
+    rpc: Arc<Mutex<Rpc>>,
+    /// The connection's `Rpc::changed`, to be read without waiting for a call that holds it.
+    changed: Arc<AtomicBool>,
     /// What each tool is called by its server, by the name the model knows it by.
     names: BTreeMap<String, String>,
     schemas: Vec<Value>,
-    _process: Option<Process>,
+    _process: Option<Arc<Process>>,
+}
+
+impl Running {
+    /// Up, with the tools it listed as `schemas` (under its own names, and none placed yet).
+    fn new(rpc: Rpc, schemas: Vec<Value>, process: Option<Process>) -> Running {
+        Running { changed: rpc.changed.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, _process: process.map(Arc::new) }
+    }
+
+    /// The same server with its tools as it lists them now.
+    fn with_tools(&self, names: BTreeMap<String, String>, schemas: Vec<Value>) -> Running {
+        Running { rpc: self.rpc.clone(), changed: self.changed.clone(), names, schemas, _process: self._process.clone() }
+    }
+
+    fn is(&self, other: &Running) -> bool {
+        Arc::ptr_eq(&self.rpc, &other.rpc)
+    }
 }
 
 type Starter = Arc<dyn Fn() -> Result<Arc<Running>, String> + Send + Sync>;
@@ -750,6 +798,8 @@ struct Slot {
     had: Vec<String>,
     /// While it starts again, on a thread of its own.
     restarting: bool,
+    /// The names of the tools it no longer lists, as it said its list changed: a call for one is told so.
+    dropped: Vec<String>,
     failed: Option<String>,
     trusted: bool,
     /// What it was started from, and its part of its tools' names: a change of either starts it again.
@@ -786,7 +836,7 @@ fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Res
     if config.is_http() {
         let mut rpc = Rpc::http(HttpLink::new(&config.url, &config.headers)?);
         let tools = rpc.start(limit)?;
-        return Ok(Running { rpc: Mutex::new(rpc), names: BTreeMap::new(), schemas: tools, _process: None });
+        return Ok(Running::new(rpc, tools, None));
     }
     let (path, script) = program(&config.command);
     let mut command = if script {
@@ -825,7 +875,7 @@ fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Res
     let reader = process.child.stdout.take().ok_or("no stdout")?;
     let mut rpc = Rpc::over(Box::new(writer), BufReader::new(reader));
     let tools = rpc.start(limit)?;
-    Ok(Running { rpc: Mutex::new(rpc), names: BTreeMap::new(), schemas: tools, _process: Some(process) })
+    Ok(Running::new(rpc, tools, Some(process)))
 }
 
 fn schema_of(server: &str, part: &str, tool: &Value) -> Option<(String, String, Value)> {
@@ -951,8 +1001,19 @@ impl Hub {
         self.unreadable.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
-    /// The tools of the servers up by now. A session that began before one was up is offered its tools from the next turn the person starts.
+    /// The tools of the servers up by now. A session that began before one was up is offered its tools from the next turn the person starts. A server that
+    /// said its tools changed while no call was made of it is asked for them first, unless a call has it now: that call asks as it ends.
     pub fn schemas(&self) -> Vec<Value> {
+        let told: Vec<Arc<Running>> = {
+            let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            slots.iter().filter_map(|slot| slot.running.clone()).filter(|running| running.changed.load(Ordering::Relaxed)).collect()
+        };
+        for running in told {
+            let Ok(mut rpc) = running.rpc.try_lock() else { continue };
+            let listed = rpc.list_tools(LIST_LIMIT, None);
+            drop(rpc);
+            self.relisted(&running, listed);
+        }
         let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         slots.iter().filter_map(|slot| slot.running.as_ref()).flat_map(|running| running.schemas.iter().cloned()).collect()
     }
@@ -964,6 +1025,7 @@ impl Hub {
             up.ok_or_else(|| match slots.iter().find(|slot| slot.had.iter().any(|had| had == tool)) {
                 Some(slot) if slot.restarting => format!("{tool}: its server is starting again"),
                 Some(Slot { failed: Some(reason), .. }) => format!("{tool}: its server did not start again: {reason}"),
+                _ if slots.iter().any(|slot| slot.running.is_some() && slot.dropped.iter().any(|name| name == tool)) => format!("{tool}: its server no longer has this tool"),
                 _ => format!("{tool}: its server is not running"),
             })?
         };
@@ -978,7 +1040,14 @@ impl Hub {
                     Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(50)),
                 }
             };
-            rpc.call("tools/call", json!({"name": real, "arguments": arguments}), CALL_LIMIT, Some(cancel))
+            let answer = rpc.call("tools/call", json!({"name": real, "arguments": arguments}), CALL_LIMIT, Some(cancel));
+            // (said in the call, as a server says it that adds tools on request: asked for while it is held, so the next request has them)
+            let listed = running.changed.load(Ordering::Relaxed).then(|| rpc.list_tools(LIST_LIMIT, Some(cancel)));
+            drop(rpc);
+            if let Some(listed) = listed {
+                self.relisted(&running, listed);
+            }
+            answer
         };
         let result = match answer {
             Ok(result) => result,
@@ -992,14 +1061,40 @@ impl Hub {
         Ok(text)
     }
 
+    /// What a server that said its tools changed lists now, in place of what it listed: for calls at once, and offered to a session from its next request.
+    /// The names it no longer lists are kept, for a call of one to be told so. A list that could not be had leaves what was, unless the person stopped
+    /// the call it was asked for in: it is asked for again.
+    fn relisted(&self, running: &Running, listed: Result<Vec<Value>, String>) {
+        let tools = match listed {
+            Ok(tools) => tools,
+            Err(error) => {
+                if error == "stopped" {
+                    running.changed.store(true, Ordering::Relaxed);
+                }
+                return;
+            }
+        };
+        let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(slot) = slots.iter_mut().find(|slot| slot.running.as_ref().is_some_and(|now| now.is(running))) else { return };
+        let Some(now) = slot.running.clone() else { return };
+        let (names, schemas) = place_tools(&slot.name, &slot.part, &tools);
+        if names == now.names && schemas == now.schemas {
+            return;
+        }
+        slot.dropped.retain(|name| !names.contains_key(name));
+        slot.dropped.extend(now.names.keys().filter(|name| !names.contains_key(*name)).cloned());
+        slot.running = Some(Arc::new(now.with_tools(names, schemas)));
+    }
+
     /// A server that has ended starts again, on a thread of its own: its handshake can take a minute, and a person who stops the turn does not wait for that. This call is
     /// not made again: it may have done what it was asked before the server went.
     fn start_again(&self, ended: Arc<Running>, error: String) -> String {
         let start = {
             let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let slot = slots.iter_mut().find(|slot| slot.running.as_ref().is_some_and(|running| Arc::ptr_eq(running, &ended)));
+            let slot = slots.iter_mut().find(|slot| slot.running.as_ref().is_some_and(|running| running.is(&ended)));
             slot.and_then(|slot| {
-                slot.had = ended.names.keys().cloned().collect();
+                // (its tools as it last listed them, which the call that found it ended may have had before)
+                slot.had = slot.running.as_ref().map_or_else(Vec::new, |running| running.names.keys().cloned().collect());
                 slot.running = None;
                 slot.restarting = slot.start.is_some();
                 slot.start.clone()
@@ -1016,6 +1111,7 @@ impl Hub {
                 slot.restarting = false;
                 match outcome {
                     Ok(running) => {
+                        slot.dropped.retain(|name| !running.names.contains_key(name));
                         slot.running = Some(running);
                         slot.failed = None;
                         slot.had.clear();
@@ -1071,9 +1167,24 @@ impl Hub {
     #[cfg(test)]
     pub(crate) fn add_scripted(&self, server: &str, tools: &[Value], lines: &[Value], trusted: bool) {
         let script: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        self.add_running(server, tools, Box::new(std::io::sink()), std::io::Cursor::new(script.into_bytes()), trusted);
+    }
+
+    /// A server, up with these tools, that says each of `turns` as it is sent a request, in order: what it says in a call is said in it, and not before.
+    #[cfg(test)]
+    pub(crate) fn answering(server: &str, tools: &[Value], turns: Vec<Vec<Value>>, trusted: bool) -> Arc<Hub> {
+        let (said, heard) = channel();
+        let turns = turns.iter().map(|lines| lines.iter().map(|line| format!("{line}\n")).collect::<String>().into_bytes()).collect();
+        let hub = Arc::new(Hub::default());
+        hub.add_running(server, tools, Box::new(Turns { turns, said, written: Vec::new() }), BufReader::new(Heard { from: heard, pending: Vec::new() }), trusted);
+        hub
+    }
+
+    #[cfg(test)]
+    fn add_running(&self, server: &str, tools: &[Value], writer: Box<dyn Write + Send>, reader: impl BufRead + Send + 'static, trusted: bool) {
         let (names, schemas) = place_tools(server, &name_part(server), tools);
-        let running = Arc::new(Running { rpc: Mutex::new(Rpc::over(Box::new(std::io::sink()), std::io::Cursor::new(script.into_bytes()))), names, schemas, _process: None });
-        self.slots.lock().unwrap().push(Slot { name: server.into(), running: Some(running), trusted, ..Slot::default() });
+        let running = Arc::new(Running { names, schemas, ..Running::new(Rpc::over(writer, reader), Vec::new(), None) });
+        self.slots.lock().unwrap().push(Slot { name: server.into(), part: name_part(server), running: Some(running), trusted, ..Slot::default() });
     }
 
     /// One line a server, for the person.
@@ -1095,6 +1206,56 @@ impl Hub {
             };
             (slot.name.clone(), state)
         }).collect()
+    }
+}
+
+/// The side of `Hub::answering`'s server that is written to: each request it is sent lets the next of its turns be said.
+#[cfg(test)]
+struct Turns {
+    turns: std::collections::VecDeque<Vec<u8>>,
+    said: std::sync::mpsc::Sender<Vec<u8>>,
+    written: Vec<u8>,
+}
+
+#[cfg(test)]
+impl Write for Turns {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.written.extend_from_slice(bytes);
+        while let Some(end) = self.written.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.written.drain(..=end).collect();
+            let request = serde_json::from_slice::<Value>(&line).is_ok_and(|message| message.get("id").is_some() && message.get("method").is_some());
+            if let Some(turn) = self.turns.pop_front().filter(|_| request) {
+                let _ = self.said.send(turn);
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The side of it that is read: what it says, as it says it; its end as the other side goes.
+#[cfg(test)]
+struct Heard {
+    from: Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+}
+
+#[cfg(test)]
+impl std::io::Read for Heard {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.pending.is_empty() {
+            match self.from.recv() {
+                Ok(bytes) => self.pending = bytes,
+                Err(_) => return Ok(0),
+            }
+        }
+        let count = buffer.len().min(self.pending.len());
+        buffer[..count].copy_from_slice(&self.pending[..count]);
+        self.pending.drain(..count);
+        Ok(count)
     }
 }
 
@@ -1230,7 +1391,8 @@ mod tests {
                         }
                         Some("tools/call") if message["params"]["name"] == "ask" => {
                             let asked = json!({"jsonrpc": "2.0", "id": "srv-1", "method": "roots/list", "params": {}});
-                            let body = format!("event: message\r\ndata: {asked}\r\n\r\nevent: message\r\ndata: {}\r\n\r\n", answer(json!({"content": [{"type": "text", "text": "asked"}]})));
+                            let changed = json!({"jsonrpc": "2.0", "method": LIST_CHANGED});
+                            let body = format!("event: message\r\ndata: {asked}\r\n\r\nevent: message\r\ndata: {changed}\r\n\r\nevent: message\r\ndata: {}\r\n\r\n", answer(json!({"content": [{"type": "text", "text": "asked"}]})));
                             format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}", body.len())
                         }
                         Some("tools/call") => {
@@ -1275,6 +1437,7 @@ mod tests {
     }
 
     /// What a server asks of this side in a call's stream is answered by a POST in its session: a ping, and a refusal of what was not offered (its folders here).
+    /// What it says there of its tools has them asked for again in the session.
     #[test]
     fn what_a_server_at_a_url_asks_is_answered_in_its_session() {
         let (url, seen) = http_server("ask");
@@ -1288,6 +1451,8 @@ mod tests {
         let (head, reply) = seen.iter().find(|(_, message)| message["id"] == "srv-1").expect("the request was answered");
         assert_eq!((reply["error"]["code"].as_i64(), reply.get("method")), (Some(-32601), None), "{reply}");
         assert!(head.starts_with("POST") && head.to_ascii_lowercase().contains("mcp-session-id: s-1"), "{head}");
+        let listed = seen.iter().filter(|(head, message)| message["method"] == "tools/list" && head.to_ascii_lowercase().contains("mcp-session-id: s-1")).count();
+        assert_eq!(listed, 2, "the list is asked for again in the session, after the handshake's");
     }
 
     /// A server over pipes is answered in them: its ping, and a refusal of what was not offered, each by the id it asked with.
@@ -1498,7 +1663,38 @@ mod tests {
     fn running(lines: &[Value], names: &[&str]) -> Arc<Running> {
         let script: String = lines.iter().map(|line| format!("{line}\n")).collect();
         let (names, schemas) = place_tools("srv", "srv", &names.iter().map(|name| tool(name)).collect::<Vec<_>>());
-        Arc::new(Running { rpc: Mutex::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(script.into_bytes()))), names, schemas, _process: None })
+        Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(script.into_bytes())), Vec::new(), None) })
+    }
+
+    /// A server that says in a call that its tools changed is asked for them as the call ends: the new one is offered, and one it no longer lists is said to be gone.
+    #[test]
+    fn a_server_that_says_its_tools_changed_in_a_call_is_asked_for_them_as_it_ends() {
+        let lines = [
+            json!({"jsonrpc": "2.0", "method": LIST_CHANGED}),
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "enabled"}]}}),
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"tools": [tool("u"), tool("v")]}}),
+        ];
+        let hub = Hub::default();
+        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), part: "srv".into(), running: Some(running(&lines, &["t", "u"])), ..Slot::default() });
+        assert_eq!(hub.call("mcp__srv__t", &json!({}), &AtomicBool::new(false)).unwrap(), "enabled");
+        let names: Vec<String> = hub.schemas().iter().map(|schema| schema["function"]["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, ["mcp__srv__u", "mcp__srv__v"]);
+        assert_eq!(hub.states(), [("srv".to_string(), State::Up(2))]);
+        let said = hub.call("mcp__srv__t", &json!({}), &AtomicBool::new(false)).unwrap_err();
+        assert!(said.contains("no longer has this tool"), "{said}");
+    }
+
+    /// One that says it between calls is asked as the tools are next given, as a turn begins.
+    #[test]
+    fn a_server_that_says_its_tools_changed_between_calls_is_asked_as_they_are_next_given() {
+        let lines = [json!({"jsonrpc": "2.0", "method": LIST_CHANGED}), json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [tool("t"), tool("w")]}})];
+        let server = running(&lines, &["t"]);
+        let hub = Hub::default();
+        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), part: "srv".into(), running: Some(server.clone()), ..Slot::default() });
+        waited("the server's word", || server.changed.load(Ordering::Relaxed));
+        assert_eq!(hub.schemas().len(), 2);
+        assert!(!server.changed.load(Ordering::Relaxed), "it was answered");
+        assert_eq!(hub.schemas().len(), 2, "and is not asked again");
     }
 
     /// Waits for what another thread does.
@@ -1592,7 +1788,7 @@ mod tests {
         let named = ["a b".to_string(), "a_b".to_string()];
         for ((name, trusted), part) in named.iter().zip([false, true]).zip(name_parts(&named)) {
             let (names, schemas) = place_tools(name, &part, &[tool("t")]);
-            let server = Arc::new(Running { rpc: Mutex::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(Vec::new()))), names, schemas, _process: None });
+            let server = Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(Vec::new())), Vec::new(), None) });
             both.slots.lock().unwrap().push(Slot { name: name.clone(), running: Some(server), trusted, ..Slot::default() });
         }
         assert!(!both.trusts_tool("mcp__a_b__t"));

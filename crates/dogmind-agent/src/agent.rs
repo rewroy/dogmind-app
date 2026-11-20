@@ -1591,8 +1591,9 @@ impl Agent {
         }
     }
 
-    /// The tools of MCP servers that came up after the conversation began (one the person added or changed in Settings, or one slow to start):
-    /// offered from this turn, before `run_code`, which is declared again with them. The engine reads the prefix again once, as for the web turned
+    /// The tools of MCP servers that came up after the conversation began (one the person added or changed in Settings, or one slow to start), and
+    /// those a server listed again as it said its tools changed: offered from this turn, or from the next request of it after a call that changed
+    /// them, before `run_code`, which is declared again with them. The engine reads the prefix again once, as for the web turned
     /// on; a tool whose server has gone stays offered, and a call to it says so.
     fn servers_caught_up(&mut self) {
         let Some(hub) = &self.mcp else { return };
@@ -2512,6 +2513,10 @@ impl Agent {
                 let most = note_repeats(&calls, &self.workspace, &mut repeats, &mut self.repeated);
                 let failures = self.run_tools(&calls);
                 let nested = std::mem::take(&mut self.program_calls);
+                // (a server may have tools now that it had not, as one does that adds them on request: the model may call them in this turn)
+                if calls.iter().chain(&nested).any(|call| call.function.name.starts_with("mcp__")) {
+                    self.servers_caught_up();
+                }
                 failed_calls = if failures == calls.len() { failed_calls + failures } else { 0 };
                 let edited = std::mem::take(&mut self.edited);
                 // What a command wrote counts as an edit for the calls that look: what they would answer now is not what they did. (Not for what the model wrote: the draft watch is for that.)
@@ -7848,6 +7853,34 @@ Body").unwrap();
         let bodies = bodies.lock().unwrap();
         let messages = bodies[1]["messages"].as_array().unwrap();
         assert!(messages.last().unwrap()["content"].as_str().unwrap().contains("cut off"), "{:?}", messages.last());
+    }
+
+    /// A server that says in a call that it has a new tool has it offered from the next request of the same turn, which calls it.
+    #[test]
+    fn a_tool_a_server_adds_in_a_call_is_offered_in_the_same_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = |name: &str| serde_json::json!({"name": name, "description": "d", "inputSchema": {"type": "object"}});
+        // (what the server says in the call, and as it is asked for its tools and called again)
+        let turns = vec![
+            vec![serde_json::json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}), serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "enabled"}]}})],
+            vec![serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {"tools": [tool("enable"), tool("u")]}})],
+            vec![serde_json::json!({"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": "the new one answered"}]}})],
+        ];
+        let hub = mcp::Hub::answering("srv", &[tool("enable")], turns, true);
+        let (client, bodies) = server(vec![call_answer("mcp__srv__enable", serde_json::json!({})), call_answer("mcp__srv__u", serde_json::json!({})), text_answer("done")]);
+        let (sender, events) = channel();
+        let sessions = tempfile::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub.clone()), policy: Default::default(), code_mode: true }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("the new one answered")), "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let names = |body: &Value| body["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let (first, second) = (names(&bodies[0]), names(&bodies[1]));
+        assert!(!first.contains(&"mcp__srv__u".to_string()), "{first:?}");
+        assert_eq!(second[first.len() - 1..], ["mcp__srv__u", "run_code"], "offered from the next request, before run_code");
     }
 
     /// A server the person adds while a conversation goes on is offered from their next turn, and its tool is called there.
