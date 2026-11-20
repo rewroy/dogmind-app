@@ -373,7 +373,7 @@ mod tests {
         write(&home.join(".claude/skills/one"), "---\ndescription: from Claude\n---\nb");
         write(&home.join(".claude/skills/synced/abc/deep"), "---\nname: deep\ndescription: nested\n---\nb");
         write(&home.join(".codex/skills/two"), "---\nname: two\ndescription: from Codex\n---\nb");
-        write(&home.join(".codex/skills/.system/review-agent"), "---\nname: review-agent\ndescription: Codex's own\n---\nb");
+        write(&home.join(".codex/skills/.system/review-agent"), "---\nname: review-agent\ndescription: another tool's own\n---\nb");
         write(&home.join(".agents/skills/three"), "---\nname: three\ndescription: shared\n---\nb");
         write(&home.join(".claude/skills/nameless"), "---\nname: nothing-said\n---\nb");
         write(&work.join(".claude/skills/one"), "---\nname: one\ndescription: the project's own\n---\nb");
