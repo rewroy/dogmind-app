@@ -317,6 +317,9 @@ struct HttpLink {
 /// How long a connection to a server at a URL is waited for.
 const HTTP_CONNECT: Duration = Duration::from_secs(10);
 
+/// What a request comes to when the server at a URL no longer knows its session, as a server may forget one that has been quiet.
+const SESSION_GONE: &str = "the server no longer knows this session";
+
 impl HttpLink {
     fn new(url: &str, headers: &BTreeMap<String, String>) -> Result<HttpLink, String> {
         let url = crate::http::Url::parse(url)?;
@@ -337,28 +340,21 @@ impl HttpLink {
             headers.push(("Mcp-Session-Id".into(), session.clone()));
         }
         // (the request's own flag: set by the person's stop, or once the limit is past, by a watcher of both that ends with the request)
-        let give_up = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicBool::new(false));
-        let person = cancel.map(|flag| flag as *const AtomicBool as usize);
-        {
-            let (give_up, done) = (give_up.clone(), done.clone());
-            let started = Instant::now();
-            std::thread::spawn(move || {
+        let (give_up, done, started) = (AtomicBool::new(false), AtomicBool::new(false), Instant::now());
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
                 while !done.load(Ordering::Relaxed) {
-                    // SAFETY: the flag outlives this request, which `done` ends this watch before returning from.
-                    let stopped = person.is_some_and(|flag| unsafe { (*(flag as *const AtomicBool)).load(Ordering::Relaxed) });
-                    if stopped || started.elapsed() > limit {
+                    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) || started.elapsed() > limit {
                         give_up.store(true, Ordering::Relaxed);
                         return;
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             });
-        }
-        let outcome = self.exchange(&message.to_string(), &headers, id, &give_up);
-        done.store(true, Ordering::Relaxed);
-        // (the watcher may still read the person's flag for one more look: it is told first, and the flag is not read after this)
-        std::thread::sleep(Duration::from_millis(60));
+            let outcome = self.exchange(&message.to_string(), &headers, id, &give_up);
+            done.store(true, Ordering::Relaxed);
+            outcome
+        });
         match outcome {
             Err(_) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => Err("stopped".to_string()),
             Err(_) if give_up.load(Ordering::Relaxed) => Err(format!("no answer to {method} within {} s", limit.as_secs())),
@@ -374,6 +370,11 @@ impl HttpLink {
 
     fn exchange(&mut self, body: &str, headers: &[(String, String)], id: Option<u64>, give_up: &AtomicBool) -> Result<Option<Value>, String> {
         let mut response = crate::http::request("POST", &self.url, headers, Some(body), HTTP_CONNECT, give_up).map_err(|error| format!("{}: {error}", self.url.host))?;
+        // (as the protocol has a server say it no longer knows the session it was sent: this side begins another)
+        if response.status == 404 && self.session.is_some() {
+            (self.session, self.initialized) = (None, false);
+            return Err(SESSION_GONE.to_string());
+        }
         if let Some(session) = response.header("mcp-session-id") {
             self.session = Some(session.to_string());
         }
@@ -479,9 +480,13 @@ impl Rpc {
     fn call(&mut self, method: &str, params: Value, limit: Duration, cancel: Option<&AtomicBool>) -> Result<Value, String> {
         let id = self.next;
         self.next += 1;
-        if let Some(http) = &self.http {
+        if self.http.is_some() {
             let asked = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-            let outcome = http.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).post(&asked, limit, cancel);
+            let mut outcome = self.post(&asked, limit, cancel);
+            // (a new session, and the request again in it: the old session never took it)
+            if method != "initialize" && matches!(&outcome, Err(error) if error == SESSION_GONE) {
+                outcome = self.begin_again(limit).and_then(|()| self.post(&asked, limit, cancel));
+            }
             return match outcome {
                 Ok(Some(answer)) => match answer.get("error") {
                     Some(error) => Err(error.get("message").and_then(Value::as_str).map_or_else(|| error.to_string(), str::to_string)),
@@ -525,9 +530,26 @@ impl Rpc {
         }
     }
 
+    /// One message to a server at a URL; its answer, if it has one.
+    fn post(&self, message: &Value, limit: Duration, cancel: Option<&AtomicBool>) -> Result<Option<Value>, String> {
+        let http = self.http.as_ref().ok_or("not a server at a URL")?;
+        http.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).post(message, limit, cancel)
+    }
+
+    /// A new session with a server at a URL that let the last one go: the handshake again, without its list of tools, which the session does not change.
+    fn begin_again(&mut self, limit: Duration) -> Result<(), String> {
+        let id = self.next;
+        self.next += 1;
+        let answer = self.post(&json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": hello()}), limit, None)?;
+        if let Some(error) = answer.as_ref().and_then(|answer| answer.get("error")) {
+            return Err(format!("a new session was refused: {error}"));
+        }
+        self.post(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), limit, None).map(|_| ())
+    }
+
     /// The handshake, and what tools the server has, each step given this long to answer.
     fn start(&mut self, limit: Duration) -> Result<Vec<Value>, String> {
-        self.call("initialize", json!({"protocolVersion": PROTOCOL, "capabilities": {}, "clientInfo": {"name": "dogmind-app", "version": env!("CARGO_PKG_VERSION")}}), limit, None)?;
+        self.call("initialize", hello(), limit, None)?;
         self.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
@@ -543,6 +565,11 @@ impl Rpc {
         }
         Ok(tools)
     }
+}
+
+/// What this side says of itself in the handshake.
+fn hello() -> Value {
+    json!({"protocolVersion": PROTOCOL, "capabilities": {}, "clientInfo": {"name": "dogmind-app", "version": env!("CARGO_PKG_VERSION")}})
 }
 
 /// A tool's result as text: what it says in words, and a word for what it says otherwise.
@@ -1085,7 +1112,14 @@ mod tests {
     /// event stream (a notification first, then the answer), and `tools/call` in JSON with what it was asked and the headers it was sent. What each request carried
     /// is kept, to be read back.
     fn http_server(tool: &'static str) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+        http_server_with(tool, false)
+    }
+
+    /// The same, and with `forgets` it lets its first session go once it has answered a call in it: a request in it is answered 404 from then on, and the next
+    /// `initialize` begins `s-2`.
+    fn http_server_with(tool: &'static str, forgets: bool) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
         use std::io::Read;
+        let sessions = Arc::new(Mutex::new((0u32, false)));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}/mcp", listener.local_addr().unwrap().port());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1093,7 +1127,7 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
-                let kept = kept.clone();
+                let (kept, sessions) = (kept.clone(), sessions.clone());
                 std::thread::spawn(move || {
                     let mut data = Vec::new();
                     let mut block = [0u8; 4096];
@@ -1120,24 +1154,31 @@ mod tests {
                     kept.lock().unwrap().push((head.clone(), message.clone()));
                     let headers: Vec<String> = head.lines().skip(1).map(str::to_string).collect();
                     let answer = |result: Value| json!({"jsonrpc": "2.0", "id": message["id"], "result": result}).to_string();
+                    let sent = headers.iter().find_map(|line| line.to_ascii_lowercase().strip_prefix("mcp-session-id: ").map(str::to_string));
+                    let mut known = sessions.lock().unwrap();
+                    let unknown = sent.is_some_and(|sent| known.1 || sent != format!("s-{}", known.0));
                     let reply = match message["method"].as_str() {
                         _ if head.starts_with("DELETE") => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
                         Some("initialize") => {
+                            *known = (known.0 + 1, false);
                             let body = answer(json!({"protocolVersion": PROTOCOL, "capabilities": {"tools": {}}}));
-                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: s-1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: s-{}\r\nContent-Length: {}\r\n\r\n{body}", known.0, body.len())
                         }
+                        _ if unknown => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string(),
                         Some("tools/list") => {
                             let note = json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {}});
                             let body = format!("event: message\r\ndata: {note}\r\n\r\nevent: message\r\ndata: {}\r\n\r\n", answer(json!({"tools": [{"name": tool, "inputSchema": {"type": "object"}}]})));
                             format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}", body.len())
                         }
                         Some("tools/call") => {
+                            known.1 = forgets && known.0 == 1;
                             let said = format!("{} with {}", message["params"]["arguments"], headers.join(" | "));
                             let body = answer(json!({"content": [{"type": "text", "text": said}]}));
                             format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len())
                         }
                         _ => "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n".to_string(),
                     };
+                    drop(known);
                     let _ = stream.write_all(reply.as_bytes());
                 });
             }
@@ -1168,6 +1209,27 @@ mod tests {
         let methods: Vec<&str> = seen.iter().filter_map(|(_, message)| message["method"].as_str()).collect();
         assert_eq!(methods, ["initialize", "notifications/initialized", "tools/list", "tools/call"]);
         assert!(!seen[0].0.to_ascii_lowercase().contains("mcp-session-id"), "the first request has no session yet");
+    }
+
+    /// A server that lets its session go answers 404 in it: a new session is begun, and the call is made again in it, which the old one never took.
+    #[test]
+    fn a_session_the_server_let_go_is_begun_again_and_the_call_made_in_the_new_one() {
+        let (url, seen) = http_server_with("echo", true);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        save_server(&file, None, "remote", ServerConfig { url, ..ServerConfig::default() }).unwrap();
+        let hub = Hub::start(&file);
+        let started = Instant::now();
+        while hub.schemas().is_empty() && started.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let call = |n: u32| hub.call("mcp__remote__echo", &json!({"n": n}), &AtomicBool::new(false)).unwrap();
+        assert!(call(1).to_ascii_lowercase().contains("mcp-session-id: s-1"));
+        assert!(call(2).to_ascii_lowercase().contains("mcp-session-id: s-2"), "the second call is made in the new session");
+        let seen = seen.lock().unwrap();
+        let methods: Vec<&str> = seen.iter().filter_map(|(_, message)| message["method"].as_str()).collect();
+        assert_eq!(methods, ["initialize", "notifications/initialized", "tools/list", "tools/call", "tools/call", "initialize", "notifications/initialized", "tools/call"]);
+        assert!(!seen[5].0.to_ascii_lowercase().contains("mcp-session-id"), "the new handshake is sent with no session");
     }
 
     /// A change to the file, as Settings makes one, starts what is new and what changed again, ends what is gone, and leaves the rest as it was.
