@@ -417,6 +417,10 @@ impl HttpLink {
                     if is_ours(&message) {
                         return Ok(Some(message));
                     }
+                    // (as the protocol has a client answer a request on its stream: a POST of its own, which the server takes with 202)
+                    if let Some(reply) = answer_to_server(&message) {
+                        let _ = crate::http::request("POST", &self.url, headers, Some(&reply.to_string()), HTTP_CONNECT, give_up).and_then(|mut answered| answered.text());
+                    }
                 }
             }
         }
@@ -435,7 +439,7 @@ impl Drop for HttpLink {
 }
 
 impl Rpc {
-    /// Reads the server's lines on a thread of its own; it answers a ping itself, as the server may wait on one.
+    /// Reads the server's lines on a thread of its own; it answers what the server asks of it itself (see `answer_to_server`), as the server may wait on that.
     fn over(writer: Box<dyn Write + Send>, reader: impl BufRead + Send + 'static) -> Rpc {
         let writer = Arc::new(Mutex::new(writer));
         let (sender, answers) = channel();
@@ -450,12 +454,9 @@ impl Rpc {
                     return;
                 }
                 let Ok(message) = serde_json::from_str::<Value>(&String::from_utf8_lossy(&line)) else { continue };
-                if message.get("method").and_then(Value::as_str) == Some("ping") {
-                    if let Some(id) = message.get("id") {
-                        let pong = json!({"jsonrpc": "2.0", "id": id, "result": {}});
-                        let mut out = replies.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let _ = writeln!(out, "{pong}").and_then(|()| out.flush());
-                    }
+                if let Some(reply) = answer_to_server(&message) {
+                    let mut out = replies.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let _ = writeln!(out, "{reply}").and_then(|()| out.flush());
                     continue;
                 }
                 if message.get("id").is_some() && message.get("method").is_none() && sender.send(message).is_err() {
@@ -572,6 +573,17 @@ impl Rpc {
         }
         Ok(tools)
     }
+}
+
+/// This side's answer to a request the server makes of it, none for what is not a request. A ping is answered. Anything else (the person's folders, a model's
+/// answer, a question for the person: what the handshake did not offer) is refused at once, as a server that waits for an answer never given holds the call
+/// it is in until that call's limit, ten minutes.
+fn answer_to_server(message: &Value) -> Option<Value> {
+    let (id, method) = (message.get("id")?, message.get("method")?.as_str()?);
+    Some(match method {
+        "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+        _ => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("Method not found: {method}")}}),
+    })
 }
 
 /// What this side says of itself in the handshake.
@@ -1216,6 +1228,11 @@ mod tests {
                             let body = format!("event: message\r\ndata: {note}\r\n\r\nevent: message\r\ndata: {}\r\n\r\n", answer(json!({"tools": [{"name": tool, "inputSchema": {"type": "object"}}]})));
                             format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}", body.len())
                         }
+                        Some("tools/call") if message["params"]["name"] == "ask" => {
+                            let asked = json!({"jsonrpc": "2.0", "id": "srv-1", "method": "roots/list", "params": {}});
+                            let body = format!("event: message\r\ndata: {asked}\r\n\r\nevent: message\r\ndata: {}\r\n\r\n", answer(json!({"content": [{"type": "text", "text": "asked"}]})));
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                        }
                         Some("tools/call") => {
                             known.1 = forgets && known.0 == 1;
                             let said = format!("{} with {}", message["params"]["arguments"], headers.join(" | "));
@@ -1255,6 +1272,41 @@ mod tests {
         let methods: Vec<&str> = seen.iter().filter_map(|(_, message)| message["method"].as_str()).collect();
         assert_eq!(methods, ["initialize", "notifications/initialized", "tools/list", "tools/call"]);
         assert!(!seen[0].0.to_ascii_lowercase().contains("mcp-session-id"), "the first request has no session yet");
+    }
+
+    /// What a server asks of this side in a call's stream is answered by a POST in its session: a ping, and a refusal of what was not offered (its folders here).
+    #[test]
+    fn what_a_server_at_a_url_asks_is_answered_in_its_session() {
+        let (url, seen) = http_server("ask");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        save_server(&file, None, "remote", ServerConfig { url, ..ServerConfig::default() }).unwrap();
+        let hub = Hub::start(&file);
+        waited("the server to be up", || !hub.schemas().is_empty());
+        assert_eq!(hub.call("mcp__remote__ask", &json!({}), &AtomicBool::new(false)).unwrap(), "asked");
+        let seen = seen.lock().unwrap();
+        let (head, reply) = seen.iter().find(|(_, message)| message["id"] == "srv-1").expect("the request was answered");
+        assert_eq!((reply["error"]["code"].as_i64(), reply.get("method")), (Some(-32601), None), "{reply}");
+        assert!(head.starts_with("POST") && head.to_ascii_lowercase().contains("mcp-session-id: s-1"), "{head}");
+    }
+
+    /// A server over pipes is answered in them: its ping, and a refusal of what was not offered, each by the id it asked with.
+    #[test]
+    fn what_a_server_over_pipes_asks_is_answered() {
+        let lines = [
+            json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": "e", "method": "elicitation/create", "params": {"message": "sure?"}}),
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "done"}]}}),
+        ];
+        let script: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        let sent = Sent::default();
+        let mut rpc = Rpc::over(Box::new(sent.clone()), Cursor::new(script.into_bytes()));
+        assert_eq!(result_text(&rpc.call("tools/call", json!({}), Duration::from_secs(5), None).unwrap()), "done");
+        waited("both answers", || sent.messages().len() == 3);
+        // (the reader answers as it reads, which may be before the call is written)
+        let answers: Vec<Value> = sent.messages().into_iter().filter(|message| message.get("method").is_none()).collect();
+        assert_eq!(answers[0], json!({"jsonrpc": "2.0", "id": 7, "result": {}}));
+        assert_eq!((answers[1]["id"].as_str(), answers[1]["error"]["code"].as_i64()), (Some("e"), Some(-32601)), "{}", answers[1]);
     }
 
     /// A server that lets its session go answers 404 in it: a new session is begun, and the call is made again in it, which the old one never took.
