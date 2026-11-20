@@ -7426,6 +7426,7 @@ impl App {
                     let runs = configs.iter().find(|(known, _)| known == name).map_or(String::new(), |(_, config)| mcp_runs(config));
                     // (why one did not start needs the room of the page)
                     let state = match states.iter().find(|(known, _)| known == name).map(|(_, state)| state) {
+                        Some(dogmind_agent::mcp::State::Up(1)) => t("1 tool").to_string(),
                         Some(dogmind_agent::mcp::State::Up(tools)) => tf("{0} tools", &[tools]),
                         Some(dogmind_agent::mcp::State::Failed(why)) => tf("Did not start: {0}", &[why]),
                         _ => t("Starting…").to_string(),
@@ -12275,7 +12276,7 @@ impl App {
         }
         self.mcp_changed();
         self.mcp_close_form();
-        self.say_in_panel(&tf("{0} is starting. Its tools join the conversation from your next message after it is up.", &[&name]));
+        self.say_in_panel(&tf("{0} was saved. Once it is up, its tools join the conversation from your next message.", &[&name]));
         // (the page is scrolled to the form: what it says is under it)
         self.scroll_panel_to(self.panel_extent);
         true
