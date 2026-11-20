@@ -869,9 +869,23 @@ fn hello() -> Value {
 }
 
 /// A tool's result as text: what it says in words, and a word for what it says otherwise.
+/// A resource it holds is read as its text, with its URI (a file's contents come so from GitHub's server); one of bytes, and a link to one, by what they
+/// are.
 fn result_text(result: &Value) -> String {
+    let said = |part: &Value, field: &str| part.get(field).and_then(Value::as_str).unwrap_or("").to_string();
     let parts: Vec<String> = result.get("content").and_then(Value::as_array).into_iter().flatten().map(|part| match part.get("type").and_then(Value::as_str) {
-        Some("text") => part.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+        Some("text") => said(part, "text"),
+        Some("resource") => {
+            let resource = part.get("resource").unwrap_or(&Value::Null);
+            match resource.get("text").and_then(Value::as_str) {
+                Some(text) => format!("[resource {}]\n{text}", said(resource, "uri")),
+                None => format!("[resource {}: {} bytes, not shown]", said(resource, "uri"), said(resource, "mimeType")),
+            }
+        }
+        Some("resource_link") => {
+            let about = [said(part, "name"), said(part, "description")].into_iter().filter(|text| !text.is_empty()).collect::<Vec<_>>().join(": ");
+            format!("[resource link {}{}]", said(part, "uri"), if about.is_empty() { String::new() } else { format!(" ({about})") })
+        }
         Some(kind) => format!("[{kind} content is not shown]"),
         None => part.to_string(),
     }).collect();
@@ -2017,6 +2031,12 @@ mod tests {
     fn a_result_is_read_as_words() {
         let result = json!({"content": [{"type": "text", "text": "one"}, {"type": "image", "data": "x"}, {"type": "text", "text": "two"}]});
         assert_eq!(result_text(&result), "one\n[image content is not shown]\ntwo");
+        let resources = json!({"content": [
+            {"type": "resource", "resource": {"uri": "repo://o/r/contents/a.rs", "mimeType": "text/plain", "text": "fn main() {}"}},
+            {"type": "resource", "resource": {"uri": "file:///x.png", "mimeType": "image/png", "blob": "iVBO"}},
+            {"type": "resource_link", "uri": "file:///y.txt", "name": "y.txt", "description": "the log"}
+        ]});
+        assert_eq!(result_text(&resources), "[resource repo://o/r/contents/a.rs]\nfn main() {}\n[resource file:///x.png: image/png bytes, not shown]\n[resource link file:///y.txt (y.txt: the log)]");
         assert_eq!(result_text(&json!({"structuredContent": {"a": 1}})), r#"{"a":1}"#);
     }
 
