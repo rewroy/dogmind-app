@@ -278,6 +278,18 @@ pub const HELPER_NO_MORE: &str = "error: not run. There is no more looking: answ
 
 /// The app's word to the model: files changed, and nothing has looked at them since. Marked as the app's: a real model took it for the person's, and argued with itself over what they wanted.
 /// The person's word goes first: a model that had been told "do not run it" ran it on this word for six minutes.
+/// What the model is told when it answered with the rest of a file whose write was cut, as text: that writes nothing.
+pub fn cut_write_as_text(path: &str) -> String {
+    format!("[From the app, not the user] Your answer went on with `{path}` as text, and an answer's text writes nothing: the file still ends where its write was cut. Write the rest with create_file, the same path: it goes on from the end of the file. Put none of the file in your answer.")
+}
+
+/// Whether an answer's text is mostly code, as the rest of a file written as an answer is: five lines or more, and most of them end as code does or assign.
+pub fn mostly_code(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with("```")).collect();
+    let code = lines.iter().filter(|line| line.ends_with([';', '{', '}', ')', ',', '>']) || line.contains(" = ")).count();
+    lines.len() >= 5 && code * 3 >= lines.len() * 2
+}
+
 pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, it would not be worth running, or the user asked you not to run it, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";
 
 /// The app's word after an answer in Japanese with letters in it that no Japanese is written with, which it cannot see for itself. What it has written stays as it is, on the screen and in the
@@ -810,6 +822,14 @@ mod tests {
         std::fs::write(folder.path().join("new.txt"), "x").unwrap();
         assert_eq!(system_prompt(folder.path(), false, "", ""), before, "the engine would read all of it again");
         assert_ne!(workspace_state(folder.path()), state);
+    }
+
+    #[test]
+    fn an_answer_that_is_mostly_code_is_told_from_one_that_is_words() {
+        let code = "        brickAt(pb);\n        burst(pb.x, pb.y, 4, levelHue, 120);\n        playerBullets.splice(i, 1);\n        continue;\n      }\n      if (pb.y < WALL) { playerBullets.splice(i, 1); }\n    }";
+        assert!(mostly_code(code));
+        assert!(!mostly_code("The game is in game.html.\nOpen it in a browser.\nArrows move the paddle.\nSpace fires.\nP pauses."));
+        assert!(!mostly_code("x = 1;\ny = 2;"), "too short to say");
     }
 
     #[test]

@@ -2227,6 +2227,8 @@ impl Agent {
             .find(|text| !text.starts_with("[From the app")).is_some_and(asks_not_to_run);
         let (mut unchecked, mut asked_to_check) = (false, not_to_run);
         let (mut said, mut asked_about_slips) = (String::new(), false);
+        // Whether the rest of a file whose write was cut, given as the answer's text, has been told of: once a turn.
+        let mut cut_as_text_told = false;
         // The request this one repeats, why, and how long it waited, for the trajectory.
         let mut retry: Option<(String, &'static str, u64)> = None;
         // What this turn has waited for a server being restarted, in all.
@@ -2582,6 +2584,16 @@ impl Agent {
             // Something said just as the answer ended is answered too, and not left for the next turn.
             if !self.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty() {
                 continue;
+            }
+            // The rest of a file whose write was cut, written as the answer's text: it writes nothing, and the turn would end with the file cut. (A game's
+            // last 4,761 characters ended a turn so on the Homelab's DeepSeek, its page unable to run.)
+            if !cut_as_text_told && prompt::mostly_code(&completion.content) {
+                if let Some(path) = self.bench.cut_file().map(|path| path_for_trajectory(&path.to_string_lossy(), &self.workspace)) {
+                    cut_as_text_told = true;
+                    self.intervened("cut_write_as_text", json!({"chars": completion.content.chars().count(), "path": path}));
+                    self.push(Message::text("user", prompt::cut_write_as_text(&path)));
+                    continue;
+                }
             }
             // Once a turn: a model that says it is done without having run what it wrote gets one word about it.
             if unchecked && !asked_to_check && self.mode != Mode::Plan {
@@ -3387,7 +3399,7 @@ impl Agent {
         if let Some((path, tail)) = self.cut_writes.remove(id) {
             if ok {
                 self.bench.note_cut(resolve(&self.workspace, &path));
-                output.push_str(&format!("\nnote: this call was cut off here, to get the work on disk. The file ends with this line: `{tail}`. Go straight on with the next line, in create_file with the same path, and write only what is missing: there is no need to think it over again."));
+                output.push_str(&format!("\nnote: this call was cut off here, to get the work on disk. The file ends with this line: `{tail}`. Go straight on with the next line, in create_file with the same path (not in your answer's text, which writes nothing), and write only what is missing: there is no need to think it over again."));
             }
         }
         self.tool_ended(id, ok, declined, &output, elapsed);
@@ -7907,6 +7919,24 @@ Body").unwrap();
         let bodies = bodies.lock().unwrap();
         let messages = bodies[1]["messages"].as_array().unwrap();
         assert!(messages.last().unwrap()["content"].as_str().unwrap().contains("cut off"), "{:?}", messages.last());
+    }
+
+    /// A file whose write was cut, whose rest the model then gives as its answer's text, is not left so: the model is told once that text writes nothing,
+    /// and the turn goes on.
+    #[test]
+    fn the_rest_of_a_cut_file_given_as_text_is_told_to_go_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cut = llm::Completion { tool_calls: vec![crate::message::ToolCall { id: "w".into(), kind: "function".into(), function: crate::message::FunctionCall { name: "create_file".into(), arguments: write_arguments(50, 3000) } }], finish: "length".into(), ..llm::Completion::default() };
+        let event = serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "w", "type": "function", "function": {"name": "create_file", "arguments": cut.tool_calls[0].function.arguments}}]}, "finish_reason": "length"}]});
+        let rest = "  ctx.fillRect(0, 0, 10, 10);\n  ctx.fill();\n  score += 1;\n  draw();\n}\nloop();";
+        let (client, bodies) = server(vec![sse(&[event]), text_answer(rest), text_answer("done"), text_answer("never")]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "told once, and the answer after that ends the turn");
+        let told = bodies[2]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+        assert!(told.contains("writes nothing") && told.contains("web/index.html"), "{told}");
     }
 
     /// A server that says in a call that it has a new tool has it told of before the next request of the same turn, which calls it: the tools offered

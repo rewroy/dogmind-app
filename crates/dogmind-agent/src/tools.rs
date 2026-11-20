@@ -988,6 +988,11 @@ impl Workbench {
         self.cut_file = Some(path);
     }
 
+    /// The file whose write was cut off and has not gone on yet.
+    pub fn cut_file(&self) -> Option<&Path> {
+        self.cut_file.as_deref()
+    }
+
     /// Whether the next write to this file goes on from what is there.
     pub fn goes_on_with(&self, path: &Path) -> bool {
         self.cut_file.as_deref() == Some(path)
