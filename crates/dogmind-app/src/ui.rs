@@ -2129,6 +2129,8 @@ struct App {
     mcp_form_url: bool,
     /// What the form said when it opened: leaving the page keeps a change, and only a change.
     mcp_form_was: [String; 4],
+    /// The server just saved, while the page waits to say how its start went.
+    mcp_saved: Option<String>,
     /// The sizes of the conversation's words, on the Appearance page.
     size_segments: [HWND; TEXT_SIZES.len()],
     /// A switch for each skill found, made when the Skills page first needs it.
@@ -12182,7 +12184,19 @@ impl App {
 
     /// While a server is starting, the Tools page is laid out again as it comes up.
     unsafe fn mcp_tick(&mut self) {
-        let starting = self.mcp.states().iter().any(|(_, state)| *state == dogmind_agent::mcp::State::Starting);
+        let states = self.mcp.states();
+        let starting = states.iter().any(|(_, state)| *state == dogmind_agent::mcp::State::Starting);
+        // (what was said when it was saved is no longer true of one that did not start: the page says that instead)
+        if let Some(name) = self.mcp_saved.clone() {
+            match states.iter().find(|(known, _)| *known == name).map(|(_, state)| state) {
+                Some(dogmind_agent::mcp::State::Starting) => {}
+                Some(dogmind_agent::mcp::State::Failed(why)) if self.panel == Panel::Tools => {
+                    self.mcp_saved = None;
+                    self.problem_in_panel(&tf("{0} did not start: {1}", &[&name, why]));
+                }
+                _ => self.mcp_saved = None,
+            }
+        }
         if self.panel == Panel::Tools {
             self.layout();
         }
@@ -12278,6 +12292,7 @@ impl App {
         self.mcp_changed();
         self.mcp_close_form();
         self.say_in_panel(&tf("{0} was saved. Once it is up, its tools join the conversation from your next message.", &[&name]));
+        self.mcp_saved = Some(name);
         // (the page is scrolled to the form: what it says is under it)
         self.scroll_panel_to(self.panel_extent);
         true
@@ -17717,6 +17732,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             mcp_form: None,
             mcp_form_url: false,
             mcp_form_was: Default::default(),
+            mcp_saved: None,
             size_segments: std::array::from_fn(|at| make_button(pane, ID_TEXT_SIZE + at as isize, "", ButtonKind::Segment, theme::surface())),
             skill_toggles: Vec::new(),
             skill_toggle_areas: Vec::new(),

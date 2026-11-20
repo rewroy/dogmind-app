@@ -555,6 +555,7 @@ const JA: &[(&str, &str)] = &[
     ("{0} tools", "ツール {0} 個"),
     ("1 tool", "ツール 1 個"),
     ("Did not start: {0}", "起動できませんでした: {0}"),
+    ("{0} did not start: {1}", "{0} を起動できませんでした: {1}"),
     ("Give the server a name.", "サーバーの名前を入力してください。"),
     ("Give a command to run, or the URL of a server.", "実行するコマンドか、サーバーの URL を入力してください。"),
     ("There is a server called {0} already.", "{0} という名前のサーバーはすでにあります。"),
