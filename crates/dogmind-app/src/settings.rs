@@ -408,6 +408,22 @@ fn migrate(mut file: serde_json::Value) -> serde_json::Value {
     file
 }
 
+/// A file of the person's, whole or not at all: it changes by a rename, of one already on the disk. Written over in place, or renamed unflushed, a
+/// power cut leaves the name on zeros.
+pub fn write_whole(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let written = std::fs::File::create(&part).and_then(|mut file| {
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()
+    });
+    written.and_then(|()| std::fs::rename(&part, path)).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 impl Settings {
     /// What a new install begins with: files change and safe commands run without asking. Not `Default`, which fills in what a file does not say:
     /// whoever has settings keeps what they had.
@@ -441,12 +457,7 @@ impl Settings {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
         }
-        let part = path.with_extension("json.part");
-        let written = std::fs::File::create(&part).and_then(|mut file| {
-            std::io::Write::write_all(&mut file, text.as_bytes())?;
-            file.sync_all()
-        });
-        written.and_then(|()| std::fs::rename(&part, path)).map_err(|error| format!("{}: {error}", path.display()))
+        write_whole(path, text.as_bytes())
     }
 
     /// As the file may hold it: whatever else goes wrong, what looks like a key is not written.
@@ -635,6 +646,18 @@ pub fn what_remove_leaves(data: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A file of the person's is written whole, over what was there, and leaves no partial one beside it.
+    #[test]
+    fn a_file_written_whole_replaces_the_one_there_and_leaves_nothing_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("instructions.md");
+        std::fs::write(&file, "old words that were longer").unwrap();
+        super::write_whole(&file, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no .part left");
+        super::write_whole(&dir.path().join("made").join("here.md"), b"x").unwrap();
+    }
+
     /// The conversation's state is kept only where it is no more readable than the conversations: with no encryption, or with the key remembered on this PC,
     /// which Windows opens for the account as it opens the state. Encrypted and not remembered, the option is off whatever was chosen, and choosing it is
     /// refused; when the combination goes, the choice is not given back.

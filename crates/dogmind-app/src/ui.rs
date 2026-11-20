@@ -7725,7 +7725,8 @@ impl App {
                 if text.trim_end() == known.trim_end() {
                     return true;
                 }
-                match std::fs::write(self.folder.join("instructions.md"), text) {
+                // (whole or not at all: written over in place, a power cut leaves the person's instructions as zeros)
+                match settings::write_whole(&self.folder.join("instructions.md"), text.as_bytes()) {
                     Ok(()) => true,
                     Err(error) => {
                         self.problem_in_panel(&error.to_string());

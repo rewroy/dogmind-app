@@ -1830,7 +1830,8 @@ impl Agent {
 
     /// Frozen for the session: the prefix Straydog keeps.
     fn frozen_prompt(&self) -> String {
-        let personal = self.instructions.as_ref().and_then(|file| std::fs::read_to_string(file).ok()).unwrap_or_default();
+        // (what a power cut can leave of the file, zeros, is no instruction)
+        let personal = self.instructions.as_ref().and_then(|file| std::fs::read_to_string(file).ok()).filter(|text| !images::left_by_a_power_cut(text.as_bytes())).unwrap_or_default();
         let notes = self.memory.as_deref().map_or(String::new(), |folder| memory::prompt_section(folder, &self.workspace));
         let tools: Vec<String> = self.tool_schemas.as_array().into_iter().flatten().filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string)).collect();
         let more = format!("{}{notes}", skills::prompt_section(&self.bench.skills, &tools));
