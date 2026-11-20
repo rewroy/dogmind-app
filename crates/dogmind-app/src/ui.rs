@@ -312,6 +312,11 @@ const ID_SETUP_AGAIN: isize = 9620;
 const ID_REMOVE_ALL: isize = 9621;
 const ID_MODEL_LICENCE: isize = 9622;
 const ID_MCP_TRUST: isize = 9700; // ..+ as many servers as there are
+const ID_MCP_EDIT: isize = 10800; // ..+ as many servers as there are
+const ID_MCP_ADD: isize = 9623;
+const ID_MCP_SAVE: isize = 9624;
+const ID_MCP_REMOVE: isize = 9625;
+const ID_MCP_CANCEL: isize = 9626;
 const ID_VISION: isize = 9903;
 const ID_VISION_DELETE: isize = 9904;
 const ID_VISION_OFFER: isize = 9905;
@@ -348,6 +353,8 @@ const TIMER_UPDATE: usize = 8;
 /// answer; and when the window comes back from the tray, an hour: Self::tray_open).
 const TIMER_RELEASES: usize = 9;
 const TIMER_SKILL_SCROLL: usize = 10;
+/// While an MCP server the Tools page lists is starting: the page follows it until it is up.
+const TIMER_MCP: usize = 31;
 const FIRST_RELEASE_LOOK_MS: u32 = 30_000;
 const RELEASE_LOOK_MS: u32 = 60 * 60 * 1000;
 /// The conversation's width below which the panel on the right gives way, at 96 dpi.
@@ -575,7 +582,7 @@ A command can write only in the session's folder, and has no network unless you 
 Keys you paste go to Windows Credential Manager, and nowhere else.
 Pictures: the paperclip, /attach, a paste or a drop. PNG, JPEG, WebP and GIF.
 Skills: .claude/skills, .agents/skills, .codex/skills and .dogmind/skills, in the project and in your home. /name starts one.
-MCP servers: mcp.json in the data folder. They start with the app, and each call asks. Settings > Tools can trust what one returns.
+MCP servers: Settings > Tools adds, changes and removes them (a program, or a server's URL), and can trust what one returns. Each call asks.
 Web: what comes back is marked as data, and once it is in a conversation every command asks.
 Your instructions (Settings) go for every session; a DOGMIND.md for its project. /init has the model write one.
 Terminal: the panel on the right has your own shell. Its commands run with your rights, apart from the agent's, and what it shows is not sent to the model. Every key goes to the shell: Ctrl+C copies when something is selected and otherwise stops what runs, and Ctrl+V pastes.
@@ -1667,6 +1674,20 @@ impl Form {
         self.end_row(height);
     }
 
+    /// A field of several lines, on a frame of ours as a field's is; its label is level with its first line.
+    unsafe fn area(&mut self, words: &str, edit: HWND, lines: i32) {
+        let one = self.s(ds::size::CONTROL);
+        let height = one + self.s(ds::size::FIELD_TEXT) * (lines - 1).max(0);
+        self.label(words, one);
+        let (x, width) = (self.value_x(), self.value_width());
+        let border = if GetFocus() == edit { theme::accent() } else { theme::line() };
+        self.shapes.push(Shape::Round { area: rect(x, self.y, width, height), radius: self.s(ds::radius::CONTROL), fill: Some(theme::surface()), border: Some(border) });
+        let inset = self.s(ds::size::FIELD_INSET);
+        place(edit, x + self.s(ds::space::M), self.y + inset, width - 2 * self.s(ds::space::M), height - 2 * inset);
+        self.used.push(edit);
+        self.end_row(height);
+    }
+
     /// The same, with what goes with it at its end: a way to choose what goes in it.
     unsafe fn field_with_button(&mut self, words: &str, edit: HWND, button: HWND) {
         let height = self.s(ds::size::CONTROL);
@@ -2094,6 +2115,20 @@ struct App {
     mcp_import: HWND,
     /// A switch for each MCP server, made when the Tools page first needs it.
     mcp_trust: Vec<HWND>,
+    /// An Edit button for each MCP server, beside what it runs.
+    mcp_edit: Vec<HWND>,
+    mcp_add: HWND,
+    mcp_save: HWND,
+    mcp_remove: HWND,
+    mcp_cancel: HWND,
+    /// A server's environment variables, or its headers, a line each.
+    mcp_vars: HWND,
+    /// The server the form under the list changes: none while it is shut, `Some(None)` for a new one.
+    mcp_form: Option<Option<String>>,
+    /// Whether what the form runs is a URL: it asks for headers then, and not for arguments and variables.
+    mcp_form_url: bool,
+    /// What the form said when it opened: leaving the page keeps a change, and only a change.
+    mcp_form_was: [String; 4],
     /// The sizes of the conversation's words, on the Appearance page.
     size_segments: [HWND; TEXT_SIZES.len()],
     /// A switch for each skill found, made when the Skills page first needs it.
@@ -2708,6 +2743,21 @@ unsafe fn control(parent: HWND, class: &str, text: &str, style: u32, ex: u32, id
     let (class, text) = (wide(class), wide(text));
     // (none of them draws over a dialog that lies on top of it)
     CreateWindowExW(ex, class.as_ptr(), text.as_ptr(), WS_CHILD | WS_CLIPSIBLINGS | style, 0, 0, 0, 0, parent, id as HMENU, GetModuleHandleW(std::ptr::null()), std::ptr::null())
+}
+
+/// What an MCP server runs, or where it is, as its row says it. Its headers are not said: a key is among them.
+fn mcp_runs(config: &dogmind_agent::mcp::ServerConfig) -> String {
+    if config.is_http() {
+        config.url.clone()
+    } else {
+        format!("{} {}", config.command, dogmind_agent::mcp::line_of_args(&config.args)).trim().to_string()
+    }
+}
+
+/// What was typed as a server's URL, with its scheme as the protocol writes it; none for what is not one.
+fn mcp_url(typed: &str) -> Option<String> {
+    let lower = typed.to_ascii_lowercase();
+    ["http://", "https://"].into_iter().find(|scheme| lower.starts_with(scheme)).map(|scheme| format!("{scheme}{}", &typed[scheme.len()..]))
 }
 
 unsafe fn set_text(window: HWND, text: &str) {
@@ -6931,6 +6981,8 @@ impl App {
         all.extend(self.theme_segments);
         all.extend(self.size_segments);
         all.extend(self.mcp_trust.iter().copied());
+        all.extend(self.mcp_edit.iter().copied());
+        all.extend([self.mcp_add, self.mcp_save, self.mcp_remove, self.mcp_cancel, self.mcp_vars]);
         all.extend(self.skill_toggles.iter().copied());
         all.extend(self.memory_remove.iter().copied());
         all.push(self.vision_delete);
@@ -7151,7 +7203,11 @@ impl App {
                 }
             }
             Panel::Models => {}
-            Panel::Tools => field_cue(self.fields[KEY_FIELD], t("Optional. Kept in Credential Manager")),
+            Panel::Tools => {
+                field_cue(self.fields[KEY_FIELD], t("Optional. Kept in Credential Manager"));
+                field_cue(self.fields[1], t("A program, or the URL of a server"));
+                field_cue(self.fields[2], t("Separated by spaces"));
+            }
             _ => {}
         }
     }
@@ -7363,23 +7419,44 @@ impl App {
                 let setting = self.settings.search_key.clone();
                 self.key_rows(form, &setting, t("Brave Search key"));
                 form.section(t("MCP servers"));
-                let lines = self.mcp.status();
-                let servers = self.mcp.trust();
+                let (states, configs, servers) = (self.mcp.states(), self.mcp.configs(), self.mcp.trust());
                 for (at, (name, _)) in servers.iter().enumerate() {
-                    let Some(toggle) = self.mcp_trust.get(at) else { break };
-                    let line = lines.get(at).map_or(name.as_str(), String::as_str);
-                    // (why one did not start needs the room of the page)
-                    let failed = line.strip_prefix(&format!("{name}: did not start: "));
+                    let (Some(toggle), Some(edit)) = (self.mcp_trust.get(at), self.mcp_edit.get(at)) else { break };
                     form.toggle_beside(name, *toggle, t("Trust what it returns"));
-                    if let Some(why) = failed {
-                        form.note(why, theme::muted());
-                    }
+                    let runs = configs.iter().find(|(known, _)| known == name).map_or(String::new(), |(_, config)| mcp_runs(config));
+                    // (why one did not start needs the room of the page)
+                    let state = match states.iter().find(|(known, _)| known == name).map(|(_, state)| state) {
+                        Some(dogmind_agent::mcp::State::Up(tools)) => tf("{0} tools", &[tools]),
+                        Some(dogmind_agent::mcp::State::Failed(why)) => tf("Did not start: {0}", &[why]),
+                        _ => t("Starting…").to_string(),
+                    };
+                    form.note_with_button(&format!("{runs}\n{state}"), *edit);
                 }
                 if !servers.is_empty() {
                     // (it takes a safeguard away: this much is said where it is done)
                     form.note(t("What a trusted server returns no longer makes later commands ask. Its own tools still ask."), theme::muted());
                 }
-                form.buttons(0, &[self.mcp_import]);
+                match &self.mcp_form {
+                    None => form.buttons(0, &[self.mcp_add, self.mcp_import]),
+                    Some(editing) => {
+                        form.section(&editing.as_ref().map_or_else(|| t("Add a server").to_string(), |name| tf("Change {0}", &[name])));
+                        form.field(t("Name"), self.fields[0]);
+                        form.field(t("Command or URL"), self.fields[1]);
+                        if self.mcp_form_url {
+                            form.area(t("Headers"), self.mcp_vars, 3);
+                            form.note(t("A line each, as Name: value. An Authorization header goes here."), theme::muted());
+                        } else {
+                            form.field(t("Arguments"), self.fields[2]);
+                            form.area(t("Environment variables"), self.mcp_vars, 3);
+                            form.note(t("A line each, as NAME=value."), theme::muted());
+                        }
+                        if editing.is_some() {
+                            form.buttons(0, &[self.mcp_save, self.mcp_remove, self.mcp_cancel]);
+                        } else {
+                            form.buttons(0, &[self.mcp_save, self.mcp_cancel]);
+                        }
+                    }
+                }
                 form.note(&log, log_color);
             }
             Panel::Memory => {
@@ -7640,7 +7717,7 @@ impl App {
                     false
                 }
             },
-            Panel::Tools => self.keep_search_key(),
+            Panel::Tools => self.keep_search_key() && self.mcp_keep_form(),
             Panel::Instructions => {
                 let text = get_text(self.doc).replace("\r\n", "\n").replace('\r', "\n");
                 let known = std::fs::read_to_string(self.folder.join("instructions.md")).unwrap_or_default();
@@ -8819,15 +8896,15 @@ impl App {
                 set_text(self.key_replace, t("Replace"));
                 set_text(self.key_remove, t("Remove"));
                 set_text(self.mcp_import, t("Import from Claude and Codex"));
-                let servers = self.mcp.trust().len();
-                while self.mcp_trust.len() < servers {
-                    let id = ID_MCP_TRUST + self.mcp_trust.len() as isize;
-                    self.mcp_trust.push(make_button(self.pane, id, "", ButtonKind::Toggle, theme::background()));
+                set_text(self.mcp_add, t("Add a server"));
+                set_text(self.mcp_save, t("Save"));
+                set_text(self.mcp_remove, t("Remove"));
+                set_text(self.mcp_cancel, t("Cancel"));
+                self.mcp_form = None;
+                self.mcp_controls();
+                if self.mcp.states().iter().any(|(_, state)| *state == dogmind_agent::mcp::State::Starting) {
+                    SetTimer(self.window, TIMER_MCP, 500, None);
                 }
-                for toggle in &self.mcp_trust {
-                    self.tip(*toggle, t("What this server returns no longer counts as web content, so later commands stop asking on its account. Its tools still ask, and in a session that already has web content they keep asking. What it returns is still marked as data."));
-                }
-                self.update_toggles();
             }
             Panel::ConfirmRemove => {
                 self.panel_title = t("Remove this app from this PC?").into();
@@ -12051,8 +12128,8 @@ impl App {
         self.layout();
     }
 
-    /// What Claude's and Codex's settings list goes in with this app's, and how that went.
-    unsafe fn mcp_servers_imported(&self) -> String {
+    /// What Claude's and Codex's settings list goes in with this app's, started at once, and how that went.
+    unsafe fn mcp_servers_imported(&mut self) -> String {
         let file = self.folder.join("mcp.json");
         let home = std::env::var_os("USERPROFILE").map_or(PathBuf::new(), PathBuf::from);
         let mut found = dogmind_agent::mcp::servers_of_claude(&std::fs::read_to_string(home.join(".claude.json")).unwrap_or_default());
@@ -12060,7 +12137,11 @@ impl App {
             found.entry(name).or_insert(server);
         }
         match dogmind_agent::mcp::import(&file, found) {
-            Ok(added) => tf("{0} servers added to {1}. They start the next time this app does.", &[&added, &file.display()]),
+            Ok(0) => t("Claude and Codex list no server that is not here already.").to_string(),
+            Ok(added) => {
+                self.mcp_changed();
+                tf("{0} servers added to {1}. They are starting.", &[&added, &file.display()])
+            }
             Err(error) => error,
         }
     }
@@ -12068,6 +12149,157 @@ impl App {
     unsafe fn import_mcp_servers(&mut self) {
         let said = self.mcp_servers_imported();
         self.say_in_panel(&said);
+    }
+
+    /// A switch and an Edit button for each MCP server, made as the Tools page first needs them.
+    unsafe fn mcp_controls(&mut self) {
+        let servers = self.mcp.trust().len();
+        while self.mcp_trust.len() < servers {
+            let id = ID_MCP_TRUST + self.mcp_trust.len() as isize;
+            self.mcp_trust.push(make_button(self.pane, id, "", ButtonKind::Toggle, theme::background()));
+        }
+        while self.mcp_edit.len() < servers {
+            let id = ID_MCP_EDIT + self.mcp_edit.len() as isize;
+            self.mcp_edit.push(make_button(self.pane, id, "", ButtonKind::Secondary, theme::background()));
+        }
+        for edit in &self.mcp_edit {
+            set_text(*edit, t("Edit"));
+        }
+        for toggle in &self.mcp_trust {
+            self.tip(*toggle, t("What this server returns no longer counts as web content, so later commands stop asking on its account. Its tools still ask, and in a session that already has web content they keep asking. What it returns is still marked as data."));
+        }
+        self.update_toggles();
+    }
+
+    /// mcp.json changed here: the servers start and end to match it at once, and the Tools page follows them as they come up.
+    unsafe fn mcp_changed(&mut self) {
+        self.mcp.reload();
+        self.mcp_controls();
+        SetTimer(self.window, TIMER_MCP, 500, None);
+    }
+
+    /// While a server is starting, the Tools page is laid out again as it comes up.
+    unsafe fn mcp_tick(&mut self) {
+        let starting = self.mcp.states().iter().any(|(_, state)| *state == dogmind_agent::mcp::State::Starting);
+        if self.panel == Panel::Tools {
+            self.layout();
+        }
+        if !starting || self.panel != Panel::Tools {
+            KillTimer(self.window, TIMER_MCP);
+        }
+    }
+
+    /// The form under the list of MCP servers, open on one (or on a new one, with `None`).
+    unsafe fn mcp_open_form(&mut self, name: Option<String>) {
+        let config = name.as_ref().and_then(|name| self.mcp.configs().into_iter().find(|(known, _)| known == name)).map(|(_, config)| config).unwrap_or_default();
+        let (target, vars) = if config.is_http() {
+            (config.url.clone(), dogmind_agent::mcp::lines_of_pairs(&config.headers, ':'))
+        } else {
+            (config.command.clone(), dogmind_agent::mcp::lines_of_pairs(&config.env, '='))
+        };
+        let was = [name.clone().unwrap_or_default(), target, dogmind_agent::mcp::line_of_args(&config.args), vars];
+        for (field, text) in self.fields[..3].iter().zip(&was) {
+            set_text(*field, text);
+        }
+        set_text(self.mcp_vars, &was[3]);
+        self.mcp_form_url = config.is_http();
+        self.mcp_form_was = was;
+        let new = name.is_none();
+        self.mcp_form = Some(name);
+        self.panel_log.clear();
+        self.panel_problem = false;
+        self.layout();
+        self.scroll_panel_to(self.panel_extent);
+        SetFocus(self.fields[if new { 0 } else { 1 }]);
+    }
+
+    unsafe fn mcp_close_form(&mut self) {
+        self.mcp_form = None;
+        for field in &self.fields[..3] {
+            set_text(*field, "");
+        }
+        set_text(self.mcp_vars, "");
+        self.layout();
+    }
+
+    /// What the form says now.
+    unsafe fn mcp_form_typed(&self) -> [String; 4] {
+        [get_text(self.fields[0]), get_text(self.fields[1]), get_text(self.fields[2]), get_text(self.mcp_vars)]
+    }
+
+    /// What the form runs is a URL now, or is no longer one: it asks for what that needs.
+    unsafe fn mcp_kind_changed(&mut self) {
+        let url = mcp_url(get_text(self.fields[1]).trim()).is_some();
+        if url != self.mcp_form_url {
+            self.mcp_form_url = url;
+            self.layout();
+        }
+    }
+
+    /// The form's server written to mcp.json, and started (again) at once. `false`: it cannot be, and the page says why.
+    unsafe fn mcp_save_form(&mut self) -> bool {
+        use dogmind_agent::mcp;
+        let Some(before) = self.mcp_form.clone() else { return true };
+        let [name, target, args, vars] = self.mcp_form_typed();
+        let (name, target) = (name.trim().to_string(), target.trim().to_string());
+        if name.is_empty() {
+            self.problem_in_panel(t("Give the server a name."));
+            return false;
+        }
+        if target.is_empty() {
+            self.problem_in_panel(t("Give a command to run, or the URL of a server."));
+            return false;
+        }
+        let configs = self.mcp.configs();
+        if before.as_deref() != Some(name.as_str()) && configs.iter().any(|(known, _)| *known == name) {
+            self.problem_in_panel(&tf("There is a server called {0} already.", &[&name]));
+            return false;
+        }
+        let url = mcp_url(&target);
+        let pairs = match mcp::pairs_of_lines(&vars, if url.is_some() { ':' } else { '=' }) {
+            Ok(pairs) => pairs,
+            Err((line, said)) => {
+                self.problem_in_panel(&if url.is_some() { tf("Line {0} of the headers is not Name: value: {1}", &[&line, &said]) } else { tf("Line {0} of the variables is not NAME=value: {1}", &[&line, &said]) });
+                return false;
+            }
+        };
+        // (the person's word on what it returns goes with it, under a new name too)
+        let trusted = before.as_ref().and_then(|before| configs.iter().find(|(known, _)| known == before)).is_some_and(|(_, config)| config.trusted);
+        let config = match url {
+            Some(url) => mcp::ServerConfig { kind: "http".into(), url, headers: pairs, trusted, ..Default::default() },
+            None => mcp::ServerConfig { command: target, args: mcp::args_of_line(&args), env: pairs, trusted, ..Default::default() },
+        };
+        if let Err(error) = mcp::save_server(&self.folder.join("mcp.json"), before.as_deref(), &name, config) {
+            self.problem_in_panel(&error);
+            return false;
+        }
+        self.mcp_changed();
+        self.mcp_close_form();
+        self.say_in_panel(&tf("{0} is starting. Its tools join the conversation from your next message after it is up.", &[&name]));
+        // (the page is scrolled to the form: what it says is under it)
+        self.scroll_panel_to(self.panel_extent);
+        true
+    }
+
+    unsafe fn mcp_remove_server(&mut self) {
+        let Some(Some(name)) = self.mcp_form.clone() else { return };
+        if let Err(error) = dogmind_agent::mcp::remove_server(&self.folder.join("mcp.json"), &name) {
+            self.problem_in_panel(&error);
+            return;
+        }
+        self.mcp_changed();
+        self.mcp_close_form();
+        self.say_in_panel(&tf("{0} was removed.", &[&name]));
+        // (the page is scrolled to the form: what it says is under it)
+        self.scroll_panel_to(self.panel_extent);
+    }
+
+    /// Leaving the page with the form changed keeps the change, as the other pages do.
+    unsafe fn mcp_keep_form(&mut self) -> bool {
+        if self.mcp_form.is_none() || self.mcp_form_typed() == self.mcp_form_was {
+            return true;
+        }
+        self.mcp_save_form()
     }
 
     /// How high what shows of a panel is.
@@ -15697,7 +15929,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
             set_button_fonts(app.fonts);
-            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.term.rename_field, app.timeline.search, app.picker_search]) {
+            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.term.rename_field, app.timeline.search, app.picker_search, app.mcp_vars]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
             }
             // (the command's own size follows the screen's: it is set again when it is next shown, and this one keeps what it has)
@@ -15946,6 +16178,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.spinner_tick();
             0
         }
+        WM_TIMER if wparam == TIMER_MCP => {
+            app.mcp_tick();
+            0
+        }
         WM_TIMER if wparam == TIMER_SKILL_SCROLL => {
             app.tick_skill_scroll();
             0
@@ -16031,9 +16267,12 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 return 0;
             }
-            if app.fields.contains(&(lparam as HWND)) {
+            if app.fields.contains(&(lparam as HWND)) || lparam as HWND == app.mcp_vars {
                 if code == EN_SETFOCUS as usize || code == EN_KILLFOCUS as usize {
                     app.layout();
+                }
+                if code == EN_CHANGE as usize && lparam as HWND == app.fields[1] && app.panel == Panel::Tools && app.mcp_form.is_some() {
+                    app.mcp_kind_changed();
                 }
                 return 0;
             }
@@ -16225,6 +16464,17 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_MCP_IMPORT => app.import_mcp_servers(),
+                ID_MCP_ADD => app.mcp_open_form(None),
+                ID_MCP_SAVE => {
+                    app.mcp_save_form();
+                }
+                ID_MCP_REMOVE => app.mcp_remove_server(),
+                ID_MCP_CANCEL => app.mcp_close_form(),
+                _ if (ID_MCP_EDIT..ID_MCP_EDIT + app.mcp_edit.len() as isize).contains(&id) => {
+                    if let Some((name, _)) = app.mcp.trust().get((id - ID_MCP_EDIT) as usize).cloned() {
+                        app.mcp_open_form(Some(name));
+                    }
+                }
                 ID_READ_FOLDER_ADD => {
                     // (a debug build told to, for tests: the picker is a dialog on the person's screen, which nothing may put there)
                     let forced = if cfg!(debug_assertions) { std::env::var_os("DOGMIND_TEST_READ_FOLDER").map(PathBuf::from) } else { None };
@@ -16539,6 +16789,9 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             }
             VK_RETURN if !shift && app.panel == Panel::Providers && app.fields.contains(&message.hwnd) => app.on_button(1),
             VK_RETURN if !shift && app.panel == Panel::Rename && app.fields.contains(&message.hwnd) => app.on_button(0),
+            VK_RETURN if !shift && app.panel == Panel::Tools && app.mcp_form.is_some() && app.fields[..3].contains(&message.hwnd) => {
+                app.mcp_save_form();
+            }
             VK_RETURN if !shift && matches!(app.panel, Panel::Unlock | Panel::CryptoOn | Panel::CryptoPassphrase) && app.fields.contains(&message.hwnd) => app.on_button(0),
             VK_RETURN if !shift && matches!(app.panel, Panel::Sessions | Panel::Rewind) && message.hwnd == app.list => app.on_button(0),
             _ => return false,
@@ -17453,6 +17706,15 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             variable_toggle: make_button(pane, ID_VARIABLE_TOGGLE, "", ButtonKind::Toggle, theme::background()),
             mcp_import: make_button(pane, ID_MCP_IMPORT, "", ButtonKind::Secondary, theme::background()),
             mcp_trust: Vec::new(),
+            mcp_edit: Vec::new(),
+            mcp_add: make_button(pane, ID_MCP_ADD, "", ButtonKind::Secondary, theme::background()),
+            mcp_save: make_button(pane, ID_MCP_SAVE, "", ButtonKind::Primary, theme::background()),
+            mcp_remove: make_button(pane, ID_MCP_REMOVE, "", ButtonKind::Secondary, theme::background()),
+            mcp_cancel: make_button(pane, ID_MCP_CANCEL, "", ButtonKind::Secondary, theme::background()),
+            mcp_vars: control(pane, "EDIT", "", WS_TABSTOP | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_WANTRETURN as u32, 0, 0),
+            mcp_form: None,
+            mcp_form_url: false,
+            mcp_form_was: Default::default(),
             size_segments: std::array::from_fn(|at| make_button(pane, ID_TEXT_SIZE + at as isize, "", ButtonKind::Segment, theme::surface())),
             skill_toggles: Vec::new(),
             skill_toggle_areas: Vec::new(),
@@ -17788,7 +18050,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let app = &mut *APP.load(Ordering::Relaxed);
         SendMessageW(app.composer, EM_SETEVENTMASK, 0, ENM_CHANGE as LPARAM);
         SendMessageW(app.note, EM_SETMARGINS, 3, 0); // EC_LEFTMARGIN | EC_RIGHTMARGIN
-        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.timeline.search, app.picker_search]) {
+        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.timeline.search, app.picker_search, app.mcp_vars]) {
             SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
         }
         app.list_procedure = SetWindowLongPtrW(app.side, GWLP_WNDPROC, list_subclass as *const () as isize);

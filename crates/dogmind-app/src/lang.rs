@@ -543,6 +543,24 @@ const JA: &[(&str, &str)] = &[
     ("MCP servers", "MCP サーバー"),
     ("No server yet.", "サーバーはまだありません。"),
     ("Import from Claude and Codex", "Claude と Codex から取り込む"),
+    ("Add a server", "サーバーを追加"),
+    ("Change {0}", "{0} を変更"),
+    ("Command or URL", "コマンドまたは URL"),
+    ("Environment variables", "環境変数"),
+    ("Headers", "ヘッダー"),
+    ("A line each, as NAME=value.", "1 行に 1 つ、NAME=value の形で書きます。"),
+    ("A line each, as Name: value. An Authorization header goes here.", "1 行に 1 つ、Name: value の形で書きます。Authorization ヘッダーもここに書きます。"),
+    ("A program, or the URL of a server", "プログラム、またはサーバーの URL"),
+    ("Separated by spaces", "スペース区切り"),
+    ("{0} tools", "ツール {0} 個"),
+    ("Did not start: {0}", "起動できませんでした: {0}"),
+    ("Give the server a name.", "サーバーの名前を入力してください。"),
+    ("Give a command to run, or the URL of a server.", "実行するコマンドか、サーバーの URL を入力してください。"),
+    ("There is a server called {0} already.", "{0} という名前のサーバーはすでにあります。"),
+    ("Line {0} of the headers is not Name: value: {1}", "ヘッダーの {0} 行目が Name: value の形になっていません: {1}"),
+    ("Line {0} of the variables is not NAME=value: {1}", "環境変数の {0} 行目が NAME=value の形になっていません: {1}"),
+    ("{0} is starting. Its tools join the conversation from your next message after it is up.", "{0} を起動しています。起動が終わると、次のメッセージから会話で使えます。"),
+    ("{0} was removed.", "{0} を削除しました。"),
     ("Licenses", "ライセンス"),
     ("LICENSE.txt is not beside this program.", "このプログラムの隣に LICENSE.txt がありません。"),
     ("Check for updates", "更新を確認"),
@@ -662,7 +680,8 @@ const JA: &[(&str, &str)] = &[
     (", last answer at {0} tok/s", "、最後の回答は {0} tok/s"),
     ("{0} requests: {1} prompt tokens, {2} of them from the cache, {3} written{4}. The conversation is {5} of {6}.", "{0} リクエスト: プロンプト {1} トークン (うちキャッシュ {2})、生成 {3}{4}。会話の長さは {5} / {6} です。"),
     ("Nothing to show yet. Name a file: /preview page.html", "表示できるものがまだありません。ファイルを指定してください: /preview page.html"),
-    ("{0} servers added to {1}. They start the next time this app does.", "{0} 個のサーバーを {1} に追加しました。次にアプリを起動したときに開始します。"),
+    ("{0} servers added to {1}. They are starting.", "{0} 個のサーバーを {1} に追加しました。起動しています。"),
+    ("Claude and Codex list no server that is not here already.", "Claude と Codex の設定に、まだ取り込んでいないサーバーはありません。"),
     ("No server yet. {0} lists them, and /mcp import copies Claude's and Codex's in.", "サーバーはまだありません。{0} に記述するか、/mcp import で Claude と Codex の設定を取り込めます。"),
     ("The notes in {0} could not be read ({1}). The file is left as it is.", "{0} のメモを読めませんでした（{1}）。ファイルはそのままにしてあります。"),
     ("Notes the model forgot are kept in {0}, so that you can get one back.", "モデルが忘れたメモは {0} に残してあります。戻したいときはそこからコピーしてください。"),
@@ -1366,7 +1385,7 @@ N / P\t次と前の変更 (変更の画面で)
 貼り付けたキーは Windows の資格情報マネージャーにだけ保存します。
 画像: クリップのボタン、/attach、貼り付け、ドロップ。PNG、JPEG、WebP、GIF。
 スキル: プロジェクトとホームの .claude/skills、.agents/skills、.codex/skills、.dogmind/skills。/スキル名 で始めます。
-MCP サーバー: データフォルダーの mcp.json。アプリと一緒に起動し、呼び出しのたびに確認します。設定 > ツール で返す内容を信頼できます。
+MCP サーバー: 設定 > ツール で追加・変更・削除できます (プログラム、またはサーバーの URL)。返す内容を信頼することもできます。呼び出しのたびに確認します。
 Web: 返ってきた内容はデータとして扱い、会話に入ると以後のコマンドはすべて確認します。
 カスタム指示 (設定) は全セッション共通、DOGMIND.md はそのプロジェクト用です。/init でモデルに書かせることもできます。
 ターミナル: 右側のパネルの「ターミナル」は、あなた自身のシェルです。コマンドはエージェントの権限とは別に、あなた自身の権限で動き、そこに表示される内容はモデルには送られません。キーはすべてシェルに渡ります。Ctrl+C は選択があるときはコピー、ないときは実行中のものを止め、Ctrl+V は貼り付けです。
