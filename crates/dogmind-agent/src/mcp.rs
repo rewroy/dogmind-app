@@ -324,8 +324,85 @@ struct HttpLink {
     headers: Vec<(String, String)>,
     session: Option<String>,
     initialized: bool,
-    /// The connection's `Rpc::changed`: the server says it in a request's event stream.
+    /// The connection's `Rpc::changed`: the server says it in a request's event stream, or in its session's (see `listen`).
     changed: Arc<AtomicBool>,
+    /// The session's stream, read while the session lasts.
+    listening: Option<Listening>,
+}
+
+/// The thread that reads a session's stream (see `listen`): it ends as this goes.
+struct Listening(Arc<AtomicBool>);
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Server-sent events as their pieces come: the JSON-RPC message each event's data holds. An event's end may come split across two pieces.
+#[derive(Default)]
+struct Events {
+    pending: Vec<u8>,
+}
+
+impl Events {
+    fn read(&mut self, bytes: &[u8]) -> Vec<Value> {
+        self.pending.extend_from_slice(bytes);
+        let find = |bytes: &[u8], what: &[u8]| bytes.windows(what.len()).position(|window| window == what).map(|at| (at, what.len()));
+        let mut messages = Vec::new();
+        while let Some((at, length)) = [find(&self.pending, b"\n\n"), find(&self.pending, b"\r\n\r\n")].into_iter().flatten().min() {
+            let event: Vec<u8> = self.pending.drain(..at + length).collect();
+            let text = String::from_utf8_lossy(&event).replace("\r\n", "\n");
+            let data: Vec<&str> = text.lines().filter_map(|line| line.strip_prefix("data:")).map(|data| data.strip_prefix(' ').unwrap_or(data)).collect();
+            if let Ok(message) = serde_json::from_str::<Value>(&data.join("\n")) {
+                messages.push(message);
+            }
+        }
+        messages
+    }
+}
+
+/// What a server at a URL said outside an answer: a request of this side answered by a POST of its own (as the protocol has it, which the server takes
+/// with 202), sent with `posting`; its word that its tools changed kept in `changed`.
+fn heard(url: &crate::http::Url, posting: &[(String, String)], message: &Value, changed: &AtomicBool, cancel: &AtomicBool) {
+    if let Some(reply) = answer_to_server(message) {
+        let _ = crate::http::request("POST", url, posting, Some(&reply.to_string()), HTTP_CONNECT, cancel).and_then(|mut answered| answered.text());
+    }
+    if message.get("method").and_then(Value::as_str) == Some(LIST_CHANGED) {
+        changed.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Reads what a server at a URL says between requests, on its session's stream (a GET, as Streamable HTTP has it), until `stop`: that its tools changed,
+/// as the official SDKs say it there, and what it asks, which is answered. `headers` are the session's. A server that offers no such stream (405), or no
+/// longer knows the session, is not asked again; one whose stream ends or breaks is, a little later each time.
+fn listen(url: &crate::http::Url, headers: &[(String, String)], changed: &AtomicBool, stop: &AtomicBool) {
+    let mut asking = headers.to_vec();
+    asking.push(("Accept".into(), "text/event-stream".into()));
+    let mut posting = headers.to_vec();
+    posting.push(("Content-Type".into(), "application/json".into()));
+    posting.push(("Accept".into(), "application/json, text/event-stream".into()));
+    let mut wait = Duration::from_secs(1);
+    while !stop.load(Ordering::Relaxed) {
+        if let Ok(mut response) = crate::http::request("GET", url, &asking, None, HTTP_CONNECT, stop) {
+            let streamed = response.header("content-type").is_some_and(|kind| kind.to_ascii_lowercase().starts_with("text/event-stream"));
+            if response.status != 200 || !streamed {
+                return;
+            }
+            let mut events = Events::default();
+            while let Ok(Some(bytes)) = response.next() {
+                wait = Duration::from_secs(1);
+                for message in events.read(&bytes) {
+                    heard(url, &posting, &message, changed, stop);
+                }
+            }
+        }
+        let until = Instant::now() + wait;
+        while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        wait = (wait * 2).min(Duration::from_secs(60));
+    }
 }
 
 /// How long a connection to a server at a URL is waited for.
@@ -341,7 +418,19 @@ impl HttpLink {
     fn new(url: &str, headers: &BTreeMap<String, String>) -> Result<HttpLink, String> {
         let url = crate::http::Url::parse(url)?;
         let headers = headers.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
-        Ok(HttpLink { url, headers, session: None, initialized: false, changed: Arc::new(AtomicBool::new(false)) })
+        Ok(HttpLink { url, headers, session: None, initialized: false, changed: Arc::new(AtomicBool::new(false)), listening: None })
+    }
+
+    /// The session's stream read on a thread of its own, from now until the session ends (the stream of one before it ends here).
+    fn listen(&mut self) {
+        let Some(session) = self.session.clone() else { return };
+        let mut headers = self.headers.clone();
+        headers.push(("MCP-Protocol-Version".into(), PROTOCOL.into()));
+        headers.push(("Mcp-Session-Id".into(), session));
+        let stop = Arc::new(AtomicBool::new(false));
+        self.listening = Some(Listening(stop.clone()));
+        let (url, changed) = (self.url.clone(), self.changed.clone());
+        std::thread::spawn(move || listen(&url, &headers, &changed, &stop));
     }
 
     /// Posts one message; its answer when it has an `id` (a request), none for a notification. Gives up at `limit`, or when `cancel` is set.
@@ -381,6 +470,10 @@ impl HttpLink {
                 if method == "initialize" {
                     self.initialized = true;
                 }
+                // (the session begun: what the server says between requests comes on a stream of its own)
+                if method == "notifications/initialized" {
+                    self.listen();
+                }
                 Ok(answer)
             }
         }
@@ -390,7 +483,7 @@ impl HttpLink {
         let mut response = crate::http::request("POST", &self.url, headers, Some(body), HTTP_CONNECT, give_up).map_err(|error| format!("{}: {error}", self.url.host))?;
         // (as the protocol has a server say it no longer knows the session it was sent: this side begins another)
         if response.status == 404 && self.session.is_some() {
-            (self.session, self.initialized) = (None, false);
+            (self.session, self.initialized, self.listening) = (None, false, None);
             return Err(SESSION_GONE.to_string());
         }
         if let Some(session) = response.header("mcp-session-id") {
@@ -415,27 +508,16 @@ impl HttpLink {
             return found.map(Some).ok_or_else(|| "the server's answer was not to this request".to_string());
         }
         // An event stream: its events' data, until the answer to this request is among them.
-        let mut pending = String::new();
+        let mut events = Events::default();
         loop {
             let Some(bytes) = response.next().map_err(|error| error.to_string())? else {
                 return Err("the server's event stream ended with no answer to this request".to_string());
             };
-            pending.push_str(&String::from_utf8_lossy(&bytes).replace("\r\n", "\n"));
-            while let Some(end) = pending.find("\n\n") {
-                let event: String = pending.drain(..end + 2).collect();
-                let data: Vec<&str> = event.lines().filter_map(|line| line.strip_prefix("data:")).map(|data| data.strip_prefix(' ').unwrap_or(data)).collect();
-                if let Ok(message) = serde_json::from_str::<Value>(&data.join("\n")) {
-                    if is_ours(&message) {
-                        return Ok(Some(message));
-                    }
-                    // (as the protocol has a client answer a request on its stream: a POST of its own, which the server takes with 202)
-                    if let Some(reply) = answer_to_server(&message) {
-                        let _ = crate::http::request("POST", &self.url, headers, Some(&reply.to_string()), HTTP_CONNECT, give_up).and_then(|mut answered| answered.text());
-                    }
-                    if message.get("method").and_then(Value::as_str) == Some(LIST_CHANGED) {
-                        self.changed.store(true, Ordering::Relaxed);
-                    }
+            for message in events.read(&bytes) {
+                if is_ours(&message) {
+                    return Ok(Some(message));
                 }
+                heard(&self.url, headers, &message, &self.changed, give_up);
             }
         }
     }
@@ -444,6 +526,7 @@ impl HttpLink {
 impl Drop for HttpLink {
     /// The session ends with this side of it, as the protocol asks of a client that is done.
     fn drop(&mut self) {
+        self.listening = None;
         let Some(session) = self.session.take() else { return };
         let mut headers = self.headers.clone();
         headers.push(("Mcp-Session-Id".into(), session));
@@ -1331,14 +1414,16 @@ mod tests {
     /// event stream (a notification first, then the answer), and `tools/call` in JSON with what it was asked and the headers it was sent. What each request carried
     /// is kept, to be read back.
     fn http_server(tool: &'static str) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
-        http_server_with(tool, false)
+        http_server_with(tool, false, false)
     }
 
     /// The same, and with `forgets` it lets its first session go once it has answered a call in it: a request in it is answered 404 from then on, and the next
-    /// `initialize` begins `s-2`.
-    fn http_server_with(tool: &'static str, forgets: bool) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+    /// `initialize` begins `s-2`. With `announces` it offers its session's stream (otherwise a GET is answered 405), and says on it that its tools changed
+    /// once it has listed them: from then on it lists `secret` too.
+    fn http_server_with(tool: &'static str, forgets: bool, announces: bool) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
         use std::io::Read;
         let sessions = Arc::new(Mutex::new((0u32, false)));
+        let (listed, announced) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}/mcp", listener.local_addr().unwrap().port());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1346,7 +1431,7 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
-                let (kept, sessions) = (kept.clone(), sessions.clone());
+                let (kept, sessions, listed, announced) = (kept.clone(), sessions.clone(), listed.clone(), announced.clone());
                 std::thread::spawn(move || {
                     let mut data = Vec::new();
                     let mut block = [0u8; 4096];
@@ -1378,6 +1463,20 @@ mod tests {
                     let unknown = sent.is_some_and(|sent| known.1 || sent != format!("s-{}", known.0));
                     let reply = match message["method"].as_str() {
                         _ if head.starts_with("DELETE") => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+                        _ if head.starts_with("GET") && !announces => "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n".to_string(),
+                        _ if head.starts_with("GET") => {
+                            drop(known);
+                            let until = Instant::now() + Duration::from_secs(10);
+                            while !listed.load(Ordering::Relaxed) && Instant::now() < until {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            announced.store(true, Ordering::Relaxed);
+                            let note = json!({"jsonrpc": "2.0", "method": LIST_CHANGED});
+                            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: message\r\ndata: {note}\r\n\r\n").as_bytes());
+                            // (held open, as a session's stream is, until the client goes)
+                            let _ = stream.read(&mut block);
+                            return;
+                        }
                         Some("initialize") => {
                             *known = (known.0 + 1, false);
                             let body = answer(json!({"protocolVersion": PROTOCOL, "capabilities": {"tools": {}}}));
@@ -1385,8 +1484,13 @@ mod tests {
                         }
                         _ if unknown => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string(),
                         Some("tools/list") => {
+                            let mut tools = vec![json!({"name": tool, "inputSchema": {"type": "object"}})];
+                            if announced.load(Ordering::Relaxed) {
+                                tools.push(json!({"name": "secret", "inputSchema": {"type": "object"}}));
+                            }
+                            listed.store(true, Ordering::Relaxed);
                             let note = json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {}});
-                            let body = format!("event: message\r\ndata: {note}\r\n\r\nevent: message\r\ndata: {}\r\n\r\n", answer(json!({"tools": [{"name": tool, "inputSchema": {"type": "object"}}]})));
+                            let body = format!("event: message\r\ndata: {note}\r\n\r\nevent: message\r\ndata: {}\r\n\r\n", answer(json!({"tools": tools})));
                             format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}", body.len())
                         }
                         Some("tools/call") if message["params"]["name"] == "ask" => {
@@ -1474,10 +1578,40 @@ mod tests {
         assert_eq!((answers[1]["id"].as_str(), answers[1]["error"]["code"].as_i64()), (Some("e"), Some(-32601)), "{}", answers[1]);
     }
 
+    /// What a server at a URL says between requests, on its session's stream, is heard: its word that its tools changed has them asked for again, and the
+    /// stream is asked for in the session, as an event stream.
+    #[test]
+    fn a_server_at_a_url_that_says_between_requests_that_its_tools_changed_is_heard() {
+        let (url, seen) = http_server_with("echo", false, true);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        save_server(&file, None, "remote", ServerConfig { url, ..ServerConfig::default() }).unwrap();
+        let hub = Hub::start(&file);
+        waited("the new tool", || hub.schemas().len() == 2);
+        assert_eq!(hub.call("mcp__remote__secret", &json!({}), &AtomicBool::new(false)).map(|said| said.starts_with("{}")), Ok(true));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.iter().filter(|(_, message)| message["method"] == "tools/list").count(), 2, "asked for again, and not before it was said");
+        let stream = &seen.iter().find(|(head, _)| head.starts_with("GET")).expect("the session's stream was asked for").0.to_ascii_lowercase();
+        assert!(stream.contains("mcp-session-id: s-1") && stream.contains("accept: text/event-stream"), "{stream}");
+    }
+
+    /// Server-sent events are read whole, whichever pieces they come in.
+    #[test]
+    fn events_split_anywhere_are_read_whole() {
+        let text = "event: message\r\ndata: {\"a\":\"\u{3042}\"}\r\n\r\n: a comment\n\ndata: {\"b\":2}\n\n";
+        for cut in 0..=text.len() {
+            let mut events = Events::default();
+            let (one, two) = text.as_bytes().split_at(cut);
+            let mut read = events.read(one);
+            read.extend(events.read(two));
+            assert_eq!(read, [json!({"a": "\u{3042}"}), json!({"b": 2})], "cut at {cut}");
+        }
+    }
+
     /// A server that lets its session go answers 404 in it: a new session is begun, and the call is made again in it, which the old one never took.
     #[test]
     fn a_session_the_server_let_go_is_begun_again_and_the_call_made_in_the_new_one() {
-        let (url, seen) = http_server_with("echo", true);
+        let (url, seen) = http_server_with("echo", true, false);
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "remote", ServerConfig { url, ..ServerConfig::default() }).unwrap();
@@ -1492,7 +1626,8 @@ mod tests {
         let seen = seen.lock().unwrap();
         let methods: Vec<&str> = seen.iter().filter_map(|(_, message)| message["method"].as_str()).collect();
         assert_eq!(methods, ["initialize", "notifications/initialized", "tools/list", "tools/call", "tools/call", "initialize", "notifications/initialized", "tools/call"]);
-        assert!(!seen[5].0.to_ascii_lowercase().contains("mcp-session-id"), "the new handshake is sent with no session");
+        let again = seen.iter().filter(|(_, message)| message["method"] == "initialize").nth(1).unwrap();
+        assert!(!again.0.to_ascii_lowercase().contains("mcp-session-id"), "the new handshake is sent with no session");
     }
 
     /// A change to the file, as Settings makes one, starts what is new and what changed again, ends what is gone, and leaves the rest as it was.
