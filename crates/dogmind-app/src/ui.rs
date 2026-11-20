@@ -2050,7 +2050,7 @@ struct App {
     folder_chip: HWND,
     /// Under the dog of a session not begun yet, beside the workspace's name: what switches it, where it is seen first.
     start_folder: HWND,
-    /// The workspace picker `start_folder` opens, as Claude Code's environment picker: a panel over what lies below it (a child window on top
+    /// The workspace picker `start_folder` opens: a panel over what lies below it (a child window on top
     /// of the others, `picker_procedure`), with a search field over the folders worked in before ([`picker_rows`]). Shown while `picker_open`;
     /// `picker_selected` is the row the keys are on, `picker_hover` the one under the pointer.
     picker: HWND,
@@ -6393,7 +6393,7 @@ impl App {
                 shapes.push(Shape::Logo { x: dog_x, y: dog_top, size: dog });
                 shapes.push(Shape::TitleMark { x: left + (column - mark_width) / 2, y: dog_top + dog_bottom, width: mark_width });
                 if !bare {
-                    // A card, as Claude Code's environment picker has: the folder and a check, and under them the choice that opens the
+                    // A card: the folder and a check, and under them the choice that opens the
                     // picker over what lies below (`place_picker`).
                     let across = s(420).min(column);
                     let x = left + (column - across) / 2;
@@ -10015,7 +10015,7 @@ impl App {
     }
 
     /// The picker beside its card (`card_top`, `card_bottom`), as tall as its rows, short of the window's top or foot (`bottom`), where its list
-    /// scrolls: under the card, as Claude Code's opens, unless its rows do not fit there and there is more room over it.
+    /// scrolls: under the card, unless its rows do not fit there and there is more room over it.
     unsafe fn place_picker(&mut self, x: i32, card_top: i32, card_bottom: i32, width: i32, bottom: i32) {
         let s = |value: i32| scale(self.dpi, value);
         let (search, pad, gap) = (s(PICKER_SEARCH_ROW), s(ds::space::XS), s(ds::space::XS));
