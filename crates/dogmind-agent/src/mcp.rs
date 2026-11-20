@@ -1026,6 +1026,53 @@ struct Process {
     child: Child,
     #[cfg(windows)]
     ending: Option<Ending>,
+    words: LastWords,
+}
+
+/// The last lines a server wrote to its stderr. Why one did not start, or ended, is there more often than not (a module not found, a key not set), and a
+/// person mends it by them.
+#[derive(Clone, Default)]
+struct LastWords(Arc<(Mutex<std::collections::VecDeque<String>>, AtomicBool)>);
+
+impl LastWords {
+    const LINES: usize = 6;
+    const CHARS: usize = 300;
+
+    /// Reads `stderr` on a thread of its own to its end, keeping the last lines.
+    fn hear(&self, stderr: impl std::io::Read + Send + 'static) {
+        let kept = self.clone();
+        std::thread::spawn(move || {
+            let (mut reader, mut line) = (BufReader::new(stderr), Vec::new());
+            loop {
+                line.clear();
+                if matches!(reader.read_until(b'\n', &mut line), Ok(0) | Err(_)) {
+                    break;
+                }
+                let text: String = String::from_utf8_lossy(&line).trim().chars().take(Self::CHARS).collect();
+                if !text.is_empty() {
+                    let mut lines = kept.0 .0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    lines.push_back(text);
+                    while lines.len() > Self::LINES {
+                        lines.pop_front();
+                    }
+                }
+            }
+            kept.0 .1.store(true, Ordering::Relaxed);
+        });
+    }
+
+    /// `error`, with what the server last said, once it has said all it will: its end is waited for a moment.
+    fn after(&self, error: String) -> String {
+        let until = Instant::now() + Duration::from_millis(500);
+        while !self.0 .1.load(Ordering::Relaxed) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let lines = self.0 .0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lines.is_empty() {
+            return error;
+        }
+        format!("{error}. It said: {}", lines.iter().cloned().collect::<Vec<_>>().join(" | "))
+    }
 }
 
 impl Drop for Process {
@@ -1052,18 +1099,18 @@ struct Running {
     /// What each tool is called by its server, by the name the model knows it by.
     names: BTreeMap<String, String>,
     schemas: Vec<Value>,
-    _process: Option<Arc<Process>>,
+    process: Option<Arc<Process>>,
 }
 
 impl Running {
     /// Up, with the tools it listed as `schemas` (under its own names, and none placed yet).
     fn new(rpc: Rpc, schemas: Vec<Value>, process: Option<Process>) -> Running {
-        Running { changed: rpc.changed.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, _process: process.map(Arc::new) }
+        Running { changed: rpc.changed.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, process: process.map(Arc::new) }
     }
 
     /// The same server with its tools as it lists them now.
     fn with_tools(&self, names: BTreeMap<String, String>, schemas: Vec<Value>) -> Running {
-        Running { rpc: self.rpc.clone(), changed: self.changed.clone(), names, schemas, _process: self._process.clone() }
+        Running { rpc: self.rpc.clone(), changed: self.changed.clone(), names, schemas, process: self.process.clone() }
     }
 
     fn is(&self, other: &Running) -> bool {
@@ -1153,7 +1200,7 @@ fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Res
     // (the protocol's messages are UTF-8: a Python server reads and writes its pipes in the machine's own code page otherwise, cp932 on a Japanese
     // Windows, and Japanese in a call came to it garbled; what the configuration says comes after, and wins)
     command.env("PYTHONIOENCODING", "utf-8");
-    command.args(&config.args).envs(&config.env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    command.args(&config.args).envs(&config.env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1168,15 +1215,21 @@ fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Res
     #[cfg(not(windows))]
     let _ = job;
     // (from here on, whatever fails, the process ends as this is dropped: a handshake that gets no answer is otherwise a server that goes on running)
+    let words = LastWords::default();
+    let mut child = child;
+    if let Some(stderr) = child.stderr.take() {
+        words.hear(stderr);
+    }
     let mut process = Process {
         child,
         #[cfg(windows)]
         ending,
+        words: words.clone(),
     };
     let writer = process.child.stdin.take().ok_or("no stdin")?;
     let reader = process.child.stdout.take().ok_or("no stdout")?;
     let mut rpc = Rpc::over(Box::new(writer), BufReader::new(reader));
-    let tools = rpc.start(limit)?;
+    let tools = rpc.start(limit).map_err(|error| words.after(error))?;
     Ok(Running::new(rpc, tools, Some(process)))
 }
 
@@ -1358,7 +1411,13 @@ impl Hub {
         };
         let result = match answer {
             Ok(result) => result,
-            Err(error) if error == ENDED || error.starts_with(PIPE) => return Err(self.start_again(running, error)),
+            Err(error) if error == ENDED || error.starts_with(PIPE) => {
+                let error = match &running.process {
+                    Some(process) => process.words.after(error),
+                    None => error,
+                };
+                return Err(self.start_again(running, error));
+            }
             Err(error) => return Err(error),
         };
         let (text, taken) = result_parts(&result, pictures);
@@ -2437,6 +2496,22 @@ mod tests {
     fn a_server_that_fails_its_handshake_does_not_outlive_it() {
         // (no job holds it, as where none could be made, or on a system that has none: the process is then the app's to end)
         start_a_mute_one(false);
+    }
+
+    /// What a server wrote to its stderr as it ended is said with why it did not start, and with why a call of it failed: a person mends it by that.
+    #[test]
+    fn what_a_server_said_as_it_ended_is_said_with_why() {
+        let config = fake("import sys\nsys.stderr.write('starting\\n')\nsys.stderr.write('ModuleNotFoundError: No module named mcp\\n')\nsys.exit(1)\n", &[]);
+        let Err(error) = start_server_within(&config, Duration::from_secs(20), false) else { panic!("a server that ends was started") };
+        assert!(error.ends_with("It said: starting | ModuleNotFoundError: No module named mcp"), "{error}");
+        let crashing = "import json, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n    if 'id' not in m:\n        continue\n    if m['method'] == 'tools/call':\n        sys.stderr.write('KeyError: token\\n')\n        sys.exit(1)\n    r = {'tools': [{'name': 't', 'inputSchema': {'type': 'object'}}]} if m['method'] == 'tools/list' else {'protocolVersion': '2025-06-18', 'capabilities': {}}\n    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': r}), flush=True)\n";
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        save_server(&file, None, "srv", fake(crashing, &[])).unwrap();
+        let hub = Hub::start(&file);
+        waited("the server to be up", || !hub.schemas().is_empty());
+        let said = hub.call("mcp__srv__t", &json!({}), &AtomicBool::new(false)).unwrap_err();
+        assert!(said.contains("It said: KeyError: token"), "{said}");
     }
 
     #[cfg(windows)]
