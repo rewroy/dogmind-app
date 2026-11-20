@@ -191,3 +191,63 @@ fn calibrate_the_draft_stop() {
         println!("{:24} {:>4} {:>7} {:>7} {:>4} {:>4} {:>4} {:>7} {:>4}", row.session, row.at, row.chars, row.longest, u8::from(row.true_draft), u8::from(row.wrote), u8::from(row.old), u8::from(row.watched), u8::from(row.new && row.watched));
     }
 }
+
+
+/// The sizes of a draft the stop could be set at, below and at `DRAFT_LINES`.
+const STOP_AT: [usize; 7] = [20, 30, 40, 50, 60, 80, 100];
+
+/// Where, in characters of the reasoning, its run of code of its own first reached each of [`STOP_AT`]: the point a stop at that size would have
+/// fired, fed as it streams, a line at a time. None where it never did.
+fn reached(shown: BTreeSet<String>, reasoning: &str) -> [Option<usize>; 7] {
+    let mut watch = DraftWatch::new(shown);
+    let mut at = [None; 7];
+    let mut end = 0;
+    for line in reasoning.split_inclusive('\n') {
+        end += line.len();
+        watch.is_a_draft(&reasoning[..end]);
+        for (slot, size) in at.iter_mut().zip(STOP_AT) {
+            if slot.is_none() && watch.stats() >= size {
+                *slot = Some(end);
+            }
+        }
+    }
+    at
+}
+
+#[test]
+#[ignore = "reads the sessions of the folder DOGMIND_CALIBRATE names"]
+fn calibrate_where_a_draft_reaches_each_size() {
+    let Some(root) = std::env::var_os("DOGMIND_CALIBRATE") else {
+        eprintln!("DOGMIND_CALIBRATE names no folder: nothing to read");
+        return;
+    };
+    // One line a reasoning, tab-separated: what it is, its length, its longest run, whether it was a true draft, whether the person allowed changes, where
+    // the run began, and where it reached each size (- for never).
+    println!("session\tmsg\tchars\tlongest\ttrue\twatched\tbegan\t{}", STOP_AT.map(|size| format!("at{size}")).join("\t"));
+    let mut folders: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|entry| entry.path()).filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().ends_with("-data"))).collect();
+    folders.sort();
+    for folder in folders {
+        let tag = folder.file_name().unwrap().to_string_lossy().trim_end_matches("-data").to_string();
+        let mut files: Vec<_> = std::fs::read_dir(folder.join("sessions")).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !crate::trajectory::is_trajectory(path) && !crate::session::is_helper(path)).collect();
+        files.sort();
+        for file in files {
+            let Ok(messages) = crate::session::read(&file) else { continue };
+            let name = format!("{tag}/{}", file.file_stem().unwrap().to_string_lossy());
+            for (at, message) in messages.iter().enumerate() {
+                let Some(reasoning) = message.reasoning_content.as_deref().filter(|text| message.role == "assistant" && text.chars().count() > 200) else { continue };
+                let shown = lines_shown(&messages[..at]);
+                let own: BTreeSet<&str> = reasoning.lines().map(str::trim).filter(|line| is_code_line(line) && line.len() >= QUOTE_MIN && !shown.contains(*line)).collect();
+                let wrote = written(message);
+                let put: BTreeSet<&str> = wrote.lines().map(str::trim).collect();
+                let true_draft = !wrote.trim().is_empty() && own.len() >= 8 && own.iter().filter(|line| put.contains(*line)).count() * 2 >= own.len();
+                let asked = messages[..at].iter().rev().find(|message| message.role == "user" && !message.content.as_deref().is_some_and(prompt::is_nudge)).and_then(|message| message.content.as_deref()).unwrap_or("");
+                let watched = !prompt::forbids_changes(prompt::typed_text(asked));
+                let mut whole = DraftWatch::new(shown.clone());
+                whole.is_a_draft(&format!("{reasoning}\n"));
+                let at_sizes = reached(shown, reasoning);
+                let cell = |value: Option<usize>| value.map_or("-".to_string(), |chars| chars.to_string());
+                println!("{name}\t{at}\t{}\t{}\t{}\t{}\t{}\t{}", reasoning.len(), whole.stats(), u8::from(true_draft), u8::from(watched), whole.began_at(), at_sizes.map(cell).join("\t"));
+            }
+        }
+    }
+}
