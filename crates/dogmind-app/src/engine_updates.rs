@@ -395,7 +395,11 @@ fn selection(data: &Path) -> Vec<String> {
 fn atomic_selection(folder: &Path, text: &str) -> std::io::Result<()> {
     let pending = folder.join("selected.partial");
     let active = folder.join(SELECTED);
-    fs::write(&pending, text)?;
+    // (on the disk before it takes the name: the move's write-through flushes the move, not what was written, and a power cut would leave the name on zeros, which select no engine)
+    fs::File::create(&pending).and_then(|mut out| {
+        std::io::Write::write_all(&mut out, text.as_bytes())?;
+        out.sync_all()
+    })?;
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
