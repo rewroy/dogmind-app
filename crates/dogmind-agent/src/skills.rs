@@ -160,7 +160,7 @@ fn walk(folder: &Path, depth: usize, scope: &'static str, found: &mut Vec<Skill>
         found.extend(read_skill(&file, scope));
         return;
     }
-    // (not a hidden folder: `.system` is a tool's own, as Codex's are, written for its tools and its agents. Codex's review-agent, for one,
+    // (not a hidden folder: `.system` holds another tool's own skills, written for its tools and its agents. One such review skill
     // says to read every line itself and hand nothing on, and Dogmind's model, given it for a review, read 880 KB into one turn.)
     let mut folders: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.is_dir() && !path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.'))).collect();
     folders.sort();

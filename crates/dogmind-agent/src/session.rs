@@ -675,8 +675,8 @@ pub fn rename(path: &Path, title: &str) -> Result<(), String> {
     }
 }
 
-/// A new session beside this one, with its conversation through its `through`th message (from 0): to go on from there another way, as
-/// DeepSeek Harness's fork does. It has the workspace, the tools this one was offered, its mark of web content, and the pictures of the
+/// A new session beside this one, with its conversation through its `through`th message (from 0): to go on from there another way.
+/// It has the workspace, the tools this one was offered, its mark of web content, and the pictures of the
 /// messages it keeps; `title`, when given, is its name. This one is only read. What changed in the workspace since is not undone: a branch
 /// of the conversation, not of the files. A branch of an encrypted session is encrypted, under the same key, with an id of its own; one of a conversation with lines that did not open is
 /// refused, as it would leave them out without a word.

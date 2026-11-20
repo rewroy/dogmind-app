@@ -563,7 +563,7 @@ impl Drop for OwnedSid {
 }
 
 /// The SID a workspace's commands that run with a restricted token write as ([`restricted_token`]): a random one in the form of a domain account's, made once for
-/// the workspace and kept beside the app's other files, as Codex keeps its own. One workspace's commands cannot write in another's.
+/// the workspace and kept beside the app's other files. One workspace's commands cannot write in another's.
 fn workspace_sid_text(root: &Path) -> String {
     static MADE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
     let place = key(&real(root));
@@ -600,7 +600,7 @@ fn random_sid_text() -> String {
     format!("S-1-5-21-{}-{}-{}-{}", part(1), part(2), part(3), part(4).max(1000))
 }
 
-/// A primary token for a command that reads as the person does and writes only where `writer` may, made as Codex's Windows sandbox makes its own (RestrictedToken):
+/// A primary token for a command that reads as the person does and writes only where `writer` may, a restricted token (CreateRestrictedToken):
 /// the person's token with no privilege but going through folders (`DISABLE_MAX_PRIVILEGE`, `LUA_TOKEN`), and `WRITE_RESTRICTED`, so that the restricting SIDs
 /// (`writer`, the logon session's and Everyone) are looked at for writes alone. What it makes with no list of its own can be opened by its logon session only.
 unsafe fn restricted_token(writer: PSID) -> Result<Handle, String> {
@@ -1773,7 +1773,7 @@ unsafe fn profile_folder(sid: PSID) -> Option<PathBuf> {
     Some(path)
 }
 
-/// What points a command that runs with a restricted token away from the network when it was not let reach it, as Codex's own sandbox does: a proxy that is not there for what
+/// What points a command that runs with a restricted token away from the network when it was not let reach it: a proxy that is not there for what
 /// honours one, and the offline switches of cargo, npm and pip. Nothing enforces it.
 const OFFLINE: [(&str, &str); 10] = [
     ("HTTP_PROXY", "http://127.0.0.1:9"), ("HTTPS_PROXY", "http://127.0.0.1:9"), ("ALL_PROXY", "http://127.0.0.1:9"), ("NO_PROXY", "localhost,127.0.0.1,::1"),
@@ -2093,7 +2093,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let mut command_line = wide(&format!("\"{shell}\" /d /s /c \"chcp 65001 >nul & {line}\""));
         // (the look for the build tools may still be going on: the command's start waits for it no longer than the command has time, and not past Stop)
         let env_began = Instant::now();
-        // (with a restricted token nothing stops the network: a command not let reach it is pointed away from it, as Codex points its own)
+        // (with a restricted token nothing stops the network: a command not let reach it is pointed away from it)
         let block = environment(temp.as_deref().filter(|_| token != Token::Person), &root, writer.is_some() && !network, token == Token::Person, || crate::msvc::found_before(asked_at.checked_add(timeout).unwrap_or(asked_at + Duration::from_secs(3600)), cancel));
         times.env = env_began.elapsed();
         let place = wide_path(cwd);
