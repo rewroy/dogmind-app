@@ -868,6 +868,29 @@ fn hello() -> Value {
     json!({"protocolVersion": PROTOCOL, "capabilities": {}, "clientInfo": {"name": "dogmind-app", "version": env!("CARGO_PKG_VERSION")}})
 }
 
+/// A call's arguments as its tool's schema has them: a field the schema says is text, given as a number or as true or false, as its text. An engine
+/// that reads a call's arguments by the tools it was offered reads those of a tool it was only told of (see `Agent::servers_caught_up`) as what
+/// they look like: a path `2024` as a number, which the server refuses. The top fields only, as the engine reads them.
+fn as_the_schema_has_it(arguments: &Value, schema: Option<&Value>) -> Value {
+    let properties = schema.and_then(|schema| schema.pointer("/function/parameters/properties")).and_then(Value::as_object);
+    let (Some(fields), Some(properties)) = (arguments.as_object(), properties) else { return arguments.clone() };
+    let only_text = |schema: &Value| {
+        let kinds: Vec<&Value> = match schema.get("type") {
+            Some(Value::Array(kinds)) => kinds.iter().collect(),
+            Some(kind) => vec![kind],
+            None => Vec::new(),
+        };
+        kinds.iter().any(|kind| kind.as_str() == Some("string")) && kinds.iter().all(|kind| matches!(kind.as_str(), Some("string" | "null")))
+    };
+    let mut fixed = fields.clone();
+    for (name, value) in &mut fixed {
+        if (value.is_number() || value.is_boolean()) && properties.get(name).is_some_and(only_text) {
+            *value = Value::String(value.to_string());
+        }
+    }
+    Value::Object(fixed)
+}
+
 /// A tool's result as text: what it says in words, and a word for what it says otherwise.
 /// A resource it holds is read as its text, with its URI (a file's contents come so from GitHub's server); one of bytes, and a link to one, by what they
 /// are. (The tests' word for `result_parts` with no pictures.)
@@ -1390,6 +1413,8 @@ impl Hub {
             })?
         };
         let real = running.names.get(tool).cloned().unwrap_or_default();
+        let schema = running.schemas.iter().find(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some(tool));
+        let arguments = &as_the_schema_has_it(arguments, schema);
         let answer = {
             // Another session's call may have it for minutes, and a person who stops the turn does not wait for that.
             let mut rpc = loop {
@@ -2090,6 +2115,18 @@ mod tests {
     fn names_are_what_a_model_api_takes() {
         assert_eq!(tool_name("my server", "do.it"), "mcp__my_server__do_it");
         assert_eq!(tool_name(&"s".repeat(80), "t").len(), 64);
+    }
+
+    /// A field the schema says is text is sent as text, whatever it was read as; any other field as it was.
+    #[test]
+    fn arguments_go_as_the_schema_has_them() {
+        let schema = json!({"function": {"name": "mcp__s__t", "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "flag": {"type": ["string", "null"]}, "n": {"type": "integer"}, "any": {}, "s": {"type": "string"}
+        }}}});
+        let read = json!({"path": 2024, "flag": true, "n": 5, "any": 7, "s": "x", "other": 1.5});
+        assert_eq!(as_the_schema_has_it(&read, Some(&schema)), json!({"path": "2024", "flag": "true", "n": 5, "any": 7, "s": "x", "other": 1.5}));
+        assert_eq!(as_the_schema_has_it(&read, None), read);
+        assert_eq!(as_the_schema_has_it(&json!("not an object"), Some(&schema)), json!("not an object"));
     }
 
     /// A lone half of a surrogate pair, as Python writes a byte it could not decode, is read as U+FFFD; a pair, and an escaped backslash before a `u`,
