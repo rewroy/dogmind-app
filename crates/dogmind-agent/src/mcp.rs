@@ -266,6 +266,8 @@ pub fn remove_server(file: &Path, name: &str) -> Result<(), String> {
 /// The file's servers; a file that is there and cannot be read is an error, so that nothing is written over it.
 fn readable_config(file: &Path) -> Result<Config, String> {
     match std::fs::read_to_string(file) {
+        // (all a power cut left of it, which has nothing in it to keep)
+        Ok(text) if crate::images::left_by_a_power_cut(text.as_bytes()) => Ok(Config::default()),
         Ok(text) => serde_json::from_str(&text).map_err(|error| format!("{}: {error}", file.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(error) => Err(format!("{}: {error}", file.display())),
@@ -278,7 +280,9 @@ fn write_config(file: &Path, config: &Config) -> Result<(), String> {
     }
     let text = serde_json::to_string_pretty(config).map_err(|error| error.to_string())?;
     let partial = file.with_extension("partial");
-    std::fs::write(&partial, text).map_err(|error| format!("{}: {error}", partial.display()))?;
+    // (on the disk before it takes the name: otherwise a power cut just after can leave the person's servers as zeros, which read as none)
+    let written = std::fs::File::create(&partial).and_then(|mut out| out.write_all(text.as_bytes()).and_then(|()| out.sync_all()));
+    written.map_err(|error| format!("{}: {error}", partial.display()))?;
     std::fs::rename(&partial, file).map_err(|error| format!("{}: {error}", file.display()))
 }
 
@@ -1271,6 +1275,11 @@ mod tests {
         assert!(hub.configs()[0].1.trusted, "Settings reads the trust back as the switch set it, so that a change made after keeps it");
         assert!(hub.reload().is_empty());
         assert!(save_server(&file, None, "x", ServerConfig::default()).unwrap_err().contains("needed"));
+        // (what a power cut leaves of the file, its length in zeros, is no list to keep: a server is added to an empty one)
+        let length = std::fs::metadata(&file).unwrap().len() as usize;
+        std::fs::write(&file, vec![0u8; length]).unwrap();
+        save_server(&file, None, "d", at(&one)).unwrap();
+        assert_eq!(load_config(&file).servers.keys().collect::<Vec<_>>(), ["d"]);
         assert!(save_server(&file, None, "x", at("ftp://x")).unwrap_err().contains("http"));
     }
 
