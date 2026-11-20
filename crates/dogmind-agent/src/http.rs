@@ -174,6 +174,13 @@ fn with_an_ear_for_a_stop<T>(socket: &TcpStream, cancel: &AtomicBool, write: imp
             while !done.load(Ordering::Relaxed) {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = socket.shutdown(Shutdown::Both);
+                    // (on Windows the shutdown alone leaves a send that blocks where it is: what it waits on is cancelled too, and it then fails as
+                    // shut down; again until it has, as one that had not yet begun to wait when the first went is not reached by it)
+                    #[cfg(windows)]
+                    while !done.load(Ordering::Relaxed) {
+                        cancel_waiting_io(socket);
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -183,6 +190,14 @@ fn with_an_ear_for_a_stop<T>(socket: &TcpStream, cancel: &AtomicBool, write: imp
         done.store(true, Ordering::Relaxed);
         result
     })
+}
+
+/// The socket's I/O that waits, from every thread, cancelled.
+#[cfg(windows)]
+fn cancel_waiting_io(socket: &TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+    // SAFETY: the socket is open for as long as it is borrowed, and with no OVERLAPPED named, all of its I/O is what is cancelled.
+    unsafe { windows_sys::Win32::System::IO::CancelIoEx(socket.as_raw_socket() as windows_sys::Win32::Foundation::HANDLE, std::ptr::null()) };
 }
 
 /// What a head, or a chunk's size line, comes to at most: past this it is no web server, and memory is all it could cost.
