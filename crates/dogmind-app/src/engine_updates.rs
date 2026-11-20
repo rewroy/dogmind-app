@@ -392,14 +392,21 @@ fn selection(data: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The selection's text on the disk before the move gives it the name: the move's write-through flushes the move, not what was written, and a power cut
+/// would leave the name on zeros, which select no engine (the app then started the bundled one in place of the one the person had fetched).
+fn flushed_partial(pending: &Path, text: &str) -> std::io::Result<()> {
+    let mut out = fs::File::create(pending)?;
+    std::io::Write::write_all(&mut out, text.as_bytes())?;
+    out.sync_all()?;
+    #[cfg(test)]
+    tests::FLUSHED.with(|flushed| flushed.borrow_mut().push(pending.to_path_buf()));
+    Ok(())
+}
+
 fn atomic_selection(folder: &Path, text: &str) -> std::io::Result<()> {
     let pending = folder.join("selected.partial");
     let active = folder.join(SELECTED);
-    // (on the disk before it takes the name: the move's write-through flushes the move, not what was written, and a power cut would leave the name on zeros, which select no engine)
-    fs::File::create(&pending).and_then(|mut out| {
-        std::io::Write::write_all(&mut out, text.as_bytes())?;
-        out.sync_all()
-    })?;
+    flushed_partial(&pending, text)?;
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -834,6 +841,23 @@ fn grant_worker_access(_folder: &Path) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// The files `flushed_partial` has put on the disk in this test's thread.
+        pub(super) static FLUSHED: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The selection is on the disk before it takes its name, and is what was chosen. (A power cut cannot be had in a test; that the text is flushed before
+    /// the move can: written unflushed, as it was, a cut just after the move left the name on zeros.)
+    #[test]
+    fn the_selection_is_on_the_disk_before_it_takes_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        FLUSHED.with(|flushed| flushed.borrow_mut().clear());
+        atomic_selection(dir.path(), "0.1.13\n0.1.12").unwrap();
+        assert_eq!(FLUSHED.with(|flushed| flushed.borrow().clone()), vec![dir.path().join("selected.partial")]);
+        assert_eq!(fs::read_to_string(dir.path().join(SELECTED)).unwrap(), "0.1.13\n0.1.12");
+        assert!(!dir.path().join("selected.partial").exists());
+    }
 
     fn release(tag: &str, draft: bool, assets: &[(&str, &str)]) -> Value {
         serde_json::json!({"tag_name":tag,"draft":draft,"prerelease":true,"published_at":"2026-11-10T00:00:00Z","assets": assets.iter().map(|(name, digest)| serde_json::json!({"name":name,"size":100,"digest":format!("sha256:{digest}"),"browser_download_url":format!("https://github.com/rewroy/Straydog/releases/download/{tag}/{name}")})).collect::<Vec<_>>()})
