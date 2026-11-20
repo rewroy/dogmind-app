@@ -507,6 +507,12 @@ pub trait Provider: Send + Sync {
     fn restart(&self, _cancel: &AtomicBool) -> Restart {
         Restart::Unknown
     }
+
+    /// Whether a server that answered in the conversation, and now answers nothing at all ([`Restart::Silent`]), is waited for as one between two processes: not the
+    /// app's own engine, which the app starts again itself.
+    fn waits_out_silence(&self) -> bool {
+        false
+    }
 }
 
 /// What a server that refused a request says, when asked, of whether it is on its way back.
@@ -591,6 +597,10 @@ impl Provider for Client {
         true
     }
 
+    fn waits_out_silence(&self) -> bool {
+        !self.own_engine
+    }
+
     fn restart(&self, cancel: &AtomicBool) -> Restart {
         match self.get_json(&self.root("/health"), cancel, RESTART_ASK_WITHIN) {
             Err(_) => Restart::Silent,
@@ -645,6 +655,9 @@ pub struct Client {
     pub vision_asked: std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Option<bool>)>>>,
     /// The next request's thinking is to be closed ([`Provider::close_thinking_once`]).
     pub close_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The engine this app starts and watches: nothing listening there is said at once, as the app knows why and starts it again. Any other server, on this
+    /// machine too, may be on its way back, and is waited for as one.
+    pub own_engine: bool,
 }
 
 /// How long an answer of `/props` that the model reads no pictures holds before it is asked again ([`Client::reads_pictures`]).
@@ -653,7 +666,7 @@ const VISION_ASKED_AGAIN: Duration = Duration::from_secs(10);
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
         Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None,
-                    vision_asked: Default::default(), close_next: Default::default() })
+                    vision_asked: Default::default(), close_next: Default::default(), own_engine: false })
     }
 
     /// The request a model's turn is sent as, for this server.
@@ -701,10 +714,11 @@ impl Client {
         Url { path: path.to_string(), ..self.base.clone() }
     }
 
-    /// Nothing listening on this machine will not change in a few seconds; another machine may be on its way back.
+    /// Nothing listening where the app's own engine is will not change in a few seconds (the app starts it again); any other server, a person's own on this machine
+    /// too, may be on its way back.
     fn unreached(&self, failure: Failure) -> LlmError {
         match failure {
-            Failure::Connect(_) if matches!(self.base.host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]") => LlmError::Down(SERVER_GONE.to_string()),
+            Failure::Connect(_) if self.own_engine => LlmError::Down(SERVER_GONE.to_string()),
             other => other.into(),
         }
     }
@@ -1519,13 +1533,16 @@ mod tests {
         assert_eq!(taken.load(Ordering::SeqCst), 2, "its first question ended it: the second was not asked");
     }
 
+    /// The app's own engine: nothing listening there is said at once. A person's own server on this machine is asked again, as any server is: it may be on its way back.
     #[test]
     fn no_listener_here_is_no_use_asking_again_and_says_nothing_of_the_socket() {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let client = Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap();
+        let client = Client { own_engine: true, ..Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap() };
         let cancel = AtomicBool::new(false);
         let request = Request { model: "m", messages: &[], tools: None, effort: None, images: None, japanese_letters: false, request_id: None };
         assert!(matches!(client.stream(&request, &cancel, &mut |_| {}), Err(LlmError::Down(_))));
+        let persons = Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap();
+        assert!(matches!(persons.stream(&request, &cancel, &mut |_| {}), Err(LlmError::Transient(_))));
         assert!(!client.answers());
         let said = client.describe().unwrap_err();
         assert!(said.starts_with(NO_ANSWER) && !said.contains("os error"), "{said}");

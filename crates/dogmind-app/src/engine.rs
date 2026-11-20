@@ -1000,7 +1000,7 @@ pub fn start_alone(straydog: &Path, settings: &Settings, folder: &Path, keep_goi
 }
 
 pub fn client(port: u16) -> Client {
-    Client::new(&format!("http://127.0.0.1:{port}/v1"), None).expect("the URL is well formed")
+    Client { own_engine: true, ..Client::new(&format!("http://127.0.0.1:{port}/v1"), None).expect("the URL is well formed") }
 }
 
 /// What `/health`'s loading progress says, in a line.
