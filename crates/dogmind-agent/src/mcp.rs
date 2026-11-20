@@ -321,6 +321,9 @@ struct HttpLink {
 /// How long a connection to a server at a URL is waited for.
 const HTTP_CONNECT: Duration = Duration::from_secs(10);
 
+/// What is said of a server whose program is neither where its command says nor in a folder on PATH, after the command: words the app has in the person's language.
+pub const NOT_FOUND: &str = "the program is not there, nor in a folder on PATH";
+
 /// What a request comes to when the server at a URL no longer knows its session, as a server may forget one that has been quiet.
 const SESSION_GONE: &str = "the server no longer knows this session";
 
@@ -792,7 +795,10 @@ fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Res
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let child = command.spawn().map_err(|error| format!("{}: {error}", config.command))?;
+    let child = command.spawn().map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => format!("{}: {NOT_FOUND}", config.command),
+        _ => format!("{}: {error}", config.command),
+    })?;
     #[cfg(windows)]
     let ending = if job { ends_with_this_process(&child) } else { None };
     #[cfg(not(windows))]
@@ -1140,6 +1146,12 @@ mod tests {
         std::fs::write(&file, "{\"mcpServers\": {\"a\": {\"command\": \"no-such-program-here\"}}}").unwrap();
         assert_eq!(hub.reload(), ["a"]);
         assert_eq!(hub.unreadable(), None);
+        // (its program is not there: said in words the app has in the person's language)
+        let started = Instant::now();
+        while hub.status().iter().all(|line| !line.contains("did not start")) && started.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(hub.status(), [format!("a: did not start: no-such-program-here: {NOT_FOUND}")]);
     }
 
     /// A server of Streamable HTTP for the tests, on this machine: it answers `initialize` in JSON with a session's id, a notification with 202, `tools/list` in an

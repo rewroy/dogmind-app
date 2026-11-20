@@ -556,6 +556,7 @@ const JA: &[(&str, &str)] = &[
     ("1 tool", "ツール 1 個"),
     ("Did not start: {0}", "起動できませんでした: {0}"),
     ("{0} did not start: {1}", "{0} を起動できませんでした: {1}"),
+    ("the program is not there, nor in a folder on PATH", "指定の場所にも PATH のフォルダーにもプログラムがありません"),
     ("The list of servers could not be read, and none was started: {0}", "サーバーの一覧を読み込めなかったため、どれも起動していません: {0}"),
     ("Give the server a name.", "サーバーの名前を入力してください。"),
     ("Give a command to run, or the URL of a server.", "実行するコマンドか、サーバーの URL を入力してください。"),
@@ -1483,6 +1484,7 @@ mod tests {
             assert!(table.contains_key(words), "{words}");
         }
         assert!(table.contains_key(crate::settings::VARIABLE_NAME_ONLY));
+        assert!(table.contains_key(dogmind_agent::mcp::NOT_FOUND));
         for template in dogmind_agent::safety::REASONS {
             assert!(table.contains_key(template), "no Japanese for the reason: {template}");
         }

@@ -2747,6 +2747,21 @@ unsafe fn control(parent: HWND, class: &str, text: &str, style: u32, ex: u32, id
     CreateWindowExW(ex, class.as_ptr(), text.as_ptr(), WS_CHILD | WS_CLIPSIBLINGS | style, 0, 0, 0, 0, parent, id as HMENU, GetModuleHandleW(std::ptr::null()), std::ptr::null())
 }
 
+/// How an MCP server is, in the person's words: for its row in Settings and for /mcp.
+fn mcp_state_words(state: Option<&dogmind_agent::mcp::State>) -> String {
+    match state {
+        Some(dogmind_agent::mcp::State::Up(1)) => t("1 tool").to_string(),
+        Some(dogmind_agent::mcp::State::Up(tools)) => tf("{0} tools", &[tools]),
+        Some(dogmind_agent::mcp::State::Failed(why)) => tf("Did not start: {0}", &[&mcp_why(why)]),
+        _ => t("Starting…").to_string(),
+    }
+}
+
+/// Why an MCP server did not start, with the words the app has for a program not found in the person's language.
+fn mcp_why(why: &str) -> String {
+    why.replace(dogmind_agent::mcp::NOT_FOUND, t(dogmind_agent::mcp::NOT_FOUND))
+}
+
 /// What an MCP server runs, or where it is, as its row says it. Its headers are not said: a key is among them.
 fn mcp_runs(config: &dogmind_agent::mcp::ServerConfig) -> String {
     if config.is_http() {
@@ -6121,7 +6136,7 @@ impl App {
                 } else if let Some(why) = self.mcp.unreadable() {
                     self.say(&tf("The list of servers could not be read, and none was started: {0}", &[&why]));
                 } else {
-                    let lines = self.mcp.status();
+                    let lines: Vec<String> = self.mcp.states().iter().map(|(name, state)| format!("{name}: {}", mcp_state_words(Some(state)))).collect();
                     self.say(&if lines.is_empty() { tf("No server yet. {0} lists them, and /mcp import copies Claude's and Codex's in.", &[&file.display()]) } else { lines.join("\n") });
                 }
             }
@@ -7432,12 +7447,7 @@ impl App {
                     form.toggle_beside(name, *toggle, t("Trust what it returns"));
                     let runs = configs.iter().find(|(known, _)| known == name).map_or(String::new(), |(_, config)| mcp_runs(config));
                     // (why one did not start needs the room of the page)
-                    let state = match states.iter().find(|(known, _)| known == name).map(|(_, state)| state) {
-                        Some(dogmind_agent::mcp::State::Up(1)) => t("1 tool").to_string(),
-                        Some(dogmind_agent::mcp::State::Up(tools)) => tf("{0} tools", &[tools]),
-                        Some(dogmind_agent::mcp::State::Failed(why)) => tf("Did not start: {0}", &[why]),
-                        _ => t("Starting…").to_string(),
-                    };
+                    let state = mcp_state_words(states.iter().find(|(known, _)| known == name).map(|(_, state)| state));
                     form.note_with_button(&format!("{runs}\n{state}"), *edit);
                 }
                 if !servers.is_empty() {
@@ -12197,7 +12207,7 @@ impl App {
                 Some(dogmind_agent::mcp::State::Starting) => {}
                 Some(dogmind_agent::mcp::State::Failed(why)) if self.panel == Panel::Tools => {
                     self.mcp_saved = None;
-                    self.problem_in_panel(&tf("{0} did not start: {1}", &[&name, why]));
+                    self.problem_in_panel(&tf("{0} did not start: {1}", &[&name, &mcp_why(why)]));
                 }
                 _ => self.mcp_saved = None,
             }
