@@ -1592,6 +1592,9 @@ mod tests {
         assert_eq!(hub.status(), [format!("a: did not start: no-such-program-here: {NOT_FOUND}")]);
     }
 
+    /// What each request to a test server carried: its head, and its body as JSON.
+    type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+
     /// A request as a test server reads it: its head, and its body, as long as its length says.
     fn request_of(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
         use std::io::Read;
@@ -1614,7 +1617,7 @@ mod tests {
     /// A server of the older transport for the tests, at `/sse`: a GET of it opens the stream, which says first to post to `/messages?session=1` (as the
     /// official SDK says it) and then carries each answer; a POST to `/sse` is answered 405, as such a server answers one of Streamable HTTP. Its one tool,
     /// `echo`, says what it was given. What each request carried is kept.
-    fn older_server() -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+    fn older_server() -> (String, Seen) {
         use std::io::Read;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}/sse", listener.local_addr().unwrap().port());
@@ -1691,14 +1694,14 @@ mod tests {
     /// A server of Streamable HTTP for the tests, on this machine: it answers `initialize` in JSON with a session's id, a notification with 202, `tools/list` in an
     /// event stream (a notification first, then the answer), and `tools/call` in JSON with what it was asked and the headers it was sent. What each request carried
     /// is kept, to be read back.
-    fn http_server(tool: &'static str) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+    fn http_server(tool: &'static str) -> (String, Seen) {
         http_server_with(tool, false, false)
     }
 
     /// The same, and with `forgets` it lets its first session go once it has answered a call in it: a request in it is answered 404 from then on, and the next
     /// `initialize` begins `s-2`. With `announces` it offers its session's stream (otherwise a GET is answered 405), and says on it that its tools changed
     /// once it has listed them: from then on it lists `secret` too.
-    fn http_server_with(tool: &'static str, forgets: bool, announces: bool) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+    fn http_server_with(tool: &'static str, forgets: bool, announces: bool) -> (String, Seen) {
         use std::io::Read;
         let sessions = Arc::new(Mutex::new((0u32, false)));
         let (listed, announced) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
