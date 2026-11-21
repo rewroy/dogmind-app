@@ -1826,6 +1826,13 @@ impl Agent {
     fn extras_with(&mut self, found: Vec<skills::Skill>) {
         let servers = self.mcp.as_ref().map_or(Vec::new(), |hub| hub.schemas());
         self.tool_schemas = tools::schemas_for(self.web.enabled, found.iter().any(|skill| skill.for_the_model), self.memory.is_some(), servers, self.code_mode);
+        // (DeepSeek was taught to change a file with one exact replacement, by these names: offered it beside apply_patch, it wrote its edits as a list in a
+        // string twice in one conversation, each refused and sent again)
+        if self.model.to_ascii_lowercase().contains("deepseek") {
+            if let Some(list) = self.tool_schemas.as_array_mut() {
+                list.push(tools::edit_schema());
+            }
+        }
         if self.provider.as_ref().is_some_and(|provider| provider.shows_calls_as_written()) {
             tools::for_calls_shown_as_written(&mut self.tool_schemas);
         }
@@ -3341,6 +3348,14 @@ impl Agent {
     /// A call that has begun, run: the gate first (the rules, the person's approval, plan mode's limits), then the tool, and what follows from its result. A call of the model's own and one a program
     /// makes (`nested`) go through this alike; what is done with the result is for the caller to do: the first puts it in the conversation, the second gives it to the program.
     fn run_call(&mut self, id: &str, name: &str, arguments: &Value, nested: bool) -> Ran {
+        // (`edit` is apply_patch with one edit, and goes through all that apply_patch does: the gate, the marks, the result)
+        let as_patch;
+        let (name, arguments) = if name == "edit" {
+            as_patch = tools::edit_as_patch(arguments, &self.workspace);
+            ("apply_patch", &as_patch)
+        } else {
+            (name, arguments)
+        };
         if self.round_goal.as_ref().is_some_and(|goal| goal.closing) && name != "goal_status" {
             self.refusal = Some("refused_gate");
             return Ran::turned_down("the goal is finished: write your answer to the user now, with no more calls".to_string(), 0);

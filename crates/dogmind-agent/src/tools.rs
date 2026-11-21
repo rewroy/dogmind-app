@@ -164,6 +164,32 @@ pub fn schemas() -> Value {
     ])
 }
 
+/// `edit`, for a model that was taught to change a file so: one exact piece of text replaced, or every one with `replace_all`. It is apply_patch with one edit
+/// ([`edit_as_patch`]), and goes through all that apply_patch does.
+pub fn edit_schema() -> Value {
+    json!({"type": "function", "function": {"name": "edit", "description": "Replace an exact piece of text in a file: old_string must be there once, or set replace_all.", "parameters": {"type": "object", "properties": {
+        "file_path": {"type": "string"},
+        "old_string": {"type": "string"},
+        "new_string": {"type": "string"},
+        "replace_all": {"type": "boolean"}
+    }, "required": ["file_path", "old_string", "new_string"]}}})
+}
+
+/// An `edit` call as the apply_patch call it is: its one edit, as many times as old_string is there when it asks for all of them.
+pub fn edit_as_patch(arguments: &Value, workspace: &Path) -> Value {
+    let path = arguments.get("file_path").or_else(|| arguments.get("path")).and_then(Value::as_str).unwrap_or("");
+    let old = arguments.get("old_string").and_then(Value::as_str).unwrap_or("");
+    let new = arguments.get("new_string").cloned().unwrap_or(Value::Null);
+    let mut edit = json!({"path": path, "old_string": old, "new_string": new});
+    if arguments.get("replace_all").and_then(Value::as_bool) == Some(true) && !old.is_empty() {
+        let found = std::fs::read_to_string(resolve(workspace, path)).map_or(0, |text| text.matches(old).count());
+        if found > 1 {
+            edit["count"] = json!(found);
+        }
+    }
+    json!({"edits": [edit]})
+}
+
 /// All the tools of a session: those every session has, and those that depend on what is on.
 pub fn schemas_for(web: bool, skills: bool, memory: bool, mcp: Vec<Value>, code_mode: bool) -> Value {
     let mut all = schemas();
@@ -3893,6 +3919,19 @@ mod tests {
         assert!(tail.contains("3|three") && !tail.contains("2|two"), "{tail}");
         std::fs::write(dir.path().join("b.bin"), [0u8, 1, 2]).unwrap();
         assert!(bench.run("read_file", &json!({"path": "b.bin"}), dir.path(), &cancel).is_err());
+    }
+
+    /// `edit` is apply_patch with one edit: once, or every time old_string is there with replace_all.
+    #[test]
+    fn edit_is_a_patch_of_one_edit() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join("a.js"), "let x = 1;\nlet y = x;\nlet z = x;\n").unwrap();
+        let once = edit_as_patch(&json!({"file_path": "a.js", "old_string": "let y", "new_string": "const y"}), dir.path());
+        bench.run("apply_patch", &once, dir.path(), &cancel).unwrap();
+        let all = edit_as_patch(&json!({"file_path": "a.js", "old_string": "= x;", "new_string": "= 2;", "replace_all": true}), dir.path());
+        assert_eq!(all["edits"][0]["count"], 2);
+        bench.run("apply_patch", &all, dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.js")).unwrap(), "let x = 1;\nconst y = 2;\nlet z = 2;\n");
     }
 
     /// Edits written as a string of JSON are taken as the list they are, and a patch to a file not read in the session goes through where its text is there.
