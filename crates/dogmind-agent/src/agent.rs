@@ -594,7 +594,50 @@ fn without_call_markup(text: &str) -> &str {
 
 /// A call's arguments as every step reads them, the gate and the run alike: none at all is an empty object.
 fn parse_arguments(text: &str) -> serde_json::Result<Value> {
-    serde_json::from_str(if text.trim().is_empty() { "{}" } else { text })
+    let text = if text.trim().is_empty() { "{}" } else { text };
+    serde_json::from_str(text).or_else(|error| {
+        // (a Windows path written with one backslash, as a person writes it: `\P` is no escape, and the call was refused and made again. Each backslash that begins
+        // none is read as itself; what the model wrote stays as it wrote it)
+        let mended = backslashes_as_written(text);
+        if mended == text { Err(error) } else { serde_json::from_str(&mended).map_err(|_| error) }
+    })
+}
+
+/// JSON text with each backslash inside a string that begins no escape (`\P`, `\u` with no four hex digits after it) doubled, so that it stands for itself.
+fn backslashes_as_written(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut in_string = false;
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        if !in_string {
+            in_string = c == '"';
+            out.push(c);
+            at += 1;
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = false;
+                out.push(c);
+            }
+            '\\' => {
+                let next = chars.get(at + 1).copied();
+                let unicode = next == Some('u') && chars.get(at + 2..at + 6).is_some_and(|hex| hex.iter().all(char::is_ascii_hexdigit));
+                if matches!(next, Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't')) || unicode {
+                    out.push(c);
+                    out.push(next.unwrap_or_default());
+                    at += 1;
+                } else {
+                    out.push_str("\\\\");
+                }
+            }
+            _ => out.push(c),
+        }
+        at += 1;
+    }
+    out
 }
 
 fn arguments_of(call: &crate::message::ToolCall) -> Option<Value> {
@@ -4402,6 +4445,15 @@ mod tests {
 
     /// The goal the person sets goes to the model with the next message once (the history holds it after that), is kept in the session file,
     /// and is told back to the window.
+    /// A Windows path written with one backslash is read as it was meant; an escape that is one stays one.
+    #[test]
+    fn a_path_with_single_backslashes_is_read_as_written() {
+        let read = parse_arguments(r#"{"command":"powershell -File C:\Projects\App\Data\check.ps1","note":"a\tb \u0041"}"#).unwrap();
+        assert_eq!(read["command"], r"powershell -File C:\Projects\App\Data\check.ps1");
+        assert_eq!(read["note"], "a\tb A");
+        assert!(parse_arguments("{not json").is_err());
+    }
+
     #[test]
     fn a_goal_is_said_once_and_kept_with_the_session() {
         let dir = crate::in_container::tempdir().unwrap();
