@@ -167,6 +167,10 @@ pub fn workspace_state(cwd: &Path) -> String {
     format!("## The Workspace\n- Root, which relative paths start at: `{}`\n- {}\n- {git}", cwd.display(), folder_contents(cwd))
 }
 
+/// What comes before the project's instruction files. They were put there for agents, often for others: a session on Dogmind's own source took a rule of its
+/// owner's other agents' (ask for the OK to push in their team's room) as its own, and stopped there.
+pub const PROJECT_INSTRUCTIONS_PREFACE: &str = "The files below are kept in the workspace for agents. Follow what applies to this session and what you can do here: a rule that names a channel, a person or a step you do not have (a room to post in, another agent's tools) does not apply to you. What the user says in this conversation comes before them.\n";
+
 /// `more`: what else this session is to know from the start, such as its skills and notes.
 pub fn system_prompt(cwd: &Path, web: bool, personal: &str, more: &str) -> String {
     let mut prompt = SYSTEM_PROMPT.to_string();
@@ -177,6 +181,7 @@ pub fn system_prompt(cwd: &Path, web: bool, personal: &str, more: &str) -> Strin
     let files = instruction_files(cwd);
     if !files.is_empty() {
         prompt.push_str("## Project Instructions\n");
+        prompt.push_str(PROJECT_INSTRUCTIONS_PREFACE);
         for file in files {
             if let Ok(text) = std::fs::read_to_string(&file) {
                 prompt.push_str(&format!("### {}\n{}\n\n", file.display(), project_instructions(&text, &file)));
@@ -519,6 +524,20 @@ pub fn typed_text(message: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    /// The project's instruction files come with a word on whose rules they are; with none, neither comes.
+    #[test]
+    fn instruction_files_come_with_a_word_on_whose_rules_they_are() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let none = super::system_prompt(dir.path(), false, "", "");
+        assert!(!none.contains("## Project Instructions") && !none.contains(super::PROJECT_INSTRUCTIONS_PREFACE), "no file, no heading and no word");
+        std::fs::write(dir.path().join("AGENTS.md"), "Ask in the team room before you push.").unwrap();
+        let with = super::system_prompt(dir.path(), false, "", "");
+        let heading = with.find("## Project Instructions\n").expect("the heading");
+        let preface = with.find(super::PROJECT_INSTRUCTIONS_PREFACE).expect("the word");
+        let file = with.find("Ask in the team room").expect("the file");
+        assert!(heading < preface && preface < file, "the heading, the word, then the files");
+    }
     /// What a person says that makes a turn read-only: nothing in the work is to change, or only a look is wanted. In English and Japanese, as it is written in real requests.
     const READ_ONLY: &[&str] = &[
         // (the request of a review in which a model wrote and ran files in the workspace: it ends with the words)
