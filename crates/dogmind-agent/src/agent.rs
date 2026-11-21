@@ -2371,6 +2371,8 @@ impl Agent {
         let (mut transient, mut overflow, mut failed_calls) = (0u32, 0u32, 0usize);
         let (mut cut_off, mut empties) = (0u32, 0u32);
         let mut drafts_stopped = 0u32;
+        // Whether the requests have their thinking closed, after a draft stop, until one writes a file.
+        let mut thinking_closed = false;
         let mut wrote = false;
         let mut repeats: HashMap<String, u32> = HashMap::new();
         // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
@@ -2402,6 +2404,9 @@ impl Agent {
                 self.traj.write("wake", Some(&req_id), fields);
             }
             let folder = self.picture_folder();
+            if thinking_closed {
+                provider.close_thinking_once();
+            }
             let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
             let mut written = String::new();
             let (mut reasoned, mut calling) = (String::new(), Vec::<crate::message::ToolCall>::new());
@@ -2527,10 +2532,12 @@ impl Agent {
             if drafting && stopped_by_the_app && matches!(result, Err(LlmError::Cancelled)) {
                 // (what it had come to when it was stopped, and what the stop cost: the tokens that are thrown away)
                 let run = watch.as_ref().map_or(0, DraftWatch::stats);
-                // The request that writes after the stop has its thinking closed, where the server can: it has decided already, and what it was told is to write. Left open, it
-                // thought again for 16,000 to 36,000 characters (97 to 256 s) in each of three stops, before writing what it had, with no better result than the two closed
-                // ones, which wrote at once (27 and 95 s); one request alone, and the next thinks as before.
+                // The requests after the stop have their thinking closed, where the server can, until one writes a file: it has decided already, and what it was told is to
+                // write. Left open, it thought again for 16,000 to 36,000 characters (97 to 256 s) in each of three stops, before writing what it had, with no better result
+                // than the two closed ones, which wrote at once (27 and 95 s). Closed for one request alone, a look at the folder first (4 s) used it up, and the request
+                // after it thought for 410 s (66,369 characters) before it wrote. Once a file is written, the next request thinks as before.
                 let plain = provider.close_thinking_once();
+                thinking_closed = plain;
                 self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "next_without_thinking": plain}));
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
@@ -2663,6 +2670,10 @@ impl Agent {
                 }
             };
             transient = 0;
+            // (a file written, or begun: what the stop closed the thinking for is done)
+            if completion.tool_calls.iter().any(|call| matches!(call.function.name.as_str(), "create_file" | "apply_patch")) {
+                thinking_closed = false;
+            }
             // The model's own limit in the middle of a file: as with a cut, what it wrote stays and it goes on.
             if cuts && completion.finish == "length" {
                 if let Some((answer, path, tail)) = cut_answer(&completion.content, &completion.reasoning, &completion.tool_calls, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) {
@@ -9072,6 +9083,26 @@ Body").unwrap();
         assert_eq!(bodies.len(), 2);
         assert!(bodies[0].pointer("/straydog/reasoning").is_none(), "{}", bodies[0]);
         assert_eq!(bodies[1].pointer("/straydog/reasoning"), Some(&serde_json::json!(false)), "{}", bodies[1]);
+    }
+
+    /// The thinking a draft stop closes stays closed until a file is written: a look at the folder first does not use it up (a real run listed the folder in 4 s, and
+    /// the request after it thought for 410 s, 66,369 characters, before it wrote). After the write, the next request thinks as any does.
+    #[test]
+    fn the_thinking_a_draft_stop_closes_stays_closed_until_a_file_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, bodies, _, _) = thinking_server(3, vec![
+            call_answer("list_files", serde_json::json!({"path": "."})),
+            call_answer("create_file", serde_json::json!({"path": "b.txt", "content": "b\n"})),
+            text_answer("written"),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("write it".into())).unwrap();
+        let (_, cancelled) = until_end(&run, Decision::Approve);
+        assert!(!cancelled);
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "b\n");
+        let bodies = bodies.lock().unwrap();
+        let closed: Vec<bool> = bodies.iter().map(|body| body.pointer("/straydog/reasoning") == Some(&serde_json::json!(false))).collect();
+        assert_eq!(closed, [false, true, true, false], "the draft that was stopped, the look at the folder, the write, and the answer after it");
     }
 
     #[test]
