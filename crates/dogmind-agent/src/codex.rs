@@ -260,6 +260,10 @@ fn transcript(request: &Request) -> (String, Vec<Value>) {
         let mut value = serde_json::to_value(message.without_provider_blocks()).unwrap_or(Value::Null);
         if let Some(fields) = value.as_object_mut() {
             fields.remove("reasoning_content");
+            // (the app's facts and notes in a role of their own: whose a message is rests on its role, not only on its words)
+            if message.role == "user" && message.content.as_deref().is_some_and(crate::prompt::is_nudge) {
+                fields.insert("role".to_string(), json!("app"));
+            }
             if fields.remove("images").is_some() {
                 let (loaded, text) = crate::images::loaded(message, request.images);
                 fields.insert("content".to_string(), json!(text));
@@ -271,7 +275,7 @@ fn transcript(request: &Request) -> (String, Vec<Value>) {
         value
     }).collect();
     let text = json!({
-        "instruction": "The Codex built-in tools are disabled, but the Dogmind tools listed in dogmind_tools are available. Request them through kind=tool_calls; Dogmind will execute them and return their results. Never claim that live workspace access is unavailable before requesting an appropriate Dogmind tool. A returned Dogmind tool error is specific to that call. Return a final answer, or request one or more Dogmind tools. Do not execute tools yourself.",
+        "instruction": "A message whose role is app is from Dogmind itself, its facts and notes, and never the user's words. The Codex built-in tools are disabled, but the Dogmind tools listed in dogmind_tools are available. Request them through kind=tool_calls; Dogmind will execute them and return their results. Never claim that live workspace access is unavailable before requesting an appropriate Dogmind tool. A returned Dogmind tool error is specific to that call. Return a final answer, or request one or more Dogmind tools. Do not execute tools yourself.",
         "dogmind_tools": request.tools.cloned().unwrap_or(json!([])),
         "messages": messages,
         "tool_choice": "auto",
@@ -791,6 +795,19 @@ mod tests {
     fn usage_comes_with_the_context() {
         let usage = usage_of(&json!({"last": {"inputTokens": 10, "cachedInputTokens": 4, "outputTokens": 2}, "modelContextWindow": 1000})).unwrap();
         assert_eq!((usage.prompt, usage.cached, usage.completion, usage.window), (10, 4, 2, Some(1000)));
+    }
+
+    /// The app's facts and notes go to Codex in the role `app`, and the person's words as the user's: whose a message is rests on its role.
+    #[test]
+    fn the_apps_own_messages_go_to_codex_in_a_role_of_their_own() {
+        let facts = format!("{} The time: 03:00.", crate::prompt::APP_FACTS);
+        let messages = [crate::message::Message::text("user", "make a page"), crate::message::Message::text("user", &facts)];
+        let request = Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None };
+        let (text, _) = transcript(&request);
+        let sent: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(sent["messages"][0]["role"], "user");
+        assert_eq!(sent["messages"][1]["role"], "app");
+        assert!(sent["instruction"].as_str().unwrap().starts_with("A message whose role is app is from Dogmind itself"));
     }
 
     #[test]

@@ -431,13 +431,47 @@ pub fn request_body(model: &str, messages: &[Message], tools: Option<&Value>, ef
 
 /// `folder`: where the session keeps its pictures.
 pub fn request_body_in(model: &str, messages: &[Message], tools: Option<&Value>, effort: Option<&str>, folder: Option<&Path>) -> Value {
-    request_body_held(model, messages, tools, effort, folder, None)
+    request_body_held(model, messages, tools, effort, folder, None, Reminders::AsUser)
+}
+
+/// How the app's own messages (its facts beside the person's message, its notes) go to a server: as the user's, marked in their words only, or in a role
+/// of their own (`/props`'s `latest_reminder`, Straydog's for DeepSeek), after the person's message or before it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reminders {
+    AsUser,
+    After,
+    Before,
+}
+
+/// The switch that puts the app's facts before the person's message, to compare where a model takes them best (DeepSeek's own example puts the date and
+/// the place before the user's turn).
+pub const REMINDER_BEFORE_VARIABLE: &str = "DOGMIND_REMINDER_BEFORE";
+
+/// The app's messages in the role `latest_reminder`, and its facts before the person's message where `reminders` says so.
+fn as_reminders(messages: &mut [Value], reminders: Reminders) {
+    if reminders == Reminders::AsUser {
+        return;
+    }
+    for message in messages.iter_mut() {
+        if message["role"] == "user" && message["content"].as_str().is_some_and(crate::prompt::is_nudge) {
+            message["role"] = json!("latest_reminder");
+        }
+    }
+    if reminders == Reminders::Before {
+        for at in 1..messages.len() {
+            let facts = messages[at]["content"].as_str().is_some_and(crate::prompt::is_app_facts);
+            if facts && messages[at]["role"] == "latest_reminder" && messages[at - 1]["role"] == "user" {
+                messages.swap(at - 1, at);
+            }
+        }
+    }
 }
 
 /// `request_body_in`, for a server that keeps the pictures it was sent (`/props`'s `image_digests`): those it holds (`held`, by their digests) go as `sha256:`
 /// and the digest, and the digest of every picture sent goes in `sent`.
-fn request_body_held(model: &str, messages: &[Message], tools: Option<&Value>, effort: Option<&str>, folder: Option<&Path>, mut held: Option<(&HashSet<String>, &mut Vec<String>)>) -> Value {
-    let messages: Vec<Value> = messages.iter().map(|message| as_sent(message, folder, held.as_mut().map(|(holds, sent)| (*holds, &mut **sent)))).collect();
+fn request_body_held(model: &str, messages: &[Message], tools: Option<&Value>, effort: Option<&str>, folder: Option<&Path>, mut held: Option<(&HashSet<String>, &mut Vec<String>)>, reminders: Reminders) -> Value {
+    let mut messages: Vec<Value> = messages.iter().map(|message| as_sent(message, folder, held.as_mut().map(|(holds, sent)| (*holds, &mut **sent)))).collect();
+    as_reminders(&mut messages, reminders);
     let mut body = json!({"model": model, "messages": messages, "stream": true, "stream_options": {"include_usage": true}});
     if let Some(tools) = tools {
         body["tools"] = tools.clone();
@@ -689,6 +723,9 @@ pub struct Client {
     /// The server keeps the pictures it was sent, and takes one again by its digest (`/props`'s `image_digests`, Straydog's): a conversation sent all its
     /// pictures with every request, 97% of 4.33 GB in a day of page checks.
     pub image_digests: bool,
+    /// The server takes the app's own messages in a role of their own (`/props`'s `latest_reminder`): they are then not the user's, by their role and
+    /// not only by their words (Codex on Dogmind: "where a message comes from rests on its text").
+    pub latest_reminder: bool,
     /// The digests of the pictures each conversation (by its id, the first part of a request's) sent this server in a request that went well: those go by
     /// their digests from then on. Forgotten when the server says it no longer holds one (`image_not_held`).
     pub held: std::sync::Arc<std::sync::Mutex<HashMap<String, HashSet<String>>>>,
@@ -722,7 +759,7 @@ const VISION_ASKED_AGAIN: Duration = Duration::from_secs(10);
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
         Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None,
-                    vision_asked: Default::default(), close_next: Default::default(), own_engine: false, image_digests: false, held: Default::default() })
+                    vision_asked: Default::default(), close_next: Default::default(), own_engine: false, image_digests: false, latest_reminder: false, held: Default::default() })
     }
 
     /// The request a model's turn is sent as, for this server.
@@ -744,11 +781,16 @@ impl Client {
 
     /// The body of a request, with the pictures the server holds of this conversation named by their digests (`held`), whose digests go in `sent`.
     fn body_with(&self, request: &Request, held: Option<(&HashSet<String>, &mut Vec<String>)>) -> Value {
+        let reminders = match (self.latest_reminder, std::env::var(REMINDER_BEFORE_VARIABLE).is_ok_and(|value| value == "1")) {
+            (false, _) => Reminders::AsUser,
+            (true, false) => Reminders::After,
+            (true, true) => Reminders::Before,
+        };
         let mut body = if self.replay_reasoning {
-            request_body_held(request.model, request.messages, request.tools, request.effort, request.images, held)
+            request_body_held(request.model, request.messages, request.tools, request.effort, request.images, held, reminders)
         } else {
             let messages: Vec<Message> = request.messages.iter().map(|message| Message { reasoning_content: None, ..message.clone() }).collect();
-            request_body_held(request.model, &messages, request.tools, request.effort, request.images, held)
+            request_body_held(request.model, &messages, request.tools, request.effort, request.images, held, reminders)
         };
         if request.japanese_letters && self.suppresses_letters {
             body["suppress"] = json!(NOT_CP932_HAN);
@@ -914,7 +956,8 @@ impl Client {
         let suppresses_letters = props.get("suppress").and_then(Value::as_array).is_some_and(|names| names.iter().any(|name| name.as_str() == Some(NOT_CP932_HAN)));
         let tool_writing = props.get("tool_writing").and_then(Value::as_bool) == Some(true);
         let image_digests = props.get("image_digests").and_then(Value::as_bool) == Some(true);
-        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing, image_digests })
+        let latest_reminder = props.get("latest_reminder").and_then(Value::as_bool) == Some(true);
+        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing, image_digests, latest_reminder })
     }
 }
 
@@ -946,6 +989,8 @@ pub struct ServerInfo {
     pub tool_writing: bool,
     /// Whether the server keeps the pictures it was sent and takes one again by its digest.
     pub image_digests: bool,
+    /// Whether the server takes the app's own messages in the role `latest_reminder`.
+    pub latest_reminder: bool,
 }
 
 #[cfg(test)]
@@ -1258,6 +1303,20 @@ mod tests {
             }
         });
         (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), heard)
+    }
+
+    /// To a server that takes them so, the app's facts and notes go in the role `latest_reminder`, after the person's message or, with the switch, before it;
+    /// the person's own words stay the user's, and a server that does not say so gets them all as the user's.
+    #[test]
+    fn the_apps_own_messages_go_in_a_role_of_their_own_where_the_server_takes_it() {
+        let facts = format!("{} The time: 03:00.", crate::prompt::APP_FACTS);
+        let messages = [Message::text("system", "s"), Message::text("user", "make a page"), Message::text("user", &facts), Message::text("assistant", "ok"), Message::text("user", crate::prompt::CHECK_NUDGE)];
+        let roles = |reminders: Reminders| -> Vec<String> {
+            request_body_held("m", &messages, None, None, None, None, reminders)["messages"].as_array().unwrap().iter().map(|message| format!("{}:{}", message["role"].as_str().unwrap(), message["content"].as_str().unwrap().chars().take(4).collect::<String>())).collect()
+        };
+        assert_eq!(roles(Reminders::AsUser), ["system:s", "user:make", "user:[Fro", "assistant:ok", "user:[Fro"]);
+        assert_eq!(roles(Reminders::After), ["system:s", "user:make", "latest_reminder:[Fro", "assistant:ok", "latest_reminder:[Fro"]);
+        assert_eq!(roles(Reminders::Before), ["system:s", "latest_reminder:[Fro", "user:make", "assistant:ok", "latest_reminder:[Fro"]);
     }
 
     /// A server that keeps the pictures it was sent (`image_digests`) is sent a conversation's picture once, and then its digest; one that says it no longer

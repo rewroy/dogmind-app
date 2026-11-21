@@ -12790,6 +12790,7 @@ impl App {
                         client.suppresses_letters = info.suppresses_letters;
                         client.tool_writing = info.tool_writing;
                         client.image_digests = info.image_digests;
+                        client.latest_reminder = info.latest_reminder;
                         client.vision = info.vision;
                     }
                     poster.send(match result {
@@ -12812,6 +12813,7 @@ impl App {
                         client.suppresses_letters = info.suppresses_letters;
                         client.tool_writing = info.tool_writing;
                         client.image_digests = info.image_digests;
+                        client.latest_reminder = info.latest_reminder;
                         client.vision = info.vision;
                         Ok::<_, String>((client, info))
                     })();
