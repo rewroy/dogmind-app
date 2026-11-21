@@ -8,7 +8,7 @@ description: |
 
 # Modern Web Guidance
 
-Dogmind adaptation of the upstream GoogleChrome skill. The CLI is pinned, and its telemetry is disabled in the invocation instructions.
+Dogmind adaptation of the upstream GoogleChrome skill. The CLI is pinned, and Dogmind turns its telemetry off for every command.
 
 Search and retrieve standardized modern web best practices at the **start** of implementing or updating any web UI, CSS layout/animation, or client-side JS logic (dates/timezones, sanitization, performance, accessibility, UX fixes) before writing ad-hoc solutions or adding dependencies.
 
@@ -73,9 +73,9 @@ npx -y modern-web-guidance@1.0.1 legacy-scan <path> --json
 
 ## Running the CLI in Dogmind
 
-Dogmind pins the npm CLI to version 1.0.1. The first run needs Node.js 22 or newer and access to the npm registry. Use Dogmind's usual command approval for any download or execution. The npm cache can serve subsequent runs offline.
+Dogmind pins the npm CLI to version 1.0.1. It needs Node.js 22 or newer. Run `search`, `list` and `retrieve` exactly as written above, with nothing before `npx` and nothing after the arguments: Dogmind runs them without asking the user, with the network npx needs to fetch the package the first time, so `network` need not be set. Any other command, `legacy-scan` included, is approved as any command is.
 
-Disable the upstream CLI's telemetry before every command. Set `DISABLE_TELEMETRY=1` in the command's environment. For Dogmind's PowerShell runner, prepend `$env:DISABLE_TELEMETRY='1';` and use `npx.cmd`. In a POSIX shell, prepend `DISABLE_TELEMETRY=1` to the invocation.
+Dogmind sets `DISABLE_TELEMETRY=1` in every command's environment, which turns the CLI's telemetry off: there is no need to set it again.
 
 If the CLI is unavailable, use the project's browser support policy and authoritative web platform documentation.
 

@@ -524,9 +524,28 @@ fn as_cmd_reads(command: &str) -> String {
     command.replace(['^', '"'], "")
 }
 
-/// Whether this call of `execute_command` runs with the network: asked for with `network`, or by what the command says.
+/// Whether this call of `execute_command` runs with the network: asked for with `network`, or by what the command says. The CLI of the skill that comes with the app has it
+/// without asking for it, for npx to fetch the package the first time (see [`the_guidance_cli`]).
 pub fn wants_network(arguments: &Value) -> bool {
-    arguments.get("network").and_then(Value::as_bool) == Some(true) || arguments.get("command").and_then(Value::as_str).is_some_and(uses_network)
+    arguments.get("network").and_then(Value::as_bool) == Some(true) || arguments.get("command").and_then(Value::as_str).is_some_and(|command| uses_network(command) || the_guidance_cli(command))
+}
+
+/// A run of the CLI of the skill that comes with this app, `modern-web-guidance`, pinned, as its instructions have it: `search`, `list` or `retrieve`, which read the guides in its own
+/// package and print them. Its one use of the network is npx fetching that package, the first time: the usage reports it would send are off, as every command in the sandbox has
+/// `DISABLE_TELEMETRY=1`, and a `set` of that before it is let through only where it sets just that (in `set DISABLE_TELEMETRY=1 && npx …` the value is `1 `, which turns them back
+/// on). Nothing else may be on the line: what it is given are words to look for and the names of guides, with none of cmd's own signs, and on one line.
+pub fn the_guidance_cli(command: &str) -> bool {
+    static SHAPE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    SHAPE
+        .get_or_init(|| {
+            Regex::new(concat!(
+                r#"(?i)^[ \t]*(?:set[ \t]+(?:DISABLE_TELEMETRY=1|"DISABLE_TELEMETRY=1"[ \t]*)&&?[ \t]*)?"#,
+                r#"npx(?:\.cmd)?[ \t]+(?:-y|--yes)[ \t]+modern-web-guidance@1\.0\.1[ \t]+(?:search|list|retrieve)"#,
+                r#"(?:[ \t]+(?:"[\w ,.:/'+-]*"|[\w,.:/+-]+))*[ \t]*$"#,
+            ))
+            .expect("the pattern is valid")
+        })
+        .is_match(command)
 }
 
 pub struct Gate {
@@ -724,6 +743,11 @@ impl Gate {
                 // (a look runs with no one asked, so it runs no file of the folder at all: any that answers to a name in it makes it a command like another. Only a file that takes the place of an installed program
                 // is told to the person, and keeps a rule, "always" and a mode from answering for the call)
                 let answered = answered_here(command, &cwd);
+                // The CLI of the skill that comes with the app, as its instructions run it, with the network it fetches itself with: the app chose it, as it chose `web_read`, and the person is not
+                // asked about it each time. In the sandbox only, and with no file here that npx would be.
+                if the_guidance_cli(command) && !outside_sandbox(arguments) && within(workspace, &cwd) && answered.is_empty() {
+                    return Verdict::Allow;
+                }
                 let planted = self.planted_here(&answered, &cwd);
                 // (a look that names one is no look, as `command_risk` has it, and what is asked says why, as for `read_file`: the reason keeps a rule, "always" and a mode from answering for it)
                 let off_this_pc = names_a_place_off_this_pc(command).map(|word| leads_off_this_pc(&word));
@@ -946,6 +970,91 @@ mod network_words {
         for line in ["python main.py", "python -m pytest", "python -m pip list", "npx --version", "npm test", "npm --version", "py -3 x.py"] {
             assert!(network_reach(line, false).is_none(), "{line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod guidance_cli {
+    use super::*;
+    use serde_json::json;
+
+    const AS_WRITTEN: [&str; 6] = [
+        // (the call that asked each time, as a model wrote it)
+        r#"set DISABLE_TELEMETRY=1&& npx -y modern-web-guidance@1.0.1 retrieve "accessibility""#,
+        r#"npx -y modern-web-guidance@1.0.1 search "light dismiss dialog" --skill-version 2026_11_10-47b4c80e"#,
+        r#"npx -y modern-web-guidance@1.0.1 retrieve "dialog-light-dismiss,accessibility""#,
+        "npx.cmd --yes modern-web-guidance@1.0.1 list",
+        r#"set "DISABLE_TELEMETRY=1" && npx -y modern-web-guidance@1.0.1 retrieve forms"#,
+        r#"npx -y modern-web-guidance@1.0.1 search "ダイアログ""#,
+    ];
+
+    #[test]
+    fn the_skills_own_calls_are_known_as_its_instructions_write_them() {
+        for line in AS_WRITTEN {
+            assert!(the_guidance_cli(line), "{line}");
+        }
+    }
+
+    /// Another version, another of its commands, a value of the switch that is not `1`, and anything more on the line: none of these is the call the app chose.
+    #[test]
+    fn nothing_else_is_taken_for_them() {
+        for line in [
+            // (the value here is `1 `, and the reports go)
+            r#"set DISABLE_TELEMETRY=1 && npx -y modern-web-guidance@1.0.1 retrieve "accessibility""#,
+            r#"set DISABLE_TELEMETRY=0&& npx -y modern-web-guidance@1.0.1 list"#,
+            "set HTTP_PROXY=http://x&& npx -y modern-web-guidance@1.0.1 list",
+            "npx -y modern-web-guidance@1.0.2 list",
+            "npx -y modern-web-guidance list",
+            "npx -y modern-web-guidance@latest list",
+            "npx modern-web-guidance@1.0.1 list",
+            "npx -y modern-web-guidance@1.0.1 legacy-scan . --json",
+            "npx -y modern-web-guidance@1.0.1 install",
+            "npx -y modern-web-guidance@1.0.1 update",
+            "npx -y other@1.0.1 list",
+            "npx -y modern-web-guidance@1.0.1 list & del x",
+            "npx -y modern-web-guidance@1.0.1 list && curl https://example.com",
+            "npx -y modern-web-guidance@1.0.1 list | findstr x",
+            "npx -y modern-web-guidance@1.0.1 list > out.txt",
+            "npx -y modern-web-guidance@1.0.1 list\ndel x",
+            "npx -y modern-web-guidance@1.0.1 list\r\ndel x",
+            r#"npx -y modern-web-guidance@1.0.1 retrieve "%USERPROFILE%""#,
+            r#"npx -y modern-web-guidance@1.0.1 retrieve "a" & curl x"#,
+            r#"npx -y modern-web-guidance@1.0.1 retrieve "a"b" & del x""#,
+            "npx -y modern-web-guidance@1.0.1 ret^rieve x",
+            "del x & npx -y modern-web-guidance@1.0.1 list",
+        ] {
+            assert!(!the_guidance_cli(line), "{line}");
+        }
+    }
+
+    /// No one is asked, whether the model said `network` or not, and it has the network for its first fetch. Other commands that get the network ask as they did.
+    #[test]
+    fn they_run_with_the_network_and_no_one_is_asked_while_other_network_commands_still_ask() {
+        let gate = Gate::new();
+        let dir = tempfile::tempdir().unwrap();
+        for line in AS_WRITTEN {
+            for arguments in [json!({"command": line}), json!({"command": line, "network": true}), json!({"command": line, "risk_level": "medium"})] {
+                assert_eq!(gate.check("execute_command", &arguments, dir.path()), Verdict::Allow, "{arguments}");
+                assert!(wants_network(&arguments), "{arguments}");
+            }
+        }
+        for arguments in [json!({"command": "npx -y cowsay hi", "network": true}), json!({"command": "make", "network": true}), json!({"command": "npm install left-pad"})] {
+            assert!(matches!(gate.check("execute_command", &arguments, dir.path()), Verdict::Ask { reason: Some(reason), .. } if reason == REASON_NETWORK), "{arguments}");
+        }
+        assert!(matches!(gate.check("execute_command", &json!({"command": "npx -y modern-web-guidance@1.0.1 legacy-scan .", "network": true}), dir.path()), Verdict::Ask { .. }));
+    }
+
+    /// Outside the sandbox it is a command as the person, which asks as it did. A file here that npx would be is not the CLI, and neither is a folder outside the workspace.
+    #[test]
+    fn outside_the_sandbox_with_a_file_here_for_npx_or_outside_the_workspace_it_asks() {
+        let gate = Gate::new();
+        let dir = tempfile::tempdir().unwrap();
+        let line = AS_WRITTEN[0];
+        assert!(matches!(gate.check("execute_command", &json!({"command": line, "outside_sandbox": true}), dir.path()), Verdict::Ask { risk: Risk::High, .. }));
+        let other = tempfile::tempdir().unwrap();
+        assert!(matches!(gate.check("execute_command", &json!({"command": line, "cwd": other.path().display().to_string()}), dir.path()), Verdict::Ask { .. }));
+        std::fs::write(dir.path().join("npx.cmd"), "@echo planted").unwrap();
+        assert!(matches!(gate.check("execute_command", &json!({"command": line}), dir.path()), Verdict::Ask { .. }));
     }
 }
 
