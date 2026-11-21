@@ -126,6 +126,16 @@ pub fn schemas() -> Value {
         function("submit_plan", "Plan mode: put the finished plan (Markdown) to the person. Approved, plan mode ends and you carry it out now; if not, you get what to change.", json!({
             "plan": {"type": "string"}
         }), &["plan"]),
+        function("set_goal", "For a request of many steps (build, fix, investigate, change several files): what this turn works toward. The app keeps the turn going, round after round, until finish_goal. Not for a question answered at once.", json!({
+            "objective": {"type": "string", "description": "The user's request in one sentence, in their language."},
+            "rounds": {"type": "integer", "description": "At most, default 12."}
+        }), &["objective"]),
+        function("goal_status", "The turn's goal, its round, and how it stands.", json!({}), &[]),
+        function("finish_goal", "done: with the tool results that showed all of the goal is met. blocked: only when the same obstacle that only the user can remove (a password, a decision, a device) stopped the last three rounds; failing tests, an error or work left are not.", json!({
+            "result": {"type": "string", "enum": ["done", "blocked"]},
+            "evidence": {"type": "string"},
+            "blocker": {"type": "string"}
+        }), &["result"]),
         function("todo", "A checklist the person sees beside the conversation, each item pending, doing, done or blocked. Items sent are added or changed by their id.", json!({
             "todos": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "doing", "done", "blocked"]}}, "required": ["id"]}},
             "merge": {"type": "boolean", "description": "false: replace the whole list."}
@@ -3685,7 +3695,7 @@ mod tests {
     fn every_generated_schema_has_a_tool() {
         let schemas = schemas();
         let names: Vec<&str> = schemas.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "ask_user", "submit_plan", "todo", "present", "find_files", "check_page", "command_status", "command_stop", "wake_at", "explore"]);
+        assert_eq!(names, ["apply_patch", "create_file", "execute_command", "list_files", "read_file", "search_files", "show_diff", "ask_user", "submit_plan", "set_goal", "goal_status", "finish_goal", "todo", "present", "find_files", "check_page", "command_status", "command_stop", "wake_at", "explore"]);
     }
 
     /// `present` names files of the workspace, each once, from its root with forward slashes; a file that is not there, or a path out of the workspace, is refused, and so is none.

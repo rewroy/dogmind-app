@@ -17,7 +17,7 @@ pub const SYSTEM_PROMPT: &str = "You are Dogmind, an agent on the user's own com
 - When a result changes the plan, decide again from what it showed, in a few lines.
 
 ## Doing the Work
-- Keep going until the request is handled. End your turn only with the result, with a question only the user can answer, or with a named blocker: never with a promise of what you will do next, and never over the size of the conversation, which is managed for you.
+- Keep going until the request is handled. A request of many steps: `set_goal` first, and the turn goes on round after round until `finish_goal`. End your turn only with the result, with a question only the user can answer, or with a blocker only the user can remove (a failing test or an error is work): never with a promise of what you will do next, and never over the size of the conversation, which is managed for you.
 - A request to build or fix means the working change, not a plan of it. A broad request is enough: take the safest useful first step and go on. Looking around does not authorize editing.
 - A request to change something: begin in your first response with the reads or writes it needs. A question alone: write nothing. Find what a change touches with `search_files` and read the lines it needs first. A question across many files (a review, an audit, what uses what) goes to `explore` first, and you work from its answer.
 - Make the change asked, as asked: no feature, setting, file or asset the user did not ask for, and none of the workspace's own files used for something they were not made for. What you think is missing, say at the end in a line.
@@ -290,6 +290,16 @@ const NOW_MARK: &str = "[Now: ";
 /// The app's word to the model in a user's place: an answer was cut off.
 /// How what goes back to a model stopped from writing code in its reasoning begins.
 pub const DRAFT_NOTE: &str = "[From the app, not the user] ";
+
+/// The next round of a goal that is open, sent where the model stopped with no call: the turn goes on, as the user asked for the whole of it.
+pub fn goal_round(round: u32, most: u32, objective: &str) -> String {
+    format!("{DRAFT_NOTE}Round {round} of {most}. Objective: {objective}. Go on in this session. Take the workspace and the tool results as they are now, not as earlier messages said. Make concrete progress and check it. Mark the goal done with finish_goal only with evidence that all of the objective is met; while work is left, leave it open.")
+}
+
+/// The one step that ends a goal: its answer to the user. `how`: done, blocked, or at its last round.
+pub fn goal_closing(how: &str) -> String {
+    format!("{DRAFT_NOTE}The goal is {how}. Write your answer to the user now: what came of it, what was done and how it was checked, where the results are (files, commits); if blocked, what stops it, what you tried, and exactly what you need from the user. Only what this session's tools showed. No more tool calls.")
+}
 pub const CONTINUE_NUDGE: &str = "Your last answer was cut off by the output limit. Continue exactly where it stopped.";
 /// What the model is told when its connection broke while it was making calls: they were not made, and nothing says so otherwise.
 pub fn calls_broken_off(names: &[&str]) -> String {
@@ -786,7 +796,9 @@ mod tests {
         // (then outside_sandbox, about 150 characters, under 40 tokens once a session: without it what the person asked to have done outside the workspace could only be refused)
         // (then a sentence on fetching files with a plain curl each, some 120 characters, 30 tokens once a session: a URL in a variable or a for over files leaves "always" for the site
         // of no use, and a person was asked about each of five downloads from one site)
-        assert!(tools.len() < 8_050, "the tools have grown to {} characters", tools.len());
+        // (then set_goal, goal_status and finish_goal, some 1,180 characters, about 300 tokens once a session: without them a request of many steps ended at the
+        // model's first stop, a failing test reported as the end of a turn three turns in a row)
+        assert!(tools.len() < 9_300, "the tools have grown to {} characters", tools.len());
         assert!(app_facts("2026-11-02 20:01:18 +09:00", Some("Japanese"), &[]).len() < 200, "what rides on every message");
     }
 

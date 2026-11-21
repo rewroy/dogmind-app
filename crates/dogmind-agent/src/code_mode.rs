@@ -602,7 +602,7 @@ fn gist(args: &serde_json::Value) -> String {
 
 /// What a program cannot call: `run_code` itself, the tools that wait for the person's answer or decision (it has no one to ask), `explore` (a helper of its own) and `wake_at` (the session's
 /// own clock). They are left out of what the model is told, and refused if called.
-pub const NOT_CALLABLE: [&str; 5] = ["run_code", "submit_plan", "ask_user", "explore", "wake_at"];
+pub const NOT_CALLABLE: [&str; 8] = ["run_code", "submit_plan", "ask_user", "explore", "wake_at", "set_goal", "goal_status", "finish_goal"];
 
 /// The rules the model reads before the tools it can call from a program.
 const RULES: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Use it when the work needs three or more tool calls whose order can be decided up front (several reads, a search then reads). Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws.";

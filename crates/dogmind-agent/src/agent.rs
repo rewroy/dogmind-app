@@ -856,6 +856,32 @@ fn close_cut_write(raw: &str) -> Option<(String, String, String)> {
 /// of an edit), only a draft of more than `LONG_DRAFT_LINES` is stopped. Not watched at all after that, a real turn wrote a whole page of 101,903 characters in
 /// its reasoning (567 s) and then wrote it again with create_file.
 const MAX_DRAFTS_STOPPED: u32 = 3;
+/// The rounds a goal has when the model does not say (set_goal's `rounds`), and the most it may ask for.
+const GOAL_ROUNDS: u32 = 12;
+const MOST_GOAL_ROUNDS: u32 = 30;
+/// The round from which a goal may be marked blocked: an obstacle that stopped the last three rounds. Before it, a failing test, an error or a hard step is
+/// work, and a model took one for the end of the turn (a session on Dogmind's own source reported its failing tests and stopped, three turns in a row).
+const BLOCKED_FROM_ROUND: u32 = 3;
+
+/// What a turn works toward, round after round: set by the model (`set_goal`), or the user's own goal for the session (/goal). Where the model stops with it
+/// open, the app sends the next round in place of ending the turn.
+struct RoundGoal {
+    objective: String,
+    round: u32,
+    most: u32,
+    /// How it ended, once it has.
+    finished: Option<GoalEnd>,
+    /// Whether the step that answers the user has been asked for: no call is made after it.
+    closing: bool,
+    /// The user's /goal: met, it is cleared from the session.
+    from_user: bool,
+}
+
+enum GoalEnd {
+    Done,
+    Blocked,
+    OutOfRounds,
+}
 /// After the first stop, or once a file is written: a draft is stopped only when it is longer than this, a whole file and not the plan of an edit.
 const LONG_DRAFT_LINES: usize = 150;
 const MOST_DECIDED: usize = 2500;
@@ -1222,6 +1248,8 @@ struct Agent {
     /// What the session works toward (Command::SetGoal), and whether the model is yet to be told it: with the next message, and after a compaction.
     goal: Option<String>,
     goal_due: bool,
+    /// This turn's goal and its rounds, while there is one.
+    round_goal: Option<RoundGoal>,
     /// This session's use of its workspace: when it moves on and nothing else is there, commands lose their write access to it.
     #[cfg(windows)]
     place: Option<crate::workspace_grants::Use>,
@@ -1528,6 +1556,7 @@ impl Agent {
             workspace: config.workspace,
             goal: None,
             goal_due: false,
+            round_goal: None,
             #[cfg(windows)]
             place: None,
             sessions: config.sessions,
@@ -2246,12 +2275,91 @@ impl Agent {
             let path = session.path.clone();
             self.emit(Event::SessionFile(path));
         }
+        self.begin_rounds();
         let ended = self.iterate();
         self.finish_turn(ended, turn_began);
     }
 
+    /// A turn of the person's begins with the goal they set for the session (/goal), if there is one; the model may set one itself (`set_goal`).
+    fn begin_rounds(&mut self) {
+        self.round_goal = self.goal.clone().map(|objective| RoundGoal { objective, round: 1, most: GOAL_ROUNDS, finished: None, closing: false, from_user: true });
+        if self.round_goal.is_some() {
+            self.show_goal();
+        }
+    }
+
+    /// The bar over the conversation: the turn's goal and its round while one is open, and else the session's.
+    fn show_goal(&self) {
+        let shown = match &self.round_goal {
+            Some(goal) if goal.finished.is_none() => Some(format!("{} ({}/{})", goal.objective, goal.round, goal.most)),
+            _ => self.goal.clone(),
+        };
+        self.emit(Event::Goal(shown));
+    }
+
+    /// `set_goal`: what this turn works toward. A goal already open keeps its round.
+    fn set_goal(&mut self, arguments: &Value) -> Result<String, String> {
+        let objective = arguments.get("objective").and_then(Value::as_str).map(str::trim).filter(|objective| !objective.is_empty())
+            .ok_or("objective is required: the user's request in one sentence")?.to_string();
+        let asked = arguments.get("rounds").and_then(Value::as_u64).map_or(GOAL_ROUNDS, |rounds| (rounds.min(u64::from(MOST_GOAL_ROUNDS)) as u32).max(1));
+        let (round, from_user) = self.round_goal.as_ref().filter(|goal| goal.finished.is_none()).map_or((1, false), |goal| (goal.round, goal.from_user));
+        let most = asked.max(round);
+        self.round_goal = Some(RoundGoal { objective: objective.clone(), round, most, finished: None, closing: false, from_user });
+        self.intervened("goal_set", json!({"round": round, "most": most}));
+        self.show_goal();
+        Ok(format!("The goal is set: {objective}. This is round {round} of {most}. The turn goes on, round after round, until you call finish_goal."))
+    }
+
+    /// `goal_status`.
+    fn goal_status(&self) -> Result<String, String> {
+        let Some(goal) = &self.round_goal else { return Ok("No goal is set for this turn.".to_string()) };
+        let stands = match goal.finished {
+            None => "It is open.",
+            Some(GoalEnd::Done) => "It is marked done.",
+            Some(GoalEnd::Blocked) => "It is marked blocked.",
+            Some(GoalEnd::OutOfRounds) => "It is out of rounds.",
+        };
+        Ok(format!("Objective: {}. Round {} of {}. {stands}", goal.objective, goal.round, goal.most))
+    }
+
+    /// `finish_goal`: done with what showed it, or blocked by what only the user can remove, from the third round on. What it returns is the closing step's word: the
+    /// answer it writes next is the turn's last.
+    fn finish_goal(&mut self, arguments: &Value) -> Result<String, String> {
+        let Some(goal) = self.round_goal.as_mut() else { return Err("no goal is set for this turn: there is nothing to finish. Answer the user.".to_string()) };
+        let said = |key: &str| arguments.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty()).map(str::to_string);
+        let (end, how) = match arguments.get("result").and_then(Value::as_str) {
+            Some("done") => {
+                said("evidence").ok_or("evidence is required: the tool results that showed all of the objective is met. While part of it is not shown, leave the goal open and go on")?;
+                (GoalEnd::Done, "done")
+            }
+            Some("blocked") => {
+                if goal.round < BLOCKED_FROM_ROUND {
+                    return Err(format!("not blocked: this is round {} of {}. A goal is blocked only when the same obstacle that only the user can remove (a password, a decision, a device, access the sandbox and their approval cannot give) has stopped the last {BLOCKED_FROM_ROUND} rounds. A failing test, an error to fix, a hard step or work left is the work: go on with it.", goal.round, goal.most));
+                }
+                said("blocker").ok_or("blocker is required: what stops it, and what only the user can do about it")?;
+                (GoalEnd::Blocked, "blocked")
+            }
+            _ => return Err("result is done or blocked".to_string()),
+        };
+        let round = goal.round;
+        goal.finished = Some(end);
+        goal.closing = true;
+        self.intervened("goal_finished", json!({"result": how, "round": round}));
+        self.show_goal();
+        Ok(prompt::goal_closing(how))
+    }
+
     /// How a turn ends, whoever began it: what it left half done is closed, its end is recorded and told. A turn the person stopped stops the background work too: the commands, and the waits.
     fn finish_turn(&mut self, ended: Ended, turn_began: Instant) {
+        if let Some(goal) = self.round_goal.take() {
+            if goal.from_user && matches!(goal.finished, Some(GoalEnd::Done)) {
+                self.goal = None;
+                if let Some(session) = &mut self.session {
+                    let _ = session.set_goal(None);
+                }
+            }
+            self.show_goal();
+        }
         let before = self.messages.len();
         // A word to go on with what no one went on with would be read as still standing, after what the person writes next.
         // (the app's facts after the person's message are not such a word: they stay with that message)
@@ -2891,6 +2999,23 @@ impl Agent {
                     continue;
                 }
             }
+            // A goal still open: the turn goes on, in the next round, or ends with the step that answers the user. (A goal it marked done or blocked was told to answer
+            // in what finish_goal returned: that answer is the closing step.)
+            if let Some(goal) = self.round_goal.as_mut().filter(|goal| goal.finished.is_none()) {
+                let note = if goal.round < goal.most {
+                    goal.round += 1;
+                    prompt::goal_round(goal.round, goal.most, &goal.objective)
+                } else {
+                    goal.finished = Some(GoalEnd::OutOfRounds);
+                    goal.closing = true;
+                    prompt::goal_closing("at its last round")
+                };
+                let (round, most, closing) = (goal.round, goal.most, goal.closing);
+                self.intervened(if closing { "goal_closing" } else { "goal_round" }, json!({"round": round, "most": most}));
+                self.show_goal();
+                self.push(Message::text("user", note));
+                continue;
+            }
             return Ended::Done;
         }
         Ended::Failed(format!("stopped after {MAX_ITERATIONS} iterations"))
@@ -3208,6 +3333,10 @@ impl Agent {
     /// A call that has begun, run: the gate first (the rules, the person's approval, plan mode's limits), then the tool, and what follows from its result. A call of the model's own and one a program
     /// makes (`nested`) go through this alike; what is done with the result is for the caller to do: the first puts it in the conversation, the second gives it to the program.
     fn run_call(&mut self, id: &str, name: &str, arguments: &Value, nested: bool) -> Ran {
+        if self.round_goal.as_ref().is_some_and(|goal| goal.closing) && name != "goal_status" {
+            self.refusal = Some("refused_gate");
+            return Ran::turned_down("the goal is finished: write your answer to the user now, with no more calls".to_string(), 0);
+        }
         if nested && code_mode::NOT_CALLABLE.contains(&name) {
             self.refusal = Some("refused_gate");
             return Ran::turned_down(format!("{name} cannot be called from a program: call it directly"), 1);
@@ -3236,6 +3365,9 @@ impl Agent {
         }
         let special = match name {
             "submit_plan" => Some(self.submit_plan(arguments)),
+            "set_goal" => Some(self.set_goal(arguments)),
+            "goal_status" => Some(self.goal_status()),
+            "finish_goal" => Some(self.finish_goal(arguments)),
             "ask_user" => Some(self.ask_user(arguments)),
             "explore" => Some(self.explore(id, arguments)),
             "run_code" => Some(self.run_program(id, arguments)),
@@ -4509,10 +4641,69 @@ mod tests {
         assert!(parse_arguments("{not json").is_err());
     }
 
+    /// A goal the model sets keeps the turn going: where it stops with the goal open, the next round is sent, and the turn ends after finish_goal and the answer
+    /// that follows it. A goal marked blocked before its third round is refused with the rule; a question with no goal ends in one step.
+    #[test]
+    fn a_goal_keeps_the_turn_going_until_it_is_finished() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (client, bodies) = server(vec![
+            call_answer("set_goal", serde_json::json!({"objective": "make the page work"})),
+            text_answer("I have made a start."),
+            call_answer("finish_goal", serde_json::json!({"result": "blocked", "blocker": "it is hard"})),
+            call_answer("finish_goal", serde_json::json!({"result": "done", "evidence": "the page opened with no error"})),
+            text_answer("The page works: it opened with no error."),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("make the page work".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 5, "set, a stop that is sent on, a blocked refused, done, the answer: {log:?}");
+        let last_of = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string();
+        assert!(last_of(2).contains("Round 2 of 12. Objective: make the page work."), "{}", last_of(2));
+        assert!(last_of(3).contains("not blocked: this is round 2 of 12"), "{}", last_of(3));
+        assert!(last_of(4).contains("The goal is done. Write your answer to the user now"), "{}", last_of(4));
+        assert!(log.iter().any(|line| line.contains("The page works")), "{log:?}");
+        drop(bodies);
+        // A question: no goal, one step.
+        let (client, bodies) = server(vec![text_answer("Sunny.")]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("tomorrow's weather?".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+    }
+
+    /// A goal out of rounds ends with one step that answers, in which no call is made.
+    #[test]
+    fn a_goal_out_of_rounds_ends_with_an_answer_and_no_call() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (client, bodies) = server(vec![
+            call_answer("set_goal", serde_json::json!({"objective": "fix it", "rounds": 2})),
+            text_answer("Working."),
+            text_answer("Still working."),
+            call_answer("list_files", serde_json::json!({})),
+            text_answer("Here is where it stands."),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("fix it".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 5, "{log:?}");
+        let last_of = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string();
+        assert!(last_of(2).contains("Round 2 of 2."), "{}", last_of(2));
+        assert!(last_of(3).contains("The goal is at its last round. Write your answer to the user now"), "{}", last_of(3));
+        assert!(last_of(4).contains("the goal is finished: write your answer to the user now"), "the call in the closing step is not made: {}", last_of(4));
+    }
+
+    /// The user's goal is said once and kept with the session; a turn of theirs works toward it round after round, and met, it is cleared.
     #[test]
     fn a_goal_is_said_once_and_kept_with_the_session() {
         let dir = crate::in_container::tempdir().unwrap();
-        let (client, bodies) = server(vec![text_answer("on it"), text_answer("more")]);
+        let (client, bodies) = server(vec![
+            text_answer("on it"),
+            call_answer("finish_goal", serde_json::json!({"result": "done", "evidence": "the login page answers"})),
+            text_answer("shipped"),
+            text_answer("more"),
+        ]);
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::SetGoal(Some("  ship the login page  ".into()))).unwrap();
         let told = loop {
@@ -4530,13 +4721,16 @@ mod tests {
                 _ => {}
             }
         }
+        let file = file.expect("the session has a file");
+        assert_eq!(crate::session::goal_of(&file), None, "met, it is cleared from the session");
         run.handle.commands.send(Command::Send("go on".into())).unwrap();
         until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 4, "a round, done, its answer; then a turn of one step, with no goal");
         assert_eq!(bodies[0].to_string().matches("## Session Goal").count(), 1);
         assert_eq!(bodies[1].to_string().matches("## Session Goal").count(), 1, "said once, and held by the history after");
-        let file = file.expect("the session has a file");
-        assert_eq!(crate::session::goal_of(&file).as_deref(), Some("ship the login page"));
+        let last = bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+        assert!(last.contains("Round 2 of 12. Objective: ship the login page."), "{last}");
     }
 
     /// The cards' turns come in a reply of their own, never taken for the rewind panel's, and that reply and a turn's changes say which session they
@@ -4589,7 +4783,7 @@ mod tests {
         assert_eq!(second[3]["reasoning_content"], "thinking");
         assert!(bodies[0].get("tool_choice").is_none() && bodies[0].get("max_tokens").is_none());
         let tools = bodies[0]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 18, "the usual seventeen and the built-in skill tool");
+        assert_eq!(tools.len(), 21, "the usual twenty and the built-in skill tool");
         assert!(tools.iter().any(|tool| tool["function"]["name"] == "skill"));
     }
 
@@ -7202,7 +7396,7 @@ Body").unwrap();
         std::fs::write(dir.path().join("big.txt"), format!("{}\n", "y".repeat(100)).repeat(2000)).unwrap();
         let (run, provider) = scripted(dir.path(), vec![calls(&[("read_file", serde_json::json!({"path": "big.txt", "limit": 2000}))]), says("done")], Mode::Default);
         // A context that holds the prompt and not this file on top of it.
-        run.handle.commands.send(Command::Provider(provider.clone(), "model".into(), 7_000)).unwrap();
+        run.handle.commands.send(Command::Provider(provider.clone(), "model".into(), 7_600)).unwrap();
         run.handle.commands.send(Command::Send("read it".into())).unwrap();
         let (failed, _) = turn_said(&run);
         assert!(failed.is_empty(), "{failed:?}");
