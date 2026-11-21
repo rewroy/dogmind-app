@@ -1,6 +1,8 @@
 //! Opening a page of the workspace in a headless browser, inside the sandbox: what its scripts printed and threw, and what it shows. It is the same sandbox as any command's, with no
 //! network, so what a page takes from a CDN does not load; this says so plainly, as nothing else would tell: the page just sits there with no error.
 
+mod cdn;
+
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -1027,6 +1029,16 @@ struct Reading {
     seen: Option<String>,
     /// The last run was stopped by its time, still running the page: what it draws took longer than a run may, and it did not crash.
     timed_out: bool,
+    /// What the app fetched from CDNs for the page, and what it did not and why.
+    cdn: Option<CdnWords>,
+}
+
+/// What `cdn::for_page` came to, as the report says it.
+#[derive(Debug, Default)]
+struct CdnWords {
+    loaded: Vec<String>,
+    files: usize,
+    refused: Vec<(String, String)>,
 }
 
 /// The console's heading when none of the views asked for is the desktop's: the first block is still the console of a run at 1280x800, and under a plain "Console" a model that asked
@@ -1039,7 +1051,17 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
     let served = needs.is_none();
     let unknown = Needs::default();
     let needs = needs.unwrap_or(&unknown);
-    let mut out = if served { format!("{page_name} in headless {browser_name}, with no network but this machine's own servers.\n") } else { format!("{page_name} in headless {browser_name}, with no network.\n") };
+    let loaded = reading.cdn.as_ref().filter(|cdn| !cdn.loaded.is_empty());
+    let mut out = if served {
+        format!("{page_name} in headless {browser_name}, with no network but this machine's own servers.\n")
+    } else if loaded.is_some() {
+        format!("{page_name} in headless {browser_name}, with no network but the CDN files the app fetched for it.\n")
+    } else {
+        format!("{page_name} in headless {browser_name}, with no network.\n")
+    };
+    if let Some(cdn) = loaded {
+        out.push_str(&format!("Loaded from CDNs, fetched by the app: {} ({} files in all, with what they import).\n", cdn.loaded.join(", "), cdn.files));
+    }
     if let (false, Some(lost)) = (finished, &reading.steps_lost) {
         out.push_str(lost);
     } else if let (false, Some(words)) = (finished, &reading.not_loaded) {
@@ -1050,7 +1072,9 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
         out.push_str("NOT CHECKED: the browser crashed or was stopped each time it was tried. This browser sometimes crashes in the sandbox, whatever the page, and a big WebGL drawing stops it too, so this says nothing about the page. What it had said by then is below. Running this check again changes nothing, and do not install anything to check it another way: say in your answer that the page was not checked.\n");
     }
     if !needs.remote.is_empty() {
-        out.push_str(&format!("NOT LOADED, as a CDN library cannot load under this check: {}.\n", needs.remote.join(", ")));
+        let why = |address: &String| reading.cdn.as_ref().and_then(|cdn| cdn.refused.iter().find(|(refused, _)| refused == address)).map_or(String::new(), |(_, why)| format!(" ({why})"));
+        let listed: Vec<String> = needs.remote.iter().map(|address| format!("{address}{}", why(address))).collect();
+        out.push_str(&format!("NOT LOADED, as a check fetches only from well-known CDNs, and only what answers: {}.\n", listed.join(", ")));
     }
     if !needs.did_not_run.is_empty() {
         out.push_str(&format!("DID NOT RUN, as they need those, and nothing about them is known: {}. Do not set up another way to check them: say in your answer that they have not been run.\n", needs.did_not_run.join(", ")));
@@ -1107,7 +1131,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     let served = arguments.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty());
     let plain = |path: &Path| path.display().to_string().trim_start_matches("\\\\?\\").to_string();
     let root = std::fs::canonicalize(workspace).map_err(|error| format!("{}: {error}", workspace.display()))?;
-    let (page, name, needs) = match served {
+    let (page, name, mut needs) = match served {
         Some(url) => {
             if steps.is_some() {
                 return Err("steps run in a page file of the workspace: give its path rather than a url".to_string());
@@ -1157,12 +1181,34 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     }
     // (what this check makes in that folder goes when it ends, whichever way)
     let mut made = Removing(Vec::new());
+    // What the page loads from well-known CDNs, fetched by the app into the sandbox's folder (the check's browser has no network, and cannot reach the app
+    // on localhost either), and the page's copy pointing there. A page of three.js from unpkg was never run in a check, and a real model downloaded the
+    // library and ran Chrome outside the sandbox to see it.
+    let (mut source, mut fetched) = (None, None);
+    if let (Some(page), Some(temp)) = (&page, &temp) {
+        if let Ok(html) = page_html(page) {
+            let also = needs.as_ref().map_or(Vec::new(), |needs| needs.remote.clone());
+            let got = cdn::for_page(&html, &also, temp, &mut |address| cdn::get(address, cancel));
+            if let Some(needs) = needs.as_mut() {
+                needs.remote.retain(|address| !cdn::allowed(address).is_ok_and(|whole| got.loaded.contains(&whole)));
+                if needs.remote.is_empty() {
+                    let ran = std::mem::take(&mut needs.did_not_run);
+                    needs.run.extend(ran);
+                }
+            }
+            source = Some(got.html.clone());
+            fetched = Some(got);
+        }
+    }
     // With steps, what is opened is a copy of the page with them in it, in the sandbox's own folder, that reads the page's own files from where they are. A plain page of HTML is opened in a
     // copy too, with a script that says the words the browser shows of it (the DOM a dump gives does not know a rule of a style sheet); a page that cannot be copied is opened as it is.
     let (mut copy_name, mut opened) = (None, page.clone());
     if let (Some(page), Some(steps)) = (&page, steps) {
         let temp = temp.as_ref().ok_or("the sandbox's folder could not be found, so the steps could not be run")?;
-        let html = page_html(page).map_err(|error| format!("{name}: {error}"))?;
+        let html = match source.take() {
+            Some(html) => html,
+            None => page_html(page).map_err(|error| format!("{name}: {error}"))?,
+        };
         let base = file_url(page.parent().unwrap_or(workspace)) + "/";
         let run = next_run();
         let file_name = steps_page_of(&run);
@@ -1172,7 +1218,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         (copy_name, opened) = (Some(file_name), Some(copy));
     } else if let (Some(page), Some(temp), None) = (&page, &temp, steps) {
         let html_page = page.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm"));
-        if let (true, Ok(html)) = (html_page, page_html(page)) {
+        if let (true, Ok(html)) = (html_page, source.take().map_or_else(|| page_html(page), Ok)) {
             let base = file_url(page.parent().unwrap_or(workspace)) + "/";
             let file_name = steps_page_of(&next_run());
             let copy = temp.join(&file_name);
@@ -1296,7 +1342,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     };
     // (the words that the page the steps left said at their end are not of the page that is shown)
     let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
-    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen, timed_out: how == "timed out" };
+    let cdn = fetched.map(|fetched| CdnWords { loaded: fetched.loaded, files: fetched.files, refused: fetched.refused });
+    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen, timed_out: how == "timed out", cdn };
     let said = format!("{}{wait_cut}{shortened}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
@@ -1638,7 +1685,7 @@ mod tests {
         assert!(needs.local_module);
         let said = report("index.html", "Edge", true, Some(&needs), &[], "<html><body>hi</body></html>", &Reading::default());
         assert!(said.contains("DID NOT RUN"), "{said}");
-        assert!(said.contains("a CDN library cannot load"), "{said}");
+        assert!(said.contains("NOT LOADED, as a check fetches only from well-known CDNs"), "{said}");
         assert!(!said.contains("no errors"), "it does not say all is well of what did not run: {said}");
     }
 
