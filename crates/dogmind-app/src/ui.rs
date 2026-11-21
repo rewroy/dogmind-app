@@ -1009,6 +1009,8 @@ enum OverlayKey {
     Card(usize, usize),
     /// A picture of a message or an answer (`picture_blocks`) and its place among that message's pictures: opened beside the conversation.
     Picture(usize, usize),
+    /// The line that says how many pictures a call gave the model (`picture_blocks`): they are shown under it, or put away.
+    Pictures(usize),
 }
 
 /// Where an icon was drawn the last time the transcript was painted, in the transcript's own pixels.
@@ -1107,7 +1109,23 @@ struct PictureBlock {
     start: i32,
     paths: Vec<PathBuf>,
     tiles: attach::Tiles,
+    /// The pictures a call gave the model, with whether they are shown: a line with their number stands over them, and they are put away until it is pressed. None: a
+    /// message's or an answer's, shown as they are.
+    fold: Option<bool>,
+    /// Where its row is in the transcript, and what it was made with, to make it again at another height.
+    span: (i32, i32),
+    width: i32,
+    alone: bool,
+    right: bool,
 }
+
+/// The height of the line over a call's pictures that says how many there are, in twips.
+const PICTURES_LINE: i32 = 330;
+/// The room a block of pictures has at its sides and above them, in twips.
+const PICTURES_ACROSS: i32 = 200;
+const PICTURES_DOWN: i32 = 100;
+/// How wide the row of a call's pictures is while they are put away: room for the line that says how many, and no more.
+const PICTURES_SHUT_WIDTH: i32 = 1800;
 
 /// A small copy, and when it was last asked for.
 struct KeptThumb {
@@ -1803,7 +1821,7 @@ enum Shown {
     Block(String),
     /// The pictures of a message and their sizes, at the top of its card. `alone`: no text under them.
     /// `right`: what the person sent; otherwise what a tool opened for the model.
-    Pictures { pictures: Vec<(PathBuf, (i32, i32))>, width: i32, alone: bool, right: bool },
+    Pictures { pictures: Vec<(PathBuf, (i32, i32))>, width: i32, alone: bool, right: bool, folds: bool },
     /// Tool calls as one row: which of `runs`.
     Run(usize),
     /// A card that asks something of the person or shows something of the work, in the state it is in now.
@@ -2471,6 +2489,8 @@ struct App {
     attached_windows: Vec<HWND>,
     /// The pictures of the transcript's messages: drawn in its own paint, from the places that same frame gives their rooms.
     picture_blocks: Vec<PictureBlock>,
+    /// The calls' pictures the person has opened in this session, by their files: they stay open when the transcript is made again.
+    pictures_opened: HashSet<Vec<PathBuf>>,
     /// The small copies the view wants now: they are not the ones to be forgotten.
     thumb_wanted: std::collections::HashSet<(PathBuf, (i32, i32))>,
     thumbs: HashMap<(PathBuf, (i32, i32)), KeptThumb>,
@@ -3520,11 +3540,16 @@ impl App {
 
     /// RTF at the end of the transcript, its text in this colour.
     unsafe fn insert_rtf(&mut self, rtf: String, text_color: Option<u32>) -> i32 {
+        self.insert_rtf_span(rtf, text_color).0
+    }
+
+    /// `insert_rtf`, and where what went in ends.
+    unsafe fn insert_rtf_span(&mut self, rtf: String, text_color: Option<u32>) -> (i32, i32) {
         let bytes: Vec<u8> = rtf.into_bytes().into_iter().chain(std::iter::once(0)).collect();
         let how = SetTextEx { flags: ST_SELECTION, code_page: 65001 };
         let mut color = char_format(text_color.unwrap_or(0), 0, "", 0, None);
         color.mask = CFM_COLOR;
-        let mut first = 0;
+        let (mut first, mut last) = (0, 0);
         self.at_end(|edit| {
             let mut range = CharRange { first: 0, last: 0 };
             SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(range) as LPARAM);
@@ -3535,12 +3560,13 @@ impl App {
             let mut end = CharRange { first: 0, last: 0 };
             SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(end) as LPARAM);
             range.last = end.last;
+            last = end.last;
             if text_color.is_some() {
                 SendMessageW(edit, EM_EXSETSEL, 0, std::ptr::addr_of!(range) as LPARAM);
                 SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION as WPARAM, std::ptr::addr_of!(color) as LPARAM);
             }
         });
-        first
+        (first, last)
     }
 
     /// The transcript again, at the column's width now, with the view where it was.
@@ -3592,7 +3618,7 @@ impl App {
                 Shown::Code { line, language, open } => {
                     self.code_row(line, language, *open);
                 }
-                Shown::Pictures { pictures, width, alone, right } => self.append_pictures(pictures, (*width).min((self.text_twips * 4 / 5).max(800)), *alone, *right),
+                Shown::Pictures { pictures, width, alone, right, folds } => self.append_pictures(pictures, (*width).min((self.text_twips * 4 / 5).max(800)), *alone, *right, *folds),
                 Shown::Run(at) => self.write_run(*at),
                 Shown::Card(card) => self.write_card(card),
                 Shown::Block(code) => {
@@ -4515,7 +4541,11 @@ impl App {
         self.answers.iter_mut().for_each(|(place, _)| moved(place));
         self.user_cards.iter_mut().for_each(|card| moved(&mut card.start));
         self.rail_turns.iter_mut().for_each(|turn| moved(&mut turn.start));
-        self.picture_blocks.iter_mut().for_each(|block| moved(&mut block.start));
+        self.picture_blocks.iter_mut().for_each(|block| {
+            moved(&mut block.start);
+            moved(&mut block.span.0);
+            moved(&mut block.span.1);
+        });
         self.blocks.iter_mut().for_each(|block| moved(&mut block.at));
         self.card_slots.iter_mut().for_each(|slot| moved(&mut slot.start));
         for (from, to, _) in &mut self.links {
@@ -4638,7 +4668,7 @@ impl App {
         };
         let width = wanted.clamp(800, most);
         if !images.is_empty() {
-            self.append_pictures(images, width, lines.is_empty(), true);
+            self.append_pictures(images, width, lines.is_empty(), true, false);
         }
         if !lines.is_empty() {
             self.append_row(&rtf::Row { lines: &lines, face: UI_FACE, points: 11, color: theme::text(), back: theme::user_back(), width, right: true, column: self.text_twips, padding });
@@ -4699,7 +4729,7 @@ impl App {
         let sizes: Vec<(i32, i32)> = pictures.iter().map(|(_, size)| *size).collect();
         let tiles = attach::Tiles::of(&sizes, room as i32, self.dpi);
         let width = ((i64::from(tiles.total_width()) * 1440 / i64::from(self.dpi)) as i32 + 2 * ACROSS + 40).clamp(800, most);
-        self.append_pictures(pictures, width, true, false);
+        self.append_pictures(pictures, width, true, false, under_a_call);
         if under_a_call {
             self.append("\n", Style::Tool);
         }
@@ -4707,22 +4737,25 @@ impl App {
         self.para_next = Some(Para::AfterBlock);
     }
 
-    /// Room in a card for pictures, which come when they come into view: nothing is read now, however long the conversation.
-    unsafe fn append_pictures(&mut self, pictures: &[(PathBuf, (i32, i32))], width: i32, alone: bool, right: bool) {
+    /// Room in a card for pictures, which come when they come into view: nothing is read now, however long the conversation. `folds`: the pictures a call gave the model,
+    /// which are a line that says how many until it is pressed (they were a picture of each in the conversation, 37 in a session of a day). Those the person sent or an
+    /// answer shows are shown as they are.
+    unsafe fn append_pictures(&mut self, pictures: &[(PathBuf, (i32, i32))], width: i32, alone: bool, right: bool, folds: bool) {
         if !self.replaying {
-            self.shown.push(Shown::Pictures { pictures: pictures.to_vec(), width, alone, right });
+            self.shown.push(Shown::Pictures { pictures: pictures.to_vec(), width, alone, right, folds });
         }
-        const ACROSS: i32 = 200;
-        const DOWN: i32 = 100;
-        let room = i64::from(width - 2 * ACROSS) * i64::from(self.dpi) / 1440;
+        let room = i64::from(width - 2 * PICTURES_ACROSS) * i64::from(self.dpi) / 1440;
         let sizes: Vec<(i32, i32)> = pictures.iter().map(|(_, size)| *size).collect();
         let tiles = attach::Tiles::of(&sizes, room as i32, self.dpi);
-        // (the room above them is in the height of this row, and what is under them is the text's, or if none, this row's too)
-        let height = (i64::from(tiles.total_height()) * 1440 / i64::from(self.dpi)) as i32 + if alone { 2 * DOWN } else { DOWN };
+        let paths: Vec<PathBuf> = pictures.iter().map(|(path, _)| path.clone()).collect();
+        // (opened, they stay so when the transcript is made again at another width, until another session is opened)
+        let fold = folds.then(|| self.pictures_opened.contains(&paths));
+        let height = self.pictures_height(&tiles, alone, fold);
         let back = if right { theme::user_back() } else { theme::code_back() };
-        let first = self.insert_rtf(rtf::spacer_row(width, self.text_twips, height, back, (ACROSS, DOWN), right), None);
-        let start = text_start(self.transcript, first);
-        self.picture_blocks.push(PictureBlock { start, paths: pictures.iter().map(|(path, _)| path.clone()).collect(), tiles });
+        let shown_width = if fold == Some(false) { width.min(PICTURES_SHUT_WIDTH) } else { width };
+        let span = self.insert_rtf_span(rtf::spacer_row(shown_width, self.text_twips, height, back, (PICTURES_ACROSS, PICTURES_DOWN), right), None);
+        let start = text_start(self.transcript, span.0);
+        self.picture_blocks.push(PictureBlock { start, paths, tiles, fold, span, width, alone, right });
         // (a message's card begins at its pictures, whether words follow them or not)
         if alone || right {
             self.user_cards.push(UserCard { start, kind: if right { CardKind::Person } else { CardKind::Block }, shape: None, looked_at: None });
@@ -4734,6 +4767,62 @@ impl App {
                 self.place_rail();
             }
         }
+    }
+
+    /// How tall a block of pictures' row is, in twips: the room above them is in it, and what is under them is the text's, or if none, this row's too. A call's
+    /// pictures have the line that says how many over them, and put away they are that line alone.
+    fn pictures_height(&self, tiles: &attach::Tiles, alone: bool, fold: Option<bool>) -> i32 {
+        let line = if fold.is_some() { PICTURES_LINE } else { 0 };
+        let shown = if fold == Some(false) { 0 } else { (i64::from(tiles.total_height()) * 1440 / i64::from(self.dpi)) as i32 };
+        line + shown + if alone { 2 * PICTURES_DOWN } else { PICTURES_DOWN }
+    }
+
+    /// A call's pictures shown or put away where they stand. The row is made again at its new height in its place: it is as many characters as it was, so that
+    /// nothing after it moves in the text, and the view stays where it is.
+    unsafe fn toggle_pictures(&mut self, at: usize) {
+        let Some(block) = self.picture_blocks.get(at) else { return };
+        let Some(open) = block.fold else { return };
+        let (open, paths) = (!open, block.paths.clone());
+        if open {
+            self.pictures_opened.insert(paths);
+        } else {
+            self.pictures_opened.remove(&paths);
+        }
+        let block = &self.picture_blocks[at];
+        let height = self.pictures_height(&block.tiles, block.alone, Some(open));
+        let back = if block.right { theme::user_back() } else { theme::code_back() };
+        let shown_width = if open { block.width } else { block.width.min(PICTURES_SHUT_WIDTH) };
+        let row = rtf::spacer_row(shown_width, self.text_twips, height, back, (PICTURES_ACROSS, PICTURES_DOWN), block.right);
+        let (first, last) = block.span;
+        let edit = self.transcript;
+        let mut position = POINT { x: 0, y: 0 };
+        SendMessageW(edit, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
+        let mut selection = CharRange { first: 0, last: 0 };
+        SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(selection) as LPARAM);
+        redraw(edit, false);
+        let bytes: Vec<u8> = row.into_bytes().into_iter().chain(std::iter::once(0)).collect();
+        let how = SetTextEx { flags: ST_SELECTION, code_page: 65001 };
+        let range = CharRange { first, last };
+        SendMessageW(edit, EM_EXSETSEL, 0, std::ptr::addr_of!(range) as LPARAM);
+        SendMessageW(edit, EM_SETTEXTEX, std::ptr::addr_of!(how) as WPARAM, bytes.as_ptr() as LPARAM);
+        let mut end = CharRange { first: 0, last: 0 };
+        SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(end) as LPARAM);
+        // (a row of another length would leave what follows at other places: the places are found again from the text, as a reflow does)
+        let same = end.last == last;
+        SendMessageW(edit, EM_EXSETSEL, 0, std::ptr::addr_of!(selection) as LPARAM);
+        SendMessageW(edit, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
+        redraw(edit, true);
+        if let Some(block) = self.picture_blocks.get_mut(at) {
+            block.fold = Some(open);
+        }
+        if !same {
+            self.reflow();
+        }
+        InvalidateRect(edit, std::ptr::null(), 0);
+        if self.find_open {
+            self.find_scan();
+        }
+        self.place_thumb();
     }
 
     /// A small copy of a file at a size, from what is kept, or asked for on another thread and not there yet.
@@ -5277,6 +5366,7 @@ impl App {
                     self.open_picture(&path);
                 }
             }
+            OverlayKey::Pictures(block) => self.toggle_pictures(block),
         }
     }
 
@@ -5289,6 +5379,7 @@ impl App {
             OverlayKey::Run(_) => t("Show or hide these calls").to_string(),
             OverlayKey::Card(slot, part) => self.card_slots.get(slot).and_then(|room| room.parts.get(part)).map_or(String::new(), card_part_words),
             OverlayKey::Picture(block, at) => self.picture_blocks.get(block).and_then(|block| block.paths.get(at)).map_or(String::new(), |path| file_name_of(path)),
+            OverlayKey::Pictures(_) => t("Show or hide the pictures the model looked at").to_string(),
         }
     }
 
@@ -5388,9 +5479,17 @@ impl App {
             if point.y >= height {
                 continue;
             }
+            // (a call's: the line that says how many, and the pictures under it when they are shown)
+            let line = if block.fold.is_some() { (i64::from(PICTURES_LINE) * i64::from(dpi) / 1440) as i32 } else { 0 };
+            if block.fold.is_some() {
+                found.push(OverlayHit { area: picture_area(point, (0, 0), (scale(dpi, 160), line), dpi), key: OverlayKey::Pictures(at) });
+            }
+            if block.fold == Some(false) {
+                continue;
+            }
             for (index, path) in block.paths.iter().enumerate() {
                 let (x, y) = block.tiles.at(index);
-                let area = picture_area(point, (x, y), (block.tiles.width, block.tiles.height), dpi);
+                let area = picture_area(point, (x, y + line), (block.tiles.width, block.tiles.height), dpi);
                 if tile_is_in_view(&area, height) && wanted.len() < PICTURES_IN_VIEW {
                     found.push(OverlayHit { area, key: OverlayKey::Picture(at, index) });
                     wanted.push((path.clone(), (block.tiles.width, block.tiles.height)));
@@ -5432,6 +5531,20 @@ impl App {
                 }
                 continue;
             }
+            if let OverlayKey::Pictures(block) = key {
+                let Some((count, open)) = self.picture_blocks.get(block).map(|block| (block.paths.len(), block.fold == Some(true))) else { continue };
+                if lit || pressed {
+                    rounded(device, area, scale(dpi, ds::radius::SMALL), Some(if pressed { theme::raised() } else { theme::surface() }), None);
+                }
+                let mark = scale(dpi, ds::size::ICON) + scale(dpi, ds::space::S);
+                let color = if lit || pressed { theme::text() } else { theme::muted() };
+                icon::draw(device, if open { "chevron-down" } else { "chevron-right" }, RECT { left: area.left, top: area.top, right: area.left + mark, bottom: area.bottom }, scale(dpi, ds::size::ICON_SMALL), color);
+                draw_text(device, &tf("{0} pictures", &[&count]), RECT { left: area.left + mark, top: area.top, right: area.right, bottom: area.bottom }, self.fonts.small, color, ONE_LINE);
+                if ring && focused == Some(key) {
+                    rounded(device, RECT { left: area.left + 1, top: area.top + 1, right: area.right - 1, bottom: area.bottom - 1 }, scale(dpi, ds::radius::SMALL), None, Some(theme::accent()));
+                }
+                continue;
+            }
             if let OverlayKey::Picture(block, index) = key {
                 let Some((path, room)) = self.picture_blocks.get(block).and_then(|block| block.paths.get(index).map(|path| (path.clone(), (block.tiles.width, block.tiles.height)))) else { continue };
                 let thumb = self.thumb_of(&path, room);
@@ -5458,7 +5571,7 @@ impl App {
                 OverlayKey::Copy(_) | OverlayKey::Block(_) => "copy",
                 OverlayKey::Fork(_) => "git-branch",
                 OverlayKey::Run(at) if self.runs[at].expanded => "chevron-down",
-                OverlayKey::Run(_) | OverlayKey::Card(..) | OverlayKey::Picture(..) => "chevron-right",
+                OverlayKey::Run(_) | OverlayKey::Card(..) | OverlayKey::Picture(..) | OverlayKey::Pictures(_) => "chevron-right",
             };
             // As an icon button of the window draws: a shade under it when the pointer is on it, one up on a card of a block of code.
             if lit || pressed {
@@ -12935,6 +13048,7 @@ impl App {
         self.rail_turns.clear();
         self.turn_words_due = false;
         self.picture_blocks.clear();
+        self.pictures_opened.clear();
         self.blocks.clear();
         self.card_slots.clear();
         self.open_block = None;
@@ -18031,6 +18145,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             attached_windows: (0..attach::MOST_IMAGES).map(|at| make_button(window, ID_ATTACHED + at as isize, "", ButtonKind::Attached, theme::surface())).collect(),
             thumb_wanted: std::collections::HashSet::new(),
             picture_blocks: Vec::new(),
+            pictures_opened: HashSet::new(),
             thumbs: HashMap::new(),
             thumb_clock: 0,
             vision: None,

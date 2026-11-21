@@ -1130,6 +1130,7 @@ const JA: &[(&str, &str)] = &[
     ("This model on this PC cannot see pictures: it has no vision file. Not every model has one. If yours does, put its mmproj-*.gguf beside the model, in {0}, and start the engine again.", "この PC のモデルにはビジョンファイルがないため、画像を読めません。ビジョンファイルのないモデルもあります。お使いのモデルにある場合は、mmproj-*.gguf をモデルと同じ場所 ({0} の中) に置いて、エンジンを起動し直してください。"),
     // The transcript and its controls.
     ("{0} pictures", "画像 {0} 枚"),
+    ("Show or hide the pictures the model looked at", "モデルが見た画像を表示する・しまう"),
     ("Delete this session", "このセッションを削除する"),
     ("Stopped\n", "停止しました\n"),
     ("Connecting…", "接続しています…"),
