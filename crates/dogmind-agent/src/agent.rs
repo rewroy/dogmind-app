@@ -4293,8 +4293,10 @@ mod tests {
         let file = std::fs::read_dir(sessions.path()).unwrap().flatten().map(|entry| entry.path()).find(|path| path.extension().is_some_and(|ext| ext == "jsonl")).expect("a session");
         // (b.txt changes while the app is closed)
         std::fs::write(dir.path().join("b.txt"), "one\nTWO\n").unwrap();
-        let patch = |name: &str| serde_json::json!({"edits": [{"path": name, "old_string": "one", "new_string": "ONE"}]});
-        let (client, _) = server(vec![call_answer("apply_patch", patch("a.txt")), call_answer("apply_patch", patch("b.txt")), text_answer("done")]);
+        // (a whole write of a file that is there is what asks for it to be as it was read: b.txt, read before the restart, is known to have changed since)
+        let patch = serde_json::json!({"edits": [{"path": "a.txt", "old_string": "one", "new_string": "ONE"}]});
+        let write = serde_json::json!({"path": "b.txt", "content": "ONE\ntwo\n"});
+        let (client, _) = server(vec![call_answer("apply_patch", patch), call_answer("create_file", write), text_answer("done")]);
         let run = run_agent(dir.path(), client, Mode::Auto);
         run.handle.commands.send(Command::Resume(file)).unwrap();
         loop {

@@ -1089,7 +1089,12 @@ impl Workbench {
     /// Every edit is validated against the text before anything is written; then the files change together, or, when a
     /// write fails, those already written go back.
     fn apply_patch(&mut self, arguments: &Value, workspace: &Path) -> Result<String, String> {
-        let edits = arguments.get("edits").and_then(Value::as_array).filter(|edits| !edits.is_empty())
+        // (a list written as a string of JSON is the list: a model sent its edits so twice in one conversation, and each was refused and sent again)
+        let unwrapped = match arguments.get("edits") {
+            Some(Value::String(text)) => serde_json::from_str::<Value>(text).ok().filter(Value::is_array),
+            _ => None,
+        };
+        let edits = unwrapped.as_ref().or(arguments.get("edits")).and_then(Value::as_array).filter(|edits| !edits.is_empty())
             .ok_or("edits is required: a list of {path, old_string, new_string}")?;
         let expected: Vec<&str> = arguments.get("expected_files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
         let mut files: Vec<PatchFile> = Vec::new();
@@ -1112,14 +1117,10 @@ impl Workbench {
                     if !path.exists() {
                         return Err(format!("{}: it does not exist: nothing was changed", path.display()));
                     }
-                    // (first, as in `create_file`)
-                    let Some(known) = self.seen.get(&path) else {
-                        return Err(format!("{given} has not been read in this session: read it first; nothing was changed"));
-                    };
+                    // (no read is asked for, nor that the file is as it was read: old_string has to be there as often as asked, as it is now, and that is
+                    // what keeps an edit to what the model knows of the file. A file the model had written itself and knew to the byte was refused for not
+                    // having been read in the session, and 5,207 characters were sent again after a read for nothing.)
                     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}: nothing was changed", path.display()))?;
-                    if *known != sha16(&bytes) {
-                        return Err(format!("{given} changed since it was read: read it again; nothing was changed"));
-                    }
                     let Some((mut text, encoding)) = text_of_file(&bytes) else {
                         return Err(format!("{given} is binary: nothing was changed"));
                     };
@@ -1517,14 +1518,35 @@ fn nearest_line(text: &str, old: &str) -> String {
     if !places.is_empty() {
         return format!(". Its first line is at line {}, spaced differently or followed by other lines: read there", places.join(", "));
     }
-    // One character different, as a Chinese form for a Japanese one, is what it cannot see in what it read: the line itself, to copy from, with no read for it.
-    let wanted: Vec<char> = first.chars().collect();
-    let shared = |line: &str| line.chars().filter(|letter| !letter.is_whitespace() && wanted.contains(letter)).count();
-    let best = text.lines().enumerate().map(|(at, line)| (shared(line), at, line)).max_by_key(|(count, at, _)| (*count, std::cmp::Reverse(*at)));
+    // One character different, as a Chinese form for a Japanese one, or one word, is what it cannot see in what it read: the line itself, to copy from, with no read for it.
+    // How alike two lines are is how many of their pairs of letters they share, against how many they have: a long line that holds the same letters elsewhere is not
+    // like the line. (By the letters alone, a long line of the file won over the line that differed by one word, and the model was shown that one.)
+    let wanted = letter_pairs(&first);
+    let best = text.lines().enumerate().map(|(at, line)| (alike(&wanted, &letter_pairs(&squeeze(line))), at, line)).max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
     match best {
-        Some((count, at, line)) if count * 10 >= wanted.iter().filter(|letter| !letter.is_whitespace()).count() * 6 => format!(". The nearest is line {}, character for character: {}", at + 1, line.trim().chars().take(160).collect::<String>()),
+        Some((score, at, line)) if score >= 0.6 => format!(". The nearest is line {}, character for character: {}", at + 1, line.trim().chars().take(240).collect::<String>()),
         _ => String::new(),
     }
+}
+
+/// A line's pairs of letters, each as often as it is there.
+fn letter_pairs(line: &str) -> HashMap<(char, char), usize> {
+    let letters: Vec<char> = line.chars().collect();
+    let mut pairs = HashMap::new();
+    for pair in letters.windows(2) {
+        *pairs.entry((pair[0], pair[1])).or_insert(0) += 1;
+    }
+    pairs
+}
+
+/// How alike two lines are, from 0 to 1, by the pairs of letters they share (Dice's measure).
+fn alike(one: &HashMap<(char, char), usize>, other: &HashMap<(char, char), usize>) -> f64 {
+    let (total_one, total_other): (usize, usize) = (one.values().sum(), other.values().sum());
+    if total_one + total_other == 0 {
+        return 0.0;
+    }
+    let shared: usize = one.iter().map(|(pair, count)| (*count).min(other.get(pair).copied().unwrap_or(0))).sum();
+    2.0 * shared as f64 / (total_one + total_other) as f64
 }
 
 /// Han characters no Japanese text is written with: a local model's Chinese comes through in the middle of good Japanese, one word at a time, and it does not see it unless told.
@@ -3780,17 +3802,36 @@ mod tests {
         assert!(bench.run("read_file", &json!({"path": "b.bin"}), dir.path(), &cancel).is_err());
     }
 
+    /// Edits written as a string of JSON are taken as the list they are, and a patch to a file not read in the session goes through where its text is there.
     #[test]
-    fn a_patch_needs_a_read_of_what_is_there_and_is_all_or_nothing() {
+    fn edits_written_as_a_string_are_the_list_and_no_read_is_asked_for() {
+        let (dir, mut bench, cancel) = bench();
+        std::fs::write(dir.path().join("page.html"), "<p>one</p>\n<p>two</p>\n").unwrap();
+        let listed = serde_json::to_string(&json!([{"path": "page.html", "old_string": "<p>two</p>", "new_string": "<p>2</p>"}])).unwrap();
+        bench.run("apply_patch", &json!({"edits": listed}), dir.path(), &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("page.html")).unwrap(), "<p>one</p>\n<p>2</p>\n");
+        assert!(bench.run("apply_patch", &json!({"edits": "not a list"}), dir.path(), &cancel).unwrap_err().contains("edits is required"));
+    }
+
+    /// An edit whose line differs by a word is shown the line it differs from, not a longer line that only holds the same letters.
+    #[test]
+    fn the_nearest_line_is_the_one_most_like_it() {
+        let text = "for (toggle, on) in [(self.toggle_thinking, self.settings.show_thinking), (self.toggle_compact, self.settings.compact_tools), (self.toggle_safe, self.settings.safe_commands)] {\n\
+                    let edit = CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_POPUP | ES_MULTILINE, 0, 0, 700, 500, std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null());\n";
+        let old = "let edit = CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_POPUP | ES_MULTILINE, 0, 0, 700, 500, std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null_mut());";
+        let said = nearest_line(text, old);
+        assert!(said.starts_with(". The nearest is line 2,"), "{said}");
+        assert_eq!(nearest_line(text, "nothing at all like either of them"), "");
+    }
+
+    #[test]
+    fn a_patch_goes_by_what_is_there_and_is_all_or_nothing() {
         let (dir, mut bench, cancel) = bench();
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "alpha\nbeta\n").unwrap();
         let edit = json!({"edits": [{"path": "a.txt", "old_string": "alpha", "new_string": "ALPHA"}], "expected_files": ["a.txt"]});
-        assert!(bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap_err().contains("not been read"));
-        bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
+        // (what is there is what counts: no read is asked for, and a file changed since it was read takes an edit whose text is still there)
         std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
-        assert!(bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap_err().contains("changed since"));
-        bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
         let bad = json!({"edits": [{"path": "a.txt", "old_string": "alpha", "new_string": "ALPHA"}, {"path": "a.txt", "old_string": "nowhere", "new_string": "x"}], "expected_files": ["a.txt"]});
         assert!(bench.run("apply_patch", &bad, dir.path(), &cancel).unwrap_err().contains("nothing was changed"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\nbeta\ngamma\n");
