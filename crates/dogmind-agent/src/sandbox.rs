@@ -1074,7 +1074,7 @@ pub(crate) fn owned_by_another(path: &Path) -> Option<String> {
     }
 }
 
-/// An account's name as Windows gives it, with its domain or machine: `DOGMIND\CodexSandboxOffline`.
+/// An account's name as Windows gives it, with its domain or machine: `MACHINE\CodexSandboxOffline`.
 unsafe fn account_name(sid: PSID) -> Option<String> {
     let (mut name, mut domain) = ([0u16; 256], [0u16; 256]);
     let (mut name_length, mut domain_length, mut kind) = (name.len() as u32, domain.len() as u32, 0);
