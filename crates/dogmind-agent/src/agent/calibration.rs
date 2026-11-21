@@ -160,7 +160,7 @@ fn rows_of(root: &Path) -> Vec<Row> {
                 let wrote = written(message);
                 let put: BTreeSet<&str> = wrote.lines().map(str::trim).collect();
                 let true_draft = !wrote.trim().is_empty() && own.len() >= 8 && own.iter().filter(|line| put.contains(*line)).count() * 2 >= own.len();
-                let (mut old, mut new) = (old::DraftWatch::new(shown.clone()), DraftWatch::new(shown));
+                let (mut old, mut new) = (old::DraftWatch::new(shown.clone()), DraftWatch::new(shown, DRAFT_LINES));
                 let (old_fires, new_fires) = (old.is_a_draft(reasoning), new.is_a_draft(reasoning));
                 let asked = messages[..at].iter().rev().find(|message| message.role == "user" && !message.content.as_deref().is_some_and(prompt::is_nudge)).and_then(|message| message.content.as_deref()).unwrap_or("");
                 let watched = !prompt::forbids_changes(prompt::typed_text(asked));
@@ -199,7 +199,7 @@ const STOP_AT: [usize; 7] = [20, 30, 40, 50, 60, 80, 100];
 /// Where, in characters of the reasoning, its run of code of its own first reached each of [`STOP_AT`]: the point a stop at that size would have
 /// fired, fed as it streams, a line at a time. None where it never did.
 fn reached(shown: BTreeSet<String>, reasoning: &str) -> [Option<usize>; 7] {
-    let mut watch = DraftWatch::new(shown);
+    let mut watch = DraftWatch::new(shown, DRAFT_LINES);
     let mut at = [None; 7];
     let mut end = 0;
     for line in reasoning.split_inclusive('\n') {
@@ -242,7 +242,7 @@ fn calibrate_where_a_draft_reaches_each_size() {
                 let true_draft = !wrote.trim().is_empty() && own.len() >= 8 && own.iter().filter(|line| put.contains(*line)).count() * 2 >= own.len();
                 let asked = messages[..at].iter().rev().find(|message| message.role == "user" && !message.content.as_deref().is_some_and(prompt::is_nudge)).and_then(|message| message.content.as_deref()).unwrap_or("");
                 let watched = !prompt::forbids_changes(prompt::typed_text(asked));
-                let mut whole = DraftWatch::new(shown.clone());
+                let mut whole = DraftWatch::new(shown.clone(), DRAFT_LINES);
                 whole.is_a_draft(&format!("{reasoning}\n"));
                 let at_sizes = reached(shown, reasoning);
                 let cell = |value: Option<usize>| value.map_or("-".to_string(), |chars| chars.to_string());
