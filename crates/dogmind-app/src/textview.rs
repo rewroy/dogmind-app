@@ -663,8 +663,11 @@ unsafe extern "system" fn create_caret(this: *mut Host, bitmap: HBITMAP, _width:
     CreateCaret(window, picture, width, height)
 }
 
+/// A text that is only read (the conversation) shows no caret: it is read and selected, never typed in, and a caret blinking in it was in the way (the
+/// owner, 2026-11-22). Its selection is drawn as before.
 unsafe extern "system" fn show_caret(this: *mut Host, show: i32) -> i32 {
-    if show != 0 { ShowCaret(host(this).window) } else { HideCaret(host(this).window) }
+    let host = host(this);
+    if show != 0 && host.style() & ES_READONLY == 0 { ShowCaret(host.window) } else { HideCaret(host.window) }
 }
 unsafe extern "system" fn set_caret_pos(_this: *mut Host, x: i32, y: i32) -> i32 {
     SetCaretPos(x, y)
