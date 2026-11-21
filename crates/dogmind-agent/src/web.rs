@@ -26,7 +26,8 @@ use crate::http::{self, Failure, Url};
 pub const WARNING_MARK: &str = "[Warning: this text has passages that read like instructions to an AI";
 const USER_AGENT: &str = concat!("DogmindApp/", env!("CARGO_PKG_VERSION"), " (desktop agent; reads a page when its user asks)");
 const BLOCK: &str = "untrusted_web_content";
-const MAX_REDIRECTS: usize = 5;
+/// A browser follows twenty; sites that send a reader on through a check of its region or a consent page and back take more than five.
+const MAX_REDIRECTS: usize = 10;
 const MAX_BODY: usize = 5 << 20;
 const MAX_DECODED: u64 = 20 << 20;
 /// A page's text at a time: `start_char` reads on. A local model takes half a minute to read 24,000 characters, each time.
@@ -459,14 +460,30 @@ fn follow(url: &str, headers: &[(String, String)], settings: &WebSettings, stop:
     all.extend_from_slice(headers);
     // (the time `get` allows the whole of it, as far as a name lookup waits)
     let until = Instant::now() + FETCH_LIMIT;
+    // The cookies a site sets on the way, by its host, sent back to it on the next step: a site that sets one and sends the reader to the same page again, to be
+    // read with it, sent a reader with none round and round (four pages of a person's searches, a weather page among them, ended at the limit of redirects).
+    let mut cookies: Vec<(String, String, String)> = Vec::new();
     for _ in 0..=MAX_REDIRECTS {
         let target = target_of(&current, settings).map_err(Failure::Connect)?;
         let addresses = pin(&target, settings, stop, until)?;
-        let mut response = http::request_at(&addresses, "GET", &target, &all, None, CONNECT, stop)?;
+        let mut sent = all.clone();
+        let host = target.host_for_header();
+        let jar: Vec<String> = cookies.iter().filter(|(of, _, _)| *of == host).map(|(_, name, value)| format!("{name}={value}")).collect();
+        if !jar.is_empty() {
+            sent.push(("Cookie".to_string(), jar.join("; ")));
+        }
+        let mut response = http::request_at(&addresses, "GET", &target, &sent, None, CONNECT, stop)?;
+        for set in response.headers_named("set-cookie") {
+            if let Some((name, value)) = set.split(';').next().and_then(|pair| pair.split_once('=')) {
+                let (name, value) = (name.trim().to_string(), value.trim().to_string());
+                cookies.retain(|(of, known, _)| !(*of == host && *known == name));
+                cookies.push((host.clone(), name, value));
+            }
+        }
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             if let Some(next) = response.header("location").and_then(|location| join_address(&current, location)) {
-                // The same address again is asked for the same answer, so it is a loop: said now, not after the limit.
-                if same_address(&target, &next, settings) {
+                // The same address again, with no cookie it did not have, is asked for the same answer, so it is a loop: said now, not after the limit.
+                if same_address(&target, &next, settings) && response.headers_named("set-cookie").next().is_none() {
                     return Err(Failure::Stream(format!("{current}: the site redirects this address to itself")));
                 }
                 current = next;
@@ -1311,12 +1328,35 @@ mod tests {
         }
     }
 
+    /// A site that sets a cookie and sends the reader to the same page, to be read with it, is read: the cookie goes back to it on the next step.
+    #[test]
+    fn a_cookie_set_on_the_way_goes_back_to_the_site() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().take(3).flatten() {
+                let mut buffer = [0u8; 4096];
+                let read = std::io::Read::read(&mut stream, &mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
+                let answer = if request.contains("\r\ncookie: seen=1") {
+                    let body = "<html><body><p>tomorrow: sunny</p></body></html>";
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                } else {
+                    "HTTP/1.1 302 Found\r\nLocation: /page\r\nSet-Cookie: seen=1; Path=/; HttpOnly\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+                let _ = std::io::Write::write_all(&mut stream, answer.as_bytes());
+            }
+        });
+        let said = local().read(&json!({"url": format!("{base}/page")}), &AtomicBool::new(false)).unwrap();
+        assert!(said.contains("tomorrow: sunny"), "{said}");
+    }
+
     /// A circle through two addresses is not the same address again, and ends at the limit as it did.
     #[test]
     fn a_circle_of_two_addresses_still_ends_at_the_limit() {
         let (base, asked) = serve_by_path(|path| redirect_answer("302 Found", if path == "/one" { "/two" } else { "/one" }));
         let said = local().read(&json!({"url": format!("{base}/one")}), &AtomicBool::new(false)).unwrap_err();
-        assert!(said.contains("more than 5 redirects"), "{said}");
+        assert!(said.contains(&format!("more than {MAX_REDIRECTS} redirects")), "{said}");
         assert_eq!(asked.lock().unwrap().len(), MAX_REDIRECTS + 1);
     }
 

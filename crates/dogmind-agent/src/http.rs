@@ -367,6 +367,11 @@ impl Response<'_> {
         self.headers.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str())
     }
 
+    /// Every value of a header that may come more than once, as Set-Cookie does.
+    pub fn headers_named<'s>(&'s self, name: &'s str) -> impl Iterator<Item = &'s str> + 's {
+        self.headers.iter().filter(move |(known, _)| known == name).map(|(_, value)| value.as_str())
+    }
+
     /// More bytes off the socket into the buffer; `false` when the server has closed.
     fn fill(&mut self) -> Result<bool, Failure> {
         let started = Instant::now();
