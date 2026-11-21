@@ -36,12 +36,15 @@ fn main() {
     // `--instructions FILE`, `--language LANG`, `--skills-off a,b`: the person's own instructions, answer language and skills turned off, as their settings
     // give them, to run a job as they would.
     let (mut instructions, mut language, mut skills_off): (Option<PathBuf>, String, Vec<String>) = (None, "auto".to_string(), Vec::new());
+    // `--web`: web search and reading are offered, as with the person's setting on.
+    let mut web = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--refuse" => refuse = true,
             "--code-mode" => code_mode = true,
             "--effort" => effort = args.next().filter(|level| !level.is_empty()),
             "--instructions" => instructions = args.next().map(PathBuf::from),
+            "--web" => web = true,
             "--language" => language = args.next().unwrap_or_else(|| "auto".to_string()),
             "--skills-off" => skills_off = args.next().unwrap_or_default().split(',').map(str::trim).filter(|name| !name.is_empty()).map(str::to_string).collect(),
             "--warm-wait" => warm_wait = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
@@ -93,7 +96,7 @@ fn main() {
         rules: data.join("permissions.json"),
         mode,
         effort: effort.clone(),
-        web: WebSettings::default(),
+        web: WebSettings { enabled: web, ..WebSettings::default() },
         language: language.clone(),
         japanese_system: false,
         instructions: instructions.clone(),
