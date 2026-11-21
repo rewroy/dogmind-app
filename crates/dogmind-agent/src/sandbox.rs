@@ -1901,7 +1901,7 @@ fn environment(temp: Option<&Path>, workspace: &Path, offline: bool, as_person: 
     let mut block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, build_tools);
     // (as the person, git reads their own settings and Python starts as it does for them: what stands in for those in the sandbox is not for them)
     if as_person {
-        block.retain(|(name, _)| !["XDG_CONFIG_HOME", "PYTHONPATH", "GIT_CONFIG_GLOBAL", POWERSHELL_POLICY.0].iter().any(|kept_out| name.eq_ignore_ascii_case(kept_out)));
+        block.retain(|(name, _)| !["XDG_CONFIG_HOME", "PYTHONPATH", "GIT_CONFIG_GLOBAL", POWERSHELL_POLICY.0, NO_ZONE_CHECKS.0].iter().any(|kept_out| name.eq_ignore_ascii_case(kept_out)));
         their_git_first(&mut block, &std::env::var("PATH").unwrap_or_default(), crate::bundled::root().as_deref());
         // (their credential helper may not ask anything on a desktop nobody sees: what it has stored is used, and without it the push fails at once and says so)
         block.push(("GCM_INTERACTIVE".to_string(), "never".to_string()));
@@ -1965,12 +1965,19 @@ fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, t
     // process and what it starts, it is not asked)
     block.retain(|(name, _)| !name.eq_ignore_ascii_case(POWERSHELL_POLICY.0));
     block.push((POWERSHELL_POLICY.0.to_string(), POWERSHELL_POLICY.1.to_string()));
+    // (a program a command starts the way a person's shell does, Start-Process among them, was checked for where it came from, and the question about it, "Open
+    // File - Security Warning", was put on the command's desktop, where nobody sees it: the command waited until it was stopped, a session's screenshot script
+    // among them. Its own question keeps no one out of anything here: what it starts runs in the same sandbox)
+    block.retain(|(name, _)| !name.eq_ignore_ascii_case(NO_ZONE_CHECKS.0));
+    block.push((NO_ZONE_CHECKS.0.to_string(), NO_ZONE_CHECKS.1.to_string()));
     block.sort_by_key(|(name, _)| name.to_uppercase());
     block
 }
 
 /// The execution policy a command's PowerShell takes, for itself and what it starts: see `environment_block`.
 const POWERSHELL_POLICY: (&str, &str) = ("PSExecutionPolicyPreference", "Bypass");
+/// No question of where a program came from, when a command starts one through the shell: see `environment_block`.
+const NO_ZONE_CHECKS: (&str, &str) = ("SEE_MASK_NOZONECHECKS", "1");
 
 /// The folders on the PATH a command starts with, in order, made as `environment_block` makes it: the bundled tools, the machine's without a person's own Python, Node or Git and without MSYS
 /// or Cygwin folders, and then Visual Studio's. Only the PATH is made: `environment_block` goes on to ask git for a name and to write a config file, which a question about a name in a command
@@ -3404,8 +3411,9 @@ mod tests {
         let place = crate::in_container::tempdir().unwrap();
         let block = environment_block(Vec::new(), None, place.path().display().to_string(), place.path(), || None);
         assert!(block.iter().any(|(name, value)| name == POWERSHELL_POLICY.0 && value == "Bypass"), "{block:?}");
-        let theirs = String::from_utf16_lossy(&environment(Some(place.path()), place.path(), false, true, || None));
-        assert!(!theirs.to_ascii_lowercase().contains("psexecutionpolicypreference"), "{theirs}");
+        assert!(block.iter().any(|(name, value)| name == NO_ZONE_CHECKS.0 && value == "1"), "no question nobody can answer: {block:?}");
+        let theirs = String::from_utf16_lossy(&environment(Some(place.path()), place.path(), false, true, || None)).to_ascii_lowercase();
+        assert!(!theirs.contains("psexecutionpolicypreference") && !theirs.contains("see_mask_nozonechecks"), "{theirs}");
     }
 
     #[test]
