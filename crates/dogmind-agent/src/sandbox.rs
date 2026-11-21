@@ -686,6 +686,27 @@ unsafe fn prepare_restricted(workspace: &Path, writer: PSID, temp: Option<&Path>
 static PROFILE_SID: Mutex<Option<Sid>> = Mutex::new(None);
 static GRANTED: Mutex<Option<HashSet<(String, u32, bool)>>> = Mutex::new(None);
 
+/// Whether this process runs in an AppContainer itself: a project's own tests that run commands, run by a command of the app's, or the app built and run
+/// so. A container cannot make a window station, a desktop or a container of its own, nor write a grant on anything, and every command that was run so
+/// failed before it started ("a window station for commands: access is denied"). A command is then run in the container it is in, with what that one was
+/// given: it can do no more than its caller, which is what the sandbox is for, and the caller's own command is what was granted and looked after.
+pub(crate) fn in_a_container() -> bool {
+    static IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IN.get_or_init(|| {
+        // SAFETY: the token is this process's own, opened for asking and closed here; the answer is a 32-bit value.
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let (mut value, mut size) = (0u32, 0u32);
+            let asked = GetTokenInformation(token, TokenIsAppContainer, std::ptr::addr_of_mut!(value).cast(), std::mem::size_of::<u32>() as u32, &mut size) != 0;
+            CloseHandle(token);
+            asked && value != 0
+        }
+    })
+}
+
 pub(crate) unsafe fn profile_sid() -> Result<PSID, String> {
     let mut slot = PROFILE_SID.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(sid) = &*slot {
@@ -1880,7 +1901,7 @@ fn environment(temp: Option<&Path>, workspace: &Path, offline: bool, as_person: 
     let mut block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, build_tools);
     // (as the person, git reads their own settings and Python starts as it does for them: what stands in for those in the sandbox is not for them)
     if as_person {
-        block.retain(|(name, _)| !["XDG_CONFIG_HOME", "PYTHONPATH", "GIT_CONFIG_GLOBAL"].iter().any(|kept_out| name.eq_ignore_ascii_case(kept_out)));
+        block.retain(|(name, _)| !["XDG_CONFIG_HOME", "PYTHONPATH", "GIT_CONFIG_GLOBAL", POWERSHELL_POLICY.0].iter().any(|kept_out| name.eq_ignore_ascii_case(kept_out)));
         their_git_first(&mut block, &std::env::var("PATH").unwrap_or_default(), crate::bundled::root().as_deref());
         // (their credential helper may not ask anything on a desktop nobody sees: what it has stored is used, and without it the push fails at once and says so)
         block.push(("GCM_INTERACTIVE".to_string(), "never".to_string()));
@@ -1939,9 +1960,17 @@ fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, t
     // (the CLI of the skill that comes with the app sends usage reports to its makers otherwise, and it runs with no one asked: see `safety::the_guidance_cli`. Other programs that read it send none either)
     block.retain(|(name, _)| !name.eq_ignore_ascii_case("DISABLE_TELEMETRY"));
     block.push(("DISABLE_TELEMETRY".to_string(), "1".to_string()));
+    // (in a container PowerShell's check of a script against the execution policy fails whatever the policy, "AuthorizationManager check failed", and no `.ps1`
+    // ran with -File: a project's own scripts, a test's screenshot script among them. The policy keeps no one out of anything, the sandbox does: for this
+    // process and what it starts, it is not asked)
+    block.retain(|(name, _)| !name.eq_ignore_ascii_case(POWERSHELL_POLICY.0));
+    block.push((POWERSHELL_POLICY.0.to_string(), POWERSHELL_POLICY.1.to_string()));
     block.sort_by_key(|(name, _)| name.to_uppercase());
     block
 }
+
+/// The execution policy a command's PowerShell takes, for itself and what it starts: see `environment_block`.
+const POWERSHELL_POLICY: (&str, &str) = ("PSExecutionPolicyPreference", "Bypass");
 
 /// The folders on the PATH a command starts with, in order, made as `environment_block` makes it: the bundled tools, the machine's without a person's own Python, Node or Git and without MSYS
 /// or Cygwin folders, and then Visual Studio's. Only the PATH is made: `environment_block` goes on to ask git for a name and to write a config file, which a question about a name in a command
@@ -2039,19 +2068,21 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
     if let Some(reason) = volume_of(&root).and_then(|volume| drive_refusal(&volume, &root)) {
         return Err(reason);
     }
+    // (in a container already, nothing is granted, made or looked after: see `in_a_container`)
+    let nested = in_a_container();
     // It counts as in use from before it is granted to when all it started has ended.
-    let _in_use = crate::workspace_grants::Use::new(&root);
+    let _in_use = (!nested).then(|| crate::workspace_grants::Use::new(&root));
     // SAFETY: every pointer below lives until the call that takes it returns, and the attribute list's buffers until the process is started.
     unsafe {
         let sid = profile_sid()?;
         // (a restricted token's command writes as its workspace's own SID, and is given what it writes and what is guarded as that SID: see `restricted_token`)
-        let writer = if token == Token::Restricted { Some(OwnedSid::from_text(&workspace_sid_text(&root))?) } else { None };
+        let writer = if token == Token::Restricted && !nested { Some(OwnedSid::from_text(&workspace_sid_text(&root))?) } else { None };
         let grantee = writer.as_ref().map_or(sid, |writer| writer.0);
-        let temp = profile_folder(sid);
+        let temp = if nested { std::env::var_os("TEMP").map(PathBuf::from) } else { profile_folder(sid) };
         let mut disarmed = Vec::new();
         let mut times = Timings::default();
         // (as the person, nothing is to be granted: it can do what they can)
-        if token != Token::Person {
+        if token != Token::Person && !nested {
             let _one = crate::workspace_grants::before_grant(&root)?;
             if let Some(writer) = &writer {
                 prepare_restricted(&root, writer.0, temp.as_deref(), &mut disarmed, &mut times)?;
@@ -2101,14 +2132,17 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         if SetInformationJobObject(job.0, JobObjectExtendedLimitInformation, std::ptr::addr_of!(limits).cast(), std::mem::size_of_val(&limits) as u32) == 0 {
             return Err(last_error("the limits that end what it starts"));
         }
-        let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS { UIRestrictionsClass: ui_limits };
-        if SetInformationJobObject(job.0, JobObjectBasicUIRestrictions, std::ptr::addr_of!(ui).cast(), std::mem::size_of_val(&ui) as u32) == 0 {
+        // (in a container already, the caller's job has the screen's limits, and a job of its own with them cannot be nested in it: error 50)
+        let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS { UIRestrictionsClass: if nested { 0 } else { ui_limits } };
+        if (!nested || ui_limits == 0) && SetInformationJobObject(job.0, JobObjectBasicUIRestrictions, std::ptr::addr_of!(ui).cast(), std::mem::size_of_val(&ui) as u32) == 0 {
             return Err(last_error("the limits on what it can do to the screen"));
         }
-        let desktop = Desktop::new(grantee)?;
+        let desktop = if nested { None } else { Some(Desktop::new(grantee)?) };
+        // (what runs in a container of the app's own is given that container and its capabilities; in a container already, it is in that one)
+        let contained = token == Token::Container && !nested;
 
         let mut capability_sids: Vec<PSID> = Vec::new();
-        if network && token == Token::Container {
+        if network && contained {
             for text in NETWORK_CAPABILITIES {
                 let mut capability: PSID = std::ptr::null_mut();
                 let text = wide(text);
@@ -2124,7 +2158,8 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let jobs = [job.0];
 
         // (a restricted token, or the person's own, is not a container's: no capabilities to give it)
-        let count = if token == Token::Container { 3 } else { 2 };
+        // (in a container already, a job given at the start is not supported, error 50: the process starts suspended and is put in it then)
+        let count = if contained { 3 } else if nested { 1 } else { 2 };
         let mut size = 0usize;
         InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size);
         let mut list_memory = vec![0u8; size];
@@ -2132,9 +2167,9 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         if InitializeProcThreadAttributeList(list, count, 0, &mut size) == 0 {
             return Err(last_error("the attribute list"));
         }
-        let attributes_ok = (token != Token::Container || UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize, std::ptr::addr_of!(security).cast(), std::mem::size_of_val(&security), std::ptr::null_mut(), std::ptr::null()) != 0)
+        let attributes_ok = (!contained || UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize, std::ptr::addr_of!(security).cast(), std::mem::size_of_val(&security), std::ptr::null_mut(), std::ptr::null()) != 0)
             && UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, handles.as_ptr().cast(), std::mem::size_of_val(&handles), std::ptr::null_mut(), std::ptr::null()) != 0
-            && UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, jobs.as_ptr().cast(), std::mem::size_of_val(&jobs), std::ptr::null_mut(), std::ptr::null()) != 0;
+            && (nested || UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, jobs.as_ptr().cast(), std::mem::size_of_val(&jobs), std::ptr::null_mut(), std::ptr::null()) != 0);
         if !attributes_ok {
             DeleteProcThreadAttributeList(list);
             return Err(last_error("the process attributes"));
@@ -2143,8 +2178,10 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let mut startup: STARTUPINFOEXW = std::mem::zeroed();
         startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        let mut desktop_name = desktop.name.clone();
-        startup.StartupInfo.lpDesktop = desktop_name.as_mut_ptr();
+        let mut desktop_name = desktop.as_ref().map(|desktop| desktop.name.clone());
+        if let Some(name) = &mut desktop_name {
+            startup.StartupInfo.lpDesktop = name.as_mut_ptr();
+        }
         startup.StartupInfo.hStdInput = input.0;
         startup.StartupInfo.hStdOutput = out_write.0;
         startup.StartupInfo.hStdError = err_write.0;
@@ -2160,7 +2197,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let place = wide_path(cwd);
         let mut process: PROCESS_INFORMATION = std::mem::zeroed();
         times.prepare = asked_at.elapsed();
-        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | if nested { CREATE_SUSPENDED } else { 0 };
         let failure = match &writer {
             Some(writer) => match restricted_token(writer.0) {
                 Ok(token) => {
@@ -2182,7 +2219,16 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
             return Err(failure);
         }
         let process_handle = Handle(process.hProcess);
-        drop(Handle(process.hThread));
+        let thread = Handle(process.hThread);
+        if nested {
+            if AssignProcessToJobObject(job.0, process_handle.0) == 0 {
+                let failed = last_error("the Job Object of a command run in the container it is in");
+                TerminateProcess(process_handle.0, 1);
+                return Err(failed);
+            }
+            ResumeThread(thread.0);
+        }
+        drop(thread);
         drop(out_write);
         drop(err_write);
         drop(input);
@@ -2214,7 +2260,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
             }
             if looked.elapsed() > Duration::from_secs(1) {
                 looked = Instant::now();
-                last_seen = desktop.windows();
+                last_seen = desktop.as_ref().map_or_else(Vec::new, |desktop| desktop.windows());
                 if !last_seen.iter().any(|(class, _)| class == "#32770") {
                     dialog_since = None;
                 } else if dialog_since.get_or_insert(looked).elapsed() > MOST_DIALOG {
@@ -2223,7 +2269,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
             }
         };
         times.run = began.elapsed();
-        let seen = desktop.windows();
+        let seen = desktop.as_ref().map_or_else(Vec::new, |desktop| desktop.windows());
         let shown = (if seen.is_empty() { last_seen } else { seen }).into_iter().filter(|(class, title)| class == "#32770" || !title.is_empty()).map(|(_, title)| title).collect();
         let mut code = 0u32;
         let status = if ended.is_empty() && GetExitCodeProcess(process_handle.0, &mut code) != 0 { Some(code as i32) } else { None };
@@ -2237,7 +2283,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         // What it made, with nothing of its own left running to go on making it. (Not being able to guard this does not take back what has already run: the next command is what is refused, for what is
         // found again before it, and it is said now in what this one returns.)
         let after_began = Instant::now();
-        let looked = look_after_repositories(&root, grantee, Look::AfterACommand);
+        let looked = if nested { Looked { said: Vec::new(), refused: None } } else { look_after_repositories(&root, grantee, Look::AfterACommand) };
         times.after = after_began.elapsed();
         TIMINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(times);
         disarmed.extend(looked.said);
@@ -3298,6 +3344,16 @@ mod tests {
 
     /// As the person, their own Git is the first on PATH, and the bundled one after it: theirs has their credential helper. A PATH with no Git of theirs stays
     /// as it was, and the bundled folder is never taken for theirs.
+    /// A command's PowerShell runs a script with -File: in a container the execution policy's check fails whatever the policy. As the person, their own policy holds.
+    #[test]
+    fn a_commands_powershell_runs_scripts_and_the_persons_keeps_their_policy() {
+        let place = tempfile::tempdir().unwrap();
+        let block = environment_block(Vec::new(), None, place.path().display().to_string(), place.path(), || None);
+        assert!(block.iter().any(|(name, value)| name == POWERSHELL_POLICY.0 && value == "Bypass"), "{block:?}");
+        let theirs = String::from_utf16_lossy(&environment(Some(place.path()), place.path(), false, true, || None));
+        assert!(!theirs.to_ascii_lowercase().contains("psexecutionpolicypreference"), "{theirs}");
+    }
+
     #[test]
     fn as_the_person_their_own_git_comes_first() {
         let holder = tempfile::tempdir().unwrap();
