@@ -219,7 +219,6 @@ const JA: &[(&str, &str)] = &[
     ("waits for {0}", "{0} を待っています"),
     ("ended", "終了"),
     ("in {0}", "あと {0}"),
-    ("These end when Dogmind quits.", "ここにあるものは、Dogmind を終了すると終わります。"),
     ("Stop all", "すべて止める"),
     ("It goes on with what waits in the background, and says here when it has something for you. Quit it from the tray icon's menu to end all of it.", "バックグラウンドで待っているものは続きます。用があるときはここで通知します。すべて終えるには、トレイのアイコンのメニューから終了してください。"),
     ("Standing by", "待機中"),

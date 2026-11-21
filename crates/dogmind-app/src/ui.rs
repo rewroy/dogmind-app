@@ -8132,8 +8132,8 @@ impl App {
         self.changes.iter().map(|change| change.path.clone()).find(|path| preview::is_page(path)).or_else(|| self.workspace.join("index.html").is_file().then(|| "index.html".to_string()))
     }
 
-    /// How many rows the list of what waits takes in the panel on the right: its heading, a row for each command and each wait (a second for what a command waits to read), what has stopped
-    /// waking, and the line that says these end with the app. At most so many are listed.
+    /// How many rows the list of what waits takes in the panel on the right: its heading, a row for each command and each wait (a second for what a command waits to read), and what has
+    /// stopped waking. At most so many are listed.
     fn background_rows(&self) -> usize {
         if self.waiting.is_empty() {
             return 0;
@@ -8141,10 +8141,11 @@ impl App {
         let listed = |count: usize| count.min(WAITING_LISTED);
         let commands = self.waiting.commands.iter().take(WAITING_LISTED).map(|command| 1 + usize::from(command.watching_for.is_some())).sum::<usize>();
         let (more_commands, more_waits) = (self.waiting.commands.len() > WAITING_LISTED, self.waiting.waits.len() > WAITING_LISTED);
-        1 + commands + listed(self.waiting.waits.len()) + usize::from(more_commands) + usize::from(more_waits) + if self.waiting.paused.is_some() { 3 } else { 0 } + 1
+        1 + commands + listed(self.waiting.waits.len()) + usize::from(more_commands) + usize::from(more_waits) + if self.waiting.paused.is_some() { 3 } else { 0 }
     }
 
-    /// The list of what the session has going or waiting in the background: each command and wait with a stop of its own, what stopped it from waking, and that these end with the app.
+    /// The list of what the session has going or waiting in the background: each command and wait with a stop of its own, and what stopped it from waking. (A line that said these end
+    /// with the app was taken out: the owner found it of no use, 2026-11-22.)
     /// The times are drawn as the window paints them (`paint`), so that they run on without the panel being laid out again. Returns where the next section begins.
     unsafe fn layout_waiting(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, mut y: i32) -> i32 {
         let dpi = self.dpi;
@@ -8202,8 +8203,7 @@ impl App {
             shapes.push(Shape::Text { area: rect(x, y, width, 3 * row), text: lang::notice(paused.sentence()), font: FontKind::Small, color: theme::warn(), flags: DT_WORDBREAK });
             y += 3 * row;
         }
-        shapes.push(Shape::Text { area: rect(x, y, width, row), text: t("These end when Dogmind quits.").to_string(), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
-        y + row
+        y
     }
 
     /// What a row of the list says of its time now: how long a command has run, or has to run, and how long until a wait is up. Counted on from when the agent last said.
