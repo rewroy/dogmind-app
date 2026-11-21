@@ -226,7 +226,7 @@ const JA: &[(&str, &str)] = &[
     (dogmind_agent::background::PAUSED_IN_A_ROW, "自動の再開を止めました。このセッションは、あなたの言葉なしに 30 回続けて自分で動き出しました。メッセージを書くと続きます。"),
     (dogmind_agent::background::PAUSED_IN_AN_HOUR, "自動の再開を止めました。このセッションは、この 1 時間に 60 回自分で動き出しました。1 時間たつと続きます。"),
     (dogmind_agent::background::SERVER_WAIT_NOTE, "サーバーが戻るのを待っています。戻ったら、止まったターンを続けます"),
-    (dogmind_agent::background::SERVER_WAIT_SET, "サーバーが 3 分たっても戻りませんでした。Dogmind は 15 秒ごとに最長 60 分までサーバーに確認し、戻ったらこのターンを続けます。待っているものの一覧から止めるか、メッセージを書くと、待つのをやめます。"),
+    (dogmind_agent::background::SERVER_WAIT_SET, "サーバーが応答しません。戻ったら、Dogmind がこのターンを自動で続けます(15 秒ごとに確認し、最長 60 分)。Stop、待っているものの一覧、またはメッセージを書くと、待つのをやめます。"),
     ("The server is back", "サーバーが戻りました"),
     ("Away for {0} after the turn failed", "ターンの失敗から {0} 後"),
     // Commands.

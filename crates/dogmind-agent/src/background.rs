@@ -37,9 +37,9 @@ pub const PAUSED_IN_AN_HOUR: &str = "Waking is paused: this session has woken it
 
 /// What the window lists for a wait for the model's server ([`Background::add_server_wait`]).
 pub const SERVER_WAIT_NOTE: &str = "Waiting for the server to come back, to go on with the turn it stopped";
-/// What the person is told when a turn that failed as the server stopped answering is to go on by itself once it is back. The times are the agent's
-/// `QUIET_RESTART_WAIT`, `SERVER_WAIT_EVERY` and `SERVER_WAIT_MOST`.
-pub const SERVER_WAIT_SET: &str = "The server has not come back in 3 minutes. Dogmind asks it every 15 seconds, for up to 60 minutes, and goes on with this turn when it is back. Stop it in the list of what waits, or write a message.";
+/// What the person is told, in place of the failure's own words, when a turn that failed as the server stopped answering is to go on by itself once it is back:
+/// nothing is to be sent again. The times are the agent's `SERVER_WAIT_EVERY` and `SERVER_WAIT_MOST`.
+pub const SERVER_WAIT_SET: &str = "The server is not answering. Dogmind goes on with this turn by itself when it is back, asking every 15 seconds for up to 60 minutes. Stop, the list of what waits, or a message of yours ends the wait.";
 
 /// Every sentence of the agent's that the window shows as it is, for the Japanese the window has for each.
 pub const WORDS: [&str; 4] = [PAUSED_IN_A_ROW, PAUSED_IN_AN_HOUR, SERVER_WAIT_NOTE, SERVER_WAIT_SET];

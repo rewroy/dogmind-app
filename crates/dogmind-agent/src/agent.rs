@@ -2178,14 +2178,17 @@ impl Agent {
             Ended::Failed(error) => {
                 // A server that answered in this conversation and stayed away for all of the time the turn had for it: the session waits for it on its own, and the turn
                 // goes on when it is back.
+                // (said so in place of the failure's words, which ask for the message to be sent again: nothing is to be)
                 let waits = (self.quiet_gave_up && llm::is_gone(&error)).then(|| self.provider.clone()).flatten();
-                self.emit(Event::Failed(error));
-                if let Some(provider) = waits {
-                    let (id, stop) = self.background.add_server_wait(server_wait_limits().1);
-                    self.intervened("server_wait", json!({"id": id}));
-                    watch_for_the_server(provider, self.background.clone(), id, stop, self.model.clone());
-                    self.emit(Event::Notice(background::SERVER_WAIT_SET.into()));
-                    self.tell_waiting();
+                match waits {
+                    Some(provider) => {
+                        let (id, stop) = self.background.add_server_wait(server_wait_limits().1);
+                        self.intervened("server_wait", json!({"id": id}));
+                        watch_for_the_server(provider, self.background.clone(), id, stop, self.model.clone());
+                        self.emit(Event::Failed(background::SERVER_WAIT_SET.into()));
+                        self.tell_waiting();
+                    }
+                    None => self.emit(Event::Failed(error)),
                 }
                 self.emit(Event::TurnEnded { cancelled: false });
             }
@@ -7251,8 +7254,7 @@ Body").unwrap();
                 _ => {}
             }
         }
-        assert!(failed.len() == 1 && llm::is_gone(&failed[0]), "{failed:?}");
-        assert!(told.iter().any(|text| text == background::SERVER_WAIT_SET), "{told:?}");
+        assert_eq!(failed, [background::SERVER_WAIT_SET], "said so in place of the failure's words, which ask for the message again: {told:?}");
         assert!(listed, "the wait is listed, with a stop");
         assert_eq!(woken.iter().map(|wake| (wake.cause, wake.id.as_str())).collect::<Vec<_>>(), [(crate::message::WakeCause::ServerBack, "server1")]);
         assert_eq!(content, "back", "the woken turn went on");
