@@ -2357,6 +2357,64 @@ fn build_tools_note(program: &str, why: Option<crate::msvc::Why>, known: bool) -
     }
 }
 
+/// What says a file or folder could not be opened for want of the right, in the words of cargo, git, cmd, PowerShell and Windows in Japanese.
+const DENIED_WORDS: [&str; 4] = ["Access is denied", "アクセスが拒否されました", "Permission denied", "is denied"];
+
+/// The paths a line of a refusal names: what it quotes (`...`, '...', "...") and what comes before its first `: ` (git's and icacls' way), each taken
+/// apart on `/` and `\` and with `.` and `..` worked out, so that cargo's `src\../../../assets` is the folder it means.
+fn named_paths(line: &str) -> Vec<PathBuf> {
+    let mut found: Vec<String> = Vec::new();
+    for quote in ['`', '\'', '"'] {
+        let parts: Vec<&str> = line.split(quote).collect();
+        found.extend(parts.iter().skip(1).step_by(2).take(parts.len().saturating_sub(1) / 2).map(|part| part.to_string()));
+    }
+    if let Some((before, _)) = line.split_once(": ") {
+        found.push(before.trim().trim_start_matches("error").trim_start_matches(':').trim().to_string());
+    }
+    found.into_iter().filter(|text| !text.is_empty() && (text.contains('\\') || text.contains('/') || text.contains('.'))).map(|text| {
+        let mut path = PathBuf::new();
+        for part in text.split(['/', '\\']) {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    path.pop();
+                }
+                part if path.as_os_str().is_empty() && part.ends_with(':') => path.push(format!("{part}\\")),
+                part => path.push(part),
+            }
+        }
+        path
+    }).collect()
+}
+
+/// A refusal of a path in the workspace under a folder another account owns (another program's sandbox account made it there): the person cannot change
+/// that folder's access list, so the access the app gives commands never reached it, and nothing a command does will. Said, with the folder and its owner,
+/// so that the model neither tries again nor takes the file for damaged. (A folder Codex's sandbox account made in a repository stopped every build there
+/// with "access is denied", a real session of 2026-11-22.)
+fn foreign_owner_note(err: &str, workspace: &Path) -> Option<String> {
+    let root = crate::sandbox::key(workspace);
+    for line in err.lines().filter(|line| DENIED_WORDS.iter().any(|word| line.contains(word))).take(20) {
+        for named in named_paths(line) {
+            let full = if named.is_absolute() { named } else { workspace.join(named) };
+            let Ok(inside) = full.strip_prefix(workspace) else { continue };
+            if !crate::sandbox::key(&full).starts_with(&root) {
+                continue;
+            }
+            let mut at = workspace.to_path_buf();
+            for part in inside.components() {
+                at.push(part);
+                if !at.exists() {
+                    break;
+                }
+                if let Some(owner) = crate::sandbox::owned_by_another(&at) {
+                    return Some(format!("note: `{}` belongs to another account, {owner} (another program's sandbox may have made it), not to the user. The user cannot change its access list, so the access this app gives commands never reached it, and the sandbox is refused what is in it. The files are not damaged, and no command can change this: tell the user. A copy the user makes is theirs: copying the folder, deleting the original and giving the copy its name puts it right (for files a repository tracks, deleting the folder and `git checkout -- <folder>` does too).\n", at.display()));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// One line more where a sandbox's answer reads as something else: a model believes it, and the next rounds go on that.
 #[cfg(windows)]
 fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -> String {
@@ -2377,6 +2435,10 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     // server another conversation started went too)
     if (lower.contains("taskkill") && lower.contains("/im")) || (lower.contains("stop-process") && lower.contains("-name")) {
         notes.push_str("note: a command started in the background is ended with command_stop and its id, with all it started. By name, this ends every such program the sandbox runs, those of the user's other conversations too.\n");
+    }
+    // (git says it and goes on, with nothing else wrong)
+    if let Some(note) = foreign_owner_note(err, workspace) {
+        notes.push_str(&note);
     }
     if status == Some(0) {
         return notes;
@@ -4760,6 +4822,29 @@ mod tests {
     }
 
     /// Chrome stopped by its crash handler in the sandbox, as it said it on its error stream or, with `2>&1`, in its output: the model is told of check_page. Nothing else is.
+    /// A refusal names its path as cargo, git, icacls and PowerShell do, and cargo's `..` are worked out.
+    #[test]
+    fn the_path_a_refusal_names_is_read_as_each_program_writes_it() {
+        let cargo = r"error: couldn't read `crates\dogmind-agent\src\../../../assets/skills/modern-web-guidance/SKILL.md`: アクセスが拒否されました。 (os error 5)";
+        assert!(named_paths(cargo).contains(&PathBuf::from(r"assets\skills\modern-web-guidance\SKILL.md")), "{:?}", named_paths(cargo));
+        assert_eq!(named_paths("assets/skills/modern-web-guidance/SOURCE: Permission denied"), [PathBuf::from(r"assets\skills\modern-web-guidance\SOURCE")]);
+        assert_eq!(named_paths(r"assets\skills: Access is denied."), [PathBuf::from(r"assets\skills")]);
+        assert!(named_paths(r"Set-Content : Access to the path 'C:\w\a.txt' is denied.").contains(&PathBuf::from(r"C:\w\a.txt")));
+    }
+
+    /// A refused path under a folder another account owns is said so, with that folder and its owner; one under the user's own folders is not. (Windows'
+    /// own folders stand in for one another account owns: nothing here can make such a folder without being an administrator.)
+    #[test]
+    fn a_refusal_under_a_folder_another_account_owns_names_it() {
+        let windows = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
+        let note = foreign_owner_note(r"System32\config\SAM: Access is denied.", &windows).expect("System32 is TrustedInstaller's");
+        assert!(note.contains(&windows.join("System32").display().to_string()) && note.contains("TrustedInstaller"), "{note}");
+        let mine = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(mine.path().join("a").join("b")).unwrap();
+        assert_eq!(foreign_owner_note("a/b/c.txt: Permission denied", mine.path()), None);
+        assert_eq!(foreign_owner_note("System32: no such thing", &windows), None, "only a refusal");
+    }
+
     #[test]
     fn chrome_that_cannot_start_in_the_sandbox_points_to_check_page() {
         let fatal = "[1121/211815.239:FATAL:third_party\\crashpad\\crashpad\\client\\crashpad_client_win.cc:331] Check failed: . CreateNamedPipe: アクセスが拒否されました。 (0x5)";

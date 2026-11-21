@@ -1046,6 +1046,45 @@ pub(crate) fn profile_sid_text() -> String {
     unsafe { sid_text(profile_sid().unwrap()) }
 }
 
+/// The account that owns `path`, by its name (or its SID where it has none), when that is not the person this app runs as: then they cannot change the
+/// path's access list, and the access the app gives commands does not reach it. None where it is theirs, or where that cannot be told.
+pub(crate) fn owned_by_another(path: &Path) -> Option<String> {
+    // SAFETY: the descriptor is the system's, freed here; the token and its buffer live through the calls.
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let token = Handle(token);
+        let mut needed = 0u32;
+        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        let mut user = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+        if GetTokenInformation(token.0, TokenUser, user.as_mut_ptr().cast(), needed, &mut needed) == 0 {
+            return None;
+        }
+        let person = (*(user.as_ptr() as *const TOKEN_USER)).User.Sid;
+        let name = wide_path(path);
+        let (mut owner, mut descriptor): (PSID, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
+        if GetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &mut owner, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut descriptor) != 0 {
+            return None;
+        }
+        let another = (!owner.is_null() && EqualSid(owner, person) == 0).then(|| account_name(owner).unwrap_or_else(|| sid_text(owner)));
+        LocalFree(descriptor as HLOCAL);
+        another
+    }
+}
+
+/// An account's name as Windows gives it, with its domain or machine: `DOGMIND\CodexSandboxOffline`.
+unsafe fn account_name(sid: PSID) -> Option<String> {
+    let (mut name, mut domain) = ([0u16; 256], [0u16; 256]);
+    let (mut name_length, mut domain_length, mut kind) = (name.len() as u32, domain.len() as u32, 0);
+    if LookupAccountSidW(std::ptr::null(), sid, name.as_mut_ptr(), &mut name_length, domain.as_mut_ptr(), &mut domain_length, &mut kind) == 0 {
+        return None;
+    }
+    let (name, domain) = (String::from_utf16_lossy(&name[..name_length as usize]), String::from_utf16_lossy(&domain[..domain_length as usize]));
+    Some(if domain.is_empty() { name } else { format!("{domain}\\{name}") })
+}
+
 /// A SID as its text (S-1-...); empty if the system cannot say it.
 unsafe fn sid_text(sid: PSID) -> String {
     let mut text: *mut u16 = std::ptr::null_mut();
