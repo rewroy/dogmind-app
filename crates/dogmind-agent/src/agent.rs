@@ -2351,7 +2351,9 @@ impl Agent {
 
     /// How a turn ends, whoever began it: what it left half done is closed, its end is recorded and told. A turn the person stopped stops the background work too: the commands, and the waits.
     fn finish_turn(&mut self, ended: Ended, turn_began: Instant) {
-        if let Some(goal) = self.round_goal.take() {
+        // (a goal left open for the background work's end goes on in the turn that end wakes; a Stop or a failure ends it)
+        let waits = matches!(ended, Ended::Done) && self.background.has_work() && self.round_goal.as_ref().is_some_and(|goal| goal.finished.is_none());
+        if let Some(goal) = if waits { None } else { self.round_goal.take() } {
             if goal.from_user && matches!(goal.finished, Some(GoalEnd::Done)) {
                 self.goal = None;
                 if let Some(session) = &mut self.session {
@@ -3001,6 +3003,12 @@ impl Agent {
             }
             // A goal still open: the turn goes on, in the next round, or ends with the step that answers the user. (A goal it marked done or blocked was told to answer
             // in what finish_goal returned: that answer is the closing step.)
+            // (with a command of its going on in the background, the next round would only look at it: the turn ends, the command's end wakes the session, and the goal is
+            // still open then)
+            if self.round_goal.as_ref().is_some_and(|goal| goal.finished.is_none()) && self.background.has_work() {
+                self.intervened("goal_waits", json!({}));
+                return Ended::Done;
+            }
             if let Some(goal) = self.round_goal.as_mut().filter(|goal| goal.finished.is_none()) {
                 let note = if goal.round < goal.most {
                     goal.round += 1;
@@ -4670,6 +4678,26 @@ mod tests {
         run.handle.commands.send(Command::Send("tomorrow's weather?".into())).unwrap();
         until_end(&run, Decision::Approve);
         assert_eq!(bodies.lock().unwrap().len(), 1);
+    }
+
+    /// A look again at a command that has printed nothing new says to wait for its end to wake the session, not to look.
+    #[test]
+    fn a_look_again_at_a_quiet_command_says_its_end_wakes_the_session() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (client, bodies) = server(vec![
+            call_answer("execute_command", serde_json::json!({"command": "ping -n 30 127.0.0.1 >nul", "background": true})),
+            call_answer("command_status", serde_json::json!({"id": "job1"})),
+            call_answer("command_status", serde_json::json!({"id": "job1"})),
+            text_answer("waiting for it"),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("run it".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let bodies = bodies.lock().unwrap();
+        let last_of = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string();
+        assert!(last_of(3).contains("do not look again to wait for it"), "{}", last_of(3));
+        drop(bodies);
+        run.handle.commands.send(Command::Quit).unwrap();
     }
 
     /// A goal out of rounds ends with one step that answers, in which no call is made.
@@ -9684,26 +9712,6 @@ Body").unwrap();
         let bodies = bodies.lock().unwrap();
         let closed: Vec<bool> = bodies.iter().map(|body| body.pointer("/straydog/reasoning") == Some(&serde_json::json!(false))).collect();
         assert_eq!(closed, [false, true, true, false], "the draft that was stopped, the look at the folder, the write, and the answer after it");
-    }
-
-    /// A look again at a command that has printed nothing new says to wait for its end to wake the session, not to look.
-    #[test]
-    fn a_look_again_at_a_quiet_command_says_its_end_wakes_the_session() {
-        let dir = crate::in_container::tempdir().unwrap();
-        let (client, bodies) = server(vec![
-            call_answer("execute_command", serde_json::json!({"command": "ping -n 30 127.0.0.1 >nul", "background": true})),
-            call_answer("command_status", serde_json::json!({"id": "job1"})),
-            call_answer("command_status", serde_json::json!({"id": "job1"})),
-            text_answer("waiting for it"),
-        ]);
-        let run = run_agent(dir.path(), client, Mode::Auto);
-        run.handle.commands.send(Command::Send("run it".into())).unwrap();
-        until_end(&run, Decision::Approve);
-        let bodies = bodies.lock().unwrap();
-        let last_of = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string();
-        assert!(last_of(3).contains("do not look again to wait for it"), "{}", last_of(3));
-        drop(bodies);
-        run.handle.commands.send(Command::Quit).unwrap();
     }
 
     /// The records are the sessions' folder and the engine's log beside the rules, and the model is told where they are, the log only where there is one.
