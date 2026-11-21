@@ -582,7 +582,7 @@ fn written_whole(path: &Path, bytes: &[u8], exists: bool) -> std::io::Result<()>
 /// Every file's new text, or none: each is written whole beside its file first, and only when all of them are on the disk do they take
 /// the files' places, one by one. A failure on the way puts back what had changed. No file is ever left part written, and what is said
 /// of a failure is what the files are.
-fn write_all_or_none(files: &[(PathBuf, String, String)]) -> Result<(), String> {
+fn write_all_or_none(files: &[(&Path, &[u8], Vec<u8>)]) -> Result<(), String> {
     let beside: Vec<PathBuf> = files.iter().map(|(path, _, _)| written_beside(path)).collect();
     let forget = |from: usize| {
         for new in &beside[from..] {
@@ -591,7 +591,7 @@ fn write_all_or_none(files: &[(PathBuf, String, String)]) -> Result<(), String> 
     };
     for (at, (path, _, after)) in files.iter().enumerate() {
         let written = std::fs::File::create(&beside[at]).and_then(|mut out| {
-            std::io::Write::write_all(&mut out, after.as_bytes())?;
+            std::io::Write::write_all(&mut out, after)?;
             out.sync_all()
         });
         if let Err(error) = written {
@@ -623,6 +623,14 @@ fn write_all_or_none(files: &[(PathBuf, String, String)]) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+struct PatchFile {
+    path: PathBuf,
+    original: Vec<u8>,
+    form: Form,
+    before: String,
+    after: String,
 }
 
 /// Head and tail, with what is left out said between them.
@@ -1064,7 +1072,7 @@ impl Workbench {
         let edits = arguments.get("edits").and_then(Value::as_array).filter(|edits| !edits.is_empty())
             .ok_or("edits is required: a list of {path, old_string, new_string}")?;
         let expected: Vec<&str> = arguments.get("expected_files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
-        let mut files: Vec<(PathBuf, String, String)> = Vec::new();
+        let mut files: Vec<PatchFile> = Vec::new();
         for (number, edit) in edits.iter().enumerate() {
             let given = edit.get("path").and_then(Value::as_str).or(if expected.len() == 1 { expected.first().copied() } else { None })
                 .ok_or_else(|| format!("edit {}: path is required", number + 1))?;
@@ -1078,7 +1086,7 @@ impl Workbench {
             if old.is_empty() {
                 return Err(format!("edit {}: old_string is empty", number + 1));
             }
-            let slot = match files.iter().position(|file| file.0 == path) {
+            let slot = match files.iter().position(|file| file.path == path) {
                 Some(slot) => slot,
                 None => {
                     if !path.exists() {
@@ -1092,12 +1100,22 @@ impl Workbench {
                     if *known != sha16(&bytes) {
                         return Err(format!("{given} changed since it was read: read it again; nothing was changed"));
                     }
-                    let text = String::from_utf8(bytes).map_err(|_| format!("{given} is not UTF-8 text: nothing was changed"))?;
-                    files.push((path, text.clone(), text));
+                    let Some((mut text, encoding)) = text_of_file(&bytes) else {
+                        return Err(format!("{given} is binary: nothing was changed"));
+                    };
+                    let form = Form::from_text(&bytes, &text, encoding);
+                    if encoding == "utf-8" && !form.mark.is_empty() {
+                        text.drain(..'\u{feff}'.len_utf8());
+                    }
+                    // A readable file may still have been decoded lossily. Do not rewrite bytes the decoder cannot recover.
+                    if !form.encode(&text, true).is_ok_and(|encoded| encoded == bytes) {
+                        return Err(format!("{given} cannot be decoded and re-encoded without changing its bytes: nothing was changed"));
+                    }
+                    files.push(PatchFile { path, original: bytes, form, before: text.clone(), after: text });
                     files.len() - 1
                 }
             };
-            let text = &mut files[slot].2;
+            let text = &mut files[slot].after;
             // A file with CRLF lines takes an edit written with LF: as written first, and else with CRLF lines, whichever is there as often as
             // asked. (A file with both, as an editor that ended only its last line with CRLF leaves, took every edit as CRLF, and none of more
             // than one line of its LF part could be found: a real model gave up and wrote the whole file again.)
@@ -1122,24 +1140,28 @@ impl Workbench {
             }
             *text = changed;
         }
+        let writes = files.iter().map(|file| {
+            let bytes = file.form.encode(&file.after, true)
+                .map_err(|error| format!("{}: {error}: nothing was changed", file.path.display()))?;
+            Ok((file.path.as_path(), file.original.as_slice(), bytes))
+        }).collect::<Result<Vec<_>, String>>()?;
+        write_all_or_none(&writes)?;
         let mut report = String::new();
-        write_all_or_none(&files)?;
-        for (path, before, after) in &files {
+        for (file, (_, _, bytes)) in files.iter().zip(writes) {
+            let PatchFile { path, before, after, .. } = file;
             // (the model wrote this change itself: enough to see that it landed where it meant, and a local model pays for every token of it, again in each later request's prefix)
             let diff = similar::TextDiff::from_lines(before, after).unified_diff().context_radius(2).to_string();
             let name = path.strip_prefix(workspace).unwrap_or(path).display().to_string();
             report.push_str(&format!("--- applied_diff {name} ---\n{}\n", cap(&diff, MAX_APPLIED_DIFF)));
-        }
-        for (path, before, after) in files {
             // (seen whole before, it is seen whole after: the model wrote what changed)
-            if self.covered.get(&path).is_some_and(|covered| *covered >= before.lines().count()) {
+            if self.covered.get(path).is_some_and(|covered| *covered >= before.lines().count()) {
                 self.covered.insert(path.clone(), after.lines().count());
             }
             // A write cut off and going on is not, once its file is patched: the next create_file of it is the model's own, whole or not as it says.
-            if self.cut_file.as_ref() == Some(&path) {
+            if self.cut_file.as_ref() == Some(path) {
                 self.cut_file = None;
             }
-            self.seen.insert(path, sha16(after.as_bytes()));
+            self.seen.insert(path.clone(), sha16(&bytes));
         }
         let mut said = spill("edits", &report, MAX_OUTPUT);
         if self.in_japanese {
@@ -1252,6 +1274,10 @@ struct Form {
 impl Form {
     fn of(bytes: &[u8]) -> Form {
         let (text, encoding) = file_text(bytes);
+        Self::from_text(bytes, &text, encoding)
+    }
+
+    fn from_text(bytes: &[u8], text: &str, encoding: &'static str) -> Form {
         let mark: &'static [u8] = [&[0xEF, 0xBB, 0xBF][..], &[0xFF, 0xFE], &[0xFE, 0xFF]].into_iter().find(|mark| bytes.starts_with(mark)).unwrap_or(&[]);
         // (as most of its lines end: an editor may have ended only its last one otherwise)
         let ends = text.matches('\n').count();
@@ -1261,13 +1287,21 @@ impl Form {
     /// `text` as this file has it; with its mark when it is the whole of the file.
     fn bytes(&self, text: &str, whole: bool) -> Result<Vec<u8>, String> {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        let text = if self.crlf { text.replace("\r\n", "\n").replace('\n', "\r\n") } else { text.to_string() };
+        if self.crlf {
+            self.encode(&text.replace("\r\n", "\n").replace('\n', "\r\n"), whole)
+        } else {
+            self.encode(text, whole)
+        }
+    }
+
+    /// Encodes already edited text without changing its line endings.
+    fn encode(&self, text: &str, whole: bool) -> Result<Vec<u8>, String> {
         let mut out = if whole { self.mark.to_vec() } else { Vec::new() };
         match self.encoding {
             "utf-8" => out.extend_from_slice(text.as_bytes()),
             "utf-16" if self.mark == [0xFE, 0xFF] => out.extend(text.encode_utf16().flat_map(u16::to_be_bytes)),
             "utf-16" => out.extend(text.encode_utf16().flat_map(u16::to_le_bytes)),
-            "shift_jis" => out.extend(shift_jis(&text)?),
+            "shift_jis" => out.extend(shift_jis(text)?),
             _ => return Err("it is in an encoding this cannot write (not UTF-8, UTF-16 or Shift_JIS)".into()),
         }
         Ok(out)
@@ -1341,6 +1375,7 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
         return Err(format!("{} is binary: unsupported binaries are refused", path.display()));
     };
     let hash = sha16(&bytes);
+    let text = if encoding == "utf-8" { text.strip_prefix('\u{feff}').unwrap_or(&text) } else { &text };
     let lines: Vec<&str> = text.lines().collect();
     // A large file asked for with no place in it: where its parts begin, to read the one wanted, and not its first 500 lines, which stay
     // in the context for the rest of the conversation whether they were the part or not.
@@ -3739,6 +3774,69 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("sjis.txt")).unwrap(), [0x93, 0xFA, 0x96, 0x7B, 0x0A]);
         bench.run("create_file", &json!({"path": "sjis.txt", "content": "本日\n"}), dir.path(), &cancel).unwrap();
         assert_eq!(std::fs::read(dir.path().join("sjis.txt")).unwrap(), [0x96, 0x7B, 0x93, 0xFA, 0x0A]);
+    }
+
+    #[test]
+    fn a_patch_keeps_the_file_encoding_mark_and_mixed_line_ends() {
+        let (dir, mut bench, cancel) = bench();
+        let before = "日本\r\n二行目\r\n末尾\n";
+        let after = "本日\r\n日本\r\n二行目\r\n末尾\n";
+        let utf16 = |text: &str, big_endian: bool| {
+            let mark = if big_endian { [0xFE, 0xFF] } else { [0xFF, 0xFE] };
+            mark.into_iter().chain(text.encode_utf16().flat_map(|unit| {
+                if big_endian { unit.to_be_bytes() } else { unit.to_le_bytes() }
+            })).collect::<Vec<u8>>()
+        };
+        for (name, before, after) in [
+            ("le.txt", utf16(before, false), utf16(after, false)),
+            ("be.txt", utf16(before, true), utf16(after, true)),
+            ("bom.txt", format!("\u{feff}{before}").into_bytes(), format!("\u{feff}{after}").into_bytes()),
+            ("sjis.txt", shift_jis(before).unwrap(), shift_jis(after).unwrap()),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, before).unwrap();
+            bench.run("read_file", &json!({"path": name}), dir.path(), &cancel).unwrap();
+            let edit = json!({"edits": [{"path": name, "old_string": "日本", "new_string": "本日\n日本"}]});
+            let said = bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap();
+            assert!(said.contains("+本日"), "{said}");
+            assert_eq!(std::fs::read(&path).unwrap(), after, "{name}");
+            let again = json!({"edits": [{"path": name, "old_string": "本日", "new_string": "日本"}]});
+            bench.run("apply_patch", &again, dir.path(), &cancel).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_patch_that_cannot_encode_one_file_leaves_all_files_unchanged() {
+        let (dir, mut bench, cancel) = bench();
+        let plain = dir.path().join("plain.txt");
+        let legacy = dir.path().join("legacy.txt");
+        let original = [0x93, 0xFA, 0x96, 0x7B, 0x0A];
+        std::fs::write(&plain, "alpha\n").unwrap();
+        std::fs::write(&legacy, original).unwrap();
+        for name in ["plain.txt", "legacy.txt"] {
+            bench.run("read_file", &json!({"path": name}), dir.path(), &cancel).unwrap();
+        }
+        let edit = json!({"edits": [
+            {"path": "plain.txt", "old_string": "alpha", "new_string": "ALPHA"},
+            {"path": "legacy.txt", "old_string": "日本", "new_string": "会员"},
+        ]});
+        let said = bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap_err();
+        assert!(said.contains("legacy.txt") && said.contains("Shift_JIS") && said.contains('员'), "{said}");
+        assert_eq!(std::fs::read(&plain).unwrap(), b"alpha\n");
+        assert_eq!(std::fs::read(&legacy).unwrap(), original);
+    }
+
+    #[test]
+    fn a_patch_does_not_rewrite_malformed_utf16() {
+        let (dir, mut bench, cancel) = bench();
+        let path = dir.path().join("bad.txt");
+        let original = [0xFF, 0xFE, b'a', 0, 0xFF];
+        std::fs::write(&path, original).unwrap();
+        bench.run("read_file", &json!({"path": "bad.txt"}), dir.path(), &cancel).unwrap();
+        let edit = json!({"edits": [{"path": "bad.txt", "old_string": "a", "new_string": "b"}]});
+        let said = bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap_err();
+        assert!(said.contains("nothing was changed"), "{said}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     /// A file shown only in part is not written whole over, as what was not shown would go; read on to its end, it is. Patched, a
