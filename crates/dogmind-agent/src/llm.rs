@@ -431,40 +431,56 @@ pub fn request_body(model: &str, messages: &[Message], tools: Option<&Value>, ef
 
 /// `folder`: where the session keeps its pictures.
 pub fn request_body_in(model: &str, messages: &[Message], tools: Option<&Value>, effort: Option<&str>, folder: Option<&Path>) -> Value {
-    request_body_held(model, messages, tools, effort, folder, None, Reminders::AsUser)
+    request_body_held(model, messages, tools, effort, folder, None, Reminders::AS_USER)
 }
 
-/// How the app's own messages (its facts beside the person's message, its notes) go to a server: as the user's, marked in their words only, or in a role
-/// of their own (`/props`'s `latest_reminder`, Straydog's for DeepSeek), after the person's message or before it.
+/// How the app's own messages (its facts beside the person's message, its notes and notices) go to a server: in a role of their own (`role`), so that
+/// whose a message is rests on its role and not only on its words, or as the user's (none), marked in their words only; and the facts after the person's
+/// message or before it (`before`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Reminders {
-    AsUser,
-    After,
-    Before,
+pub struct Reminders {
+    pub role: Option<&'static str>,
+    pub before: bool,
 }
+
+impl Reminders {
+    pub const AS_USER: Reminders = Reminders { role: None, before: false };
+}
+
+/// The role a server that says so takes them in (`/props`'s `latest_reminder`: Straydog's, for DeepSeek, whose template has it).
+pub const REMINDER_ROLE: &str = "latest_reminder";
+/// The role Straydog is sent them in for any other model: a chat API's own role for what is not the user's, which its templates place where it is in the
+/// conversation. A server whose templates are not known (one may take a system message only first, or move it there) is sent them as the user's, marked
+/// in their words; one that refuses the role is sent them so from then on.
+pub const APP_ROLE: &str = "system";
+/// OpenAI's own API: its role for what the application says, as opposed to the user.
+pub const OPENAI_APP_ROLE: &str = "developer";
 
 /// The switch that puts the app's facts before the person's message, to compare where a model takes them best (DeepSeek's own example puts the date and
 /// the place before the user's turn).
 pub const REMINDER_BEFORE_VARIABLE: &str = "DOGMIND_REMINDER_BEFORE";
 
-/// The app's messages in the role `latest_reminder`, and its facts before the person's message where `reminders` says so.
+/// The app's messages in the role `reminders` names, and its facts before the person's message where it says so.
 fn as_reminders(messages: &mut [Value], reminders: Reminders) {
-    if reminders == Reminders::AsUser {
-        return;
-    }
+    let Some(role) = reminders.role else { return };
     for message in messages.iter_mut() {
-        if message["role"] == "user" && message["content"].as_str().is_some_and(crate::prompt::is_nudge) {
-            message["role"] = json!("latest_reminder");
+        if message["role"] == "user" && message["content"].as_str().is_some_and(crate::prompt::is_from_app) {
+            message["role"] = json!(role);
         }
     }
-    if reminders == Reminders::Before {
+    if reminders.before {
         for at in 1..messages.len() {
             let facts = messages[at]["content"].as_str().is_some_and(crate::prompt::is_app_facts);
-            if facts && messages[at]["role"] == "latest_reminder" && messages[at - 1]["role"] == "user" {
+            if facts && messages[at]["role"] == role && messages[at - 1]["role"] == "user" {
                 messages.swap(at - 1, at);
             }
         }
     }
+}
+
+/// Whether a body holds a message of the app's in a role of its own, as `as_reminders` gives it.
+fn has_app_role(body: &Value) -> bool {
+    body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message| matches!(message["role"].as_str(), Some(REMINDER_ROLE | APP_ROLE | OPENAI_APP_ROLE)) && message["content"].as_str().is_some_and(crate::prompt::is_from_app)))
 }
 
 /// `request_body_in`, for a server that keeps the pictures it was sent (`/props`'s `image_digests`): those it holds (`held`, by their digests) go as `sha256:`
@@ -575,11 +591,22 @@ impl Provider for Client {
     fn stream(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
         // (a conversation's pictures go by their digests to a server that keeps them, once a request of it has sent them: what it is known by is the request's id)
         let conversation = request.request_id.and_then(|id| id.split('/').next()).filter(|id| self.image_digests && !id.is_empty());
-        let Some(conversation) = conversation else { return self.post(&self.body_for(request), request.request_id, cancel, on) };
+        let Some(conversation) = conversation else {
+            return match self.post_with_app_role(&self.body_for(request), &mut || self.body_for(request), request.request_id, cancel, on) {
+                Ok(completion) => Ok(completion),
+                Err(Refused::Failed(error)) => Err(error),
+                Err(Refused::ImageNotHeld) => Err(LlmError::Rejected(IMAGE_NOT_HELD.to_string())),
+            };
+        };
         let holds = self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(conversation).cloned().unwrap_or_default();
         let mut sent = Vec::new();
         let body = self.body_with(request, Some((&holds, &mut sent)));
-        let answered = match self.post_once(&body, request.request_id, cancel, on) {
+        let mut again_sent = Vec::new();
+        let first = self.post_with_app_role(&body, &mut || { again_sent.clear(); self.body_with(request, Some((&holds, &mut again_sent))) }, request.request_id, cancel, on);
+        if !again_sent.is_empty() {
+            sent = again_sent;
+        }
+        let answered = match first {
             // (it started again, or let one go: none of it is known to be held any more, and the request goes again with all the bytes)
             Err(Refused::ImageNotHeld) => {
                 self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(conversation);
@@ -648,7 +675,11 @@ impl Provider for Client {
     /// Straydog keeps of a request that says `checkpoint: false` only its system prompt's checkpoint: the checkpoints another
     /// conversation resumes from (where its last reply began) stay as they were.
     fn warm(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
-        self.post(&self.warm_body(request), request.request_id, cancel, on)
+        match self.post_with_app_role(&self.warm_body(request), &mut || self.warm_body(request), request.request_id, cancel, on) {
+            Ok(completion) => Ok(completion),
+            Err(Refused::Failed(error)) => Err(error),
+            Err(Refused::ImageNotHeld) => Err(LlmError::Rejected(IMAGE_NOT_HELD.to_string())),
+        }
     }
 
     fn answers(&self) -> bool {
@@ -723,9 +754,11 @@ pub struct Client {
     /// The server keeps the pictures it was sent, and takes one again by its digest (`/props`'s `image_digests`, Straydog's): a conversation sent all its
     /// pictures with every request, 97% of 4.33 GB in a day of page checks.
     pub image_digests: bool,
-    /// The server takes the app's own messages in a role of their own (`/props`'s `latest_reminder`): they are then not the user's, by their role and
-    /// not only by their words (Codex on Dogmind: "where a message comes from rests on its text").
-    pub latest_reminder: bool,
+    /// The role the server takes the app's own messages in: `latest_reminder` where `/props` says so, `system` for any other model of Straydog's
+    /// ([`ServerInfo::app_role`]); none for a server whose templates are not known. (Whose a message is then rests on its role, not only on its words.)
+    pub app_role: Option<&'static str>,
+    /// The server refused a request with the app's messages in a role of their own, and took it with them as the user's: they go so from then on.
+    pub app_role_refused: std::sync::Arc<AtomicBool>,
     /// The digests of the pictures each conversation (by its id, the first part of a request's) sent this server in a request that went well: those go by
     /// their digests from then on. Forgotten when the server says it no longer holds one (`image_not_held`).
     pub held: std::sync::Arc<std::sync::Mutex<HashMap<String, HashSet<String>>>>,
@@ -759,7 +792,7 @@ const VISION_ASKED_AGAIN: Duration = Duration::from_secs(10);
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
         Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None,
-                    vision_asked: Default::default(), close_next: Default::default(), own_engine: false, image_digests: false, latest_reminder: false, held: Default::default() })
+                    vision_asked: Default::default(), close_next: Default::default(), own_engine: false, image_digests: false, app_role: None, app_role_refused: Default::default(), held: Default::default() })
     }
 
     /// The request a model's turn is sent as, for this server.
@@ -779,13 +812,42 @@ impl Client {
         self.body_with(request, None)
     }
 
+    /// How the app's own messages go to this server: in the role it is known to take them in, as `developer` messages to OpenAI's API, and as the user's
+    /// to any other server or once it refused a role of their own.
+    fn reminders(&self) -> Reminders {
+        let role = if self.app_role_refused.load(std::sync::atomic::Ordering::Relaxed) {
+            None
+        } else if self.app_role.is_some() {
+            self.app_role
+        } else if self.base.host.eq_ignore_ascii_case("api.openai.com") {
+            Some(OPENAI_APP_ROLE)
+        } else {
+            None
+        };
+        Reminders { role, before: std::env::var(REMINDER_BEFORE_VARIABLE).is_ok_and(|value| value == "1") }
+    }
+
+    /// `post_once`, and for a body with the app's messages in a role of their own that the server refused: once more with them as the user's (`again`
+    /// makes that body), which, taken, is how they go to it from then on.
+    fn post_with_app_role(&self, body: &Value, again: &mut dyn FnMut() -> Value, id: Option<&str>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, Refused> {
+        let refused = match self.post_once(body, id, cancel, on) {
+            // (a request it would not take, not a key it refused or an address it does not have)
+            Err(Refused::Failed(LlmError::Rejected(said))) if said.starts_with(REFUSED) && has_app_role(body) && !cancel.load(std::sync::atomic::Ordering::SeqCst) => said,
+            other => return other,
+        };
+        self.app_role_refused.store(true, std::sync::atomic::Ordering::Relaxed);
+        let answered = self.post_once(&again(), id, cancel, on);
+        // (refused again: it was not the role, and the first refusal is the one to tell)
+        if matches!(answered, Err(Refused::Failed(LlmError::Rejected(_)))) {
+            self.app_role_refused.store(false, std::sync::atomic::Ordering::Relaxed);
+            return Err(Refused::Failed(LlmError::Rejected(refused)));
+        }
+        answered
+    }
+
     /// The body of a request, with the pictures the server holds of this conversation named by their digests (`held`), whose digests go in `sent`.
     fn body_with(&self, request: &Request, held: Option<(&HashSet<String>, &mut Vec<String>)>) -> Value {
-        let reminders = match (self.latest_reminder, std::env::var(REMINDER_BEFORE_VARIABLE).is_ok_and(|value| value == "1")) {
-            (false, _) => Reminders::AsUser,
-            (true, false) => Reminders::After,
-            (true, true) => Reminders::Before,
-        };
+        let reminders = self.reminders();
         let mut body = if self.replay_reasoning {
             request_body_held(request.model, request.messages, request.tools, request.effort, request.images, held, reminders)
         } else {
@@ -991,6 +1053,20 @@ pub struct ServerInfo {
     pub image_digests: bool,
     /// Whether the server takes the app's own messages in the role `latest_reminder`.
     pub latest_reminder: bool,
+}
+
+impl ServerInfo {
+    /// The role the app's own messages go to this server in: `latest_reminder` where it says it takes that, `system` for Straydog's other models, none for
+    /// a server whose templates are not known.
+    pub fn app_role(&self) -> Option<&'static str> {
+        if self.latest_reminder {
+            Some(REMINDER_ROLE)
+        } else if self.straydog {
+            Some(APP_ROLE)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1305,18 +1381,26 @@ mod tests {
         (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), heard)
     }
 
-    /// To a server that takes them so, the app's facts and notes go in the role `latest_reminder`, after the person's message or, with the switch, before it;
-    /// the person's own words stay the user's, and a server that does not say so gets them all as the user's.
+    /// The app's facts and notes go in the role a server is known to take them in (`latest_reminder` after the person's message or, with the switch, before
+    /// it; `system`; `developer` for OpenAI's API), and as the user's to any other or once it refused them; the person's own words stay the user's.
     #[test]
-    fn the_apps_own_messages_go_in_a_role_of_their_own_where_the_server_takes_it() {
+    fn the_apps_own_messages_go_in_a_role_of_their_own() {
         let facts = format!("{} The time: 03:00.", crate::prompt::APP_FACTS);
         let messages = [Message::text("system", "s"), Message::text("user", "make a page"), Message::text("user", &facts), Message::text("assistant", "ok"), Message::text("user", crate::prompt::CHECK_NUDGE)];
         let roles = |reminders: Reminders| -> Vec<String> {
             request_body_held("m", &messages, None, None, None, None, reminders)["messages"].as_array().unwrap().iter().map(|message| format!("{}:{}", message["role"].as_str().unwrap(), message["content"].as_str().unwrap().chars().take(4).collect::<String>())).collect()
         };
-        assert_eq!(roles(Reminders::AsUser), ["system:s", "user:make", "user:[Fro", "assistant:ok", "user:[Fro"]);
-        assert_eq!(roles(Reminders::After), ["system:s", "user:make", "latest_reminder:[Fro", "assistant:ok", "latest_reminder:[Fro"]);
-        assert_eq!(roles(Reminders::Before), ["system:s", "latest_reminder:[Fro", "user:make", "assistant:ok", "latest_reminder:[Fro"]);
+        assert_eq!(roles(Reminders::AS_USER), ["system:s", "user:make", "user:[Fro", "assistant:ok", "user:[Fro"]);
+        assert_eq!(roles(Reminders { role: Some(REMINDER_ROLE), before: false }), ["system:s", "user:make", "latest_reminder:[Fro", "assistant:ok", "latest_reminder:[Fro"]);
+        assert_eq!(roles(Reminders { role: Some(REMINDER_ROLE), before: true }), ["system:s", "latest_reminder:[Fro", "user:make", "assistant:ok", "latest_reminder:[Fro"]);
+        assert_eq!(roles(Reminders { role: Some(APP_ROLE), before: false }), ["system:s", "user:make", "system:[Fro", "assistant:ok", "system:[Fro"]);
+        // (the person's own words that only look like it stay theirs: a message of theirs never begins so, as it is what they typed)
+        let client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        assert_eq!(client.reminders().role, None, "a server whose templates are not known");
+        assert_eq!(Client::new("https://api.openai.com/v1", None).unwrap().reminders().role, Some(OPENAI_APP_ROLE));
+        assert_eq!(Client { app_role: Some(REMINDER_ROLE), ..client.clone() }.reminders().role, Some(REMINDER_ROLE));
+        client.app_role_refused.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(Client { app_role: Some(REMINDER_ROLE), ..client }.reminders().role, None);
     }
 
     /// A server that keeps the pictures it was sent (`image_digests`) is sent a conversation's picture once, and then its digest; one that says it no longer

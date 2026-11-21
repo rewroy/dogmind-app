@@ -337,6 +337,12 @@ pub fn slip_note(letters: &str) -> String {
     format!("{DRAFT_NOTE}今の回答に日本語で使わない字が混ざっています: {letters}。その字を含む行だけを、「訂正:」に続けて日本語の字で書き直してください。ほかの行や説明は要りません。")
 }
 
+/// Whether a message in the user's place is the app's own (its facts, notes and notices, a helper's limit), by how the app begins each: what goes to a
+/// server in a role of its own where it takes one.
+pub fn is_from_app(text: &str) -> bool {
+    text.starts_with("[From the app") || is_nudge(text)
+}
+
 /// Whether a user's message was the app's and not the person's: it is not shown as something they said. (A saved session has the check's word as it was, unmarked.)
 pub fn is_nudge(text: &str) -> bool {
     text == CONTINUE_NUDGE || text.starts_with(DRAFT_NOTE) || is_app_facts(text) || Some(text) == CHECK_NUDGE.strip_prefix(DRAFT_NOTE) || text == CHECK_NUDGE_BEFORE

@@ -33,11 +33,17 @@ fn main() {
     let mut code_mode = false;
     // `--effort LEVEL`: the thinking level the app sends (`reasoning_effort`), as the person's setting would; none sends nothing.
     let mut effort: Option<String> = None;
+    // `--instructions FILE`, `--language LANG`, `--skills-off a,b`: the person's own instructions, answer language and skills turned off, as their settings
+    // give them, to run a job as they would.
+    let (mut instructions, mut language, mut skills_off): (Option<PathBuf>, String, Vec<String>) = (None, "auto".to_string(), Vec::new());
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--refuse" => refuse = true,
             "--code-mode" => code_mode = true,
             "--effort" => effort = args.next().filter(|level| !level.is_empty()),
+            "--instructions" => instructions = args.next().map(PathBuf::from),
+            "--language" => language = args.next().unwrap_or_else(|| "auto".to_string()),
+            "--skills-off" => skills_off = args.next().unwrap_or_default().split(',').map(str::trim).filter(|name| !name.is_empty()).map(str::to_string).collect(),
             "--warm-wait" => warm_wait = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
             "--between" => between = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
             "--warm-between" => warm_between = true,
@@ -76,7 +82,7 @@ fn main() {
     client.suppresses_letters = info.suppresses_letters;
     client.tool_writing = info.tool_writing;
     client.image_digests = info.image_digests;
-    client.latest_reminder = info.latest_reminder;
+    client.app_role = info.app_role();
     client.vision = info.vision;
     println!("server: model {} window {} straydog {}", info.model, info.context, info.straydog);
 
@@ -88,11 +94,11 @@ fn main() {
         mode,
         effort: effort.clone(),
         web: WebSettings::default(),
-        language: "auto".into(),
+        language: language.clone(),
         japanese_system: false,
-        instructions: None,
+        instructions: instructions.clone(),
         home: None,
-        skills_off: Vec::new(),
+        skills_off: skills_off.clone(),
         skills_on: Vec::new(),
         memory: None,
         mcp: None,
