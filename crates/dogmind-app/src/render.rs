@@ -63,6 +63,27 @@ struct Engine {
 thread_local! {
     /// Made on first use, on the window's thread; None for good once it could not be.
     static ENGINE: RefCell<Option<Option<Engine>>> = const { RefCell::new(None) };
+    /// A paint drawn as one (`batch`): the device, the area it is bound over, and whether it is bound now. Each drawing then goes into it at its own place, with no
+    /// binding of its own. A binding reads the device's pixels in and writes them back: a path of 25 rows in view had some 125 of those a paint, 35 ms of it.
+    static BATCH: std::cell::Cell<Option<(isize, RECT, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// `paint` drawn on `device` over `area` with Direct2D bound once, for all of it: what draws with GDI meanwhile calls [`flush`] first, and the next drawing of
+/// Direct2D binds it again, reading in what GDI drew. Where Direct2D cannot start, each drawing binds on its own, as without this.
+pub unsafe fn batch<R>(device: HDC, area: RECT, paint: impl FnOnce() -> R) -> R {
+    BATCH.set(Some((device as isize, area, false)));
+    let out = paint();
+    flush(device);
+    BATCH.set(None);
+    out
+}
+
+/// What was drawn so far in a [`batch`] on `device`, on the device now: before GDI draws on it. Nothing outside one. (bound again only when Direct2D draws next:
+/// bound at once, the pixels it read would not have what GDI then drew, and the end of the batch wrote them over it)
+pub unsafe fn flush(device: HDC) {
+    let Some((bound, area, true)) = BATCH.get().filter(|(bound, _, _)| *bound == device as isize) else { return };
+    BATCH.set(Some((bound, area, false)));
+    with_engine(|engine| engine.unbind());
 }
 
 /// The Japanese face's files, when they are beside the app (or fetched, for a build that was not packaged), and its family's name.
@@ -166,16 +187,44 @@ impl Engine {
         if area.right <= area.left || area.bottom <= area.top {
             return Ok(());
         }
+        // (in a batch over this device: at this area's origin, and no further than it, as a binding to the area alone would have it)
+        if let Some((_, whole, open)) = BATCH.get().filter(|(bound, _, _)| *bound == device as isize) {
+            if !open {
+                self.bind(device, whole)?;
+                BATCH.set(Some((device as isize, whole, true)));
+            }
+            let target = self.target()?;
+            target.SetTransform(&windows_numerics::Matrix3x2::translation((area.left - whole.left) as f32, (area.top - whole.top) as f32));
+            let within = D2D_RECT_F { left: 0.0, top: 0.0, right: (area.right - area.left) as f32, bottom: (area.bottom - area.top) as f32 };
+            target.PushAxisAlignedClip(&within, D2D1_ANTIALIAS_MODE_ALIASED);
+            let painted = paint(&target, self);
+            target.PopAxisAlignedClip();
+            target.SetTransform(&windows_numerics::Matrix3x2::identity());
+            return painted;
+        }
+        self.bind(device, area)?;
+        let target = self.target()?;
+        let painted = paint(&target, self);
+        painted.and(self.unbind())
+    }
+
+    /// The target bound to `device` over `area`, and begun on.
+    unsafe fn bind(&mut self, device: HDC, area: RECT) -> windows::core::Result<()> {
         let target = self.target()?;
         let bounds = windows::Win32::Foundation::RECT { left: area.left, top: area.top, right: area.right, bottom: area.bottom };
         target.BindDC(windows::Win32::Graphics::Gdi::HDC(device), &bounds)?;
         target.BeginDraw();
-        let painted = paint(&target, self);
+        Ok(())
+    }
+
+    /// What was drawn since `bind`, on the device. A target that has gone (a device that was lost) is made again next time.
+    unsafe fn unbind(&mut self) -> windows::core::Result<()> {
+        let target = self.target()?;
         let ended = target.EndDraw(None, None);
         if ended.is_err() {
             self.target = None;
         }
-        painted.and(ended)
+        ended
     }
 }
 
@@ -671,6 +720,51 @@ pub unsafe fn terminal(device: HDC, area: RECT, font: &TermFont, scene: &TermSce
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a paint drawn as one (`batch`) draws is what the same drawings each on their own draw, Direct2D and GDI one after another: what GDI drew between two of
+    /// Direct2D's is kept where nothing covers it, and what Direct2D drew after it covers it. (Bound again at once after a flush, the end of the batch wrote a picture of
+    /// the timeline's over with what it had read before it.)
+    #[test]
+    fn a_paint_drawn_as_one_draws_what_its_drawings_each_do() {
+        use windows_sys::Win32::Graphics::Gdi::{CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject, FillRect, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS};
+        let (width, height) = (120, 60);
+        // SAFETY: a bitmap of this thread's own, read once its drawings are done.
+        let draw = |batched: bool| unsafe {
+            let device = CreateCompatibleDC(std::ptr::null_mut());
+            let mut info: BITMAPINFO = std::mem::zeroed();
+            info.bmiHeader = BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: width, biHeight: -height, biPlanes: 1, biBitCount: 32, ..std::mem::zeroed() };
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(device, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+            let previous = SelectObject(device, bitmap);
+            let gdi = |area: RECT, color: u32| {
+                flush(device);
+                let brush = CreateSolidBrush(color);
+                FillRect(device, &area, brush);
+                DeleteObject(brush);
+            };
+            let scene = || {
+                assert!(rounded(device, RECT { left: 0, top: 0, right: width, bottom: height }, 0, Some(0x00_20_20_20), None));
+                gdi(RECT { left: 10, top: 10, right: 50, bottom: 50 }, 0x00_00_00_FF);
+                assert!(rounded(device, RECT { left: 30, top: 20, right: 70, bottom: 40 }, 0, Some(0x00_00_FF_00), None));
+                gdi(RECT { left: 60, top: 30, right: 100, bottom: 55 }, 0x00_FF_00_00);
+                assert!(rounded(device, RECT { left: 90, top: 5, right: 115, bottom: 35 }, 0, Some(0x00_FF_FF_FF), None));
+            };
+            if batched { batch(device, RECT { left: 0, top: 0, right: width, bottom: height }, scene) } else { scene() }
+            let pixels = std::slice::from_raw_parts(bits as *const u32, (width * height) as usize).to_vec();
+            SelectObject(device, previous);
+            DeleteObject(bitmap);
+            DeleteDC(device);
+            pixels
+        };
+        let (alone, as_one) = (draw(false), draw(true));
+        // (as 0xRRGGBB: GDI's red is 0x0000FF as it is given)
+        let at = |pixels: &[u32], x: i32, y: i32| pixels[(y * width + x) as usize] & 0x00FF_FFFF;
+        assert_eq!(at(&alone, 15, 15), 0x00FF_0000, "the red that GDI drew");
+        assert_eq!(at(&alone, 40, 30), 0x0000_FF00, "the green drawn after it, over it");
+        assert_eq!(at(&alone, 80, 50), 0x0000_00FF, "the blue that GDI drew last");
+        assert_eq!(at(&alone, 100, 30), 0x00FF_FFFF, "the white over the blue");
+        assert_eq!(as_one, alone);
+    }
 
     /// A path too long for its line keeps its last name and its beginning, "..." between, as DrawTextW's DT_PATH_ELLIPSIS does; one that
     /// fits stays as it is.
