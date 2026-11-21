@@ -95,8 +95,8 @@ pub fn schemas() -> Value {
             "cwd": {"type": "string", "description": "Where to run, instead of `cd ... &&`. Default: the workspace."},
             "timeout_seconds": {"type": "integer", "description": "How long to wait for it, default 180. Past that it goes on in the background."},
             "purpose": {"type": "string", "description": "A few words on why, for the user when they are asked."},
-            "network": {"type": "boolean", "description": "Needs the network, and is not curl, a package install or remote git, which get it anyway. Asks the user."},
-            "outside_sandbox": {"type": "boolean", "description": "Run as the user, outside the sandbox: for what the user asked to read or change outside the workspace. Asks the user each time."},
+            "network": {"type": "boolean", "description": "Needs the network for what the Environment section does not cover. Asks the user."},
+            "outside_sandbox": {"type": "boolean", "description": "Run as the user: only for what the user asked for outside the workspace, never to check your work. Asks the user each time."},
             "background": {"type": "boolean", "description": "Start it and go on, for what takes minutes. Gives an id for command_status; its end wakes you."},
             "wake_on": {"type": "string", "description": "With background: a regex. The first line it prints that matches wakes you, once. A server: \"Listening on\"."}
         }), &["command"]),
@@ -137,7 +137,7 @@ pub fn schemas() -> Value {
             "pattern": {"type": "string"},
             "path": {"type": "string"}
         }), &["pattern"]),
-        function("check_page", "Open a page in a headless browser with no network: what its scripts printed and threw, what it shows, pictures.", json!({
+        function("check_page", "Open a page in a headless browser: what its scripts printed and threw, what it shows, pictures. Scripts, styles and fonts from well-known CDNs load; nothing else from the network.", json!({
             "path": {"type": "string"},
             "url": {"type": "string", "description": "Instead of path: http://localhost:PORT/ of a server you started"},
             "views": {"type": "array", "items": {"type": "string"}, "description": "desktop (default), mobile, or WxH"},

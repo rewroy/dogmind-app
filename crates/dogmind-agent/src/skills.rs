@@ -10,10 +10,12 @@ use serde_json::{json, Value};
 const MAX_DEPTH: usize = 6;
 const MAX_SKILLS: usize = 200;
 const MAX_BODY: usize = 48 * 1024;
-/// What the list may take of the prompt: it is there for every request of the session.
-const MAX_LIST: usize = 1400;
-/// (a local model reads the list in every new session: 32 skills from other tools were 1,000 tokens of a 7,700-token prefix, and 200 tokens a second is what it reads at)
-const MAX_DESCRIPTION: usize = 60;
+/// What the list may take of the prompt: it is there for every request of the session. (a local model reads it in every new session, at some 200 tokens
+/// a second: 32 skills from other tools were 1,000 tokens of a 7,700-token prefix)
+const MAX_LIST: usize = 1800;
+/// A skill's line is its first sentence, which says when it applies, up to this many characters. Cut at 60 in the middle of a word, the line of one whose
+/// description began "MANDATORY" said "MANDA" (a real prompt of 2026-11-21).
+const MAX_DESCRIPTION: usize = 160;
 /// Under a project and under the home alike. Claude's and the shared form come first, then Codex's, then Dogmind's own.
 const FOLDERS: [&str; 4] = [".claude/skills", ".agents/skills", ".codex/skills", ".dogmind/skills"];
 const MODERN_WEB_GUIDANCE: &str = include_str!("../../../assets/skills/modern-web-guidance/SKILL.md");
@@ -236,7 +238,7 @@ pub fn prompt_section(skills: &[Skill], tools: &[String]) -> String {
     let mut chosen = the_model_may_start(skills);
     chosen.sort_by_key(|skill| skill.embedded.is_none());
     for skill in chosen.into_iter().filter(|skill| !for_tools_not_here(skill, tools)) {
-        let about: String = skill.description.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MAX_DESCRIPTION).collect();
+        let about = first_sentence(&skill.description);
         let line = format!("- {}: {about}\n", skill.name);
         if list.len() + line.len() > MAX_LIST {
             more += 1;
@@ -249,6 +251,27 @@ pub fn prompt_section(skills: &[Skill], tools: &[String]) -> String {
     }
     let more = if more > 0 { format!("And {more} more: `skill` with the name `list` lists them all.\n") } else { String::new() };
     format!("## Skills\nInstructions for particular kinds of task. Most messages need none, nor does anything you already know how to do with the tools here, and one says nothing about this conversation: a file it mentions has not been given to you. When one is needed, call `skill` before you start and follow it, using what tools you have to the same end.\n{list}{more}\n")
+}
+
+/// A description's first sentence, at most `MAX_DESCRIPTION` characters: cut where a word ends (in Japanese after `、`), with `…` where it was cut.
+fn first_sentence(description: &str) -> String {
+    let text = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut end = text.len();
+    for (at, c) in text.char_indices() {
+        let next = text[at + c.len_utf8()..].chars().next();
+        if c == '。' || (matches!(c, '.' | '!' | '?') && next.is_none_or(|next| next == ' ')) {
+            end = at + c.len_utf8();
+            break;
+        }
+    }
+    let sentence = &text[..end];
+    let Some((limit, _)) = sentence.char_indices().nth(MAX_DESCRIPTION) else { return sentence.to_string() };
+    let head = &sentence[..limit];
+    match head.char_indices().rev().find(|(_, c)| *c == ' ' || *c == '、') {
+        Some((at, ' ')) if at > 0 => format!("{}…", &head[..at]),
+        Some((at, c)) if c != ' ' => format!("{}…", &head[..at + c.len_utf8()]),
+        _ => format!("{head}…"),
+    }
 }
 
 /// All of them, for what the prompt had no room for.
@@ -301,6 +324,19 @@ pub fn schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A skill's line is its first sentence, cut where a word ends when it is long, and never in the middle of one.
+    #[test]
+    fn a_skills_line_is_its_first_sentence_cut_where_a_word_ends() {
+        assert_eq!(first_sentence("Search tool for best practices, for when you are unsure.\n  Useful for: dialogs, tables."), "Search tool for best practices, for when you are unsure.");
+        assert_eq!(first_sentence("説明的な文章に緩急を設計するための規範。緩急を装飾ではなく扱う。"), "説明的な文章に緩急を設計するための規範。");
+        let long = "word ".repeat(60);
+        let line = first_sentence(&long);
+        assert!(line.ends_with("word…") && line.chars().count() <= MAX_DESCRIPTION + 1, "{line}");
+        let japanese = format!("{}、{}", "あ".repeat(100), "い".repeat(100));
+        assert_eq!(first_sentence(&japanese), format!("{}、…", "あ".repeat(100)));
+        assert_eq!(first_sentence("Version 1.0.1 of it."), "Version 1.0.1 of it.", "a dot inside a word is no end");
+    }
 
     fn write(folder: &Path, text: &str) {
         std::fs::create_dir_all(folder).unwrap();

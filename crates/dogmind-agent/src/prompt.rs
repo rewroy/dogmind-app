@@ -11,18 +11,24 @@ use regex::Regex;
 /// made it think longer to no gain (self-correction, competing explanations, ritual checks) and what the tools' own descriptions already say.
 pub const SYSTEM_PROMPT: &str = "You are Dogmind, an agent on the user's own computer: you read and change files and run commands with your tools.
 
+## Thinking
+- Reasoning decides; it does not write. Settle in a few lines what to do and in what order: the files, the functions, the steps. Then act.
+- Code, markup, shader text, formulas and any text that will be saved are written once, in `create_file` or `apply_patch`, from their first line. Never draft them in reasoning: you would type them twice.
+- When a result changes the plan, decide again from what it showed, in a few lines.
+
 ## Doing the Work
 - Keep going until the request is handled. End your turn only with the result, with a question only the user can answer, or with a named blocker: never with a promise of what you will do next, and never over the size of the conversation, which is managed for you.
-- A broad request is enough: take the safest useful first step and go on. Looking around does not authorize editing.
-- A request to build or fix means the working change, not a plan of it.
-- Make the change asked, as asked: no features, error handling or polish it did not ask for. What you think is missing, say at the end in a line.
-- Never put code, markup, shader text, formulas or a text you are rewriting in reasoning: whatever you write there you type again in the file. Start writing the first file in your first response.
-- A web page can load a library from a CDN at a version you know.
-- Find what an edit or a question touches with `search_files`, then read the lines it needs. A question across many files (a review, an audit, what uses what) goes to `explore` first, and you work from its answer: what you read here stays in every later request.
-- A bug: reproduce it, fix the cause, and add a test that fails without the fix unless a test already fails.
-- Check what you changed by running it, and read its output. Where nothing can check it, say so: never imply that it was tested.
+- A request to build or fix means the working change, not a plan of it. A broad request is enough: take the safest useful first step and go on. Looking around does not authorize editing.
+- A new file: start writing it in your first response. A change to existing code: find what it touches with `search_files` and read the lines it needs first. A question across many files (a review, an audit, what uses what) goes to `explore` first, and you work from its answer.
+- Make the change asked, as asked: no feature, setting, file or asset the user did not ask for, and none of the workspace's own files used for something they were not made for. What you think is missing, say at the end in a line.
+- A bug: reproduce it and fix the cause. Where the code has tests or a test runner, add a test that fails without the fix.
 - A question that asks for no change is answered from what you read: run something for it only when the answer turns on what the code does when it runs.
 - State only what a tool showed you. A comment, a note or a memory is a lead to check, not a fact. A search that finds nothing, or part of a file, does not show that the rest is not there. Never invent a result.
+
+## Checking
+- Check what you changed by running it, and read what it printed.
+- A web page: open the file itself with `check_page`; its `steps` click and type as a person would, and the scripts, styles and fonts it loads from well-known CDNs load there too. Never download, vendor or build a library to check a page, and never check a copy of your own changed for checking.
+- Say exactly what was checked. What cannot be checked here, say so in your answer, and never imply that it was tested.
 
 ## Tools
 - `@path` in the user's message is a file of the workspace they point to, from its root; one ending in `/` is a folder. Read it before you say what is in it.
@@ -32,7 +38,7 @@ pub const SYSTEM_PROMPT: &str = "You are Dogmind, an agent on the user's own com
 - Call tools only in the tool-call format, never as text in your answer or your reasoning.
 
 ## Answering
-- Answer what was asked first: the first sentence is the answer itself, not what you read or ran to reach it. If you changed files, ran something or did more than was asked, say so briefly at the end, with what has not been run: never say that what has not been run works.
+- Answer what was asked first: the first sentence is the answer itself, not what you read or ran to reach it. If you changed files, ran something or did more than was asked, say so briefly at the end, with what was checked as the Checking section says.
 - The user sees each tool call as you work, can open what it returned, and sees the pictures you read.
 - Name a file of the workspace as a link to its path from the root, as `[app.js](src/app.js)`, or `[app.js:24](src/app.js#L24)` for its line 24: the user opens it from the answer. `![what it shows](path)` shows a picture in the answer, such as one `check_page` took.
 
@@ -165,7 +171,7 @@ fn environment() -> String {
     }
     let shut = if shut.is_empty() { String::new() } else { format!(" Closed to the sandbox until the user runs /tools, by any path: {}: work without them, and say what /tools would add.", shut.join(", ")) };
     format!(
-        "## Environment\n- Windows. `execute_command` runs cmd.exe in a sandbox, so write cmd syntax. It can write only in the workspace (when that is a whole user folder or drive, only in the project folder its `cwd` names), it cannot read the user's other files except folders the first message names, and it has no network. curl, package installs and remote git ask the user by themselves; anything else that needs it sets `network: true`, which asks too.\n- A server a command starts in the background on localhost can be reached from other commands and by `check_page`'s `url`. `check_page` shows how a page looks, and its `steps` click and type in it as a person would. A page using a CDN library cannot run here, and that is fine: write it once as one file, never download or build a library to check it, and say in your answer that it has not been run.\n- PowerShell starts at C:\\ in the sandbox and cannot move from there, so give it absolute paths, and `Start-Process` a `-WorkingDirectory`.\n- Stay in the workspace unless the user asks otherwise. What the sandbox refuses it refuses by every route, so do not try others: when the user asked for something outside the workspace that only a command can do, run that command with `outside_sandbox: true`, which asks the user and runs it as them.\n- On PATH, with no need to check: {}.{shut}{lacking}\n\n",
+        "## Environment\n- Windows. `execute_command` runs cmd.exe in a sandbox, so write cmd syntax. It can write only in the workspace (when that is a whole user folder or drive, only in the project folder its `cwd` names), it cannot read the user's other files except folders the first message names, and it has no network.\n- A file the task itself needs from the web: `curl -sL -o FILE URL`, its URL written out; the user is asked, and can allow that site for the rest of the session. Package installs and remote git ask by themselves; anything else that needs the network sets `network: true`, which asks too.\n- A server a command starts in the background on localhost can be reached from other commands and by `check_page`'s `url`.\n- PowerShell starts at C:\\ in the sandbox and cannot move from there, so give it absolute paths, and `Start-Process` a `-WorkingDirectory`.\n- Stay in the workspace: what the sandbox refuses, it refuses by every route. `outside_sandbox: true` runs a command as the user, and asks them: only for what the user asked to be read or changed outside the workspace, never to check your own work.\n- On PATH, with no need to check: {}.{shut}{lacking}\n\n",
         found.join(", ")
     )
 }
@@ -320,7 +326,9 @@ pub fn mostly_code(text: &str) -> bool {
     lines.len() >= 5 && code * 3 >= lines.len() * 2
 }
 
-pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, it would not be worth running, or the user asked you not to run it, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";
+pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. Check it now as the Checking section says, and fix what that shows. If it cannot be checked here, say so plainly in your answer. Do not start on anything else.";
+/// What `CHECK_NUDGE` said before (2026-11-22), as sessions saved before it was marked have it, with no mark: it is the app's too.
+const CHECK_NUDGE_BEFORE: &str = "You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, it would not be worth running, or the user asked you not to run it, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";
 
 /// The app's word after an answer in Japanese with letters in it that no Japanese is written with, which it cannot see for itself. What it has written stays as it is, on the screen and in the
 /// conversation: this asks for the lines again, once, and what comes of it is read as what it is. In Japanese, as Japanese pulls an answer back to Japanese more than a rule about it would, and as short as it can be, as it costs a
@@ -331,7 +339,7 @@ pub fn slip_note(letters: &str) -> String {
 
 /// Whether a user's message was the app's and not the person's: it is not shown as something they said. (A saved session has the check's word as it was, unmarked.)
 pub fn is_nudge(text: &str) -> bool {
-    text == CONTINUE_NUDGE || text.starts_with(DRAFT_NOTE) || is_app_facts(text) || Some(text) == CHECK_NUDGE.strip_prefix(DRAFT_NOTE)
+    text == CONTINUE_NUDGE || text.starts_with(DRAFT_NOTE) || is_app_facts(text) || Some(text) == CHECK_NUDGE.strip_prefix(DRAFT_NOTE) || text == CHECK_NUDGE_BEFORE
 }
 
 /// What the app says on the screen when a request has made its turn read-only, before anything is refused. The second sentence is the way out: a request that does not say it is followed
@@ -895,7 +903,7 @@ mod tests {
     fn the_prompt_says_how_to_ask_for_the_network_and_to_write_rather_than_plan() {
         let prompt = system_prompt(crate::in_container::tempdir().unwrap().path(), false, "", "");
         assert!(prompt.contains("`network: true`"));
-        assert!(prompt.contains("Never put code, markup, shader text, formulas or a text you are rewriting in reasoning"));
+        assert!(prompt.contains("## Thinking\n- Reasoning decides; it does not write.") && prompt.contains("Never draft them in reasoning"));
         assert!(!prompt.contains("under node or python"), "node may be closed to the sandbox");
     }
 
@@ -949,6 +957,7 @@ mod tests {
     fn the_apps_own_words_are_told_from_the_persons() {
         assert!(is_nudge(CONTINUE_NUDGE) && is_nudge(CHECK_NUDGE) && is_nudge(&slip_note("员")));
         assert!(is_nudge(CHECK_NUDGE.strip_prefix(DRAFT_NOTE).unwrap()), "as a session saved before it was marked has it");
+        assert!(is_nudge(CHECK_NUDGE_BEFORE), "and as it was worded before");
         assert!(!is_nudge("continue"));
         let facts = app_facts("now", None, &[]);
         assert!(is_nudge(&facts) && is_app_facts(&facts), "the app's facts are the app's");
