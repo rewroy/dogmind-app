@@ -3653,7 +3653,7 @@ impl Agent {
             return Permission::Run;
         }
         // A line of several commands, each as it would be alone: what "always" allowed of each answers for it in any line.
-        let by_parts = self.by_parts(tool, arguments, &place, risk, reason.as_deref(), runs_as.is_some());
+        let by_parts = self.by_parts(tool, arguments, &place, risk, reason.as_deref());
         if matches!(by_parts, Some(ByParts::Allowed)) {
             return Permission::Run;
         }
@@ -3783,8 +3783,10 @@ impl Agent {
     /// A command line of several commands, each asked about as it would be alone, where nothing but that would ask for it: whether all of them may run, and if not, what "always" would
     /// allow of the ones that ask. None for any other call, and for a line that is asked about whole (`safety::LineParts::Whole`). The line runs with the network if it has it at
     /// all, so with the network a part is a fetch whose site (or installer) can be allowed, or one that makes no use of the network: any other program could send what it reads anywhere.
-    fn by_parts(&self, tool: &str, arguments: &Value, place: &Path, risk: Risk, reason: Option<&str>, rewritten: bool) -> Option<ByParts> {
-        if tool != "execute_command" || safety::outside_sandbox(arguments) || rewritten || risk >= Risk::High {
+    /// The parts are those of the line as written, as the rules and "always" go by: the line that runs differs from it only where `dir` and `del` are done by cmd's own `for`, `if` and
+    /// `echo` in their place (a part of cmd's own either way), and where `| head` goes, which a pipe keeps whole. What the gate made of that line is in `reason` and `risk` already.
+    fn by_parts(&self, tool: &str, arguments: &Value, place: &Path, risk: Risk, reason: Option<&str>) -> Option<ByParts> {
+        if tool != "execute_command" || safety::outside_sandbox(arguments) || risk >= Risk::High {
             return None;
         }
         let network = safety::wants_network(arguments);
@@ -5357,6 +5359,8 @@ mod tests {
             command(format!("curl -sL -o a.js {site}/a.js & curl -sL -o b.js {site}/b.js & echo ok")),
             command(format!("mkdir v && curl -sL -o v/c.js {site}/c.js")),
             command(format!("mkdir w 2>nul & curl -sL -o w/x.js {site}/x.js 2>&1")),
+            // (`dir` runs as cmd's own `for` and `echo` in its place: the line as written is what is judged)
+            command(format!("curl -sL -o w/y.js {site}/y.js & dir /s /-c w")),
             command(format!("for %f in (d e) do @curl -sL -o \"%f.js\" \"{site}/%f.js\"\necho done")),
             command(format!("python -c \"print(1)\" && curl -sL -o f.js {site}/f.js")),
             command(format!("set B={site}& curl -sL -o g.js %B%/g.js")),
