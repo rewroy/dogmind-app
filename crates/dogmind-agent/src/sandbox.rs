@@ -1841,7 +1841,11 @@ fn environment(temp: Option<&Path>, workspace: &Path, offline: bool, as_person: 
     let mut block = environment_block(block, crate::bundled::root().as_deref(), temp, workspace, build_tools);
     // (as the person, git reads their own settings and Python starts as it does for them: what stands in for those in the sandbox is not for them)
     if as_person {
-        block.retain(|(name, _)| !name.eq_ignore_ascii_case("XDG_CONFIG_HOME") && !name.eq_ignore_ascii_case("PYTHONPATH"));
+        block.retain(|(name, _)| !["XDG_CONFIG_HOME", "PYTHONPATH", "GIT_CONFIG_GLOBAL"].iter().any(|kept_out| name.eq_ignore_ascii_case(kept_out)));
+        their_git_first(&mut block, &std::env::var("PATH").unwrap_or_default(), crate::bundled::root().as_deref());
+        // (their credential helper may not ask anything on a desktop nobody sees: what it has stored is used, and without it the push fails at once and says so)
+        block.push(("GCM_INTERACTIVE".to_string(), "never".to_string()));
+        block.sort_by_key(|(name, _)| name.to_uppercase());
     }
     if offline {
         block.retain(|(name, _)| !OFFLINE.iter().any(|(set, _)| set.eq_ignore_ascii_case(name)));
@@ -1855,6 +1859,19 @@ fn environment(temp: Option<&Path>, workspace: &Path, offline: bool, as_person: 
     }
     out.push(0);
     out
+}
+
+/// As the person, their own Git comes first on PATH, ahead of the bundled one: with it come its settings, and Git for Windows keeps its credential helper
+/// (`credential.helper=manager`) in its own system config, which the bundled Git does not read. Without it `git push` as the person had no credentials and
+/// could only fail ("could not read Username for 'https://github.com': terminal prompts disabled", a real session of 2026-11-22). Nothing changes where they
+/// have no Git of their own.
+fn their_git_first(block: &mut [(String, String)], inherited: &str, bundled: Option<&Path>) {
+    let theirs = std::env::split_paths(inherited).find(|folder| folder.join("git.exe").is_file() && !bundled.is_some_and(|root| key(folder).starts_with(&key(root))));
+    let (Some(theirs), Some((_, path))) = (theirs, block.iter_mut().find(|(name, _)| name.eq_ignore_ascii_case("PATH"))) else { return };
+    let rest: Vec<PathBuf> = std::env::split_paths(path.as_str()).filter(|folder| key(folder) != key(&theirs)).collect();
+    if let Ok(joined) = std::env::join_paths(std::iter::once(theirs).chain(rest)) {
+        *path = joined.to_string_lossy().into_owned();
+    }
 }
 
 /// A command's environment from what it inherits. The PATH comes out as the bundled tools and the folder `npm install -g` fills, then what the machine has (without a person's own Python,
@@ -3238,6 +3255,27 @@ mod tests {
         let fine = run_limited("echo fine", &place, &place, false, Duration::from_secs(60), &AtomicBool::new(false), UI_LIMITS, Some(cap), false, None, Token::Container).unwrap();
         assert!(decode(&fine.stdout).contains("fine") && fine.out_of_memory.is_none());
         drop(holder);
+    }
+
+    /// As the person, their own Git is the first on PATH, and the bundled one after it: theirs has their credential helper. A PATH with no Git of theirs stays
+    /// as it was, and the bundled folder is never taken for theirs.
+    #[test]
+    fn as_the_person_their_own_git_comes_first() {
+        let holder = tempfile::tempdir().unwrap();
+        let (bundle, theirs, other) = (holder.path().join("tools"), holder.path().join("Git").join("cmd"), holder.path().join("bin"));
+        for folder in [bundle.join("git").join("cmd"), theirs.clone(), other.clone()] {
+            std::fs::create_dir_all(&folder).unwrap();
+        }
+        std::fs::write(bundle.join("git").join("cmd").join("git.exe"), "").unwrap();
+        std::fs::write(theirs.join("git.exe"), "").unwrap();
+        let path = |folders: &[&Path]| std::env::join_paths(folders).unwrap().to_string_lossy().into_owned();
+        let mut block = vec![("PATH".to_string(), path(&[&bundle.join("git").join("cmd"), &other]))];
+        their_git_first(&mut block, &path(&[&other, &theirs]), Some(&bundle));
+        assert_eq!(block[0].1, path(&[&theirs, &bundle.join("git").join("cmd"), &other]));
+        // (no Git of theirs: as it was; and the bundle's own folder on the inherited PATH is not theirs)
+        let mut block = vec![("PATH".to_string(), path(&[&bundle.join("git").join("cmd"), &other]))];
+        their_git_first(&mut block, &path(&[&other, &bundle.join("git").join("cmd")]), Some(&bundle));
+        assert_eq!(block[0].1, path(&[&bundle.join("git").join("cmd"), &other]));
     }
 
     #[test]
