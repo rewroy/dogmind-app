@@ -3099,10 +3099,13 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let most_err = if no_network.is_some() { MAX_COMMAND_ERR / 6 } else { MAX_COMMAND_ERR };
     let whole = (out.len() > MAX_COMMAND_OUT || err.len() > most_err).then(|| kept_whole(&out, &err)).flatten();
     report.push_str(&format!("stdout:\n{said_by_init}{}\nstderr:\n{}\n", cap_evenly(&out, MAX_COMMAND_OUT, whole.as_deref()), cap_evenly(&err, most_err, whole.as_deref())));
-    match done.status {
-        Some(code) => report.push_str(&format!("exit_code: {code}")),
-        None => report.push_str(&format!("exit_code: none, {} after {} s", done.ended, started.elapsed().as_secs())),
-    }
+    let ended = match done.status {
+        Some(code) => format!("exit_code: {code}"),
+        None => format!("exit_code: none, {} after {} s", done.ended, started.elapsed().as_secs()),
+    };
+    // (first as well as last: how it ended is read before what it printed, as a model was taught to read a command's result; the last line stays what the app reads)
+    report.insert_str(0, &format!("{ended}\n"));
+    report.push_str(&ended);
     Ok(report)
 }
 
@@ -3153,10 +3156,12 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     // (all of it kept, as a sandboxed command's is: the part cut out is read back, not run again)
     let whole = (out.len() > MAX_OUTPUT || err.len() > MAX_OUTPUT / 2).then(|| kept_whole(&out, &err)).flatten();
     report.push_str(&format!("stdout:\n{}\nstderr:\n{}\n", cap_evenly(&out, MAX_OUTPUT, whole.as_deref()), cap_evenly(&err, MAX_OUTPUT / 2, whole.as_deref())));
-    match status {
-        Some(status) => report.push_str(&format!("exit_code: {}", status.code().unwrap_or(-1))),
-        None => report.push_str(&format!("exit_code: none, {ended} after {} s", started.elapsed().as_secs())),
-    }
+    let ended = match status {
+        Some(status) => format!("exit_code: {}", status.code().unwrap_or(-1)),
+        None => format!("exit_code: none, {ended} after {} s", started.elapsed().as_secs()),
+    };
+    report.insert_str(0, &format!("{ended}\n"));
+    report.push_str(&ended);
     Ok(report)
 }
 
@@ -3269,6 +3274,16 @@ mod power_tests {
         live.push(&[b'x'; LIVE_SHOWN]);
         let (shown, _) = live.since(0, LIVE_SHOWN + 1);
         assert!(shown.starts_with('(') && !shown.contains('\u{FFFD}') && !shown.contains('あ') && shown.ends_with('x'), "{shown}");
+    }
+
+    /// A command's result says how it ended on its first line as well as its last.
+    #[cfg(windows)]
+    #[test]
+    fn a_commands_result_says_how_it_ended_first_and_last() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (mut bench, cancel) = (Workbench::default(), AtomicBool::new(false));
+        let said = bench.run("execute_command", &json!({"command": "echo hello& exit /b 3"}), dir.path(), &cancel).unwrap();
+        assert!(said.starts_with("exit_code: 3\n") && said.ends_with("exit_code: 3") && said.contains("hello"), "{said}");
     }
 
     /// What a real command in the sandbox prints reaches a look while it still runs: a server's ready line before it ends, which it never does.
