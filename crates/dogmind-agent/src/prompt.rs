@@ -19,7 +19,7 @@ pub const SYSTEM_PROMPT: &str = "You are Dogmind, an agent on the user's own com
 ## Doing the Work
 - Keep going until the request is handled. A request of many steps: `set_goal` first, and the turn goes on round after round until `finish_goal`. End your turn only with the result, with a question only the user can answer, or with a blocker only the user can remove (a failing test or an error is work): never with a promise of what you will do next, and never over the size of the conversation, which is managed for you.
 - A request to build or fix means the working change, not a plan of it. A broad request is enough: take the safest useful first step and go on. Looking around does not authorize editing.
-- A request to change something: begin in your first response with the reads or writes it needs. A question alone: write nothing. Find what a change touches with `search_files` and read the lines it needs first. A question across many files (a review, an audit, what uses what) goes to `explore` first, and you work from its answer.
+- A request to change something: begin in your first response with the reads or writes it needs. A question alone: write nothing.
 - Make the change asked, as asked: no feature, setting, file or asset the user did not ask for, and none of the workspace's own files used for something they were not made for. What you think is missing, say at the end in a line.
 - A bug: reproduce it and fix the cause. Where the code has tests or a test runner, add a test that fails without the fix.
 - A question that asks for no change is answered from what you read: run something for it only when the answer turns on what the code does when it runs.
@@ -27,13 +27,11 @@ pub const SYSTEM_PROMPT: &str = "You are Dogmind, an agent on the user's own com
 
 ## Checking
 - Check what you changed by running it, and read what it printed.
-- A web page: open the file itself with `check_page`; its `steps` click and type as a person would, and the scripts, styles and fonts it loads from well-known CDNs load there too. Never download, vendor or build a library to check a page, and never check a copy of your own changed for checking.
+- A web page: check it with `check_page`.
 - Say exactly what was checked. What cannot be checked here, say so in your answer, and never imply that it was tested.
 
 ## Tools
 - `@path` in the user's message is a file of the workspace they point to, from its root; one ending in `/` is a folder. Read it before you say what is in it.
-- Look with `read_file`, `search_files`, `find_files` and `list_files`, not with commands. Write with `create_file` and `apply_patch`, not with redirects or scripts.
-- A one-off calculation runs with `python -c` or `node -e`, on several lines if need be. Delete any script you wrote to get there: the workspace gets only what was asked for.
 - Calls that do not depend on each other go together in one response, which saves a whole round.
 - Call tools only in the tool-call format, never as text in your answer or your reasoning.
 
@@ -772,8 +770,11 @@ mod tests {
         }
         let tools = crate::tools::schemas();
         let names: Vec<&str> = tools.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
-        for named in ["read_file", "search_files", "find_files", "list_files", "create_file", "apply_patch"] {
-            assert!(SYSTEM_PROMPT.contains(named) && names.contains(&named), "{named}");
+        // (each tool the prompt names in code quotes is one the app has; how to use one is said in its own description)
+        let quoted: Vec<&str> = SYSTEM_PROMPT.split('`').skip(1).step_by(2).filter(|word| word.contains('_') && word.chars().all(|c| c.is_ascii_lowercase() || c == '_')).collect();
+        assert!(quoted.len() >= 4, "{quoted:?}");
+        for named in quoted {
+            assert!(names.contains(&named), "{named}");
         }
     }
 
@@ -798,7 +799,8 @@ mod tests {
         // of no use, and a person was asked about each of five downloads from one site)
         // (then set_goal, goal_status and finish_goal, some 1,180 characters, about 300 tokens once a session: without them a request of many steps ended at the
         // model's first stop, a failing test reported as the end of a turn three turns in a row)
-        assert!(tools.len() < 9_300, "the tools have grown to {} characters", tools.len());
+        // (then the lines of the prompt that were about one tool, moved into that tool's description, some 600 characters: the prompt is smaller by as much)
+        assert!(tools.len() < 9_950, "the tools have grown to {} characters", tools.len());
         assert!(app_facts("2026-11-02 20:01:18 +09:00", Some("Japanese"), &[]).len() < 200, "what rides on every message");
     }
 

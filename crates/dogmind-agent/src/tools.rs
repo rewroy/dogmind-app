@@ -90,7 +90,7 @@ pub fn schemas() -> Value {
             "content": {"type": "string"},
             "append": {"type": "boolean", "description": "Add to the end of the file."}
         }), &["path", "content"]),
-        function("execute_command", "Run a program, script, test, build, package manager or git, through cmd.exe in the sandbox the Environment section describes. Output is captured whole, so no redirect to a log and no `| head`. Not for reading files or listing folders. Fetch files with plain `curl -sL -o FILE URL`, each URL written out (no variable): the user can then allow that site once.", json!({
+        function("execute_command", "Run a program, script, test, build, package manager or git, through cmd.exe in the sandbox the Environment section describes. Output is captured whole, so no redirect to a log and no `| head`. Not for reading files or listing folders (read_file, search_files, find_files, list_files), nor for writing them (create_file, apply_patch). A one-off calculation: `python -c` or `node -e`, and no script left behind. Fetch files with plain `curl -sL -o FILE URL`, each URL written out (no variable): the user can then allow that site once.", json!({
             "command": {"type": "string"},
             "cwd": {"type": "string", "description": "Where to run, instead of `cd ... &&`. Default: the workspace."},
             "timeout_seconds": {"type": "integer", "description": "How long to wait for it, default 180. Past that it goes on in the background."},
@@ -109,7 +109,7 @@ pub fn schemas() -> Value {
             "start_line": {"type": "integer", "description": "1-based. -N starts N lines from the end."},
             "limit": {"type": "integer", "description": "Lines. Default and max 2000."}
         }), &["path"]),
-        function("search_files", "Search file contents by regex, ignoring case unless the pattern has capitals. Skips what .gitignore skips.", json!({
+        function("search_files", "Search file contents by regex, ignoring case unless the pattern has capitals. Skips what .gitignore skips. Find what a change touches with it first, then read only the lines needed.", json!({
             "pattern": {"type": "string"},
             "literal": {"type": "boolean", "description": "The pattern is plain text."},
             "path": {"type": "string"},
@@ -147,7 +147,7 @@ pub fn schemas() -> Value {
             "pattern": {"type": "string"},
             "path": {"type": "string"}
         }), &["pattern"]),
-        function("check_page", "Open a page in a headless browser: what its scripts printed and threw, what it shows, pictures. Scripts, styles and fonts from well-known CDNs load; nothing else from the network.", json!({
+        function("check_page", "Open a page in a headless browser: what its scripts printed and threw, what it shows, pictures. Open the page itself, never a copy changed for checking; steps click and type as a person would. Scripts, styles and fonts from well-known CDNs load, nothing else from the network: never download, vendor or build a library to check a page.", json!({
             "path": {"type": "string"},
             "url": {"type": "string", "description": "Instead of path: http://localhost:PORT/ of a server you started"},
             "views": {"type": "array", "items": {"type": "string"}, "description": "desktop (default), mobile, or WxH"},
@@ -160,7 +160,7 @@ pub fn schemas() -> Value {
             "delay_seconds": {"type": "integer", "description": "60 to 86400."},
             "note": {"type": "string"}
         }), &["delay_seconds", "note"]),
-        function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads. Not for one file: read that file yourself.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
+        function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads. First for a question across many files (a review, an audit, what uses what); not for one file: read that file yourself.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
     ])
 }
 
