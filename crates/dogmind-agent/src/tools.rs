@@ -51,10 +51,10 @@ pub fn helper_schemas() -> Value {
 /// What create_file asks of a model whose provider gives a call only once it is whole: a long call shows nothing for minutes, and a
 /// stop loses what it was writing.
 const CREATE_FILE_IN_PARTS: &str = "Write a file, new or one you have read. Over about 300 lines, write the first part, then add each further part with append=true: what is on disk survives a stop, and a long call is minutes with nothing to show.";
-/// What it asks where the call shows as it is written ([`crate::llm::Provider::shows_calls_as_written`]): there the app keeps a very long
-/// file on disk in parts itself, and each part a model wrote by its own choice cost a request and its thinking again (on an RTX 5070 Ti
-/// with Qwen3.8 IQ2_XS, a file of some 400 lines took 174 s in 2 to 4 writes, and 143 s in one).
-const CREATE_FILE_WHOLE: &str = "Write a file, new or one you have read, whole in one call: what you write shows as it comes, and of a very long file the app keeps on disk what is written and has you go on. append=true adds to the end of the file.";
+/// What it asks where the call shows as it is written ([`crate::llm::Provider::shows_calls_as_written`]): there what a stop or a broken
+/// connection cut off of a file is kept on disk to go on from, and each part a model wrote by its own choice cost a request and its thinking
+/// again (on an RTX 5070 Ti with Qwen3.8 IQ2_XS, a file of some 400 lines took 174 s in 2 to 4 writes, and 143 s in one).
+const CREATE_FILE_WHOLE: &str = "Write a file, new or one you have read, whole in one call: what you write shows as it comes. append=true adds to the end of the file.";
 
 /// The tools' schemas for a provider whose calls show as they are written: create_file asks for a file whole.
 pub fn for_calls_shown_as_written(schemas: &mut Value) {

@@ -479,6 +479,7 @@ fn fits(line: &Line, message: &Message, by_place: bool) -> bool {
     let made: Vec<&str> = message.tool_calls.iter().flatten().map(|call| call.function.name.as_str()).collect();
     match line.s("end") {
         "stop" | "tool_calls" | "" => made == asked,
+        // (the second, a long write the app cut, is in sessions from before it stopped doing so)
         "length" | "stopped_app:cut_write" => is_subsequence(&made, &asked),
         _ if by_place => is_subsequence(&made, &asked),
         _ => made.is_empty() && content_chars_of(message) > 0,

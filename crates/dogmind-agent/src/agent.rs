@@ -160,21 +160,6 @@ fn window_with(provided: u64, asked: Option<u64>) -> (u64, &'static str) {
 const REPEATS_NOTED: u32 = 2;
 const REPEATS_STOPPED: u32 = 5;
 const REPEAT_NOTE: &str = "\nnote: this exact call has run before with nothing edited in between, so its answer will not change. Try something different, or tell the user what is blocking you.";
-/// One `create_file` this long, written for longer than `MAX_WRITE_TIME`, is cut off and goes on in another: some 3 minutes of a local model's writing, which is as much as it
-/// should risk with nothing on disk. A file of this size or more had taken 14 minutes in one call, and a stop or a crash in that time lost all of it.
-const MAX_WRITE_CHARS: usize = 24_000;
-/// ... and the time it must have been written for, so that a fast model is not cut where a slow one is: the Homelab's DeepSeek wrote 24,000 characters of a game in
-/// 132 s, and after the cut gave the rest as its answer's text, its page cut short. A slow model is cut as before.
-const MAX_WRITE_TIME: Duration = Duration::from_secs(180);
-
-/// `MAX_WRITE_TIME`, which the tests of a cut set to nothing (`write_time_for_tests`), as their writes come at once.
-fn max_write_time() -> Duration {
-    #[cfg(test)]
-    return Duration::from_millis(tests::WRITE_TIME_MS.load(Ordering::Relaxed));
-    #[cfg(not(test))]
-    MAX_WRITE_TIME
-}
-
 pub enum Command {
     Send(String),
     /// What was written, and the pictures that go with it.
@@ -2413,10 +2398,7 @@ impl Agent {
             let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
             let mut written = String::new();
             let (mut reasoned, mut calling) = (String::new(), Vec::<crate::message::ToolCall>::new());
-            // (when each call began to be written, by its index: a long write is cut only once it has taken long)
-            let mut writes_began: Vec<Instant> = Vec::new();
             let cuts = provider.keeps_cut_writes();
-            let mut cut = false;
             let mut drafting = false;
             // Only where a file may change: a draft in a turn the person asked for no change in, or in plan mode, is the model thinking with code, whose answer will have it once.
             // (Four such turns in the sessions were stopped, each thrown away at 4,900 to 22,800 tokens, and the model then reasoned 20,000 to 30,000 tokens over again.)
@@ -2425,13 +2407,12 @@ impl Agent {
             let watch_is = if may_stop_drafting { "on" } else if !files_may_change { "off:no_change_asked" } else if wrote { "off:file_written" } else if drafts_stopped >= MAX_DRAFTS_STOPPED { "off:stopped_once" } else { "off" };
             // (what it has been shown, once for the request: its code in its reasoning that is a line of that is a quote, and not a draft)
             let mut watch = may_stop_drafting.then(|| DraftWatch::new(lines_shown(&self.messages)));
-            // The app's own stops (a draft, a file cut to get it on disk) end the stream through a flag of the stream's: on the person's,
-            // and taken back after, a Stop pressed as one of them fired was taken for it, and the turn went on. The person's is passed on to it.
+            // The app's own stop (of a draft) ends the stream through a flag of the stream's: on the person's,
+            // and taken back after, a Stop pressed as it fired was taken for it, and the turn went on. The person's is passed on to it.
             let halt = AtomicBool::new(self.cancelled());
             let cancel = &halt;
             let events = self.events.clone();
             let wake = &self.wake;
-            let (workspace, bench) = (&self.workspace, &self.bench);
             // (from before its first word: reading a long conversation takes a while, and is what the context bar is for)
             let base = self.expected_use();
             let window = self.window;
@@ -2474,10 +2455,6 @@ impl Agent {
                     Delta::Tool(index, name) => {
                         clock.writing();
                         meter.call(index).name = name.to_string();
-                        while writes_began.len() <= index {
-                            writes_began.push(now);
-                        }
-                        writes_began[index] = now;
                         while calling.len() <= index {
                             calling.push(crate::message::ToolCall::default());
                         }
@@ -2489,14 +2466,7 @@ impl Agent {
                         meter.count(text, now);
                         meter.call(index).pending.push_str(text);
                         if let Some(call) = calling.get_mut(index) {
-                            let before = call.function.arguments.len() / 1024;
                             call.function.arguments.push_str(text);
-                            // (looked at each kilobyte: what it looks through is long by then)
-                            let long_written = writes_began.get(index).is_some_and(|began| now.duration_since(*began) >= max_write_time());
-                            if cuts && !cut && call.function.name == "create_file" && call.function.arguments.len() >= MAX_WRITE_CHARS && long_written && call.function.arguments.len() / 1024 != before && close_cut_write(&call.function.arguments).is_some_and(|(closed, path, _)| !cut_would_lose(&closed, &path, workspace, bench)) {
-                                cut = true;
-                                cancel.store(true, Ordering::Relaxed);
-                            }
                         }
                         Vec::new()
                     }
@@ -2512,7 +2482,7 @@ impl Agent {
                 }
             }));
             // (a Stop of the person's, whatever else stopped the stream, is the turn's end)
-            let stopped_by_the_app = (cut || drafting) && !self.cancelled();
+            let stopped_by_the_app = drafting && !self.cancelled();
             // (an answer, or a part of one: the server answers in this conversation, and a refusal later is waited for as a restart's)
             if result.is_ok() || !reasoned.is_empty() || !written.is_empty() || !calling.is_empty() {
                 self.server_answered = true;
@@ -2520,7 +2490,6 @@ impl Agent {
             // (how it ended, as the trajectory says it: what ended it from outside is not in what the provider returned)
             let end = match &result {
                 Err(LlmError::Cancelled) if drafting && stopped_by_the_app => "stopped_app:draft_stop".to_string(),
-                Err(LlmError::Cancelled) if cut && stopped_by_the_app => "stopped_app:cut_write".to_string(),
                 other => trajectory::end_of(other),
             };
             let (usage, timings) = result.as_ref().ok().map_or((None, None), |completion| (completion.usage.as_ref(), completion.timings.as_ref()));
@@ -2551,14 +2520,6 @@ impl Agent {
             }
             let mut completion = match result {
                 Ok(completion) => completion,
-                // Ended here, not by the person: the rest goes on in the next call.
-                Err(LlmError::Cancelled) if cut && stopped_by_the_app && saved.is_some() => {
-                    // (an answer cut here has no count of its own, and it is the long ones that come this way)
-                    let (answer, path, tail) = saved.expect("just looked at");
-                    self.cut_write_noted("size", &answer, &path, meter.tokens);
-                    self.note_cut_write(&answer, path, tail);
-                    answer
-                }
                 Err(LlmError::Cancelled) => {
                     if !saved.is_some_and(|saved| self.keep_cut_write(saved.0)) {
                         self.keep_written(&written);
@@ -2677,7 +2638,7 @@ impl Agent {
             if completion.tool_calls.iter().any(|call| matches!(call.function.name.as_str(), "create_file" | "apply_patch")) {
                 thinking_closed = false;
             }
-            // The model's own limit in the middle of a file: as with a cut, what it wrote stays and it goes on.
+            // The model's own limit in the middle of a file: as with a broken connection, what it wrote stays and it goes on.
             if cuts && completion.finish == "length" {
                 if let Some((answer, path, tail)) = cut_answer(&completion.content, &completion.reasoning, &completion.tool_calls, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) {
                     self.cut_write_noted("length", &answer, &path, 0);
@@ -3586,7 +3547,7 @@ impl Agent {
         if let Some((path, tail)) = self.cut_writes.remove(id) {
             if ok {
                 self.bench.note_cut(resolve(&self.workspace, &path));
-                output.push_str(&format!("\nnote: this call was cut off here, to get the work on disk. The file ends with this line: `{tail}`. Go straight on with the next line, in create_file with the same path (not in your answer's text, which writes nothing), and write only what is missing: there is no need to think it over again."));
+                output.push_str(&format!("\nnote: this call was cut off here, before its end. The file ends with this line: `{tail}`. Go straight on with the next line, in create_file with the same path (not in your answer's text, which writes nothing), and write only what is missing: there is no need to think it over again."));
             }
         }
         self.tool_ended(id, ok, declined, &output, elapsed);
@@ -8141,49 +8102,34 @@ Body").unwrap();
         assert!(!streamed(&mut watching_totals(), &long), "forty times as much of the same is still not a run");
     }
 
-    /// The time a write must have taken to be cut, in the tests: none unless a test that holds `write_time_for_tests` sets it.
-    pub(super) static WRITE_TIME_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static WRITE_TIME_HELD: Mutex<()> = Mutex::new(());
-
-    /// While this is held, a write must have taken `time` to be cut; the tests that write long hold it, so that one that sets another time does not run beside them.
-    fn write_time_for_tests(time: Duration) -> impl Drop {
-        struct Held {
-            _held: std::sync::MutexGuard<'static, ()>,
-        }
-        impl Drop for Held {
-            fn drop(&mut self) {
-                WRITE_TIME_MS.store(0, Ordering::Relaxed);
-            }
-        }
-        let held = Held { _held: WRITE_TIME_HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) };
-        WRITE_TIME_MS.store(time.as_millis() as u64, Ordering::Relaxed);
-        held
-    }
-
-    /// A long write that has not taken long is not cut: a fast model writes its file in one call.
+    /// A long `create_file` is written whole, in one call: the app cuts no write that is going on as it should, however long it is.
     #[test]
-    fn a_long_write_that_came_fast_is_not_cut() {
-        let _time = write_time_for_tests(MAX_WRITE_TIME);
+    fn a_long_write_is_written_whole_in_one_call() {
         let dir = tempfile::tempdir().unwrap();
         let raw = write_arguments(1000, usize::MAX);
+        assert!(raw.len() > 40_000);
         let (client, bodies) = trickling_server(vec![pieces(&raw), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
         run.handle.commands.send(Command::Send("make a page".into())).unwrap();
-        let (log, _) = until_end(&run, Decision::Reject);
+        let (log, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled, "{log:?}");
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2, "{log:?}");
         let sent = bodies[1]["messages"].as_array().unwrap()[3]["tool_calls"][0]["function"]["arguments"].as_str().unwrap().to_string();
-        assert_eq!(sent.len(), raw.len(), "written whole, in one call");
+        assert!(sent == raw, "written whole, in one call: {} bytes of {}", sent.len(), raw.len());
         assert!(!bodies[1].to_string().contains("cut off"));
+        let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
+        assert_eq!(on_disk.lines().count(), 1000);
     }
 
+    /// A write the output limit ended half way goes on from what is on disk, whether the model says append or not.
     #[test]
-    fn a_long_write_is_cut_off_on_disk_and_goes_on_from_there_with_or_without_append() {
-        let _time = write_time_for_tests(Duration::ZERO);
+    fn a_write_the_output_limit_ended_goes_on_from_what_is_on_disk_with_or_without_append() {
         let dir = tempfile::tempdir().unwrap();
-        let raw = write_arguments(1000, usize::MAX);
-        assert!(raw.len() > 2 * MAX_WRITE_CHARS);
-        let (client, bodies) = trickling_server(vec![pieces(&raw), whole_call(serde_json::json!({"path": "web/index.html", "content": "the rest\n"})), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
+        let raw = write_arguments(1000, 24_000);
+        let parts: Vec<&[u8]> = raw.as_bytes().chunks(2000).collect();
+        let first: Vec<Value> = parts.iter().enumerate().map(|(at, piece)| piece_of_call(std::str::from_utf8(piece).unwrap(), (at + 1 == parts.len()).then_some("length"))).collect();
+        let (client, bodies) = trickling_server(vec![first, whole_call(serde_json::json!({"path": "web/index.html", "content": "the rest\n"})), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
         run.handle.commands.send(Command::Send("make a page".into())).unwrap();
         let (log, cancelled) = until_end(&run, Decision::Reject);
@@ -8194,7 +8140,7 @@ Body").unwrap();
         let call = &messages[3]["tool_calls"][0]["function"];
         assert_eq!(call["name"], "create_file");
         let sent: &str = call["arguments"].as_str().unwrap();
-        assert!(sent.len() < MAX_WRITE_CHARS + 2100 && sent.starts_with(r#"{"path":"web/index.html","content":"line 0 "#), "the bytes as they came: {}", &sent[..80]);
+        assert!(sent.len() <= raw.len() + 2 && sent.starts_with(r#"{"path":"web/index.html","content":"line 0 "#), "the bytes as they came: {}", &sent[..80]);
         let kept: Value = serde_json::from_str(sent).expect("whole JSON");
         assert!(kept["content"].as_str().unwrap().ends_with("to something\n"), "at a line's end");
         let said = messages[4]["content"].as_str().unwrap();
@@ -8222,7 +8168,7 @@ Body").unwrap();
     fn a_call_straydog_sends_as_it_is_written_is_shown_and_then_done_once() {
         let dir = tempfile::tempdir().unwrap();
         let raw = spaced_write_arguments(100, usize::MAX);
-        assert!(raw.len() > 6000 && raw.len() < MAX_WRITE_CHARS);
+        assert!(raw.len() > 6000);
         let mut events = straydog_pieces(&raw);
         events.push(piece_of_call(&raw, Some("tool_calls")));
         let (client, bodies) = trickling_server(vec![events, vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
@@ -8254,36 +8200,6 @@ Body").unwrap();
         assert_eq!(bodies[1]["messages"].as_array().unwrap()[3]["tool_calls"].as_array().unwrap().len(), 1);
     }
 
-    /// A call too long for one answer is cut off from the pieces Straydog sends, as from a server's own, and goes on from what is on disk.
-    #[test]
-    fn a_long_write_straydog_sends_in_pieces_is_cut_off_all_the_same() {
-        let _time = write_time_for_tests(Duration::ZERO);
-        let dir = tempfile::tempdir().unwrap();
-        let raw = spaced_write_arguments(1000, usize::MAX);
-        assert!(raw.len() > 2 * MAX_WRITE_CHARS);
-        let mut first = straydog_pieces(&raw);
-        // (a server that is not stopped goes on to send the call whole)
-        first.push(piece_of_call(&raw, Some("tool_calls")));
-        let (client, bodies) = trickling_server(vec![first, whole_call(serde_json::json!({"path": "web/index.html", "content": "the rest\n"})), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
-        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
-        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
-        let (log, cancelled) = until_end(&run, Decision::Reject);
-        assert!(!cancelled, "{log:?}");
-        let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 3, "{log:?}");
-        let messages = bodies[1]["messages"].as_array().unwrap();
-        let call = &messages[3]["tool_calls"][0]["function"];
-        assert_eq!(call["name"], "create_file");
-        let sent: &str = call["arguments"].as_str().unwrap();
-        assert!(sent.len() < MAX_WRITE_CHARS + 2100 && sent.starts_with(r#"{"path": "web/index.html", "content": "line 0 "#), "the bytes as they came: {}", &sent[..80]);
-        let kept: Value = serde_json::from_str(sent).expect("whole JSON");
-        assert!(kept["content"].as_str().unwrap().ends_with("to something\n"), "at a line's end");
-        let said = messages[4]["content"].as_str().unwrap();
-        assert!(said.contains("cut off") && said.contains("Go straight on"), "{said}");
-        let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
-        assert_eq!(on_disk, format!("{}the rest\n", kept["content"].as_str().unwrap()));
-    }
-
     #[test]
     fn always_to_a_command_is_not_always_to_it_with_the_network() {
         let (plain, asked, named) = (serde_json::json!({"command": "python x.py"}), serde_json::json!({"command": "python x.py", "network": true}), serde_json::json!({"command": "curl https://x.example"}));
@@ -8293,7 +8209,6 @@ Body").unwrap();
 
     #[test]
     fn a_long_write_over_a_file_that_is_there_is_not_cut_and_a_stop_leaves_the_file_whole() {
-        let _time = write_time_for_tests(Duration::ZERO);
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("web")).unwrap();
         let existing = "the person's page\n".repeat(50);
@@ -8312,23 +8227,7 @@ Body").unwrap();
     }
 
     #[test]
-    fn a_long_write_is_not_told_what_it_has_cost() {
-        let _time = write_time_for_tests(Duration::ZERO);
-        let dir = tempfile::tempdir().unwrap();
-        // Each cut comes at some 3000 tokens as they are counted: three cuts were past where a note of the cost was due, when the app sent one.
-        let script = || pieces(&write_arguments(1000, usize::MAX));
-        let (client, bodies) = trickling_server(vec![script(), script(), script(), script(), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
-        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
-        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
-        let (log, _) = until_end(&run, Decision::Reject);
-        let bodies = bodies.lock().unwrap();
-        let told = bodies.iter().flat_map(|body| body["messages"].as_array().unwrap().iter()).filter_map(|message| message["content"].as_str()).any(|said| said.contains("This request has cost"));
-        assert!(!told, "nothing tells the model to end its turn over what it has written: {log:?}");
-    }
-
-    #[test]
     fn a_long_write_asks_as_any_write_does_and_a_no_keeps_nothing() {
-        let _time = write_time_for_tests(Duration::ZERO);
         let dir = tempfile::tempdir().unwrap();
         let (client, _) = trickling_server(vec![pieces(&write_arguments(1000, usize::MAX)), vec![serde_json::json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]})]]);
         let run = run_agent(dir.path(), client, Mode::Default);
