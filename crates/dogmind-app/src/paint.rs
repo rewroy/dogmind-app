@@ -1050,6 +1050,13 @@ unsafe extern "system" fn button_procedure(window: HWND, message: u32, wparam: W
             EndPaint(window, &paint);
             0
         }
+        // (on a device it is given: a picture of the window where the system has none, as on a station with no display)
+        WM_PRINTCLIENT => {
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            draw_button(window, wparam as HDC, client, state);
+            0
+        }
         WM_MOUSEMOVE => {
             if state & FLAG_HOVER == 0 {
                 SetWindowLongPtrW(window, GWLP_USERDATA, state | FLAG_HOVER);

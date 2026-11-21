@@ -16096,6 +16096,16 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             EndPaint(window, &paint);
             0
         }
+        // Drawn on a device it is given: a picture of the window where the system has none of it to give, as on a station with no display (the test hook's `shot`,
+        // in the sandbox), and PrintWindow where the window has no surface of its own.
+        WM_PRINTCLIENT => {
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            if client.right > 0 && client.bottom > 0 {
+                app.paint(wparam as HDC, client, client);
+            }
+            0
+        }
         WM_GETMINMAXINFO => {
             let info = &mut *(lparam as *mut MINMAXINFO);
             info.ptMinTrackSize = POINT { x: scale(app.dpi, ds::size::WINDOW_LEAST.0), y: scale(app.dpi, ds::size::WINDOW_LEAST.1) };

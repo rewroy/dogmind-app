@@ -77,6 +77,11 @@ function Stop-App($a) { if ($a -and $a.Process -and -not $a.Process.HasExited) {
 function Shot($a, [string]$Name, [int]$Flag = 3) {
   # (the app draws first: the system keeps what a window last drew, and a picture taken in the moment after a change can be of the one before)
   if ($env:DOGMIND_TEST_TERMINAL) { [void][Hook]::Send($a.Window, 'repaint'); Start-Sleep -Milliseconds 250 }
+  # (a window on a station with no display, as a command's in the sandbox is, is on no screen: the app draws its own picture of its client area, which the hook writes)
+  if ($env:DOGMIND_TEST_TERMINAL -and ($Flag -band 1)) {
+    $own = "$Shots\$Name.png"
+    if ([Hook]::Send($a.Window, "shot $own") -eq 1) { return $own }
+  }
   $r = New-Object UI+RECT; if ($Flag -band 1) { [void][UI]::GetClientRect($a.Window, [ref]$r) } else { [void][UI]::GetWindowRect($a.Window, [ref]$r) }
   $b = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T); $g = [System.Drawing.Graphics]::FromImage($b); $d = $g.GetHdc(); [void][UI]::PrintWindow($a.Window, $d, $Flag); $g.ReleaseHdc($d)
   # The terminal's window is asked for its own picture (it draws itself on the device it is given), and put where it stands: of what it holds now, and not of what the system last composed of it.

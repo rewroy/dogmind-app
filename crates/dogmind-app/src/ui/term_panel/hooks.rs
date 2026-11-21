@@ -11,6 +11,8 @@
 //!   what is known of the terminal, and the terminals in the order of the tabs.
 //! - `selection id row col row col`, `selected id path`, `scroll id lines`: the selection, what it holds, and the view moved back.
 //! - `focus on|off`: the window draws as if it had the keys; `menu shells|terminal|choose n|close`.
+//! - `shot path`: a picture of the window as it draws itself, its child windows over it, written as a PNG. A window on a station with no display (a command's in the
+//!   sandbox) is on no screen: the system has nothing of it to give, PrintWindow gives an empty picture and a copy of its device fails, so a test there takes this.
 
 use std::sync::OnceLock;
 
@@ -52,6 +54,90 @@ fn unescaped(text: &str) -> String {
         }
     }
     made
+}
+
+/// A window and the windows in it, drawn by themselves (`WM_PRINTCLIENT`) into a bitmap of the top one's client area: each child over its parent, the lowest of
+/// a parent's children first.
+unsafe fn own_picture(window: HWND) -> Result<image::RgbaImage, String> {
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(window, &mut client);
+    let (width, height) = (client.right - client.left, client.bottom - client.top);
+    if width <= 0 || height <= 0 {
+        return Err("the window has no client area".to_string());
+    }
+    let mut all = vec![0u8; (width * height * 4) as usize];
+    drawn_into(window, window, &mut all, width, height)?;
+    // (BGRA from the bitmap, its alpha left as the drawing left it: what was drawn is all there is)
+    let mut picture = image::RgbaImage::new(width as u32, height as u32);
+    for (at, pixel) in picture.pixels_mut().enumerate() {
+        let bgra = &all[at * 4..at * 4 + 4];
+        *pixel = image::Rgba([bgra[2], bgra[1], bgra[0], 255]);
+    }
+    Ok(picture)
+}
+
+/// `window` drawn into `all` (the top window's client area, `width` by `height`, BGRA rows from the top) where it lies in `top`, and then its visible children.
+unsafe fn drawn_into(top: HWND, window: HWND, all: &mut [u8], width: i32, height: i32) -> Result<(), String> {
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(window, &mut client);
+    let (w, h) = (client.right, client.bottom);
+    let mut corner = POINT { x: 0, y: 0 };
+    MapWindowPoints(window, top, &mut corner, 1);
+    if w > 0 && h > 0 {
+        let screen = GetDC(std::ptr::null_mut());
+        let device = CreateCompatibleDC(screen);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        if device.is_null() {
+            return Err("a device to draw in".to_string());
+        }
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(device, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+        if bitmap.is_null() || bits.is_null() {
+            DeleteDC(device);
+            return Err("a bitmap to draw in".to_string());
+        }
+        let before = SelectObject(device, bitmap);
+        SendMessageW(window, WM_PRINTCLIENT, device as WPARAM, (PRF_CLIENT | PRF_ERASEBKGND) as LPARAM);
+        GdiFlush();
+        let drawn = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+        for row in 0..h {
+            let y = corner.y + row;
+            if y < 0 || y >= height {
+                continue;
+            }
+            let (from, to) = (corner.x.max(0), (corner.x + w).min(width));
+            if from >= to {
+                continue;
+            }
+            let source = ((row * w + (from - corner.x)) * 4) as usize;
+            let target = ((y * width + from) * 4) as usize;
+            let length = ((to - from) * 4) as usize;
+            all[target..target + length].copy_from_slice(&drawn[source..source + length]);
+        }
+        SelectObject(device, before);
+        DeleteObject(bitmap);
+        DeleteDC(device);
+    }
+    // (the topmost child is the first; the lowest is drawn first, so that what lies over it is over it in the picture too)
+    let mut children = Vec::new();
+    let mut child = GetWindow(window, GW_CHILD);
+    while !child.is_null() {
+        // (its own mark, not IsWindowVisible: a window started hidden, as a test's is, has every child of it not visible by that)
+        if GetWindowLongPtrW(child, GWL_STYLE) as u32 & WS_VISIBLE != 0 {
+            children.push(child);
+        }
+        child = GetWindow(child, GW_HWNDNEXT);
+    }
+    for child in children.into_iter().rev() {
+        drawn_into(top, child, all, width, height)?;
+    }
+    Ok(())
 }
 
 impl App {
@@ -195,6 +281,7 @@ impl App {
                 }
                 1
             }
+            "shot" => isize::from(own_picture(self.window).and_then(|picture| picture.save(rest.trim()).map_err(|error| error.to_string())).is_ok()),
             // The window is drawn now, so that a picture taken after it is of what the screen holds and not of what the system last kept of the window.
             "repaint" => {
                 RedrawWindow(self.window, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
