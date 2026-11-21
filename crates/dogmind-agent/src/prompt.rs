@@ -714,7 +714,9 @@ mod tests {
         // build that ends ten minutes later waits for the person to type)
         // (then present, to put the files of the work before the person as a card: some 380 characters, under 100 tokens once a session)
         // (then outside_sandbox, about 150 characters, under 40 tokens once a session: without it what the person asked to have done outside the workspace could only be refused)
-        assert!(tools.len() < 7_900, "the tools have grown to {} characters", tools.len());
+        // (then a sentence on fetching files with a plain curl each, some 120 characters, 30 tokens once a session: a URL in a variable or a for over files leaves "always" for the site
+        // of no use, and a person was asked about each of five downloads from one site)
+        assert!(tools.len() < 8_050, "the tools have grown to {} characters", tools.len());
         assert!(app_facts("2026-11-02 20:01:18 +09:00", Some("Japanese"), &[]).len() < 200, "what rides on every message");
     }
 

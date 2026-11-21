@@ -680,8 +680,14 @@ fn always_places(scope: &Option<AlwaysScope>) -> String {
         Some(AlwaysScope::File(file)) => file.display().to_string(),
         Some(AlwaysScope::Folders(folders)) => folders.iter().map(|folder| folder.display().to_string()).collect::<Vec<_>>().join(", "),
         Some(AlwaysScope::Network(reach)) => reach.clone(),
+        Some(AlwaysScope::Parts(parts)) => parts.join(", "),
         None => String::new(),
     }
+}
+
+/// Whether the card in view has no "always" at all: a line of several commands that cannot each be allowed.
+fn without_always(pending: Option<&Approval>) -> bool {
+    pending.is_some_and(|approval| approval.no_always.is_some())
 }
 
 /// The files the settings name as holding keys: reading one asks, as for any place secrets are kept.
@@ -6415,7 +6421,7 @@ impl App {
         }
         let band = conversation && self.pending.is_some();
         for window in [self.note, self.approve, self.always, self.reject, self.feedback] {
-            show(window, band);
+            show(window, band && !(window == self.always && without_always(self.pending.as_ref())));
         }
         show(self.transcript, conversation && self.has_messages);
         if !(conversation && self.has_messages) {
@@ -6656,10 +6662,12 @@ impl App {
                 }
                 let row = top + s(ds::size::MENU_ROW) + head_room + note_height + line;
                 let button = s(96);
+                // (with no "always", reject moves into its place)
+                let slots = if without_always(self.pending.as_ref()) { 2 } else { 3 };
                 place(self.approve, left + s(ds::space::L), row, button, s(ds::size::CONTROL));
                 place(self.always, left + s(ds::space::L) + button + s(ds::space::S), row, button, s(ds::size::CONTROL));
-                place(self.reject, left + s(ds::space::L) + 2 * (button + s(ds::space::S)), row, button, s(ds::size::CONTROL));
-                let after = left + s(ds::space::L) + 3 * (button + s(ds::space::S));
+                place(self.reject, left + s(ds::space::L) + (slots - 1) * (button + s(ds::space::S)), row, button, s(ds::size::CONTROL));
+                let after = left + s(ds::space::L) + slots * (button + s(ds::space::S));
                 shapes.push(Shape::Round { area: rect(after, row, left + column - s(ds::space::L) - after, s(ds::size::CONTROL)), radius: s(ds::radius::CONTROL), fill: Some(theme::raised()), border: None });
                 place(self.feedback, after + s(ds::space::M), row + s(ds::size::FIELD_INSET), left + column - s(ds::space::L) - after - 2 * s(ds::space::M), s(ds::size::FIELD_TEXT));
                 bottom = top - s(ds::space::S);
@@ -13539,8 +13547,10 @@ impl App {
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::File(_))) => tf("Always allows this file, for this session: {0}", &[&always_places(&approval.scope)]),
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::Folders(_))) => tf("Always allows this folder, for this session: {0}", &[&always_places(&approval.scope)]),
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::Network(_))) => tf("Always allows this on the network, for this session: {0}", &[&always_places(&approval.scope)]),
+                    (_, true) if matches!(approval.scope, Some(AlwaysScope::Parts(_))) => tf("Always allows each part of this line (sites for this session): {0}", &[&always_places(&approval.scope)]),
                     (Some(rule), true) => tf("Always saves: {0}", &[&t(&rule.label())]),
-                    _ => String::new(),
+                    // (in its place, why there is none)
+                    _ => approval.no_always.as_deref().map_or(String::new(), |why| t(why).to_string()),
                 };
                 // (the rule is made of the command: what hides in it is shown as its mark here too, or the line under the buttons reads in another order than the command above)
                 let always = markdown::show_hidden(&always).into_owned();

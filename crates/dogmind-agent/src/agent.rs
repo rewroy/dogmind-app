@@ -224,9 +224,48 @@ pub struct Approval {
     pub rule: Option<Rule>,
     /// What `Always` would allow for this session instead: a file, or folders. With neither of these, this exact call.
     pub scope: Option<AlwaysScope>,
+    /// Why `Always` is not on the card at all, said in its place: a line of several commands some part of which cannot be read from it (`safety::NO_ALWAYS`).
+    pub no_always: Option<String>,
     /// The call is one a program makes (`run_code`) in the middle of its run: what the program says it does.
     pub program: Option<String>,
     pub answer: Sender<(Decision, Option<String>)>,
+}
+
+/// A line of several commands, each asked about as it would be alone (`safety::line_parts`).
+enum ByParts {
+    /// Each part may run with no one asked: by the mode, a rule, or what "always" allowed of it before.
+    Allowed,
+    /// What "always" would allow of the parts that ask.
+    Grants(PartGrants),
+    /// A part cannot be read from the line, or could never be allowed always: the card has no "always".
+    NoAlways,
+}
+
+/// What "always" to a line of several commands allows of each of its parts that would ask alone.
+#[derive(Debug, Default)]
+struct PartGrants {
+    /// What the parts that get the network fetch from or install with, as `safety::network_reach` words it: for this session.
+    networks: Vec<String>,
+    /// The other parts: a rule where one can be made, and otherwise the part itself, for this session.
+    parts: Vec<PartGrant>,
+}
+
+#[derive(Debug)]
+struct PartGrant {
+    rule: Option<Rule>,
+    key: String,
+    label: String,
+}
+
+impl PartGrants {
+    fn is_empty(&self) -> bool {
+        self.networks.is_empty() && self.parts.is_empty()
+    }
+
+    /// As the card shows them.
+    fn labels(&self) -> Vec<String> {
+        self.networks.iter().cloned().chain(self.parts.iter().map(|part| part.label.clone())).collect()
+    }
 }
 
 /// What the model asks the person (the `ask_user` tool): a question with its choices, the first the model's own pick, each with what it means.
@@ -3613,6 +3652,11 @@ impl Agent {
         if delegated(self.mode, tool, risk, reason.as_deref(), self.safe_commands) {
             return Permission::Run;
         }
+        // A line of several commands, each as it would be alone: what "always" allowed of each answers for it in any line.
+        let by_parts = self.by_parts(tool, arguments, &place, risk, reason.as_deref(), runs_as.is_some());
+        if matches!(by_parts, Some(ByParts::Allowed)) {
+            return Permission::Run;
+        }
         let key = always_key(tool, arguments);
         let free = risk < Risk::High && reason.is_none();
         let scope = self.gate.always_scope(tool, arguments, &place);
@@ -3632,6 +3676,13 @@ impl Agent {
             return Permission::Run;
         }
         let rule = if free { rules::proposed(&self.gate, &place, tool, arguments, risk) } else { None };
+        // (of a line of several, "always" is for each of its parts that asks, or not on the card at all: for the line alone it would never be of use again)
+        let no_always = matches!(by_parts, Some(ByParts::NoAlways)).then(|| safety::NO_ALWAYS.to_string());
+        let (offered, scope, rule, mut grants) = match by_parts {
+            Some(ByParts::Grants(grants)) => (true, Some(AlwaysScope::Parts(grants.labels())), None, Some(grants)),
+            Some(_) => (false, None, None, None),
+            None => (offered, scope, rule, None),
+        };
         let (answer, answered) = channel();
         let (asked_at, asked) = (chrono::Local::now(), Instant::now());
         let risk_name = risk.name();
@@ -3646,6 +3697,7 @@ impl Agent {
             always_allowed: offered,
             rule: rule.clone(),
             scope: scope.clone(),
+            no_always,
             program: self.program.as_ref().map(|program| program.description.clone()),
             answer,
         }));
@@ -3673,6 +3725,23 @@ impl Agent {
                         }
                         Some(AlwaysScope::Network(reach)) => {
                             self.always_networks.push(reach);
+                            break ("always", Permission::Run);
+                        }
+                        Some(AlwaysScope::Parts(_)) => {
+                            let grants = grants.take().unwrap_or_default();
+                            self.always_networks.extend(grants.networks);
+                            for part in grants.parts {
+                                match part.rule.map(|rule| rules::add(&self.rules, rule)) {
+                                    Some(Ok(())) => {}
+                                    Some(Err(error)) => {
+                                        self.emit(Event::Notice(format!("the rule could not be saved, so it lasts this session: {error}")));
+                                        self.always.insert(part.key);
+                                    }
+                                    None => {
+                                        self.always.insert(part.key);
+                                    }
+                                }
+                            }
                             break ("always", Permission::Run);
                         }
                         None => {}
@@ -3709,6 +3778,68 @@ impl Agent {
         }
         self.traj.write("approval", req.as_deref(), line);
         permission
+    }
+
+    /// A command line of several commands, each asked about as it would be alone, where nothing but that would ask for it: whether all of them may run, and if not, what "always" would
+    /// allow of the ones that ask. None for any other call, and for a line that is asked about whole (`safety::LineParts::Whole`). The line runs with the network if it has it at
+    /// all, so with the network a part is a fetch whose site (or installer) can be allowed, or one that makes no use of the network: any other program could send what it reads anywhere.
+    fn by_parts(&self, tool: &str, arguments: &Value, place: &Path, risk: Risk, reason: Option<&str>, rewritten: bool) -> Option<ByParts> {
+        if tool != "execute_command" || safety::outside_sandbox(arguments) || rewritten || risk >= Risk::High {
+            return None;
+        }
+        let network = safety::wants_network(arguments);
+        // (another reason is its own question, and after a page what gets the network is asked about each time)
+        let only_the_network = network && reason == Some(safety::REASON_NETWORK) && !self.web_seen;
+        if !(reason.is_none() || only_the_network) {
+            return None;
+        }
+        let command = arguments.get("command").and_then(Value::as_str)?;
+        let parts = match safety::line_parts(command) {
+            safety::LineParts::Whole => return None,
+            safety::LineParts::Unreadable => return Some(ByParts::NoAlways),
+            safety::LineParts::Commands(parts) if parts.len() == 1 && parts[0] == command.trim() => return None,
+            safety::LineParts::Commands(parts) => parts,
+        };
+        let mut grants = PartGrants::default();
+        for part in parts {
+            let mut alone = json!({"command": part});
+            for name in ["cwd", "risk_level"] {
+                if let Some(value) = arguments.get(name) {
+                    alone[name] = value.clone();
+                }
+            }
+            if network && (safety::uses_network(&part) || safety::network_reach(&part, false).is_some()) {
+                alone["network"] = json!(true);
+                match self.gate.check(tool, &alone, place) {
+                    // (the CLI of the skill that comes with the app)
+                    Verdict::Allow => continue,
+                    Verdict::Ask { risk, reason: Some(why) } if risk < Risk::High && why == safety::REASON_NETWORK => {}
+                    _ => return Some(ByParts::NoAlways),
+                }
+                let Some(reach) = safety::network_reach(&part, false) else { return Some(ByParts::NoAlways) };
+                if !self.always_networks.contains(&reach) && !grants.networks.contains(&reach) {
+                    grants.networks.push(reach);
+                }
+                continue;
+            }
+            if network && !self.gate.stays_off_the_network(&part) {
+                return Some(ByParts::NoAlways);
+            }
+            match self.gate.check(tool, &alone, place) {
+                Verdict::Allow => {}
+                Verdict::Ask { risk, reason: None } if risk < Risk::High => {
+                    let key = always_key(tool, &alone);
+                    if delegated(self.mode, tool, risk, None, self.safe_commands) || self.always.contains(&key) || rules::allows(&self.rules, &self.gate, place, tool, &alone) {
+                        continue;
+                    }
+                    let rule = rules::proposed(&self.gate, place, tool, &alone, risk);
+                    let label = rule.as_ref().map_or_else(|| part.clone(), Rule::label);
+                    grants.parts.push(PartGrant { rule, key, label });
+                }
+                _ => return Some(ByParts::NoAlways),
+            }
+        }
+        Some(if grants.is_empty() { ByParts::Allowed } else { ByParts::Grants(grants) })
     }
 
     /// A checkpoint first whenever there is a middle to sum up, however few turns it is made of: it extends what the engine holds, and a trim changes the conversation near its start so that all of it after
@@ -4988,8 +5119,8 @@ mod tests {
     #[test]
     fn always_for_the_session_does_not_reach_a_file_that_stands_in_for_the_program() {
         let dir = folder_for_commands();
-        // (a line of two has no rule, so that "always" to it is for the session)
-        let command = serde_json::json!({"command": "attrib now & attrib again"});
+        // (a line with a pipe is asked about whole and has no rule, so that "always" to it is for the session)
+        let command = serde_json::json!({"command": "attrib now | attrib again"});
         let (client, _) = server(vec![call_answer("execute_command", command.clone()), text_answer("done"), call_answer("execute_command", command.clone()), text_answer("again")]);
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Send("go".into())).unwrap();
@@ -5189,6 +5320,79 @@ mod tests {
         let network = Some(safety::REASON_NETWORK.to_string());
         let command = |offered: bool| ("execute_command".to_string(), offered, network.clone());
         assert_eq!(approvals_and_reasons(&run, Decision::Reject), [command(true), command(false), command(false)], "\"always\" was on offer before the page, and not after it");
+    }
+
+    /// `folder_for_commands` with no `..` in its path: the gate weighs a path as it is spelled, and a look is a look only in a workspace that holds its folder.
+    #[cfg(windows)]
+    fn plain_folder_for_commands() -> tempfile::TempDir {
+        tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target")).unwrap()
+    }
+
+    /// The cards of a turn as what "always" would allow, whether it is on the card, and why not, each answered by the next of `decisions` (and "reject" once they run out).
+    fn cards(run: &Run, decisions: &[Decision]) -> Vec<(Option<AlwaysScope>, bool, Option<String>)> {
+        let mut asked = Vec::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(60)).expect("the turn ended") {
+                Event::Approval(approval) => {
+                    let decision = decisions.get(asked.len()).copied().unwrap_or(Decision::Reject);
+                    asked.push((approval.scope.clone(), approval.always_allowed, approval.no_always.clone()));
+                    approval.answer.send((decision, None)).unwrap();
+                }
+                Event::TurnEnded { .. } => return asked,
+                _ => {}
+            }
+        }
+    }
+
+    /// A line of several commands is asked about part by part: "always" to it allows the site its fetches read, and a later line whose parts are all allowed runs with no one asked,
+    /// a `for` over words written out included. A part that could send what it reads (with the network the line has, any program but cmd's own and a look), a variable cmd fills in and
+    /// a `for` over files leave the card with no "always" at all; a pipe is asked about whole, as before. (The site is this machine's port 9, where nothing answers.)
+    #[cfg(windows)]
+    #[test]
+    fn a_line_of_several_commands_is_allowed_part_by_part() {
+        let dir = plain_folder_for_commands();
+        let site = "http://127.0.0.1:9";
+        let command = |line: String| calls(&[("execute_command", serde_json::json!({"command": line}))]);
+        let steps = vec![
+            command(format!("curl -sL -o a.js {site}/a.js & curl -sL -o b.js {site}/b.js & echo ok")),
+            command(format!("mkdir v && curl -sL -o v/c.js {site}/c.js")),
+            command(format!("for %f in (d e) do @curl -sL -o \"%f.js\" \"{site}/%f.js\"\necho done")),
+            command(format!("python -c \"print(1)\" && curl -sL -o f.js {site}/f.js")),
+            command(format!("set B={site}& curl -sL -o g.js %B%/g.js")),
+            command(format!("for %f in (*.txt) do @curl -sL -o \"%f\" \"{site}/%f\"")),
+            command(format!("curl -sL {site}/h | findstr x")),
+            command("curl -sL -o i.js http://127.0.0.2:9/i.js & echo x".to_string()),
+            says("done"),
+        ];
+        let (run, _) = scripted(dir.path(), steps, Mode::Auto);
+        run.handle.commands.send(Command::Send("fetch them".into())).unwrap();
+        let none = Some(safety::NO_ALWAYS.to_string());
+        assert_eq!(cards(&run, &[Decision::Always]), [
+            (Some(AlwaysScope::Parts(vec!["curl 127.0.0.1:9".into()])), true, None),
+            (None, false, none.clone()),
+            (None, false, none.clone()),
+            (None, false, none),
+            // (a pipe: the line whole, with "always" for it alone, as before)
+            (None, true, None),
+            (Some(AlwaysScope::Parts(vec!["curl 127.0.0.2:9".into()])), true, None),
+        ]);
+    }
+
+    /// In the default mode a line of looks runs with no one asked, and of another line only the part that asks is asked about: "always" saves a rule for it, which answers for that part
+    /// in another line.
+    #[cfg(windows)]
+    #[test]
+    fn in_the_default_mode_each_part_of_a_line_gets_its_own_rule() {
+        let dir = plain_folder_for_commands();
+        let command = |line: &str| calls(&[("execute_command", serde_json::json!({"command": line}))]);
+        let steps = vec![command("where cmd & ver"), command("attrib now & hostname"), says("done"), command("attrib now && ver"), says("again")];
+        let (run, _) = scripted(dir.path(), steps, Mode::Default);
+        run.handle.commands.send(Command::Send("look".into())).unwrap();
+        assert_eq!(cards(&run, &[Decision::Always]), [(Some(AlwaysScope::Parts(vec!["attrib now ...".into()])), true, None)]);
+        let saved = rules::list(&run._sessions.path().join("permissions.json"));
+        assert_eq!(saved.iter().map(|rule| rule.prefix.as_str()).collect::<Vec<_>>(), ["attrib now"]);
+        run.handle.commands.send(Command::Send("again".into())).unwrap();
+        assert!(cards(&run, &[]).is_empty(), "the rule answers for its part in another line");
     }
 
     /// An MCP server's tool can do what a command can, outside the sandbox: it asks after a page with the web as its reason, and with no "always".

@@ -843,6 +843,8 @@ const JA: &[(&str, &str)] = &[
     ("Always saves: {0}", "常に許可で保存されるルール: {0}"),
     ("Always allows this file, for this session: {0}", "常に許可: このセッションの間、このファイル: {0}"),
     ("Always allows this on the network, for this session: {0}", "常に許可: このセッションの間、次のネットワーク利用: {0}"),
+    ("Always allows each part of this line (sites for this session): {0}", "常に許可: この行の部分ごとに(サイトはこのセッションの間): {0}"),
+    ("Always cannot be used for this line.", "この行には常に許可を使えません。"),
     ("Folders commands can read", "コマンドが読めるフォルダー"),
     ("Commands can read everything in these folders, and that includes any keys or passwords kept there. They cannot write there, and the network stays off unless you approve it. Files that look like keys are left out only if they are there when you add the folder, not ones made later.", "コマンドはこれらのフォルダーの中身をすべて読めます。そこに置かれた鍵やパスワードも読めます。書き込みはできず、ネットワークも許可しない限り使えません。鍵に見えるファイルを除外するのは、追加したときに既にあったものだけで、後から作られたものは除外されません。"),
     ("Add a folder...", "フォルダーを追加..."),

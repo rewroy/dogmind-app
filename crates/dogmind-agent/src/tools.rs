@@ -86,7 +86,7 @@ pub fn schemas() -> Value {
             "content": {"type": "string"},
             "append": {"type": "boolean", "description": "Add to the end of the file."}
         }), &["path", "content"]),
-        function("execute_command", "Run a program, script, test, build, package manager or git, through cmd.exe in the sandbox the Environment section describes. Output is captured whole, so no redirect to a log and no `| head`. Not for reading files or listing folders.", json!({
+        function("execute_command", "Run a program, script, test, build, package manager or git, through cmd.exe in the sandbox the Environment section describes. Output is captured whole, so no redirect to a log and no `| head`. Not for reading files or listing folders. Fetch files with plain `curl -sL -o FILE URL`, each URL written out (no variable): the user can then allow that site once.", json!({
             "command": {"type": "string"},
             "cwd": {"type": "string", "description": "Where to run, instead of `cd ... &&`. Default: the workspace."},
             "timeout_seconds": {"type": "integer", "description": "How long to wait for it, default 180. Past that it goes on in the background."},

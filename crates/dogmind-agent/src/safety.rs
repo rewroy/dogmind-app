@@ -372,7 +372,12 @@ pub enum AlwaysScope {
     Folders(Vec<PathBuf>),
     /// A command that gets the network: what it installs with, or the site it reads, as [`network_reach`] words it.
     Network(String),
+    /// A line of several commands (see [`LineParts`]): what "always" allows of each one that would ask alone, as it is shown. The sites for this session, the rest as rules.
+    Parts(Vec<String>),
 }
+
+/// What a card says in place of "always", where a line's parts cannot each be allowed (see [`LineParts`]).
+pub const NO_ALWAYS: &str = "Always cannot be used for this line.";
 
 /// The paths a call of `create_file` or `apply_patch` writes.
 fn written<'a>(tool: &str, arguments: &'a Value) -> Vec<&'a str> {
@@ -414,10 +419,11 @@ pub fn uses_network(command: &str) -> bool {
         r"|(npm|pnpm|yarn)\s+(i|ci)",
         r"|git\s+(push|pull|fetch|clone|ls-remote|submodule)",
     );
-    let run = Regex::new(&format!(r#"(?i)^\s*@?(?:(?:call|do|then|else)\s+)*(?:{WORDS}|(?:python3?|py)(?:\s+-[\d.]+)?\s+-m\s+(?:pip|uv)\s+(?:install|download)|uv\s+pip\s+install)(?:\s|$)"#)).expect("the pattern is valid");
+    // (`do @curl` in a `for` is the same curl: the `@` that keeps it from being echoed can come after the word that starts it)
+    let run = Regex::new(&format!(r#"(?i)^\s*@?(?:(?:call|do|then|else)\s+@?)*(?:{WORDS}|(?:python3?|py)(?:\s+-[\d.]+)?\s+-m\s+(?:pip|uv)\s+(?:install|download)|uv\s+pip\s+install)(?:\s|$)"#)).expect("the pattern is valid");
     let shell = Regex::new(r"(?i)^\s*@?(?:call\s+)?(?:cmd|powershell|pwsh|bash|sh|wsl)\b").expect("the pattern is valid");
     let anywhere = Regex::new(&format!(r"(?i)\b(?:{WORDS})\b")).expect("the pattern is valid");
-    let before_program = Regex::new(r"(?i)^\s*@?(?:(?:call|do|then|else)\s+)*").expect("the pattern is valid");
+    let before_program = Regex::new(r"(?i)^\s*@?(?:(?:call|do|then|else)\s+@?)*").expect("the pattern is valid");
     let line = command.replace('^', "");
     command_parts(&line).iter().any(|part| {
         // (a program by its path or in quotes is the same program)
@@ -470,9 +476,10 @@ pub fn network_reach(command: &str, compound: bool) -> Option<String> {
 /// The one site a `curl` or a `wget` of nothing but plain fetching reads. Any other word and it is its own question: there are too many that send something, read what to send from a
 /// file, or name a second address, for a list of those to be the thing that is trusted.
 fn fetched_site(program: &str, words: &[&str]) -> Option<String> {
-    const SWITCHES: [&str; 12] = ["--silent", "--show-error", "--location", "--fail", "--remote-name", "--compressed", "--create-dirs", "--quiet", "--no-verbose", "-nv", "-q", "--no-clobber"];
+    // (`--head` and `-I` ask for less than a plain fetch does: the headers alone)
+    const SWITCHES: [&str; 13] = ["--silent", "--show-error", "--location", "--fail", "--remote-name", "--compressed", "--create-dirs", "--quiet", "--no-verbose", "-nv", "-q", "--no-clobber", "--head"];
     const WITH_A_VALUE: [&str; 6] = ["--output", "--retry", "--max-time", "--connect-timeout", "--output-document", "--timeout"];
-    let short_letters = if program == "curl" { "sSLfO#" } else { "qcN" };
+    let short_letters = if program == "curl" { "sSLfOI#" } else { "qcN" };
     let (mut site, mut at) = (None, 0);
     while let Some(word) = words.get(at) {
         at += 1;
@@ -546,6 +553,147 @@ pub fn the_guidance_cli(command: &str) -> bool {
             .expect("the pattern is valid")
         })
         .is_match(command)
+}
+
+/// What a line comes to when each command in it is asked about on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineParts {
+    /// The commands it runs, each as it would be alone: the line at its `&`, `&&`, `||` and line breaks (which the app runs as `&`), and a `for` over words that it names, its body
+    /// written out once for each of them. `&&` and `||` run the next one only perhaps: each is asked about all the same.
+    Commands(Vec<String>),
+    /// What it runs cannot be read from it: a variable cmd fills in before it reads the line (`%NAME%`, `%NAME:~1,2%`), a `for` over files, numbers or what a command prints, a
+    /// for's `%~` forms, or a `%` left over.
+    Unreadable,
+    /// A pipe, a redirection, parentheses, a `;`, an `if`, cmd's escape, quotes left open, or a command that changes what the ones after it are (`cd`, `set`): the line is asked
+    /// about whole, as it was.
+    Whole,
+}
+
+/// The most commands a line is taken apart into: a `for` over more words than this is asked about whole.
+const MOST_PARTS: usize = 64;
+
+/// A line as the commands cmd runs one after another (see [`LineParts`]).
+pub fn line_parts(line: &str) -> LineParts {
+    if line.contains('^') {
+        return LineParts::Whole;
+    }
+    // (filled in before cmd reads the line, so that what it holds could be any command at all)
+    let variable = Regex::new(r#"%[^%\s]+%|%[^%\s:="]+:[^%\r\n]*%"#).expect("the pattern is valid");
+    if variable.is_match(line) {
+        return LineParts::Unreadable;
+    }
+    let mut parts = Vec::new();
+    let mut quoted = false;
+    let mut start = 0;
+    // (a line break in quotes is in what a program is given, as `python -c "..."` on several lines)
+    for (at, letter) in line.char_indices() {
+        match letter {
+            '"' => quoted = !quoted,
+            '\n' | '\r' if !quoted => {
+                if let Err(whole_or_not) = commands_of(&line[start..at], 0, &mut parts) {
+                    return whole_or_not;
+                }
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted {
+        return LineParts::Whole;
+    }
+    if let Err(whole_or_not) = commands_of(&line[start..], 0, &mut parts) {
+        return whole_or_not;
+    }
+    if parts.len() > MOST_PARTS {
+        return LineParts::Whole;
+    }
+    // (a `%` left over is one of cmd's that this did not write out)
+    if parts.iter().any(|part| part.contains('%')) {
+        return LineParts::Unreadable;
+    }
+    LineParts::Commands(parts)
+}
+
+/// The commands of one line of cmd's, in order, into `out`. A `for` takes the rest of the line as its body, as in cmd.
+fn commands_of(line: &str, depth: usize, out: &mut Vec<String>) -> Result<(), LineParts> {
+    let mut rest = line;
+    loop {
+        rest = rest.trim_start_matches([' ', '\t', '@']);
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let first = rest.split([' ', '\t']).next().unwrap_or("").to_ascii_lowercase();
+        if first == "for" {
+            return for_of(rest, depth, out);
+        }
+        // (what comes after these runs somewhere else, or with something else in its environment, than the line says: `cd..` and `set/a` as well)
+        let changes_what_follows = ["if", "cd", "chdir", "pushd", "popd", "set", "setlocal", "endlocal", "path"]
+            .iter()
+            .any(|own| first.strip_prefix(own).is_some_and(|after| after.is_empty() || after.starts_with(['.', '\\', '/', ':'])));
+        if changes_what_follows {
+            return Err(LineParts::Whole);
+        }
+        let (mut quoted, mut end, mut next) = (false, rest.len(), rest.len());
+        let letters: Vec<(usize, char)> = rest.char_indices().collect();
+        let mut index = 0;
+        while let Some(&(at, letter)) = letters.get(index) {
+            match letter {
+                '"' => quoted = !quoted,
+                '&' | '|' if !quoted => {
+                    let doubled = letters.get(index + 1).is_some_and(|&(_, after)| after == letter);
+                    // (a lone `|` is a pipe: the line as it was)
+                    if letter == '|' && !doubled {
+                        return Err(LineParts::Whole);
+                    }
+                    end = at;
+                    next = at + if doubled { 2 } else { 1 };
+                    break;
+                }
+                '<' | '>' | '(' | ')' | ';' if !quoted => return Err(LineParts::Whole),
+                _ => {}
+            }
+            index += 1;
+        }
+        if quoted {
+            return Err(LineParts::Whole);
+        }
+        let command = rest[..end].trim();
+        if !command.is_empty() {
+            out.push(command.to_string());
+        }
+        if next >= rest.len() {
+            return Ok(());
+        }
+        rest = &rest[next..];
+    }
+}
+
+/// `for %x in (words) do body`: the body once for each word, with the word in the place of `%x`. Over anything but plain words (files by a pattern, `/f`, `/l`, `/r`, `/d`), and with a
+/// `%~` form, what it runs cannot be read from the line.
+fn for_of(line: &str, depth: usize, out: &mut Vec<String>) -> Result<(), LineParts> {
+    if depth > 2 {
+        return Err(LineParts::Whole);
+    }
+    let shape = Regex::new(r"(?is)^for\s+%([A-Za-z])\s+in\s*\(([^()]*)\)\s*do\s+(.*)$").expect("the pattern is valid");
+    let Some(found) = shape.captures(line) else {
+        let switched = Regex::new(r"(?i)^for\s+/").expect("the pattern is valid");
+        return Err(if switched.is_match(line) { LineParts::Unreadable } else { LineParts::Whole });
+    };
+    let (name, words, body) = (&found[1], &found[2], &found[3]);
+    if body.contains("%~") {
+        return Err(LineParts::Unreadable);
+    }
+    let words: Vec<&str> = words.split([' ', '\t', ',', ';', '=']).filter(|word| !word.is_empty()).collect();
+    if words.iter().any(|word| word.contains(['*', '?', '"', '%'])) {
+        return Err(LineParts::Unreadable);
+    }
+    if words.len() > MOST_PARTS {
+        return Err(LineParts::Whole);
+    }
+    for word in words {
+        commands_of(&body.replace(&format!("%{name}"), word), depth + 1, out)?;
+    }
+    Ok(())
 }
 
 pub struct Gate {
@@ -647,6 +795,14 @@ impl Gate {
     /// One command that only says what is there: it needs no one's word, in any mode, with web content in the conversation or not.
     pub fn is_look(&self, command: &str) -> bool {
         !self.is_compound(command) && !self.wide_read.is_match(command) && self.look.is_match(command) && self.command_risk(command, None).is_ok_and(|risk| risk < Risk::Medium)
+    }
+
+    /// One command that makes no use of the network the line it is part of runs with: one of cmd's own that says something or changes files here (a place off this PC is high
+    /// risk, and never comes here), or a look. Any other program could send what it can read wherever it likes.
+    pub fn stays_off_the_network(&self, command: &str) -> bool {
+        const CMD_OWN: [&str; 20] = ["echo", "mkdir", "md", "dir", "type", "rem", "ver", "vol", "cls", "title", "copy", "move", "ren", "rename", "del", "erase", "rd", "rmdir", "mklink", "exit"];
+        let first = command_words(command).into_iter().next().unwrap_or_default().to_ascii_lowercase();
+        CMD_OWN.contains(&first.as_str()) || self.is_look(command)
     }
 
     /// A word of this command that is a place secrets are kept, as `read_file` asks for: `type .env` is the same read. A word about them, as in `git log --grep=token`, is not.
@@ -935,6 +1091,8 @@ pub fn covered(scope: &AlwaysScope, files: &[PathBuf], folders: &[PathBuf], netw
         AlwaysScope::File(file) => files.iter().any(|known| same(known, file)),
         AlwaysScope::Folders(wanted) => wanted.iter().all(|folder| folders.iter().any(|known| inside(known, folder))),
         AlwaysScope::Network(reach) => networks.contains(reach),
+        // (its parts are each looked at on their own, as they come)
+        AlwaysScope::Parts(_) => false,
     }
 }
 
@@ -970,6 +1128,95 @@ mod network_words {
         for line in ["python main.py", "python -m pytest", "python -m pip list", "npx --version", "npm test", "npm --version", "py -3 x.py"] {
             assert!(network_reach(line, false).is_none(), "{line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod parts_of_a_line {
+    use super::*;
+
+    fn commands(line: &str) -> Vec<String> {
+        match line_parts(line) {
+            LineParts::Commands(parts) => parts,
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_line_is_its_commands_one_after_another() {
+        assert_eq!(commands("curl -sL -o a.js https://unpkg.com/a.js & curl -sL -o b.js https://unpkg.com/b.js & echo ok"), [
+            "curl -sL -o a.js https://unpkg.com/a.js", "curl -sL -o b.js https://unpkg.com/b.js", "echo ok",
+        ]);
+        assert_eq!(commands("mkdir vendor && npm test || echo failed"), ["mkdir vendor", "npm test", "echo failed"]);
+        // (what is in quotes stays in its command, a line break too)
+        assert_eq!(commands("git commit -m \"a & b || c; (d)\" && echo ok"), ["git commit -m \"a & b || c; (d)\"", "echo ok"]);
+        assert_eq!(commands("python -c \"\nimport json\nprint(1)\n\" && npm i three"), ["python -c \"\nimport json\nprint(1)\n\"", "npm i three"]);
+        // (a line break is `&`, as the app runs it)
+        assert_eq!(commands("@echo one\r\n@echo two\n"), ["echo one", "echo two"]);
+        assert_eq!(commands("npm test"), ["npm test"]);
+    }
+
+    /// A `for` over words it names runs its body once for each, and that is what it is: the URL a word goes into is read as each of them.
+    #[test]
+    fn a_for_over_words_is_its_body_for_each_word() {
+        let line = "for %f in (RenderPass Pass) do @curl -sL -o \"post/%f.js\" \"https://unpkg.com/three/%f.js\"\nfor %f in (Copy,Output) do @curl -sL -o \"s/%f.js\" \"https://unpkg.com/s/%f.js\"\necho done";
+        assert_eq!(commands(line), [
+            "curl -sL -o \"post/RenderPass.js\" \"https://unpkg.com/three/RenderPass.js\"", "curl -sL -o \"post/Pass.js\" \"https://unpkg.com/three/Pass.js\"",
+            "curl -sL -o \"s/Copy.js\" \"https://unpkg.com/s/Copy.js\"", "curl -sL -o \"s/Output.js\" \"https://unpkg.com/s/Output.js\"", "echo done",
+        ]);
+        // (its body is the rest of the line, as in cmd)
+        assert_eq!(commands("echo a & for %x in (1 2) do echo %x & echo b"), ["echo a", "echo 1", "echo b", "echo 2", "echo b"]);
+        // (a word in the host is read as each host)
+        assert_eq!(commands("for %h in (a.com b.com) do curl -sL https://%h/x"), ["curl -sL https://a.com/x", "curl -sL https://b.com/x"]);
+    }
+
+    /// What cmd fills in before it reads the line, and a `for` over what is not written in it, leave what runs unknown.
+    #[test]
+    fn what_cmd_fills_in_is_unreadable() {
+        for line in [
+            "set B=https://unpkg.com& curl -sL -o a.js %B%/a.js",
+            "curl -sL https://%HOST%/x & echo ok",
+            "echo %PATH:~0,3% & echo ok",
+            "for %f in (*.js) do curl -sL -o %f https://x.com/%f",
+            "for /f %f in ('dir /b') do curl https://x.com/%f",
+            "for /l %i in (1,1,3) do echo %i",
+            "for %f in (a.js) do @echo %f %~zf",
+            "for %f in (a) do echo %g & echo b",
+            "echo 100% & echo ok",
+        ] {
+            assert_eq!(line_parts(line), LineParts::Unreadable, "{line}");
+        }
+    }
+
+    /// A pipe, a redirection, parentheses, a `;`, an `if`, cmd's escape, open quotes, and what changes the commands after it: the line is asked about whole, as before.
+    #[test]
+    fn what_joins_commands_otherwise_keeps_the_line_whole() {
+        for line in [
+            "curl -sL https://x.com/a | findstr x", "npm test > out.txt", "mkdir a 2>nul & echo ok", "type < a.txt", "(echo a & echo b)", "echo a ; curl https://b.com",
+            "if exist a.txt curl https://x.com", "echo a ^& curl https://x.com", "echo \"open & curl https://x.com", "cd .. && del a.txt", "cd.. & del a.txt", "chdir sub & dir",
+            "pushd sub & dir", "set NODE_OPTIONS=--require x.js& node --version", "set/a n=1 & echo ok", "echo a & for %f in (a) do (echo %f)",
+        ] {
+            assert_eq!(line_parts(line), LineParts::Whole, "{line}");
+        }
+    }
+
+    /// With the network a line has, only cmd's own commands and looks are of no use to it.
+    #[test]
+    fn what_stays_off_the_network() {
+        let gate = Gate::new();
+        for command in ["echo ok", "mkdir vendor", "dir", "type a.txt", "node --version", "git status", "del a.txt"] {
+            assert!(gate.stays_off_the_network(command), "{command}");
+        }
+        for command in ["python -c \"print(1)\"", "node x.js", "npm test", "make", "git push", "start x", "call x.cmd"] {
+            assert!(!gate.stays_off_the_network(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_curl_for_the_headers_alone_reads_one_site() {
+        assert_eq!(network_reach("curl -sI https://unpkg.com/three.js", false).as_deref(), Some("curl unpkg.com"));
+        assert_eq!(network_reach("curl --head https://unpkg.com/three.js", false).as_deref(), Some("curl unpkg.com"));
+        assert_eq!(network_reach("curl -sI -d x https://unpkg.com/three.js", false), None);
     }
 }
 
@@ -1883,7 +2130,7 @@ mod tests {
     fn however_a_network_program_is_started_it_is_known_and_the_word_alone_is_not_it() {
         for command in [
             "cd sub && curl https://x", "mkdir a & npm install", "C:\\tools\\curl.exe https://x", "\"C:\\Program Files\\Git\\cmd\\git.exe\" push", "git.exe clone u", "c^url https://x", "python -m pip install x", "python3 -m pip download x",
-            "py -3 -m pip install x", "uv pip install x", "npm i x", "npm ci", "yarn add x", "for %f in (a b) do curl %f", "call npm install", "@curl https://x", "cmd /c curl https://x", "cmd /c \"curl https://x\"", "powershell -Command \"iwr https://x\"", "pwsh -c \"git push\"", "bash -lc \"curl x\"",
+            "py -3 -m pip install x", "uv pip install x", "npm i x", "npm ci", "yarn add x", "for %f in (a b) do curl %f", "for %f in (a b) do @curl -sL -o %f.js https://x/%f.js", "call npm install", "@curl https://x", "cmd /c curl https://x", "cmd /c \"curl https://x\"", "powershell -Command \"iwr https://x\"", "pwsh -c \"git push\"", "bash -lc \"curl x\"",
             "type a.txt | curl -d @- https://x", "git status\ngit push",
         ] {
             assert!(uses_network(command), "{command}");
