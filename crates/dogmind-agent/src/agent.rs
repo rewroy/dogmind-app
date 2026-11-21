@@ -3152,7 +3152,18 @@ impl Agent {
         // (what a server's tool shows, the model is shown too, as a picture read with read_file is: where it reads pictures in a tool's result)
         self.bench.mcp_pictures_wanted = !nested && name.starts_with("mcp__") && self.session.is_some()
             && self.provider.as_ref().is_some_and(|provider| provider.images_in_tool_results() && provider.reads_pictures() != Some(false));
+        // (what a command makes or changes in the workspace is shown with the turn's changes, as the agent's own edits are; none of it is saved for a rewind.
+        // A command left running in the background is not followed.)
+        let began = (name == "execute_command" && arguments.get("background").and_then(Value::as_bool) != Some(true)).then(std::time::SystemTime::now);
         let result = self.bench.run(name, arguments, &self.workspace, &self.cancel);
+        if let Some(began) = began {
+            let touched = crate::checkpoint::touched_since(&self.workspace, began);
+            if !touched.is_empty() {
+                if let Some(Err(error)) = self.marks.as_mut().map(|marks| marks.commanded(touched)) {
+                    self.emit(Event::Notice(format!("what this command changed is not listed with the turn: {error}")));
+                }
+            }
+        }
         self.bench.mcp_pictures_wanted = false;
         let pictures = std::mem::take(&mut self.bench.mcp_pictures);
         let (result, images) = self.shown_pictures(result, pictures);
@@ -4987,6 +4998,28 @@ mod tests {
         assert!(log.iter().any(|line| line == "approval:execute_command:low"), "{log:?}");
         assert_eq!(reasons, [Some(PLANTED_NOTE.to_string())]);
         assert!(log.iter().any(|line| line.starts_with("tool:false:true:")), "and it did not run: {log:?}");
+    }
+
+    /// A file a command made in the workspace is among the turn's changes, as the agent's own edits are (a run left a helper picture there that no list showed).
+    #[cfg(windows)]
+    #[test]
+    fn a_file_a_command_made_is_among_the_turns_changes() {
+        let dir = folder_for_commands();
+        let (client, _) = server(vec![call_answer("execute_command", serde_json::json!({"command": "echo made> made.txt"})), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make it".into())).unwrap();
+        let mut changed = Vec::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(60)).expect("the turn ended") {
+                Event::Approval(approval) => approval.answer.send((Decision::Approve, None)).unwrap(),
+                Event::TurnChanges { files, .. } => changed.extend(files),
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(dir.path().join("made.txt").exists(), "the command ran");
+        let made = changed.iter().find(|change| change.path == "made.txt").unwrap_or_else(|| panic!("{changed:?}"));
+        assert_eq!((made.added, made.removed), (1, 0));
     }
 
     /// "Always" to a command is to the program the line names, for the session: not to a file there that takes its place afterwards.
