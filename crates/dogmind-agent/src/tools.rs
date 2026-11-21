@@ -19,15 +19,19 @@ const MAX_OUTPUT: usize = 12 * 1024;
 /// A command's report keeps as much of its end as of its start: that is where a build or a test run says how it went.
 const MAX_COMMAND_OUT: usize = 12 * 1024;
 const MAX_COMMAND_ERR: usize = 6 * 1024;
-/// What one `read_file` brings back, whatever its `limit`: a local model pays for each token of it as it goes in, and it stays in the context.
-const MAX_READ: usize = 32 * 1024;
+/// What one `read_file` brings back, whatever its `limit`: a local model pays for each token of it as it goes in, and it stays in the context. A page of a
+/// thousand lines (47.8 KB, 42.6 KB in the owner's conversations) is read in one, not in two.
+const MAX_READ: usize = 64 * 1024;
+/// Lines one `read_file` brings back when no `limit` is given, and at most.
+const READ_LINES: usize = 2000;
 /// A line of a minified file, as read: 65 KB of one once came back from a request for two lines.
 const MAX_LINE: usize = 2000;
 /// What a turn reads of files before it is told how much that is, and of explore: 96 KB, some 30,000 tokens.
 const READ_TOLD_PAST: usize = 96 * 1024;
-/// A file longer than this, read with no place in it, is shown as where its parts begin: a review that read every file from the top
-/// had a context of 197K tokens for 6,600 lines, most of them of no use to it.
-const OUTLINE_PAST: usize = 800;
+/// A file longer than this, or than `MAX_READ`, read with no place in it, is shown as where its parts begin: a review that read every file from the top
+/// had a context of 197K tokens for 6,600 lines, most of them of no use to it. One that fits in a read is read whole: a page of 1,153 lines came as its
+/// outline, and then in three more reads.
+const OUTLINE_PAST: usize = READ_LINES;
 /// Lines of a file's head shown with its outline: what it says it is, and what it brings in.
 const OUTLINE_HEAD: usize = 30;
 /// Lines of an outline: past this, only the ones at the left edge.
@@ -103,7 +107,7 @@ pub fn schemas() -> Value {
         function("read_file", "Read a text file as numbered lines, or see a picture where this model can be shown one.", json!({
             "path": {"type": "string"},
             "start_line": {"type": "integer", "description": "1-based. -N starts N lines from the end."},
-            "limit": {"type": "integer", "description": "Lines. Default 500, max 2000."}
+            "limit": {"type": "integer", "description": "Lines. Default and max 2000."}
         }), &["path"]),
         function("search_files", "Search file contents by regex, ignoring case unless the pattern has capitals. Skips what .gitignore skips.", json!({
             "pattern": {"type": "string"},
@@ -1401,13 +1405,13 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
     // A large file asked for with no place in it: where its parts begin, to read the one wanted, and not its first 500 lines, which stay
     // in the context for the rest of the conversation whether they were the part or not.
     let placed = arguments.get("start_line").is_some() || arguments.get("limit").is_some();
-    if !placed && lines.len() > OUTLINE_PAST {
+    if !placed && (lines.len() > OUTLINE_PAST || text.len() > MAX_READ) {
         let parts = outline(&lines);
         if !parts.is_empty() {
             return Ok((outlined(&lines, &parts, size), (path, hash)));
         }
     }
-    let limit = arguments.get("limit").and_then(Value::as_i64).unwrap_or(500).clamp(1, 2000) as usize;
+    let limit = arguments.get("limit").and_then(Value::as_i64).unwrap_or(READ_LINES as i64).clamp(1, READ_LINES as i64) as usize;
     let start = arguments.get("start_line").and_then(Value::as_i64).unwrap_or(1);
     let first = if start < 0 { lines.len().saturating_sub(start.unsigned_abs() as usize) } else { (start.max(1) as usize) - 1 };
     // (the guard on edits keeps its own hash: the model has no use for one)
@@ -1480,7 +1484,7 @@ fn outlined(lines: &[&str], parts: &[(usize, usize)], size: u64) -> String {
     let shown = |line: &str| -> String { if line.len() > 160 { format!("{}…", &line[..line.floor_char_boundary(160)]) } else { line.to_string() } };
     // (and the way to all of it, for a task that needs all of it, such as summing a document up: a model given only the outline once took
     // the long way round, a helper that read it all again, 105 s of a 186-s task)
-    let reads = lines.len().div_ceil(500).max((size as usize).div_ceil(MAX_READ));
+    let reads = lines.len().div_ceil(READ_LINES).max((size as usize).div_ceil(MAX_READ));
     let mut out = format!(
         "--- {} lines, {} KB: more than to read whole at once. Its first lines, then where its parts begin. All of it is {reads} reads: read_file with start_line=1, then from where each one says to go on ---\n",
         lines.len(),
@@ -3967,15 +3971,15 @@ mod tests {
     #[test]
     fn a_file_seen_in_part_is_not_written_whole_over() {
         let (dir, mut bench, cancel) = bench();
-        std::fs::write(dir.path().join("long.txt"), (1..=600).map(|at| format!("line {at}\n")).collect::<String>()).unwrap();
+        std::fs::write(dir.path().join("long.txt"), (1..=2600).map(|at| format!("line {at}\n")).collect::<String>()).unwrap();
         bench.run("read_file", &json!({"path": "long.txt"}), dir.path(), &cancel).unwrap();
         let write = json!({"path": "long.txt", "content": "short\n"});
         let said = bench.run("create_file", &write, dir.path(), &cancel).unwrap_err();
-        assert!(said.contains("600 lines") && said.contains("shown 500") && said.contains("start_line=501"), "{said}");
-        bench.run("read_file", &json!({"path": "long.txt", "start_line": 501}), dir.path(), &cancel).unwrap();
+        assert!(said.contains("2600 lines") && said.contains("shown 2000") && said.contains("start_line=2001"), "{said}");
+        bench.run("read_file", &json!({"path": "long.txt", "start_line": 2001}), dir.path(), &cancel).unwrap();
         bench.run("create_file", &write, dir.path(), &cancel).unwrap();
         // (an outline shows its head, and not its parts after a gap)
-        let source: String = (0..60).map(|at| format!("fn part_{at}() {{\n{}}}\n", "    x();\n".repeat(14))).collect();
+        let source: String = (0..150).map(|at| format!("fn part_{at}() {{\n{}}}\n", "    x();\n".repeat(14))).collect();
         std::fs::write(dir.path().join("big.rs"), &source).unwrap();
         assert!(bench.run("read_file", &json!({"path": "big.rs"}), dir.path(), &cancel).unwrap().contains("--- outline ---"));
         assert!(bench.run("create_file", &json!({"path": "big.rs", "content": "fn main() {}\n"}), dir.path(), &cancel).unwrap_err().contains("shown 30"));
@@ -4210,12 +4214,20 @@ mod tests {
     }
 
     /// A long file read with no place in it comes as its head and where its parts begin; asked for a place, it comes as lines, as before;
-    /// a long file of no language the outline knows is read as lines too.
+    /// a long file of no language the outline knows is read as lines too. One that fits in a read, a page of a thousand lines, comes whole.
     #[test]
     fn a_long_file_read_whole_comes_as_its_outline() {
+        {
+            let (dir, mut bench, cancel) = bench();
+            let page: String = (0..1153).map(|at| format!("<div class=\"row-{at}\">{at}</div>\n")).collect();
+            assert!(page.len() < MAX_READ, "{}", page.len());
+            std::fs::write(dir.path().join("kuji.html"), &page).unwrap();
+            let out = bench.run("read_file", &json!({"path": "kuji.html"}), dir.path(), &cancel).unwrap();
+            assert!(out.starts_with("1|<div") && out.contains("1153|<div class=\"row-1152\">") && !out.contains("outline") && !out.contains("continue with"), "{}", &out[out.len() - 200..]);
+        }
         let (dir, mut bench, cancel) = bench();
         let mut source = String::from("//! What this module is.\nuse std::path::Path;\n");
-        for at in 0..60 {
+        for at in 0..130 {
             source.push_str(&format!("\n/// Part {at}.\npub fn part_{at}(x: u32) -> u32 {{\n"));
             for line in 0..14 {
                 source.push_str(&format!("    let v{line} = x + {at};\n"));
@@ -4224,17 +4236,17 @@ mod tests {
         }
         std::fs::write(dir.path().join("big.rs"), &source).unwrap();
         let out = bench.run("read_file", &json!({"path": "big.rs"}), dir.path(), &cancel).unwrap();
-        assert!(out.starts_with("--- ") && out.contains("--- outline ---") && out.contains("|pub fn part_59(x: u32) -> u32 {") && out.contains("start_line and limit"), "{}", &out[..out.len().min(600)]);
-        assert!(!out.contains("let v7 = x + 59;"), "the bodies are not in it");
-        assert!(out.len() < 8000, "{}", out.len());
-        // (and how to read all of it, where all of it is wanted: its lines in reads of 500)
-        let reads = source.lines().count().div_ceil(500);
+        assert!(out.starts_with("--- ") && out.contains("--- outline ---") && out.contains("|pub fn part_129(x: u32) -> u32 {") && out.contains("start_line and limit"), "{}", &out[..out.len().min(600)]);
+        assert!(!out.contains("let v7 = x + 129;"), "the bodies are not in it");
+        assert!(out.len() < 12000, "{}", out.len());
+        // (and how to read all of it, where all of it is wanted: in reads of 2000 lines and 64 KB)
+        let reads = source.lines().count().div_ceil(READ_LINES).max(source.len().div_ceil(MAX_READ));
         assert!(out.lines().next().unwrap().contains(&format!("All of it is {reads} reads: read_file with start_line=1")), "{}", out.lines().next().unwrap());
         // A place asked for is read as it was.
         let part = bench.run("read_file", &json!({"path": "big.rs", "start_line": 100, "limit": 5}), dir.path(), &cancel).unwrap();
         assert!(part.starts_with("100|") && !part.contains("outline"), "{part}");
         // Lines of no language: read as lines.
-        std::fs::write(dir.path().join("big.log"), (0..1000).map(|at| format!("entry {at}\n")).collect::<String>()).unwrap();
+        std::fs::write(dir.path().join("big.log"), (0..2500).map(|at| format!("entry {at}\n")).collect::<String>()).unwrap();
         let log = bench.run("read_file", &json!({"path": "big.log"}), dir.path(), &cancel).unwrap();
         assert!(log.starts_with("1|entry 0") && log.contains("continue with start_line="), "{}", &log[..200]);
     }
