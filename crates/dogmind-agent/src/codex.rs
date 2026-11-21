@@ -2,6 +2,7 @@
 //! own tools are off, and any request of it to run something ends the turn. The tools stay this app's: the model asks for
 //! them in a structured answer, and they pass through the same approvals as with any other provider.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -360,6 +361,14 @@ fn models_of(page: &Value, models: &mut Vec<String>) {
 pub struct Codex {
     server: Mutex<Option<Server>>,
     stand_in: Option<StandIn>,
+    /// Each conversation's anchor, by its id (the first part of a request's): a saved thread with no turn, forked for each of its requests so that they
+    /// share its prompt cache key. None where one could not be made: that conversation's requests start threads of their own.
+    anchors: Mutex<HashMap<String, Option<String>>>,
+}
+
+/// The thread id an app-server's answer gives.
+fn thread_id_of(answer: &Value) -> Option<String> {
+    answer.pointer("/thread/id").or_else(|| answer.get("threadId")).and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)
 }
 
 impl Codex {
@@ -395,16 +404,65 @@ impl Codex {
         Ok(models)
     }
 
-    fn turn(server: &mut Server, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
+    /// A saved thread with no turn, for a conversation's requests to be forked from. A thread that has had no turn has no rollout, and a fork needs one:
+    /// archiving it writes it, and it is taken out of the archive again (a thread in it cannot be forked). With no turn, Codex's own list leaves it out.
+    fn anchor(server: &mut Server, settings: &Value, cancel: &AtomicBool) -> Result<String, LlmError> {
+        let mut params = settings.clone();
+        params["ephemeral"] = json!(false);
+        let anchor = thread_id_of(&server.request("thread/start", params, cancel, &mut |_| Ok(()))?).ok_or_else(|| LlmError::Rejected("the Codex app-server returned no thread".into()))?;
+        server.request("thread/archive", json!({"threadId": anchor}), cancel, &mut |_| Ok(()))?;
+        server.request("thread/unarchive", json!({"threadId": anchor}), cancel, &mut |_| Ok(()))?;
+        Ok(anchor)
+    }
+
+    /// The thread a request goes in. A conversation's is an ephemeral fork of its anchor: Codex keys the prompt cache by the thread's session, which a fork
+    /// takes from its parent, so each request reuses what the one before sent. A new ephemeral thread for each, as before, reused none of it (0% of
+    /// 37,703 tokens at the ninth request of a real conversation; 99.7% by a fork). An anchor that is gone (its history deleted) is made again, once; a
+    /// request with no conversation, or one whose anchor cannot be made, starts a thread of its own.
+    fn thread_for(server: &mut Server, request: &Request, anchors: &Mutex<HashMap<String, Option<String>>>, cancel: &AtomicBool) -> Result<String, LlmError> {
         let folder = std::env::temp_dir().join("dogmind-app-codex");
         std::fs::create_dir_all(&folder).map_err(|error| LlmError::Transient(format!("{}: {error}", folder.display())))?;
-        let thread = server.request("thread/start", json!({
-            "model": request.model, "cwd": folder, "sandbox": "read-only", "approvalPolicy": "never", "ephemeral": true, "baseInstructions": INSTRUCTIONS,
-        }), cancel, &mut |_| Ok(()))?;
-        let thread_id = thread.pointer("/thread/id").or_else(|| thread.get("threadId")).and_then(Value::as_str).unwrap_or("").to_string();
-        if thread_id.is_empty() {
-            return Err(LlmError::Transient("the Codex app-server returned no thread".into()));
+        let settings = json!({"model": request.model, "cwd": folder, "sandbox": "read-only", "approvalPolicy": "never", "baseInstructions": INSTRUCTIONS});
+        if let Some(conversation) = request.request_id.and_then(|id| id.split('/').next()).filter(|id| !id.is_empty()) {
+            let anchors_now = |anchors: &Mutex<HashMap<String, Option<String>>>| anchors.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(conversation).cloned();
+            for _ in 0..2 {
+                let anchor = match anchors_now(anchors) {
+                    Some(Some(anchor)) => anchor,
+                    Some(None) => break,
+                    None => {
+                        let made = match Codex::anchor(server, &settings, cancel) {
+                            Ok(anchor) => Some(anchor),
+                            Err(LlmError::Rejected(_)) => None,
+                            Err(other) => return Err(other),
+                        };
+                        anchors.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(conversation.to_string(), made.clone());
+                        let Some(made) = made else { break };
+                        made
+                    }
+                };
+                let mut params = settings.clone();
+                params["threadId"] = json!(anchor);
+                params["ephemeral"] = json!(true);
+                params["excludeTurns"] = json!(true);
+                match server.request("thread/fork", params, cancel, &mut |_| Ok(())) {
+                    Ok(forked) => {
+                        if let Some(thread) = thread_id_of(&forked) {
+                            return Ok(thread);
+                        }
+                    }
+                    Err(LlmError::Rejected(_)) => {}
+                    Err(other) => return Err(other),
+                }
+                anchors.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(conversation);
+            }
         }
+        let mut params = settings;
+        params["ephemeral"] = json!(true);
+        thread_id_of(&server.request("thread/start", params, cancel, &mut |_| Ok(()))?).ok_or_else(|| LlmError::Transient("the Codex app-server returned no thread".into()))
+    }
+
+    fn turn(server: &mut Server, request: &Request, anchors: &Mutex<HashMap<String, Option<String>>>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
+        let thread_id = Codex::thread_for(server, request, anchors, cancel)?;
         let (text, pictures) = transcript(request);
         let mut input = vec![json!({"type": "text", "text": text})];
         input.extend(pictures);
@@ -474,7 +532,7 @@ impl Provider for Codex {
             *slot = Some(Server::start(self.stand_in.as_ref())?);
         }
         let server = slot.as_mut().ok_or_else(|| LlmError::Transient("the Codex app-server did not start".into()))?;
-        let result = Codex::turn(server, request, cancel, on);
+        let result = Codex::turn(server, request, &self.anchors, cancel, on);
         // Anything but an answer leaves a server in an unknown state: the next request starts another. A cancelled turn ends here too.
         if result.is_err() {
             *slot = None;
@@ -494,17 +552,57 @@ mod tests {
         let mut out = std::io::stdout();
         // (the test harness has left its own words on this line)
         writeln!(out).unwrap();
+        // Saved threads, as Codex keeps them: (has a rollout, is archived). One with no turn has its rollout written when it is archived, and only one with a
+        // rollout and out of the archive can be forked. A model named "gpt-old" is of an app-server that does not know the archive.
+        let (mut saved, mut old): (HashMap<String, (bool, bool)>, Vec<String>) = (HashMap::new(), Vec::new());
         for line in BufReader::new(std::io::stdin()).lines().map_while(Result::ok) {
             let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
             let (id, method) = (message["id"].clone(), message["method"].as_str().unwrap_or("").to_string());
-            let answer = match method.as_str() {
-                "model/list" if message["params"].get("cursor").is_some() => json!({"data": [{"id": "gpt-chosen", "model": "gpt-chosen"}]}),
-                "model/list" => json!({"data": [{"id": "gpt-first"}, {"id": "gpt-default", "isDefault": true}], "nextCursor": "more"}),
-                "thread/start" => json!({"thread": {"id": format!("thread-{}", message["params"]["model"].as_str().unwrap_or(""))}}),
-                "initialize" | "turn/start" => json!({}),
-                _ => continue,
+            let (params, model) = (&message["params"], message["params"]["model"].as_str().unwrap_or("").to_string());
+            let thread = params["threadId"].as_str().unwrap_or("").to_string();
+            let unknown = json!({"code": -32601, "message": format!("unknown method {method}")});
+            let refused = |message: String| Err(json!({"code": -32600, "message": message}));
+            let answer: Result<Value, Value> = match method.as_str() {
+                "model/list" if params.get("cursor").is_some() => Ok(json!({"data": [{"id": "gpt-chosen", "model": "gpt-chosen"}]})),
+                "model/list" => Ok(json!({"data": [{"id": "gpt-first"}, {"id": "gpt-default", "isDefault": true}], "nextCursor": "more"})),
+                "thread/start" if params["ephemeral"] == json!(false) => {
+                    let anchor = format!("anchor-{}", saved.len() + 1);
+                    saved.insert(anchor.clone(), (false, false));
+                    if model == "gpt-old" {
+                        old.push(anchor.clone());
+                    }
+                    Ok(json!({"thread": {"id": anchor}}))
+                }
+                "thread/start" => Ok(json!({"thread": {"id": format!("thread-{model}")}})),
+                "thread/archive" | "thread/unarchive" if old.contains(&thread) => Err(unknown.clone()),
+                "thread/archive" => match saved.get_mut(&thread) {
+                    Some(state) => {
+                        *state = (true, true);
+                        Ok(json!({}))
+                    }
+                    None => refused(format!("no thread {thread}")),
+                },
+                "thread/unarchive" => match saved.get_mut(&thread) {
+                    Some(state) => {
+                        state.1 = false;
+                        Ok(json!({"thread": {"id": thread}}))
+                    }
+                    None => refused(format!("no thread {thread}")),
+                },
+                "thread/fork" => match saved.get(&thread) {
+                    Some((true, false)) if params["ephemeral"] == json!(true) => Ok(json!({"thread": {"id": format!("fork-of-{thread}")}})),
+                    Some((_, true)) => refused(format!("session {thread} is archived")),
+                    _ => refused(format!("no rollout found for thread id {thread}")),
+                },
+                "initialize" | "turn/start" => Ok(json!({})),
+                _ if id.is_null() => continue,
+                _ => Err(unknown),
             };
-            writeln!(out, "{}", json!({"jsonrpc": "2.0", "id": id, "result": answer})).unwrap();
+            let reply = match answer {
+                Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
+            };
+            writeln!(out, "{reply}").unwrap();
             if method == "turn/start" {
                 // What the conversation asks for is what it does: a search of the web of its own, or an ordinary message of the model's.
                 let asked = message["params"]["input"][0]["text"].as_str().unwrap_or("");
@@ -545,6 +643,32 @@ mod tests {
         let request = Request { model: "gpt-chosen", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: None };
         let answer = codex.stream(&request, &AtomicBool::new(false), &mut |_| {}).unwrap();
         assert_eq!(answer.content, "thread-gpt-chosen gpt-chosen");
+    }
+
+    /// A conversation's requests are forks of its one saved thread with no turn, so that Codex gives them one prompt cache key; another conversation has
+    /// its own; a request of no conversation starts a thread of its own. An anchor that is gone is made again; where none can be made (an app-server that
+    /// does not know the archive), the conversation's requests start threads of their own, and it is not tried again.
+    #[test]
+    fn a_conversations_requests_are_forks_of_its_one_anchor() {
+        let codex = stood_in();
+        let messages = [crate::message::Message::text("user", "hi")];
+        let ask = |model: &str, id: Option<&str>| {
+            let request = Request { model, messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id: id };
+            codex.stream(&request, &AtomicBool::new(false), &mut |_| {}).unwrap().content
+        };
+        assert_eq!(ask("gpt-chosen", Some("talk/1")), "fork-of-anchor-1 gpt-chosen");
+        assert_eq!(ask("gpt-chosen", Some("talk/2")), "fork-of-anchor-1 gpt-chosen");
+        assert_eq!(ask("gpt-first", Some("talk/3")), "fork-of-anchor-1 gpt-first", "the model is the request's");
+        assert_eq!(ask("gpt-chosen", Some("other/1")), "fork-of-anchor-2 gpt-chosen");
+        assert_eq!(ask("gpt-chosen", None), "thread-gpt-chosen gpt-chosen");
+        // (its history deleted in Codex)
+        codex.anchors.lock().unwrap().insert("talk".into(), Some("anchor-gone".into()));
+        assert_eq!(ask("gpt-chosen", Some("talk/4")), "fork-of-anchor-3 gpt-chosen");
+        assert_eq!(ask("gpt-chosen", Some("talk/5")), "fork-of-anchor-3 gpt-chosen");
+        // (an app-server of before the archive: the anchor it started is never used, and no other is made)
+        assert_eq!(ask("gpt-old", Some("old/1")), "thread-gpt-old gpt-old");
+        assert_eq!(ask("gpt-old", Some("old/2")), "thread-gpt-old gpt-old");
+        assert_eq!(codex.anchors.lock().unwrap().get("old"), Some(&None));
     }
 
     #[test]
