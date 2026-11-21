@@ -60,9 +60,22 @@ struct Engine {
     round: Option<ID2D1StrokeStyle>,
 }
 
+/// A thread's engine, kept when the thread ends: Windows ends a thread's values holding its loader lock, and Direct3D under Direct2D (on the CPU as well) let
+/// go there raised DXGI_ERROR_INVALID_CALL and ended the process (four runs of the tests, 2026-11-22), or stopped the thread's end for good. The windows draw
+/// on one thread, which ends with the app.
+struct Kept(RefCell<Option<Option<Engine>>>);
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        if let Some(Some(engine)) = self.0.get_mut().take() {
+            std::mem::forget(engine);
+        }
+    }
+}
+
 thread_local! {
     /// Made on first use, on the window's thread; None for good once it could not be.
-    static ENGINE: RefCell<Option<Option<Engine>>> = const { RefCell::new(None) };
+    static ENGINE: Kept = const { Kept(RefCell::new(None)) };
     /// A paint drawn as one (`batch`): the device, the area it is bound over, and whether it is bound now. Each drawing then goes into it at its own place, with no
     /// binding of its own. A binding reads the device's pixels in and writes them back: a path of 25 rows in view had some 125 of those a paint, 35 ms of it.
     static BATCH: std::cell::Cell<Option<(isize, RECT, bool)>> = const { std::cell::Cell::new(None) };
@@ -230,8 +243,8 @@ impl Engine {
 
 /// With the engine, made if it is not: None where Direct2D or DirectWrite could not start, or `act` failed (the caller then draws with GDI).
 fn with_engine<R>(act: impl FnOnce(&mut Engine) -> windows::core::Result<R>) -> Option<R> {
-    ENGINE.with(|cell| {
-        let mut slot = cell.borrow_mut();
+    ENGINE.with(|kept| {
+        let mut slot = kept.0.borrow_mut();
         if slot.is_none() {
             // SAFETY: COM objects made and used on this one thread.
             *slot = Some(unsafe { Engine::new() }.ok());
@@ -764,6 +777,38 @@ mod tests {
         assert_eq!(at(&alone, 80, 50), 0x0000_00FF, "the blue that GDI drew last");
         assert_eq!(at(&alone, 100, 30), 0x00FF_FFFF, "the white over the blue");
         assert_eq!(as_one, alone);
+    }
+
+    /// A thread that drew and ends takes the process with it in nothing: Windows ends a thread's values holding its loader lock, and Direct3D (under Direct2D,
+    /// on the CPU as well) let go there raised DXGI_ERROR_INVALID_CALL and ended the process, four runs of the tests of 2026-11-22. Threads that draw and end,
+    /// in a process of its own.
+    #[test]
+    fn a_thread_that_drew_ends_and_the_process_goes_on() {
+        const NAME: &str = "render::tests::a_thread_that_drew_ends_and_the_process_goes_on";
+        if std::env::var_os("DOGMIND_TEST_DRAWING_THREADS").is_none() {
+            let run = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", NAME, "--nocapture", "--test-threads=1"]).env("DOGMIND_TEST_DRAWING_THREADS", "1").output().unwrap();
+            let said = String::from_utf8_lossy(&run.stdout).into_owned() + &String::from_utf8_lossy(&run.stderr);
+            assert!(run.status.success() && said.contains("1 passed"), "{:?} {said}", run.status);
+            return;
+        }
+        use windows_sys::Win32::Graphics::Gdi::{CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS};
+        for _ in 0..20 {
+            // SAFETY: a bitmap of the thread's own.
+            std::thread::spawn(|| unsafe {
+                let device = CreateCompatibleDC(std::ptr::null_mut());
+                let mut info: BITMAPINFO = std::mem::zeroed();
+                info.bmiHeader = BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: 40, biHeight: -40, biPlanes: 1, biBitCount: 32, ..std::mem::zeroed() };
+                let mut bits = std::ptr::null_mut();
+                let bitmap = CreateDIBSection(device, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+                let previous = SelectObject(device, bitmap);
+                assert!(rounded(device, RECT { left: 0, top: 0, right: 40, bottom: 40 }, 6, Some(0x00_20_80_20), None));
+                SelectObject(device, previous);
+                DeleteObject(bitmap);
+                DeleteDC(device);
+            })
+            .join()
+            .unwrap();
+        }
     }
 
     /// A path too long for its line keeps its last name and its beginning, "..." between, as DrawTextW's DT_PATH_ELLIPSIS does; one that
