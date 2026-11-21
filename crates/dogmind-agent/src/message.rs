@@ -66,6 +66,8 @@ pub enum WakeCause {
     CommandLine,
     /// A wait the model set (`wake_at`) is up.
     Wait,
+    /// The model's server, which stopped answering in a turn that failed for it, answers again ([`crate::background::Background::add_server_wait`]).
+    ServerBack,
 }
 
 impl WakeCause {
@@ -74,6 +76,7 @@ impl WakeCause {
             WakeCause::CommandEnded => "command_ended",
             WakeCause::CommandLine => "command_line",
             WakeCause::Wait => "wait",
+            WakeCause::ServerBack => "server_back",
         }
     }
 }

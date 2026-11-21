@@ -51,10 +51,10 @@ pub fn helper_schemas() -> Value {
 /// What create_file asks of a model whose provider gives a call only once it is whole: a long call shows nothing for minutes, and a
 /// stop loses what it was writing.
 const CREATE_FILE_IN_PARTS: &str = "Write a file, new or one you have read. Over about 300 lines, write the first part, then add each further part with append=true: what is on disk survives a stop, and a long call is minutes with nothing to show.";
-/// What it asks where the call shows as it is written ([`crate::llm::Provider::shows_calls_as_written`]): there the app keeps a very long
-/// file on disk in parts itself, and each part a model wrote by its own choice cost a request and its thinking again (on an RTX 5070 Ti
-/// with Qwen3.8 IQ2_XS, a file of some 400 lines took 174 s in 2 to 4 writes, and 143 s in one).
-const CREATE_FILE_WHOLE: &str = "Write a file, new or one you have read, whole in one call: what you write shows as it comes, and of a very long file the app keeps on disk what is written and has you go on. append=true adds to the end of the file.";
+/// What it asks where the call shows as it is written ([`crate::llm::Provider::shows_calls_as_written`]): there what a stop or a broken
+/// connection cut off of a file is kept on disk to go on from, and each part a model wrote by its own choice cost a request and its thinking
+/// again (on an RTX 5070 Ti with Qwen3.8 IQ2_XS, a file of some 400 lines took 174 s in 2 to 4 writes, and 143 s in one).
+const CREATE_FILE_WHOLE: &str = "Write a file, new or one you have read, whole in one call: what you write shows as it comes. append=true adds to the end of the file.";
 
 /// The tools' schemas for a provider whose calls show as they are written: create_file asks for a file whole.
 pub fn for_calls_shown_as_written(schemas: &mut Value) {
@@ -68,7 +68,7 @@ pub fn for_calls_shown_as_written(schemas: &mut Value) {
 }
 
 /// `run_code`, where it is offered, made again from the tools offered beside it as they are now.
-fn redeclare_run_code(schemas: &mut Value) {
+pub(crate) fn redeclare_run_code(schemas: &mut Value) {
     let Some(list) = schemas.as_array_mut() else { return };
     let Some(at) = list.iter().position(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("run_code")) else { return };
     let others = Value::Array(list.iter().enumerate().filter(|(index, _)| *index != at).map(|(_, tool)| tool.clone()).collect());
@@ -92,6 +92,7 @@ pub fn schemas() -> Value {
             "timeout_seconds": {"type": "integer", "description": "How long to wait for it, default 180. Past that it goes on in the background."},
             "purpose": {"type": "string", "description": "A few words on why, for the user when they are asked."},
             "network": {"type": "boolean", "description": "Needs the network, and is not curl, a package install or remote git, which get it anyway. Asks the user."},
+            "outside_sandbox": {"type": "boolean", "description": "Run as the user, outside the sandbox: for what the user asked to read or change outside the workspace. Asks the user each time."},
             "background": {"type": "boolean", "description": "Start it and go on, for what takes minutes. Gives an id for command_status; its end wakes you."},
             "wake_on": {"type": "string", "description": "With background: a regex. The first line it prints that matches wakes you, once. A server: \"Listening on\"."}
         }), &["command"]),
@@ -136,7 +137,7 @@ pub fn schemas() -> Value {
             "path": {"type": "string"},
             "url": {"type": "string", "description": "Instead of path: http://localhost:PORT/ of a server you started"},
             "views": {"type": "array", "items": {"type": "string"}, "description": "desktop (default), mobile, or WxH"},
-            "wait_ms": {"type": "integer"},
+            "wait_ms": {"type": "integer", "description": "At most 10000"},
             "steps": {"type": "string", "description": "JS run after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results. A reload (await reload()) starts the next part in the new load; variables do not carry over."}
         }), &[]),
         function("command_status", "A background command's state, and what it printed since the last look. Also your waits.", json!({"id": {"type": "string"}}), &[]),
@@ -493,6 +494,9 @@ fn wait_for_command(result: &CommandResult, stop: &AtomicBool, cancel: &AtomicBo
 pub struct Workbench {
     /// The conversation is in Japanese, so what it writes is looked at for what is not.
     pub in_japanese: bool,
+    /// The next MCP call is to take the pictures its result holds (where the model reads pictures in a tool's result), into `mcp_pictures`.
+    pub mcp_pictures_wanted: bool,
+    pub mcp_pictures: Vec<crate::mcp::Picture>,
     /// The hash of each file as this session last saw it: an edit needs a read of what is there now.
     seen: HashMap<PathBuf, String>,
     pub todos: Vec<Value>,
@@ -522,6 +526,8 @@ pub struct Workbench {
     pub secrets: Vec<PathBuf>,
     /// While the person has asked for no changes to the files: the folder outside the workspace where a command may run, and where the write tools may write.
     pub scratch: Option<PathBuf>,
+    /// A `run_code` program is making the calls: what they read goes to the program, not into the conversation.
+    pub in_program: bool,
 }
 
 fn sha16(bytes: &[u8]) -> String {
@@ -738,6 +744,10 @@ impl Workbench {
             "execute_command" => {
                 // A command whose folder is the scratch folder runs there as it would in a workspace: that folder is the only one it may write in.
                 let place = self.scratch_for(arguments).unwrap_or_else(|| workspace.to_path_buf());
+                // (the person has asked for no changes: outside the sandbox nothing would keep a command to the scratch folder)
+                if self.scratch.is_some() && crate::safety::outside_sandbox(arguments) {
+                    return Err("not run: the user has asked for no changes to the files, and outside the sandbox a command could change anything. Nothing was started.".to_string());
+                }
                 if arguments.get("background").and_then(Value::as_bool) == Some(true) {
                     self.start_job(arguments, &place)
                 } else if arguments.get("wake_on").and_then(Value::as_str).is_some_and(|pattern| !pattern.trim().is_empty()) {
@@ -758,7 +768,9 @@ impl Workbench {
             _ if tool.starts_with("mcp__") => {
                 let hub = self.mcp.as_ref().ok_or("no MCP server is running")?;
                 // What a server says may come from anywhere: it is data, as a page is.
-                hub.call(tool, arguments, cancel).map(|text| crate::web::envelope(tool, &format!("{text}\n")))
+                let (text, pictures) = hub.call_with_pictures(tool, arguments, cancel, std::mem::take(&mut self.mcp_pictures_wanted))?;
+                self.mcp_pictures = pictures;
+                Ok(crate::web::envelope(tool, &format!("{text}\n")))
             }
             "remember" | "forget" => {
                 let folder = self.memory.as_deref().ok_or("notes are not kept here")?;
@@ -804,8 +816,6 @@ impl Workbench {
         }
         let skill = self.skills.iter().find(|skill| skill.name.eq_ignore_ascii_case(name) && skill.for_the_model)
             .ok_or_else(|| format!("no skill is called {name}: the Skills list has the names"))?;
-        #[cfg(windows)]
-        crate::sandbox::also_readable(&skill.folder);
         crate::skills::instructions(skill)
     }
 
@@ -915,6 +925,12 @@ impl Workbench {
         if self.seen.insert(path.clone(), hash.clone()).is_some_and(|before| before != hash) {
             self.covered.remove(&path);
         }
+        // A program's read: the file as it is now has been read (an edit may follow), but nothing of it is in the conversation, so it is not
+        // what the conversation was shown, nor counted as read into it, and the program always has the text. (A program that read two files
+        // again was given "already in the conversation" in their place each time, did nothing with them, and the model ran it six times.)
+        if self.in_program {
+            return result;
+        }
         if let Ok(text) = &result {
             // (the lines shown in a row from where what was seen ends: an outline's head counts, and its parts after a gap do not)
             let mut covered = self.covered.get(&path).copied().unwrap_or(0);
@@ -970,6 +986,11 @@ impl Workbench {
     /// This file's write was cut off and is to go on.
     pub fn note_cut(&mut self, path: PathBuf) {
         self.cut_file = Some(path);
+    }
+
+    /// The file whose write was cut off and has not gone on yet.
+    pub fn cut_file(&self) -> Option<&Path> {
+        self.cut_file.as_deref()
     }
 
     /// Whether the next write to this file goes on from what is there.
@@ -2120,8 +2141,19 @@ fn del_stand_in(words: &[String]) -> Option<String> {
     if files.is_empty() || files.iter().any(|file| file.contains('\'')) {
         return None;
     }
-    let delete = |file: &str| format!("powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('{file}')\"");
-    Some(files.iter().map(|file| if file.contains(['*', '?']) { format!("for %d in (\"{file}\") do @{}", delete("%d")) } else { delete(file) }).collect::<Vec<_>>().join(" & "))
+    // (`[IO.File]::Delete` says nothing of a file that is not there, and a pattern that matches nothing runs no delete: each says so, as `del` does, or a delete outside the
+    // workspace, where the container sees no file, and one of a misspelt name, were told to the model as done. PowerShell started in the container says on its error output that
+    // it could not set up the drives, each time, in the system's language: that line is none of the delete's, and was taken for a failed one; what the delete has to say goes to
+    // the output instead.)
+    let missing = |file: &str| format!("[Console]::Out.WriteLine('Could Not Find {file}'); exit 1");
+    let delete = |file: &str| {
+        format!(
+            "powershell -NoProfile -NonInteractive -Command \"if (-not ([IO.File]::Exists('{file}') -or [IO.Directory]::Exists('{file}'))) {{ {} }} try {{ [IO.File]::Delete('{file}') }} catch {{ [Console]::Out.WriteLine($_.Exception.GetBaseException().Message); exit 1 }}\" 2>nul",
+            missing(file)
+        )
+    };
+    let matched = |file: &str| format!("if exist \"{file}\" (for %d in (\"{file}\") do @{}) else (powershell -NoProfile -NonInteractive -Command \"{}\" 2>nul)", delete("%d"), missing(file));
+    Some(files.iter().map(|file| if file.contains(['*', '?']) { matched(file) } else { delete(file) }).collect::<Vec<_>>().join(" & "))
 }
 
 /// One step of a line, with `dir` or `del` in the forms that say plainly what they want replaced by what does that.
@@ -2336,9 +2368,8 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     if lower_err.contains("config file") || (denied && in_git) || (in_git && lower_err.contains("permission denied")) {
         notes.push_str("note: the sandbox refuses changes to `.git\\config` and `.git\\hooks`, as what is written there would run outside it the next time git is used. Tell the user the exact command, for them to run.\n");
     }
-    let root = workspace.to_string_lossy().to_lowercase();
-    let outside = line.split(|c: char| c.is_whitespace() || c == '"').any(|word| word.as_bytes().get(1) == Some(&b':') && !word.to_lowercase().starts_with(&root));
-    if denied && outside {
+    // (the line may name no path, as `python clean.py` does: then the refusal's own line says where)
+    if denied && (names_outside(line, workspace) || err.lines().any(|said| says_access_denied(said, system_access_denied()) && names_outside(said, workspace))) {
         notes.push_str(OUTSIDE_READ_NOTE);
     }
     // (a model's habit from elsewhere: cmd says only that it does not know the program, in the language of Windows, or Git's own copy fails at its start and says nothing a model can use)
@@ -2353,6 +2384,17 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
         notes.push_str("note: programs from Git's `usr\\bin` (MSYS) cannot start in the sandbox, git hooks included.\n");
     }
     notes
+}
+
+/// Whether a line names a path on a drive that is not under the workspace.
+#[cfg(windows)]
+/// A program's own words count too: Python's `'C:\\Users\\me\\a.txt'`, in quotes and with its backslashes doubled.
+fn names_outside(line: &str, workspace: &Path) -> bool {
+    let root = workspace.to_string_lossy().to_lowercase();
+    line.split(|c: char| c.is_whitespace() || c == '"').any(|word| {
+        let word = word.trim_matches(|c: char| matches!(c, '\'' | '(' | ')' | '[' | ']' | ',' | ';')).replace("\\\\", "\\").to_lowercase();
+        word.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) && word.as_bytes().get(1) == Some(&b':') && !word.starts_with(&root)
+    })
 }
 
 /// The Unix tools a line starts: the first word of each of its commands, when it is one of those a model reaches for from habit. By the line that runs, in which `| head` is no longer there.
@@ -2507,9 +2549,9 @@ fn after_cd_to<'a>(line: &'a str, cwd: &Path) -> Option<(&'a str, &'a str)> {
 }
 
 /// What a command refused outside the workspace is told, in the container, which reads there no more than it writes.
-const OUTSIDE_READ_NOTE: &str = "note: a command cannot read outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there; for a command to read it, ask the user to name its folder there.\n";
+const OUTSIDE_READ_NOTE: &str = "note: in the sandbox a command cannot read or change anything outside the workspace and the folders the user has named under Settings > Permissions and safety, by any route. `read_file`, `list_files` and `search_files` can look there. If the user asked for this, run the same command again with `outside_sandbox: true`: the user is asked, and if they allow it, it runs as them.\n";
 /// The same, for a command run with a restricted token, which reads where the user can.
-const OUTSIDE_WRITE_NOTE: &str = "note: this command could read outside the workspace but not write there: it writes in the workspace alone. Write in the workspace, or tell the user what to put where.\n";
+const OUTSIDE_WRITE_NOTE: &str = "note: this command could read outside the workspace but not write there: in the sandbox it writes in the workspace alone. If the user asked for this, run the same command again with `outside_sandbox: true`: the user is asked, and if they allow it, it runs as them.\n";
 
 /// Whether a line is one cargo command, under the user folder, in a workspace whose manifest (the one cargo would load from `cwd`) names its members by a pattern: cargo
 /// expands it by looking at each folder from the drive's root, and in the container C:\Users is refused, so the pattern finds nothing. Such a command, once the person has
@@ -2820,21 +2862,33 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let network = crate::safety::wants_network(arguments);
     let started = Instant::now();
     let before = file_states(&cwd);
-    let runs = line_that_runs(line);
+    // As the person, allowed by them: `dir` and `del` work there as they are, and the line runs as it was written and shown.
+    let as_person = crate::safety::outside_sandbox(arguments);
+    let runs = if as_person { line.to_string() } else { line_that_runs(line) };
     // One cargo command under the user folder, in a workspace that names its members by a pattern, which cargo expands looking at each folder from the drive's root: a
     // container may not look at C:\Users, so this one runs with a restricted token, reading as the person does and writing in the workspace alone (`run_live_restricted`).
     // Judged on the line as the model wrote it, which is what the gate judged and the person allowed (`REASON_CARGO_OUTSIDE`), and on what runs, which must be that line.
     let root = resolve(workspace, ".");
-    let restricted = cargo_reads_above(text_arg(arguments, "command")?, &cwd, &root, home.as_deref()) && cargo_reads_above(&runs, &cwd, &root, home.as_deref());
-    let run = if restricted { crate::sandbox::run_live_restricted } else { crate::sandbox::run_live };
+    let restricted = !as_person && cargo_reads_above(text_arg(arguments, "command")?, &cwd, &root, home.as_deref()) && cargo_reads_above(&runs, &cwd, &root, home.as_deref());
     // Spelled as `cwd` is, or a path with `..` in it would not be seen as holding it.
-    let done = run(&runs, &cwd, &root, network, timeout, cancel, live).map_err(|error| {
+    let done = if as_person {
+        crate::sandbox::run_live_as_person(&runs, &cwd, &root, timeout, cancel, live)
+    } else if restricted {
+        crate::sandbox::run_live_restricted(&runs, &cwd, &root, network, timeout, cancel, live)
+    } else {
+        crate::sandbox::run_live(&runs, &cwd, &root, network, timeout, cancel, live)
+    };
+    let done = done.map_err(|error| {
         // (the app's `git init` has run by then, and what is said is what is there)
         let started = if started_with_init.is_some() { "`git init` ran, and made .git there; the rest of the line was not started" } else { "The command was not started" };
         format!("{error}. {started}; changing its spelling cannot repair this")
     })?;
     let (out, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
     let mut report = String::new();
+    if as_person {
+        // (a model that checked what it did with another command there asked the person again for a look: `dir` and `type` are let through, `if exist … (echo …)` is not)
+        report.push_str("note: this ran outside the sandbox, as the user, who allowed it. To see what it did there, use `list_files` or `read_file`, which look anywhere with no one asked.\n");
+    }
     if restricted {
         report.push_str(&format!("note: cargo ran outside the container, with a restricted token: in the container cargo cannot expand this workspace's `members` pattern under \
                                   the user folder. It could read what the user can and write only in the workspace{}.\n",
@@ -2880,7 +2934,11 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
         report.push_str(&format!("note: this reached the {} GiB that commands may use on this machine, and was refused more. It needs to use less at a time.\n", cap >> 30));
     }
     // (with the cause said above, a traceback's middle tells nothing more, and it is read again with every later request)
-    let notes = sandbox_notes(line, &resolve(workspace, "."), done.status, &err);
+    let mut notes = if as_person { String::new() } else { sandbox_notes(line, &resolve(workspace, "."), done.status, &err) };
+    // (the stand-in for `del` finds no file outside the workspace, where the container sees none, and says it could not find it: that is the sandbox's refusal too)
+    if !as_person && done.status != Some(0) && !notes.contains(OUTSIDE_READ_NOTE) && out.contains("Could Not Find") && names_outside(line, &resolve(workspace, ".")) {
+        notes.push_str(OUTSIDE_READ_NOTE);
+    }
     // (a restricted token reads anywhere the user can: what it is refused outside the workspace is a write)
     report.push_str(&if restricted { notes.replace(OUTSIDE_READ_NOTE, OUTSIDE_WRITE_NOTE) } else { notes });
     let most_err = if no_network.is_some() { MAX_COMMAND_ERR / 6 } else { MAX_COMMAND_ERR };
@@ -4354,7 +4412,10 @@ mod tests {
         let line = with_stand_ins("mkdir vendor 2>nul & curl -o vendor/a.js https://x.example/a.js & dir vendor");
         assert!(line.starts_with("mkdir vendor 2>nul & curl -o vendor/a.js https://x.example/a.js & (if exist"), "{line}");
         let del = with_stand_ins("del /q a.txt \"b c.txt\"");
-        assert_eq!(del, "(powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\" & powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('b c.txt')\")");
+        assert!(del.starts_with("(powershell -NoProfile -NonInteractive -Command ") && del.matches("powershell").count() == 2 && !del.contains("del "), "{del}");
+        for file in ["a.txt", "b c.txt"] {
+            assert!(del.contains(&format!("[IO.File]::Delete('{file}')")) && del.contains(&format!("Could Not Find {file}")), "{file}: {del}");
+        }
         assert!(with_stand_ins("erase *.log").contains("for %d in (\"*.log\") do @powershell"));
         let piped = with_stand_ins("dir /b vendor | findstr three");
         assert!(piped.starts_with("((for /d %d in (\"vendor\\*\")") && !piped.contains("if exist") && piped.ends_with("| findstr three"), "{piped}");
@@ -4379,12 +4440,13 @@ mod tests {
         for same in ["echo hi", "python x.py", "if exist x (del x)", "dir > out.txt", "echo a\necho b", "python -c \"print(1)\nprint(2)\""] {
             assert_eq!(line_that_runs(same), same, "joining the lines alone is not told of: {same}");
         }
-        assert_eq!(line_that_runs("del a.txt"), "(powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\")");
+        assert_eq!(line_that_runs("del a.txt"), with_stand_ins("del a.txt"));
+        assert!(line_that_runs("del a.txt").starts_with("(powershell -NoProfile -NonInteractive -Command "));
         assert_eq!(line_that_runs("x | head -60"), "x | findstr \"^\"");
         assert_eq!(line_that_runs("dir /s *.js"), with_stand_ins("dir /s *.js"));
         // Lines are joined before the stand-ins go in, so that a `del` on the second one is replaced too.
         let two = line_that_runs("echo a\ndel a.txt");
-        assert_eq!(two, "echo a & (powershell -NoProfile -NonInteractive -Command \"[IO.File]::Delete('a.txt')\")", "{two}");
+        assert_eq!(two, format!("echo a & {}", with_stand_ins("del a.txt")), "{two}");
         // A line that is refused is not run, so there is nothing else for it to be.
         assert_eq!(line_that_runs("echo \"a\nb\"\ndel x"), "echo \"a\nb\"\ndel x");
     }
@@ -4500,6 +4562,10 @@ mod tests {
     #[test]
     fn a_sandboxs_answer_that_reads_as_something_else_is_explained() {
         let root = Path::new("C:\\work");
+        // A program that names no path, refused one outside the workspace, in its own words: the note says how to ask for it; refused one inside, it does not.
+        let python = |path: &str| sandbox_notes("python clean.py", root, Some(1), &format!("Traceback (most recent call last):\n  File \"C:\\work\\clean.py\", line 2\nPermissionError: [WinError 5] Access is denied: '{path}'"));
+        assert!(python("C:\\\\Users\\\\me\\\\old.txt").contains("`outside_sandbox: true`"));
+        assert!(!python("C:\\\\work\\\\out\\\\a.txt").contains("`outside_sandbox: true`"));
         assert!(sandbox_notes("where python", root, Some(1), "INFO: Could not find files for the given pattern(s).").contains("does not say the program is missing"));
         assert!(sandbox_notes("powershell -NoProfile -Command \"Get-Item a\"", root, Some(1), "Get-Item : Cannot find path 'C:\\a' because it does not exist.").contains("absolute paths"));
         assert!(sandbox_notes("powershell -NoProfile -Command \"Get-ChildItem\"", root, Some(1), "PermissionDenied: (C:\\:String) [Get-ChildItem]").contains("absolute paths"));
@@ -4513,7 +4579,8 @@ mod tests {
         assert!(sandbox_notes("taskkill /F /IM python.exe /T", root, Some(0), "").contains("command_stop"));
         assert!(sandbox_notes("powershell -Command \"Stop-Process -Name node\"", root, Some(1), "").contains("command_stop"));
         assert!(!sandbox_notes("taskkill /PID 4242 /F", root, Some(0), "").contains("command_stop"));
-        assert!(sandbox_notes("type C:\\elsewhere\\a.txt", root, Some(1), "Access is denied.").contains("cannot read outside the workspace"));
+        let refused = sandbox_notes("type C:\\elsewhere\\a.txt", root, Some(1), "Access is denied.");
+        assert!(refused.contains("cannot read or change anything outside the workspace") && refused.contains("`outside_sandbox: true`"), "{refused}");
         assert!(sandbox_notes("type C:\\elsewhere\\a.txt", root, Some(1), "アクセスが拒否されました。").contains("`read_file`"));
         // On another drive, and in another language, the same.
         assert!(sandbox_notes("powershell -c \"Get-Item a\"", Path::new("E:\\work"), Some(1), "Get-Item : Der Pfad \"D:\\a\" kann nicht gefunden werden.\n    + CategoryInfo : ObjectNotFound: (D:\\a:String) [Get-Item], ItemNotFoundException\n    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand").contains("absolute paths"));
@@ -4523,7 +4590,7 @@ mod tests {
         assert!(!sandbox_notes("where /?", root, Some(2), "FEHLER").contains("Run the program itself"), "something else went wrong");
         for (err, by) in [("PermissionError: [WinError 5] Zugriff verweigert: 'x'", "Python"), ("PermissionError: [Errno 13] Permission denied: 'x'", "Python"), ("Error: EPERM: operation not permitted, open 'x'", "Node"), ("Error: EACCES: permission denied, open 'x'", "Node"), ("Zugriff verweigert (os error 5)", "Rust"), ("Ausnahme von HRESULT: 0x80070005", "COM"), ("+ FullyQualifiedErrorId : UnauthorizedAccess, System.UnauthorizedAccessException", "PowerShell")] {
             assert!(says_access_denied(err, ""), "{by}: {err}");
-            assert!(sandbox_notes("type D:\\elsewhere\\a.txt", root, Some(1), err).contains("cannot read outside the workspace"), "{by}");
+            assert!(sandbox_notes("type D:\\elsewhere\\a.txt", root, Some(1), err).contains("cannot read or change anything outside the workspace"), "{by}");
         }
         // What only has words, in the words of a German Windows.
         assert!(says_access_denied("Zugriff verweigert\r\n", "Zugriff verweigert"));

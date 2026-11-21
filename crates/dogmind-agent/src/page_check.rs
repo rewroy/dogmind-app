@@ -17,7 +17,8 @@ const LIMIT: Duration = Duration::from_secs(20);
 /// from raising a dialog is the error mode and the job's limit, in `sandbox`.)
 /// `msWindowsTaskManager` is off because Edge's part that tells the Windows Task Manager of its processes (`WindowsTaskManagerHandler::DoTasksUpdated`, in msedge.dll) reads through a
 /// null when the registration it makes fails, which it does in a container: the browser ended with 0xc0000005 in about 6 runs of 10 on this machine, always there, and in none of
-/// 90 with the feature off. A browser that does not know the name (Chrome) ignores it.
+/// 90 with the feature off. A browser that does not know the name (Chrome) ignores it. `DisableLoadExtensionCommandLineSwitch` is off for a branded Chrome, which since 137 loads no
+/// extension from the command line otherwise: the one extension a run loads is that of [`FRAMES`], and every other is off (`extension_flags`).
 /// The flags, with what a debug build is told to add (for a look at what the browser does in the sandbox).
 fn flags() -> String {
     #[cfg(debug_assertions)]
@@ -26,7 +27,19 @@ fn flags() -> String {
     }
     FLAGS.to_string()
 }
-const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-extensions --disable-background-networking --disable-sync --disable-component-update --disable-features=msWindowsTaskManager --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
+const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-background-networking --disable-sync --disable-component-update --disable-features=msWindowsTaskManager,DisableLoadExtensionCommandLineSwitch --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
+
+/// What is added to [`FLAGS`] for the extensions: the frames' alone when its folder is there (`frames_extension`), and none at all when it is not.
+fn extension_flags(frames: Option<&Path>) -> String {
+    match frames {
+        Some(folder) => {
+            let folder = folder.display().to_string();
+            let folder = folder.trim_start_matches("\\\\?\\");
+            format!(" --disable-extensions-except=\"{folder}\" --load-extension=\"{folder}\"")
+        }
+        None => " --disable-extensions".to_string(),
+    }
+}
 
 /// The command line of a run that dumps the page's DOM, as the sandbox's shell is given it: `%TEMP%` is the container's own folder, where the run's profile is.
 fn page_line(program: &Path, flags: &str, wait: u64, profile: &str, address: &str) -> String {
@@ -41,6 +54,12 @@ fn shot_line(program: &Path, flags: &str, window: (u32, u32), wait: u64, profile
 /// How long a page runs before it is read, unless the model asks for longer, for an animation, and the most it may.
 const WAIT_MS: u64 = 1500;
 const MOST_WAIT_MS: u64 = 10_000;
+
+/// What is said of a longer wait than [`MOST_WAIT_MS`] asked for: that it was cut. A model that is not told asks for more and more of it, as one did up to 30000 in eight checks
+/// of a game that stood still.
+fn wait_cut(asked: Option<u64>) -> String {
+    asked.filter(|asked| *asked > MOST_WAIT_MS).map(|asked| format!("wait_ms is at most {MOST_WAIT_MS}: the {asked} asked for was cut to it.\n")).unwrap_or_default()
+}
 
 /// A size to look at a page at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,8 +362,9 @@ fn utf8_declared(html: &str) -> String {
 
 /// The page with a script of ours at its end and its folder as its base, so that what it names by a relative path is what it would have had.
 fn with_script(html: &str, base: &str, script: &str) -> String {
+    let html = with_frames(html);
     let lower = html.to_ascii_lowercase();
-    let mut out = html.to_string();
+    let mut out = html.clone();
     // (one with a base of its own keeps it)
     if !lower.contains("<base") {
         let tag = format!("<base href=\"{base}\">");
@@ -355,6 +375,49 @@ fn with_script(html: &str, base: &str, script: &str) -> String {
         Some(at) => out.insert_str(at, script),
         None => out.push_str(script),
     }
+    out
+}
+
+// (the script of [`FRAMES`], which its extension takes as it is)
+macro_rules! frames_js {
+    () => {
+        "(() => { let next = 1; const waiting = new Map(); window.requestAnimationFrame = (callback) => { const id = next++; waiting.set(id, setTimeout(() => { waiting.delete(id); callback(performance.now()); }, 16)); return id; }; window.cancelAnimationFrame = (id) => { clearTimeout(waiting.get(id)); waiting.delete(id); }; })();"
+    };
+}
+/// A browser given a time budget (`--virtual-time-budget`) runs a page's timers on it and draws no frames: `requestAnimationFrame` never calls back,
+/// and every game or animation drawn that way stood at its first frame in a check, its loop never run (a model spent its turn on why `frames=0`).
+/// These two take the page's frames from its timers instead, one every 16 ms of its time, as a screen at 60 a second would, with the time a frame is
+/// given as `requestAnimationFrame` gives it. Before any script of the page's own.
+/// It is put in every page a run opens, a page of the workspace, a server's and the pictures' frames alike, by an extension of the browser's whose script runs in the page's own world
+/// before anything of the page's (`frames_extension`); and in the copy of a page of the workspace too, for a browser that loads no extension.
+const FRAMES: &str = concat!("<script>", frames_js!(), "</script>");
+const FRAMES_MANIFEST: &str = r#"{"manifest_version": 3, "name": "Dogmind page frames", "version": "1.0", "content_scripts": [{"matches": ["<all_urls>"], "js": ["frames.js"], "run_at": "document_start", "all_frames": true, "match_about_blank": true, "world": "MAIN"}]}"#;
+
+/// The folder of the extension that puts [`FRAMES`] in each page, in the sandbox's folder `temp`, written there if it is not yet: its name has its contents' digest in it, so two copies
+/// of the app with other contents each have theirs. None if it could not be written.
+fn frames_extension(temp: &Path) -> Option<PathBuf> {
+    let digest = FRAMES_MANIFEST.bytes().chain(frames_js!().bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let folder = temp.join(format!("dogmind-frames-{:016x}", digest));
+    for (name, contents) in [("manifest.json", FRAMES_MANIFEST), ("frames.js", frames_js!())] {
+        let file = folder.join(name);
+        if std::fs::read_to_string(&file).ok().as_deref() != Some(contents) {
+            std::fs::create_dir_all(&folder).ok()?;
+            // (another process may be writing the same: what it writes is the same)
+            if std::fs::write(&file, contents).is_err() && std::fs::read_to_string(&file).ok().as_deref() != Some(contents) {
+                return None;
+            }
+        }
+    }
+    Some(folder)
+}
+
+/// The page with [`FRAMES`] first: after `<head>` (or `<html>`, or the doctype), where no script of the page's comes before it, and not before the doctype, which would put the page in quirks mode.
+fn with_frames(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let after = |tag: &str| lower.find(tag).and_then(|at| lower[at..].find('>').map(|end| at + end + 1));
+    let at = after("<head").or_else(|| after("<html")).or_else(|| after("<!doctype")).unwrap_or(0);
+    let mut out = html.to_string();
+    out.insert_str(at, FRAMES);
     out
 }
 
@@ -652,6 +715,34 @@ fn crash_repeats(before: &mut Option<Vec<String>>, err: &str) -> bool {
 }
 
 /// What the page printed and threw, from all the browser says of itself. Long paths to the workspace go, and every line a browser's own extension or service prints.
+/// The lines of a console, each once, in the order they first came, with how many times one came when it came more than once: a page that warns on each
+/// sound it makes said the same line of the browser's eight times in a check, and a game's checks spent thousands of words of the conversation on it.
+fn counted(lines: &[String]) -> Vec<String> {
+    distinct(lines)
+        .into_iter()
+        .map(|line| match lines.iter().filter(|other| *other == line).count() {
+            1 => line.clone(),
+            times => format!("{line} ({times} times)"),
+        })
+        .collect()
+}
+
+/// The lines, each once, in the order they first came.
+fn distinct(lines: &[String]) -> Vec<&String> {
+    let mut seen = Vec::new();
+    for line in lines {
+        if !seen.contains(&line) {
+            seen.push(line);
+        }
+    }
+    seen
+}
+
+/// The browser's line for sound a page asked for before a person's gesture, and what is said of it: the clicks and keys of steps are no person's to the browser, so
+/// the line comes however the page starts its sound, and a model chased it in check after check.
+const NO_SOUND_YET: &str = "The AudioContext was not allowed to start";
+const SOUND_NOTE: &str = "(The AudioContext line is the browser's rule that sound waits for a person's tap, click or key. Those of steps are not a person's to the browser, so it comes whatever the page does: a page that creates or resumes its AudioContext in a handler of a person's input plays in a real browser.)\n";
+
 fn console_lines(err: &str, folder_url: &str) -> Vec<String> {
     let start = Regex::new(r#"INFO:CONSOLE:\d+\] "(.*)"#).expect("the pattern is valid");
     let end = Regex::new(r#"^(.*)", source: (.*) \((\d+)\)\s*$"#).expect("the pattern is valid");
@@ -978,11 +1069,15 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
         out.push_str(&if needs.remote.is_empty() && finished { format!("{head}: nothing, so no errors.\n") } else { format!("{head}: nothing, which says little with that not loaded.\n") });
     } else {
         out.push_str(&format!("{head}:\n"));
-        for line in console.iter().take(MOST_LINES) {
+        let lines = counted(console);
+        for line in lines.iter().take(MOST_LINES) {
             out.push_str(&format!("- {line}\n"));
         }
-        if console.len() > MOST_LINES {
-            out.push_str(&format!("- and {} more\n", console.len() - MOST_LINES));
+        if lines.len() > MOST_LINES {
+            out.push_str(&format!("- and {} more\n", lines.len() - MOST_LINES));
+        }
+        if console.iter().any(|line| line.contains(NO_SOUND_YET)) {
+            out.push_str(SOUND_NOTE);
         }
     }
     if finished {
@@ -1046,7 +1141,9 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     // (steps take time of their own, as their waits count in it)
     let (parts, more_parts) = steps.map_or((Vec::new(), 0), step_parts);
     // (each load after the first costs time of its own: a page's own, as a plain page is given)
-    let wait = arguments.get("wait_ms").and_then(Value::as_u64).unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS) + parts.len().saturating_sub(1) as u64 * WAIT_MS;
+    let asked_wait = arguments.get("wait_ms").and_then(Value::as_u64);
+    let wait = asked_wait.unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS) + parts.len().saturating_sub(1) as u64 * WAIT_MS;
+    let wait_cut = wait_cut(asked_wait);
     let cwd = page.as_deref().and_then(Path::parent).unwrap_or(workspace).to_path_buf();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp = crate::sandbox::temp_folder();
@@ -1081,14 +1178,14 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             }
         }
     }
-    // What the browser is given, on its command line and in the pictures' frame (the pictures of a plain page are of the page itself, not of its copy).
+    // What the browser is given, on its command line and in the pictures' frame: the copy where there is one, whose frames run (`FRAMES`).
     let (address, src) = match &opened {
-        Some(file) => (plain(file), file_url(if steps.is_some() { file } else { page.as_deref().unwrap_or(file) })),
+        Some(file) => (plain(file), file_url(if copy_name.is_some() { file } else { page.as_deref().unwrap_or(file) })),
         None => (name.clone(), name.clone()),
     };
     // (the script that reads a plain page's words waits for the page's time to be up, so the browser is given a little more of it than that)
     let run_wait = if steps.is_none() && copy_name.is_some() { wait + READ_MARGIN_MS } else { wait };
-    let browser_flags = flags();
+    let browser_flags = flags() + &extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
     // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
     let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
     let mut ended_as = EndOfRun::Stopped;
@@ -1148,7 +1245,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
                 (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
                 (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
                 (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
-                (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms.\n"),
+                (false, None, None) if asked_wait.unwrap_or(0) >= MOST_WAIT_MS => format!("Steps: they had not ended when the page was read, after {wait} ms of its time, the longest a check gives: shorten the waits in them, or check a part of them at a time.\n"),
+                (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms (at most {MOST_WAIT_MS}).\n"),
             };
             let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
             steps_said.push_str(&more_note);
@@ -1173,7 +1271,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     // (the words that the page the steps left said at their end are not of the page that is shown)
     let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
     let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen };
-    let said = format!("{}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
+    let said = format!("{}{wait_cut}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
     }
@@ -1245,9 +1343,9 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         });
         // What the page said at this size, where it says other than above: the console above is of the desktop's width, and a model that
         // measured a phone's layout from a script was given the desktop's numbers.
-        if taken && !said_there.is_empty() && said_there != console {
+        if taken && !said_there.is_empty() && distinct(&said_there) != distinct(&console) {
             out.push_str(&format!("Console at {}:\n", view.label));
-            for said in said_there.iter().take(MOST_LINES) {
+            for said in counted(&said_there).iter().take(MOST_LINES) {
                 out.push_str(&format!("  {said}\n"));
             }
         }
@@ -1634,7 +1732,7 @@ mod tests {
 
     #[test]
     fn steps_cannot_end_their_script_whatever_the_case_of_the_end_tag() {
-        let page = with_steps("<body></body>", "file:///C:/w/", "console.log('</script>', '</SCRIPT>', '</Script >', '</sCrIpT'); await wait(1)", "k");
+        let page = with_steps("<body></body>", "file:///C:/w/", "console.log('</script>', '</SCRIPT>', '</Script >', '</sCrIpT'); await wait(1)", "k").replace(FRAMES, "");
         let ends = Regex::new(r"(?i)</script").unwrap().find_iter(&page).count();
         assert_eq!(ends, 1, "only the script's own end: {page}");
         assert!(page.contains("<\\/Script >") && page.contains("<\\/sCrIpT'") && page.contains("<\\/script>"), "{page}");
@@ -1702,9 +1800,57 @@ mod tests {
         assert!(both.starts_with("Shows (read at 1280x800; from the page's DOM"), "{both}");
     }
 
+    /// The frames' extension is written once into the folder, under a name of its contents, and is the one extension a run lets in; with none, a run has none at all.
+    #[test]
+    fn the_frames_extension_is_written_once_and_is_the_one_a_run_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = frames_extension(temp.path()).unwrap();
+        assert!(folder.file_name().unwrap().to_string_lossy().starts_with("dogmind-frames-"), "{}", folder.display());
+        assert_eq!(std::fs::read_to_string(folder.join("frames.js")).unwrap(), frames_js!());
+        let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("manifest.json")).unwrap()).unwrap();
+        let scripts = &manifest["content_scripts"][0];
+        assert_eq!((scripts["world"].as_str(), scripts["run_at"].as_str(), scripts["all_frames"].as_bool()), (Some("MAIN"), Some("document_start"), Some(true)));
+        assert_eq!(frames_extension(temp.path()).unwrap(), folder, "the same folder again");
+        assert!(!is_run_leftover(&folder.file_name().unwrap().to_string_lossy()), "it is not a run's to clear");
+        let flags = extension_flags(Some(&folder));
+        assert!(flags.contains(&format!("--disable-extensions-except=\"{}\"", folder.display())) && flags.contains("--load-extension="), "{flags}");
+        assert_eq!(extension_flags(None), " --disable-extensions");
+        assert!(!FLAGS.split(' ').any(|flag| flag == "--disable-extensions"), "which would keep the frames' extension out");
+        assert!(FRAMES.starts_with("<script>(() =>") && FRAMES.ends_with("})();</script>"));
+    }
+
+    #[test]
+    fn a_line_said_again_and_again_is_shown_once_with_its_count() {
+        let lines: Vec<String> = ["a:1: x", "a:2: y", "a:1: x", "a:1: x"].iter().map(|line| line.to_string()).collect();
+        assert_eq!(counted(&lines), ["a:1: x (3 times)", "a:2: y"]);
+        let same: Vec<String> = ["a:2: y", "a:1: x"].iter().map(|line| line.to_string()).collect();
+        assert_eq!(distinct(&lines), distinct(&[same[1].clone(), same[0].clone(), same[1].clone()]), "the same lines, counted otherwise, are the same console");
+        assert_ne!(distinct(&lines), distinct(&same), "and in another order they are not");
+    }
+
+    #[test]
+    fn a_longer_wait_than_a_check_gives_is_said_to_be_cut() {
+        assert_eq!(wait_cut(Some(30_000)), "wait_ms is at most 10000: the 30000 asked for was cut to it.\n");
+        assert_eq!(wait_cut(Some(MOST_WAIT_MS)), "");
+        assert_eq!(wait_cut(None), "");
+    }
+
+    /// The frames' script goes before any of the page's own, and never before its doctype (quirks mode): after `<head>`, else `<html>`, else the doctype.
+    #[test]
+    fn the_frames_go_before_the_pages_own_scripts_and_after_its_doctype() {
+        let head = with_frames("<!doctype html><html lang=ja><head><script>requestAnimationFrame(f)</script></head></html>");
+        assert!(head.starts_with(&format!("<!doctype html><html lang=ja><head>{FRAMES}<script>requestAnimationFrame")), "{head}");
+        assert!(with_frames("<!DOCTYPE html><script>x</script>").starts_with(&format!("<!DOCTYPE html>{FRAMES}<script>x")));
+        assert!(with_frames("<canvas></canvas><script>x</script>").starts_with(FRAMES));
+        assert!(FRAMES.contains("window.requestAnimationFrame") && FRAMES.contains("setTimeout") && FRAMES.contains("cancelAnimationFrame"));
+    }
+
     #[test]
     fn a_plain_page_is_given_a_script_that_says_its_words_and_nothing_else() {
         let page = with_script("<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>", "file:///C:/w/", &reading_script(1500));
+        // (the frames' script first, in the head; what follows is said of the page without it)
+        assert!(page.contains(&format!("<head><base href=\"file:///C:/w/\">{FRAMES}<title>")), "{page}");
+        let page = page.replace(FRAMES, "");
         assert!(page.contains("<head><base href=\"file:///C:/w/\"><title>"), "{page}");
         let (script_at, body_end) = (page.find("setTimeout(done, 1500)").unwrap(), page.rfind("</body>").unwrap());
         assert!(page.find("<p>x</p>").unwrap() < script_at && script_at < body_end, "{page}");
@@ -1795,6 +1941,26 @@ mod tests {
         assert!(said.contains("How it looks at desktop"), "{said}");
     }
 
+    /// With the real browser, in the real sandbox: a page a server gives runs its animation frames too, by the extension, as no copy of it is made.
+    #[test]
+    #[ignore = "starts Edge and a server in the sandbox"]
+    fn a_page_a_local_server_gives_runs_its_animation_frames() {
+        let (dir, _) = page(&[(
+            "index.html",
+            "<!DOCTYPE html><title>served</title><div id=o>start</div><script>let frames = 0; function step() { frames++; document.getElementById('o').textContent = 'frames ' + (frames > 30 ? 'many' : frames); requestAnimationFrame(step); } requestAnimationFrame(step);</script>",
+        )]);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (folder, halt) = (dir.path().to_path_buf(), stop.clone());
+        let server = std::thread::spawn(move || crate::sandbox::run("python -m http.server 8766 --bind 127.0.0.1", &folder, &folder, false, Duration::from_secs(90), &halt));
+        std::thread::sleep(Duration::from_secs(8));
+        let said = check_page(&serde_json::json!({"url": "http://127.0.0.1:8766/index.html"}), dir.path(), &AtomicBool::new(false));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = server.join();
+        let said = said.unwrap();
+        println!("{said}");
+        assert!(said.contains("text: frames many"), "{said}");
+    }
+
     /// A run has a limit of its own from the wait it was given, a hang is tried once more and no more, and only a run that was ended by its time is a hang.
     #[test]
     fn a_run_that_hangs_is_ended_early_and_tried_once_more() {
@@ -1859,6 +2025,26 @@ mod tests {
         assert!(!text.contains("NOT CHECKED"), "the browser did not run, so this shows nothing: {text}");
         assert!(!text.contains("SECRET-OUTSIDE-THE-SANDBOX"), "{text}");
         assert!(!served.load(std::sync::atomic::Ordering::Relaxed), "the browser reached a server outside the sandbox");
+    }
+
+    /// With the real browser, in the real sandbox: a page drawn by `requestAnimationFrame` runs its frames in the check, in what is read of it and in its picture
+    /// (which, with the browser's time budget alone, stood at its first frame: `frames=0`, and the canvas never drawn).
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn a_page_drawn_by_animation_frames_runs_them_in_the_check() {
+        let html = "<!DOCTYPE html><title>a</title><style>body{margin:0}</style><div id=o>start</div><canvas id=c width=200 height=100></canvas><script>\
+            let frames = 0; const ctx = document.getElementById('c').getContext('2d');\
+            function step(t) { frames++; document.getElementById('o').textContent = 'frames ' + (frames > 30 ? 'many' : frames); if (frames > 30) { ctx.fillStyle = '#22aa44'; ctx.fillRect(0, 0, 200, 100); } requestAnimationFrame(step); }\
+            requestAnimationFrame(step);</script>";
+        let (dir, _) = page(&[("index.html", html)]);
+        let said = check_page(&serde_json::json!({"path": "index.html"}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        assert!(said.contains("frames many"), "{said}");
+        let path = said.lines().find(|line| line.starts_with("How it looks at desktop ")).and_then(|line| line.split("`read_file` ").nth(1)).map(PathBuf::from).unwrap_or_else(|| panic!("{said}"));
+        let picture = image::open(path).unwrap().to_rgb8();
+        // (the canvas is below the line of text: drawn green once its frames have run)
+        let green = (0..picture.height().min(200)).any(|y| picture.get_pixel(100, y).0 == [0x22, 0xaa, 0x44]);
+        assert!(green, "the canvas was drawn in the picture");
     }
 
     /// With the real browser, in the real sandbox: a phone's width is the width the page is laid out at, not the browser window's least.
@@ -2005,7 +2191,7 @@ mod tests {
 
     #[test]
     fn steps_go_at_the_end_of_the_page_with_its_folder_as_base_and_cannot_end_their_script() {
-        let page = with_steps("<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>", "file:///C:/w/", "await click('#a'); console.log('</script>')", "k");
+        let page = with_steps("<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>", "file:///C:/w/", "await click('#a'); console.log('</script>')", "k").replace(FRAMES, "");
         assert!(page.contains("<head><base href=\"file:///C:/w/\"><title>"), "{page}");
         let (steps_at, body_end) = (page.find("click('#a')").unwrap(), page.rfind("</body>").unwrap());
         assert!(page.find("<p>x</p>").unwrap() < steps_at && steps_at < body_end, "{page}");

@@ -39,18 +39,73 @@ const RESTART_WAIT: Duration = Duration::from_secs(600);
 const RESTART_SILENCE: Duration = Duration::from_secs(90);
 /// How often it is asked.
 const RESTART_ASK_EVERY: Duration = Duration::from_secs(1);
+/// How long in a turn a server that answered in this conversation may refuse, or answer nothing, with the request kept, before it is taken for gone: a restart that
+/// never says it is loading (the process stopped and started again; the Homelab's DeepSeek refused for 1 to 2 minutes so, and a turn failed in 24 s of retries), not a
+/// stop of many minutes, which is said as before.
+const QUIET_RESTART_WAIT: Duration = Duration::from_secs(180);
 
-/// `(how often, how long in all, how long it may be silent)`; a test shortens them.
-fn restart_limits() -> (Duration, Duration, Duration) {
+/// How often a server that stayed away past `QUIET_RESTART_WAIT`, its turn failed, is asked whether it is back, and for how long at the most: the turn then goes
+/// on by itself when it is ([`Background::add_server_wait`]).
+const SERVER_WAIT_EVERY: Duration = Duration::from_secs(15);
+const SERVER_WAIT_MOST: Duration = Duration::from_secs(3600);
+
+/// `(how often, how long at the most)` for a server's coming back; a test shortens them.
+fn server_wait_limits() -> (Duration, Duration) {
+    #[cfg(test)]
+    if let Some(limits) = *TEST_SERVER_WAIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+        return limits;
+    }
+    (SERVER_WAIT_EVERY, SERVER_WAIT_MOST)
+}
+
+#[cfg(test)]
+static TEST_SERVER_WAIT: Mutex<Option<(Duration, Duration)>> = Mutex::new(None);
+
+/// Asks the server every `every` whether it is back, for `most` at the longest, on a thread of its own: back (ready, or answering without a word of loading), the session is
+/// woken to go on with the turn that failed; stopped, or out of time, nothing. `what` is whose server it is, for the window.
+fn watch_for_the_server(provider: Arc<dyn Provider>, background: Arc<Background>, id: String, stop: Arc<AtomicBool>, what: String) {
+    let (every, most) = server_wait_limits();
+    // (what is told when no thread can be had: the wait is not listed as going on)
+    let (listed, listed_id) = (background.clone(), id.clone());
+    let spawned = std::thread::Builder::new().name("dogmind-server-wait".into()).spawn(move || {
+        let began = Instant::now();
+        loop {
+            let next = Instant::now() + every;
+            while Instant::now() < next {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(every.min(Duration::from_millis(250)));
+            }
+            if began.elapsed() >= most {
+                background.server_wait_over(&id);
+                return;
+            }
+            match provider.restart(&stop) {
+                llm::Restart::Ready | llm::Restart::Unknown => {
+                    background.server_back(&id, &what);
+                    return;
+                }
+                llm::Restart::Coming(_) | llm::Restart::Silent => {}
+            }
+        }
+    });
+    if spawned.is_err() {
+        listed.server_wait_over(&listed_id);
+    }
+}
+
+/// `(how often, how long in all, how long it may be silent, how long a quiet one is waited for)`; a test shortens them.
+fn restart_limits() -> (Duration, Duration, Duration, Duration) {
     #[cfg(test)]
     if let Some(limits) = *TEST_RESTART_LIMITS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
         return limits;
     }
-    (RESTART_ASK_EVERY, RESTART_WAIT, RESTART_SILENCE)
+    (RESTART_ASK_EVERY, RESTART_WAIT, RESTART_SILENCE, QUIET_RESTART_WAIT)
 }
 
 #[cfg(test)]
-static TEST_RESTART_LIMITS: Mutex<Option<(Duration, Duration, Duration)>> = Mutex::new(None);
+static TEST_RESTART_LIMITS: Mutex<Option<(Duration, Duration, Duration, Duration)>> = Mutex::new(None);
 
 /// How a wait for a restarting server ended.
 enum Restarted {
@@ -105,10 +160,6 @@ fn window_with(provided: u64, asked: Option<u64>) -> (u64, &'static str) {
 const REPEATS_NOTED: u32 = 2;
 const REPEATS_STOPPED: u32 = 5;
 const REPEAT_NOTE: &str = "\nnote: this exact call has run before with nothing edited in between, so its answer will not change. Try something different, or tell the user what is blocking you.";
-/// One `create_file` this long is cut off and goes on in another: some 3 minutes of a local model's writing, which is as much as it should risk with nothing on disk.
-/// A file of this size or more had taken 14 minutes in one call, and a stop or a crash in that time lost all of it.
-const MAX_WRITE_CHARS: usize = 24_000;
-
 pub enum Command {
     Send(String),
     /// What was written, and the pictures that go with it.
@@ -550,7 +601,8 @@ fn retry_pause(attempt: u32, said: &str) -> Duration {
 /// A command call as the sandbox will run it: its arguments with the line that runs in place of the line as written. None for any other call, and for a command
 /// that runs as it was written.
 fn as_run(tool: &str, arguments: &Value) -> Option<Value> {
-    if tool != "execute_command" {
+    // (outside the sandbox the line runs as it was written)
+    if tool != "execute_command" || safety::outside_sandbox(arguments) {
         return None;
     }
     let written = arguments.get("command")?.as_str()?;
@@ -588,7 +640,13 @@ fn both_weighed(written: Verdict, runs: Verdict) -> Verdict {
 fn always_key(tool: &str, arguments: &Value) -> String {
     match tool {
         // (the network too: "always" to a command is not to the same command with the network, which asks a person each time)
-        "execute_command" => format!("{tool}\n{}\n{}\n{}", arguments.get("command").and_then(Value::as_str).unwrap_or(""), arguments.get("cwd").and_then(Value::as_str).unwrap_or("."), safety::wants_network(arguments)),
+        "execute_command" => format!(
+            "{tool}\n{}\n{}\n{}\n{}",
+            arguments.get("command").and_then(Value::as_str).unwrap_or(""),
+            arguments.get("cwd").and_then(Value::as_str).unwrap_or("."),
+            safety::wants_network(arguments),
+            safety::outside_sandbox(arguments)
+        ),
         _ if tool.starts_with("mcp__") => format!("{tool}\n{arguments}"),
         _ => format!("{tool}\n{}", tools::summary(tool, arguments)),
     }
@@ -926,20 +984,58 @@ fn one_shape_for_edits(calls: &[crate::message::ToolCall]) -> Vec<crate::message
     for call in calls.iter_mut().filter(|call| call.function.name == "apply_patch") {
         let Ok(mut arguments) = serde_json::from_str::<Value>(&call.function.arguments) else { continue };
         let Some(all) = arguments.as_object_mut() else { continue };
+        let mut changed = false;
+        // (the list given as its text, in a string: the Homelab's DeepSeek sent 13 edits so, 4,126 characters, and the 68 s it took to write them went for nothing)
+        if let Some(list) = all.get("edits").and_then(Value::as_str).and_then(list_of_text) {
+            all.insert("edits".to_string(), list);
+            changed = true;
+        }
         if !all.contains_key("edits") && all.contains_key("old_string") && all.contains_key("new_string") {
             let one: serde_json::Map<String, Value> = ["path", "old_string", "new_string", "count"].iter().filter_map(|field| Some((field.to_string(), all.remove(*field)?))).collect();
             all.insert("edits".to_string(), Value::Array(vec![Value::Object(one)]));
+            changed = true;
+        } else if all.get("edits").is_some_and(Value::is_array) {
+            if let Some(path) = all.remove("path") {
+                for edit in all.get_mut("edits").and_then(Value::as_array_mut).into_iter().flatten().filter_map(Value::as_object_mut) {
+                    edit.entry("path").or_insert_with(|| path.clone());
+                }
+                changed = true;
+            }
+        }
+        if changed {
             call.function.arguments = arguments.to_string();
-            continue;
         }
-        let Some(path) = all.remove("path") else { continue };
-        let Some(edits) = arguments.get_mut("edits").and_then(Value::as_array_mut) else { continue };
-        for edit in edits.iter_mut().filter_map(Value::as_object_mut) {
-            edit.entry("path").or_insert_with(|| path.clone());
-        }
-        call.function.arguments = arguments.to_string();
     }
     calls
+}
+
+/// The list a string's text writes, or one edit there as a list of it; the line breaks typed as they are inside its strings, which JSON does not allow, taken as the ones
+/// they stand for (the DeepSeek call had five, in the middle of its code).
+fn list_of_text(text: &str) -> Option<Value> {
+    let mut escaped = String::with_capacity(text.len());
+    let (mut in_string, mut after_backslash) = (false, false);
+    for c in text.chars() {
+        if in_string && c < ' ' {
+            escaped.push_str(&format!("\\u{:04x}", c as u32));
+            after_backslash = false;
+            continue;
+        }
+        escaped.push(c);
+        if !in_string {
+            in_string = c == '"';
+        } else if after_backslash {
+            after_backslash = false;
+        } else if c == '\\' {
+            after_backslash = true;
+        } else if c == '"' {
+            in_string = false;
+        }
+    }
+    match serde_json::from_str::<Value>(&escaped).ok()? {
+        list @ Value::Array(_) => Some(list),
+        one @ Value::Object(_) => Some(Value::Array(vec![one])),
+        _ => None,
+    }
 }
 
 /// An answer that stopped in a `create_file`, as if it had ended where that file's last whole line does. The calls before it stand; what comes of the last is said in `cut_write`.
@@ -992,6 +1088,10 @@ fn still_unchecked(mut unchecked: bool, calls: &[crate::message::ToolCall]) -> b
 
 struct Agent {
     provider: Option<Arc<dyn Provider>>,
+    /// Whether the server has answered in this conversation: one that did, and then refuses or answers nothing, is waited for as one being restarted.
+    server_answered: bool,
+    /// This turn waited out its time for such a server, which did not come back: if the turn fails for it, the session waits for the server on its own.
+    quiet_gave_up: bool,
     model: String,
     window: u64,
     workspace: PathBuf,
@@ -1008,6 +1108,10 @@ struct Agent {
     safe_commands: bool,
     gate: Gate,
     tool_schemas: Value,
+    /// The tools of MCP servers the conversation was told of after it began (see `servers_caught_up`): callable as those it is offered.
+    added_tools: Vec<Value>,
+    /// They are to be told of again, as a compaction may have left out where they were.
+    added_due: bool,
     bench: Workbench,
     messages: Vec<Message>,
     session: Option<Session>,
@@ -1287,6 +1391,8 @@ impl Agent {
             repeated: HashSet::new(),
             web_seen: false,
             provider: None,
+            server_answered: false,
+            quiet_gave_up: false,
             model: String::new(),
             window: 0,
             workspace: config.workspace,
@@ -1318,6 +1424,8 @@ impl Agent {
             read_only: false,
             turn_began: std::time::SystemTime::now(),
             web_rules_due: false,
+            added_tools: Vec::new(),
+            added_due: false,
             events,
             wake,
             cancel,
@@ -1379,6 +1487,11 @@ impl Agent {
                 Command::Provider(provider, model, provided) => {
                     let (window, from) = window_in_use(provided);
                     self.provider = Some(provider);
+                    self.server_answered = false;
+                    // (a wait for the server there was is a wait for another one)
+                    if self.background.cancel_server_waits() {
+                        self.tell_waiting();
+                    }
                     self.model = model;
                     self.window = window;
                     // (a window that is not the provider's is said, for a run that compacts is read against it; the compaction lines carry the one in use)
@@ -1513,7 +1626,7 @@ impl Agent {
         self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": 0, "first": false, "woken": true}));
         let message = self.messages.len();
         if let Some(marks) = &mut self.marks {
-            let title = format!("(woken) {}", wakes.iter().map(|wake| format!("{} {}", wake.id, match wake.cause { crate::message::WakeCause::CommandEnded => "ended", crate::message::WakeCause::CommandLine => "printed", crate::message::WakeCause::Wait => "is up" })).collect::<Vec<_>>().join(", "));
+            let title = format!("(woken) {}", wakes.iter().map(|wake| format!("{} {}", wake.id, match wake.cause { crate::message::WakeCause::CommandEnded => "ended", crate::message::WakeCause::CommandLine => "printed", crate::message::WakeCause::Wait => "is up", crate::message::WakeCause::ServerBack => "is back" })).collect::<Vec<_>>().join(", "));
             if let Err(error) = marks.begin(&title, &now(), Some(message)) {
                 self.emit(Event::Notice(format!("this turn cannot be rewound: {error}")));
             }
@@ -1527,6 +1640,8 @@ impl Agent {
     fn load_extras(&mut self) {
         let found = self.allowed(skills::discover(&self.workspace, self.home.as_deref()));
         self.extras_with(found);
+        // (a conversation that begins is offered every server's tools)
+        (self.added_tools, self.added_due) = (Vec::new(), false);
     }
 
     /// The skills the model may be told of and start: not one the person turned off, nor one that needs what this app has not (a server not
@@ -1584,6 +1699,42 @@ impl Agent {
         }
     }
 
+    /// The tools of MCP servers that are new to the conversation: one the person added or changed in Settings, one slow to start, or one a server listed
+    /// as it said its tools changed. The tools it is offered are the start of what the engine keeps of it, and a change there has the engine read the whole
+    /// conversation again (most of 2 minutes at 100K tokens on the Homelab's DeepSeek): they stay as they were, and the new ones are told of where the
+    /// conversation is, callable as the others are, directly and from a program. What to tell, if there are any. A tool whose server has gone stays
+    /// callable, and a call to it says so.
+    fn servers_caught_up(&mut self) -> Option<String> {
+        let hub = self.mcp.clone()?;
+        let name = |tool: &Value| tool.pointer("/function/name").and_then(Value::as_str).map(str::to_string);
+        let known: std::collections::HashSet<String> = self.tool_schemas.as_array().into_iter().flatten().chain(&self.added_tools).filter_map(name).collect();
+        let more: Vec<Value> = hub.schemas().into_iter().filter(|tool| name(tool).is_some_and(|it| !known.contains(&it))).collect();
+        if more.is_empty() {
+            return None;
+        }
+        self.added_tools.extend(more.iter().cloned());
+        let added = Value::Array(self.added_tools.clone());
+        if let Some(session) = &mut self.session {
+            let _ = session.set_added(&added);
+        }
+        self.traj.write("tools_added", None, json!({"names": more.iter().filter_map(name).collect::<Vec<_>>(), "told": true}));
+        Some(prompt::tools_added(&more, self.code_mode))
+    }
+
+    /// Whether a tool told of after the conversation began is no longer told of in it: a rewind, or a fork, cut where it was.
+    fn added_untold(&self) -> bool {
+        let told: Vec<&str> = self.messages.iter().filter_map(|message| message.content.as_deref()).filter(|text| text.contains(prompt::TOOLS_ADDED)).collect();
+        self.added_tools.iter().filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str)).any(|name| !told.iter().any(|text| text.contains(&format!("`{name}`"))))
+    }
+
+    /// All the tools told of after the conversation began, told of again in a message of the app's: after a compaction, which may have left out where they were.
+    fn tell_added_again(&mut self) {
+        if std::mem::take(&mut self.added_due) && !self.added_tools.is_empty() {
+            let note = prompt::tools_added(&self.added_tools, self.code_mode);
+            self.push(Message::text("user", prompt::app_facts(&now(), None, &[note])));
+        }
+    }
+
     /// With no conversation yet it decides what one will begin with. In one, its tools are part of its prefix, so they stay: turned off, a call to `run_code` is answered as a call to a tool there
     /// is none of; turned on, it is offered from the next conversation.
     fn set_code_mode(&mut self, on: bool) {
@@ -1604,6 +1755,7 @@ impl Agent {
     fn move_to(&mut self, _workspace: &Path) {}
 
     fn new_session(&mut self, workspace: PathBuf) {
+        self.server_answered = false;
         self.move_to(&workspace);
         self.workspace = workspace;
         // (what the last session had going or waiting is ended with it)
@@ -1638,6 +1790,7 @@ impl Agent {
     }
 
     fn resume(&mut self, path: &Path) {
+        self.server_answered = false;
         // (nothing is opened until the key is: a plain session too, as what the person sees of the conversations is all or none)
         if self.policy.is_locked() {
             return self.failed(crate::conversation_key::LOCKED.to_string());
@@ -1656,7 +1809,10 @@ impl Agent {
                 if let Some(tools) = crate::session::tools_of(path) {
                     self.tool_schemas = tools;
                 }
+                self.added_tools = crate::session::added_of(path).and_then(|tools| tools.as_array().cloned()).unwrap_or_default();
                 self.messages = messages;
+                // (a fork keeps the tools told of in the one it came from, and maybe not where they were told of)
+                self.added_due = self.added_untold();
                 self.web_rules_due = false;
                 self.japanese_session = false;
                 self.rewound.clear();
@@ -1799,7 +1955,8 @@ impl Agent {
 
     /// Frozen for the session: the prefix Straydog keeps.
     fn frozen_prompt(&self) -> String {
-        let personal = self.instructions.as_ref().and_then(|file| std::fs::read_to_string(file).ok()).unwrap_or_default();
+        // (what a power cut can leave of the file, zeros, is no instruction)
+        let personal = self.instructions.as_ref().and_then(|file| std::fs::read_to_string(file).ok()).filter(|text| !images::left_by_a_power_cut(text.as_bytes())).unwrap_or_default();
         let notes = self.memory.as_deref().map_or(String::new(), |folder| memory::prompt_section(folder, &self.workspace));
         let tools: Vec<String> = self.tool_schemas.as_array().into_iter().flatten().filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string)).collect();
         let more = format!("{}{notes}", skills::prompt_section(&self.bench.skills, &tools));
@@ -1838,6 +1995,7 @@ impl Agent {
             self.cancel.store(true, Ordering::Relaxed);
         });
         self.traced("warm", &req_id, &clock, &streamed);
+        self.server_answered |= answered;
         if answered {
             self.cancel.store(false, Ordering::Relaxed);
         }
@@ -1847,8 +2005,11 @@ impl Agent {
     fn turn(&mut self, text: &str, pictures: Vec<Attachment>, kept: Vec<ImageRef>) {
         self.turn_began = std::time::SystemTime::now();
         let turn_began = Instant::now();
-        // (what counted against waking in a row is no longer counted: the person is here)
+        // (what counted against waking in a row is no longer counted: the person is here, and what they write goes in place of a wait for the server)
         self.background.person_spoke();
+        if self.background.cancel_server_waits() {
+            self.tell_waiting();
+        }
         self.bench.new_turn();
         self.cancel.store(false, Ordering::Relaxed);
         self.emit(Event::TurnStarted);
@@ -1860,6 +2021,7 @@ impl Agent {
         }
         self.traj.begin_turn();
         self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": pictures.len() + kept.len(), "first": new_session}));
+        let added = if new_session { None } else { self.servers_caught_up() };
         let mut images = kept;
         if let Some(session) = self.session.as_ref().map(|session| session.path.clone()) {
             let limit = self.image_limit();
@@ -1900,6 +2062,12 @@ impl Agent {
         }
         if std::mem::take(&mut self.web_rules_due) {
             notes.push(prompt::WEB_RULES.trim_end().to_string());
+        }
+        // (all of them after a compaction, and the new ones otherwise)
+        if std::mem::take(&mut self.added_due) && !self.added_tools.is_empty() {
+            notes.push(prompt::tools_added(&self.added_tools, self.code_mode));
+        } else if let Some(note) = added {
+            notes.push(note);
         }
         if let Some(note) = self.asked_skill(text) {
             notes.push(note);
@@ -1993,7 +2161,20 @@ impl Agent {
             Ended::Done => self.emit(Event::TurnEnded { cancelled: false }),
             Ended::Cancelled => self.emit(Event::TurnEnded { cancelled: true }),
             Ended::Failed(error) => {
-                self.emit(Event::Failed(error));
+                // A server that answered in this conversation and stayed away for all of the time the turn had for it: the session waits for it on its own, and the turn
+                // goes on when it is back.
+                // (said so in place of the failure's words, which ask for the message to be sent again: nothing is to be)
+                let waits = (self.quiet_gave_up && llm::is_gone(&error)).then(|| self.provider.clone()).flatten();
+                match waits {
+                    Some(provider) => {
+                        let (id, stop) = self.background.add_server_wait(server_wait_limits().1);
+                        self.intervened("server_wait", json!({"id": id}));
+                        watch_for_the_server(provider, self.background.clone(), id, stop, self.model.clone());
+                        self.emit(Event::Failed(background::SERVER_WAIT_SET.into()));
+                        self.tell_waiting();
+                    }
+                    None => self.emit(Event::Failed(error)),
+                }
                 self.emit(Event::TurnEnded { cancelled: false });
             }
         }
@@ -2004,8 +2185,6 @@ impl Agent {
         let rest = text.strip_prefix('/')?;
         let (name, arguments) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(name, arguments)| (name, arguments.trim()));
         let skill = self.bench.skills.iter().find(|skill| skill.name.eq_ignore_ascii_case(name) && skill.for_the_person)?;
-        #[cfg(windows)]
-        crate::sandbox::also_readable(&skill.folder);
         let body = skills::instructions(skill).ok()?;
         Some(format!("## The Skill The User Asked For\n{}", skills::with_arguments(&body, arguments)))
     }
@@ -2083,6 +2262,7 @@ impl Agent {
                     typed = Some(prompt::typed_text(self.messages[at].content.as_deref().unwrap_or("")).to_string());
                     self.messages.truncate(at);
                     marks.conversation_cut(at);
+                    self.added_due |= self.added_untold();
                     self.use_estimate();
                     self.save_snapshot();
                     let (path, workspace) = (self.session.as_ref().map_or(PathBuf::new(), |session| session.path.clone()), self.workspace.clone());
@@ -2109,17 +2289,21 @@ impl Agent {
 
     /// A request the server refused or lost: asks `/health` whether it is being restarted, and if it is keeps the request and waits while it says so (loading, or a proxy's 502, 503 or 504 with no
     /// health of its own), up to the time this turn has for it. A server that is ready, or has no health to ask, is none of this: the usual retries go. The person's Stop ends it at once.
+    /// A server that answered in this conversation and now answers nothing at all is waited for so too, for a time of its own in the turn (`quiet`, what it has had of
+    /// that): a restart that never says it is one leaves its port closed until the next process opens it.
     /// `spent`: what this turn has waited in all.
-    fn wait_for_restart(&mut self, provider: &dyn Provider, spent: &mut Duration) -> Restarted {
-        let (every, bound, silence) = restart_limits();
+    fn wait_for_restart(&mut self, provider: &dyn Provider, spent: &mut Duration, quiet: &mut Duration) -> Restarted {
+        let (every, bound, silence, quiet_wait) = restart_limits();
         let began = Instant::now();
         let (mut coming, mut silent_since, mut shown) = (false, None::<Instant>, None::<Value>);
+        // (when this wait began to be for a server that says nothing)
+        let mut quiet_since = None::<Instant>;
         let ended = loop {
             if self.cancelled() {
                 break Restarted::Stopped;
             }
             if *spent + began.elapsed() >= bound {
-                break if coming { Restarted::GaveUp } else { Restarted::Not };
+                break if coming || quiet_since.is_some() { Restarted::GaveUp } else { Restarted::Not };
             }
             match provider.restart(&self.cancel) {
                 llm::Restart::Coming(progress) => {
@@ -2133,19 +2317,34 @@ impl Agent {
                         shown = Some(progress);
                     }
                 }
-                llm::Restart::Ready => break if coming { Restarted::Back(0) } else { Restarted::Not },
+                llm::Restart::Ready => break if coming || quiet_since.is_some() { Restarted::Back(0) } else { Restarted::Not },
                 llm::Restart::Silent if coming => {
                     if silent_since.get_or_insert_with(Instant::now).elapsed() > silence {
                         break Restarted::GaveUp;
                     }
                 }
+                // (it answered in this conversation: refusing now, it is taken for one between two processes, as long as the turn has for that)
+                llm::Restart::Silent if self.server_answered && provider.waits_out_silence() && *quiet < quiet_wait => {
+                    let since = *quiet_since.get_or_insert_with(Instant::now);
+                    if *quiet + since.elapsed() >= quiet_wait {
+                        self.quiet_gave_up = true;
+                        break Restarted::GaveUp;
+                    }
+                    if shown.is_none() {
+                        self.emit(Event::ServerRestarting(Value::Null));
+                        shown = Some(Value::Null);
+                    }
+                }
                 llm::Restart::Silent => break Restarted::Not,
                 // (it answers, and no longer as a server that is loading: it is for the request to find out)
-                llm::Restart::Unknown => break if coming { Restarted::Back(0) } else { Restarted::Not },
+                llm::Restart::Unknown => break if coming || quiet_since.is_some() { Restarted::Back(0) } else { Restarted::Not },
             }
             self.wait_to_retry(every);
         };
-        if coming {
+        if let Some(since) = quiet_since {
+            *quiet += since.elapsed();
+        }
+        if coming || quiet_since.is_some() {
             *spent += began.elapsed();
         }
         match ended {
@@ -2156,9 +2355,12 @@ impl Agent {
 
     fn iterate(&mut self) -> Ended {
         let Some(provider) = self.provider.clone() else { return Ended::Failed(llm::NOT_READY.into()) };
+        self.quiet_gave_up = false;
         let (mut transient, mut overflow, mut failed_calls) = (0u32, 0u32, 0usize);
         let (mut cut_off, mut empties) = (0u32, 0u32);
         let mut drafts_stopped = 0u32;
+        // Whether the requests have their thinking closed, after a draft stop, until one writes a file.
+        let mut thinking_closed = false;
         let mut wrote = false;
         let mut repeats: HashMap<String, u32> = HashMap::new();
         // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
@@ -2166,10 +2368,12 @@ impl Agent {
             .find(|text| !text.starts_with("[From the app")).is_some_and(asks_not_to_run);
         let (mut unchecked, mut asked_to_check) = (false, not_to_run);
         let (mut said, mut asked_about_slips) = (String::new(), false);
+        // Whether the rest of a file whose write was cut, given as the answer's text, has been told of: once a turn.
+        let mut cut_as_text_told = false;
         // The request this one repeats, why, and how long it waited, for the trajectory.
         let mut retry: Option<(String, &'static str, u64)> = None;
-        // What this turn has waited for a server being restarted, in all.
-        let mut restart_spent = Duration::ZERO;
+        // What this turn has waited for a server being restarted, in all; and of that, for one that said nothing.
+        let (mut restart_spent, mut quiet_spent) = (Duration::ZERO, Duration::ZERO);
         for _ in 0..MAX_ITERATIONS {
             if self.cancelled() {
                 return Ended::Cancelled;
@@ -2180,6 +2384,7 @@ impl Agent {
                 if let Err(error) = self.compact(false, false) {
                     return if self.cancelled() { Ended::Cancelled } else { Ended::Failed(error) };
                 }
+                self.tell_added_again();
             }
             let req_id = self.traj.request_id();
             self.last_req = Some(req_id.clone());
@@ -2187,11 +2392,13 @@ impl Agent {
                 self.traj.write("wake", Some(&req_id), fields);
             }
             let folder = self.picture_folder();
+            if thinking_closed {
+                provider.close_thinking_once();
+            }
             let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
             let mut written = String::new();
             let (mut reasoned, mut calling) = (String::new(), Vec::<crate::message::ToolCall>::new());
             let cuts = provider.keeps_cut_writes();
-            let mut cut = false;
             let mut drafting = false;
             // Only where a file may change: a draft in a turn the person asked for no change in, or in plan mode, is the model thinking with code, whose answer will have it once.
             // (Four such turns in the sessions were stopped, each thrown away at 4,900 to 22,800 tokens, and the model then reasoned 20,000 to 30,000 tokens over again.)
@@ -2200,13 +2407,12 @@ impl Agent {
             let watch_is = if may_stop_drafting { "on" } else if !files_may_change { "off:no_change_asked" } else if wrote { "off:file_written" } else if drafts_stopped >= MAX_DRAFTS_STOPPED { "off:stopped_once" } else { "off" };
             // (what it has been shown, once for the request: its code in its reasoning that is a line of that is a quote, and not a draft)
             let mut watch = may_stop_drafting.then(|| DraftWatch::new(lines_shown(&self.messages)));
-            // The app's own stops (a draft, a file cut to get it on disk) end the stream through a flag of the stream's: on the person's,
-            // and taken back after, a Stop pressed as one of them fired was taken for it, and the turn went on. The person's is passed on to it.
+            // The app's own stop (of a draft) ends the stream through a flag of the stream's: on the person's,
+            // and taken back after, a Stop pressed as it fired was taken for it, and the turn went on. The person's is passed on to it.
             let halt = AtomicBool::new(self.cancelled());
             let cancel = &halt;
             let events = self.events.clone();
             let wake = &self.wake;
-            let (workspace, bench) = (&self.workspace, &self.bench);
             // (from before its first word: reading a long conversation takes a while, and is what the context bar is for)
             let base = self.expected_use();
             let window = self.window;
@@ -2260,13 +2466,7 @@ impl Agent {
                         meter.count(text, now);
                         meter.call(index).pending.push_str(text);
                         if let Some(call) = calling.get_mut(index) {
-                            let before = call.function.arguments.len() / 1024;
                             call.function.arguments.push_str(text);
-                            // (looked at each kilobyte: what it looks through is long by then)
-                            if cuts && !cut && call.function.name == "create_file" && call.function.arguments.len() >= MAX_WRITE_CHARS && call.function.arguments.len() / 1024 != before && close_cut_write(&call.function.arguments).is_some_and(|(closed, path, _)| !cut_would_lose(&closed, &path, workspace, bench)) {
-                                cut = true;
-                                cancel.store(true, Ordering::Relaxed);
-                            }
                         }
                         Vec::new()
                     }
@@ -2282,11 +2482,14 @@ impl Agent {
                 }
             }));
             // (a Stop of the person's, whatever else stopped the stream, is the turn's end)
-            let stopped_by_the_app = (cut || drafting) && !self.cancelled();
+            let stopped_by_the_app = drafting && !self.cancelled();
+            // (an answer, or a part of one: the server answers in this conversation, and a refusal later is waited for as a restart's)
+            if result.is_ok() || !reasoned.is_empty() || !written.is_empty() || !calling.is_empty() {
+                self.server_answered = true;
+            }
             // (how it ended, as the trajectory says it: what ended it from outside is not in what the provider returned)
             let end = match &result {
                 Err(LlmError::Cancelled) if drafting && stopped_by_the_app => "stopped_app:draft_stop".to_string(),
-                Err(LlmError::Cancelled) if cut && stopped_by_the_app => "stopped_app:cut_write".to_string(),
                 other => trajectory::end_of(other),
             };
             let (usage, timings) = result.as_ref().ok().map_or((None, None), |completion| (completion.usage.as_ref(), completion.timings.as_ref()));
@@ -2301,7 +2504,13 @@ impl Agent {
             if drafting && stopped_by_the_app && matches!(result, Err(LlmError::Cancelled)) {
                 // (what it had come to when it was stopped, and what the stop cost: the tokens that are thrown away)
                 let run = watch.as_ref().map_or(0, DraftWatch::stats);
-                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run}));
+                // The requests after the stop have their thinking closed, where the server can, until one writes a file: it has decided already, and what it was told is to
+                // write. Left open, it thought again for 16,000 to 36,000 characters (97 to 256 s) in each of three stops, before writing what it had, with no better result
+                // than the two closed ones, which wrote at once (27 and 95 s). Closed for one request alone, a look at the folder first (4 s) used it up, and the request
+                // after it thought for 410 s (66,369 characters) before it wrote. Once a file is written, the next request thinks as before.
+                let plain = provider.close_thinking_once();
+                thinking_closed = plain;
+                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "next_without_thinking": plain}));
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
                 self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped, watch.as_ref().map(DraftWatch::began_at))));
@@ -2311,14 +2520,6 @@ impl Agent {
             }
             let mut completion = match result {
                 Ok(completion) => completion,
-                // Ended here, not by the person: the rest goes on in the next call.
-                Err(LlmError::Cancelled) if cut && stopped_by_the_app && saved.is_some() => {
-                    // (an answer cut here has no count of its own, and it is the long ones that come this way)
-                    let (answer, path, tail) = saved.expect("just looked at");
-                    self.cut_write_noted("size", &answer, &path, meter.tokens);
-                    self.note_cut_write(&answer, path, tail);
-                    answer
-                }
                 Err(LlmError::Cancelled) => {
                     if !saved.is_some_and(|saved| self.keep_cut_write(saved.0)) {
                         self.keep_written(&written);
@@ -2359,7 +2560,7 @@ impl Agent {
                 }
                 Err(LlmError::Transient(message)) => {
                     // A server being restarted is waited for, with the request kept, and that is no retry of the three.
-                    let waited_for_restart = match self.wait_for_restart(provider.as_ref(), &mut restart_spent) {
+                    let waited_for_restart = match self.wait_for_restart(provider.as_ref(), &mut restart_spent, &mut quiet_spent) {
                         Restarted::Back(ms) => Some(ms),
                         Restarted::Stopped => {
                             self.restart_wait_ended("stopped", restart_spent);
@@ -2433,7 +2634,11 @@ impl Agent {
                 }
             };
             transient = 0;
-            // The model's own limit in the middle of a file: as with a cut, what it wrote stays and it goes on.
+            // (a file written, or begun: what the stop closed the thinking for is done)
+            if completion.tool_calls.iter().any(|call| matches!(call.function.name.as_str(), "create_file" | "apply_patch")) {
+                thinking_closed = false;
+            }
+            // The model's own limit in the middle of a file: as with a broken connection, what it wrote stays and it goes on.
             if cuts && completion.finish == "length" {
                 if let Some((answer, path, tail)) = cut_answer(&completion.content, &completion.reasoning, &completion.tool_calls, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) {
                     self.cut_write_noted("length", &answer, &path, 0);
@@ -2475,6 +2680,12 @@ impl Agent {
                 let most = note_repeats(&calls, &self.workspace, &mut repeats, &mut self.repeated);
                 let failures = self.run_tools(&calls);
                 let nested = std::mem::take(&mut self.program_calls);
+                // (a server may have tools now that it had not, as one does that adds them on request: the model may call them in this turn)
+                if calls.iter().chain(&nested).any(|call| call.function.name.starts_with("mcp__")) {
+                    if let Some(note) = self.servers_caught_up() {
+                        self.push(Message::text("user", prompt::app_facts(&now(), None, &[note])));
+                    }
+                }
                 failed_calls = if failures == calls.len() { failed_calls + failures } else { 0 };
                 let edited = std::mem::take(&mut self.edited);
                 // What a command wrote counts as an edit for the calls that look: what they would answer now is not what they did. (Not for what the model wrote: the draft watch is for that.)
@@ -2510,6 +2721,16 @@ impl Agent {
             // Something said just as the answer ended is answered too, and not left for the next turn.
             if !self.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty() {
                 continue;
+            }
+            // The rest of a file whose write was cut, written as the answer's text: it writes nothing, and the turn would end with the file cut. (A game's
+            // last 4,761 characters ended a turn so on the Homelab's DeepSeek, its page unable to run.)
+            if !cut_as_text_told && prompt::mostly_code(&completion.content) {
+                if let Some(path) = self.bench.cut_file().map(|path| path_for_trajectory(&path.to_string_lossy(), &self.workspace)) {
+                    cut_as_text_told = true;
+                    self.intervened("cut_write_as_text", json!({"chars": completion.content.chars().count(), "path": path}));
+                    self.push(Message::text("user", prompt::cut_write_as_text(&path)));
+                    continue;
+                }
             }
             // Once a turn: a model that says it is done without having run what it wrote gets one word about it.
             if unchecked && !asked_to_check && self.mode != Mode::Plan {
@@ -2889,7 +3110,24 @@ impl Agent {
             }
         }
         self.bench.secrets.clone_from(&self.gate.secrets);
+        // (what a server's tool shows, the model is shown too, as a picture read with read_file is: where it reads pictures in a tool's result)
+        self.bench.mcp_pictures_wanted = !nested && name.starts_with("mcp__") && self.session.is_some()
+            && self.provider.as_ref().is_some_and(|provider| provider.images_in_tool_results() && provider.reads_pictures() != Some(false));
+        // (what a command makes or changes in the workspace is shown with the turn's changes, as the agent's own edits are; none of it is saved for a rewind.
+        // A command left running in the background is not followed.)
+        let began = (name == "execute_command" && arguments.get("background").and_then(Value::as_bool) != Some(true)).then(std::time::SystemTime::now);
         let result = self.bench.run(name, arguments, &self.workspace, &self.cancel);
+        if let Some(began) = began {
+            let touched = crate::checkpoint::touched_since(&self.workspace, began);
+            if !touched.is_empty() {
+                if let Some(Err(error)) = self.marks.as_mut().map(|marks| marks.commanded(touched)) {
+                    self.emit(Event::Notice(format!("what this command changed is not listed with the turn: {error}")));
+                }
+            }
+        }
+        self.bench.mcp_pictures_wanted = false;
+        let pictures = std::mem::take(&mut self.bench.mcp_pictures);
+        let (result, images) = self.shown_pictures(result, pictures);
         // A server's answer is as much a stranger's as a page: it may have come from one.
         let from_a_stranger = matches!(name, "web_search" | "web_read") || (name.starts_with("mcp__") && !self.mcp.as_ref().is_some_and(|hub| hub.trusts_tool(name)));
         if from_a_stranger && result.is_ok() && !self.web_seen {
@@ -2919,7 +3157,23 @@ impl Agent {
         let result = self.with_changes_noted(name, arguments, result);
         // (a command that ran and failed is a failure too: a model can spend an hour on those with nothing being wrong with a call)
         let failed = usize::from(result.as_ref().map_or(true, |output| name == "execute_command" && command_failed(output)));
-        Ran { stranger: from_a_stranger && result.is_ok(), ..Ran::done(result, failed) }
+        Ran { stranger: from_a_stranger && result.is_ok(), images, ..Ran::done(result, failed) }
+    }
+
+    /// The pictures a server's tool returned, kept with the conversation as a picture read with read_file is (see `read_picture`), to go with its result;
+    /// one that cannot be is said so in it, by the number its text gave it.
+    fn shown_pictures(&mut self, result: Result<String, String>, pictures: Vec<crate::mcp::Picture>) -> (Result<String, String>, Vec<ImageRef>) {
+        let Some(session) = self.session.as_ref().map(|session| session.path.clone()).filter(|_| !pictures.is_empty()) else { return (result, Vec::new()) };
+        let limit = self.image_limit();
+        let (mut kept, mut lost) = (Vec::new(), Vec::new());
+        for (at, picture) in pictures.into_iter().enumerate() {
+            match images::attach_bytes(&format!("picture-{}", at + 1), picture.bytes).and_then(|attached| images::save(&session, &attached, limit)) {
+                Ok(image) => kept.push(image),
+                Err(error) => lost.push(format!("picture {} could not be shown: {error}", at + 1)),
+            }
+        }
+        let result = if lost.is_empty() { result } else { result.map(|text| format!("{text}\n({})", lost.join("; "))) };
+        (result, kept)
     }
 
     /// A `run_code` call: its program runs in the embedded engine, and each tool it calls goes through [`Agent::program_call`]. What comes back is what the program returned, what it logged and how
@@ -2932,7 +3186,8 @@ impl Agent {
         // (a model that left it out is still told to the person: the program's first line)
         let description = said.map_or_else(|| code.trim().lines().next().unwrap_or("").chars().take(80).collect(), str::to_string);
         let limits = code_mode::Limits::default().with_timeout_seconds(arguments.get("timeout_seconds").and_then(Value::as_f64));
-        let offered = code_mode::callable(&self.tool_schemas);
+        let mut offered = code_mode::callable(&self.tool_schemas);
+        offered.extend(code_mode::callable(&Value::Array(self.added_tools.clone())));
         let names: Vec<&str> = offered.iter().map(String::as_str).collect();
         self.program = Some(Program { id: id.to_string(), description, calls: 0, waited: Duration::ZERO, stranger: false });
         let cancel = self.cancel.clone();
@@ -2966,7 +3221,9 @@ impl Agent {
         let started = Instant::now();
         self.emit(Event::ProgramStep { id: parent.clone(), call, tool: name.to_string(), summary: tools::summary(name, &arguments) });
         self.call_begun(&id, name, Some(&arguments), &raw, 1, Some(&parent));
+        self.bench.in_program = true;
         let ran = self.run_call(&id, name, &arguments, true);
+        self.bench.in_program = false;
         let (ok, output) = match &ran.result {
             Ok(output) => (true, output.clone()),
             Err(error) => (false, format!("error: {error}")),
@@ -3290,7 +3547,7 @@ impl Agent {
         if let Some((path, tail)) = self.cut_writes.remove(id) {
             if ok {
                 self.bench.note_cut(resolve(&self.workspace, &path));
-                output.push_str(&format!("\nnote: this call was cut off here, to get the work on disk. The file ends with this line: `{tail}`. Go straight on with the next line, in create_file with the same path, and write only what is missing: there is no need to think it over again."));
+                output.push_str(&format!("\nnote: this call was cut off here, before its end. The file ends with this line: `{tail}`. Go straight on with the next line, in create_file with the same path (not in your answer's text, which writes nothing), and write only what is missing: there is no need to think it over again."));
             }
         }
         self.tool_ended(id, ok, declined, &output, elapsed);
@@ -3464,8 +3721,9 @@ impl Agent {
         if self.messages.is_empty() {
             return Ok(());
         }
-        // (what a compaction leaves may not hold the goal: it is said again with the next message)
+        // (what a compaction leaves may not hold the goal, nor the tools told of: they are said again with the next message)
         self.goal_due |= self.goal.is_some();
+        self.added_due |= !self.added_tools.is_empty();
         let (before, began) = (self.expected_use(), Instant::now());
         // (as it was: the engine reads again everything from the first message that differs, and that is what a compaction costs it)
         let was = self.messages.clone();
@@ -4035,7 +4293,9 @@ mod tests {
         assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "so are the tools");
         assert_eq!(second[3]["reasoning_content"], "thinking");
         assert!(bodies[0].get("tool_choice").is_none() && bodies[0].get("max_tokens").is_none());
-        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 17, "Dogmind's ten and the app's seven");
+        let tools = bodies[0]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 18, "the usual seventeen and the built-in skill tool");
+        assert!(tools.iter().any(|tool| tool["function"]["name"] == "skill"));
     }
 
     /// What the person typed goes to the model as it was typed, with nothing around it, and the app's facts (the time, the language, at the first message the workspace)
@@ -4403,9 +4663,10 @@ mod tests {
     fn nothing_listening_during_a_turn_loses_nothing_and_says_so_plainly() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        // One answer, and then the server has gone: the call's result has no one to go to.
+        // One answer, and then the app's own engine has gone: the call's result has no one to go to. (A server of the person's is waited for: see
+        // a_server_that_answered_and_then_refuses_is_waited_for_and_the_request_goes_when_it_listens_again.)
         let (client, bodies) = server(vec![call_answer("read_file", serde_json::json!({"path": "a.txt"}))]);
-        let run = run_agent(dir.path(), client, Mode::Default);
+        let run = run_agent(dir.path(), Client { own_engine: true, ..client }, Mode::Default);
         run.handle.commands.send(Command::Send("look".into())).unwrap();
         let path = session_file(&run);
         let (failed, notices) = turn_said(&run);
@@ -4467,9 +4728,9 @@ mod tests {
             let event = format!("data: {}\n\n", serde_json::json!({"choices": [{"delta": {"content": "half an"}}]}));
             let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n", event.len()).as_bytes());
             std::thread::sleep(Duration::from_millis(200));
-            // And it and its listener are gone, with no end to the body.
+            // And it and its listener are gone, with no end to the body: the app's own engine, which is not waited for.
         });
-        let run = run_agent(dir.path(), Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), Mode::Default);
+        let run = run_agent(dir.path(), Client { own_engine: true, ..Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap() }, Mode::Default);
         run.handle.commands.send(Command::Send("first".into())).unwrap();
         let path = session_file(&run);
         let (failed, notices) = turn_said(&run);
@@ -4698,6 +4959,28 @@ mod tests {
         assert!(log.iter().any(|line| line == "approval:execute_command:low"), "{log:?}");
         assert_eq!(reasons, [Some(PLANTED_NOTE.to_string())]);
         assert!(log.iter().any(|line| line.starts_with("tool:false:true:")), "and it did not run: {log:?}");
+    }
+
+    /// A file a command made in the workspace is among the turn's changes, as the agent's own edits are (a run left a helper picture there that no list showed).
+    #[cfg(windows)]
+    #[test]
+    fn a_file_a_command_made_is_among_the_turns_changes() {
+        let dir = folder_for_commands();
+        let (client, _) = server(vec![call_answer("execute_command", serde_json::json!({"command": "echo made> made.txt"})), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make it".into())).unwrap();
+        let mut changed = Vec::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(60)).expect("the turn ended") {
+                Event::Approval(approval) => approval.answer.send((Decision::Approve, None)).unwrap(),
+                Event::TurnChanges { files, .. } => changed.extend(files),
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(dir.path().join("made.txt").exists(), "the command ran");
+        let made = changed.iter().find(|change| change.path == "made.txt").unwrap_or_else(|| panic!("{changed:?}"));
+        assert_eq!((made.added, made.removed), (1, 0));
     }
 
     /// "Always" to a command is to the program the line names, for the session: not to a file there that takes its place afterwards.
@@ -5391,6 +5674,40 @@ mod tests {
         assert_eq!((&made["edits"][0]["path"], &made["edits"][0]["old_string"], &made["edits"][0]["new_string"]), (&json_str("../outside.txt"), &json_str("a"), &json_str("b")));
         assert!(made.get("path").is_none() && made.get("old_string").is_none());
         assert!(matches!(gate.check("apply_patch", &made, Path::new("C:\\work")), crate::safety::Verdict::Ask { risk: crate::safety::Risk::High, .. }), "and what it would write outside is seen in this shape too");
+    }
+
+    /// The list of edits given as its text in a string, as the Homelab's DeepSeek sent it (the call's arguments as they came, 13 edits in 4,126 characters, five line
+    /// breaks typed inside its strings): the gate and the tool see the list, and the conversation keeps what the model wrote.
+    #[test]
+    fn edits_given_as_the_text_of_a_list_are_taken_as_the_list() {
+        let raw = include_str!("agent/tests/edits_as_text.json").trim_end();
+        let given = crate::message::ToolCall { id: "p".into(), kind: "function".into(), function: crate::message::FunctionCall { name: "apply_patch".into(), arguments: raw.to_string() } };
+        let text = serde_json::from_str::<Value>(raw).unwrap()["edits"].as_str().unwrap().to_string();
+        assert_eq!(text.chars().count(), 4126);
+        assert!(serde_json::from_str::<Value>(&text).is_err(), "not JSON as it stands");
+        let made: Value = serde_json::from_str(&one_shape_for_edits(std::slice::from_ref(&given))[0].function.arguments).unwrap();
+        let edits = made["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 13);
+        assert!(edits.iter().all(|edit| edit["path"] == "game.html" && edit["old_string"].is_string() && edit["new_string"].is_string()));
+        assert_eq!(edits[0]["old_string"], "        damageBrick(b, 1, pb.x + pb.w / 2, pb.y);\n        brickAt(pb);\n        burst(pb.x, pb.y, 4, levelHue, 120);");
+        let broken = edits.iter().find_map(|edit| edit["new_string"].as_str().filter(|new| new.contains("ALL STAGE CLEAR!"))).unwrap();
+        assert!(broken.contains("' +\n      '<div class=\"scoreline\">"), "a line break typed in a string is the line break: {broken}");
+        // The tool takes them, on the file they were written for.
+        let dir = tempfile::tempdir().unwrap();
+        let before: String = edits.iter().map(|edit| format!("{}\n", edit["old_string"].as_str().unwrap())).collect();
+        std::fs::write(dir.path().join("game.html"), &before).unwrap();
+        let (mut bench, cancel) = (tools::Workbench::new(dir.path()), AtomicBool::new(false));
+        bench.run("read_file", &serde_json::json!({"path": "game.html"}), dir.path(), &cancel).unwrap();
+        let done = bench.run("apply_patch", &made, dir.path(), &cancel);
+        assert!(done.is_ok(), "{done:?}");
+        let after = std::fs::read_to_string(dir.path().join("game.html")).unwrap();
+        assert!(after.contains("ALL STAGE CLEAR!") && !after.contains("        brickAt(pb);\n"));
+        // An edit given alone as text is a list of one; a string that is no list is left as it was, to fail as it would.
+        let call_of = |arguments: Value| crate::message::ToolCall { id: "p".into(), kind: "function".into(), function: crate::message::FunctionCall { name: "apply_patch".into(), arguments: arguments.to_string() } };
+        let one = one_shape_for_edits(&[call_of(serde_json::json!({"edits": r#"{"path": "a.txt", "old_string": "x", "new_string": "y"}"#}))]);
+        assert_eq!(serde_json::from_str::<Value>(&one[0].function.arguments).unwrap()["edits"][0]["path"], "a.txt");
+        let not = call_of(serde_json::json!({"edits": "change x to y"}));
+        assert_eq!(one_shape_for_edits(std::slice::from_ref(&not))[0].function.arguments, not.function.arguments);
     }
 
     fn json_str(text: &str) -> Value {
@@ -6719,15 +7036,224 @@ Body").unwrap();
     impl ShortRestartLimits<'_> {
         fn of(bound: Duration) -> ShortRestartLimits<'static> {
             let one_at_a_time = RESTART_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            *TEST_RESTART_LIMITS.lock().unwrap() = Some((Duration::from_millis(20), bound, Duration::from_millis(300)));
+            *TEST_RESTART_LIMITS.lock().unwrap() = Some((Duration::from_millis(20), bound, Duration::from_millis(300), Duration::from_millis(300)));
             ShortRestartLimits { _one_at_a_time: one_at_a_time }
         }
+
+        /// As `of`, a quiet server waited for up to `quiet`, and one that stays away asked after every 50 ms for up to a minute.
+        fn quiet(bound: Duration, quiet: Duration) -> ShortRestartLimits<'static> {
+            let one_at_a_time = RESTART_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *TEST_RESTART_LIMITS.lock().unwrap() = Some((Duration::from_millis(20), bound, Duration::from_millis(300), quiet));
+            *TEST_SERVER_WAIT.lock().unwrap() = Some((Duration::from_millis(50), Duration::from_secs(60)));
+            ShortRestartLimits { _one_at_a_time: one_at_a_time }
+        }
+    }
+
+    /// A server as `routed`'s that stops listening once it has answered `posts` requests for an answer, for `down` (connections refused, as nothing is there), and then
+    /// listens on the same port again: a server stopped and started again, which says nothing in between.
+    fn routed_with_a_stop(answer: impl Fn(&str, &str, usize) -> (u16, &'static str, String) + Send + Sync + 'static, posts: usize, down: Duration)
+                          -> (Client, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let (answer, seen) = (Arc::new(answer), Arc::new(Mutex::new(Vec::<String>::new())));
+        let kept = seen.clone();
+        let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            let (mut listener, mut stopped) = (Some(listener), false);
+            loop {
+                let posted = kept.lock().unwrap().iter().filter(|line| line.starts_with("POST")).count();
+                if !stopped && posted >= posts && open.load(Ordering::SeqCst) == 0 {
+                    stopped = true;
+                    drop(listener.take());
+                    std::thread::sleep(down);
+                    let again = TcpListener::bind(("127.0.0.1", port)).unwrap();
+                    again.set_nonblocking(true).unwrap();
+                    listener = Some(again);
+                }
+                let Some(listening) = listener.as_ref() else { return };
+                let mut stream = match listening.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                stream.set_nonblocking(false).unwrap();
+                let (answer, kept, open) = (answer.clone(), kept.clone(), open.clone());
+                open.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let (mut request, mut block) = (Vec::new(), [0u8; 65536]);
+                    let head = loop {
+                        let Ok(count @ 1..) = stream.read(&mut block) else {
+                            open.fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        };
+                        request.extend_from_slice(&block[..count]);
+                        let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&request[..at]).to_string();
+                        let length: usize = head.to_lowercase().lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                        if request.len() >= at + 4 + length {
+                            break head;
+                        }
+                    };
+                    let mut first = head.lines().next().unwrap_or("").split_whitespace();
+                    let (method, path) = (first.next().unwrap_or("").to_string(), first.next().unwrap_or("").to_string());
+                    let (status, kind, body) = answer(&method, &path, 0);
+                    let reason = match status { 200 => "OK", 404 => "Not Found", _ => "Service Unavailable" };
+                    let said = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(said.as_bytes());
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+                    // (counted once it is answered and closed: the stop comes after the answer, as a server that is stopped between two messages)
+                    kept.lock().unwrap().push(format!("{method} {path}"));
+                    open.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), seen)
+    }
+
+    /// The Homelab's DeepSeek, stopped and started again between two messages: nothing listened for a while, and the turn failed in 24 s of retries. A server that answered
+    /// in this conversation and then refuses is waited for now, with the request kept and the wait shown, and the request goes when it listens again.
+    #[test]
+    fn a_server_that_answered_and_then_refuses_is_waited_for_and_the_request_goes_when_it_listens_again() {
+        let _short = ShortRestartLimits::quiet(Duration::from_secs(60), Duration::from_secs(20));
+        let dir = tempfile::tempdir().unwrap();
+        let answers = std::sync::atomic::AtomicUsize::new(0);
+        let (client, seen) = routed_with_a_stop(move |method, path, _| match (method, path) {
+            ("POST", _) => (200, "text/event-stream", text_answer(if answers.fetch_add(1, Ordering::SeqCst) == 0 { "one" } else { "two" })),
+            ("GET", "/health") => (200, "application/json", r#"{"status": "ok"}"#.to_string()),
+            _ => (404, "application/json", "{}".to_string()),
+        // (longer than Windows tries a refused connection for, some 2 s: a server back before that is never seen refusing)
+        }, 1, Duration::from_secs(5));
+        let run = run_agent(dir.path(), client, Mode::Default);
+        let turn = |text: &str| {
+            run.handle.commands.send(Command::Send(text.into())).unwrap();
+            let (mut content, mut waiting) = (String::new(), Vec::new());
+            loop {
+                match run.events.recv_timeout(Duration::from_secs(30)).expect("the turn ended") {
+                    Event::ServerRestarting(progress) => waiting.push(progress),
+                    Event::Content(text) => content.push_str(&text),
+                    Event::Failed(text) => panic!("the turn failed: {text}"),
+                    Event::TurnEnded { cancelled } => {
+                        assert!(!cancelled);
+                        return (content, waiting);
+                    }
+                    _ => {}
+                }
+            }
+        };
+        assert_eq!(turn("hello"), ("one".to_string(), Vec::new()));
+        // (the server stops once the answer is closed: the next message finds nothing listening)
+        while seen.lock().unwrap().iter().filter(|line| line.starts_with("POST")).count() < 1 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let (content, waiting) = turn("again");
+        assert_eq!(content, "two");
+        assert_eq!(waiting, vec![Value::Null], "the wait is shown, once, as a restart's with nothing said of its loading");
+        let lines = trajectory_of(&run);
+        let requests = of_kind(&lines, "request");
+        let waited: Vec<&&Value> = requests.iter().filter(|line| line["retry_why"] == "server_restart").collect();
+        assert_eq!(waited.len(), 1, "{requests:?}");
+        assert!(waited[0]["wait_ms"].as_u64().is_some_and(|ms| ms >= 1000), "{:?}", waited[0]);
+    }
+
+    /// One that answered and stays away is waited for as long as the turn has for that, once, and then the usual retries go; one that has not answered in this conversation,
+    /// refusing, is not waited for: a server that is not there is said as before. (Each ends with the person's Stop, at the retries.)
+    #[test]
+    fn a_refusing_server_that_stays_away_is_given_up_and_one_that_never_answered_is_not_waited_for() {
+        let _short = ShortRestartLimits::quiet(Duration::from_secs(60), Duration::from_millis(400));
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _) = routed_with_a_stop(|method, path, _| match (method, path) {
+            ("POST", _) => (200, "text/event-stream", text_answer("one")),
+            _ => (404, "application/json", "{}".to_string()),
+        }, 1, Duration::from_secs(600));
+        // (the events up to the `retries`-th retry, then the person's Stop: how many times the wait was shown, and the retries' reasons)
+        let until_retries = |run: &Run, text: &str, retries: usize| {
+            run.handle.commands.send(Command::Send(text.into())).unwrap();
+            let (mut waiting, mut why) = (0, Vec::new());
+            loop {
+                match run.events.recv_timeout(Duration::from_secs(60)).expect("the turn ended") {
+                    Event::ServerRestarting(_) => waiting += 1,
+                    Event::Retrying { why: reason, .. } => {
+                        why.push(reason);
+                        if why.len() == retries {
+                            run.handle.cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Event::TurnEnded { .. } => return (waiting, why),
+                    _ => {}
+                }
+            }
+        };
+        let run = run_agent(dir.path(), client, Mode::Default);
+        assert_eq!(until_retries(&run, "hello", 1), (0, Vec::new()), "answered");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(until_retries(&run, "again", 2), (1, vec!["transient".to_string(), "transient".to_string()]), "waited for once in the turn, then the retries as before");
+        let lines = trajectory_of(&run);
+        assert!(of_kind(&lines, "intervention").iter().any(|line| line["kind"] == "server_restart_wait" && line["outcome"] == "gave_up"), "{lines:?}");
+        // A conversation of its own, with a server that is not there: no wait.
+        let gone = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_agent(dir.path(), Client::new(&format!("http://127.0.0.1:{gone}/v1"), None).unwrap(), Mode::Default);
+        assert_eq!(until_retries(&run, "hello", 1), (0, vec!["transient".to_string()]));
     }
 
     impl Drop for ShortRestartLimits<'_> {
         fn drop(&mut self) {
             *TEST_RESTART_LIMITS.lock().unwrap() = None;
+            *TEST_SERVER_WAIT.lock().unwrap() = None;
         }
+    }
+
+    /// A server that answered and then stayed away past the turn's time for it: the turn fails, the person is told the session waits for the server, the wait is listed,
+    /// and when the server listens again the session goes on by itself with the turn, told why.
+    #[test]
+    fn a_turn_that_failed_as_the_server_stayed_away_goes_on_by_itself_when_it_is_back() {
+        let _short = ShortRestartLimits::quiet(Duration::from_secs(60), Duration::from_millis(400));
+        let dir = tempfile::tempdir().unwrap();
+        let answers = std::sync::atomic::AtomicUsize::new(0);
+        // (away for longer than the turn's wait and its three retries, some 20 s with the refused connections Windows tries for 2 s each)
+        let (client, seen) = routed_with_a_stop(move |method, path, _| match (method, path) {
+            ("POST", _) => (200, "text/event-stream", text_answer(if answers.fetch_add(1, Ordering::SeqCst) == 0 { "one" } else { "back" })),
+            ("GET", "/health") => (200, "application/json", r#"{"status": "ok"}"#.to_string()),
+            _ => (404, "application/json", "{}".to_string()),
+        }, 1, Duration::from_secs(30));
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("hello".into())).unwrap();
+        loop {
+            if let Event::TurnEnded { .. } = run.events.recv_timeout(Duration::from_secs(30)).expect("the first turn ended") {
+                break;
+            }
+        }
+        // (the server stops once the answer is closed: the next message finds nothing listening)
+        while seen.lock().unwrap().iter().filter(|line| line.starts_with("POST")).count() < 1 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        run.handle.commands.send(Command::Send("again".into())).unwrap();
+        let (mut failed, mut told, mut listed, mut woken, mut content) = (Vec::new(), Vec::new(), false, Vec::new(), String::new());
+        let mut ended = 0;
+        while ended < 2 {
+            match run.events.recv_timeout(Duration::from_secs(90)).expect("the turns ended") {
+                Event::Failed(text) => failed.push(text),
+                Event::Notice(text) => told.push(text),
+                Event::Waiting(waiting) => listed |= waiting.waits.iter().any(|wait| wait.note == background::SERVER_WAIT_NOTE),
+                Event::Woken(wakes) => woken.extend(wakes),
+                Event::Content(text) if ended == 1 => content.push_str(&text),
+                Event::TurnEnded { .. } => ended += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(failed, [background::SERVER_WAIT_SET], "said so in place of the failure's words, which ask for the message again: {told:?}");
+        assert!(listed, "the wait is listed, with a stop");
+        assert_eq!(woken.iter().map(|wake| (wake.cause, wake.id.as_str())).collect::<Vec<_>>(), [(crate::message::WakeCause::ServerBack, "server1")]);
+        assert_eq!(content, "back", "the woken turn went on");
+        let lines = trajectory_of(&run);
+        assert!(of_kind(&lines, "intervention").iter().any(|line| line["kind"] == "server_wait"), "{lines:?}");
     }
 
     const LOADING: &str = r#"{"status": "loading", "progress": {"stage": "load", "done": 1, "total": 4}}"#;
@@ -7576,12 +8102,34 @@ Body").unwrap();
         assert!(!streamed(&mut watching_totals(), &long), "forty times as much of the same is still not a run");
     }
 
+    /// A long `create_file` is written whole, in one call: the app cuts no write that is going on as it should, however long it is.
     #[test]
-    fn a_long_write_is_cut_off_on_disk_and_goes_on_from_there_with_or_without_append() {
+    fn a_long_write_is_written_whole_in_one_call() {
         let dir = tempfile::tempdir().unwrap();
         let raw = write_arguments(1000, usize::MAX);
-        assert!(raw.len() > 2 * MAX_WRITE_CHARS);
-        let (client, bodies) = trickling_server(vec![pieces(&raw), whole_call(serde_json::json!({"path": "web/index.html", "content": "the rest\n"})), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
+        assert!(raw.len() > 40_000);
+        let (client, bodies) = trickling_server(vec![pieces(&raw), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        let (log, cancelled) = until_end(&run, Decision::Reject);
+        assert!(!cancelled, "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "{log:?}");
+        let sent = bodies[1]["messages"].as_array().unwrap()[3]["tool_calls"][0]["function"]["arguments"].as_str().unwrap().to_string();
+        assert!(sent == raw, "written whole, in one call: {} bytes of {}", sent.len(), raw.len());
+        assert!(!bodies[1].to_string().contains("cut off"));
+        let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
+        assert_eq!(on_disk.lines().count(), 1000);
+    }
+
+    /// A write the output limit ended half way goes on from what is on disk, whether the model says append or not.
+    #[test]
+    fn a_write_the_output_limit_ended_goes_on_from_what_is_on_disk_with_or_without_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = write_arguments(1000, 24_000);
+        let parts: Vec<&[u8]> = raw.as_bytes().chunks(2000).collect();
+        let first: Vec<Value> = parts.iter().enumerate().map(|(at, piece)| piece_of_call(std::str::from_utf8(piece).unwrap(), (at + 1 == parts.len()).then_some("length"))).collect();
+        let (client, bodies) = trickling_server(vec![first, whole_call(serde_json::json!({"path": "web/index.html", "content": "the rest\n"})), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
         run.handle.commands.send(Command::Send("make a page".into())).unwrap();
         let (log, cancelled) = until_end(&run, Decision::Reject);
@@ -7592,7 +8140,7 @@ Body").unwrap();
         let call = &messages[3]["tool_calls"][0]["function"];
         assert_eq!(call["name"], "create_file");
         let sent: &str = call["arguments"].as_str().unwrap();
-        assert!(sent.len() < MAX_WRITE_CHARS + 2100 && sent.starts_with(r#"{"path":"web/index.html","content":"line 0 "#), "the bytes as they came: {}", &sent[..80]);
+        assert!(sent.len() <= raw.len() + 2 && sent.starts_with(r#"{"path":"web/index.html","content":"line 0 "#), "the bytes as they came: {}", &sent[..80]);
         let kept: Value = serde_json::from_str(sent).expect("whole JSON");
         assert!(kept["content"].as_str().unwrap().ends_with("to something\n"), "at a line's end");
         let said = messages[4]["content"].as_str().unwrap();
@@ -7620,7 +8168,7 @@ Body").unwrap();
     fn a_call_straydog_sends_as_it_is_written_is_shown_and_then_done_once() {
         let dir = tempfile::tempdir().unwrap();
         let raw = spaced_write_arguments(100, usize::MAX);
-        assert!(raw.len() > 6000 && raw.len() < MAX_WRITE_CHARS);
+        assert!(raw.len() > 6000);
         let mut events = straydog_pieces(&raw);
         events.push(piece_of_call(&raw, Some("tool_calls")));
         let (client, bodies) = trickling_server(vec![events, vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
@@ -7652,35 +8200,6 @@ Body").unwrap();
         assert_eq!(bodies[1]["messages"].as_array().unwrap()[3]["tool_calls"].as_array().unwrap().len(), 1);
     }
 
-    /// A call too long for one answer is cut off from the pieces Straydog sends, as from a server's own, and goes on from what is on disk.
-    #[test]
-    fn a_long_write_straydog_sends_in_pieces_is_cut_off_all_the_same() {
-        let dir = tempfile::tempdir().unwrap();
-        let raw = spaced_write_arguments(1000, usize::MAX);
-        assert!(raw.len() > 2 * MAX_WRITE_CHARS);
-        let mut first = straydog_pieces(&raw);
-        // (a server that is not stopped goes on to send the call whole)
-        first.push(piece_of_call(&raw, Some("tool_calls")));
-        let (client, bodies) = trickling_server(vec![first, whole_call(serde_json::json!({"path": "web/index.html", "content": "the rest\n"})), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
-        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
-        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
-        let (log, cancelled) = until_end(&run, Decision::Reject);
-        assert!(!cancelled, "{log:?}");
-        let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 3, "{log:?}");
-        let messages = bodies[1]["messages"].as_array().unwrap();
-        let call = &messages[3]["tool_calls"][0]["function"];
-        assert_eq!(call["name"], "create_file");
-        let sent: &str = call["arguments"].as_str().unwrap();
-        assert!(sent.len() < MAX_WRITE_CHARS + 2100 && sent.starts_with(r#"{"path": "web/index.html", "content": "line 0 "#), "the bytes as they came: {}", &sent[..80]);
-        let kept: Value = serde_json::from_str(sent).expect("whole JSON");
-        assert!(kept["content"].as_str().unwrap().ends_with("to something\n"), "at a line's end");
-        let said = messages[4]["content"].as_str().unwrap();
-        assert!(said.contains("cut off") && said.contains("Go straight on"), "{said}");
-        let on_disk = std::fs::read_to_string(dir.path().join("web/index.html")).unwrap();
-        assert_eq!(on_disk, format!("{}the rest\n", kept["content"].as_str().unwrap()));
-    }
-
     #[test]
     fn always_to_a_command_is_not_always_to_it_with_the_network() {
         let (plain, asked, named) = (serde_json::json!({"command": "python x.py"}), serde_json::json!({"command": "python x.py", "network": true}), serde_json::json!({"command": "curl https://x.example"}));
@@ -7705,20 +8224,6 @@ Body").unwrap();
         let (_, cancelled) = until_end(&run, Decision::Reject);
         assert!(cancelled);
         assert_eq!(std::fs::read_to_string(dir.path().join("web/index.html")).unwrap(), existing, "what is there is not put in place of the whole of it by a stop");
-    }
-
-    #[test]
-    fn a_long_write_is_not_told_what_it_has_cost() {
-        let dir = tempfile::tempdir().unwrap();
-        // Each cut comes at some 3000 tokens as they are counted: three cuts were past where a note of the cost was due, when the app sent one.
-        let script = || pieces(&write_arguments(1000, usize::MAX));
-        let (client, bodies) = trickling_server(vec![script(), script(), script(), script(), vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})]]);
-        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
-        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
-        let (log, _) = until_end(&run, Decision::Reject);
-        let bodies = bodies.lock().unwrap();
-        let told = bodies.iter().flat_map(|body| body["messages"].as_array().unwrap().iter()).filter_map(|message| message["content"].as_str()).any(|said| said.contains("This request has cost"));
-        assert!(!told, "nothing tells the model to end its turn over what it has written: {log:?}");
     }
 
     #[test]
@@ -7807,6 +8312,114 @@ Body").unwrap();
         let bodies = bodies.lock().unwrap();
         let messages = bodies[1]["messages"].as_array().unwrap();
         assert!(messages.last().unwrap()["content"].as_str().unwrap().contains("cut off"), "{:?}", messages.last());
+    }
+
+    /// A file whose write was cut, whose rest the model then gives as its answer's text, is not left so: the model is told once that text writes nothing,
+    /// and the turn goes on.
+    #[test]
+    fn the_rest_of_a_cut_file_given_as_text_is_told_to_go_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cut = llm::Completion { tool_calls: vec![crate::message::ToolCall { id: "w".into(), kind: "function".into(), function: crate::message::FunctionCall { name: "create_file".into(), arguments: write_arguments(50, 3000) } }], finish: "length".into(), ..llm::Completion::default() };
+        let event = serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "w", "type": "function", "function": {"name": "create_file", "arguments": cut.tool_calls[0].function.arguments}}]}, "finish_reason": "length"}]});
+        let rest = "  ctx.fillRect(0, 0, 10, 10);\n  ctx.fill();\n  score += 1;\n  draw();\n}\nloop();";
+        let (client, bodies) = server(vec![sse(&[event]), text_answer(rest), text_answer("done"), text_answer("never")]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "told once, and the answer after that ends the turn");
+        let told = bodies[2]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+        assert!(told.contains("writes nothing") && told.contains("web/index.html"), "{told}");
+    }
+
+    /// A server that says in a call that it has a new tool has it told of before the next request of the same turn, which calls it: the tools offered
+    /// stay as they were.
+    #[test]
+    fn a_tool_a_server_adds_in_a_call_is_told_of_and_called_in_the_same_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = |name: &str| serde_json::json!({"name": name, "description": "d", "inputSchema": {"type": "object"}});
+        // (what the server says in the call, and as it is asked for its tools and called again)
+        let turns = vec![
+            vec![serde_json::json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}), serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "enabled"}]}})],
+            vec![serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {"tools": [tool("enable"), tool("u")]}})],
+            vec![serde_json::json!({"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": "the new one answered"}]}})],
+        ];
+        let hub = mcp::Hub::answering("srv", &[tool("enable")], turns, true);
+        let (client, bodies) = server(vec![call_answer("mcp__srv__enable", serde_json::json!({})), call_answer("mcp__srv__u", serde_json::json!({})), text_answer("done")]);
+        let (sender, events) = channel();
+        let sessions = tempfile::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub.clone()), policy: Default::default(), code_mode: true }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("the new one answered")), "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let names = |body: &Value| body["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "the tools offered stay as they were");
+        assert!(!names(&bodies[0]).contains(&"mcp__srv__u".to_string()));
+        let told = bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+        assert!(told.contains("## Tools Added") && told.contains("`mcp__srv__u`") && told.contains("tools.mcp__srv__u({})"), "{told}");
+    }
+
+    /// A fork of the conversation cut before an added server's tools were told of tells of them again in its next turn, and once.
+    #[test]
+    fn a_fork_cut_before_the_tools_were_told_of_tells_of_them_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = |name: &str| [serde_json::json!({"name": name, "description": "d", "inputSchema": {"type": "object"}})];
+        let hub = mcp::Hub::scripted("srv", &tool("t"), &[], true);
+        let (client, bodies) = server(vec![text_answer("one"), text_answer("two"), text_answer("three"), text_answer("four")]);
+        let (sender, events) = channel();
+        let sessions = tempfile::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub.clone()), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        let path = session_file(&run);
+        until_end(&run, Decision::Reject);
+        hub.add_scripted("late", &tool("u"), &[], true);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        // (the first turn's message and its facts, and its answer: a fork through it has none of the second turn's)
+        let fork = crate::session::fork(&path, 2, None).unwrap();
+        run.handle.commands.send(Command::Resume(fork)).unwrap();
+        for text in ["again", "and again"] {
+            run.handle.commands.send(Command::Send(text.into())).unwrap();
+            until_end(&run, Decision::Reject);
+        }
+        let bodies = bodies.lock().unwrap();
+        let told = |body: &Value| body["messages"].as_array().unwrap().iter().filter(|message| message["content"].as_str().is_some_and(|text| text.contains("`mcp__late__u`"))).count();
+        assert_eq!((told(&bodies[1]), told(&bodies[2]), told(&bodies[3])), (1, 1, 1), "told in the second turn, again in the fork's first, and not a third time");
+    }
+
+    /// A server the person adds while a conversation goes on is told of in their next turn, whose tools offered stay as they were, and its tool is called
+    /// there.
+    #[test]
+    fn a_server_added_in_a_conversation_is_told_of_in_the_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = |name: &str| [serde_json::json!({"name": name, "description": "d", "inputSchema": {"type": "object"}})];
+        let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "the late one answered"}]}});
+        let hub = mcp::Hub::scripted("srv", &tool("t"), &[], true);
+        let (client, bodies) = server(vec![text_answer("one"), call_answer("mcp__late__u", serde_json::json!({})), text_answer("done")]);
+        let (sender, events) = channel();
+        let sessions = tempfile::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub.clone()), policy: Default::default(), code_mode: true }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        hub.add_scripted("late", &tool("u"), &[answer], true);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("the late one answered")), "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let names = |body: &Value| body["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let first = names(&bodies[0]);
+        assert!(first.contains(&"mcp__srv__t".to_string()) && !first.contains(&"mcp__late__u".to_string()), "{first:?}");
+        assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "the tools offered stay as they were");
+        let told: Vec<String> = bodies[1]["messages"].as_array().unwrap().iter().filter_map(|message| message["content"].as_str()).filter(|text| text.contains("## Tools Added")).map(str::to_string).collect();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("`mcp__late__u`") && told[0].contains("From the MCP server late."), "{}", told[0]);
     }
 
     #[test]
@@ -7976,6 +8589,36 @@ Body").unwrap();
         assert!(log[0].starts_with("tool:false:") && log[0].contains("reads no pictures"), "{log:?}");
         assert_eq!(provider.requests(), 2, "the answer after the tool is the second request, and no refused one is between");
         assert!(provider.messages(1).iter().all(|message| message.images.is_empty()));
+    }
+
+    /// A picture a server's tool returns goes with its result where the model reads pictures in one, and is said not shown where it does not.
+    #[test]
+    fn a_picture_a_servers_tool_returns_is_shown_where_a_tool_can_show_one() {
+        for (tool_pictures, shown) in [(true, 1), (false, 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let png = images::base64(&images::tests::encoded(16, 16, image::ImageFormat::Png));
+            let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "the page"}, {"type": "image", "mimeType": "image/png", "data": png}]}});
+            let hub = mcp::Hub::scripted("web", &[serde_json::json!({"name": "shot", "inputSchema": {"type": "object"}})], &[answer], true);
+            let steps = vec![calls(&[("mcp__web__shot", serde_json::json!({}))]), says("a page")];
+            let (sender, events) = channel();
+            let sessions = tempfile::tempdir().unwrap();
+            let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+            let provider = Arc::new(Scripted { steps: Mutex::new(steps.into()), tool_pictures, ..Scripted::default() });
+            handle.commands.send(Command::Provider(provider.clone(), "model".into(), 100_000)).unwrap();
+            let run = Run { handle, events, _sessions: sessions };
+            run.handle.commands.send(Command::Send("look".into())).unwrap();
+            let (log, _) = until_end(&run, Decision::Reject);
+            let said = log.iter().find(|line| line.starts_with("tool:")).cloned().unwrap_or_default();
+            let result = provider.messages(1).last().cloned().unwrap();
+            assert_eq!(result.images.len(), shown, "{log:?}");
+            let text = user_text(&result).to_string();
+            if shown == 1 {
+                assert!(text.contains("[picture 1 (image/png): shown with this result]"), "{text}");
+            } else {
+                assert!(text.contains("[image content is not shown]"), "{text}");
+            }
+            assert!(said.starts_with("tool:true:"), "{said}");
+        }
     }
 
     #[test]
@@ -8349,9 +8992,9 @@ Body").unwrap();
         assert!(requests[0]["first_ms"].is_u64() && requests[0]["reasoning_chars"].as_u64().unwrap() > 0);
         assert_eq!(of_kind(&lines, "turn_end")[0]["cancelled"], true);
         assert!(of_kind(&lines, "intervention").is_empty());
-        // The app's: a draft stopped, which goes on in a request that ends as any does.
+        // The app's: a draft stopped, which goes on in a request that ends as any does, with its thinking closed.
         let dir = tempfile::tempdir().unwrap();
-        let (client, _, _, _) = thinking_server(3, vec![text_answer("written")]);
+        let (client, bodies, _, _) = thinking_server(3, vec![text_answer("written")]);
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Send("write it".into())).unwrap();
         let (_, cancelled) = until_end(&run, Decision::Reject);
@@ -8368,6 +9011,32 @@ Body").unwrap();
         assert_eq!(of_kind(&lines, "turn_end")[0]["cancelled"], false);
         // The draft stopped made no message (nothing was said); the request that went on from it did.
         assert!(lines[1].get("message").is_none() && lines[3]["message"].is_u64(), "{lines:?}");
+        // That request alone is asked to write without thinking first, and it is recorded so.
+        assert_eq!(stop["next_without_thinking"], true, "{stop}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].pointer("/straydog/reasoning").is_none(), "{}", bodies[0]);
+        assert_eq!(bodies[1].pointer("/straydog/reasoning"), Some(&serde_json::json!(false)), "{}", bodies[1]);
+    }
+
+    /// The thinking a draft stop closes stays closed until a file is written: a look at the folder first does not use it up (a real run listed the folder in 4 s, and
+    /// the request after it thought for 410 s, 66,369 characters, before it wrote). After the write, the next request thinks as any does.
+    #[test]
+    fn the_thinking_a_draft_stop_closes_stays_closed_until_a_file_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, bodies, _, _) = thinking_server(3, vec![
+            call_answer("list_files", serde_json::json!({"path": "."})),
+            call_answer("create_file", serde_json::json!({"path": "b.txt", "content": "b\n"})),
+            text_answer("written"),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("write it".into())).unwrap();
+        let (_, cancelled) = until_end(&run, Decision::Approve);
+        assert!(!cancelled);
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "b\n");
+        let bodies = bodies.lock().unwrap();
+        let closed: Vec<bool> = bodies.iter().map(|body| body.pointer("/straydog/reasoning") == Some(&serde_json::json!(false))).collect();
+        assert_eq!(closed, [false, true, true, false], "the draft that was stopped, the look at the folder, the write, and the answer after it");
     }
 
     #[test]

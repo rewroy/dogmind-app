@@ -133,10 +133,7 @@ fn keep_forgotten(folder: &Path, workspace: &Path, scope: &str, note: &str, poli
         let mut text = text_of(&file).map_err(|error| format!("{}: {error}: the note was not dropped", file.display()))?;
         text.push_str(&entry);
         if text.len() as u64 > MAX_FORGOTTEN {
-            let from = text.len() - (MAX_FORGOTTEN as usize / 2).min(text.len());
-            let from = (from..=text.len()).find(|at| text.is_char_boundary(*at)).unwrap_or(text.len());
-            let at = text[from..].find("\n## ").map_or(from, |found| from + found);
-            text = text[at..].to_string();
+            text = newest_forgotten(&text).to_string();
         }
         return write_text(&file, &text, policy).map_err(|error| format!("{error}: the note was not dropped"));
     }
@@ -144,15 +141,22 @@ fn keep_forgotten(folder: &Path, workspace: &Path, scope: &str, note: &str, poli
         std::io::Write::write_all(&mut out, entry.as_bytes())?;
         out.sync_all()
     }).map_err(|error| format!("{}: {error}: the note was not dropped", file.display()))?;
-    // (kept to a size: from the start of an entry, the newest)
+    // (kept to a size, and written whole, as a power cut would leave it as zeros written over in place)
     if std::fs::metadata(&file).is_ok_and(|meta| meta.len() > MAX_FORGOTTEN) {
         if let Ok(text) = std::fs::read_to_string(&file) {
-            let from = text.len() - (MAX_FORGOTTEN as usize / 2).min(text.len());
-            let at = text[from..].find("\n## ").map_or(from, |found| from + found);
-            let _ = std::fs::write(&file, &text[at..]);
+            let _ = write_text(&file, newest_forgotten(&text), policy);
         }
     }
     Ok(())
+}
+
+/// What is kept of what was forgotten once it is past its size: the newest half, from the start of an entry.
+fn newest_forgotten(text: &str) -> &str {
+    let from = text.len() - (MAX_FORGOTTEN as usize / 2).min(text.len());
+    // (from the start of a character: the notes are in the person's own language)
+    let from = (from..=text.len()).find(|at| text.is_char_boundary(*at)).unwrap_or(text.len());
+    let at = text[from..].find("\n## ").map_or(from, |found| from + found);
+    &text[at..]
 }
 
 /// A line to say which notes hold the words, for the model to pick one by.
@@ -291,6 +295,27 @@ mod tests {
 
     fn forget_one(folder: &Path, workspace: &Path, scope: &str, note: &str) -> Result<bool, String> {
         super::forget_one(folder, workspace, scope, note, &Policy::default())
+    }
+
+    /// A plain file of what was forgotten, in Japanese and past its size: it is cut to its newest entries at the start of a character, wherever the half falls.
+    #[test]
+    fn what_was_forgotten_in_japanese_is_cut_to_its_newest_at_a_character() {
+        for pad in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let file = forgotten_file(dir.path());
+            let entry = format!("\n## 2026-11-20 09:00 (you, in every project)\n- {}\n", "会員の設定は保存しない".repeat(30));
+            let mut text = String::new();
+            while (text.len() as u64) < MAX_FORGOTTEN {
+                text.push_str(&entry);
+            }
+            std::fs::write(&file, &text).unwrap();
+            // (the last note's length moves where the half falls, a byte at a time)
+            let last = format!("{}最後に忘れたメモ", "x".repeat(pad));
+            keep_forgotten(dir.path(), Path::new("C:/w"), "user", &last, &Policy::default()).unwrap();
+            let kept = std::fs::read_to_string(&file).unwrap();
+            assert!(kept.starts_with("\n## ") && kept.trim_end().ends_with(&format!("- {last}")), "pad {pad}");
+            assert!((kept.len() as u64) <= MAX_FORGOTTEN / 2 + entry.len() as u64, "pad {pad}: {}", kept.len());
+        }
     }
 
     /// Notes kept by many at once are all kept; notes that cannot be read are not written over.

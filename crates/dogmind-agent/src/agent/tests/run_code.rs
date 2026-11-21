@@ -36,6 +36,12 @@ struct Told {
 
 /// The turn's events up to its end, answering every approval with `decision` and `feedback`.
 fn the_turn(run: &Run, decision: Decision, feedback: Option<&str>) -> Told {
+    the_turn_deciding(run, |approval| {
+        approval.answer.send((decision, feedback.map(str::to_string))).unwrap();
+    })
+}
+
+fn the_turn_deciding(run: &Run, mut decide: impl FnMut(Approval)) -> Told {
     let mut told = Told::default();
     loop {
         match run.events.recv_timeout(Duration::from_secs(30)).expect("the turn ended") {
@@ -44,7 +50,7 @@ fn the_turn(run: &Run, decision: Decision, feedback: Option<&str>) -> Told {
             Event::ProgramStep { call, tool, summary, .. } => told.program_steps.push((call, tool, summary)),
             Event::Approval(approval) => {
                 told.approvals.push((approval.tool.clone(), approval.program.clone()));
-                approval.answer.send((decision, feedback.map(str::to_string))).unwrap();
+                decide(approval);
             }
             Event::WebSeen(seen) => told.web_seen |= seen,
             Event::TurnEnded { cancelled } => {
@@ -161,6 +167,28 @@ fn a_program_that_reads_two_files_gives_both_in_one_result_and_leaves_the_calls_
     assert_eq!(of_kind(&lines, "turn_end")[0]["tools"].as_u64(), Some(3));
 }
 
+/// A program has the file each time it reads it, as it is not shown to the conversation, and a direct read after it is the file and not "above".
+/// (A program that read two files again was given "already in the conversation" in their place each time, and the model ran it six times.)
+#[test]
+fn a_program_that_reads_a_file_again_has_it_again_and_so_does_a_direct_read_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    let code = "const a = await tools.read_file({ path: 'a.txt' });\nconst again = await tools.read_file({ path: 'a.txt' });\nreturn a.length + ' ' + again.length + ' ' + again;";
+    let steps = vec![a_program(code, "read it twice"), a_program(code, "and again"), calls(&[("read_file", serde_json::json!({"path": "a.txt"}))]), says("done")];
+    let (run, provider) = code_run(dir.path(), steps, Mode::Default, false);
+    run.handle.commands.send(Command::Send("read it".into())).unwrap();
+    the_turn(&run, Decision::Reject, None);
+    for request in [1, 2] {
+        let messages = provider.messages(request);
+        let results = results_in(&messages);
+        let last = results.last().unwrap();
+        assert!(last.contains("1|alpha") && !last.contains("not repeated"), "request {request}: {last}");
+    }
+    let messages = provider.messages(3);
+    let direct = results_in(&messages);
+    assert!(direct.last().unwrap().contains("1|alpha"), "the conversation had only the programs' results: {direct:?}");
+}
+
 #[test]
 fn a_call_a_program_makes_asks_the_person_as_a_direct_one_does_and_says_whose_it_is() {
     let dir = tempfile::tempdir().unwrap();
@@ -188,6 +216,151 @@ fn a_call_a_program_makes_asks_the_person_as_a_direct_one_does_and_says_whose_it
     assert_eq!(yes.approvals.len(), 1, "{yes:?}");
     assert!(yes.ended[0].starts_with("wrote it"), "{yes:?}");
     assert_eq!(std::fs::read_to_string(dir.path().join("new.txt")).unwrap(), "x");
+}
+
+const APPEND_LINE: &str = "echo written>>writes.txt";
+
+fn program_command_workspace() -> tempfile::TempDir {
+    #[cfg(windows)]
+    return folder_for_commands();
+    #[cfg(not(windows))]
+    return tempfile::tempdir().unwrap();
+}
+
+fn assert_program_trace(run: &Run, calls: &[(&str, &str)], approvals: &[&str]) {
+    let lines = trajectory_of(run);
+    let tools = of_kind(&lines, "tool");
+    let (program, nested) = tools.split_last().unwrap();
+    assert_eq!(program["name"], "run_code");
+    assert_eq!(program["nested"].as_u64(), Some(nested.len() as u64), "{program}");
+    assert_eq!(tools.iter().map(|line| (line["name"].as_str().unwrap(), line["outcome"].as_str().unwrap())).collect::<Vec<_>>(), calls);
+    assert!(nested.iter().all(|call| call["parent"] == program["id"]), "{tools:?}");
+    let decisions = of_kind(&lines, "approval");
+    assert_eq!(decisions.iter().map(|line| line["decision"].as_str().unwrap()).collect::<Vec<_>>(), approvals);
+    assert!(decisions.iter().all(|line| line["tool"] == "execute_command" && line["parent"] == program["id"]), "{decisions:?}");
+}
+
+#[test]
+fn one_approval_does_not_cover_a_second_identical_command_in_a_program() {
+    let code = format!(r#"
+const before = await tools.read_file({{ path: 'before.txt' }});
+const args = {{ command: {APPEND_LINE:?} }};
+await tools.execute_command(args);
+await tools.execute_command(args);
+const after = await tools.read_file({{ path: 'writes.txt' }});
+return before + '\n' + after;
+"#);
+    for second in [Decision::Approve, Decision::Reject] {
+        let dir = program_command_workspace();
+        std::fs::write(dir.path().join("before.txt"), "before-marker\n").unwrap();
+        let (run, provider) = code_run(dir.path(), vec![a_program(&code, "append twice"), says("done")], Mode::Default, false);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let mut asked = 0;
+        let told = the_turn_deciding(&run, |approval| {
+            assert_eq!(approval.tool, "execute_command");
+            asked += 1;
+            let decision = if asked == 1 { Decision::Approve } else { second };
+            approval.answer.send((decision, (decision == Decision::Reject).then(|| "one line is enough".into()))).unwrap();
+        });
+        assert_eq!(asked, 2, "{told:?}");
+        assert!(!told.cancelled, "{told:?}");
+        let contents = std::fs::read_to_string(dir.path().join("writes.txt")).unwrap();
+        let messages = provider.messages(1);
+        let results = results_in(&messages);
+        assert_eq!(results.len(), 1, "{results:?}");
+        if second == Decision::Approve {
+            assert_eq!(contents.lines().collect::<Vec<_>>(), ["written", "written"]);
+            assert!(results[0].contains("1|before-marker") && results[0].contains("2|written"), "{results:?}");
+            assert_program_trace(&run, &[("read_file", "ok"), ("execute_command", "ok"), ("execute_command", "ok"), ("read_file", "ok"), ("run_code", "ok")], &["approve", "approve"]);
+        } else {
+            assert_eq!(contents.lines().collect::<Vec<_>>(), ["written"]);
+            assert!(results[0].contains("the user declined this call and said: one line is enough"), "{results:?}");
+            assert_program_trace(&run, &[("read_file", "ok"), ("execute_command", "ok"), ("execute_command", "declined_person"), ("run_code", "error")], &["approve", "reject"]);
+        }
+    }
+}
+
+#[test]
+fn stopping_a_program_during_command_approval_does_not_run_the_command() {
+    let dir = program_command_workspace();
+    let code = format!("await tools.execute_command({{ command: {APPEND_LINE:?} }});\nreturn await tools.read_file({{ path: 'writes.txt' }});");
+    let (run, provider) = code_run(dir.path(), vec![a_program(&code, "append a line")], Mode::Default, false);
+    run.handle.commands.send(Command::Send("go".into())).unwrap();
+    let mut pending = None;
+    let told = the_turn_deciding(&run, |approval| {
+        assert_eq!(approval.tool, "execute_command");
+        // Keep the channel open so the stop is observed while approval is still pending.
+        pending = Some(approval.answer);
+        run.handle.cancel.store(true, Ordering::Relaxed);
+    });
+    assert!(pending.is_some() && told.cancelled, "{told:?}");
+    assert!(!dir.path().join("writes.txt").exists());
+    assert_eq!(provider.requests(), 1);
+    assert_program_trace(&run, &[("execute_command", "cancelled"), ("run_code", "cancelled")], &["stopped"]);
+}
+
+#[test]
+fn stopping_a_program_during_a_command_keeps_only_the_write_already_made() {
+    let dir = program_command_workspace();
+    // The command signals that it wrote, then waits for a file the test never creates.
+    let command = if cfg!(windows) {
+        r#"powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; Set-Content -LiteralPath started.txt -Value started -Encoding ascii; while (-not (Test-Path -LiteralPath continue.txt)) { Start-Sleep -Milliseconds 25 }; Set-Content -LiteralPath finished.txt -Value finished -Encoding ascii""#
+    } else {
+        "echo started >started.txt; while [ ! -e continue.txt ]; do sleep 1; done; echo finished >finished.txt"
+    };
+    let code = format!("await tools.execute_command({{ command: {command:?}, timeout_seconds: 25 }});\nreturn await tools.read_file({{ path: 'started.txt' }});");
+    let (run, provider) = code_run(dir.path(), vec![a_program(&code, "write and wait")], Mode::Default, false);
+    run.handle.commands.send(Command::Send("go".into())).unwrap();
+    let first = dir.path().join("started.txt");
+    let told = the_turn_deciding(&run, |approval| {
+        assert_eq!(approval.tool, "execute_command");
+        approval.answer.send((Decision::Approve, None)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !std::fs::read_to_string(&first).is_ok_and(|text| text.trim() == "started") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        run.handle.cancel.store(true, Ordering::Relaxed);
+    });
+    assert!(told.cancelled && told.ended[0].contains("cancelled"), "{told:?}");
+    assert_eq!(std::fs::read_to_string(&first).unwrap().trim(), "started");
+    assert!(!dir.path().join("finished.txt").exists());
+    assert_eq!(provider.requests(), 1);
+    let lines = trajectory_of(&run);
+    let tools = of_kind(&lines, "tool");
+    assert_eq!(tools.iter().map(|line| line["name"].as_str().unwrap()).collect::<Vec<_>>(), ["execute_command", "run_code"], "{tools:?}");
+    assert_ne!(tools[0]["outcome"], "timeout", "the command must stop before its own timeout: {tools:?}");
+    assert_eq!(tools[1]["outcome"], "cancelled");
+    assert_eq!(tools[0]["parent"], tools[1]["id"]);
+}
+
+#[test]
+fn plan_refuses_a_write_command_marked_safe_even_with_safe_commands_enabled() {
+    let dir = program_command_workspace();
+    let path = dir.path().join("writes.txt");
+    std::fs::write(&path, "original\n").unwrap();
+    let code = format!(r#"
+const before = await tools.read_file({{ path: 'writes.txt' }});
+let refusal;
+try {{
+    await tools.execute_command({{ command: {APPEND_LINE:?}, risk_level: 'safe' }});
+}} catch (error) {{
+    refusal = error.message;
+}}
+const after = await tools.read_file({{ path: 'writes.txt' }});
+return [before, refusal, after].join('\n---\n');
+"#);
+    let (run, provider) = code_run(dir.path(), vec![a_program(&code, "look in plan mode"), says("done")], Mode::Plan, false);
+    run.handle.commands.send(Command::SetSafeCommands(true)).unwrap();
+    run.handle.commands.send(Command::Send("go".into())).unwrap();
+    let told = the_turn(&run, Decision::Reject, None);
+    assert!(told.approvals.is_empty() && !told.cancelled, "{told:?}");
+    let messages = provider.messages(1);
+    let results = results_in(&messages);
+    let parts: Vec<_> = results[0].split("\n---\n").collect();
+    assert_eq!(parts.len(), 3, "{results:?}");
+    assert!(parts[0].contains("1|original") && parts[1].starts_with("plan mode: nothing changes yet") && parts[2].contains("1|original"), "{results:?}");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "original\n");
+    assert_program_trace(&run, &[("read_file", "ok"), ("execute_command", "refused_gate"), ("read_file", "ok"), ("run_code", "ok")], &[]);
 }
 
 #[test]

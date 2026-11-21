@@ -221,10 +221,14 @@ const JA: &[(&str, &str)] = &[
     ("in {0}", "あと {0}"),
     ("These end when Dogmind quits.", "ここにあるものは、Dogmind を終了すると終わります。"),
     ("Stop all", "すべて止める"),
-    ("It goes on with what waits in the background, and says here when it has something for you. Quit it from the tray icon's menu to end all of it.", "バックグラウンドで待っているものは続きます。用があるときはここでお知らせします。すべて終えるには、トレイのアイコンのメニューから終了してください。"),
+    ("It goes on with what waits in the background, and says here when it has something for you. Quit it from the tray icon's menu to end all of it.", "バックグラウンドで待っているものは続きます。用があるときはここで通知します。すべて終えるには、トレイのアイコンのメニューから終了してください。"),
     ("Standing by", "待機中"),
     (dogmind_agent::background::PAUSED_IN_A_ROW, "自動の再開を止めました。このセッションは、あなたの言葉なしに 30 回続けて自分で動き出しました。メッセージを書くと続きます。"),
     (dogmind_agent::background::PAUSED_IN_AN_HOUR, "自動の再開を止めました。このセッションは、この 1 時間に 60 回自分で動き出しました。1 時間たつと続きます。"),
+    (dogmind_agent::background::SERVER_WAIT_NOTE, "サーバーが戻るのを待っています。戻ったら、止まったターンを続けます"),
+    (dogmind_agent::background::SERVER_WAIT_SET, "サーバーが応答しません。戻ったら、Dogmind がこのターンを自動で続けます(15 秒ごとに確認し、最長 60 分)。Stop、待っているものの一覧、またはメッセージを書くと、待つのをやめます。"),
+    ("The server is back", "サーバーが戻りました"),
+    ("Away for {0} after the turn failed", "ターンの失敗から {0} 後"),
     // Commands.
     ("Go through the first setup again", "最初のセットアップをやり直す"),
     ("How to use this app", "このアプリの使い方"),
@@ -248,7 +252,7 @@ const JA: &[(&str, &str)] = &[
     ("Change how the model runs: /model Claude", "接続先を変更: /model Claude"),
     ("How hard to think: none low medium high xhigh/max default", "思考の強さ: none low medium high xhigh/max default"),
     ("When to ask: ask edits auto plan", "確認のタイミング: ask edits auto plan"),
-    ("Look and plan first, and change nothing until you say", "まず調べて計画し、指示があるまで何も変更しない"),
+    ("Look and plan first, and change nothing until you say", "まず調査して計画し、指示があるまで何も変更しない"),
     ("The skills of this folder, from Claude's and Codex's folders too", "このフォルダーのスキル (Claude と Codex のフォルダーも含む)"),
     ("What is kept between sessions", "セッションをまたいで保持される内容"),
     ("MCP servers: /mcp shows them, /mcp import takes Claude's and Codex's", "MCP サーバー: /mcp で一覧、/mcp import で Claude と Codex の設定を取り込み"),
@@ -320,6 +324,7 @@ const JA: &[(&str, &str)] = &[
     (dogmind_agent::safety::REASON_WEB_ASKED, "この会話にはウェブの内容が含まれていて、これはそこから求められたことかもしれません"),
     (dogmind_agent::safety::REASON_CARGO_OUTSIDE, "このワークスペースはサンドボックスの中の cargo では読めないため、サンドボックスの読み込みの制限を外して実行します。あなたが読めるファイルはすべて読め、ネットワークも止められません"),
     (dogmind_agent::safety::REASON_CARGO_CONFIG_RUNS, "ここの cargo の設定は {0} も実行し、同じ範囲に届きます"),
+    (dogmind_agent::safety::REASON_OUTSIDE_SANDBOX, "サンドボックスの外で、あなたとして実行します。あなたが読み書きできるファイルはすべて読み書きでき、ネットワークにも届きます"),
     ("Needs tools this app does not have: mcp__{0}__…", "このアプリにないツールが必要です: mcp__{0}__…"),
     ("Needs something of another app that this app does not have: {0}", "このアプリにない、別のアプリの機能が必要です: {0}"),
     ("a connector of another app", "別のアプリのコネクター"),
@@ -542,6 +547,28 @@ const JA: &[(&str, &str)] = &[
     ("MCP servers", "MCP サーバー"),
     ("No server yet.", "サーバーはまだありません。"),
     ("Import from Claude and Codex", "Claude と Codex から取り込む"),
+    ("Add a server", "サーバーを追加"),
+    ("Change {0}", "{0} を変更"),
+    ("Command or URL", "コマンドまたは URL"),
+    ("Environment variables", "環境変数"),
+    ("Headers", "ヘッダー"),
+    ("A line each, as NAME=value.", "1 行に 1 つ、NAME=value の形で書きます。"),
+    ("A line each, as Name: value. An Authorization header goes here.", "1 行に 1 つ、Name: value の形で書きます。Authorization ヘッダーもここに書きます。"),
+    ("A program, or the URL of a server", "プログラム、またはサーバーの URL"),
+    ("Separated by spaces", "スペース区切り"),
+    ("{0} tools", "ツール {0} 個"),
+    ("1 tool", "ツール 1 個"),
+    ("Did not start: {0}", "起動できませんでした: {0}"),
+    ("{0} did not start: {1}", "{0} を起動できませんでした: {1}"),
+    ("the program is not there, nor in a folder on PATH", "指定の場所にも PATH のフォルダーにもプログラムがありません"),
+    ("The list of servers could not be read, and none was started: {0}", "サーバーの一覧を読み込めなかったため、どれも起動していません: {0}"),
+    ("Give the server a name.", "サーバーの名前を入力してください。"),
+    ("Give a command to run, or the URL of a server.", "実行するコマンドか、サーバーの URL を入力してください。"),
+    ("There is a server called {0} already.", "{0} という名前のサーバーはすでにあります。"),
+    ("Line {0} of the headers is not Name: value: {1}", "ヘッダーの {0} 行目が Name: value の形になっていません: {1}"),
+    ("Line {0} of the variables is not NAME=value: {1}", "環境変数の {0} 行目が NAME=value の形になっていません: {1}"),
+    ("{0} was saved. Once it is up, its tools join the conversation from your next message.", "{0} を保存しました。起動が終わると、次のメッセージから会話で使えます。"),
+    ("{0} was removed.", "{0} を削除しました。"),
     ("Licenses", "ライセンス"),
     ("LICENSE.txt is not beside this program.", "このプログラムの隣に LICENSE.txt がありません。"),
     ("Check for updates", "更新を確認"),
@@ -598,7 +625,7 @@ const JA: &[(&str, &str)] = &[
     ("GitHub did not answer in time.", "GitHub からの応答が時間内にありませんでした。"),
     ("GitHub answered with an error ({0}). Try again later.", "GitHub がエラーを返しました ({0})。しばらくしてからもう一度お試しください。"),
     ("GitHub's answer could not be read.", "GitHub からの応答を読み取れませんでした。"),
-    ("Dogmind asks GitHub for the newest release every six hours, and when you bring the window back from the tray after an hour. It sends only its name and version. When there is a newer one, it says so on the main screen, downloads the setup in the background and checks it, and restarts into it only when you press Restart to update.", "Dogmind は 6 時間ごとと、タスクトレイから 1 時間ぶりに開いたときに、GitHub に最新のリリースを問い合わせます。送るのは名前とバージョンだけです。新しいリリースがあるとメイン画面でお知らせし、セットアップをバックグラウンドでダウンロードして検証し、「再起動して更新」を押したときだけ再起動して更新します。"),
+    ("Dogmind asks GitHub for the newest release every six hours, and when you bring the window back from the tray after an hour. It sends only its name and version. When there is a newer one, it says so on the main screen, downloads the setup in the background and checks it, and restarts into it only when you press Restart to update.", "Dogmind は 6 時間ごとと、タスクトレイから 1 時間ぶりに開いたときに、GitHub に最新のリリースを問い合わせます。送るのは名前とバージョンだけです。新しいリリースがあるとメイン画面で通知し、セットアップをバックグラウンドでダウンロードして検証し、「再起動して更新」を押したときだけ再起動して更新します。"),
     ("Downloading Dogmind {0}… {1}%", "Dogmind {0} をダウンロードしています… {1}%"),
     ("Dogmind {0} is ready to install.", "Dogmind {0} をインストールする準備ができました。"),
     ("The update download was cancelled, and its partial file deleted. The next automatic look tries again.", "更新のダウンロードを中止し、途中のファイルを削除しました。次の自動確認でもう一度試します。"),
@@ -661,7 +688,8 @@ const JA: &[(&str, &str)] = &[
     (", last answer at {0} tok/s", "、最後の回答は {0} tok/s"),
     ("{0} requests: {1} prompt tokens, {2} of them from the cache, {3} written{4}. The conversation is {5} of {6}.", "{0} リクエスト: プロンプト {1} トークン (うちキャッシュ {2})、生成 {3}{4}。会話の長さは {5} / {6} です。"),
     ("Nothing to show yet. Name a file: /preview page.html", "表示できるものがまだありません。ファイルを指定してください: /preview page.html"),
-    ("{0} servers added to {1}. They start the next time this app does.", "{0} 個のサーバーを {1} に追加しました。次にアプリを起動したときに開始します。"),
+    ("{0} servers added to {1}. They are starting.", "{0} 個のサーバーを {1} に追加しました。起動しています。"),
+    ("Claude and Codex list no server that is not here already.", "Claude と Codex の設定に、まだ取り込んでいないサーバーはありません。"),
     ("No server yet. {0} lists them, and /mcp import copies Claude's and Codex's in.", "サーバーはまだありません。{0} に記述するか、/mcp import で Claude と Codex の設定を取り込めます。"),
     ("The notes in {0} could not be read ({1}). The file is left as it is.", "{0} のメモを読めませんでした（{1}）。ファイルはそのままにしてあります。"),
     ("Notes the model forgot are kept in {0}, so that you can get one back.", "モデルが忘れたメモは {0} に残してあります。戻したいときはそこからコピーしてください。"),
@@ -749,6 +777,10 @@ const JA: &[(&str, &str)] = &[
     // The folder.
     ("Choose a folder...", "フォルダーを選択..."),
     ("Choose a folder", "フォルダーを選択"),
+    ("Choose a workspace", "ワークスペースを選択"),
+    ("Search workspaces", "ワークスペースを検索"),
+    ("Recent workspaces", "最近のワークスペース"),
+    ("No workspace matches", "一致するワークスペースはありません"),
     ("New session here", "ここで新しいセッション"),
     // Text menus.
     ("Cut", "切り取り"),
@@ -1119,7 +1151,7 @@ const JA: &[(&str, &str)] = &[
     ("Windows did not keep the key (Credential Manager, error {0}). A policy on this PC may forbid saved passwords: under More, read it from an environment variable instead.", "Windows がキーを保存しませんでした (資格情報マネージャー、エラー {0})。この PC のポリシーがパスワードの保存を禁止している可能性があります。「詳細」から環境変数で読むようにしてください。"),
     // Settings and the engine.
     ("The best for this PC", "この PC に最適なもの"),
-    ("Straydog looks at this machine and chooses", "Straydog がこのマシンを調べて選びます"),
+    ("Straydog looks at this machine and chooses", "Straydog がこのマシンを確認して選びます"),
     ("Recommended for this PC  ·  ", "おすすめ  ·  "),
     // The files of the folder, in the panel on the right.
     ("Overview", "概要"),
@@ -1135,9 +1167,8 @@ const JA: &[(&str, &str)] = &[
     ("{0}, changed by this session: {1} lines added, {2} removed", "{0}、このセッションで変更: {1} 行追加、{2} 行削除"),
     ("Copy the path", "パスをコピー"),
     ("Mention in the message", "メッセージで参照する"),
-    // The timeline, in the panel on the right: what is going on now, where the work is heading, and the path the session took.
+    // The central timeline: what is going on now, where the work is heading, and the path the session took.
     ("Timeline", "タイムライン"),
-    ("Now", "今"),
     ("Heading to", "向かう先"),
     ("{0} earlier", "これより前 {0} 件"),
     ("The approved plan", "承認された計画"),
@@ -1282,7 +1313,7 @@ const JA: &[(&str, &str)] = &[
     ("Kept a file write that was cut off, to go on from", "途中で切れたファイルの書き込みを残し、続きから書かせました"),
     ("Stopped a helper", "サブエージェントを止めました"),
     ("Told a helper it had looked enough", "サブエージェントに十分見たと伝えました"),
-    ("Noted a call repeated", "呼び出しの繰り返しを知らせました"),
+    ("Noted a call repeated", "呼び出しの繰り返しを伝えました"),
     ("approved", "承認"),
     ("approved for good", "常に許可"),
     ("declined", "却下"),
@@ -1301,12 +1332,12 @@ const JA: &[(&str, &str)] = &[
     ("the model cannot read pictures", "モデルが画像を読めない"),
     ("the model gave no answer", "モデルが回答しなかった"),
     ("the server answered with an error", "サーバーがエラーを返した"),
-    // The terminal, in the panel on the right.
+    // The central terminal.
     ("Terminal", "ターミナル"),
     ("New terminal", "新しいターミナル"),
     ("Choose a shell", "シェルを選ぶ"),
     ("Close the terminal", "ターミナルを閉じる"),
-    ("Show a terminal in the panel on the right, or open one", "右のパネルにターミナルを表示します。なければ開きます"),
+    ("Switch to Terminal or open a shell", "ターミナルに切り替えます。シェルがなければ開きます"),
     ("Exited with code {0}", "終了コード {0} で終了しました"),
     ("Exited with code 0x{0}", "終了コード 0x{0} で終了しました"),
     ("{0} terminals are open: close one to open another.", "ターミナルが {0} 個開いています。新しく開くには、どれかを閉じてください。"),
@@ -1362,7 +1393,7 @@ N / P\t次と前の変更 (変更の画面で)
 貼り付けたキーは Windows の資格情報マネージャーにだけ保存します。
 画像: クリップのボタン、/attach、貼り付け、ドロップ。PNG、JPEG、WebP、GIF。
 スキル: プロジェクトとホームの .claude/skills、.agents/skills、.codex/skills、.dogmind/skills。/スキル名 で始めます。
-MCP サーバー: データフォルダーの mcp.json。アプリと一緒に起動し、呼び出しのたびに確認します。設定 > ツール で返す内容を信頼できます。
+MCP サーバー: 設定 > ツール で追加・変更・削除できます (プログラム、またはサーバーの URL)。返す内容を信頼することもできます。呼び出しのたびに確認します。
 Web: 返ってきた内容はデータとして扱い、会話に入ると以後のコマンドはすべて確認します。
 カスタム指示 (設定) は全セッション共通、DOGMIND.md はそのプロジェクト用です。/init でモデルに書かせることもできます。
 ターミナル: 右側のパネルの「ターミナル」は、あなた自身のシェルです。コマンドはエージェントの権限とは別に、あなた自身の権限で動き、そこに表示される内容はモデルには送られません。キーはすべてシェルに渡ります。Ctrl+C は選択があるときはコピー、ないときは実行中のものを止め、Ctrl+V は貼り付けです。
@@ -1457,6 +1488,7 @@ mod tests {
             assert!(table.contains_key(words), "{words}");
         }
         assert!(table.contains_key(crate::settings::VARIABLE_NAME_ONLY));
+        assert!(table.contains_key(dogmind_agent::mcp::NOT_FOUND));
         for template in dogmind_agent::safety::REASONS {
             assert!(table.contains_key(template), "no Japanese for the reason: {template}");
         }

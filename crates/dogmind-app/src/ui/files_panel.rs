@@ -108,14 +108,9 @@ pub(super) fn key_does(key: u16, control: bool, row: Option<&Row>) -> KeyDoes {
 }
 
 impl App {
-    /// The panel shows this view: it is the chat, the panel is there, and no preview is in its place.
-    pub(super) fn view_shown(&self, view: RightView) -> bool {
-        self.panel == Panel::Chat && self.right_width > 0 && self.preview_file.is_none() && self.settings.right_view == view
-    }
-
     /// The panel shows the tree.
     pub(super) fn files_shown(&self) -> bool {
-        self.view_shown(RightView::Files)
+        self.panel == Panel::Chat && self.right_width > 0 && self.preview_file.is_none() && self.steps.is_none() && self.settings.right_view == RightView::Files
     }
 
     /// Which of the panel's views, and its choice kept.
@@ -128,9 +123,6 @@ impl App {
         self.layout();
         if view == RightView::Files && self.files_shown() {
             SetFocus(self.tree_list);
-        }
-        if view == RightView::Timeline && self.timeline_shown() {
-            SetFocus(self.timeline.window);
         }
     }
 
@@ -488,6 +480,7 @@ impl App {
     unsafe fn files_mention(&mut self, row: &Row) {
         let named = if row.is_folder() { format!("@{}/ ", row.path) } else { format!("@{} ", row.path) };
         let text = wide(&named);
+        self.set_center_view(CenterView::Conversation);
         let before = get_text(self.composer);
         // (a space between it and what is there, unless there is none)
         let separator = if before.is_empty() || before.ends_with(char::is_whitespace) { "" } else { " " };
@@ -667,11 +660,6 @@ impl App {
         let mut area: RECT = std::mem::zeroed();
         SendMessageW(self.tree_list, LB_GETITEMRECT, at, std::ptr::addr_of_mut!(area) as LPARAM);
         self.files_menu(at, (area.left + scale(self.dpi, 40), area.bottom));
-    }
-
-    /// The view whose word of the panel is under a point of the window, for a press.
-    pub(super) fn right_tab_at(&self, x: i32, y: i32) -> Option<RightView> {
-        self.right_tab_hits.iter().find(|(area, _)| x >= area.left && x < area.right && y >= area.top && y < area.bottom).map(|(_, view)| *view)
     }
 }
 

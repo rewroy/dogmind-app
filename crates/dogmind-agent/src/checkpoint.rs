@@ -1,6 +1,7 @@
 //! What the agent's edits replaced, turn by turn, so that they can be undone. A file's history is one line: the first
-//! copy saved after a moment is what the file held at that moment. What a command changed is not here, and neither is
-//! what the person changed: a rewind says so, and first saves what it is about to overwrite, as a turn of its own.
+//! copy saved after a moment is what the file held at that moment. What a command changed is not saved, and neither is
+//! what the person changed: a rewind says so, and first saves what it is about to overwrite, as a turn of its own. The files a
+//! command made or changed are named with their turn all the same ([`Touched`]), for the turn's changes to show them.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,50 @@ use serde::{Deserialize, Serialize};
 use crate::tools::FileChange;
 
 const INDEX: &str = "index.json";
+
+/// A file a command made or changed in a turn ([`Checkpoints::commanded`], [`touched_since`]): shown with the turn's changes, never put back by a
+/// rewind, as nothing of it was saved before the command ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Touched {
+    pub path: PathBuf,
+    /// It was not there before the command: what it holds is all that came of it.
+    pub made: bool,
+}
+
+/// Folders a walk for what a command touched does not go into: tools' own, which a build or an install fills with thousands of files.
+const NOT_WALKED: [&str; 8] = [".git", "node_modules", "target", ".venv", "venv", "__pycache__", ".next", ".gradle"];
+/// The most entries a walk looks at: past them it stops with what it has (a workspace that large would take the walk too long after every command).
+const MOST_WALKED: usize = 20_000;
+
+/// The files under `workspace` written since `since`: made since then, or changed. Links and junctions are not followed, and [`NOT_WALKED`] folders are not
+/// gone into.
+pub fn touched_since(workspace: &Path, since: std::time::SystemTime) -> Vec<Touched> {
+    let (mut found, mut seen, mut folders) = (Vec::new(), 0usize, vec![workspace.to_path_buf()]);
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > MOST_WALKED {
+                return found;
+            }
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if !NOT_WALKED.iter().any(|name| entry.file_name().eq_ignore_ascii_case(name)) {
+                    folders.push(entry.path());
+                }
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.modified().is_ok_and(|modified| modified >= since) {
+                found.push(Touched { path: entry.path(), made: meta.created().is_ok_and(|created| created >= since) });
+            }
+        }
+    }
+    found
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Saved {
@@ -46,6 +91,9 @@ pub struct Turn {
     /// Where the conversation stood when the turn began; none once that place is gone (compacted, or rewound past).
     pub message: Option<usize>,
     pub files: Vec<Saved>,
+    /// What its commands made or changed, of the files it did not save itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commanded: Vec<Touched>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -125,7 +173,10 @@ fn folder_of(session: &Path) -> PathBuf {
 /// failed on the way (a full disk, the app ended) left the file cut or empty.
 fn put_back(copy: &Path, path: &Path) -> std::io::Result<()> {
     let beside = crate::tools::written_beside(path);
-    let done = std::fs::copy(copy, &beside).and_then(|_| if path.exists() { crate::tools::take_the_place(&beside, path) } else { std::fs::rename(&beside, path) });
+    // (on the disk before it takes the place: a power cut just after would otherwise leave the person's file as zeros)
+    let done = std::fs::copy(copy, &beside)
+        .and_then(|_| std::fs::OpenOptions::new().write(true).open(&beside)?.sync_all())
+        .and_then(|()| if path.exists() { crate::tools::take_the_place(&beside, path) } else { std::fs::rename(&beside, path) });
     if done.is_err() {
         let _ = std::fs::remove_file(&beside);
     }
@@ -173,11 +224,30 @@ fn same_bytes(a: &Path, b: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Whether a kept copy is what a power cut leaves of a file written just before it: its length, and only zeros. A block at a time, as a copy may be large.
+fn left_as_zeros(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut block = vec![0u8; 64 * 1024];
+    let mut any = false;
+    loop {
+        let count = file.read(&mut block)?;
+        if count == 0 {
+            return Ok(any);
+        }
+        if block[..count].iter().any(|&byte| byte != 0) {
+            return Ok(false);
+        }
+        any = true;
+    }
+}
+
 /// `from` as a new file at `to`, streamed, and never over one that is there: a copy that was kept is the only one there is of what it held.
 fn copy_new(from: &Path, to: &Path) -> std::io::Result<u64> {
     let mut source = std::fs::File::open(from)?;
     let mut copy = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
-    let written = std::io::copy(&mut source, &mut copy);
+    // (on the disk before the index, which is flushed, names it: a power cut would otherwise leave a copy of zeros that a rewind puts back)
+    let written = std::io::copy(&mut source, &mut copy).and_then(|count| copy.sync_all().map(|()| count));
     if written.is_err() {
         drop(copy);
         let _ = std::fs::remove_file(to);
@@ -211,8 +281,24 @@ impl Checkpoints {
 
     pub fn begin(&mut self, title: &str, at: &str, message: Option<usize>) -> Result<(), String> {
         let id = self.index.turns.last().map_or(1, |turn| turn.id + 1);
-        self.index.turns.push(Turn { id, title: title.to_string(), at: at.to_string(), message, files: Vec::new() });
+        self.index.turns.push(Turn { id, title: title.to_string(), at: at.to_string(), message, files: Vec::new(), commanded: Vec::new() });
         self.save()
+    }
+
+    /// Files a command of the turn made or changed: named with it, for its changes to show them, and not saved. One the turn saved itself, or named
+    /// already, is left as it is (the first word on a file is what it was before the turn).
+    pub fn commanded(&mut self, touched: Vec<Touched>) -> Result<(), String> {
+        let Some(turn) = self.index.turns.last_mut() else { return Ok(()) };
+        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
+        let mut added = false;
+        for one in touched {
+            let known = turn.files.iter().any(|saved| key(&saved.path) == key(&one.path)) || turn.commanded.iter().any(|named| key(&named.path) == key(&one.path));
+            if !known {
+                turn.commanded.push(one);
+                added = true;
+            }
+        }
+        if added { self.save() } else { Ok(()) }
     }
 
     fn copy_of(&mut self, path: &Path) -> Result<Saved, String> {
@@ -280,10 +366,39 @@ impl Checkpoints {
     }
 
     fn session_changes_within(&self, workspace: &Path, most_read: u64) -> Vec<FileChange> {
-        self.plan(0).into_iter().filter_map(|saved| {
-            let now = std::fs::metadata(&saved.path).ok().filter(std::fs::Metadata::is_file).map(|_| saved.path.clone());
-            self.change_of(&saved, now, workspace, most_read)
+        // (each file from the first word on it: what the agent saved, or what a command did to it, turn by turn)
+        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
+        let mut seen = HashSet::new();
+        let mut first: Vec<Result<Saved, &Touched>> = Vec::new();
+        for turn in &self.index.turns {
+            for saved in &turn.files {
+                if seen.insert(key(&saved.path)) {
+                    first.push(Ok(saved.clone()));
+                }
+            }
+            for touched in &turn.commanded {
+                if seen.insert(key(&touched.path)) {
+                    first.push(Err(touched));
+                }
+            }
+        }
+        first.into_iter().filter_map(|first| {
+            let path = match &first { Ok(saved) => saved.path.clone(), Err(touched) => touched.path.clone() };
+            let now = std::fs::metadata(&path).ok().filter(std::fs::Metadata::is_file).map(|_| path.clone());
+            match first {
+                Ok(saved) => self.change_of(&saved, now, workspace, most_read),
+                Err(touched) => self.touched_change(touched, now, workspace, most_read),
+            }
         }).collect()
+    }
+
+    /// A file a command touched, from before the command to `after`: made, what it holds; changed, that it changed, with no text (what it was is not
+    /// saved).
+    fn touched_change(&self, touched: &Touched, after: Option<PathBuf>, workspace: &Path, most_read: u64) -> Option<FileChange> {
+        if touched.made {
+            return self.change_of(&Saved { path: touched.path.clone(), copy: None, real: None }, after, workspace, most_read);
+        }
+        Some(FileChange::without_diff(&touched.path.strip_prefix(workspace).unwrap_or(&touched.path).display().to_string()))
     }
 
     /// What turn `id`'s edits changed, for the card under its answer: each file the turn saved, against what it held when the next turn that saved
@@ -296,14 +411,14 @@ impl Checkpoints {
     fn turn_changes_within(&self, id: u64, workspace: &Path, most_read: u64) -> Vec<FileChange> {
         let Some(at) = self.index.turns.iter().position(|turn| turn.id == id) else { return Vec::new() };
         let turns = &self.index.turns;
-        turns[at].files.iter().filter_map(|saved| {
-            let later = turns[at + 1..].iter().find_map(|turn| turn.files.iter().find(|next| next.path == saved.path));
-            let after = match later {
-                Some(next) => next.copy.as_ref().map(|copy| self.folder.join(copy)),
-                None => std::fs::metadata(&saved.path).ok().filter(std::fs::Metadata::is_file).map(|_| saved.path.clone()),
-            };
-            self.change_of(saved, after, workspace, most_read)
-        }).collect()
+        // (a file after the turn: as the next turn that saved it found it, or as it is now)
+        let after = |path: &Path| match turns[at + 1..].iter().find_map(|turn| turn.files.iter().find(|next| next.path == path)) {
+            Some(next) => next.copy.as_ref().map(|copy| self.folder.join(copy)),
+            None => std::fs::metadata(path).ok().filter(std::fs::Metadata::is_file).map(|_| path.to_path_buf()),
+        };
+        let saved = turns[at].files.iter().filter_map(|saved| self.change_of(saved, after(&saved.path), workspace, most_read));
+        let touched = turns[at].commanded.iter().filter_map(|touched| self.touched_change(touched, after(&touched.path), workspace, most_read));
+        saved.chain(touched).collect()
     }
 
     /// A saved file's change from its copy to `after` (the file as it is now, or a later copy; none: it was not there), or none when the bytes are
@@ -381,7 +496,7 @@ impl Checkpoints {
         let kept: HashSet<PathBuf> = keep.iter().map(|saved| saved.path.clone()).collect();
         let keep_seen = keep.clone();
         let next = self.index.turns.last().map_or(1, |turn| turn.id + 1);
-        self.index.turns.push(Turn { id: next, title: format!("Before the rewind to: {title}"), at: at.to_string(), message: None, files: keep });
+        self.index.turns.push(Turn { id: next, title: format!("Before the rewind to: {title}"), at: at.to_string(), message: None, files: keep, commanded: Vec::new() });
         if let Err(error) = self.save() {
             restored.failed.push(error);
             return restored;
@@ -400,6 +515,11 @@ impl Checkpoints {
             }
             match &saved.copy {
                 Some(copy) => {
+                    // (zeros put back would be the person's file lost: it is left as it is, and said)
+                    if left_as_zeros(&self.folder.join(copy)).unwrap_or(false) {
+                        restored.failed.push(format!("{}: the copy kept of it is only zeros, as a power cut leaves a file written just before it, so it was left as it is", saved.path.display()));
+                        continue;
+                    }
                     if let Some(parent) = saved.path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -680,6 +800,23 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
     }
 
+    /// A kept copy that a power cut left as zeros is not put back: the file stays as it is, and the rewind says why.
+    #[test]
+    fn a_copy_a_power_cut_left_as_zeros_is_not_put_back() {
+        let mut f = fixture();
+        std::fs::write(&f.file, "before").unwrap();
+        f.marks.begin("one", "t", Some(1)).unwrap();
+        f.marks.before_edit(&[f.file.clone()]).unwrap();
+        std::fs::write(&f.file, "after").unwrap();
+        let copy = f.marks.folder.join("0.bin");
+        assert_eq!(read(&copy), "before");
+        std::fs::write(&copy, vec![0u8; "before".len()]).unwrap();
+        let restored = f.marks.restore(1, "t");
+        assert_eq!(read(&f.file), "after");
+        assert!(restored.written.is_empty() && restored.failed.len() == 1 && restored.failed[0].contains("only zeros"), "{:?}", restored.failed);
+        assert!(!left_as_zeros(&f.file).unwrap() && !left_as_zeros(&f.marks.folder.join("index.json")).unwrap());
+    }
+
     #[test]
     fn a_rewind_brings_back_the_beginning_of_a_turn() {
         let mut f = fixture();
@@ -861,5 +998,45 @@ mod sealed_tests {
         let plain_session = Session::create(dir.path(), Path::new("w"), "now", "2").unwrap().path.clone();
         Checkpoints::open(&plain_session).begin("plain title", "now", Some(1)).unwrap();
         assert!(std::fs::read_to_string(folder_of(&plain_session).join(INDEX)).unwrap().contains("plain title"));
+    }
+    /// What a command made or changed is found by when it was written, named with the turn, and shown with its changes and the session's: a made file
+    /// with what it holds, a changed one with no text. A file the turn saved itself stays its own; a rewind puts back nothing of a command's.
+    #[test]
+    fn what_a_command_made_or_changed_is_shown_with_the_turn_and_not_put_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("node_modules")).unwrap();
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::write(work.join("old.txt"), "old\n").unwrap();
+        std::fs::write(work.join("edited.txt"), "before\n").unwrap();
+        let since = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(work.join("sub").join("made.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(work.join("edited.txt"), "after\n").unwrap();
+        std::fs::write(work.join("node_modules").join("dep.js"), "x").unwrap();
+        let mut touched = touched_since(&work, since);
+        touched.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(touched, [Touched { path: work.join("edited.txt"), made: false }, Touched { path: work.join("sub").join("made.txt"), made: true }], "not the old file, nor in node_modules");
+        let mut marks = Checkpoints::open(&dir.path().join("session.jsonl"));
+        marks.begin("first", "now", Some(0)).unwrap();
+        // (the agent's own edit of a file is its own, whatever a command did to it after)
+        std::fs::write(work.join("mine.txt"), "mine\n").unwrap();
+        marks.before_edit(&[work.join("mine.txt")]).unwrap();
+        marks.commanded(touched.into_iter().chain([Touched { path: work.join("mine.txt"), made: false }]).collect()).unwrap();
+        let id = marks.turns()[0].id;
+        let changes = marks.turn_changes(id, &work);
+        let by = |name: &str| changes.iter().find(|change| change.path.replace('\\', "/") == name).cloned();
+        let made = by("sub/made.txt").expect("the made file");
+        assert_eq!((made.added, made.removed), (2, 0));
+        let edited = by("edited.txt").expect("the changed file");
+        assert_eq!((edited.added, edited.removed, edited.diff.as_str()), (0, 0, ""), "what it was is not known");
+        assert!(by("mine.txt").is_none(), "unchanged since the agent saved it");
+        assert_eq!(marks.session_changes(&work).len(), 2);
+        // Kept with the index, and a rewind puts none of it back.
+        let opened = Checkpoints::open(&dir.path().join("session.jsonl"));
+        assert_eq!(opened.turns()[0].commanded.len(), 2);
+        let restored = marks.restore(id, "later");
+        assert!(restored.removed.iter().all(|path| path != &work.join("sub").join("made.txt")) && work.join("sub").join("made.txt").exists());
+        assert_eq!(std::fs::read_to_string(work.join("edited.txt")).unwrap(), "after\n");
     }
 }

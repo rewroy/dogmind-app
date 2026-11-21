@@ -29,7 +29,7 @@ use dogmind_agent::web::{WebSettings, WARNING_MARK};
 use crate::design as ds;
 use crate::machine::readable_build;
 use crate::diffview::{self, RowKind};
-use crate::settings::{KeySource, RightView};
+use crate::settings::{CenterView, KeySource, RightView};
 use crate::toolrun::{self, LineKind, RunEntry, Tone, ToolRun};
 use crate::cards::{self, AnswerState, Card, PlanState};
 use crate::notice;
@@ -247,6 +247,15 @@ const ID_PREVIEW_CLOSE: isize = 9049;
 const ID_STEPS_CLOSE: isize = 9072;
 const ID_PROVIDER_UP: isize = 9050;
 const ID_FOLDER_CHIP: isize = 9052;
+/// Under the dog of a session not begun yet: the button that switches the session's workspace.
+const ID_START_FOLDER: isize = 9053;
+/// The row of the card under the dog that names the workspace, over its "Choose a workspace".
+const START_NAME_ROW: i32 = 44;
+/// The workspace picker that button opens: its search field and its list.
+const ID_PICKER_SEARCH: isize = 9057;
+const ID_PICKER_LIST: isize = 9058;
+/// The most folders the workspace picker lists, the latest first (its search looks through these).
+const PICKER_MOST: usize = 40;
 const ID_TOGGLE_DISPLAY: isize = 9054;
 const ID_ATTACH: isize = 9055;
 const ID_ATTACHED: isize = 9060; // ..+ attach::MOST_IMAGES
@@ -303,6 +312,11 @@ const ID_SETUP_AGAIN: isize = 9620;
 const ID_REMOVE_ALL: isize = 9621;
 const ID_MODEL_LICENCE: isize = 9622;
 const ID_MCP_TRUST: isize = 9700; // ..+ as many servers as there are
+const ID_MCP_EDIT: isize = 10800; // ..+ as many servers as there are
+const ID_MCP_ADD: isize = 9623;
+const ID_MCP_SAVE: isize = 9624;
+const ID_MCP_REMOVE: isize = 9625;
+const ID_MCP_CANCEL: isize = 9626;
 const ID_VISION: isize = 9903;
 const ID_VISION_DELETE: isize = 9904;
 const ID_VISION_OFFER: isize = 9905;
@@ -338,12 +352,13 @@ const TIMER_UPDATE: usize = 8;
 /// Whether it is time to ask GitHub for a newer release: the first time a little after the start, then once an hour (it asks only when six hours have gone by since the last
 /// answer; and when the window comes back from the tray, an hour: Self::tray_open).
 const TIMER_RELEASES: usize = 9;
+const TIMER_SKILL_SCROLL: usize = 10;
+/// While an MCP server the Tools page lists is starting: the page follows it until it is up.
+const TIMER_MCP: usize = 31;
 const FIRST_RELEASE_LOOK_MS: u32 = 30_000;
 const RELEASE_LOOK_MS: u32 = 60 * 60 * 1000;
 /// The conversation's width below which the panel on the right gives way, at 96 dpi.
 const RIGHT_NEEDS: i32 = 480;
-/// The panel on the right is no wider than this while it shows a terminal.
-const TERMINAL_PANEL_MOST: i32 = 720;
 /// How many commands, and as many waits, the panel on the right lists of what waits in the background: a session has five waits at most, and few commands.
 const WAITING_LISTED: usize = 6;
 /// How often a server that cannot be reached is tried again, while something waits to be sent to it.
@@ -513,7 +528,7 @@ const COMMANDS: [(&str, &str); 47] = [
     ("/panel", "Show or hide the panel on the right"),
     ("/preview", "Show a web page or picture of the folder beside the conversation"),
     ("/files", "Show the files of the folder in the panel on the right"),
-    ("/terminal", "Show a terminal in the panel on the right, or open one"),
+    ("/terminal", "Switch to Terminal or open a shell"),
     ("/theme", "As Windows is set, dark, or light: the next of them"),
     ("/safe", "Allow safe commands without asking, or not"),
     ("/workspace", "Start a session in another folder"),
@@ -567,7 +582,7 @@ A command can write only in the session's folder, and has no network unless you 
 Keys you paste go to Windows Credential Manager, and nowhere else.
 Pictures: the paperclip, /attach, a paste or a drop. PNG, JPEG, WebP and GIF.
 Skills: .claude/skills, .agents/skills, .codex/skills and .dogmind/skills, in the project and in your home. /name starts one.
-MCP servers: mcp.json in the data folder. They start with the app, and each call asks. Settings > Tools can trust what one returns.
+MCP servers: Settings > Tools adds, changes and removes them (a program, or a server's URL), and can trust what one returns. Each call asks.
 Web: what comes back is marked as data, and once it is in a conversation every command asks.
 Your instructions (Settings) go for every session; a DOGMIND.md for its project. /init has the model write one.
 Terminal: the panel on the right has your own shell. Its commands run with your rights, apart from the agent's, and what it shows is not sent to the model. Every key goes to the shell: Ctrl+C copies when something is selected and otherwise stops what runs, and Ctrl+V pastes.
@@ -1218,9 +1233,10 @@ fn next_greeting(last: usize, seed: u64) -> usize {
     (last + 1 + (seed % (GREETINGS.len() as u64 - 1)) as usize) % GREETINGS.len()
 }
 
-/// The line the engine or a server said of a failure, under the app's sentence in `text`, goes to the report (`/report`). Not while the app is taking itself off this PC: nothing is written then.
+/// The line the engine or a server said of a failure, under the app's sentence in `text` or in it ([`llm::server_said`]), goes to the report
+/// (`/report`). Not while the app is taking itself off this PC: nothing is written then.
 fn keep_server_line(folder: &Path, leaving: &Leaving, text: &str) {
-    if let (Leaving::No, Some(line)) = (leaving, llm::line_under(text)) {
+    if let (Leaving::No, Some(line)) = (leaving, llm::server_said(text)) {
         crate::crash::note_engine_error(folder, line);
     }
 }
@@ -1500,6 +1516,7 @@ struct Form {
     shapes: Vec<Shape>,
     /// What this page shows.
     used: Vec<HWND>,
+    end_toggles: Vec<(HWND, RECT)>,
     y: i32,
     width: i32,
     stacked: bool,
@@ -1515,7 +1532,7 @@ impl Form {
     fn new(width: i32, top: i32, fonts: Fonts, dpi: u32) -> Form {
         let stacked = width < scale(dpi, ds::size::STACK_BELOW);
         let label = scale(dpi, ds::size::LABEL_WIDTH).min(width * 42 / 100);
-        Form { shapes: Vec::new(), used: Vec::new(), y: top, width, stacked, label, fonts, dpi, first_section: true, extra: 0 }
+        Form { shapes: Vec::new(), used: Vec::new(), end_toggles: Vec::new(), y: top, width, stacked, label, fonts, dpi, first_section: true, extra: 0 }
     }
 
     fn s(&self, value: i32) -> i32 {
@@ -1643,7 +1660,7 @@ impl Form {
         let state_x = switch_x - self.s(ds::space::S) - state_width;
         self.shapes.push(Shape::Text { area: rect(0, self.y, (state_x - self.s(ds::space::M)).max(0), height), text: words.to_string(), font: FontKind::Body, color: theme::text(), flags: ONE_LINE });
         self.shapes.push(Shape::Text { area: rect(state_x, self.y, state_width, height), text: state.to_string(), font: FontKind::Small, color: theme::muted(), flags: ONE_LINE | DT_RIGHT });
-        place(window, switch_x, self.y + (height - tall) / 2, across, tall);
+        self.end_toggles.push((window, rect(switch_x, self.y + (height - tall) / 2, across, tall)));
         self.used.push(window);
         self.end_row(height);
     }
@@ -1654,6 +1671,20 @@ impl Form {
         self.label(words, height);
         let (x, width) = (self.value_x(), self.value_width());
         self.frame(x, width, edit);
+        self.end_row(height);
+    }
+
+    /// A field of several lines, on a frame of ours as a field's is; its label is level with its first line.
+    unsafe fn area(&mut self, words: &str, edit: HWND, lines: i32) {
+        let one = self.s(ds::size::CONTROL);
+        let height = one + self.s(ds::size::FIELD_TEXT) * (lines - 1).max(0);
+        self.label(words, one);
+        let (x, width) = (self.value_x(), self.value_width());
+        let border = if GetFocus() == edit { theme::accent() } else { theme::line() };
+        self.shapes.push(Shape::Round { area: rect(x, self.y, width, height), radius: self.s(ds::radius::CONTROL), fill: Some(theme::surface()), border: Some(border) });
+        let inset = self.s(ds::size::FIELD_INSET);
+        place(edit, x + self.s(ds::space::M), self.y + inset, width - 2 * self.s(ds::space::M), height - 2 * inset);
+        self.used.push(edit);
         self.end_row(height);
     }
 
@@ -1760,8 +1791,8 @@ enum Shown {
     Answer(String, String),
     /// A line of code, coloured when it is drawn: `open` is whether a block comment runs into it.
     Code { line: String, language: String, open: bool },
-    /// A Markdown table: its first row is the heading. Drawn afresh each time, as its colours and widths depend on the moment.
-    Table(Vec<Vec<String>>),
+    /// A Markdown table: its first row is the heading, and how each column lines up. Drawn afresh each time, as its colours and widths depend on the moment.
+    Table(Vec<Vec<String>>, Vec<rtf::Align>),
     /// A block of code begins here: all of it, for its copy button.
     Block(String),
     /// The pictures of a message and their sizes, at the top of its card. `alone`: no text under them.
@@ -1853,6 +1884,47 @@ enum FontKind {
     Greeting,
 }
 
+/// A row of the workspace picker under the dog of a session not begun yet ([`picker_rows`]).
+#[derive(Clone, Debug, PartialEq)]
+enum PickerRow {
+    /// The name over a group of rows.
+    Heading(String),
+    /// A folder worked in before: its name, and where it is under it.
+    Folder { path: PathBuf, name: String },
+    /// No folder has the words searched for.
+    Nothing,
+    /// The line between groups.
+    Line,
+    /// Any other folder, from the system's chooser.
+    Choose,
+}
+
+impl PickerRow {
+    /// Whether the keys and the pointer can choose it.
+    fn chosen_by_hand(&self) -> bool {
+        matches!(self, PickerRow::Folder { .. } | PickerRow::Choose)
+    }
+}
+
+/// The workspace picker's rows for `query`: the `folders` worked in before whose path has it (all of them for none), ignoring case, under their
+/// heading, then a line and the way to any other folder.
+fn picker_rows(folders: &[PathBuf], query: &str) -> Vec<PickerRow> {
+    let query = query.trim().to_lowercase();
+    let found: Vec<PickerRow> = folders.iter()
+        .filter(|folder| query.is_empty() || folder.display().to_string().to_lowercase().contains(&query))
+        .map(|folder| PickerRow::Folder { path: folder.clone(), name: folder.file_name().map_or_else(|| folder.display().to_string(), |name| name.to_string_lossy().into_owned()) })
+        .collect();
+    let mut rows = vec![PickerRow::Heading(t("Recent workspaces").to_string())];
+    if found.is_empty() {
+        rows.push(PickerRow::Nothing);
+    } else {
+        rows.extend(found);
+    }
+    rows.push(PickerRow::Line);
+    rows.push(PickerRow::Choose);
+    rows
+}
+
 #[derive(Clone)]
 enum SideRow {
     Workspace { path: PathBuf, name: String, collapsed: bool },
@@ -1875,6 +1947,18 @@ struct Suggestion {
     detail: String,
     /// What it puts in place of the word being typed.
     insert: String,
+}
+
+#[derive(Clone, Copy)]
+enum PanelTab {
+    Center(CenterView),
+    Right(RightView),
+}
+
+struct SkillScroll {
+    from: i32,
+    to: i32,
+    began: std::time::Instant,
 }
 
 struct App {
@@ -1920,10 +2004,10 @@ struct App {
     panel_menu: files_panel::PanelMenu,
     /// The Terminal view of the panel on the right (`term_panel`): its windows and its terminals.
     term: term_panel::TermView,
-    /// The Timeline view of the panel on the right (`timeline_view`): its window, the session's path read from its files, and what the events say between two reads.
+    /// The central Timeline view (`timeline_view`): its window, the session's path read from its files, and what the events say between two reads.
     timeline: timeline_view::TimelineView,
-    /// The words over the panel on the right, where a press goes to the view each names.
-    right_tab_hits: Vec<(RECT, RightView)>,
+    /// The hit areas of the central and right panel tabs.
+    tab_hits: Vec<(RECT, PanelTab)>,
     collapsed: HashSet<String>,
     all_sessions: Vec<session::Summary>,
     /// The session on screen, once it has a file.
@@ -1985,6 +2069,21 @@ struct App {
     toggle_language: HWND,
     toggle_display: HWND,
     folder_chip: HWND,
+    /// Under the dog of a session not begun yet, beside the workspace's name: what switches it, where it is seen first.
+    start_folder: HWND,
+    /// The workspace picker `start_folder` opens: a panel over what lies below it (a child window on top
+    /// of the others, `picker_procedure`), with a search field over the folders worked in before ([`picker_rows`]). Shown while `picker_open`;
+    /// `picker_selected` is the row the keys are on, `picker_hover` the one under the pointer.
+    picker: HWND,
+    picker_search: HWND,
+    picker_list: HWND,
+    picker_rows: Vec<PickerRow>,
+    picker_selected: Option<usize>,
+    picker_hover: Option<usize>,
+    picker_open: bool,
+    /// Where the picker goes, from this layout's card: its left, the card's top and bottom, its width and the window's foot. Placed when the
+    /// layout ends, so that it lies over every control the layout raised.
+    picker_at: Option<(i32, i32, i32, i32, i32)>,
     /// How many lines the composer last had: the card grows with them.
     composer_lines: i32,
     provider_up: HWND,
@@ -2016,10 +2115,28 @@ struct App {
     mcp_import: HWND,
     /// A switch for each MCP server, made when the Tools page first needs it.
     mcp_trust: Vec<HWND>,
+    /// An Edit button for each MCP server, beside what it runs.
+    mcp_edit: Vec<HWND>,
+    mcp_add: HWND,
+    mcp_save: HWND,
+    mcp_remove: HWND,
+    mcp_cancel: HWND,
+    /// A server's environment variables, or its headers, a line each.
+    mcp_vars: HWND,
+    /// The server the form under the list changes: none while it is shut, `Some(None)` for a new one.
+    mcp_form: Option<Option<String>>,
+    /// Whether what the form runs is a URL: it asks for headers then, and not for arguments and variables.
+    mcp_form_url: bool,
+    /// What the form said when it opened: leaving the page keeps a change, and only a change.
+    mcp_form_was: [String; 4],
+    /// The server just saved, while the page waits to say how its start went.
+    mcp_saved: Option<String>,
     /// The sizes of the conversation's words, on the Appearance page.
     size_segments: [HWND; TEXT_SIZES.len()],
     /// A switch for each skill found, made when the Skills page first needs it.
     skill_toggles: Vec<HWND>,
+    skill_toggle_areas: Vec<(HWND, RECT)>,
+    skill_scroll: Option<SkillScroll>,
     /// What the model keeps between sessions, as the Memory page last read it, and a button to take out each.
     memory_notes: Vec<(&'static str, String)>,
     memory_remove: Vec<HWND>,
@@ -2085,6 +2202,10 @@ struct App {
     // Finding in the conversation.
     find_open: bool,
     find_field: HWND,
+    /// The field of the card of the question that waits, over its frame where all of that is in view (`place_card_field`): an answer of the person's own is written there and sent
+    /// by Enter or the card's Send. Where it is placed now, in the window: none while it is hidden.
+    card_field: HWND,
+    card_field_at: Option<(i32, i32, i32, i32)>,
     find_previous: HWND,
     find_next: HWND,
     find_close: HWND,
@@ -2410,6 +2531,10 @@ struct App {
     activity: String,
     /// When the work the activity line tells of began: what it shows, with a turning ring, so that waiting is seen to be waiting.
     activity_since: Option<std::time::Instant>,
+    /// What the request's text came to when it began (its first report), and how many tokens it has written since, while no word of its answer has come:
+    /// shown small beside "Thinking…", which says nothing else of thinking that is not shown.
+    thinking_base: Option<u64>,
+    thinking_tokens: u64,
     /// The seconds the activity line shows now.
     activity_second: u64,
     connected: bool,
@@ -2609,10 +2734,63 @@ fn web_settings(settings: &Settings) -> WebSettings {
     WebSettings { enabled: settings.web_tools, search_key: holder.key().ok().flatten().filter(|key| !key.is_empty()), allow_local: false }
 }
 
+/// The height of a line of `font` in an edit control: its text's height, with a pixel above and below.
+unsafe fn field_line_height(window: HWND, font: HFONT) -> i32 {
+    let device = GetDC(window);
+    let previous = SelectObject(device, font);
+    let mut metrics: TEXTMETRICW = std::mem::zeroed();
+    GetTextMetricsW(device, &mut metrics);
+    SelectObject(device, previous);
+    ReleaseDC(window, device);
+    metrics.tmHeight + 2
+}
+
 unsafe fn control(parent: HWND, class: &str, text: &str, style: u32, ex: u32, id: isize) -> HWND {
     let (class, text) = (wide(class), wide(text));
     // (none of them draws over a dialog that lies on top of it)
     CreateWindowExW(ex, class.as_ptr(), text.as_ptr(), WS_CHILD | WS_CLIPSIBLINGS | style, 0, 0, 0, 0, parent, id as HMENU, GetModuleHandleW(std::ptr::null()), std::ptr::null())
+}
+
+/// How an MCP server is, in the person's words: for its row in Settings and for /mcp.
+fn mcp_state_words(state: Option<&dogmind_agent::mcp::State>) -> String {
+    match state {
+        Some(dogmind_agent::mcp::State::Up(1)) => t("1 tool").to_string(),
+        Some(dogmind_agent::mcp::State::Up(tools)) => tf("{0} tools", &[tools]),
+        Some(dogmind_agent::mcp::State::Failed(why)) => tf("Did not start: {0}", &[&mcp_why(why)]),
+        _ => t("Starting…").to_string(),
+    }
+}
+
+/// Why an MCP server did not start, with the words the app has for a program not found in the person's language.
+fn mcp_why(why: &str) -> String {
+    why.replace(dogmind_agent::mcp::NOT_FOUND, t(dogmind_agent::mcp::NOT_FOUND))
+}
+
+/// What an MCP server runs, or where it is, as its row says it. Its headers are not said: a key is among them.
+fn mcp_runs(config: &dogmind_agent::mcp::ServerConfig) -> String {
+    if config.is_http() {
+        config.url.clone()
+    } else {
+        format!("{} {}", config.command, dogmind_agent::mcp::line_of_args(&config.args)).trim().to_string()
+    }
+}
+
+/// What was typed as a server's URL, with its scheme as the protocol writes it; none for what is not one.
+/// The server the Settings form says, as mcp.json keeps it, `was` the one it edits. The person's word on what it returns goes with it, under a new name too; and
+/// one of the older transport stays one, its stream asked for first: saved as `http`, it was asked with a POST of Streamable HTTP first, as a new one is.
+fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Option<String>, target: String, args: &str, pairs: std::collections::BTreeMap<String, String>) -> dogmind_agent::mcp::ServerConfig {
+    use dogmind_agent::mcp;
+    let trusted = was.is_some_and(|config| config.trusted);
+    let kind = if was.is_some_and(|config| config.kind == "sse") { "sse" } else { "http" };
+    match url {
+        Some(url) => mcp::ServerConfig { kind: kind.into(), url, headers: pairs, trusted, ..Default::default() },
+        None => mcp::ServerConfig { command: target, args: mcp::args_of_line(args), env: pairs, trusted, ..Default::default() },
+    }
+}
+
+fn mcp_url(typed: &str) -> Option<String> {
+    let lower = typed.to_ascii_lowercase();
+    ["http://", "https://"].into_iter().find(|scheme| lower.starts_with(scheme)).map(|scheme| format!("{scheme}{}", &typed[scheme.len()..]))
 }
 
 unsafe fn set_text(window: HWND, text: &str) {
@@ -2765,8 +2943,9 @@ fn char_format(color: u32, effects: u32, face: &str, points: i32, back: Option<u
 #[derive(Clone, Copy, PartialEq)]
 enum Para {
     Normal,
-    /// An item of a list, this far in: its lines keep to its text, and the items stay together.
-    Item(i32),
+    /// An item of a list, this far in, and the room over it: its lines keep to its text, and the items stay together, unless a blank line or a block
+    /// is between two (a list after another, or a list's items written apart).
+    Item(i32, i32),
     AfterList,
     AfterBlock,
     Quote,
@@ -3076,7 +3255,8 @@ impl App {
                 row.tabs[0] = ANSWERED_AT_TAB;
                 row
             }
-            Style::Title => para_format(15, 0, 160, 100),
+            // (as much room over `#` as over `##`: less, a title in the middle of an answer stood closer to what is above it than a heading under it does)
+            Style::Title => para_format(15, 0, 240, 100),
             Style::Gap => para_format(6, 0, 0, 0),
             Style::Heading => para_format(13, 0, 240, 80),
             Style::Subheading => para_format(12, 0, 180, 60),
@@ -3087,10 +3267,10 @@ impl App {
                 Para::AfterList => para_format(11, 0, 80, 120),
                 Para::AfterBlock => para_format(11, 0, 300, 120),
                 Para::Quote => para_format(11, 280, 40, 40),
-                Para::Item(indent) => {
+                Para::Item(indent, before) => {
                     const TEXT_AT: i32 = 280;
                     let start = indent * 130;
-                    let mut item = para_format(11, start, 0, 40);
+                    let mut item = para_format(11, start, before, 40);
                     item.mask |= PFM_OFFSET | PFM_TABSTOPS;
                     item.offset = TEXT_AT;
                     item.tab_count = 1;
@@ -3402,7 +3582,7 @@ impl App {
                     self.append_row(&rtf::Row { lines: &lines, face, points: *points, color: *color, back: *back, width, right: *right, column: self.text_twips, padding: *padding });
                 }
                 Shown::Answer(text, at) => self.answer_row(text, at),
-                Shown::Table(rows) => self.table_rows(rows),
+                Shown::Table(rows, aligns) => self.table_rows(rows, aligns),
                 Shown::Code { line, language, open } => {
                     self.code_row(line, language, *open);
                 }
@@ -3445,20 +3625,23 @@ impl App {
             }
             return;
         }
+        let aligns = rtf::table_aligns(&parsed[1]);
         let rows: Vec<Vec<String>> = parsed.into_iter().enumerate().filter(|(at, _)| *at != 1).map(|(_, row)| row).collect();
-        self.gap_after_a_block();
+        // (as much room over it as under it, as a block of code has)
+        self.room_over_a_block();
         if !self.replaying {
-            self.shown.push(Shown::Table(rows.clone()));
+            self.shown.push(Shown::Table(rows.clone(), aligns.clone()));
         }
-        self.table_rows(&rows);
+        self.table_rows(&rows, &aligns);
         self.para_next = Some(Para::AfterBlock);
     }
 
-    unsafe fn table_rows(&mut self, rows: &[Vec<String>]) {
-        const POINTS: i32 = 10;
+    unsafe fn table_rows(&mut self, rows: &[Vec<String>], aligns: &[rtf::Align]) {
+        // The body's size: a table is read as part of the answer, not as a note beside it.
+        const POINTS: i32 = 11;
         let ends = rtf::table_ends(rows, POINTS, self.text_twips);
         for (at, cells) in rows.iter().enumerate() {
-            let row = rtf::TableRow { cells, ends: &ends, face: UI_FACE, points: POINTS, color: theme::text(), back: if at == 0 { theme::code_back() } else { theme::background() }, line: theme::line(), bold: at == 0 };
+            let row = rtf::TableRow { cells, ends: &ends, aligns, face: UI_FACE, points: POINTS, color: theme::text(), back: if at == 0 { theme::code_back() } else { theme::background() }, line: theme::line(), bold: at == 0 };
             self.insert_rtf(rtf::table_row(&row), Some(theme::text()));
         }
     }
@@ -3469,18 +3652,11 @@ impl App {
         self.append_row(&rtf::Row { lines: &[shown], face: "Consolas", points, color, back: theme::code_back(), width: self.text_twips, right: false, column: 0, padding: (260, 26) });
     }
 
-    /// Before a block or a table: right after another they would read as one, as rows of a table join.
-    unsafe fn gap_after_a_block(&mut self) {
-        if matches!(self.shown.last(), Some(Shown::Row { .. } | Shown::Code { .. } | Shown::Table(_))) {
-            self.append("\n", Style::Gap);
-        }
-    }
-
-    /// Room over a block of code or of a command's output: after another block, as for a table, and after words too, whose paragraph leaves
-    /// little under it (a list's item hardly any), so that the block stood tight under them. Not under a run of calls, whose output it is.
+    /// Room over a block of code, a command's output or a table: after another block, which it would otherwise read as one with, as rows of a table join, and after words
+    /// too, whose paragraph leaves little under it (a list's item hardly any), so that the block stood tight under them. Not under a run of calls, whose output it is.
     unsafe fn room_over_a_block(&mut self) {
         let room = match self.shown.last() {
-            Some(Shown::Row { .. } | Shown::Code { .. } | Shown::Table(_) | Shown::Link(..)) => true,
+            Some(Shown::Row { .. } | Shown::Code { .. } | Shown::Table(..) | Shown::Link(..)) => true,
             Some(Shown::Text(text, style, _)) => *style != Style::Gap && !text.trim().is_empty(),
             _ => false,
         };
@@ -3517,7 +3693,13 @@ impl App {
         let shown = if label.is_empty() { " " } else { label };
         let points = if label.is_empty() { 6 } else { 8 };
         // (room enough over and under the lines, which the rounded corners also take some of)
-        self.append_row(&rtf::Row { lines: &[shown], face: UI_FACE, points, color: theme::muted(), back: theme::code_back(), width: self.text_twips, right: false, column: 0, padding: (260, 80) });
+        let width = self.text_twips;
+        let row = |lines, points| rtf::Row { lines, face: UI_FACE, points, color: theme::muted(), back: theme::code_back(), width, right: false, column: 0, padding: (260, 80) };
+        if !label.is_empty() {
+            // A label has room over it as the end of a block has under its last line: a row's own padding is not given it, and it stood against the top edge.
+            self.append_row(&row(&[" "], 3));
+        }
+        self.append_row(&row(&[shown], points));
     }
 
     /// A line of code in an answer; a diff in its colours.
@@ -3577,7 +3759,7 @@ impl App {
     /// The caret stays out of the composer's way: its hint lies over the first line, and what an IME is composing goes there.
     unsafe fn update_composer_cue(&self) {
         let empty = GetWindowTextLengthW(self.composer) == 0;
-        show(self.composer_cue, self.panel == Panel::Chat && empty && !self.composing);
+        show(self.composer_cue, self.conversation_shown() && empty && !self.composing);
     }
 
     /// An answer as it streams, with its Markdown rendered: what a marker means is known once the line has begun, so a
@@ -3600,6 +3782,10 @@ impl App {
                     self.flush_table();
                 }
                 if !self.in_code && pending.starts_with('\n') {
+                    // (a blank line after an item: what follows, an item too, keeps a little away)
+                    if matches!(self.para, Para::Item(..)) && self.para_next.is_none() {
+                        self.para_next = Some(Para::AfterList);
+                    }
                     self.pending_text = pending[1..].to_string();
                     continue;
                 }
@@ -3665,7 +3851,7 @@ impl App {
                     let marker = list_marker(trimmed);
                     if marker.is_none() {
                         // What follows a list or a block keeps a little away from it, for this one paragraph.
-                        self.para = self.para_next.take().unwrap_or(if matches!(self.para, Para::Item(_)) { Para::AfterList } else { Para::Normal });
+                        self.para = self.para_next.take().unwrap_or(if matches!(self.para, Para::Item(..)) { Para::AfterList } else { Para::Normal });
                     }
                     if let Some(level) = markdown::heading_level(trimmed) {
                         self.heading = level;
@@ -3683,8 +3869,13 @@ impl App {
                         continue;
                     }
                     if let Some((shown, length)) = marker {
-                        self.para_next = None;
-                        self.para = Para::Item(indent as i32);
+                        // As far from what is over it as a paragraph would be: a block, a quote, or items a blank line parts.
+                        let before = match self.para_next.take() {
+                            Some(Para::AfterBlock) => 300,
+                            Some(Para::AfterList) => 80,
+                            _ => 0,
+                        };
+                        self.para = Para::Item(indent as i32, before);
                         self.append(&format!("{shown}\t"), Style::Body);
                         self.pending_text = pending[indent + length..].to_string();
                         continue;
@@ -4842,6 +5033,8 @@ impl App {
     unsafe fn answer_question(&mut self, words: &str) -> bool {
         let Some(asked) = self.question.take() else { return false };
         let words = words.trim().to_string();
+        set_text(self.card_field, "");
+        self.hide_card_field();
         self.reset_composer_cue();
         let said = words.clone();
         self.settle_card(asked.card, |card| {
@@ -4893,15 +5086,78 @@ impl App {
         set_text(self.composer_cue, t("Message Dogmind"));
     }
 
-    /// What was written in the composer, as the answer; with nothing written it is where to write it.
+    /// What was written in the card's field, or else in the composer, as the answer (`cards::own_answer`); with nothing written in either, the card's field is where to write it.
     unsafe fn card_pressed_own(&mut self) {
-        let words = get_text(self.composer);
-        if words.trim().is_empty() {
-            self.focus_composer();
+        let (field, composer) = (get_text(self.card_field), get_text(self.composer));
+        match cards::own_answer(&field, &composer) {
+            Some(cards::OwnAnswer::Field(words)) => {
+                let words = words.to_string();
+                set_text(self.card_field, "");
+                self.answer_question(&words);
+            }
+            Some(cards::OwnAnswer::Composer(words)) => {
+                let words = words.to_string();
+                set_text(self.composer, "");
+                self.composer_typed_at = None;
+                self.answer_question(&words);
+            }
+            None => self.focus_card_field(),
+        }
+    }
+
+    /// The keys to the card's field, where it is shown; else to the composer, which takes an answer too.
+    unsafe fn focus_card_field(&self) {
+        if self.modal_open {
+            return;
+        }
+        if IsWindowVisible(self.card_field) != 0 {
+            SetFocus(self.card_field);
         } else {
-            set_text(self.composer, "");
-            self.composer_typed_at = None;
-            self.answer_question(&words);
+            self.focus_composer();
+        }
+    }
+
+    /// The card's field over the frame of the card of the question that waits, where all of the frame is in the transcript's view (an edit is a window of its own, which the
+    /// transcript's edges would not cut): placed as the transcript's paint finds the frame, so that it follows a scroll. Hidden where no question waits or the frame is not in view
+    /// whole; what was written in it stays for when it is shown again, and the keys go to the composer if it had them.
+    unsafe fn place_card_field(&mut self) {
+        let frame = if self.question.is_some() {
+            self.overlay_hits.iter().find(|hit| match hit.key {
+                OverlayKey::Card(slot, part) => self.card_slots.get(slot).and_then(|room| room.parts.get(part)).is_some_and(|part| matches!(part.act, CardAct::FocusField)),
+                _ => false,
+            }).map(|hit| hit.area)
+        } else {
+            None
+        };
+        let mut view: RECT = std::mem::zeroed();
+        GetClientRect(self.transcript, &mut view);
+        let place = frame.filter(|area| area.top >= view.top && area.bottom <= view.bottom && area.left >= view.left && area.right <= view.right).map(|area| {
+            // (inside the frame's edge, where its words begin; a line of its font tall, in the middle of the frame, so that what is written stands where the frame's words did)
+            let inset = scale(self.dpi, ds::space::M);
+            let tall = field_line_height(self.window, self.fonts.field).min(area.bottom - area.top);
+            let mut corner = POINT { x: area.left + inset, y: area.top + (area.bottom - area.top - tall) / 2 };
+            MapWindowPoints(self.transcript, self.window, &mut corner, 1);
+            (corner.x, corner.y, (area.right - area.left - 2 * inset).max(1), tall)
+        });
+        if place == self.card_field_at {
+            return;
+        }
+        self.card_field_at = place;
+        match place {
+            Some((x, y, width, height)) => {
+                SetWindowPos(self.card_field, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+            }
+            None => self.hide_card_field(),
+        }
+    }
+
+    /// The card's field out of sight, the keys going to the composer if it had them.
+    unsafe fn hide_card_field(&mut self) {
+        self.card_field_at = None;
+        let had_the_keys = GetFocus() == self.card_field;
+        show(self.card_field, false);
+        if had_the_keys {
+            self.focus_composer();
         }
     }
 
@@ -4986,7 +5242,7 @@ impl App {
                 self.answer_question(&label);
             }
             CardAct::SendOwn => self.card_pressed_own(),
-            CardAct::FocusField => self.focus_composer(),
+            CardAct::FocusField => self.focus_card_field(),
             CardAct::Carry => {
                 self.decide_plan(Ok(()));
             }
@@ -5148,6 +5404,7 @@ impl App {
     /// `dx`, `dy`: where the transcript's own pixels are in `device` (the bitmap of the area drawn, or the window itself).
     unsafe fn paint_overlay_icons(&mut self, device: HDC, dx: i32, dy: i32) {
         self.overlay_hits = self.overlays_in_view();
+        self.place_card_field();
         let dpi = self.dpi;
         let focused = {
             let focus = GetFocus();
@@ -5163,8 +5420,8 @@ impl App {
             let lit = self.overlay_hover == Some(key);
             if let OverlayKey::Card(slot, part) = key {
                 if let Some(part) = self.card_slots.get(slot).and_then(|room| room.parts.get(part)) {
-                    // (the card's field is the composer: its frame is lit while the composer has the focus and the question waits for what is written in it)
-                    let composer = part.kind == ButtonKind::Frame && self.question.is_some() && GetFocus() == self.composer;
+                    // (its frame is lit while the card's field or the composer has the focus and the question waits for what is written there)
+                    let composer = part.kind == ButtonKind::Frame && self.question.is_some() && [self.composer, self.card_field].contains(&GetFocus());
                     paint_button(device, area, part.kind, &part.text, theme::code_back(), lit || composer, pressed, ring && focused == Some(key));
                 }
                 continue;
@@ -5660,7 +5917,7 @@ impl App {
         if !same_size {
             self.layout();
         }
-        show(self.composer_cue, self.panel == Panel::Chat && text.is_empty());
+        show(self.composer_cue, self.conversation_shown() && text.is_empty());
     }
 
     /// The offered word in place of what was being typed.
@@ -5892,8 +6149,10 @@ impl App {
                 if argument.eq_ignore_ascii_case("import") {
                     let said = self.mcp_servers_imported();
                     self.say(&said);
+                } else if let Some(why) = self.mcp.unreadable() {
+                    self.say(&tf("The list of servers could not be read, and none was started: {0}", &[&why]));
                 } else {
-                    let lines = self.mcp.status();
+                    let lines: Vec<String> = self.mcp.states().iter().map(|(name, state)| format!("{name}: {}", mcp_state_words(Some(state)))).collect();
                     self.say(&if lines.is_empty() { tf("No server yet. {0} lists them, and /mcp import copies Claude's and Codex's in.", &[&file.display()]) } else { lines.join("\n") });
                 }
             }
@@ -5922,7 +6181,14 @@ impl App {
                 self.on_menu(M_SAFE);
                 self.say(if self.settings.safe_commands { t("Safe commands run without asking.") } else { t("Every command asks.") });
             }
-            "workspace" => self.folder_menu(),
+            // (beside the button under the dog where a session not begun shows it, otherwise the chip under the composer)
+            "workspace" => {
+                if IsWindowVisible(self.start_folder) != 0 {
+                    self.open_picker();
+                } else {
+                    self.folder_menu(self.folder_chip);
+                }
+            }
             "providers" => self.set_panel(Panel::Providers),
             "models" => self.set_panel(Panel::Models),
             "settings" => self.set_panel(Panel::General),
@@ -5995,6 +6261,7 @@ impl App {
         let s = |value: i32| scale(dpi, value);
         let mut shapes = Vec::new();
         let chat = self.panel == Panel::Chat;
+        let conversation = self.conversation_shown();
 
         // The sidebar.
         let bare = self.onboarding;
@@ -6034,15 +6301,13 @@ impl App {
         } else if (self.preview_file.is_some() || self.steps.is_some()) && room >= s(760) {
             (room / 2).max(s(380))
         } else if self.preview_file.is_none() && (self.settings.right_panel || self.steps.is_some()) && room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS) {
-            // (a terminal wants columns: nearly half of what the sidebar leaves, as far as the conversation can spare it)
-            let wanted = if matches!(self.settings.right_view, RightView::Terminal | RightView::Timeline) { (room * 45 / 100).clamp(s(ds::size::RIGHT_PANEL), s(TERMINAL_PANEL_MOST)) } else { s(ds::size::RIGHT_PANEL) };
-            wanted.min(room - s(RIGHT_NEEDS))
+            s(ds::size::RIGHT_PANEL)
         } else {
             0
         };
         self.right_width = right;
         self.right_hits.clear();
-        self.right_tab_hits.clear();
+        self.tab_hits.clear();
         self.preview_hits.clear();
         self.waiting_hits.clear();
         self.waiting_times.clear();
@@ -6075,7 +6340,11 @@ impl App {
         // (no switch for what could not show)
         let toggles = chat && !bare && (self.preview_file.is_some() || self.steps.is_some() || room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS));
         show(self.right_toggle, toggles);
-        show(self.folder_chip, chat && !bare);
+        show(self.folder_chip, conversation && !bare);
+        if !conversation {
+            show(self.start_folder, false);
+            self.close_picker();
+        }
 
         // The column the content keeps to, however wide the window.
         let main_left = sidebar;
@@ -6083,18 +6352,56 @@ impl App {
         let column = main_width.min(if bare { s(ds::size::COLUMN_FIRST_RUN) } else { s(ds::size::COLUMN) }) - s(48);
         let left = main_left + (main_width - column) / 2;
 
+        let strip = s(ds::size::TITLE_STRIP);
+        let mut content_top = strip;
+        if chat {
+            // The session's name, as it scrolls under nothing: at a glance, which one this is.
+            let toggle = s(ds::size::ICON_BUTTON);
+            // (at the right end of the conversation's own area, beside the panel it opens, not at the end of the column the words keep to)
+            let toggle_x = main_left + main_width - toggle - s(ds::space::M);
+            place(self.right_toggle, toggle_x, (strip - toggle) / 2, toggle, toggle);
+            // (an empty session has no name to tell it by, and the dog says what it is)
+            let (name, color) = if !self.session_title.is_empty() { (self.session_title.clone(), theme::text()) } else if self.has_messages { (t("New session").to_string(), theme::faint()) } else { (String::new(), theme::faint()) };
+            let title_room = if toggles { column.min(toggle_x - s(ds::space::S) - left) } else { column };
+            self.title_area = rect(left, 0, title_room, strip);
+            shapes.push(Shape::Text { area: self.title_area, text: name, font: FontKind::Strong, color, flags: ONE_LINE });
+            if !bare {
+                let tabs = [
+                    (t("Conversation"), PanelTab::Center(CenterView::Conversation)),
+                    (t("Terminal"), PanelTab::Center(CenterView::Terminal)),
+                    (t("Timeline"), PanelTab::Center(CenterView::Timeline)),
+                ];
+                self.layout_tabs(&mut shapes, left, column, strip, FontKind::Small, &tabs);
+                content_top += s(ds::size::NAV_ROW);
+                shapes.push(Shape::Fill { area: rect(main_left, content_top - s(ds::space::PIXEL), main_width, s(ds::space::PIXEL)), color: theme::line() });
+            }
+        }
+        if !conversation {
+            self.queue_hits.clear();
+            self.rail_hits.clear();
+            self.vision_offer_close = None;
+            self.activity_area = rect(0, 0, 0, 0);
+            self.status_area = rect(0, 0, 0, 0);
+        }
+        let margin = s(ds::size::RIGHT_GAP);
+        if self.terminal_shown() {
+            self.layout_terminal_view(&mut shapes, main_left + margin, main_width - 2 * margin, content_top, height);
+        } else if self.timeline_shown() {
+            self.layout_timeline_view(&mut shapes, main_left + margin, main_width - 2 * margin, content_top, height);
+        }
+
         for window in [self.composer, self.send, self.attach_button, self.model_chip, self.mode_chip, self.effort_chip] {
-            show(window, chat);
+            show(window, conversation);
         }
         // The notice of a newer version, on the pages that have it; what is not there is hidden, once, and not hidden and shown again by every layout.
-        let notice = if notice::is_on_page(chat, looking_at_changes, bare) { self.notice() } else { None };
+        let notice = if notice::is_on_page(conversation, looking_at_changes, bare) { self.notice() } else { None };
         if notice.is_none() {
             for window in [self.update_offer_button, self.release_offer_button, self.notice_later] {
                 show(window, false);
             }
         }
         let notice_room = if notice.is_some() { self.notice_height() + s(ds::space::S) } else { 0 };
-        if !chat {
+        if !conversation {
             for window in &self.attached_windows {
                 show(*window, false);
             }
@@ -6102,20 +6409,23 @@ impl App {
             show(self.goal_clear, false);
         }
         show(self.help_button, !bare && !squeezed);
-        show(self.suggest, chat && !self.suggestions.is_empty());
-        if !chat {
+        show(self.suggest, conversation && !self.suggestions.is_empty());
+        if !conversation {
             show(self.composer_cue, false);
         }
-        let band = chat && self.pending.is_some();
+        let band = conversation && self.pending.is_some();
         for window in [self.note, self.approve, self.always, self.reject, self.feedback] {
             show(window, band);
         }
-        show(self.transcript, chat && self.has_messages);
-        let finding = chat && self.has_messages && self.find_open;
+        show(self.transcript, conversation && self.has_messages);
+        if !(conversation && self.has_messages) {
+            self.hide_card_field();
+        }
+        let finding = conversation && self.has_messages && self.find_open;
         for window in [self.find_field, self.find_previous, self.find_next, self.find_close] {
             show(window, finding);
         }
-        if chat {
+        if conversation {
             let status_height = s(ds::size::STATUS);
             let inner = s(ds::size::COMPOSER_INSET);
             // Two lines' room to begin with; it grows with what is typed, up to about half the window, and then scrolls.
@@ -6140,22 +6450,56 @@ impl App {
             let (bubble_height, dog_gap, mark_width) = (s(72), s(3), s(150));
             let mark_height = title_height(mark_width);
             let dog_bottom = dog * 91 / 100;
-            let greeting_height = bubble_height + dog_gap + dog_bottom + mark_height + s(ds::space::XL);
+            // Under the name, the workspace the session will work in and the button that switches it: the chip under the composer says the
+            // same, but a session not begun yet is where the folder is chosen, and the eye is on the dog there.
+            let folder_row = s(ds::space::L) + s(START_NAME_ROW) + s(ds::size::CONTROL) + s(ds::space::XS);
+            let greeting_height = bubble_height + dog_gap + dog_bottom + mark_height + folder_row + s(ds::space::XL);
+            let mut greeting_folder = false;
             let card_top = foot;
             let status_top = card_top + card_height + s(ds::space::XS);
             let above = card_top - waiting_height;
-            if !self.has_messages && above - greeting_height >= s(40) + notice_room {
-                let title = GREETINGS[self.greeting];
-                let bubble_top = s(40) + notice_room + (above - s(40) - notice_room - greeting_height) / 2;
-                let bubble_width = (text_width(self.fonts.greeting, title) + s(60)).min(column);
-                let area = rect(left + (column - bubble_width) / 2, bubble_top, bubble_width, bubble_height);
+            // (where all of it does not fit, the dog's words give way first: the workspace's card under its name is what a new session is for)
+            let room = above - content_top - notice_room;
+            let unsaid = greeting_height - bubble_height - dog_gap;
+            if !self.has_messages && room >= unsaid {
+                let said = room >= greeting_height;
+                let shown = if said { greeting_height } else { unsaid };
+                let top = content_top + notice_room + (room - shown) / 2;
                 // The drawing fills its square's width, and is about 0.82 of it high, centred. Its line is about 5% of its width.
-                let (dog_x, dog_top) = (left + (column - dog) / 2, bubble_top + bubble_height + dog_gap);
-                let tip = (dog_x + dog * 11 / 100 - s(ds::space::XL), bubble_top + bubble_height + s(13));
-                shapes.push(Shape::Bubble { area, radius: s(26), tip, fill: theme::background(), line: theme::text(), thickness: dog as f32 * 0.05 });
-                shapes.push(Shape::Text { area, text: title.into(), font: FontKind::Greeting, color: theme::text(), flags: DT_CENTER | ONE_LINE });
+                let (dog_x, dog_top) = (left + (column - dog) / 2, if said { top + bubble_height + dog_gap } else { top });
+                if said {
+                    let title = GREETINGS[self.greeting];
+                    let bubble_width = (text_width(self.fonts.greeting, title) + s(60)).min(column);
+                    let area = rect(left + (column - bubble_width) / 2, top, bubble_width, bubble_height);
+                    let tip = (dog_x + dog * 11 / 100 - s(ds::space::XL), top + bubble_height + s(13));
+                    shapes.push(Shape::Bubble { area, radius: s(26), tip, fill: theme::background(), line: theme::text(), thickness: dog as f32 * 0.05 });
+                    shapes.push(Shape::Text { area, text: title.into(), font: FontKind::Greeting, color: theme::text(), flags: DT_CENTER | ONE_LINE });
+                }
                 shapes.push(Shape::Logo { x: dog_x, y: dog_top, size: dog });
                 shapes.push(Shape::TitleMark { x: left + (column - mark_width) / 2, y: dog_top + dog_bottom, width: mark_width });
+                if !bare {
+                    // A card: the folder and a check, and under them the choice that opens the
+                    // picker over what lies below (`place_picker`).
+                    let across = s(420).min(column);
+                    let x = left + (column - across) / 2;
+                    let top = dog_top + dog_bottom + mark_height + s(ds::space::L);
+                    let (named, inset, choice) = (s(START_NAME_ROW), s(ds::space::XS), s(ds::size::CONTROL));
+                    let card = rect(x, top, across, named + choice + inset);
+                    shapes.push(Shape::Round { area: card, radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
+                    let name = self.workspace.file_name().map_or_else(|| self.workspace.display().to_string(), |name| name.to_string_lossy().into_owned());
+                    let icon = s(ds::size::ICON);
+                    shapes.push(Shape::Icon { name: "folder", area: rect(x + s(ds::space::M), top, icon, named), size: icon, color: theme::text() });
+                    shapes.push(Shape::Text { area: rect(x + s(ds::space::M) + icon + s(ds::space::S), top, across - 2 * s(ds::space::M) - 2 * icon - 2 * s(ds::space::S), named), text: name, font: FontKind::Body, color: theme::text(), flags: ONE_LINE });
+                    shapes.push(Shape::Icon { name: "check", area: rect(x + across - s(ds::space::M) - icon, top, icon, named), size: icon, color: theme::text() });
+                    set_text_if_changed(self.start_folder, t("Choose a workspace"));
+                    place(self.start_folder, x + inset, top + named, across - 2 * inset, choice);
+                    self.picker_at = Some((x, top, card.bottom, across, height));
+                    greeting_folder = true;
+                }
+            }
+            show(self.start_folder, greeting_folder);
+            if !greeting_folder {
+                self.close_picker();
             }
             shapes.push(Shape::Round { area: rect(left, card_top, column, card_height), radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
             if strip > 0 {
@@ -6196,21 +6540,6 @@ impl App {
                 shapes.push(Shape::Round { area: rect(left, top, column, list_height + s(ds::space::M)), radius: s(ds::radius::CARD), fill: Some(theme::surface()), border: Some(theme::line()) });
                 place(self.suggest, left + s(6), top + s(6), column - s(ds::space::M), list_height);
                 SetWindowPos(self.suggest, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            }
-            // The session's name, as it scrolls under nothing: at a glance, which one this is.
-            let strip = s(ds::size::TITLE_STRIP);
-            let toggle = s(ds::size::ICON_BUTTON);
-            // (at the right end of the conversation's own area, beside the panel it opens, not at the end of the column the words keep to)
-            let toggle_x = main_left + main_width - toggle - s(ds::space::M);
-            place(self.right_toggle, toggle_x, (strip - toggle) / 2, toggle, toggle);
-            // (an empty session has no name to tell it by, and the dog says what it is)
-            let (name, color) = if !self.session_title.is_empty() { (self.session_title.clone(), theme::text()) } else if self.has_messages { (t("New session").to_string(), theme::faint()) } else { (String::new(), theme::faint()) };
-            let title_room = if toggles { column.min(toggle_x - s(ds::space::S) - left) } else { column };
-            self.title_area = rect(left, 0, title_room, strip);
-            shapes.push(Shape::Text { area: self.title_area, text: name, font: FontKind::Body, color, flags: ONE_LINE });
-            // (what scrolls goes under an edge, and not into the name)
-            if self.has_messages {
-                shapes.push(Shape::Fill { area: rect(main_left, strip - s(ds::space::PIXEL), main_width, s(ds::space::PIXEL)), color: theme::line() });
             }
             let name = self.workspace.file_name().map_or_else(|| self.workspace.display().to_string(), |name| name.to_string_lossy().into_owned());
             let chip_width = (text_width(self.fonts.small, &name) + s(66)).clamp(s(90), s(280));
@@ -6353,7 +6682,7 @@ impl App {
                     SetTimer(self.window, TIMER_REFLOW, 150, None);
                 }
             }
-            let mut top = strip;
+            let mut top = content_top;
             // The session's goal, as a thin bar under its name, with a cross that clears it.
             show(self.goal_clear, cards::goal_bar(self.goal.as_deref()).is_some());
             if let Some(goal) = cards::goal_bar(self.goal.as_deref()) {
@@ -6657,9 +6986,13 @@ impl App {
         show(self.doc, false);
         // A row kept lit is one that is still there.
         if let Some(row) = self.hover_row {
-            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.right_tab_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).chain(self.waiting_hits.iter().map(|(area, _)| area)).any(|area| same_rect(area, &row)) {
+            if !self.preview_hits.iter().map(|(area, _)| area).chain(self.right_hits.iter().map(|(area, _)| area)).chain(self.tab_hits.iter().map(|(area, _)| area)).chain(self.queue_hits.iter().map(|(area, _, _)| area)).chain(self.waiting_hits.iter().map(|(area, _)| area)).any(|area| same_rect(area, &row)) {
                 self.hover_row = None;
             }
+        }
+        // (last, over the composer's controls the layout raised)
+        if let Some((x, card_top, card_bottom, width, bottom)) = self.picker_at.take().filter(|_| self.picker_open) {
+            self.place_picker(x, card_top, card_bottom, width, bottom);
         }
         self.shapes = shapes;
         InvalidateRect(self.window, std::ptr::null(), 0);
@@ -6683,6 +7016,8 @@ impl App {
         all.extend(self.theme_segments);
         all.extend(self.size_segments);
         all.extend(self.mcp_trust.iter().copied());
+        all.extend(self.mcp_edit.iter().copied());
+        all.extend([self.mcp_add, self.mcp_save, self.mcp_remove, self.mcp_cancel, self.mcp_vars]);
         all.extend(self.skill_toggles.iter().copied());
         all.extend(self.memory_remove.iter().copied());
         all.push(self.vision_delete);
@@ -6736,11 +7071,17 @@ impl App {
     /// What a dialog's window draws.
     unsafe fn paint_modal(&self, window: HWND, device: HDC, client: RECT) {
         if window == self.pane {
-            let brush = CreateSolidBrush(theme::background());
-            FillRect(device, &client, brush);
-            DeleteObject(brush);
-            for shape in &self.pane_shapes {
+            FillRect(device, &client, self.brushes[0]);
+            let scroll = if self.panel == Panel::Skills { self.panel_scroll } else { 0 };
+            let view = RECT { top: scroll, bottom: client.bottom + scroll, ..client };
+            OffsetViewportOrgEx(device, 0, -scroll, std::ptr::null_mut());
+            for shape in self.pane_shapes.iter().filter(|shape| overlaps(&shape.bounds(), &view)) {
                 self.draw_shape(device, shape);
+            }
+            OffsetViewportOrgEx(device, 0, scroll, std::ptr::null_mut());
+            if let Some((thumb, _, _)) = self.pane_thumb {
+                let color = if self.pane_thumb_grab.is_some() { theme::muted() } else { theme::line() };
+                rounded(device, thumb, scale(self.dpi, ds::size::THUMB) / 2, Some(color), None);
             }
             return;
         }
@@ -6803,9 +7144,10 @@ impl App {
             self.settings_cues();
         }
         let view = (wanted_height - head - foot).max(0);
-        let mut form = Form::new(content, -self.panel_scroll, self.fonts, dpi);
+        let top = if self.panel == Panel::Skills { 0 } else { -self.panel_scroll };
+        let mut form = Form::new(content, top, self.fonts, dpi);
         self.build_page(&mut form, view);
-        let extent = form.y + self.panel_scroll + s(ds::space::XS);
+        let extent = form.y - top + s(ds::space::XS);
         let card_height = if wanted_height > 0 { wanted_height } else { (extent + head + foot).min(height - 2 * margin) };
         let view = (card_height - head - foot).max(0);
         // Scrolled past what there now is.
@@ -6852,6 +7194,10 @@ impl App {
         }
         // (it reaches to the dialog's edge, for the thumb to stand there)
         place(self.pane, card.left + pane_x, card.top + head, card_width - pane_x - s(ds::space::HAIR), view);
+        self.skill_toggle_areas = form.end_toggles;
+        for &(window, area) in &self.skill_toggle_areas {
+            place(window, area.left, area.top - self.panel_scroll, area.right - area.left, area.bottom - area.top);
+        }
         for control in self.pane_controls() {
             show(control, form.used.contains(&control));
         }
@@ -6860,8 +7206,6 @@ impl App {
             let tall = thumb_height(view, view, extent, s(ds::space::XXL));
             let at = thumb_offset(view - tall, self.panel_scroll, most);
             let thumb = rect(card_width - pane_x - s(11), at, s(ds::size::THUMB), tall);
-            let held = self.pane_thumb_grab.is_some();
-            form.shapes.push(Shape::Round { area: thumb, radius: s(ds::size::THUMB) / 2, fill: Some(if held { theme::muted() } else { theme::line() }), border: None });
             self.pane_thumb = Some((thumb, view, most));
         }
         self.pane_shapes = form.shapes;
@@ -6894,7 +7238,11 @@ impl App {
                 }
             }
             Panel::Models => {}
-            Panel::Tools => field_cue(self.fields[KEY_FIELD], t("Optional. Kept in Credential Manager")),
+            Panel::Tools => {
+                field_cue(self.fields[KEY_FIELD], t("Optional. Kept in Credential Manager"));
+                field_cue(self.fields[1], t("A program, or the URL of a server"));
+                field_cue(self.fields[2], t("Separated by spaces"));
+            }
             _ => {}
         }
     }
@@ -7106,23 +7454,43 @@ impl App {
                 let setting = self.settings.search_key.clone();
                 self.key_rows(form, &setting, t("Brave Search key"));
                 form.section(t("MCP servers"));
-                let lines = self.mcp.status();
-                let servers = self.mcp.trust();
+                if let Some(why) = self.mcp.unreadable() {
+                    form.note(&tf("The list of servers could not be read, and none was started: {0}", &[&why]), theme::bad());
+                }
+                let (states, configs, servers) = (self.mcp.states(), self.mcp.configs(), self.mcp.trust());
                 for (at, (name, _)) in servers.iter().enumerate() {
-                    let Some(toggle) = self.mcp_trust.get(at) else { break };
-                    let line = lines.get(at).map_or(name.as_str(), String::as_str);
-                    // (why one did not start needs the room of the page)
-                    let failed = line.strip_prefix(&format!("{name}: did not start: "));
+                    let (Some(toggle), Some(edit)) = (self.mcp_trust.get(at), self.mcp_edit.get(at)) else { break };
                     form.toggle_beside(name, *toggle, t("Trust what it returns"));
-                    if let Some(why) = failed {
-                        form.note(why, theme::muted());
-                    }
+                    let runs = configs.iter().find(|(known, _)| known == name).map_or(String::new(), |(_, config)| mcp_runs(config));
+                    // (why one did not start needs the room of the page)
+                    let state = mcp_state_words(states.iter().find(|(known, _)| known == name).map(|(_, state)| state));
+                    form.note_with_button(&format!("{runs}\n{state}"), *edit);
                 }
                 if !servers.is_empty() {
                     // (it takes a safeguard away: this much is said where it is done)
                     form.note(t("What a trusted server returns no longer makes later commands ask. Its own tools still ask."), theme::muted());
                 }
-                form.buttons(0, &[self.mcp_import]);
+                match &self.mcp_form {
+                    None => form.buttons(0, &[self.mcp_add, self.mcp_import]),
+                    Some(editing) => {
+                        form.section(&editing.as_ref().map_or_else(|| t("Add a server").to_string(), |name| tf("Change {0}", &[name])));
+                        form.field(t("Name"), self.fields[0]);
+                        form.field(t("Command or URL"), self.fields[1]);
+                        if self.mcp_form_url {
+                            form.area(t("Headers"), self.mcp_vars, 3);
+                            form.note(t("A line each, as Name: value. An Authorization header goes here."), theme::muted());
+                        } else {
+                            form.field(t("Arguments"), self.fields[2]);
+                            form.area(t("Environment variables"), self.mcp_vars, 3);
+                            form.note(t("A line each, as NAME=value."), theme::muted());
+                        }
+                        if editing.is_some() {
+                            form.buttons(0, &[self.mcp_save, self.mcp_remove, self.mcp_cancel]);
+                        } else {
+                            form.buttons(0, &[self.mcp_save, self.mcp_cancel]);
+                        }
+                    }
+                }
                 form.note(&log, log_color);
             }
             Panel::Memory => {
@@ -7383,14 +7751,15 @@ impl App {
                     false
                 }
             },
-            Panel::Tools => self.keep_search_key(),
+            Panel::Tools => self.keep_search_key() && self.mcp_keep_form(),
             Panel::Instructions => {
                 let text = get_text(self.doc).replace("\r\n", "\n").replace('\r', "\n");
                 let known = std::fs::read_to_string(self.folder.join("instructions.md")).unwrap_or_default();
                 if text.trim_end() == known.trim_end() {
                     return true;
                 }
-                match std::fs::write(self.folder.join("instructions.md"), text) {
+                // (whole or not at all: written over in place, a power cut leaves the person's instructions as zeros)
+                match settings::write_whole(&self.folder.join("instructions.md"), text.as_bytes()) {
                     Ok(()) => true,
                     Err(error) => {
                         self.problem_in_panel(&error.to_string());
@@ -7697,7 +8066,9 @@ impl App {
         let waits = self.waiting.waits.clone();
         for (at, wait) in waits.iter().enumerate().take(WAITING_LISTED) {
             shapes.push(Shape::Icon { name: "clock", area: rect(x, y, s(ds::space::L), row), size: s(ds::size::ICON_SMALL), color: theme::muted() });
-            shapes.push(Shape::Text { area: rect(x + indent, y, width - indent - stop_wide - time_wide, row), text: wait.note.clone(), font: FontKind::Small, color: theme::text(), flags: ONE_LINE });
+            // (the session's own wait for the server is said in the person's language; a wait the model set says its note as it was written)
+            let note = if wait.note == dogmind_agent::background::SERVER_WAIT_NOTE { lang::notice(&wait.note) } else { wait.note.clone() };
+            shapes.push(Shape::Text { area: rect(x + indent, y, width - indent - stop_wide - time_wide, row), text: note, font: FontKind::Small, color: theme::text(), flags: ONE_LINE });
             self.waiting_times.push((rect(x + width - stop_wide - time_wide, y, time_wide, row), WaitRow::Wait(at)));
             stop_at(self, shapes, y, &wait.id);
             y += row;
@@ -7750,6 +8121,46 @@ impl App {
         self.layout();
     }
 
+    unsafe fn layout_tabs(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32, font: FontKind, views: &[(&str, PanelTab)]) {
+        let dpi = self.dpi;
+        let s = |value: i32| scale(dpi, value);
+        let words_top = top + s(ds::space::XS);
+        let mut across_to = x;
+        let face = self.font(font);
+        let widths: Vec<i32> = views.iter().map(|(words, _)| text_width(face, words)).collect();
+        let gap = ((width - widths.iter().sum::<i32>()) / (views.len() as i32 - 1)).clamp(s(ds::space::S), s(ds::space::XL));
+        for ((words, view), across) in views.iter().copied().zip(widths) {
+            let on = match view {
+                PanelTab::Center(view) => self.settings.center_view == view,
+                PanelTab::Right(view) => self.settings.right_view == view,
+            };
+            shapes.push(Shape::Text { area: rect(across_to, words_top, across, s(ds::space::XL)), text: words.to_string(), font, color: if on { theme::text() } else { theme::muted() }, flags: ONE_LINE });
+            if on {
+                shapes.push(Shape::Fill { area: rect(across_to, words_top + s(ds::space::XL) + s(ds::space::HAIR), across, s(ds::space::HAIR)), color: theme::accent() });
+            }
+            self.tab_hits.push((rect(across_to - gap / 2, top, across + gap, s(ds::size::NAV_ROW)), view));
+            across_to += across + gap;
+        }
+    }
+
+    fn conversation_shown(&self) -> bool {
+        self.panel == Panel::Chat && (self.onboarding || self.settings.center_view == CenterView::Conversation)
+    }
+
+    unsafe fn set_center_view(&mut self, view: CenterView) {
+        if self.settings.center_view == view {
+            return;
+        }
+        self.settings.center_view = view;
+        self.save();
+        self.layout();
+        if self.timeline_shown() {
+            SetFocus(self.timeline.window);
+        } else if self.conversation_shown() {
+            self.focus_composer();
+        }
+    }
+
     unsafe fn layout_right(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, height: i32) {
         if self.preview_file.is_some() {
             self.layout_preview(shapes, x, width, height);
@@ -7762,22 +8173,9 @@ impl App {
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let row = s(ds::size::TEXT_ROW);
-        // The views of the panel, as words over it (level with the session's name): the one shown is underlined.
-        let words_top = (s(ds::size::TITLE_STRIP) - s(ds::space::XL)) / 2;
-        let mut across_to = x;
-        let views = [(t("Overview"), RightView::Overview), (t("Files"), RightView::Files), (t("Terminal"), RightView::Terminal), (t("Timeline"), RightView::Timeline)];
-        let widths: Vec<i32> = views.iter().map(|(words, _)| text_width(self.fonts.strong, words)).collect();
-        // (four words in a panel as narrow as this one: the room between them gives way before the words do)
-        let gap = ((width - widths.iter().sum::<i32>()) / (views.len() as i32 - 1)).clamp(s(ds::space::S), s(ds::space::XL));
-        for ((words, view), across) in views.into_iter().zip(widths) {
-            let on = self.settings.right_view == view;
-            shapes.push(Shape::Text { area: rect(across_to, words_top, across, s(ds::space::XL)), text: words.to_string(), font: FontKind::Strong, color: if on { theme::text() } else { theme::muted() }, flags: ONE_LINE });
-            if on {
-                shapes.push(Shape::Fill { area: rect(across_to, words_top + s(ds::space::XL) + s(ds::space::HAIR), across, s(ds::space::HAIR)), color: theme::accent() });
-            }
-            self.right_tab_hits.push((rect(across_to - gap / 2, words_top - s(ds::space::XS), across + gap, s(ds::space::XL) + s(ds::space::M)), view));
-            across_to += across + gap;
-        }
+        let tabs_top = (s(ds::size::TITLE_STRIP) - s(ds::size::NAV_ROW)) / 2;
+        let tabs = [(t("Overview"), PanelTab::Right(RightView::Overview)), (t("Files"), PanelTab::Right(RightView::Files))];
+        self.layout_tabs(shapes, x, width, tabs_top, FontKind::Strong, &tabs);
         // (what is under them begins past the strip the session's name has)
         let mut y = s(ds::size::TITLE_STRIP) + s(ds::space::S);
         let heading = |shapes: &mut Vec<Shape>, y: &mut i32, text: String| {
@@ -7789,18 +8187,6 @@ impl App {
             *y += s(ds::space::XL);
         };
 
-        // The terminal has the panel to the foot of the window: no engine line under it.
-        if self.settings.right_view == RightView::Terminal {
-            self.dashboard_hit = None;
-            self.layout_terminal_view(shapes, x, width, s(ds::size::TITLE_STRIP), height);
-            return;
-        }
-        // The timeline has the panel to the foot of the window too: the path is long.
-        if self.settings.right_view == RightView::Timeline {
-            self.dashboard_hit = None;
-            self.layout_timeline_view(shapes, x, width, s(ds::size::TITLE_STRIP), height);
-            return;
-        }
         // The engine, at the foot: what it is and the way to its dashboard.
         self.dashboard_hit = None;
         let foot = height - s(ds::space::L);
@@ -7996,7 +8382,7 @@ impl App {
                 }
             }
         }
-        if self.panel == Panel::Chat {
+        if self.conversation_shown() {
             if !self.activity.is_empty() && !self.waits_for_person() {
                 let area = self.activity_area;
                 let elapsed = self.activity_since.map_or(0.0, |since| since.elapsed().as_secs_f32());
@@ -8005,6 +8391,11 @@ impl App {
                 if overlaps(&words, &dirty) && !self.activity.trim().is_empty() {
                     let text = if elapsed >= 3.0 { format!("{}   {}", self.activity, tf("{0} s", &[&(elapsed as u32)])) } else { self.activity.clone() };
                     draw_text(device, &text, words, self.fonts.body, theme::text(), ONE_LINE);
+                    // (how far the thinking has come, small, as nothing else says it where it is not shown)
+                    if self.thinking_tokens > 0 && self.activity == t("Thinking…") {
+                        let after = RECT { left: words.left + text_width(self.fonts.body, &text) + s(ds::space::M), ..words };
+                        draw_text(device, &tf("{0} tokens", &[&cards::token_count_words(self.thinking_tokens)]), after, self.fonts.small, theme::faint(), ONE_LINE);
+                    }
                 }
             }
             if self.rail.is_some_and(|rail| overlaps(&rail, &dirty)) {
@@ -8418,6 +8809,7 @@ impl App {
         EnableWindow(self.buttons[1], 1);
         self.panel_log.clear();
         self.panel_problem = false;
+        self.stop_skill_scroll();
         self.panel_scroll = 0;
         self.machine_line.clear();
         self.refusal = None;
@@ -8546,15 +8938,15 @@ impl App {
                 set_text(self.key_replace, t("Replace"));
                 set_text(self.key_remove, t("Remove"));
                 set_text(self.mcp_import, t("Import from Claude and Codex"));
-                let servers = self.mcp.trust().len();
-                while self.mcp_trust.len() < servers {
-                    let id = ID_MCP_TRUST + self.mcp_trust.len() as isize;
-                    self.mcp_trust.push(make_button(self.pane, id, "", ButtonKind::Toggle, theme::background()));
+                set_text(self.mcp_add, t("Add a server"));
+                set_text(self.mcp_save, t("Save"));
+                set_text(self.mcp_remove, t("Remove"));
+                set_text(self.mcp_cancel, t("Cancel"));
+                self.mcp_form = None;
+                self.mcp_controls();
+                if self.mcp.states().iter().any(|(_, state)| *state == dogmind_agent::mcp::State::Starting) {
+                    SetTimer(self.window, TIMER_MCP, 500, None);
                 }
-                for toggle in &self.mcp_trust {
-                    self.tip(*toggle, t("What this server returns no longer counts as web content, so later commands stop asking on its account. Its tools still ask, and in a session that already has web content they keep asking. What it returns is still marked as data."));
-                }
-                self.update_toggles();
             }
             Panel::ConfirmRemove => {
                 self.panel_title = t("Remove this app from this PC?").into();
@@ -9630,8 +10022,9 @@ impl App {
         }
     }
 
-    /// Where this session works, as a list: the folders used before and a way to any other. Beside the chip, on the side with room.
-    unsafe fn folder_menu(&mut self) {
+    /// Where this session works, as a list: the folders used before and a way to any other. Beside `anchor` (the chip under the composer, or
+    /// the button under the dog), on the side with room.
+    unsafe fn folder_menu(&mut self, anchor: HWND) {
         let mut items: Vec<(usize, String, bool)> = Vec::new();
         for (at, folder) in self.settings.workspaces.iter().filter(|folder| folder.is_dir()).take(FOLDERS_SHOWN).enumerate() {
             let name = folder.file_name().map_or_else(|| folder.display().to_string(), |name| name.to_string_lossy().into_owned());
@@ -9642,12 +10035,121 @@ impl App {
         }
         items.push((M_FOLDER_CHOOSE, t("Choose a folder...").to_string(), false));
         if self.has_messages {
-            self.popup(self.folder_chip, &items);
+            self.popup(anchor, &items);
         } else {
             let mut area: RECT = std::mem::zeroed();
-            GetWindowRect(self.folder_chip, &mut area);
+            GetWindowRect(anchor, &mut area);
             self.popup_at(area.left, area.bottom + 2, TPM_TOPALIGN, &items);
         }
+    }
+
+    /// The workspace picker opens under its card, its search field empty and with the keys, the first folder chosen for Enter.
+    unsafe fn open_picker(&mut self) {
+        self.picker_open = true;
+        set_text(self.picker_search, "");
+        self.fill_picker();
+        self.layout();
+        SetFocus(self.picker_search);
+    }
+
+    /// The workspace picker goes, and the keys it had go back to the composer.
+    unsafe fn close_picker(&mut self) {
+        if !self.picker_open {
+            return;
+        }
+        self.picker_open = false;
+        let had_the_keys = [self.picker_search, self.picker_list].contains(&GetFocus());
+        show(self.picker, false);
+        if had_the_keys {
+            SetFocus(self.composer);
+        }
+    }
+
+    /// The keys went somewhere else than the picker's field or list: it goes.
+    unsafe fn picker_focus_left(&mut self) {
+        let now = GetFocus();
+        if now != self.picker_search && now != self.picker_list {
+            self.close_picker();
+        }
+    }
+
+    /// The picker's rows for what its search field says: the folders worked in before that are still there.
+    unsafe fn fill_picker(&mut self) {
+        let folders: Vec<PathBuf> = self.settings.workspaces.iter().filter(|folder| folder.is_dir()).take(PICKER_MOST).cloned().collect();
+        self.picker_rows = picker_rows(&folders, &get_text(self.picker_search));
+        self.picker_selected = self.picker_rows.iter().position(PickerRow::chosen_by_hand);
+        self.picker_hover = None;
+        SendMessageW(self.picker_list, WM_SETREDRAW, 0, 0);
+        SendMessageW(self.picker_list, LB_RESETCONTENT, 0, 0);
+        for _ in &self.picker_rows {
+            SendMessageW(self.picker_list, LB_ADDSTRING, 0, 0);
+        }
+        SendMessageW(self.picker_list, WM_SETREDRAW, 1, 0);
+        InvalidateRect(self.picker_list, std::ptr::null(), 1);
+        if self.picker_open {
+            self.layout();
+        }
+    }
+
+    /// The keys' row moves `step` rows that can be chosen, and stays in sight.
+    unsafe fn move_picker(&mut self, step: isize) {
+        let rows: Vec<usize> = self.picker_rows.iter().enumerate().filter(|(_, row)| row.chosen_by_hand()).map(|(at, _)| at).collect();
+        if rows.is_empty() {
+            return;
+        }
+        let now = self.picker_selected.and_then(|at| rows.iter().position(|row| *row == at));
+        let next = now.map_or(0, |place| (place as isize + step).clamp(0, rows.len() as isize - 1) as usize);
+        self.picker_selected = Some(rows[next]);
+        self.picker_hover = None;
+        SendMessageW(self.picker_list, LB_SETCARETINDEX, rows[next], 0);
+        InvalidateRect(self.picker_list, std::ptr::null(), 0);
+    }
+
+    /// A row of the picker taken: a folder starts a session there (where it is not this one's already), the last row asks the system's chooser.
+    unsafe fn choose_picker_row(&mut self, at: usize) {
+        match self.picker_rows.get(at).cloned() {
+            Some(PickerRow::Folder { path, .. }) => {
+                self.close_picker();
+                self.go_to_folder(path);
+            }
+            Some(PickerRow::Choose) => {
+                self.close_picker();
+                if let Some(folder) = self.browse_folder() {
+                    self.go_to_folder(folder);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// How tall a row of the picker is: a folder has its path under its name.
+    fn picker_row_height(&self, at: usize) -> i32 {
+        let s = |value: i32| scale(self.dpi, value);
+        match self.picker_rows.get(at) {
+            Some(PickerRow::Heading(_)) => s(26),
+            Some(PickerRow::Folder { .. }) => s(46),
+            Some(PickerRow::Line) => s(ds::space::M),
+            _ => s(ds::size::MENU_ROW),
+        }
+    }
+
+    /// The picker beside its card (`card_top`, `card_bottom`), as tall as its rows, short of the window's top or foot (`bottom`), where its list
+    /// scrolls: under the card, unless its rows do not fit there and there is more room over it.
+    unsafe fn place_picker(&mut self, x: i32, card_top: i32, card_bottom: i32, width: i32, bottom: i32) {
+        let s = |value: i32| scale(self.dpi, value);
+        let (search, pad, gap) = (s(PICKER_SEARCH_ROW), s(ds::space::XS), s(ds::space::XS));
+        let rows: i32 = (0..self.picker_rows.len()).map(|at| self.picker_row_height(at)).sum();
+        let wanted = search + 1 + pad + rows + pad;
+        let (below, over) = (bottom - card_bottom - gap - s(ds::space::M), card_top - gap - s(ds::space::M));
+        let (top, height) = if wanted <= below || below >= over {
+            (card_bottom + gap, wanted.min(below).max(search + s(60)))
+        } else {
+            let height = wanted.min(over);
+            (card_top - gap - height, height)
+        };
+        SetWindowPos(self.picker, HWND_TOP, x, top, width, height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        SetWindowPos(self.picker_search, std::ptr::null_mut(), s(ds::space::L), (search - s(ds::size::FIELD_TEXT)) / 2, width - 2 * s(ds::space::L), s(ds::size::FIELD_TEXT), SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(self.picker_list, std::ptr::null_mut(), pad, search + 1 + pad, width - 2 * pad, height - search - 1 - 2 * pad, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     /// A new session in this folder. The folder it is in already stays as it is.
@@ -9659,6 +10161,7 @@ impl App {
 
     /// A new conversation, straight away, in the folder of the last one. Clicking the folder in the header chooses another.
     unsafe fn new_session(&mut self) {
+        self.settings.center_view = CenterView::Conversation;
         let on_screen = Some(self.workspace.clone()).filter(|folder| folder.is_dir());
         match on_screen.or_else(|| self.settings.workspace.clone().filter(|folder| folder.is_dir())) {
             Some(folder) => self.start_session(folder),
@@ -10903,6 +11406,7 @@ impl App {
             self.say(t("There is nothing to find in yet."));
             return;
         }
+        self.set_center_view(CenterView::Conversation);
         self.find_open = true;
         self.layout();
         SetFocus(self.find_field);
@@ -11306,13 +11810,20 @@ impl App {
                 }
             }
         }
+        let visible = IsWindowVisible(self.side) != 0;
+        if visible {
+            SendMessageW(self.side, WM_SETREDRAW, 0, 0);
+        }
         self.side_rows = rows;
         SendMessageW(self.side, LB_RESETCONTENT, 0, 0);
         for _ in &self.side_rows {
             SendMessageW(self.side, LB_ADDSTRING, 0, 0);
         }
         SendMessageW(self.side, LB_SETTOPINDEX, top.max(0) as WPARAM, 0);
-        InvalidateRect(self.side, std::ptr::null(), 1);
+        if visible {
+            SendMessageW(self.side, WM_SETREDRAW, 1, 0);
+        }
+        InvalidateRect(self.side, std::ptr::null(), 0);
     }
 
     /// A click in the sidebar: a session opens, a workspace folds, and the plus at its end starts a new session there.
@@ -11424,6 +11935,44 @@ impl App {
         let split = s(180);
         draw_text(device, &row.title, RECT { left: area.left + s(ds::space::M), right: if row.detail.is_empty() { area.right - s(ds::space::M) } else { area.left + split }, ..area }, self.fonts.body, theme::text(), ONE_LINE);
         draw_text(device, &row.detail, RECT { left: area.left + split, right: area.right - s(ds::space::M), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+    }
+
+    /// A row of the workspace picker: a heading, a folder (its name over where it is, a check on the one this session works in), the line, or
+    /// the way to any other folder; the row under the pointer, or else the keys' row, raised.
+    unsafe fn draw_picker_row(&self, item: &DRAWITEMSTRUCT) {
+        let device = item.hDC;
+        FillRect(device, &item.rcItem, self.brushes[2]);
+        let at = item.itemID as usize;
+        let Some(row) = self.picker_rows.get(at) else { return };
+        let area = item.rcItem;
+        let s = |value: i32| scale(self.dpi, value);
+        if row.chosen_by_hand() && self.picker_hover.map_or(self.picker_selected == Some(at), |hover| hover == at) {
+            rounded(device, RECT { left: area.left + s(ds::space::HAIR), right: area.right - s(ds::space::HAIR), top: area.top + s(ds::space::PIXEL), bottom: area.bottom - s(ds::space::PIXEL) }, s(ds::radius::CONTROL), Some(theme::raised()), None);
+        }
+        let inner = RECT { left: area.left + s(ds::space::M), right: area.right - s(ds::space::M), ..area };
+        match row {
+            PickerRow::Heading(words) => draw_text(device, words, RECT { top: area.top + s(ds::space::S), ..inner }, self.fonts.small, theme::muted(), ONE_LINE),
+            PickerRow::Folder { path, name } => {
+                let check = s(ds::size::ICON) + s(ds::space::S);
+                let middle = (area.top + area.bottom) / 2;
+                draw_text(device, name, RECT { right: inner.right - check, top: area.top + s(ds::space::XS), bottom: middle + s(ds::space::PIXEL), ..inner }, self.fonts.body, theme::text(), DT_SINGLELINE | DT_BOTTOM | DT_END_ELLIPSIS);
+                draw_text(device, &path.display().to_string(), RECT { right: inner.right - check, top: middle + s(ds::space::PIXEL), bottom: area.bottom - s(ds::space::XS), ..inner }, self.fonts.small, theme::muted(), DT_SINGLELINE | DT_PATH_ELLIPSIS);
+                if *path == self.workspace {
+                    icon::draw(device, "check", RECT { left: inner.right - s(ds::size::ICON), ..inner }, s(ds::size::ICON), theme::accent());
+                }
+            }
+            PickerRow::Nothing => draw_text(device, t("No workspace matches"), inner, self.fonts.body, theme::muted(), ONE_LINE),
+            PickerRow::Line => {
+                let line = CreateSolidBrush(theme::line());
+                let middle = (area.top + area.bottom) / 2;
+                FillRect(device, &RECT { left: area.left + s(ds::space::S), right: area.right - s(ds::space::S), top: middle, bottom: middle + 1 }, line);
+                DeleteObject(line);
+            }
+            PickerRow::Choose => {
+                icon::draw(device, "plus", RECT { right: inner.left + s(ds::size::ICON), ..inner }, s(ds::size::ICON), theme::text());
+                draw_text(device, t("Choose a folder..."), RECT { left: inner.left + s(ds::size::ICON) + s(ds::space::S), ..inner }, self.fonts.body, theme::text(), ONE_LINE);
+            }
+        }
     }
 
     unsafe fn draw_side_row(&self, item: &DRAWITEMSTRUCT) {
@@ -11621,8 +12170,8 @@ impl App {
         self.layout();
     }
 
-    /// What Claude's and Codex's settings list goes in with this app's, and how that went.
-    unsafe fn mcp_servers_imported(&self) -> String {
+    /// What Claude's and Codex's settings list goes in with this app's, started at once, and how that went.
+    unsafe fn mcp_servers_imported(&mut self) -> String {
         let file = self.folder.join("mcp.json");
         let home = std::env::var_os("USERPROFILE").map_or(PathBuf::new(), PathBuf::from);
         let mut found = dogmind_agent::mcp::servers_of_claude(&std::fs::read_to_string(home.join(".claude.json")).unwrap_or_default());
@@ -11630,7 +12179,11 @@ impl App {
             found.entry(name).or_insert(server);
         }
         match dogmind_agent::mcp::import(&file, found) {
-            Ok(added) => tf("{0} servers added to {1}. They start the next time this app does.", &[&added, &file.display()]),
+            Ok(0) => t("Claude and Codex list no server that is not here already.").to_string(),
+            Ok(added) => {
+                self.mcp_changed();
+                tf("{0} servers added to {1}. They are starting.", &[&added, &file.display()])
+            }
             Err(error) => error,
         }
     }
@@ -11638,6 +12191,166 @@ impl App {
     unsafe fn import_mcp_servers(&mut self) {
         let said = self.mcp_servers_imported();
         self.say_in_panel(&said);
+    }
+
+    /// A switch and an Edit button for each MCP server, made as the Tools page first needs them.
+    unsafe fn mcp_controls(&mut self) {
+        let servers = self.mcp.trust().len();
+        while self.mcp_trust.len() < servers {
+            let id = ID_MCP_TRUST + self.mcp_trust.len() as isize;
+            self.mcp_trust.push(make_button(self.pane, id, "", ButtonKind::Toggle, theme::background()));
+        }
+        while self.mcp_edit.len() < servers {
+            let id = ID_MCP_EDIT + self.mcp_edit.len() as isize;
+            self.mcp_edit.push(make_button(self.pane, id, "", ButtonKind::Secondary, theme::background()));
+        }
+        for edit in &self.mcp_edit {
+            set_text(*edit, t("Edit"));
+        }
+        for toggle in &self.mcp_trust {
+            self.tip(*toggle, t("What this server returns no longer counts as web content, so later commands stop asking on its account. Its tools still ask, and in a session that already has web content they keep asking. What it returns is still marked as data."));
+        }
+        self.update_toggles();
+    }
+
+    /// mcp.json changed here: the servers start and end to match it at once, and the Tools page follows them as they come up.
+    unsafe fn mcp_changed(&mut self) {
+        self.mcp.reload();
+        self.mcp_controls();
+        SetTimer(self.window, TIMER_MCP, 500, None);
+    }
+
+    /// While a server is starting, the Tools page is laid out again as it comes up.
+    unsafe fn mcp_tick(&mut self) {
+        let states = self.mcp.states();
+        let starting = states.iter().any(|(_, state)| *state == dogmind_agent::mcp::State::Starting);
+        // (what was said when it was saved is no longer true of one that did not start: the page says that instead)
+        if let Some(name) = self.mcp_saved.clone() {
+            match states.iter().find(|(known, _)| *known == name).map(|(_, state)| state) {
+                Some(dogmind_agent::mcp::State::Starting) => {}
+                Some(dogmind_agent::mcp::State::Failed(why)) if self.panel == Panel::Tools => {
+                    self.mcp_saved = None;
+                    self.problem_in_panel(&tf("{0} did not start: {1}", &[&name, &mcp_why(why)]));
+                }
+                _ => self.mcp_saved = None,
+            }
+        }
+        if self.panel == Panel::Tools {
+            self.layout();
+        }
+        if !starting || self.panel != Panel::Tools {
+            KillTimer(self.window, TIMER_MCP);
+        }
+    }
+
+    /// The form under the list of MCP servers, open on one (or on a new one, with `None`).
+    unsafe fn mcp_open_form(&mut self, name: Option<String>) {
+        let config = name.as_ref().and_then(|name| self.mcp.configs().into_iter().find(|(known, _)| known == name)).map(|(_, config)| config).unwrap_or_default();
+        let (target, vars) = if config.is_http() {
+            (config.url.clone(), dogmind_agent::mcp::lines_of_pairs(&config.headers, ':'))
+        } else {
+            (config.command.clone(), dogmind_agent::mcp::lines_of_pairs(&config.env, '='))
+        };
+        let was = [name.clone().unwrap_or_default(), target, dogmind_agent::mcp::line_of_args(&config.args), vars];
+        for (field, text) in self.fields[..3].iter().zip(&was) {
+            set_text(*field, text);
+        }
+        set_text(self.mcp_vars, &was[3]);
+        self.mcp_form_url = config.is_http();
+        self.mcp_form_was = was;
+        let new = name.is_none();
+        self.mcp_form = Some(name);
+        self.panel_log.clear();
+        self.panel_problem = false;
+        self.layout();
+        self.scroll_panel_to(self.panel_extent);
+        SetFocus(self.fields[if new { 0 } else { 1 }]);
+    }
+
+    unsafe fn mcp_close_form(&mut self) {
+        self.mcp_form = None;
+        for field in &self.fields[..3] {
+            set_text(*field, "");
+        }
+        set_text(self.mcp_vars, "");
+        self.layout();
+    }
+
+    /// What the form says now.
+    unsafe fn mcp_form_typed(&self) -> [String; 4] {
+        [get_text(self.fields[0]), get_text(self.fields[1]), get_text(self.fields[2]), get_text(self.mcp_vars)]
+    }
+
+    /// What the form runs is a URL now, or is no longer one: it asks for what that needs.
+    unsafe fn mcp_kind_changed(&mut self) {
+        let url = mcp_url(get_text(self.fields[1]).trim()).is_some();
+        if url != self.mcp_form_url {
+            self.mcp_form_url = url;
+            self.layout();
+        }
+    }
+
+    /// The form's server written to mcp.json, and started (again) at once. `false`: it cannot be, and the page says why.
+    unsafe fn mcp_save_form(&mut self) -> bool {
+        use dogmind_agent::mcp;
+        let Some(before) = self.mcp_form.clone() else { return true };
+        let [name, target, args, vars] = self.mcp_form_typed();
+        let (name, target) = (name.trim().to_string(), target.trim().to_string());
+        if name.is_empty() {
+            self.problem_in_panel(t("Give the server a name."));
+            return false;
+        }
+        if target.is_empty() {
+            self.problem_in_panel(t("Give a command to run, or the URL of a server."));
+            return false;
+        }
+        let configs = self.mcp.configs();
+        if before.as_deref() != Some(name.as_str()) && configs.iter().any(|(known, _)| *known == name) {
+            self.problem_in_panel(&tf("There is a server called {0} already.", &[&name]));
+            return false;
+        }
+        let url = mcp_url(&target);
+        let pairs = match mcp::pairs_of_lines(&vars, if url.is_some() { ':' } else { '=' }) {
+            Ok(pairs) => pairs,
+            Err((line, said)) => {
+                self.problem_in_panel(&if url.is_some() { tf("Line {0} of the headers is not Name: value: {1}", &[&line, &said]) } else { tf("Line {0} of the variables is not NAME=value: {1}", &[&line, &said]) });
+                return false;
+            }
+        };
+        let was = before.as_ref().and_then(|before| configs.iter().find(|(known, _)| known == before)).map(|(_, config)| config);
+        let config = mcp_config_of_form(was, url, target, &args, pairs);
+        if let Err(error) = mcp::save_server(&self.folder.join("mcp.json"), before.as_deref(), &name, config) {
+            self.problem_in_panel(&error);
+            return false;
+        }
+        self.mcp_changed();
+        self.mcp_close_form();
+        self.say_in_panel(&tf("{0} was saved. Once it is up, its tools join the conversation from your next message.", &[&name]));
+        self.mcp_saved = Some(name);
+        // (the page is scrolled to the form: what it says is under it)
+        self.scroll_panel_to(self.panel_extent);
+        true
+    }
+
+    unsafe fn mcp_remove_server(&mut self) {
+        let Some(Some(name)) = self.mcp_form.clone() else { return };
+        if let Err(error) = dogmind_agent::mcp::remove_server(&self.folder.join("mcp.json"), &name) {
+            self.problem_in_panel(&error);
+            return;
+        }
+        self.mcp_changed();
+        self.mcp_close_form();
+        self.say_in_panel(&tf("{0} was removed.", &[&name]));
+        // (the page is scrolled to the form: what it says is under it)
+        self.scroll_panel_to(self.panel_extent);
+    }
+
+    /// Leaving the page with the form changed keeps the change, as the other pages do.
+    unsafe fn mcp_keep_form(&mut self) -> bool {
+        if self.mcp_form.is_none() || self.mcp_form_typed() == self.mcp_form_was {
+            return true;
+        }
+        self.mcp_save_form()
     }
 
     /// How high what shows of a panel is.
@@ -11655,18 +12368,84 @@ impl App {
     /// The same, to a place. A dialog's page is laid out again alone: the window behind it does not change as it scrolls, and laying all of
     /// it out again for every notch of the wheel made the page slow to follow.
     unsafe fn scroll_panel_to(&mut self, to: i32) {
+        self.stop_skill_scroll();
+        self.move_panel_scroll(to);
+    }
+
+    unsafe fn move_panel_scroll(&mut self, to: i32) {
         let most = (self.panel_extent - self.panel_view()).max(0);
         let to = to.clamp(0, most);
         if to == self.panel_scroll {
             return;
         }
         self.panel_scroll = to;
-        if self.modal_open {
+        if self.modal_open && self.panel == Panel::Skills {
+            self.scroll_skill_pane();
+        } else if self.modal_open {
             let mut client: RECT = std::mem::zeroed();
             GetClientRect(self.window, &mut client);
             self.layout_modal(client.right, client.bottom);
         } else {
             self.layout();
+        }
+    }
+
+    unsafe fn scroll_skill_pane(&mut self) {
+        let mut batch = BeginDeferWindowPos(self.skill_toggle_areas.len() as i32);
+        for &(window, area) in &self.skill_toggle_areas {
+            if batch.is_null() {
+                break;
+            }
+            batch = DeferWindowPos(batch, window, std::ptr::null_mut(), area.left, area.top - self.panel_scroll, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+        }
+        if batch.is_null() || EndDeferWindowPos(batch) == 0 {
+            for &(window, area) in &self.skill_toggle_areas {
+                place(window, area.left, area.top - self.panel_scroll, area.right - area.left, area.bottom - area.top);
+            }
+        }
+        if let Some((thumb, view, most)) = &mut self.pane_thumb {
+            let tall = thumb.bottom - thumb.top;
+            thumb.top = thumb_offset(*view - tall, self.panel_scroll, *most);
+            thumb.bottom = thumb.top + tall;
+        }
+        // Paint while the pointer is still moving, including the child controls at their new positions.
+        RedrawWindow(self.pane, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
+
+    unsafe fn wheel_skill_scroll(&mut self, by: i32) {
+        if self.pane_thumb_grab.is_some() || by == 0 {
+            return;
+        }
+        let most = (self.panel_extent - self.panel_view()).max(0);
+        let to = (self.skill_scroll.as_ref().map_or(self.panel_scroll, |scroll| scroll.to) + by).clamp(0, most);
+        if to == self.panel_scroll {
+            self.stop_skill_scroll();
+            return;
+        }
+        let mut animate = 1i32;
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, std::ptr::addr_of_mut!(animate).cast(), 0);
+        if animate == 0 || (self.skill_scroll.is_none() && SetTimer(self.window, TIMER_SKILL_SCROLL, 16, None) == 0) {
+            self.scroll_panel_to(to);
+            return;
+        }
+        self.skill_scroll = Some(SkillScroll { from: self.panel_scroll, to, began: std::time::Instant::now() });
+    }
+
+    unsafe fn tick_skill_scroll(&mut self) {
+        let Some(scroll) = &self.skill_scroll else { return };
+        let elapsed = (scroll.began.elapsed().as_secs_f64() / 0.12).min(1.0);
+        let step = 1.0 - (1.0 - elapsed).powi(3);
+        let to = scroll.from + (f64::from(scroll.to - scroll.from) * step).round() as i32;
+        self.move_panel_scroll(to);
+        if elapsed == 1.0 {
+            self.stop_skill_scroll();
+        }
+    }
+
+    unsafe fn stop_skill_scroll(&mut self) {
+        if self.skill_scroll.take().is_some() {
+            KillTimer(self.window, TIMER_SKILL_SCROLL);
         }
     }
 
@@ -12104,7 +12883,7 @@ impl App {
 
     /// Back to what is being written, unless a dialog is open: its keys stay with it.
     unsafe fn focus_composer(&self) {
-        if !self.modal_open {
+        if !self.modal_open && self.conversation_shown() {
             SetFocus(self.composer);
         }
     }
@@ -12643,6 +13422,7 @@ impl App {
                 self.set_activity(waiting);
             }
             Event::RequestStarted => {
+                (self.thinking_base, self.thinking_tokens) = (None, 0);
                 if self.activity == t("Compacting the session…") || self.activity == t("Retrying the request…") || self.activity == t("Waiting for the server to restart…") || self.activity.starts_with(&tf("Waiting for the server: {0}", &[&""])) {
                     self.set_activity(t("Thinking…").into());
                 }
@@ -12793,6 +13573,14 @@ impl App {
             Event::Usage { used, window, usage } => {
                 // A report from a request under way comes a couple of times a second: only what it changes is drawn. The panel's words change with each thousand.
                 let panel_changed = used / 1000 != self.used / 1000 || window != self.window_tokens;
+                // (the request's first report is its own text; the ones after count what it writes: its thinking, while "Thinking…" is what is shown)
+                if live_report {
+                    match self.thinking_base {
+                        None => self.thinking_base = Some(used),
+                        Some(base) if self.activity == t("Thinking…") => self.thinking_tokens = used.saturating_sub(base),
+                        Some(_) => {}
+                    }
+                }
                 self.used = used;
                 self.window_tokens = window;
                 if usage.tokens_per_second.is_some() {
@@ -12858,13 +13646,14 @@ impl App {
                 let id = self.card_next;
                 self.write_card(&Card::Question { id, question: question.question.clone(), options: question.options.clone(), state: AnswerState::Waiting });
                 let words: String = question.question.lines().next().unwrap_or("").chars().take(120).collect();
+                set_text(self.card_field, "");
                 self.question = Some(AskedQuestion { answer: question.answer, question: question.question, options: question.options, card: id });
                 self.set_activity(String::new());
                 self.update_buttons();
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.tray_note(t("Dogmind is waiting for you"), &words);
                 self.flash_for_attention(self.woken_turn);
-                // (the card's field is the composer: what is written in it is the answer)
+                // (what is written in the composer is an answer too, as is what is written in the card's field)
                 set_text(self.composer_cue, t("Write your own answer…"));
                 self.update_composer_cue();
                 self.focus_composer();
@@ -13984,10 +14773,13 @@ impl App {
         ] {
             set_text(window, t(words));
         }
-        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.find_field, "Find in this conversation"), (self.side_search, "Search sessions"), (self.timeline.search, "Search the timeline")] {
+        for (edit, words) in [(self.feedback, "Reason (optional)"), (self.find_field, "Find in this conversation"), (self.card_field, "Write your own answer…"), (self.side_search, "Search sessions"), (self.timeline.search, "Search the timeline")] {
             let cue = wide(t(words));
             SendMessageW(edit, EM_SETCUEBANNER, 0, cue.as_ptr() as LPARAM);
         }
+        // (the workspace picker's field has the keys whenever it is seen: its words stay while it does)
+        let cue = wide(t("Search workspaces"));
+        SendMessageW(self.picker_search, EM_SETCUEBANNER, 1, cue.as_ptr() as LPARAM);
         // What has only an icon says what it is when the pointer rests on it.
         for (window, words) in [
             (self.help_button, t("Help")),
@@ -14247,6 +15039,9 @@ unsafe fn with_thin_bar(app: &mut App, window: HWND, base: WNDPROC, message: u32
             if let Some(thumb) = thin_thumb(window, app.dpi).filter(|thumb| x >= thumb.left - scale(app.dpi, ds::space::S) && y >= thumb.top && y < thumb.bottom) {
                 app.bar_grab = Some((window, y - thumb.top));
                 SetCapture(window);
+                return 0;
+            }
+            if window == app.side && side_row_at(window, lparam).is_none() {
                 return 0;
             }
         }
@@ -14717,6 +15512,26 @@ fn mix(under: u32, over: u32, cover: f32) -> u32 {
     channel(0) | channel(8) | channel(16)
 }
 
+/// LB_ITEMFROMPOINT returns the nearest row even in the empty space below it.
+unsafe fn side_row_at(window: HWND, position: LPARAM) -> Option<usize> {
+    let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, position);
+    if (found >> 16) & 0xFFFF != 0 {
+        return None;
+    }
+    let index = (found & 0xFFFF) as usize;
+    let mut area: RECT = std::mem::zeroed();
+    if SendMessageW(window, LB_GETITEMRECT, index, std::ptr::addr_of_mut!(area) as LPARAM) == -1 {
+        return None;
+    }
+    let point = POINT { x: (position & 0xFFFF) as i16 as i32, y: (position >> 16) as i16 as i32 };
+    (PtInRect(&area, point) != 0).then_some(index)
+}
+
+unsafe fn paint_side_list(app: &mut App, window: HWND, base: WNDPROC, device: HDC, client: RECT) {
+    FillRect(device, &client, app.brushes[1]);
+    with_thin_bar(app, window, base, WM_PRINTCLIENT, device as WPARAM, PRF_CLIENT as LPARAM);
+}
+
 /// The list boxes, with hover and, in the sidebar, a click that knows where it fell.
 unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let Some(app) = app() else { return DefWindowProcW(window, message, wparam, lparam) };
@@ -14724,14 +15539,49 @@ unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPAR
     let is_side = window == app.side;
     let is_tree = window == app.tree_list;
     match message {
+        WM_ERASEBKGND if is_side => 1,
+        WM_PRINTCLIENT if is_side => {
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            paint_side_list(app, window, base, wparam as HDC, client);
+            0
+        }
+        WM_PAINT if is_side => {
+            let mut paint: PAINTSTRUCT = std::mem::zeroed();
+            let target = BeginPaint(window, &mut paint);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            if client.right > 0 && client.bottom > 0 {
+                let device = CreateCompatibleDC(target);
+                let bitmap = CreateCompatibleBitmap(target, client.right, client.bottom);
+                if !device.is_null() && !bitmap.is_null() {
+                    let previous = SelectObject(device, bitmap);
+                    paint_side_list(app, window, base, device, client);
+                    BitBlt(target, 0, 0, client.right, client.bottom, device, 0, 0, SRCCOPY);
+                    SelectObject(device, previous);
+                } else {
+                    paint_side_list(app, window, base, target, client);
+                }
+                DeleteObject(bitmap);
+                DeleteDC(device);
+            }
+            EndPaint(window, &paint);
+            0
+        }
         WM_MOUSEMOVE | WM_MOUSELEAVE => {
             // (a test that has no pointer of its own: the leave the system sends is not the pointer leaving)
             if message == WM_MOUSELEAVE && is_tree && test_pointer_stays() {
                 return 0;
             }
-            let found = if message == WM_MOUSEMOVE { SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam) } else { 0x10000 };
-            let hover = ((found >> 16) & 0xFFFF == 0).then_some((found & 0xFFFF) as usize);
-            let slot = if is_side { &mut app.side_hover } else if is_tree { &mut app.tree_hover } else if window == app.suggest { &mut app.suggest_hover } else { &mut app.list_hover };
+            let hover = if message == WM_MOUSELEAVE {
+                None
+            } else if is_side {
+                side_row_at(window, lparam)
+            } else {
+                let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
+                ((found >> 16) & 0xFFFF == 0).then_some((found & 0xFFFF) as usize)
+            };
+            let slot = if is_side { &mut app.side_hover } else if is_tree { &mut app.tree_hover } else if window == app.suggest { &mut app.suggest_hover } else if window == app.picker_list { &mut app.picker_hover } else { &mut app.list_hover };
             if *slot != hover {
                 for index in [*slot, hover].into_iter().flatten() {
                     let mut area: RECT = std::mem::zeroed();
@@ -14778,18 +15628,20 @@ unsafe extern "system" fn list_subclass(window: HWND, message: u32, wparam: WPAR
         }
         WM_KEYDOWN if is_tree && app.files_key(wparam as u16) => 0,
         WM_RBUTTONUP if is_side => {
-            let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
-            if (found >> 16) & 0xFFFF == 0 {
-                app.on_side_menu((found & 0xFFFF) as usize);
+            if let Some(index) = side_row_at(window, lparam) {
+                app.on_side_menu(index);
             }
             0
         }
+        WM_LBUTTONDBLCLK if is_side && side_row_at(window, lparam).is_none() => 0,
         WM_LBUTTONUP if is_side && app.bar_grab.is_none() => {
+            let index = side_row_at(window, lparam);
+            if index.is_none() && GetCapture() != window {
+                return 0;
+            }
             let result = CallWindowProcW(base, window, message, wparam, lparam);
-            let found = SendMessageW(window, LB_ITEMFROMPOINT, 0, lparam);
-            if (found >> 16) & 0xFFFF == 0 {
+            if let Some(index) = index {
                 let x = (lparam & 0xFFFF) as i16 as i32;
-                let index = (found & 0xFFFF) as usize;
                 // It may rebuild this very list: after the control has finished with the click.
                 app.on_side_click(index, x);
             }
@@ -14962,6 +15814,44 @@ unsafe extern "system" fn diff_procedure(window: HWND, message: u32, wparam: WPA
 }
 
 /// A dialog's backdrop and its pane. What their controls say goes to the main window, as it does from any control; they draw what `layout_modal` has set out.
+/// The workspace picker's panel: its rounded face and the line under its search field. What its field and its list tell their parent goes to
+/// the window's own procedure, as the modal's does.
+unsafe extern "system" fn picker_procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let Some(app) = app() else { return DefWindowProcW(window, message, wparam, lparam) };
+    match message {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            let mut paint: PAINTSTRUCT = std::mem::zeroed();
+            let target = BeginPaint(window, &mut paint);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            if client.right > 0 && client.bottom > 0 {
+                let device = CreateCompatibleDC(target);
+                let bitmap = CreateCompatibleBitmap(target, client.right, client.bottom);
+                let previous = SelectObject(device, bitmap);
+                FillRect(device, &client, app.brushes[0]);
+                let s = |value: i32| scale(app.dpi, value);
+                rounded(device, client, s(ds::radius::CARD), Some(theme::surface()), Some(theme::line()));
+                let line = CreateSolidBrush(theme::line());
+                let under = s(PICKER_SEARCH_ROW);
+                FillRect(device, &RECT { left: 1, right: client.right - 1, top: under, bottom: under + 1 }, line);
+                DeleteObject(line);
+                BitBlt(target, 0, 0, client.right, client.bottom, device, 0, 0, SRCCOPY);
+                SelectObject(device, previous);
+                DeleteObject(bitmap);
+                DeleteDC(device);
+            }
+            EndPaint(window, &paint);
+            0
+        }
+        WM_COMMAND | WM_CTLCOLORLISTBOX | WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_MEASUREITEM | WM_DRAWITEM => procedure(app.window, message, wparam, lparam),
+        _ => DefWindowProcW(window, message, wparam, lparam),
+    }
+}
+
+/// The height of the workspace picker's search row, over the line under it.
+const PICKER_SEARCH_ROW: i32 = 46;
+
 unsafe extern "system" fn modal_procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let Some(app) = app() else { return DefWindowProcW(window, message, wparam, lparam) };
     let within_card = |lparam: LPARAM| {
@@ -15003,6 +15893,7 @@ unsafe extern "system" fn modal_procedure(window: HWND, message: u32, wparam: WP
                 app.pane_thumb_grab = Some(grab);
                 SetCapture(window);
                 app.drag_pane_thumb(y);
+                InvalidateRect(window, &thumb, 0);
             }
             0
         }
@@ -15016,9 +15907,9 @@ unsafe extern "system" fn modal_procedure(window: HWND, message: u32, wparam: WP
         }
         WM_CAPTURECHANGED if window == app.pane && app.pane_thumb_grab.is_some() => {
             app.pane_thumb_grab = None;
-            let mut client: RECT = std::mem::zeroed();
-            GetClientRect(app.window, &mut client);
-            app.layout_modal(client.right, client.bottom);
+            if let Some((thumb, _, _)) = app.pane_thumb {
+                InvalidateRect(window, &thumb, 0);
+            }
             0
         }
         WM_LBUTTONUP if window == app.modal => {
@@ -15098,7 +15989,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
             set_button_fonts(app.fonts);
-            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.term.rename_field, app.timeline.search]) {
+            for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.term.rename_field, app.timeline.search, app.picker_search, app.mcp_vars]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
             }
             // (the command's own size follows the screen's: it is set again when it is next shown, and this one keeps what it has)
@@ -15222,6 +16113,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             }
             0
         }
+        // (a press anywhere else in the window puts the workspace picker away)
+        WM_LBUTTONDOWN if app.picker_open => {
+            app.close_picker();
+            0
+        }
         WM_LBUTTONDOWN if app.panel == Panel::Chat && app.has_messages => {
             let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
             let strip = app.thumb_strip();
@@ -15261,15 +16157,18 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_MOUSEWHEEL if app.panel != Panel::Chat => {
-            // (a notch is 120: about three lines of a page, as a browser goes)
-            let notches = ((wparam >> 16) & 0xFFFF) as u16 as i16 as i32;
-            app.scroll_panel(-notches * scale(app.dpi, 120) / 120);
+            let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+            if app.modal_open && app.panel == Panel::Skills {
+                app.wheel_skill_scroll(-delta * scale(app.dpi, 240) / 120);
+            } else {
+                app.scroll_panel(-delta * scale(app.dpi, 120) / 120);
+            }
             0
         }
         WM_MOUSEMOVE if app.panel == Panel::Chat => {
             let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
             let within = |area: &RECT| x >= area.left && x < area.right && y >= area.top && y < area.bottom;
-            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.right_tab_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.waiting_hits.iter().map(|(area, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
+            let found = app.preview_hits.iter().map(|(area, _)| *area).chain(app.right_hits.iter().map(|(area, _)| *area)).chain(app.tab_hits.iter().map(|(area, _)| *area)).chain(app.queue_hits.iter().map(|(area, _, _)| *area)).chain(app.waiting_hits.iter().map(|(area, _)| *area)).chain(app.dashboard_hit.iter().map(|(area, _)| *area)).find(|area| within(area));
             app.hover_on(found);
             app.rail_hover_at(x, y);
             0
@@ -15283,7 +16182,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
             1
         }
-        WM_MOUSEWHEEL if app.panel == Panel::Chat && app.has_messages => {
+        WM_MOUSEWHEEL if app.conversation_shown() && app.has_messages => {
             // Over the strip the wheel reaches this window: the control would have taken it.
             SendMessageW(app.transcript, message, wparam, lparam)
         }
@@ -15306,8 +16205,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 app.layout();
                 return 0;
             }
-            if let Some(view) = app.right_tab_at(x, y) {
-                app.set_right_view(view);
+            if let Some((_, tab)) = app.tab_hits.iter().find(|(area, _)| within(area)) {
+                match *tab {
+                    PanelTab::Center(view) => app.set_center_view(view),
+                    PanelTab::Right(view) => app.set_right_view(view),
+                }
             } else if let Some((at, act)) = app.queue_hits.iter().find(|(area, _, _)| within(area)).map(|(_, at, act)| (*at, *act)) {
                 app.queue_act(at, act);
             } else if let Some(at) = app.rail_hits.iter().find(|(area, _)| within(area)).map(|(_, at)| *at) {
@@ -15336,6 +16238,14 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             app.spinner_tick();
             0
         }
+        WM_TIMER if wparam == TIMER_MCP => {
+            app.mcp_tick();
+            0
+        }
+        WM_TIMER if wparam == TIMER_SKILL_SCROLL => {
+            app.tick_skill_scroll();
+            0
+        }
         WM_CTLCOLORLISTBOX => {
             let side = lparam as HWND == app.side || lparam as HWND == app.tree_list || app.panel == Panel::Diff;
             SetBkColor(wparam as HDC, if side { theme::sidebar() } else { theme::surface() });
@@ -15356,6 +16266,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             let item = &mut *(lparam as *mut MEASUREITEMSTRUCT);
             item.itemHeight = if item.CtlID as isize == ID_SUGGEST {
                 scale(app.dpi, ds::size::MENU_ROW) as u32
+            } else if item.CtlID as isize == ID_PICKER_LIST {
+                app.picker_row_height(item.itemID as usize) as u32
             } else if item.CtlID as isize == ID_FILES {
                 scale(app.dpi, ds::size::TEXT_ROW) as u32
             } else if item.CtlID as isize == ID_FILES_MENU {
@@ -15389,6 +16301,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     app.draw_menu_row(item);
                 } else if item.hwndItem == app.suggest {
                     app.draw_suggestion(item);
+                } else if item.hwndItem == app.picker_list {
+                    app.draw_picker_row(item);
                 } else if item.hwndItem == app.list {
                     app.draw_list_row(item);
                 }
@@ -15413,9 +16327,18 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 return 0;
             }
-            if app.fields.contains(&(lparam as HWND)) {
+            if app.fields.contains(&(lparam as HWND)) || lparam as HWND == app.mcp_vars {
                 if code == EN_SETFOCUS as usize || code == EN_KILLFOCUS as usize {
                     app.layout();
+                }
+                if code == EN_CHANGE as usize && lparam as HWND == app.fields[1] && app.panel == Panel::Tools && app.mcp_form.is_some() {
+                    app.mcp_kind_changed();
+                }
+                return 0;
+            }
+            if lparam as HWND == app.card_field {
+                if code == EN_SETFOCUS as usize || code == EN_KILLFOCUS as usize {
+                    InvalidateRect(app.transcript, std::ptr::null(), 0);
                 }
                 return 0;
             }
@@ -15601,6 +16524,17 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_MCP_IMPORT => app.import_mcp_servers(),
+                ID_MCP_ADD => app.mcp_open_form(None),
+                ID_MCP_SAVE => {
+                    app.mcp_save_form();
+                }
+                ID_MCP_REMOVE => app.mcp_remove_server(),
+                ID_MCP_CANCEL => app.mcp_close_form(),
+                _ if (ID_MCP_EDIT..ID_MCP_EDIT + app.mcp_edit.len() as isize).contains(&id) => {
+                    if let Some((name, _)) = app.mcp.trust().get((id - ID_MCP_EDIT) as usize).cloned() {
+                        app.mcp_open_form(Some(name));
+                    }
+                }
                 ID_READ_FOLDER_ADD => {
                     // (a debug build told to, for tests: the picker is a dialog on the person's screen, which nothing may put there)
                     let forced = if cfg!(debug_assertions) { std::env::var_os("DOGMIND_TEST_READ_FOLDER").map(PathBuf::from) } else { None };
@@ -15660,7 +16594,14 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     let names = DISPLAY_LANGUAGES.map(|(_, name)| name);
                     app.choices(app.toggle_display, M_DISPLAY, &names, chosen);
                 }
-                ID_FOLDER_CHIP => app.folder_menu(),
+                ID_FOLDER_CHIP => app.folder_menu(app.folder_chip),
+                ID_START_FOLDER => {
+                    if app.picker_open {
+                        app.close_picker();
+                    } else {
+                        app.open_picker();
+                    }
+                }
                 ID_PROVIDER_UP => app.move_provider(-1),
                 ID_PROVIDER_DOWN => app.move_provider(1),
                 ID_TOGGLE_COMPACT => app.on_menu(M_COMPACT_CHOICE + usize::from(app.settings.compact_tools)),
@@ -15669,6 +16610,17 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_FILES => {
                     if code == LBN_SELCHANGE as usize {
                         app.files_selection_changed();
+                    }
+                }
+                ID_PICKER_SEARCH if code == EN_CHANGE as usize => app.fill_picker(),
+                ID_PICKER_SEARCH if code == EN_KILLFOCUS as usize => app.picker_focus_left(),
+                ID_PICKER_LIST if code == LBN_KILLFOCUS as usize => app.picker_focus_left(),
+                // (a press on a row: the list takes the keys for it, and its selection says which)
+                ID_PICKER_LIST if code == LBN_SELCHANGE as usize => {
+                    let at = SendMessageW(app.picker_list, LB_GETCURSEL, 0, 0);
+                    SendMessageW(app.picker_list, LB_SETCURSEL, usize::MAX, 0);
+                    if at >= 0 && GetFocus() == app.picker_list {
+                        app.choose_picker_row(at as usize);
                     }
                 }
                 ID_SUGGEST => {
@@ -15799,6 +16751,26 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             term_panel::TermKey::Pass => {}
         }
     }
+    // The workspace picker: the arrows go through its rows, Enter takes the one they are on, Esc puts it away.
+    if message.message == WM_KEYDOWN && app.picker_open && (message.hwnd == app.picker_search || message.hwnd == app.picker_list) {
+        match message.wParam as u16 {
+            VK_ESCAPE => {
+                app.close_picker();
+                return true;
+            }
+            VK_DOWN | VK_UP => {
+                app.move_picker(if message.wParam as u16 == VK_DOWN { 1 } else { -1 });
+                return true;
+            }
+            VK_RETURN => {
+                if let Some(at) = app.picker_selected {
+                    app.choose_picker_row(at);
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
     // A tab being renamed: Enter keeps the name and Esc leaves it.
     if message.message == WM_KEYDOWN && message.hwnd == app.term.rename_field && matches!(message.wParam as u16, VK_RETURN | VK_ESCAPE) {
         app.terminal_rename_end(message.wParam as u16 == VK_RETURN);
@@ -15877,6 +16849,9 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
             }
             VK_RETURN if !shift && app.panel == Panel::Providers && app.fields.contains(&message.hwnd) => app.on_button(1),
             VK_RETURN if !shift && app.panel == Panel::Rename && app.fields.contains(&message.hwnd) => app.on_button(0),
+            VK_RETURN if !shift && app.panel == Panel::Tools && app.mcp_form.is_some() && app.fields[..3].contains(&message.hwnd) => {
+                app.mcp_save_form();
+            }
             VK_RETURN if !shift && matches!(app.panel, Panel::Unlock | Panel::CryptoOn | Panel::CryptoPassphrase) && app.fields.contains(&message.hwnd) => app.on_button(0),
             VK_RETURN if !shift && matches!(app.panel, Panel::Sessions | Panel::Rewind) && message.hwnd == app.list => app.on_button(0),
             _ => return false,
@@ -15892,6 +16867,11 @@ unsafe fn take_key(app: &mut App, message: &MSG) -> bool {
     if message.hwnd == app.composer && key == VK_PROCESSKEY {
         // A key an IME took: composing is about to begin, whichever way this IME says so.
         show(app.composer_cue, false);
+    }
+    // In the card's field: Enter sends what is written there as the answer to the question.
+    if message.hwnd == app.card_field && key == VK_RETURN && !shift {
+        app.card_pressed_own();
+        return true;
     }
     if message.hwnd == app.find_field {
         match key {
@@ -16656,6 +17636,14 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let pane = CreateWindowExW(0, pane_class.as_ptr(), nothing.as_ptr(), WS_CHILD | WS_CLIPCHILDREN | WS_VISIBLE, 0, 0, 0, 0, modal, std::ptr::null_mut(), instance, std::ptr::null());
         let list_style = WS_VSCROLL | WS_CLIPSIBLINGS | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWVARIABLE) as u32;
         let edit_style = WS_TABSTOP | ES_AUTOHSCROLL as u32;
+        let picker_class = wide("DogPicker");
+        let class = WNDCLASSW { lpfnWndProc: Some(picker_procedure), hInstance: instance, lpszClassName: picker_class.as_ptr(), hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW), ..std::mem::zeroed() };
+        RegisterClassW(&class);
+        let picker = CreateWindowExW(0, picker_class.as_ptr(), nothing.as_ptr(), WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, 0, 0, window, std::ptr::null_mut(), instance, std::ptr::null());
+        let picker_search = control(picker, "EDIT", "", edit_style, 0, ID_PICKER_SEARCH);
+        let picker_list = control(picker, "LISTBOX", "", list_style, 0, ID_PICKER_LIST);
+        ShowWindow(picker_search, SW_SHOWNOACTIVATE);
+        ShowWindow(picker_list, SW_SHOWNOACTIVATE);
         // What is found stays selected while the focus is in the find field.
         crate::textview::register(instance);
         let transcript_class = if crate::textview::wanted() { crate::textview::CLASS } else { "RICHEDIT50W" };
@@ -16715,7 +17703,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             panel_menu: files_panel::PanelMenu { items: Vec::new(), whose: files_panel::MenuFor::Nothing },
             term: term_panel::TermView::new(window, theme::sidebar()),
             timeline: timeline_view::TimelineView::new(window),
-            right_tab_hits: Vec::new(),
+            tab_hits: Vec::new(),
             collapsed: HashSet::new(),
             all_sessions: Vec::new(),
             current_session: None,
@@ -16778,8 +17766,20 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             variable_toggle: make_button(pane, ID_VARIABLE_TOGGLE, "", ButtonKind::Toggle, theme::background()),
             mcp_import: make_button(pane, ID_MCP_IMPORT, "", ButtonKind::Secondary, theme::background()),
             mcp_trust: Vec::new(),
+            mcp_edit: Vec::new(),
+            mcp_add: make_button(pane, ID_MCP_ADD, "", ButtonKind::Secondary, theme::background()),
+            mcp_save: make_button(pane, ID_MCP_SAVE, "", ButtonKind::Primary, theme::background()),
+            mcp_remove: make_button(pane, ID_MCP_REMOVE, "", ButtonKind::Secondary, theme::background()),
+            mcp_cancel: make_button(pane, ID_MCP_CANCEL, "", ButtonKind::Secondary, theme::background()),
+            mcp_vars: control(pane, "EDIT", "", WS_TABSTOP | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_WANTRETURN as u32, 0, 0),
+            mcp_form: None,
+            mcp_form_url: false,
+            mcp_form_was: Default::default(),
+            mcp_saved: None,
             size_segments: std::array::from_fn(|at| make_button(pane, ID_TEXT_SIZE + at as isize, "", ButtonKind::Segment, theme::surface())),
             skill_toggles: Vec::new(),
+            skill_toggle_areas: Vec::new(),
+            skill_scroll: None,
             memory_notes: Vec::new(),
             memory_remove: Vec::new(),
             builds: Vec::new(),
@@ -16820,11 +17820,22 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             toggle_language: make_button(pane, ID_TOGGLE_LANGUAGE, "", ButtonKind::Select, theme::background()),
             toggle_display: make_button(window, ID_TOGGLE_DISPLAY, "", ButtonKind::Select, theme::background()),
             folder_chip: make_button(window, ID_FOLDER_CHIP, "", ButtonKind::Chip, theme::background()),
+            start_folder: make_button(window, ID_START_FOLDER, t("Choose a workspace"), ButtonKind::Select, theme::surface()),
+            picker,
+            picker_search,
+            picker_list,
+            picker_rows: Vec::new(),
+            picker_selected: None,
+            picker_hover: None,
+            picker_open: false,
+            picker_at: None,
             composer_lines: 1,
             provider_up: make_button(window, ID_PROVIDER_UP, "chevron-up", ButtonKind::Icon, theme::background()),
             provider_down: make_button(window, ID_PROVIDER_DOWN, "chevron-down", ButtonKind::Icon, theme::background()),
             find_open: false,
             find_field: control(window, "EDIT", "", edit_style, 0, 0),
+            card_field: control(window, "EDIT", "", edit_style, 0, 0),
+            card_field_at: None,
             find_previous: make_button(window, ID_FIND_PREVIOUS, "chevron-up", ButtonKind::Icon, theme::surface()),
             find_next: make_button(window, ID_FIND_NEXT, "chevron-down", ButtonKind::Icon, theme::surface()),
             find_close: make_button(window, ID_FIND_CLOSE, "x", ButtonKind::Icon, theme::surface()),
@@ -17058,6 +18069,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             thinking: String::new(),
             activity: String::new(),
             activity_since: None,
+            thinking_base: None,
+            thinking_tokens: 0,
             activity_second: 0,
             connected: false,
             connection: String::new(),
@@ -17100,13 +18113,14 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let app = &mut *APP.load(Ordering::Relaxed);
         SendMessageW(app.composer, EM_SETEVENTMASK, 0, ENM_CHANGE as LPARAM);
         SendMessageW(app.note, EM_SETMARGINS, 3, 0); // EC_LEFTMARGIN | EC_RIGHTMARGIN
-        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.side_search, app.timeline.search]) {
+        for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.timeline.search, app.picker_search, app.mcp_vars]) {
             SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
         }
         app.list_procedure = SetWindowLongPtrW(app.side, GWLP_WNDPROC, list_subclass as *const () as isize);
         SetWindowLongPtrW(app.list, GWLP_WNDPROC, list_subclass as *const () as isize);
         app.composer_procedure = SetWindowLongPtrW(app.composer, GWLP_WNDPROC, composer_subclass as *const () as isize);
         SetWindowLongPtrW(app.suggest, GWLP_WNDPROC, list_subclass as *const () as isize);
+        SetWindowLongPtrW(app.picker_list, GWLP_WNDPROC, list_subclass as *const () as isize);
         SetWindowLongPtrW(app.tree_list, GWLP_WNDPROC, list_subclass as *const () as isize);
         SetWindowLongPtrW(app.tree_menu, GWLP_WNDPROC, files_panel::menu_subclass as *const () as isize);
         // (what a reader says of the list: its own name)
@@ -17262,6 +18276,24 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server of the older transport edited in Settings stays one, and the person's word on it goes with it: saved as `http`, it was asked with a POST of
+    /// Streamable HTTP first. A new server at a URL, and one that was `http`, are `http`; a program is a program.
+    #[test]
+    fn a_server_of_the_older_transport_edited_in_settings_stays_one() {
+        use dogmind_agent::mcp::ServerConfig;
+        let at = |url: &str| (Some(url.to_string()), url.to_string());
+        let older = ServerConfig { kind: "sse".into(), url: "http://127.0.0.1:9/sse".into(), trusted: true, ..Default::default() };
+        let (url, target) = at("http://127.0.0.1:9/sse");
+        let edited = mcp_config_of_form(Some(&older), url, target, "", Default::default());
+        assert_eq!((edited.kind.as_str(), edited.url.as_str(), edited.trusted), ("sse", "http://127.0.0.1:9/sse", true));
+        let newer = ServerConfig { kind: "http".into(), url: "http://127.0.0.1:9/mcp".into(), ..Default::default() };
+        let (url, target) = at("http://127.0.0.1:9/mcp");
+        assert_eq!(mcp_config_of_form(Some(&newer), url.clone(), target.clone(), "", Default::default()).kind, "http");
+        assert_eq!(mcp_config_of_form(None, url, target, "", Default::default()).kind, "http", "a new one");
+        let program = mcp_config_of_form(Some(&older), None, "node".into(), "server.js --port 1", Default::default());
+        assert_eq!((program.command.as_str(), program.args.join(" "), program.kind.as_str(), program.trusted), ("node", "server.js --port 1".to_string(), "", true));
+    }
 
     #[test]
     fn model_sliders_use_card_memory_and_engine_limits() {
@@ -17546,6 +18578,21 @@ mod tests {
         keep_server_line(dir.path(), &Leaving::No, &text);
         let report = std::fs::read_to_string(crate::crash::write_report(dir.path(), &Settings::default(), "RTX").unwrap()).unwrap();
         assert!(report.contains("--- the last engine error ---\n") && report.contains("  GPU fault\n"), "{report}");
+    }
+
+    /// The workspace picker lists the folders worked in before under their heading, those whose path has what is searched for (in any case), or
+    /// that none has it; then a line and the way to any other folder, the only rows besides the folders that can be chosen.
+    #[test]
+    fn the_workspace_picker_lists_the_folders_that_have_what_is_searched_for() {
+        let folders = [PathBuf::from(r"C:\work\my-website"), PathBuf::from(r"C:\work\Notes"), PathBuf::from(r"D:\site-tools")];
+        let folder = |at: usize| PickerRow::Folder { path: folders[at].clone(), name: folders[at].file_name().unwrap().to_string_lossy().into_owned() };
+        let heading = PickerRow::Heading(t("Recent workspaces").to_string());
+        assert_eq!(picker_rows(&folders, ""), vec![heading.clone(), folder(0), folder(1), folder(2), PickerRow::Line, PickerRow::Choose]);
+        assert_eq!(picker_rows(&folders, " SITE "), vec![heading.clone(), folder(0), folder(2), PickerRow::Line, PickerRow::Choose], "the path, any case");
+        assert_eq!(picker_rows(&folders, "work\\n"), vec![heading.clone(), folder(1), PickerRow::Line, PickerRow::Choose]);
+        assert_eq!(picker_rows(&folders, "nowhere"), vec![heading, PickerRow::Nothing, PickerRow::Line, PickerRow::Choose]);
+        let chosen: Vec<bool> = picker_rows(&folders, "").iter().map(PickerRow::chosen_by_hand).collect();
+        assert_eq!(chosen, [false, true, true, true, false, true]);
     }
 
     #[test]

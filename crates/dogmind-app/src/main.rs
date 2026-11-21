@@ -22,6 +22,7 @@ mod office;
 mod highlight;
 mod notice;
 mod paint;
+mod pc_facts;
 mod preview;
 mod render;
 mod rtf;

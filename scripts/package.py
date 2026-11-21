@@ -45,6 +45,7 @@ PARTS = [
     ("Dogmind (this program)", ROOT / "LICENSE", None),
     ("Straydog", ROOT / "assets" / "licenses" / "straydog-LICENSE.txt", "The engine, a separate program beside this one."),
     ("Lucide", ROOT / "assets" / "lucide" / "LICENSE", "The icons."),
+    ("Modern Web Guidance (GoogleChrome)", ROOT / "assets" / "licenses" / "modern-web-guidance-LICENSE.txt", "The built-in skill is adapted from https://github.com/GoogleChrome/modern-web-guidance."),
     ("Rust crates in these executables", ROOT / "assets" / "licenses" / "third-party.txt", None),
     ("The WebView2 SDK", ROOT / "assets" / "licenses" / "webview2-sdk-LICENSE.txt", "Its loader, WebView2LoaderStatic.lib, is linked into the app, for the preview."),
     ("webview2-com and webview2-com-sys", ROOT / "assets" / "licenses" / "webview2-rs-LICENSE.txt", "These crates ship no license file: this is the one in their repository, github.com/wravery/webview2-rs."),

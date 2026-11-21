@@ -113,6 +113,7 @@ pub fn notice_row(wake: &Wake) -> NoticeRow {
         }
         WakeCause::CommandLine => NoticeRow { title: t("A background command printed the line it was watched for").to_string(), what: format!("{}  ·  {}", wake.id, wake.what), how: tf("Running for {0}, and going on", &[&took]), failed: false },
         WakeCause::Wait => NoticeRow { title: t("A wait is up").to_string(), what: wake.what.clone(), how: tf("Set for {0}", &[&took]), failed: false },
+        WakeCause::ServerBack => NoticeRow { title: t("The server is back").to_string(), what: wake.what.clone(), how: tf("Away for {0} after the turn failed", &[&took]), failed: false },
     }
 }
 
@@ -320,6 +321,24 @@ fn options_of(arguments: &Value) -> Vec<(String, String)> {
 }
 
 /// Whether a tool is one whose call is a card of its own, and so has no row among the calls.
+/// Where an answer of the person's own to a question is taken from, when the card's Send is pressed or Enter in its field: what is written in the card's field, else what is
+/// written in the composer (which takes an answer too); none where both are empty, and the card's field is then where to write it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OwnAnswer<'a> {
+    Field(&'a str),
+    Composer(&'a str),
+}
+
+pub fn own_answer<'a>(field: &'a str, composer: &'a str) -> Option<OwnAnswer<'a>> {
+    if !field.trim().is_empty() {
+        Some(OwnAnswer::Field(field.trim()))
+    } else if !composer.trim().is_empty() {
+        Some(OwnAnswer::Composer(composer.trim()))
+    } else {
+        None
+    }
+}
+
 pub fn is_asking(tool: &str) -> bool {
     matches!(tool, "ask_user" | "submit_plan" | "present")
 }
@@ -420,6 +439,21 @@ mod tests {
 
     fn call(name: &str, arguments: Value, result: Option<&str>) -> Option<Card> {
         Card::of_call(1, name, &arguments, result)
+    }
+
+    /// An answer of the person's own is taken from the card's field, where they wrote it, before the composer; with both empty there is none.
+    #[test]
+    fn an_answer_written_in_the_cards_field_is_the_answer() {
+        assert_eq!(own_answer("neither, hey", ""), Some(OwnAnswer::Field("neither, hey")));
+        assert_eq!(own_answer("  in the card 
+", "in the composer"), Some(OwnAnswer::Field("in the card")), "the card's field first, trimmed");
+        assert_eq!(own_answer(" ", "in the composer"), Some(OwnAnswer::Composer("in the composer")), "the composer as before");
+        assert_eq!(own_answer("", " 
+"), None);
+        // (and it comes back as the card's answer, as a choice does)
+        let ask = json!({"question": "Which word?", "options": ["hello", "hi"]});
+        let card = call("ask_user", ask, Some("the person answered: neither, hey")).unwrap();
+        assert!(matches!(card, Card::Question { state: AnswerState::Answered(words), .. } if words == "neither, hey"));
     }
 
     #[test]

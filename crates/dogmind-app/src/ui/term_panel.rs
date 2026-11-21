@@ -1,4 +1,4 @@
-//! The Terminal view of the panel on the right: the person's own shells, as tabs, each a window drawn in the app's own paint. This file is the view's page and tabs, its one window (which
+//! The central Terminal view: the person's own shells, as tabs, each a window drawn in the app's own paint. This file is the view's page and tabs, its one window (which
 //! shows the terminal of the tab chosen, and takes the keys, the pointer and an IME), the menus, and what it asks of the rest of the app; the shells themselves are `term`.
 //!
 //! A terminal is the person's, with the person's own rights: nothing it shows goes to the model, and nothing here is given to the agent.
@@ -201,7 +201,7 @@ impl App {
 
     /// The panel shows the Terminal view.
     pub(super) fn terminal_shown(&self) -> bool {
-        self.view_shown(RightView::Terminal)
+        self.panel == Panel::Chat && !self.onboarding && self.settings.center_view == CenterView::Terminal
     }
 
     /// What `look` makes of the terminal that is shown on its tab, when there is one. The terminal is borrowed for no longer than that, so that what comes of it can be acted on.
@@ -369,25 +369,13 @@ impl App {
 
     // ---- Starting, choosing and closing.
 
-    /// The view is on screen, as `/terminal` and a new terminal want it: the conversation, the panel there, and the Terminal view in it.
+    /// The view is on screen, as `/terminal` and a new terminal want it: the central panel on Terminal.
     pub(super) unsafe fn show_terminal_view(&mut self) -> bool {
         if self.panel != Panel::Chat {
             self.set_panel(Panel::Chat);
         }
-        if self.preview_file.is_some() {
-            self.close_preview();
-        }
-        if !self.settings.right_panel {
-            self.settings.right_panel = true;
-        }
-        self.settings.right_view = RightView::Terminal;
-        self.save();
-        self.layout();
-        if self.right_width == 0 {
-            self.say(t("The window is too narrow for the panel: make it wider."));
-            return false;
-        }
-        true
+        self.set_center_view(CenterView::Terminal);
+        self.terminal_shown()
     }
 
     /// `/terminal` and Ctrl+`: the view, with a terminal in it: the one there is, or a new one when there is none.
@@ -610,7 +598,7 @@ impl App {
         }
         // F6 is the way out of the terminal by keys: every other key is the shell's.
         if vk == VK_F6 && !mods.ctrl && !mods.alt {
-            self.focus_composer();
+            self.set_center_view(CenterView::Conversation);
             return TermKey::Taken;
         }
         let Some((over, modes, selected, rows)) = self.with_active(|terminal| {

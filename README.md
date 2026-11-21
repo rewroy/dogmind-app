@@ -61,13 +61,15 @@ change anything") makes that turn read-only, and a line says so before anything 
 changing the tests") only limits that object. Keys and tokens that a tool brings back are hidden on screen; the model still gets
 them as they were.
 
-The panel on the right (the button at the right of the title, or `/panel`) has *Overview*, *Files* and *Terminal*. *Files* shows the workspace
+The panel on the right (the button at the right of the title, or `/panel`) has *Overview* and *Files*. *Files* shows the workspace
 as a tree, folders first, with the files this session changed marked, and follows the disk as it changes. A click previews a file
 beside the conversation (Markdown, HTML, pictures, code and text, CSV and TSV as tables, an Excel workbook's first sheet), a double
 click opens it in its app, and a right click opens it, shows it in Explorer, copies its path or mentions it in your message
 (`@path`). A helper's steps take the panel's place while they are shown, and a preview opened after them takes theirs.
 
-*Terminal* (`/terminal`, or Ctrl+`` ` ``) is your own shell, beside the conversation: PowerShell 7, Windows PowerShell, the Command
+Below the session title, switch between *Conversation*, *Terminal* and *Timeline*. The timeline shows current activity and the session history.
+
+*Terminal* (`/terminal`, or Ctrl+`` ` ``) is your own shell: PowerShell 7, Windows PowerShell, the Command
 Prompt, and Git Bash where a full Git for Windows is installed (the Git that comes with Dogmind has no bash). **New terminal** opens
 the shell you chose last, the arrow beside it lists the others, and it starts in the session's folder (your own folder when there is
 none). Programs behave as in Windows Terminal (it is a pseudo console, ConPTY): colours in 16, 256 and true colour, bold,
@@ -75,7 +77,7 @@ underline, the cursor, wide Japanese characters, git, python, vim, a progress ba
 `NO_COLOR` in it (a variable some tools set for what they start) is the shell's too, and programs that honour it print plain text.
 Each terminal is a tab, up to 8: double click a
 tab to rename it, and its cross closes it, which ends the shell and everything it started, as quitting Dogmind does. A terminal goes
-on running while the panel is collapsed, another view is shown or you open another session. A shell that has ended stays on the
+on running while another view is shown or you open another session. A shell that has ended stays on the
 screen with its exit code and a *New terminal* button, and never starts again by itself. While it has the keys, every key is the
 shell's (Tab, the arrows, F-keys, Ctrl and Alt with a letter) except Ctrl+`` ` `` (another terminal), Ctrl+Tab and Ctrl+1 to 9 (the
 sessions) and F6, which leaves the terminal for the message box. Ctrl+C copies what is selected, and otherwise is the shell's ^C;

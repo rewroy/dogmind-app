@@ -40,14 +40,21 @@ impl Kind {
 pub enum RightView {
     /// The folder's files as a tree.
     Files,
-    /// The person's own shells.
-    Terminal,
-    /// What the model and the app are doing now, where the work is heading, and the path the session took.
-    Timeline,
     /// The session's tasks, what waits, the changes and the engine. (A name no version of this app knows is this too: the file is not refused for it.)
     #[default]
     #[serde(other)]
     Overview,
+}
+
+/// What the central panel shows within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CenterView {
+    Terminal,
+    Timeline,
+    #[default]
+    #[serde(other)]
+    Conversation,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,6 +263,7 @@ pub struct Settings {
     pub right_panel: bool,
     /// What it shows. (Before the Terminal view the choice was `right_files`, true for the files: `Settings::load` reads that key where it is, see `migrate`.)
     pub right_view: RightView,
+    pub center_view: CenterView,
     /// The shell the last new terminal was started with, by its name in `term::shells` (`pwsh`, `powershell`, `cmd`, `git-bash`); empty before one was chosen.
     pub terminal_shell: String,
     pub web_tools: bool,
@@ -360,6 +368,7 @@ impl Default for Settings {
             set_up: false,
             right_panel: true,
             right_view: RightView::Overview,
+            center_view: CenterView::Conversation,
             terminal_shell: String::new(),
             web_tools: true,
             code_mode: false,
@@ -390,8 +399,29 @@ fn migrate(mut file: serde_json::Value) -> serde_json::Value {
                 map.insert("right_view".into(), if old == serde_json::Value::Bool(true) { "files" } else { "overview" }.into());
             }
         }
+        if let Some(view @ ("terminal" | "timeline")) = map.get("right_view").and_then(serde_json::Value::as_str) {
+            let view = serde_json::Value::from(view);
+            map.entry("center_view").or_insert(view);
+            map.insert("right_view".into(), "overview".into());
+        }
     }
     file
+}
+
+/// A file of the person's, whole or not at all: it changes by a rename, of one already on the disk. Written over in place, or renamed unflushed, a
+/// power cut leaves the name on zeros.
+pub fn write_whole(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let written = std::fs::File::create(&part).and_then(|mut file| {
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()
+    });
+    written.and_then(|()| std::fs::rename(&part, path)).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 impl Settings {
@@ -427,12 +457,7 @@ impl Settings {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
         }
-        let part = path.with_extension("json.part");
-        let written = std::fs::File::create(&part).and_then(|mut file| {
-            std::io::Write::write_all(&mut file, text.as_bytes())?;
-            file.sync_all()
-        });
-        written.and_then(|()| std::fs::rename(&part, path)).map_err(|error| format!("{}: {error}", path.display()))
+        write_whole(path, text.as_bytes())
     }
 
     /// As the file may hold it: whatever else goes wrong, what looks like a key is not written.
@@ -621,6 +646,18 @@ pub fn what_remove_leaves(data: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A file of the person's is written whole, over what was there, and leaves no partial one beside it.
+    #[test]
+    fn a_file_written_whole_replaces_the_one_there_and_leaves_nothing_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("instructions.md");
+        std::fs::write(&file, "old words that were longer").unwrap();
+        super::write_whole(&file, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no .part left");
+        super::write_whole(&dir.path().join("made").join("here.md"), b"x").unwrap();
+    }
+
     /// The conversation's state is kept only where it is no more readable than the conversations: with no encryption, or with the key remembered on this PC,
     /// which Windows opens for the account as it opens the state. Encrypted and not remembered, the option is off whatever was chosen, and choosing it is
     /// refused; when the combination goes, the choice is not given back.
@@ -1092,9 +1129,9 @@ mod tests {
         assert_eq!(loaded(r#"{"right_files": false}"#).right_view, RightView::Overview);
         assert_eq!(loaded("{}").right_view, RightView::Overview);
         // (the new key wins over the old when a file somehow has both)
-        assert_eq!(loaded(r#"{"right_files": true, "right_view": "terminal"}"#).right_view, RightView::Terminal);
+        assert_eq!(loaded(r#"{"right_files": true, "right_view": "terminal"}"#).center_view, CenterView::Terminal);
         assert_eq!(loaded(r#"{"right_view": "files"}"#).right_view, RightView::Files);
-        assert_eq!(loaded(r#"{"right_view": "timeline"}"#).right_view, RightView::Timeline);
+        assert_eq!(loaded(r#"{"right_view": "timeline"}"#).center_view, CenterView::Timeline);
         // (a view that a later version has is the overview here, and the file is not refused for it)
         let later = loaded(r#"{"right_view": "something_later", "right_panel": false}"#);
         assert_eq!((later.right_view, later.right_panel), (RightView::Overview, false));
@@ -1114,9 +1151,9 @@ mod tests {
         let mut settings = Settings::default();
         assert_eq!(settings.terminal_shell, "");
         settings.terminal_shell = "git-bash".into();
-        settings.right_view = RightView::Terminal;
+        settings.center_view = CenterView::Terminal;
         settings.save(&path).unwrap();
         let back = Settings::load(&path);
-        assert_eq!((back.terminal_shell.as_str(), back.right_view), ("git-bash", RightView::Terminal));
+        assert_eq!((back.terminal_shell.as_str(), back.center_view), ("git-bash", CenterView::Terminal));
     }
 }

@@ -2,7 +2,7 @@
 //! a picture goes out the same bytes every time, as the local engine reuses its prefix by each picture's digest. A picture is looked at
 //! when it is attached, made smaller only if the provider allows no larger, once, and never encoded again after that.
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
@@ -221,7 +221,8 @@ const SEALED: &[u8; 8] = crate::session::SEALED_MARK;
 pub(crate) fn store(session: &Path, file: &str, bytes: &[u8]) -> Result<(), String> {
     let folder = folder_of(session);
     let target = folder.join(file);
-    if target.exists() {
+    // (one there already is these bytes, by its name: unless a power cut left it as zeros, and then it is written again)
+    if target.exists() && !std::fs::read(&target).is_ok_and(|there| left_by_a_power_cut(&there)) {
         return Ok(());
     }
     let kept = match crate::session::sealed_of(session).map_err(|error| error.to_string())? {
@@ -230,8 +231,15 @@ pub(crate) fn store(session: &Path, file: &str, bytes: &[u8]) -> Result<(), Stri
     };
     std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
     let partial = target.with_extension("partial");
-    std::fs::write(&partial, &kept).map_err(|error| error.to_string())?;
+    // (on the disk before it takes the name: otherwise a power cut just after can leave the name with the length and zeros in it)
+    let written = std::fs::File::create(&partial).and_then(|mut out| out.write_all(&kept).and_then(|()| out.sync_all()));
+    written.map_err(|error| error.to_string())?;
     std::fs::rename(&partial, &target).map_err(|error| error.to_string())
+}
+
+/// What a power cut leaves of a file written just before it: nothing in it, or its length and only zeros. Seen on this app's own pictures after one.
+pub(crate) fn left_by_a_power_cut(bytes: &[u8]) -> bool {
+    bytes.iter().all(|&byte| byte == 0)
 }
 
 /// A picture of a session as it was: read from its file, and opened if it is sealed. A file that is not sealed is read as it is, whatever the session is.
@@ -282,8 +290,8 @@ pub(crate) fn loaded(message: &Message, folder: Option<&Path>) -> (Vec<Loaded>, 
     let mut text = message.content.clone().unwrap_or_default();
     let mut pictures = Vec::new();
     for image in &message.images {
-        // (a file with nothing in it, as a power cut can leave: a service refuses the empty picture, and with it every later request of this conversation)
-        match folder.and_then(|folder| read_stored(&folder.join(&image.file)).ok()).filter(|bytes| !bytes.is_empty()) {
+        // (what a power cut can leave, nothing or zeros: a service refuses a picture that is not one, and with it every later request of this conversation)
+        match folder.and_then(|folder| read_stored(&folder.join(&image.file)).ok()).filter(|bytes| !left_by_a_power_cut(bytes)) {
             Some(bytes) => pictures.push(Loaded { media_type: image.media_type.clone(), data: base64(&bytes) }),
             None => {
                 if !text.is_empty() {
@@ -468,6 +476,26 @@ pub(crate) mod tests {
         let (pictures, text) = loaded(&message, Some(dir.path()));
         assert!(pictures.is_empty(), "a service refuses it, and all that comes after it");
         assert!(text.contains("no longer on this computer"), "{text}");
+    }
+
+    /// What a power cut left of two pictures of a session written just before it: their length, all zeros. Such a one is not sent, and saved again it is written over.
+    #[test]
+    fn a_picture_a_power_cut_left_as_zeros_is_not_sent_and_saved_again_is_written_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("s.jsonl");
+        let picture = attach_bytes("a.png", encoded(8, 8, ImageFormat::Png)).unwrap();
+        let kept = save(&session, &picture, ImageLimit::WIDE).unwrap();
+        let file = file_of(&session, &kept);
+        let length = std::fs::metadata(&file).unwrap().len() as usize;
+        std::fs::write(&file, vec![0u8; length]).unwrap();
+        let message = Message { images: vec![kept.clone()], ..Message::text("user", "look") };
+        let (pictures, text) = loaded(&message, Some(&folder_of(&session)));
+        assert!(pictures.is_empty(), "a service refuses it, and all that comes after it");
+        assert!(text.contains("could not be read"), "{text}");
+        assert_eq!(save(&session, &picture, ImageLimit::WIDE).unwrap(), kept);
+        let (pictures, _) = loaded(&message, Some(&folder_of(&session)));
+        assert_eq!(pictures.len(), 1, "written over, it is sent again");
+        assert!(!dir.path().join("s.images").join(format!("{}.partial", kept.file.trim_end_matches(".png"))).exists());
     }
 
     #[test]
