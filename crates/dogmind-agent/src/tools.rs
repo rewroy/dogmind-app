@@ -2386,6 +2386,15 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     notes
 }
 
+/// What to say where Chrome stopped at once in the sandbox: its crash handler is refused the pipe it makes there, whatever switches it is given (with
+/// `2>&1` what it said is in the output). A model that wanted a page's picture ran it outside the sandbox for it, which the user is asked about each time.
+fn chrome_note(out: &str, err: &str) -> Option<&'static str> {
+    [out, err].iter().any(|said| said.contains("crashpad_client_win.cc") && said.contains("CreateNamedPipe")).then_some(
+        "note: Chrome cannot start in the sandbox: it stops at once when its crash handler is refused there, whatever its switches. To look at a page, use check_page, \
+         which opens it in a browser in the sandbox and gives a picture of it, WebGL drawn too.\n",
+    )
+}
+
 /// Whether a line names a path on a drive that is not under the workspace.
 #[cfg(windows)]
 /// A program's own words count too: Python's `'C:\\Users\\me\\a.txt'`, in quotes and with its backslashes doubled.
@@ -2935,6 +2944,9 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     }
     // (with the cause said above, a traceback's middle tells nothing more, and it is read again with every later request)
     let mut notes = if as_person { String::new() } else { sandbox_notes(line, &resolve(workspace, "."), done.status, &err) };
+    if let Some(note) = chrome_note(&out, &err).filter(|_| !as_person) {
+        notes.push_str(note);
+    }
     // (the stand-in for `del` finds no file outside the workspace, where the container sees none, and says it could not find it: that is the sandbox's refusal too)
     if !as_person && done.status != Some(0) && !notes.contains(OUTSIDE_READ_NOTE) && out.contains("Could Not Find") && names_outside(line, &resolve(workspace, ".")) {
         notes.push_str(OUTSIDE_READ_NOTE);
@@ -4627,6 +4639,16 @@ mod tests {
                 assert_eq!(sandbox_notes(line, root, status, err), "", "{line} {status:?}");
             }
         }
+    }
+
+    /// Chrome stopped by its crash handler in the sandbox, as it said it on its error stream or, with `2>&1`, in its output: the model is told of check_page. Nothing else is.
+    #[test]
+    fn chrome_that_cannot_start_in_the_sandbox_points_to_check_page() {
+        let fatal = "[1121/211815.239:FATAL:third_party\\crashpad\\crashpad\\client\\crashpad_client_win.cc:331] Check failed: . CreateNamedPipe: アクセスが拒否されました。 (0x5)";
+        assert!(chrome_note("", fatal).is_some_and(|note| note.contains("check_page")));
+        assert!(chrome_note(fatal, "").is_some());
+        assert!(chrome_note("crashpad_client_win.cc is a file", "").is_none());
+        assert!(chrome_note("", "").is_none());
     }
 
     /// A Unix habit that fails says what to use instead, whether cmd does not know the program (in English or in Japanese) or Git's own copy of it fails at its start.

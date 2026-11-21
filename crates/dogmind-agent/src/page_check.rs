@@ -1025,6 +1025,8 @@ struct Reading {
     console_head: Option<String>,
     /// The words the page said it shows, at the end of the steps or of its time, where they ended; none where the browser was not asked to say them.
     seen: Option<String>,
+    /// The last run was stopped by its time, still running the page: what it draws took longer than a run may, and it did not crash.
+    timed_out: bool,
 }
 
 /// The console's heading when none of the views asked for is the desktop's: the first block is still the console of a run at 1280x800, and under a plain "Console" a model that asked
@@ -1042,6 +1044,8 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
         out.push_str(lost);
     } else if let (false, Some(words)) = (finished, &reading.not_loaded) {
         out.push_str(words);
+    } else if !finished && reading.timed_out {
+        out.push_str("NOT CHECKED: the browser was stopped each time it was tried, still running the page when its time was up, at the usual wait too: it draws more than a run of the browser may take here (WebGL is drawn on the CPU, with no GPU). This is not the page failing, and not the browser crashing. Check it at a smaller view, or a page with less to draw. Do not run a browser yourself to see it instead: Chrome does not start in the sandbox, and outside it the user is asked each time. If it cannot be checked, say in your answer that the page was not checked.\n");
     } else if !finished {
         out.push_str("NOT CHECKED: the browser crashed or was stopped each time it was tried. This browser sometimes crashes in the sandbox, whatever the page, and a big WebGL drawing stops it too, so this says nothing about the page. What it had said by then is below. Running this check again changes nothing, and do not install anything to check it another way: say in your answer that the page was not checked.\n");
     }
@@ -1142,7 +1146,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     let (parts, more_parts) = steps.map_or((Vec::new(), 0), step_parts);
     // (each load after the first costs time of its own: a page's own, as a plain page is given)
     let asked_wait = arguments.get("wait_ms").and_then(Value::as_u64);
-    let wait = asked_wait.unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS) + parts.len().saturating_sub(1) as u64 * WAIT_MS;
+    let mut wait = asked_wait.unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS) + parts.len().saturating_sub(1) as u64 * WAIT_MS;
     let wait_cut = wait_cut(asked_wait);
     let cwd = page.as_deref().and_then(Path::parent).unwrap_or(workspace).to_path_buf();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1184,41 +1188,63 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         None => (name.clone(), name.clone()),
     };
     // (the script that reads a plain page's words waits for the page's time to be up, so the browser is given a little more of it than that)
-    let run_wait = if steps.is_none() && copy_name.is_some() { wait + READ_MARGIN_MS } else { wait };
+    let run_wait_of = |wait: u64| if steps.is_none() && copy_name.is_some() { wait + READ_MARGIN_MS } else { wait };
     let browser_flags = flags() + &extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
-    // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
-    let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
-    let mut ended_as = EndOfRun::Stopped;
-    let mut hangs = 0;
-    // (a page with steps may take as long as its steps do; one without has a limit of its own, and a run that hangs is ended early)
-    let limit = if steps.is_some() { LIMIT } else { run_limit(run_wait) };
-    let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
-    let mut before = None;
-    for _ in 0..TRIES {
-        let started = std::time::Instant::now();
-        let profile = profiles.next();
-        let line = page_line(&program, &browser_flags, run_wait, &profile, &address);
-        let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel)?;
-        (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
-        #[cfg(debug_assertions)]
-        if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
-            eprintln!("--- browser, {:?} {:?}:\n{err}\n--- dom: {} bytes", done.status, done.ended, dom.len());
+    // The page read, at `run_wait` of its time: its DOM, what the browser said, whether it was read, how the last run ended (`exit code 0x0`, `timed out`) and as what.
+    let read_at = |run_wait: u64| -> Result<(String, String, bool, String, EndOfRun), String> {
+        // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
+        let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
+        let mut ended_as = EndOfRun::Stopped;
+        let mut hangs = 0;
+        // (a page with steps may take as long as its steps do; one without has a limit of its own, and a run that hangs is ended early)
+        let limit = if steps.is_some() { LIMIT } else { run_limit(run_wait) };
+        let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
+        let mut before = None;
+        for _ in 0..TRIES {
+            let started = std::time::Instant::now();
+            let profile = profiles.next();
+            let line = page_line(&program, &browser_flags, run_wait, &profile, &address);
+            let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel)?;
+            (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
+            #[cfg(debug_assertions)]
+            if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
+                eprintln!("--- browser, {:?} {:?}:\n{err}\n--- dom: {} bytes", done.status, done.ended, dom.len());
+            }
+            ended_as = end_of_run(done.status, &dom, &err);
+            finished = ended_as == EndOfRun::Read;
+            how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
+            note_browser_run("page", how.clone(), started);
+            #[cfg(test)]
+            note_run(false, !finished);
+            // (a run that hung and printed nothing, not so much as a console line of the page's, is the browser's: it is tried once more)
+            let silent_hang = hung(&done) && !page_wrote_to_console(&err);
+            hangs += usize::from(silent_hang);
+            let again = silent_hang && tries_again_after_a_hang(hangs);
+            if finished || cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING || (!again && (started.elapsed() > LIMIT / 2 || crash_repeats(&mut before, &err))) {
+                break;
+            }
         }
-        ended_as = end_of_run(done.status, &dom, &err);
-        finished = ended_as == EndOfRun::Read;
-        how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
-        note_browser_run("page", how.clone(), started);
-        #[cfg(test)]
-        note_run(false, !finished);
-        // (a run that hung and printed nothing, not so much as a console line of the page's, is the browser's: it is tried once more)
-        let silent_hang = hung(&done) && !page_wrote_to_console(&err);
-        hangs += usize::from(silent_hang);
-        let again = silent_hang && tries_again_after_a_hang(hangs);
-        if finished || cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING || (!again && (started.elapsed() > LIMIT / 2 || crash_repeats(&mut before, &err))) {
-            break;
+        profiles.clear();
+        Ok((dom, err, finished, how, ended_as))
+    };
+    let (mut dom, mut err, mut finished, mut how, mut ended_as) = read_at(run_wait_of(wait))?;
+    // A page that draws much with WebGL is drawn here on the CPU, with no GPU, a frame every 16 ms of its time: at a long wait that takes longer than a run may, and
+    // each run was stopped (a three.js scene with bloom took 60 s for 5 s of its time). It is read once more at the usual wait, and its pictures are taken at that wait too.
+    let mut shortened = String::new();
+    if !finished && how == "timed out" && steps.is_none() && wait > WAIT_MS && !cancel.load(Ordering::Relaxed) {
+        let asked = wait;
+        wait = WAIT_MS;
+        // (the copy that says the page's words waits for its time to be up: for this wait now)
+        if let (Some(page), Some(copy)) = (&page, opened.as_ref().filter(|_| copy_name.is_some())) {
+            if let Ok(html) = page_html(page) {
+                let _ = std::fs::write(copy, with_script(&html, &(file_url(page.parent().unwrap_or(workspace)) + "/"), &reading_script(wait)));
+            }
+        }
+        (dom, err, finished, how, ended_as) = read_at(run_wait_of(wait))?;
+        if finished {
+            shortened = format!("At the {asked} ms of its time asked for, its drawing took longer than a run of the browser may here (WebGL is drawn on the CPU, with no GPU): it was read, and its pictures taken, after {WAIT_MS} ms of its time instead. To see it later than that, ask for a smaller view or a page with less to draw.\n");
         }
     }
-    profiles.clear();
     // (what its console names is said from the workspace, or from the server's root)
     let base_url = match served {
         Some(url) => url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/") + "/",
@@ -1270,12 +1296,13 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     };
     // (the words that the page the steps left said at their end are not of the page that is shown)
     let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
-    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen };
-    let said = format!("{}{wait_cut}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
+    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen, timed_out: how == "timed out" };
+    let said = format!("{}{wait_cut}{shortened}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
     if !finished {
         return Ok(format!("{said}The browser's end: {how}.\n"));
     }
-    // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. Not of a page that draws with WebGL, which ends the browser here.
+    // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. What a page draws with WebGL is in it, drawn on the CPU: a picture said
+    // otherwise, and a model that wanted to see a scene of three.js ran a browser outside the sandbox for it.
     let Some(temp) = temp else { return Ok(said) };
     let mut out = said;
     // Each picture by a name of its own: one name for every call had a later check, or another session's, write over a picture an answer
@@ -1337,7 +1364,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let _ = std::fs::remove_file(&shot);
         let _ = std::fs::remove_file(&frame);
         out.push_str(&if taken {
-            format!("How it looks at {} ({}x{}), without WebGL drawing: `read_file` {}\n", view.label, view.width, view.height, picture.display())
+            format!("How it looks at {} ({}x{}), WebGL drawn too (on the CPU, with no GPU): `read_file` {}\n", view.label, view.width, view.height, picture.display())
         } else {
             format!("No picture at {} could be taken: the browser ended without one each time it was tried, which says nothing of the page. Do not build other pages to measure the layout instead; say in your answer that there is no picture.\n", view.label)
         });
@@ -1994,6 +2021,9 @@ mod tests {
         // a crash and a stop keep their words
         let crash = report("p", "Edge", false, None, &[], "", &Reading::default());
         assert!(crash.contains("NOT CHECKED: the browser crashed or was stopped"), "{crash}");
+        // stopped by its time, still drawing: said as that, and not as a crash that a browser run another way might get past (one was run outside the sandbox for it)
+        let slow = report("page.html", "Edge", false, Some(&Needs::default()), &[], "", &Reading { timed_out: true, ..Reading::default() });
+        assert!(slow.contains("not the browser crashing") && slow.contains("Do not run a browser yourself") && !slow.contains("crashed or was stopped"), "{slow}");
     }
 
     /// With the real browser, in the real sandbox: a server on this machine that no command started (this test's own, outside the sandbox)
