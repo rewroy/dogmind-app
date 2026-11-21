@@ -1931,6 +1931,8 @@ impl Agent {
         self.bench.web.settings = self.web.clone();
         self.load_extras();
         (self.goal, self.goal_due) = (None, false);
+        // (a goal left open for background work's end is that session's: another one starts with none)
+        self.round_goal = None;
         self.emit(Event::Goal(None));
         self.web_seen = false;
         self.japanese_session = false;
@@ -1989,6 +1991,7 @@ impl Agent {
                 self.emit(Event::WebSeen(self.web_seen));
                 // (the history has said it already; a compaction will say it again)
                 (self.goal, self.goal_due) = (crate::session::goal_of(path), false);
+                self.round_goal = None;
                 self.emit(Event::Goal(self.goal.clone()));
                 for message in &self.messages {
                     match (message.role.as_str(), message.content.as_deref()) {

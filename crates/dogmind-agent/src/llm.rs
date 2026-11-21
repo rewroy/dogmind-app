@@ -463,10 +463,19 @@ pub const REMINDER_BEFORE_VARIABLE: &str = "DOGMIND_REMINDER_BEFORE";
 /// The app's messages in the role `reminders` names, and its facts before the person's message where it says so.
 fn as_reminders(messages: &mut [Value], reminders: Reminders) {
     let Some(role) = reminders.role else { return };
-    for message in messages.iter_mut() {
-        if message["role"] == "user" && message["content"].as_str().is_some_and(crate::prompt::is_from_app) {
-            message["role"] = json!(role);
+    for at in 0..messages.len() {
+        let message = &messages[at];
+        if message["role"] != "user" || !message["content"].as_str().is_some_and(crate::prompt::is_from_app) {
+            continue;
         }
+        // (latest_reminder is the facts that go with the person's message, right after it: its template opens the answer after that message, and a reminder
+        // with nothing of the person's before it, as the note after a stopped draft is, was the last thing in the prompt with no answer opened. DeepSeek went on
+        // writing the note itself, 47,000 characters of it as its answer, before its call. Every other note of the app's stays the user's, marked in its words.)
+        let after_the_person = at > 0 && messages[at - 1]["role"] == "user" && !messages[at - 1]["content"].as_str().is_some_and(crate::prompt::is_from_app);
+        if role == REMINDER_ROLE && !(after_the_person && message["content"].as_str().is_some_and(crate::prompt::is_app_facts)) {
+            continue;
+        }
+        messages[at]["role"] = json!(role);
     }
     if reminders.before {
         for at in 1..messages.len() {
@@ -1391,8 +1400,9 @@ mod tests {
             request_body_held("m", &messages, None, None, None, None, reminders)["messages"].as_array().unwrap().iter().map(|message| format!("{}:{}", message["role"].as_str().unwrap(), message["content"].as_str().unwrap().chars().take(4).collect::<String>())).collect()
         };
         assert_eq!(roles(Reminders::AS_USER), ["system:s", "user:make", "user:[Fro", "assistant:ok", "user:[Fro"]);
-        assert_eq!(roles(Reminders { role: Some(REMINDER_ROLE), before: false }), ["system:s", "user:make", "latest_reminder:[Fro", "assistant:ok", "latest_reminder:[Fro"]);
-        assert_eq!(roles(Reminders { role: Some(REMINDER_ROLE), before: true }), ["system:s", "latest_reminder:[Fro", "user:make", "assistant:ok", "latest_reminder:[Fro"]);
+        // (latest_reminder only for the facts right after the person's message: a note after an answer stays the user's, as the template opens no answer after it)
+        assert_eq!(roles(Reminders { role: Some(REMINDER_ROLE), before: false }), ["system:s", "user:make", "latest_reminder:[Fro", "assistant:ok", "user:[Fro"]);
+        assert_eq!(roles(Reminders { role: Some(REMINDER_ROLE), before: true }), ["system:s", "latest_reminder:[Fro", "user:make", "assistant:ok", "user:[Fro"]);
         assert_eq!(roles(Reminders { role: Some(APP_ROLE), before: false }), ["system:s", "user:make", "system:[Fro", "assistant:ok", "system:[Fro"]);
         // (the person's own words that only look like it stay theirs: a message of theirs never begins so, as it is what they typed)
         let client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
