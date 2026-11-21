@@ -1265,7 +1265,7 @@ mod tests {
     /// A server that does not say it keeps them is never sent a digest.
     #[test]
     fn a_picture_sent_once_goes_by_its_digest_and_again_with_its_bytes_when_the_server_no_longer_holds_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut png = Vec::new();
         image::DynamicImage::new_rgb8(4, 4).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         std::fs::write(dir.path().join("a.png"), &png).unwrap();
@@ -1362,7 +1362,7 @@ mod tests {
 
     #[test]
     fn a_picture_goes_as_parts_and_the_same_bytes_each_time() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let bytes = images::tests::encoded(8, 8, image::ImageFormat::Png);
         let kept = images::save(&session, &images::attach_bytes("a", bytes.clone()).unwrap(), ImageLimit::WIDE).unwrap();

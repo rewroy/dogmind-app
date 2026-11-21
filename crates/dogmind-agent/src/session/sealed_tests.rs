@@ -37,7 +37,7 @@ fn sealed_session(dir: &Path, stamp: &str) -> (Session, Arc<Cipher>) {
 
 #[test]
 fn an_encrypted_session_begins_with_a_header_that_holds_nothing_and_every_line_after_it_is_one_sealed_message() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let (mut session, key) = sealed_session(dir.path(), "1");
     session.mark_web_seen().unwrap();
     session.set_goal(Some("ship the page")).unwrap();
@@ -76,7 +76,7 @@ fn an_encrypted_session_begins_with_a_header_that_holds_nothing_and_every_line_a
 
 #[test]
 fn the_same_message_is_a_different_line_each_time_and_two_files_have_two_ids() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let key = cipher();
     let mut one = Session::create_with(dir.path(), Path::new("w"), "now", "1", Some(&key)).unwrap();
     let mut two = Session::create_with(dir.path(), Path::new("w"), "now", "2", Some(&key)).unwrap();
@@ -92,7 +92,7 @@ fn the_same_message_is_a_different_line_each_time_and_two_files_have_two_ids() {
 
 #[test]
 fn a_flipped_byte_is_damage_that_is_told_and_what_is_left_still_opens() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let (session, _) = sealed_session(dir.path(), "1");
     let path = session.path.clone();
     drop(session);
@@ -119,7 +119,7 @@ fn a_flipped_byte_is_damage_that_is_told_and_what_is_left_still_opens() {
 
 #[test]
 fn a_line_moved_to_another_file_or_to_another_place_is_damage() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let key = cipher();
     let make = |stamp: &str, words: &[&str]| {
         let mut session = Session::create_with(dir.path(), Path::new("w"), "now", stamp, Some(&key)).unwrap();
@@ -163,7 +163,7 @@ fn a_line_moved_to_another_file_or_to_another_place_is_damage() {
 
 #[test]
 fn a_plain_session_opens_and_goes_on_plain_whatever_is_chosen() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let mut old = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
     old.append(&Message::text("user", "plain words")).unwrap();
     let path = old.path.clone();
@@ -187,7 +187,7 @@ fn a_plain_session_opens_and_goes_on_plain_whatever_is_chosen() {
 
 #[test]
 fn a_session_goes_on_after_a_cut_line_and_the_cut_is_told() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let (mut session, _) = sealed_session(dir.path(), "1");
     session.append(&Message::text("user", "the line the crash cuts")).unwrap();
     let path = session.path.clone();
@@ -208,7 +208,7 @@ fn a_session_goes_on_after_a_cut_line_and_the_cut_is_told() {
 
 #[test]
 fn a_name_given_by_the_window_while_the_agent_writes_is_not_a_line_out_of_place() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let (mut session, _) = sealed_session(dir.path(), "1");
     let path = session.path.clone();
     for round in 0..5 {
@@ -226,7 +226,7 @@ fn a_name_given_by_the_window_while_the_agent_writes_is_not_a_line_out_of_place(
 
 #[test]
 fn a_session_whose_key_is_not_here_is_listed_as_such_and_never_opened_or_written() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let (session, key) = sealed_session(dir.path(), "1");
     let path = session.path.clone();
     drop(session);
@@ -246,7 +246,7 @@ fn a_session_whose_key_is_not_here_is_listed_as_such_and_never_opened_or_written
 
 #[test]
 fn a_branch_of_an_encrypted_session_is_encrypted_with_an_id_of_its_own_and_its_pictures_with_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let key = cipher();
     let mut session = Session::create_with(dir.path(), Path::new("C:/w"), "now", "1", Some(&key)).unwrap();
     session.set_tools(&serde_json::json!([{"function": {"name": "read_file"}}])).unwrap();
@@ -278,7 +278,7 @@ fn a_branch_of_an_encrypted_session_is_encrypted_with_an_id_of_its_own_and_its_p
 
 #[test]
 fn a_picture_opens_only_as_its_own_sessions_and_only_under_its_own_name() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let key = cipher();
     let make = |stamp: &str| Session::create_with(dir.path(), Path::new("w"), "now", stamp, Some(&key)).unwrap().path.clone();
     let (one, two) = (make("1"), make("2"));
@@ -314,7 +314,7 @@ fn a_picture_opens_only_as_its_own_sessions_and_only_under_its_own_name() {
 
 #[test]
 fn a_plain_session_keeps_its_pictures_as_they_were() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap().path.clone();
     crate::images::store(&session, "a.png", b"plain picture").unwrap();
     assert_eq!(fs::read(crate::images::folder_of(&session).join("a.png")).unwrap(), b"plain picture");

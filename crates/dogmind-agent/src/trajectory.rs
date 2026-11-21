@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn requests_are_counted_from_one_in_a_session_and_go_on_when_it_is_opened_again() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("20261105-120000.jsonl");
         let mut traj = Trajectory::new();
         assert_eq!(traj.request_id(), "warm/1", "before a session has a name");
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn what_happens_before_a_session_has_a_file_waits_for_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let mut traj = Trajectory::new();
         traj.write("request", Some("warm/1"), json!({"role": "warm"}));
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn a_request_says_where_the_message_it_made_is_and_a_request_that_made_none_says_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let mut traj = Trajectory::new();
         traj.open(&session);
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn a_session_cut_in_the_middle_of_a_line_goes_on_on_a_line_of_its_own() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         fs::write(file_of(&session), "{\"t\":\"x\",\"ev\":\"turn_st").unwrap();
         let mut traj = Trajectory::new();

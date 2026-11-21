@@ -1629,6 +1629,9 @@ mod button_style_tests {
     /// A button that has the style it is asked for is not drawn again, however often the layout asks; one that is given another is.
     #[test]
     fn a_button_is_drawn_again_only_when_its_style_changes() {
+        if crate::in_container::cannot_run(crate::in_container::SYSTEM) {
+            return;
+        }
         // SAFETY: a window of this test's own, off every screen and never activated, made and ended on this thread.
         unsafe {
             register_button_class();

@@ -13,6 +13,8 @@ mod engine_updates;
 mod files;
 mod frametrace;
 mod icon;
+#[cfg(test)]
+mod in_container;
 mod keys;
 mod lang;
 mod machine;

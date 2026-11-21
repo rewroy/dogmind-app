@@ -315,7 +315,7 @@ mod tests {
     use super::*;
 
     fn fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
-        let (work, sessions) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (work, sessions) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
         let session = sessions.path().join("s.jsonl");
         (work, sessions, session)
     }

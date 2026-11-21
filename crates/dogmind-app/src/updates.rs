@@ -1748,7 +1748,7 @@ mod tests {
         let bytes = file_bytes(300_000, 1);
         let server = Server::start(|_| vec![(SETUP_PATH.into(), file_answer(&bytes))]);
         let setup = setup_at(&server, SETUP_PATH, &bytes);
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let mut told = Vec::new();
         let ready = obtain_from("0.2.0", &setup, folder.path(), Some(&server.as_url()), &mut |done, total| told.push((done, total)), &AtomicBool::new(false)).unwrap();
         assert_eq!(ready.path, folder.path().join("DogmindSetup-0.2.0.exe"));
@@ -1771,7 +1771,7 @@ mod tests {
     fn a_download_that_does_not_have_the_published_hash_is_refused_and_leaves_no_file() {
         let (bytes, other) = (file_bytes(200_000, 1), file_bytes(200_000, 2));
         let server = Server::start(|_| vec![(SETUP_PATH.into(), file_answer(&other))]);
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         // (the same length, so that only the hash can tell)
         let failed = fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_err();
         assert_eq!(failed, Failed::DidNotMatch);
@@ -1802,14 +1802,14 @@ mod tests {
         ];
         for (what, answer, published_size) in cases {
             let server = Server::start(|_| vec![(SETUP_PATH.into(), answer)]);
-            let folder = tempfile::tempdir().unwrap();
+            let folder = crate::in_container::tempdir().unwrap();
             let setup = Setup { url: server.url(SETUP_PATH), size: published_size, ..published.clone() };
             assert_eq!(fetched(&server, &setup, folder.path()).unwrap_err(), Failed::DidNotMatch, "{what}");
             assert_eq!(names_in(folder.path()), Vec::<String>::new(), "{what}");
         }
         // a server that has not the file says so, and that is not a size that did not match
         let server = Server::start(|_| Vec::new());
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         assert_eq!(fetched(&server, &Setup { url: server.url(SETUP_PATH), ..published }, folder.path()).unwrap_err(), Failed::Refused(404));
         assert_eq!(names_in(folder.path()), Vec::<String>::new());
     }
@@ -1825,7 +1825,7 @@ mod tests {
             ("a file", "file:///C:/Windows/System32/cmd.exe".to_string()),
         ] {
             let server = Server::start(|_| vec![(SETUP_PATH.into(), redirect_to(&location))]);
-            let folder = tempfile::tempdir().unwrap();
+            let folder = crate::in_container::tempdir().unwrap();
             let failed = fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_err();
             assert_eq!(failed, Failed::NotAllowed, "{what}");
             assert_eq!(server.requests().len(), 1, "{what}: it asked once, and went nowhere else");
@@ -1835,7 +1835,7 @@ mod tests {
         let other = TcpListener::bind("127.0.0.1:0").unwrap();
         let elsewhere = format!("http://127.0.0.1:{}/x", other.local_addr().unwrap().port());
         let server = Server::start(|_| vec![(SETUP_PATH.into(), redirect_to(&elsewhere))]);
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         assert_eq!(fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_err(), Failed::NotAllowed);
         other.set_nonblocking(true).unwrap();
         assert!(other.accept().is_err(), "nothing went to it");
@@ -1858,17 +1858,17 @@ mod tests {
         };
         // one hop is the redirect GitHub makes to its storage
         let server = chain(1);
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let ready = fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap();
         assert_eq!(std::fs::read(ready.path).unwrap(), bytes);
         assert_eq!(server.requests().len(), 3, "the address asked for, the one it sent on to, and the file: {:?}", server.requests());
         // five is as far as it goes: the request that is sent on five times is the last
         let server = chain(4);
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         assert!(fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).is_ok(), "five times is allowed");
         assert_eq!(server.requests().len(), 6);
         let server = chain(5);
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         assert_eq!(fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap_err(), Failed::NotAllowed, "a sixth is not followed");
         assert_eq!(server.requests().len(), 6, "{:?}", server.requests());
         assert_eq!(names_in(folder.path()), Vec::<String>::new());
@@ -1885,7 +1885,7 @@ mod tests {
         let mut lost = 0;
         loop {
             let (server, setup) = start();
-            let folder = tempfile::tempdir().unwrap();
+            let folder = crate::in_container::tempdir().unwrap();
             let stop = AtomicBool::new(false);
             let (over, watching) = mpsc::channel::<()>();
             let result = std::thread::scope(|scope| {
@@ -1957,7 +1957,7 @@ mod tests {
         head.extend_from_slice(&bytes[..50_000]);
         // stopped from the progress it reports, with the rest of the file still to come
         let server = Server::start(|_| vec![(SETUP_PATH.into(), Answer::Stalls(head.clone()))]);
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let (setup, stop) = (setup_at(&server, SETUP_PATH, &bytes), AtomicBool::new(false));
         let failed = obtain_from("0.2.0", &setup, folder.path(), Some(&server.as_url()), &mut |done, _| if done >= 10_000 { stop.store(true, Ordering::Relaxed) }, &stop).unwrap_err();
         assert_eq!(failed, Failed::Cancelled);
@@ -1983,7 +1983,7 @@ mod tests {
     #[test]
     fn an_address_that_is_not_allowed_is_not_asked_at_all() {
         let server = Server::start(|_| Vec::new());
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let bytes = file_bytes(10, 0);
         // (in a build for release nothing but GitHub's own is: the test server is the debug build's)
         let setup = Setup { url: server.url(SETUP_PATH), size: 10, sha256: sha_of(&bytes), parts: None };
@@ -2002,7 +2002,7 @@ mod tests {
         let bytes = file_bytes(250_000, 7);
         let server = Server::start(|_| vec![(SETUP_PATH.into(), file_answer(&bytes))]);
         let setup = setup_at(&server, SETUP_PATH, &bytes);
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let first = fetched(&server, &setup, folder.path()).unwrap();
         assert_eq!(server.requests().len(), 1);
         // the next start: nothing asked, nothing fetched, and the same setup is there
@@ -2036,7 +2036,7 @@ mod tests {
 
     #[test]
     fn a_fetch_that_fails_leaves_the_setup_checked_before_to_be_offered_again_and_one_that_succeeds_takes_its_place() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let (old_bytes, new_bytes, other_bytes) = (file_bytes(250_000, 3), file_bytes(260_000, 4), file_bytes(260_000, 5));
         // 0.1.3, fetched and checked by an earlier look, for the copy that runs as 0.1.2
         let old_server = Server::start(|_| vec![("/download/DogmindSetup-0.1.3.exe".into(), file_answer(&old_bytes))]);
@@ -2069,7 +2069,7 @@ mod tests {
 
     #[test]
     fn a_setup_kept_whose_bytes_are_not_those_that_were_checked_is_not_offered_and_is_taken_away() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let bytes = file_bytes(100_000, 6);
         let server = Server::start(|_| vec![(SETUP_PATH.into(), file_answer(&bytes))]);
         let ready = fetched(&server, &setup_at(&server, SETUP_PATH, &bytes), folder.path()).unwrap();
@@ -2092,7 +2092,7 @@ mod tests {
 
     #[test]
     fn a_setup_is_run_only_if_its_bytes_are_those_that_were_checked_and_cannot_be_changed_while_held() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let bytes = file_bytes(300_000, 9);
         let ready = checked_file(folder.path(), &bytes);
         // as it was checked: held, with every other way to it shut but reading
@@ -2126,7 +2126,7 @@ mod tests {
     #[test]
     fn a_setup_is_started_while_the_handle_that_checked_it_is_still_open() {
         // (a copy of the command interpreter stands in for the setup: it is a program, and it ends with the code it is told)
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let program = std::fs::read(std::env::var_os("ComSpec").expect("ComSpec")).unwrap();
         let ready = checked_file(folder.path(), &program);
         let held = ready.hold_if_sound().unwrap();
@@ -2140,7 +2140,7 @@ mod tests {
 
     #[test]
     fn the_start_takes_out_what_is_done_with_and_nothing_else() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let put = |name: &str| std::fs::write(folder.path().join(name), name).unwrap();
         for name in ["DogmindSetup-0.1.0.exe", "DogmindSetup-0.1.2.exe", "DogmindSetup-0.3.0.exe", "DogmindSetup-0.4.0.exe.partial", "DogmindSetup-0.9.9.exe.partial", "notes.txt", "DogmindSetup-0.1.1-beta.1.exe", "DogmindSetup-x.exe"] {
             put(name);
@@ -2188,7 +2188,7 @@ mod tests {
         let to_fetch = setup_to_fetch(&outcome, true, true, None, true).expect("the setup is to be fetched on its own");
         assert_eq!(to_fetch, release);
         let setup = to_fetch.setup.clone().unwrap();
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let ready = obtain_from(&to_fetch.version, &setup, folder.path(), Some(&Url::parse(&address).unwrap()), &mut |_, _| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!(std::fs::read(&ready.path).unwrap(), bytes);
         assert_eq!(server.requests(), ["GET /repos/rewroy/dogmind-app/releases?per_page=20 HTTP/1.1", format!("GET {SETUP_PATH} HTTP/1.1").as_str()], "one look, one fetch");
@@ -2217,7 +2217,7 @@ mod tests {
 
     #[test]
     fn a_copy_is_an_install_when_the_installers_manifest_is_in_its_folder() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         assert!(!is_install(folder.path()), "a copy unpacked from the zip");
         std::fs::write(folder.path().join("dogmind-app.exe"), "x").unwrap();
         std::fs::write(folder.path().join("LICENSE.txt"), "x").unwrap();
@@ -2226,7 +2226,7 @@ mod tests {
         assert!(is_install(folder.path()), "what the installer wrote there");
         assert!(!is_install(&folder.path().join("elsewhere")));
         // a folder of that name is no file of the installer's
-        let other = tempfile::tempdir().unwrap();
+        let other = crate::in_container::tempdir().unwrap();
         std::fs::create_dir(other.path().join(INSTALL_MANIFEST)).unwrap();
         assert!(!is_install(other.path()));
         // the name is the one the installer writes, which this cannot link to
@@ -2267,7 +2267,7 @@ mod tests {
 
     impl Scene {
         fn new(with_sums: bool) -> Scene {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::in_container::tempdir().unwrap();
             let exe = make_setup(dir.path(), "0.2.0", &borrowed(&new_files()));
             let (exe_bytes, parts_bytes) = (std::fs::read(&exe).unwrap(), std::fs::read(setup_pack::parts_path(&exe)).unwrap());
             let install = dir.path().join("install");

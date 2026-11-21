@@ -441,7 +441,7 @@ mod tests {
     }
 
     fn stand() -> Stand {
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let base = std::fs::canonicalize(holder.path()).map_or(holder.path().to_path_buf(), |full| PathBuf::from(full.to_string_lossy().trim_start_matches("\\\\?\\")));
         let file = base.join("journal").join(FILE_NAME);
         TEST_FILE.with(|known| *known.borrow_mut() = Some(file.clone()));
@@ -487,6 +487,9 @@ mod tests {
 
     #[test]
     fn moving_on_takes_back_the_write_grant_exactly_and_the_other_workspace_is_untouched() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let (first, second) = (folder(&stand, "first"), folder(&stand, "second"));
         let before = lists(&first);
@@ -517,6 +520,9 @@ mod tests {
 
     #[test]
     fn two_chats_in_one_folder_keep_it_until_the_last_has_gone() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let place = folder(&stand, "shared");
         let (one, two) = (Use::new(&place), Use::new(&place));
@@ -531,6 +537,9 @@ mod tests {
 
     #[test]
     fn a_grant_is_not_taken_back_during_a_command_only_after() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let place = folder(&stand, "busy");
         let chat = Use::new(&place);
@@ -553,6 +562,9 @@ mod tests {
     /// As `Documents` is: a list that says nothing of auto-inheritance, where what is handed down carries no mark.
     #[test]
     fn a_workspace_whose_lists_say_nothing_of_inheritance_loses_the_grant_too() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let place = folder(&stand, "plain-shape");
         let text = sandbox::dacl_text(&place).unwrap();
@@ -570,6 +582,9 @@ mod tests {
 
     #[test]
     fn a_workspace_renamed_after_its_session_is_found_and_leaves_no_grant() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let place = folder(&stand, "before-rename");
         let chat = Use::new(&place);
@@ -605,6 +620,9 @@ mod tests {
 
     #[test]
     fn a_guarded_repository_is_put_back_as_it_was() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let place = folder(&stand, "repo");
         crate::tools::git(&place, &["init", "-q"]).unwrap();
@@ -627,6 +645,9 @@ mod tests {
 
     #[test]
     fn what_can_be_proved_is_cleaned_at_the_start_and_what_cannot_is_left() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let sid = unsafe { sandbox::profile_sid().unwrap() };
         let (old, other_shape, not_named, in_use) = (folder(&stand, "old"), folder(&stand, "other-shape"), folder(&stand, "not-named"), folder(&stand, "in-use"));
@@ -691,6 +712,9 @@ mod tests {
 
     #[test]
     fn a_repository_the_person_had_closed_themselves_is_guarded_and_loses_all_it_was_given() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let place = folder(&stand, "repo");
         let git = place.join(".git");
@@ -731,6 +755,9 @@ mod tests {
 
     #[test]
     fn a_planted_commondir_does_not_send_git_elsewhere_for_its_config() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let place = folder(&stand, "repo");
         let git = place.join(".git");
@@ -749,6 +776,9 @@ mod tests {
 
     #[test]
     fn the_one_line_of_a_worktrees_git_cannot_be_rewritten_and_is_put_back() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let place = folder(&stand, "worktree");
         let git = place.join(".git");
@@ -765,6 +795,9 @@ mod tests {
 
     #[test]
     fn a_folder_on_the_way_keeps_its_list_to_itself_when_it_is_passed_through() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let place = folder(&stand, "closed");
         let sid = unsafe { sandbox::profile_sid().unwrap() };
@@ -777,6 +810,9 @@ mod tests {
 
     #[test]
     fn what_reads_as_a_secret_in_a_toolchains_folder_is_not_given_with_it() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let home = stand.base.join("me");
         let cargo = home.join(".cargo");
@@ -801,6 +837,9 @@ mod tests {
     /// An item under the grant that refuses to have its list changed leaves the grant on the list, and the take-back is done when it can be.
     #[test]
     fn a_take_back_that_could_not_change_everything_stays_on_the_list_and_is_tried_again() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let first = folder(&stand, "first");
         let chat = Use::new(&first);
@@ -836,6 +875,9 @@ mod tests {
     /// A workspace opened through a junction is the folder the junction leads to: the chat that has it open keeps the grant a command in it made, whichever way the two are spelled.
     #[test]
     fn a_workspace_opened_through_a_junction_keeps_its_grant_while_the_chat_is_open() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let first = folder(&stand, "first");
         let link = stand.base.join("through");

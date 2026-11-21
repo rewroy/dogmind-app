@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn the_files_are_turned_on_and_off_in_the_settings_and_the_drafter_file_stays() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let config = dir.path().join("engine.toml");
         let mtp = dir.path().join("Qwen").join("mtp");
         std::fs::write(&config, "model = 'M'\nquant = \"X\"\n").unwrap();

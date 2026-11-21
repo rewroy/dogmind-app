@@ -222,7 +222,7 @@ mod tests {
         png.extend(chunk(b"IEND", &[]));
         assert!(png.len() < 1000);
         assert_eq!(decode_bytes(&png, 280, 200).err(), Some(Undecoded::Unreadable), "refused from its header");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("huge.png");
         std::fs::write(&file, &png).unwrap();
         assert_eq!(decode(&file, 280, 200).err(), Some(Undecoded::Unreadable));
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn a_file_that_went_or_is_no_picture_says_which() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         assert_eq!(decode(&dir.path().join("gone.png"), 10, 10).err(), Some(Undecoded::Gone));
         let broken = dir.path().join("broken.png");
         std::fs::write(&broken, b"not a picture").unwrap();

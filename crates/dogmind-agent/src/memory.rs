@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn what_was_forgotten_in_japanese_is_cut_to_its_newest_at_a_character() {
         for pad in 0..3 {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::in_container::tempdir().unwrap();
             let file = forgotten_file(dir.path());
             let entry = format!("\n## 2026-11-20 09:00 (you, in every project)\n- {}\n", "会員の設定は保存しない".repeat(30));
             let mut text = String::new();
@@ -321,7 +321,7 @@ mod tests {
     /// Notes kept by many at once are all kept; notes that cannot be read are not written over.
     #[test]
     fn notes_kept_at_once_are_all_kept_and_unreadable_ones_are_not_written_over() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let workspace = Path::new("C:/w");
         std::thread::scope(|scope| {
             for at in 0..8 {
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn the_person_sees_every_note_and_takes_out_one_alone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (folder, workspace) = (dir.path().join("memory"), dir.path().join("work"));
         for (note, scope) in [("Reu was a Newfoundland", "project"), ("answers in Japanese", "user"), ("Reu crossed the rainbow bridge", "project")] {
             remember(&folder, &workspace, &json!({"note": note, "scope": scope})).unwrap();
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn a_note_reaches_later_sessions_of_its_scope() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (one, two) = (Path::new("C:/w/one"), Path::new("C:/w/two"));
         remember(dir.path(), one, &json!({"note": "builds with  make\nnot cargo"})).unwrap();
         remember(dir.path(), one, &json!({"note": "prefers short answers", "scope": "user"})).unwrap();
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn notes_are_kept_small_and_can_go() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = Path::new("w");
         assert!(remember(dir.path(), root, &json!({"note": "x".repeat(601)})).is_err());
         assert!(remember(dir.path(), root, &json!({"note": "  "})).is_err());
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn with_no_notes_yet_the_prompt_says_nothing_and_the_tool_says_how_to_use_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         assert_eq!(prompt_section(dir.path(), Path::new("w")), "", "a section of no notes is read by every session for nothing");
         assert!(schemas().to_string().contains("could not find by looking"));
     }
@@ -387,7 +387,7 @@ mod tests {
     /// A word every note holds drops none of them; one clear match is dropped, and kept where the person can get it back.
     #[test]
     fn a_forget_that_matches_many_drops_none_and_one_that_is_clear_is_kept_for_getting_back() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (folder, workspace) = (dir.path().join("memory"), dir.path().join("work"));
         for (note, scope) in [("answers in Japanese", "user"), ("builds with make", "project"), ("builds on CI take ten minutes", "project"), ("tests need the server up", "project"), ("deploys on Fridays", "project")] {
             remember(&folder, &workspace, &json!({"note": note, "scope": scope})).unwrap();
@@ -439,7 +439,7 @@ mod tests {
     /// What reads as a secret is refused and not written; what is only about one is kept.
     #[test]
     fn a_note_that_holds_a_key_or_a_password_is_refused_and_nothing_is_written() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (folder, workspace) = (dir.path().join("memory"), dir.path().join("work"));
         for note in ["use sk-abcdefghijklmnopqrstuv for the API", "the token: ghp_abcdefghijklmnopqrstuvwxyz0123456789", "password: hunter2", "key is in C:/Users/me/.ssh/id_rsa"] {
             for scope in ["project", "user"] {
@@ -456,7 +456,7 @@ mod tests {
     /// The person's own notes still reach the prompt when the project's fill the room, and the model is told that some are left out.
     #[test]
     fn the_persons_notes_reach_the_prompt_when_the_projects_fill_the_room() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (folder, workspace) = (dir.path().join("memory"), dir.path().join("work"));
         remember(&folder, &workspace, &json!({"note": "answers in Japanese", "scope": "user"})).unwrap();
         remember(&folder, &workspace, &json!({"note": "asks before it deletes anything", "scope": "user"})).unwrap();
@@ -478,7 +478,7 @@ mod tests {
         assert!(section.contains("About the user:") && section.contains("About this project:"), "{section}");
         assert!(section.matches("older notes are kept").count() == 2, "{section}");
         // and no title stands over nothing
-        let alone = tempfile::tempdir().unwrap();
+        let alone = crate::in_container::tempdir().unwrap();
         remember(alone.path(), &workspace, &json!({"note": "only mine", "scope": "user"})).unwrap();
         let section = prompt_section(alone.path(), &workspace);
         assert!(section.contains("About the user:\n- only mine") && !section.contains("About this project"), "{section}");
@@ -487,7 +487,7 @@ mod tests {
     /// Notes that cannot be read are said so, in the prompt and for the panel, and the file is left as it is.
     #[test]
     fn notes_that_cannot_be_read_are_said_so_and_the_file_is_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (folder, workspace) = (dir.path().to_path_buf(), Path::new("C:/w"));
         let bytes = [b'-', b' ', 0xFF, 0xFE, b'\n'];
         std::fs::write(folder.join("user.md"), bytes).unwrap();
@@ -520,7 +520,7 @@ mod sealed_tests {
     /// The notes are sealed whole in a file of their own, read back whole, and what the model forgot goes to a sealed file too; nothing of them is in the clear.
     #[test]
     fn notes_and_what_was_forgotten_are_sealed_and_come_back() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let workspace = Path::new("C:/w");
         let (policy, key) = on();
         remember(dir.path(), workspace, &json!({"note": "the deploy key lives in the vault, named banana", "scope": "user"}), &policy).unwrap();
@@ -550,7 +550,7 @@ mod sealed_tests {
     /// A plain file of notes is read as it is while the choice is made, and is sealed when it is next written: the notes of before are not lost to the choice.
     #[test]
     fn a_plain_file_is_read_and_is_sealed_when_it_is_written_next() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let workspace = Path::new("C:/w");
         std::fs::write(dir.path().join("user.md"), "- an old plain note\n").unwrap();
         let (policy, _) = on();
@@ -563,7 +563,7 @@ mod sealed_tests {
     /// Notes under a key that is not here are said to be unreadable, in words; they are not shown as none, and not written over. A file that is another's, or changed by a byte, does not open.
     #[test]
     fn notes_that_do_not_open_are_said_so_and_are_never_written_over() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let workspace = Path::new("C:/w");
         let (policy, key) = on();
         remember(dir.path(), workspace, &json!({"note": "a note", "scope": "user"}), &policy).unwrap();

@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn the_bundled_tools_come_first_and_a_persons_own_are_left_off() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = whole_bundle(dir.path());
         let (own_node, other) = (dir.path().join("Program Files\\nodejs"), dir.path().join("other"));
         std::fs::create_dir_all(&own_node).unwrap();
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn only_a_folder_that_holds_the_runtime_itself_is_left_off() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (unix, cyg, deeper, plain) = (dir.path().join("unix"), dir.path().join("cyg"), dir.path().join("deeper"), dir.path().join("plain"));
         for (folder, file) in [(&unix, "msys-2.0.dll"), (&cyg, "cygwin1.dll"), (&deeper.join("bin"), "msys-2.0.dll"), (&plain, "find.exe")] {
             std::fs::create_dir_all(folder).unwrap();
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn what_they_would_write_goes_where_a_command_can_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = whole_bundle(dir.path());
         let block = environment(&root, "C:\\x", "C:\\ac\\Temp", Path::new("C:\\work"));
         let value = |name: &str| block.iter().find(|(key, _)| key == name).unwrap().1.clone();
@@ -336,7 +336,7 @@ mod tests {
     /// A bundle with a program missing is promised, set and taken off PATH only as far as what is there.
     #[test]
     fn a_bundle_with_only_git_offers_only_git_and_leaves_a_persons_python_and_node_alone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = bundle_with(dir.path(), &["git"]);
         let (python, node) = (dir.path().join("Python312"), dir.path().join("nodejs"));
         for (folder, program) in [(&python, "python.exe"), (&node, "node.exe")] {
@@ -389,7 +389,7 @@ mod tests {
     fn the_real_tools_work_in_the_sandbox_and_change_nothing_outside_it() {
         let root = real_root();
         set_test_root(Some(&root));
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let (work, outside) = (holder.path().join("work"), holder.path().join("outside"));
         std::fs::create_dir_all(&work).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
@@ -449,7 +449,7 @@ mod tests {
     fn a_command_installed_with_npm_g_runs_by_its_name() {
         let root = real_root();
         set_test_root(Some(&root));
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let (work, package) = (holder.path().join("work"), holder.path().join("work").join("hello-pkg"));
         std::fs::create_dir_all(&package).unwrap();
         std::fs::write(package.join("package.json"), r#"{"name":"hello-pkg","version":"1.0.0","bin":{"hellopkg":"cli.js"}}"#).unwrap();
@@ -474,7 +474,7 @@ mod tests {
         let saved = std::env::var_os("PATH");
         // SAFETY: this test runs alone, as its reason says.
         unsafe { std::env::set_var("PATH", format!("{system}\\System32;{system}")) };
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let work = holder.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         for (line, shows) in [

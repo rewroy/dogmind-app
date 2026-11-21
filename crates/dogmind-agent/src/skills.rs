@@ -308,7 +308,7 @@ mod tests {
     }
 
     fn found_as(text: &str) -> Skill {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         write(&dir.path().join("a"), text);
         read_skill(&dir.path().join("a").join("SKILL.md"), "user").unwrap()
     }
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn skills_are_found_where_each_tool_keeps_them() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (home, work) = (dir.path().join("me"), dir.path().join("work"));
         std::fs::create_dir_all(work.join(".git")).unwrap();
         write(&home.join(".claude/skills/one"), "---\ndescription: from Claude\n---\nb");
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn the_home_as_workspace_is_still_the_persons() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let home = dir.path().join("me");
         write(&home.join(".claude/skills/one"), "---\ndescription: mine\n---\nb");
         assert_eq!(discover(&home, Some(&home))[0].scope, "user");
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn modern_web_guidance_is_available_and_a_project_can_override_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let name = "modern-web-guidance";
         let skills = discover(dir.path(), None);
         assert!(prompt_section(&skills, &[]).contains(name));
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn who_may_start_a_skill_is_respected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         write(&dir.path().join(".claude/skills/manual"), "---\nname: manual\ndescription: d\ndisable-model-invocation: true\n---\nb");
         write(&dir.path().join(".claude/skills/hidden"), "---\nname: hidden\ndescription: d\nuser-invocable: false\n---\nb");
         let skills = discover(dir.path(), None);
@@ -434,7 +434,7 @@ mod tests {
     /// Two skills of a name: the one a project has and the model may not start does not hide the person's own that it may, and the one the person may not start does not hide the other.
     #[test]
     fn two_skills_of_one_name_are_chosen_between_by_who_starts_the_one_asked_for() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (home, work) = (dir.path().join("me"), dir.path().join("work"));
         std::fs::create_dir_all(work.join(".git")).unwrap();
         write(&work.join(".claude/skills/pdf"), "---\nname: pdf\ndescription: from the project, for the person\ndisable-model-invocation: true\n---\nb");
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn a_name_that_the_person_may_not_start_is_still_listed_once_for_its_switch() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         write(&dir.path().join(".claude/skills/hidden"), "---\nname: Hidden\ndescription: d\nuser-invocable: false\n---\nb");
         let one = one_each(discover(dir.path(), None));
         let mut hidden = one.iter().filter(|skill| skill.name == "Hidden");
@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn instructions_say_where_they_are_and_take_arguments() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let folder = dir.path().join(".claude/skills/pdf");
         write(&folder, "---\nname: pdf\ndescription: d\n---\nRun scripts/x.py on $ARGUMENTS.");
         std::fs::write(folder.join("reference.md"), "r").unwrap();
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn a_skill_turned_off_is_gone_whatever_its_case() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         write(&dir.path().join(".claude/skills/pdf"), "---\nname: PDF\ndescription: d\n---\nb");
         write(&dir.path().join(".claude/skills/xlsx"), "---\nname: xlsx\ndescription: d\n---\nb");
         let left = without(discover(dir.path(), None), &["pdf".to_string()]);

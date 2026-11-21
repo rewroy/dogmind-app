@@ -690,7 +690,7 @@ static GRANTED: Mutex<Option<HashSet<(String, u32, bool)>>> = Mutex::new(None);
 /// so. A container cannot make a window station, a desktop or a container of its own, nor write a grant on anything, and every command that was run so
 /// failed before it started ("a window station for commands: access is denied"). A command is then run in the container it is in, with what that one was
 /// given: it can do no more than its caller, which is what the sandbox is for, and the caller's own command is what was granted and looked after.
-pub(crate) fn in_a_container() -> bool {
+pub fn in_a_container() -> bool {
     static IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *IN.get_or_init(|| {
         // SAFETY: the token is this process's own, opened for asking and closed here; the answer is a 32-bit value.
@@ -2346,7 +2346,10 @@ mod tests {
     /// folder of the person's, nor in another workspace's; a command not let reach the network is pointed away from it.
     #[test]
     fn a_restricted_command_reads_as_the_person_and_writes_in_its_workspace_alone() {
-        let (work, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (work, elsewhere) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
         std::fs::write(elsewhere.path().join("theirs.txt"), "theirs").unwrap();
         let (cancel, time) = (AtomicBool::new(false), Duration::from_secs(60));
         let run = |line: &str, network: bool| run_live_restricted(line, work.path(), work.path(), network, time, &cancel, None).unwrap();
@@ -2365,7 +2368,7 @@ mod tests {
         let online = run("set CARGO_NET_OFFLINE", true);
         assert!(!String::from_utf8_lossy(&online.stdout).contains("CARGO_NET_OFFLINE=true"), "let reach the network, it is not pointed away");
         // another workspace's restricted command cannot write here either
-        let other = tempfile::tempdir().unwrap();
+        let other = crate::in_container::tempdir().unwrap();
         let across = run_live_restricted(&format!("echo no> \"{}\"", work.path().join("from-other.txt").display()), other.path(), other.path(), false, time, &cancel, None).unwrap();
         assert_ne!(across.status, Some(0));
         assert!(!work.path().join("from-other.txt").exists(), "one workspace's command wrote in another's");
@@ -2377,6 +2380,9 @@ mod tests {
 
     #[test]
     fn a_command_gets_a_desktop_in_a_station_of_its_own_and_no_error_boxes() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
         no_error_boxes();
         // SAFETY: it reads a flag of this process.
         let mode = unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode() };
@@ -2392,6 +2398,9 @@ mod tests {
 
     #[test]
     fn the_station_is_shared_with_browsers_and_is_left_as_it_was_found() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
         // Its access list and label, as text.
         unsafe fn security_of(station: usize) -> String {
             let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -2424,13 +2433,16 @@ mod tests {
 
     #[test]
     fn a_drive_that_cannot_contain_a_command_says_so_first() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
         let folder = Path::new("E:\\work");
         let plain = |file_system: &str, keeps_permissions: bool, remote: bool| Volume { file_system: file_system.into(), keeps_permissions, remote };
         assert_eq!(drive_refusal(&plain("NTFS", true, false), folder), None);
         assert!(drive_refusal(&plain("exFAT", false, false), folder).unwrap().contains("exFAT"));
         assert!(drive_refusal(&plain("FAT32", false, false), folder).unwrap().contains("no file permissions"));
         assert!(drive_refusal(&plain("", true, true), folder).unwrap().contains("network"));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let here = volume_of(&dir.path().join("not").join("yet")).unwrap();
         assert!(!here.remote && here.keeps_permissions && !here.file_system.is_empty(), "{here:?}");
         let rights = rights_on(dir.path()).unwrap();
@@ -2440,7 +2452,7 @@ mod tests {
 
     #[test]
     fn a_workspace_too_wide_still_has_project_folders_to_run_in() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let home = dir.path().join("me");
         let project = home.join("iris-study");
         std::fs::create_dir_all(project.join("src")).unwrap();
@@ -2462,7 +2474,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_workspace_is_the_root_whatever_the_folder_in_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (home, work) = (dir.path().join("me"), dir.path().join("work"));
         std::fs::create_dir_all(work.join("sub")).unwrap();
         assert_eq!(writable_root(&work.join("sub"), &work, Some(&home)).unwrap(), work);
@@ -2527,7 +2539,7 @@ mod tests {
 
     #[test]
     fn a_link_is_judged_by_where_it_leads() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (home, projects) = (dir.path().join("me"), dir.path().join("projects"));
         std::fs::create_dir_all(home.join("AppData\\Local")).unwrap();
         std::fs::create_dir_all(home.join("work\\sub")).unwrap();
@@ -2554,7 +2566,10 @@ mod tests {
     /// The real home, which only a test that asks can reach. It writes nothing: this is what an ACE on it would have been for.
     #[test]
     fn a_link_to_the_real_home_or_a_short_name_for_it_is_the_home() {
-        let dir = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let dir = crate::in_container::tempdir().unwrap();
         let home = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
         let link = dir.path().join("to-home");
         junction(&link, &home);
@@ -2565,7 +2580,7 @@ mod tests {
     /// Each way a workspace is closed has the advice that is true for it: a wide one has project folders to run in, and a folder made in what holds keys or this app's own files is as closed.
     #[test]
     fn the_advice_for_a_closed_workspace_is_the_one_that_is_true_for_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let home = dir.path().join("me");
         let ssh = home.join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -2585,7 +2600,7 @@ mod tests {
 
     #[test]
     fn what_holds_this_app_or_keys_is_no_workspace() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (home, tools, data) = (dir.path().join("me"), dir.path().join("Tools"), dir.path().join("Tools\\Dogmind"));
         std::fs::create_dir_all(&data).unwrap();
         let own = [data.clone()];
@@ -2691,6 +2706,9 @@ mod tests {
     /// What the person asked to have done outside the workspace, and allowed: as them it is done, where the container is refused.
     #[test]
     fn a_command_run_as_the_person_changes_what_is_outside_the_workspace_and_one_in_the_container_cannot() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
         let folder = work_folder("as-person");
         let outside = work_folder("as-person-outside");
         std::fs::write(outside.join("old.txt"), "a").unwrap();
@@ -2710,6 +2728,9 @@ mod tests {
     /// A `del` of what is not there says so, as `del` does: a name the container does not see (outside the workspace, or misspelt) was a delete with nothing said and exit 0.
     #[test]
     fn a_del_of_what_is_not_there_says_so_and_one_of_what_is_deletes_it() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
         let folder = work_folder("del-missing");
         let outside = work_folder("del-outside");
         std::fs::write(outside.join("kept.txt"), "a").unwrap();
@@ -2751,7 +2772,10 @@ mod tests {
     /// In a temp folder, which goes with the test. The one sandbox test written to run on its own: `--skip sandbox::` leaves it out with the others.
     #[test]
     fn a_command_cannot_plant_what_would_run_outside_the_sandbox_and_git_still_works() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let (place, kept) = (holder.path().join("repo"), holder.path().to_path_buf());
         std::fs::create_dir_all(&place).unwrap();
         let host = |args: &[&str]| crate::tools::git(&place, args);
@@ -2792,7 +2816,10 @@ mod tests {
     /// In a temp folder too, and run on its own as the one above is.
     #[test]
     fn what_a_command_plants_in_a_repository_it_made_is_gone_when_it_ends_at_any_depth() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let place = holder.path().join("work");
         std::fs::create_dir_all(place.join("a/b/c")).unwrap();
         let run_here = |line: &str| command(line, &place, false);
@@ -2829,7 +2856,10 @@ mod tests {
     /// not to be done through such a junction.
     #[test]
     fn a_junction_a_command_makes_to_a_repository_of_the_person_is_not_gone_through_when_it_ends() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let place = holder.path().join("work");
         let mine = place.join("mine");
         std::fs::create_dir_all(mine.join(".git\\hooks")).unwrap();
@@ -2945,7 +2975,7 @@ mod tests {
     /// disarming of a repository a command made (which is where the app would delete hooks and cut a config as the person), and not by the guarding.
     #[test]
     fn a_git_that_is_a_link_to_a_repository_is_refused_and_it_is_not_changed() {
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let mut links = Links(Vec::new());
         let (place, standin) = (holder.path().join("work"), holder.path().join("standin"));
         let git = stand_in_repository(&standin);
@@ -2997,7 +3027,10 @@ mod tests {
     /// The same where it is a `.git` file that says where git's folder is, and that is spelled as in the workspace, with a junction in it that leads out.
     #[test]
     fn a_gitdir_that_leads_out_through_a_junction_is_refused_and_not_changed() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let mut links = Links(Vec::new());
         let (place, standin) = (holder.path().join("work"), holder.path().join("standin"));
         let git = stand_in_repository(&standin);
@@ -3040,7 +3073,10 @@ mod tests {
     /// A junction where a repository's `hooks` is, or in it, leads nowhere that the app goes: what is removed is the junction.
     #[test]
     fn a_junction_in_a_repositorys_hooks_is_removed_and_what_it_leads_to_is_not_changed() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let mut links = Links(Vec::new());
         let (place, standin) = (holder.path().join("work"), holder.path().join("standin"));
         let git = stand_in_repository(&standin);
@@ -3075,7 +3111,7 @@ mod tests {
     /// What is looked for is what is there, and a junction is no folder to look in: the stand-in's `.git` is never found by way of one, and a `.git` that is one is found, to be refused.
     #[test]
     fn a_junction_is_not_looked_into_and_a_git_that_is_one_is_found() {
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let mut links = Links(Vec::new());
         let (place, standin) = (holder.path().join("work"), holder.path().join("standin"));
         let git = stand_in_repository(&standin);
@@ -3094,7 +3130,10 @@ mod tests {
     /// the workspace is not looked at at all.
     #[test]
     fn a_gitdir_in_the_workspace_is_disarmed_a_known_repository_is_not_and_one_outside_is_left() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let (place, standin) = (holder.path().join("work"), holder.path().join("standin"));
         let git = stand_in_repository(&standin);
         let mine = place.join("mine\\.git");
@@ -3124,7 +3163,10 @@ mod tests {
 
     #[test]
     fn what_a_person_had_is_not_touched_and_a_config_keeps_what_git_writes() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let place = holder.path().join("work");
         std::fs::create_dir_all(place.join("deep/er")).unwrap();
         let own = |args: &[&str], folder: &Path| crate::tools::git(folder, args).unwrap();
@@ -3174,7 +3216,10 @@ mod tests {
     /// it, and it is guarded as any other: no command can write its hooks or its config.
     #[test]
     fn a_repository_the_person_makes_between_two_commands_is_theirs_and_is_guarded() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let place = holder.path().join("work");
         std::fs::create_dir_all(&place).unwrap();
         assert_eq!(command("echo first> first.txt", &place, false).status, Some(0));
@@ -3201,7 +3246,10 @@ mod tests {
     /// and the command's result names where.
     #[test]
     fn a_repository_made_while_a_background_job_runs_is_disarmed_and_what_is_taken_is_kept() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let place = holder.path().join("work");
         std::fs::create_dir_all(&place).unwrap();
         assert_eq!(command("echo first> first.txt", &place, false).status, Some(0));
@@ -3237,7 +3285,10 @@ mod tests {
     /// Without a command: what a look takes as a command's and what it takes as the person's, by what has been at work since the last look.
     #[test]
     fn a_new_repository_is_a_commands_only_if_one_was_at_work_or_ran_since_the_last_look() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let place = holder.path().join("work");
         std::fs::create_dir_all(&place).unwrap();
         assert!(look_between_commands(&place).said.is_empty(), "the first look takes what is there");
@@ -3280,7 +3331,10 @@ mod tests {
     /// A worktree's folder and its repository's config are put aside too, each inside the git folder it was taken from; a link that stood in place of a hook leaves where it led in a note.
     #[test]
     fn what_is_taken_from_a_repository_is_put_aside_in_its_own_git_folder() {
-        let holder = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let holder = crate::in_container::tempdir().unwrap();
         let place = holder.path().join("work");
         std::fs::create_dir_all(&place).unwrap();
         assert!(look(&place).said.is_empty());
@@ -3321,7 +3375,7 @@ mod tests {
     /// In a temp folder, with a small limit of its own: nothing here comes near the machine's.
     #[test]
     fn a_command_past_its_memory_is_refused_it_and_said_to_have_been() {
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let place = holder.path().join("work");
         std::fs::create_dir_all(&place).unwrap();
         let cap = 300u64 << 20;
@@ -3347,7 +3401,7 @@ mod tests {
     /// A command's PowerShell runs a script with -File: in a container the execution policy's check fails whatever the policy. As the person, their own policy holds.
     #[test]
     fn a_commands_powershell_runs_scripts_and_the_persons_keeps_their_policy() {
-        let place = tempfile::tempdir().unwrap();
+        let place = crate::in_container::tempdir().unwrap();
         let block = environment_block(Vec::new(), None, place.path().display().to_string(), place.path(), || None);
         assert!(block.iter().any(|(name, value)| name == POWERSHELL_POLICY.0 && value == "Bypass"), "{block:?}");
         let theirs = String::from_utf16_lossy(&environment(Some(place.path()), place.path(), false, true, || None));
@@ -3356,7 +3410,7 @@ mod tests {
 
     #[test]
     fn as_the_person_their_own_git_comes_first() {
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let (bundle, theirs, other) = (holder.path().join("tools"), holder.path().join("Git").join("cmd"), holder.path().join("bin"));
         for folder in [bundle.join("git").join("cmd"), theirs.clone(), other.clone()] {
             std::fs::create_dir_all(&folder).unwrap();
@@ -3375,7 +3429,7 @@ mod tests {
 
     #[test]
     fn several_processes_share_one_memory_cap() {
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let place = holder.path().join("work");
         std::fs::create_dir_all(&place).unwrap();
         // Each alone fits under the cap; four together do not.
@@ -3393,7 +3447,7 @@ mod tests {
     /// What the prompt and the notes tell the model to do instead works from there: absolute paths, and `Start-Process` given its folder.
     #[test]
     fn powershell_works_from_a_profile_by_absolute_paths() {
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let folder = holder.path().join("work");
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("a.txt"), "IN-A").unwrap();
@@ -3478,7 +3532,7 @@ mod tests {
         let tools = PathBuf::from(std::env::var_os("DOGMIND_TOOLS").expect("DOGMIND_TOOLS"));
         crate::bundled::set_test_root(Some(&tools));
         let sources = PathBuf::from(std::env::var_os("DOGMIND_MEASURE_SOURCES").expect("DOGMIND_MEASURE_SOURCES"));
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let (small, copy, deep) = (holder.path().join("small"), holder.path().join("sources"), holder.path().join("deep"));
         std::fs::create_dir_all(&small).unwrap();
         for at in 0..5 {
@@ -3580,7 +3634,7 @@ mod tests {
 
     #[test]
     fn a_build_gets_its_libraries_and_its_tools_come_after_everything_on_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (root, work) = (dir.path().join("tools"), dir.path().join("work"));
         for (folder, program) in [("python", "python.exe"), ("node", "node.exe"), ("git\\cmd", "git.exe")] {
             std::fs::create_dir_all(root.join(folder)).unwrap();
@@ -3615,7 +3669,7 @@ mod tests {
 
     #[test]
     fn a_folder_of_msys_or_cygwin_programs_is_left_off_a_commands_path_and_only_there() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (root, work) = (dir.path().join("tools"), dir.path().join("work"));
         for (folder, program) in [("python", "python.exe"), ("node", "node.exe"), ("git\\cmd", "git.exe")] {
             std::fs::create_dir_all(root.join(folder)).unwrap();
@@ -3667,7 +3721,7 @@ mod tests {
         for name in ["LIB", "INCLUDE", "LIBPATH"] {
             assert!(VARIABLES.contains(&name), "{name} is what the app was started with");
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let start = vec![("PATH".to_string(), "C:\\a".to_string()), ("LIB".to_string(), "C:\\dev\\lib".to_string()), ("INCLUDE".to_string(), "C:\\dev\\include".to_string()), ("LIBPATH".to_string(), "C:\\dev\\libpath".to_string())];
         let made = environment_block(start, None, dir.path().display().to_string(), dir.path(), || panic!("an app with a LIB of its own looks for none"));
         let value = |name: &str| made.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
@@ -3677,7 +3731,7 @@ mod tests {
     /// The CLI of the skill that comes with the app runs with no one asked, so what it would report of its use is off in every command, with the bundled tools or without, whatever was inherited.
     #[test]
     fn every_command_has_usage_reports_off() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = dir.path().join("tools");
         for bundled in [None, Some(root.as_path())] {
             let start = vec![("PATH".to_string(), "C:\\a".to_string()), ("disable_telemetry".to_string(), "0".to_string())];

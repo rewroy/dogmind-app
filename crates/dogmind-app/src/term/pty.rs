@@ -319,6 +319,9 @@ mod tests {
 
     #[test]
     fn the_job_ends_a_shell_and_a_program_it_started_when_it_is_dropped() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
         let folder = std::env::temp_dir();
         let (pty, output) = Pty::spawn_line(&format!("{} /c ping -n 60 127.0.0.1 >nul", command()), &[], &folder, 80, 24, |_| {}).unwrap();
         let reading = read_all(output);
@@ -350,7 +353,7 @@ mod tests {
 
     #[test]
     fn the_shell_starts_in_the_folder_it_is_given_and_with_the_environment_asked_for() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let (sender, receiver) = channel();
         let (pty, output) = Pty::spawn_line(&format!("{} /c cd&echo [%DOGMIND_TERM_TEST%]&echo [%TERM_PROGRAM%]&echo [%COLORTERM%]", command()), &[("DOGMIND_TERM_TEST", "zebra42")], folder.path(), 120, 24, move |code| {
             let _ = sender.send(code);

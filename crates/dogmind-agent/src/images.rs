@@ -427,7 +427,7 @@ pub(crate) mod tests {
         let upright = attach_bytes("u.jpg", with_orientation(&red_then_blue(40, 20), 6)).unwrap();
         assert_eq!((upright.width, upright.height), (20, 40), "width and height are swapped for a quarter turn");
         // (the bytes are the original ones, EXIF and all, when they fit)
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let kept = save(&session, &upright, ImageLimit::WIDE).unwrap();
         assert_eq!((kept.width, kept.height), (20, 40));
@@ -449,7 +449,7 @@ pub(crate) mod tests {
 
     #[test]
     fn attached_pictures_are_copied_as_they_were_under_names_a_command_takes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let picture = |name: &str, bytes: &[u8], media_type: &str| Attachment { name: name.into(), bytes: bytes.to_vec(), media_type: media_type.into(), width: 4, height: 3 };
         let folder = dir.path().join("attachments");
         let written = copies_for_commands(&folder, "20261103-151658", &[picture("レウ の写真.JPG", b"jpeg bytes", "image/jpeg"), picture("", b"png bytes", "image/png"), picture("my photo (2).webp", b"webp", "image/webp")]);
@@ -511,7 +511,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_message_of_only_pictures_has_no_empty_text_part() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), encoded(4, 4, ImageFormat::Png)).unwrap();
         let image = ImageRef { file: "a.png".into(), media_type: "image/png".into(), width: 4, height: 4 };
         let only = Message { images: vec![image.clone()], ..Message::text("user", "") };
@@ -525,7 +525,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_picture_with_nothing_in_it_goes_as_one_that_has_gone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), "").unwrap();
         let message = Message { images: vec![ImageRef { file: "a.png".into(), media_type: "image/png".into(), width: 1, height: 1 }], ..Message::text("user", "look") };
         let (pictures, text) = loaded(&message, Some(dir.path()));
@@ -536,7 +536,7 @@ pub(crate) mod tests {
     /// What a power cut left of two pictures of a session written just before it: their length, all zeros. Such a one is not sent, and saved again it is written over.
     #[test]
     fn a_picture_a_power_cut_left_as_zeros_is_not_sent_and_saved_again_is_written_over() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let picture = attach_bytes("a.png", encoded(8, 8, ImageFormat::Png)).unwrap();
         let kept = save(&session, &picture, ImageLimit::WIDE).unwrap();
@@ -573,7 +573,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_file_is_told_by_its_bytes_and_keeps_its_name() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (picture, text) = (dir.path().join("named.txt"), dir.path().join("a.png"));
         std::fs::write(&picture, encoded(8, 8, ImageFormat::Png)).unwrap();
         std::fs::write(&text, "not a picture").unwrap();
@@ -583,7 +583,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_picture_that_fits_is_the_same_bytes_and_one_that_does_not_is_made_smaller_once() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let bytes = encoded(300, 100, ImageFormat::Png);
         let picture = attach_bytes("a", bytes.clone()).unwrap();
@@ -604,7 +604,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_picture_too_heavy_goes_as_a_jpeg_and_smaller_until_it_fits() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let picture = attach_bytes("a", encoded(600, 600, ImageFormat::Png)).unwrap();
         let most = picture.bytes.len() / 8;
@@ -625,7 +625,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_message_goes_pictures_first_and_a_lost_picture_is_said_in_words() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let bytes = encoded(8, 8, ImageFormat::Png);
         let kept = save(&session, &attach_bytes("a", bytes.clone()).unwrap(), ImageLimit::WIDE).unwrap();

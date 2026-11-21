@@ -1734,6 +1734,9 @@ mod tests {
     /// that does not end within the limit is killed after the limit, and not before.
     #[test]
     fn a_graceful_stop_waits_for_the_engine_and_kills_it_after_the_limit() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
         let (mut child, stop) = stoppable(false);
         let began = std::time::Instant::now();
         assert!(end_gracefully(&mut child, stop, Duration::from_secs(20)), "an engine that ends when told is waited for");
@@ -1759,6 +1762,9 @@ mod tests {
     /// of the app, what needs the engine gone) waits for it; an engine that is not to keep it is killed at once, as it was.
     #[test]
     fn a_dropped_engine_that_keeps_the_conversation_ends_on_its_own_and_is_waited_for() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
         let (child, stop) = stoppable(false);
         let id = child.id();
         let engine = Engine { child: Some(child), _job: None, stop: Some(stop), stop_limit: Duration::from_secs(20), not_held: None, said: Said::default(), exited: None, port: 0 };
@@ -1887,6 +1893,9 @@ mod tests {
 
     #[test]
     fn a_setup_can_be_cancelled_with_all_it_started() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
         let (lines, _seen) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
@@ -1961,7 +1970,7 @@ mod tests {
     /// drafter itself, as it always did; every other argument stays, and so do the arguments of a program that is not setup.
     #[test]
     fn an_option_an_older_straydog_does_not_know_is_not_passed_to_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let program = |name: &str, lines: &[&str]| {
             let file = dir.path().join(format!("{name}.cmd"));
             std::fs::write(&file, format!("@echo off\r\n{}\r\n", lines.iter().map(|line| format!("echo {line}")).collect::<Vec<_>>().join("\r\n"))).unwrap();

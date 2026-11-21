@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn the_default_toolset_and_the_newest_sdk_are_taken_by_number() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         // (9600 is more than 22621 as text; the toolset that is not the default is not the one taken, however new)
         let (install, kits) = machine(dir.path(), &["14.29.30133", "14.44.35207", "14.50.1"], "14.44.35207", &["10.0.9600.0", "10.0.19041.0", "10.0.22621.0"]);
         // (a folder in Lib that is no version)
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn an_sdk_with_a_part_missing_is_passed_over_for_the_newest_that_has_them_all() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (install, kits) = machine(dir.path(), &["14.44.35207"], "14.44.35207", &["10.0.19041.0"]);
         // The newest has a folder of libraries and nothing in it; the next has everything but the SDK's tools.
         std::fs::create_dir_all(kits.join("Lib\\10.0.26100.0\\um\\x64")).unwrap();
@@ -484,7 +484,7 @@ mod tests {
             ("kits:Lib", false),
         ];
         for (part, is_file) in parts {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::in_container::tempdir().unwrap();
             let (install, kits) = machine(dir.path(), &["14.44.35207"], "14.44.35207", &["10.0.22621.0"]);
             assert!(layout("AMD64", &install, &kits).is_some(), "the whole layout is accepted");
             let path = part.strip_prefix("kits:").map_or_else(|| install.join(part), |part| kits.join(part));
@@ -500,14 +500,14 @@ mod tests {
 
     #[test]
     fn a_version_that_is_a_path_is_no_toolset() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (install, kits) = machine(dir.path(), &["14.44.35207"], "..\\..\\..\\..", &["10.0.22621.0"]);
         assert_eq!(layout("AMD64", &install, &kits), None);
     }
 
     #[test]
     fn only_an_x64_host_is_given_anything() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (install, kits) = machine(dir.path(), &["14.44.35207"], "14.44.35207", &["10.0.22621.0"]);
         for architecture in ["ARM64", "x86", ""] {
             assert_eq!(layout(architecture, &install, &kits), None, "{architecture}");
@@ -582,6 +582,9 @@ mod tests {
 
     #[test]
     fn a_program_that_does_not_end_is_ended_and_one_that_does_is_heard() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
         let mut slow = std::process::Command::new("cmd");
         slow.args(["/d", "/c", "ping -n 6 127.0.0.1 >nul"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
         crate::tools::no_window(&mut slow);
@@ -620,7 +623,7 @@ mod tests {
 
     #[test]
     fn a_program_whose_output_stays_open_after_it_ended_is_given_up_at_the_limit() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let pid_file = dir.path().join("sleeper.pid");
         let _ends = EndsWhatItStarted { pid_file: pid_file.clone() };
         // The program starts a sleeper that shares its output, writes the sleeper's number and ends: the sleeper holds the output open for twenty seconds more.
@@ -637,7 +640,7 @@ mod tests {
 
     #[test]
     fn a_vswhere_that_is_not_there_is_a_machine_without_visual_studio_for_good() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         assert!(matches!(installation(dir.path()), Looked::Settled(Err(Why::NoInstaller))));
     }
 
@@ -681,7 +684,7 @@ mod tests {
     /// Each way the layout can fail says which it was.
     #[test]
     fn a_layout_that_fails_says_why() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (install, kits) = machine(dir.path(), &["14.38.33130"], "14.38.33130", &["10.0.22621.0"]);
         assert!(layout_or_why("AMD64", &install, &kits).is_ok());
         assert_eq!(layout_or_why("ARM64", &install, &kits), Err(Why::NotX64));

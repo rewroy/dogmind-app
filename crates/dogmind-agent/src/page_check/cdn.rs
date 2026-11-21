@@ -437,7 +437,7 @@ mod tests {
     /// it did not load); checked again, nothing is fetched.
     #[test]
     fn a_pages_cdn_files_are_kept_and_pointed_at_and_kept_files_are_not_fetched_again() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::in_container::tempdir().unwrap();
         let html = r#"<html><head><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans"><script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}</script></head><body><script src="https://example.com/track.js"></script><script type="module">import * as THREE from 'three'; import { OrbitControls } from 'three/addons/controls/OrbitControls.js';</script></body></html>"#;
         let also = ["https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js".to_string()];
         let mut asked: Vec<String> = Vec::new();
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn a_redirect_is_followed_on_the_cdns_and_not_off_them() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::in_container::tempdir().unwrap();
         let html = r#"<script src="https://unpkg.com/lib"></script><script src="https://unpkg.com/away"></script>"#;
         let mut get = |address: &str| -> Result<Got, String> {
             Ok(match address {

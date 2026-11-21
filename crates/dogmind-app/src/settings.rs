@@ -649,7 +649,7 @@ mod tests {
     /// A file of the person's is written whole, over what was there, and leaves no partial one beside it.
     #[test]
     fn a_file_written_whole_replaces_the_one_there_and_leaves_nothing_beside_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("instructions.md");
         std::fs::write(&file, "old words that were longer").unwrap();
         super::write_whole(&file, b"new").unwrap();
@@ -730,7 +730,7 @@ mod tests {
     fn the_update_check_comes_from_an_older_file_as_on_and_never_made_and_is_kept() {
         let older: Settings = serde_json::from_str(r#"{"active": "This PC", "theme": "dark"}"#).unwrap();
         assert_eq!((older.check_for_updates, older.last_update_check, older.dismissed_update.clone()), (true, None, None));
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let file = folder.path().join("settings.json");
         let mut settings = older;
         settings.check_for_updates = false;
@@ -760,7 +760,10 @@ mod tests {
 
     #[test]
     fn remove_takes_from_this_apps_folder_alone_and_leaves_the_model_however_its_path_is_spelled() {
-        let dir = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SYSTEM) {
+            return;
+        }
+        let dir = crate::in_container::tempdir().unwrap();
         // A folder a variable might name, with a person's files in it and no settings.
         let other = dir.path().join("Documents");
         std::fs::create_dir_all(&other).unwrap();
@@ -793,7 +796,7 @@ mod tests {
     /// Even in its own folder, Remove takes only what this app makes there, by name: what another put there stays, and is said.
     #[test]
     fn remove_takes_what_this_app_makes_and_leaves_what_another_put_there() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let data = dir.path().join("DogmindApp");
         for folder in ["sessions", "memory", "preview", "crashes", "attachments", "updates", "my photos", "settings.json.d"] {
             std::fs::create_dir_all(data.join(folder)).unwrap();
@@ -817,7 +820,7 @@ mod tests {
 
     #[test]
     fn settings_come_back_as_saved() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("sub/settings.json");
         assert_eq!(Settings::load(&path), Settings::fresh());
         let mut settings = Settings::default();
@@ -852,7 +855,7 @@ mod tests {
 
     #[test]
     fn a_broken_file_gives_the_defaults_and_is_kept() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(Settings::load(&path), Settings::default());
@@ -866,7 +869,7 @@ mod tests {
 
     #[test]
     fn a_setting_missing_from_an_older_file_takes_its_default() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"active": "Codex"}"#).unwrap();
         let settings = Settings::load(&path);
@@ -876,7 +879,7 @@ mod tests {
 
     #[test]
     fn only_a_new_install_begins_by_accepting_edits() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let new = Settings::load(&path);
         assert_eq!((new.mode.as_str(), new.safe_commands), ("accept_edits", true), "no file: a new install");
@@ -893,7 +896,7 @@ mod tests {
 
     #[test]
     fn a_key_comes_from_where_the_provider_says() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("key");
         std::fs::write(&file, "secret\n").unwrap();
         let mut provider = ProviderConfig { name: "p".into(), kind: Kind::Server, base_url: String::new(), model: String::new(), api_key: String::new() };
@@ -953,7 +956,7 @@ mod tests {
     fn a_key_the_store_refuses_is_said_and_never_written_back_to_the_file() {
         const KEY: &str = "sk-very-secret-0123456789";
         const OTHER: &str = "sk-another-0123456789abcdef";
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let mut settings = Settings::default();
         settings.providers.push(server("Homelab", "http://host/v1"));
@@ -1023,7 +1026,7 @@ mod tests {
     #[test]
     fn a_key_in_an_address_or_a_name_is_not_written_whatever_checked_it() {
         const KEY: &str = "sk-very-secret-0123456789";
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let mut settings = Settings::default();
         settings.providers.push(server(KEY, &format!("https://host.example/v1?key={KEY}")));
@@ -1039,7 +1042,7 @@ mod tests {
     #[test]
     fn a_key_is_never_written_to_the_settings() {
         const KEY: &str = "sk-very-secret-0123456789";
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let store = keys::MemoryKeys::default();
         let target = new_key_target("Claude", &[]);
@@ -1116,7 +1119,7 @@ mod tests {
         assert!(ProviderConfig { api_key: "env:K".into(), ..claude }.problem().is_none());
     }
     fn loaded(text: &str) -> Settings {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, text).unwrap();
         Settings::load(&path)
@@ -1135,7 +1138,7 @@ mod tests {
         // (a view that a later version has is the overview here, and the file is not refused for it)
         let later = loaded(r#"{"right_view": "something_later", "right_panel": false}"#);
         assert_eq!((later.right_view, later.right_panel), (RightView::Overview, false));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"right_files": true}"#).unwrap();
         Settings::load(&path).save(&path).unwrap();
@@ -1146,7 +1149,7 @@ mod tests {
 
     #[test]
     fn the_shell_last_chosen_is_kept() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let mut settings = Settings::default();
         assert_eq!(settings.terminal_shell, "");

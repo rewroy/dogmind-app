@@ -569,7 +569,7 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("a.txt");
         let other = dir.path().join("b.txt");
         let marks = Checkpoints::open(&dir.path().join("session.jsonl"));
@@ -585,7 +585,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_rewind_puts_nothing_where_a_junction_now_leads() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (work, elsewhere) = (dir.path().join("work"), dir.path().join("elsewhere"));
         std::fs::create_dir_all(work.join("sub")).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
@@ -612,7 +612,7 @@ mod tests {
     /// The index is gone bad (a cut, a bad disk): it is kept aside and not written over, and none of the copies it named is overwritten by the next one.
     #[test]
     fn a_damaged_index_keeps_the_copies_it_named_and_is_put_aside() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("session.jsonl");
         let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
         std::fs::write(&a, "first").unwrap();
@@ -641,7 +641,7 @@ mod tests {
     /// A copy never goes over a file that is there, whatever the numbering says.
     #[test]
     fn a_copy_takes_the_next_name_that_is_free() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("session.jsonl");
         let folder = folder_of(&session);
         std::fs::create_dir_all(&folder).unwrap();
@@ -697,7 +697,7 @@ mod tests {
     /// Two files are told apart by their size, or by the first block that differs, and the same bytes are the same.
     #[test]
     fn two_files_are_compared_by_size_and_then_by_blocks() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (a, b) = (dir.path().join("a"), dir.path().join("b"));
         let body = vec![7u8; 200_000];
         std::fs::write(&a, &body).unwrap();
@@ -743,7 +743,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_older_record_is_not_written_through_a_junction_that_is_there_now() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (work, elsewhere) = (dir.path().join("work"), dir.path().join("elsewhere"));
         std::fs::create_dir_all(work.join("sub")).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
@@ -774,7 +774,7 @@ mod tests {
     /// A path with no link on its way is no concern of the guard's, whether its record says where it led or not.
     #[test]
     fn a_plain_path_has_no_link_on_its_way() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("a").join("b")).unwrap();
         assert!(!has_a_link_on_its_way(&dir.path().join("a").join("b").join("c.txt")));
         let record = Saved { path: dir.path().join("a").join("b").join("c.txt"), copy: None, real: None };
@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn they_come_back_with_the_session_and_go_with_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("session.jsonl");
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "x").unwrap();
@@ -976,7 +976,7 @@ mod sealed_tests {
     /// The index of an encrypted session's checkpoints is sealed (the turns' titles are the first words of what was asked), the copies are not, and a session changed from one form to the other has its index changed with it.
     #[test]
     fn the_index_of_an_encrypted_session_is_sealed_and_follows_the_session_between_the_two_forms() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let key = Cipher::generate().unwrap();
         let session = Session::create_with(dir.path(), Path::new("w"), "now", "1", Some(&key)).unwrap().path.clone();
         let mut marks = Checkpoints::open(&session);
@@ -1003,7 +1003,7 @@ mod sealed_tests {
     /// with what it holds, a changed one with no text. A file the turn saved itself stays its own; a rewind puts back nothing of a command's.
     #[test]
     fn what_a_command_made_or_changed_is_shown_with_the_turn_and_not_put_back() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("node_modules")).unwrap();
         std::fs::create_dir_all(work.join("sub")).unwrap();

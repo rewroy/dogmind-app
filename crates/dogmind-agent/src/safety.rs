@@ -1316,7 +1316,7 @@ mod guidance_cli {
     #[test]
     fn they_run_with_the_network_and_no_one_is_asked_while_other_network_commands_still_ask() {
         let gate = Gate::new();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         for line in AS_WRITTEN {
             for arguments in [json!({"command": line}), json!({"command": line, "network": true}), json!({"command": line, "risk_level": "medium"})] {
                 assert_eq!(gate.check("execute_command", &arguments, dir.path()), Verdict::Allow, "{arguments}");
@@ -1333,10 +1333,10 @@ mod guidance_cli {
     #[test]
     fn outside_the_sandbox_with_a_file_here_for_npx_or_outside_the_workspace_it_asks() {
         let gate = Gate::new();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let line = AS_WRITTEN[0];
         assert!(matches!(gate.check("execute_command", &json!({"command": line, "outside_sandbox": true}), dir.path()), Verdict::Ask { risk: Risk::High, .. }));
-        let other = tempfile::tempdir().unwrap();
+        let other = crate::in_container::tempdir().unwrap();
         assert!(matches!(gate.check("execute_command", &json!({"command": line, "cwd": other.path().display().to_string()}), dir.path()), Verdict::Ask { .. }));
         std::fs::write(dir.path().join("npx.cmd"), "@echo planted").unwrap();
         assert!(matches!(gate.check("execute_command", &json!({"command": line}), dir.path()), Verdict::Ask { .. }));
@@ -1490,7 +1490,7 @@ mod tests {
 
     #[test]
     fn a_program_planted_in_the_folder_is_not_a_look_and_a_folder_outside_is_not_either() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (work, elsewhere) = (dir.path().join("work"), dir.path().join("elsewhere"));
         std::fs::create_dir_all(work.join("sub")).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
@@ -1509,7 +1509,7 @@ mod tests {
     /// A file in the folder that takes the place of an installed program is a reason to ask, for a look and for any other command, however the line spells the program.
     #[test]
     fn a_program_planted_in_the_folder_asks_with_a_reason_the_person_can_act_on() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("sub")).unwrap();
         let mut gate = Gate::new();
@@ -1553,7 +1553,7 @@ mod tests {
     /// A file in the folder is only the place of an installed program when a program of that name is on PATH: `gradlew.bat` in a project is the project's own, and `gradlew build` is a command like another.
     #[test]
     fn a_file_in_the_folder_that_no_installed_program_answers_to_is_the_projects_own() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         let mut gate = Gate::new();
@@ -1578,7 +1578,7 @@ mod tests {
     /// A look runs with no one asked, so it runs no file of the folder: one that a file answers to is a command like another, whether or not the file takes the place of an installed program. Only when it does is there a reason.
     #[test]
     fn a_look_that_a_file_in_the_folder_answers_to_asks_whether_or_not_it_takes_the_place_of_an_installed_program() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         let mut gate = Gate::new();
@@ -1610,7 +1610,7 @@ mod tests {
     /// setting for safe commands lets through, so such a call is medium, and asks. A higher risk stays, and a command the list does not know stays low, as `make` is.
     #[test]
     fn a_file_in_the_folder_that_answers_to_a_safe_program_makes_the_call_more_than_safe() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         let mut gate = Gate::new();
@@ -1637,7 +1637,7 @@ mod tests {
     /// What cmd runs itself is never replaced by a file in the folder: `dir.cmd` there does not make `dir` ask.
     #[test]
     fn what_cmd_runs_itself_is_not_taken_the_place_of_by_a_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         let mut gate = Gate::new();
@@ -1826,7 +1826,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn cargo_that_would_run_with_its_read_limits_lifted_is_asked_about() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = dir.path();
         let under_users = std::env::var_os("USERPROFILE").map(PathBuf::from).and_then(|home| home.parent().map(Path::to_path_buf)).is_some_and(|users| root.starts_with(users));
         if !under_users {
@@ -2058,7 +2058,7 @@ mod tests {
 
     #[test]
     fn a_link_into_a_secret_folder_asks_and_one_out_of_the_workspace_is_outside_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (work, ssh, elsewhere) = (dir.path().join("work"), dir.path().join("home").join(".ssh"), dir.path().join("elsewhere"));
         for folder in [&work, &ssh, &elsewhere] {
             std::fs::create_dir_all(folder).unwrap();
@@ -2089,7 +2089,7 @@ mod tests {
     #[test]
     fn a_short_name_for_a_secret_folder_is_seen_through() {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let ssh = dir.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
         std::fs::write(ssh.join("key"), "secret").unwrap();

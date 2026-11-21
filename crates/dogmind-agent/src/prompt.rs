@@ -700,7 +700,7 @@ mod tests {
     /// What a new session's prefill pays for, in characters of the prompt and the tools. A sentence added here is read by every session, at 200 tokens a second.
     #[test]
     fn what_every_session_reads_stays_small() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let prompt = system_prompt(folder.path(), false, "", "");
         assert!(prompt.len() < 5_500, "the system prompt has grown to {} characters", prompt.len());
         let tools = crate::tools::schemas_for(false, false, false, Vec::new(), false).to_string();
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn instructions_come_from_the_git_root_down() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::in_container::tempdir().unwrap();
         let inner = root.path().join("a");
         std::fs::create_dir_all(root.path().join(".git")).unwrap();
         std::fs::create_dir_all(&inner).unwrap();
@@ -739,7 +739,7 @@ mod tests {
         std::fs::write(inner.join("DOGMIND.md"), "inner").unwrap();
         std::fs::write(root.path().join("CLAUDE.md"), "not this").unwrap();
         std::fs::write(root.path().join("AGENTS.md"), "not this either").unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = crate::in_container::tempdir().unwrap();
         std::fs::write(elsewhere.path().join("AGENTS.md"), "from codex").unwrap();
         assert!(system_prompt(elsewhere.path(), false, "", "").contains("from codex"));
         let prompt = system_prompt(&inner, false, "", "SKILLS HERE");
@@ -755,7 +755,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_bundle_in_part_offers_what_is_there_and_says_what_is_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = dir.path().join("tools");
         std::fs::create_dir_all(root.join("git\\cmd")).unwrap();
         std::fs::write(root.join("git\\cmd\\git.exe"), "").unwrap();
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn the_prompt_says_what_the_sandbox_refuses_and_keeps_to_the_workspace() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let prompt = system_prompt(folder.path(), false, "", "");
         assert!(prompt.contains("PowerShell starts at C:\\") && prompt.contains("it cannot read the user's other files") && prompt.contains("every route"));
         assert!(workspace_state(folder.path()).contains("The workspace is empty"));
@@ -796,7 +796,7 @@ mod tests {
     /// A folder of a larger repository: the first message names the repository and says that git cannot reach it from the sandbox; the top of a repository keeps the sentence it had.
     #[test]
     fn a_folder_of_a_larger_repository_is_told_so_and_the_top_of_one_is_not() {
-        let repo = tempfile::tempdir().unwrap();
+        let repo = crate::in_container::tempdir().unwrap();
         let run = |args: &[&str]| {
             crate::tools::git(repo.path(), args).unwrap();
         };
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn work_in_the_workspace_leaves_the_system_prompt_as_it_was() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let (before, state) = (system_prompt(folder.path(), false, "", ""), workspace_state(folder.path()));
         std::fs::write(folder.path().join("new.txt"), "x").unwrap();
         assert_eq!(system_prompt(folder.path(), false, "", ""), before, "the engine would read all of it again");
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn the_prompt_says_how_to_ask_for_the_network_and_to_write_rather_than_plan() {
-        let prompt = system_prompt(tempfile::tempdir().unwrap().path(), false, "", "");
+        let prompt = system_prompt(crate::in_container::tempdir().unwrap().path(), false, "", "");
         assert!(prompt.contains("`network: true`"));
         assert!(prompt.contains("Never put code, markup, shader text, formulas or a text you are rewriting in reasoning"));
         assert!(!prompt.contains("under node or python"), "node may be closed to the sandbox");
@@ -844,7 +844,7 @@ mod tests {
 
     #[test]
     fn the_prompt_does_not_offer_what_it_then_says_fails() {
-        let prompt = system_prompt(tempfile::tempdir().unwrap().path(), false, "", "");
+        let prompt = system_prompt(crate::in_container::tempdir().unwrap().path(), false, "", "");
         assert!(!prompt.contains("cmd syntax: `dir`"), "`dir` is refused in the sandbox");
         assert!(!TOOLS.contains(&"py"), "its launcher does not start in the sandbox");
     }

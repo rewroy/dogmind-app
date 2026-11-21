@@ -193,7 +193,7 @@ mod tests {
     /// A rules file that does not read as rules is moved aside before the next rule is written, not written over with that one alone.
     #[test]
     fn rules_that_do_not_read_are_kept_aside_and_not_written_over() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("permissions.json");
         std::fs::write(&path, b"[{\"workspace\": \"C:\\\\w\", \"tool\"\0\0\0\0").unwrap();
         let rule = Rule { workspace: PathBuf::from("C:\\w"), tool: COMMAND.to_string(), prefix: "npm test".into(), exact: false };
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn rules_that_cannot_be_read_are_not_written_over() {
         use std::os::windows::fs::OpenOptionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("permissions.json");
         let kept = Rule { workspace: PathBuf::from("C:\\w"), tool: COMMAND.to_string(), prefix: "npm test".into(), exact: false };
         add(&path, kept.clone()).unwrap();
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn rules_that_do_not_read_and_cannot_be_moved_aside_are_not_written_over() {
         use std::os::windows::fs::OpenOptionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("permissions.json");
         std::fs::write(&path, b"[{\"workspace\": \"C:\\\\w\", \"tool\"\0\0\0\0").unwrap();
         let rule = Rule { workspace: PathBuf::from("C:\\w"), tool: COMMAND.to_string(), prefix: "npm test".into(), exact: false };
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn rules_outlive_the_program_and_go_when_removed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("deep").join("permissions.json");
         let gate = Gate::new();
         let root = Path::new("C:\\w");
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn a_damaged_file_allows_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("permissions.json");
         std::fs::write(&path, "{ not json").unwrap();
         assert!(!allows(&path, &Gate::new(), Path::new("C:\\w"), COMMAND, &command("make")));

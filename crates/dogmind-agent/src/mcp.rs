@@ -1682,7 +1682,7 @@ mod tests {
 
     #[test]
     fn an_import_adds_and_keeps_what_was_there() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("deep/mcp.json");
         let one = |command: &str| ServerConfig { command: command.into(), ..ServerConfig::default() };
         assert_eq!(import(&file, BTreeMap::from([("a".to_string(), one("first"))])).unwrap(), 1);
@@ -1701,7 +1701,7 @@ mod tests {
     /// A file written by hand with a mistake in it: the hub says why, and starts nothing; mended, it starts what it lists.
     #[test]
     fn a_file_that_cannot_be_read_is_said_and_starts_nothing_until_it_can() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         std::fs::write(&file, "{\"mcpServers\": {\"a\": {\"command\": \"no-such-program-here\"},}}").unwrap();
         let hub = Hub::start(&file);
@@ -1792,7 +1792,7 @@ mod tests {
     fn a_server_of_the_older_transport_is_reached_as_its_configuration_says_or_as_its_url_answers() {
         for kind in ["sse", "http"] {
             let (url, seen) = older_server();
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::in_container::tempdir().unwrap();
             let file = dir.path().join("mcp.json");
             let headers = BTreeMap::from([("Authorization".to_string(), "Bearer t".to_string())]);
             save_server(&file, None, "old", ServerConfig { url, kind: kind.into(), headers, ..ServerConfig::default() }).unwrap();
@@ -1930,7 +1930,7 @@ mod tests {
         let (url, seen) = http_server("echo");
         let config = ServerConfig { url: url.clone(), kind: "http".into(), headers: BTreeMap::from([("Authorization".to_string(), "Bearer secret".to_string())]), ..ServerConfig::default() };
         assert!(config.is_http() && config.problem().is_none());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "remote", config).unwrap();
         let hub = Hub::start(&file);
@@ -1954,7 +1954,7 @@ mod tests {
     #[test]
     fn what_a_server_at_a_url_asks_is_answered_in_its_session() {
         let (url, seen) = http_server("ask");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "remote", ServerConfig { url, ..ServerConfig::default() }).unwrap();
         let hub = Hub::start(&file);
@@ -1992,7 +1992,7 @@ mod tests {
     #[test]
     fn a_server_at_a_url_that_says_between_requests_that_its_tools_changed_is_heard() {
         let (url, seen) = http_server_with("echo", false, true);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "remote", ServerConfig { url, ..ServerConfig::default() }).unwrap();
         let hub = Hub::start(&file);
@@ -2021,7 +2021,7 @@ mod tests {
     #[test]
     fn a_session_the_server_let_go_is_begun_again_and_the_call_made_in_the_new_one() {
         let (url, seen) = http_server_with("echo", true, false);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "remote", ServerConfig { url, ..ServerConfig::default() }).unwrap();
         let hub = Hub::start(&file);
@@ -2043,7 +2043,7 @@ mod tests {
     #[test]
     fn a_change_to_the_servers_starts_and_ends_only_what_changed() {
         let ((one, _), (two, _)) = (http_server("first"), http_server("second"));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         let at = |url: &str| ServerConfig { url: url.to_string(), ..ServerConfig::default() };
         save_server(&file, None, "a", at(&one)).unwrap();
@@ -2360,7 +2360,7 @@ mod tests {
 
     #[test]
     fn trust_is_the_persons_word_kept_in_the_file_and_for_the_server_a_call_reaches() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         std::fs::write(&file, r#"{"mcpServers": {"srv": {"command": "no-such-program-here", "args": ["a"]}}}"#).unwrap();
         let hub = Hub::start(&file);
@@ -2515,7 +2515,7 @@ mod tests {
 
     /// Starts a server that never answers, with 3 s to, and checks that its process has ended after.
     fn start_a_mute_one(job: bool) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mute.pid");
         let _reaper = Reaper(vec![file.clone()]);
         let config = fake(MUTE, &[&file.display().to_string()]);
@@ -2542,7 +2542,7 @@ mod tests {
         let Err(error) = start_server_within(&config, Duration::from_secs(20), false) else { panic!("a server that ends was started") };
         assert!(error.ends_with("It said: starting | ModuleNotFoundError: No module named mcp"), "{error}");
         let crashing = "import json, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n    if 'id' not in m:\n        continue\n    if m['method'] == 'tools/call':\n        sys.stderr.write('KeyError: token\\n')\n        sys.exit(1)\n    r = {'tools': [{'name': 't', 'inputSchema': {'type': 'object'}}]} if m['method'] == 'tools/list' else {'protocolVersion': '2025-06-18', 'capabilities': {}}\n    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': r}), flush=True)\n";
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "srv", fake(crashing, &[])).unwrap();
         let hub = Hub::start(&file);
@@ -2559,7 +2559,7 @@ mod tests {
 
     #[test]
     fn two_servers_whose_names_clean_to_one_keep_their_own_tools() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (mut servers, mut files) = (BTreeMap::new(), Vec::new());
         for name in ["my.server", "my_server"] {
             let file = dir.path().join(format!("{name}.pid"));

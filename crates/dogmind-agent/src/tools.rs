@@ -3201,7 +3201,7 @@ mod power_tests {
 
     #[test]
     fn files_are_found_by_name_and_what_git_ignores_is_not() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".gitignore"), "skip.rs\n").unwrap();
@@ -3275,7 +3275,7 @@ mod power_tests {
     #[cfg(windows)]
     #[test]
     fn what_a_command_in_the_sandbox_prints_is_seen_while_it_runs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (mut bench, cancel) = (Workbench::default(), AtomicBool::new(false));
         // (spelled with a caret, so that the line itself does not say what it prints)
         let line = "echo ready^-now& powershell -NoProfile -Command \"Start-Sleep -Seconds 30\"";
@@ -3295,7 +3295,7 @@ mod power_tests {
     /// `wake_on` belongs to a command started in the background, and has to be a pattern: what is wrong with it is said before anything is started.
     #[test]
     fn wake_on_is_for_a_background_command_and_has_to_be_a_pattern() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (mut bench, cancel) = (Workbench::default(), AtomicBool::new(false));
         let waited = bench.run("execute_command", &json!({"command": "echo x", "wake_on": "x"}), dir.path(), &cancel).unwrap_err();
         assert!(waited.contains("background: true") && waited.contains("not started"), "{waited}");
@@ -3328,7 +3328,10 @@ mod change_tests {
 
     #[test]
     fn what_a_repository_plants_in_its_own_config_does_not_run_when_the_app_asks_git_anything() {
-        let dir = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let dir = crate::in_container::tempdir().unwrap();
         run_git(dir.path(), &["init", "-q"]);
         std::fs::write(dir.path().join(".gitattributes"), "*.txt filter=planted diff=planted\n").unwrap();
         std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
@@ -3354,7 +3357,7 @@ mod change_tests {
 
     #[test]
     fn a_file_changed_a_file_new_and_a_file_deleted_are_each_a_row() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         run_git(dir.path(), &["init", "-q"]);
         std::fs::write(dir.path().join("kept.txt"), "one\ntwo\n").unwrap();
         std::fs::write(dir.path().join("gone.txt"), "x\n").unwrap();
@@ -3371,7 +3374,7 @@ mod change_tests {
 
     #[test]
     fn a_repository_with_no_commit_shows_its_new_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         run_git(dir.path(), &["init", "-q"]);
         std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
         std::fs::write(dir.path().join("b.bin"), [0xFFu8, 0, 1]).unwrap();
@@ -3384,7 +3387,7 @@ mod change_tests {
     #[cfg(windows)]
     #[test]
     fn what_a_command_changed_is_said_whatever_its_exit_code() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("kept.txt"), "a").unwrap();
         std::fs::write(dir.path().join("gone.txt"), "a").unwrap();
         std::fs::write(dir.path().join("grows.txt"), "a").unwrap();
@@ -3411,7 +3414,7 @@ mod change_tests {
     #[cfg(windows)]
     #[test]
     fn what_would_open_on_the_desktop_is_told_from_what_runs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("data.xyz"), "x").unwrap();
         std::fs::write(dir.path().join("run.bat"), "@echo x").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
@@ -3447,7 +3450,7 @@ mod change_tests {
     #[cfg(windows)]
     #[test]
     fn a_cd_by_full_path_to_the_folder_it_runs_in_is_left_out() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         let here = dir.path().display().to_string();
         assert_eq!(after_cd_to(&format!("cd {here} && python x.py"), dir.path()), Some((format!("cd {here}").as_str(), "python x.py")));
@@ -3468,7 +3471,7 @@ mod change_tests {
                      "cargo run %PATH%", "cargo run !x!", "cargo build; x", "cargo build\necho x", "python cargo.py", "echo cargo", "cargo-nextest run"] {
             assert!(!one_cargo_command(more), "{more}");
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
         std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\n  \"crates/*\",\n]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"0.1.0\"\n").unwrap();
@@ -3494,7 +3497,7 @@ mod change_tests {
         if !std::process::Command::new("cargo").arg("--version").output().is_ok_and(|output| output.status.success()) {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = dir.path();
         for name in ["a", "b"] {
             std::fs::create_dir_all(root.join("crates").join(name).join("src")).unwrap();
@@ -3512,7 +3515,7 @@ mod change_tests {
     #[cfg(windows)]
     #[test]
     fn a_command_that_cds_to_its_own_folder_runs_and_one_whose_cwd_is_not_there_is_told_so() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let ran = execute_command(&json!({"command": format!("cd /d \"{}\" && echo ran-here", dir.path().display())}), dir.path(), &AtomicBool::new(false), None).unwrap();
         assert!(ran.contains("ran-here") && ran.contains("was left out") && ran.contains("exit_code: 0"), "{ran}");
         let said = execute_command(&json!({"command": "echo x", "cwd": "made-later"}), dir.path(), &AtomicBool::new(false), None).unwrap_err();
@@ -3522,7 +3525,7 @@ mod change_tests {
     #[cfg(windows)]
     #[test]
     fn a_line_that_would_open_a_dialog_is_refused_before_any_sandbox_is_made() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let said = execute_command(&json!({"command": "x.py"}), dir.path(), &AtomicBool::new(false), None).unwrap_err();
         assert!(said.contains("Nothing was started") && said.contains("python x.py"), "{said}");
     }
@@ -3553,7 +3556,7 @@ mod change_tests {
 
     #[test]
     fn an_empty_folder_is_said_to_be() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         assert!(list_files(&json!({}), dir.path()).unwrap().ends_with("is empty"));
     }
 
@@ -3570,14 +3573,14 @@ mod change_tests {
 
     #[test]
     fn outside_a_repository_it_says_so() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         assert!(workspace_changes(dir.path()).is_err());
         assert_eq!(git_info(dir.path()), None);
     }
 
     #[test]
     fn a_repository_says_where_it_stands() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         run_git(dir.path(), &["init", "-q", "-b", "work"]);
         assert_eq!(git_info(dir.path()).unwrap().branch, "work");
         std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
@@ -3599,7 +3602,7 @@ mod tests {
     use super::*;
 
     fn bench() -> (tempfile::TempDir, Workbench, AtomicBool) {
-        (tempfile::tempdir().unwrap(), Workbench::default(), AtomicBool::new(false))
+        (crate::in_container::tempdir().unwrap(), Workbench::default(), AtomicBool::new(false))
     }
 
     #[test]
@@ -3612,7 +3615,7 @@ mod tests {
     /// `present` names files of the workspace, each once, from its root with forward slashes; a file that is not there, or a path out of the workspace, is refused, and so is none.
     #[test]
     fn present_names_files_of_the_workspace_and_nothing_else() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("web")).unwrap();
         std::fs::write(dir.path().join("web/index.html"), "<p>").unwrap();
         std::fs::write(dir.path().join("notes.md"), "x").unwrap();
@@ -3629,7 +3632,7 @@ mod tests {
 
     #[test]
     fn show_diff_outside_git_answers_in_a_line_and_never_with_gits_usage() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         for scope in ["staged", "unstaged"] {
             let said = show_diff(&json!({"scope": scope}), dir.path(), None).unwrap_err();
             assert!(said.contains("use scope session") && !said.contains('\n') && !said.contains("usage"), "{said}");
@@ -3642,7 +3645,7 @@ mod tests {
 
     #[test]
     fn show_diff_in_a_repository_goes_on_as_it_did_and_says_a_bad_path_in_a_line() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let run = |args: &[&str]| {
             let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.com"];
             all.extend(args);
@@ -3652,7 +3655,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "first"]);
-        let sessions = tempfile::tempdir().unwrap();
+        let sessions = crate::in_container::tempdir().unwrap();
         let baseline = crate::baseline::Baseline::for_session(&sessions.path().join("s.jsonl"), dir.path());
         std::fs::write(dir.path().join("a.txt"), "b\n").unwrap();
         for scope in ["session", "workspace", "unstaged"] {
@@ -3677,7 +3680,7 @@ mod tests {
     /// changes are not shown to the model as its work (a real run's first show_diff in an empty folder printed its parent's every change).
     #[test]
     fn a_workspace_in_a_larger_repository_sees_only_its_own_changes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let run = |args: &[&str]| {
             let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.com"];
             all.extend(args);
@@ -4255,7 +4258,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_refused_line_makes_no_repository_first() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("app.log"), "x").unwrap();
         let said = execute_command(&json!({"command": "git init && app.log"}), dir.path(), &AtomicBool::new(false), None).unwrap_err();
         assert!(said.contains("Nothing was started"), "{said}");
@@ -4307,7 +4310,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn what_opens_on_the_screen_is_seen_as_cmd_reads_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let opens = |line: &str| opened_on_the_desktop(line, dir.path());
         assert_eq!(opens("x.t^xt").as_deref(), Some("x.txt"));
         assert_eq!(opens("^x.py").as_deref(), Some("x.py"));
@@ -4323,7 +4326,7 @@ mod tests {
 
     #[test]
     fn a_file_too_large_to_hold_is_not_read_to_say_so() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let large = dir.path().join("model.gguf");
         std::fs::File::create(&large).unwrap().set_len(MOST_READ_WHOLE + 1).unwrap();
         let said = read_file(&json!({"path": "model.gguf"}), dir.path()).err().unwrap();
@@ -4332,7 +4335,7 @@ mod tests {
 
     #[test]
     fn a_search_leaves_out_what_else_holds_keys_as_it_does_what_reads_as_keys() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (app, keys) = (dir.path().join("DogmindApp"), dir.path().join("keys"));
         std::fs::create_dir_all(&app).unwrap();
         std::fs::create_dir_all(&keys).unwrap();
@@ -4349,7 +4352,7 @@ mod tests {
 
     #[test]
     fn a_repositorys_worktree_config_and_its_submodules_start_no_program_either() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let run = |args: &[&str]| { git(dir.path(), args).unwrap(); };
         run(&["init", "-q"]);
         run(&["config", "extensions.worktreeConfig", "true"]);
@@ -4364,7 +4367,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_command_for_a_place_it_cannot_run_in_is_refused_before_anything_looks_there() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let said = execute_command(&json!({"command": "x.py", "cwd": "\\\\127.0.0.1\\nothing-here"}), dir.path(), &AtomicBool::new(false), None).unwrap_err();
         assert!(said.contains("outside the workspace") && said.contains("was not started"), "{said}");
     }
@@ -4383,7 +4386,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn what_a_for_goes_through_opens_nothing_and_what_it_runs_is_as_before() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("app.log"), "x").unwrap();
         assert_eq!(opened_on_the_desktop("for %f in (app.log) do @echo %~zf bytes", dir.path()), None);
         assert_eq!(opened_on_the_desktop("@for %f in (*.log) do echo %f", dir.path()), None);
@@ -4527,7 +4530,7 @@ mod tests {
     /// Two outputs kept in the same millisecond are two files, each with its own words.
     #[test]
     fn two_outputs_kept_in_one_millisecond_take_two_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let first = keep_whole_in(dir.path(), "command", "20261105-120000000", "first output").unwrap();
         let second = keep_whole_in(dir.path(), "command", "20261105-120000000", "second output").unwrap();
         let third = keep_whole_in(dir.path(), "command", "20261105-120000000", "third output").unwrap();
@@ -4698,7 +4701,7 @@ mod tests {
 
     /// A repository with `pkg` and `other` folders, each with a file committed, and a change to each: the workspace is `pkg`.
     fn repository_with_a_folder() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let run = |args: &[&str]| {
             let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.com"];
             all.extend(args);
@@ -4724,7 +4727,7 @@ mod tests {
         assert_eq!(std::fs::canonicalize(&top).unwrap(), real);
         assert!(!top.display().to_string().starts_with("\\\\?"), "{}", top.display());
         assert_eq!(repository_above(dir.path()), None, "the top itself");
-        let alone = tempfile::tempdir().unwrap();
+        let alone = crate::in_container::tempdir().unwrap();
         assert_eq!(repository_above(alone.path()), None, "no repository");
         assert_eq!(repository_above(&alone.path().join("not-there")), None);
     }
@@ -4748,7 +4751,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn cargo_that_cannot_expand_a_members_pattern_is_told_why() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let err = "error: failed to load manifest for workspace member `C:\\Users\\a\\work\\crates/*`\nreferenced by workspace at `C:\\Users\\a\\work\\Cargo.toml`\n\nCaused by:\n  \
                    failed to read `C:\\Users\\a\\work\\crates\\*\\Cargo.toml`\n\nCaused by:\n  ファイル名、ディレクトリ名、またはボリューム ラベルの構文が間違っています。 (os error 123)\n";
         let note = sandbox_notes("cargo test -p app", dir.path(), Some(101), err);
@@ -4771,7 +4774,7 @@ mod tests {
         }
         // not a command of git's, and a folder that is no repository's: as before
         assert!(!sandbox_notes("dir", &pkg, Some(1), "fatal: not a git repository").contains("part of the git repository"));
-        let alone = tempfile::tempdir().unwrap();
+        let alone = crate::in_container::tempdir().unwrap();
         assert!(sandbox_notes("git status", alone.path(), Some(128), "fatal: failed to stat 'C:/Users': Permission denied").contains("not a git repository. `git init`"));
         assert_eq!(sandbox_notes("git status", alone.path(), Some(128), "fatal: not a git repository (or any of the parent directories): .git"), "");
     }
@@ -4892,7 +4895,7 @@ mod tests {
         let windows = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
         let note = foreign_owner_note(r"System32\config\SAM: Access is denied.", &windows).expect("System32 is TrustedInstaller's");
         assert!(note.contains(&windows.join("System32").display().to_string()) && note.contains("TrustedInstaller"), "{note}");
-        let mine = tempfile::tempdir().unwrap();
+        let mine = crate::in_container::tempdir().unwrap();
         std::fs::create_dir_all(mine.path().join("a").join("b")).unwrap();
         assert_eq!(foreign_owner_note("a/b/c.txt: Permission denied", mine.path()), None);
         assert_eq!(foreign_owner_note("System32: no such thing", &windows), None, "only a refusal");
@@ -4998,7 +5001,10 @@ mod tests {
     /// next one is not started. Nothing of the other repository is changed.
     #[test]
     fn a_link_a_command_made_to_a_repository_is_said_in_its_result_and_the_next_command_is_not_started() {
-        let dir = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let dir = crate::in_container::tempdir().unwrap();
         let mine = dir.path().join("mine\\.git");
         std::fs::create_dir_all(mine.join("hooks")).unwrap();
         std::fs::write(mine.join("hooks\\pre-commit"), "the person's\n").unwrap();

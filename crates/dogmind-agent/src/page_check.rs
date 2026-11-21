@@ -1548,7 +1548,7 @@ mod tests {
 
     #[test]
     fn a_week_old_picture_goes_and_a_new_one_and_other_files_stay() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (old, new, other) = (dir.path().join("dogmind-page-20261020-101010000-desktop.png"), dir.path().join("dogmind-page-20261103-101010000-mobile.png"), dir.path().join("notes.png"));
         for file in [&old, &new, &other] {
             std::fs::write(file, b"png").unwrap();
@@ -1582,7 +1582,7 @@ mod tests {
 
     #[test]
     fn the_tries_of_one_loop_each_have_a_profile_of_their_own() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut profiles = Profiles::new(dir.path(), dir.path());
         let names: Vec<String> = (0..TRIES).map(|_| profiles.next()).collect();
         assert_eq!(names.iter().collect::<HashSet<_>>().len(), TRIES);
@@ -1593,7 +1593,7 @@ mod tests {
 
     #[test]
     fn a_sweep_removes_only_old_names_a_run_makes_and_leaves_the_rest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (old_folders, old_files) = (["dogmind-profile-4242-7"], ["dogmind-frame-4242-7.html", "dogmind-shot-4242-7.png", "dogmind-steps-4242-7.html"]);
         // What is not a run's, however old: the names the browser's runs once had, a name that only begins as theirs, a picture, and what a command made.
         let kept_files = ["dogmind-frame.html", "dogmind-shot.png", "dogmind-steps.html", "dogmind-frame-4242-7.txt", "dogmind-frame-x-7.html", "dogmind-shot-4242-7-8.png", "dogmind-steps-4242-.html", "dogmind-page-20261020-101010000-desktop.png", "my-dogmind-frame-4242-7.html", "notes-4242-7"];
@@ -1630,7 +1630,7 @@ mod tests {
     }
 
     fn page(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         for (name, text) in files {
             let path = dir.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1828,7 +1828,7 @@ mod tests {
 
     #[test]
     fn a_page_in_shift_jis_or_utf_16_is_read_and_says_it_is_utf_8() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let sjis = dir.path().join("sjis.html");
         let mut bytes = b"<!DOCTYPE html><html><head><meta charset=\"Shift_JIS\"><title>".to_vec();
         bytes.extend_from_slice(&[0x94, 0x84, 0x8F, 0xE3]);
@@ -1877,7 +1877,7 @@ mod tests {
     /// The frames' extension is written once into the folder, under a name of its contents, and is the one extension a run lets in; with none, a run has none at all.
     #[test]
     fn the_frames_extension_is_written_once_and_is_the_one_a_run_loads() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::in_container::tempdir().unwrap();
         let folder = frames_extension(temp.path()).unwrap();
         assert!(folder.file_name().unwrap().to_string_lossy().starts_with("dogmind-frames-"), "{}", folder.display());
         assert_eq!(std::fs::read_to_string(folder.join("frames.js")).unwrap(), frames_js!());
@@ -2094,7 +2094,7 @@ mod tests {
                 let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             }
         });
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let said = check_page(&serde_json::json!({"url": format!("http://127.0.0.1:{port}/")}), dir.path(), &AtomicBool::new(false));
         println!("{said:?}");
         let text = match &said { Ok(text) | Err(text) => text.clone() };
@@ -2218,7 +2218,7 @@ mod tests {
     #[test]
     #[ignore = "starts Edge in the sandbox"]
     fn a_page_in_shift_jis_is_checked_with_steps_and_without() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut bytes = b"<!DOCTYPE html><html><head><meta charset=\"Shift_JIS\"><title>".to_vec();
         bytes.extend_from_slice(&[0x94, 0x84, 0x8F, 0xE3]);
         bytes.extend_from_slice(b"</title></head><body><p id=t>");

@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn a_folder_is_read_with_its_kinds_hidden_names_and_order() {
-        let place = tempfile::tempdir().unwrap();
+        let place = crate::in_container::tempdir().unwrap();
         std::fs::create_dir(place.path().join("src")).unwrap();
         std::fs::create_dir(place.path().join(".git")).unwrap();
         std::fs::write(place.path().join("b.txt"), "b").unwrap();
@@ -981,7 +981,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_file_marked_hidden_by_windows_is_hidden_with_no_dot_in_its_name() {
-        let place = tempfile::tempdir().unwrap();
+        let place = crate::in_container::tempdir().unwrap();
         let hidden = place.path().join("quiet.txt");
         std::fs::write(&hidden, "x").unwrap();
         let wide: Vec<u16> = hidden.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
@@ -994,7 +994,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_watcher_tells_of_a_change_once_it_is_quiet_and_not_of_noise_and_not_before() {
-        let place = tempfile::tempdir().unwrap();
+        let place = crate::in_container::tempdir().unwrap();
         std::fs::create_dir(place.path().join("src")).unwrap();
         std::fs::create_dir(place.path().join("target")).unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();

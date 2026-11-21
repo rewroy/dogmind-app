@@ -860,7 +860,7 @@ mod tests {
     /// as they were (older builds skip these lines).
     #[test]
     fn what_a_session_read_comes_back_from_its_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261122-1").unwrap();
         session.append(&Message::text("user", "hi")).unwrap();
         session.note_seen(Path::new("C:/w/a.txt"), "1111").unwrap();
@@ -878,7 +878,7 @@ mod tests {
 
     #[test]
     fn a_branch_has_the_conversation_through_its_message_and_its_pictures_and_the_original_is_as_it_was() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261103-1").unwrap();
         session.set_tools(&serde_json::json!([{"function": {"name": "read_file"}}])).unwrap();
         session.append(&Message::text("system", "s")).unwrap();
@@ -908,7 +908,7 @@ mod tests {
 
     #[test]
     fn a_session_comes_back_as_it_was_after_its_last_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261031-1").unwrap();
         session.append(&Message::text("system", "s")).unwrap();
         session.append(&Message::text("user", "old")).unwrap();
@@ -926,7 +926,7 @@ mod tests {
     /// A name given after a line a crash cut short is on a line of its own, and read; a session with such a line can still be branched.
     #[test]
     fn a_cut_line_takes_neither_the_name_after_it_nor_a_branch() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261104-1").unwrap();
         session.append(&Message::text("user", "hello")).unwrap();
         session.append(&Message::text("assistant", "hi")).unwrap();
@@ -981,7 +981,7 @@ mod tests {
 
     #[test]
     fn two_sessions_begun_in_one_second_have_a_file_each() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let first = Session::create(dir.path(), Path::new("w"), "now", "same").unwrap();
         let second = Session::create(dir.path(), Path::new("w"), "now", "same").unwrap();
         assert_ne!(first.path, second.path);
@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn the_tools_come_back_to_the_byte_and_the_last_ones_count() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         assert_eq!(tools_of(&session.path), None);
         let tools = serde_json::json!([{"zebra": 1, "apple": {"é": "日本語\n"}}]);
@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn a_call_cut_off_gets_a_result_and_a_cut_line_is_skipped() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "a").unwrap();
         session.append(&Message { role: "assistant".into(), tool_calls: Some(vec![call("1"), call("2")]), ..Message::default() }).unwrap();
         session.append(&Message::tool_result("1", "done")).unwrap();
@@ -1036,7 +1036,7 @@ mod tests {
 
     #[test]
     fn a_reader_beside_the_writer_sees_a_running_call_as_it_is() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         session.append(&Message { role: "assistant".into(), tool_calls: Some(vec![call("1")]), ..Message::default() }).unwrap();
         assert_eq!(read(&session.path).unwrap().len(), 1);
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn a_search_finds_what_was_said_and_not_what_every_session_has() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut first = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         first.append(&Message::text("system", "the system prompt mentions Banana")).unwrap();
         first.append(&Message::text("user", "ハッシュテーブルの話")).unwrap();
@@ -1079,7 +1079,7 @@ mod tests {
 
     #[test]
     fn a_new_name_replaces_the_first_words_and_leaves_the_conversation() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         session.append(&Message::text("user", "first words")).unwrap();
         let path = session.path.clone();
@@ -1092,7 +1092,7 @@ mod tests {
 
     #[test]
     fn the_list_counts_every_message_after_the_title() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         session.append(&Message::text("system", "s")).unwrap();
         session.append(&Message::text("user", "title")).unwrap();
@@ -1104,7 +1104,7 @@ mod tests {
 
     #[test]
     fn the_list_is_newest_first_and_titled_by_what_was_typed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         for (stamp, text) in [("1", "first"), ("2", "second")] {
             let mut session = Session::create(dir.path(), Path::new("w"), "now", stamp).unwrap();
             session.append(&Message::text("user", text)).unwrap();
@@ -1128,7 +1128,7 @@ mod notice_tests {
     /// A session with a notice in it: it comes back as one, whether it is a line of its own or in a snapshot, it is not the person's words to the list, the search or the model's request.
     #[test]
     fn a_notice_is_kept_as_one_and_is_not_taken_for_the_persons_words() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         session.append(&Message::text("user", "build it")).unwrap();
         session.append(&Message::text("assistant", "started")).unwrap();
@@ -1169,7 +1169,7 @@ mod notice_tests {
         assert!(crate::prompt::is_nudge(message.content.as_deref().unwrap()), "it shows as the app's word, never as the person's bubble");
 
         // a line of a kind no reader has (what a later app may write): it is skipped by `read`, `open`, `list` and `fork`, and what is around it is read
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         session.append(&Message::text("user", "first")).unwrap();
         let path = session.path.clone();
@@ -1192,7 +1192,7 @@ mod crash_tests {
 
     #[test]
     fn a_file_cut_by_a_crash_opens_and_goes_on_cleanly() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("cut.jsonl");
         let whole = serde_json::to_string(&Line::Message { message: Message::text("user", "kept") }).unwrap();
         // A line cut in the middle of a character, with no newline after it.

@@ -2069,7 +2069,7 @@ mod tests {
         let Some(file) = std::env::var_os("DOGMIND_TEST_LENT_FACE") else {
             let regular = crate::paint::BUNDLED_FILES[0];
             let Some(folder) = crate::paint::font_folders().into_iter().find(|folder| folder.join(regular).is_file()) else { return };
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::in_container::tempdir().unwrap();
             let copy = dir.path().join("QZXUDGothic-Regular.ttf");
             std::fs::write(&copy, renamed(&std::fs::read(folder.join(regular)).unwrap(), "BIZ", "QZX")).unwrap();
             let run = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", NAME, "--nocapture", "--test-threads=1"]).env("DOGMIND_TEST_LENT_FACE", &copy).output().unwrap();

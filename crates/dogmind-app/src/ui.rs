@@ -18695,7 +18695,7 @@ mod tests {
     /// The line goes to the report, once, and not while the app is taking itself off this PC.
     #[test]
     fn the_line_a_server_said_goes_to_the_report_and_nothing_is_written_while_the_app_leaves() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let text = llm::with_line(llm::SERVER_GONE, "GPU fault");
         keep_server_line(dir.path(), &Leaving::Going, &text);
         keep_server_line(dir.path(), &Leaving::Gone("done".into()), &text);
@@ -18801,7 +18801,7 @@ mod tests {
     #[test]
     fn a_key_given_to_the_agent_reaches_the_server_and_nothing_written() {
         const KEY: &str = "sk-never-written-0123456789";
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (told, seen) = channel();
@@ -18868,7 +18868,7 @@ mod tests {
 
     #[test]
     fn a_picture_reaches_the_server_as_a_data_url() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (told, seen) = channel();
@@ -19466,7 +19466,7 @@ mod crypt_tests {
     /// What the start makes of the data folder: no key file is conversations as they are; a key file is a question, unless this Windows user has the key; one that cannot be read is no way in.
     #[test]
     fn the_start_asks_for_the_key_exactly_when_the_folder_says_it_must() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::in_container::tempdir().unwrap();
         let (crypt, policy) = Crypt::open(data.path());
         assert!(!crypt.is_locked() && crypt.keystore.is_none() && policy.writer().unwrap().is_none());
 
@@ -19498,7 +19498,7 @@ mod crypt_tests {
     /// Remove takes the key file with the conversations it was for, and the page's words are in both languages.
     #[test]
     fn the_key_file_goes_with_what_remove_takes() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::in_container::tempdir().unwrap();
         std::fs::write(data.path().join("settings.json"), r#"{"providers": []}"#).unwrap();
         std::fs::create_dir_all(data.path().join("sessions")).unwrap();
         Keystore::create(data.path(), "the passphrase of the test", false, None).unwrap();

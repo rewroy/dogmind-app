@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn the_program_ends_where_the_installer_finds_its_package() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mini = dir.path().join("mini.exe");
         std::fs::write(&mini, mini_exe()).unwrap();
         for program in [mini, std::env::current_exe().unwrap()] {
@@ -781,7 +781,7 @@ mod tests {
 
     #[test]
     fn the_installers_manifest_is_read_for_its_records_and_nothing_that_is_not_one() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         std::fs::write(
             dir.path().join(INSTALL_MANIFEST),
@@ -811,7 +811,7 @@ mod tests {
 
     /// A parts file as the installer's `--pack` writes it, of a folder, and the setup it describes.
     fn parts_of_a_setup() -> (tempfile::TempDir, std::path::PathBuf, serde_json::Value) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let exe = make_setup(dir.path(), "1.2.3", &[("a.txt", b"hello"), ("b.bin", &noisy(5000, 1)), ("c\\d.txt", &vec![b'x'; 9000]), ("empty", b"")]);
         let parts = serde_json::from_slice(&std::fs::read(setup_pack::parts_path(&exe)).unwrap()).unwrap();
         (dir, exe, parts)
@@ -869,7 +869,7 @@ mod tests {
         let (_dir, exe, parts) = parts_of_a_setup();
         let length = std::fs::metadata(&exe).unwrap().len();
         let parts = read_parts(&serde_json::to_vec(&parts).unwrap(), "1.2.3", length).unwrap();
-        let install = tempfile::tempdir().unwrap();
+        let install = crate::in_container::tempdir().unwrap();
         let files: [(&str, &[u8]); 4] = [("a.txt", b"hello"), ("b.bin", &noisy(5000, 1)), ("c\\d.txt", &[b'x'; 9000]), ("empty", b"")];
         make_install(install.path(), &files, true);
         let records = records_of(install.path());
@@ -919,7 +919,7 @@ mod tests {
         }
         assert_eq!(out.len() as u64, parts.base + layout.index_at);
         out.extend_from_slice(&layout.index);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let made = dir.path().join("Made.exe");
         std::fs::write(&made, out).unwrap();
         let mut package = Package::open(&made).unwrap();

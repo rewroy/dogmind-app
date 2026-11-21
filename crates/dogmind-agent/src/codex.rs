@@ -803,7 +803,7 @@ mod tests {
 
     #[test]
     fn a_picture_goes_beside_the_transcript_and_is_named_in_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let bytes = crate::images::tests::encoded(8, 8, image::ImageFormat::Png);
         let kept = crate::images::save(&session, &crate::images::attach_bytes("a", bytes.clone()).unwrap(), crate::images::ImageLimit::WIDE).unwrap();

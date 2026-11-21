@@ -1207,7 +1207,7 @@ mod tests {
     /// Read from the files, an explore's call has the steps of its helper's own conversation: why in the helper's words, and what it called.
     #[test]
     fn an_explore_call_read_from_the_files_has_its_helpers_steps() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = session::Session::create(dir.path(), dir.path(), "2026-11-05 10:00:00 +09:00", "20261105-100000").unwrap();
         for message in [Message::text("system", "s"), user("find"), assistant("", "", vec![call("e1", "explore", json!({"task": "Where is the needle?"}))]), Message::tool_result("e1", "At a.txt:1."), assistant("Done", "", vec![])] {
             session.append(&message).unwrap();
@@ -1323,7 +1323,7 @@ mod tests {
 
     #[test]
     fn a_session_is_read_with_the_trajectory_beside_it_and_one_without_is_no_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = session::Session::create(dir.path(), dir.path(), "2026-11-05 10:00:00 +09:00", "20261105-100000").unwrap();
         for message in [Message::text("system", "s"), user("hello there"), assistant("Hi, I can help.", "", vec![])] {
             session.append(&message).unwrap();
