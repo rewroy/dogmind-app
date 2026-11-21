@@ -119,6 +119,8 @@ impl Stop {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NestedCall {
     pub name: String,
+    /// What it was about, in a few words: its path, its command, its pattern or its address.
+    pub about: String,
     /// Whether it gave its text (`Ok`) and did not fail.
     pub ok: bool,
     pub ms: u64,
@@ -295,6 +297,7 @@ pub fn run(code: &str, tools: &[&str], limits: &Limits, cancel: &AtomicBool, cal
             }
             Ok(Message::Call { name, args, reply }) => {
                 let began = Instant::now();
+                let about = gist(&args);
                 let answer = if cancel.load(Ordering::SeqCst) {
                     Err("the run was cancelled".to_string())
                 } else if !tools.contains(&name.as_str()) {
@@ -308,7 +311,7 @@ pub fn run(code: &str, tools: &[&str], limits: &Limits, cancel: &AtomicBool, cal
                 }
                 let spent = began.elapsed();
                 in_calls += spent;
-                calls.push(NestedCall { name, ok: answer.is_ok(), ms: millis(spent) });
+                calls.push(NestedCall { name, about, ok: answer.is_ok(), ms: millis(spent) });
                 let _ = reply.send(answer);
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -568,7 +571,33 @@ pub fn render(outcome: &Outcome, limits: &Limits) -> String {
         text.push_str("\n\n");
         text.push_str(hint);
     }
+    // (a program that failed part of the way has done what its calls did up to there: said, so that it is not done twice, as an append was)
+    if (outcome.error.is_some() || outcome.stopped.is_some()) && !outcome.calls.is_empty() {
+        text.push_str("\n\nThe calls it made before it ended, in order. What is done took effect: do not make it again.");
+        for (at, call) in outcome.calls.iter().enumerate() {
+            let about = if call.about.is_empty() { String::new() } else { format!(" {}", call.about) };
+            text.push_str(&format!("\n{}. {}{about}: {}", at + 1, call.name, if call.ok { "done" } else { "failed" }));
+        }
+    }
     cap(&text, limits.output)
+}
+
+/// A call's arguments in a few words: the first of its path, command, pattern, address or the like that it has, at most 80 characters.
+fn gist(args: &serde_json::Value) -> String {
+    const KEYS: [&str; 9] = ["path", "command", "pattern", "url", "queries", "paths", "edits", "name", "id"];
+    let said = KEYS.iter().find_map(|key| {
+        let value = args.get(*key)?;
+        match value {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Array(items) => {
+                let named: Vec<String> = items.iter().filter_map(|item| item.as_str().map(str::to_string).or_else(|| item.get("path")?.as_str().map(str::to_string))).collect();
+                (!named.is_empty()).then(|| named.join(", "))
+            }
+            _ => None,
+        }
+    });
+    let said = said.unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
+    if said.chars().count() > 80 { format!("{}…", said.chars().take(79).collect::<String>()) } else { said }
 }
 
 /// What a program cannot call: `run_code` itself, the tools that wait for the person's answer or decision (it has no one to ask), `explore` (a helper of its own) and `wake_at` (the session's
@@ -685,6 +714,25 @@ fn first_sentence(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A program that fails part of the way says what its calls did before it ended, each with what it was about, so that what was done is not done again.
+    #[test]
+    fn a_program_that_fails_says_the_calls_it_made_before_it_ended() {
+        let outcome = Outcome {
+            error: Some("Error: no such file (line 3)".into()),
+            calls: vec![
+                NestedCall { name: "create_file".into(), about: gist(&serde_json::json!({"path": "notes.txt", "content": "a", "append": true})), ok: true, ms: 1 },
+                NestedCall { name: "execute_command".into(), about: gist(&serde_json::json!({"command": "npm   test"})), ok: false, ms: 1 },
+                NestedCall { name: "apply_patch".into(), about: gist(&serde_json::json!({"edits": [{"path": "a.js"}, {"path": "b.js"}]})), ok: true, ms: 1 },
+            ],
+            ..Outcome::default()
+        };
+        let said = render(&outcome, &limits());
+        assert!(said.contains("1. create_file notes.txt: done\n2. execute_command npm test: failed\n3. apply_patch a.js, b.js: done"), "{said}");
+        let fine = Outcome { value: Some("ok".into()), calls: outcome.calls.clone(), ..Outcome::default() };
+        assert!(!render(&fine, &limits()).contains("calls it made"), "only for a program that did not end well");
+        assert_eq!(gist(&serde_json::json!({"command": "x".repeat(200)})).chars().count(), 80);
+    }
     use serde_json::json;
 
     fn limits() -> Limits {
