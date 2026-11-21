@@ -633,10 +633,11 @@ fn commands_of(line: &str, depth: usize, out: &mut Vec<String>) -> Result<(), Li
         if changes_what_follows {
             return Err(LineParts::Whole);
         }
-        let (mut quoted, mut end, mut next) = (false, rest.len(), rest.len());
+        let (mut quoted, mut next, mut command) = (false, rest.len(), String::new());
         let letters: Vec<(usize, char)> = rest.char_indices().collect();
         let mut index = 0;
         while let Some(&(at, letter)) = letters.get(index) {
+            let redirects = letter == '>' || (matches!(letter, '1' | '2') && letters.get(index + 1).is_some_and(|&(_, after)| after == '>'));
             match letter {
                 '"' => quoted = !quoted,
                 '&' | '|' if !quoted => {
@@ -645,19 +646,31 @@ fn commands_of(line: &str, depth: usize, out: &mut Vec<String>) -> Result<(), Li
                     if letter == '|' && !doubled {
                         return Err(LineParts::Whole);
                     }
-                    end = at;
                     next = at + if doubled { 2 } else { 1 };
                     break;
                 }
-                '<' | '>' | '(' | ')' | ';' if !quoted => return Err(LineParts::Whole),
+                // (what goes to nul is thrown away, and stderr into stdout is captured as stdout is: neither writes a file, and the command is what is left)
+                _ if redirects && !quoted => match discarded(&rest[at..]) {
+                    Some(length) => {
+                        command.push(' ');
+                        while letters.get(index).is_some_and(|&(start, _)| start < at + length) {
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    None if letter == '>' => return Err(LineParts::Whole),
+                    None => {}
+                },
+                '<' | '(' | ')' | ';' if !quoted => return Err(LineParts::Whole),
                 _ => {}
             }
+            command.push(letter);
             index += 1;
         }
         if quoted {
             return Err(LineParts::Whole);
         }
-        let command = rest[..end].trim();
+        let command = command.trim();
         if !command.is_empty() {
             out.push(command.to_string());
         }
@@ -666,6 +679,14 @@ fn commands_of(line: &str, depth: usize, out: &mut Vec<String>) -> Result<(), Li
         }
         rest = &rest[next..];
     }
+}
+
+/// The length of a redirection that writes no file, at the start of `text`: stdout or stderr thrown away (`>nul`, `1>nul`, `2>>NUL`, `2> nul`) or stderr sent where stdout goes
+/// (`2>&1`), ended by the line's end, a space or a `&`. Any other (`>nul.txt`, `>nul:x`, `2>&3`, a file) is none.
+fn discarded(text: &str) -> Option<usize> {
+    static SHAPE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let found = SHAPE.get_or_init(|| Regex::new(r"(?i)^(?:[12]?>>?[ \t]*nul|2>&1)").expect("the pattern is valid")).find(text)?;
+    text[found.end()..].chars().next().is_none_or(|after| matches!(after, ' ' | '\t' | '&')).then_some(found.end())
 }
 
 /// `for %x in (words) do body`: the body once for each word, with the word in the place of `%x`. Over anything but plain words (files by a pattern, `/f`, `/l`, `/r`, `/d`), and with a
@@ -1192,10 +1213,27 @@ mod parts_of_a_line {
     #[test]
     fn what_joins_commands_otherwise_keeps_the_line_whole() {
         for line in [
-            "curl -sL https://x.com/a | findstr x", "npm test > out.txt", "mkdir a 2>nul & echo ok", "type < a.txt", "(echo a & echo b)", "echo a ; curl https://b.com",
+            "curl -sL https://x.com/a | findstr x", "npm test > out.txt", "type < a.txt", "(echo a & echo b)", "echo a ; curl https://b.com",
             "if exist a.txt curl https://x.com", "echo a ^& curl https://x.com", "echo \"open & curl https://x.com", "cd .. && del a.txt", "cd.. & del a.txt", "chdir sub & dir",
             "pushd sub & dir", "set NODE_OPTIONS=--require x.js& node --version", "set/a n=1 & echo ok", "echo a & for %f in (a) do (echo %f)",
         ] {
+            assert_eq!(line_parts(line), LineParts::Whole, "{line}");
+        }
+    }
+
+    /// What goes to nul, and stderr into stdout, writes no file: the command is what is left. Any other redirection keeps the line whole.
+    #[test]
+    fn a_redirection_that_writes_no_file_is_no_part_of_the_command() {
+        assert_eq!(commands("mkdir vendor 2>nul & curl -sL -o vendor/a.js https://unpkg.com/a.js"), ["mkdir vendor", "curl -sL -o vendor/a.js https://unpkg.com/a.js"]);
+        assert_eq!(commands("npm test >nul 2>&1 && echo ok"), ["npm test", "echo ok"]);
+        assert_eq!(commands("dir 1>NUL&echo ok"), ["dir", "echo ok"]);
+        assert_eq!(commands("del a.txt 2> nul"), ["del a.txt"]);
+        assert_eq!(commands("type a.txt >>Nul & echo ok"), ["type a.txt", "echo ok"]);
+        // (cmd takes a digit just before `>` for the handle)
+        assert_eq!(commands("mkdir a2>nul & echo ok"), ["mkdir a", "echo ok"]);
+        // (in quotes it is a program's words)
+        assert_eq!(commands("echo \"a >nul\" & echo b"), ["echo \"a >nul\"", "echo b"]);
+        for line in ["echo a >nul.txt", "echo a >nul:x & echo b", "npm test 2>&3", "npm test 2>err.txt", "echo a 1>&2", "echo a >&2", "type <nul", "echo a >/dev/null", "echo a >nulx & echo b"] {
             assert_eq!(line_parts(line), LineParts::Whole, "{line}");
         }
     }

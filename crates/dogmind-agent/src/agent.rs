@@ -5356,6 +5356,7 @@ mod tests {
         let steps = vec![
             command(format!("curl -sL -o a.js {site}/a.js & curl -sL -o b.js {site}/b.js & echo ok")),
             command(format!("mkdir v && curl -sL -o v/c.js {site}/c.js")),
+            command(format!("mkdir w 2>nul & curl -sL -o w/x.js {site}/x.js 2>&1")),
             command(format!("for %f in (d e) do @curl -sL -o \"%f.js\" \"{site}/%f.js\"\necho done")),
             command(format!("python -c \"print(1)\" && curl -sL -o f.js {site}/f.js")),
             command(format!("set B={site}& curl -sL -o g.js %B%/g.js")),
