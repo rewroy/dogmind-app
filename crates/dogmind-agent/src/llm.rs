@@ -1,6 +1,7 @@
 //! Chat completions over SSE, as Dogmind speaks to Straydog: `tool_choice` only when it is one Straydog takes, no
 //! `/tokenize`, no `max_tokens` or `temperature` on a main turn, the reasoning effort by name.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -404,8 +405,9 @@ fn classify(status: u16, body: &str) -> LlmError {
 
 /// A message as a server reads it back. Arguments that are no JSON object (a call cut off, a model's slip) are kept in the session and go here as
 /// none: Straydog's template refuses a request that holds them, and so every request after one such call. The same each time, so the prefix holds.
-/// With no pictures it is the message as it is; with them its content is parts, read from the session's folder.
-fn as_sent(message: &Message, folder: Option<&Path>) -> Value {
+/// With no pictures it is the message as it is; with them its content is parts, read from the session's folder. `held`: the digests of the pictures the server
+/// keeps, which go as those, and where the digest of each picture sent goes.
+fn as_sent(message: &Message, folder: Option<&Path>, held: Option<(&HashSet<String>, &mut Vec<String>)>) -> Value {
     let mut sent = message.without_provider_blocks();
     for call in sent.tool_calls.iter_mut().flatten() {
         let text = call.function.arguments.trim();
@@ -413,7 +415,7 @@ fn as_sent(message: &Message, folder: Option<&Path>) -> Value {
             call.function.arguments = "{}".to_string();
         }
     }
-    let content = (!sent.images.is_empty()).then(|| images::openai_content(&sent, folder));
+    let content = (!sent.images.is_empty()).then(|| images::openai_content_held(&sent, folder, held));
     sent.images.clear();
     let mut value = serde_json::to_value(&sent).unwrap_or(Value::Null);
     if let Some(content) = content {
@@ -429,7 +431,13 @@ pub fn request_body(model: &str, messages: &[Message], tools: Option<&Value>, ef
 
 /// `folder`: where the session keeps its pictures.
 pub fn request_body_in(model: &str, messages: &[Message], tools: Option<&Value>, effort: Option<&str>, folder: Option<&Path>) -> Value {
-    let messages: Vec<Value> = messages.iter().map(|message| as_sent(message, folder)).collect();
+    request_body_held(model, messages, tools, effort, folder, None)
+}
+
+/// `request_body_in`, for a server that keeps the pictures it was sent (`/props`'s `image_digests`): those it holds (`held`, by their digests) go as `sha256:`
+/// and the digest, and the digest of every picture sent goes in `sent`.
+fn request_body_held(model: &str, messages: &[Message], tools: Option<&Value>, effort: Option<&str>, folder: Option<&Path>, mut held: Option<(&HashSet<String>, &mut Vec<String>)>) -> Value {
+    let messages: Vec<Value> = messages.iter().map(|message| as_sent(message, folder, held.as_mut().map(|(holds, sent)| (*holds, &mut **sent)))).collect();
     let mut body = json!({"model": model, "messages": messages, "stream": true, "stream_options": {"include_usage": true}});
     if let Some(tools) = tools {
         body["tools"] = tools.clone();
@@ -531,7 +539,27 @@ pub enum Restart {
 
 impl Provider for Client {
     fn stream(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
-        self.post(&self.body_for(request), request.request_id, cancel, on)
+        // (a conversation's pictures go by their digests to a server that keeps them, once a request of it has sent them: what it is known by is the request's id)
+        let conversation = request.request_id.and_then(|id| id.split('/').next()).filter(|id| self.image_digests && !id.is_empty());
+        let Some(conversation) = conversation else { return self.post(&self.body_for(request), request.request_id, cancel, on) };
+        let holds = self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(conversation).cloned().unwrap_or_default();
+        let mut sent = Vec::new();
+        let body = self.body_with(request, Some((&holds, &mut sent)));
+        let answered = match self.post_once(&body, request.request_id, cancel, on) {
+            // (it started again, or let one go: none of it is known to be held any more, and the request goes again with all the bytes)
+            Err(Refused::ImageNotHeld) => {
+                self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(conversation);
+                sent.clear();
+                let body = self.body_with(request, Some((&HashSet::new(), &mut sent)));
+                self.post(&body, request.request_id, cancel, on)
+            }
+            Err(Refused::Failed(error)) => Err(error),
+            Ok(completion) => Ok(completion),
+        };
+        if answered.is_ok() && !sent.is_empty() {
+            self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(conversation.to_string()).or_default().extend(sent);
+        }
+        answered
     }
 
     /// Straydog's: its body's `straydog.reasoning`, which a server that cannot close the thinking ignores.
@@ -658,6 +686,34 @@ pub struct Client {
     /// The engine this app starts and watches: nothing listening there is said at once, as the app knows why and starts it again. Any other server, on this
     /// machine too, may be on its way back, and is waited for as one.
     pub own_engine: bool,
+    /// The server keeps the pictures it was sent, and takes one again by its digest (`/props`'s `image_digests`, Straydog's): a conversation sent all its
+    /// pictures with every request, 97% of 4.33 GB in a day of page checks.
+    pub image_digests: bool,
+    /// The digests of the pictures each conversation (by its id, the first part of a request's) sent this server in a request that went well: those go by
+    /// their digests from then on. Forgotten when the server says it no longer holds one (`image_not_held`).
+    pub held: std::sync::Arc<std::sync::Mutex<HashMap<String, HashSet<String>>>>,
+}
+
+/// The error type of a request that names by digest a picture the server no longer keeps (it started again, or let it go): nothing of it ran, and the same
+/// request goes again with the pictures' bytes.
+const IMAGE_NOT_HELD: &str = "image_not_held";
+
+/// How a request was refused: as any refusal, or because a picture it named by digest is not held.
+enum Refused {
+    Failed(LlmError),
+    ImageNotHeld,
+}
+
+impl From<LlmError> for Refused {
+    fn from(error: LlmError) -> Refused {
+        Refused::Failed(error)
+    }
+}
+
+impl From<http::Failure> for Refused {
+    fn from(failure: http::Failure) -> Refused {
+        Refused::Failed(LlmError::from(failure))
+    }
 }
 
 /// How long an answer of `/props` that the model reads no pictures holds before it is asked again ([`Client::reads_pictures`]).
@@ -666,7 +722,7 @@ const VISION_ASKED_AGAIN: Duration = Duration::from_secs(10);
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
         Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None,
-                    vision_asked: Default::default(), close_next: Default::default(), own_engine: false })
+                    vision_asked: Default::default(), close_next: Default::default(), own_engine: false, image_digests: false, held: Default::default() })
     }
 
     /// The request a model's turn is sent as, for this server.
@@ -683,11 +739,16 @@ impl Client {
     }
 
     fn body_for(&self, request: &Request) -> Value {
+        self.body_with(request, None)
+    }
+
+    /// The body of a request, with the pictures the server holds of this conversation named by their digests (`held`), whose digests go in `sent`.
+    fn body_with(&self, request: &Request, held: Option<(&HashSet<String>, &mut Vec<String>)>) -> Value {
         let mut body = if self.replay_reasoning {
-            request_body_in(request.model, request.messages, request.tools, request.effort, request.images)
+            request_body_held(request.model, request.messages, request.tools, request.effort, request.images, held)
         } else {
             let messages: Vec<Message> = request.messages.iter().map(|message| Message { reasoning_content: None, ..message.clone() }).collect();
-            request_body_in(request.model, &messages, request.tools, request.effort, request.images)
+            request_body_held(request.model, &messages, request.tools, request.effort, request.images, held)
         };
         if request.japanese_letters && self.suppresses_letters {
             body["suppress"] = json!(NOT_CP932_HAN);
@@ -733,6 +794,16 @@ impl Client {
     }
 
     fn post(&self, body: &Value, id: Option<&str>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
+        match self.post_once(body, id, cancel, on) {
+            Ok(completion) => Ok(completion),
+            Err(Refused::Failed(error)) => Err(error),
+            // (not one that named a picture by digest: the server's words for it, as any refusal of a request)
+            Err(Refused::ImageNotHeld) => Err(LlmError::Rejected(IMAGE_NOT_HELD.to_string())),
+        }
+    }
+
+    /// `post`, with a refusal for a picture named by digest that the server does not hold told apart.
+    fn post_once(&self, body: &Value, id: Option<&str>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, Refused> {
         let text = body.to_string();
         let url = self.base.join("chat/completions");
         // (OpenAI-compatible servers ignore a header they do not know; Straydog writes it in its own line for the request)
@@ -741,7 +812,12 @@ impl Client {
         let mut response = http::request("POST", &url, &headers, Some(&text), Duration::from_secs(10), cancel).map_err(|failure| self.unreached(failure))?;
         if response.status != 200 {
             let status = response.status;
-            return Err(self.without_key(classify(status, &response.text()?)));
+            let said = response.text()?;
+            let error_type = serde_json::from_str::<Value>(&said).ok().and_then(|said| said.pointer("/error/type").and_then(Value::as_str).map(str::to_string));
+            if status == 400 && error_type.as_deref() == Some(IMAGE_NOT_HELD) {
+                return Err(Refused::ImageNotHeld);
+            }
+            return Err(Refused::Failed(self.without_key(classify(status, &said))));
         }
         let mut assembly = Assembly::default();
         let mut pending = Vec::new();
@@ -766,7 +842,7 @@ impl Client {
         // No [DONE] and no reason to end: a server that closes its connection to end a body died here, not finished.
         let completion = assembly.finish();
         if completion.finish.is_empty() {
-            return Err(LlmError::Transient(SERVER_GONE.to_string()));
+            return Err(Refused::Failed(LlmError::Transient(SERVER_GONE.to_string())));
         }
         Ok(completion)
     }
@@ -837,7 +913,8 @@ impl Client {
         let vision = props.pointer("/modalities/vision").and_then(Value::as_bool);
         let suppresses_letters = props.get("suppress").and_then(Value::as_array).is_some_and(|names| names.iter().any(|name| name.as_str() == Some(NOT_CP932_HAN)));
         let tool_writing = props.get("tool_writing").and_then(Value::as_bool) == Some(true);
-        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing })
+        let image_digests = props.get("image_digests").and_then(Value::as_bool) == Some(true);
+        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing, image_digests })
     }
 }
 
@@ -867,6 +944,8 @@ pub struct ServerInfo {
     pub suppresses_letters: bool,
     /// Whether the server sends the calls as the model writes them.
     pub tool_writing: bool,
+    /// Whether the server keeps the pictures it was sent and takes one again by its digest.
+    pub image_digests: bool,
 }
 
 #[cfg(test)]
@@ -1148,6 +1227,76 @@ mod tests {
         let request = Request { model: "m", messages: &messages, tools: None, effort: None, images: None, japanese_letters: false, request_id };
         assert_eq!(client.stream(&request, &AtomicBool::new(false), &mut |_| {}).unwrap().content, "a");
         heard.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
+    /// A server that answers each request by `answers` in turn (a status and a body), and tells each request's body as it read it.
+    fn answering_in_turn(answers: Vec<(u16, String)>) -> (Client, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (told, heard) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, answer) in answers {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let (mut request, mut block) = (Vec::new(), [0u8; 65536]);
+                let body = loop {
+                    let count = stream.read(&mut block).unwrap();
+                    request.extend_from_slice(&block[..count]);
+                    let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&request[..at]).to_lowercase();
+                    let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                    if request.len() >= at + 4 + length {
+                        break String::from_utf8_lossy(&request[at + 4..at + 4 + length]).into_owned();
+                    }
+                };
+                told.send(body).unwrap();
+                let kind = if status == 200 { "text/event-stream" } else { "application/json" };
+                let reason = if status == 200 { "OK" } else { "Bad Request" };
+                let _ = stream.write_all(format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n{answer}", answer.len()).as_bytes());
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+            }
+        });
+        (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), heard)
+    }
+
+    /// A server that keeps the pictures it was sent (`image_digests`) is sent a conversation's picture once, and then its digest; one that says it no longer
+    /// holds it (`image_not_held`, nothing run) has the same request again with the bytes, and the digest again after that. Another conversation sends its bytes.
+    /// A server that does not say it keeps them is never sent a digest.
+    #[test]
+    fn a_picture_sent_once_goes_by_its_digest_and_again_with_its_bytes_when_the_server_no_longer_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(4, 4).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        std::fs::write(dir.path().join("a.png"), &png).unwrap();
+        let digest = images::digest(&png);
+        let messages = [Message { images: vec![crate::message::ImageRef { file: "a.png".into(), media_type: "image/png".into(), width: 4, height: 4 }], ..Message::text("user", "what is this")}];
+        let ok = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string();
+        let gone = r#"{"error": {"message": "Straydog does not hold 1 of the images named by digest; send their bytes", "type": "image_not_held"}}"#.to_string();
+        let (mut client, heard) = answering_in_turn(vec![(200, ok.clone()), (400, gone), (200, ok.clone()), (200, ok.clone()), (200, ok.clone())]);
+        client.image_digests = true;
+        let ask = |client: &Client, id: &str| {
+            let request = Request { model: "m", messages: &messages, tools: None, effort: None, images: Some(dir.path()), japanese_letters: false, request_id: Some(id) };
+            client.stream(&request, &AtomicBool::new(false), &mut |_| {}).map(|done| done.content)
+        };
+        let by_digest = format!("\"sha256:{digest}\"");
+        let bytes = "\"data:image/png;base64,";
+        assert_eq!(ask(&client, "talk/1").unwrap(), "a");
+        assert!(heard.recv().unwrap().contains(bytes), "the first time, its bytes");
+        assert_eq!(ask(&client, "talk/2").unwrap(), "a", "refused for a picture not held, and then sent again");
+        let (named, again) = (heard.recv().unwrap(), heard.recv().unwrap());
+        assert!(named.contains(&by_digest) && !named.contains(bytes), "{named}");
+        assert!(again.contains(bytes) && !again.contains("sha256:"), "{again}");
+        assert_eq!(ask(&client, "talk/3").unwrap(), "a");
+        assert!(heard.recv().unwrap().contains(&by_digest), "held again once its bytes went");
+        assert_eq!(ask(&client, "other/1").unwrap(), "a");
+        assert!(heard.recv().unwrap().contains(bytes), "another conversation has sent nothing yet");
+        // (a server that does not say so)
+        let (plain, heard) = answering_in_turn(vec![(200, ok.clone()), (200, ok)]);
+        for id in ["talk/1", "talk/2"] {
+            assert_eq!(ask(&plain, id).unwrap(), "a");
+            assert!(!heard.recv().unwrap().contains("sha256:"));
+        }
     }
 
     #[test]

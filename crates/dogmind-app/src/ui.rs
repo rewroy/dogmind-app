@@ -12782,6 +12782,7 @@ impl App {
                     if let Ok(info) = &result {
                         client.suppresses_letters = info.suppresses_letters;
                         client.tool_writing = info.tool_writing;
+                        client.image_digests = info.image_digests;
                         client.vision = info.vision;
                     }
                     poster.send(match result {
@@ -12803,6 +12804,7 @@ impl App {
                         client.replay_reasoning = info.straydog;
                         client.suppresses_letters = info.suppresses_letters;
                         client.tool_writing = info.tool_writing;
+                        client.image_digests = info.image_digests;
                         client.vision = info.vision;
                         Ok::<_, String>((client, info))
                     })();

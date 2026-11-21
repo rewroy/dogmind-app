@@ -290,20 +290,43 @@ pub(crate) fn loaded(message: &Message, folder: Option<&Path>) -> (Vec<Loaded>, 
     let mut text = message.content.clone().unwrap_or_default();
     let mut pictures = Vec::new();
     for image in &message.images {
-        // (what a power cut can leave, nothing or zeros: a service refuses a picture that is not one, and with it every later request of this conversation)
-        match folder.and_then(|folder| read_stored(&folder.join(&image.file)).ok()).filter(|bytes| !left_by_a_power_cut(bytes)) {
-            Some(bytes) => pictures.push(Loaded { media_type: image.media_type.clone(), data: base64(&bytes) }),
-            None => {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                // (a file that is there and does not open is not one that is gone: a sealed picture that is damaged, or whose key is not here)
-                let there = folder.is_some_and(|folder| std::fs::metadata(folder.join(&image.file)).is_ok_and(|file| file.is_file() && file.len() > 0));
-                text.push_str(&if there { unreadable_note(&image.file) } else { gone_note(&image.file) });
-            }
+        match read_picture(image, folder) {
+            Ok(bytes) => pictures.push(Loaded { media_type: image.media_type.clone(), data: base64(&bytes) }),
+            Err(note) => add_note(&mut text, &note),
         }
     }
     (pictures, text)
+}
+
+/// A picture's bytes from its file, or what is said in its place when it cannot be had.
+fn read_picture(image: &ImageRef, folder: Option<&Path>) -> Result<Vec<u8>, String> {
+    // (what a power cut can leave, nothing or zeros: a service refuses a picture that is not one, and with it every later request of this conversation)
+    match folder.and_then(|folder| read_stored(&folder.join(&image.file)).ok()).filter(|bytes| !left_by_a_power_cut(bytes)) {
+        Some(bytes) => Ok(bytes),
+        None => {
+            // (a file that is there and does not open is not one that is gone: a sealed picture that is damaged, or whose key is not here)
+            let there = folder.is_some_and(|folder| std::fs::metadata(folder.join(&image.file)).is_ok_and(|file| file.is_file() && file.len() > 0));
+            Err(if there { unreadable_note(&image.file) } else { gone_note(&image.file) })
+        }
+    }
+}
+
+fn add_note(text: &mut String, note: &str) {
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(note);
+}
+
+/// What a server that keeps the pictures it was sent (Straydog's `image_digests`) knows a picture by: the SHA-256 of its bytes, 64 lowercase hex digits.
+pub(crate) fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The digests of the pictures sent, by their files: a picture's file is never written again once it is, and a picture sent by its digest is then not read at all.
+fn known_digests() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, String>> {
+    static KNOWN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, String>>> = std::sync::OnceLock::new();
+    KNOWN.get_or_init(Default::default)
 }
 
 fn gone_note(file: &str) -> String {
@@ -320,12 +343,44 @@ pub(crate) fn note_for(file: &str, why: &str) -> String {
 }
 
 /// The content of an OpenAI-style message with pictures: they come first, then the words.
+#[cfg(test)]
 pub(crate) fn openai_content(message: &Message, folder: Option<&Path>) -> Value {
-    let (pictures, text) = loaded(message, folder);
-    if pictures.is_empty() {
+    openai_content_held(message, folder, None)
+}
+
+/// `openai_content`, for a server that keeps the pictures it was sent: one of those it holds (`held`, by digest) goes as `sha256:` and its digest, and its file is
+/// not read. `sent` is given the digest of every picture that goes, either way.
+pub(crate) fn openai_content_held(message: &Message, folder: Option<&Path>, mut held: Option<(&std::collections::HashSet<String>, &mut Vec<String>)>) -> Value {
+    let mut text = message.content.clone().unwrap_or_default();
+    let mut parts: Vec<Value> = Vec::new();
+    for image in &message.images {
+        let file = folder.map(|folder| folder.join(&image.file));
+        let known = file.as_ref().and_then(|file| known_digests().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(file).cloned());
+        if let (Some((holds, sent)), Some(digest)) = (held.as_mut(), known.as_ref()) {
+            if holds.contains(digest) {
+                sent.push(digest.clone());
+                parts.push(json!({"type": "image_url", "image_url": {"url": format!("sha256:{digest}")}}));
+                continue;
+            }
+        }
+        match read_picture(image, folder) {
+            Ok(bytes) => {
+                if let Some((_, sent)) = held.as_mut() {
+                    let digest = known.unwrap_or_else(|| digest(&bytes));
+                    if let Some(file) = file {
+                        known_digests().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(file, digest.clone());
+                    }
+                    sent.push(digest);
+                }
+                let picture = Loaded { media_type: image.media_type.clone(), data: base64(&bytes) };
+                parts.push(json!({"type": "image_url", "image_url": {"url": picture.data_url()}}));
+            }
+            Err(note) => add_note(&mut text, &note),
+        }
+    }
+    if parts.is_empty() {
         return Value::String(text);
     }
-    let mut parts: Vec<Value> = pictures.iter().map(|picture| json!({"type": "image_url", "image_url": {"url": picture.data_url()}})).collect();
     // (a message that is only pictures has no text part: some servers refuse an empty one, and anthropic.rs leaves it out as well)
     if !text.is_empty() {
         parts.push(json!({"type": "text", "text": text}));
