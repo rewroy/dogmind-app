@@ -6,7 +6,7 @@
 //! a turn may be run for it (`may_wake`: the limits that keep a session from running away).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -35,8 +35,14 @@ const COMMAND_SHOWN: usize = 160;
 pub const PAUSED_IN_A_ROW: &str = "Waking is paused: this session has woken itself 30 times in a row with no word from you. Write a message and it goes on.";
 pub const PAUSED_IN_AN_HOUR: &str = "Waking is paused: this session has woken itself 60 times in the last hour. It goes on when the hour has passed.";
 
+/// What the window lists for a wait for the model's server ([`Background::add_server_wait`]).
+pub const SERVER_WAIT_NOTE: &str = "Waiting for the server to come back, to go on with the turn it stopped";
+/// What the person is told when a turn that failed as the server stopped answering is to go on by itself once it is back. The times are the agent's
+/// `QUIET_RESTART_WAIT`, `SERVER_WAIT_EVERY` and `SERVER_WAIT_MOST`.
+pub const SERVER_WAIT_SET: &str = "The server has not come back in 3 minutes. Dogmind asks it every 15 seconds, for up to 60 minutes, and goes on with this turn when it is back. Stop it in the list of what waits, or write a message.";
+
 /// Every sentence of the agent's that the window shows as it is, for the Japanese the window has for each.
-pub const WORDS: [&str; 2] = [PAUSED_IN_A_ROW, PAUSED_IN_AN_HOUR];
+pub const WORDS: [&str; 4] = [PAUSED_IN_A_ROW, PAUSED_IN_AN_HOUR, SERVER_WAIT_NOTE, SERVER_WAIT_SET];
 
 /// Why the session does not wake itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +81,18 @@ struct Wait {
     seconds: u64,
 }
 
+/// A wait for the model's server to answer again, which a thread of the agent's asks after ([`Background::add_server_wait`]).
+struct ServerWait {
+    id: String,
+    /// By the session's clock: when it was set, and when it is given up.
+    began: Instant,
+    until: Instant,
+    /// When it is given up, on this PC's clock, for the person to read.
+    at: String,
+    /// Set when it ends any way but the server's coming back: the thread that asks stops.
+    stop: Arc<AtomicBool>,
+}
+
 #[derive(Default)]
 struct Limits {
     in_a_row: u32,
@@ -91,6 +109,8 @@ struct Inner {
     pending: Vec<Pending>,
     next_wait: u32,
     limits: Limits,
+    servers: Vec<ServerWait>,
+    next_server: u32,
 }
 
 /// One session's background work. Shared: the agent's thread, the commands' own threads and the window all look at it.
@@ -269,9 +289,61 @@ impl Background {
         }).collect()
     }
 
+    /// A wait for the model's server, which stopped answering in a turn that failed for it, of `most` at the longest: the one there was gives way to it. Its
+    /// id, and the flag that tells whatever asks the server to stop. It is listed with the waits, and stopped as they are.
+    pub fn add_server_wait(&self, most: Duration) -> (String, Arc<AtomicBool>) {
+        let now = self.now();
+        let mut inner = self.lock();
+        for server in inner.servers.drain(..) {
+            server.stop.store(true, Ordering::Relaxed);
+        }
+        inner.next_server += 1;
+        let id = format!("server{}", inner.next_server);
+        let at = (chrono::Local::now() + chrono::Duration::seconds(most.as_secs() as i64)).format("%H:%M").to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        inner.servers.push(ServerWait { id: id.clone(), began: now, until: now + most, at, stop: stop.clone() });
+        (id, stop)
+    }
+
+    /// The server answers again: the wait `id` becomes what wakes the session, with `what` (whose server) for the window. Nothing if it was stopped meanwhile.
+    pub fn server_back(&self, id: &str, what: &str) {
+        let now = self.now();
+        let mut inner = self.lock();
+        let Some(at) = inner.servers.iter().position(|server| server.id == id && !server.stop.load(Ordering::Relaxed)) else { return };
+        let server = inner.servers.remove(at);
+        let away = now.saturating_duration_since(server.began).as_secs();
+        let text = format!("{id}: the model's server stopped answering in your last turn, which failed there, and it answers again ({} after the turn failed). Go on with that turn from where it stopped: what was done before is in the conversation above.\n", how_long(away));
+        inner.pending.push(Pending { wake: Wake { cause: WakeCause::ServerBack, id: id.to_string(), what: what.to_string(), exit_code: None, ended: None, seconds: away }, text, happened: Instant::now() });
+    }
+
+    /// The wait `id` is over with no answer from the server, or stopped: it is no longer listed.
+    pub fn server_wait_over(&self, id: &str) {
+        let mut inner = self.lock();
+        for server in inner.servers.iter().filter(|server| server.id == id) {
+            server.stop.store(true, Ordering::Relaxed);
+        }
+        inner.servers.retain(|server| server.id != id);
+    }
+
+    /// The waits for the server, ended: the person wrote, or the session has another server now. Whether there was one.
+    pub fn cancel_server_waits(&self) -> bool {
+        let mut inner = self.lock();
+        let any = !inner.servers.is_empty();
+        for server in inner.servers.drain(..) {
+            server.stop.store(true, Ordering::Relaxed);
+        }
+        inner.pending.retain(|pending| pending.wake.cause != WakeCause::ServerBack);
+        any
+    }
+
     /// One command or wait ended on purpose, by the person's choice on the list: it wakes nothing. False: there is none of that id.
     pub fn stop(&self, id: &str) -> bool {
         let mut inner = self.lock();
+        if let Some(at) = inner.servers.iter().position(|server| server.id == id) {
+            inner.servers.remove(at).stop.store(true, Ordering::Relaxed);
+            inner.pending.retain(|pending| pending.wake.id != id);
+            return true;
+        }
         if let Some(job) = inner.jobs.iter().find(|job| job.id == id) {
             job.stop();
             inner.pending.retain(|pending| pending.wake.id != id);
@@ -286,9 +358,12 @@ impl Background {
     /// Everything ended on purpose, as the person's Stop does it: the commands, the waits, and what had come and not woken the session. How many things that was.
     pub fn stop_all(&self) -> usize {
         let mut inner = self.lock();
-        let count = inner.jobs.len() + inner.waits.len() + inner.pending.len();
+        let count = inner.jobs.len() + inner.waits.len() + inner.pending.len() + inner.servers.len();
         for job in &inner.jobs {
             job.stop();
+        }
+        for server in inner.servers.drain(..) {
+            server.stop.store(true, Ordering::Relaxed);
         }
         inner.jobs.clear();
         inner.waits.clear();
@@ -343,7 +418,7 @@ impl Background {
     /// Whether anything is going on or waiting, so that the agent's loop looks again soon and does not sleep until a command comes.
     pub fn has_work(&self) -> bool {
         let inner = self.lock();
-        !inner.waits.is_empty() || !inner.pending.is_empty() || inner.jobs.iter().any(|job| !job.stopped())
+        !inner.waits.is_empty() || !inner.pending.is_empty() || !inner.servers.is_empty() || inner.jobs.iter().any(|job| !job.stopped())
     }
 
     pub fn has_pending(&self) -> bool {
@@ -416,7 +491,9 @@ impl Background {
             }
             Some(WaitingCommand { id: job.id.clone(), command: first_line(&job.command), started_at: job.started_at.clone(), seconds: job.started.elapsed().as_secs(), watching_for: job.wake_on.clone(), ended })
         }).collect();
-        let waits = inner.waits.iter().map(|wait| WaitingWait { id: wait.id.clone(), note: first_line(&wait.note), due_at: wait.at.clone(), in_seconds: seconds_left(wait.due, now) }).collect();
+        let waits = inner.waits.iter().map(|wait| WaitingWait { id: wait.id.clone(), note: first_line(&wait.note), due_at: wait.at.clone(), in_seconds: seconds_left(wait.due, now) })
+            .chain(inner.servers.iter().map(|server| WaitingWait { id: server.id.clone(), note: SERVER_WAIT_NOTE.to_string(), due_at: server.at.clone(), in_seconds: seconds_left(server.until, now) }))
+            .collect();
         Waiting { commands, waits, paused: inner.limits.paused }
     }
 }
@@ -705,5 +782,38 @@ mod tests {
         assert_eq!(first_line(&"あ".repeat(300)).chars().count(), COMMAND_SHOWN + 1);
         let tail = tail_of(&"x".repeat(10_000));
         assert!(tail.len() <= TAIL_BYTES + 4 && tail.starts_with('…'));
+    }
+    /// A wait for the server is listed with the waits, in the window's words; the server's coming back wakes the session once; stopped, or given way to, it wakes nothing.
+    #[test]
+    fn a_wait_for_the_server_is_listed_wakes_once_when_it_is_back_and_stops_as_the_others() {
+        let background = Background::default();
+        let (id, stop) = background.add_server_wait(Duration::from_secs(3600));
+        assert_eq!(id, "server1");
+        let listed = background.snapshot();
+        assert_eq!((listed.waits.len(), listed.waits[0].note.as_str(), listed.waits[0].in_seconds), (1, SERVER_WAIT_NOTE, 3600));
+        assert!(background.has_work());
+        background.skip(Duration::from_secs(90));
+        background.server_back(&id, "DeepSeek");
+        background.server_back(&id, "DeepSeek");
+        assert!(background.snapshot().waits.is_empty() && !stop.load(Ordering::Relaxed));
+        let woke = background.take_pending();
+        assert_eq!(woke.len(), 1, "once");
+        assert_eq!((woke[0].wake.cause, woke[0].wake.id.as_str(), woke[0].wake.what.as_str(), woke[0].wake.seconds), (WakeCause::ServerBack, "server1", "DeepSeek", 90));
+        assert!(woke[0].text.contains("answers again (1 min 30 s after") && woke[0].text.contains("Go on with that turn"), "{}", woke[0].text);
+        // Stopped from the list: its asking stops, and its coming back wakes nothing.
+        let (id, stop) = background.add_server_wait(Duration::from_secs(60));
+        assert!(background.stop(&id) && stop.load(Ordering::Relaxed));
+        background.server_back(&id, "DeepSeek");
+        assert!(!background.has_pending() && background.snapshot().waits.is_empty());
+        // A new one gives the last its stop; the person's message, or another server, ends it; so does a session of its own.
+        let (_, first) = background.add_server_wait(Duration::from_secs(60));
+        let (second, last) = background.add_server_wait(Duration::from_secs(60));
+        assert!(first.load(Ordering::Relaxed) && !last.load(Ordering::Relaxed) && background.snapshot().waits.len() == 1);
+        assert!(background.cancel_server_waits() && last.load(Ordering::Relaxed));
+        background.server_back(&second, "DeepSeek");
+        assert!(!background.has_pending() && !background.has_work());
+        let (_, gone) = background.add_server_wait(Duration::from_secs(60));
+        background.reset();
+        assert!(gone.load(Ordering::Relaxed) && background.snapshot().waits.is_empty());
     }
 }

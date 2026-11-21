@@ -44,6 +44,57 @@ const RESTART_ASK_EVERY: Duration = Duration::from_secs(1);
 /// stop of many minutes, which is said as before.
 const QUIET_RESTART_WAIT: Duration = Duration::from_secs(180);
 
+/// How often a server that stayed away past `QUIET_RESTART_WAIT`, its turn failed, is asked whether it is back, and for how long at the most: the turn then goes
+/// on by itself when it is ([`Background::add_server_wait`]).
+const SERVER_WAIT_EVERY: Duration = Duration::from_secs(15);
+const SERVER_WAIT_MOST: Duration = Duration::from_secs(3600);
+
+/// `(how often, how long at the most)` for a server's coming back; a test shortens them.
+fn server_wait_limits() -> (Duration, Duration) {
+    #[cfg(test)]
+    if let Some(limits) = *TEST_SERVER_WAIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+        return limits;
+    }
+    (SERVER_WAIT_EVERY, SERVER_WAIT_MOST)
+}
+
+#[cfg(test)]
+static TEST_SERVER_WAIT: Mutex<Option<(Duration, Duration)>> = Mutex::new(None);
+
+/// Asks the server every `every` whether it is back, for `most` at the longest, on a thread of its own: back (ready, or answering without a word of loading), the session is
+/// woken to go on with the turn that failed; stopped, or out of time, nothing. `what` is whose server it is, for the window.
+fn watch_for_the_server(provider: Arc<dyn Provider>, background: Arc<Background>, id: String, stop: Arc<AtomicBool>, what: String) {
+    let (every, most) = server_wait_limits();
+    // (what is told when no thread can be had: the wait is not listed as going on)
+    let (listed, listed_id) = (background.clone(), id.clone());
+    let spawned = std::thread::Builder::new().name("dogmind-server-wait".into()).spawn(move || {
+        let began = Instant::now();
+        loop {
+            let next = Instant::now() + every;
+            while Instant::now() < next {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(every.min(Duration::from_millis(250)));
+            }
+            if began.elapsed() >= most {
+                background.server_wait_over(&id);
+                return;
+            }
+            match provider.restart(&stop) {
+                llm::Restart::Ready | llm::Restart::Unknown => {
+                    background.server_back(&id, &what);
+                    return;
+                }
+                llm::Restart::Coming(_) | llm::Restart::Silent => {}
+            }
+        }
+    });
+    if spawned.is_err() {
+        listed.server_wait_over(&listed_id);
+    }
+}
+
 /// `(how often, how long in all, how long it may be silent, how long a quiet one is waited for)`; a test shortens them.
 fn restart_limits() -> (Duration, Duration, Duration, Duration) {
     #[cfg(test)]
@@ -1054,6 +1105,8 @@ struct Agent {
     provider: Option<Arc<dyn Provider>>,
     /// Whether the server has answered in this conversation: one that did, and then refuses or answers nothing, is waited for as one being restarted.
     server_answered: bool,
+    /// This turn waited out its time for such a server, which did not come back: if the turn fails for it, the session waits for the server on its own.
+    quiet_gave_up: bool,
     model: String,
     window: u64,
     workspace: PathBuf,
@@ -1354,6 +1407,7 @@ impl Agent {
             web_seen: false,
             provider: None,
             server_answered: false,
+            quiet_gave_up: false,
             model: String::new(),
             window: 0,
             workspace: config.workspace,
@@ -1449,6 +1503,10 @@ impl Agent {
                     let (window, from) = window_in_use(provided);
                     self.provider = Some(provider);
                     self.server_answered = false;
+                    // (a wait for the server there was is a wait for another one)
+                    if self.background.cancel_server_waits() {
+                        self.tell_waiting();
+                    }
                     self.model = model;
                     self.window = window;
                     // (a window that is not the provider's is said, for a run that compacts is read against it; the compaction lines carry the one in use)
@@ -1583,7 +1641,7 @@ impl Agent {
         self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": 0, "first": false, "woken": true}));
         let message = self.messages.len();
         if let Some(marks) = &mut self.marks {
-            let title = format!("(woken) {}", wakes.iter().map(|wake| format!("{} {}", wake.id, match wake.cause { crate::message::WakeCause::CommandEnded => "ended", crate::message::WakeCause::CommandLine => "printed", crate::message::WakeCause::Wait => "is up" })).collect::<Vec<_>>().join(", "));
+            let title = format!("(woken) {}", wakes.iter().map(|wake| format!("{} {}", wake.id, match wake.cause { crate::message::WakeCause::CommandEnded => "ended", crate::message::WakeCause::CommandLine => "printed", crate::message::WakeCause::Wait => "is up", crate::message::WakeCause::ServerBack => "is back" })).collect::<Vec<_>>().join(", "));
             if let Err(error) = marks.begin(&title, &now(), Some(message)) {
                 self.emit(Event::Notice(format!("this turn cannot be rewound: {error}")));
             }
@@ -1962,8 +2020,11 @@ impl Agent {
     fn turn(&mut self, text: &str, pictures: Vec<Attachment>, kept: Vec<ImageRef>) {
         self.turn_began = std::time::SystemTime::now();
         let turn_began = Instant::now();
-        // (what counted against waking in a row is no longer counted: the person is here)
+        // (what counted against waking in a row is no longer counted: the person is here, and what they write goes in place of a wait for the server)
         self.background.person_spoke();
+        if self.background.cancel_server_waits() {
+            self.tell_waiting();
+        }
         self.bench.new_turn();
         self.cancel.store(false, Ordering::Relaxed);
         self.emit(Event::TurnStarted);
@@ -2115,7 +2176,17 @@ impl Agent {
             Ended::Done => self.emit(Event::TurnEnded { cancelled: false }),
             Ended::Cancelled => self.emit(Event::TurnEnded { cancelled: true }),
             Ended::Failed(error) => {
+                // A server that answered in this conversation and stayed away for all of the time the turn had for it: the session waits for it on its own, and the turn
+                // goes on when it is back.
+                let waits = (self.quiet_gave_up && llm::is_gone(&error)).then(|| self.provider.clone()).flatten();
                 self.emit(Event::Failed(error));
+                if let Some(provider) = waits {
+                    let (id, stop) = self.background.add_server_wait(server_wait_limits().1);
+                    self.intervened("server_wait", json!({"id": id}));
+                    watch_for_the_server(provider, self.background.clone(), id, stop, self.model.clone());
+                    self.emit(Event::Notice(background::SERVER_WAIT_SET.into()));
+                    self.tell_waiting();
+                }
                 self.emit(Event::TurnEnded { cancelled: false });
             }
         }
@@ -2268,6 +2339,7 @@ impl Agent {
                 llm::Restart::Silent if self.server_answered && provider.waits_out_silence() && *quiet < quiet_wait => {
                     let since = *quiet_since.get_or_insert_with(Instant::now);
                     if *quiet + since.elapsed() >= quiet_wait {
+                        self.quiet_gave_up = true;
                         break Restarted::GaveUp;
                     }
                     if shown.is_none() {
@@ -2295,6 +2367,7 @@ impl Agent {
 
     fn iterate(&mut self) -> Ended {
         let Some(provider) = self.provider.clone() else { return Ended::Failed(llm::NOT_READY.into()) };
+        self.quiet_gave_up = false;
         let (mut transient, mut overflow, mut failed_calls) = (0u32, 0u32, 0usize);
         let (mut cut_off, mut empties) = (0u32, 0u32);
         let mut drafts_stopped = 0u32;
@@ -6959,10 +7032,11 @@ Body").unwrap();
             ShortRestartLimits { _one_at_a_time: one_at_a_time }
         }
 
-        /// As `of`, a quiet server waited for up to `quiet`.
+        /// As `of`, a quiet server waited for up to `quiet`, and one that stays away asked after every 50 ms for up to a minute.
         fn quiet(bound: Duration, quiet: Duration) -> ShortRestartLimits<'static> {
             let one_at_a_time = RESTART_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *TEST_RESTART_LIMITS.lock().unwrap() = Some((Duration::from_millis(20), bound, Duration::from_millis(300), quiet));
+            *TEST_SERVER_WAIT.lock().unwrap() = Some((Duration::from_millis(50), Duration::from_secs(60)));
             ShortRestartLimits { _one_at_a_time: one_at_a_time }
         }
     }
@@ -7123,7 +7197,56 @@ Body").unwrap();
     impl Drop for ShortRestartLimits<'_> {
         fn drop(&mut self) {
             *TEST_RESTART_LIMITS.lock().unwrap() = None;
+            *TEST_SERVER_WAIT.lock().unwrap() = None;
         }
+    }
+
+    /// A server that answered and then stayed away past the turn's time for it: the turn fails, the person is told the session waits for the server, the wait is listed,
+    /// and when the server listens again the session goes on by itself with the turn, told why.
+    #[test]
+    fn a_turn_that_failed_as_the_server_stayed_away_goes_on_by_itself_when_it_is_back() {
+        let _short = ShortRestartLimits::quiet(Duration::from_secs(60), Duration::from_millis(400));
+        let dir = tempfile::tempdir().unwrap();
+        let answers = std::sync::atomic::AtomicUsize::new(0);
+        // (away for longer than the turn's wait and its three retries, some 20 s with the refused connections Windows tries for 2 s each)
+        let (client, seen) = routed_with_a_stop(move |method, path, _| match (method, path) {
+            ("POST", _) => (200, "text/event-stream", text_answer(if answers.fetch_add(1, Ordering::SeqCst) == 0 { "one" } else { "back" })),
+            ("GET", "/health") => (200, "application/json", r#"{"status": "ok"}"#.to_string()),
+            _ => (404, "application/json", "{}".to_string()),
+        }, 1, Duration::from_secs(30));
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("hello".into())).unwrap();
+        loop {
+            if let Event::TurnEnded { .. } = run.events.recv_timeout(Duration::from_secs(30)).expect("the first turn ended") {
+                break;
+            }
+        }
+        // (the server stops once the answer is closed: the next message finds nothing listening)
+        while seen.lock().unwrap().iter().filter(|line| line.starts_with("POST")).count() < 1 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        run.handle.commands.send(Command::Send("again".into())).unwrap();
+        let (mut failed, mut told, mut listed, mut woken, mut content) = (Vec::new(), Vec::new(), false, Vec::new(), String::new());
+        let mut ended = 0;
+        while ended < 2 {
+            match run.events.recv_timeout(Duration::from_secs(90)).expect("the turns ended") {
+                Event::Failed(text) => failed.push(text),
+                Event::Notice(text) => told.push(text),
+                Event::Waiting(waiting) => listed |= waiting.waits.iter().any(|wait| wait.note == background::SERVER_WAIT_NOTE),
+                Event::Woken(wakes) => woken.extend(wakes),
+                Event::Content(text) if ended == 1 => content.push_str(&text),
+                Event::TurnEnded { .. } => ended += 1,
+                _ => {}
+            }
+        }
+        assert!(failed.len() == 1 && llm::is_gone(&failed[0]), "{failed:?}");
+        assert!(told.iter().any(|text| text == background::SERVER_WAIT_SET), "{told:?}");
+        assert!(listed, "the wait is listed, with a stop");
+        assert_eq!(woken.iter().map(|wake| (wake.cause, wake.id.as_str())).collect::<Vec<_>>(), [(crate::message::WakeCause::ServerBack, "server1")]);
+        assert_eq!(content, "back", "the woken turn went on");
+        let lines = trajectory_of(&run);
+        assert!(of_kind(&lines, "intervention").iter().any(|line| line["kind"] == "server_wait"), "{lines:?}");
     }
 
     const LOADING: &str = r#"{"status": "loading", "progress": {"stage": "load", "done": 1, "total": 4}}"#;

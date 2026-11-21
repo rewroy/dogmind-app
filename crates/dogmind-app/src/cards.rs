@@ -113,6 +113,7 @@ pub fn notice_row(wake: &Wake) -> NoticeRow {
         }
         WakeCause::CommandLine => NoticeRow { title: t("A background command printed the line it was watched for").to_string(), what: format!("{}  ·  {}", wake.id, wake.what), how: tf("Running for {0}, and going on", &[&took]), failed: false },
         WakeCause::Wait => NoticeRow { title: t("A wait is up").to_string(), what: wake.what.clone(), how: tf("Set for {0}", &[&took]), failed: false },
+        WakeCause::ServerBack => NoticeRow { title: t("The server is back").to_string(), what: wake.what.clone(), how: tf("Away for {0} after the turn failed", &[&took]), failed: false },
     }
 }
 

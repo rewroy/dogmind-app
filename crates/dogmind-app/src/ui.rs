@@ -8062,7 +8062,9 @@ impl App {
         let waits = self.waiting.waits.clone();
         for (at, wait) in waits.iter().enumerate().take(WAITING_LISTED) {
             shapes.push(Shape::Icon { name: "clock", area: rect(x, y, s(ds::space::L), row), size: s(ds::size::ICON_SMALL), color: theme::muted() });
-            shapes.push(Shape::Text { area: rect(x + indent, y, width - indent - stop_wide - time_wide, row), text: wait.note.clone(), font: FontKind::Small, color: theme::text(), flags: ONE_LINE });
+            // (the session's own wait for the server is said in the person's language; a wait the model set says its note as it was written)
+            let note = if wait.note == dogmind_agent::background::SERVER_WAIT_NOTE { lang::notice(&wait.note) } else { wait.note.clone() };
+            shapes.push(Shape::Text { area: rect(x + indent, y, width - indent - stop_wide - time_wide, row), text: note, font: FontKind::Small, color: theme::text(), flags: ONE_LINE });
             self.waiting_times.push((rect(x + width - stop_wide - time_wide, y, time_wide, row), WaitRow::Wait(at)));
             stop_at(self, shapes, y, &wait.id);
             y += row;
