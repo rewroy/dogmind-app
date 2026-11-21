@@ -973,13 +973,18 @@ struct DraftWatch {
     /// The longest run so far, and where it began.
     longest: usize,
     longest_began: usize,
+    /// The lines of its own inside fences, all of them, whether in a run or not, and where the first fence that held one began. A design worked out in many short
+    /// blocks is code all the same: DeepSeek wrote 126 blocks, 1,056 lines, none of them longer than 28 in a row, over 615 s and 35,000 tokens of a first
+    /// request, before it wrote the page it had put together in them.
+    fenced_lines: usize,
+    fenced_began: Option<usize>,
     /// Whether the last line that could be told was a quote: a `}` that follows it ends a quote, and one that follows a line of its own ends that.
     after_quote: bool,
 }
 
 impl DraftWatch {
     fn new(shown: BTreeSet<String>, at_least: usize) -> DraftWatch {
-        DraftWatch { shown, at_least, line_starts: 0, fenced: false, fence_began: 0, run: 0, run_began: 0, prose: 0, longest: 0, longest_began: 0, after_quote: false }
+        DraftWatch { shown, at_least, line_starts: 0, fenced: false, fence_began: 0, run: 0, run_began: 0, prose: 0, longest: 0, longest_began: 0, fenced_lines: 0, fenced_began: None, after_quote: false }
     }
 
     /// What it had come to, for the trajectory: the longest run of lines of code of its own.
@@ -987,9 +992,14 @@ impl DraftWatch {
         self.longest
     }
 
-    /// Where the draft that was found began: the line of its first code, or of the fence that held it.
+    /// The lines of its own inside fences, all of them.
+    fn fenced(&self) -> usize {
+        self.fenced_lines
+    }
+
+    /// Where the draft that was found began: the line of its first code, or of the fence that held it; for one found by all its fenced lines, the first fence.
     fn began_at(&self) -> usize {
-        self.longest_began
+        if self.longest >= self.at_least { self.longest_began } else { self.fenced_began.unwrap_or(self.longest_began) }
     }
 
     /// Whether a line of the reasoning is one it was shown; none where it is too short to say.
@@ -1023,6 +1033,10 @@ impl DraftWatch {
             return;
         }
         if self.fenced || is_code_line(line) {
+            if self.fenced {
+                self.fenced_lines += 1;
+                self.fenced_began.get_or_insert(self.fence_began);
+            }
             if self.run == 0 {
                 self.run_began = if self.fenced { self.fence_began } else { at };
             }
@@ -1049,7 +1063,8 @@ impl DraftWatch {
             }
             self.line_starts = end + 1;
         }
-        self.longest >= self.at_least
+        // (as many lines as a draft, in a row or in blocks of a few: whichever comes first)
+        self.longest >= self.at_least || self.fenced_lines >= self.at_least
     }
 }
 
@@ -1082,7 +1097,7 @@ fn draft_stopped_note(reasoned: &str, stopped_before: u32, began: Option<usize>)
         }
         return format!("{}You started on the code in your reasoning again. What you have thought so far is here, and it is enough:\n{}\nWrite the code now, once, and put no code in your reasoning.", prompt::DRAFT_NOTE, &decided[start..]);
     }
-    format!("{}You began writing code in your reasoning, and all of it would be typed again where it goes. Your reasoning so far:\n{}\nWrite the code now, once, where your task needs it (in your answer if no file is to be changed), and improve it afterwards.", prompt::DRAFT_NOTE, &decided[start..])
+    format!("{}You are writing the program in your reasoning, and all of it would be typed again where it goes. Your reasoning so far:\n{}\nWrite the code now, from its first line, where your task needs it: a new file with create_file, a file that is there with apply_patch, in your answer if no file is to be changed. Decide the rest of the design in the file, and improve it afterwards.", prompt::DRAFT_NOTE, &decided[start..])
 }
 
 /// `apply_patch` with the path beside the edits, for all of them, or one edit's fields with no list, is how it comes out of a model often enough, and the call failing means every edit typed again.
@@ -2636,7 +2651,8 @@ impl Agent {
                 // after it thought for 410 s (66,369 characters) before it wrote. Once a file is written, the next request thinks as before.
                 let plain = provider.close_thinking_once();
                 thinking_closed = plain;
-                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "next_without_thinking": plain}));
+                let fenced = watch.as_ref().map_or(0, DraftWatch::fenced);
+                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "fenced": fenced, "next_without_thinking": plain}));
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
                 self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped, watch.as_ref().map(DraftWatch::began_at))));
@@ -5701,14 +5717,43 @@ mod tests {
         assert_eq!(last(2)["role"], "tool", "after 9,500 tokens the work goes on from the tool's result, with no word from the app to end the turn");
     }
 
+    /// A design worked out in many short fenced blocks is a draft once its fenced lines come to as many as a draft's, though no run of them is long; lines it read,
+    /// quoted in a fence, are not counted.
+    #[test]
+    fn many_short_fenced_blocks_are_a_draft_together() {
+        let mut watch = DraftWatch::new(BTreeSet::new(), DRAFT_LINES);
+        let mut reasoned = String::from("Plan the gacha: three tiers, then the reveal.\n");
+        let mut block = 0;
+        while !watch.is_a_draft(&reasoned) {
+            reasoned.push_str(&format!("Then part {block}:\n```js\n"));
+            for line in 0..9 {
+                reasoned.push_str(&format!("const part{block}_{line} = make({block}, {line});\n"));
+            }
+            // (more than PROSE_BETWEEN lines of thought between blocks: each block is a run of its own)
+            reasoned.push_str("```\nThat settles it.\nThe reveal comes after.\nNow the next piece.\n\n");
+            block += 1;
+            assert!(block < 40, "never a draft: {} fenced lines", watch.fenced());
+        }
+        assert!(watch.stats() < DRAFT_LINES, "no run is long: {}", watch.stats());
+        assert!(watch.fenced() >= DRAFT_LINES && watch.fenced() < DRAFT_LINES + 10, "{}", watch.fenced());
+        assert_eq!(&reasoned[watch.began_at()..watch.began_at() + 5], "```js", "the draft begins at the first fence");
+        // (what it was shown, quoted in fences, is not its own)
+        let read: String = (0..200).map(|at| format!("let shown_value_{at} = read_it({at});\n")).collect();
+        let shown = lines_shown(&[Message::tool_result("r", read.lines().enumerate().map(|(at, line)| format!("{}|{line}\n", at + 1)).collect::<String>())]);
+        let mut quoting = DraftWatch::new(shown, DRAFT_LINES);
+        let quoted = format!("It says:\n```\n{read}```\n");
+        assert!(!quoting.is_a_draft(&quoted), "{} fenced lines of its own", quoting.fenced());
+    }
+
     #[test]
     fn what_goes_back_after_a_draft_is_what_it_had_decided_and_to_write() {
         let note = draft_stopped_note("A single page with sliders.\n```\nvoid main() {}\n```\nAnd then\n```\nmore", 0, None);
         assert!(note.contains("A single page with sliders."), "{note}");
         assert!(!note.contains("void main"), "{note}");
-        // (it is told to write, and not where: a person who asked for a review wrote no file, and a note that names a tool for making one gets one made)
-        assert!(note.contains("Write the code now") && !note.contains("create_file") && !note.contains("apply_patch"), "{note}");
-        assert!(note.contains("in your answer if no file is to be changed"), "{note}");
+        // (it is told to write from the first line, and where: a new file, a file that is there, or the answer where no file is to be changed. The watch is off where the
+        // person asked for nothing to be changed, so a review is not told to make a file.)
+        assert!(note.contains("Write the code now, from its first line") && note.contains("create_file") && note.contains("apply_patch"), "{note}");
+        assert!(note.contains("in your answer if no file is to be changed") && note.contains("Decide the rest of the design in the file"), "{note}");
         assert!(!note.contains("Decide nothing more"), "it may be in the middle of ranking what it found: {note}");
         assert!(prompt::is_nudge(&note), "not shown as something the person said");
         assert!(draft_stopped_note(&"x".repeat(9000), 0, None).len() < 3000);
