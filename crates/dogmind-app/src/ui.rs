@@ -2531,6 +2531,10 @@ struct App {
     activity: String,
     /// When the work the activity line tells of began: what it shows, with a turning ring, so that waiting is seen to be waiting.
     activity_since: Option<std::time::Instant>,
+    /// What the request's text came to when it began (its first report), and how many tokens it has written since, while no word of its answer has come:
+    /// shown small beside "Thinking…", which says nothing else of thinking that is not shown.
+    thinking_base: Option<u64>,
+    thinking_tokens: u64,
     /// The seconds the activity line shows now.
     activity_second: u64,
     connected: bool,
@@ -8387,6 +8391,11 @@ impl App {
                 if overlaps(&words, &dirty) && !self.activity.trim().is_empty() {
                     let text = if elapsed >= 3.0 { format!("{}   {}", self.activity, tf("{0} s", &[&(elapsed as u32)])) } else { self.activity.clone() };
                     draw_text(device, &text, words, self.fonts.body, theme::text(), ONE_LINE);
+                    // (how far the thinking has come, small, as nothing else says it where it is not shown)
+                    if self.thinking_tokens > 0 && self.activity == t("Thinking…") {
+                        let after = RECT { left: words.left + text_width(self.fonts.body, &text) + s(ds::space::M), ..words };
+                        draw_text(device, &tf("{0} tokens", &[&cards::token_count_words(self.thinking_tokens)]), after, self.fonts.small, theme::faint(), ONE_LINE);
+                    }
                 }
             }
             if self.rail.is_some_and(|rail| overlaps(&rail, &dirty)) {
@@ -13413,6 +13422,7 @@ impl App {
                 self.set_activity(waiting);
             }
             Event::RequestStarted => {
+                (self.thinking_base, self.thinking_tokens) = (None, 0);
                 if self.activity == t("Compacting the session…") || self.activity == t("Retrying the request…") || self.activity == t("Waiting for the server to restart…") || self.activity.starts_with(&tf("Waiting for the server: {0}", &[&""])) {
                     self.set_activity(t("Thinking…").into());
                 }
@@ -13563,6 +13573,14 @@ impl App {
             Event::Usage { used, window, usage } => {
                 // A report from a request under way comes a couple of times a second: only what it changes is drawn. The panel's words change with each thousand.
                 let panel_changed = used / 1000 != self.used / 1000 || window != self.window_tokens;
+                // (the request's first report is its own text; the ones after count what it writes: its thinking, while "Thinking…" is what is shown)
+                if live_report {
+                    match self.thinking_base {
+                        None => self.thinking_base = Some(used),
+                        Some(base) if self.activity == t("Thinking…") => self.thinking_tokens = used.saturating_sub(base),
+                        Some(_) => {}
+                    }
+                }
                 self.used = used;
                 self.window_tokens = window;
                 if usage.tokens_per_second.is_some() {
@@ -18051,6 +18069,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             thinking: String::new(),
             activity: String::new(),
             activity_since: None,
+            thinking_base: None,
+            thinking_tokens: 0,
             activity_second: 0,
             connected: false,
             connection: String::new(),
