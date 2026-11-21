@@ -38,6 +38,11 @@ enum Line {
     Goal { goal: Option<String> },
     /// The tools the conversation was told of after it began, callable as those it is offered (which stay as they were), the last of these lines counting.
     Added { tools: serde_json::Value },
+    /// A file the conversation has read or written, with the hash of it as it was then: reopened, the conversation has still read it. An edit checks the
+    /// file as it is against this, so one changed since is read again. The last line of a file counts.
+    Seen { path: PathBuf, hash: String },
+    /// What the conversation had read is forgotten: its files went back.
+    SeenForgotten,
 }
 
 /// The plain first line of an encrypted session.
@@ -382,7 +387,7 @@ fn load(path: &Path) -> Result<Loaded, String> {
                 Ok(Line::Meta { workspace: place, .. }) => workspace = place,
                 Ok(Line::Message { message }) => messages.push(message),
                 Ok(Line::Snapshot { messages: all }) => messages = all,
-                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. }) => {}
+                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. } | Line::Seen { .. } | Line::SeenForgotten) => {}
                 Err(_) => {} // a line cut short by a crash, or of a kind that is not known
             },
         }
@@ -552,6 +557,33 @@ impl Session {
     pub fn snapshot(&mut self, messages: &[Message]) -> Result<(), String> {
         self.write(&Line::Snapshot { messages: messages.to_vec() })
     }
+
+    /// The conversation has read or written this file, which was then as `hash` says.
+    pub fn note_seen(&mut self, path: &Path, hash: &str) -> Result<(), String> {
+        self.write(&Line::Seen { path: path.to_path_buf(), hash: hash.to_string() })
+    }
+
+    /// Its files went back: what it had read is forgotten.
+    pub fn forget_seen(&mut self) -> Result<(), String> {
+        self.write(&Line::SeenForgotten)
+    }
+}
+
+/// The files a session had read, each with the hash of it as the session last saw it: what its lines of them come to. (Tested in agent's
+/// `a_conversation_opened_again_has_read_what_it_read`, and below.)
+pub fn seen_of(path: &Path) -> std::collections::HashMap<PathBuf, String> {
+    let mut seen = std::collections::HashMap::new();
+    let Ok(lines) = lines_of(path) else { return seen };
+    for line in lines.filter(|line| line.starts_with("{\"kind\":\"seen")) {
+        match serde_json::from_str(&line) {
+            Ok(Line::Seen { path, hash }) => {
+                seen.insert(path, hash);
+            }
+            Ok(Line::SeenForgotten) => seen.clear(),
+            _ => {}
+        }
+    }
+    seen
 }
 
 /// Whether the file ends a line (or is empty): what is written after a cut line starts one of its own.
@@ -822,6 +854,26 @@ mod tests {
 
     fn call(id: &str) -> ToolCall {
         ToolCall { id: id.into(), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: "{}".into() } }
+    }
+
+    /// What a session has read comes back from its file: the last hash of each file counts, files going back forget all of it, and the messages are
+    /// as they were (older builds skip these lines).
+    #[test]
+    fn what_a_session_read_comes_back_from_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261122-1").unwrap();
+        session.append(&Message::text("user", "hi")).unwrap();
+        session.note_seen(Path::new("C:/w/a.txt"), "1111").unwrap();
+        session.note_seen(Path::new("C:/w/b.txt"), "2222").unwrap();
+        session.forget_seen().unwrap();
+        session.note_seen(Path::new("C:/w/a.txt"), "3333").unwrap();
+        session.note_seen(Path::new("C:/w/a.txt"), "4444").unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let seen = seen_of(&path);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.get(Path::new("C:/w/a.txt")).map(String::as_str), Some("4444"));
+        assert_eq!(Session::open(&path).unwrap().2.len(), 1);
     }
 
     #[test]

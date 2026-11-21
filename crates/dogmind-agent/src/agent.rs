@@ -1843,6 +1843,9 @@ impl Agent {
                 self.bench.background = self.background.clone();
                 self.bench.web.settings = self.web.clone();
                 self.bench.baseline = Some(Arc::new(crate::baseline::Baseline::for_session(path, &self.workspace)));
+                // (what it had read, it has read: a real one, refused an edit of a file it had read before the app was closed, read it and wrote the same 4,776
+                // characters again)
+                self.bench.restore_seen(crate::session::seen_of(path));
                 self.load_extras();
                 // As it was sent, whatever is installed or running by now: the prefix goes on, and a call to what has gone says so.
                 if let Some(tools) = crate::session::tools_of(path) {
@@ -2314,6 +2317,9 @@ impl Agent {
         }
         // What was on disk may no longer be what the model last read.
         self.bench.forget_seen();
+        if let Some(session) = &mut self.session {
+            let _ = session.forget_seen();
+        }
         self.emit(Event::Rewound { restored, prompt: typed });
     }
 
@@ -3591,6 +3597,13 @@ impl Agent {
         }
         self.tool_ended(id, ok, declined, &output, elapsed);
         self.emit(Event::ToolEnded { id: id.to_string(), ok, declined, elapsed, output: output.clone(), images: images.clone() });
+        // (what the call read or wrote, kept with the conversation for when it is opened again)
+        let seen = self.bench.take_seen();
+        if let Some(session) = &mut self.session {
+            for (path, hash) in &seen {
+                let _ = session.note_seen(path, hash);
+            }
+        }
         let helper = self.helper_refs.remove(id);
         self.push(Message { images, helper, ..Message::tool_result(id, output) });
         // (a command may have been started, ended or stopped by this call, or a wait set)
@@ -4259,6 +4272,46 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// A conversation opened again has read what it read before the app was closed: an edit of such a file goes ahead with no read first (a real
+    /// conversation, refused, read the file and wrote the same 4,776 characters again). One changed on disk since must be read again, as before.
+    #[test]
+    fn a_conversation_opened_again_has_read_what_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(dir.path().join(name), "one\ntwo\n").unwrap();
+        }
+        let (client, _) = server(vec![call_answer("read_file", serde_json::json!({"path": "a.txt"})), call_answer("read_file", serde_json::json!({"path": "b.txt"})), text_answer("read")]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("read them".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert_eq!(log.iter().filter(|line| line.starts_with("tool:true")).count(), 2, "{log:?}");
+        let Run { handle, events, _sessions: sessions } = run;
+        handle.commands.send(Command::Quit).unwrap();
+        drop(events);
+        let file = std::fs::read_dir(sessions.path()).unwrap().flatten().map(|entry| entry.path()).find(|path| path.extension().is_some_and(|ext| ext == "jsonl")).expect("a session");
+        // (b.txt changes while the app is closed)
+        std::fs::write(dir.path().join("b.txt"), "one\nTWO\n").unwrap();
+        let patch = |name: &str| serde_json::json!({"edits": [{"path": name, "old_string": "one", "new_string": "ONE"}]});
+        let (client, _) = server(vec![call_answer("apply_patch", patch("a.txt")), call_answer("apply_patch", patch("b.txt")), text_answer("done")]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Resume(file)).unwrap();
+        loop {
+            if let Event::SessionStarted { transcript, .. } = run.events.recv_timeout(Duration::from_secs(20)).unwrap() {
+                if !transcript.is_empty() {
+                    break;
+                }
+            }
+        }
+        run.handle.commands.send(Command::Send("change them".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        let tools: Vec<&String> = log.iter().filter(|line| line.starts_with("tool:")).collect();
+        assert!(tools[0].starts_with("tool:true"), "{log:?}");
+        assert!(tools[1].starts_with("tool:false") && tools[1].contains("changed since it was read"), "{log:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "ONE\ntwo\n");
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "one\nTWO\n");
+        drop(sessions);
     }
 
     /// The model asks with choices (ask_user): the window is told the question and its choices, and what the person answers is the call's result in

@@ -499,6 +499,8 @@ pub struct Workbench {
     pub mcp_pictures: Vec<crate::mcp::Picture>,
     /// The hash of each file as this session last saw it: an edit needs a read of what is there now.
     seen: HashMap<PathBuf, String>,
+    /// What `seen` was given since the session was last told, for its file: a conversation reopened has read what it read.
+    seen_untold: Vec<(PathBuf, String)>,
     pub todos: Vec<Value>,
     /// Where the session began, for `show_diff`. None until it has a file to keep that beside.
     pub baseline: Option<Arc<crate::baseline::Baseline>>,
@@ -930,7 +932,7 @@ impl Workbench {
 
     /// A read has come back. The same lines of the same file as they were are already in the conversation, and are not sent again to be paid for twice.
     pub fn after_read(&mut self, arguments: &Value, path: PathBuf, hash: String, result: Result<String, String>) -> Result<String, String> {
-        if self.seen.insert(path.clone(), hash.clone()).is_some_and(|before| before != hash) {
+        if self.saw(path.clone(), hash.clone()).is_some_and(|before| before != hash) {
             self.covered.remove(&path);
         }
         // A program's read: the file as it is now has been read (an edit may follow), but nothing of it is in the conversation, so it is not
@@ -983,9 +985,27 @@ impl Workbench {
         self.covered.clear();
     }
 
+    /// The file as this session now has seen it, to be told to its file too.
+    fn saw(&mut self, path: PathBuf, hash: String) -> Option<String> {
+        self.seen_untold.push((path.clone(), hash.clone()));
+        self.seen.insert(path, hash)
+    }
+
+    /// What it has seen since it was last asked, for the session's file.
+    pub fn take_seen(&mut self) -> Vec<(PathBuf, String)> {
+        std::mem::take(&mut self.seen_untold)
+    }
+
+    /// A conversation reopened: what it had read, as its file kept it. An edit still checks each file as it is now.
+    pub fn restore_seen(&mut self, seen: HashMap<PathBuf, String>) {
+        self.seen = seen;
+        self.seen_untold.clear();
+    }
+
     /// Files went back: a patch must read them again first.
     pub fn forget_seen(&mut self) {
         self.seen.clear();
+        self.seen_untold.clear();
         self.reads.clear();
         self.covered.clear();
         self.cut_file = None;
@@ -1056,7 +1076,7 @@ impl Workbench {
         };
         written_whole(&path, &written, exists).map_err(|error| format!("{given}: {error}: {}", if exists { "the file is as it was" } else { "it was not made" }))?;
         let lines = file_text(&written).0.lines().count();
-        self.seen.insert(path.clone(), sha16(&written));
+        self.saw(path.clone(), sha16(&written));
         if self.cut_file.as_ref() == Some(&path) {
             self.cut_file = None;
         }
@@ -1161,7 +1181,7 @@ impl Workbench {
             if self.cut_file.as_ref() == Some(path) {
                 self.cut_file = None;
             }
-            self.seen.insert(path.clone(), sha16(&bytes));
+            self.saw(path.clone(), sha16(&bytes));
         }
         let mut said = spill("edits", &report, MAX_OUTPUT);
         if self.in_japanese {
