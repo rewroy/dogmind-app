@@ -1880,6 +1880,9 @@ fn environment_block(mut block: Vec<(String, String)>, bundled: Option<&Path>, t
     }
     block.push(("TEMP".to_string(), temp.clone()));
     block.push(("TMP".to_string(), temp));
+    // (the CLI of the skill that comes with the app sends usage reports to its makers otherwise, and it runs with no one asked: see `safety::the_guidance_cli`. Other programs that read it send none either)
+    block.retain(|(name, _)| !name.eq_ignore_ascii_case("DISABLE_TELEMETRY"));
+    block.push(("DISABLE_TELEMETRY".to_string(), "1".to_string()));
     block.sort_by_key(|(name, _)| name.to_uppercase());
     block
 }
@@ -3536,5 +3539,18 @@ mod tests {
         let made = environment_block(start, None, dir.path().display().to_string(), dir.path(), || panic!("an app with a LIB of its own looks for none"));
         let value = |name: &str| made.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
         assert_eq!((value("PATH"), value("LIB"), value("INCLUDE"), value("LIBPATH")), (Some("C:\\a"), Some("C:\\dev\\lib"), Some("C:\\dev\\include"), Some("C:\\dev\\libpath")));
+    }
+
+    /// The CLI of the skill that comes with the app runs with no one asked, so what it would report of its use is off in every command, with the bundled tools or without, whatever was inherited.
+    #[test]
+    fn every_command_has_usage_reports_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tools");
+        for bundled in [None, Some(root.as_path())] {
+            let start = vec![("PATH".to_string(), "C:\\a".to_string()), ("disable_telemetry".to_string(), "0".to_string())];
+            let made = environment_block(start, bundled, dir.path().display().to_string(), dir.path(), || None);
+            let set: Vec<&str> = made.iter().filter(|(name, _)| name.eq_ignore_ascii_case("DISABLE_TELEMETRY")).map(|(_, value)| value.as_str()).collect();
+            assert_eq!(set, ["1"], "{bundled:?}");
+        }
     }
 }
