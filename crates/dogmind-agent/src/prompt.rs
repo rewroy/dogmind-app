@@ -43,8 +43,9 @@ pub const CHECKPOINT_AGAIN: &str = "Your reply was empty: the checkpoint was onl
 pub const CODEX_JSON: &str = include_str!("../../../assets/dogmind/codex.json");
 pub const DOGMIND_COMMIT: &str = include_str!("../../../assets/dogmind/SOURCE");
 
-/// From the git root down to `cwd`, each folder's `DOGMIND.md`, or else its `AGENTS.md` or `CLAUDE.md`: a project written for
-/// Codex or Claude Code has already said how it wants to be worked on. Dogmind itself reads only the first.
+/// From the git root down to `cwd`, each folder's `DOGMIND.md`, `AGENTS.md` and `CLAUDE.md`, all that are there, in that order: a project written for
+/// other agents has already said how it wants to be worked on. (Only the first of them was read, and the owner: why read the others only when there is no
+/// DOGMIND.md; read all of them.) What applies is followed, a narrower folder's first: the prompt says so before them.
 pub fn instruction_files(cwd: &Path) -> Vec<PathBuf> {
     if let Some(list) = std::env::var_os("DOGMIND_PROJECT_INSTRUCTIONS") {
         return std::env::split_paths(&list).filter(|path| path.exists()).collect();
@@ -53,11 +54,37 @@ pub fn instruction_files(cwd: &Path) -> Vec<PathBuf> {
     let mut folders: Vec<&Path> = cwd.ancestors().take_while(|folder| *folder != root).collect();
     folders.push(root);
     folders.reverse();
-    folders.iter().filter_map(|folder| ["DOGMIND.md", "AGENTS.md", "CLAUDE.md"].iter().map(|name| folder.join(name)).find(|path| path.is_file())).collect()
+    folders.iter().flat_map(|folder| ["DOGMIND.md", "AGENTS.md", "CLAUDE.md"].iter().map(|name| folder.join(name)).filter(|path| path.is_file()).collect::<Vec<_>>()).collect()
 }
 
 /// A project's instructions as far as a prompt should carry them: a local model reads the whole prompt in every new session, 100 KB in five minutes.
 const MAX_INSTRUCTIONS: usize = 10_000;
+
+/// The instruction files as the prompt carries them: an empty one not at all, one with the same text as another of its folder (a copy, a link) once, and all of
+/// them within `MAX_INSTRUCTIONS`: past it, those nearest the root go first, each said in a line with where to read it, and the one left last is shortened.
+fn instructions_kept(files: Vec<(PathBuf, String)>) -> Vec<(PathBuf, String)> {
+    let mut kept: Vec<(PathBuf, String)> = Vec::new();
+    for (file, text) in files {
+        let text = text.trim().to_string();
+        let folder = file.parent().map(Path::to_path_buf);
+        if text.is_empty() || kept.iter().any(|(other, said)| other.parent().map(Path::to_path_buf) == folder && *said == text) {
+            continue;
+        }
+        kept.push((file, text));
+    }
+    let mut left_out = Vec::new();
+    while kept.len() > 1 && kept.iter().map(|(_, text)| text.len()).sum::<usize>() > MAX_INSTRUCTIONS {
+        left_out.push(kept.remove(0).0);
+    }
+    let mut kept: Vec<(PathBuf, String)> = kept.into_iter().map(|(file, text)| { let shown = project_instructions(&text, &file); (file, shown) }).collect();
+    if let Some((_, first)) = kept.first_mut() {
+        for file in left_out.iter().rev() {
+            first.insert_str(0, &format!("--- {} is left out, as the files are long: read it where it applies ---\n", file.display()));
+        }
+    }
+    kept
+}
+
 fn project_instructions(text: &str, file: &Path) -> String {
     let text = text.trim_end();
     if text.len() <= MAX_INSTRUCTIONS {
@@ -169,7 +196,7 @@ pub fn workspace_state(cwd: &Path) -> String {
 
 /// What comes before the project's instruction files. They were put there for agents, often for others: a session on Dogmind's own source took a rule of its
 /// owner's other agents' (ask for the OK to push in their team's room) as its own, and stopped there.
-pub const PROJECT_INSTRUCTIONS_PREFACE: &str = "The files below are kept in the workspace for agents. Follow what applies to this session and what you can do here: a rule that names a channel, a person or a step you do not have (a room to post in, another agent's tools) does not apply to you. What the user says in this conversation comes before them.\n";
+pub const PROJECT_INSTRUCTIONS_PREFACE: &str = "The files below are kept in the workspace for agents. Follow what applies to this session and what you can do here: a rule that names a channel, a person or a step you do not have (a room to post in, another agent's tools) does not apply to you. Where two differ, a narrower folder's comes first, and what the user says in this conversation comes before them all.\n";
 
 /// `more`: what else this session is to know from the start, such as its skills and notes.
 pub fn system_prompt(cwd: &Path, web: bool, personal: &str, more: &str) -> String {
@@ -178,14 +205,12 @@ pub fn system_prompt(cwd: &Path, web: bool, personal: &str, more: &str) -> Strin
     if web {
         prompt.push_str(WEB_RULES);
     }
-    let files = instruction_files(cwd);
+    let files = instructions_kept(instruction_files(cwd).into_iter().filter_map(|file| std::fs::read_to_string(&file).ok().map(|text| (file, text))).collect());
     if !files.is_empty() {
         prompt.push_str("## Project Instructions\n");
         prompt.push_str(PROJECT_INSTRUCTIONS_PREFACE);
-        for file in files {
-            if let Ok(text) = std::fs::read_to_string(&file) {
-                prompt.push_str(&format!("### {}\n{}\n\n", file.display(), project_instructions(&text, &file)));
-            }
+        for (file, text) in files {
+            prompt.push_str(&format!("### {}\n{}\n\n", file.display(), text));
         }
     }
     prompt.push_str(more);
@@ -537,6 +562,18 @@ mod tests {
         let preface = with.find(super::PROJECT_INSTRUCTIONS_PREFACE).expect("the word");
         let file = with.find("Ask in the team room").expect("the file");
         assert!(heading < preface && preface < file, "the heading, the word, then the files");
+        // (an empty file shows nothing, not even its heading, and the others are read all the same; the same text twice in a folder is said once)
+        std::fs::write(dir.path().join("DOGMIND.md"), "\n").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "Ask in the team room before you push.\n").unwrap();
+        let read = super::system_prompt(dir.path(), false, "", "");
+        assert!(!read.contains("DOGMIND.md") && read.matches("Ask in the team room").count() == 1, "{read}");
+        // (past the most, the root's go first and are named)
+        let long = "x".repeat(super::MAX_INSTRUCTIONS - 100);
+        std::fs::write(dir.path().join("AGENTS.md"), &long).unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "the inner rule").unwrap();
+        let kept = super::instructions_kept(vec![(dir.path().join("AGENTS.md"), long.clone()), (dir.path().join("CLAUDE.md"), "the inner rule".to_string()), (dir.path().join("x").join("AGENTS.md"), "y".repeat(500))]);
+        assert_eq!(kept.len(), 2, "the first is left out");
+        assert!(kept[0].1.starts_with("--- ") && kept[0].1.contains("AGENTS.md is left out"), "{}", &kept[0].1[..120]);
     }
     /// What a person says that makes a turn read-only: nothing in the work is to change, or only a look is wanted. In English and Japanese, as it is written in real requests.
     const READ_ONLY: &[&str] = &[
@@ -756,18 +793,19 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         std::fs::write(root.path().join("DOGMIND.md"), "top").unwrap();
         std::fs::write(inner.join("DOGMIND.md"), "inner").unwrap();
-        std::fs::write(root.path().join("CLAUDE.md"), "not this").unwrap();
-        std::fs::write(root.path().join("AGENTS.md"), "not this either").unwrap();
+        std::fs::write(root.path().join("CLAUDE.md"), "the third").unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "the second").unwrap();
         let elsewhere = crate::in_container::tempdir().unwrap();
         std::fs::write(elsewhere.path().join("AGENTS.md"), "from codex").unwrap();
         assert!(system_prompt(elsewhere.path(), false, "", "").contains("from codex"));
         let prompt = system_prompt(&inner, false, "", "SKILLS HERE");
-        assert!(prompt.contains("SKILLS HERE") && !prompt.contains("not this either"));
+        assert!(prompt.contains("SKILLS HERE"));
+        // (all of a folder's files, the root's before the inner folder's, DOGMIND.md, AGENTS.md, CLAUDE.md in a folder)
+        let at = |said: &str| prompt.find(said).unwrap_or_else(|| panic!("{said} is not in it"));
+        assert!(at("top\n") < at("the second\n") && at("the second\n") < at("the third\n") && at("the third\n") < at("inner\n"));
         assert!(!prompt.contains("untrusted_web_content") && !prompt.contains("Own Instructions"));
         assert!(system_prompt(&inner, true, "", "").contains("untrusted_web_content"));
         assert!(system_prompt(&inner, false, "  語尾はにゃん  ", "").contains("語尾はにゃん\n"));
-        assert!(prompt.find("top").unwrap() < prompt.find("inner\n").unwrap());
-        assert!(!prompt.contains("not this"));
     }
 
     /// Only what of the bundle is there is offered, and what is not is said so.
