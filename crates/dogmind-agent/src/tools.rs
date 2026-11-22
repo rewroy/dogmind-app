@@ -2244,6 +2244,11 @@ fn step_stand_in(step: &str, piped: bool) -> Option<String> {
     let word = bare.split_whitespace().next().unwrap_or("");
     let (name, glued) = word.split_once('/').map_or((word, None), |(name, rest)| (name, Some(rest)));
     let name = name.to_ascii_lowercase();
+    if glued.is_none() {
+        if let Some(rest) = with_backslashes(&name, &bare[word.len()..]) {
+            return Some(format!("{}{word}{rest}", &step[..step.len() - bare.len()]));
+        }
+    }
     if !matches!(name.as_str(), "dir" | "del" | "erase") {
         return None;
     }
@@ -2251,6 +2256,58 @@ fn step_stand_in(step: &str, piped: bool) -> Option<String> {
     words.extend(glued.into_iter().flat_map(|rest| rest.split('/')).map(|switch| format!("/{switch}")));
     let text = if name == "dir" { dir_stand_in(&words, piped) } else { del_stand_in(&words)? };
     Some(format!("{}({text})", &step[..step.len() - step.trim_start().len()]))
+}
+
+/// The words after a command's name, for `type`, `findstr`, `copy`, `move`, `mkdir` and `md`, with a path's `/` written `\` and `mkdir`'s `-p` left out; None where nothing changes.
+/// cmd takes a `/` for the start of a switch: `findstr /n x gacha/three.module.js` said "Cannot open three.module.js", and `type`, `copy` and `mkdir` fail the same way. And
+/// `mkdir -p gacha`, a habit from elsewhere, made a folder named `-p` in the person's workspace beside `gacha` (cmd's `mkdir` makes the folders between anyway). A real
+/// turn lost rounds to both, and a model went on to `pause` and `echo noop` with them. Switches, addresses, what `findstr` looks for and lines with more than plain words are left.
+#[cfg(windows)]
+fn with_backslashes(name: &str, rest: &str) -> Option<String> {
+    if !matches!(name, "type" | "findstr" | "copy" | "move" | "mkdir" | "md") || rest.contains(['%', '^', '!', '<', '>', '`']) {
+        return None;
+    }
+    // (each word where it is, its quotes and all)
+    let (mut words, mut began, mut quoted) = (Vec::new(), None, false);
+    for (at, c) in rest.char_indices() {
+        if c == '"' {
+            quoted = !quoted;
+        }
+        if c.is_whitespace() && !quoted {
+            if let Some(start) = began.take() {
+                words.push(start..at);
+            }
+        } else if began.is_none() {
+            began = Some(at);
+        }
+    }
+    if quoted {
+        return None;
+    }
+    words.extend(began.map(|start| start..rest.len()));
+    let read = |at: &std::ops::Range<usize>| rest[at.clone()].replace('"', "");
+    // (`findstr`'s first word that is not a switch is what it looks for, unless a switch gives that)
+    let looked_for = (name == "findstr" && !words.iter().any(|at| read(at).get(..3).is_some_and(|start| start.eq_ignore_ascii_case("/c:") || start.eq_ignore_ascii_case("/g:"))))
+        .then(|| words.iter().position(|at| !read(at).starts_with('/')))
+        .flatten();
+    let (mut out, mut last, mut changed) = (String::new(), 0, false);
+    for (index, at) in words.iter().enumerate() {
+        let word = read(at);
+        if matches!(name, "mkdir" | "md") && matches!(word.as_str(), "-p" | "--parents") {
+            (last, changed) = (at.end, true);
+            continue;
+        }
+        out.push_str(&rest[last..at.start]);
+        last = at.end;
+        if !word.starts_with(['/', '-']) && word.contains('/') && !word.contains("://") && Some(index) != looked_for {
+            out.push_str(&rest[at.clone()].replace('/', "\\"));
+            changed = true;
+        } else {
+            out.push_str(&rest[at.clone()]);
+        }
+    }
+    out.push_str(&rest[last..]);
+    changed.then_some(out)
 }
 
 /// The line that runs for a line a model wrote: the same, but where `dir`, `del` or `| head` is replaced by what does that in the
@@ -3051,7 +3108,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
         report.push_str(&format!("note: `{cd}` was left out: the command runs in that folder already, and in the sandbox `cd` to a full path under the user folder is refused.\n"));
     }
     if runs != line {
-        report.push_str(&format!("note: this ran as `{runs}`: in the sandbox `dir`, `del` and `| head` are replaced by what does the same there.\n"));
+        report.push_str(&format!("note: this ran as `{runs}`: in the sandbox `dir`, `del` and `| head` are replaced by what does the same there, and cmd takes a `/` for a switch, so a path is written with `\\`.\n"));
     }
     if !done.shown.is_empty() {
         report.push_str(&format!("note: it opened a window that nobody can see, as nothing from a command reaches the screen: {}. Run what prints instead of what shows.\n", done.shown.iter().map(|title| if title.is_empty() { "a dialog" } else { title.as_str() }).take(4).collect::<Vec<_>>().join(", ")));
@@ -4684,6 +4741,30 @@ mod tests {
         assert!(piped.starts_with("((for /d %d in (\"vendor\\*\")") && !piped.contains("if exist") && piped.ends_with("| findstr three"), "{piped}");
         assert!(with_stand_ins("dir vendor || echo none").contains("if exist"), "a second chance is not a pipe");
         assert_eq!(with_stand_ins("del it's.txt"), "del it's.txt");
+    }
+
+    /// A path written with `/` is given to cmd's commands with `\`, and `mkdir -p` makes no folder named `-p`; what `findstr` looks for, switches and addresses stay as written.
+    #[cfg(windows)]
+    #[test]
+    fn a_path_with_slashes_is_given_to_cmd_with_backslashes() {
+        for (written, runs) in [
+            ("findstr /n /c:\"three.core\" gacha/three.module.js", "findstr /n /c:\"three.core\" gacha\\three.module.js"),
+            ("findstr from gacha/a.js gacha/b.js", "findstr from gacha\\a.js gacha\\b.js"),
+            ("type \"docs/a b.md\"", "type \"docs\\a b.md\""),
+            ("mkdir -p gacha/assets && copy a.txt gacha/assets/", "mkdir gacha\\assets && copy a.txt gacha\\assets\\"),
+            ("mkdir -p gacha", "mkdir gacha"),
+            ("cd gacha && findstr /i three x/y.js | findstr import", "cd gacha && findstr /i three x\\y.js | findstr import"),
+            ("  @move a/b.txt c/", "  @move a\\b.txt c\\"),
+        ] {
+            assert_eq!(with_stand_ins(written), runs, "{written}");
+            assert_eq!(with_stand_ins(runs), runs, "{runs}: once is all");
+        }
+        for same in [
+            "findstr src/main.rs Cargo.toml", "findstr /s /i \"a/b\"", "curl -sL -o gacha/x.js https://cdn.example/x.js", "copy /y a.txt b.txt", "type %TEMP%/x.txt",
+            "type a/b.txt > c.txt", "copy https://x.example/a b", "mkdir a", "python tools/x.py", "md \"unclosed/x",
+        ] {
+            assert_eq!(with_stand_ins(same), same, "{same}");
+        }
     }
 
     /// What a person was shown must be what runs: a line this has made is not changed by being gone over again.
