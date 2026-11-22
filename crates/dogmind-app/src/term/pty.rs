@@ -163,6 +163,12 @@ impl Pty {
 
             let mut list_size = 0usize;
             InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut list_size);
+            // (a size of nothing would hand Windows an empty buffer's pointer: said as the failure it is)
+            if list_size == 0 {
+                let error = io::Error::last_os_error();
+                console.close();
+                return Err(error);
+            }
             let mut list_buffer = vec![0u64; list_size.div_ceil(8)];
             let list = list_buffer.as_mut_ptr().cast::<c_void>();
             if InitializeProcThreadAttributeList(list, 1, 0, &mut list_size) == 0 || UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize, held as *const c_void, std::mem::size_of::<HPCON>(), std::ptr::null_mut(), std::ptr::null()) == 0 {

@@ -2486,6 +2486,8 @@ struct App {
     attach_button: HWND,
     /// What goes with the next message, and the windows that show it.
     attachments: Vec<Attached>,
+    /// The plain copy of an encrypted session's picture that is shown beside the conversation, if one is: it goes when another is shown and when the app ends.
+    shown_plain: Option<PathBuf>,
     attached_windows: Vec<HWND>,
     /// The pictures of the transcript's messages: drawn in its own paint, from the places that same frame gives their rooms.
     picture_blocks: Vec<PictureBlock>,
@@ -5930,11 +5932,16 @@ impl App {
         let shown = if dogmind_agent::images::is_sealed(path) {
             let folder = self.folder.join("attachments");
             let copy = folder.join(path.file_name().unwrap_or_default());
+            // (the one shown before goes: a plain copy is kept only while it is the one shown, and never past the app's end, where it was left until the next start)
+            if let Some(before) = self.shown_plain.take().filter(|before| *before != copy) {
+                let _ = std::fs::remove_file(before);
+            }
             let made = dogmind_agent::images::read_stored(path).and_then(|bytes| std::fs::create_dir_all(&folder).and_then(|()| std::fs::write(&copy, bytes)));
             if made.is_err() {
                 self.warn(t("This picture cannot be opened here."));
                 return;
             }
+            self.shown_plain = Some(copy.clone());
             copy
         } else {
             path.to_path_buf()
@@ -16870,6 +16877,12 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             // (before the controls go, after this: the document holds the text services, and they hold the control's host, which goes with
             // its window whether anything holds it or not)
             release_document(std::mem::replace(&mut app.transcript_document, std::ptr::null_mut()));
+            // (the plain copy of an encrypted session's picture that was shown, and what was pasted and not sent, which the next start would take out: they go now, and are
+            // not left on the disk while the app is not running)
+            if let Some(shown) = app.shown_plain.take() {
+                let _ = std::fs::remove_file(shown);
+            }
+            let _ = std::fs::remove_dir_all(app.folder.join("attachments"));
             PostQuitMessage(0);
             0
         }
@@ -18154,6 +18167,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             composer_typed_at: None,
             attach_button: make_button(window, ID_ATTACH, "paperclip", ButtonKind::Icon, theme::surface()),
             attachments: Vec::new(),
+            shown_plain: None,
             attached_windows: (0..attach::MOST_IMAGES).map(|at| make_button(window, ID_ATTACHED + at as isize, "", ButtonKind::Attached, theme::surface())).collect(),
             thumb_wanted: std::collections::HashSet::new(),
             picture_blocks: Vec::new(),

@@ -562,7 +562,15 @@ mod watch {
             }
             let stop = std::sync::Arc::new(Event(stop));
             let (for_thread, directory, io) = (stop.clone(), directory as usize, Event(io));
-            let thread = std::thread::Builder::new().name("files-watch".into()).spawn(move || run(directory as HANDLE, io, &for_thread, changed)).ok()?;
+            let thread = match std::thread::Builder::new().name("files-watch".into()).spawn(move || run(directory as HANDLE, io, &for_thread, changed)) {
+                Ok(thread) => thread,
+                // (the folder's handle is the thread's to close: with no thread, it is closed here; the two events close themselves)
+                Err(_) => {
+                    // SAFETY: the handle was opened above, and nothing else has it.
+                    unsafe { CloseHandle(directory as HANDLE) };
+                    return None;
+                }
+            };
             Some(Watcher { stop, thread: Some(thread) })
         }
     }
