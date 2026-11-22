@@ -28,6 +28,10 @@ use crate::web::WebSettings;
 const MAX_ITERATIONS: usize = 300;
 /// An `explore` helper's requests: past these it is asked to answer with what it has, and has as many more as this to do so.
 const HELPER_STEPS: usize = 20;
+/// What a second `explore` in one answer is told, and not run: each takes minutes while the agent that asked waits, and two of a DeepSeek session took 1,248 s of its 25 minutes.
+/// The effort a helper's requests ask for, where the agent's ask for one.
+const HELPER_EFFORT: &str = "low";
+const ONE_HELPER: &str = "not run: one helper a step, as each takes minutes while you wait. Put all you want looked into in the task of the one before, or read what is left yourself.";
 /// How long a helper looks before it is told to answer with what it has. Two of them took 726 s and 522 s of a request's 25 minutes on a local model, and the
 /// turn ran out before its own answer: the agent that asked is waiting all that time, and has the rest of the work to do.
 const HELPER_TIME: Duration = Duration::from_secs(240);
@@ -3257,10 +3261,21 @@ impl Agent {
     fn run_tools(&mut self, calls: &[crate::message::ToolCall]) -> usize {
         let mut failures = 0;
         let mut at = 0;
+        let mut explored = false;
         self.read_live();
         while at < calls.len() {
             if self.cancelled() {
                 return failures;
+            }
+            if calls[at].function.name == "explore" {
+                if explored {
+                    let call = &calls[at];
+                    self.tool_started(&call.id, "explore", arguments_of(call).as_ref(), &call.function.arguments, 1);
+                    self.finish_call(&call.id, Err(ONE_HELPER.into()), false, Duration::ZERO);
+                    (failures, at) = (failures + 1, at + 1);
+                    continue;
+                }
+                explored = true;
             }
             let reads = calls[at..].iter().take_while(|call| tools::is_read(&call.function.name) && self.free_read(call)).count();
             if reads > 1 {
@@ -3664,7 +3679,8 @@ impl Agent {
             // The tools are offered to the end. Not offered, a real model (DeepSeek-V4.1) went on calling one, in its own markup: that came back as
             // the answer, and the agent that asked got that and nothing of what the helper had found.
             let req_id = self.traj.request_id();
-            let request = Request { model: &self.model, messages, tools: Some(schemas), effort: self.effort.as_deref(), images: None, japanese_letters: false, request_id: Some(&req_id) };
+            // (it reads and says what it found: a low effort, whatever the agent's, as its thinking is the agent's wait)
+            let request = Request { model: &self.model, messages, tools: Some(schemas), effort: self.effort.as_deref().map(|_| HELPER_EFFORT), images: None, japanese_letters: false, request_id: Some(&req_id) };
             let mut clock = Clock::start();
             // (the person's Stop on the turn ends it, and so does the one on this helper alone: the stream has a flag of its own that either sets)
             let halt = AtomicBool::new(false);
@@ -4927,6 +4943,28 @@ mod tests {
         assert!(bodies[2]["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool" && message["content"].as_str().unwrap().contains("the needle is here")), "the helper saw what it searched");
         let after = serde_json::to_string(&bodies[3]["messages"]).unwrap();
         assert!(after.contains("The needle is at a.txt:1.") && !after.contains("the needle is here"), "the conversation has the answer, and not what the helper read: {after}");
+    }
+
+    /// One helper a step: a second explore in the same answer is not run and says why, and the first is; a helper asks for a low effort whatever the agent's.
+    #[test]
+    fn a_second_explore_in_one_answer_is_not_run_and_a_helper_thinks_little() {
+        let dir = crate::in_container::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "the needle is here\n").unwrap();
+        let both = sse(&[serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "type": "function", "function": {"name": "explore", "arguments": "{\"task\": \"Where is the needle?\"}"}},
+            {"index": 1, "id": "c2", "type": "function", "function": {"name": "explore", "arguments": "{\"task\": \"And the thread?\"}"}}
+        ]}, "finish_reason": "tool_calls"}]})]);
+        let (client, bodies) = server(vec![both, text_answer("The needle is at a.txt:1."), text_answer("found it")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::SetEffort(Some("high".into()))).unwrap();
+        run.handle.commands.send(Command::Send("find the needle".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "the answer with both, the one helper's request, the answer after: {log:?}");
+        assert_eq!(bodies[1]["reasoning_effort"], "low", "{}", bodies[1]);
+        assert_eq!(bodies[0]["reasoning_effort"], "high");
+        let after = serde_json::to_string(&bodies[2]["messages"]).unwrap();
+        assert!(after.contains("The needle is at a.txt:1.") && after.contains("not run: one helper a step"), "{after}");
     }
 
     /// A helper that has used its requests is still offered its tools, so that a call is a call and not words; a call then is turned down,
