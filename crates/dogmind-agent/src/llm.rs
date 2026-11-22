@@ -566,6 +566,11 @@ pub trait Provider: Send + Sync {
     fn close_thinking_once(&self) -> bool {
         false
     }
+    /// The next request, the first after a draft stop, is to answer with a call (`tool_choice: "required"`), where the server is one that closes thinking: one that
+    /// cannot write its thinking on in the answer's text. Says whether it will be.
+    fn require_call_once(&self) -> bool {
+        false
+    }
     /// Whether a call it was still writing can join the conversation as far as it had come. A provider with blocks of its own to send back cannot make those up.
     fn keeps_cut_writes(&self) -> bool {
         false
@@ -638,6 +643,14 @@ impl Provider for Client {
             self.close_next.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.replay_reasoning
+    }
+
+    fn require_call_once(&self) -> bool {
+        let will = self.replay_reasoning && !self.required_refused.load(std::sync::atomic::Ordering::Relaxed);
+        if will {
+            self.require_next.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        will
     }
 
     /// Straydog's API takes them, and its template shows them inside the tool's response. The services' chat completions take text there.
@@ -757,6 +770,9 @@ pub struct Client {
     pub vision_asked: std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Option<bool>)>>>,
     /// The next request's thinking is to be closed ([`Provider::close_thinking_once`]).
     pub close_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The next request is to answer with a call ([`Provider::require_call_once`]); and the server refused that once, so it is not asked again.
+    pub require_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub required_refused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The engine this app starts and watches: nothing listening there is said at once, as the app knows why and starts it again. Any other server, on this
     /// machine too, may be on its way back, and is waited for as one.
     pub own_engine: bool,
@@ -801,7 +817,7 @@ const VISION_ASKED_AGAIN: Duration = Duration::from_secs(10);
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
         Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None,
-                    vision_asked: Default::default(), close_next: Default::default(), own_engine: false, image_digests: false, app_role: None, app_role_refused: Default::default(), held: Default::default() })
+                    vision_asked: Default::default(), close_next: Default::default(), require_next: Default::default(), required_refused: Default::default(), own_engine: false, image_digests: false, app_role: None, app_role_refused: Default::default(), held: Default::default() })
     }
 
     /// The request a model's turn is sent as, for this server.
@@ -839,7 +855,7 @@ impl Client {
     /// `post_once`, and for a body with the app's messages in a role of their own that the server refused: once more with them as the user's (`again`
     /// makes that body), which, taken, is how they go to it from then on.
     fn post_with_app_role(&self, body: &Value, again: &mut dyn FnMut() -> Value, id: Option<&str>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, Refused> {
-        let refused = match self.post_once(body, id, cancel, on) {
+        let refused = match self.post_or_without_required(body, id, cancel, on) {
             // (a request it would not take, not a key it refused or an address it does not have)
             Err(Refused::Failed(LlmError::Rejected(said))) if said.starts_with(REFUSED) && has_app_role(body) && !cancel.load(std::sync::atomic::Ordering::SeqCst) => said,
             other => return other,
@@ -852,6 +868,23 @@ impl Client {
             return Err(Refused::Failed(LlmError::Rejected(refused)));
         }
         answered
+    }
+
+    /// A request asked to answer with a call (`tool_choice: "required"`) that the server refuses for that: sent again without it, the same request in all else,
+    /// and not asked so again. (Not `again`: what closed its thinking is in this body alone.)
+    fn post_or_without_required(&self, body: &Value, id: Option<&str>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, Refused> {
+        let answered = self.post_once(body, id, cancel, on);
+        match answered {
+            Err(Refused::Failed(LlmError::Rejected(said))) if body.get("tool_choice") == Some(&json!("required")) && said.contains("tool_choice") && !cancel.load(std::sync::atomic::Ordering::SeqCst) => {
+                self.required_refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                let mut plain = body.clone();
+                if let Some(fields) = plain.as_object_mut() {
+                    fields.remove("tool_choice");
+                }
+                self.post_once(&plain, id, cancel, on)
+            }
+            other => other,
+        }
     }
 
     /// The body of a request, with the pictures the server holds of this conversation named by their digests (`held`), whose digests go in `sent`.
@@ -870,11 +903,17 @@ impl Client {
         if self.tool_writing && request.tools.is_some() {
             body["straydog"] = json!({"tool_writing": true});
         }
+        let require = self.require_next.swap(false, std::sync::atomic::Ordering::Relaxed);
         if self.close_next.swap(false, std::sync::atomic::Ordering::Relaxed) {
             if !body.get("straydog").is_some_and(Value::is_object) {
                 body["straydog"] = json!({});
             }
             body["straydog"]["reasoning"] = json!(false);
+            // (with no thinking, the first after a draft stop: a DeepSeek model went on with its thinking in the answer's text, 37,248 characters of it and "</think>" at
+            // its end, shown to the person as the answer. Asked for a call, the server holds its first token to a call's form.)
+            if require && request.tools.is_some() {
+                body["tool_choice"] = json!("required");
+            }
         }
         body
     }
@@ -1083,6 +1122,52 @@ mod tests {
     use super::*;
 
     /// Straydog's comment while it reads a prompt is read as how far it has got; other comments, and a malformed one, are nothing.
+    /// A server that refuses to be asked for a call is sent the same request without it, its thinking closed still, and not asked so again.
+    #[test]
+    fn a_refused_required_call_is_sent_again_without_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let kept = bodies.clone();
+        std::thread::spawn(move || {
+            for (at, stream) in listener.incoming().take(3).enumerate() {
+                let mut stream = stream.unwrap();
+                let (mut request, mut block) = (Vec::new(), [0u8; 65536]);
+                let body = loop {
+                    let count = std::io::Read::read(&mut stream, &mut block).unwrap();
+                    request.extend_from_slice(&block[..count]);
+                    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break serde_json::from_slice::<Value>(&request[end + 4..end + 4 + length]).unwrap();
+                    }
+                };
+                kept.lock().unwrap().push(body);
+                let answer = if at == 0 {
+                    let said = r#"{"error":{"message":"tool_choice must be auto or none"}}"#;
+                    format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{said}", said.len())
+                } else {
+                    let said = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{said}", said.len())
+                };
+                let _ = std::io::Write::write_all(&mut stream, answer.as_bytes());
+            }
+        });
+        let mut client = Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap();
+        client.replay_reasoning = true;
+        let tools = json!([{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]);
+        let messages = [Message::text("user", "go")];
+        let request = Request { model: "m", messages: &messages, tools: Some(&tools), effort: None, images: None, japanese_letters: false, request_id: None };
+        assert!(client.close_thinking_once() && client.require_call_once());
+        let answered = client.stream(&request, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(answered.content, "ok");
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!((sent[0]["tool_choice"].clone(), sent[1].get("tool_choice").cloned()), (json!("required"), None));
+        assert_eq!(sent[1]["straydog"]["reasoning"], false, "its thinking closed still: {}", sent[1]);
+        assert!(!client.require_call_once(), "not asked so again");
+    }
+
     #[test]
     fn the_prompts_reading_is_read_from_the_streams_comments() {
         assert_eq!(prefill_said(" prefill 4096/90724"), Some((4096, 90724)));

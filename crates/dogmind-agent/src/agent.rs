@@ -966,6 +966,9 @@ fn after_the_line_number(line: &str) -> Option<&str> {
     None
 }
 
+/// Where a model whose thinking was closed ended the thinking it wrote in its answer's text anyway.
+const THINK_END: &str = "</think>";
+
 /// The lines a call writes into files: a new file's, or the new text of each edit. None for a call that writes nothing, or whose arguments are not JSON.
 fn lines_written(name: &str, arguments: &str) -> usize {
     let Ok(arguments) = serde_json::from_str::<Value>(arguments) else { return 0 };
@@ -2684,6 +2687,10 @@ impl Agent {
             if thinking_closed {
                 provider.close_thinking_once();
             }
+            // (with its thinking closed, what it writes is held back until it is seen not to be its thinking: a DeepSeek model went on thinking in its answer, 37,248
+            // characters with "</think>" at their end, and that was shown as its answer and kept as one. What comes before that mark is its thinking.)
+            let mut held_back = thinking_closed;
+            let mut thought_in_text = 0usize;
             let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
             let mut written = String::new();
             let (mut reasoned, mut calling) = (String::new(), Vec::<crate::message::ToolCall>::new());
@@ -2740,7 +2747,19 @@ impl Agent {
                         clock.answering();
                         meter.count(text, now);
                         written.push_str(text);
-                        vec![Event::Content(text.to_string())]
+                        if !held_back {
+                            vec![Event::Content(text.to_string())]
+                        } else if let Some(at) = written.find(THINK_END) {
+                            let thought = written[..at].to_string();
+                            written = written[at + THINK_END.len()..].trim_start().to_string();
+                            reasoned.push_str(&thought);
+                            (held_back, thought_in_text) = (false, thought.chars().count());
+                            let mut out = vec![Event::Reasoning(thought)];
+                            out.extend((!written.is_empty()).then(|| Event::Content(written.clone())));
+                            out
+                        } else {
+                            Vec::new()
+                        }
                     }
                     Delta::Tool(index, name) => {
                         clock.writing();
@@ -2771,6 +2790,13 @@ impl Agent {
                     wake();
                 }
             }));
+            // (held back and not thinking after all: it is shown now, as the answer it is)
+            if held_back && !written.is_empty() {
+                self.emit(Event::Content(written.clone()));
+            }
+            if thought_in_text > 0 {
+                self.intervened("thinking_in_text", json!({"req": req_id, "chars": thought_in_text}));
+            }
             // (a Stop of the person's, whatever else stopped the stream, is the turn's end)
             let stopped_by_the_app = drafting && !self.cancelled();
             // (an answer, or a part of one: the server answers in this conversation, and a refusal later is waited for as a restart's)
@@ -2800,8 +2826,10 @@ impl Agent {
                 // after it thought for 410 s (66,369 characters) before it wrote. Once a file is written, the next request thinks as before.
                 let plain = provider.close_thinking_once();
                 (thinking_closed, written_since_stop) = (plain, 0);
+                // (and the first request after it answers with a call: the note says to write)
+                let required = provider.require_call_once();
                 let fenced = watch.as_ref().map_or(0, DraftWatch::fenced);
-                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "fenced": fenced, "next_without_thinking": plain}));
+                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "fenced": fenced, "next_without_thinking": plain, "next_call_required": required}));
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
                 self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped, watch.as_ref().map(DraftWatch::began_at))));
@@ -2925,6 +2953,14 @@ impl Agent {
                 }
             };
             transient = 0;
+            // (what it thought in its text is its thinking in the conversation too, and its answer is what came after the mark)
+            if thought_in_text > 0 {
+                if let Some(at) = completion.content.find(THINK_END) {
+                    let thought = completion.content[..at].to_string();
+                    completion.content = completion.content[at + THINK_END.len()..].trim_start().to_string();
+                    completion.reasoning.push_str(&thought);
+                }
+            }
             // (the program written, as many lines as a draft that is stopped, in one file or in several writes: what the stop closed the thinking for is done. Not any
             // file: a picture of 20 lines, and a page of 43 to try a thing in, opened it in two turns, and the next request drafted the same program again for 220 s,
             // to be stopped again. `edit` is a write too, though it is an `apply_patch` only when it runs.)
@@ -9799,9 +9835,34 @@ Body").unwrap();
         let bodies = bodies.lock().unwrap();
         let closed: Vec<bool> = bodies.iter().map(|body| body.pointer("/straydog/reasoning") == Some(&serde_json::json!(false))).collect();
         assert_eq!(closed, [false, true, true, true, false], "the draft that was stopped, the look at the folder, the small file, the program, and the answer after it");
+        // (the first after the stop is to answer with a call, and only it)
+        let required: Vec<bool> = bodies.iter().map(|body| body.get("tool_choice") == Some(&serde_json::json!("required"))).collect();
+        assert_eq!(required, [false, true, false, false, false], "{}", bodies[1]);
         assert_eq!(lines_written("edit", r#"{"file_path": "a", "old_string": "x", "new_string": "1\n2\n3"}"#), 3);
         assert_eq!(lines_written("apply_patch", r#"{"edits": "[{\"path\": \"a\", \"old_string\": \"x\", \"new_string\": \"1\\n2\"}]"}"#), 2, "edits as a string");
         assert_eq!(lines_written("read_file", r#"{"path": "a"}"#), 0);
+    }
+
+    /// With its thinking closed, what a model writes before "</think>" in its answer is its thinking: shown as thinking, kept as thinking, and not as its answer;
+    /// an answer with no such mark is shown whole, as it is. A server that refuses `tool_choice: "required"` is sent the same request without it.
+    #[test]
+    fn thinking_written_in_the_answer_before_its_mark_is_thinking() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (client, bodies, _, _) = thinking_server(3, vec![text_answer("the layout, the colours, the cards</think>The page is ready to write."), text_answer("on it")]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("write it".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        let shown: Vec<&String> = log.iter().filter(|line| line.starts_with("content:")).collect();
+        assert_eq!(shown, ["content:The page is ready to write."], "{log:?}");
+        assert!(log.iter().any(|line| line == "reasoning:the layout, the colours, the cards"), "{log:?}");
+        run.handle.commands.send(Command::Send("go on".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let bodies = bodies.lock().unwrap();
+        let kept = serde_json::to_string(&bodies[2]["messages"]).unwrap();
+        assert!(kept.contains("The page is ready to write.") && !kept.contains("</think>") && !kept.contains("\"content\":\"the layout"), "{kept}");
+        let lines = trajectory_of(&run);
+        assert!(of_kind(&lines, "intervention").iter().any(|line| line["kind"] == "thinking_in_text" && line["chars"] == 34), "{lines:?}");
+        assert_eq!(of_kind(&lines, "intervention").iter().find(|line| line["kind"] == "draft_stop").unwrap()["next_call_required"], true);
     }
 
     /// The records are the sessions' folder and the engine's log beside the rules, and the model is told where they are, the log only where there is one.
