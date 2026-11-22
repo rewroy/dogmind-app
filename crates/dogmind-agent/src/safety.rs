@@ -537,6 +537,21 @@ pub fn wants_network(arguments: &Value) -> bool {
     arguments.get("network").and_then(Value::as_bool) == Some(true) || arguments.get("command").and_then(Value::as_str).is_some_and(|command| uses_network(command) || the_guidance_cli(command))
 }
 
+/// A line that only sets variables for the one command after it, as cmd writes that: `set NAME=VALUE&&`, with no space before the `&&` (one there is part of the value), or
+/// `set "NAME=VALUE" &&`, once or more. The settings as written, spaces between them made one, and the command. None for anything else, a value with a space or one of cmd's
+/// signs in it included. A skill's instructions run its CLI so (`set DISABLE_TELEMETRY=1&& npx …`), and "always" to such a line was "always" to that exact line alone: a
+/// lottery turn asked the person seven times for one CLI with other words to look up.
+pub fn after_settings(command: &str) -> Option<(String, String)> {
+    static SHAPE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let shape = SHAPE.get_or_init(|| {
+        Regex::new(r#"(?i)^[ \t]*((?:set[ \t]+(?:"[A-Za-z_][A-Za-z0-9_]*=[^ \t"&|<>^%\r\n]*"[ \t]*|[A-Za-z_][A-Za-z0-9_]*=[^ \t"&|<>^%\r\n]*)&&[ \t]*)+)(\S.*)$"#)
+            .expect("the pattern is valid")
+    });
+    let found = shape.captures(command)?;
+    let settings = found[1].split_whitespace().collect::<Vec<_>>().join(" ");
+    Some((settings.trim_end_matches(['&', ' ']).to_string() + "&&", found[2].trim_end().to_string()))
+}
+
 /// A run of the CLI of the skill that comes with this app, `modern-web-guidance`, pinned, as its instructions have it: `search`, `list` or `retrieve`, which read the guides in its own
 /// package and print them. Its one use of the network is npx fetching that package, the first time: the usage reports it would send are off, as every command in the sandbox has
 /// `DISABLE_TELEMETRY=1`, and a `set` of that before it is let through only where it sets just that (in `set DISABLE_TELEMETRY=1 && npx …` the value is `1 `, which turns them back
@@ -866,7 +881,12 @@ impl Gate {
         }
         if tool == "execute_command" {
             let command = arguments.get("command").and_then(Value::as_str)?;
-            return wants_network(arguments).then(|| network_reach(command, self.is_compound(command))).flatten().map(AlwaysScope::Network);
+            // (settings for the command, as a skill's instructions put before it, go with what it reaches: "always" is said of that command with those settings)
+            let reach = match after_settings(command).filter(|(_, rest)| !self.is_compound(rest)) {
+                Some((settings, rest)) => network_reach(&rest, false).map(|reach| format!("{settings} {reach}")),
+                None => network_reach(command, self.is_compound(command)),
+            };
+            return wants_network(arguments).then_some(reach).flatten().map(AlwaysScope::Network);
         }
         let mut folders: Vec<PathBuf> = Vec::new();
         for path in written(tool, arguments) {
@@ -1348,6 +1368,43 @@ mod guidance_cli {
         assert!(matches!(gate.check("execute_command", &json!({"command": line, "cwd": other.path().display().to_string()}), dir.path()), Verdict::Ask { .. }));
         std::fs::write(dir.path().join("npx.cmd"), "@echo planted").unwrap();
         assert!(matches!(gate.check("execute_command", &json!({"command": line}), dir.path()), Verdict::Ask { .. }));
+    }
+
+    /// The seven calls of the CLI that asked one after another in a lottery turn on 11-21, each answered "always", as the model wrote them: now one asks, the line of
+    /// several, which "always" cannot be said of as a whole.
+    #[test]
+    fn the_seven_calls_that_asked_on_11_21_ask_once() {
+        let gate = Gate::new();
+        let dir = crate::in_container::tempdir().unwrap();
+        let calls = [
+            r#"set DISABLE_TELEMETRY=1&& npx -y modern-web-guidance@1.0.1 search "webgl canvas animation" --skill-version 2026_11_10-47b4c80e"#,
+            r#"set DISABLE_TELEMETRY=1&& npx -y modern-web-guidance@1.0.1 retrieve "apply-webgl-shaders,efficient-background-processing,motion""#,
+            r#"set DISABLE_TELEMETRY=1&& npx -y modern-web-guidance@1.0.1 search "animate element entry exit" --skill-version 2026_11_10-47b4c80e && set DISABLE_TELEMETRY=1&& npx -y modern-web-guidance@1.0.1 search "animate dialog top layer" --skill-version 2026_11_10-47b4c80e"#,
+            r#"set DISABLE_TELEMETRY=1&& npx -y modern-web-guidance@1.0.1 retrieve "animate-element-entry-exit,html,progress,dialog""#,
+            r#"set DISABLE_TELEMETRY=1&& npx -y modern-web-guidance@1.0.1 retrieve "animate-to-from-top-layer""#,
+            r#"set DISABLE_TELEMETRY=1&& npx -y modern-web-guidance@1.0.1 retrieve "accessibility""#,
+            r#"set DISABLE_TELEMETRY=1&& npx -y modern-web-guidance@1.0.1 search "live region announce status" --skill-version 2026_11_10-47b4c80e"#,
+        ];
+        let asked = calls.iter().filter(|line| gate.check("execute_command", &json!({"command": line, "network": true}), dir.path()) != Verdict::Allow).count();
+        assert_eq!(asked, 1);
+    }
+
+    /// Settings before one command are part of what "always" to it is said of: the same command with other words after it is covered, with other settings or none it is not.
+    #[test]
+    fn settings_before_a_command_go_with_what_always_reaches() {
+        let gate = Gate::new();
+        let dir = crate::in_container::tempdir().unwrap();
+        let scope = |line: &str| gate.always_scope("execute_command", &json!({"command": line, "network": true}), dir.path());
+        let first = scope("set DISABLE_TELEMETRY=1&& npx -y some-cli@2.0.0 search one").unwrap();
+        assert_eq!(first, AlwaysScope::Network("set DISABLE_TELEMETRY=1&& npx some-cli@2.0.0".into()));
+        assert_eq!(scope(r#"set DISABLE_TELEMETRY=1&& npx -y some-cli@2.0.0 retrieve "two, three""#).unwrap(), first);
+        assert_ne!(scope("set NODE_OPTIONS=--require=x&& npx -y some-cli@2.0.0 search one"), Some(first.clone()));
+        assert_eq!(scope("npx -y some-cli@2.0.0 search one"), Some(AlwaysScope::Network("npx some-cli@2.0.0".into())));
+        // (a space before `&&` is in the value: that line is two commands, as before)
+        assert_eq!(after_settings("set DISABLE_TELEMETRY=1 && npx -y some-cli@2.0.0 list"), None);
+        assert_eq!(after_settings(r#"set "A=1" && set B=2&& npx x"#), Some((r#"set "A=1" && set B=2&&"#.to_string(), "npx x".to_string())));
+        assert_eq!(after_settings("set A=a b&& npx x"), None);
+        assert_eq!(after_settings("npx -y some-cli@2.0.0 list"), None);
     }
 }
 

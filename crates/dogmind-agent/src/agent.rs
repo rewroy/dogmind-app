@@ -4591,6 +4591,11 @@ impl Agent {
             return None;
         }
         let command = arguments.get("command").and_then(Value::as_str)?;
+        // (settings for the one command after them, as a skill's instructions write them, are that command's: the line is asked about as one command, and "always" goes by it with
+        // those settings, the network's reach as the rules do. As parts, `set` was a part that may send what it reads anywhere, and "always" could not be said of the line at all.)
+        if safety::after_settings(command).is_some_and(|(_, rest)| !self.gate.is_compound(&rest)) {
+            return None;
+        }
         let parts = match safety::line_parts(command) {
             safety::LineParts::Whole => return None,
             safety::LineParts::Unreadable => return Some(ByParts::NoAlways),
