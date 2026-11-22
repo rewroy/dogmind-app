@@ -175,7 +175,34 @@ const STEPS_PRELUDE: &str = r#"<script>
   };
   const text = (selector) => find(selector).textContent.trim();
   const count = (selector) => document.querySelectorAll(selector).length;
-  const visible = (selector) => { const found = document.querySelector(selector); if (!found) return false; const box = found.getBoundingClientRect(); return box.width > 0 && box.height > 0 && getComputedStyle(found).visibility !== 'hidden'; };
+  // (seen as a person sees it: not of no size, not hidden, not wholly transparent by itself or what holds it, and not where no one can see or scroll to: moved off the window by a
+  // transform, or cut off by what holds it. A panel kept out of sight by a transform or opacity 0 was taken for shown, and a wait for it ended before it came.)
+  const visible = (selector) => {
+    const found = document.querySelector(selector); if (!found) return false;
+    const box = found.getBoundingClientRect(); if (!(box.width > 0 && box.height > 0)) return false;
+    const style = getComputedStyle(found); if (style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+    let [left, top, right, bottom, fixed] = [box.left, box.top, box.right, box.bottom, false];
+    for (let at = found; at && at.nodeType === 1; at = at.parentElement) {
+      const its = at === found ? style : getComputedStyle(at);
+      if (Number(its.opacity) === 0) return false;
+      if (its.position === 'fixed') fixed = true;
+      // (what holds it cuts it off where it hides its overflow; where it scrolls, what is past its edge is still to be scrolled to)
+      if (at !== found && at !== document.documentElement && at !== document.body) {
+        const cuts = (overflow) => overflow === 'hidden' || overflow === 'clip';
+        const clip = at.getBoundingClientRect();
+        if (cuts(its.overflowX)) { left = Math.max(left, clip.left); right = Math.min(right, clip.right); }
+        if (cuts(its.overflowY)) { top = Math.max(top, clip.top); bottom = Math.min(bottom, clip.bottom); }
+        if (right <= left || bottom <= top) return false;
+      }
+    }
+    // (what is fixed is seen in the window; the rest where the page scrolls to, or in the window too when the page does not scroll that way)
+    const held = (axis) => [document.documentElement, document.body].some((at) => at && ['hidden', 'clip'].includes(getComputedStyle(at)['overflow' + axis]));
+    const page = document.scrollingElement || document.documentElement;
+    const [x, y] = fixed ? [0, 0] : [scrollX, scrollY];
+    const width = fixed || held('X') ? innerWidth : Math.max(innerWidth, page.scrollWidth);
+    const height = fixed || held('Y') ? innerHeight : Math.max(innerHeight, page.scrollHeight);
+    return right + x > 0 && bottom + y > 0 && left + x < width && top + y < height;
+  };
   // (what a model writes of Playwright, on the helpers above; `evaluate` runs the function in this page itself, as the steps are, and gives what it gives)
   const evaluate = async (fn, ...args) => { const made = typeof fn === 'string' ? (0, eval)(fn) : fn; return typeof made === 'function' ? made(...args) : made; };
   const locator = (selector) => ({ click: () => click(selector), fill: (value) => fill(selector, value), press: (key) => press(selector, key), check: () => check(selector), textContent: async () => find(selector).textContent, isVisible: async () => visible(selector), count: async () => count(selector) });
@@ -2443,6 +2470,42 @@ mod tests {
         assert!(!text.contains("NOT CHECKED"), "the browser did not run, so this shows nothing: {text}");
         assert!(!text.contains("SECRET-OUTSIDE-THE-SANDBOX"), "{text}");
         assert!(!served.load(std::sync::atomic::Ordering::Relaxed), "the browser reached a server outside the sandbox");
+    }
+
+    /// What the steps' `visible(selector)` says of `#it` in a page, and of `#shown` beside it, with the real browser in the real sandbox: the console line `v IT SHOWN`.
+    fn visible_in(body: &str) -> String {
+        let html = format!("<!DOCTYPE html><title>v</title><style>body{{margin:0}}#shown{{width:100px;height:20px;background:#3366cc}}</style><div id=shown>shown</div>{body}");
+        let (dir, _) = page(&[("index.html", &html)]);
+        let said = check_page(&serde_json::json!({"path": "index.html", "steps": "console.log('v', visible('#it'), visible('#shown'))"}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        said.lines().find_map(|line| line.split_once(": v ").map(|(_, rest)| format!("v {rest}"))).unwrap_or_else(|| panic!("no line of visible(): {said}"))
+    }
+
+    /// With the real browser: an element made wholly transparent, by itself or by what holds it, is not visible. (A result panel at opacity 0 was said to be,
+    /// and a wait for it ended before it came.)
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn an_element_at_opacity_0_is_not_visible() {
+        assert_eq!(visible_in("<div id=it style=\"width:100px;height:20px;opacity:0\">faded</div>"), "v false true");
+        assert_eq!(visible_in("<div style=\"opacity:0\"><div id=it style=\"width:100px;height:20px\">in a faded one</div></div>"), "v false true");
+    }
+
+    /// With the real browser: an element a transform keeps out of the window, where the page does not scroll to, is not visible; one below the window that the
+    /// page scrolls to is.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn an_element_moved_off_the_window_by_a_transform_is_not_visible() {
+        assert_eq!(visible_in("<div id=it style=\"position:fixed;left:0;bottom:0;width:100%;height:120px;transform:translateY(120%)\">panel</div>"), "v false true");
+        assert_eq!(visible_in("<div id=it style=\"position:absolute;top:0;left:0;width:100px;height:20px;transform:translateX(-300px)\">left</div>"), "v false true");
+        assert_eq!(visible_in("<div style=\"height:3000px\"></div><div id=it style=\"width:100px;height:20px\">far below</div>"), "v true true");
+    }
+
+    /// With the real browser: an element of no size, or cut off by what holds it, is not visible.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn an_element_of_no_size_or_cut_off_is_not_visible() {
+        assert_eq!(visible_in("<div id=it style=\"width:0;height:0;overflow:hidden\">none</div>"), "v false true");
+        assert_eq!(visible_in("<div style=\"width:100px;height:40px;overflow:hidden;position:relative\"><div id=it style=\"position:absolute;top:60px;width:100px;height:20px\">cut</div></div>"), "v false true");
     }
 
     /// With the real browser, in the real sandbox: a page drawn by `requestAnimationFrame` runs its frames in the check, in what is read of it and in its picture
