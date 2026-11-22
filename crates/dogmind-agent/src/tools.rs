@@ -2393,7 +2393,40 @@ fn with_backslashes(name: &str, rest: &str) -> Option<String> {
 /// ([`powershell_in_place`]). What the person is asked about and shown is this line, as it is what runs.
 pub fn line_that_runs_at(line: &str, arguments: &Value, workspace: &Path) -> String {
     let cwd = resolve(workspace, arguments.get("cwd").and_then(Value::as_str).unwrap_or("."));
-    powershell_in_place(&line_that_runs(line), &cwd, users_folder().as_deref())
+    venv_in_two_steps(&powershell_in_place(&line_that_runs(line), &cwd, users_folder().as_deref()), bundled_python())
+}
+
+/// Whether the Python a command runs is the bundle's (an embeddable one, with no venv), and not the system's.
+fn bundled_python() -> bool {
+    crate::bundled::root().is_some_and(|root| crate::bundled::Present::of(&root).python)
+}
+
+/// A line whose `python -m venv FOLDER` is made in two steps where the system's Python runs it: in the sandbox, venv's own last step, ensurepip run by the new
+/// Python as a child of it, fails as it clears its temporary folder (WinError 5), though the same ensurepip run by itself goes through. So: the venv with no pip,
+/// then its own Python's ensurepip. One folder and plain words only; the bundle's Python, which has no venv, is left to say so (`venv_note`).
+fn venv_in_two_steps(line: &str, bundled: bool) -> String {
+    if bundled {
+        return line.to_string();
+    }
+    let pattern = regex::Regex::new(r#"(?i)(^|[&|(]\s*)(python(?:\.exe)?)\s+-m\s+venv\s+([\w.\-/\: ]+?)\s*($|&&|&|\|\||\))"#).expect("the pattern is valid");
+    pattern.replace_all(line, |found: &regex::Captures| {
+        let (before, program, words, after) = (&found[1], &found[2], found[3].trim(), &found[4]);
+        let mut options: Vec<&str> = words.split_whitespace().filter(|word| word.starts_with('-')).collect();
+        let folders: Vec<&str> = words.split_whitespace().filter(|word| !word.starts_with('-')).collect();
+        if folders.len() != 1 || options.iter().any(|option| option.eq_ignore_ascii_case("--without-pip")) {
+            return found[0].to_string();
+        }
+        let folder = folders[0].replace('/', "\\");
+        options.push("--without-pip");
+        let space = if after.is_empty() { "" } else { " " };
+        format!("{before}{program} -m venv {} {folder} && {folder}\\Scripts\\python -m ensurepip --upgrade --default-pip{space}{after}", options.join(" "))
+    }).to_string()
+}
+
+/// What is said of a venv the bundle's Python could not make: it has none, as an embeddable Python, and the system's would.
+fn venv_note(out: &str, err: &str) -> Option<&'static str> {
+    (format!("{out}\n{err}").contains("No module named venv") && bundled_python())
+        .then_some("note: this Python is the app's own, an embeddable one with no venv. Where the system has a Python of its own, run that one by its full path for a venv.\n")
 }
 
 /// The folder the users' own folders are in (`C:\Users`), from this account's.
@@ -3252,7 +3285,8 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let before = file_states(&cwd);
     // As the person, allowed by them: `dir` and `del` work there as they are, and the line runs as it was written and shown.
     let as_person = crate::safety::outside_sandbox(arguments);
-    let runs = if as_person { line.to_string() } else { powershell_in_place(&line_that_runs(line), &cwd, users_folder().as_deref()) };
+    // (as line_that_runs_at makes it, which is what the person was shown: the folder here is the one after a leading `cd` was left out)
+    let runs = if as_person { line.to_string() } else { venv_in_two_steps(&powershell_in_place(&line_that_runs(line), &cwd, users_folder().as_deref()), bundled_python()) };
     // One cargo command under the user folder, in a workspace that names its members by a pattern, which cargo expands looking at each folder from the drive's root: a
     // container may not look at C:\Users, so this one runs with a restricted token, reading as the person does and writing in the workspace alone (`run_live_restricted`).
     // Judged on the line as the model wrote it, which is what the gate judged and the person allowed (`REASON_CARGO_OUTSIDE`), and on what runs, which must be that line.
@@ -3294,6 +3328,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     }
     let no_network = no_network_note(network, done.status, &out, &err);
     report.push_str(no_network.unwrap_or(""));
+    report.push_str(venv_note(&out, &err).unwrap_or(""));
     if let (Some(before), Some(after)) = (&before, file_states(&cwd)) {
         report.push_str(&described_changes(before, &after));
     }
@@ -4995,6 +5030,21 @@ mod tests {
             assert_eq!(powershell_in_place(same, cwd, Some(users)), same, "{same}");
         }
         assert_eq!(powershell_in_place("powershell -Command ls", Path::new("C:\\Users\\me\\100%\\x"), Some(users)), "powershell -Command ls", "a name cmd would read a variable into");
+    }
+
+    /// A venv of the system's Python is made in two steps, with no pip and then its own ensurepip; with the bundle's Python, two folders, options with no pip
+    /// already, or anything else, the line is as it was.
+    #[test]
+    fn a_venv_of_the_systems_python_is_made_in_two_steps() {
+        assert_eq!(venv_in_two_steps("python -m venv .venv", false), "python -m venv --without-pip .venv && .venv\\Scripts\\python -m ensurepip --upgrade --default-pip");
+        assert_eq!(venv_in_two_steps("python -m venv --clear env/dev && env\\dev\\Scripts\\pip install -r requirements.txt", false),
+            "python -m venv --clear --without-pip env\\dev && env\\dev\\Scripts\\python -m ensurepip --upgrade --default-pip && env\\dev\\Scripts\\pip install -r requirements.txt");
+        for same in ["python -m venv .venv"] {
+            assert_eq!(venv_in_two_steps(same, true), same, "the bundle's Python");
+        }
+        for same in ["python -m venv a b", "python -m venv --without-pip .venv", "python -m venvx .venv", "python script.py -m venv", "py -m venv .venv"] {
+            assert_eq!(venv_in_two_steps(same, false), same, "{same}");
+        }
     }
 
     /// What a person was shown must be what runs: a line this has made is not changed by being gone over again.
