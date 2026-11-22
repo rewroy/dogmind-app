@@ -6,47 +6,58 @@
 //!
 //! DOGMIND_TOOLS names the bundle's tools folder (honoured by a debug build), and DOGMIND_MATRIX_OUTSIDE the folder outside the users' folder to work in
 //! (C:\dogmind-matrix when it is not set). It prints a table of how each line went, and why a line that failed did (the sandbox, a tool that is not there,
-//! the network that is closed by default), and writes all of it to OUT.json. Given LAST.json, the table of the version before, it names the lines that went
+//! the network), and writes all of it to OUT.json. Given LAST.json, the table of the version before, it names the lines that went
 //! through then and do not now, and ends with 1 when there is one: a release is not made with any.
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-/// One line: its name in the table, what it runs, and what its output must hold for it to have gone through (beside exit code 0).
+/// One line: its name in the table, what it runs, and what its output must hold for it to have gone through (beside exit code 0). `network`: the call asks for
+/// the network, as a model's does with `network: true`. `refused`: it goes as it should when it fails, as the network is closed to a line that neither asks for
+/// it nor says a word that uses it.
 struct Line {
     name: &'static str,
     runs: &'static str,
     holds: &'static str,
+    network: bool,
+    refused: bool,
 }
 
+const PLAIN: Line = Line { name: "", runs: "", holds: "", network: false, refused: false };
+
+/// A line of Python that opens https with no word of the network in it (no curl, no pip install).
+const OPENS_HTTPS: &str = "python -c \"import urllib.request; print('status', urllib.request.urlopen('https://example.com/', timeout=15).status)\"";
+
 const LINES: &[Line] = &[
-    Line { name: "python -c", runs: "python -c \"print(6*7)\"", holds: "42" },
-    Line { name: "pip install (a local wheel)", runs: "python -m pip install --no-index --no-deps --disable-pip-version-check -q tiny-0.1-py3-none-any.whl && python -c \"import tiny; print(tiny.VALUE)\"", holds: "tiny-ok" },
-    Line { name: "venv", runs: "python -m venv .venv && .venv\\Scripts\\python -c \"print('venv-ok')\"", holds: "venv-ok" },
-    Line { name: "pytest", runs: "python -m pytest -q -p no:cacheprovider test_a.py", holds: "1 passed" },
-    Line { name: "http.server, then curl", runs: "start /b python -m http.server 8765 >nul 2>&1 & python -c \"import time; time.sleep(2)\" & curl -s -o nul -w \"code %{http_code}\" http://127.0.0.1:8765/", holds: "code 200" },
-    Line { name: "node -e", runs: "node -e \"console.log(6*7)\"", holds: "42" },
-    Line { name: "npm init -y", runs: "npm init -y >nul && type package.json | findstr /c:\"\\\"name\\\"\"", holds: "name" },
-    Line { name: "npm install (a local package)", runs: "npm install --no-audit --no-fund --offline ./localpkg >nul && node -e \"console.log(require('localpkg').value)\"", holds: "localpkg-ok" },
-    Line { name: "node --test", runs: "node --test t.test.js", holds: "pass 1" },
-    Line { name: "node execSync", runs: "node -e \"console.log(require('child_process').execSync('echo exec-ok').toString().trim())\"", holds: "exec-ok" },
-    Line { name: "git init", runs: "git init", holds: "" },
-    Line { name: "git add, commit, log", runs: "git add -A && git commit -q -m first && git log --oneline", holds: "first" },
-    Line { name: "git branch, switch", runs: "git branch feature && git switch -q feature && git branch --show-current", holds: "feature" },
-    Line { name: "git diff", runs: "echo more>> a.txt && git diff --stat", holds: "a.txt" },
-    Line { name: "git stash", runs: "git stash && git stash list", holds: "stash@{0}" },
-    Line { name: "cargo new", runs: "cargo new --vcs none -q hello && dir /b hello", holds: "Cargo.toml" },
-    Line { name: "cargo build, run", runs: "cd hello && cargo run -q", holds: "Hello, world!" },
-    Line { name: "cargo test", runs: "cd hello && cargo test -q", holds: "test result: ok" },
-    Line { name: "dir", runs: "dir", holds: "a.txt" },
-    Line { name: "copy, move, type", runs: "copy a.txt b.txt >nul && move b.txt c.txt >nul && type c.txt", holds: "one" },
-    Line { name: "mkdir, rmdir", runs: "mkdir d1\\d2 && rmdir /s /q d1 && if not exist d1 echo gone", holds: "gone" },
-    Line { name: "del", runs: "del c.txt && if not exist c.txt echo deleted", holds: "deleted" },
-    Line { name: "findstr", runs: "findstr /n one a.txt", holds: "1:one" },
-    Line { name: "PowerShell Get-ChildItem", runs: "powershell -NoProfile -Command \"Get-ChildItem -Name a.txt\"", holds: "a.txt" },
-    Line { name: "PowerShell Get-Content", runs: "powershell -NoProfile -Command \"Get-Content a.txt\"", holds: "one" },
-    Line { name: "curl https (the network as set by default)", runs: "curl -s -o nul -w \"code %{http_code}\" https://example.com/", holds: "code 200" },
+    Line { name: "python -c", runs: "python -c \"print(6*7)\"", holds: "42", ..PLAIN },
+    Line { name: "pip install (a local wheel)", runs: "python -m pip install --no-index --no-deps --disable-pip-version-check -q tiny-0.1-py3-none-any.whl && python -c \"import tiny; print(tiny.VALUE)\"", holds: "tiny-ok", ..PLAIN },
+    Line { name: "venv", runs: "python -m venv .venv && .venv\\Scripts\\python -c \"print('venv-ok')\"", holds: "venv-ok", ..PLAIN },
+    Line { name: "pytest", runs: "python -m pytest -q -p no:cacheprovider test_a.py", holds: "1 passed", ..PLAIN },
+    Line { name: "http.server, then curl", runs: "start /b python -m http.server 8765 >nul 2>&1 & python -c \"import time; time.sleep(2)\" & curl -s -o nul -w \"code %{http_code}\" http://127.0.0.1:8765/", holds: "code 200", ..PLAIN },
+    Line { name: "node -e", runs: "node -e \"console.log(6*7)\"", holds: "42", ..PLAIN },
+    Line { name: "npm init -y", runs: "npm init -y >nul && type package.json | findstr /c:\"\\\"name\\\"\"", holds: "name", ..PLAIN },
+    Line { name: "npm install (a local package)", runs: "npm install --no-audit --no-fund --offline ./localpkg >nul && node -e \"console.log(require('localpkg').value)\"", holds: "localpkg-ok", ..PLAIN },
+    Line { name: "node --test", runs: "node --test t.test.js", holds: "pass 1", ..PLAIN },
+    Line { name: "node execSync", runs: "node -e \"console.log(require('child_process').execSync('echo exec-ok').toString().trim())\"", holds: "exec-ok", ..PLAIN },
+    Line { name: "git init", runs: "git init", holds: "", ..PLAIN },
+    Line { name: "git add, commit, log", runs: "git add -A && git commit -q -m first && git log --oneline", holds: "first", ..PLAIN },
+    Line { name: "git branch, switch", runs: "git branch feature && git switch -q feature && git branch --show-current", holds: "feature", ..PLAIN },
+    Line { name: "git diff", runs: "echo more>> a.txt && git diff --stat", holds: "a.txt", ..PLAIN },
+    Line { name: "git stash", runs: "git stash && git stash list", holds: "stash@{0}", ..PLAIN },
+    Line { name: "cargo new", runs: "cargo new --vcs none -q hello && dir /b hello", holds: "Cargo.toml", ..PLAIN },
+    Line { name: "cargo build, run", runs: "cd hello && cargo run -q", holds: "Hello, world!", ..PLAIN },
+    Line { name: "cargo test", runs: "cd hello && cargo test -q", holds: "test result: ok", ..PLAIN },
+    Line { name: "dir", runs: "dir", holds: "a.txt", ..PLAIN },
+    Line { name: "copy, move, type", runs: "copy a.txt b.txt >nul && move b.txt c.txt >nul && type c.txt", holds: "one", ..PLAIN },
+    Line { name: "mkdir, rmdir", runs: "mkdir d1\\d2 && rmdir /s /q d1 && if not exist d1 echo gone", holds: "gone", ..PLAIN },
+    Line { name: "del", runs: "del c.txt && if not exist c.txt echo deleted", holds: "deleted", ..PLAIN },
+    Line { name: "findstr", runs: "findstr /n one a.txt", holds: "1:one", ..PLAIN },
+    Line { name: "PowerShell Get-ChildItem", runs: "powershell -NoProfile -Command \"Get-ChildItem -Name a.txt\"", holds: "a.txt", ..PLAIN },
+    Line { name: "PowerShell Get-Content", runs: "powershell -NoProfile -Command \"Get-Content a.txt\"", holds: "one", ..PLAIN },
+    Line { name: "curl https (a line that names the network, so it is opened)", runs: "curl -s -o nul -w \"code %{http_code}\" https://example.com/", holds: "code 200", ..PLAIN },
+    Line { name: "https from Python, the network not asked for (refused)", runs: OPENS_HTTPS, holds: "", refused: true, ..PLAIN },
+    Line { name: "https from Python, the network asked for", runs: OPENS_HTTPS, holds: "status 200", network: true, ..PLAIN },
 ];
 
 /// What a workspace starts with for the lines: a wheel and a package to install with no network, a test of each kind, and a text file.
@@ -98,12 +109,16 @@ fn run_all(place: &str, workspace: &Path) -> Value {
     let mut results = serde_json::Map::new();
     for line in LINES {
         let began = Instant::now();
-        let said = bench.run("execute_command", &json!({"command": line.runs, "timeout_seconds": 60}), workspace, &cancel);
+        let said = bench.run("execute_command", &json!({"command": line.runs, "timeout_seconds": 60, "network": line.network}), workspace, &cancel);
         let seconds = began.elapsed().as_secs_f64();
         let report = said.unwrap_or_else(|error| format!("error: {error}"));
         let exit = report.lines().rev().find_map(|row| row.strip_prefix("exit_code: ")).and_then(|code| code.trim().parse::<i64>().ok());
-        let ok = exit == Some(0) && report.contains(line.holds) && seconds < 59.0;
-        let cause = if ok { "" } else { why(&report, seconds) };
+        let ok = seconds < 59.0 && if line.refused { exit.is_some_and(|code| code != 0) } else { exit == Some(0) && report.contains(line.holds) };
+        let cause = match (ok, line.refused) {
+            (true, _) => "",
+            (false, true) if seconds < 59.0 => "it reached the network, which a line that neither asks for it nor uses a word of it should not",
+            _ => why(&report, seconds),
+        };
         eprintln!("{place:8} {:44} {:5} {seconds:5.1} s {cause}", line.name, if ok { "ok" } else { "FAIL" });
         results.insert(line.name.to_string(), json!({"ok": ok, "exit": exit, "seconds": (seconds * 10.0).round() / 10.0, "why": cause, "said": report.chars().take(600).collect::<String>()}));
     }
