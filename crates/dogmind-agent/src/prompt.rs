@@ -341,6 +341,13 @@ pub fn cut_write_as_text(path: &str) -> String {
     format!("[From the app, not the user] Your answer went on with `{path}` as text, and an answer's text writes nothing: the file still ends where its write was cut. Write the rest with create_file, the same path: it goes on from the end of the file. Put none of the file in your answer.")
 }
 
+/// What the model is told when its answer ended with a tool call written out as text, which the server could not read as a call: nothing ran, and the turn would
+/// have ended with that markup as its answer.
+pub fn call_as_text(tool: Option<&str>) -> String {
+    let which = tool.map_or(String::new(), |tool| format!(" (`{tool}`)"));
+    format!("[From the app, not the user] Your last message wrote a tool call{which} out as text, and it could not be read as a call: nothing ran. Make the call again, as a tool call. If you meant no call, give your answer without that markup.")
+}
+
 /// Whether an answer's text is mostly code, as the rest of a file written as an answer is: five lines or more, and most of them end as code does or assign.
 pub fn mostly_code(text: &str) -> bool {
     let lines: Vec<&str> = text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with("```")).collect();

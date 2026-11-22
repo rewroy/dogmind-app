@@ -4176,7 +4176,7 @@ impl App {
         let words = self.answers[at].1.clone();
         let same_before = self.answers[..at].iter().filter(|(_, other)| *other == words).count();
         let messages = session::read(&path).unwrap_or_default();
-        let found = messages.iter().enumerate().filter(|(_, message)| message.role == "assistant" && message.content.as_deref().map(str::trim) == Some(words.trim())).nth(same_before).map(|(place, _)| place);
+        let found = messages.iter().enumerate().filter(|(_, message)| message.role == "assistant" && message.content.as_deref().map(|text| dogmind_agent::agent::shown_answer(text).trim()) == Some(words.trim())).nth(same_before).map(|(place, _)| place);
         let Some(through) = found else {
             self.say(t("This answer is not in the saved session yet, so there is nothing to branch from. Try again once it is."));
             return;
@@ -13133,13 +13133,14 @@ impl App {
                     }
                 }
                 "assistant" => {
-                    if let Some(text) = &message.content {
+                    // (a tool call it wrote out as text, which ran nothing, is not shown as words, as it was not while it streamed)
+                    if let Some(text) = message.content.as_deref().map(dogmind_agent::agent::shown_answer) {
                         if !text.trim().is_empty() {
                             self.flush_told_calls(&mut told);
                         }
                         self.append_answer(&crate::mask::hide_keys(text));
                         self.finish_answer();
-                        self.last_answer = text.clone();
+                        self.last_answer = text.to_string();
                         self.mark_answer(text, &written_words(message));
                     }
                     for call in message.tool_calls.iter().flatten() {

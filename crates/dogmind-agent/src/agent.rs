@@ -599,8 +599,56 @@ pub fn start(config: Config, events: Sender<Event>, wake: Box<dyn Fn() + Send>) 
 /// What a model wrote before any tool call it wrote out in its own markup (DeepSeek's DSML, a `<tool_call>`): a server that was not
 /// offered tools, or did not read them as calls, passes them on as words.
 fn without_call_markup(text: &str) -> &str {
-    const MARKS: [&str; 4] = ["<｜DSML｜", "<｜tool▁calls", "<tool_call>", "<|tool_call"];
-    MARKS.iter().filter_map(|mark| text.find(mark)).min().map_or(text, |at| &text[..at])
+    CALL_MARKS.iter().filter_map(|mark| text.find(mark)).min().map_or(text, |at| &text[..at])
+}
+
+/// How a model's own markup for a tool call begins.
+const CALL_MARKS: [&str; 4] = ["<｜DSML｜", "<｜tool▁calls", "<tool_call>", "<|tool_call"];
+
+/// Where an answer's text has a tool call written out as markup, as a call is: at the start of a line, and not in a block of code (an answer about the markup
+/// quotes it in one, or in backticks within a line). The server could not read it as a call, and nothing ran: a DeepSeek model wrote `<｜DSML｜ parameter
+/// name="path" "analyze_traj.py" content=""/>`, and its turn ended with that markup as its answer.
+pub fn call_markup_at(text: &str) -> Option<usize> {
+    let mut in_code = false;
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let start = line.trim_start();
+        if start.starts_with("```") || start.starts_with("~~~") {
+            in_code = !in_code;
+        } else if !in_code && CALL_MARKS.iter().any(|mark| start.starts_with(mark)) {
+            return Some(at + line.len() - start.len());
+        }
+        at += line.len();
+    }
+    None
+}
+
+/// What of an answer's text is shown: all of it but a tool call written out as markup ([`call_markup_at`]), which is no part of what it says.
+pub fn shown_answer(text: &str) -> &str {
+    call_markup_at(text).map_or(text, |at| text[..at].trim_end())
+}
+
+/// How much of an answer's text, as it streams, may be shown now: all of it but a call written out as markup, and a last line that may be the start of one.
+fn showable_now(text: &str) -> usize {
+    if let Some(at) = call_markup_at(text) {
+        return at;
+    }
+    let line_start = text.rfind('\n').map_or(0, |at| at + 1);
+    let last = &text[line_start..];
+    let start = last.trim_start();
+    let begins_a_mark = !start.is_empty() && CALL_MARKS.iter().any(|mark| mark.starts_with(start) && mark.len() > start.len());
+    if begins_a_mark && !inside_code(&text[..line_start]) { line_start + last.len() - start.len() } else { text.len() }
+}
+
+/// Whether text that ends a line ends inside a block of code.
+fn inside_code(text: &str) -> bool {
+    text.lines().filter(|line| line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~")).count() % 2 == 1
+}
+
+/// The tool a call written out as markup names, as far as it can be read.
+fn tool_in_markup(markup: &str) -> Option<String> {
+    let name = regex::Regex::new(r#"(?:invoke\s+name\s*=\s*"|"name"\s*:\s*")([A-Za-z_][A-Za-z0-9_]*)"#).expect("the pattern is valid");
+    name.captures(markup).map(|found| found[1].to_string())
 }
 
 /// A call's arguments as every step reads them, the gate and the run alike: none at all is an empty object.
@@ -2805,6 +2853,8 @@ impl Agent {
         let (mut said, mut asked_about_slips) = (String::new(), false);
         // Whether the rest of a file whose write was cut, given as the answer's text, has been told of: once a turn.
         let mut cut_as_text_told = false;
+        // Whether a tool call written out as text, which ran nothing, has been told of: once a turn. Until it has, such markup is not shown as it streams.
+        let mut markup_told = false;
         // The request this one repeats, why, and how long it waited, for the trajectory.
         let mut retry: Option<(String, &'static str, u64)> = None;
         // What this turn has waited for a server being restarted, in all; and of that, for one that said nothing.
@@ -2836,6 +2886,8 @@ impl Agent {
             let mut thought_in_text = 0usize;
             let request = Request { model: &self.model, messages: &self.messages, tools: Some(&self.tool_schemas), effort: self.effort.as_deref(), images: folder.as_deref(), japanese_letters: self.bench.in_japanese && self.needs_no_other_letters(), request_id: Some(&req_id) };
             let mut written = String::new();
+            // (how much of what it has written is shown: a call written out as markup is held back, `showable_now`)
+            let (hide_markup, mut shown_to) = (!markup_told, 0usize);
             let (mut reasoned, mut calling) = (String::new(), Vec::<crate::message::ToolCall>::new());
             let cuts = provider.keeps_cut_writes();
             let mut drafting = false;
@@ -2893,14 +2945,22 @@ impl Agent {
                         meter.count(text, now);
                         written.push_str(text);
                         if !held_back {
-                            vec![Event::Content(text.to_string())]
+                            let end = if hide_markup { showable_now(&written) } else { written.len() };
+                            if end > shown_to {
+                                let piece = written[shown_to..end].to_string();
+                                shown_to = end;
+                                vec![Event::Content(piece)]
+                            } else {
+                                Vec::new()
+                            }
                         } else if let Some(at) = written.find(THINK_END) {
                             let thought = written[..at].to_string();
                             written = written[at + THINK_END.len()..].trim_start().to_string();
                             reasoned.push_str(&thought);
                             (held_back, thought_in_text) = (false, thought.chars().count());
                             let mut out = vec![Event::Reasoning(thought)];
-                            out.extend((!written.is_empty()).then(|| Event::Content(written.clone())));
+                            shown_to = if hide_markup { showable_now(&written) } else { written.len() };
+                            out.extend((shown_to > 0).then(|| Event::Content(written[..shown_to].to_string())));
                             out
                         } else {
                             Vec::new()
@@ -2935,9 +2995,11 @@ impl Agent {
                     wake();
                 }
             }));
-            // (held back and not thinking after all: it is shown now, as the answer it is)
-            if held_back && !written.is_empty() {
-                self.emit(Event::Content(written.clone()));
+            // (held back and not thinking after all: it is shown now, as the answer it is; and so is a last line held back as the start of a call written out, which it was not)
+            let shown_from = if held_back { 0 } else { shown_to };
+            let end = if hide_markup { call_markup_at(&written).unwrap_or(written.len()) } else { written.len() };
+            if end > shown_from {
+                self.emit(Event::Content(written[shown_from..end].to_string()));
             }
             if thought_in_text > 0 {
                 self.intervened("thinking_in_text", json!({"req": req_id, "chars": thought_in_text}));
@@ -3216,6 +3278,16 @@ impl Agent {
             }
             // Something said just as the answer ended is answered too, and not left for the next turn.
             if !self.interject.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty() {
+                continue;
+            }
+            // A tool call written out as markup, which the server could not read as a call (`call_markup_at`): nothing ran, and the turn would end with the markup
+            // as its answer. Once a turn, it is told so, and makes the call again. What it wrote stays in the conversation as it was written, so the next prompt is
+            // read from the cache to its end.
+            if let (false, Some(at)) = (markup_told, call_markup_at(&completion.content)) {
+                markup_told = true;
+                let tool = tool_in_markup(&completion.content[at..]);
+                self.intervened("call_as_text", json!({"chars": completion.content[at..].chars().count(), "tool": tool}));
+                self.push(Message::text("user", prompt::call_as_text(tool.as_deref())));
                 continue;
             }
             // The rest of a file whose write was cut, written as the answer's text: it writes nothing, and the turn would end with the file cut. (A game's
@@ -5359,6 +5431,57 @@ mod tests {
         }
     }
 
+    /// A tool call written out as text, its markup broken so that the server passed it on as words (as a DeepSeek model's was), ran nothing: the turn does
+    /// not end with it as the answer. The model is told once a turn, with the tool it named, and the markup is not shown as it streams, nor in the session
+    /// opened again. Markup in a block of code, or within a line, is words; and once told, what it writes is shown and ends the turn.
+    #[test]
+    fn a_tool_call_written_out_as_text_is_told_of_once_and_not_shown() {
+        let broken = "Counting the requests.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"create_file\">\n<｜DSML｜ parameter name=\"path\" \"analyze.py\" content=\"\"/>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        assert_eq!(call_markup_at(broken), Some("Counting the requests.\n\n".len()));
+        assert_eq!(shown_answer(broken), "Counting the requests.");
+        assert_eq!(tool_in_markup(&broken[call_markup_at(broken).unwrap()..]).as_deref(), Some("create_file"));
+        assert_eq!(tool_in_markup("<tool_call>\n{\"name\": \"read_file\", \"arguments\": {}}").as_deref(), Some("read_file"));
+        let quoted = "The format is:\n```\n<tool_call>\n{\"name\": \"x\"}\n</tool_call>\n```\nand a line may say `<｜DSML｜ calls>` too.";
+        assert_eq!(call_markup_at(quoted), None);
+        assert_eq!(shown_answer(quoted), quoted);
+        // (as it streams: a last line that may be the start of a call waits, and one that is not goes out)
+        assert_eq!(showable_now("Done.\n<｜DS"), "Done.\n".len());
+        assert_eq!(showable_now("Done.\n  <tool"), "Done.\n  ".len());
+        assert_eq!(showable_now("Done.\n<b>bold</b>"), "Done.\n<b>bold</b>".len());
+        assert_eq!(showable_now("a < b"), "a < b".len());
+        assert_eq!(showable_now("```\n<tool"), "```\n<tool".len(), "in a block of code");
+
+        let dir = crate::in_container::tempdir().unwrap();
+        let provider = Scripted { steps: Mutex::new(vec![says(broken), says("Done.")].into()), streams_text: true, ..Scripted::default() };
+        let (run, provider) = scripted_as(dir.path(), provider, Mode::Default);
+        run.handle.commands.send(Command::Send("count them".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert_eq!(provider.requests(), 2);
+        let shown: String = log.iter().filter_map(|line| line.strip_prefix("content:")).collect();
+        assert_eq!(shown, "Counting the requests.\n\nDone.", "{log:?}");
+        let second = provider.messages(1);
+        assert_eq!(second[second.len() - 2].content.as_deref(), Some(broken), "kept as it was written");
+        let note = user_text(second.last().unwrap());
+        assert!(note.contains("(`create_file`)") && note.contains("nothing ran"), "{note}");
+
+        // (told once: the second goes out whole, and ends the turn)
+        let provider = Scripted { steps: Mutex::new(vec![says(broken), says(broken), says("never asked")].into()), streams_text: true, ..Scripted::default() };
+        let (run, provider) = scripted_as(dir.path(), provider, Mode::Default);
+        run.handle.commands.send(Command::Send("count them".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert_eq!(provider.requests(), 2);
+        let shown: String = log.iter().filter_map(|line| line.strip_prefix("content:")).collect();
+        assert_eq!(shown, format!("Counting the requests.\n\n{broken}"));
+
+        // (quoted markup is words: one request, all of it shown)
+        let provider = Scripted { steps: Mutex::new(vec![says(quoted)].into()), streams_text: true, ..Scripted::default() };
+        let (run, provider) = scripted_as(dir.path(), provider, Mode::Default);
+        run.handle.commands.send(Command::Send("what is the format".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        assert_eq!(provider.requests(), 1);
+        assert_eq!(log.iter().filter_map(|line| line.strip_prefix("content:")).collect::<String>(), quoted);
+    }
+
     /// A helper that has used its requests is still offered its tools, so that a call is a call and not words; a call then is turned down,
     /// and what it writes before any call markup is its answer.
     #[test]
@@ -7137,6 +7260,8 @@ note: the helper took")), "{log:?}");
         busy: bool,
         /// A call comes in pieces as it is written.
         streams: bool,
+        /// An answer's words come in pieces of five characters, as a stream's do.
+        streams_text: bool,
     }
 
     impl Scripted {
@@ -7149,12 +7274,20 @@ note: the helper took")), "{log:?}");
     }
 
     impl llm::Provider for Scripted {
-        fn stream(&self, request: &Request, cancel: &AtomicBool, _on: &mut dyn FnMut(Delta)) -> Result<llm::Completion, LlmError> {
+        fn stream(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<llm::Completion, LlmError> {
             self.seen.lock().unwrap().push((request.messages.to_vec(), request.tools.cloned().unwrap_or(Value::Null)));
-            match self.steps.lock().unwrap().pop_front() {
+            let step = self.steps.lock().unwrap().pop_front();
+            let answer = match step {
                 Some(step) => step(cancel),
                 None => Err(LlmError::Down("the script has ended".into())),
+            };
+            if let (true, Ok(completion)) = (self.streams_text, &answer) {
+                let letters: Vec<char> = completion.content.chars().collect();
+                for piece in letters.chunks(5) {
+                    on(Delta::Content(&piece.iter().collect::<String>()));
+                }
             }
+            answer
         }
         fn images_in_tool_results(&self) -> bool {
             self.tool_pictures
