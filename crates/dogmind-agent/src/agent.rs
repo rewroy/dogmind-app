@@ -28,6 +28,9 @@ use crate::web::WebSettings;
 const MAX_ITERATIONS: usize = 300;
 /// An `explore` helper's requests: past these it is asked to answer with what it has, and has as many more as this to do so.
 const HELPER_STEPS: usize = 20;
+/// How long a helper looks before it is told to answer with what it has. Two of them took 726 s and 522 s of a request's 25 minutes on a local model, and the
+/// turn ran out before its own answer: the agent that asked is waiting all that time, and has the rest of the work to do.
+const HELPER_TIME: Duration = Duration::from_secs(240);
 const HELPER_PAST_ENOUGH: usize = 2;
 /// What its answer brings back into the conversation, in bytes: the 4,000 characters it is told of, in Japanese too. (At 8 KB, a real
 /// review's answer of ten findings lost four from its middle.)
@@ -3406,15 +3409,16 @@ impl Agent {
         // (half of the window for what it reads: the rest for its thinking and its answer)
         let room = (self.window as usize).saturating_mul(CHARS_A_TOKEN) / 2;
         let mut told_enough = false;
+        let began = Instant::now();
         let (person, stops) = (self.cancel.clone(), self.helper_stop.clone());
         // (past its last word, a round or two for a model that calls a tool still: each call is turned down, and it is asked again)
         for step in 0..=HELPER_STEPS + HELPER_PAST_ENOUGH {
             if self.cancelled() || stops.asked(id) {
                 return self.helper_stopped(run, step);
             }
-            let last = step >= HELPER_STEPS || messages.iter().map(Message::chars).sum::<usize>() > room;
+            let last = step >= HELPER_STEPS || messages.iter().map(Message::chars).sum::<usize>() > room || began.elapsed() >= HELPER_TIME;
             if last && !told_enough {
-                self.intervened("helper_enough", json!({"step": step}));
+                self.intervened("helper_enough", json!({"step": step, "s": began.elapsed().as_secs()}));
                 let nudge = Message::text("user", prompt::HELPER_ENOUGH);
                 self.keep_helper(run, &nudge);
                 messages.push(nudge);
