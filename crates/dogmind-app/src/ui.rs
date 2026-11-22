@@ -10024,11 +10024,35 @@ impl App {
         }
     }
 
-    /// A word from the tray, only while the window is out of sight.
-    unsafe fn tray_note(&self, title: &str, words: &str) {
-        if IsWindowVisible(self.window) != 0 {
-            return;
+    /// Whether the person has the window in front of them: it, or a window of its own (a dialog), has the foreground, and it is not minimized.
+    unsafe fn in_front(&self) -> bool {
+        // (a debug build told to by a test: a window off the screen is given the foreground only by taking it from the person at the machine)
+        if cfg!(debug_assertions) {
+            if let Ok(front) = std::env::var("DOGMIND_TEST_IN_FRONT") {
+                return front == "1";
+            }
         }
+        let front = GetForegroundWindow();
+        !front.is_null() && (front == self.window || GetAncestor(front, GA_ROOTOWNER) == self.window) && IsIconic(self.window) == 0
+    }
+
+    /// A word from the tray of a new version: only while the window is hidden.
+    unsafe fn tray_note(&self, title: &str, words: &str) {
+        if tray_speaks(TrayWord::Version, IsWindowVisible(self.window) != 0, self.in_front()) {
+            self.balloon(title, words);
+        }
+    }
+
+    /// A word from the tray that the work wants the person (a turn's end, a question, an approval, a plan): whenever the window is not in front of them, hidden
+    /// or behind another. Only a hidden window had one, and a person working in another window behind which Dogmind sat was told nothing.
+    unsafe fn attention_note(&self, title: &str, words: &str) {
+        if tray_speaks(TrayWord::Attention, IsWindowVisible(self.window) != 0, self.in_front()) {
+            self.balloon(title, words);
+        }
+    }
+
+    /// The tray's balloon.
+    unsafe fn balloon(&self, title: &str, words: &str) {
         // (a debug build told to by a test writes down what the balloon says: off the screen, no one sees it)
         if cfg!(debug_assertions) {
             if let Some(path) = std::env::var_os("DOGMIND_TEST_TRAYLOG") {
@@ -13249,7 +13273,7 @@ impl App {
                 parked.pending = Some(approval);
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.flash_for_attention(woken);
-                self.tray_note(t("Dogmind is waiting for you"), &tf("It asks to use {0}.", &[&t(tool_name(&tool))]));
+                self.attention_note(t("Dogmind is waiting for you"), &tf("It asks to use {0}.", &[&t(tool_name(&tool))]));
             }
             Event::Usage { used, window, usage } => {
                 parked.used = used;
@@ -13283,14 +13307,14 @@ impl App {
                 parked.question = Some(question);
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.flash_for_attention(woken);
-                self.tray_note(t("Dogmind is waiting for you"), &words);
+                self.attention_note(t("Dogmind is waiting for you"), &words);
             }
             Event::PlanReview(review) => {
                 let woken = parked.woken;
                 parked.plan_review = Some(review);
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.flash_for_attention(woken);
-                self.tray_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
+                self.attention_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
             }
             Event::TurnEnded { .. } => {
                 parked.pending = None;
@@ -13331,7 +13355,7 @@ impl App {
                 let (title, failed, woken) = (parked.title.clone(), std::mem::take(&mut parked.failed), std::mem::take(&mut parked.woken));
                 let (path, notices) = (parked.path.clone(), std::mem::take(&mut parked.notices));
                 let words = if title.is_empty() { t("The work is done.").to_string() } else { title };
-                self.tray_note(t(if failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &words);
+                self.attention_note(t(if failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &words);
                 if let (Some(path), true) = (&path, failed) {
                     self.failed_sessions.insert(path.clone());
                 }
@@ -13340,7 +13364,7 @@ impl App {
                 }
                 self.refresh_sessions();
                 InvalidateRect(self.side, std::ptr::null(), 0);
-                if GetForegroundWindow() != self.window {
+                if !self.in_front() {
                     self.flash_for_attention(woken);
                 }
             }
@@ -13701,7 +13725,7 @@ impl App {
                 SendMessageW(self.note, EM_SCROLLCARET, 0, 0);
                 SendMessageW(self.note, WM_VSCROLL, SB_TOP as WPARAM, 0);
                 EnableWindow(self.always, i32::from(approval.always_allowed));
-                self.tray_note(t("Dogmind is waiting for you"), &tf("It asks to use {0}.", &[&t(tool_name(&approval.tool))]));
+                self.attention_note(t("Dogmind is waiting for you"), &tf("It asks to use {0}.", &[&t(tool_name(&approval.tool))]));
                 self.pending = Some(approval);
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.layout();
@@ -13802,7 +13826,7 @@ impl App {
                 self.set_activity(String::new());
                 self.update_buttons();
                 InvalidateRect(self.side, std::ptr::null(), 0);
-                self.tray_note(t("Dogmind is waiting for you"), &words);
+                self.attention_note(t("Dogmind is waiting for you"), &words);
                 self.flash_for_attention(self.woken_turn);
                 // (what is written in the composer is an answer too, as is what is written in the card's field)
                 set_text(self.composer_cue, t("Write your own answer…"));
@@ -13824,7 +13848,7 @@ impl App {
                 self.set_activity(String::new());
                 self.update_buttons();
                 InvalidateRect(self.side, std::ptr::null(), 0);
-                self.tray_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
+                self.attention_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
                 self.flash_for_attention(self.woken_turn);
                 self.focus_composer();
             }
@@ -13932,7 +13956,7 @@ impl App {
                 let failed = std::mem::take(&mut self.turn_failed);
                 if !cancelled {
                     let title = if self.session_title.is_empty() { t("The work is done.").to_string() } else { self.session_title.clone() };
-                    self.tray_note(t(if failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &title);
+                    self.attention_note(t(if failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &title);
                 }
                 self.running = false;
                 self.request_live = None;
@@ -13952,7 +13976,7 @@ impl App {
                 self.set_activity(String::new());
                 self.update_buttons();
                 self.refresh_sessions();
-                if GetForegroundWindow() != self.window {
+                if !self.in_front() {
                     self.flash_for_attention(woken);
                 }
                 self.flush_queue();
@@ -18391,6 +18415,38 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         }
     }
     ExitCode::SUCCESS
+}
+
+/// What a balloon of the tray is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayWord {
+    /// A new version: what the main screen says to an open window is told already.
+    Version,
+    /// What the work wants of the person: a turn's end, a question, an approval, a plan.
+    Attention,
+}
+
+/// Whether the tray says a word, from whether the window is shown and whether it is in front of the person.
+fn tray_speaks(word: TrayWord, shown: bool, in_front: bool) -> bool {
+    match word {
+        TrayWord::Version => !shown,
+        TrayWord::Attention => !in_front,
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use super::*;
+
+    /// The work's words come from the tray whenever the window is not in front of the person: hidden, or behind another window. In front, the window says them
+    /// itself. A new version's, only while it is hidden.
+    #[test]
+    fn the_tray_speaks_for_the_work_whenever_the_window_is_not_in_front() {
+        // (in front; shown behind another window; hidden)
+        let cases = [(true, true), (true, false), (false, false)];
+        assert_eq!(cases.map(|(shown, in_front)| tray_speaks(TrayWord::Attention, shown, in_front)), [false, true, true]);
+        assert_eq!(cases.map(|(shown, in_front)| tray_speaks(TrayWord::Version, shown, in_front)), [false, false, true]);
+    }
 }
 
 #[cfg(test)]
