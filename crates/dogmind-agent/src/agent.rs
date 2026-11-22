@@ -932,6 +932,19 @@ fn after_the_line_number(line: &str) -> Option<&str> {
     None
 }
 
+/// Dogmind's own records that commands and the tools may read: the folder of its conversations, each with its trajectory, and the engine's log beside the rules.
+fn records(sessions: &Path, rules: &Path) -> Vec<PathBuf> {
+    std::iter::once(sessions.to_path_buf()).chain(rules.parent().map(|app| app.join("engine.log"))).collect()
+}
+
+/// What the model is told of the records, where they are: `%LOCALAPPDATA%` in a command is the container's own folder, and a model that went there for them found nothing,
+/// and went outside the sandbox for each read instead.
+fn records_note(records: &[PathBuf]) -> Option<String> {
+    let sessions = records.first().filter(|folder| folder.is_dir())?;
+    let log = records.get(1).filter(|file| file.is_file()).map_or(String::new(), |file| format!(", and the engine's log is `{}`", file.display()));
+    Some(format!("- Dogmind's own conversations on this machine, each with its trajectory, are in `{}`{log}: commands and the tools can read them, and write in none of it.", sessions.display()))
+}
+
 /// Whether the reasoning, as it streams, has become a draft of what is to be written: a run of `DRAFT_LINES` lines of code of its own. What it was shown (`lines_shown`) and says again is
 /// not code of its own, in a fence or out of one, and neither breaks a run nor goes into it.
 struct DraftWatch {
@@ -1449,9 +1462,15 @@ impl Agent {
     fn new(config: Config, events: Sender<Event>, wake: Box<dyn Fn() + Send>, cancel: Arc<AtomicBool>) -> Agent {
         let mut bench = Workbench::new(&config.workspace);
         bench.web.settings = config.web.clone();
-        // The app's own folder: the sessions and the rules are there, and what keeps its keys.
+        // The app's own folder: the sessions and the rules are there, and what keeps its keys. Its records are read as any file is (`records`).
         let mut gate = Gate::new();
         gate.secrets.extend(config.rules.parent().map(Path::to_path_buf));
+        gate.records = records(&config.sessions, &config.rules);
+        // (and opened to commands, to read: not for a test's, whose folders are made and gone by the hundred, nor where this runs in a command of the app's)
+        #[cfg(all(windows, not(test)))]
+        if !crate::sandbox::in_a_container() {
+            crate::sandbox::records_readable(&gate.records);
+        }
         gate.code_mode = config.code_mode;
         // (Visual Studio's build tools are looked for from here, in the background: the gate weighs a command without waiting for them, and its environment then usually finds them ready)
         #[cfg(windows)]
@@ -2146,6 +2165,10 @@ impl Agent {
                 if !open.is_empty() {
                     notes.push(format!("- Commands can also read these folders, and write in none of them: {}.", open.join(", ")));
                 }
+            }
+            #[cfg(all(windows, not(test)))]
+            if !crate::sandbox::in_a_container() {
+                notes.extend(records_note(&self.gate.records));
             }
         }
         if std::mem::take(&mut self.web_rules_due) {
@@ -9357,6 +9380,21 @@ Body").unwrap();
         let bodies = bodies.lock().unwrap();
         let closed: Vec<bool> = bodies.iter().map(|body| body.pointer("/straydog/reasoning") == Some(&serde_json::json!(false))).collect();
         assert_eq!(closed, [false, true, true, false], "the draft that was stopped, the look at the folder, the write, and the answer after it");
+    }
+
+    /// The records are the sessions' folder and the engine's log beside the rules, and the model is told where they are, the log only where there is one.
+    #[test]
+    fn the_records_are_the_sessions_and_the_engines_log_and_the_model_is_told_where() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let found = records(&sessions, &dir.path().join("permissions.json"));
+        assert_eq!(found, [sessions.clone(), dir.path().join("engine.log")]);
+        assert_eq!(records_note(&found), None, "no folder, no word");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let note = records_note(&found).unwrap();
+        assert!(note.contains(&format!("`{}`", sessions.display())) && !note.contains("engine's log"), "{note}");
+        std::fs::write(dir.path().join("engine.log"), "x").unwrap();
+        assert!(records_note(&found).unwrap().contains(&format!("the engine's log is `{}`", dir.path().join("engine.log").display())));
     }
 
     #[test]

@@ -720,6 +720,8 @@ fn for_of(line: &str, depth: usize, out: &mut Vec<String>) -> Result<(), LinePar
 pub struct Gate {
     /// What else holds keys on this machine: the app's own folder, and the files its settings name.
     pub secrets: Vec<PathBuf>,
+    /// Dogmind's own records in its folder, which are not kept secret: its conversations with their trajectories, and the engine's log (`records`).
+    pub records: Vec<PathBuf>,
     denied: RegexSet,
     safe: Regex,
     look: Regex,
@@ -744,6 +746,7 @@ impl Gate {
         let set = |patterns: &[&str]| RegexSet::new(patterns.iter().map(|p| format!("(?i){p}"))).expect("the patterns are valid");
         Gate {
             secrets: Vec::new(),
+            records: Vec::new(),
             // Never, whoever asks.
             denied: set(&[
                 r"^\s*sudo\b", r"\bmkfs", r"\bformat\s+[a-z]:", r"\bdd\b.*\bof=/dev/", r":\(\)\s*\{", r"\b(curl|wget|iwr|irm|invoke-webrequest)\b.*\|\s*(sh|bash|cmd|powershell|pwsh|iex)\b",
@@ -836,14 +839,19 @@ impl Gate {
             let path = Path::new(word);
             let rooted = |path: &Path| if path.is_absolute() { path.to_path_buf() } else { Path::new("/").join(path) };
             let after_a_revision = word.rsplit_once(':').map(|(_, path)| Path::new(path));
-            sensitive(&rooted(path)) || after_a_revision.is_some_and(|path| sensitive(&rooted(path))) || self.secrets.iter().any(|secret| inside(secret, path))
+            sensitive(&rooted(path)) || after_a_revision.is_some_and(|path| sensitive(&rooted(path))) || self.kept_secret(path)
         })
+    }
+
+    /// Under a place that holds keys, as the app's folder does, and not one of the records in it.
+    fn kept_secret(&self, path: &Path) -> bool {
+        self.secrets.iter().any(|secret| inside(secret, path)) && !self.records.iter().any(|record| inside(record, path))
     }
 
     /// A place secrets are kept, as it is spelled or where it really leads: `..`, a link, a junction and a short name all end up here.
     pub fn is_secret(&self, path: &Path) -> bool {
         let real = real_path(path);
-        std::iter::once(path).chain(real.as_deref()).any(|path| sensitive(path) || self.secrets.iter().any(|secret| inside(secret, path)))
+        std::iter::once(path).chain(real.as_deref()).any(|path| sensitive(path) || self.kept_secret(path))
     }
 
     /// What "Always" would allow of this call, where it is not a rule's to answer.
@@ -2054,6 +2062,15 @@ mod tests {
             assert!(matches!(read_verdict(&gate, path, root), Verdict::Ask { .. }), "{path}");
         }
         assert_eq!(read_verdict(&gate, "D:\\keys\\other.txt", root), Verdict::Allow);
+        // (its records are not: they are read as any file outside the workspace is, by the tools and by a command, and the rest of the folder still asks)
+        gate.records = vec![PathBuf::from("C:\\Data\\DogmindApp\\sessions"), PathBuf::from("C:\\Data\\DogmindApp\\engine.log")];
+        for path in ["C:\\Data\\DogmindApp\\sessions\\a.jsonl", "c:\\data\\dogmindapp\\SESSIONS\\a.trajectory.jsonl", "C:\\Data\\DogmindApp\\engine.log"] {
+            assert_eq!(read_verdict(&gate, path, root), Verdict::Allow, "{path}");
+        }
+        for path in ["C:\\Data\\DogmindApp\\settings.json", "C:\\Data\\DogmindApp\\engine.log.old", "C:\\Data\\DogmindApp\\sessions-old\\a.jsonl", "D:\\keys\\openai.txt"] {
+            assert!(matches!(read_verdict(&gate, path, root), Verdict::Ask { .. }), "{path}");
+        }
+        assert!(!gate.names_a_secret("type C:\\Data\\DogmindApp\\sessions\\a.jsonl") && gate.names_a_secret("type C:\\Data\\DogmindApp\\settings.json"));
     }
 
     #[test]

@@ -1715,6 +1715,26 @@ pub fn also_readable(folder: &Path) {
     }
 }
 
+/// What of the app's folder stays closed to commands, whatever of it is opened ([`records_readable`]): the settings, which may hold a key, and what was set aside of them,
+/// the folders the person has granted and opened, the engine's own settings, and the person's notes, instructions and attachments. Nothing opens these; a test reads each
+/// from a command once the records are open, and is refused.
+pub const HELD_CLOSED: [&str; 10] = ["settings.json", "settings.json.broken", "workspace-grants.json", "read-folders.json", "engine.toml", "engine.toml.old", "instructions.md", "memory", "attachments", "updates"];
+
+/// Dogmind's own records that commands may read, besides the workspace: its conversations, each with its trajectory, and the engine's log.
+static RECORDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Opens these records of the app's to each command from now on, to read and not to write: a folder with what is in it and what comes to be, a file alone, and the folders above
+/// them only to pass through, the app's own folder among them, which is not listed. A session asked why its replies had slowed went outside the sandbox for each of 29 reads of
+/// them, each a card for the person in real use: in the sandbox `%LOCALAPPDATA%` is the container's own folder, and the app's was closed to commands.
+pub fn records_readable(records: &[PathBuf]) {
+    let mut known = RECORDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for record in records {
+        if !known.iter().any(|kept| key(kept) == key(record)) {
+            known.push(record.clone());
+        }
+    }
+}
+
 /// Where the time of a command went apart from the program's own: what the app does before the process starts (`prepare`, in the parts of it that take time), the program from its start to its
 /// end, and the look after it. A command's one duration says none of this, and a data job's seven Python commands took 30% of it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1765,6 +1785,16 @@ unsafe fn prepare(workspace: &Path, sid: PSID, disarmed: &mut Vec<String>, times
         for ancestor in folder.ancestors().skip(1).filter(|above| above.parent().is_some()) {
             let _ = grant(ancestor, sid, FILE_GENERIC_EXECUTE, false);
         }
+    }
+    // (Dogmind's records, to read alone: `FILE_GENERIC_READ`, which a folder's things inherit, and the folders above them to pass through. A file's folder is listed as well, and
+    // nothing in it read: cmd's `type` and `findstr` look a file up in its folder's list first, and were refused the engine's log, though it could be read.)
+    for record in RECORDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().filter(|record| record.exists()) {
+        let folder = record.is_dir();
+        let _ = grant(record, sid, FILE_GENERIC_READ, folder);
+        if let Some(parent) = record.parent().filter(|_| !folder) {
+            let _ = grant(parent, sid, READ_EXECUTE, false);
+        }
+        grant_way_to(record, sid);
     }
     // The folders above: their attributes only, and only for shells that look at where they are. An OS-owned one may refuse, which costs little.
     for ancestor in workspace.ancestors().skip(1).filter(|folder| folder.parent().is_some()) {
@@ -2679,6 +2709,41 @@ mod tests {
         let script = "powershell -NoProfile -Command \"try { (New-Object Net.Sockets.TcpClient).Connect('1.1.1.1', 443); 'connected' } catch { 'refused' }\"";
         let closed = command(script, &folder, false);
         assert!(!String::from_utf8_lossy(&closed.stdout).contains("connected"), "{}", String::from_utf8_lossy(&closed.stdout));
+    }
+
+    /// Dogmind's records, once open, are read by a command, in a folder of them and beneath it, and are not written; and nothing else of the app's folder is read,
+    /// what is held closed (`HELD_CLOSED`) above all.
+    #[test]
+    fn a_command_reads_the_apps_records_and_nothing_else_of_its_folder() {
+        let (work, app) = (work_folder("records-work"), work_folder("records-app"));
+        let sessions = app.join("sessions");
+        std::fs::create_dir_all(sessions.join("a.checkpoints")).unwrap();
+        std::fs::write(sessions.join("a.trajectory.jsonl"), "RECORD-ONE\n").unwrap();
+        std::fs::write(sessions.join("a.checkpoints").join("1.json"), "RECORD-TWO\n").unwrap();
+        std::fs::write(app.join("engine.log"), "RECORD-LOG\n").unwrap();
+        let held = |name: &str| if name.contains('.') { app.join(name) } else { app.join(name).join("x.txt") };
+        for name in HELD_CLOSED {
+            std::fs::create_dir_all(held(name).parent().unwrap()).unwrap();
+            std::fs::write(held(name), format!("HELD-{name}\n")).unwrap();
+        }
+        records_readable(&[sessions.clone(), app.join("engine.log")]);
+        let read = |path: &Path| command(&format!("type \"{}\"", path.display()), &work, false);
+        for (path, said) in [(sessions.join("a.trajectory.jsonl"), "RECORD-ONE"), (sessions.join("a.checkpoints").join("1.json"), "RECORD-TWO"), (app.join("engine.log"), "RECORD-LOG")] {
+            let out = read(&path);
+            assert!(decode(&out.stdout).contains(said), "{}: {:?} {}", path.display(), out.status, decode(&out.stderr));
+        }
+        // (a session written after they were opened is read as well: it inherits what the folder gives)
+        std::fs::write(sessions.join("b.jsonl"), "RECORD-NEW\n").unwrap();
+        assert!(decode(&read(&sessions.join("b.jsonl")).stdout).contains("RECORD-NEW"));
+        for name in HELD_CLOSED {
+            let out = read(&held(name));
+            assert!(!decode(&out.stdout).contains("HELD-") && out.status != Some(0), "{name} was read: {:?} {}", out.status, decode(&out.stdout));
+        }
+        let written = command(&format!("echo more>> \"{}\"", sessions.join("a.trajectory.jsonl").display()), &work, false);
+        assert_ne!(written.status, Some(0), "{}", decode(&written.stderr));
+        assert_eq!(std::fs::read_to_string(sessions.join("a.trajectory.jsonl")).unwrap(), "RECORD-ONE\n", "a record is not written");
+        let made = command(&format!("echo x> \"{}\"", sessions.join("c.jsonl").display()), &work, false);
+        assert!(made.status != Some(0) && !sessions.join("c.jsonl").exists(), "nothing is made among them");
     }
 
     #[test]
