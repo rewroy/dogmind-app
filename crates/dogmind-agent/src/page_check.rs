@@ -486,6 +486,11 @@ fn picture_limit(wait: u64, read_took: Option<Duration>) -> Duration {
     }
 }
 
+/// The wait past which a check with steps takes its pictures after its read, one at a time, and not beside it: measured with nothing else running, a WebGL
+/// page drawn on the CPU with steps at a 10 s wait had its picture beside the read stopped at its limit, 36 s, in 2 of 4 checks (48 and 53 s in all, against
+/// 21 to 25 s one after another), where every other form was quicker beside it.
+const STEPS_AT_LENGTH: u64 = 2 * WAIT_MS;
+
 /// A read longer than this is of a page that is slow to draw (WebGL on the CPU, at a long wait or with steps), and its pictures are taken one at a time: two of them
 /// at once with the read just over shared the CPU so that one was stopped at its limit (a read of 14.8 s, a picture of 12 s by itself stopped at 30 s).
 const SLOW_READ: Duration = Duration::from_secs(8);
@@ -1519,13 +1524,16 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         };
         // The read, with the pictures begun beside it. Its turn is taken first, so that the pictures do not take both before it; a slow read keeps it until the
         // pictures are done, and they go one at a time (`SLOW_READ`).
+        // Steps at a long wait are the most a check draws: there the pictures follow the read, one at a time, as before (`STEPS_AT_LENGTH`).
+        let beside = !(steps.is_some() && wait > STEPS_AT_LENGTH);
         let read_with_pictures = |wait: u64| {
             read_ms.store(u64::MAX, Ordering::Relaxed);
             let reading = slots.take(&never);
-            let pictures = start(wait);
+            let pictures = if beside { start(wait) } else { Vec::new() };
             let read = read_at(run_wait_of(wait));
             read_ms.store(read_took.get().as_millis() as u64, Ordering::Relaxed);
-            let kept = reading.filter(|_| read_took.get() > SLOW_READ);
+            let kept = reading.filter(|_| !beside || read_took.get() > SLOW_READ);
+            let pictures = if beside { pictures } else { start(wait) };
             (read, pictures, kept)
         };
         let (read, mut pictures, mut kept) = read_with_pictures(wait);
