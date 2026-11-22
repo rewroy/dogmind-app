@@ -2401,7 +2401,7 @@ fn in_sandbox_form(line: &str, cwd: &Path) -> String {
     let users = users_folder();
     let made = powershell_in_place(&line_that_runs(line), cwd, users.as_deref());
     let made = git_init_whole(&made, cwd, users.as_deref(), crate::bundled::default_branch);
-    venv_in_two_steps(&made, bundled_python())
+    venv_in_two_steps(&made, bundled_python().as_deref())
 }
 
 /// What a `git init` made whole has in it, by which a line already made so is known.
@@ -2464,6 +2464,17 @@ fn git_init_whole(line: &str, cwd: &Path, users: Option<&Path>, default_branch: 
     }).to_string()
 }
 
+/// What is said of a `git init` made whole (`git_init_whole`) whose first try failed: that the line wrote HEAD and ran it again, and that the repository is
+/// whole only where each git folder it wrote HEAD in has its objects folder now. (A `cd` earlier in the line puts a folder elsewhere than `cwd`: one not found
+/// there is not said to be whole, nor to be broken.)
+fn git_init_note(runs: &str, cwd: &Path) -> String {
+    let pattern = regex::Regex::new(r"if not exist (\S+)\\HEAD \(").expect("the pattern is valid");
+    let folders: Vec<PathBuf> = pattern.captures_iter(runs).map(|found| cwd.join(&found[1])).collect();
+    let whole = !folders.is_empty() && folders.iter().all(|git| git.join("HEAD").is_file() && git.join("objects").is_dir());
+    let then = if whole { "which made the rest: the repository is whole" } else { "and what that said is above" };
+    format!("note: under the users' folder git cannot look at C:\\Users, so `git init` could not lock the new repository's HEAD and stopped (the error above). The line then wrote HEAD and ran `git init` again, {then}.\n")
+}
+
 /// Whether a folder is under the users' folder, which a container cannot look at.
 fn under_users(cwd: &Path, users: Option<&Path>) -> bool {
     users.is_some_and(|users| {
@@ -2472,21 +2483,35 @@ fn under_users(cwd: &Path, users: Option<&Path>) -> bool {
     })
 }
 
-/// Whether the Python a command runs is the bundle's (an embeddable one, with no venv), and not the system's.
-fn bundled_python() -> bool {
-    crate::bundled::root().is_some_and(|root| crate::bundled::Present::of(&root).python)
+/// The bundle's Python folder, where it has one: an embeddable Python, with no venv. A bare `python` in a command is that one, as the bundle takes the
+/// system's Python folders off PATH.
+fn bundled_python() -> Option<PathBuf> {
+    crate::bundled::root().filter(|root| crate::bundled::Present::of(root).python).map(|root| root.join("python"))
 }
 
-/// A line whose `python -m venv FOLDER` is made in two steps where the system's Python runs it: in the sandbox, venv's own last step, ensurepip run by the new
+/// A line whose `python -m venv FOLDER` is made in two steps where a system's Python runs it: in the sandbox, venv's own last step, ensurepip run by the new
 /// Python as a child of it, fails as it clears its temporary folder (WinError 5), though the same ensurepip run by itself goes through. So: the venv with no pip,
-/// then its own Python's ensurepip. One folder and plain words only; the bundle's Python, which has no venv, is left to say so (`venv_note`).
-fn venv_in_two_steps(line: &str, bundled: bool) -> String {
-    if bundled {
-        return line.to_string();
-    }
-    let pattern = regex::Regex::new(r#"(?i)(^|[&|(]\s*)(python(?:\.exe)?)\s+-m\s+venv\s+([\w.\-/\: ]+?)\s*($|&&|&|\|\||\))"#).expect("the pattern is valid");
+/// then its own Python's ensurepip. Which Python it is, is the line's: a bare `python` is the bundle's where there is one (`bundled`, its folder), which has no
+/// venv and is left to say so (`venv_note`); one named by its path is a system's unless it is in the bundle's folder; the `py` launcher's are the system's. One
+/// folder and plain words only.
+fn venv_in_two_steps(line: &str, bundled: Option<&Path>) -> String {
+    let pattern = regex::Regex::new(
+        r#"(?i)(^|[&|(]\s*)("[^"]*\\python(?:\.exe)?"|(?:[^\s"&|()]*\\)?python(?:\.exe)?|py(?:\.exe)?(?:\s+-[0-9][0-9.\-]*)?)\s+-m\s+venv\s+([\w.\-/\\: ]+?)\s*($|&&|&|\|\||\))"#,
+    )
+    .expect("the pattern is valid");
+    let key = |path: &str| path.trim_matches('"').trim_start_matches("\\\\?\\").replace('/', "\\").trim_end_matches('\\').to_lowercase();
     pattern.replace_all(line, |found: &regex::Captures| {
         let (before, program, words, after) = (&found[1], &found[2], found[3].trim(), &found[4]);
+        let path = key(program);
+        let systems = if path.contains('\\') {
+            bundled.is_none_or(|folder| !path.starts_with(&format!("{}\\", key(&folder.to_string_lossy()))))
+        } else {
+            // (`py`, the launcher, or a bare `python`)
+            !path.starts_with("python") || bundled.is_none()
+        };
+        if !systems {
+            return found[0].to_string();
+        }
         let mut options: Vec<&str> = words.split_whitespace().filter(|word| word.starts_with('-')).collect();
         let folders: Vec<&str> = words.split_whitespace().filter(|word| !word.starts_with('-')).collect();
         if folders.len() != 1 || options.iter().any(|option| option.eq_ignore_ascii_case("--without-pip")) {
@@ -2499,10 +2524,16 @@ fn venv_in_two_steps(line: &str, bundled: bool) -> String {
     }).to_string()
 }
 
-/// What is said of a venv the bundle's Python could not make: it has none, as an embeddable Python, and the system's would.
-fn venv_note(out: &str, err: &str) -> Option<&'static str> {
-    (format!("{out}\n{err}").contains("No module named venv") && bundled_python())
-        .then_some("note: this Python is the app's own, an embeddable one with no venv. Where the system has a Python of its own, run that one by its full path for a venv.\n")
+/// What is said of a venv the bundle's Python could not make: it has none, as an embeddable Python, and a project needs none here, as what pip installs goes
+/// to the workspace's own folder for it, which this Python reads. A person's Python in their own folder is not one to turn to: with the bundle's on PATH in
+/// its place, its folder is not opened to commands, and it cannot start in the sandbox (measured: "Access is denied", or no `encodings` module).
+fn venv_note(out: &str, err: &str) -> Option<String> {
+    (format!("{out}\n{err}").contains("No module named venv") && bundled_python().is_some()).then(|| {
+        format!(
+            "note: this Python is the app's own, an embeddable one with no venv, and a project needs none here: `python -m pip install` puts packages in the workspace's `{}`, which this Python and the scripts it runs read. A Python installed in the user's own folder cannot start in the sandbox.\n",
+            crate::bundled::PY_DEPS
+        )
+    })
 }
 
 /// The folder the users' own folders are in (`C:\Users`), from this account's.
@@ -3401,9 +3432,9 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     }
     let no_network = no_network_note(network, done.status, &out, &err);
     report.push_str(no_network.unwrap_or(""));
-    report.push_str(venv_note(&out, &err).unwrap_or(""));
+    report.push_str(&venv_note(&out, &err).unwrap_or_default());
     if runs.contains(GIT_HEAD_WRITTEN) && err.contains("cannot lock ref 'HEAD'") {
-        report.push_str("note: under the users' folder git cannot look at C:\\Users, so `git init` could not lock the new repository's HEAD and stopped (the error above). The line then wrote HEAD and ran `git init` again, which made the rest: the repository is whole, and what came after it ran.\n");
+        report.push_str(&git_init_note(&runs, &cwd));
     }
     if let (Some(before), Some(after)) = (&before, file_states(&cwd)) {
         report.push_str(&described_changes(before, &after));
@@ -5142,19 +5173,43 @@ mod tests {
         assert_eq!(asked.get(), 1, "and once for a line");
     }
 
-    /// A venv of the system's Python is made in two steps, with no pip and then its own ensurepip; with the bundle's Python, two folders, options with no pip
-    /// already, or anything else, the line is as it was.
+    /// A venv of a system's Python is made in two steps, with no pip and then its own ensurepip. Which Python is the line's: with the bundle, a bare `python`
+    /// is its own and is left as it is, one named by its path is a system's unless it is in the bundle's folder, and the launcher's are the system's. Two
+    /// folders, options with no pip already, or anything else, are as they were.
     #[test]
     fn a_venv_of_the_systems_python_is_made_in_two_steps() {
-        assert_eq!(venv_in_two_steps("python -m venv .venv", false), "python -m venv --without-pip .venv && .venv\\Scripts\\python -m ensurepip --upgrade --default-pip");
-        assert_eq!(venv_in_two_steps("python -m venv --clear env/dev && env\\dev\\Scripts\\pip install -r requirements.txt", false),
+        let two = |program: &str, folder: &str| format!(r"{program} -m venv --without-pip {folder} && {folder}\Scripts\python -m ensurepip --upgrade --default-pip");
+        assert_eq!(venv_in_two_steps("python -m venv .venv", None), two("python", ".venv"));
+        assert_eq!(venv_in_two_steps("python -m venv --clear env/dev && env\\dev\\Scripts\\pip install -r requirements.txt", None),
             "python -m venv --clear --without-pip env\\dev && env\\dev\\Scripts\\python -m ensurepip --upgrade --default-pip && env\\dev\\Scripts\\pip install -r requirements.txt");
-        for same in ["python -m venv .venv"] {
-            assert_eq!(venv_in_two_steps(same, true), same, "the bundle's Python");
+        assert_eq!(venv_in_two_steps(r"python -m venv env\dev", None), two("python", r"env\dev"), "a folder with backslashes");
+        let bundle = Some(Path::new(r"C:\Apps\Dogmind\tools\python"));
+        for (line, program) in [
+            (r"C:\Python314\python.exe -m venv .venv", r"C:\Python314\python.exe"),
+            (r#""C:\Program Files\Python314\python.exe" -m venv .venv"#, r#""C:\Program Files\Python314\python.exe""#),
+            ("py -3.14 -m venv .venv", "py -3.14"),
+            ("py -m venv .venv", "py"),
+        ] {
+            assert_eq!(venv_in_two_steps(line, bundle), two(program, ".venv"), "a system's Python, with the bundle there");
         }
-        for same in ["python -m venv a b", "python -m venv --without-pip .venv", "python -m venvx .venv", "python script.py -m venv", "py -m venv .venv"] {
-            assert_eq!(venv_in_two_steps(same, false), same, "{same}");
+        for same in ["python -m venv .venv", r"C:\Apps\Dogmind\tools\python\python.exe -m venv .venv", r#""c:/apps/dogmind/tools/python/python.exe" -m venv .venv"#] {
+            assert_eq!(venv_in_two_steps(same, bundle), same, "the bundle's Python");
         }
+        for same in ["python -m venv a b", "python -m venv --without-pip .venv", "python -m venvx .venv", "python script.py -m venv", "pyx -m venv .venv"] {
+            assert_eq!(venv_in_two_steps(same, None), same, "{same}");
+        }
+    }
+
+    /// The note of a `git init` made whole says it is whole only where the git folder it wrote HEAD in has its objects now.
+    #[test]
+    fn a_git_init_made_whole_is_said_whole_only_when_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = git_init_whole("git init", Path::new(r"C:\Users\someone\app"), Some(Path::new(r"C:\Users")), || "main");
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(git_init_note(&runs, dir.path()).contains("and what that said is above"), "no objects folder yet");
+        std::fs::create_dir_all(dir.path().join(".git").join("objects")).unwrap();
+        assert!(git_init_note(&runs, dir.path()).contains("the repository is whole"));
     }
 
     /// What a person was shown must be what runs: a line this has made is not changed by being gone over again.
