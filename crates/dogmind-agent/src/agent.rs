@@ -402,8 +402,9 @@ pub enum Event {
     ModeChanged(Mode),
     Usage { used: u64, window: u64, usage: Usage },
     Todos(Vec<Value>),
-    /// Files of the workspace the model put before the person (present): its call, and the files from the workspace's root.
-    Presented { call: String, files: Vec<String> },
+    /// Files of the workspace put before the person: the call, and the files from the workspace's root. The model's own `present`; or, `interim`, the app's,
+    /// for a page this turn made that a check has just found running with no error, while the model goes on with it.
+    Presented { call: String, files: Vec<String>, interim: bool },
     /// Whether web content is in this conversation, so that a command that gets the network asks.
     WebSeen(bool),
     Turns(Vec<Turn>),
@@ -1372,6 +1373,10 @@ struct Agent {
     /// The files this turn made, as the calls named them, and whether the model was told of those its answer does not name (`prompt::scratch_files`).
     made_this_turn: Vec<String>,
     scratch_told: bool,
+    /// The files put before the person this turn, by present or as a version in the making.
+    put_before: Vec<String>,
+    /// A page to put before the person in the making, once its check's own line is shown (`page_in_the_making`): the call, and the page.
+    in_the_making: Option<(String, Vec<String>)>,
     /// A page that has passed check_page with no error, and how it has gone since (`prompt::polished`).
     polish: Polish,
     /// This session's use of its workspace: when it moves on and nothing else is there, commands lose their write access to it.
@@ -1682,6 +1687,8 @@ impl Agent {
             goal_due: false,
             round_goal: None,
             made_this_turn: Vec::new(),
+            put_before: Vec::new(),
+            in_the_making: None,
             scratch_told: false,
             polish: Polish::default(),
             #[cfg(windows)]
@@ -2320,7 +2327,7 @@ impl Agent {
         }
         self.traj.begin_turn();
         self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": pictures.len() + kept.len(), "first": new_session}));
-        (self.made_this_turn, self.scratch_told, self.polish) = (Vec::new(), false, Polish::default());
+        (self.made_this_turn, self.scratch_told, self.polish, self.put_before) = (Vec::new(), false, Polish::default(), Vec::new());
         let added = if new_session { None } else { self.servers_caught_up() };
         let mut images = kept;
         if let Some(session) = self.session.as_ref().map(|session| session.path.clone()) {
@@ -3623,6 +3630,10 @@ impl Agent {
         let ran = self.run_call(&call.id, name, &arguments, false);
         self.note_outcome(name, &arguments, &ran.result);
         self.finish_call_with(&call.id, ran.result, ran.declined, started.elapsed(), ran.images);
+        // (under the check's own line, with its pictures: where the person looks for what the check found)
+        if let Some((call, files)) = self.in_the_making.take() {
+            self.emit(Event::Presented { call, files, interim: true });
+        }
         ran.failed
     }
 
@@ -3721,7 +3732,16 @@ impl Agent {
         }
         if name == "present" && result.is_ok() {
             if let Ok(files) = crate::tools::present(arguments, &self.workspace) {
-                self.emit(Event::Presented { call: id.to_string(), files });
+                self.put_before.extend(files.iter().cloned());
+                self.emit(Event::Presented { call: id.to_string(), files, interim: false });
+            }
+        }
+        // A page this turn made, which a check has just found running with no error, is put before the person as present puts it, as a version in the making: the
+        // model goes on polishing it, for minutes (in two comparison runs the page ran at 345 and 430 s, and the person could open it only at the present after
+        // 1,313 and 1,401 s). The model is told nothing of it; its own present takes the card's place.
+        if name == "check_page" && !nested {
+            if let Some(files) = result.as_ref().ok().and_then(|said| self.page_in_the_making(arguments, said)) {
+                self.in_the_making = Some((id.to_string(), files));
             }
         }
         if matches!(name, "create_file" | "apply_patch") && result.is_ok() {
@@ -3737,6 +3757,16 @@ impl Agent {
         // (a command that ran and failed is a failure too: a model can spend an hour on those with nothing being wrong with a call)
         let failed = usize::from(result.as_ref().map_or(true, |output| name == "execute_command" && command_failed(output)));
         Ran { stranger: from_a_stranger && result.is_ok(), images, ..Ran::done(result, failed) }
+    }
+
+    /// The page a check_page was of, to put before the person as a version in the making: one this turn made, not put before them yet, that the check found
+    /// running with no error. It is then counted as put before them.
+    fn page_in_the_making(&mut self, arguments: &Value, said: &str) -> Option<Vec<String>> {
+        let page = arguments.get("path").and_then(Value::as_str)?;
+        let new_here = self.made_this_turn.iter().any(|made| same_file(made, page)) && !self.put_before.iter().any(|shown| same_file(shown, page));
+        let files = crate::tools::present(&json!({"paths": [page]}), &self.workspace).ok().filter(|_| new_here && page_ran_clean(said))?;
+        self.put_before.extend(files.iter().cloned());
+        Some(files)
     }
 
     /// The pictures a check_page took, kept with the conversation as a picture read with read_file is (see `read_picture`), to go with its result: in the
@@ -10174,6 +10204,26 @@ Body").unwrap();
         let last_of = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string();
         assert!(last_of(4).contains("_tmp_make.py") && last_of(4).contains("call finish_goal again"), "{}", last_of(4));
         assert!(last_of(5).contains("The goal is done"), "{}", last_of(5));
+    }
+
+    /// A page this turn made is put before the person in the making at its first check that found it running with no error: once, and not one that was there
+    /// before the turn, one a check found wrong, or one the model has put before them already.
+    #[test]
+    fn a_page_this_turn_made_is_put_before_the_person_at_its_first_clean_check() {
+        let (mut agent, _, _, dirs) = agent_holding(Vec::new(), 100_000, Vec::new());
+        for page in ["kuji.html", "old.html", "shown.html"] {
+            std::fs::write(dirs[0].path().join(page), "<html></html>").unwrap();
+        }
+        let (clean, wrong) = ("Console: nothing, so no errors.", "Console:
+- kuji.html:3: Uncaught TypeError: x");
+        let check = |page: &str| serde_json::json!({"path": page});
+        agent.made_this_turn = vec!["kuji.html".into(), "shown.html".into()];
+        agent.put_before = vec!["shown.html".into()];
+        assert_eq!(agent.page_in_the_making(&check("kuji.html"), wrong), None, "a check that found it wrong");
+        assert_eq!(agent.page_in_the_making(&check("old.html"), clean), None, "a page from before the turn");
+        assert_eq!(agent.page_in_the_making(&check("shown.html"), clean), None, "put before them already");
+        assert_eq!(agent.page_in_the_making(&check("./kuji.html"), clean), Some(vec!["kuji.html".to_string()]));
+        assert_eq!(agent.page_in_the_making(&check("kuji.html"), clean), None, "once");
     }
 
     /// A check's pictures go with its result where a tool's result can show the model one, its lines naming them stay, and they count as seen; with no

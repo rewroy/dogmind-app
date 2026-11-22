@@ -5060,10 +5060,12 @@ impl App {
                 }
                 self.card_room(s(12), Vec::new());
             }
-            Card::Presented { files } => {
+            Card::Presented { files, interim } => {
                 let count = if files.len() == 1 { t("1 file").to_string() } else { tf("{0} files", &[&files.len()]) };
+                // (one the app put there while the model goes on with the page says so, until the model's own present takes its place or the turn ends)
+                let head = if *interim { format!("{}  ·  {count}  ·  {}", t("Files for you"), t("a version in the making")) } else { format!("{}  ·  {count}", t("Files for you")) };
                 self.card_row(&[" "], 6, theme::muted(), 80, true);
-                self.card_row(&[&format!("{}  ·  {count}", t("Files for you"))], 8, theme::muted(), 26, false);
+                self.card_row(&[&head], 8, theme::muted(), 26, false);
                 self.card_room(s(4), Vec::new());
                 for path in files {
                     let tip = if preview::can_show(path) { t("Show beside the conversation") } else if cards::opens_in_app(path) { t("Open in its app") } else { t("Show in Explorer") };
@@ -5113,6 +5115,11 @@ impl App {
                 }
                 Shown::Card(Card::Plan { state, .. }) if *state == PlanState::Waiting => {
                     *state = PlanState::Undecided;
+                    changed = true;
+                }
+                // (a page put there in the making is what the turn left: no longer in the making)
+                Shown::Card(Card::Presented { interim, .. }) if *interim => {
+                    *interim = false;
                     changed = true;
                 }
                 _ => {}
@@ -13743,8 +13750,16 @@ impl App {
                 self.web_seen = on;
                 self.layout();
             }
-            Event::Presented { files, .. } => {
-                self.write_card(&Card::Presented { files });
+            Event::Presented { files, interim, .. } => {
+                // (the model's own present of files the app put there in the making takes that card's place: the latest is the one at the end)
+                if !interim {
+                    let before = self.shown.len();
+                    self.shown.retain(|item| !matches!(item, Shown::Card(Card::Presented { files: shown, interim: true }) if shown.iter().all(|file| files.contains(file))));
+                    if self.shown.len() != before {
+                        self.reflow();
+                    }
+                }
+                self.write_card(&Card::Presented { files, interim });
             }
             Event::Todos(items) => {
                 let lines: Vec<String> = items.iter().map(|item| format!("    {}  {}", task_mark(item["status"].as_str().unwrap_or("")), item["text"].as_str().unwrap_or(""))).collect();

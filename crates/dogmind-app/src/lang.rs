@@ -716,6 +716,7 @@ const JA: &[(&str, &str)] = &[
     ("Show in Explorer", "エクスプローラーで表示"),
     ("Show beside the conversation", "会話の横に表示"),
     ("Files for you", "確認してほしいファイル"),
+    ("a version in the making", "途中の版"),
     ("Question", "質問"),
     ("Send", "送信"),
     ("Suggested", "おすすめ"),
