@@ -33,6 +33,7 @@ pub mod prompt;
 pub mod read_folders;
 pub mod rules;
 pub mod safety;
+pub mod script_syntax;
 #[cfg(windows)]
 pub mod sandbox;
 pub mod session;

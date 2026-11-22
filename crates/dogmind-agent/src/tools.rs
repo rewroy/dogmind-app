@@ -60,6 +60,39 @@ const CREATE_FILE_IN_PARTS: &str = "Write a file, new or one you have read. Over
 /// again (on an RTX 5070 Ti with Qwen3.8 IQ2_XS, a file of some 400 lines took 174 s in 2 to 4 writes, and 143 s in one).
 const CREATE_FILE_WHOLE: &str = "Write a file, new or one you have read, whole in one call: what you write shows as it comes. append=true adds to the end of the file.";
 
+/// The paths an apply_patch call names, its edits' (given as a list or as a string of JSON).
+fn patched_paths(arguments: &Value) -> Vec<String> {
+    let edits = match arguments.get("edits") {
+        Some(Value::String(text)) => serde_json::from_str::<Value>(text).ok(),
+        other => other.cloned(),
+    };
+    let mut paths: Vec<String> = edits.as_ref().and_then(Value::as_array).into_iter().flatten().filter_map(|edit| edit.get("path").and_then(Value::as_str)).map(str::to_string).collect();
+    paths.extend(arguments.get("path").and_then(Value::as_str).map(str::to_string));
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// A write's result, with what a browser would refuse in the scripts of the pages and script files it wrote: their syntax errors, each at its line. A page written
+/// whole is looked at once it is all there (its `</html>`), as one written in parts is not, part by part.
+fn with_script_errors(mut said: String, paths: &[String], workspace: &Path, whole_write: bool) -> String {
+    for path in paths.iter().filter(|path| !path.is_empty()) {
+        let full = resolve(workspace, path);
+        if whole_write && full.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm"))
+            && !std::fs::read_to_string(&full).is_ok_and(|text| text.to_ascii_lowercase().contains("</html>")) {
+            continue;
+        }
+        let errors = crate::script_syntax::errors_in(&full);
+        if errors.is_empty() {
+            continue;
+        }
+        let parts = if whole_write { " (if more of it is still to be appended, finish that first)" } else { "" };
+        said.push_str(&format!("
+note: as a browser reads it, {path} has a syntax error, and the script it is in does not run at all: {}. Fix it before you check the page{parts}.", errors.join("; ")));
+    }
+    said
+}
+
 /// The tools' schemas for a provider whose calls show as they are written: create_file asks for a file whole.
 pub fn for_calls_shown_as_written(schemas: &mut Value) {
     for tool in schemas.as_array_mut().into_iter().flatten() {
@@ -790,9 +823,16 @@ impl Workbench {
     }
 
     pub fn run(&mut self, tool: &str, arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
+        self.run_tool(tool, arguments, workspace, cancel)
+    }
+
+    fn run_tool(&mut self, tool: &str, arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
         match tool {
-            "apply_patch" => self.apply_patch(arguments, workspace),
-            "create_file" => self.create_file(arguments, workspace),
+            "apply_patch" => self.apply_patch(arguments, workspace).map(|said| with_script_errors(said, &patched_paths(arguments), workspace, false)),
+            "create_file" => {
+                let path = arguments.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+                self.create_file(arguments, workspace).map(|said| with_script_errors(said, &[path], workspace, true))
+            }
             "execute_command" => {
                 // A command whose folder is the scratch folder runs there as it would in a workspace: that folder is the only one it may write in.
                 let place = self.scratch_for(arguments).unwrap_or_else(|| workspace.to_path_buf());
@@ -4001,6 +4041,21 @@ mod tests {
         // And done again with nothing in the way, both change.
         bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap();
         assert_eq!((std::fs::read_to_string(&first).unwrap(), std::fs::read_to_string(&second).unwrap()), ("ALPHA\n".to_string(), "BETA\n".to_string()));
+    }
+
+    /// A page or a script written with a syntax error says so in the write's result, at its line; a page not yet whole (no `</html>`) and a clean one say nothing.
+    #[test]
+    fn a_write_with_a_script_that_will_not_parse_says_so() {
+        let (dir, mut bench, cancel) = bench();
+        let page = "<!DOCTYPE html>\n<html><body>\n<script type=\"module\">\nconst a = 1;\nemit(a, 1 and 0);\n</script>\n</body></html>\n";
+        let said = bench.run("create_file", &json!({"path": "page.html", "content": page}), dir.path(), &cancel).unwrap();
+        assert!(said.contains("page.html has a syntax error") && said.contains("line 5: SyntaxError"), "{said}");
+        let part = bench.run("create_file", &json!({"path": "part.html", "content": "<html><script>if (a) {\n"}), dir.path(), &cancel).unwrap();
+        assert!(!part.contains("syntax error"), "not whole yet: {part}");
+        let fixed = bench.run("apply_patch", &json!({"edits": [{"path": "page.html", "old_string": "1 and 0", "new_string": "1 && 0"}]}), dir.path(), &cancel).unwrap();
+        assert!(!fixed.contains("syntax error"), "{fixed}");
+        let broke = bench.run("apply_patch", &json!({"edits": [{"path": "page.html", "old_string": "const a = 1;", "new_string": "const a = (1;"}]}), dir.path(), &cancel).unwrap();
+        assert!(broke.contains("line 4: SyntaxError"), "{broke}");
     }
 
     /// What is written to a file is written in its form: UTF-16 with its mark, appended to as UTF-16; CRLF lines; a UTF-8 mark kept;
