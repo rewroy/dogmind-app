@@ -5638,7 +5638,8 @@ note: the helper took")), "{log:?}");
         let (client, _) = server(vec![
             call_answer("create_file", serde_json::json!({"path": "x.txt", "content": "c"})),
             call_answer("create_file", serde_json::json!({"path": "y.txt", "content": "c"})),
-            text_answer("ok"),
+            // (an answer that names the files it made: one that does not is asked about them, in a request this server has no answer for)
+            text_answer("made x.txt and y.txt"),
         ]);
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Send("go".into())).unwrap();
