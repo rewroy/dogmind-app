@@ -569,6 +569,57 @@ fn browser() -> Option<(PathBuf, &'static str)> {
     PLACES.iter().find_map(|(variable, path, name)| Some((PathBuf::from(std::env::var_os(variable)?).join(path), *name)).filter(|(found, _)| found.is_file()))
 }
 
+/// What is said of a page whose module scripts load its own files: a browser refuses those from file://, which this check allows. It used to say to check it through a local server,
+/// and a model made a page that ran only so: the person opened it from its folder, by a double-click, and nothing of it ran.
+const LOCAL_MODULE_WORDS: &str = "Opened from its file, as the user opens a page by a double-click, its module scripts that load its own files do not run at all: a browser refuses them from file://, which this check allows. Unless the user is to open it from a server, put that code in plain <script> tags, or import only from CDN addresses.";
+
+/// The page of the workspace that a local server's address gives, where one can be told: the address's path under the workspace, or the one file whose path ends so (a server
+/// started in a folder of the workspace), or of several the one written last. None for an address of no page that is there.
+fn page_of_address(url: &str, workspace: &Path) -> Option<PathBuf> {
+    let rest = url.split_once("://")?.1;
+    let path = rest.find('/').map_or("/", |at| &rest[at..]);
+    let path = path.split(['?', '#']).next().unwrap_or("/");
+    let wanted = if path.ends_with('/') { format!("{path}index.html") } else { path.to_string() };
+    let wanted = wanted.trim_start_matches('/').replace('/', "\\");
+    if wanted.is_empty() || wanted.split('\\').any(|part| part == "..") {
+        return None;
+    }
+    let direct = workspace.join(&wanted);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let ending = format!("\\{}", wanted.to_ascii_lowercase());
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut folders = vec![workspace.to_path_buf()];
+    let mut looked = 0usize;
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        for entry in entries.flatten() {
+            looked += 1;
+            if looked > 20_000 {
+                break;
+            }
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if path.is_dir() {
+                if !matches!(name.as_str(), "node_modules" | ".git" | "target" | "dist" | "build") {
+                    folders.push(path);
+                }
+            } else if path.to_string_lossy().to_ascii_lowercase().ends_with(&ending) {
+                found.push(path);
+            }
+        }
+    }
+    found.into_iter().max_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
+}
+
+/// For a check through a local server: what the page does opened from its file, as the user opens it, where it differs. A three.js page served from its folder ran in every
+/// check, and opened from that folder by the person it ran nothing.
+fn opened_from_its_file(url: &str, workspace: &Path) -> Option<String> {
+    let page = page_of_address(url, workspace)?;
+    needs_of(&page).local_module.then(|| format!("AS THE USER OPENS IT: {} is in the workspace. {LOCAL_MODULE_WORDS}\n", page.strip_prefix(workspace).unwrap_or(&page).display()))
+}
+
 /// What in a page cannot load or run with no network, worked out from its text, as nothing the browser prints says so.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Needs {
@@ -696,6 +747,9 @@ fn needs_of(page: &Path) -> Needs {
             Some(address) => follow(&root.join(file_part(address)), &map, &mut seen, &mut remote, &mut missing, root),
             None => imports_of(body, root, &map, &mut seen, &mut remote, &mut missing, root),
         }
+        // (a module written in the page that imports a file of its own is refused from file:// as one with a `src` is: a three.js page that imported the library and its
+        // add-ons from its folder ran nothing when the person opened it, and the check, through a server and with file access allowed, never said so)
+        needs.local_module |= !seen.is_empty();
         if remote.is_empty() {
             needs.run.push(label);
         } else {
@@ -1093,7 +1147,8 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
         out.push_str(&format!("MISSING: {}.\n", needs.missing.join(", ")));
     }
     if needs.local_module {
-        out.push_str("A browser refuses a module script from file:// when the page is opened by double-click, which this check allows: that page needs a local server to be opened, or a plain script. To check it as served, start one in the background (as `python -m http.server 8000 --bind 127.0.0.1`) and give this its `url`.\n");
+        out.push_str(LOCAL_MODULE_WORDS);
+        out.push('\n');
     }
     if served {
         // (what a server gives is not read here beforehand: its console says what ran)
@@ -1137,6 +1192,15 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
 
 /// A page of the workspace, by its path; or, by `url`, what a server on this machine gives, as one the model started in the background.
 pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    let said = check(arguments, workspace, cancel)?;
+    let served = arguments.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty());
+    Ok(match served.and_then(|url| opened_from_its_file(url, workspace)) {
+        Some(first) => format!("{first}{said}"),
+        None => said,
+    })
+}
+
+fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let steps = arguments.get("steps").and_then(Value::as_str).filter(|steps| !steps.trim().is_empty());
     let served = arguments.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty());
     let plain = |path: &Path| path.display().to_string().trim_start_matches("\\\\?\\").to_string();
@@ -1704,6 +1768,33 @@ mod tests {
         assert!(said.contains("DID NOT RUN"), "{said}");
         assert!(said.contains("NOT LOADED, as a check fetches only from well-known CDNs"), "{said}");
         assert!(!said.contains("no errors"), "it does not say all is well of what did not run: {said}");
+    }
+
+    /// A module written in the page that imports its own files is one a browser refuses from file://, as one with a `src` is; one that imports only from a CDN is not.
+    /// Checked through a local server, the page of the workspace the address gives says so first.
+    #[test]
+    fn a_module_in_the_page_that_imports_its_own_files_is_said_not_to_run_from_its_file() {
+        let (dir, index) = page(&[
+            ("gacha/index.html", r#"<script type="importmap">{"imports":{"three":"./three.module.js"}}</script><script type="module">import * as THREE from 'three'; import { a } from './post/pass.js';</script>"#),
+            ("gacha/three.module.js", "export const REVISION = '169';\n"),
+            ("gacha/post/pass.js", "export const a = 1;\n"),
+            ("cdn.html", r#"<script type="module">import * as THREE from 'https://unpkg.com/three@0.161.0/build/three.module.js';</script>"#),
+            ("plain.html", r#"<script>console.log(1)</script>"#),
+        ]);
+        let root = dir.path();
+        assert!(needs_of(&root.join("gacha").join("index.html")).local_module);
+        assert!(!needs_of(&root.join("cdn.html")).local_module && !needs_of(&root.join("plain.html")).local_module);
+        let _ = index;
+        // (the server was started in gacha: its address's path is the file's under it)
+        assert_eq!(page_of_address("http://127.0.0.1:8765/index.html", root), Some(root.join("gacha").join("index.html")));
+        assert_eq!(page_of_address("http://localhost:8000/gacha/", root), Some(root.join("gacha").join("index.html")));
+        assert_eq!(page_of_address("http://localhost:8000/gacha/index.html?x=1#top", root), Some(root.join("gacha").join("index.html")));
+        assert_eq!(page_of_address("http://localhost:8000/none.html", root), None);
+        assert_eq!(page_of_address("http://localhost:8000/../secret.html", root), None);
+        let first = opened_from_its_file("http://127.0.0.1:8765/index.html", root).unwrap();
+        assert!(first.starts_with("AS THE USER OPENS IT: gacha") && first.contains("do not run at all") && !first.contains("http.server"), "{first}");
+        assert_eq!(opened_from_its_file("http://127.0.0.1:8765/plain.html", root), None);
+        assert_eq!(opened_from_its_file("http://127.0.0.1:8765/cdn.html", root), None);
     }
 
     #[test]
