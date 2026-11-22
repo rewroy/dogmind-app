@@ -1003,8 +1003,16 @@ fn looks_like_a_try(path: &str) -> bool {
 
 /// The picture a check_page result says it took: the path after its `read_file`.
 fn picture_of_check(said: &str) -> Option<String> {
-    said.lines().find(|line| line.starts_with("How it looks at")).and_then(|line| line.split("`read_file` ").nth(1)).map(|path| path.trim().to_string())
+    said.lines().find_map(picture_of_line)
 }
+
+/// The picture one line of a check_page result names, where it is a line of one.
+fn picture_of_line(line: &str) -> Option<String> {
+    line.strip_prefix("How it looks at").and_then(|line| line.split("`read_file` ").nth(1)).map(|path| path.trim().to_string()).filter(|path| !path.is_empty())
+}
+
+/// What a check_page result says when its pictures go with it.
+const PICTURES_SHOWN: &str = "These pictures are shown under this call, as read_file would show them, and the user sees them there too: there is no need to read them.";
 
 /// The files a command's result says it made: its `- created PATH (SIZE)` lines.
 fn made_by_command(said: &str) -> Vec<String> {
@@ -3472,9 +3480,10 @@ impl Agent {
                     if self.polish.changed {
                         (self.polish.checks, self.polish.changed) = (self.polish.checks + 1, false);
                     }
-                    (self.polish.picture, self.polish.looked) = (picture_of_check(said), false);
+                    // (a picture that went with the check has been seen)
+                    (self.polish.picture, self.polish.looked) = (picture_of_check(said), said.contains(PICTURES_SHOWN));
                 } else {
-                    self.polish = Polish { page: Some(path), told: self.polish.told, picture: picture_of_check(said), ..Polish::default() };
+                    self.polish = Polish { page: Some(path), told: self.polish.told, picture: picture_of_check(said), looked: said.contains(PICTURES_SHOWN), ..Polish::default() };
                 }
             }
             _ => {}
@@ -3656,6 +3665,7 @@ impl Agent {
         self.bench.mcp_pictures_wanted = false;
         let pictures = std::mem::take(&mut self.bench.mcp_pictures);
         let (result, images) = self.shown_pictures(result, pictures);
+        let (result, images) = if name == "check_page" && !nested { self.with_check_pictures(result, images) } else { (result, images) };
         // A server's answer is as much a stranger's as a page: it may have come from one.
         let from_a_stranger = matches!(name, "web_search" | "web_read") || (name.starts_with("mcp__") && !self.mcp.as_ref().is_some_and(|hub| hub.trusts_tool(name)));
         if from_a_stranger && result.is_ok() && !self.web_seen {
@@ -3686,6 +3696,27 @@ impl Agent {
         // (a command that ran and failed is a failure too: a model can spend an hour on those with nothing being wrong with a call)
         let failed = usize::from(result.as_ref().map_or(true, |output| name == "execute_command" && command_failed(output)));
         Ran { stranger: from_a_stranger && result.is_ok(), images, ..Ran::done(result, failed) }
+    }
+
+    /// The pictures a check_page took, kept with the conversation as a picture read with read_file is (see `read_picture`), to go with its result: in the
+    /// comparison runs, 80 checks were followed by a read_file of their own picture, a round of 3.6 s each (8.9 s at p90). The lines that name them stay, for a look
+    /// later. Made in this turn, each goes at the smaller size of a model's own picture. A model or server that cannot be shown one is left with the lines alone.
+    fn with_check_pictures(&mut self, result: Result<String, String>, mut images: Vec<ImageRef>) -> (Result<String, String>, Vec<ImageRef>) {
+        let Ok(said) = result else { return (result, images) };
+        let shown_here = self.provider.as_ref().is_some_and(|provider| provider.images_in_tool_results() && provider.reads_pictures() != Some(false));
+        let Some(session) = self.session.as_ref().map(|session| session.path.clone()).filter(|_| shown_here) else { return (Ok(said), images) };
+        let limit = self.image_limit();
+        let limit = ImageLimit { side: limit.side.min(OWN_PICTURE_SIDE), ..limit };
+        let before = images.len();
+        for path in said.lines().filter_map(picture_of_line) {
+            if let Ok(image) = images::attach_file(Path::new(&path)).and_then(|picture| images::save(&session, &picture, limit)) {
+                images.push(image);
+            }
+        }
+        if images.len() == before {
+            return (Ok(said), images);
+        }
+        (Ok(format!("{said}{PICTURES_SHOWN}\n")), images)
     }
 
     /// The pictures a server's tool returned, kept with the conversation as a picture read with read_file is (see `read_picture`), to go with its result;
@@ -10064,6 +10095,32 @@ Body").unwrap();
         let last_of = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string();
         assert!(last_of(4).contains("_tmp_make.py") && last_of(4).contains("call finish_goal again"), "{}", last_of(4));
         assert!(last_of(5).contains("The goal is done"), "{}", last_of(5));
+    }
+
+    /// A check's pictures go with its result where a tool's result can show the model one, its lines naming them stay, and they count as seen; with no
+    /// conversation to keep them, or a model that cannot be shown one, the result is as it was.
+    #[test]
+    fn a_checks_pictures_go_with_its_result() {
+        let (mut agent, _, _, dirs) = agent_holding(Vec::new(), 100_000, Vec::new());
+        let picture = dirs[0].path().join("dogmind-page-1-desktop.png");
+        std::fs::write(&picture, images::tests::encoded(16, 16, image::ImageFormat::Png)).unwrap();
+        let said = format!("Console: nothing, so no errors.\nHow it looks at desktop (1280x800), WebGL drawn too (on the CPU, with no GPU): `read_file` {}\n", picture.display());
+        agent.provider = Some(Arc::new(Scripted { tool_pictures: true, ..Scripted::default() }));
+        let (kept, images) = agent.with_check_pictures(Ok(said.clone()), Vec::new());
+        assert_eq!((kept.unwrap(), images.len()), (said.clone(), 0), "no conversation yet");
+        agent.session = Some(Session::create_under(&agent.policy, &agent.sessions, &agent.workspace, &now(), "20261122-000000").unwrap());
+        let (shown, images) = agent.with_check_pictures(Ok(said.clone()), Vec::new());
+        let shown = shown.unwrap();
+        assert_eq!(images.len(), 1);
+        assert!(shown.starts_with(&said) && shown.ends_with(&format!("{PICTURES_SHOWN}\n")), "{shown}");
+        agent.note_outcome("check_page", &serde_json::json!({"path": "kuji.html"}), &Ok(shown));
+        assert!(agent.polish.looked && agent.polish.picture.is_some(), "a picture that went with the check is seen");
+        for provider in [Scripted { tool_pictures: false, ..Scripted::default() }, Scripted { tool_pictures: true, reads: Some(false), ..Scripted::default() }] {
+            agent.provider = Some(Arc::new(provider));
+            let (kept, images) = agent.with_check_pictures(Ok(said.clone()), Vec::new());
+            assert_eq!((kept.unwrap(), images.len()), (said.clone(), 0), "a model that cannot be shown one");
+        }
+        assert!(agent.with_check_pictures(Err("no such page".into()), Vec::new()).0.is_err());
     }
 
     /// A page that passed check_page with no error counts a further such check only after a change to it; an error starts it over, and another page starts again from that one.
