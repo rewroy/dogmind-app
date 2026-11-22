@@ -9973,12 +9973,15 @@ Body").unwrap();
             call_answer("list_files", serde_json::json!({"path": "."})),
             call_answer("create_file", serde_json::json!({"path": "b.txt", "content": "b\n"})),
             call_answer("create_file", serde_json::json!({"path": "c.txt", "content": program})),
-            text_answer("written"),
+            // (an answer that names the files it made: one that does not is asked about them, in a request this server has no answer for, and the turn then
+            // ended only as fast as that request failed)
+            text_answer("wrote b.txt and c.txt"),
         ]);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
         run.handle.commands.send(Command::Send("write it".into())).unwrap();
-        let (_, cancelled) = until_end(&run, Decision::Approve);
+        let (log, cancelled) = until_end(&run, Decision::Approve);
         assert!(!cancelled);
+        assert_eq!(log.last().map(String::as_str), Some("content:wrote b.txt and c.txt"), "the answer ends the turn");
         assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "b\n");
         let bodies = bodies.lock().unwrap();
         let closed: Vec<bool> = bodies.iter().map(|body| body.pointer("/straydog/reasoning") == Some(&serde_json::json!(false))).collect();
