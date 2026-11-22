@@ -966,6 +966,51 @@ fn after_the_line_number(line: &str) -> Option<&str> {
     None
 }
 
+/// A page that passed check_page with no error: which, whether it has been changed since its last such check, and how many more such checks have followed a change.
+#[derive(Default)]
+struct Polish {
+    page: Option<String>,
+    changed: bool,
+    checks: u32,
+    told: bool,
+    /// The picture of its latest check with no error, and whether the model has looked at it since.
+    picture: Option<String>,
+    looked: bool,
+}
+
+/// How many more checks with no error, each after a change to the page, before the model is told the page works and to answer.
+const POLISHED_AFTER: u32 = 3;
+
+/// Whether what check_page said is of a page that ran with nothing wrong: none of what it says of an error, a script that did not run or load, a file missing, a page
+/// that does not run opened from its file, or a check that could not be made.
+fn page_ran_clean(said: &str) -> bool {
+    const WRONG: [&str; 10] = ["Uncaught", "Error", "error:", "DID NOT RUN", "NOT CHECKED", "NOT LOADED", "MISSING", "COULD NOT BE LOADED", "AS THE USER OPENS IT", "Failed to"];
+    !WRONG.iter().any(|word| said.contains(word)) || said.contains("so no errors") && !said.contains("DID NOT RUN") && !said.contains("AS THE USER OPENS IT") && !said.contains("NOT LOADED")
+}
+
+/// Whether two paths as calls name them are one file: the same once their slashes and case are made alike, or one the other's end (a full path and the workspace's).
+fn same_file(one: &str, other: &str) -> bool {
+    let plain = |path: &str| path.replace('\\', "/").trim_start_matches("./").to_lowercase();
+    let (one, other) = (plain(one), plain(other));
+    one == other || one.ends_with(&format!("/{other}")) || other.ends_with(&format!("/{one}"))
+}
+
+/// Whether a file's name is one a model gives a try of its own: `_probe.html`, `_t3.html`, `_tmp_make.py`, `scratch.js`, `debug_page.html`.
+fn looks_like_a_try(path: &str) -> bool {
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase();
+    file.starts_with('_') || ["tmp", "temp", "probe", "scratch", "debug"].iter().any(|word| file.contains(word))
+}
+
+/// The picture a check_page result says it took: the path after its `read_file`.
+fn picture_of_check(said: &str) -> Option<String> {
+    said.lines().find(|line| line.starts_with("How it looks at")).and_then(|line| line.split("`read_file` ").nth(1)).map(|path| path.trim().to_string())
+}
+
+/// The files a command's result says it made: its `- created PATH (SIZE)` lines.
+fn made_by_command(said: &str) -> Vec<String> {
+    said.lines().filter_map(|line| line.trim_start().strip_prefix("- created ")).map(|rest| rest.rsplit_once(" (").map_or(rest, |(path, _)| path).trim().to_string()).collect()
+}
+
 /// Where a model whose thinking was closed ended the thinking it wrote in its answer's text anyway.
 const THINK_END: &str = "</think>";
 
@@ -1281,6 +1326,11 @@ struct Agent {
     goal_due: bool,
     /// This turn's goal and its rounds, while there is one.
     round_goal: Option<RoundGoal>,
+    /// The files this turn made, as the calls named them, and whether the model was told of those its answer does not name (`prompt::scratch_files`).
+    made_this_turn: Vec<String>,
+    scratch_told: bool,
+    /// A page that has passed check_page with no error, and how it has gone since (`prompt::polished`).
+    polish: Polish,
     /// This session's use of its workspace: when it moves on and nothing else is there, commands lose their write access to it.
     #[cfg(windows)]
     place: Option<crate::workspace_grants::Use>,
@@ -1588,6 +1638,9 @@ impl Agent {
             goal: None,
             goal_due: false,
             round_goal: None,
+            made_this_turn: Vec::new(),
+            scratch_told: false,
+            polish: Polish::default(),
             #[cfg(windows)]
             place: None,
             sessions: config.sessions,
@@ -2224,6 +2277,7 @@ impl Agent {
         }
         self.traj.begin_turn();
         self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": pictures.len() + kept.len(), "first": new_session}));
+        (self.made_this_turn, self.scratch_told, self.polish) = (Vec::new(), false, Polish::default());
         let added = if new_session { None } else { self.servers_caught_up() };
         let mut images = kept;
         if let Some(session) = self.session.as_ref().map(|session| session.path.clone()) {
@@ -2382,6 +2436,17 @@ impl Agent {
             }
             _ => return Err("result is done or blocked".to_string()),
         };
+        // (done, and files made in this turn that neither the objective nor the evidence names: once, before it closes, while it can still delete them)
+        if matches!(end, GoalEnd::Done) && !self.scratch_told {
+            let named = format!("{} {}", goal.objective, said("evidence").unwrap_or_default());
+            let left = self.scratch_left(&named);
+            if !left.is_empty() {
+                self.scratch_told = true;
+                self.intervened("scratch_files", json!({"files": left, "at": "finish_goal"}));
+                return Err(prompt::scratch_files(&left, true));
+            }
+        }
+        let Some(goal) = self.round_goal.as_mut() else { return Err("no goal is set for this turn".to_string()) };
         let round = goal.round;
         goal.finished = Some(end);
         goal.closing = true;
@@ -3036,6 +3101,14 @@ impl Agent {
                     return Ended::Failed(format!("the model made the same call {most} times with nothing edited in between: stopped so that you can look"));
                 }
                 unchecked = still_unchecked(unchecked, &[calls.as_slice(), nested.as_slice()].concat());
+                // (only once it has looked at the page as it is now: what it is told is to go through what was asked against that picture)
+                if !self.polish.told && self.polish.checks >= POLISHED_AFTER && self.polish.looked {
+                    self.polish.told = true;
+                    let (page, checks) = (self.polish.page.clone().unwrap_or_default(), self.polish.checks);
+                    let goal = self.round_goal.as_ref().is_some_and(|goal| goal.finished.is_none());
+                    self.intervened("polished", json!({"page": page, "checks": checks}));
+                    self.push(Message::text("user", prompt::polished(&page, checks, goal)));
+                }
                 continue;
             }
             if completion.finish == "length" {
@@ -3076,6 +3149,16 @@ impl Agent {
                     asked_about_slips = true;
                     self.intervened("slip_note", json!({"letters": letters.chars().count()}));
                     self.push(Message::text("user", prompt::slip_note(&letters)));
+                    continue;
+                }
+            }
+            // Once a turn, with no goal open or closing: files it made that its answer does not name, to delete those that were only for checking.
+            if !self.scratch_told && self.round_goal.is_none() && self.mode != Mode::Plan {
+                let left = self.scratch_left(&said);
+                if !left.is_empty() {
+                    self.scratch_told = true;
+                    self.intervened("scratch_files", json!({"files": left, "at": "answer"}));
+                    self.push(Message::text("user", prompt::scratch_files(&left, false)));
                     continue;
                 }
             }
@@ -3355,9 +3438,74 @@ impl Agent {
                 None => result,
             };
             failures += usize::from(result.is_err());
+            self.note_outcome(&call.function.name, arguments, &result);
             self.finish_call(&call.id, result, false, started.elapsed());
         }
         failures
+    }
+
+    /// What a call that ended says for the notes before an answer: the files it made, and how a page's checks have gone.
+    fn note_outcome(&mut self, name: &str, arguments: &Value, result: &Result<String, String>) {
+        let Ok(said) = result else {
+            if name == "check_page" {
+                self.polish = Polish { told: self.polish.told, ..Polish::default() };
+            }
+            return;
+        };
+        let path = arguments.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let mut changed: Vec<String> = Vec::new();
+        match name {
+            "create_file" => {
+                if said.starts_with("created ") && !path.is_empty() {
+                    self.made_this_turn.push(path.clone());
+                }
+                changed.push(path);
+            }
+            "apply_patch" => changed.extend(arguments.get("edits").and_then(Value::as_array).into_iter().flatten().filter_map(|edit| edit.get("path").and_then(Value::as_str)).map(str::to_string)),
+            "edit" => changed.extend(arguments.get("file_path").and_then(Value::as_str).map(str::to_string)),
+            "execute_command" => self.made_this_turn.extend(made_by_command(said)),
+            "read_file" if self.polish.picture.as_deref().is_some_and(|picture| same_file(picture, &path)) => self.polish.looked = true,
+            "check_page" if !path.is_empty() => {
+                if !page_ran_clean(said) {
+                    self.polish = Polish { told: self.polish.told, ..Polish::default() };
+                } else if self.polish.page.as_deref().is_some_and(|page| same_file(page, &path)) {
+                    if self.polish.changed {
+                        (self.polish.checks, self.polish.changed) = (self.polish.checks + 1, false);
+                    }
+                    (self.polish.picture, self.polish.looked) = (picture_of_check(said), false);
+                } else {
+                    self.polish = Polish { page: Some(path), told: self.polish.told, picture: picture_of_check(said), ..Polish::default() };
+                }
+            }
+            _ => {}
+        }
+        if let Some(page) = self.polish.page.as_deref() {
+            if changed.iter().any(|path| same_file(path, page)) {
+                self.polish.changed = true;
+            }
+        }
+    }
+
+    /// The files this turn made that are still there and that `named` (an answer, an objective) and the person's last message do not name.
+    fn scratch_left(&self, named: &str) -> Vec<String> {
+        let asked = self.messages.iter().rev().find(|message| Self::of_the_person(message)).and_then(|message| message.content.as_deref()).map_or("", prompt::typed_text).to_lowercase();
+        let named = named.to_lowercase();
+        let mut left: Vec<String> = Vec::new();
+        for path in &self.made_this_turn {
+            let file = path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase();
+            // (in the workspace alone: a file written outside it was asked for there, and the person allowed it)
+            let full = resolve(&self.workspace, path);
+            if file.is_empty() || named.contains(&file) || asked.contains(&file) || !full.is_file() || !crate::safety::inside(&self.workspace, &full) || left.iter().any(|kept| same_file(kept, path)) {
+                continue;
+            }
+            left.push(path.clone());
+        }
+        // (one file left that has no name of a try is the one the turn was for, written without its name in the answer, as most answers are: a word about it would be a
+        // round for nothing in most turns)
+        if left.len() == 1 && !looks_like_a_try(&left[0]) {
+            left.clear();
+        }
+        left
     }
 
     /// The model's question to the person, with its choices (ask_user): two to six, the first the model's pick. The turn waits for the answer;
@@ -3423,6 +3571,7 @@ impl Agent {
         };
         self.tool_started(&call.id, name, Some(&arguments), &call.function.arguments, 1);
         let ran = self.run_call(&call.id, name, &arguments, false);
+        self.note_outcome(name, &arguments, &ran.result);
         self.finish_call_with(&call.id, ran.result, ran.declined, started.elapsed(), ran.images);
         ran.failed
     }
@@ -3603,6 +3752,7 @@ impl Agent {
         self.bench.in_program = true;
         let ran = self.run_call(&id, name, &arguments, true);
         self.bench.in_program = false;
+        self.note_outcome(name, &arguments, &ran.result);
         let (ok, output) = match &ran.result {
             Ok(output) => (true, output.clone()),
             Err(error) => (false, format!("error: {error}")),
@@ -9863,6 +10013,111 @@ Body").unwrap();
         let lines = trajectory_of(&run);
         assert!(of_kind(&lines, "intervention").iter().any(|line| line["kind"] == "thinking_in_text" && line["chars"] == 34), "{lines:?}");
         assert_eq!(of_kind(&lines, "intervention").iter().find(|line| line["kind"] == "draft_stop").unwrap()["next_call_required"], true);
+    }
+
+    /// Files the turn made that its answer does not name are told of once before it ends, to delete those that were only for checking; a file it names is not.
+    #[test]
+    fn files_made_for_checking_are_told_of_once_before_the_answer() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (client, bodies) = server(vec![
+            call_answer("create_file", serde_json::json!({"path": "page.html", "content": "<p>the page</p>\n"})),
+            call_answer("create_file", serde_json::json!({"path": "_probe.html", "content": "<p>a try</p>\n"})),
+            text_answer("page.html is ready."),
+            call_answer("execute_command", serde_json::json!({"command": "del _probe.html"})),
+            text_answer("page.html is ready, and the try is gone."),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("make a page".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 5, "{log:?}");
+        let last_of = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string();
+        let note = last_of(3);
+        assert!(note.contains("Files you made in this turn") && note.contains("_probe.html") && !note.contains("page.html,") && !note.contains(": page.html"), "{note}");
+        assert!(!dir.path().join("_probe.html").exists() && dir.path().join("page.html").exists());
+        let lines = trajectory_of(&run);
+        let told: Vec<&Value> = of_kind(&lines, "intervention").into_iter().filter(|line| line["kind"] == "scratch_files").collect();
+        assert_eq!(told.len(), 1, "once: {told:?}");
+        assert_eq!(told[0]["files"], serde_json::json!(["_probe.html"]));
+    }
+
+    /// With a goal, the files are told of when it is marked done, which is refused once for them while calls can still be made; the second finish closes it.
+    #[test]
+    fn a_goal_marked_done_with_files_made_for_checking_is_told_of_them_first() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (client, bodies) = server(vec![
+            call_answer("set_goal", serde_json::json!({"objective": "make page.html"})),
+            call_answer("create_file", serde_json::json!({"path": "page.html", "content": "x\n"})),
+            call_answer("create_file", serde_json::json!({"path": "_tmp_make.py", "content": "print(1)\n"})),
+            call_answer("finish_goal", serde_json::json!({"result": "done", "evidence": "page.html opened"})),
+            call_answer("finish_goal", serde_json::json!({"result": "done", "evidence": "page.html opened"})),
+            text_answer("page.html is made."),
+            // (and the word about what it wrote and never ran, which comes after an answer as it does)
+            text_answer("It was not run here."),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("make page.html".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 7, "{log:?}");
+        let last_of = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string();
+        assert!(last_of(4).contains("_tmp_make.py") && last_of(4).contains("call finish_goal again"), "{}", last_of(4));
+        assert!(last_of(5).contains("The goal is done"), "{}", last_of(5));
+    }
+
+    /// A page that passed check_page with no error counts a further such check only after a change to it; an error starts it over, and another page starts again from that one.
+    #[test]
+    fn a_page_counts_clean_checks_after_changes_and_starts_over_on_an_error() {
+        let (mut agent, _, _, _dirs) = agent_holding(Vec::new(), 100_000, Vec::new());
+        let clean: Result<String, String> = Ok("Console: nothing, so no errors.".into());
+        let check = |page: &str| serde_json::json!({"path": page});
+        let patch = |page: &str| serde_json::json!({"edits": [{"path": page, "old_string": "a", "new_string": "b"}]});
+        agent.note_outcome("check_page", &check("kuji.html"), &clean);
+        agent.note_outcome("check_page", &check("kuji.html"), &clean);
+        assert_eq!(agent.polish.checks, 0, "not changed between");
+        for round in 1..=2 {
+            agent.note_outcome("apply_patch", &patch("kuji.html"), &Ok("--- applied".into()));
+            agent.note_outcome("check_page", &check("./kuji.html"), &clean);
+            assert_eq!(agent.polish.checks, round);
+        }
+        // (its picture: looked at only when the model reads that one, and not yet after the next check)
+        let pictured: Result<String, String> = Ok("Console: nothing, so no errors.\nHow it looks at desktop (1280x800), WebGL drawn too: `read_file` C:\\AC\\dogmind-page-1-desktop.png".into());
+        agent.note_outcome("apply_patch", &patch("kuji.html"), &Ok("--- applied".into()));
+        agent.note_outcome("check_page", &check("kuji.html"), &pictured);
+        assert_eq!((agent.polish.checks, agent.polish.looked), (3, false));
+        agent.note_outcome("read_file", &serde_json::json!({"path": "C:\\AC\\other.png"}), &Ok(String::new()));
+        assert!(!agent.polish.looked);
+        agent.note_outcome("read_file", &serde_json::json!({"path": "C:\\AC\\dogmind-page-1-desktop.png"}), &Ok(String::new()));
+        assert!(agent.polish.looked);
+        agent.note_outcome("apply_patch", &patch("kuji.html"), &Ok("--- applied".into()));
+        agent.note_outcome("check_page", &check("kuji.html"), &clean);
+        assert_eq!((agent.polish.checks, agent.polish.looked, agent.polish.picture.is_none()), (4, false, true), "a new check, and its picture not seen");
+        agent.note_outcome("apply_patch", &patch("other.css"), &Ok("--- applied".into()));
+        agent.note_outcome("check_page", &check("kuji.html"), &clean);
+        assert_eq!(agent.polish.checks, 4, "a change to another file is not one to the page");
+        agent.note_outcome("apply_patch", &patch("kuji.html"), &Ok("--- applied".into()));
+        agent.note_outcome("check_page", &check("kuji.html"), &Ok("Console:\n- kuji.html:3: Uncaught TypeError: x".into()));
+        assert_eq!((agent.polish.checks, agent.polish.page.is_none()), (0, true), "an error starts it over");
+        agent.note_outcome("check_page", &check("b.html"), &clean);
+        assert_eq!(agent.polish.page.as_deref(), Some("b.html"));
+        // (and the files a turn made: a new one, and a command's)
+        agent.note_outcome("create_file", &serde_json::json!({"path": "_t.html"}), &Ok("created _t.html: now 3 lines".into()));
+        agent.note_outcome("create_file", &serde_json::json!({"path": "kuji.html"}), &Ok("wrote kuji.html: now 30 lines".into()));
+        agent.note_outcome("execute_command", &serde_json::json!({"command": "python make.py"}), &Ok("exit_code: 0\nfiles changed by this command:\n- created _tmp_a.html (10 bytes)\n".into()));
+        assert_eq!(agent.made_this_turn, ["_t.html", "_tmp_a.html"]);
+    }
+
+    /// What says a page ran clean, the files a command made by its result, and one file named two ways.
+    #[test]
+    fn a_clean_check_a_commands_files_and_one_file_named_two_ways() {
+        assert!(page_ran_clean("page.html in headless Edge, with no network.\nRan: the page's script 1.\nConsole: nothing, so no errors.\nShows: title \"t\""));
+        assert!(page_ran_clean("Console:\n- page.html:10: ready 3\nShows: title \"t\""), "the page's own logs are not errors");
+        assert_eq!(picture_of_check("Ran.\nHow it looks at desktop (1280x800): `read_file` C:\\x\\p.png\nConsole at 480"), Some("C:\\x\\p.png".to_string()));
+        for wrong in ["Console:\n- page.html:3: Uncaught TypeError: x is not a function", "DID NOT RUN, as they need those", "AS THE USER OPENS IT: page.html is in the workspace.", "MISSING: a.js."] {
+            assert!(!page_ran_clean(wrong), "{wrong}");
+        }
+        assert_eq!(made_by_command("exit_code: 0\nfiles changed by this command:\n- created gacha/three.module.js (1304798 bytes)\n- changed a.txt (3 bytes)\n- created b c.txt (1 bytes)\n"), ["gacha/three.module.js", "b c.txt"]);
+        assert!(same_file("kuji.html", "./KUJI.html") && same_file("C:\\work\\gacha\\index.html", "gacha/index.html") && !same_file("kuji.html", "kuji_new.html"));
     }
 
     /// The records are the sessions' folder and the engine's log beside the rules, and the model is told where they are, the log only where there is one.

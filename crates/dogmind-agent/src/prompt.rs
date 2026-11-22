@@ -298,6 +298,20 @@ pub fn goal_round(round: u32, most: u32, objective: &str) -> String {
 pub fn goal_closing(how: &str) -> String {
     format!("{DRAFT_NOTE}The goal is {how}. Write your answer to the user now: what came of it, what was done and how it was checked, where the results are (files, commits); if blocked, what stops it, what you tried, and exactly what you need from the user. Only what this session's tools showed. No more tool calls.")
 }
+/// Before the turn's answer, once: the files it made that its answer does not name, to delete those that were only for checking. In two lottery turns a DeepSeek model left
+/// _cdncheck.html, _t3.html, _tmp_all_super.html, _tmp_kuji_full.html and _tmp_make.py in the person's folder beside the page it was asked for.
+pub fn scratch_files(files: &[String], goal: bool) -> String {
+    let then = if goal { "then call finish_goal again" } else { "then give your answer again" };
+    format!("{DRAFT_NOTE}Files you made in this turn that neither your answer nor the user names: {}. Delete those that were only for checking, in one command, and keep what the user's work needs; {then}.", files.join(", "))
+}
+
+/// After a page has passed check_page with no error, and has been changed and passed again and again, and the model has looked at its latest picture: to go through what was
+/// asked against that picture, and answer if nothing is missing. Two lottery turns went on so until their 25 minutes were up, with no answer written; and the owner: speed
+/// matters, and so does quality, so it is not told to stop, but to see whether all that was asked is there.
+pub fn polished(page: &str, checks: u32, goal: bool) -> String {
+    let close = if goal { ", closing the goal with finish_goal" } else { "" };
+    format!("{DRAFT_NOTE}{page} has passed check_page with no error {checks} more times since it first did, with changes between, and you have looked at its latest picture. Go through what the user asked for, one thing at a time, against that picture and the page. If each is there and right, stop changing it and answer now{close}; if one is missing or wrong, fix that one and check it again.")
+}
 pub const CONTINUE_NUDGE: &str = "Your last answer was cut off by the output limit. Continue exactly where it stopped.";
 /// What the model is told when its connection broke while it was making calls: they were not made, and nothing says so otherwise.
 pub fn calls_broken_off(names: &[&str]) -> String {
