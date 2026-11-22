@@ -1061,29 +1061,6 @@ fn made_by_command(said: &str) -> Vec<String> {
 /// Where a model whose thinking was closed ended the thinking it wrote in its answer's text anyway.
 const THINK_END: &str = "</think>";
 
-/// The lines a call writes into files: a new file's, or the new text of each edit. None for a call that writes nothing, or whose arguments are not JSON.
-fn lines_written(name: &str, arguments: &str) -> usize {
-    let Ok(arguments) = serde_json::from_str::<Value>(arguments) else { return 0 };
-    let lines = |text: Option<&Value>| match text {
-        Some(Value::String(text)) => text.lines().count(),
-        Some(Value::Array(lines)) => lines.len(),
-        _ => 0,
-    };
-    match name {
-        "create_file" => lines(arguments.get("content")),
-        "edit" => lines(arguments.get("new_string")),
-        "apply_patch" => {
-            // (`edits` as a string of JSON is taken as `apply_patch` takes it)
-            let edits = match arguments.get("edits") {
-                Some(Value::String(text)) => serde_json::from_str::<Value>(text).ok(),
-                other => other.cloned(),
-            };
-            edits.as_ref().and_then(Value::as_array).map_or(0, |edits| edits.iter().map(|edit| lines(edit.get("new_string"))).sum())
-        }
-        _ => 0,
-    }
-}
-
 /// Dogmind's own records that commands and the tools may read: the folder of its conversations, each with its trajectory, the engine's log beside the rules, and
 /// the folder the app is installed in, whose version and files a session asked about the app looked at outside the sandbox. Not that folder where the app's
 /// data is in it or it is in the app's data: what it opened would be the settings too.
@@ -1282,6 +1259,14 @@ fn draft_stopped_note(reasoned: &str, stopped_before: u32, began: Option<usize>)
         return format!("{}You started on the code in your reasoning again. What you have thought so far is here, and it is enough:\n{}\nWrite the code now, once, in the file it goes in, and put no code in your reasoning.", prompt::DRAFT_NOTE, &decided[start..]);
     }
     format!("{}You are writing the program in your reasoning, and all of it would be typed again where it goes. Your reasoning so far:\n{}\nWrite the code now, from its first line, where your task needs it: in the file it goes in, under that file's own name, with create_file for a new file or one written anew whole, and apply_patch for part of one; in your answer if no file is to be changed. Decide the rest of the design in the file, and improve it afterwards.", prompt::DRAFT_NOTE, &decided[start..])
+}
+
+/// What goes back after a stop whose reasoning the conversation kept (the message before this one): to write, from what is there. No part of it is said again.
+fn draft_stopped_note_kept(stopped_before: u32) -> String {
+    if stopped_before > 0 {
+        return format!("{}You started on the code in your reasoning again. Your reasoning so far is above, and it is enough: write the code now, once, in the file it goes in, and put no code in your reasoning.", prompt::DRAFT_NOTE);
+    }
+    format!("{}You are writing the program in your reasoning, and all of it would be typed again where it goes. Your reasoning so far is above: write the code now, from its first line, where your task needs it: in the file it goes in, under that file's own name, with create_file for a new file or one written anew whole, and apply_patch for part of one; in your answer if no file is to be changed. Decide the rest of the design in the file, and improve it afterwards.", prompt::DRAFT_NOTE)
 }
 
 /// `apply_patch` with the path beside the edits, for all of them, or one edit's fields with no list, is how it comes out of a model often enough, and the call failing means every edit typed again.
@@ -2809,8 +2794,8 @@ impl Agent {
         let (mut cut_off, mut empties) = (0u32, 0u32);
         let mut drafts_stopped = 0u32;
         // Whether the requests have their thinking closed, after a draft stop, until they have written the program; and the lines they have written since the stop.
+        // (closed after a stop whose reasoning the conversation kept, for the next request alone: what it had worked out is there to go on from)
         let mut thinking_closed = false;
-        let mut written_since_stop = 0usize;
         let mut wrote = false;
         let mut repeats: HashMap<String, u32> = HashMap::new();
         // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
@@ -2985,18 +2970,30 @@ impl Agent {
                 // than the two closed ones, which wrote at once (27 and 95 s). Closed for one request alone, a look at the folder first (4 s) used it up, and the request
                 // after it thought for 410 s (66,369 characters) before it wrote. Once a file is written, the next request thinks as before.
                 let plain = provider.close_thinking_once();
-                (thinking_closed, written_since_stop) = (plain, 0);
+                thinking_closed = plain;
                 // (and the first request after it answers with a call: the note says to write)
                 let required = provider.require_call_once();
                 let fenced = watch.as_ref().map_or(0, DraftWatch::fenced);
-                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "fenced": fenced, "next_without_thinking": plain, "next_call_required": required}));
-                // (what it had reasoned, which the conversation goes on without, is kept with it, under its encryption: for a later look at where it could have been stopped)
-                if let Some(session) = self.session.as_mut() {
-                    let _ = session.keep_stopped(&req_id, &reasoned);
+                // Where the server is sent back what its model reasoned (Straydog, whose DeepSeek template draws past reasoning in a conversation with tools), the
+                // reasoning stays in the conversation, as the stopped request's message: the next prompt is then what the server generated, to the cut, and it goes on
+                // from there with nothing read again, and what was worked out is not lost. Its thinking is closed for the next request alone. Thrown away, the four
+                // stops of four comparison runs lost 606 s of generation, and a model that then wrote patch after patch with its thinking closed (it never came to a
+                // draft's lines written) went on so for 22 to 30 requests, and gave no answer.
+                let kept = plain;
+                self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "fenced": fenced, "next_without_thinking": plain, "next_call_required": required, "reasoning_kept": kept}));
+                if kept {
+                    self.push(Message { role: "assistant".into(), content: Some(written.clone()), reasoning_content: Some(reasoned.clone()), ..Message::default() });
+                    self.emit(Event::AssistantEnded);
+                    self.push(Message::text("user", draft_stopped_note_kept(drafts_stopped)));
+                } else {
+                    // (what it had reasoned, which the conversation goes on without, is kept with it, under its encryption: for a later look at where it could have been stopped)
+                    if let Some(session) = self.session.as_mut() {
+                        let _ = session.keep_stopped(&req_id, &reasoned);
+                    }
+                    // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
+                    self.keep_written(&written);
+                    self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped, watch.as_ref().map(DraftWatch::began_at))));
                 }
-                // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
-                self.keep_written(&written);
-                self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped, watch.as_ref().map(DraftWatch::began_at))));
                 drafts_stopped += 1;
                 self.emit(Event::AssistantEnded);
                 continue;
@@ -3125,13 +3122,10 @@ impl Agent {
                     completion.reasoning.push_str(&thought);
                 }
             }
-            // (the program written, as many lines as a draft that is stopped, in one file or in several writes: what the stop closed the thinking for is done. Not any
-            // file: a picture of 20 lines, and a page of 43 to try a thing in, opened it in two turns, and the next request drafted the same program again for 220 s,
-            // to be stopped again. `edit` is a write too, though it is an `apply_patch` only when it runs.)
-            if thinking_closed {
-                written_since_stop += completion.tool_calls.iter().map(|call| lines_written(&call.function.name, &call.function.arguments)).sum::<usize>();
-                thinking_closed = written_since_stop < DRAFT_LINES;
-            }
+            // (one request with its thinking closed after a stop: the reasoning it stopped is in the conversation, and a second whole draft is stopped again by
+            // LONG_DRAFT_LINES. Kept closed until a draft's lines were written, as when the reasoning was thrown away, a model writing patch after patch went on so
+            // for 22 to 30 requests and gave no answer.)
+            thinking_closed = false;
             // The model's own limit in the middle of a file: as with a broken connection, what it wrote stays and it goes on.
             if cuts && completion.finish == "length" {
                 if let Some((answer, path, tail)) = cut_answer(&completion.content, &completion.reasoning, &completion.tool_calls, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) {
@@ -6490,15 +6484,25 @@ note: the helper took")), "{log:?}");
     /// A shader drafted with no fence: a real wave job thought on for 3,600 characters more after what is stopped here.
     #[test]
     fn a_draft_with_no_fence_is_stopped_too_and_goes_on_from_what_was_decided() {
-        let dir = crate::in_container::tempdir().unwrap();
-        let (client, bodies, _, _went) = thinking_server(0, vec![text_answer("written")]);
-        let run = run_agent(dir.path(), client, Mode::Default);
-        run.handle.commands.send(Command::Send("write it".into())).unwrap();
-        let (log, cancelled) = until_end(&run, Decision::Reject);
-        assert!(!cancelled && log.last().unwrap() == "content:written", "{log:?}");
-        let bodies = bodies.lock().unwrap();
-        let last = bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
-        assert!(last.contains("A page with sliders.") && !last.contains("float h"), "{last}");
+        // (a server that is sent its reasoning back keeps it in the conversation; one that is not is given what was decided in the note, the code left out)
+        for replays in [true, false] {
+            let dir = crate::in_container::tempdir().unwrap();
+            let (mut client, bodies, _, _went) = thinking_server(0, vec![text_answer("written")]);
+            client.replay_reasoning = replays;
+            let run = run_agent(dir.path(), client, Mode::Default);
+            run.handle.commands.send(Command::Send("write it".into())).unwrap();
+            let (log, cancelled) = until_end(&run, Decision::Reject);
+            assert!(!cancelled && log.last().unwrap() == "content:written", "{log:?}");
+            let bodies = bodies.lock().unwrap();
+            let messages = bodies[1]["messages"].as_array().unwrap();
+            let last = messages.last().unwrap()["content"].as_str().unwrap().to_string();
+            if replays {
+                assert!(messages[messages.len() - 2]["reasoning_content"].as_str().unwrap().contains("float h") && last.contains("Your reasoning so far is above"), "{last}");
+            } else {
+                assert!(last.contains("A page with sliders.") && !last.contains("float h"), "{last}");
+                assert!(!messages.iter().any(|message| message["role"] == "assistant"), "what was cut is not in what goes back");
+            }
+        }
     }
 
     /// One piece of an answer's stream, as a chunk of SSE.
@@ -6590,15 +6594,13 @@ note: the helper took")), "{log:?}");
         let bodies = bodies.lock().unwrap();
         let (first, second) = (bodies[0]["messages"].as_array().unwrap(), bodies[1]["messages"].as_array().unwrap());
         assert_eq!(second[..first.len()], first[..], "the same prefix to the byte");
-        assert!(second.last().unwrap()["content"].as_str().unwrap().contains("A page with sliders."));
+        assert!(second[first.len()]["reasoning_content"].as_str().unwrap().contains("A page with sliders."));
         assert_eq!(bodies[1].get("reasoning_effort"), bodies[0].get("reasoning_effort"));
-        // What it had reasoned is kept with the conversation, which goes on without it, and the stopped request's line says where its fenced lines came to each mark.
+        // What it had reasoned is in the conversation (and so needs no line of its own), and the stopped request's line says where its fenced lines came to each mark.
         let files: Vec<PathBuf> = std::fs::read_dir(run._sessions.path()).unwrap().flatten().map(|entry| entry.path()).collect();
         let session = files.iter().find(|path| path.to_string_lossy().ends_with(".jsonl") && !path.to_string_lossy().ends_with(".trajectory.jsonl")).unwrap();
-        let stopped = crate::session::stopped_of(session);
-        assert_eq!(stopped.len(), 1);
-        assert!(stopped[0].1.starts_with("A page with sliders.\n```\nfloat h = 0.0;"), "{}", &stopped[0].1[..60]);
-        assert!(!crate::session::read(session).unwrap().iter().any(|message| message.reasoning_content.as_deref().is_some_and(|said| said.contains("float h"))), "not in the conversation");
+        assert!(crate::session::stopped_of(session).is_empty());
+        assert!(crate::session::read(session).unwrap().iter().any(|message| message.reasoning_content.as_deref().is_some_and(|said| said.starts_with("A page with sliders.\n```\nfloat h = 0.0;"))));
         let trajectory = std::fs::read_to_string(files.iter().find(|path| path.to_string_lossy().ends_with(".trajectory.jsonl")).unwrap()).unwrap();
         let line: Value = trajectory.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()).find(|line| line["end"] == "stopped_app:draft_stop").unwrap();
         let marks: Vec<&str> = line["draft_marks"].as_array().unwrap().iter().map(|mark| mark["at"].as_str().unwrap()).collect();
@@ -8977,8 +8979,9 @@ Body").unwrap();
         let note = messages.last().unwrap();
         assert_eq!(note["role"], "user");
         let said = note["content"].as_str().unwrap();
-        assert!(said.contains("A page with sliders.") && said.contains("Write the code now") && !said.contains("let step_"), "{said}");
-        assert!(!messages.iter().any(|message| message["role"] == "assistant"), "what was cut is not in what goes back");
+        assert!(said.contains("Your reasoning so far is above") && said.contains("write the code now") && !said.contains("let step_"), "{said}");
+        let kept = &messages[messages.len() - 2];
+        assert!(kept["role"] == "assistant" && kept["reasoning_content"].as_str().unwrap().starts_with("A page with sliders."), "what was cut goes back as it was: {kept}");
         assert!(bodies.iter().all(|body| body["reasoning_effort"] != "none"), "the person's effort stays theirs");
         assert!(dir.path().join("index.html").is_file());
     }
@@ -9023,7 +9026,8 @@ Body").unwrap();
             whole_call(serde_json::json!({"path": "index.html", "content": "x\n"})),
             draft,
             whole_call(serde_json::json!({"path": "second.html", "content": "y\n"})),
-            vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})],
+            // (an answer that names the files it made: one that does not is asked about them, in a request this server has no answer for)
+            vec![serde_json::json!({"choices": [{"delta": {"content": "made index.html and second.html"}, "finish_reason": "stop"}]})],
         ]);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
         run.handle.commands.send(Command::Send("make two pages".into())).unwrap();
@@ -10216,11 +10220,10 @@ Body").unwrap();
         assert_eq!(bodies[1].pointer("/straydog/reasoning"), Some(&serde_json::json!(false)), "{}", bodies[1]);
     }
 
-    /// The thinking a draft stop closes stays closed until the program is written: a look at the folder first does not use it up (a real run listed the folder in 4 s, and
-    /// the request after it thought for 410 s, 66,369 characters, before it wrote), and neither does a small file (a picture of 20 lines opened it, and the request after it
-    /// drafted the same program again for 220 s). After as many lines as a draft, the next request thinks as any does.
+    /// A stop whose reasoning the conversation keeps closes the thinking for the next request alone, which is asked to answer with a call; the reasoning stands
+    /// before the note, as the stopped request's message, so that the prompt after it is what the server generated, to the cut.
     #[test]
-    fn the_thinking_a_draft_stop_closes_stays_closed_until_a_file_is_written() {
+    fn a_stop_keeps_its_reasoning_and_closes_the_thinking_for_one_request() {
         let dir = crate::in_container::tempdir().unwrap();
         let program: String = (0..DRAFT_LINES).map(|line| format!("line {line}\n")).collect();
         let (client, bodies, _, _) = thinking_server(3, vec![
@@ -10239,13 +10242,17 @@ Body").unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "b\n");
         let bodies = bodies.lock().unwrap();
         let closed: Vec<bool> = bodies.iter().map(|body| body.pointer("/straydog/reasoning") == Some(&serde_json::json!(false))).collect();
-        assert_eq!(closed, [false, true, true, true, false], "the draft that was stopped, the look at the folder, the small file, the program, and the answer after it");
+        assert_eq!(closed, [false, true, false, false, false], "the draft that was stopped, the one after it, and the rest thinking as any does");
         // (the first after the stop is to answer with a call, and only it)
         let required: Vec<bool> = bodies.iter().map(|body| body.get("tool_choice") == Some(&serde_json::json!("required"))).collect();
         assert_eq!(required, [false, true, false, false, false], "{}", bodies[1]);
-        assert_eq!(lines_written("edit", r#"{"file_path": "a", "old_string": "x", "new_string": "1\n2\n3"}"#), 3);
-        assert_eq!(lines_written("apply_patch", r#"{"edits": "[{\"path\": \"a\", \"old_string\": \"x\", \"new_string\": \"1\\n2\"}]"}"#), 2, "edits as a string");
-        assert_eq!(lines_written("read_file", r#"{"path": "a"}"#), 0);
+        let (first, second) = (bodies[0]["messages"].as_array().unwrap(), bodies[1]["messages"].as_array().unwrap());
+        assert_eq!(second[..first.len()], first[..], "the same prefix to the byte");
+        let kept = &second[first.len()];
+        assert_eq!(kept["role"], "assistant");
+        assert!(kept["reasoning_content"].as_str().unwrap().starts_with("A page with sliders.\n```\nfloat h = 0.0;"), "{kept}");
+        let note = second.last().unwrap()["content"].as_str().unwrap();
+        assert!(note.contains("Your reasoning so far is above") && !note.contains("A page with sliders."), "{note}");
     }
 
     /// With its thinking closed, what a model writes before "</think>" in its answer is its thinking: shown as thinking, kept as thinking, and not as its answer;
