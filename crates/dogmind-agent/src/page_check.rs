@@ -475,11 +475,77 @@ fn run_limit(wait: u64) -> Duration {
 /// The most a picture's run may take, for a page whose read took long: a picture draws the same page at the same wait, in a frame.
 const MOST_PICTURE: Duration = Duration::from_secs(40);
 
-/// How long one run for a picture may take: what the page's own read took, and half again, where that is more than [`run_limit`]. A three.js page with bloom, drawn on the CPU,
-/// was read with its steps in 14 s and each picture's run was stopped at the 17 s of `run_limit`: the check said there was no picture, and the model went looking for a browser of
-/// its own outside the sandbox to see it, nine commands that would each have asked the person.
-fn picture_limit(wait: u64, read_took: Duration) -> Duration {
-    run_limit(wait).max((read_took * 3 / 2 + Duration::from_secs(3)).min(MOST_PICTURE))
+/// How long one run for a picture may take. Begun while the page's read goes on, with no knowing what that will take and sharing the CPU with it: twice
+/// [`run_limit`] (a picture of 12 s by itself took 17 s beside its read), and never more than [`MOST_PICTURE`], as a run that hangs waits for all of it. Begun after it: what the read took, and half again, where that is more than [`run_limit`]. A three.js page with bloom, drawn on the CPU, was read with its steps in
+/// 14 s and each picture's run was stopped at the 17 s of `run_limit`: the check said there was no picture, and the model went looking for a browser of its own outside
+/// the sandbox to see it, nine commands that would each have asked the person.
+fn picture_limit(wait: u64, read_took: Option<Duration>) -> Duration {
+    match read_took {
+        None => (run_limit(wait) * 2).min(MOST_PICTURE),
+        Some(took) => run_limit(wait).max((took * 3 / 2 + Duration::from_secs(3)).min(MOST_PICTURE)),
+    }
+}
+
+/// A read longer than this is of a page that is slow to draw (WebGL on the CPU, at a long wait or with steps), and its pictures are taken one at a time: two of them
+/// at once with the read just over shared the CPU so that one was stopped at its limit (a read of 14.8 s, a picture of 12 s by itself stopped at 30 s).
+const SLOW_READ: Duration = Duration::from_secs(8);
+
+/// Runs of the browser at once in one check: the page's read and one picture, then the pictures two at a time. Three at once, each drawing WebGL on the CPU, were
+/// slower than one after another, and lost a picture: a check with steps and a 10 s wait took 43 and 61 s, with picture runs stopped at their limit, where it had
+/// taken 26 s. The read and one picture at once took a light page's check from 2.7 s to 1.6 s.
+const AT_ONCE: usize = 2;
+
+/// The turns of a check's runs of the browser ([`AT_ONCE`] at a time).
+struct Slots {
+    free: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// A run's turn, given back when it is dropped.
+struct Slot<'a>(&'a Slots);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+impl Slots {
+    fn new(count: usize) -> Self {
+        Slots { free: Mutex::new(count), freed: std::sync::Condvar::new() }
+    }
+
+    /// A turn, waited for: none when `stop` is set first.
+    fn take(&self, stop: &AtomicBool) -> Option<Slot<'_>> {
+        let mut free = self.free.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            if *free > 0 {
+                *free -= 1;
+                return Some(Slot(self));
+            }
+            free = self.freed.wait_timeout(free, Duration::from_millis(25)).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+        }
+    }
+}
+
+/// What came of one view's picture.
+struct Taken {
+    /// Where it is, when it was taken.
+    picture: Option<PathBuf>,
+    /// Runs stopped by their time.
+    hangs: usize,
+    /// The time each run had.
+    limit: Duration,
+    /// What the page said in the run that took it.
+    said_there: Vec<String>,
+    /// Not taken, as the turn was stopped or the read made it of no use.
+    stopped: bool,
+    /// Its runs of the browser, for the check's own list of them (`RUNS_OF_THIS_CHECK`, of the thread that runs the check).
+    runs: Vec<BrowserRun>,
 }
 
 /// Whether a run that did not give what was wanted is tried again, when it hung: once. A hang is the browser's and not the page's when the page's other run went well (a picture) or when it
@@ -1310,7 +1376,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     // (the script that reads a plain page's words waits for the page's time to be up, so the browser is given a little more of it than that)
     let run_wait_of = |wait: u64| if steps.is_none() && copy_name.is_some() { wait + READ_MARGIN_MS } else { wait };
     let browser_flags = flags() + &extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
-    // (how long the last run that read the page took, for the pictures' limit)
+    // (how long the last run that read the page took, for what is said of a picture that took too long)
     let read_took = std::cell::Cell::new(Duration::ZERO);
     // The page read, at `run_wait` of its time: its DOM, what the browser said, whether it was read, how the last run ended (`exit code 0x0`, `timed out`) and as what.
     let read_at = |run_wait: u64| -> Result<(String, String, bool, String, EndOfRun), String> {
@@ -1350,117 +1416,52 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         profiles.clear();
         Ok((dom, err, finished, how, ended_as))
     };
-    let (mut dom, mut err, mut finished, mut how, mut ended_as) = read_at(run_wait_of(wait))?;
-    // A page that draws much with WebGL is drawn here on the CPU, with no GPU, a frame every 16 ms of its time: at a long wait that takes longer than a run may, and
-    // each run was stopped (a three.js scene with bloom took 60 s for 5 s of its time). It is read once more at the usual wait, and its pictures are taken at that wait too.
-    let mut shortened = String::new();
-    if !finished && how == "timed out" && steps.is_none() && wait > WAIT_MS && !cancel.load(Ordering::Relaxed) {
-        let asked = wait;
-        wait = WAIT_MS;
-        // (the copy that says the page's words waits for its time to be up: for this wait now)
-        if let (Some(page), Some(copy)) = (&page, opened.as_ref().filter(|_| copy_name.is_some())) {
-            if let Ok(html) = page_html(page) {
-                let _ = std::fs::write(copy, with_script(&html, &(file_url(page.parent().unwrap_or(workspace)) + "/"), &reading_script(wait)));
-            }
-        }
-        (dom, err, finished, how, ended_as) = read_at(run_wait_of(wait))?;
-        if finished {
-            shortened = format!("At the {asked} ms of its time asked for, its drawing took longer than a run of the browser may here (WebGL is drawn on the CPU, with no GPU): it was read, and its pictures taken, after {WAIT_MS} ms of its time instead. To see it later than that, ask for a smaller view or a page with less to draw.\n");
-        }
-    }
     // (what its console names is said from the workspace, or from the server's root)
     let base_url = match served {
         Some(url) => url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/") + "/",
         None => format!("file:///{}/", plain(&root).replace('\\', "/")),
     };
-    let mut console = console_lines(&err, &base_url);
-    let (mut steps_said, mut steps_lost) = (String::new(), None);
-    if let (Some(page), Some(copy)) = (&page, &copy_name) {
-        // (the copy's lines are the page's own; and whether the steps got to their end is said apart)
-        let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
-        let done = console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE"));
-        let failed = console.iter().find_map(|line| line.split_once("DOGMIND-STEPS-FAILED: ").map(|(_, why)| why.to_string()));
-        let began = parts_begun(&err);
-        let left = if steps.is_some() { steps_left(&err) } else { None };
-        // (a part that began more than once is the page loading itself again, and with it the steps, from where it was: not the browser's doing, and not a crash)
-        let again = began.iter().find(|part| began.iter().filter(|other| other == part).count() > 1).copied();
-        console.retain(|line| !line.contains("DOGMIND-STEPS-"));
-        console.iter_mut().for_each(|line| *line = line.replace(copy.as_str(), &file_name));
-        if steps.is_some() {
-            let in_parts = if parts.len() > 1 { format!(" (in {} parts, one after each reload they make)", parts.len()) } else { String::new() };
-            steps_said = match (done, failed, again) {
-                // (the steps that went on in the page they left, until it was gone, may have failed on what the new page does not have, or have ended: the page they left is what happened)
-                _ if left.is_some() => left.as_ref().map_or(String::new(), |left| left_words(left, &base_url, copy, &name)),
-                (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
-                (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
-                (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
-                (false, None, None) if asked_wait.unwrap_or(0) >= MOST_WAIT_MS => format!("Steps: they had not ended when the page was read, after {wait} ms of its time, the longest a check gives: shorten the waits in them, or check a part of them at a time.\n"),
-                (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms (at most {MOST_WAIT_MS}).\n"),
-            };
-            let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
-            steps_said.push_str(&more_note);
-            // (stopped with them going on: that says what the steps and the page did, and nothing of a crash)
-            if !finished && (again.is_some() || how == "timed out") {
-                if again.is_none() {
-                    steps_said = more_note;
-                }
-                steps_lost = Some(match (again, began.is_empty()) {
-                    (Some(_), _) => "NOT CHECKED: the steps began again and again until the browser was stopped, which is not the browser crashing: see the steps below. Running this check again changes nothing until that is changed.\n".to_string(),
-                    (None, true) => format!("NOT CHECKED: the browser was stopped after {} s and the steps had not begun: the page had not finished loading, with its own scripts and anything it waits for (or it loads itself again and again). This is not the browser crashing.\n", LIMIT.as_secs()),
-                    (None, false) => format!("NOT CHECKED: the browser was stopped after {} s with the steps still going: the page or the steps are slow or do not end (a wait, a loop, a load that waits for the network). This is not the browser crashing. Shorter steps, or a page that settles, will be read.\n", LIMIT.as_secs()),
-                });
-            }
-        }
-    }
-    // (a run that ended well with nothing to read is a page that did not load, and not a crash: unless the steps say what the page did)
-    let not_loaded = match &ended_as {
-        EndOfRun::NotLoaded(reason) if steps_lost.is_none() => Some(not_loaded_words(reason.as_deref())),
-        _ => None,
-    };
-    // (the words that the page the steps left said at their end are not of the page that is shown)
-    let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
-    let cdn = fetched.map(|fetched| CdnWords { loaded: fetched.loaded, files: fetched.files, refused: fetched.refused });
-    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen, timed_out: how == "timed out", cdn };
-    let said = format!("{}{wait_cut}{shortened}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
-    if !finished {
-        return Ok(format!("{said}The browser's end: {how}.\n"));
-    }
-    // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. What a page draws with WebGL is in it, drawn on the CPU: a picture said
-    // otherwise, and a model that wanted to see a scene of three.js ran a browser outside the sandbox for it.
-    let Some(temp) = temp else { return Ok(said) };
-    let mut out = said;
     // Each picture by a name of its own: one name for every call had a later check, or another session's, write over a picture an answer
     // still showed.
     let taken_at = chrono::Local::now().format("%Y%m%d-%H%M%S%3f").to_string();
-    for view in &views {
-        if cancel.load(Ordering::Relaxed) {
-            out.push_str(&format!("No picture at {} was taken: the turn was stopped.\n", view.label));
-            continue;
-        }
+    // (set when the turn is stopped, or when what the pictures were taking is of no use: each picture's run ends at it)
+    let stop = AtomicBool::new(false);
+    let slots = Slots::new(AT_ONCE);
+    // (the read's own turn is never refused)
+    let never = AtomicBool::new(false);
+    // (what the read took, in ms, for the pictures begun after it: none while it goes on)
+    let read_ms = AtomicU64::new(u64::MAX);
+    // One view's picture, at `wait` of the page's time: a run of the browser of its own, with a profile, frame and shot of its own.
+    let take = |view: &View, wait: u64| -> Taken {
+        let mut taken = Taken { picture: None, hangs: 0, limit: Duration::ZERO, said_there: Vec::new(), stopped: false, runs: Vec::new() };
+        let Some(temp) = temp.as_deref() else { return taken };
         let tag = view.label.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
         let run = next_run();
         let (frame, shot, picture) = (temp.join(frame_of(&run)), temp.join(shot_of(&run)), temp.join(format!("dogmind-page-{taken_at}-{tag}.png")));
         let _ = std::fs::remove_file(&picture);
         // (with steps, each picture is of the page after them, as they run again in its load)
         if std::fs::write(&frame, frame_page(&src, view)).is_err() {
-            out.push_str(&format!("No picture at {} could be taken.\n", view.label));
-            continue;
+            return taken;
         }
         // (a window larger than the frame by what the browser takes of it, and at least its least width)
         let (window_width, window_height) = (view.width.max(600) + 64, view.height + 160);
-        let (mut taken, mut said_there, mut picture_hangs) = (false, Vec::new(), 0);
-        let limit = picture_limit(wait, read_took.get());
-        let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
+        let (mut trying, mut profiles) = (None, Profiles::new(&cwd, workspace));
         for _ in 0..TRIES {
-            if cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING {
+            // (its turn among the check's runs: waiting for it is no part of the tries' time)
+            let Some(_slot) = slots.take(&stop) else { break };
+            if trying.get_or_insert_with(std::time::Instant::now).elapsed() > MOST_TRYING {
                 break;
             }
             let _ = std::fs::remove_file(&shot);
             let started = std::time::Instant::now();
+            let read = read_ms.load(Ordering::Relaxed);
+            let limit = picture_limit(wait, (read != u64::MAX).then(|| Duration::from_millis(read)));
+            taken.limit = limit;
             let profile = profiles.next();
             let line = shot_line(&program, &browser_flags, (window_width, window_height), wait, &profile, &shot, &plain(&frame));
-            let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel);
-            note_browser_run("picture", done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32))), started);
+            let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, &stop);
+            let end = done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32)));
+            taken.runs.push(BrowserRun { of: "picture", end, ms: started.elapsed().as_millis() as u64 });
             #[cfg(debug_assertions)]
             if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
                 if let Ok(done) = &done {
@@ -1473,39 +1474,178 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             note_run(true, shot_image.is_err());
             if let Ok(whole) = shot_image {
                 if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
-                    taken = true;
-                    said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref().zip(copy_name.as_deref()))).unwrap_or_default();
+                    taken.picture = Some(picture.clone());
+                    taken.said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref().zip(copy_name.as_deref()))).unwrap_or_default();
                     break;
                 }
             }
             // (a sandbox that could not run it will not do better the next time; a run that hung is the browser's, as the page's own run went well, and is tried once more)
             let hung_now = done.as_ref().is_ok_and(hung);
-            picture_hangs += usize::from(hung_now);
-            if done.is_err() || (hung_now && !tries_again_after_a_hang(picture_hangs)) || (!hung_now && started.elapsed() > limit / 2) {
+            taken.hangs += usize::from(hung_now);
+            if done.is_err() || (hung_now && !tries_again_after_a_hang(taken.hangs)) || (!hung_now && started.elapsed() > limit / 2) {
                 break;
             }
         }
+        taken.stopped = taken.picture.is_none() && stop.load(Ordering::Relaxed);
         profiles.clear();
         let _ = std::fs::remove_file(&shot);
         let _ = std::fs::remove_file(&frame);
-        out.push_str(&if taken {
-            format!("How it looks at {} ({}x{}), WebGL drawn too (on the CPU, with no GPU): `read_file` {}\n", view.label, view.width, view.height, picture.display())
-        } else if picture_hangs > 0 {
-            // (a run stopped by its time did not end by itself: to say the browser ended without one was not so, and a model took it for the sandbox's fault)
-            format!("No picture at {} could be taken: each run that drew it was stopped after {} s, the page drawn on the CPU being slow (its read took {} s). What is read above is the page all the same. Do not run a browser yourself for it; say in your answer that there is no picture, or check it again with a shorter wait or shorter steps.\n", view.label, limit.as_secs(), read_took.get().as_secs())
-        } else {
-            format!("No picture at {} could be taken: the browser ended without one each time it was tried, which says nothing of the page. Do not build other pages to measure the layout instead; say in your answer that there is no picture.\n", view.label)
-        });
-        // What the page said at this size, where it says other than above: the console above is of the desktop's width, and a model that
-        // measured a phone's layout from a script was given the desktop's numbers.
-        if taken && !said_there.is_empty() && distinct(&said_there) != distinct(&console) {
-            out.push_str(&format!("Console at {}:\n", view.label));
-            for said in counted(&said_there).iter().take(MOST_LINES) {
-                out.push_str(&format!("  {said}\n"));
+        taken
+    };
+    let take = &take;
+    std::thread::scope(|scope| -> Result<String, String> {
+        // The pictures need nothing of the read but its wait: they are taken with it, each view in a run of its own, [`AT_ONCE`] runs at a time. A picture
+        // taken at a wait the read then leaves is taken again.
+        let start = |wait: u64| -> Vec<std::thread::ScopedJoinHandle<'_, Taken>> {
+            if temp.is_none() {
+                return Vec::new();
+            }
+            views.iter().map(|view| scope.spawn(move || take(view, wait))).collect()
+        };
+        // (what was being taken, ended and waited for; the turn stopped meanwhile ends it too)
+        let ended = |handles: Vec<std::thread::ScopedJoinHandle<'_, Taken>>, end_now: bool| -> Vec<Taken> {
+            if end_now {
+                stop.store(true, Ordering::Relaxed);
+            }
+            while !handles.iter().all(|handle| handle.is_finished()) {
+                if cancel.load(Ordering::Relaxed) {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let mut all: Vec<Taken> = handles.into_iter().map(|handle| handle.join().unwrap_or(Taken { picture: None, hangs: 0, limit: Duration::ZERO, said_there: Vec::new(), stopped: false, runs: Vec::new() })).collect();
+            RUNS_OF_THIS_CHECK.with(|runs| runs.borrow_mut().extend(all.iter_mut().flat_map(|taken| std::mem::take(&mut taken.runs))));
+            all
+        };
+        // The read, with the pictures begun beside it. Its turn is taken first, so that the pictures do not take both before it; a slow read keeps it until the
+        // pictures are done, and they go one at a time (`SLOW_READ`).
+        let read_with_pictures = |wait: u64| {
+            read_ms.store(u64::MAX, Ordering::Relaxed);
+            let reading = slots.take(&never);
+            let pictures = start(wait);
+            let read = read_at(run_wait_of(wait));
+            read_ms.store(read_took.get().as_millis() as u64, Ordering::Relaxed);
+            let kept = reading.filter(|_| read_took.get() > SLOW_READ);
+            (read, pictures, kept)
+        };
+        let (read, mut pictures, mut kept) = read_with_pictures(wait);
+        let (mut dom, mut err, mut finished, mut how, mut ended_as) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                ended(pictures, true);
+                return Err(error);
+            }
+        };
+        // A page that draws much with WebGL is drawn here on the CPU, with no GPU, a frame every 16 ms of its time: at a long wait that takes longer than a run may, and
+        // each run was stopped (a three.js scene with bloom took 60 s for 5 s of its time). It is read once more at the usual wait, and its pictures are taken at that wait too.
+        let mut shortened = String::new();
+        if !finished && how == "timed out" && steps.is_none() && wait > WAIT_MS && !cancel.load(Ordering::Relaxed) {
+            let asked = wait;
+            wait = WAIT_MS;
+            ended(std::mem::take(&mut pictures), true);
+            drop(kept.take());
+            stop.store(false, Ordering::Relaxed);
+            // (the copy that says the page's words waits for its time to be up: for this wait now)
+            if let (Some(page), Some(copy)) = (&page, opened.as_ref().filter(|_| copy_name.is_some())) {
+                if let Ok(html) = page_html(page) {
+                    let _ = std::fs::write(copy, with_script(&html, &(file_url(page.parent().unwrap_or(workspace)) + "/"), &reading_script(wait)));
+                }
+            }
+            let read;
+            (read, pictures, kept) = read_with_pictures(wait);
+            (dom, err, finished, how, ended_as) = match read {
+                Ok(read) => read,
+                Err(error) => {
+                    ended(pictures, true);
+                    return Err(error);
+                }
+            };
+            if finished {
+                shortened = format!("At the {asked} ms of its time asked for, its drawing took longer than a run of the browser may here (WebGL is drawn on the CPU, with no GPU): it was read, and its pictures taken, after {WAIT_MS} ms of its time instead. To see it later than that, ask for a smaller view or a page with less to draw.\n");
             }
         }
-    }
-    Ok(out)
+        let mut console = console_lines(&err, &base_url);
+        let (mut steps_said, mut steps_lost) = (String::new(), None);
+        if let (Some(page), Some(copy)) = (&page, &copy_name) {
+            // (the copy's lines are the page's own; and whether the steps got to their end is said apart)
+            let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
+            let done = console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE"));
+            let failed = console.iter().find_map(|line| line.split_once("DOGMIND-STEPS-FAILED: ").map(|(_, why)| why.to_string()));
+            let began = parts_begun(&err);
+            let left = if steps.is_some() { steps_left(&err) } else { None };
+            // (a part that began more than once is the page loading itself again, and with it the steps, from where it was: not the browser's doing, and not a crash)
+            let again = began.iter().find(|part| began.iter().filter(|other| other == part).count() > 1).copied();
+            console.retain(|line| !line.contains("DOGMIND-STEPS-"));
+            console.iter_mut().for_each(|line| *line = line.replace(copy.as_str(), &file_name));
+            if steps.is_some() {
+                let in_parts = if parts.len() > 1 { format!(" (in {} parts, one after each reload they make)", parts.len()) } else { String::new() };
+                steps_said = match (done, failed, again) {
+                    // (the steps that went on in the page they left, until it was gone, may have failed on what the new page does not have, or have ended: the page they left is what happened)
+                    _ if left.is_some() => left.as_ref().map_or(String::new(), |left| left_words(left, &base_url, copy, &name)),
+                    (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
+                    (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
+                    (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
+                    (false, None, None) if asked_wait.unwrap_or(0) >= MOST_WAIT_MS => format!("Steps: they had not ended when the page was read, after {wait} ms of its time, the longest a check gives: shorten the waits in them, or check a part of them at a time.\n"),
+                    (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms (at most {MOST_WAIT_MS}).\n"),
+                };
+                let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
+                steps_said.push_str(&more_note);
+                // (stopped with them going on: that says what the steps and the page did, and nothing of a crash)
+                if !finished && (again.is_some() || how == "timed out") {
+                    if again.is_none() {
+                        steps_said = more_note;
+                    }
+                    steps_lost = Some(match (again, began.is_empty()) {
+                        (Some(_), _) => "NOT CHECKED: the steps began again and again until the browser was stopped, which is not the browser crashing: see the steps below. Running this check again changes nothing until that is changed.\n".to_string(),
+                        (None, true) => format!("NOT CHECKED: the browser was stopped after {} s and the steps had not begun: the page had not finished loading, with its own scripts and anything it waits for (or it loads itself again and again). This is not the browser crashing.\n", LIMIT.as_secs()),
+                        (None, false) => format!("NOT CHECKED: the browser was stopped after {} s with the steps still going: the page or the steps are slow or do not end (a wait, a loop, a load that waits for the network). This is not the browser crashing. Shorter steps, or a page that settles, will be read.\n", LIMIT.as_secs()),
+                    });
+                }
+            }
+        }
+        // (a run that ended well with nothing to read is a page that did not load, and not a crash: unless the steps say what the page did)
+        let not_loaded = match &ended_as {
+            EndOfRun::NotLoaded(reason) if steps_lost.is_none() => Some(not_loaded_words(reason.as_deref())),
+            _ => None,
+        };
+        // (the words that the page the steps left said at their end are not of the page that is shown)
+        let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
+        let cdn = fetched.map(|fetched| CdnWords { loaded: fetched.loaded, files: fetched.files, refused: fetched.refused });
+        let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen, timed_out: how == "timed out", cdn };
+        let said = format!("{}{wait_cut}{shortened}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
+        if !finished {
+            ended(pictures, true);
+            return Ok(format!("{said}The browser's end: {how}.\n"));
+        }
+        // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. What a page draws with WebGL is in it, drawn on the CPU: a picture said
+        // otherwise, and a model that wanted to see a scene of three.js ran a browser outside the sandbox for it.
+        // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. What a page draws with WebGL is in it, drawn on the CPU: a picture said
+        // otherwise, and a model that wanted to see a scene of three.js ran a browser outside the sandbox for it.
+        if temp.is_none() {
+            return Ok(said);
+        }
+        let mut out = said;
+        let all = ended(pictures, false);
+        drop(kept);
+        for (view, taken) in views.iter().zip(all) {
+            out.push_str(&match &taken.picture {
+                Some(picture) => format!("How it looks at {} ({}x{}), WebGL drawn too (on the CPU, with no GPU): `read_file` {}\n", view.label, view.width, view.height, picture.display()),
+                None if taken.stopped || cancel.load(Ordering::Relaxed) => format!("No picture at {} was taken: the turn was stopped.\n", view.label),
+                // (a run stopped by its time did not end by itself: to say the browser ended without one was not so, and a model took it for the sandbox's fault)
+                None if taken.hangs > 0 => format!("No picture at {} could be taken: each run that drew it was stopped after {} s, the page drawn on the CPU being slow (its read took {} s). What is read above is the page all the same. Do not run a browser yourself for it; say in your answer that there is no picture, or check it again with a shorter wait or shorter steps.\n", view.label, taken.limit.as_secs(), read_took.get().as_secs()),
+                None => format!("No picture at {} could be taken: the browser ended without one each time it was tried, which says nothing of the page. Do not build other pages to measure the layout instead; say in your answer that there is no picture.\n", view.label),
+            });
+            // What the page said at this size, where it says other than above: the console above is of the desktop's width, and a model that
+            // measured a phone's layout from a script was given the desktop's numbers.
+            if taken.picture.is_some() && !taken.said_there.is_empty() && distinct(&taken.said_there) != distinct(&console) {
+                out.push_str(&format!("Console at {}:\n", view.label));
+                for said in counted(&taken.said_there).iter().take(MOST_LINES) {
+                    out.push_str(&format!("  {said}\n"));
+                }
+            }
+        }
+        Ok(out)
+    })
 }
 
 /// What the page itself said in a run, as the check reports it: the steps' own markers left out, and the copy the steps ran in named as the page.
@@ -2151,9 +2291,11 @@ mod tests {
         assert_eq!(run_limit(MOST_WAIT_MS), Duration::from_secs(18), "at the longest wait a page may ask for");
         assert_eq!(run_limit(60_000), LIMIT, "and never more than the longest a run may take");
         // (a picture of a page that was slow to read gets what its read took, and half again, up to its own most)
-        assert_eq!(picture_limit(WAIT_MS, Duration::from_secs(2)), run_limit(WAIT_MS), "a quick page's picture has the run's limit");
-        assert_eq!(picture_limit(9_000, Duration::from_secs(14)), Duration::from_secs(24), "the three.js page read in 14 s");
-        assert_eq!(picture_limit(9_000, Duration::from_secs(60)), MOST_PICTURE, "never more than its most");
+        assert_eq!(picture_limit(WAIT_MS, None), run_limit(WAIT_MS) * 2, "begun beside the read, sharing the CPU with it");
+        assert_eq!(picture_limit(MOST_WAIT_MS, None), MOST_PICTURE, "and never more than the most");
+        assert_eq!(picture_limit(WAIT_MS, Some(Duration::from_secs(2))), run_limit(WAIT_MS), "a quick page's picture has the run's limit");
+        assert_eq!(picture_limit(9_000, Some(Duration::from_secs(14))), Duration::from_secs(24), "the three.js page read in 14 s");
+        assert_eq!(picture_limit(9_000, Some(Duration::from_secs(60))), MOST_PICTURE, "never more than its most");
         assert!(tries_again_after_a_hang(1), "the first hang is tried again");
         assert!(!tries_again_after_a_hang(2), "and the second is not: the page's own bound is MOST_TRYING, and a browser that hangs twice will not do better");
         let ended = |status: Option<i32>, ended: &'static str| crate::sandbox::Output { status, ended, ..crate::sandbox::Output::default() };
