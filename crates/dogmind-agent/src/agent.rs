@@ -4886,8 +4886,6 @@ mod tests {
         assert!(bodies.lock().unwrap()[1].to_string().contains("use a modal instead"));
     }
 
-    /// The goal the person sets goes to the model with the next message once (the history holds it after that), is kept in the session file,
-    /// and is told back to the window.
     /// A Windows path written with one backslash is read as it was meant; an escape that is one stays one.
     #[test]
     fn a_path_with_single_backslashes_is_read_as_written() {
