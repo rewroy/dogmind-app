@@ -2292,7 +2292,8 @@ mod tests {
         assert_eq!(run_limit(60_000), LIMIT, "and never more than the longest a run may take");
         // (a picture of a page that was slow to read gets what its read took, and half again, up to its own most)
         assert_eq!(picture_limit(WAIT_MS, None), run_limit(WAIT_MS) * 2, "begun beside the read, sharing the CPU with it");
-        assert_eq!(picture_limit(MOST_WAIT_MS, None), MOST_PICTURE, "and never more than the most");
+        assert_eq!(picture_limit(MOST_WAIT_MS, None), Duration::from_secs(36), "at the longest wait a page may ask for");
+        assert_eq!(picture_limit(60_000, None), MOST_PICTURE, "and never more than the most");
         assert_eq!(picture_limit(WAIT_MS, Some(Duration::from_secs(2))), run_limit(WAIT_MS), "a quick page's picture has the run's limit");
         assert_eq!(picture_limit(9_000, Some(Duration::from_secs(14))), Duration::from_secs(24), "the three.js page read in 14 s");
         assert_eq!(picture_limit(9_000, Some(Duration::from_secs(60))), MOST_PICTURE, "never more than its most");
