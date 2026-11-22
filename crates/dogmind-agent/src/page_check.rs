@@ -472,6 +472,16 @@ fn run_limit(wait: u64) -> Duration {
     (RUN_BASE + Duration::from_millis(wait)).min(LIMIT)
 }
 
+/// The most a picture's run may take, for a page whose read took long: a picture draws the same page at the same wait, in a frame.
+const MOST_PICTURE: Duration = Duration::from_secs(40);
+
+/// How long one run for a picture may take: what the page's own read took, and half again, where that is more than [`run_limit`]. A three.js page with bloom, drawn on the CPU,
+/// was read with its steps in 14 s and each picture's run was stopped at the 17 s of `run_limit`: the check said there was no picture, and the model went looking for a browser of
+/// its own outside the sandbox to see it, nine commands that would each have asked the person.
+fn picture_limit(wait: u64, read_took: Duration) -> Duration {
+    run_limit(wait).max((read_took * 3 / 2 + Duration::from_secs(3)).min(MOST_PICTURE))
+}
+
 /// Whether a run that did not give what was wanted is tried again, when it hung: once. A hang is the browser's and not the page's when the page's other run went well (a picture) or when it
 /// printed nothing at all (a page's own console would have been heard), and the browser that hangs once does not hang the next time, as far as 60 runs here say.
 fn tries_again_after_a_hang(hangs: usize) -> bool {
@@ -1236,6 +1246,8 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     // (the script that reads a plain page's words waits for the page's time to be up, so the browser is given a little more of it than that)
     let run_wait_of = |wait: u64| if steps.is_none() && copy_name.is_some() { wait + READ_MARGIN_MS } else { wait };
     let browser_flags = flags() + &extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
+    // (how long the last run that read the page took, for the pictures' limit)
+    let read_took = std::cell::Cell::new(Duration::ZERO);
     // The page read, at `run_wait` of its time: its DOM, what the browser said, whether it was read, how the last run ended (`exit code 0x0`, `timed out`) and as what.
     let read_at = |run_wait: u64| -> Result<(String, String, bool, String, EndOfRun), String> {
         // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
@@ -1258,6 +1270,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             }
             ended_as = end_of_run(done.status, &dom, &err);
             finished = ended_as == EndOfRun::Read;
+            read_took.set(started.elapsed());
             how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
             note_browser_run("page", how.clone(), started);
             #[cfg(test)]
@@ -1372,6 +1385,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         // (a window larger than the frame by what the browser takes of it, and at least its least width)
         let (window_width, window_height) = (view.width.max(600) + 64, view.height + 160);
         let (mut taken, mut said_there, mut picture_hangs) = (false, Vec::new(), 0);
+        let limit = picture_limit(wait, read_took.get());
         let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
         for _ in 0..TRIES {
             if cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING {
@@ -1381,7 +1395,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             let started = std::time::Instant::now();
             let profile = profiles.next();
             let line = shot_line(&program, &browser_flags, (window_width, window_height), wait, &profile, &shot, &plain(&frame));
-            let done = crate::sandbox::run_browser(&line, &cwd, workspace, run_limit(wait), cancel);
+            let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel);
             note_browser_run("picture", done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32))), started);
             #[cfg(debug_assertions)]
             if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
@@ -1403,7 +1417,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             // (a sandbox that could not run it will not do better the next time; a run that hung is the browser's, as the page's own run went well, and is tried once more)
             let hung_now = done.as_ref().is_ok_and(hung);
             picture_hangs += usize::from(hung_now);
-            if done.is_err() || (hung_now && !tries_again_after_a_hang(picture_hangs)) || (!hung_now && started.elapsed() > LIMIT / 2) {
+            if done.is_err() || (hung_now && !tries_again_after_a_hang(picture_hangs)) || (!hung_now && started.elapsed() > limit / 2) {
                 break;
             }
         }
@@ -1412,6 +1426,9 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         let _ = std::fs::remove_file(&frame);
         out.push_str(&if taken {
             format!("How it looks at {} ({}x{}), WebGL drawn too (on the CPU, with no GPU): `read_file` {}\n", view.label, view.width, view.height, picture.display())
+        } else if picture_hangs > 0 {
+            // (a run stopped by its time did not end by itself: to say the browser ended without one was not so, and a model took it for the sandbox's fault)
+            format!("No picture at {} could be taken: each run that drew it was stopped after {} s, the page drawn on the CPU being slow (its read took {} s). What is read above is the page all the same. Do not run a browser yourself for it; say in your answer that there is no picture, or check it again with a shorter wait or shorter steps.\n", view.label, limit.as_secs(), read_took.get().as_secs())
         } else {
             format!("No picture at {} could be taken: the browser ended without one each time it was tried, which says nothing of the page. Do not build other pages to measure the layout instead; say in your answer that there is no picture.\n", view.label)
         });
@@ -2042,6 +2059,10 @@ mod tests {
         assert!(run_limit(0) < run_limit(WAIT_MS) && run_limit(WAIT_MS) < run_limit(5_000), "it follows the wait");
         assert_eq!(run_limit(MOST_WAIT_MS), Duration::from_secs(18), "at the longest wait a page may ask for");
         assert_eq!(run_limit(60_000), LIMIT, "and never more than the longest a run may take");
+        // (a picture of a page that was slow to read gets what its read took, and half again, up to its own most)
+        assert_eq!(picture_limit(WAIT_MS, Duration::from_secs(2)), run_limit(WAIT_MS), "a quick page's picture has the run's limit");
+        assert_eq!(picture_limit(9_000, Duration::from_secs(14)), Duration::from_secs(24), "the three.js page read in 14 s");
+        assert_eq!(picture_limit(9_000, Duration::from_secs(60)), MOST_PICTURE, "never more than its most");
         assert!(tries_again_after_a_hang(1), "the first hang is tried again");
         assert!(!tries_again_after_a_hang(2), "and the second is not: the page's own bound is MOST_TRYING, and a browser that hangs twice will not do better");
         let ended = |status: Option<i32>, ended: &'static str| crate::sandbox::Output { status, ended, ..crate::sandbox::Output::default() };
@@ -2251,7 +2272,8 @@ mod tests {
         let (dir, _) = page(&[
             ("index.html", "<!DOCTYPE html><title>t</title><div id=ok>start</div><canvas id=c></canvas><script type=module src=bad.mjs></script><script>console.log('FROM-PAGE');document.getElementById('ok').textContent='ran';const gl=document.getElementById('c').getContext('webgl2');const s=gl.createShader(gl.FRAGMENT_SHADER);gl.shaderSource(s,'void main(){ nonsense }');gl.compileShader(s);console.log('shader: '+gl.getShaderInfoLog(s));missing.call();</script>"),
             ("bad.mjs", "let x = ;\n"),
-            ("cdn.html", "<!DOCTYPE html><title>c</title><script type=module>import * as T from 'https://unpkg.com/three@0.161.0/build/three.module.js'; console.log('NEVER')</script>"),
+            // (a host that is not a CDN the app fetches for the page: unpkg's files are fetched now, and run)
+            ("cdn.html", "<!DOCTYPE html><title>c</title><script type=module>import * as T from 'https://example.com/lib/three.module.js'; console.log('NEVER')</script>"),
         ]);
         let cancel = AtomicBool::new(false);
         let said = check_page(&serde_json::json!({"path": "index.html"}), dir.path(), &cancel).unwrap();
