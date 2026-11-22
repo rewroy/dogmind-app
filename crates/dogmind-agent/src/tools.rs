@@ -2491,9 +2491,9 @@ fn bundled_python() -> Option<PathBuf> {
 
 /// A line whose `python -m venv FOLDER` is made in two steps where a system's Python runs it: in the sandbox, venv's own last step, ensurepip run by the new
 /// Python as a child of it, fails as it clears its temporary folder (WinError 5), though the same ensurepip run by itself goes through. So: the venv with no pip,
-/// then its own Python's ensurepip. Which Python it is, is the line's: a bare `python` is the bundle's where there is one (`bundled`, its folder), which has no
-/// venv and is left to say so (`venv_note`); one named by its path is a system's unless it is in the bundle's folder; the `py` launcher's are the system's. One
-/// folder and plain words only.
+/// then its own Python's ensurepip. Which Python it is, is the line's: a bare `python` or `py` is the bundle's where there is one (`bundled`, its folder: the
+/// bundle has a `py.cmd` of its own, ahead of the launcher on PATH), which has no venv and is left to say so (`venv_note`); one named by its path is a system's
+/// unless it is in the bundle's folder. One folder and plain words only.
 fn venv_in_two_steps(line: &str, bundled: Option<&Path>) -> String {
     let pattern = regex::Regex::new(
         r#"(?i)(^|[&|(]\s*)("[^"]*\\python(?:\.exe)?"|(?:[^\s"&|()]*\\)?python(?:\.exe)?|py(?:\.exe)?(?:\s+-[0-9][0-9.\-]*)?)\s+-m\s+venv\s+([\w.\-/\\: ]+?)\s*($|&&|&|\|\||\))"#,
@@ -2506,8 +2506,8 @@ fn venv_in_two_steps(line: &str, bundled: Option<&Path>) -> String {
         let systems = if path.contains('\\') {
             bundled.is_none_or(|folder| !path.starts_with(&format!("{}\\", key(&folder.to_string_lossy()))))
         } else {
-            // (`py`, the launcher, or a bare `python`)
-            !path.starts_with("python") || bundled.is_none()
+            // (a bare `python`, or `py`: the launcher with no bundle, and the bundle's own shim with one)
+            bundled.is_none()
         };
         if !systems {
             return found[0].to_string();
@@ -5187,13 +5187,14 @@ mod tests {
         for (line, program) in [
             (r"C:\Python314\python.exe -m venv .venv", r"C:\Python314\python.exe"),
             (r#""C:\Program Files\Python314\python.exe" -m venv .venv"#, r#""C:\Program Files\Python314\python.exe""#),
-            ("py -3.14 -m venv .venv", "py -3.14"),
-            ("py -m venv .venv", "py"),
         ] {
             assert_eq!(venv_in_two_steps(line, bundle), two(program, ".venv"), "a system's Python, with the bundle there");
         }
-        for same in ["python -m venv .venv", r"C:\Apps\Dogmind\tools\python\python.exe -m venv .venv", r#""c:/apps/dogmind/tools/python/python.exe" -m venv .venv"#] {
-            assert_eq!(venv_in_two_steps(same, bundle), same, "the bundle's Python");
+        for same in ["python -m venv .venv", "py -m venv .venv", "py -3.14 -m venv .venv", r"C:\Apps\Dogmind\tools\python\python.exe -m venv .venv", r#""c:/apps/dogmind/tools/python/python.exe" -m venv .venv"#] {
+            assert_eq!(venv_in_two_steps(same, bundle), same, "the bundle's Python (its py is a shim of its own)");
+        }
+        for (line, program) in [("py -3.14 -m venv .venv", "py -3.14"), ("py -m venv .venv", "py")] {
+            assert_eq!(venv_in_two_steps(line, None), two(program, ".venv"), "the launcher, with no bundle");
         }
         for same in ["python -m venv a b", "python -m venv --without-pip .venv", "python -m venvx .venv", "python script.py -m venv", "pyx -m venv .venv"] {
             assert_eq!(venv_in_two_steps(same, None), same, "{same}");
