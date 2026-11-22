@@ -908,9 +908,9 @@ fn close_cut_write(raw: &str) -> Option<(String, String, String)> {
 }
 
 /// In one turn of the person's, at most: after that it has its way, as it would have without this. A real model, asked what got in its way, said the same
-/// note three times in one turn only delayed its first stroke, so after the first stop, and once a file is written (when code in its reasoning may be the plan
-/// of an edit), only a draft of more than `LONG_DRAFT_LINES` is stopped. Not watched at all after that, a real turn wrote a whole page of 101,903 characters in
-/// its reasoning (567 s) and then wrote it again with create_file.
+/// note three times in one turn only delayed its first stroke. Once a file is written (when code in its reasoning may be the plan of an edit), only a draft
+/// of more than `LONG_DRAFT_LINES` is stopped; after a stop, with its reasoning kept, one of `DRAFT_LINES_AFTER_STOP`. Not watched at all after the third,
+/// a real turn wrote a whole page of 101,903 characters in its reasoning (567 s) and then wrote it again with create_file.
 const MAX_DRAFTS_STOPPED: u32 = 3;
 /// The rounds a goal has when the model does not say (set_goal's `rounds`), and the most it may ask for.
 const GOAL_ROUNDS: u32 = 12;
@@ -938,8 +938,14 @@ enum GoalEnd {
     Blocked,
     OutOfRounds,
 }
-/// After the first stop, or once a file is written: a draft is stopped only when it is longer than this, a whole file and not the plan of an edit.
+/// Once a file is written, before any stop: a draft is stopped only when it is longer than this, a whole file and not the plan of an edit.
 const LONG_DRAFT_LINES: usize = 150;
+/// After a stop in the turn (its reasoning kept, its thinking open again): a draft is stopped at this many lines. Of the ten stops of four comparison
+/// runs, the first of each run's was mostly words (60 to 87%: design); the later six mostly code (42 to 92%), of which the file written next took 0 to 25%
+/// as it was (two took 35 and 67%), and the 441 s they ran before being stopped at 151 lines were mostly spent on that code. At this line they stop at
+/// 23 to 57% of the reasoning they had. Over 481 requests after a stop in the kept sessions, a watch at this line stopped none that wrote its code as it
+/// had it, and six others (three made the file anew, one patched, two read a file, using 0 to 32% of the code), where one at 151 stopped one of them.
+const DRAFT_LINES_AFTER_STOP: usize = 60;
 const MOST_DECIDED: usize = 2500;
 /// A draft is this many lines of code of its own in a row, in a fence or out of one, with no more than `PROSE_BETWEEN` lines of anything else between two of them. A review thinks with code
 /// as well (a signature it recalls, a fix it proposes, lines it re-types to trace): in 592 real reasonings none had more than 25 such lines together, and one stopped at 40, in a review
@@ -2896,10 +2902,17 @@ impl Agent {
             // (Four such turns in the sessions were stopped, each thrown away at 4,900 to 22,800 tokens, and the model then reasoned 20,000 to 30,000 tokens over again.)
             let files_may_change = self.mode != Mode::Plan && !self.turn_is_read_only();
             let may_stop_drafting = cuts && drafts_stopped < MAX_DRAFTS_STOPPED && files_may_change;
-            let long_only = drafts_stopped > 0 || wrote;
-            let watch_is = if may_stop_drafting { if long_only { "on:long" } else { "on" } } else if !files_may_change { "off:no_change_asked" } else if drafts_stopped >= MAX_DRAFTS_STOPPED { "off:stopped_most" } else { "off" };
+            // (after a stop, a lower line; once a file is written with no stop yet, a higher one, for the plan of an edit)
+            let (line, watch_on) = if drafts_stopped > 0 {
+                (DRAFT_LINES_AFTER_STOP, "on:after_stop")
+            } else if wrote {
+                (LONG_DRAFT_LINES + 1, "on:long")
+            } else {
+                (DRAFT_LINES, "on")
+            };
+            let watch_is = if may_stop_drafting { watch_on } else if !files_may_change { "off:no_change_asked" } else if drafts_stopped >= MAX_DRAFTS_STOPPED { "off:stopped_most" } else { "off" };
             // (what it has been shown, once for the request: its code in its reasoning that is a line of that is a quote, and not a draft)
-            let mut watch = may_stop_drafting.then(|| DraftWatch::new(lines_shown(&self.messages), if long_only { LONG_DRAFT_LINES + 1 } else { DRAFT_LINES }));
+            let mut watch = may_stop_drafting.then(|| DraftWatch::new(lines_shown(&self.messages), line));
             // The app's own stop (of a draft) ends the stream through a flag of the stream's: on the person's,
             // and taken back after, a Stop pressed as it fired was taken for it, and the turn went on. The person's is passed on to it.
             let halt = AtomicBool::new(self.cancelled());
@@ -9120,19 +9133,22 @@ Body").unwrap();
         assert!(dir.path().join("index.html").is_file());
     }
 
-    /// After a first stop, a draft is stopped again only when it is longer than a plan (`LONG_DRAFT_LINES`), and three times in a turn at most: then its
-    /// call goes through.
+    /// After a first stop, a draft is stopped again at a lower line (`DRAFT_LINES_AFTER_STOP`: shorter than the first stop's, and than a whole file's once
+    /// one is written), and three times in a turn at most: then its call goes through.
     #[test]
-    fn after_the_first_stop_only_a_long_draft_is_stopped_and_three_at_most() {
+    fn after_the_first_stop_a_draft_is_stopped_at_a_lower_line_and_three_at_most() {
         let dir = crate::in_container::tempdir().unwrap();
         let think = |text: &str| serde_json::json!({"choices": [{"delta": {"reasoning_content": text}}]});
         let long = |text: String| -> Vec<Value> { std::iter::once(think(&text)).chain((0..400).map(|_| think(" more of it"))).collect() };
         let mut last = vec![think(&format!("Once more.\n{}", fenced(&code_lines(LONG_DRAFT_LINES + 10))))];
         last.extend(whole_call(serde_json::json!({"path": "index.html", "content": "x\n"})));
+        // (the second and third: longer than the line after a stop and shorter than a draft the first stop or a written file's is stopped at)
+        let between = DRAFT_LINES_AFTER_STOP + 5;
+        assert!(between < DRAFT_LINES && between < LONG_DRAFT_LINES);
         let (client, bodies) = trickling_server(vec![
             long(format!("Plan.\n{}", fenced(&code_lines(DRAFT_LINES + 2)))),
-            long(format!("Again.\n{}", fenced(&code_lines(LONG_DRAFT_LINES + 10)))),
-            long(format!("And again.\n{}", fenced(&code_lines(LONG_DRAFT_LINES + 10)))),
+            long(format!("Again.\n{}", fenced(&code_lines(between)))),
+            long(format!("And again.\n{}", fenced(&code_lines(between)))),
             last,
             vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})],
         ]);
@@ -9146,7 +9162,7 @@ Body").unwrap();
         assert_eq!(notes, 3);
         assert!(dir.path().join("index.html").is_file());
         let watched: Vec<String> = of_kind(&trajectory_of(&run), "request").iter().map(|line| line["draft_watch"].as_str().unwrap_or("").to_string()).collect();
-        assert_eq!(watched[..4], ["on", "on:long", "on:long", "off:stopped_most"], "{watched:?}");
+        assert_eq!(watched[..4], ["on", "on:after_stop", "on:after_stop", "off:stopped_most"], "{watched:?}");
     }
 
     /// Once a file is written, a whole file in its reasoning is still stopped (a real one, 101,903 characters and 567 s, was written again with create_file);
@@ -9173,14 +9189,14 @@ Body").unwrap();
         assert!(dir.path().join("second.html").is_file());
     }
 
-    /// After a stop, a draft no longer than the plan of an edit is left to go on, and its call goes through.
+    /// After a stop, a draft shorter than the line after a stop (`DRAFT_LINES_AFTER_STOP`) is left to go on, and its call goes through.
     #[test]
-    fn after_a_stop_a_draft_no_longer_than_a_plan_is_left_to_write() {
+    fn after_a_stop_a_draft_below_its_line_is_left_to_write() {
         let dir = crate::in_container::tempdir().unwrap();
         let think = |text: &str| serde_json::json!({"choices": [{"delta": {"reasoning_content": text}}]});
         let long = |start: Vec<String>| -> Vec<Value> { start.iter().map(|text| think(text)).chain((0..400).map(|_| think(" more of it"))).collect() };
-        // (drafting again, more than enough to be stopped the first time, and then its call)
-        let mut again = vec![think(&format!("Again.\n{}", fenced(&code_lines(DRAFT_LINES + 10))))];
+        // (drafting again, a few lines short of the line after a stop, and then its call)
+        let mut again = vec![think(&format!("Again.\n{}", fenced(&code_lines(DRAFT_LINES_AFTER_STOP - 5))))];
         again.extend(whole_call(serde_json::json!({"path": "index.html", "content": "x\n"})));
         let (client, bodies) = trickling_server(vec![
             long(vec!["Plan.\n".to_string(), fenced(&code_lines(DRAFT_LINES + 2))]),
@@ -9208,7 +9224,8 @@ Body").unwrap();
         let (client, bodies) = trickling_server(vec![
             whole_call(serde_json::json!({"path": "index.html", "content": "x\n"})),
             edit,
-            vec![serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})],
+            // (an answer that names the files it made: one that does not is asked about them, in a request this server has no answer for)
+            vec![serde_json::json!({"choices": [{"delta": {"content": "made index.html and second.html"}, "finish_reason": "stop"}]})],
         ]);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
         run.handle.commands.send(Command::Send("make a page".into())).unwrap();

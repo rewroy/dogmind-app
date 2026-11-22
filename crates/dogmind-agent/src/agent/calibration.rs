@@ -251,3 +251,83 @@ fn calibrate_where_a_draft_reaches_each_size() {
         }
     }
 }
+
+/// The note a stop sends, in any of its forms: the stop's own turn goes on after it.
+fn is_stop_note(text: &str) -> bool {
+    text.starts_with(prompt::DRAFT_NOTE) && text.contains("in your reasoning") && text.to_ascii_lowercase().contains("write the code now")
+}
+
+/// The line a draft is stopped at after a stop in the same turn (one lower than the first stop's, against today's `LONG_DRAFT_LINES + 1`): every request after a stop,
+/// with whether a watch at `LOWER` and one at `LONG_DRAFT_LINES + 1` fires, where in its reasoning (characters) each does, whether a file was written since the stop,
+/// and what the request was: stopped itself (a kept reasoning, its note after it), a true draft (its own code mostly in what it then wrote), or neither.
+#[test]
+#[ignore = "reads the sessions of the folder DOGMIND_CALIBRATE names"]
+fn calibrate_the_line_after_a_stop() {
+    const LOWER: usize = 60;
+    let Some(root) = std::env::var_os("DOGMIND_CALIBRATE") else {
+        eprintln!("DOGMIND_CALIBRATE names no folder: nothing to read");
+        return;
+    };
+    let fires_at = |shown: &BTreeSet<String>, reasoning: &str, line: usize| -> Option<usize> {
+        let mut watch = DraftWatch::new(shown.clone(), line);
+        let mut end = 0;
+        for piece in reasoning.split_inclusive('\n') {
+            end += piece.len();
+            if watch.is_a_draft(&reasoning[..end]) {
+                return Some(end);
+            }
+        }
+        watch.is_a_draft(&format!("{reasoning}\n")).then_some(reasoning.len())
+    };
+    println!("session\tmsg\tchars\tkind\twrote_since\tat{LOWER}\tat{}", LONG_DRAFT_LINES + 1);
+    let (mut seen, mut lower, mut long) = (0, [0usize; 3], [0usize; 3]);
+    let mut folders: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|entry| entry.path()).filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().ends_with("-data"))).collect();
+    folders.sort();
+    for folder in folders {
+        let tag = folder.file_name().unwrap().to_string_lossy().trim_end_matches("-data").to_string();
+        let mut files: Vec<_> = std::fs::read_dir(folder.join("sessions")).into_iter().flatten().flatten().map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !path.to_string_lossy().contains(".trajectory.") && !path.to_string_lossy().contains("helper")).collect();
+        files.sort();
+        for file in files {
+            let Ok(messages) = crate::session::read(&file) else { continue };
+            let name = format!("{tag}/{}", file.file_stem().unwrap().to_string_lossy());
+            let (mut stopped, mut wrote_since) = (false, false);
+            for (at, message) in messages.iter().enumerate() {
+                if message.role == "user" {
+                    let text = message.content.as_deref().unwrap_or("");
+                    if is_stop_note(text) {
+                        (stopped, wrote_since) = (true, false);
+                    } else if !text.starts_with("[From the app") {
+                        // (the person's next message: a turn of its own, with no stop in it yet)
+                        (stopped, wrote_since) = (false, false);
+                    }
+                    continue;
+                }
+                if message.role != "assistant" {
+                    continue;
+                }
+                let wrote = written(message);
+                if let (true, Some(reasoning)) = (stopped, message.reasoning_content.as_deref().filter(|text| text.chars().count() > 200)) {
+                    let shown = lines_shown(&messages[..at]);
+                    let own: BTreeSet<&str> = reasoning.lines().map(str::trim).filter(|line| is_code_line(line) && line.len() >= QUOTE_MIN && !shown.contains(*line)).collect();
+                    let put: BTreeSet<&str> = wrote.lines().map(str::trim).collect();
+                    let stopped_itself = messages.get(at + 1).is_some_and(|next| next.role == "user" && is_stop_note(next.content.as_deref().unwrap_or("")));
+                    let true_draft = !wrote.trim().is_empty() && own.len() >= 8 && own.iter().filter(|line| put.contains(*line)).count() * 2 >= own.len();
+                    let kind = if stopped_itself { 0 } else if true_draft { 1 } else { 2 };
+                    let (at_lower, at_long) = (fires_at(&shown, reasoning, LOWER), fires_at(&shown, reasoning, LONG_DRAFT_LINES + 1));
+                    seen += 1;
+                    lower[kind] += usize::from(at_lower.is_some());
+                    long[kind] += usize::from(at_long.is_some());
+                    let cell = |value: Option<usize>| value.map_or("-".to_string(), |chars| chars.to_string());
+                    println!("{name}\t{at}\t{}\t{}\t{}\t{}\t{}", reasoning.len(), ["stopped", "true draft", "other"][kind], u8::from(wrote_since), cell(at_lower), cell(at_long));
+                }
+                if !wrote.trim().is_empty() {
+                    wrote_since = true;
+                }
+            }
+        }
+    }
+    println!("requests after a stop with a reasoning over 200 characters: {seen}");
+    println!("a watch at {LOWER} fires: stopped {}, true drafts {}, others {}", lower[0], lower[1], lower[2]);
+    println!("a watch at {} fires: stopped {}, true drafts {}, others {}", LONG_DRAFT_LINES + 1, long[0], long[1], long[2]);
+}
