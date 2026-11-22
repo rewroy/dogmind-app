@@ -3670,13 +3670,14 @@ mod power_tests {
     fn what_a_command_in_the_sandbox_prints_is_seen_while_it_runs() {
         let dir = crate::in_container::tempdir().unwrap();
         let (mut bench, cancel) = (Workbench::default(), AtomicBool::new(false));
-        // (spelled with a caret, so that the line itself does not say what it prints)
-        let line = "echo ready^-now& powershell -NoProfile -Command \"Start-Sleep -Seconds 30\"";
+        // (spelled with a caret, so that the line itself does not say what it prints. It runs far longer than it is waited for: a whole run of the tests starts
+        // so many sandboxed commands at once that one began to print only after 25 s, and the test said it had not, though it had nothing to do with the look)
+        let line = "echo ready^-now& powershell -NoProfile -Command \"Start-Sleep -Seconds 300\"";
         bench.run("execute_command", &json!({"command": line, "background": true}), dir.path(), &cancel).unwrap();
         let started = Instant::now();
         let seen = loop {
             let said = bench.job_status(&json!({"id": "job1"})).unwrap();
-            if said.contains("ready-now") || started.elapsed() > Duration::from_secs(25) {
+            if said.contains("ready-now") || started.elapsed() > Duration::from_secs(120) {
                 break said;
             }
             std::thread::sleep(Duration::from_millis(200));
