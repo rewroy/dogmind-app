@@ -9387,6 +9387,26 @@ Body").unwrap();
         assert_eq!(closed, [false, true, true, false], "the draft that was stopped, the look at the folder, the write, and the answer after it");
     }
 
+    /// A look again at a command that has printed nothing new says to wait for its end to wake the session, not to look.
+    #[test]
+    fn a_look_again_at_a_quiet_command_says_its_end_wakes_the_session() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (client, bodies) = server(vec![
+            call_answer("execute_command", serde_json::json!({"command": "ping -n 30 127.0.0.1 >nul", "background": true})),
+            call_answer("command_status", serde_json::json!({"id": "job1"})),
+            call_answer("command_status", serde_json::json!({"id": "job1"})),
+            text_answer("waiting for it"),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("run it".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let bodies = bodies.lock().unwrap();
+        let last_of = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string();
+        assert!(last_of(3).contains("do not look again to wait for it"), "{}", last_of(3));
+        drop(bodies);
+        run.handle.commands.send(Command::Quit).unwrap();
+    }
+
     /// The records are the sessions' folder and the engine's log beside the rules, and the model is told where they are, the log only where there is one.
     #[test]
     fn the_records_are_the_sessions_and_the_engines_log_and_the_model_is_told_where() {

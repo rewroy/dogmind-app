@@ -204,6 +204,8 @@ pub struct Job {
     /// What it has printed while it runs, and how far a look at it has got.
     pub(crate) live: Arc<Live>,
     looked: AtomicU64,
+    /// Whether command_status has told of it while it runs: a look after that with nothing new is a wait.
+    looked_at: AtomicBool,
     /// It was ended on purpose (`command_stop`, the person's Stop or a stop of the list, a session that was left): that wakes nothing.
     stopped: AtomicBool,
     /// Its end has been looked at for a notice, which was made or was not due (the model had read the end already).
@@ -214,7 +216,7 @@ pub struct Job {
 
 impl Job {
     pub(crate) fn new(id: &str, command: &str, started: Instant, cancel: Arc<AtomicBool>, result: CommandResult, live: Arc<Live>, wake_on: Option<String>) -> Job {
-        Job { id: id.to_string(), command: command.to_string(), started, started_at: chrono::Local::now().format("%H:%M").to_string(), cancel, result, in_scratch: false, told: AtomicBool::new(false), live, looked: AtomicU64::new(0), stopped: AtomicBool::new(false), announced: AtomicBool::new(false), wake_on }
+        Job { id: id.to_string(), command: command.to_string(), started, started_at: chrono::Local::now().format("%H:%M").to_string(), cancel, result, in_scratch: false, told: AtomicBool::new(false), live, looked: AtomicU64::new(0), looked_at: AtomicBool::new(false), stopped: AtomicBool::new(false), announced: AtomicBool::new(false), wake_on }
     }
 
     #[cfg(test)]
@@ -889,10 +891,11 @@ impl Workbench {
             }
             None => {
                 let (printed, next) = job.live.since(job.looked.load(Ordering::Relaxed), LIVE_SHOWN);
-                let first = job.looked.swap(next, Ordering::Relaxed) == 0;
+                let first = job.looked.swap(next, Ordering::Relaxed) == 0 && !job.looked_at.swap(true, Ordering::Relaxed);
                 let said = match (printed.is_empty(), first) {
                     (true, true) => "it has printed nothing yet".to_string(),
-                    (true, false) => "it has printed nothing since the last look".to_string(),
+                    // (a look again with nothing new is a wait: a session on Dogmind's own source looked 15 times in three minutes at a test run, each a request)
+                    (true, false) => "it has printed nothing since the last look. Its end wakes you with what it came to: do not look again to wait for it. Go on with other work, or end your turn.".to_string(),
                     (false, true) => format!("what it has printed:\n{printed}"),
                     (false, false) => format!("what it has printed since the last look:\n{printed}"),
                 };
@@ -3322,7 +3325,7 @@ mod power_tests {
         live.push("compiling\nlistening on http://localhost:5173\n".as_bytes());
         let first = bench.job_status(&json!({"id": "job1"})).unwrap();
         assert!(first.contains("is running") && first.contains("listening on http://localhost:5173"), "{first}");
-        assert!(bench.job_status(&json!({})).unwrap().ends_with("it has printed nothing since the last look"));
+        assert!(bench.job_status(&json!({})).unwrap().contains("it has printed nothing since the last look. Its end wakes you"), "a look again with nothing new is a wait");
         live.push("GET / 200\n".as_bytes());
         let next = bench.job_status(&json!({})).unwrap();
         assert!(next.contains("since the last look:\nGET / 200") && !next.contains("listening"), "{next}");
@@ -3361,7 +3364,8 @@ mod power_tests {
             std::thread::sleep(Duration::from_millis(200));
         };
         bench.job_stop(&json!({"id": "job1"})).unwrap();
-        assert!(seen.contains("is running") && seen.contains("printed:\nready-now"), "{seen}");
+        // (looked at before it printed, a look after says what came since)
+        assert!(seen.contains("is running") && seen.contains("printed since the last look:\nready-now"), "{seen}");
     }
 
     /// `wake_on` belongs to a command started in the background, and has to be a pattern: what is wrong with it is said before anything is started.
