@@ -3,7 +3,8 @@
 //! The turns are the lines of the file (a blank line is skipped), each sent when the one before it has ended. Approvals are given, as a person at the keyboard would who trusts the job;
 //! with `--refuse` every approval is answered no, so that no command runs. A call being written is shown as its pieces come, with the time into the turn.
 //! `--code-mode` offers the model `run_code`, a short program that calls the tools; the calls it makes are lines of the trajectory with the program's call as their `parent`.
-//! `--wake-for` goes on after the last turn for as long as the session has a background command or a wait, up to that many seconds, and shows the turns it wakes itself for.
+//! `--wake-for` goes on after the last turn for as long as the session has a background command or a wait, up to that many seconds, and shows the turns it wakes itself for;
+//! `--limit` is of the whole run, the turns it wakes itself for with the rest.
 //! The session, and the trajectory beside it (`dogmind-app --trajectory`), are in `--data\sessions`. It never touches the app's own data folder.
 
 use std::path::PathBuf;
@@ -166,6 +167,12 @@ fn main() {
         let mut seen = Seen { began: turn_began, refuse, ..Seen::default() };
         let mut in_a_turn = false;
         while waiting_since.elapsed() < Duration::from_secs(wake_for) {
+            if began.elapsed() > Duration::from_secs(limit) {
+                println!("time limit: stopping (woken turns: {woken_turns})");
+                handle.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                send(Command::Quit);
+                return;
+            }
             if !in_a_turn && handle.background.snapshot().is_empty() && !handle.background.has_pending() {
                 println!("nothing is left going or waiting");
                 break;
