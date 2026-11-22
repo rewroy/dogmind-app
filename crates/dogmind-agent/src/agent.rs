@@ -1005,6 +1005,41 @@ fn looks_like_a_try(path: &str) -> bool {
     file.starts_with('_') || ["tmp", "temp", "probe", "scratch", "debug"].iter().any(|word| file.contains(word))
 }
 
+/// What a helper's read or search was of, as the agent that asked would do it again: a file with its lines, or a search and where. None for the rest.
+fn looked_at(name: &str, arguments: &Value) -> Option<String> {
+    let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+    match name {
+        "read_file" => {
+            let start = arguments.get("start_line").and_then(Value::as_u64);
+            let lines = match (start, arguments.get("limit").and_then(Value::as_u64)) {
+                (Some(start), Some(limit)) => format!(" lines {start}-{}", start + limit.saturating_sub(1)),
+                (Some(start), None) => format!(" from line {start}"),
+                (None, Some(limit)) => format!(" lines 1-{limit}"),
+                (None, None) => String::new(),
+            };
+            Some(format!("read_file {path}{lines}"))
+        }
+        "search_files" => arguments.get("pattern").and_then(Value::as_str).map(|pattern| format!("search_files `{pattern}` in {path}")),
+        _ => None,
+    }
+}
+
+/// What comes back from a helper that gave no answer, even asked with no tools: what it read and searched, so that its work is not all lost and the agent
+/// that asked can read again what matters, first to last, the same thing once.
+fn helper_looked_at(looked: &[String]) -> String {
+    let mut seen = HashSet::new();
+    let list: Vec<&String> = looked.iter().filter(|what| seen.insert(what.as_str())).collect();
+    if list.is_empty() {
+        return "The helper gave no answer of its own, and read nothing: look into it yourself, with search_files and read_file.".to_string();
+    }
+    let lines: String = list.iter().take(60).map(|what| format!("- {what}
+")).collect();
+    let more = if list.len() > 60 { format!("- and {} more
+", list.len() - 60) } else { String::new() };
+    format!("The helper gave no answer of its own, even asked with no tools. What it read and searched, first to last, for you to read again what matters to the task:
+{lines}{more}")
+}
+
 /// The picture a check_page result says it took: the path after its `read_file`.
 fn picture_of_check(said: &str) -> Option<String> {
     said.lines().find_map(picture_of_line)
@@ -1530,6 +1565,8 @@ struct HelperRun {
     steps: u32,
     /// The files it read, once each.
     files: HashSet<String>,
+    /// What it read and searched, in order, as the agent that asked would read it again: `path` with its lines, or a search and where.
+    looked: Vec<String>,
     tokens: u64,
     stopped: bool,
 }
@@ -3887,7 +3924,7 @@ impl Agent {
         let mut messages = vec![Message::text("system", prompt::helper_prompt(&self.workspace)), Message::text("user", task)];
         // (a Stop pressed on the card of an earlier helper, after that had ended, is for none that begins now)
         self.helper_stop.forget();
-        let mut run = HelperRun { file: None, number: None, name: None, began: Instant::now(), steps: 0, files: HashSet::new(), tokens: 0, stopped: false };
+        let mut run = HelperRun { file: None, number: None, name: None, began: Instant::now(), steps: 0, files: HashSet::new(), looked: Vec::new(), tokens: 0, stopped: false };
         if let Some((session, number, name)) = self.begin_helper_file() {
             (run.file, run.number, run.name) = (Some(session), Some(number), Some(name));
         }
@@ -3984,11 +4021,14 @@ impl Agent {
                 messages.push(nudge);
                 told_enough = true;
             }
-            // The tools are offered to the end. Not offered, a real model (DeepSeek-V4.1) went on calling one, in its own markup: that came back as
-            // the answer, and the agent that asked got that and nothing of what the helper had found.
+            // The tools are offered past its last word, and a call is turned down: not offered, a real model (DeepSeek-V4.1) went on calling one in its own
+            // markup, which came back as the answer. But a model that calls them still, round after round, is asked the last time with none: its words, with
+            // any markup taken out (`without_call_markup`), are what it has. Offered to the very end, a helper's 23 requests and 36,655 characters of its
+            // reasoning were all lost, as it never answered.
+            let final_word = step == HELPER_STEPS + HELPER_PAST_ENOUGH;
             let req_id = self.traj.request_id();
             // (it reads and says what it found: a low effort, whatever the agent's, as its thinking is the agent's wait)
-            let request = Request { model: &self.model, messages, tools: Some(schemas), effort: self.effort.as_deref().map(|_| HELPER_EFFORT), images: None, japanese_letters: false, request_id: Some(&req_id) };
+            let request = Request { model: &self.model, messages, tools: (!final_word).then_some(schemas), effort: self.effort.as_deref().map(|_| HELPER_EFFORT), images: None, japanese_letters: false, request_id: Some(&req_id) };
             let mut clock = Clock::start();
             // (the person's Stop on the turn ends it, and so does the one on this helper alone: the stream has a flag of its own that either sets)
             let halt = AtomicBool::new(false);
@@ -4004,7 +4044,12 @@ impl Agent {
             let answer = without_call_markup(&completion.content).trim().to_string();
             if completion.tool_calls.is_empty() || (last && !answer.is_empty()) {
                 self.keep_helper(run, &completion.message());
-                return if answer.is_empty() { Err("the helper ended with nothing to say".into()) } else { Ok(tools::spill("helper", &answer, HELPER_ANSWER)) };
+                return match (answer.is_empty(), final_word) {
+                    (false, _) => Ok(tools::spill("helper", &answer, HELPER_ANSWER)),
+                    // (asked with no tools, it still said nothing: what it read is what there is of its work)
+                    (true, true) => Ok(helper_looked_at(&run.looked)),
+                    (true, false) => Err("the helper ended with nothing to say".into()),
+                };
             }
             let said = completion.message();
             self.keep_helper(run, &said);
@@ -4037,12 +4082,16 @@ impl Agent {
                         run.files.insert(resolve(&self.workspace, path).to_string_lossy().to_lowercase());
                     }
                 }
+                if result.is_ok() {
+                    run.looked.extend(looked_at(name, &arguments));
+                }
                 let answered = Message::tool_result(&call.id, result.unwrap_or_else(|error| format!("error: {error}")));
                 self.keep_helper(run, &answered);
                 messages.push(answered);
             }
         }
-        Err("the helper went on calling tools after it was told to answer, and gave no answer".into())
+        // (asked with no tools, it called one all the same, in markup the stream made a call of: what it read is what there is of its work)
+        Ok(helper_looked_at(&run.looked))
     }
 
     /// The picture a `read_file` names, if it names one.
@@ -5286,6 +5335,34 @@ mod tests {
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 7, "the answer with the explore, its helper's request, the answer after");
         assert!(serde_json::to_string(&bodies[6]["messages"]).unwrap().contains("The thread is not here."));
+    }
+
+    /// A helper that calls tools past its last word, round after round, is asked the last time with none: what it says then is its answer, and when it says
+    /// nothing, what it read and searched comes back in place of one, and its work is not all lost.
+    #[test]
+    fn a_helper_that_never_answers_is_asked_with_no_tools_and_what_it_read_comes_back() {
+        for (last_word, expected) in [("The answer at last.", "The answer at last."), ("", "read_file a.txt lines 1-5")] {
+            let dir = crate::in_container::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "x
+").unwrap();
+            let mut script = vec![call_answer("explore", serde_json::json!({"task": "Look"}))];
+            script.extend((0..HELPER_STEPS + HELPER_PAST_ENOUGH).map(|_| call_answer("read_file", serde_json::json!({"path": "a.txt", "start_line": 1, "limit": 5}))));
+            script.push(text_answer(last_word));
+            script.push(text_answer("done"));
+            let (client, bodies) = server(script);
+            let run = run_agent(dir.path(), client, Mode::Default);
+            run.handle.commands.send(Command::Send("look".into())).unwrap();
+            let (log, _) = until_end(&run, Decision::Reject);
+            let bodies = bodies.lock().unwrap();
+            let final_word = HELPER_STEPS + HELPER_PAST_ENOUGH + 1;
+            assert!(bodies[final_word - 1]["tools"].as_array().is_some_and(|tools| !tools.is_empty()), "offered past its last word");
+            assert!(bodies[final_word].get("tools").is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)), "the last time, none: {}", bodies[final_word]);
+            let after = serde_json::to_string(&bodies[final_word + 1]["messages"]).unwrap();
+            assert!(after.contains(expected), "{log:?}");
+            if last_word.is_empty() {
+                assert!(after.contains("The helper gave no answer of its own") && after.matches("read_file a.txt lines 1-5").count() == 1, "once: {after}");
+            }
+        }
     }
 
     /// A helper that has used its requests is still offered its tools, so that a call is a call and not words; a call then is turned down,
