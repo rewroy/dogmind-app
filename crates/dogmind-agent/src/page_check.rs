@@ -42,6 +42,16 @@ const ON_THE_CPU: &str = " --disable-gpu";
 /// run of the app.
 static GPU_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+/// The model's server is on this machine, and so, with a CUDA build, on its GPU. Its weights fill the GPU's memory (a partially resident model is made to), and
+/// a browser drawing there takes some of it, which may page the engine's out before its next request or fail an allocation of its: pages are then drawn on the
+/// CPU, as they were before the GPU was used. (Not measured: it is left alone until it is.)
+static ENGINE_HERE: AtomicBool = AtomicBool::new(false);
+
+/// Says whether the model's server is on this machine ([`ENGINE_HERE`]).
+pub fn engine_on_this_machine(here: bool) {
+    ENGINE_HERE.store(here, Ordering::Relaxed);
+}
+
 /// Whether a page draws with WebGL, from its HTML and the scripts of its own it loads: a context of it named, or a library that draws with it (three.js by its
 /// file or its import name, Babylon.js, PixiJS, A-Frame, regl).
 fn draws_webgl(texts: &[String]) -> bool {
@@ -1414,7 +1424,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         texts.extend(needs.iter().flat_map(|needs| needs.run.iter()).filter_map(|script| std::fs::read_to_string(folder.join(script)).ok()).filter(|text| text.len() < 4 << 20));
         draws_webgl(&texts)
     });
-    let on_gpu = AtomicBool::new(webgl && GPU_FAILURES.load(Ordering::Relaxed) < 2);
+    let on_gpu = AtomicBool::new(webgl && GPU_FAILURES.load(Ordering::Relaxed) < 2 && !ENGINE_HERE.load(Ordering::Relaxed));
     let extensions = extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
     let browser_flags = || flags(on_gpu.load(Ordering::Relaxed)) + &extensions;
     // (a run on the GPU that did not end well: the rest of the check draws on the CPU, and it is said whether this one is to be tried again for that)

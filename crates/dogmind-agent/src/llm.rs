@@ -585,6 +585,16 @@ pub trait Provider: Send + Sync {
     fn waits_out_silence(&self) -> bool {
         false
     }
+    /// Whether the server is on this machine, by a loopback address: the app's own engine, or one the person runs here, which has the GPU's memory.
+    fn on_this_machine(&self) -> bool {
+        false
+    }
+}
+
+/// Whether an address is of this machine: `localhost`, or a loopback IP.
+pub fn is_loopback(url: &Url) -> bool {
+    let host = url.host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// What a server that refused a request says, when asked, of whether it is on its way back.
@@ -714,6 +724,10 @@ impl Provider for Client {
 
     fn waits_out_silence(&self) -> bool {
         !self.own_engine
+    }
+
+    fn on_this_machine(&self) -> bool {
+        self.own_engine || is_loopback(&self.base)
     }
 
     fn restart(&self, cancel: &AtomicBool) -> Restart {
@@ -1229,6 +1243,17 @@ mod tests {
         ]);
         assert_eq!(seen, ["t:read_file", "a0:{\"path\": \"a\"}", "t:read_file", "a1:{\"path\": \"b", "t:read_file", "t:read_file", "a1:\"}"]);
         assert_eq!(completion.tool_calls.iter().map(|call| call.function.arguments.as_str()).collect::<Vec<_>>(), [r#"{"path": "a"}"#, r#"{"path": "b"}"#]);
+    }
+
+    /// A server on this machine is one at a loopback address, or the app's own engine: pages that draw with WebGL are then drawn on the CPU.
+    #[test]
+    fn a_server_at_a_loopback_address_is_on_this_machine() {
+        for here in ["http://127.0.0.1:8080", "http://localhost:8080/v1", "http://[::1]:8080", "http://127.0.0.2:1", "http://LOCALHOST", "http://engine.localhost:9"] {
+            assert!(is_loopback(&Url::parse(here).unwrap()), "{here}");
+        }
+        for there in ["http://192.168.0.100:8080", "https://api.example.com", "http://localhost.example.com", "http://10.0.0.1"] {
+            assert!(!is_loopback(&Url::parse(there).unwrap()), "{there}");
+        }
     }
 
     /// The pieces are a partial string: a call that never comes whole (the server released the markup as text) is no call, a final call that is not what the pieces began is told

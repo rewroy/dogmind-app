@@ -1855,6 +1855,7 @@ impl Agent {
                 Command::Quit => return,
                 Command::Provider(provider, model, provided) => {
                     let (window, from) = window_in_use(provided);
+                    crate::page_check::engine_on_this_machine(provider.on_this_machine());
                     self.provider = Some(provider);
                     self.server_answered = false;
                     // (a wait for the server there was is a wait for another one)
