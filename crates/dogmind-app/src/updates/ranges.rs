@@ -77,9 +77,11 @@ pub(super) struct Job<'a> {
 
 fn is_safe(relative: &str) -> bool {
     // (as `pack::is_safe` of `dogmind-setup`: Windows opens `a.` and `a ` as `a`, and a device has its name in any folder)
-    const DEVICES: [&str; 26] = ["con", "prn", "aux", "nul", "conin$", "conout$", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "com0", "lpt0"];
+    const DEVICES: [&str; 32] = ["con", "prn", "aux", "nul", "conin$", "conout$", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "com0", "lpt0", "com\u{b9}", "com\u{b2}", "com\u{b3}", "lpt\u{b9}", "lpt\u{b2}", "lpt\u{b3}"];
     !relative.is_empty()
-        && relative.split('\\').all(|part| !part.is_empty() && !part.ends_with(['.', ' ']) && !DEVICES.contains(&part.to_ascii_lowercase().as_str()))
+        // (a device by its name before any dot, its spaces at the end left out: Windows opens `NUL.txt`, `con .log` and `COM1.tar.gz` as the device, and what
+        // is written to one is gone with no error; COM and LPT with a superscript digit are ports too)
+        && relative.split('\\').all(|part| !part.is_empty() && !part.ends_with(['.', ' ']) && !DEVICES.contains(&part.split('.').next().unwrap_or(part).trim_end_matches(' ').to_lowercase().as_str()))
         && !relative.contains(['/', ':', '*', '?', '"', '<', '>', '|'])
         && !relative.chars().any(char::is_control)
 }
@@ -766,7 +768,7 @@ mod tests {
 
     #[test]
     fn a_name_is_judged_as_the_installer_judges_it() {
-        for name in ["..\\x", "a\\..\\..\\x", "C:\\x", "\\x", "a:stream", "a\\\\b", "", ".", "a/b", ".. \\x", "..\\ x\\..  \\y", "a\\... \\b", "a.", "a ", "NUL", "tools\\con", "a\nb", "a", "a\\b.txt", "\u{65e5}\u{672c}\\c d", "node_modules\\.bin\\x", "fonts\\BIZUDGothic-Regular.ttf"] {
+        for name in ["..\\x", "a\\..\\..\\x", "C:\\x", "\\x", "a:stream", "a\\\\b", "", ".", "a/b", ".. \\x", "..\\ x\\..  \\y", "a\\... \\b", "a.", "a ", "NUL", "tools\\con", "a\nb", "NUL.txt", "tools\\CON.log", "con .txt", "console.log", "com\u{b9}.x", "a", "a\\b.txt", "\u{65e5}\u{672c}\\c d", "node_modules\\.bin\\x", "fonts\\BIZUDGothic-Regular.ttf"] {
             assert_eq!(is_safe(name), setup_pack::is_safe(name), "{name:?}");
         }
     }
