@@ -1165,7 +1165,10 @@ impl Workbench {
         }
         self.covered.insert(path, seen_in_part.unwrap_or(lines));
         let word = if !exists { "created" } else if append { "added to" } else { "replaced" };
-        let said = format!("{word} {given}: now {lines} lines, {} bytes", written.len());
+        let mut said = format!("{word} {given}: now {lines} lines, {} bytes", written.len());
+        if !append && lines >= WRITTEN_WHOLE_LINES && is_a_page(Path::new(given)) {
+            said.push_str(&not_opened_yet(lines));
+        }
         Ok(if self.in_japanese { said + &not_japanese_note(content) } else { said })
     }
 
@@ -1652,6 +1655,21 @@ fn not_japanese(text: &str) -> Vec<char> {
         }
     }
     found
+}
+
+/// What a page written whole is told, before it has been opened: the next step is to open it. In the comparison runs a model wrote a page of 30 to 56 KB, read
+/// it over in its reasoning, and wrote it whole again before it had opened it once, six times in five runs, each 300 to 400 s of writing; what opening it would
+/// have shown was then still to be found.
+fn not_opened_yet(lines: usize) -> String {
+    format!("\nnote: open it with check_page before you change it: what it shows is what to fix. Change it with apply_patch, the parts that change: writing all {lines} lines again takes as long as writing them did.")
+}
+/// How long a page is, in lines, for [`not_opened_yet`]: one shorter is soon written again.
+const WRITTEN_WHOLE_LINES: usize = 300;
+
+/// Whether a file is a page, which check_page opens.
+fn is_a_page(path: &Path) -> bool {
+    let extension = path.extension().map_or(String::new(), |extension| extension.to_string_lossy().to_ascii_lowercase());
+    matches!(extension.as_str(), "html" | "htm" | "xhtml")
 }
 
 fn not_japanese_note(text: &str) -> String {
@@ -4548,6 +4566,27 @@ mod tests {
         bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
         assert!(bench.run("create_file", &write, dir.path(), &cancel).unwrap().starts_with("replaced a.txt"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+    }
+
+    /// A long page written whole is told to be opened with check_page before it changes, and what it shows changed with apply_patch. A short page, a file that
+    /// is not a page, and a write that goes on from a cut one are not.
+    #[test]
+    fn a_long_page_written_whole_is_told_to_be_opened_first() {
+        let (dir, mut bench, cancel) = bench();
+        let long = "<p>line</p>\n".repeat(WRITTEN_WHOLE_LINES);
+        let said = bench.run("create_file", &json!({"path": "page.html", "content": long}), dir.path(), &cancel).unwrap();
+        assert!(said.ends_with(&not_opened_yet(WRITTEN_WHOLE_LINES)) && said.contains(&format!("writing all {WRITTEN_WHOLE_LINES} lines again")), "{said}");
+        assert_eq!(said.lines().next(), Some(format!("created page.html: now {WRITTEN_WHOLE_LINES} lines, {} bytes", long.len()).as_str()), "the first line, which the window shows, is as before");
+        let again = bench.run("create_file", &json!({"path": "page.html", "content": long}), dir.path(), &cancel).unwrap();
+        assert!(again.starts_with("replaced page.html") && again.ends_with(&not_opened_yet(WRITTEN_WHOLE_LINES)), "{again}");
+        let short = "<p>line</p>\n".repeat(WRITTEN_WHOLE_LINES - 1);
+        assert!(!bench.run("create_file", &json!({"path": "short.html", "content": short}), dir.path(), &cancel).unwrap().contains("check_page"));
+        for other in ["notes.md", "game.py", "app.js"] {
+            assert!(!bench.run("create_file", &json!({"path": other, "content": long}), dir.path(), &cancel).unwrap().contains("check_page"), "{other}");
+        }
+        let added = bench.run("create_file", &json!({"path": "page.html", "content": long, "append": true}), dir.path(), &cancel).unwrap();
+        assert!(added.starts_with("added to page.html") && !added.contains("check_page"), "{added}");
+        assert!(is_a_page(Path::new(r"a\Index.HTML")) && is_a_page(Path::new("x.htm")) && !is_a_page(Path::new("image.svg")) && !is_a_page(Path::new("style.css")));
     }
 
     #[test]
