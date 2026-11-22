@@ -20,6 +20,7 @@ an error for it to be missing, as an app without it behaves differently from wha
 LICENSE.txt holds this app's license, those of Straydog, Lucide and the CUDA toolkit whose libraries go beside the engine, and the list of Rust crates in the executable.
 """
 import filecmp
+import hashlib
 import importlib.util
 import json
 import os
@@ -118,6 +119,31 @@ for (const name of ["lstat", "stat"]) {
   };
 }
 """
+# libuv names the pipes it makes for a child's standard streams, and for a fork's channel, \\?\pipe\uv\<number>-<pid>, made with FILE_FLAG_FIRST_PIPE_INSTANCE: a name refused
+# (ERROR_ACCESS_DENIED, as a name in use is) is taken for a clash, and the next number is tried, with no end. A command's AppContainer may make a pipe only in its own LOCAL\
+# space, so every name was refused, and node spun for ever on execSync, spawn with piped stdio, fork, node --test and what runs esbuild. node.exe's one format string, kept
+# to its length (its end filled with NUL), names the pipe under LOCAL\ instead, which a container may make, and any other process too. With no pid in the name, one that two
+# processes both try is a clash like any other, and the next number is taken (two at once in the sandbox, each starting 40 children, all made).
+NODE_PIPE_NAME = (b"\\\\?\\pipe\\uv\\%llu-%lu\x00", b"\\\\?\\pipe\\LOCAL\\%llu\x00\x00")
+
+
+def with_local_pipes(exe, pinned):
+    """node.exe with libuv's pipe names under LOCAL\\ (NODE_PIPE_NAME): the string found there exactly once, replaced by one of its length, and the result the hash
+    tools.lock.json pins for it. Anything else stops the bundle from being made."""
+    data = exe.read_bytes()
+    old, new = NODE_PIPE_NAME
+    if len(old) != len(new):
+        sys.exit("node's pipe name and what replaces it are not of one length")
+    found = data.count(old)
+    if found != 1:
+        sys.exit(f"{exe}: libuv's pipe name is there {found} times, not once: this is not the node the change was made for, and no bundle is made")
+    patched = data.replace(old, new)
+    made = hashlib.sha256(patched).hexdigest()
+    if made != pinned:
+        sys.exit(f"{exe} with its pipe names changed is {made}, not the {pinned or 'nothing'} that tools.lock.json pins as node's patched_sha256")
+    exe.write_bytes(patched)
+
+
 GIT_KEEPS = re.compile(r"(?i)^(git(?!-credential-(manager|helper-selector))|lib(?!skia|harfbuzz)|zlib|brotli|psl|proxy-lookup|headless-git|printf_|scalar)")
 SHIMS = {
     "pip.cmd": '@"%~dp0python.exe" -m pip %*\r\n',
@@ -292,9 +318,12 @@ def assemble_tools(target):
     root = f"node-v{lock['node']['version']}-win-x64/"
     wanted = lambda name: name in ("node.exe", "npm", "npm.cmd", "npx", "npx.cmd", "LICENSE") or (name.startswith("node_modules/npm/") and not name.startswith(("node_modules/npm/docs/", "node_modules/npm/man/")))
     extract(cached(lock["node"]), node, strip=root, keep=wanted)
+    with_local_pipes(node / "node.exe", lock["node"].get("patched_sha256", ""))
     (node / "sandbox_fix.cjs").write_text(NODE_FIX, encoding="utf-8", newline="\n")
     sizes.append((f"Node.js {lock['node']['version']} with npm and npx", size_of(node)))
-    parts.append((f"Node.js {lock['node']['version']}", node / "LICENSE", "In tools\\node, from nodejs.org. npm and the packages under node_modules\\npm carry their licences beside them."))
+    parts.append((f"Node.js {lock['node']['version']}", node / "LICENSE", "In tools\\node, from nodejs.org, with one string in node.exe changed: the format of the names libuv gives the pipes of a child process "
+                  "(\\\\?\\pipe\\uv\\%llu-%lu became \\\\?\\pipe\\LOCAL\\%llu), so that a command in the sandbox can start children that it talks to by pipes. "
+                  "npm and the packages under node_modules\\npm carry their licences beside them."))
     # Git.
     git = building / "git"
     # Without Git Credential Manager, more than half its size: it has nothing to do in a sandbox, and its way of asking is a window on the person's screen.
