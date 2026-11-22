@@ -689,13 +689,13 @@ fn retry_pause(attempt: u32, said: &str) -> Duration {
 
 /// A command call as the sandbox will run it: its arguments with the line that runs in place of the line as written. None for any other call, and for a command
 /// that runs as it was written.
-fn as_run(tool: &str, arguments: &Value) -> Option<Value> {
+fn as_run(tool: &str, arguments: &Value, workspace: &Path) -> Option<Value> {
     // (outside the sandbox the line runs as it was written)
     if tool != "execute_command" || safety::outside_sandbox(arguments) {
         return None;
     }
     let written = arguments.get("command")?.as_str()?;
-    let runs = tools::line_that_runs(written);
+    let runs = tools::line_that_runs_at(written, arguments, workspace);
     if runs == written {
         return None;
     }
@@ -708,7 +708,7 @@ fn as_run(tool: &str, arguments: &Value) -> Option<Value> {
 /// is weighed as well as the line as written, which is the one the rules and "always" go by. The second is what the person is shown, with the line as written in it.
 fn weigh(gate: &Gate, tool: &str, arguments: &Value, workspace: &Path) -> (Verdict, Option<Value>) {
     let written = gate.check(tool, arguments, workspace);
-    let Some(mut shown) = as_run(tool, arguments) else { return (written, None) };
+    let Some(mut shown) = as_run(tool, arguments, workspace) else { return (written, None) };
     let verdict = both_weighed(written, gate.check(tool, &shown, workspace));
     shown["written_as"] = arguments["command"].clone();
     (verdict, Some(shown))

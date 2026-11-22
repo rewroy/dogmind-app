@@ -2389,6 +2389,106 @@ fn with_backslashes(name: &str, rest: &str) -> Option<String> {
     changed.then_some(out)
 }
 
+/// The line a command of the sandbox runs, from the line as written and where it runs: [`line_that_runs`], and its PowerShell put where it was started
+/// ([`powershell_in_place`]). What the person is asked about and shown is this line, as it is what runs.
+pub fn line_that_runs_at(line: &str, arguments: &Value, workspace: &Path) -> String {
+    let cwd = resolve(workspace, arguments.get("cwd").and_then(Value::as_str).unwrap_or("."));
+    powershell_in_place(&line_that_runs(line), &cwd, users_folder().as_deref())
+}
+
+/// The folder the users' own folders are in (`C:\Users`), from this account's.
+fn users_folder() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").map(PathBuf::from).and_then(|home| home.parent().map(Path::to_path_buf))
+}
+
+/// The name of the PowerShell drive a command in the sandbox is put on.
+const POWERSHELL_PLACE: &str = "DogmindWork";
+
+/// A line whose PowerShell is to run in `cwd` though `cwd` is under the users' folder: there PowerShell, in the sandbox, starts at the drive's root (`C:\`), as it
+/// makes sure of each folder on the way to the one it was started in, and a container may not look into the users' folder. Every relative path then went to
+/// `C:\` and was refused, and `Set-Location` to the folder was refused the same way. On a drive of PowerShell's own whose root is the folder, it is there: the
+/// command of `-Command` (or `-c`) is given that first, and `-File` with plain words after it becomes a command that runs the script by its full path and
+/// ends with its exit code. Other forms, and a folder whose name cmd would read something into, are left as they are.
+fn powershell_in_place(line: &str, cwd: &Path, users: Option<&Path>) -> String {
+    let under = users.is_some_and(|users| {
+        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+        key(cwd).starts_with(&format!("{}\\", key(users)))
+    });
+    let folder = cwd.to_string_lossy().trim_start_matches("\\\\?\\").to_string();
+    if !under || folder.contains(['%', '^', '&', '|', '<', '>', '"', '!', '\n', '\r']) {
+        return line.to_string();
+    }
+    let prefix = format!("$null=New-PSDrive -Name {POWERSHELL_PLACE} -PSProvider FileSystem -Root '{}' -Scope Global; Set-Location {POWERSHELL_PLACE}:\\;", folder.replace('\'', "''"));
+    let program = regex::Regex::new(r#"(?i)(?:^|[&|(]\s*|^\s*@)\s*(?:"[^"]*\\(?:powershell|pwsh)(?:\.exe)?"|(?:[^\s"&|()]*\\)?(?:powershell|pwsh)(?:\.exe)?)(?:\s|$)"#).expect("the pattern is valid");
+    let mut out = String::new();
+    let mut last = 0;
+    for found in program.find_iter(line) {
+        if found.start() < last {
+            continue;
+        }
+        // (its options, then -Command or -File: a value after the options that take one)
+        let rest = &line[found.end()..];
+        let mut at = 0;
+        let mut words = Vec::new();
+        while at < rest.len() {
+            let gap = rest[at..].len() - rest[at..].trim_start().len();
+            let start = at + gap;
+            if start >= rest.len() || rest[start..].starts_with(['&', '|', ')']) {
+                break;
+            }
+            let end = rest[start..].find(char::is_whitespace).map_or(rest.len(), |length| start + length);
+            words.push((start, end));
+            at = end;
+        }
+        let word = |index: usize| words.get(index).map(|&(start, end)| rest[start..end].to_ascii_lowercase());
+        let takes_value = ["-executionpolicy", "-ep", "-ex", "-windowstyle", "-w", "-inputformat", "-outputformat", "-version", "-psconsolefile", "-configurationname", "-workingdirectory", "-wd"];
+        let mut index = 0;
+        let mut change: Option<(usize, String)> = None;
+        while let Some(current) = word(index) {
+            if !current.starts_with('-') {
+                break;
+            }
+            let is_command = current.len() >= 2 && "-command".starts_with(&current);
+            let is_file = current == "-f" || (current.len() >= 3 && "-file".starts_with(&current));
+            if is_command {
+                // (after it: the drive and the place, then the command as it was)
+                let insert = words.get(index + 1).map_or(rest.len(), |&(start, _)| start);
+                change = Some((insert, format!("{prefix} ")));
+                break;
+            }
+            if is_file {
+                let Some(&(script_start, _)) = words.get(index + 1) else { break };
+                let tail_end = words.last().map_or(rest.len(), |&(_, end)| end);
+                let after_file = &rest[script_start..tail_end];
+                let plain = regex::Regex::new(r"^[\w.\-/\\:=,+@ ]+$").expect("the pattern is valid");
+                if !plain.is_match(after_file) {
+                    break;
+                }
+                let (script, args) = after_file.split_once(' ').map_or((after_file, ""), |(script, args)| (script, args.trim()));
+                let full = if Path::new(script).is_absolute() { PathBuf::from(script) } else { cwd.join(script) };
+                let full = full.to_string_lossy().replace('\'', "''");
+                let (file_start, _) = words[index];
+                // (in double quotes, where cmd takes the call's `&` for PowerShell's and not its own; and with the script's exit code, as -File gives it: sourced with `.`
+                // instead, Windows PowerShell ended with 1 for a script's `exit 3`)
+                let command = format!("-Command \"{prefix} & '{full}'{}{}; exit $LASTEXITCODE\"", if args.is_empty() { "" } else { " " }, args);
+                out.push_str(&line[last..found.end() + file_start]);
+                out.push_str(&command);
+                last = found.end() + tail_end;
+                change = None;
+                break;
+            }
+            index += if takes_value.contains(&current.as_str()) { 2 } else { 1 };
+        }
+        if let Some((insert, text)) = change {
+            out.push_str(&line[last..found.end() + insert]);
+            out.push_str(&text);
+            last = found.end() + insert;
+        }
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
 /// The line that runs for a line a model wrote: the same, but where `dir`, `del` or `| head` is replaced by what does that in the
 /// sandbox. The gate weighs this one too, and a person who is asked is shown this one, with what was written beside it.
 /// The lines of a command are joined into one first, as `execute_command` does before it puts the stand-ins in. That alone is the same commands in the same order, so a line
@@ -3152,7 +3252,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let before = file_states(&cwd);
     // As the person, allowed by them: `dir` and `del` work there as they are, and the line runs as it was written and shown.
     let as_person = crate::safety::outside_sandbox(arguments);
-    let runs = if as_person { line.to_string() } else { line_that_runs(line) };
+    let runs = if as_person { line.to_string() } else { powershell_in_place(&line_that_runs(line), &cwd, users_folder().as_deref()) };
     // One cargo command under the user folder, in a workspace that names its members by a pattern, which cargo expands looking at each folder from the drive's root: a
     // container may not look at C:\Users, so this one runs with a restricted token, reading as the person does and writing in the workspace alone (`run_live_restricted`).
     // Judged on the line as the model wrote it, which is what the gate judged and the person allowed (`REASON_CARGO_OUTSIDE`), and on what runs, which must be that line.
@@ -3187,7 +3287,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
         report.push_str(&format!("note: `{cd}` was left out: the command runs in that folder already, and in the sandbox `cd` to a full path under the user folder is refused.\n"));
     }
     if runs != line {
-        report.push_str(&format!("note: this ran as `{runs}`: in the sandbox `dir`, `del` and `| head` are replaced by what does the same there, and cmd takes a `/` for a switch, so a path is written with `\\`.\n"));
+        report.push_str(&format!("note: this ran as `{runs}`: in the sandbox `dir`, `del` and `| head` are replaced by what does the same there, cmd takes a `/` for a switch, so a path is written with `\\`, and PowerShell under the users' folder starts on a drive of its own whose root is the folder ({POWERSHELL_PLACE}:), as it cannot start in the folder itself there.\n"));
     }
     if !done.shown.is_empty() {
         report.push_str(&format!("note: it opened a window that nobody can see, as nothing from a command reaches the screen: {}. Run what prints instead of what shows.\n", done.shown.iter().map(|title| if title.is_empty() { "a dialog" } else { title.as_str() }).take(4).collect::<Vec<_>>().join(", ")));
@@ -4873,6 +4973,28 @@ mod tests {
         ] {
             assert_eq!(with_stand_ins(same), same, "{same}");
         }
+    }
+
+    /// PowerShell in a folder under the users' folder is put on a drive whose root is the folder: its command first goes there, and a script of `-File` with plain
+    /// words is run by its full path with its exit code; elsewhere, and in other forms, the line is as it was.
+    #[test]
+    fn powershell_under_the_users_folder_is_put_where_it_was_started() {
+        let (users, cwd) = (Path::new("C:\\Users"), Path::new("C:\\Users\\me\\src\\app"));
+        let goes = "$null=New-PSDrive -Name DogmindWork -PSProvider FileSystem -Root 'C:\\Users\\me\\src\\app' -Scope Global; Set-Location DogmindWork:\\;";
+        assert_eq!(powershell_in_place("powershell -NoProfile -Command \"Set-Content a.txt x\"", cwd, Some(users)), format!("powershell -NoProfile -Command {goes} \"Set-Content a.txt x\""));
+        assert_eq!(powershell_in_place("echo hi & pwsh -nop -ExecutionPolicy Bypass -c Get-ChildItem", cwd, Some(users)), format!("echo hi & pwsh -nop -ExecutionPolicy Bypass -c {goes} Get-ChildItem"));
+        assert_eq!(powershell_in_place("powershell -NoProfile -File .\\build.ps1 -Target release", cwd, Some(users)),
+            format!("powershell -NoProfile -Command \"{goes} & 'C:\\Users\\me\\src\\app\\.\\build.ps1' -Target release; exit $LASTEXITCODE\""));
+        assert_eq!(powershell_in_place("\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command \"ls\"", cwd, Some(users)), format!("\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command {goes} \"ls\""));
+        for same in [
+            "powershell -NoProfile -Command \"ls\"",
+        ] {
+            assert_eq!(powershell_in_place(same, Path::new("C:\\work\\app"), Some(users)), same, "not under the users' folder");
+        }
+        for same in ["powershell -File .\\a.ps1 \"x y\"", "powershell -EncodedCommand AAAA", "echo powershell -Command x", "python make.py", "powershell Get-Date"] {
+            assert_eq!(powershell_in_place(same, cwd, Some(users)), same, "{same}");
+        }
+        assert_eq!(powershell_in_place("powershell -Command ls", Path::new("C:\\Users\\me\\100%\\x"), Some(users)), "powershell -Command ls", "a name cmd would read a variable into");
     }
 
     /// What a person was shown must be what runs: a line this has made is not changed by being gone over again.
