@@ -43,6 +43,9 @@ enum Line {
     Seen { path: PathBuf, hash: String },
     /// What the conversation had read is forgotten: its files went back.
     SeenForgotten,
+    /// The reasoning of a request the draft watch stopped, which the conversation goes on without: kept, as the conversation is, for a later look at where it
+    /// could have been stopped.
+    Stopped { request: String, reasoning: String },
 }
 
 /// The plain first line of an encrypted session.
@@ -387,7 +390,7 @@ fn load(path: &Path) -> Result<Loaded, String> {
                 Ok(Line::Meta { workspace: place, .. }) => workspace = place,
                 Ok(Line::Message { message }) => messages.push(message),
                 Ok(Line::Snapshot { messages: all }) => messages = all,
-                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. } | Line::Seen { .. } | Line::SeenForgotten) => {}
+                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. } | Line::Seen { .. } | Line::SeenForgotten | Line::Stopped { .. }) => {}
                 Err(_) => {} // a line cut short by a crash, or of a kind that is not known
             },
         }
@@ -567,6 +570,20 @@ impl Session {
     pub fn forget_seen(&mut self) -> Result<(), String> {
         self.write(&Line::SeenForgotten)
     }
+
+    /// The reasoning of request `request`, which the draft watch stopped.
+    pub fn keep_stopped(&mut self, request: &str, reasoning: &str) -> Result<(), String> {
+        self.write(&Line::Stopped { request: request.to_string(), reasoning: reasoning.to_string() })
+    }
+}
+
+/// The reasonings of a session's requests that the draft watch stopped, in order: the request, and what it had reasoned.
+pub fn stopped_of(path: &Path) -> Vec<(String, String)> {
+    let Ok(lines) = lines_of(path) else { return Vec::new() };
+    lines.filter(|line| line.starts_with("{\"kind\":\"stopped")).filter_map(|line| match serde_json::from_str(&line) {
+        Ok(Line::Stopped { request, reasoning }) => Some((request, reasoning)),
+        _ => None,
+    }).collect()
 }
 
 /// The files a session had read, each with the hash of it as the session last saw it: what its lines of them come to. (Tested in agent's

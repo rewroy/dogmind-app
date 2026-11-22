@@ -146,6 +146,9 @@ pub struct RequestNote<'a> {
     pub draft_watch: Option<&'static str>,
     /// For a helper's request: the name of the file its conversation is kept in, beside the session.
     pub helper_file: Option<&'a str>,
+    /// Where the draft watch saw its reasoning come to a mark (its fenced lines past 40, 60 and 80, a line saying it writes the code now): the
+    /// characters and seconds into the reasoning, for a later look at where a draft could have been stopped.
+    pub draft_marks: Option<Value>,
 }
 
 pub struct Trajectory {
@@ -326,6 +329,9 @@ impl Trajectory {
         if let Some(file) = note.helper_file {
             fields["helper_file"] = json!(file);
         }
+        if let Some(marks) = note.draft_marks {
+            fields["draft_marks"] = marks;
+        }
         // (when it began to write a call and its answer, from its start: what is before them after the first word is thinking)
         if let Some(writing) = note.clock.writing_ms() {
             fields["writing_ms"] = json!(writing);
@@ -421,7 +427,7 @@ mod tests {
         let mut traj = Trajectory::new();
         traj.open(&session);
         let clock = Clock::start();
-        let note = |id: &'static str| RequestNote { id, role: "main", clock: &clock, end: "tool_calls".into(), usage: None, timings: None, reasoning_chars: 0, content_chars: 0, calls: vec!["read_file".into()], tokens_est: 0, retry: None, draft_watch: None, helper_file: None };
+        let note = |id: &'static str| RequestNote { id, role: "main", clock: &clock, end: "tool_calls".into(), usage: None, timings: None, reasoning_chars: 0, content_chars: 0, calls: vec!["read_file".into()], tokens_est: 0, retry: None, draft_watch: None, helper_file: None, draft_marks: None };
         traj.request_waiting(note("s/1"));
         traj.message_at(2);
         // (the second makes none: the next line writes it as it is, before itself)

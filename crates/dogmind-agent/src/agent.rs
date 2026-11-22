@@ -1089,11 +1089,25 @@ struct DraftWatch {
     fenced_began: Option<usize>,
     /// Whether the last line that could be told was a quote: a `}` that follows it ends a quote, and one that follows a line of its own ends that.
     after_quote: bool,
+    /// Where the reasoning came to a mark (`DRAFT_MARKS`, and a line that `announces_code`): which, where in it (a byte of the reasoning, at a line's start), and,
+    /// once the stream has said when (`stamp`), the seconds into the request. For the trajectory alone: nothing is stopped by them.
+    marks: Vec<(&'static str, usize, Option<f64>)>,
+}
+
+/// The fenced lines of its own that the trajectory marks the reasoning at, with what each is called there.
+const DRAFT_MARKS: [(usize, &str); 3] = [(40, "fenced_40"), (60, "fenced_60"), (80, "fenced_80")];
+
+/// Whether a line of reasoning says that the code is to be written now ("Let me write the code", "Implementation details:"): in the four drafts stopped in the
+/// comparison runs, the line just before their first fenced block. A mark for the trajectory alone.
+fn announces_code(line: &str) -> bool {
+    let line = line.trim().to_lowercase();
+    const SAYS: [&str; 14] = ["let me write", "let's write", "let us write", "i'll write", "i will write", "now write", "now the code", "write the code", "write the full", "write the whole", "write the complete", "time to write", "let me implement", "let's implement"];
+    SAYS.iter().any(|words| line.contains(words)) || ["code:", "implementation:", "implementation details:", "structure:"].iter().any(|end| line.ends_with(end))
 }
 
 impl DraftWatch {
     fn new(shown: BTreeSet<String>, at_least: usize) -> DraftWatch {
-        DraftWatch { shown, at_least, line_starts: 0, fenced: false, fence_began: 0, run: 0, run_began: 0, prose: 0, longest: 0, longest_began: 0, fenced_lines: 0, fenced_began: None, after_quote: false }
+        DraftWatch { shown, at_least, line_starts: 0, fenced: false, fence_began: 0, run: 0, run_began: 0, prose: 0, longest: 0, longest_began: 0, fenced_lines: 0, fenced_began: None, after_quote: false, marks: Vec::new() }
     }
 
     /// What it had come to, for the trajectory: the longest run of lines of code of its own.
@@ -1104,6 +1118,21 @@ impl DraftWatch {
     /// The lines of its own inside fences, all of them.
     fn fenced(&self) -> usize {
         self.fenced_lines
+    }
+
+    /// The marks found since the last stamp are given the time: `elapsed` into the request.
+    fn stamp(&mut self, elapsed: Duration) {
+        for mark in self.marks.iter_mut().filter(|mark| mark.2.is_none()) {
+            mark.2 = Some(elapsed.as_secs_f64());
+        }
+    }
+
+    /// The marks as the trajectory has them: what, the characters of the reasoning before it, and the seconds. None where there are none.
+    fn marks_of(&self, reasoned: &str) -> Option<Value> {
+        let marks: Vec<Value> = self.marks.iter().map(|(what, at, seconds)| {
+            json!({"at": what, "chars": reasoned.get(..*at).map_or(0, |before| before.chars().count()), "s": seconds.map(|seconds| (seconds * 10.0).round() / 10.0)})
+        }).collect();
+        (!marks.is_empty()).then(|| json!(marks))
     }
 
     /// Where the draft that was found began: the line of its first code, or of the fence that held it; for one found by all its fenced lines, the first fence.
@@ -1145,6 +1174,9 @@ impl DraftWatch {
             if self.fenced {
                 self.fenced_lines += 1;
                 self.fenced_began.get_or_insert(self.fence_began);
+                if let Some((_, what)) = DRAFT_MARKS.iter().find(|(lines, _)| *lines == self.fenced_lines) {
+                    self.marks.push((what, at, None));
+                }
             }
             if self.run == 0 {
                 self.run_began = if self.fenced { self.fence_began } else { at };
@@ -1158,6 +1190,9 @@ impl DraftWatch {
             self.prose += 1;
             if self.prose > PROSE_BETWEEN {
                 self.run = 0;
+            }
+            if !self.marks.iter().any(|(what, ..)| *what == "announced") && announces_code(line) {
+                self.marks.push(("announced", at, None));
             }
         }
     }
@@ -2790,6 +2825,7 @@ impl Agent {
             self.emit(Event::Usage { used: base, window, usage: Usage::default() });
             let mut meter = StreamMeter::new(base, Instant::now());
             let mut clock = Clock::start();
+            let streamed_from = Instant::now();
             let person = &self.cancel;
             let result = with_the_persons_stop(person, &halt, || provider.stream(&request, &halt, &mut |delta| {
                 // (at once while words come, as the stream looks at its flag after each: the watch is for the wait before them)
@@ -2813,6 +2849,7 @@ impl Agent {
                                 drafting = true;
                                 cancel.store(true, Ordering::Relaxed);
                             }
+                            watch.stamp(streamed_from.elapsed());
                         }
                         vec![Event::Reasoning(text.to_string())]
                     }
@@ -2886,7 +2923,7 @@ impl Agent {
             let base = self.messages.len();
             let saved = if cuts { cut_answer(&written, &reasoned, &calling, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) } else { None };
             // (its line waits for the message it makes, to say where that is in the session: a reader puts the step beside what the model said)
-            self.traj.request_waiting(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is), helper_file: None });
+            self.traj.request_waiting(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is), helper_file: None, draft_marks: watch.as_ref().and_then(|watch| watch.marks_of(&reasoned)) });
             // Writing a file out in its reasoning: every token of it is typed again in the call. It goes on from what it had decided, in a request of which all but the last few tokens are
             // read already. Whatever it was thinking about before is left to it, however long: only this is stopped, and what it is told is to write. Its connection has closed by now, so
             // the engine is not writing into nothing. (The tokens it wrote were spent all the same.)
@@ -2903,6 +2940,10 @@ impl Agent {
                 let required = provider.require_call_once();
                 let fenced = watch.as_ref().map_or(0, DraftWatch::fenced);
                 self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "fenced": fenced, "next_without_thinking": plain, "next_call_required": required}));
+                // (what it had reasoned, which the conversation goes on without, is kept with it, under its encryption: for a later look at where it could have been stopped)
+                if let Some(session) = self.session.as_mut() {
+                    let _ = session.keep_stopped(&req_id, &reasoned);
+                }
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
                 self.keep_written(&written);
                 self.push(Message::text("user", draft_stopped_note(&reasoned, drafts_stopped, watch.as_ref().map(DraftWatch::began_at))));
@@ -3308,7 +3349,7 @@ impl Agent {
         let (reasoning, content, calls) = result.as_ref().ok().map_or((0, 0, Vec::new()), |completion| (completion.reasoning.chars().count(), completion.content.chars().count(), completion.tool_calls.iter().map(|call| call.function.name.clone()).collect()));
         // (a warm-up is ended by the app at its first word, which is how it is meant to end)
         let end = if role == "warm" && matches!(result, Err(LlmError::Cancelled)) { "stopped_app:warm_up".to_string() } else { trajectory::end_of(result) };
-        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: 0, retry: None, draft_watch: None, helper_file });
+        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: 0, retry: None, draft_watch: None, helper_file, draft_marks: None });
     }
 
     /// An intervention of the app's own, in the trajectory, for the request that was made last: the one it ended or follows.
@@ -6407,6 +6448,44 @@ mod tests {
         assert_eq!(second[..first.len()], first[..], "the same prefix to the byte");
         assert!(second.last().unwrap()["content"].as_str().unwrap().contains("A page with sliders."));
         assert_eq!(bodies[1].get("reasoning_effort"), bodies[0].get("reasoning_effort"));
+        // What it had reasoned is kept with the conversation, which goes on without it, and the stopped request's line says where its fenced lines came to each mark.
+        let files: Vec<PathBuf> = std::fs::read_dir(run._sessions.path()).unwrap().flatten().map(|entry| entry.path()).collect();
+        let session = files.iter().find(|path| path.to_string_lossy().ends_with(".jsonl") && !path.to_string_lossy().ends_with(".trajectory.jsonl")).unwrap();
+        let stopped = crate::session::stopped_of(session);
+        assert_eq!(stopped.len(), 1);
+        assert!(stopped[0].1.starts_with("A page with sliders.\n```\nfloat h = 0.0;"), "{}", &stopped[0].1[..60]);
+        assert!(!crate::session::read(session).unwrap().iter().any(|message| message.reasoning_content.as_deref().is_some_and(|said| said.contains("float h"))), "not in the conversation");
+        let trajectory = std::fs::read_to_string(files.iter().find(|path| path.to_string_lossy().ends_with(".trajectory.jsonl")).unwrap()).unwrap();
+        let line: Value = trajectory.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()).find(|line| line["end"] == "stopped_app:draft_stop").unwrap();
+        let marks: Vec<&str> = line["draft_marks"].as_array().unwrap().iter().map(|mark| mark["at"].as_str().unwrap()).collect();
+        assert_eq!(marks, ["fenced_40", "fenced_60", "fenced_80"], "{line}");
+        assert!(line["draft_marks"][0]["chars"].as_u64().unwrap() > 0 && line["draft_marks"][0]["s"].is_number(), "{line}");
+    }
+
+    /// The marks of a reasoning: where its fenced lines of its own came to 40, 60 and 80, and the first line that says the code is written now, each where its line
+    /// begins; the lines it quotes are none of them.
+    #[test]
+    fn a_reasoning_is_marked_where_it_says_it_writes_and_where_its_fenced_lines_come_to() {
+        let mut watch = DraftWatch::new(lines_shown(&[Message::tool_result("r", "1|let shown = 1;\n".to_string())]), DRAFT_LINES);
+        let mut reasoned = String::from("The page needs a grid.\nLet me write the code now.\n```\n");
+        let announced = "The page needs a grid.\n".len();
+        reasoned.push_str("let shown = 1;\n");
+        let fence = reasoned.len();
+        for line in 0..85 {
+            reasoned.push_str(&format!("let x{line} = {line};\n"));
+        }
+        reasoned.push_str("```\n");
+        assert!(!watch.is_a_draft(&reasoned));
+        watch.stamp(Duration::from_millis(1500));
+        let marks = watch.marks_of(&reasoned).unwrap();
+        let at = |which: usize| (marks[which]["at"].as_str().unwrap().to_string(), marks[which]["chars"].as_u64().unwrap() as usize);
+        assert_eq!(at(0), ("announced".to_string(), announced));
+        let fortieth = fence + (0..39).map(|line| format!("let x{line} = {line};\n").len()).sum::<usize>();
+        assert_eq!(at(1), ("fenced_40".to_string(), fortieth), "the quoted line is not counted");
+        assert_eq!(marks.as_array().unwrap().len(), 4);
+        assert_eq!(marks[3]["at"], "fenced_80");
+        assert_eq!(marks[0]["s"], 1.5);
+        assert!(DraftWatch::new(BTreeSet::new(), DRAFT_LINES).marks_of("no code here\n").is_none());
     }
 
     #[test]
