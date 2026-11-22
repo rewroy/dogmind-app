@@ -1418,10 +1418,39 @@ fn asks_not_to_run(text: &str) -> bool {
     ENGLISH.iter().any(|words| lower.contains(words)) || JAPANESE.iter().any(|words| text.contains(words))
 }
 
-/// Whether code has changed with no command since, after these calls in order. A page or a stylesheet is not among it: nothing here can open one, and the model has been told so.
-fn still_unchecked(mut unchecked: bool, calls: &[crate::message::ToolCall]) -> bool {
+/// Whether the person's message asks for something to be made or changed, by its words. A question that asks for neither (what to look at on a slow PC, what a
+/// thing is) is not checked by the app's word: a model that wrote a script of its own for one was told to check it, and answered with that check's report.
+fn asks_for_a_change(text: &str) -> bool {
+    const ENGLISH: [&str; 22] = ["make", "build", "create", "write", "add", "fix", "implement", "change", "update", "refactor", "remove", "delete", "rename", "port ",
+        "migrate", "install", "set up", "convert", "edit", "improve", "generate", "replace"];
+    const JAPANESE: [&str; 26] = ["作って", "作る", "作成", "書いて", "書き換", "追加", "足して", "直して", "直す", "修正", "実装", "変更", "変えて", "改善", "更新",
+        "削除", "消して", "入れて", "組んで", "対応して", "移して", "置き換", "リファクタ", "ビルド", "生成", "編集"];
+    let lower = text.to_lowercase();
+    ENGLISH.iter().any(|words| lower.contains(words)) || JAPANESE.iter().any(|words| text.contains(words))
+}
+
+/// The code files changed with no command since, after these calls in order (`still_unchecked`'s, by name).
+fn unchecked_files(mut files: Vec<String>, calls: &[crate::message::ToolCall]) -> Vec<String> {
+    for call in calls {
+        let arguments: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+        match call.function.name.as_str() {
+            "execute_command" | "check_page" => files.clear(),
+            "create_file" => files.extend(arguments.get("path").and_then(Value::as_str).filter(|path| is_code(path)).map(str::to_string)),
+            "apply_patch" => files.extend(arguments.get("edits").and_then(Value::as_array).into_iter().flatten().filter_map(|edit| edit.get("path")?.as_str()).filter(|path| is_code(path)).map(str::to_string)),
+            _ => {}
+        }
+    }
+    files
+}
+
+/// Whether a file is code, which the app's word about checking is about. A page or a stylesheet is not: nothing here can open one, and the model has been told so.
+fn is_code(path: &str) -> bool {
     const NOT_CODE: [&str; 17] = ["md", "markdown", "txt", "rst", "log", "csv", "json", "toml", "html", "htm", "css", "svg", "xml", "yaml", "yml", "ini", "cfg"];
-    let is_code = |path: &str| Path::new(path).extension().and_then(|extension| extension.to_str()).is_some_and(|extension| !NOT_CODE.contains(&extension.to_ascii_lowercase().as_str()));
+    Path::new(path).extension().and_then(|extension| extension.to_str()).is_some_and(|extension| !NOT_CODE.contains(&extension.to_ascii_lowercase().as_str()))
+}
+
+/// Whether code has changed with no command since, after these calls in order.
+fn still_unchecked(mut unchecked: bool, calls: &[crate::message::ToolCall]) -> bool {
     for call in calls {
         let arguments: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
         match call.function.name.as_str() {
@@ -2862,6 +2891,8 @@ impl Agent {
         let not_to_run = self.messages.iter().rev().filter(|message| message.role == "user").map(|message| message.content.as_deref().unwrap_or(""))
             .find(|text| !text.starts_with("[From the app")).is_some_and(asks_not_to_run);
         let (mut unchecked, mut asked_to_check) = (false, not_to_run);
+        // (the code files that are so, by name: whether they are only the model's own, for a question that asked for no change)
+        let mut unchecked_code: Vec<String> = Vec::new();
         let (mut said, mut asked_about_slips) = (String::new(), false);
         // Whether the rest of a file whose write was cut, given as the answer's text, has been told of: once a turn.
         let mut cut_as_text_told = false;
@@ -3275,6 +3306,7 @@ impl Agent {
                     return Ended::Failed(format!("the model made the same call {most} times with nothing edited in between: stopped so that you can look"));
                 }
                 unchecked = still_unchecked(unchecked, &[calls.as_slice(), nested.as_slice()].concat());
+                unchecked_code = unchecked_files(unchecked_code, &[calls.as_slice(), nested.as_slice()].concat());
                 // (only once it has looked at the page as it is now: what it is told is to go through what was asked against that picture)
                 if !self.polish.told && self.polish.checks >= POLISHED_AFTER && self.polish.looked {
                     self.polish.told = true;
@@ -3319,12 +3351,20 @@ impl Agent {
                     continue;
                 }
             }
-            // Once a turn: a model that says it is done without having run what it wrote gets one word about it.
+            // Once a turn: a model that says it is done without having run what it wrote gets one word about it. Not for a question that asked for no change, where
+            // what is unchecked is only files the model made itself in this turn: checking those is not what was asked (a model that wrote a script of its own to answer what
+            // to look at on a slow PC was told to check it, and answered with that check's report); the word about the files it made follows, as for any.
             if unchecked && !asked_to_check && self.mode != Mode::Plan {
                 asked_to_check = true;
-                self.intervened("check_nudge", json!({}));
-                self.push(Message::text("user", prompt::CHECK_NUDGE));
-                continue;
+                let asked = self.messages.iter().rev().find(|message| Self::of_the_person(message)).and_then(|message| message.content.as_deref()).map_or("", prompt::typed_text);
+                let its_own = !unchecked_code.is_empty() && unchecked_code.iter().all(|file| self.made_this_turn.iter().any(|made| same_file(made, file)));
+                if its_own && !asks_for_a_change(asked) {
+                    self.intervened("check_nudge_held", json!({"files": unchecked_code.len()}));
+                } else {
+                    self.intervened("check_nudge", json!({}));
+                    self.push(Message::text("user", prompt::CHECK_NUDGE));
+                    continue;
+                }
             }
             // Once a turn, and only when it comes to something: letters no Japanese is written with, which a model cannot see in its own answer. It stays as written; the corrected lines follow it.
             if !asked_about_slips && self.bench.in_japanese {
@@ -7220,12 +7260,36 @@ note: the helper took")), "{log:?}");
         let write = sse(&[serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "w", "type": "function", "function": {"name": "create_file", "arguments": "{\"path\":\"a.py\",\"content\":\"x\"}"}}]}, "finish_reason": "tool_calls"}]})]);
         let (client, bodies) = server(vec![write, text_answer("done"), text_answer("not tested")]);
         let run = run_agent(dir.path(), client, Mode::Auto);
-        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        run.handle.commands.send(Command::Send("write a.py".into())).unwrap();
         until_end(&run, Decision::Approve);
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 3, "asked once, not again");
         let last = bodies[2]["messages"].as_array().unwrap();
         assert_eq!(last.last().unwrap()["content"], prompt::CHECK_NUDGE);
+    }
+
+    /// A question that asked for no change, answered with a script the model wrote for itself in this turn: no word about checking it, as that is not what was
+    /// asked. The same script for a request to make one, or a change to a file that was there before, has the word.
+    #[test]
+    fn a_question_answered_with_a_script_of_its_own_gets_no_word_about_checking_it() {
+        let write = |path: &str| sse(&[serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "w", "type": "function", "function": {"name": "create_file", "arguments": serde_json::json!({"path": path, "content": "x"}).to_string()}}]}, "finish_reason": "tool_calls"}]})]);
+        let turn = |asked: &str, existing: bool| {
+            let dir = crate::in_container::tempdir().unwrap();
+            if existing {
+                std::fs::write(dir.path().join("diag.ps1"), "old").unwrap();
+            }
+            let (client, bodies) = server(vec![write("diag.ps1"), text_answer("look at the Task Manager"), text_answer("checked")]);
+            let run = run_agent(dir.path(), client, Mode::Auto);
+            run.handle.commands.send(Command::Send(asked.into())).unwrap();
+            until_end(&run, Decision::Approve);
+            let bodies = bodies.lock().unwrap();
+            bodies.len()
+        };
+        assert_eq!(turn("最近 PC が重いんですが、何を確認すればいいですか。", false), 2, "the answer stands");
+        assert_eq!(turn("PC の状態を調べるスクリプトを作って", false), 3, "a script asked for is checked");
+        assert_eq!(turn("最近 PC が重いんですが、何を確認すればいいですか。", true), 3, "a file that was there before has changed");
+        assert!(asks_for_a_change("Add an option --format") && asks_for_a_change("このバグを直してください") && asks_for_a_change("ポモドーロタイマーを作ってください"));
+        assert!(!asks_for_a_change("Git の rebase と merge の違いがいまいち分かりません。") && !asks_for_a_change("Rust の所有権を説明してください"));
     }
 
     #[test]

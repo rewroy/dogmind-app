@@ -355,7 +355,10 @@ pub fn mostly_code(text: &str) -> bool {
     lines.len() >= 5 && code * 3 >= lines.len() * 2
 }
 
-pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. Check it now as the Checking section says, and fix what that shows. If it cannot be checked here, say so plainly in your answer. Do not start on anything else.";
+/// The last sentence says what comes after the check: a model told to check a script it had written for a question answered with that check's report.
+pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. Check it now as the Checking section says, and fix what that shows. If it cannot be checked here, say so plainly in your answer. Do not start on anything else: once it is checked, answer what the user asked.";
+/// What `CHECK_NUDGE` said until 2026-11-23, as sessions saved before have it.
+const CHECK_NUDGE_MARKED_BEFORE: &str = "[From the app, not the user] You changed code and have run nothing since. Check it now as the Checking section says, and fix what that shows. If it cannot be checked here, say so plainly in your answer. Do not start on anything else.";
 /// What `CHECK_NUDGE` said before (2026-11-22), as sessions saved before it was marked have it, with no mark: it is the app's too.
 const CHECK_NUDGE_BEFORE: &str = "You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, it would not be worth running, or the user asked you not to run it, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";
 
@@ -375,6 +378,7 @@ pub fn is_from_app(text: &str) -> bool {
 /// Whether a user's message was the app's and not the person's: it is not shown as something they said. (A saved session has the check's word as it was, unmarked.)
 pub fn is_nudge(text: &str) -> bool {
     text == CONTINUE_NUDGE || text.starts_with(DRAFT_NOTE) || is_app_facts(text) || Some(text) == CHECK_NUDGE.strip_prefix(DRAFT_NOTE) || text == CHECK_NUDGE_BEFORE
+        || text == CHECK_NUDGE_MARKED_BEFORE || Some(text) == CHECK_NUDGE_MARKED_BEFORE.strip_prefix(DRAFT_NOTE)
 }
 
 /// What the app says on the screen when a request has made its turn read-only, before anything is refused. The second sentence is the way out: a request that does not say it is followed
@@ -999,6 +1003,7 @@ mod tests {
         assert!(is_nudge(CONTINUE_NUDGE) && is_nudge(CHECK_NUDGE) && is_nudge(&slip_note("员")));
         assert!(is_nudge(CHECK_NUDGE.strip_prefix(DRAFT_NOTE).unwrap()), "as a session saved before it was marked has it");
         assert!(is_nudge(CHECK_NUDGE_BEFORE), "and as it was worded before");
+        assert!(is_nudge(CHECK_NUDGE_MARKED_BEFORE) && is_nudge(CHECK_NUDGE_MARKED_BEFORE.strip_prefix(DRAFT_NOTE).unwrap()), "and as it was until 11-23");
         assert!(!is_nudge("continue"));
         let facts = app_facts("now", None, &[]);
         assert!(is_nudge(&facts) && is_app_facts(&facts), "the app's facts are the app's");
