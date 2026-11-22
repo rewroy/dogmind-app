@@ -1134,7 +1134,8 @@ fn before_the_code(reasoned: &str, began: Option<usize>) -> &str {
 }
 
 /// What goes back to it: what it had thought before the draft, in its own words, and to write. Not where: a person who asked for a review wrote no file, and a note that says
-/// to make one gets one made.
+/// to make one gets one made. But in the file it goes in, under its name: told that a file that is there is for apply_patch, a model that was making a page anew wrote
+/// kuji_new.html beside the person's kuji.html, and left theirs as it was.
 fn draft_stopped_note(reasoned: &str, stopped_before: u32, began: Option<usize>) -> String {
     let decided = before_the_code(reasoned, began).trim();
     let start = decided.char_indices().rev().nth(MOST_DECIDED).map_or(0, |(at, _)| at);
@@ -1142,11 +1143,11 @@ fn draft_stopped_note(reasoned: &str, stopped_before: u32, began: Option<usize>)
     if stopped_before > 0 {
         // (a first word that was the code: there is nothing to give back, and saying that there is sends it looking)
         if decided.is_empty() {
-            return format!("{}You started on the code in your reasoning again. Write the code now, once, and put no code in your reasoning.", prompt::DRAFT_NOTE);
+            return format!("{}You started on the code in your reasoning again. Write the code now, once, in the file it goes in, and put no code in your reasoning.", prompt::DRAFT_NOTE);
         }
-        return format!("{}You started on the code in your reasoning again. What you have thought so far is here, and it is enough:\n{}\nWrite the code now, once, and put no code in your reasoning.", prompt::DRAFT_NOTE, &decided[start..]);
+        return format!("{}You started on the code in your reasoning again. What you have thought so far is here, and it is enough:\n{}\nWrite the code now, once, in the file it goes in, and put no code in your reasoning.", prompt::DRAFT_NOTE, &decided[start..]);
     }
-    format!("{}You are writing the program in your reasoning, and all of it would be typed again where it goes. Your reasoning so far:\n{}\nWrite the code now, from its first line, where your task needs it: a new file with create_file, a file that is there with apply_patch, in your answer if no file is to be changed. Decide the rest of the design in the file, and improve it afterwards.", prompt::DRAFT_NOTE, &decided[start..])
+    format!("{}You are writing the program in your reasoning, and all of it would be typed again where it goes. Your reasoning so far:\n{}\nWrite the code now, from its first line, where your task needs it: in the file it goes in, under that file's own name, with create_file for a new file or one written anew whole, and apply_patch for part of one; in your answer if no file is to be changed. Decide the rest of the design in the file, and improve it afterwards.", prompt::DRAFT_NOTE, &decided[start..])
 }
 
 /// `apply_patch` with the path beside the edits, for all of them, or one edit's fields with no list, is how it comes out of a model often enough, and the call failing means every edit typed again.
