@@ -59,22 +59,32 @@ const QUIET_RESTART_WAIT: Duration = Duration::from_secs(180);
 const SERVER_WAIT_EVERY: Duration = Duration::from_secs(15);
 const SERVER_WAIT_MOST: Duration = Duration::from_secs(3600);
 
-/// `(how often, how long at the most)` for a server's coming back; a test shortens them.
-fn server_wait_limits() -> (Duration, Duration) {
-    #[cfg(test)]
-    if let Some(limits) = *TEST_SERVER_WAIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
-        return limits;
-    }
-    (SERVER_WAIT_EVERY, SERVER_WAIT_MOST)
+/// How a turn waits for a server that is restarting, and the session for one that stayed away: each agent's own (`Command::Waits`). One for every agent
+/// of the process, a test's shortened waits once reached the other tests running beside it, and two that should have timed out passed only next to them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Waits {
+    /// How often a restarting server is asked, how long in all a turn keeps its request for one, how long it may be silent once seen coming back, and
+    /// how long one that answered in this conversation may answer nothing.
+    pub restart_every: Duration,
+    pub restart_bound: Duration,
+    pub restart_silence: Duration,
+    pub quiet_restart: Duration,
+    /// How often a server that stayed away past the turn's time is asked whether it is back, and for how long at the most.
+    pub server_every: Duration,
+    pub server_most: Duration,
 }
 
-#[cfg(test)]
-static TEST_SERVER_WAIT: Mutex<Option<(Duration, Duration)>> = Mutex::new(None);
+impl Default for Waits {
+    fn default() -> Waits {
+        Waits { restart_every: RESTART_ASK_EVERY, restart_bound: RESTART_WAIT, restart_silence: RESTART_SILENCE, quiet_restart: QUIET_RESTART_WAIT,
+                server_every: SERVER_WAIT_EVERY, server_most: SERVER_WAIT_MOST }
+    }
+}
 
 /// Asks the server every `every` whether it is back, for `most` at the longest, on a thread of its own: back (ready, or answering without a word of loading), the session is
 /// woken to go on with the turn that failed; stopped, or out of time, nothing. `what` is whose server it is, for the window.
-fn watch_for_the_server(provider: Arc<dyn Provider>, background: Arc<Background>, id: String, stop: Arc<AtomicBool>, what: String) {
-    let (every, most) = server_wait_limits();
+fn watch_for_the_server(provider: Arc<dyn Provider>, background: Arc<Background>, id: String, stop: Arc<AtomicBool>, what: String, waits: Waits) {
+    let (every, most) = (waits.server_every, waits.server_most);
     // (what is told when no thread can be had: the wait is not listed as going on)
     let (listed, listed_id) = (background.clone(), id.clone());
     let spawned = std::thread::Builder::new().name("dogmind-server-wait".into()).spawn(move || {
@@ -105,17 +115,6 @@ fn watch_for_the_server(provider: Arc<dyn Provider>, background: Arc<Background>
     }
 }
 
-/// `(how often, how long in all, how long it may be silent, how long a quiet one is waited for)`; a test shortens them.
-fn restart_limits() -> (Duration, Duration, Duration, Duration) {
-    #[cfg(test)]
-    if let Some(limits) = *TEST_RESTART_LIMITS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
-        return limits;
-    }
-    (RESTART_ASK_EVERY, RESTART_WAIT, RESTART_SILENCE, QUIET_RESTART_WAIT)
-}
-
-#[cfg(test)]
-static TEST_RESTART_LIMITS: Mutex<Option<(Duration, Duration, Duration, Duration)>> = Mutex::new(None);
 
 /// How a wait for a restarting server ended.
 enum Restarted {
@@ -209,6 +208,8 @@ pub enum Command {
     WarmPrefix,
     /// The provider to use from now on, its model and its context (0: not known yet).
     Provider(Arc<dyn Provider>, String, u64),
+    /// How this agent waits for a server that restarts or stays away, from now on (a test shortens them for its own agent alone).
+    Waits(Waits),
     /// How a connection to the provider went, for the trajectory: `at` is when it ended (a time as the trajectory writes them), `what` is `connect` or `loading_wait`.
     Connection { at: String, what: String, ms: u64, outcome: String },
     Quit,
@@ -1439,6 +1440,8 @@ struct Agent {
     server_answered: bool,
     /// This turn waited out its time for such a server, which did not come back: if the turn fails for it, the session waits for the server on its own.
     quiet_gave_up: bool,
+    /// How it waits for a server ([`Waits`]).
+    waits: Waits,
     model: String,
     window: u64,
     workspace: PathBuf,
@@ -1761,6 +1764,7 @@ impl Agent {
             provider: None,
             server_answered: false,
             quiet_gave_up: false,
+            waits: Waits::default(),
             model: String::new(),
             window: 0,
             workspace: config.workspace,
@@ -1859,6 +1863,7 @@ impl Agent {
             self.read_live();
             match command {
                 Command::Quit => return,
+                Command::Waits(waits) => self.waits = waits,
                 Command::Provider(provider, model, provided) => {
                     let (window, from) = window_in_use(provided);
                     crate::page_check::engine_on_this_machine(provider.on_this_machine());
@@ -2653,9 +2658,9 @@ impl Agent {
                 let waits = (self.quiet_gave_up && llm::is_gone(&error)).then(|| self.provider.clone()).flatten();
                 match waits {
                     Some(provider) => {
-                        let (id, stop) = self.background.add_server_wait(server_wait_limits().1);
+                        let (id, stop) = self.background.add_server_wait(self.waits.server_most);
                         self.intervened("server_wait", json!({"id": id}));
-                        watch_for_the_server(provider, self.background.clone(), id, stop, self.model.clone());
+                        watch_for_the_server(provider, self.background.clone(), id, stop, self.model.clone(), self.waits);
                         self.emit(Event::Failed(background::SERVER_WAIT_SET.into()));
                         self.tell_waiting();
                     }
@@ -2782,7 +2787,7 @@ impl Agent {
     /// that): a restart that never says it is one leaves its port closed until the next process opens it.
     /// `spent`: what this turn has waited in all.
     fn wait_for_restart(&mut self, provider: &dyn Provider, spent: &mut Duration, quiet: &mut Duration) -> Restarted {
-        let (every, bound, silence, quiet_wait) = restart_limits();
+        let Waits { restart_every: every, restart_bound: bound, restart_silence: silence, quiet_restart: quiet_wait, .. } = self.waits;
         let began = Instant::now();
         let (mut coming, mut silent_since, mut shown) = (false, None::<Instant>, None::<Value>);
         // (when this wait began to be for a server that says nothing)
@@ -8320,27 +8325,14 @@ Body").unwrap();
         (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), seen)
     }
 
-    /// The waits for a restarting server, shortened for as long as this is held: the tests that wait are one at a time, as the limits are one for all.
-    struct ShortRestartLimits<'a> {
-        _one_at_a_time: std::sync::MutexGuard<'a, ()>,
+    /// The waits for a restarting server, shortened for a test's own agent (`Command::Waits`): asked every 20 ms for up to `bound`, silent for 300 ms at the most.
+    fn short_waits(bound: Duration) -> Waits {
+        Waits { restart_every: Duration::from_millis(20), restart_bound: bound, restart_silence: Duration::from_millis(300), quiet_restart: Duration::from_millis(300), ..Waits::default() }
     }
 
-    static RESTART_TESTS: Mutex<()> = Mutex::new(());
-
-    impl ShortRestartLimits<'_> {
-        fn of(bound: Duration) -> ShortRestartLimits<'static> {
-            let one_at_a_time = RESTART_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            *TEST_RESTART_LIMITS.lock().unwrap() = Some((Duration::from_millis(20), bound, Duration::from_millis(300), Duration::from_millis(300)));
-            ShortRestartLimits { _one_at_a_time: one_at_a_time }
-        }
-
-        /// As `of`, a quiet server waited for up to `quiet`, and one that stays away asked after every 50 ms for up to a minute.
-        fn quiet(bound: Duration, quiet: Duration) -> ShortRestartLimits<'static> {
-            let one_at_a_time = RESTART_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            *TEST_RESTART_LIMITS.lock().unwrap() = Some((Duration::from_millis(20), bound, Duration::from_millis(300), quiet));
-            *TEST_SERVER_WAIT.lock().unwrap() = Some((Duration::from_millis(50), Duration::from_secs(60)));
-            ShortRestartLimits { _one_at_a_time: one_at_a_time }
-        }
+    /// As `short_waits`, a quiet server waited for up to `quiet`, and one that stays away asked after every 50 ms for up to a minute.
+    fn quiet_waits(bound: Duration, quiet: Duration) -> Waits {
+        Waits { quiet_restart: quiet, server_every: Duration::from_millis(50), server_most: Duration::from_secs(60), ..short_waits(bound) }
     }
 
     /// A server as `routed`'s that stops listening once it has answered `posts` requests for an answer, for `down` (connections refused, as nothing is there), and then
@@ -8413,7 +8405,6 @@ Body").unwrap();
     /// in this conversation and then refuses is waited for now, with the request kept and the wait shown, and the request goes when it listens again.
     #[test]
     fn a_server_that_answered_and_then_refuses_is_waited_for_and_the_request_goes_when_it_listens_again() {
-        let _short = ShortRestartLimits::quiet(Duration::from_secs(60), Duration::from_secs(20));
         let dir = crate::in_container::tempdir().unwrap();
         let answers = std::sync::atomic::AtomicUsize::new(0);
         let (client, seen) = routed_with_a_stop(move |method, path, _| match (method, path) {
@@ -8423,6 +8414,7 @@ Body").unwrap();
         // (longer than Windows tries a refused connection for, some 2 s: a server back before that is never seen refusing)
         }, 1, Duration::from_secs(5));
         let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Waits(quiet_waits(Duration::from_secs(60), Duration::from_secs(20)))).unwrap();
         let turn = |text: &str| {
             run.handle.commands.send(Command::Send(text.into())).unwrap();
             let (mut content, mut waiting) = (String::new(), Vec::new());
@@ -8459,7 +8451,6 @@ Body").unwrap();
     /// refusing, is not waited for: a server that is not there is said as before. (Each ends with the person's Stop, at the retries.)
     #[test]
     fn a_refusing_server_that_stays_away_is_given_up_and_one_that_never_answered_is_not_waited_for() {
-        let _short = ShortRestartLimits::quiet(Duration::from_secs(60), Duration::from_millis(400));
         let dir = crate::in_container::tempdir().unwrap();
         let (client, _) = routed_with_a_stop(|method, path, _| match (method, path) {
             ("POST", _) => (200, "text/event-stream", text_answer("one")),
@@ -8484,6 +8475,7 @@ Body").unwrap();
             }
         };
         let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Waits(quiet_waits(Duration::from_secs(60), Duration::from_millis(400)))).unwrap();
         assert_eq!(until_retries(&run, "hello", 1), (0, Vec::new()), "answered");
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(until_retries(&run, "again", 2), (1, vec!["transient".to_string(), "transient".to_string()]), "waited for once in the turn, then the retries as before");
@@ -8496,18 +8488,10 @@ Body").unwrap();
         assert_eq!(until_retries(&run, "hello", 1), (0, vec!["transient".to_string()]));
     }
 
-    impl Drop for ShortRestartLimits<'_> {
-        fn drop(&mut self) {
-            *TEST_RESTART_LIMITS.lock().unwrap() = None;
-            *TEST_SERVER_WAIT.lock().unwrap() = None;
-        }
-    }
-
     /// A server that answered and then stayed away past the turn's time for it: the turn fails, the person is told the session waits for the server, the wait is listed,
     /// and when the server listens again the session goes on by itself with the turn, told why.
     #[test]
     fn a_turn_that_failed_as_the_server_stayed_away_goes_on_by_itself_when_it_is_back() {
-        let _short = ShortRestartLimits::quiet(Duration::from_secs(60), Duration::from_millis(400));
         let dir = crate::in_container::tempdir().unwrap();
         let answers = std::sync::atomic::AtomicUsize::new(0);
         // (away for longer than the turn's wait and its three retries, some 20 s with the refused connections Windows tries for 2 s each)
@@ -8517,6 +8501,7 @@ Body").unwrap();
             _ => (404, "application/json", "{}".to_string()),
         }, 1, Duration::from_secs(30));
         let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Waits(quiet_waits(Duration::from_secs(60), Duration::from_millis(400)))).unwrap();
         run.handle.commands.send(Command::Send("hello".into())).unwrap();
         loop {
             if let Event::TurnEnded { .. } = run.events.recv_timeout(Duration::from_secs(30)).expect("the first turn ended") {
@@ -8556,7 +8541,6 @@ Body").unwrap();
     /// when it says ready, and the three retries are not used for it: four refusals in a row, each in a restart, and the answer comes.
     #[test]
     fn a_request_refused_while_the_server_loads_waits_for_it_and_goes_again() {
-        let _short = ShortRestartLimits::of(Duration::from_secs(60));
         let dir = crate::in_container::tempdir().unwrap();
         let (client, seen) = routed(|method, path, n| match (method, path) {
             ("POST", _) if n < 4 => (503, "application/json", r#"{"error": {"message": "Loading model"}}"#.to_string()),
@@ -8567,6 +8551,7 @@ Body").unwrap();
             _ => (404, "application/json", "{}".to_string()),
         });
         let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Waits(short_waits(Duration::from_secs(60)))).unwrap();
         run.handle.commands.send(Command::Send("hello".into())).unwrap();
         let mut told: Vec<String> = Vec::new();
         let mut loading = Vec::new();
@@ -8598,7 +8583,6 @@ Body").unwrap();
     /// The same, as a proxy in front of the server does it: its 502 while the server behind it is replaced, for `/health` too, and then the server's own answer.
     #[test]
     fn a_502_from_a_proxy_in_front_of_a_restarting_server_is_waited_for_too() {
-        let _short = ShortRestartLimits::of(Duration::from_secs(60));
         let dir = crate::in_container::tempdir().unwrap();
         let (client, _) = routed(|method, path, n| match (method, path) {
             ("POST", _) if n == 0 => (502, "text/html", "<html><body><h1>502 Bad Gateway</h1></body></html>".to_string()),
@@ -8608,6 +8592,7 @@ Body").unwrap();
             _ => (404, "application/json", "{}".to_string()),
         });
         let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Waits(short_waits(Duration::from_secs(60)))).unwrap();
         run.handle.commands.send(Command::Send("hello".into())).unwrap();
         let (log, cancelled) = until_end(&run, Decision::Reject);
         assert!(!cancelled && log.iter().any(|line| line == "content:back") && !log.iter().any(|line| line.starts_with("failed:")), "{log:?}");
@@ -8618,7 +8603,6 @@ Body").unwrap();
     /// The person's Stop ends the wait at once, and the turn with it.
     #[test]
     fn stop_ends_the_wait_for_a_restarting_server_at_once() {
-        let _short = ShortRestartLimits::of(Duration::from_secs(600));
         let dir = crate::in_container::tempdir().unwrap();
         let (client, _) = routed(|method, path, _| match (method, path) {
             ("POST", _) => (503, "application/json", r#"{"error": {"message": "Loading model"}}"#.to_string()),
@@ -8626,6 +8610,7 @@ Body").unwrap();
             _ => (404, "application/json", "{}".to_string()),
         });
         let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Waits(short_waits(Duration::from_secs(600)))).unwrap();
         run.handle.commands.send(Command::Send("hello".into())).unwrap();
         loop {
             if let Event::ServerRestarting(_) = run.events.recv_timeout(Duration::from_secs(20)).expect("the wait began") {
@@ -8652,7 +8637,6 @@ Body").unwrap();
     /// A server that does not come back in the time there is is given up on: the wait is over, and the usual retries are what is left (the turn is stopped here, as they take half a minute).
     #[test]
     fn a_server_that_stays_loading_past_the_time_there_is_is_given_up_on() {
-        let _short = ShortRestartLimits::of(Duration::from_millis(400));
         let dir = crate::in_container::tempdir().unwrap();
         let (client, _) = routed(|method, path, _| match (method, path) {
             ("POST", _) => (503, "application/json", r#"{"error": {"message": "Loading model"}}"#.to_string()),
@@ -8660,6 +8644,7 @@ Body").unwrap();
             _ => (404, "application/json", "{}".to_string()),
         });
         let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Waits(short_waits(Duration::from_millis(400)))).unwrap();
         run.handle.commands.send(Command::Send("hello".into())).unwrap();
         let waited = Instant::now();
         let gave_up = loop {
