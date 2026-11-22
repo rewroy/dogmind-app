@@ -962,6 +962,29 @@ fn after_the_line_number(line: &str) -> Option<&str> {
     None
 }
 
+/// The lines a call writes into files: a new file's, or the new text of each edit. None for a call that writes nothing, or whose arguments are not JSON.
+fn lines_written(name: &str, arguments: &str) -> usize {
+    let Ok(arguments) = serde_json::from_str::<Value>(arguments) else { return 0 };
+    let lines = |text: Option<&Value>| match text {
+        Some(Value::String(text)) => text.lines().count(),
+        Some(Value::Array(lines)) => lines.len(),
+        _ => 0,
+    };
+    match name {
+        "create_file" => lines(arguments.get("content")),
+        "edit" => lines(arguments.get("new_string")),
+        "apply_patch" => {
+            // (`edits` as a string of JSON is taken as `apply_patch` takes it)
+            let edits = match arguments.get("edits") {
+                Some(Value::String(text)) => serde_json::from_str::<Value>(text).ok(),
+                other => other.cloned(),
+            };
+            edits.as_ref().and_then(Value::as_array).map_or(0, |edits| edits.iter().map(|edit| lines(edit.get("new_string"))).sum())
+        }
+        _ => 0,
+    }
+}
+
 /// Dogmind's own records that commands and the tools may read: the folder of its conversations, each with its trajectory, the engine's log beside the rules, and
 /// the folder the app is installed in, whose version and files a session asked about the app looked at outside the sandbox. Not that folder where the app's
 /// data is in it or it is in the app's data: what it opened would be the settings too.
@@ -2619,8 +2642,9 @@ impl Agent {
         let (mut transient, mut overflow, mut failed_calls) = (0u32, 0u32, 0usize);
         let (mut cut_off, mut empties) = (0u32, 0u32);
         let mut drafts_stopped = 0u32;
-        // Whether the requests have their thinking closed, after a draft stop, until one writes a file.
+        // Whether the requests have their thinking closed, after a draft stop, until they have written the program; and the lines they have written since the stop.
         let mut thinking_closed = false;
+        let mut written_since_stop = 0usize;
         let mut wrote = false;
         let mut repeats: HashMap<String, u32> = HashMap::new();
         // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
@@ -2770,7 +2794,7 @@ impl Agent {
                 // than the two closed ones, which wrote at once (27 and 95 s). Closed for one request alone, a look at the folder first (4 s) used it up, and the request
                 // after it thought for 410 s (66,369 characters) before it wrote. Once a file is written, the next request thinks as before.
                 let plain = provider.close_thinking_once();
-                thinking_closed = plain;
+                (thinking_closed, written_since_stop) = (plain, 0);
                 let fenced = watch.as_ref().map_or(0, DraftWatch::fenced);
                 self.intervened("draft_stop", json!({"tokens_before": meter.tokens, "reasoning_chars": reasoned.chars().count(), "stops_before": drafts_stopped, "run": run, "fenced": fenced, "next_without_thinking": plain}));
                 // (what is on the screen is in the conversation: it would otherwise be gone when the session is opened again, and unknown to the model)
@@ -2896,9 +2920,12 @@ impl Agent {
                 }
             };
             transient = 0;
-            // (a file written, or begun: what the stop closed the thinking for is done)
-            if completion.tool_calls.iter().any(|call| matches!(call.function.name.as_str(), "create_file" | "apply_patch")) {
-                thinking_closed = false;
+            // (the program written, as many lines as a draft that is stopped, in one file or in several writes: what the stop closed the thinking for is done. Not any
+            // file: a picture of 20 lines, and a page of 43 to try a thing in, opened it in two turns, and the next request drafted the same program again for 220 s,
+            // to be stopped again. `edit` is a write too, though it is an `apply_patch` only when it runs.)
+            if thinking_closed {
+                written_since_stop += completion.tool_calls.iter().map(|call| lines_written(&call.function.name, &call.function.arguments)).sum::<usize>();
+                thinking_closed = written_since_stop < DRAFT_LINES;
             }
             // The model's own limit in the middle of a file: as with a broken connection, what it wrote stays and it goes on.
             if cuts && completion.finish == "length" {
@@ -9712,14 +9739,17 @@ Body").unwrap();
         assert_eq!(bodies[1].pointer("/straydog/reasoning"), Some(&serde_json::json!(false)), "{}", bodies[1]);
     }
 
-    /// The thinking a draft stop closes stays closed until a file is written: a look at the folder first does not use it up (a real run listed the folder in 4 s, and
-    /// the request after it thought for 410 s, 66,369 characters, before it wrote). After the write, the next request thinks as any does.
+    /// The thinking a draft stop closes stays closed until the program is written: a look at the folder first does not use it up (a real run listed the folder in 4 s, and
+    /// the request after it thought for 410 s, 66,369 characters, before it wrote), and neither does a small file (a picture of 20 lines opened it, and the request after it
+    /// drafted the same program again for 220 s). After as many lines as a draft, the next request thinks as any does.
     #[test]
     fn the_thinking_a_draft_stop_closes_stays_closed_until_a_file_is_written() {
         let dir = crate::in_container::tempdir().unwrap();
+        let program: String = (0..DRAFT_LINES).map(|line| format!("line {line}\n")).collect();
         let (client, bodies, _, _) = thinking_server(3, vec![
             call_answer("list_files", serde_json::json!({"path": "."})),
             call_answer("create_file", serde_json::json!({"path": "b.txt", "content": "b\n"})),
+            call_answer("create_file", serde_json::json!({"path": "c.txt", "content": program})),
             text_answer("written"),
         ]);
         let run = run_agent(dir.path(), client, Mode::AcceptEdits);
@@ -9729,7 +9759,10 @@ Body").unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "b\n");
         let bodies = bodies.lock().unwrap();
         let closed: Vec<bool> = bodies.iter().map(|body| body.pointer("/straydog/reasoning") == Some(&serde_json::json!(false))).collect();
-        assert_eq!(closed, [false, true, true, false], "the draft that was stopped, the look at the folder, the write, and the answer after it");
+        assert_eq!(closed, [false, true, true, true, false], "the draft that was stopped, the look at the folder, the small file, the program, and the answer after it");
+        assert_eq!(lines_written("edit", r#"{"file_path": "a", "old_string": "x", "new_string": "1\n2\n3"}"#), 3);
+        assert_eq!(lines_written("apply_patch", r#"{"edits": "[{\"path\": \"a\", \"old_string\": \"x\", \"new_string\": \"1\\n2\"}]"}"#), 2, "edits as a string");
+        assert_eq!(lines_written("read_file", r#"{"path": "a"}"#), 0);
     }
 
     /// The records are the sessions' folder and the engine's log beside the rules, and the model is told where they are, the log only where there is one.
