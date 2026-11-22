@@ -2752,7 +2752,9 @@ mod tests {
         let began = Instant::now();
         let done = run("for /l %i in (0,0,1) do @rem", &folder, &folder, false, Duration::from_secs(1), &AtomicBool::new(false)).unwrap();
         assert_eq!((done.status, done.ended), (None, "timed out"));
-        assert!(began.elapsed() < Duration::from_secs(10));
+        // (a command that is not ended goes on for ever: what is measured is that it ends, and not how soon the sandbox starts one while a thousand other tests run,
+        // which went past 10 s in every whole run here)
+        assert!(began.elapsed() < Duration::from_secs(30), "{:?}", began.elapsed());
     }
 
     #[test]
