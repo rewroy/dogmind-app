@@ -604,11 +604,12 @@ fn gist(args: &serde_json::Value) -> String {
 /// own clock). They are left out of what the model is told, and refused if called.
 pub const NOT_CALLABLE: [&str; 8] = ["run_code", "submit_plan", "ask_user", "explore", "wake_at", "set_goal", "goal_status", "finish_goal"];
 
-/// The rules the model reads before the tools it can call from a program.
-const RULES: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Use it when the work needs three or more tool calls whose order can be decided up front (several reads, a search then reads). Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws.";
+/// The rules the model reads before the tools it can call from a program. (What a call returns is said: DeepSeek, asked to show code mode in two runs,
+/// took `tools.list_files({})` and `tools.search_files` for arrays each time, and spent one or two programs on `typeof` before it used them.)
+const RULES: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Use it when the work needs three or more tool calls whose order can be decided up front (several reads, a search then reads). Each call returns the tool's text, a string, as the tool gives it alone (split its lines yourself). Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws.";
 /// The rules that push for programs, to measure whether a model can write them when it is told to (DOGMIND_CODE_MODE_EAGER=1): the
 /// default ones above left DeepSeek writing none in six runs, as it puts calls that do not depend on each other in one answer already.
-const RULES_EAGER: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Prefer it to calling tools one at a time whenever the work needs two or more calls: read, search, edit and run the tests in one program where you can, and decide in the program what to do with what a call returned. Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws.";
+const RULES_EAGER: &str = "Run a short JavaScript program that calls tools as `await tools.name({...})`; only what it returns comes back. Prefer it to calling tools one at a time whenever the work needs two or more calls: read, search, edit and run the tests in one program where you can, and decide in the program what to do with what a call returned. Each call returns the tool's text, a string, as the tool gives it alone (split its lines yourself). Plain JavaScript, no type annotations. `return` what you need to see; `console.log` for notes; a failed call throws.";
 /// The switch to [`RULES_EAGER`], read when the tools are made.
 pub const EAGER_VARIABLE: &str = "DOGMIND_CODE_MODE_EAGER";
 /// How much of a tool's first sentence its declaration keeps.
