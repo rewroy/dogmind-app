@@ -193,7 +193,7 @@ pub fn schemas() -> Value {
             "delay_seconds": {"type": "integer", "description": "60 to 86400."},
             "note": {"type": "string"}
         }), &["delay_seconds", "note"]),
-        function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads, and takes minutes while you wait: for a question across more files than you could read yourself (a review, an audit, what uses what); not for one file or a few, which you read yourself. One a step: put all it is to look into in its task.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
+        function("explore", "A look across many files by a helper with its own context: only its answer comes back. It only reads, and takes minutes while you wait: for a question across more files than you could read yourself (a review, an audit, what uses what); not for one file or a few, which you read yourself. One a turn: put all it is to look into in its task.", json!({"task": {"type": "string", "description": "All it needs: it saw none of this."}}), &["task"])
     ])
 }
 

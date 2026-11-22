@@ -31,7 +31,10 @@ const HELPER_STEPS: usize = 20;
 /// What a second `explore` in one answer is told, and not run: each takes minutes while the agent that asked waits, and two of a DeepSeek session took 1,248 s of its 25 minutes.
 /// The effort a helper's requests ask for, where the agent's ask for one.
 const HELPER_EFFORT: &str = "low";
-const ONE_HELPER: &str = "not run: one helper a step, as each takes minutes while you wait. Put all you want looked into in the task of the one before, or read what is left yourself.";
+/// What a second explore in one turn is told. A server with one place to generate in runs a helper beside the conversation only in turn with it: each helper is
+/// minutes of the same GPU, reading again what the conversation had read. In the comparison runs a model sent four, one after another, used some 1,100 s of a
+/// 1,500 s task on them, and answered nothing; with one helper the same task was answered in 901 s.
+const ONE_HELPER: &str = "not run: this turn's explore is used up, as each helper takes minutes of the one server while you wait. Go on yourself from what it found, with search_files and read_file.";
 /// How long a helper looks before it is told to answer with what it has. Two of them took 726 s and 522 s of a request's 25 minutes on a local model, and the
 /// turn ran out before its own answer: the agent that asked is waiting all that time, and has the rest of the work to do.
 const HELPER_TIME: Duration = Duration::from_secs(240);
@@ -1375,6 +1378,8 @@ struct Agent {
     scratch_told: bool,
     /// The files put before the person this turn, by present or as a version in the making.
     put_before: Vec<String>,
+    /// Whether this turn has had its explore (`ONE_HELPER`).
+    explored: bool,
     /// A page to put before the person in the making, once its check's own line is shown (`page_in_the_making`): the call, and the page.
     in_the_making: Option<(String, Vec<String>)>,
     /// A page that has passed check_page with no error, and how it has gone since (`prompt::polished`).
@@ -1689,6 +1694,7 @@ impl Agent {
             made_this_turn: Vec::new(),
             put_before: Vec::new(),
             in_the_making: None,
+            explored: false,
             scratch_told: false,
             polish: Polish::default(),
             #[cfg(windows)]
@@ -2327,7 +2333,7 @@ impl Agent {
         }
         self.traj.begin_turn();
         self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": pictures.len() + kept.len(), "first": new_session}));
-        (self.made_this_turn, self.scratch_told, self.polish, self.put_before) = (Vec::new(), false, Polish::default(), Vec::new());
+        (self.made_this_turn, self.scratch_told, self.polish, self.put_before, self.explored) = (Vec::new(), false, Polish::default(), Vec::new(), false);
         let added = if new_session { None } else { self.servers_caught_up() };
         let mut images = kept;
         if let Some(session) = self.session.as_ref().map(|session| session.path.clone()) {
@@ -3436,21 +3442,20 @@ impl Agent {
     fn run_tools(&mut self, calls: &[crate::message::ToolCall]) -> usize {
         let mut failures = 0;
         let mut at = 0;
-        let mut explored = false;
         self.read_live();
         while at < calls.len() {
             if self.cancelled() {
                 return failures;
             }
             if calls[at].function.name == "explore" {
-                if explored {
+                if self.explored {
                     let call = &calls[at];
                     self.tool_started(&call.id, "explore", arguments_of(call).as_ref(), &call.function.arguments, 1);
                     self.finish_call(&call.id, Err(ONE_HELPER.into()), false, Duration::ZERO);
                     (failures, at) = (failures + 1, at + 1);
                     continue;
                 }
-                explored = true;
+                self.explored = true;
             }
             let reads = calls[at..].iter().take_while(|call| tools::is_read(&call.function.name) && self.free_read(call)).count();
             if reads > 1 {
@@ -3902,7 +3907,22 @@ impl Agent {
             self.helper_refs.insert(id.to_string(), reference.clone());
         }
         self.emit(Event::HelperEnded { id: id.to_string(), how, steps: run.steps, files, tokens: run.tokens, elapsed, helper: reference });
-        result
+        // (with its report, what is left: the helper is this turn's only one, and a goal's rounds go on counting while it looks. A helper the person stopped
+        // has the result said for that, as it is)
+        if run.stopped {
+            return result;
+        }
+        result.map(|report| format!("{report}
+
+{}", self.after_the_helper(elapsed)))
+    }
+
+    /// What the conversation is told with a helper's report: how long it took, that no other helper comes this turn, and the rounds the open goal has left.
+    fn after_the_helper(&self, took: Duration) -> String {
+        let rounds = self.round_goal.as_ref().filter(|goal| goal.finished.is_none()).map_or(String::new(), |goal| {
+            format!(" This goal has {} of its {} rounds left.", goal.most.saturating_sub(goal.round), goal.most)
+        });
+        format!("note: the helper took {} s, and there is no other this turn: go on yourself from its report, with search_files and read_file.{rounds}", took.as_secs())
     }
 
     /// The file for a helper's conversation, beside this session's: it, its number and its name. None when the session has no file or the file could not be made, which the person is told.
@@ -5231,26 +5251,41 @@ mod tests {
         assert!(after.contains("The needle is at a.txt:1.") && !after.contains("the needle is here"), "the conversation has the answer, and not what the helper read: {after}");
     }
 
-    /// One helper a step: a second explore in the same answer is not run and says why, and the first is; a helper asks for a low effort whatever the agent's.
+    /// One helper a turn: a second explore, in the same answer or a later one of the turn, is not run and says why, and the first is, its report telling how long
+    /// it took and that there is no other; the next turn has one again. A helper asks for a low effort whatever the agent's.
     #[test]
-    fn a_second_explore_in_one_answer_is_not_run_and_a_helper_thinks_little() {
+    fn a_second_explore_in_one_turn_is_not_run_and_a_helper_thinks_little() {
         let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "the needle is here\n").unwrap();
         let both = sse(&[serde_json::json!({"choices": [{"delta": {"tool_calls": [
             {"index": 0, "id": "c1", "type": "function", "function": {"name": "explore", "arguments": "{\"task\": \"Where is the needle?\"}"}},
             {"index": 1, "id": "c2", "type": "function", "function": {"name": "explore", "arguments": "{\"task\": \"And the thread?\"}"}}
         ]}, "finish_reason": "tool_calls"}]})]);
-        let (client, bodies) = server(vec![both, text_answer("The needle is at a.txt:1."), text_answer("found it")]);
+        let again = |id: &str| sse(&[serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": id, "type": "function", "function": {"name": "explore", "arguments": "{\"task\": \"Once more?\"}"}}
+        ]}, "finish_reason": "tool_calls"}]})]);
+        let (client, bodies) = server(vec![both, text_answer("The needle is at a.txt:1."), again("c3"), text_answer("found it"),
+            again("c4"), text_answer("The thread is not here."), text_answer("no thread")]);
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::SetEffort(Some("high".into()))).unwrap();
         run.handle.commands.send(Command::Send("find the needle".into())).unwrap();
         let (log, _) = until_end(&run, Decision::Reject);
+        {
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 4, "the answer with both, the one helper's request, the answer after, and the one after the later explore: {log:?}");
+            assert_eq!(bodies[1]["reasoning_effort"], "low", "{}", bodies[1]);
+            assert_eq!(bodies[0]["reasoning_effort"], "high");
+            let after = serde_json::to_string(&bodies[2]["messages"]).unwrap();
+            assert!(after.contains("The needle is at a.txt:1.") && after.contains("the helper took") && after.contains("this turn's explore is used up"), "{after}");
+            let last = serde_json::to_string(&bodies[3]["messages"]).unwrap();
+            assert_eq!(last.matches("this turn's explore is used up").count(), 2, "the later one of the turn as well: {last}");
+        }
+        // (a new turn has its helper)
+        run.handle.commands.send(Command::Send("and the thread?".into())).unwrap();
+        until_end(&run, Decision::Reject);
         let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 3, "the answer with both, the one helper's request, the answer after: {log:?}");
-        assert_eq!(bodies[1]["reasoning_effort"], "low", "{}", bodies[1]);
-        assert_eq!(bodies[0]["reasoning_effort"], "high");
-        let after = serde_json::to_string(&bodies[2]["messages"]).unwrap();
-        assert!(after.contains("The needle is at a.txt:1.") && after.contains("not run: one helper a step"), "{after}");
+        assert_eq!(bodies.len(), 7, "the answer with the explore, its helper's request, the answer after");
+        assert!(serde_json::to_string(&bodies[6]["messages"]).unwrap().contains("The thread is not here."));
     }
 
     /// A helper that has used its requests is still offered its tools, so that a call is a call and not words; a call then is turned down,
@@ -5267,7 +5302,9 @@ mod tests {
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Send("look".into())).unwrap();
         let (log, _) = until_end(&run, Decision::Reject);
-        assert!(log.iter().any(|line| line == "tool:true:false:Found: a.txt:1."), "{log:?}");
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:Found: a.txt:1.
+
+note: the helper took")), "{log:?}");
         let bodies = bodies.lock().unwrap();
         let last_word = &bodies[HELPER_STEPS + 1];
         assert!(last_word["tools"].as_array().is_some_and(|tools| !tools.is_empty()), "offered to the end");

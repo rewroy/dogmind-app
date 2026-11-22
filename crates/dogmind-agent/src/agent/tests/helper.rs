@@ -169,9 +169,11 @@ fn the_persons_stop_on_the_helper_ends_it_with_the_stated_result_and_the_parents
 #[test]
 fn a_stop_pressed_on_a_helper_that_has_ended_is_not_for_the_next() {
     let dir = workspace();
+    // (one helper a turn: the second in a turn of its own)
     let (client, _) = server(vec![
         call_answer("explore", serde_json::json!({"task": "One"})),
         text_answer("first answer"),
+        text_answer("done once"),
         call_answer("explore", serde_json::json!({"task": "Two"})),
         text_answer("second answer"),
         text_answer("done"),
@@ -179,10 +181,12 @@ fn a_stop_pressed_on_a_helper_that_has_ended_is_not_for_the_next() {
     let run = run_agent(dir.path(), client, Mode::Default);
     // (the same call id each time, as this server gives: a stop left over from the first would end the second at once)
     run.handle.helper_stop.stop("call-1");
-    run.handle.commands.send(Command::Send("look twice".into())).unwrap();
+    run.handle.commands.send(Command::Send("look".into())).unwrap();
+    let (_, first) = until_over(&run);
+    run.handle.commands.send(Command::Send("look again".into())).unwrap();
     let (_, told) = until_over(&run);
-    assert!(told.iter().filter(|line| line.starts_with("ended")).all(|line| line.contains("Answered")), "{told:?}");
-    assert!(told.iter().any(|line| line == "tool call-1 true second answer"), "{told:?}");
+    assert!(first.iter().chain(&told).filter(|line| line.starts_with("ended")).all(|line| line.contains("Answered")), "{first:?} {told:?}");
+    assert!(told.iter().any(|line| line.starts_with("tool call-1 true second answer")), "{told:?}");
 }
 
 #[test]
