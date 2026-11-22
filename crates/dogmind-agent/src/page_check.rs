@@ -21,15 +21,34 @@ const LIMIT: Duration = Duration::from_secs(20);
 /// null when the registration it makes fails, which it does in a container: the browser ended with 0xc0000005 in about 6 runs of 10 on this machine, always there, and in none of
 /// 90 with the feature off. A browser that does not know the name (Chrome) ignores it. `DisableLoadExtensionCommandLineSwitch` is off for a branded Chrome, which since 137 loads no
 /// extension from the command line otherwise: the one extension a run loads is that of [`FRAMES`], and every other is off (`extension_flags`).
-/// The flags, with what a debug build is told to add (for a look at what the browser does in the sandbox).
-fn flags() -> String {
+/// The flags for a run that draws on the GPU (`gpu`) or on the CPU, with what a debug build is told to add (for a look at what the browser does in the sandbox).
+fn flags(gpu: bool) -> String {
+    let drawn = if gpu { ON_THE_GPU } else { ON_THE_CPU };
     #[cfg(debug_assertions)]
     if let Ok(more) = std::env::var("DOGMIND_PAGE_FLAGS") {
-        return format!("{FLAGS} {more}");
+        return format!("{FLAGS}{drawn} {more}");
     }
-    FLAGS.to_string()
+    format!("{FLAGS}{drawn}")
 }
-const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-background-networking --disable-sync --disable-component-update --disable-features=msWindowsTaskManager,DisableLoadExtensionCommandLineSwitch --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
+
+/// How a page that draws with WebGL is drawn: on the machine's GPU, through ANGLE's Direct3D 11, which a run in the sandbox reaches (its WebGL said "ANGLE (NVIDIA,
+/// NVIDIA GeForce RTX 5070 Ti ... Direct3D11 ...)" where it had said SwiftShader). A three.js page with steps at a 10 s wait was checked in 5.7 s, where on the CPU
+/// it had taken 21, and with two views in 8.5 s against 25; with two views at the usual wait, 5.0 against 8.5.
+const ON_THE_GPU: &str = " --use-angle=d3d11";
+/// How any other page is drawn: on the CPU, with no GPU process to start, which costs a run of a page with no WebGL 0.3 to 0.4 s (1.3 s against 1.7).
+const ON_THE_CPU: &str = " --disable-gpu";
+
+/// Checks that went back to the CPU after a run on the GPU crashed or hung: past two, a machine whose GPU will not draw for the sandbox is not asked again in this
+/// run of the app.
+static GPU_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a page draws with WebGL, from its HTML and the scripts of its own it loads: a context of it named, or a library that draws with it (three.js by its
+/// file or its import name, Babylon.js, PixiJS, A-Frame, regl).
+fn draws_webgl(texts: &[String]) -> bool {
+    let pattern = Regex::new(r#"(?i)webgl|three(\.module)?(\.min)?\.js|from\s*["']three["']|["']three["']\s*:|babylon|pixi(\.min)?\.js|aframe(\.min)?\.js|\bregl\b"#).expect("the pattern is valid");
+    texts.iter().any(|text| pattern.is_match(text))
+}
+const FLAGS: &str = "--headless=new --no-sandbox --no-first-run --disable-background-networking --disable-sync --disable-component-update --disable-features=msWindowsTaskManager,DisableLoadExtensionCommandLineSwitch --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
 
 /// What is added to [`FLAGS`] for the extensions: the frames' alone when its folder is there (`frames_extension`), and none at all when it is not.
 fn extension_flags(frames: Option<&Path>) -> String {
@@ -1166,6 +1185,13 @@ struct Reading {
     timed_out: bool,
     /// What the app fetched from CDNs for the page, and what it did not and why.
     cdn: Option<CdnWords>,
+    /// It was drawn on the GPU (`ON_THE_GPU`), and not on the CPU.
+    on_gpu: bool,
+}
+
+/// Where a page's WebGL was drawn, as a check says it.
+fn drawn_on(gpu: bool) -> &'static str {
+    if gpu { "on this machine's GPU" } else { "on the CPU, with no GPU" }
 }
 
 /// What `cdn::for_page` came to, as the report says it.
@@ -1202,7 +1228,7 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
     } else if let (false, Some(words)) = (finished, &reading.not_loaded) {
         out.push_str(words);
     } else if !finished && reading.timed_out {
-        out.push_str("NOT CHECKED: the browser was stopped each time it was tried, still running the page when its time was up, at the usual wait too: it draws more than a run of the browser may take here (WebGL is drawn on the CPU, with no GPU). This is not the page failing, and not the browser crashing. Check it at a smaller view, or a page with less to draw. Do not run a browser yourself to see it instead: Chrome does not start in the sandbox, and outside it the user is asked each time. If it cannot be checked, say in your answer that the page was not checked.\n");
+        out.push_str(&format!("NOT CHECKED: the browser was stopped each time it was tried, still running the page when its time was up, at the usual wait too: it draws more than a run of the browser may take here (WebGL is drawn {}). This is not the page failing, and not the browser crashing. Check it at a smaller view, or a page with less to draw. Do not run a browser yourself to see it instead: Chrome does not start in the sandbox, and outside it the user is asked each time. If it cannot be checked, say in your answer that the page was not checked.\n", drawn_on(reading.on_gpu)));
     } else if !finished {
         out.push_str("NOT CHECKED: the browser crashed or was stopped each time it was tried. This browser sometimes crashes in the sandbox, whatever the page, and a big WebGL drawing stops it too, so this says nothing about the page. What it had said by then is below. Running this check again changes nothing, and do not install anything to check it another way: say in your answer that the page was not checked.\n");
     }
@@ -1380,7 +1406,25 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     };
     // (the script that reads a plain page's words waits for the page's time to be up, so the browser is given a little more of it than that)
     let run_wait_of = |wait: u64| if steps.is_none() && copy_name.is_some() { wait + READ_MARGIN_MS } else { wait };
-    let browser_flags = flags() + &extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
+    // A page that draws with WebGL is drawn on the GPU (`ON_THE_GPU`), and any other on the CPU. A run on the GPU that crashes or hangs, of the read or of a
+    // picture, sends this check's later runs to the CPU, and is tried again there.
+    let webgl = page.as_deref().is_some_and(|page| {
+        let mut texts: Vec<String> = page_html(page).into_iter().collect();
+        let folder = page.parent().unwrap_or(workspace);
+        texts.extend(needs.iter().flat_map(|needs| needs.run.iter()).filter_map(|script| std::fs::read_to_string(folder.join(script)).ok()).filter(|text| text.len() < 4 << 20));
+        draws_webgl(&texts)
+    });
+    let on_gpu = AtomicBool::new(webgl && GPU_FAILURES.load(Ordering::Relaxed) < 2);
+    let extensions = extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
+    let browser_flags = || flags(on_gpu.load(Ordering::Relaxed)) + &extensions;
+    // (a run on the GPU that did not end well: the rest of the check draws on the CPU, and it is said whether this one is to be tried again for that)
+    let off_the_gpu = |ended_badly: bool| -> bool {
+        if !ended_badly || !on_gpu.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        GPU_FAILURES.fetch_add(1, Ordering::Relaxed);
+        true
+    };
     // (how long the last run that read the page took, for what is said of a picture that took too long)
     let read_took = std::cell::Cell::new(Duration::ZERO);
     // The page read, at `run_wait` of its time: its DOM, what the browser said, whether it was read, how the last run ended (`exit code 0x0`, `timed out`) and as what.
@@ -1396,7 +1440,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         for _ in 0..TRIES {
             let started = std::time::Instant::now();
             let profile = profiles.next();
-            let line = page_line(&program, &browser_flags, run_wait, &profile, &address);
+            let line = page_line(&program, &browser_flags(), run_wait, &profile, &address);
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel)?;
             (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
             #[cfg(debug_assertions)]
@@ -1413,8 +1457,10 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             // (a run that hung and printed nothing, not so much as a console line of the page's, is the browser's: it is tried once more)
             let silent_hang = hung(&done) && !page_wrote_to_console(&err);
             hangs += usize::from(silent_hang);
-            let again = silent_hang && tries_again_after_a_hang(hangs);
-            if finished || cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING || (!again && (started.elapsed() > LIMIT / 2 || crash_repeats(&mut before, &err))) {
+            // (a crash or a hang on the GPU is tried again on the CPU, whatever else would end the tries)
+            let to_the_cpu = !finished && off_the_gpu(silent_hang || ended_as == EndOfRun::Crashed);
+            let again = to_the_cpu || (silent_hang && tries_again_after_a_hang(hangs));
+            if finished || cancel.load(Ordering::Relaxed) || (trying.elapsed() > MOST_TRYING && !to_the_cpu) || (!again && (started.elapsed() > LIMIT / 2 || crash_repeats(&mut before, &err))) {
                 break;
             }
         }
@@ -1463,7 +1509,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             let limit = picture_limit(wait, (read != u64::MAX).then(|| Duration::from_millis(read)));
             taken.limit = limit;
             let profile = profiles.next();
-            let line = shot_line(&program, &browser_flags, (window_width, window_height), wait, &profile, &shot, &plain(&frame));
+            let line = shot_line(&program, &browser_flags(), (window_width, window_height), wait, &profile, &shot, &plain(&frame));
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, &stop);
             let end = done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32)));
             taken.runs.push(BrowserRun { of: "picture", end, ms: started.elapsed().as_millis() as u64 });
@@ -1487,6 +1533,11 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             // (a sandbox that could not run it will not do better the next time; a run that hung is the browser's, as the page's own run went well, and is tried once more)
             let hung_now = done.as_ref().is_ok_and(hung);
             taken.hangs += usize::from(hung_now);
+            // (a picture on the GPU that hung or left none is taken again on the CPU, once)
+            if done.is_ok() && !stop.load(Ordering::Relaxed) && off_the_gpu(true) {
+                taken.hangs = 0;
+                continue;
+            }
             if done.is_err() || (hung_now && !tries_again_after_a_hang(taken.hangs)) || (!hung_now && started.elapsed() > limit / 2) {
                 break;
             }
@@ -1569,7 +1620,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
                 }
             };
             if finished {
-                shortened = format!("At the {asked} ms of its time asked for, its drawing took longer than a run of the browser may here (WebGL is drawn on the CPU, with no GPU): it was read, and its pictures taken, after {WAIT_MS} ms of its time instead. To see it later than that, ask for a smaller view or a page with less to draw.\n");
+                shortened = format!("At the {asked} ms of its time asked for, its drawing took longer than a run of the browser may here (WebGL is drawn {}): it was read, and its pictures taken, after {WAIT_MS} ms of its time instead. To see it later than that, ask for a smaller view or a page with less to draw.\n", drawn_on(on_gpu.load(Ordering::Relaxed)));
             }
         }
         let mut console = console_lines(&err, &base_url);
@@ -1619,7 +1670,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         // (the words that the page the steps left said at their end are not of the page that is shown)
         let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
         let cdn = fetched.map(|fetched| CdnWords { loaded: fetched.loaded, files: fetched.files, refused: fetched.refused });
-        let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen, timed_out: how == "timed out", cdn };
+        let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen, timed_out: how == "timed out", cdn, on_gpu: on_gpu.load(Ordering::Relaxed) };
         let said = format!("{}{wait_cut}{shortened}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
         if !finished {
             ended(pictures, true);
@@ -1637,7 +1688,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         drop(kept);
         for (view, taken) in views.iter().zip(all) {
             out.push_str(&match &taken.picture {
-                Some(picture) => format!("How it looks at {} ({}x{}), WebGL drawn too (on the CPU, with no GPU): `read_file` {}\n", view.label, view.width, view.height, picture.display()),
+                Some(picture) => format!("How it looks at {} ({}x{}), WebGL drawn too ({}): `read_file` {}\n", view.label, view.width, view.height, drawn_on(on_gpu.load(Ordering::Relaxed)), picture.display()),
                 None if taken.stopped || cancel.load(Ordering::Relaxed) => format!("No picture at {} was taken: the turn was stopped.\n", view.label),
                 // (a run stopped by its time did not end by itself: to say the browser ended without one was not so, and a model took it for the sandbox's fault)
                 None if taken.hangs > 0 => format!("No picture at {} could be taken: each run that drew it was stopped after {} s, the page drawn on the CPU being slow (its read took {} s). What is read above is the page all the same. Do not run a browser yourself for it; say in your answer that there is no picture, or check it again with a shorter wait or shorter steps.\n", view.label, taken.limit.as_secs(), read_took.get().as_secs()),
@@ -2291,6 +2342,23 @@ mod tests {
         assert!(said.contains("text: frames many"), "{said}");
     }
 
+    /// A page is drawn on the GPU when it draws with WebGL, by a context of it or a library of it in its HTML or its own scripts, and on the CPU otherwise; the
+    /// flags say which, and the check says where it was drawn.
+    #[test]
+    fn a_page_that_draws_with_webgl_is_drawn_on_the_gpu() {
+        for text in ["const gl = canvas.getContext('webgl2');", "import * as THREE from \"three\";", "{\"imports\": {\"three\": \"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js\"}}",
+            "<script src=\"lib/three.min.js\"></script>", "const engine = new BABYLON.Engine(canvas);", "<script src=\"pixi.min.js\"></script>", "<script src=\"aframe.min.js\"></script>"] {
+            assert!(draws_webgl(&[text.to_string()]), "{text}");
+        }
+        for text in ["three cards in a row", "a grid of three columns", "pixies and fairies", "<canvas id=\"c\"></canvas> ctx = c.getContext('2d')", ""] {
+            assert!(!draws_webgl(&[text.to_string()]), "{text}");
+        }
+        assert!(draws_webgl(&["<p>plain</p>".to_string(), "renderer = new THREE.WebGLRenderer();".to_string()]), "in a script of its own");
+        assert!(flags(true).contains(ON_THE_GPU.trim()) && !flags(true).contains("--disable-gpu"));
+        assert!(flags(false).contains("--disable-gpu") && !flags(false).contains("--use-angle"));
+        assert_eq!((drawn_on(true), drawn_on(false)), ("on this machine's GPU", "on the CPU, with no GPU"));
+    }
+
     /// A run has a limit of its own from the wait it was given, a hang is tried once more and no more, and only a run that was ended by its time is a hang.
     #[test]
     fn a_run_that_hangs_is_ended_early_and_tried_once_more() {
@@ -2784,7 +2852,7 @@ mod tests {
         let (program, _) = browser().expect("Edge or Chrome is on this machine");
         let (dir, index) = page(&[("index.html", "<!DOCTYPE html><title>plain</title><p>hello</p>")]);
         let temp = crate::sandbox::temp_folder().expect("the sandbox's folder");
-        let (flags, wait) = (flags(), WAIT_MS);
+        let (flags, wait) = (flags(false), WAIT_MS);
         let mut made = Removing(Vec::new());
         let own = next_run();
         let (steps_copy, frame, shot) = (temp.join(steps_page_of(&own)), temp.join(frame_of(&own)), temp.join(shot_of(&own)));
