@@ -2393,7 +2393,83 @@ fn with_backslashes(name: &str, rest: &str) -> Option<String> {
 /// ([`powershell_in_place`]). What the person is asked about and shown is this line, as it is what runs.
 pub fn line_that_runs_at(line: &str, arguments: &Value, workspace: &Path) -> String {
     let cwd = resolve(workspace, arguments.get("cwd").and_then(Value::as_str).unwrap_or("."));
-    venv_in_two_steps(&powershell_in_place(&line_that_runs(line), &cwd, users_folder().as_deref()), bundled_python())
+    in_sandbox_form(line, &cwd)
+}
+
+/// What the sandbox is given for a line run in `cwd`: its stand-ins, PowerShell put in the folder, a `git init` made whole and a venv made in two steps.
+fn in_sandbox_form(line: &str, cwd: &Path) -> String {
+    let users = users_folder();
+    let made = powershell_in_place(&line_that_runs(line), cwd, users.as_deref());
+    let made = git_init_whole(&made, cwd, users.as_deref(), crate::bundled::default_branch);
+    venv_in_two_steps(&made, bundled_python())
+}
+
+/// What a `git init` made whole has in it, by which a line already made so is known.
+const GIT_HEAD_WRITTEN: &str = "HEAD echo ref: refs/heads/";
+
+/// A line whose `git init` is made whole in a folder under the users' folder. A container cannot look at C:\Users, and git, which writes a ref by the
+/// repository's full path and looks at each folder of it on the way, cannot lock HEAD there ("cannot lock ref 'HEAD'"): `git init` stops with no HEAD and no
+/// objects folder, and nothing after it finds a repository. So where it failed so, the line writes HEAD itself, on the branch named or else the person's
+/// own default, and runs `git init` again, which finds HEAD there and makes the rest. One relative folder and plain words only; a bare repository, one kept
+/// elsewhere, a reftable one and every other form are left as they are.
+fn git_init_whole(line: &str, cwd: &Path, users: Option<&Path>, default_branch: impl FnOnce() -> &'static str) -> String {
+    if !under_users(cwd, users) || line.contains(GIT_HEAD_WRITTEN) {
+        return line.to_string();
+    }
+    let pattern = regex::Regex::new(r"(?i)(^|[&|(]\s*)(git(?:\.exe)?\s+init)((?:\s+[\w.\-/\\=]+)*?)\s*($|&&|&|\|\||\))").expect("the pattern is valid");
+    let mut default_branch = Some(default_branch);
+    let mut default = None;
+    pattern.replace_all(line, |found: &regex::Captures| {
+        let words: Vec<&str> = found[3].split_whitespace().collect();
+        let (mut folder, mut named, mut again) = (None, None, vec!["-q"]);
+        let mut at = 0;
+        while at < words.len() {
+            let (word, lower) = (words[at], words[at].to_ascii_lowercase());
+            if lower == "--bare" || lower.starts_with("--separate-git-dir") || lower.starts_with("--ref-format") {
+                return found[0].to_string();
+            } else if lower == "-b" || lower == "--initial-branch" {
+                named = words.get(at + 1).copied();
+                at += 1;
+            } else if lower.starts_with("--initial-branch=") {
+                named = Some(&word["--initial-branch=".len()..]);
+            } else if lower == "--template" || lower == "--object-format" {
+                again.extend(words.get(at..at + 2).unwrap_or(&[]));
+                at += 1;
+            } else if lower == "-q" || lower == "--quiet" {
+            } else if word.starts_with('-') {
+                again.push(word);
+            } else if folder.replace(word).is_some() || word.contains(':') || word.starts_with(['\\', '/']) {
+                return found[0].to_string();
+            }
+            at += 1;
+        }
+        let branch = match named {
+            Some(name) => name,
+            None => *default.get_or_insert_with(|| default_branch.take().map_or("master", |ask| ask())),
+        };
+        if branch.is_empty() || !branch.chars().all(|c| c.is_alphanumeric() || "-_./".contains(c)) {
+            return found[0].to_string();
+        }
+        let git = folder.map_or(".git".to_string(), |folder| format!("{}\\.git", folder.replace('/', "\\").trim_end_matches('\\')));
+        let there = folder.map_or(String::new(), |folder| format!("-C {folder} "));
+        again.extend(folder);
+        let (before, init, words, after) = (&found[1], &found[2], &found[3], &found[4]);
+        let space = if after.is_empty() { "" } else { " " };
+        // (cmd's echo ends HEAD with CR LF, which git takes but its fsck warns of: git writes HEAD again once there is a repository for it to write in. Where
+        // HEAD was there, `git init` failed of something else, and `(call)` keeps it a failure for what comes after)
+        format!(
+            "{before}{init}{words} || (if not exist {git}\\HEAD (>{git}\\{GIT_HEAD_WRITTEN}{branch}&& git init {} && git {there}symbolic-ref HEAD refs/heads/{branch}) else (call)){space}{after}",
+            again.join(" ")
+        )
+    }).to_string()
+}
+
+/// Whether a folder is under the users' folder, which a container cannot look at.
+fn under_users(cwd: &Path, users: Option<&Path>) -> bool {
+    users.is_some_and(|users| {
+        let key = |path: &Path| path.to_string_lossy().trim_start_matches("\\\\?\\").replace('/', "\\").trim_end_matches('\\').to_lowercase();
+        key(cwd).starts_with(&format!("{}\\", key(users)))
+    })
 }
 
 /// Whether the Python a command runs is the bundle's (an embeddable one, with no venv), and not the system's.
@@ -2443,10 +2519,7 @@ const POWERSHELL_PLACE: &str = "DogmindWork";
 /// command of `-Command` (or `-c`) is given that first, and `-File` with plain words after it becomes a command that runs the script by its full path and
 /// ends with its exit code. Other forms, and a folder whose name cmd would read something into, are left as they are.
 fn powershell_in_place(line: &str, cwd: &Path, users: Option<&Path>) -> String {
-    let under = users.is_some_and(|users| {
-        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
-        key(cwd).starts_with(&format!("{}\\", key(users)))
-    });
+    let under = under_users(cwd, users);
     let folder = cwd.to_string_lossy().trim_start_matches("\\\\?\\").to_string();
     if !under || folder.contains(['%', '^', '&', '|', '<', '>', '"', '!', '\n', '\r']) {
         return line.to_string();
@@ -3286,7 +3359,7 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     // As the person, allowed by them: `dir` and `del` work there as they are, and the line runs as it was written and shown.
     let as_person = crate::safety::outside_sandbox(arguments);
     // (as line_that_runs_at makes it, which is what the person was shown: the folder here is the one after a leading `cd` was left out)
-    let runs = if as_person { line.to_string() } else { venv_in_two_steps(&powershell_in_place(&line_that_runs(line), &cwd, users_folder().as_deref()), bundled_python()) };
+    let runs = if as_person { line.to_string() } else { in_sandbox_form(line, &cwd) };
     // One cargo command under the user folder, in a workspace that names its members by a pattern, which cargo expands looking at each folder from the drive's root: a
     // container may not look at C:\Users, so this one runs with a restricted token, reading as the person does and writing in the workspace alone (`run_live_restricted`).
     // Judged on the line as the model wrote it, which is what the gate judged and the person allowed (`REASON_CARGO_OUTSIDE`), and on what runs, which must be that line.
@@ -3329,6 +3402,9 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let no_network = no_network_note(network, done.status, &out, &err);
     report.push_str(no_network.unwrap_or(""));
     report.push_str(venv_note(&out, &err).unwrap_or(""));
+    if runs.contains(GIT_HEAD_WRITTEN) && err.contains("cannot lock ref 'HEAD'") {
+        report.push_str("note: under the users' folder git cannot look at C:\\Users, so `git init` could not lock the new repository's HEAD and stopped (the error above). The line then wrote HEAD and ran `git init` again, which made the rest: the repository is whole, and what came after it ran.\n");
+    }
     if let (Some(before), Some(after)) = (&before, file_states(&cwd)) {
         report.push_str(&described_changes(before, &after));
     }
@@ -5030,6 +5106,40 @@ mod tests {
             assert_eq!(powershell_in_place(same, cwd, Some(users)), same, "{same}");
         }
         assert_eq!(powershell_in_place("powershell -Command ls", Path::new("C:\\Users\\me\\100%\\x"), Some(users)), "powershell -Command ls", "a name cmd would read a variable into");
+    }
+
+    /// A `git init` under the users' folder is made whole when git could not write HEAD: on the branch it names, else the person's default, asked once and only
+    /// for a line that has one; a line made so, and other forms and places, are as they were.
+    #[test]
+    fn a_git_init_under_the_users_folder_is_made_whole() {
+        let users = Path::new(r"C:\Users");
+        let (under, outside) = (Path::new(r"C:\Users\someone\Documents\app"), Path::new(r"C:\work\app"));
+        let asked = std::cell::Cell::new(0);
+        let ask = || {
+            asked.set(asked.get() + 1);
+            "main"
+        };
+        let whole = |line: &str| git_init_whole(line, under, Some(users), || "main");
+        let made = |git: &str, branch: &str, again: &str, there: &str| {
+            format!(r"|| (if not exist {git}\HEAD (>{git}\HEAD echo ref: refs/heads/{branch}&& git init {again} && git {there}symbolic-ref HEAD refs/heads/{branch}) else (call))")
+        };
+        assert_eq!(whole("git init"), format!("git init {}", made(".git", "main", "-q", "")));
+        assert_eq!(whole("git init && git add -A && git commit -m first"), format!("git init {} && git add -A && git commit -m first", made(".git", "main", "-q", "")));
+        assert_eq!(whole("mkdir web & git init -b trunk --template=t web/site & cd web"),
+            format!("mkdir web & git init -b trunk --template=t web/site {} & cd web", made(r"web\site\.git", "trunk", "-q --template=t web/site", "-C web/site ")));
+        assert_eq!(whole("git init --quiet --initial-branch=dev"), format!("git init --quiet --initial-branch=dev {}", made(".git", "dev", "-q", "")));
+        let once = whole("git init");
+        assert_eq!(whole(&once), once, "made once");
+        for same in ["git init --bare", "git init a b", r"git init C:\elsewhere", "git init --separate-git-dir=x", "git init --ref-format=reftable", "git init | more",
+            "git init -b \"a b\"", "git initx", "git status", "echo git init"] {
+            assert_eq!(whole(same), same, "{same}");
+        }
+        assert_eq!(git_init_whole("git init", outside, Some(users), ask), "git init", "outside the users' folder");
+        assert_eq!(git_init_whole("git status && python x.py", under, Some(users), ask), "git status && python x.py");
+        assert_eq!(git_init_whole("git init -b dev", under, Some(users), ask).contains("refs/heads/dev"), true);
+        assert_eq!(asked.get(), 0, "the default is asked only when a line needs it");
+        git_init_whole("git init a & git init b", under, Some(users), ask);
+        assert_eq!(asked.get(), 1, "and once for a line");
     }
 
     /// A venv of the system's Python is made in two steps, with no pip and then its own ensurepip; with the bundle's Python, two folders, options with no pip

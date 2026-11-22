@@ -197,24 +197,47 @@ pub fn environment(root: &Path, inherited_path: &str, temp: &str, workspace: &Pa
     block
 }
 
-/// A global config for commands, with only who commits. On a machine with no name set, this app's: `git commit` otherwise fails, and nothing a command can do mends it.
+/// What git, run here and not in the sandbox, has for `key` in `scope` (`--global`, the person's own config, or `--system`).
+fn config_of(scope: &str, key: &str) -> Option<String> {
+    let mut command = std::process::Command::new(git_program());
+    command.args(["config", scope, key]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command.output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).filter(|said| !said.is_empty())
+}
+
+/// The branch a new repository starts on, as git would take it: the person's own config, then the system's, then git's own. A name with anything in it
+/// that a command line would read something into is not taken.
+pub fn default_branch() -> &'static str {
+    static BRANCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BRANCH.get_or_init(|| {
+        config_of("--global", "init.defaultBranch")
+            .or_else(|| config_of("--system", "init.defaultBranch"))
+            .filter(|name| name.chars().all(|c| c.is_alphanumeric() || "-_./".contains(c)))
+            .unwrap_or_else(|| "master".to_string())
+    })
+}
+
+/// A global config for commands, with who commits and the branch a new repository starts on, as the person's own has them. On a machine with no name set,
+/// this app's: `git commit` otherwise fails, and nothing a command can do mends it.
 fn git_identity(temp: &str) -> String {
-    static WHO: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
-    let (name, address) = WHO.get_or_init(|| {
-        let ask = |key: &str, otherwise: &str| {
-            let mut command = std::process::Command::new(git_program());
-            command.args(["config", "--global", key]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-            {
-                use std::os::windows::process::CommandExt;
-                command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-            }
-            command.output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).filter(|said| !said.is_empty()).unwrap_or_else(|| otherwise.to_string())
-        };
-        (ask("user.name", "Dogmind"), ask("user.email", "dogmind@localhost"))
+    static WHO: std::sync::OnceLock<(String, String, Option<String>)> = std::sync::OnceLock::new();
+    let (name, address, branch) = WHO.get_or_init(|| {
+        (
+            config_of("--global", "user.name").unwrap_or_else(|| "Dogmind".to_string()),
+            config_of("--global", "user.email").unwrap_or_else(|| "dogmind@localhost".to_string()),
+            config_of("--global", "init.defaultBranch"),
+        )
     });
     let quoted = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
     let file = format!("{temp}\\gitconfig");
-    let _ = std::fs::write(&file, format!("[user]\n\tname = \"{}\"\n\temail = \"{}\"\n", quoted(name), quoted(address)));
+    let mut text = format!("[user]\n\tname = \"{}\"\n\temail = \"{}\"\n", quoted(name), quoted(address));
+    if let Some(branch) = branch {
+        text.push_str(&format!("[init]\n\tdefaultBranch = \"{}\"\n", quoted(branch)));
+    }
+    let _ = std::fs::write(&file, text);
     file
 }
 
