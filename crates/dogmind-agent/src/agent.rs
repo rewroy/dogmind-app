@@ -10309,7 +10309,7 @@ Body").unwrap();
         for (tool_pictures, shown) in [(true, 1), (false, 0)] {
             let dir = crate::in_container::tempdir().unwrap();
             let png = images::base64(&images::tests::encoded(16, 16, image::ImageFormat::Png));
-            let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "the page"}, {"type": "image", "mimeType": "image/png", "data": png}]}});
+            let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "the page"}, {"type": "image", "mimeType": "image/png", "data": png}], "structuredContent": {"page": 7}}});
             let hub = mcp::Hub::scripted("web", &[serde_json::json!({"name": "shot", "inputSchema": {"type": "object"}})], &[answer], true);
             let steps = vec![calls(&[("mcp__web__shot", serde_json::json!({}))]), says("a page")];
             let (sender, events) = channel();
@@ -10324,6 +10324,7 @@ Body").unwrap();
             let result = provider.messages(1).last().cloned().unwrap();
             assert_eq!(result.images.len(), shown, "{log:?}");
             let text = user_text(&result).to_string();
+            assert!(text.contains("the page") && text.contains(r#"{"page":7}"#), "{text}");
             if shown == 1 {
                 assert!(text.contains("[picture 1 (image/png): shown with this result]"), "{text}");
             } else {

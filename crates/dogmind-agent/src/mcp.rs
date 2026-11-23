@@ -1028,7 +1028,7 @@ pub struct Picture {
 fn result_parts(result: &Value, pictures: bool) -> (String, Vec<Picture>) {
     let said = |part: &Value, field: &str| part.get(field).and_then(Value::as_str).unwrap_or("").to_string();
     let mut taken = Vec::new();
-    let parts: Vec<String> = result.get("content").and_then(Value::as_array).into_iter().flatten().map(|part| match part.get("type").and_then(Value::as_str) {
+    let mut parts: Vec<String> = result.get("content").and_then(Value::as_array).into_iter().flatten().map(|part| match part.get("type").and_then(Value::as_str) {
         Some("text") => said(part, "text"),
         Some("image") if pictures => {
             let data: String = said(part, "data").chars().filter(|c| !c.is_whitespace()).collect();
@@ -1054,7 +1054,15 @@ fn result_parts(result: &Value, pictures: bool) -> (String, Vec<Picture>) {
         Some(kind) => format!("[{kind} content is not shown]"),
         None => part.to_string(),
     }).collect();
-    let text = if parts.is_empty() { result.get("structuredContent").map_or(String::new(), Value::to_string) } else { parts.join("\n") };
+    if let Some(structured) = result.get("structuredContent") {
+        // Servers can also send the same JSON as a text block for older clients.
+        let json = structured.to_string();
+        let already_shown = parts.iter().any(|part| part == &json || serde_json::from_str::<Value>(part).as_ref().ok() == Some(structured));
+        if !already_shown {
+            parts.push(json);
+        }
+    }
+    let text = parts.join("\n");
     (crate::tools::spill("mcp", &text, MAX_RESULT), taken)
 }
 
@@ -2501,6 +2509,8 @@ enabled = false
         ]});
         assert_eq!(result_text(&resources), "[resource repo://o/r/contents/a.rs]\nfn main() {}\n[resource file:///x.png: image/png bytes, not shown]\n[resource link file:///y.txt (y.txt: the log)]");
         assert_eq!(result_text(&json!({"structuredContent": {"a": 1}})), r#"{"a":1}"#);
+        let mirrored = json!({"content": [{"type": "text", "text": "ready"}, {"type": "text", "text": "{ \"b\": 2, \"a\": 1 }"}], "structuredContent": {"a": 1, "b": 2}});
+        assert_eq!(result_text(&mirrored), "ready\n{ \"b\": 2, \"a\": 1 }");
     }
 
     #[test]
