@@ -107,8 +107,7 @@ pub struct Pty {
 }
 
 /// The environment the shell has: the person's own, with what the shell asks for added, and a colour terminal said to be one.
-fn environment_block(extra: &[(&str, &str)]) -> Vec<u16> {
-    let mut entries: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+fn environment_block(mut entries: Vec<(std::ffi::OsString, std::ffi::OsString)>, extra: &[(&str, &str)]) -> Vec<u16> {
     let mut add = |name: &str, value: &str, replace: bool| {
         let known = entries.iter().position(|(known, _)| known.to_string_lossy().eq_ignore_ascii_case(name));
         match known {
@@ -189,7 +188,7 @@ impl Pty {
             startup.lpAttributeList = list;
             let mut line = wide(line);
             let folder = wide(&folder.display().to_string());
-            let environment = environment_block(environment);
+            let environment = environment_block(std::env::vars_os().collect(), environment);
             let mut process: PROCESS_INFORMATION = std::mem::zeroed();
             let started = CreateProcessW(std::ptr::null(), line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 0, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED, environment.as_ptr().cast(), folder.as_ptr(), &startup.StartupInfo, &mut process);
             let error = io::Error::last_os_error();
@@ -358,10 +357,27 @@ mod tests {
     }
 
     #[test]
+    fn colorterm_defaults_only_when_absent_and_can_be_overridden() {
+        for (inherited, extra, expected) in [
+            (None, None, "truecolor"),
+            (Some(""), None, ""),
+            (Some("24bit"), None, "24bit"),
+            (Some("24bit"), Some("truecolor"), "truecolor"),
+        ] {
+            let entries = inherited.into_iter().map(|value| ("ColorTerm".into(), value.into())).collect();
+            let extra: Vec<_> = extra.into_iter().map(|value| ("COLORTERM", value)).collect();
+            let block = String::from_utf16(&environment_block(entries, &extra)).unwrap();
+            let colors: Vec<_> = block.split('\0').filter_map(|entry| entry.split_once('='))
+                .filter(|(name, _)| name.eq_ignore_ascii_case("COLORTERM")).map(|(_, value)| value).collect();
+            assert_eq!(colors, [expected]);
+        }
+    }
+
+    #[test]
     fn the_shell_starts_in_the_folder_it_is_given_and_with_the_environment_asked_for() {
         let folder = crate::in_container::tempdir().unwrap();
         let (sender, receiver) = channel();
-        let (pty, output) = Pty::spawn_line(&format!("{} /c cd&echo [%DOGMIND_TERM_TEST%]&echo [%TERM_PROGRAM%]&echo [%COLORTERM%]", command()), &[("DOGMIND_TERM_TEST", "zebra42")], folder.path(), 120, 24, move |code| {
+        let (pty, output) = Pty::spawn_line(&format!("{} /c cd&echo [%DOGMIND_TERM_TEST%]&echo [%TERM_PROGRAM%]&echo [%COLORTERM%]", command()), &[("DOGMIND_TERM_TEST", "zebra42"), ("COLORTERM", "24bit")], folder.path(), 120, 24, move |code| {
             let _ = sender.send(code);
         })
         .unwrap();
@@ -372,7 +388,7 @@ mod tests {
         let shown = canonical.display().to_string();
         let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
         assert!(all.to_lowercase().contains(&shown.to_lowercase()), "{all:?}");
-        assert!(all.contains("[zebra42]") && all.contains("[Dogmind]") && all.contains("[truecolor]"), "{all:?}");
+        assert!(all.contains("[zebra42]") && all.contains("[Dogmind]") && all.contains("[24bit]"), "{all:?}");
         drop(pty);
     }
 
