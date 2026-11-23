@@ -185,7 +185,7 @@ fn calibrate_the_draft_stop() {
     println!("old rule: stops {} (of true drafts {}, of the others {})", count(&|row| row.old), count(&|row| row.old && row.true_draft), count(&|row| row.old && !row.true_draft));
     println!("old rule, of its stops: in a request where the person said no file is to change: {}", count(&|row| row.old && !row.watched));
     println!("new rule: stops {} (of true drafts {}, of the others {})", count(&|row| row.new && row.watched), count(&|row| row.new && row.watched && row.true_draft), count(&|row| row.new && row.watched && !row.true_draft));
-    println!("new rule, the run alone, whatever the person said: {} (of true drafts {})", count(&|row| row.new), count(&|row| row.new && row.true_draft));
+    println!("new rule, whatever the person said: {} (of true drafts {})", count(&|row| row.new), count(&|row| row.new && row.true_draft));
     println!("{:24} {:>4} {:>7} {:>7} {:>4} {:>4} {:>4} {:>7} {:>4}", "session", "msg", "chars", "longest", "true", "wrote", "old", "watched", "new");
     for row in rows.iter().filter(|row| row.old || row.new || row.true_draft) {
         println!("{:24} {:>4} {:>7} {:>7} {:>4} {:>4} {:>4} {:>7} {:>4}", row.session, row.at, row.chars, row.longest, u8::from(row.true_draft), u8::from(row.wrote), u8::from(row.old), u8::from(row.watched), u8::from(row.new && row.watched));
@@ -196,7 +196,7 @@ fn calibrate_the_draft_stop() {
 /// The sizes of a draft the stop could be set at, below and at `DRAFT_LINES`.
 const STOP_AT: [usize; 7] = [20, 30, 40, 50, 60, 80, 100];
 
-/// Byte offsets where the run of code first reached each of [`STOP_AT`]: the point a stop at that size would have
+/// Byte offsets where the draft first reached each of [`STOP_AT`]: the point a stop at that size would have
 /// fired, fed as it streams, a line at a time. None where it never did.
 fn reached(shown: BTreeSet<String>, reasoning: &str) -> [Option<usize>; 7] {
     let mut watch = DraftWatch::new(shown, DRAFT_LINES);
@@ -206,12 +206,21 @@ fn reached(shown: BTreeSet<String>, reasoning: &str) -> [Option<usize>; 7] {
         end += line.len();
         watch.is_a_draft(&reasoning[..end]);
         for (slot, size) in at.iter_mut().zip(STOP_AT) {
-            if slot.is_none() && watch.stats() >= size {
+            if slot.is_none() && watch.reached_threshold(size) {
                 *slot = Some(end);
             }
         }
     }
     at
+}
+
+#[test]
+fn a_calibrated_stop_counts_code_across_separate_fences() {
+    let block = format!("```\n{}```\n", "line\n".repeat(10));
+    let reasoning = format!("{block}First part done.\nNow consider the second part.\n{block}");
+    let at = reached(BTreeSet::new(), &reasoning);
+    assert_eq!(at[0], Some(reasoning.trim_end_matches("```\n").len()));
+    assert!(at[1..].iter().all(Option::is_none));
 }
 
 /// The watch slices UTF-8 at byte boundaries. The tables report positions in characters.

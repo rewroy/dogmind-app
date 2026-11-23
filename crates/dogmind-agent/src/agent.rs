@@ -1378,8 +1378,11 @@ impl DraftWatch {
             }
             self.line_starts = end + 1;
         }
-        // (as many lines as a draft, in a row or in blocks of a few: whichever comes first)
-        self.longest >= self.at_least || self.fenced_lines >= self.at_least
+        self.reached_threshold(self.at_least)
+    }
+
+    fn reached_threshold(&self, lines: usize) -> bool {
+        self.longest >= lines || self.fenced_lines >= lines
     }
 }
 
