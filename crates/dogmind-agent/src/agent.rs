@@ -1064,6 +1064,54 @@ fn same_file(one: &str, other: &str) -> bool {
 /// How much of a file is looked through for the names of the files it takes in: a page, a script or a stylesheet is far less; a bundled library is some 600 KB.
 const TAKEN_IN_LOOKED_AT: usize = 4 << 20;
 
+/// The files a page takes in by the paths its text gives them (src and href, a script's import and from, a stylesheet's url()), each relative to the folder of the
+/// file that names it, and what those take in in turn: what the page is made of. Not what is on the web, nor a data: URL. At most 64.
+fn taken_in_by(page: &Path) -> Vec<PathBuf> {
+    static PATHS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let paths = PATHS.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(?:\bsrc|\bhref)\s*=\s*["']([^"'#?]+)|\bfrom\s*["']([^"'#?]+)|\bimport\s*\(?\s*["']([^"'#?]+)|\burl\(\s*["']?([^"')#?]+)"#).expect("the pattern is valid")
+    });
+    let mut found: Vec<PathBuf> = vec![lexical(page)];
+    let mut at = 0;
+    while at < found.len() && found.len() <= 64 {
+        let file = found[at].clone();
+        at += 1;
+        let Some(text) = std::fs::read(&file).ok().filter(|bytes| bytes.len() <= TAKEN_IN_LOOKED_AT).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()) else { continue };
+        let folder = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        for named in paths.captures_iter(&text).filter_map(|found| (1..=4).find_map(|group| found.get(group))).map(|named| named.as_str().trim()) {
+            if named.is_empty() || named.contains("://") || named.starts_with("//") || named.to_ascii_lowercase().starts_with("data:") {
+                continue;
+            }
+            let part = lexical(&folder.join(named));
+            if part.is_file() && !found.iter().any(|known| same_place(known, &part)) {
+                found.push(part);
+            }
+        }
+    }
+    found.remove(0);
+    found
+}
+
+/// A path with its `.` and `..` worked out by its parts alone.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Whether two full paths are the same place, as Windows compares names.
+fn same_place(one: &Path, other: &Path) -> bool {
+    lexical(one).to_string_lossy().replace('/', "\\").eq_ignore_ascii_case(&lexical(other).to_string_lossy().replace('/', "\\"))
+}
+
 fn looks_like_a_try(path: &str) -> bool {
     let file = path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase();
     file.starts_with('_') || ["tmp", "temp", "probe", "scratch", "debug"].iter().any(|word| file.contains(word))
@@ -3776,8 +3824,11 @@ impl Agent {
             }
             _ => {}
         }
-        if let Some(page) = self.polish.page.as_deref() {
-            if changed.iter().any(|path| same_file(path, page)) {
+        // (a change to what the page takes in is a change to the page: a lottery turn patched its app.js and style.css 13 times and checked index.html 24 times, and
+        // the count never moved, nor the word came)
+        if let Some(page) = self.polish.page.clone() {
+            let parts = taken_in_by(&crate::safety::resolve(&self.workspace, &page));
+            if changed.iter().any(|path| same_file(path, &page) || parts.iter().any(|part| same_place(part, &crate::safety::resolve(&self.workspace, path)))) {
                 self.polish.changed = true;
             }
         }
@@ -10792,6 +10843,50 @@ Body").unwrap();
             assert_eq!((kept.unwrap(), images.len()), (said.clone(), 0), "a model that cannot be shown one");
         }
         assert!(agent.with_check_pictures(Err("no such page".into()), Vec::new()).0.is_err());
+    }
+
+    /// What a page takes in: its stylesheet in a folder, its scripts (one named with `./`), a module a script imports and one it loads later, an image a stylesheet
+    /// names from the folder above; not what is on the web, nor what is not there.
+    #[test]
+    fn what_a_page_takes_in_is_found_by_the_paths_it_gives() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let at = |path: &str| dir.path().join(path);
+        for (path, text) in [
+            ("index.html", "<link rel=\"stylesheet\" href=\"css/style.css\">\n<script src=\"https://unpkg.com/three@0.150.1/build/three.min.js\"></script>\n<script src=\"./vendor/tween.js\"></script>\n<script type=\"module\" src='app.js'></script>\n<img src=\"missing.png\">"),
+            ("css/style.css", "body { background: url(\"../img/bg.png\"); }"),
+            ("vendor/tween.js", "var TWEEN = {};"),
+            ("app.js", "import { draw } from './lib/draw.js';\nconst later = () => import('./lazy.js');\n"),
+            ("lib/draw.js", "export function draw() {}"),
+            ("lazy.js", "export default 1;"),
+            ("img/bg.png", "png"),
+            ("other.js", "not taken in"),
+        ] {
+            std::fs::create_dir_all(at(path).parent().unwrap()).unwrap();
+            std::fs::write(at(path), text).unwrap();
+        }
+        let mut found: Vec<String> = taken_in_by(&at("index.html")).iter().map(|part| part.strip_prefix(lexical(dir.path())).unwrap().to_string_lossy().replace('\\', "/")).collect();
+        found.sort();
+        assert_eq!(found, ["app.js", "css/style.css", "img/bg.png", "lazy.js", "lib/draw.js", "vendor/tween.js"]);
+    }
+
+    /// A change to a script the page takes in counts as a change to the page, for the checks that count after a change.
+    #[test]
+    fn a_change_to_what_a_page_takes_in_counts_as_a_change_to_the_page() {
+        let (mut agent, _, _, _dirs) = agent_holding(Vec::new(), 100_000, Vec::new());
+        std::fs::write(agent.workspace.join("index.html"), "<script src=\"app.js\"></script>").unwrap();
+        std::fs::write(agent.workspace.join("app.js"), "a").unwrap();
+        std::fs::write(agent.workspace.join("notes.js"), "a").unwrap();
+        let clean: Result<String, String> = Ok("Console: nothing, so no errors.".into());
+        let patch = |path: &str| serde_json::json!({"edits": [{"path": path, "old_string": "a", "new_string": "b"}]});
+        agent.note_outcome("check_page", &serde_json::json!({"path": "index.html"}), &clean);
+        agent.note_outcome("apply_patch", &patch("notes.js"), &Ok("--- applied".into()));
+        agent.note_outcome("check_page", &serde_json::json!({"path": "index.html"}), &clean);
+        assert_eq!(agent.polish.checks, 0, "a file the page does not take in");
+        for round in 1..=3 {
+            agent.note_outcome("apply_patch", &patch("app.js"), &Ok("--- applied".into()));
+            agent.note_outcome("check_page", &serde_json::json!({"path": "index.html"}), &clean);
+            assert_eq!(agent.polish.checks, round);
+        }
     }
 
     /// A page that passed check_page with no error counts a further such check only after a change to it; an error starts it over, and another page starts again from that one.
