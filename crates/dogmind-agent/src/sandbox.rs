@@ -3915,6 +3915,13 @@ mod tests {
         let gone = command(&crate::tools::line_that_runs("del b.txt"), &folder, false);
         assert_eq!(gone.status, Some(0), "{}", decode(&gone.stderr));
         assert!(!folder.join("b.txt").exists());
+        // (and those in a line with a `for`, which was left whole and read the drive's root)
+        for (line, names) in [("dir /b sub\\*.txt && for %f in (sub\\*.txt) do @echo %~zf", &["a.txt"][..]), ("for /f %f in ('dir /b /s sub\\*.txt') do @echo %~nxf", &["a.txt"][..]),
+                              ("for %F in (sub) do @echo === %F & dir \"%F\" | find \"txt\"", &["a.txt"][..])] {
+            let ran = command(&crate::tools::line_that_runs(line), &folder, false);
+            let out = decode(&ran.stdout);
+            assert!(ran.status == Some(0) && names.iter().all(|name| out.contains(name)), "{line}: {:?} {out} {}", ran.status, decode(&ran.stderr));
+        }
         let tree = command("rmdir /s /q sub", &folder, false);
         assert_eq!(tree.status, Some(0), "{}", decode(&tree.stderr));
         assert!(!folder.join("sub").exists());

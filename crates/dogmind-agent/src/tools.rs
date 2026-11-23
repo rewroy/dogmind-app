@@ -2432,9 +2432,141 @@ fn plain_words(text: &str) -> Option<Vec<String>> {
     (!words.iter().any(|word| word.contains('>'))).then_some(words)
 }
 
+/// `plain_words`, with a `for`'s own variables (`%F`, `%~nxF`, of these letters) taken as part of a word: cmd puts the name in their place before the command runs.
+#[cfg(windows)]
+fn plain_words_with(text: &str, variables: &[char]) -> Option<Vec<String>> {
+    let chars: Vec<char> = text.chars().collect();
+    let (mut masked, mut kept, mut at) = (String::new(), Vec::<String>::new(), 0);
+    while at < chars.len() {
+        if chars[at] == '%' {
+            let mut end = at + 1;
+            let found = if chars.get(end) == Some(&'~') {
+                end += 1;
+                while chars.get(end).is_some_and(char::is_ascii_alphabetic) {
+                    end += 1;
+                }
+                // (the variable is the last letter, the modifiers the ones before it)
+                end > at + 2 && variables.contains(&chars[end - 1]) && chars[at + 2..end - 1].iter().all(|c| "fdpnxsatz".contains(c.to_ascii_lowercase()))
+            } else {
+                end += 1;
+                chars.get(at + 1).is_some_and(|c| variables.contains(c))
+            };
+            if found {
+                masked.push(char::from_u32(0xE000 + kept.len() as u32)?);
+                kept.push(chars[at..end].iter().collect());
+                at = end;
+                continue;
+            }
+        }
+        masked.push(chars[at]);
+        at += 1;
+    }
+    let words = plain_words(&masked)?;
+    Some(words.into_iter().map(|word| word.chars().map(|c| match (c as u32).checked_sub(0xE000).and_then(|index| kept.get(index as usize)) {
+        Some(text) => text.clone(),
+        None => c.to_string(),
+    }).collect()).collect())
+}
+
+/// A line with parentheses (an `if`, a `for`, a group of commands) has a stand-in only for its `dir`s that cmd runs as commands of their own: a step of the line
+/// outside every parenthesis (a `for`'s body is one: it runs to the end of the line), and the command a `for /f` reads (`in ('dir /b /s crates\*.rs')`). A `for`'s
+/// variables are words there (`dir "%F"`), and the stand-in's own loop takes a letter none of the line's `for`s has. What is inside parentheses, and a `del` (which
+/// runs in the sandbox as it is, saying less), stay as they were written. (Such a line was left whole, and a raw `dir` reads the drive's root, which a container
+/// cannot: `dir /b *.html && for %f in (*.html) do @echo %~zf`, `for /f %f in ('dir /b /s crates\*.rs') do …` and `for %F in (a b) do … & dir "%F" | find "html"`
+/// ended "Access is denied", 4 of the 64 lines with a `dir` among other commands in 194 sessions; the others had no parentheses and ran.)
+#[cfg(windows)]
+fn dir_stand_ins_around_parentheses(line: &str) -> String {
+    static FOR_VARIABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern = FOR_VARIABLE.get_or_init(|| regex::Regex::new(r"(?i)\bfor\b[^%]*?%%?([a-z])\s+in\s*\(").expect("the pattern is valid"));
+    let variables: Vec<char> = pattern.captures_iter(line).filter_map(|found| found[1].chars().next()).collect();
+    let Some(own) = ['d', 'e', 'g', 'h', 'j', 'k', 'q', 'v', 'w', 'y'].into_iter().find(|letter| !variables.iter().any(|v| v.eq_ignore_ascii_case(letter))) else {
+        return line.to_string();
+    };
+    // (what a `dir` lists, as its stand-in has it)
+    let dir_words = |step: &str| -> Option<Vec<String>> {
+        let bare = step.trim_start().trim_start_matches('@');
+        let word = bare.split_whitespace().next()?;
+        let (name, glued) = word.split_once('/').map_or((word, None), |(name, rest)| (name, Some(rest)));
+        if !name.eq_ignore_ascii_case("dir") {
+            return None;
+        }
+        let mut words = plain_words_with(&bare[word.len()..], &variables)?;
+        words.extend(glued.into_iter().flat_map(|rest| rest.split('/')).map(|switch| format!("/{switch}")));
+        Some(words)
+    };
+    let dir = |step: &str, piped: bool| -> Option<String> {
+        let words = dir_words(step)?;
+        Some(format!("{}({})", &step[..step.len() - step.trim_start().len()], dir_stand_in_as(&words, piped, own)))
+    };
+    // (a `for`'s own `dir`s: the command a `for /f` reads, between `in ('` and `')`, and its body, after `) do `)
+    let in_a_for = |step: &str, piped: bool| -> Option<String> {
+        let lower = step.to_ascii_lowercase();
+        let head = lower.trim_start();
+        if !head.starts_with("for") {
+            return None;
+        }
+        let mut text = step.to_string();
+        if head.starts_with("for /f") || head.starts_with("for/f") {
+            let open = lower.find("in ('").map(|at| at + "in ('".len());
+            let close = open.and_then(|open| lower[open..].find("')").map(|at| open + at));
+            if let (Some(open), Some(close)) = (open, close) {
+                // (in the command a `for /f` reads, cmd takes a parenthesis, `&` or `|` for its own unless it has a `^`: the stand-in's `(*.txt)` ended the `in (`, and
+                // the rest was looked for as a file)
+                if let Some(words) = dir_words(&step[open..close]) {
+                    let inner: String = dir_stand_in_as(&words, false, own).chars().flat_map(|c| ["^".chars().filter(|_| "()&|<>".contains(c)).collect::<String>(), c.to_string()]).collect();
+                    text = format!("{}{inner}{}", &step[..open], &step[close..]);
+                }
+            }
+        }
+        // (the last `) do `: the command read above may have one of its own)
+        if let Some(body) = text.to_ascii_lowercase().rfind(") do ").map(|at| at + ") do ".len()) {
+            if let Some(stand_in) = dir(&text[body..], piped) {
+                text = format!("{}{stand_in}", &text[..body]);
+            }
+        }
+        (text != step).then_some(text)
+    };
+    let (mut out, mut start, mut quoted, mut depth, mut changed) = (String::new(), 0, false, 0usize, false);
+    let mut step = |text: &str, piped: bool, out: &mut String| match dir(text, piped).or_else(|| in_a_for(text, piped)) {
+        Some(stand_in) => {
+            changed = true;
+            out.push_str(&stand_in);
+        }
+        None => out.push_str(text),
+    };
+    for (at, c) in line.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => match depth.checked_sub(1) {
+                Some(less) => depth = less,
+                None => return line.to_string(),
+            },
+            '&' | '|' if !quoted && depth == 0 => {
+                let piped = c == '|' && !line[at + 1..].starts_with('|') && !line[..at].ends_with('|');
+                step(&line[start..at], piped, &mut out);
+                out.push(c);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted || depth != 0 {
+        return line.to_string();
+    }
+    step(&line[start..], false, &mut out);
+    if changed { out } else { line.to_string() }
+}
+
 /// What `dir` is asked for, in what runs in the sandbox: it lists a folder, a file or a pattern as `dir` does, in fewer words. `piped`: cmd reads what comes before a `|` again, and an `if` with parentheses does not survive that.
 #[cfg(windows)]
 fn dir_stand_in(words: &[String], piped: bool) -> String {
+    dir_stand_in_as(words, piped, 'd')
+}
+
+/// `dir_stand_in`, its own loop's variable `%v`: in a `for`'s body that is `%d` itself, a loop of `%d` in it would be the outer one's.
+#[cfg(windows)]
+fn dir_stand_in_as(words: &[String], piped: bool, v: char) -> String {
     let recursive = words.iter().any(|word| word.eq_ignore_ascii_case("/s"));
     let mut places: Vec<String> = words.iter().filter(|word| !word.starts_with('/')).map(|word| word.trim_end_matches('\\').to_string()).collect();
     if places.is_empty() {
@@ -2443,12 +2575,12 @@ fn dir_stand_in(words: &[String], piped: bool) -> String {
     let one = |place: &String| {
         if recursive {
             let (folder, mask) = if place.contains(['*', '?']) { place.rsplit_once('\\').unwrap_or((".", place.as_str())) } else { (place.as_str(), "*") };
-            return format!("for /r \"{folder}\" %d in ({mask}) do @echo %d");
+            return format!("for /r \"{folder}\" %{v} in ({mask}) do @echo %{v}");
         }
         if piped {
-            return format!("(for /d %d in (\"{place}\\*\") do @echo %~nxd\\) & (for %d in (\"{place}\\*\") do @echo %~nxd  %~zd)");
+            return format!("(for /d %{v} in (\"{place}\\*\") do @echo %~nx{v}\\) & (for %{v} in (\"{place}\\*\") do @echo %~nx{v}  %~z{v})");
         }
-        format!("if exist \"{place}\\*\" ((for /d %d in (\"{place}\\*\") do @echo %~nxd\\) & (for %d in (\"{place}\\*\") do @echo %~nxd  %~zd)) else if exist \"{place}\" (for %d in (\"{place}\") do @echo %~nxd  %~zd) else (echo File Not Found 1>&2)")
+        format!("if exist \"{place}\\*\" ((for /d %{v} in (\"{place}\\*\") do @echo %~nx{v}\\) & (for %{v} in (\"{place}\\*\") do @echo %~nx{v}  %~z{v})) else if exist \"{place}\" (for %{v} in (\"{place}\") do @echo %~nx{v}  %~z{v}) else (echo File Not Found 1>&2)")
     };
     places.iter().map(one).collect::<Vec<_>>().join(" & ")
 }
@@ -2817,6 +2949,13 @@ pub fn line_that_runs(line: &str) -> String {
 fn with_stand_ins(line: &str) -> String {
     if line.contains(['\n', '\r']) {
         return line.to_string();
+    }
+    let mut quoted = false;
+    if line.chars().any(|c| {
+        quoted ^= c == '"';
+        !quoted && matches!(c, '(' | ')')
+    }) {
+        return dir_stand_ins_around_parentheses(line);
     }
     let (mut out, mut start, mut quoted, mut changed, mut after_a_pipe) = (String::new(), 0, false, false, false);
     let mut step = |text: &str, piped: bool, after_a_pipe: bool, out: &mut String| {
@@ -5431,7 +5570,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn dir_and_del_in_their_plain_forms_get_a_stand_in_and_nothing_else_is_touched() {
-        for same in ["echo dir", "mkdir a", "python x.py", "dir > out.txt", "dir %TEMP%", "if exist x (del x)", "for %f in (*) do del %f", "del /s a.txt", "del /p a.txt", "del", "echo a & echo dir", "findstr \"dir | del\" a.txt", "dir\necho x"] {
+        for same in ["echo dir", "mkdir a", "python x.py", "dir > out.txt", "dir %TEMP%", "if exist x (del x)", "for %f in (*) do del %f", "del /s a.txt", "del /p a.txt", "del", "echo a & echo dir", "findstr \"dir | del\" a.txt", "dir\necho x",
+                     "if exist x (dir /b x) else (echo none)", "(dir /b) & echo x", "for %f in (*) do @echo %f", "echo (a & dir", "for %f in (*.js) do dir %TEMP%"] {
             assert_eq!(with_stand_ins(same), same, "{same}");
         }
         let dir = with_stand_ins("dir vendor");
@@ -5454,6 +5594,25 @@ mod tests {
         assert!(piped.starts_with("((for /d %d in (\"vendor\\*\")") && !piped.contains("if exist") && piped.ends_with("| findstr three"), "{piped}");
         assert!(with_stand_ins("dir vendor || echo none").contains("if exist"), "a second chance is not a pipe");
         assert_eq!(with_stand_ins("del it's.txt"), "del it's.txt");
+    }
+
+    /// In a line with parentheses, a `dir` cmd runs as a command of its own gets its stand-in: one before or after a `for`, one in a `for`'s body (with the `for`'s
+    /// variable as its word), and the command a `for /f` reads; the stand-in's loop takes a letter of its own.
+    #[cfg(windows)]
+    #[test]
+    fn a_dir_beside_or_in_a_for_gets_its_stand_in_too() {
+        let first = with_stand_ins("dir /b *.html && for %f in (*.html) do @echo %~zf");
+        assert!(first.starts_with("(if exist \"*.html\\*\"") && first.ends_with("&& for %f in (*.html) do @echo %~zf") && !first.contains("dir /b"), "{first}");
+        let body = with_stand_ins("for %F in (a.html b.html) do @echo === %F & dir \"%F\" | find \"html\"");
+        assert!(body.starts_with("for %F in (a.html b.html) do @echo === %F & ((for /d %d in (\"%F\\*\")") && body.ends_with("| find \"html\"") && !body.contains("dir \""), "{body}");
+        let read = with_stand_ins("for /f %f in ('dir /b /s crates\\*.rs') do @echo %~zf %f");
+        assert_eq!(read, "for /f %f in ('for /r \"crates\" %d in ^(*.rs^) do @echo %d') do @echo %~zf %f");
+        // (the line's own loop is `%d`: the stand-in's is another letter, and the line's `%d` stays the line's)
+        let own = with_stand_ins("for %d in (a b) do dir %d");
+        assert!(own.contains("for /d %e in (\"%d\\*\")") && !own.contains("for /d %d"), "{own}");
+        // (with a `del` beside it, the `del` is left: it runs in the sandbox as it is)
+        let both = with_stand_ins("for %f in (*.tmp) do del %f & dir /b");
+        assert!(both.starts_with("for %f in (*.tmp) do del %f & (if exist"), "{both}");
     }
 
     /// A path written with `/` is given to cmd's commands with `\`, and `mkdir -p` makes no folder named `-p`; what `findstr` looks for, switches and addresses stay as written.
