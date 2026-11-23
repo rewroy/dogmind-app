@@ -2848,10 +2848,14 @@ fn mcp_import(home: &Path, codex_home: Option<&Path>, file: &Path, argument: &st
     let warning = if unreadable.is_empty() { String::new() } else {
         tf("Could not read MCP settings from {0}. Check the file format and permissions.", &[&unreadable.join(", ")])
     };
+    let report = |message: String| if warning.is_empty() { message } else { format!("{message}\n{warning}") };
+    let already_configured = || tf("{0} is already configured in Dogmind.", &[&name]);
+    if !name.is_empty() && !found.contains_key(name) && mcp::readable_config(file)?.servers.contains_key(name) {
+        return Ok((0, report(already_configured())));
+    }
     if found.is_empty() && !warning.is_empty() {
         return Err(warning);
     }
-    let report = |message: String| if warning.is_empty() { message } else { format!("{message}\n{warning}") };
     if preview {
         let configured = mcp::readable_config(file)?.servers;
         let names: Vec<_> = found.into_keys().filter(|name| !configured.contains_key(name)).collect();
@@ -2869,7 +2873,7 @@ fn mcp_import(home: &Path, codex_home: Option<&Path>, file: &Path, argument: &st
     let added = mcp::import(file, found)?;
     let message = match (added, name.is_empty()) {
         (0, true) => t("Claude and Codex list no server that is not here already.").into(),
-        (0, false) => tf("{0} is already configured in Dogmind.", &[&name]),
+        (0, false) => already_configured(),
         (_, false) => tf("Added {0}. The server is starting.", &[&name]),
         (_, true) => tf("{0} servers added to {1}. They are starting.", &[&added, &file.display()]),
     };
@@ -19518,6 +19522,24 @@ mod tests {
         std::fs::write(custom.join("config.toml"), "[malformed").unwrap();
         let (_, warning) = run("candidates").unwrap();
         assert!(warning.contains("$CODEX_HOME/config.toml") && !warning.contains("[malformed"));
+    }
+
+    #[test]
+    fn a_registered_mcp_server_is_recognized_after_its_import_source_is_removed() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("mcp.json");
+        let saved = r#"{"mcpServers":{"saved clock":{"command":"clock"}}}"#;
+        std::fs::write(&file, saved).unwrap();
+        let run = |name| mcp_import(home.path(), None, &file, name);
+        let expected = tf("{0} is already configured in Dogmind.", &[&"saved clock"]);
+        assert_eq!(run("import saved clock").unwrap(), (0, expected.clone()));
+        assert!(run("import missing").is_err());
+        std::fs::write(home.path().join(".claude.json"), "{").unwrap();
+        let (added, message) = run("import saved clock").unwrap();
+        assert_eq!(added, 0);
+        assert!(message.contains(&expected) && message.contains(".claude.json"));
+        assert!(run("import missing").unwrap_err().contains(".claude.json"));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), saved);
     }
 
     #[test]
