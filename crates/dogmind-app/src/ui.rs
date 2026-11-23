@@ -3514,8 +3514,10 @@ impl App {
         self.links.push((self.last_inserted.0, self.last_inserted.1, url.to_string()));
     }
 
-    /// The pointer has moved on the transcript: whether it is on a link, and which.
-    unsafe fn track_link(&mut self, lparam: LPARAM) {
+    unsafe fn link_under(&self, lparam: LPARAM) -> Option<&str> {
+        if self.links.is_empty() {
+            return None;
+        }
         let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
         let at_point = POINT { x, y };
         let at = SendMessageW(self.transcript, EM_CHARFROMPOS_RICH, 0, std::ptr::addr_of!(at_point) as LPARAM) as i32;
@@ -3524,10 +3526,15 @@ impl App {
         // (the character nearest a pointer in empty space is not under it)
         let reach = scale(self.dpi, 32);
         let close = (x - near.x).abs() < reach && y >= near.y - scale(self.dpi, 4) && y < near.y + reach;
+        close.then(|| link_at(&self.links, at)).flatten()
+    }
+
+    /// The pointer has moved on the transcript: whether it is on a link, and which.
+    unsafe fn track_link(&mut self, lparam: LPARAM) {
         self.run_hover = self.run_under(lparam);
         let found = match self.run_hover {
             Some(run) => Some(self.runs[run].hover(&self.workspace)).filter(|words| !words.is_empty()),
-            None => close.then(|| link_at(&self.links, at)).flatten().map(str::to_string),
+            None => self.link_under(lparam).map(str::to_string),
         };
         if found != self.link_hover {
             if self.link_hover.is_none() {
@@ -3555,8 +3562,7 @@ impl App {
         ((x - near.x).abs() < reach && y >= near.y - scale(self.dpi, 4) && y < near.y + reach).then_some(run)
     }
 
-    /// A click on a link: to the browser if it is on the web, beside the conversation if it is a file here (at the lines it names, as
-    /// `src/app.js#L24`), and nowhere otherwise.
+    /// A web link opens in the browser, a file in the preview (at the lines it names), and a workspace folder in Explorer.
     unsafe fn open_link(&mut self, url: &str) {
         match markdown::web_address(url) {
             Some(address) => open_in_browser(&address),
@@ -3566,6 +3572,8 @@ impl App {
                     self.open_preview_at(path, lines);
                 } else if self.workspace.join(url).is_file() {
                     self.open_preview(url);
+                } else if let Some(folder) = workspace_folder_link(&self.workspace, url) {
+                    self.open_folder_in_explorer(&folder);
                 }
             }
         }
@@ -15733,7 +15741,7 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
                 app.toggle_run(run);
                 return result;
             }
-            if let Some(url) = app.link_hover.clone() {
+            if let Some(url) = app.link_under(lparam).map(str::to_string) {
                 let result = CallWindowProcW(base, window, message, wparam, lparam);
                 app.open_link(&url);
                 return result;
@@ -17903,6 +17911,20 @@ fn share_rows(room: i32, tasks: usize, changes: usize) -> (usize, usize) {
     } else {
         (half - 1, room - half - 1)
     }
+}
+
+/// Resolve a folder named relative to the workspace, including when it is reached through a directory link.
+fn workspace_folder_link(workspace: &Path, url: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let relative = Path::new(url);
+    if url.is_empty() || !workspace.is_absolute() || !relative.components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir)) {
+        return None;
+    }
+    let folder = workspace.join(relative.components().collect::<PathBuf>());
+    if !folder.is_dir() || !folder.canonicalize().ok()?.starts_with(workspace.canonicalize().ok()?) {
+        return None;
+    }
+    Some(folder)
 }
 
 /// The link at this character, if any: they are in order.
@@ -20161,6 +20183,22 @@ mod tests {
         assert_eq!(wrap_row(&[100, 100, 100], 10, 215), [(0, 0), (0, 110), (1, 0)]);
         assert_eq!(wrap_row(&[300], 10, 100), [(0, 0)], "one too wide stays on its row");
         assert!(wrap_row(&[], 10, 100).is_empty());
+    }
+
+    #[test]
+    fn a_folder_link_names_an_existing_directory_in_the_workspace() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let workspace = dir.path().join("project");
+        let folder = workspace.join("vendor").join("three");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("draw.js"), "").unwrap();
+        let folder_with_spaces = workspace.join("参考 資料");
+        std::fs::create_dir(&folder_with_spaces).unwrap();
+        assert_eq!(workspace_folder_link(&workspace, "vendor/three/"), Some(folder));
+        assert_eq!(workspace_folder_link(&workspace, "./参考 資料"), Some(folder_with_spaces));
+        for name in ["", "../", "missing/", "vendor/three/draw.js", "vendor/three/#L2"] {
+            assert!(workspace_folder_link(&workspace, name).is_none(), "{name}");
+        }
     }
 
     #[test]
