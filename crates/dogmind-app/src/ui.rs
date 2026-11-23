@@ -12596,10 +12596,9 @@ impl App {
     unsafe fn mcp_servers_imported(&mut self, argument: &str) -> String {
         let Some(home) = std::env::var_os("USERPROFILE") else { return t("The user profile could not be located.").into() };
         match mcp_import(Path::new(&home), dogmind_agent::codex::configured_home().as_deref(), &self.folder.join("mcp.json"), argument) {
-            Ok((added, message)) => {
-                // A file repaired after startup can already contain the requested server while the hub still has its read error.
-                let recovered = !argument.trim().eq_ignore_ascii_case("candidates") && self.mcp.unreadable().is_some();
-                if added > 0 || recovered {
+            Ok((_, message)) => {
+                // An import also picks up edits made to mcp.json since startup, even if every entry was already saved.
+                if !argument.trim().eq_ignore_ascii_case("candidates") {
                     self.mcp_changed(None);
                 }
                 message
