@@ -1,5 +1,5 @@
 //! The trajectory page's table: its columns, and its rows for the turns of a session, each open (with its requests and its tools) or shut. Nothing here draws: the window draws what these say,
-//! each cell in a column of its own of a fixed width in the characters of its monospace face, which is what makes it a table and not words lined up with tabs.
+//! each cell in a column of its own wide enough for its heading and monospace values, which is what makes it a table and not words lined up with tabs.
 
 use std::collections::BTreeSet;
 
@@ -7,7 +7,7 @@ use dogmind_agent::trajectory_report::{RequestRow, Summary, ToolRow, TurnSummary
 
 use crate::lang::{t, tf};
 
-/// A column: its title, the room it has in characters of the table's monospace face, and whether its figures stand at its right edge.
+/// A column: its title, its minimum width in characters of the table's monospace face, and whether its figures stand at its right edge.
 pub struct Column {
     pub title: &'static str,
     pub chars: usize,
@@ -131,16 +131,16 @@ fn tool_row(tool: &ToolRow) -> Row {
     Row { kind: RowKind::Tool, cells: [format!("  {} {}", tool.id, tool.name), String::new(), String::new(), String::new(), seconds(tool.ms), seconds(tool.ms)], note: parts.join(", ") }
 }
 
-/// The left edge of each column in a row, in characters from the left of the table (after the margin, where a turn's chevron stands), and where the notes begin: the columns side by side with
-/// a character between each.
-pub fn column_starts() -> ([usize; 6], usize) {
-    let mut starts = [0; 6];
-    let mut at = MARGIN;
-    for (place, column) in COLUMNS.iter().enumerate() {
-        starts[place] = at;
-        at += column.chars + 1;
-    }
-    (starts, at)
+/// Pixel bounds shared by headings and data, followed by the start of the notes column.
+pub fn column_bounds(character: i32, headings: [i32; 6]) -> ([(i32, i32); 6], i32) {
+    let mut left = MARGIN as i32 * character;
+    let bounds = std::array::from_fn(|i| {
+        let right = left + (COLUMNS[i].chars as i32 * character).max(headings[i]);
+        let cell = (left, right);
+        left = right + character;
+        cell
+    });
+    (bounds, left)
 }
 
 #[cfg(test)]
@@ -211,12 +211,15 @@ mod tests {
 
     #[test]
     fn the_columns_stand_side_by_side_each_after_the_one_before_with_a_character_between() {
-        let (starts, notes) = column_starts();
-        assert_eq!(starts[0], MARGIN);
-        for place in 1..6 {
-            assert_eq!(starts[place], starts[place - 1] + COLUMNS[place - 1].chars + 1);
+        let character = 10;
+        let (bounds, notes) = column_bounds(character, [20, 125, 90, 90, 85, 60]);
+        assert_eq!(bounds[0], (30, 250));
+        assert_eq!(bounds[1], (260, 385)); // The localized heading is wider than eight digits.
+        assert_eq!(bounds[4].1 - bounds[4].0, 85);
+        for pair in bounds.windows(2) {
+            assert_eq!(pair[1].0, pair[0].1 + character);
         }
-        assert_eq!(notes, starts[5] + COLUMNS[5].chars + 1);
+        assert_eq!(notes, bounds[5].1 + character);
         // (a figure of a tenth of a second in any of the hours a run can take fits its column)
         assert!(seconds(99_999_000).chars().count() <= COLUMNS[5].chars);
     }

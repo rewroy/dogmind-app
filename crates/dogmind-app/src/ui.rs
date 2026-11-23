@@ -9823,21 +9823,23 @@ impl App {
 
     /// The trajectory's table: each column at its own place across, in the characters of the monospace face, the header kept at the top, the rows in view under it.
     unsafe fn paint_trajectory(&self, device: HDC, client: RECT) {
-        use crate::trajectory::{column_starts, RowKind, COLUMNS};
+        use crate::trajectory::{column_bounds, RowKind, COLUMNS};
         let Some(page) = &self.trajectory else { return };
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let row = s(ds::size::DIFF_ROW);
         let face = self.fonts.code;
         let character = text_width(face, "0").max(1);
-        let (starts, notes) = column_starts();
+        let Some(header) = page.rows.first() else { return };
+        let headings = std::array::from_fn(|i| text_width(face, &header.cells[i]));
+        let (bounds, notes) = column_bounds(character, headings);
         let bar = s(ds::space::M);
         let width = client.right - bar;
         SetBkMode(device, TRANSPARENT as _);
         let cell = |device: HDC, text: &str, column: usize, y: i32, color: u32| {
-            let (left, room) = (starts[column] as i32 * character, COLUMNS[column].chars as i32 * character);
+            let (left, right) = bounds[column];
             let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | if COLUMNS[column].right { DT_RIGHT } else { 0 };
-            draw_text(device, text, RECT { left, right: left + room, top: y, bottom: y + row }, face, color, flags);
+            draw_text(device, text, RECT { left, right, top: y, bottom: y + row }, face, color, flags);
         };
         // (the header's row is the first, and stays where it is)
         let first = ((self.diff_scroll / row) as usize).max(1);
@@ -9869,7 +9871,7 @@ impl App {
                     cell(device, text, column, y, color);
                 }
                 if !line.note.is_empty() {
-                    draw_text(device, &line.note, RECT { left: notes as i32 * character, right: width, top: y, bottom: y + row }, face, theme::faint(), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                    draw_text(device, &line.note, RECT { left: notes, right: width, top: y, bottom: y + row }, face, theme::faint(), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
                 }
             }
             y += row;
@@ -9879,10 +9881,8 @@ impl App {
         let brush = CreateSolidBrush(theme::background());
         FillRect(device, &head, brush);
         DeleteObject(brush);
-        if let Some(line) = page.rows.first() {
-            for (column, text) in line.cells.iter().enumerate() {
-                cell(device, text, column, 0, theme::faint());
-            }
+        for (column, text) in header.cells.iter().enumerate() {
+            cell(device, text, column, 0, theme::faint());
         }
         let rule = rect(0, row - 1, client.right, 1);
         let brush = CreateSolidBrush(theme::line());
