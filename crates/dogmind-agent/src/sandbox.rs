@@ -646,8 +646,19 @@ pub(crate) unsafe fn workspace_capability(root: &Path) -> Result<PSID, String> {
 
 /// The name a workspace's capability is made from: the container's, and a hash of the folder's key that stays the same from one version of the app to the next.
 fn capability_name(place: &str) -> String {
-    let hash = place.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3));
-    format!("{PROFILE}.Workspace.{hash:016x}")
+    format!("{PROFILE}.Workspace.{:016x}", fnv(place))
+}
+
+/// FNV-1a, 64 bits: a short name made from a long one, the same each time.
+fn fnv(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// The temp folder of a workspace's commands that run with a restricted token: a folder of the sandbox's own temp folder, by the workspace's SID. That SID is granted
+/// this folder alone. Granted the sandbox's temp folder, the list of everything in it was written anew, 47 to 50 s with 20,000 things there, while every other command
+/// waited on the grants' lock; and each workspace's SID stayed on it, inherited by all that was made there after, 674 of them on this PC.
+fn restricted_temp(sandbox_temp: &Path, writer: &str) -> PathBuf {
+    sandbox_temp.join(format!("w-{:016x}", fnv(writer)))
 }
 
 /// The SID a workspace's commands that run with a restricted token write as ([`restricted_token`]): a random one in the form of a domain account's, made once for
@@ -752,12 +763,14 @@ unsafe fn restricted_token(writer: PSID) -> Result<Handle, String> {
     Ok(made)
 }
 
-/// What a command run with a restricted token needs before it starts: write for its SID in the workspace and in the temp folder its environment names, and the workspace's
-/// repositories guarded for that SID as for the container's (no new config or hooks). Nothing to read is opened: it reads as the person does.
+/// What a command run with a restricted token needs before it starts: write for its SID in the workspace and in the temp folder its environment names (its own,
+/// `restricted_temp`, made here), and the workspace's repositories guarded for that SID as for the container's (no new config or hooks). Nothing to read is opened: it
+/// reads as the person does.
 unsafe fn prepare_restricted(workspace: &Path, writer: PSID, temp: Option<&Path>, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
     let began = Instant::now();
     grant(workspace, writer, READ_WRITE_EXECUTE, true)?;
     if let Some(temp) = temp {
+        std::fs::create_dir_all(temp).map_err(|error| format!("{}: the temp folder of the command could not be made: {error}", temp.display()))?;
         grant(temp, writer, READ_WRITE_EXECUTE, true)?;
     }
     times.grant += began.elapsed();
@@ -2196,6 +2209,53 @@ impl Seen {
     }
 }
 
+/// What an earlier version's restricted token's commands left on the sandbox's temp folder (`profile_folder`): a grant to each workspace's SID, on the folder itself and
+/// inherited by all in it. 667 were on this PC's, three more with each whole run of the tests, and each grant there carried all of them down to everything in it again.
+/// Taken off at the app's start, off its thread, in one write of the folder's list, which Windows carries down; nothing puts one there again (`restricted_temp`), and a
+/// restricted command meanwhile does not wait, in a folder of its own. How many there were, and how long it took; nothing when there were none.
+pub fn clear_old_restricted_grants() -> Option<(usize, Duration)> {
+    if in_a_container() {
+        return None;
+    }
+    // SAFETY: the SIDs live through the calls.
+    let cleared = unsafe {
+        let temp = profile_folder(profile_sid().ok()?)?;
+        let person = PersonSid::now()?;
+        clear_restricted_grants(&temp, person.sid()).ok().filter(|(count, _)| *count > 0)
+    };
+    // (a grant written on a folder of it while the list was carried down is looked at again, not taken as given)
+    if cleared.is_some() {
+        forget_grants();
+    }
+    cleared
+}
+
+/// As `clear_old_restricted_grants`, on `folder`: an allowing grant to all in it, of read, write and run, that is the folder's own, to a SID of the form a workspace's has
+/// (a domain account's), and not the person's.
+unsafe fn clear_restricted_grants(folder: &Path, person: PSID) -> Result<(usize, Duration), String> {
+    let began = Instant::now();
+    let list = Dacl::read(folder)?;
+    let old = |ace: &Vec<u8>| {
+        let sid = ace[8..].as_ptr() as PSID;
+        u32::from(ace[0]) == ACCESS_ALLOWED_ACE_TYPE
+            && ace[1] == (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8
+            && u32::from_ne_bytes([ace[4], ace[5], ace[6], ace[7]]) == READ_WRITE_EXECUTE
+            && EqualSid(sid, person) == 0
+            && sid_text(sid).starts_with("S-1-5-21-")
+    };
+    let count = list.aces.iter().filter(|ace| old(ace)).count();
+    if count == 0 {
+        return Ok((0, began.elapsed()));
+    }
+    let kept = Dacl { aces: list.aces.iter().filter(|ace| !old(ace)).cloned().collect(), revision: list.revision, control: list.control };
+    let acl = kept.to_acl();
+    let name = wide_path(folder);
+    match SetNamedSecurityInfoW(name.as_ptr() as *mut u16, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), acl.as_ptr().cast(), std::ptr::null()) {
+        0 => Ok((count, began.elapsed())),
+        error => Err(format!("{}: its list could not be written (error {error})", folder.display())),
+    }
+}
+
 /// The person this app runs as: their SID, in the buffer the token gave it in.
 struct PersonSid(Vec<u64>);
 
@@ -2640,13 +2700,22 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
     unsafe {
         let sid = profile_sid()?;
         // (a restricted token's command writes as its workspace's own SID, and is given what it writes and what is guarded as that SID: see `restricted_token`)
-        let writer = if token == Token::Restricted && !nested { Some(OwnedSid::from_text(&workspace_sid_text(&root))?) } else { None };
+        let writer_text = (token == Token::Restricted && !nested).then(|| workspace_sid_text(&root));
+        let writer = match &writer_text {
+            Some(text) => Some(OwnedSid::from_text(text)?),
+            None => None,
+        };
         // (a command in the container writes as its workspace's capability, and is given that besides the container: see `workspace_capability`)
         let capability = if token == Token::Container && !nested { Some(workspace_capability(&root)?) } else { None };
         // (what the workspace's grant and its guards are to; the desktop and the rest are the container's, or the restricted token's own SID)
         let grantee = writer.as_ref().map(|writer| writer.0).or(capability).unwrap_or(sid);
         let runner = writer.as_ref().map_or(sid, |writer| writer.0);
         let temp = if nested { std::env::var_os("TEMP").map(PathBuf::from) } else { profile_folder(sid) };
+        // (a restricted token's command has its workspace's own, in the sandbox's: see `restricted_temp`)
+        let temp = match (&writer_text, temp) {
+            (Some(writer), Some(temp)) => Some(restricted_temp(&temp, writer)),
+            (_, temp) => temp,
+        };
         let mut disarmed = Vec::new();
         let mut times = Timings::default();
         // (as the person, nothing is to be granted: it can do what they can)
@@ -2953,6 +3022,64 @@ mod tests {
         let after = run_live("echo in-the-container> after.txt", work.path(), work.path(), false, time, &cancel, None).unwrap();
         assert_eq!(after.status, Some(0), "{}", String::from_utf8_lossy(&after.stderr));
         assert!(work.path().join("after.txt").is_file());
+    }
+
+    /// A restricted token's command writes in a temp folder of its workspace's own, in the sandbox's, and its SID is granted that folder alone: nothing of it is on the
+    /// sandbox's temp folder, whose list every grant there wrote anew on all in it.
+    #[test]
+    fn a_restricted_commands_temp_folder_is_its_workspaces_own() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let work = crate::in_container::tempdir().unwrap();
+        let (cancel, time) = (AtomicBool::new(false), Duration::from_secs(60));
+        let done = run_live_restricted("echo kept> \"%TEMP%\\kept.txt\" && echo %TEMP%", work.path(), work.path(), false, time, &cancel, None).unwrap();
+        assert_eq!(done.status, Some(0), "{}", String::from_utf8_lossy(&done.stderr));
+        let named = PathBuf::from(String::from_utf8_lossy(&done.stdout).trim());
+        // SAFETY: the profile's SID lives as long as the process.
+        let sandbox_temp = unsafe { profile_folder(profile_sid().unwrap()) }.unwrap();
+        let writer = workspace_sid_text(&real(work.path()));
+        assert_eq!(key(&named), key(&restricted_temp(&sandbox_temp, &writer)), "its TEMP is its workspace's own");
+        assert_eq!(std::fs::read_to_string(named.join("kept.txt")).unwrap().trim(), "kept");
+        // SAFETY: read only; the SID lives through the look.
+        let granted = unsafe {
+            let writer = OwnedSid::from_text(&writer).unwrap();
+            Dacl::read(&sandbox_temp).unwrap().aces.iter().any(|ace| Dacl::is_allowed_for(ace, writer.0))
+        };
+        assert!(!granted, "the sandbox's temp folder is not granted the workspace's SID");
+    }
+
+    /// What an earlier version's restricted commands left on the sandbox's temp folder, a grant to each workspace's SID, is taken off it and all in it, in one write;
+    /// what else it has stays: the person's own, one of another kind, a capability's.
+    #[test]
+    fn the_grants_an_earlier_version_left_on_the_sandboxs_temp_folder_are_taken_off() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let folder = outside_folder("old-restricted-grants");
+        std::fs::create_dir_all(folder.join("below")).unwrap();
+        std::fs::write(folder.join("below").join("made.txt"), "x").unwrap();
+        // SAFETY: what each call is given lives through it.
+        unsafe {
+            let person = PersonSid::now().unwrap();
+            let (old, other, capability) = (OwnedSid::from_text(&random_sid_text()).unwrap(), OwnedSid::from_text(&random_sid_text()).unwrap(), OwnedSid::from_text("S-1-15-3-1024-1-2-3-4-5-6-7-8").unwrap());
+            grant(&folder, old.0, READ_WRITE_EXECUTE, true).unwrap();
+            grant(&folder, other.0, READ_EXECUTE, true).unwrap();
+            grant(&folder, capability.0, READ_WRITE_EXECUTE, true).unwrap();
+            grant(&folder, person.sid(), READ_WRITE_EXECUTE, true).unwrap();
+            let below = folder.join("below").join("made.txt");
+            assert!(Dacl::read(&below).unwrap().aces.iter().any(|ace| Dacl::is_allowed_for(ace, old.0)), "inherited below, before");
+            let (count, _) = clear_restricted_grants(&folder, person.sid()).unwrap();
+            assert_eq!(count, 1);
+            for path in [folder.clone(), below] {
+                let list = Dacl::read(&path).unwrap();
+                assert!(!list.aces.iter().any(|ace| Dacl::is_allowed_for(ace, old.0)), "{} still has it", path.display());
+                for kept in [other.0, capability.0, person.sid()] {
+                    assert!(list.aces.iter().any(|ace| Dacl::is_allowed_for(ace, kept)), "{} lost {}", path.display(), sid_text(kept));
+                }
+            }
+            assert_eq!(clear_restricted_grants(&folder, person.sid()).unwrap().0, 0, "nothing the second time");
+        }
     }
 
     #[test]

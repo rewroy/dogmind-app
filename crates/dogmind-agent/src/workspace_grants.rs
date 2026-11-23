@@ -423,6 +423,8 @@ unsafe fn take_back(grant: &Grant, sid: PSID) -> Taken {
 /// something behind: they stay on the list, and the person is told ([`NOT_TAKEN_BACK`]).
 pub fn sweep(folder: &Path, named_by_sessions: &[PathBuf], listed: &[PathBuf]) -> Vec<PathBuf> {
     in_the_background();
+    // (what an earlier version's restricted commands left on the sandbox's temp folder, once: see `sandbox::clear_old_restricted_grants`)
+    sandbox::clear_old_restricted_grants();
     let file = folder.join(FILE_NAME);
     sweep_file(&file, named_by_sessions, listed).1
 }
