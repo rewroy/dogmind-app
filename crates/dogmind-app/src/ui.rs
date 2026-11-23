@@ -2924,10 +2924,14 @@ fn mcp_form_pairs(was: Option<&dogmind_agent::mcp::ServerConfig>, http: bool, or
     dogmind_agent::mcp::pairs_of_lines(typed, if http { ':' } else { '=' })
 }
 
-fn mcp_working_directory(typed: &str) -> Option<PathBuf> {
+/// Explorer's Copy as path wraps a single filesystem path in double quotes.
+fn mcp_path_text(typed: &str) -> &str {
     let typed = typed.trim();
-    // Windows Explorer's Copy as path places double quotes around the folder name.
-    let folder = typed.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(typed);
+    typed.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).filter(|path| !path.contains('"')).unwrap_or(typed)
+}
+
+fn mcp_working_directory(typed: &str) -> Option<PathBuf> {
+    let folder = mcp_path_text(typed);
     (!folder.is_empty()).then(|| PathBuf::from(folder))
 }
 
@@ -12700,7 +12704,7 @@ impl App {
 
     /// What the form runs is a URL now, or is no longer one: it asks for what that needs.
     unsafe fn mcp_kind_changed(&mut self) {
-        let url = mcp_url(get_text(self.fields[1]).trim()).is_some();
+        let url = mcp_url(mcp_path_text(&get_text(self.fields[1]))).is_some();
         if url != self.mcp_form_url {
             self.mcp_form_url = url;
             self.layout();
@@ -12712,7 +12716,7 @@ impl App {
         use dogmind_agent::mcp;
         let Some(before) = self.mcp_form.clone() else { return true };
         let [name, target, args, vars, cwd] = self.mcp_form_typed();
-        let (name, target) = (name.trim().to_string(), target.trim().to_string());
+        let (name, target) = (name.trim().to_string(), mcp_path_text(&target).to_string());
         if name.is_empty() {
             self.problem_in_panel(t("Give the server a name."));
             return false;
@@ -18927,6 +18931,17 @@ mod tests {
         assert_eq!(mcp_config_of_form(None, url, target, "", "", Default::default()).kind, "http", "a new one");
         let program = mcp_config_of_form(Some(&older), None, "node".into(), "", "server.js --port 1", Default::default());
         assert_eq!((program.command.as_str(), program.args.join(" "), program.kind.as_str(), program.trusted), ("node", "server.js --port 1".to_string(), "", true));
+    }
+
+    #[test]
+    fn a_copied_mcp_path_is_read_as_one_program() {
+        let path = r"C:\Program Files\試験\server.exe";
+        assert_eq!(mcp_path_text(&format!("  \"{path}\"  ")), path);
+        assert_eq!(mcp_path_text(path), path);
+        assert_eq!(mcp_path_text("\"\""), "");
+        for malformed in [r#""unterminated"#, r#""server.exe" "argument""#] {
+            assert_eq!(mcp_path_text(malformed), malformed);
+        }
     }
 
     #[test]
