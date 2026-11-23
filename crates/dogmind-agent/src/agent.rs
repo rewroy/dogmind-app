@@ -1407,11 +1407,7 @@ fn cut_would_lose(closed_arguments: &str, path: &str, workspace: &Path, bench: &
 
 /// Whether a command's report ends in anything but success. One left at work in the background has no end yet.
 fn command_failed(output: &str) -> bool {
-    // The status leads current reports. Older reports put it after stderr, before any file-change notes.
-    let mut lines = output.lines();
-    let status = lines.next().and_then(|first| first.strip_prefix("exit_code: "))
-        .or_else(|| lines.rev().find_map(|line| line.strip_prefix("exit_code: ")));
-    status.is_some_and(|code| code.trim() != "0")
+    tools::command_exit_status(output).is_some_and(|status| status != "0")
 }
 
 /// Whether the person's message asks for what was written not to be run: then the app does not ask the model to check it (it is the person's call).
@@ -4301,9 +4297,10 @@ impl Agent {
         let Some(meta) = self.running.remove(id) else { return };
         let wait = self.approval_wait.take();
         let ran = elapsed.saturating_sub(wait.unwrap_or_default());
+        let status = if meta.name == "execute_command" && ok && !declined { tools::command_exit_status(output) } else { None };
         let outcome = if declined {
             self.refusal.take().unwrap_or("declined_person")
-        } else if output.contains("exit_code: none, timed out") {
+        } else if status.is_some_and(|value| value.starts_with("none, timed out")) {
             "timeout"
         } else if !ok {
             if self.cancelled() { "cancelled" } else { "error" }
@@ -4334,10 +4331,8 @@ impl Agent {
             line["nested"] = json!(calls);
             line["program_ms"] = json!(ms);
         }
-        if meta.name == "execute_command" && ok {
-            if let Some((_, code)) = output.rsplit_once("exit_code: ") {
-                line["exit_code"] = code.trim().split(|c: char| !c.is_ascii_digit() && c != '-').next().and_then(|digits| digits.parse::<i64>().ok()).map_or(Value::Null, |code| json!(code));
-            }
+        if let Some(status) = status {
+            line["exit_code"] = json!(status.parse::<i64>().ok());
         }
         // What each file it wrote is now, as a short hash: a file that comes back to a state it had is what the reader looks for.
         if ok && matches!(meta.name.as_str(), "create_file" | "apply_patch") {
@@ -10325,7 +10320,7 @@ Body").unwrap();
     #[test]
     fn a_runs_trajectory_has_its_events_in_order_with_their_times_and_numbers() {
         let dir = crate::in_container::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "content here").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a log says exit_code: none, timed out after 30 s").unwrap();
         let (client, _) = server(vec![call_answer("read_file", serde_json::json!({"path": "a.txt"})), text_answer("done")]);
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Send("read it".into())).unwrap();

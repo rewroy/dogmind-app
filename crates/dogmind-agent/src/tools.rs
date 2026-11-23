@@ -3588,6 +3588,14 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     Ok(report)
 }
 
+/// Current reports lead with the exit status. Older ones put it after stderr, before any file-change notes.
+pub fn command_exit_status(output: &str) -> Option<&str> {
+    let mut lines = output.lines();
+    lines.next()?.strip_prefix("exit_code:")
+        .or_else(|| lines.rev().find_map(|line| line.strip_prefix("exit_code:")))
+        .map(str::trim)
+}
+
 /// One line saying what a call is about, for the transcript and the approval note.
 pub fn summary(tool: &str, arguments: &Value) -> String {
     let text = |name: &str| arguments.get(name).and_then(Value::as_str).unwrap_or("");

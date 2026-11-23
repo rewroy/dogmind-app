@@ -518,8 +518,7 @@ pub fn full_summary(tool: &str, summary: &str, workspace: &Path) -> String {
 /// How a command ended, from what the agent reports: none if it did not run to its end at zero. (A command that fails is no failed call: the model reads
 /// its output and goes on. The person is who has to see it.)
 pub fn command_failed(output: &str) -> Option<String> {
-    let (_, rest) = output.rsplit_once("exit_code:")?;
-    let value = rest.lines().next().unwrap_or("").trim();
+    let value = dogmind_agent::tools::command_exit_status(output)?;
     match value {
         "0" => None,
         _ => match value.strip_prefix("none,") {
@@ -644,6 +643,7 @@ mod tests {
         assert!(command_failed("stdout:\n\nstderr:\nbad\n\nexit_code: 3").is_some_and(|how| how.contains('3')));
         assert_eq!(command_failed("stdout:\n\nstderr:\n\nexit_code: none, timed out after 30 s").as_deref(), Some("timed out after 30 s"));
         assert_eq!(command_failed("stdout:\nexit_code: 9 was printed\nstderr:\n\nexit_code: 0"), None, "the report's own last line counts");
+        assert_eq!(command_failed("exit_code: 0\nstdout:\nexample exit_code: none, timed out\nstderr:\n\nexit_code: 0\nfiles changed by this command:\n- created exit_code: 2.txt"), None);
         assert_eq!(command_failed("started in the background"), None);
     }
 
