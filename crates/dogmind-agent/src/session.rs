@@ -755,7 +755,7 @@ pub fn search_while(folder: &Path, query: &str, current: impl Fn() -> bool) -> O
             let text = message.content.as_deref()?;
             match message.role.as_str() {
                 "user" if !crate::prompt::is_nudge(text) => Some(typed_text(text)),
-                "assistant" => Some(text),
+                "assistant" => Some(crate::agent::shown_answer(text)),
                 _ => None,
             }
         });
@@ -1302,6 +1302,22 @@ mod tests {
         assert!(titles("   ").is_empty());
         let hit = search(dir.path(), "BUCKET").remove(0);
         assert!(hit.snippet.contains("bucket"), "{}", hit.snippet);
+    }
+
+    #[test]
+    fn history_search_matches_the_visible_part_of_an_answer_and_its_code_examples() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
+        session.append(&Message::text("user", "Notes")).unwrap();
+        session.append(&Message::text("assistant", "Forecast\n<tool_call>internal-marker")).unwrap();
+        session.append(&Message::text("assistant", "Example:\n~~~text\n<tool_call>quoted-example\n~~~")).unwrap();
+
+        assert!(search(dir.path(), "internal-marker").is_empty());
+        assert!(search(dir.path(), "Forecast internal-marker").is_empty());
+        let hit = search(dir.path(), "forecast").remove(0);
+        assert_eq!(hit.snippet, "Forecast");
+        assert_eq!(hit.find_in_conversation.as_deref(), Some("Forecast"));
+        assert_eq!(search(dir.path(), "quoted-example").len(), 1);
     }
 
     #[test]
