@@ -26,7 +26,12 @@ use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowTextW};
 
+/// The container commands run in. The tests have one of their own: what their runs leave (the grants on its temp folder, what their commands leave in it) was in the
+/// container of the app the person uses on the same PC, which is not a place for tests; 667 grants their restricted commands had left there were inherited by all in it.
+#[cfg(not(test))]
 const PROFILE: &str = "DogmindApp.Exec";
+#[cfg(test)]
+const PROFILE: &str = "DogmindApp.Exec.Tests";
 pub(crate) const READ_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
 /// Going through a folder, and nothing of what is in it.
 pub(crate) const TRAVERSE: u32 = FILE_GENERIC_EXECUTE;
@@ -3024,6 +3029,17 @@ mod tests {
         assert!(work.path().join("after.txt").is_file());
     }
 
+    /// The tests' commands run in a container of their own: nothing a run of them leaves is in the one of the app the person uses on the same PC.
+    #[test]
+    fn the_tests_commands_run_in_a_container_of_their_own() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        // SAFETY: the profile's SID lives as long as the process.
+        let folder = unsafe { profile_folder(profile_sid().unwrap()) }.unwrap();
+        assert!(folder.to_string_lossy().to_lowercase().contains(r"\dogmindapp.exec.tests\"), "{}", folder.display());
+    }
+
     /// A restricted token's command writes in a temp folder of its workspace's own, in the sandbox's, and its SID is granted that folder alone: nothing of it is on the
     /// sandbox's temp folder, whose list every grant there wrote anew on all in it.
     #[test]
@@ -4516,7 +4532,8 @@ mod tests {
         std::fs::write(folder.join("probe.py"), script).unwrap();
         let done = command("python probe.py", &folder, false);
         let (said, errors) = (decode(&done.stdout), decode(&done.stderr));
-        if errors.contains("is not recognized") || errors.contains("was not found") {
+        // (in the tests' own container, a person's Python is not opened to commands: only the bundle's is, where `DOGMIND_TOOLS` names one)
+        if errors.contains("is not recognized") || errors.contains("認識されていません") || errors.contains("was not found") {
             eprintln!("no python here: {errors}");
             return;
         }
