@@ -15,6 +15,7 @@ use dogmind_agent::anthropic::{self, Anthropic};
 use dogmind_agent::background::Waiting;
 use dogmind_agent::codex::{self, Codex};
 use dogmind_agent::llm::{self, Client, Health, Provider};
+use dogmind_agent::mcp::mcp_url;
 use dogmind_agent::message::Message;
 use dogmind_agent::prompt::typed_text;
 use dogmind_agent::rules;
@@ -2889,7 +2890,6 @@ fn mcp_runs(config: &dogmind_agent::mcp::ServerConfig) -> String {
     }
 }
 
-/// What was typed as a server's URL, with its scheme as the protocol writes it; none for what is not one.
 /// The server the Settings form says, as mcp.json keeps it, `was` the one it edits. The person's word on what it returns goes with it, under a new name too; and
 /// one of the older transport stays one, its stream asked for first: saved as `http`, it was asked with a POST of Streamable HTTP first, as a new one is.
 fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Option<String>, target: String, original_args: &str, args: &str, pairs: std::collections::BTreeMap<String, String>) -> dogmind_agent::mcp::ServerConfig {
@@ -2929,11 +2929,6 @@ fn mcp_working_directory(typed: &str) -> Option<PathBuf> {
     // Windows Explorer's Copy as path places double quotes around the folder name.
     let folder = typed.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(typed);
     (!folder.is_empty()).then(|| PathBuf::from(folder))
-}
-
-fn mcp_url(typed: &str) -> Option<String> {
-    let lower = typed.to_ascii_lowercase();
-    ["http://", "https://"].into_iter().find(|scheme| lower.starts_with(scheme)).map(|scheme| format!("{scheme}{}", &typed[scheme.len()..]))
 }
 
 unsafe fn set_text(window: HWND, text: &str) {

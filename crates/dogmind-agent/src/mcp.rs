@@ -59,7 +59,7 @@ pub struct ServerConfig {
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default, deserialize_with = "read_server_url", skip_serializing_if = "String::is_empty")]
     pub url: String,
     /// Sent with every request to `url`: an `Authorization` among them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -69,6 +69,18 @@ pub struct ServerConfig {
     /// The person's word that what this server returns is not a stranger's. In this app's own file, which neither a model's tools nor a command can write.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trusted: bool,
+}
+
+/// Normalize the HTTP scheme while preserving the exact server address, path and query.
+pub fn mcp_url(typed: &str) -> Option<String> {
+    let (scheme, rest) = typed.split_once("://")?;
+    let scheme = ["http", "https"].into_iter().find(|candidate| scheme.eq_ignore_ascii_case(candidate))?;
+    Some(format!("{scheme}://{rest}"))
+}
+
+fn read_server_url<'de, D: serde::Deserializer<'de>>(data: D) -> Result<String, D::Error> {
+    let url = String::deserialize(data)?;
+    Ok(mcp_url(&url).unwrap_or(url))
 }
 
 impl ServerConfig {
@@ -150,6 +162,7 @@ fn parse_codex_servers(text: &str) -> Option<ParsedServers> {
         args: Vec<String>,
         cwd: Option<PathBuf>,
         env: BTreeMap<String, String>,
+        #[serde(deserialize_with = "read_server_url")]
         url: String,
         http_headers: BTreeMap<String, String>,
         #[serde(flatten)]
@@ -1813,6 +1826,25 @@ mod tests {
         assert!(found["remote"].is_http());
         assert_eq!(found["remote"].headers["Authorization"], "Bearer t");
         assert!(servers_of_claude("not json").is_empty());
+    }
+
+    #[test]
+    fn config_sources_preserve_everything_after_the_http_scheme() {
+        for (typed, scheme) in [("hTtP", "http"), ("HtTpS", "https")] {
+            let rest = "Example.org/Project/McP%2F?Mode=Live";
+            let url = format!("{typed}://{rest}");
+            let json = serde_json::json!({"mcpServers": {"remote": {"url": url}, "other": {"url": "Ws://Host/Path"}}});
+            let saved: Config = serde_json::from_value(json.clone()).unwrap();
+            let claude = servers_of_claude(&json.to_string());
+            let codex = servers_of_codex(&format!("[mcp_servers.remote]\nurl='{url}'\n[mcp_servers.other]\nurl='Ws://Host/Path'"));
+            for source in [&saved.servers, &claude, &codex] {
+                assert_eq!(source["remote"].url, format!("{scheme}://{rest}"));
+                assert!(source["remote"].problem().is_none());
+            }
+            assert_eq!(saved.servers["other"].url, "Ws://Host/Path");
+            assert!(saved.servers["other"].problem().is_some());
+            assert!(!claude.contains_key("other") && !codex.contains_key("other"));
+        }
     }
 
     #[test]
