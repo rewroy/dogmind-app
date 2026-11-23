@@ -398,6 +398,7 @@ const JA: &[(&str, &str)] = &[
     ("Try again", "再試行"),
     ("Remove remaining session files", "会話の残りのファイルを削除"),
     ("The conversation was deleted. Some files remain: {0}", "会話を削除しました。次のファイルが残っています。{0}"),
+    ("A conversation now exists at this location. Its files were kept.", "同じ場所に会話があるため、会話と関連ファイルを保持しました。"),
     ("The deletion could not be completed: {0}", "会話の削除を完了できませんでした。{0}"),
     ("The session could not be renamed: {0}", "会話の名前を保存できませんでした。{0}"),
     ("The branch could not be made: {0}", "分岐を作れませんでした: {0}"),

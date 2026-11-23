@@ -1511,6 +1511,7 @@ enum Panel {
     Rename,
     /// Is this session to go?
     ConfirmDelete,
+    RemoveRemaining,
     ConfirmRemove,
     /// The sessions of this workspace, for `/resume`.
     Sessions,
@@ -7240,7 +7241,7 @@ impl App {
 
     /// Whether this panel is shown as a dialog over the app. The first run has the window to itself.
     fn is_dialog(&self, panel: Panel) -> bool {
-        matches!(panel, Panel::Rename | Panel::ConfirmDelete | Panel::ConfirmRemove | Panel::Sessions | Panel::Rewind | Panel::CryptoOn | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff | Panel::CryptoWork | Panel::Unlock) || (!self.onboarding && (matches!(panel, Panel::Help | Panel::About) || is_settings_place(panel)))
+        matches!(panel, Panel::Rename | Panel::ConfirmDelete | Panel::RemoveRemaining | Panel::ConfirmRemove | Panel::Sessions | Panel::Rewind | Panel::CryptoOn | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff | Panel::CryptoWork | Panel::Unlock) || (!self.onboarding && (matches!(panel, Panel::Help | Panel::About) || is_settings_place(panel)))
     }
 
     /// The controls that move between the window and a dialog as they are needed, and those that only a dialog has.
@@ -7368,7 +7369,7 @@ impl App {
         let margin = s(ds::DIALOG_MARGIN);
         let (rows, chosen) = self.nav_rows();
         let (card_width, wanted_height) = match self.panel {
-            Panel::Rename | Panel::ConfirmDelete | Panel::ConfirmRemove | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff => (s(ds::size::SHORT_DIALOG).min(width - 2 * margin), 0),
+            Panel::Rename | Panel::ConfirmDelete | Panel::RemoveRemaining | Panel::ConfirmRemove | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff => (s(ds::size::SHORT_DIALOG).min(width - 2 * margin), 0),
             Panel::Sessions | Panel::Rewind => (s(ds::size::LIST_DIALOG).min(width - 2 * margin), 0),
             Panel::Help => ds::dialog_size((width, height), 80, (s(640), s(420)), (s(800), s(640)), margin),
             _ => ds::dialog_size((width, height), 80, (s(720), s(460)), (s(900), s(640)), margin),
@@ -7793,7 +7794,7 @@ impl App {
                 form.buttons(0, &[self.buttons[0], self.buttons[1]]);
                 form.note(&log, log_color);
             }
-            Panel::ConfirmDelete => {
+            Panel::ConfirmDelete | Panel::RemoveRemaining => {
                 let title = self.delete_target.as_ref().map_or(String::new(), |(_, title)| title.clone());
                 form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, s(ds::space::XL)), text: title, font: FontKind::Body, color: theme::text(), flags: ONE_LINE });
                 form.y += s(ds::space::XL);
@@ -9219,6 +9220,12 @@ impl App {
                     self.set_button_kinds(&[ButtonKind::Danger, ButtonKind::Secondary]);
                     show(self.buttons[2], false);
                 }
+            }
+            Panel::RemoveRemaining => {
+                self.panel_title = t("Remove remaining session files").into();
+                set_text(self.buttons[0], t("Try again"));
+                set_text(self.buttons[1], t("Close"));
+                self.set_button_kinds(&[ButtonKind::Danger, ButtonKind::Secondary]);
             }
             Panel::ConfirmDelete => {
                 self.panel_title = t("Delete this session?").into();
@@ -14976,36 +14983,43 @@ impl App {
                     self.problem_in_panel(&error);
                 }
             }
-            (Panel::ConfirmDelete, 1) => {
+            (Panel::ConfirmDelete | Panel::RemoveRemaining, 1) => {
                 self.delete_target = None;
                 self.set_panel(Panel::Chat);
             }
-            (Panel::ConfirmDelete, 0) => {
+            (Panel::ConfirmDelete | Panel::RemoveRemaining, 0) => {
                 if let Some((path, title)) = self.delete_target.take() {
                     use dogmind_agent::checkpoint::{delete_session, DeleteError};
-                    let leftover = match delete_session(&path) {
+                    let retry = self.panel == Panel::RemoveRemaining;
+                    let result = if retry {
+                        dogmind_agent::checkpoint::remove_remaining_if_absent(&path).map_err(DeleteError::RemainingFiles)
+                    } else {
+                        delete_session(&path).map(|()| true)
+                    };
+                    let restored = matches!(result, Ok(false));
+                    let leftover = match result {
                         Err(DeleteError::Conversation(error)) => {
                             self.delete_target = Some((path, title));
                             self.problem_in_panel(&tf("The deletion could not be completed: {0}", &[&error]));
                             return;
                         }
                         Err(DeleteError::RemainingFiles(error)) => Some(error),
-                        Ok(()) => None,
+                        Ok(_) => None,
                     };
                     self.set_panel(Panel::Chat);
-                    if self.current_session.as_ref() == Some(&path) {
+                    if !retry && self.current_session.as_ref() == Some(&path) {
                         self.start_session(self.workspace.clone());
                     }
                     self.refresh_sessions();
                     if !self.side_query.is_empty() {
                         self.search_now();
                     }
+                    if restored {
+                        self.say(t("A conversation now exists at this location. Its files were kept."));
+                    }
                     if let Some(error) = leftover {
                         self.delete_target = Some((path, title));
-                        self.set_panel(Panel::ConfirmDelete);
-                        self.panel_title = t("Remove remaining session files").into();
-                        set_text(self.buttons[0], t("Try again"));
-                        set_text(self.buttons[1], t("Close"));
+                        self.set_panel(Panel::RemoveRemaining);
                         self.problem_in_panel(&tf("The conversation was deleted. Some files remain: {0}", &[&error]));
                     }
                 }

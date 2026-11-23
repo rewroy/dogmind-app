@@ -215,6 +215,23 @@ pub fn delete_session(session: &Path) -> Result<(), DeleteError> {
     remove_for(session).map_err(DeleteError::RemainingFiles)
 }
 
+/// Retry the Windows app's cleanup of an already deleted session. If its name has been taken again,
+/// leave the replacement and its companions together and return false.
+#[cfg(windows)]
+pub fn remove_remaining_if_absent(session: &Path) -> Result<bool, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE;
+    // Reserve the name through cleanup so a new session cannot acquire these files mid-operation.
+    // Windows removes only this empty reservation on close, including if the app exits.
+    let _reservation = match std::fs::OpenOptions::new().write(true).create_new(true).share_mode(0).custom_flags(FILE_FLAG_DELETE_ON_CLOSE).open(session) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(format!("{}: {error}", session.display())),
+    };
+    remove_for(session)?;
+    Ok(true)
+}
+
 /// One more than the largest `N` of the `N.bin` copies in a folder: where the numbering goes on when the index that held it is not there to say.
 fn after_the_last_copy(folder: &Path) -> u64 {
     std::fs::read_dir(folder).into_iter().flatten().flatten()
@@ -618,6 +635,22 @@ mod tests {
         drop(held);
         delete_session(&path).unwrap();
         assert!(!trace.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_of_a_deleted_session_preserves_a_restored_conversation_and_its_files() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let helper = crate::session::helper_file_of(&path, 1);
+        std::fs::write(&path, b"restored conversation").unwrap();
+        std::fs::write(&helper, b"restored helper").unwrap();
+        assert!(!remove_remaining_if_absent(&path).unwrap());
+        assert_eq!(read(&path), "restored conversation");
+        assert_eq!(read(&helper), "restored helper");
+        std::fs::remove_file(&path).unwrap();
+        assert!(remove_remaining_if_absent(&path).unwrap());
+        assert!(!path.exists() && !helper.exists());
     }
 
     /// A folder made a junction to somewhere else after its files were saved takes nothing a rewind would have put back, and loses
