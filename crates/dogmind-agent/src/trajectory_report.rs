@@ -40,9 +40,16 @@ impl Line {
     pub(crate) fn req(&self) -> &str {
         self.s("req")
     }
-    /// A tool call that did not go well: it ended in anything but `ok`, or it was a command that ran and exited with a code that says so.
+    /// A command can run successfully as a tool call yet return a failing exit code.
+    fn tool_outcome(&self) -> &str {
+        match self.s("outcome") {
+            "ok" if self.v["exit_code"].as_i64().is_some_and(|code| code != 0) => "failed",
+            outcome => outcome,
+        }
+    }
+
     fn failed(&self) -> bool {
-        self.s("outcome") != "ok" || self.v["exit_code"].as_i64().is_some_and(|code| code != 0)
+        self.tool_outcome() != "ok"
     }
 }
 
@@ -286,7 +293,7 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
     let _ = writeln!(out, "\ntools");
     for line in lines.iter().filter(|line| line.ev() == "tool") {
         let more = tool_notes(line);
-        let _ = writeln!(out, "  {:>5} {:<16} {:>8}  {:<15} {}", short(line.req()), line.s("name"), secs(line.u("ms").unwrap_or(0)), line.s("outcome"), more.join(", "));
+        let _ = writeln!(out, "  {:>5} {:<16} {:>8}  {:<15} {}", short(line.req()), line.s("name"), secs(line.u("ms").unwrap_or(0)), line.tool_outcome(), more.join(", "));
     }
 
     let guards: Vec<usize> = lines.iter().enumerate().filter(|(_, line)| matches!(line.ev(), "intervention" | "compaction")).map(|(at, _)| at).collect();
@@ -699,7 +706,7 @@ pub fn summary(trajectory: &str) -> Summary {
                         helper_file: line.v["helper_file"].as_str().map(str::to_string),
                     });
                 }
-                "tool" => row.tools.push(ToolRow { id: short(line.req()), name: line.s("name").to_string(), ms: line.u("ms").unwrap_or(0), outcome: line.s("outcome").to_string(), notes: tool_notes(line) }),
+                "tool" => row.tools.push(ToolRow { id: short(line.req()), name: line.s("name").to_string(), ms: line.u("ms").unwrap_or(0), outcome: line.tool_outcome().to_string(), notes: tool_notes(line) }),
                 "failed" if row.failed.is_none() => row.failed = Some(line.s("kind").to_string()),
                 _ => {}
             }
@@ -849,6 +856,34 @@ mod tests {
         assert!(said.contains("\nfailures\n  turn 1 at /1: server_gone, the server said: Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory)\n  turn 1 at /1: unfinished\n"), "{said}");
         // A run that did not fail has no such section.
         assert!(!report(&text(&lines[..2]), None).contains("failures"));
+    }
+
+    #[test]
+    fn command_exit_status_agrees_in_the_report_and_turn_details() {
+        let cases = [
+            ("ok", Some(7), "failed"),
+            ("ok", Some(-1), "failed"),
+            ("ok", Some(0), "ok"),
+            ("ok", None, "ok"),
+            ("timeout", Some(1), "timeout"),
+        ];
+        for (recorded, code, expected) in cases {
+            let mut event = tool(1, "execute_command", 5, recorded, None, None, "cmd");
+            if let Some(code) = code {
+                event["exit_code"] = json!(code);
+            }
+            let input = text(&[event]);
+            let said = report(&input, None);
+            let row = said.lines().find(|line| line.split_whitespace().nth(1) == Some("execute_command")).unwrap();
+            assert_eq!(row.split_whitespace().nth(4), Some(expected), "{row}");
+            let details = summary(&input);
+            let tool = &details.turns[0].tools[0];
+            assert_eq!(tool.outcome, expected);
+            if let Some(code) = code.filter(|code| *code != 0) {
+                let exit = format!("exit {code}");
+                assert!(row.contains(&exit) && tool.notes.contains(&exit));
+            }
+        }
     }
 
     #[test]
