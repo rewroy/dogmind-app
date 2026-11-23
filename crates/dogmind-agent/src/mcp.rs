@@ -280,7 +280,8 @@ pub fn import(file: &Path, more: BTreeMap<String, ServerConfig>) -> Result<usize
     let mut config = readable_config(file)?;
     let before = config.servers.len();
     for (name, server) in more {
-        config.servers.entry(name).or_insert(server);
+        // Trust is chosen for this app. An existing local choice is kept on reimport.
+        config.servers.entry(name).or_insert(ServerConfig { trusted: false, ..server });
     }
     let added = config.servers.len() - before;
     if added > 0 {
@@ -1708,6 +1709,23 @@ enabled = false
         let found = servers_of_codex(text);
         assert_eq!(found["unity_mcp"].args, [r"C:\Tools\Unity MCP\build\index.js", "--name=a,b", ""]);
         assert!(!found.contains_key("off"));
+    }
+
+    #[test]
+    fn imported_launch_settings_leave_trust_to_the_person_in_dogmind() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        let sources = servers_of_claude(r#"{"mcpServers":{"editor":{"command":"editor","args":["--stdio"],"trusted":true}}}"#);
+        assert_eq!(import(&file, sources.clone()).unwrap(), 1);
+        let mut editor = readable_config(&file).unwrap().servers.remove("editor").unwrap();
+        assert_eq!(editor.args, ["--stdio"]);
+        assert!(!editor.trusted);
+        editor.trusted = true;
+        save_server(&file, Some("editor"), "editor", editor).unwrap();
+        let mut repeated = sources;
+        repeated.get_mut("editor").unwrap().trusted = false;
+        assert_eq!(import(&file, repeated).unwrap(), 0);
+        assert!(readable_config(&file).unwrap().servers["editor"].trusted);
     }
 
     #[test]
