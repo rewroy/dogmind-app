@@ -170,6 +170,40 @@ fn short_lived(scene: &Path) -> Child {
 }
 
 #[test]
+fn installs_and_updates_keep_out_of_default_and_custom_session_folders() {
+    let scene = Scene::new();
+    let local = scene.path().join("Local");
+    let named = scene.path().join("my history");
+    let sessions = named.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(sessions.join("conversation.jsonl"), "saved conversation").unwrap();
+    let kept = contents(&named);
+    let package = pack(scene.path(), "2.0");
+    let install = |folder: &Path, profile: &Path| {
+        setup(&package).env("LOCALAPPDATA", &local).env("DOGMIND_DATA", profile)
+            .args(["--test", "--auto", "--dir"]).arg(folder).status().unwrap().code()
+    };
+    let default = local.join("DogmindApp");
+    for folder in [&named, &sessions.join("install"), &default] {
+        assert_eq!(install(folder, &named), Some(1), "{}", folder.display());
+    }
+    assert_eq!(contents(&named), kept);
+    assert!(!default.exists());
+    let sibling = scene.path().join("my history backup");
+    assert_eq!(install(&sibling, &named), Some(0));
+    assert_eq!(version_of(&sibling), "2.0");
+
+    // A previous install can become protected later if the person moves their profile.
+    let folder = scene.installed("1.0");
+    let before = contents(&folder);
+    let status = setup(&package).env("DOGMIND_DATA", folder.parent().unwrap())
+        .args(["--test", "--auto", "--update", "--dir"]).arg(&folder).status().unwrap();
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(contents(&folder), before);
+    assert!(running_from(&folder).is_empty());
+}
+
+#[test]
 fn an_unattended_test_update_does_not_start_the_default_app() {
     let scene = Scene::new();
     let folder = scene.installed("1.0.0");

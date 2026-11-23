@@ -327,8 +327,8 @@ impl App {
         match notice {
             Notice::InSubfolder => self.w("That folder is not empty, so it goes in a Dogmind folder inside it.", "選んだフォルダーは空ではないため、その中の Dogmind フォルダーにインストールします。"),
             Notice::Refused(Refusal::SettingsFolder) => self.w(
-                "That is where the app keeps your settings and sessions (%LOCALAPPDATA%\\DogmindApp). Choose another folder.",
-                "そこはアプリの設定とセッションの保存先 (%LOCALAPPDATA%\\DogmindApp) です。別のフォルダーを選んでください。",
+                "That folder is reserved for app settings and sessions. Choose another folder.",
+                "そこはアプリの設定やセッションを保存する場所です。別のフォルダーを選んでください。",
             ),
             Notice::Refused(Refusal::NotWritable(why)) => {
                 if self.japanese {

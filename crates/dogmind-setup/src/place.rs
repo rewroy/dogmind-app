@@ -19,7 +19,13 @@ pub enum Refusal {
 
 /// The folders that hold what a person keeps: settings, sessions and the engine's log. An install is never put in them, or in anything in them.
 pub fn settings_folders() -> Vec<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()).map(|local| PathBuf::from(local).join("DogmindApp")).into_iter().collect()
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).filter(|path| path.is_absolute()).unwrap_or_else(std::env::temp_dir);
+    let mut kept = vec![local.join("DogmindApp")];
+    // Match the app's data_folder_from: an override names a directory of its own, never a drive root.
+    if let Some(named) = std::env::var_os("DOGMIND_DATA").map(PathBuf::from).filter(|path| path.is_absolute() && path.parent().is_some()) {
+        kept.push(named);
+    }
+    kept
 }
 
 /// A folder is where a person's choice lands, unless that holds other things and no install of this: then it is a `Dogmind` folder inside it, as most installers do. What is empty, what is
@@ -57,6 +63,10 @@ pub fn is_inside(folder: &Path, within: &Path) -> bool {
     parts(folder).starts_with(&parts(within))
 }
 
+pub fn in_settings_folder(folder: &Path, settings: &[PathBuf]) -> bool {
+    settings.iter().any(|kept| is_inside(folder, kept))
+}
+
 /// Whether this person can put files in the folder, as an install would: by making one there and taking it away. If the folder is not there yet it is made, by this, under the nearest
 /// folder that is, and so what is checked is the place where it would be made. Nothing is left behind.
 pub fn writable(folder: &Path) -> std::io::Result<()> {
@@ -90,7 +100,7 @@ fn words_of(error: &std::io::Error) -> String {
 
 /// Whether an install may go in this folder: not in the settings' folders, and where this person can write.
 pub fn check(folder: &Path, settings: &[PathBuf]) -> Result<(), Refusal> {
-    if settings.iter().any(|kept| is_inside(folder, kept)) {
+    if in_settings_folder(folder, settings) {
         return Err(Refusal::SettingsFolder);
     }
     writable(folder).map_err(|error| Refusal::NotWritable(words_of(&error)))

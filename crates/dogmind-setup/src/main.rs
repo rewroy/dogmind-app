@@ -316,6 +316,12 @@ fn start_of_install(options: &Options, updating: bool) -> window::Start {
     if system::windows_build().is_some_and(|build| build < 22000) {
         return window::Start::Refuse(words("Dogmind needs Windows 11", "Dogmind には Windows 11 が必要です"), words("This version of Windows is older.", "この Windows はそれより前のバージョンです。"));
     }
+    if updating && place::in_settings_folder(&options.folder, &place::settings_folders()) {
+        return window::Start::Refuse(
+            words("Dogmind cannot be updated", "Dogmind を更新できません"),
+            words("The install folder is reserved for app settings and sessions.", "インストール先がアプリの設定やセッションの保存先と重なっています。"),
+        );
+    }
     let previous = install::read_manifest(&options.folder).map(|manifest| manifest.version);
     if updating && previous.is_none() {
         let folder = options.folder.display();
