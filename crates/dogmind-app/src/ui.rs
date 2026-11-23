@@ -2846,7 +2846,7 @@ fn mcp_import(home: &Path, codex_home: Option<&Path>, file: &Path, argument: &st
     }
     let (mut found, unreadable) = mcp::external_servers_in(home, codex_home);
     let warning = if unreadable.is_empty() { String::new() } else {
-        tf("Could not read MCP settings from {0}. Check the file format and permissions.", &[&unreadable.join(", ")])
+        tf("Could not read all MCP settings from {0}. Check the file format and permissions.", &[&unreadable.join(", ")])
     };
     let report = |message: String| if warning.is_empty() { message } else { format!("{message}\n{warning}") };
     let already_configured = || tf("{0} is already configured in Dogmind.", &[&name]);
@@ -19498,6 +19498,31 @@ mod tests {
         let both = run("import").unwrap_err();
         assert!(both.contains(".claude.json") && both.contains(".codex/config.toml"));
         assert_eq!(dogmind_agent::mcp::readable_config(&file).unwrap().servers.len(), 1);
+    }
+
+    #[test]
+    fn mcp_import_reports_partial_sources_and_imports_the_readable_servers() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path();
+        let file = folder.join("mcp.json");
+        let codex = folder.join("config.toml");
+        let claude = folder.join(".claude.json");
+        let run = |action| mcp_import(folder, Some(folder), &file, action);
+        std::fs::write(&claude, r#"{"mcpServers":{"broken":{"args":"private-value"},"one":{"command":"one"}}}"#).unwrap();
+        std::fs::write(&codex, "[mcp_servers.broken]\ncommand=7\n[mcp_servers.two]\ncommand='two'").unwrap();
+        let (_, choices) = run("candidates").unwrap();
+        for text in ["one", "two", ".claude.json", "$CODEX_HOME/config.toml"] {
+            assert!(choices.contains(text), "{choices}");
+        }
+        assert!(!choices.contains("private-value") && !file.exists());
+        assert_eq!(run("import").unwrap().0, 2);
+        std::fs::write(&claude, r#"{"mcpServers":{}}"#).unwrap();
+        std::fs::write(&codex, "[mcp_servers.off]\nenabled=false\nargs='unused'").unwrap();
+        let (_, empty) = run("candidates").unwrap();
+        assert!(!empty.contains(".claude.json") && !empty.contains("$CODEX_HOME"));
+        std::fs::write(&codex, "[mcp_servers.invalid]\nenabled='private-value'").unwrap();
+        let warning = run("candidates").unwrap_err();
+        assert!(warning.contains("$CODEX_HOME/config.toml") && !warning.contains("private-value"));
     }
 
     #[test]

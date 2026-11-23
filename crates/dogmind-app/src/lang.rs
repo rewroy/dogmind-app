@@ -701,7 +701,7 @@ const JA: &[(&str, &str)] = &[
     ("Added {0}. The server is starting.", "{0} を追加しました。サーバーを起動しています。"),
     ("Use /mcp for status, /mcp candidates to list names, or /mcp import [NAME].", "状態は /mcp、候補一覧は /mcp candidates、取り込みは /mcp import [名前] で確認・操作できます。"),
     ("{0} servers added to {1}. They are starting.", "{0} 個のサーバーを {1} に追加しました。起動しています。"),
-    ("Could not read MCP settings from {0}. Check the file format and permissions.", "{0} の MCP 設定を読み込めませんでした。ファイルの書式と読み取り権限を確認してください。"),
+    ("Could not read all MCP settings from {0}. Check the file format and permissions.", "{0} から読み込めなかった MCP 設定があります。ファイルの書式と読み取り権限を確認してください。"),
     ("Claude and Codex list no server that is not here already.", "Claude と Codex の設定に、まだ取り込んでいないサーバーはありません。"),
     ("No server yet. {0} lists configured servers. Use /mcp candidates to find one to import.", "登録済みサーバーはありません。設定ファイルは {0} です。/mcp candidates で取り込み候補を確認できます。"),
     ("The notes in {0} could not be read ({1}). The file is left as it is.", "{0} のメモを読めませんでした（{1}）。ファイルはそのままにしてあります。"),

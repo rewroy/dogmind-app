@@ -98,34 +98,51 @@ pub fn load_config(file: &Path) -> Config {
     readable_config(file).unwrap_or_default()
 }
 
-/// Claude Code's own list of servers: the `mcpServers` of `~/.claude.json`, stdio, HTTP and SSE servers.
-pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
-    parse_claude_servers(text).unwrap_or_default()
+#[derive(Default)]
+struct ParsedServers {
+    servers: BTreeMap<String, ServerConfig>,
+    skipped_invalid: bool,
 }
 
-fn parse_claude_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
+impl ParsedServers {
+    fn add(&mut self, name: String, config: ServerConfig) {
+        if config.problem().is_none() {
+            self.servers.insert(name, config);
+        } else if matches!(config.kind.as_str(), "" | "http" | "sse") {
+            // Other transports can have settings of their own without a command or URL.
+            self.skipped_invalid = true;
+        }
+    }
+}
+
+/// Claude Code's own list of servers: the `mcpServers` of `~/.claude.json`, stdio, HTTP and SSE servers.
+pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
+    parse_claude_servers(text).unwrap_or_default().servers
+}
+
+fn parse_claude_servers(text: &str) -> Option<ParsedServers> {
     let mut value = serde_json::from_str::<serde_json::Map<String, Value>>(text.strip_prefix('\u{feff}').unwrap_or(text)).ok()?;
     let servers = value.remove("mcpServers").unwrap_or_else(|| Value::Object(Default::default()));
-    let mut found = BTreeMap::new();
+    let mut found = ParsedServers::default();
     for (name, server) in servers.as_object()? {
-        if let Ok(mut config) = serde_json::from_value::<ServerConfig>(server.clone()) {
-            if config.kind == "stdio" {
-                config.kind.clear();
-            }
-            if config.problem().is_none() {
-                found.insert(name.clone(), config);
-            }
+        let Ok(mut config) = serde_json::from_value::<ServerConfig>(server.clone()) else {
+            found.skipped_invalid = true;
+            continue;
+        };
+        if config.kind == "stdio" {
+            config.kind.clear();
         }
+        found.add(name.clone(), config);
     }
     Some(found)
 }
 
 /// Import the launch settings of individual servers from Codex's TOML configuration.
 pub fn servers_of_codex(text: &str) -> BTreeMap<String, ServerConfig> {
-    parse_codex_servers(text).unwrap_or_default()
+    parse_codex_servers(text).unwrap_or_default().servers
 }
 
-fn parse_codex_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
+fn parse_codex_servers(text: &str) -> Option<ParsedServers> {
     #[derive(Default, Deserialize)]
     #[serde(default)]
     struct CodexServer {
@@ -137,23 +154,32 @@ fn parse_codex_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
         http_headers: BTreeMap<String, String>,
         #[serde(flatten)]
         tool_selection: ToolSelection,
-        enabled: Option<bool>,
     }
 
     let mut config = toml::from_str::<toml::Table>(text).ok()?;
-    let Some(servers) = config.remove("mcp_servers") else { return Some(BTreeMap::new()) };
+    let mut found = ParsedServers::default();
+    let Some(servers) = config.remove("mcp_servers") else { return Some(found) };
     let toml::Value::Table(servers) = servers else { return None };
-    Some(servers.into_iter().filter_map(|(name, value)| {
-        let server: CodexServer = value.try_into().ok()?;
-        if server.enabled == Some(false) {
-            return None;
+    for (name, value) in servers {
+        match value.get("enabled") {
+            Some(toml::Value::Boolean(false)) => continue,
+            None | Some(toml::Value::Boolean(true)) => {}
+            Some(_) => {
+                found.skipped_invalid = true;
+                continue;
+            }
         }
+        let Ok(server) = value.try_into::<CodexServer>() else {
+            found.skipped_invalid = true;
+            continue;
+        };
         let config = ServerConfig {
             command: server.command, args: server.args, cwd: server.cwd, env: server.env, url: server.url,
             headers: server.http_headers, tool_selection: server.tool_selection, ..Default::default()
         };
-        config.problem().is_none().then_some((name, config))
-    }).collect())
+        found.add(name, config);
+    }
+    Some(found)
 }
 
 /// Read the optional import sources in priority order. Report only filenames so malformed lines never expose settings.
@@ -165,7 +191,7 @@ pub fn external_servers(home: &Path) -> (BTreeMap<String, ServerConfig>, Vec<&'s
 pub fn external_servers_in(home: &Path, codex_home: Option<&Path>) -> (BTreeMap<String, ServerConfig>, Vec<&'static str>) {
     let mut found = BTreeMap::new();
     let mut unreadable = Vec::new();
-    type Parser = fn(&str) -> Option<BTreeMap<String, ServerConfig>>;
+    type Parser = fn(&str) -> Option<ParsedServers>;
     let (codex_file, label) = match codex_home {
         Some(folder) => (folder.join("config.toml"), "$CODEX_HOME/config.toml"),
         None => (home.join(".codex/config.toml"), ".codex/config.toml"),
@@ -177,8 +203,11 @@ pub fn external_servers_in(home: &Path, codex_home: Option<&Path>) -> (BTreeMap<
             Err(_) => None,
         };
         match servers {
-            Some(servers) => {
-                for (name, server) in servers {
+            Some(parsed) => {
+                if parsed.skipped_invalid {
+                    unreadable.push(file);
+                }
+                for (name, server) in parsed.servers {
                     found.entry(name).or_insert(server);
                 }
             }
