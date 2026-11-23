@@ -814,8 +814,8 @@ impl Workbench {
                 Ok((text, seen)) => (Ok(text), Some(seen)),
                 Err(error) => (Err(error), None),
             },
-            "list_files" => (list_files(arguments, workspace), None),
-            "find_files" => (find_files(arguments, workspace), None),
+            "list_files" => (list_files(arguments, workspace, cancel), None),
+            "find_files" => (find_files(arguments, workspace, cancel), None),
             "search_files" => (search_files(arguments, workspace, secrets, cancel), None),
             "show_diff" => (show_diff(arguments, workspace, baseline), None),
             other => (Err(format!("{other} is not a read")), None),
@@ -1706,7 +1706,7 @@ pub(crate) fn slips_in_answer(answer: &str, given: &str) -> String {
     slips.into_iter().collect()
 }
 
-fn find_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
+fn find_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let pattern = text_arg(arguments, "pattern")?;
     let root = resolve(workspace, arguments.get("path").and_then(Value::as_str).unwrap_or("."));
     if !root.is_dir() {
@@ -1716,11 +1716,18 @@ fn find_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
     globs.add(pattern).map_err(|error| format!("{pattern}: {error}"))?;
     // Matched after the walk: given to the walk as an override, a glob would bring back what .gitignore leaves out.
     let globs = globs.build().map_err(|error| format!("{pattern}: {error}"))?;
-    let mut names: Vec<String> = walker(&root, true).build().flatten()
-        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-        .filter(|entry| globs.matched(entry.path(), false).is_whitelist())
-        .map(|entry| entry.path().strip_prefix(&root).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/"))
-        .take(LIST_LIMIT + 1).collect();
+    let mut names = Vec::new();
+    for entry in walker(&root, true).build().flatten() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        if entry.file_type().is_some_and(|kind| kind.is_file()) && globs.matched(entry.path(), false).is_whitelist() {
+            names.push(entry.path().strip_prefix(&root).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/"));
+            if names.len() > LIST_LIMIT {
+                break;
+            }
+        }
+    }
     names.sort();
     if names.is_empty() {
         return Ok(format!("no file under {} matches {pattern}", root.display()));
@@ -1734,7 +1741,7 @@ fn find_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
 /// commands to count their lines before it read any.)
 const BIG_FILE: u64 = 32 * 1024;
 
-fn list_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
+fn list_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let root = resolve(workspace, arguments.get("path").and_then(Value::as_str).unwrap_or("."));
     if !root.is_dir() {
         return Err(format!("{} is not a folder", root.display()));
@@ -1748,6 +1755,9 @@ fn list_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
     let mut names = Vec::new();
     let (mut files, mut bytes) = (0usize, 0u64);
     for entry in walk.build().flatten() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
         if entry.depth() == 0 {
             continue;
         }
@@ -3610,6 +3620,23 @@ mod power_tests {
     use super::*;
 
     #[test]
+    fn stopping_a_file_walk_returns_cancellation_even_without_matches() {
+        let dir = crate::in_container::tempdir().unwrap();
+        std::fs::write(dir.path().join("found.txt"), "x").unwrap();
+        let mut bench = Workbench::new(dir.path());
+        for (tool, args, expected) in [
+            ("list_files", json!({"recursive": true}), "found.txt"),
+            ("find_files", json!({"pattern": "*.missing"}), "no file"),
+        ] {
+            let cancel = AtomicBool::new(true);
+            assert_eq!(bench.run(tool, &args, dir.path(), &cancel), Err("cancelled".into()), "{tool}");
+            cancel.store(false, Ordering::Relaxed);
+            let output = bench.run(tool, &args, dir.path(), &cancel).unwrap();
+            assert!(output.starts_with(expected), "{tool}: {output}");
+        }
+    }
+
+    #[test]
     fn files_are_found_by_name_and_what_git_ignores_is_not() {
         let dir = crate::in_container::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
@@ -3618,10 +3645,11 @@ mod power_tests {
         for name in ["src/a.rs", "src/deep/b.rs", "src/c.txt", "skip.rs"] {
             std::fs::write(dir.path().join(name), "x").unwrap();
         }
-        let found = find_files(&json!({"pattern": "**/*.rs"}), dir.path()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let found = find_files(&json!({"pattern": "**/*.rs"}), dir.path(), &cancel).unwrap();
         assert_eq!(found, "src/a.rs\nsrc/deep/b.rs");
-        assert!(find_files(&json!({"pattern": "*.zig"}), dir.path()).unwrap().starts_with("no file"));
-        assert!(find_files(&json!({}), dir.path()).is_err());
+        assert!(find_files(&json!({"pattern": "*.zig"}), dir.path(), &cancel).unwrap().starts_with("no file"));
+        assert!(find_files(&json!({}), dir.path(), &cancel).is_err());
     }
 
     #[test]
@@ -3979,7 +4007,7 @@ mod change_tests {
     #[test]
     fn an_empty_folder_is_said_to_be() {
         let dir = crate::in_container::tempdir().unwrap();
-        assert!(list_files(&json!({}), dir.path()).unwrap().ends_with("is empty"));
+        assert!(list_files(&json!({}), dir.path(), &AtomicBool::new(false)).unwrap().ends_with("is empty"));
     }
 
     #[cfg(windows)]
