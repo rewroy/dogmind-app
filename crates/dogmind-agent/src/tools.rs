@@ -2859,6 +2859,36 @@ fn build_tools_note(program: &str, why: Option<crate::msvc::Why>, known: bool) -
     }
 }
 
+/// What a command in the sandbox is told when it asks what runs or listens on the PC: it sees only the programs it started itself.
+const PC_PROGRAMS_NOTE: &str = "note: in the sandbox a command sees only the programs it started itself. `tasklist` fails there (\"The user name or password is incorrect\"), `Get-Process` and `netstat` show nothing of the PC's other programs or the ports they listen on, and `Get-NetTCPConnection` is refused: what this printed says nothing of what runs or listens on the PC. Ask the user, or, if they asked for it, run it again with `outside_sandbox: true`.\n";
+
+/// What it is told when it could not connect to an address of the PC's own.
+const THIS_PC_SERVER_NOTE: &str = "note: a command in the sandbox cannot connect to a server of this PC's that runs outside the sandbox (127.0.0.1, localhost, ::1), with network access or without; one that a command in the sandbox started can be reached. So this does not say the server is down. An MCP server is used through Dogmind's own MCP client, which the user sets up with `/mcp`; for anything else, if the user asked for it, run the command again with `outside_sandbox: true`.\n";
+
+/// Whether the line asks what runs or listens on the PC: a command of it that is a program listing processes or connections, or a cmdlet that does.
+fn asks_what_the_pc_runs(line: &str, lower: &str) -> bool {
+    commands_of(line).iter().any(|command| {
+        let word = first_word(command).0.to_ascii_lowercase();
+        matches!(word.trim_end_matches(".exe"), "tasklist" | "netstat" | "wmic")
+    }) || ["get-process", "get-nettcpconnection", "get-netudpendpoint"].iter().any(|cmdlet| lower.contains(cmdlet))
+        || (lower.contains("win32_process") && (lower.contains("get-ciminstance") || lower.contains("get-wmiobject")))
+}
+
+/// Whether the line names an address of the PC's own.
+fn names_this_pc(lower: &str) -> bool {
+    lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("[::1]")
+}
+
+/// Whether what the command said is that a connection was not made: in the words of curl, PowerShell, Python, Node and Windows in Japanese.
+fn says_no_connection(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    ["failed to connect", "could not connect", "connection refused", "actively refused", "connection timed out", "connect timeout", "unable to connect", "no connection could be made", "econnrefused", "etimedout"]
+        .iter()
+        .any(|words| lower.contains(words))
+        || err.contains("接続できませんでした")
+        || err.contains("接続を拒否")
+}
+
 /// What says a file or folder could not be opened for want of the right, in the words of cargo, git, cmd, PowerShell and Windows in Japanese.
 const DENIED_WORDS: [&str; 4] = ["Access is denied", "アクセスが拒否されました", "Permission denied", "is denied"];
 
@@ -2942,8 +2972,17 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     if let Some(note) = foreign_owner_note(err, workspace) {
         notes.push_str(&note);
     }
+    // (a model looking for the user's Unity editor and its MCP server asked tasklist and was told "The user name or password is incorrect", and netstat answered with
+    // no connections at all, which reads as nothing listening: it does whatever it ends with)
+    if asks_what_the_pc_runs(line, &lower) {
+        notes.push_str(PC_PROGRAMS_NOTE);
+    }
     if status == Some(0) {
         return notes;
+    }
+    // (the same model then tried the server's port on 127.0.0.1, which a command in the sandbox cannot reach)
+    if names_this_pc(&lower) && says_no_connection(err) {
+        notes.push_str(THIS_PC_SERVER_NOTE);
     }
     if err.contains("Can not combine '--user' and '--target'") {
         notes.push_str("note: leave out `--user`: `pip install` already keeps packages in the workspace.\n");
@@ -5522,6 +5561,52 @@ mod tests {
         assert!(!sandbox_notes("foo", root, Some(1), "'foo' is not recognized as an internal or external command").contains("build tools"));
         assert!(!sandbox_notes("cl main.c", root, Some(0), "").contains("build tools"));
         crate::msvc::set_test_why(None);
+    }
+
+    /// A command that asks what runs or listens on the PC is told that the sandbox sees only what it started itself, whatever it ended with (netstat's empty list ends
+    /// with 0); one that could not connect to an address of the PC's own is told why, and that this does not say the server is down. Nothing for other lines.
+    #[cfg(windows)]
+    #[test]
+    fn what_the_sandbox_cannot_see_of_the_pc_is_said() {
+        let root = Path::new("C:\\work");
+        for (line, status, err) in [
+            ("tasklist /FI \"IMAGENAME eq Unity.exe\"", Some(1), "ERROR: The user name or password is incorrect."),
+            ("netstat -ano | findstr LISTENING", Some(1), ""),
+            ("netstat -ano", Some(0), ""),
+            ("powershell -NoProfile -Command \"Get-Process -Name Unity\"", Some(1), "Get-Process : Cannot find a process with the name \"Unity\"."),
+            ("powershell -Command \"Get-NetTCPConnection -State Listen\"", Some(1), "Access denied"),
+            ("powershell -Command \"Get-CimInstance Win32_Process | Select Name\"", Some(1), ""),
+        ] {
+            assert!(sandbox_notes(line, root, status, err).contains("sees only the programs it started itself"), "{line}");
+        }
+        for (line, err) in [
+            ("curl.exe -sS -m 4 http://127.0.0.1:27182/mcp", "curl: (7) Failed to connect to 127.0.0.1:27182 after 0 ms: Could not connect to server"),
+            ("curl -s http://localhost:8080/", "curl: (28) Connection timed out after 3011 milliseconds"),
+            ("powershell -Command \"Invoke-WebRequest http://localhost:3000\"", "Invoke-WebRequest : Unable to connect to the remote server"),
+            ("python -c \"import socket; socket.create_connection(('127.0.0.1', 27182))\"", "ConnectionRefusedError: [WinError 10061] No connection could be made because the target machine actively refused it"),
+        ] {
+            let note = sandbox_notes(line, root, Some(1), err);
+            assert!(note.contains("cannot connect to a server of this PC's") && note.contains("`/mcp`") && note.contains("`outside_sandbox: true`"), "{line}: {note}");
+        }
+        // (a server elsewhere, a port on the PC that answered, and lines that only mention a process)
+        assert!(!sandbox_notes("curl -s https://example.com/", root, Some(7), "curl: (7) Failed to connect to example.com port 443").contains("this PC's"));
+        assert!(!sandbox_notes("curl -s http://127.0.0.1:8000/", root, Some(0), "").contains("this PC's"));
+        assert!(!sandbox_notes("curl -s http://127.0.0.1:8000/", root, Some(22), "curl: (22) The requested URL returned error: 404").contains("this PC's"));
+        for line in ["taskkill /PID 1234", "type tasklist.txt.bak", "cargo build -p netstatus"] {
+            assert!(!sandbox_notes(line, root, Some(1), "").contains("sees only the programs"), "{line}");
+        }
+    }
+
+    /// In the real sandbox: `tasklist` there says a password is wrong, and what the model is given says why.
+    #[cfg(windows)]
+    #[test]
+    fn a_process_list_asked_in_the_sandbox_comes_with_why_it_is_not_one() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let dir = crate::in_container::tempdir().unwrap();
+        let said = execute_command(&json!({"command": "tasklist"}), dir.path(), &AtomicBool::new(false), None).unwrap();
+        assert!(said.contains("sees only the programs it started itself"), "{said}");
     }
 
     #[cfg(windows)]
