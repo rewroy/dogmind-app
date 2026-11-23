@@ -31,8 +31,12 @@ impl Line {
     pub(crate) fn u(&self, key: &str) -> Option<u64> {
         self.v[key].as_u64()
     }
+    fn estimated_tokens(&self) -> Option<u64> {
+        // Older writers recorded zero for these requests even though they had no stream meter.
+        self.u("tokens_est").filter(|&n| n != 0 || !matches!(self.s("role"), "warm" | "helper" | "checkpoint"))
+    }
     fn written_tokens(&self) -> Option<String> {
-        self.u("completion").map(|n| n.to_string()).or_else(|| self.u("tokens_est").map(|n| format!("~{n}")))
+        self.u("completion").map(|n| n.to_string()).or_else(|| self.estimated_tokens().map(|n| format!("~{n}")))
     }
     fn cache_percent(&self) -> Option<u64> {
         crate::llm::cache_percent(self.u("prompt")?, self.u("cached"))
@@ -737,6 +741,7 @@ pub fn summary(trajectory: &str) -> Summary {
                         Some(rate) => (Some(rate), false),
                         None => (completion.filter(|_| generation > 0).map(|tokens| tokens as f64 * 1000.0 / generation as f64), true),
                     };
+                    let estimate = line.estimated_tokens();
                     row.requests.push(RequestRow {
                         id: short(line.req()),
                         role: line.s("role").to_string(),
@@ -744,8 +749,8 @@ pub fn summary(trajectory: &str) -> Summary {
                         generation_ms: generation,
                         prompt: line.u("prompt"),
                         cached_percent: line.cache_percent(),
-                        tokens: completion.or(line.u("tokens_est")),
-                        tokens_estimated: completion.is_none() && line.u("tokens_est").is_some(),
+                        tokens: completion.or(estimate),
+                        tokens_estimated: completion.is_none() && estimate.is_some(),
                         rate,
                         counted: counted && rate.is_some(),
                         end: line.s("end").to_string(),
@@ -832,6 +837,23 @@ mod tests {
         assert_eq!(written[..3], ["~27", "0", "-"]);
         assert!(printed.contains("~27 tokens generated") && printed.contains(", reasoning kept)"));
         assert!(printed.contains("next: /2 wrote 0 tokens"));
+    }
+
+    #[test]
+    fn an_unmetered_request_in_an_older_file_has_no_token_estimate() {
+        for (role, reported, estimate, label, value) in [
+            ("warm", None, 0, "-", None),
+            ("helper", None, 0, "-", None),
+            ("checkpoint", None, 0, "-", None),
+            ("helper", Some(0), 0, "0", Some(0)),
+            ("main", None, 0, "~0", Some(0)),
+            ("helper", None, 17, "~17", Some(17)),
+        ] {
+            let trace = json!({"ev":"request","turn":1,"role":role,"completion":reported,"tokens_est":estimate}).to_string();
+            assert!(report(&trace, None).contains(&format!("wrote {label:>6} tok")), "{trace}");
+            let row = &summary(&trace).turns[0].requests[0];
+            assert_eq!((row.tokens, row.tokens_estimated), (value, label.starts_with('~')), "{trace}");
+        }
     }
 
     #[test]

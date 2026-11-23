@@ -3168,7 +3168,7 @@ impl Agent {
             let base = self.messages.len();
             let saved = if cuts { cut_answer(&written, &reasoned, &calling, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) } else { None };
             // (its line waits for the message it makes, to say where that is in the session: a reader puts the step beside what the model said)
-            self.traj.request_waiting(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: meter.tokens, retry: retry.take(), draft_watch: Some(watch_is), helper_file: None, draft_marks: watch.as_ref().and_then(|watch| watch.marks_of(&reasoned)) });
+            self.traj.request_waiting(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: Some(meter.tokens), retry: retry.take(), draft_watch: Some(watch_is), helper_file: None, draft_marks: watch.as_ref().and_then(|watch| watch.marks_of(&reasoned)) });
             // Writing a file out in its reasoning: every token of it is typed again in the call. It goes on from what it had decided, in a request of which all but the last few tokens are
             // read already. Whatever it was thinking about before is left to it, however long: only this is stopped, and what it is told is to write. Its connection has closed by now, so
             // the engine is not writing into nothing. (The tokens it wrote were spent all the same.)
@@ -3641,7 +3641,7 @@ impl Agent {
         let (reasoning, content, calls) = result.as_ref().ok().map_or((0, 0, Vec::new()), |completion| (completion.reasoning.chars().count(), completion.content.chars().count(), completion.tool_calls.iter().map(|call| call.function.name.clone()).collect()));
         // (a warm-up is ended by the app at its first word, which is how it is meant to end)
         let end = if role == "warm" && matches!(result, Err(LlmError::Cancelled)) { "stopped_app:warm_up".to_string() } else { trajectory::end_of(result) };
-        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: 0, retry: None, draft_watch: None, helper_file, draft_marks: None });
+        self.traj.request(RequestNote { id: req_id, role, clock, end, usage, timings, reasoning_chars: reasoning, content_chars: content, calls, tokens_est: None, retry: None, draft_watch: None, helper_file, draft_marks: None });
     }
 
     /// An intervention of the app's own, in the trajectory, for the request that was made last: the one it ended or follows.
@@ -11173,6 +11173,8 @@ Body").unwrap();
         let lines = trajectory_of(&run);
         let requests = of_kind(&lines, "request");
         assert_eq!(requests.iter().map(|line| line["role"].as_str().unwrap()).collect::<Vec<_>>(), ["main", "helper", "helper", "main"], "{lines:?}");
+        assert!(requests[0]["tokens_est"].is_u64() && requests[3]["tokens_est"].is_u64());
+        assert!(requests[1]["tokens_est"].is_null() && requests[2]["tokens_est"].is_null());
         let ids: Vec<&str> = requests.iter().map(|line| line["req"].as_str().unwrap()).collect();
         let sent = names.lock().unwrap().clone();
         assert_eq!(sent, ids, "the server was told the same name for each request, in the order they were made");

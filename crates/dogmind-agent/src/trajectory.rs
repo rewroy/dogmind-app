@@ -139,7 +139,7 @@ pub struct RequestNote<'a> {
     pub content_chars: usize,
     pub calls: Vec<String>,
     /// What the stream's own pieces came to, counted roughly: for a request that ended with no count from the server.
-    pub tokens_est: u64,
+    pub tokens_est: Option<u64>,
     /// The request this one repeats, why, and how long it waited: after a connection that dropped, or an answer with nothing in it.
     pub retry: Option<(String, &'static str, u64)>,
     /// Whether the app was watching this request's reasoning for a draft: `on`, or `off:` and why (the person asked for no change, a file has been written, it has stopped one this turn).
@@ -427,7 +427,7 @@ mod tests {
         let mut traj = Trajectory::new();
         traj.open(&session);
         let clock = Clock::start();
-        let note = |id: &'static str| RequestNote { id, role: "main", clock: &clock, end: "tool_calls".into(), usage: None, timings: None, reasoning_chars: 0, content_chars: 0, calls: vec!["read_file".into()], tokens_est: 0, retry: None, draft_watch: None, helper_file: None, draft_marks: None };
+        let note = |id: &'static str| RequestNote { id, role: "main", clock: &clock, end: "tool_calls".into(), usage: None, timings: None, reasoning_chars: 0, content_chars: 0, calls: vec!["read_file".into()], tokens_est: Some(0), retry: None, draft_watch: None, helper_file: None, draft_marks: None };
         traj.request_waiting(note("s/1"));
         traj.message_at(2);
         // (the second makes none: the next line writes it as it is, before itself)
