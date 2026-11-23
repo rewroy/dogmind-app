@@ -334,12 +334,15 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         let stopped = lines.iter().find(|request| request.ev() == "request" && request.req() == line.req());
         let mut what = match kind {
             "draft_stop" => {
-                let spent = stopped.map_or(String::new(), |request| format!(" in {}", secs(request.u("ms").unwrap_or(0))));
-                // (a stop before the rule counted runs said its totals instead)
-                let shape = match line.u("run") {
-                    Some(run) => format!("a run of {run} lines of code"),
-                    None => format!("{} lines of code and {} fence marks in all", line.u("code_lines").unwrap_or(0), line.u("fences").unwrap_or(0)),
-                };
+                let spent = stopped.and_then(|request| request.u("ms")).map_or(String::new(), |ms| format!(" in {}", secs(ms)));
+                // Older writers counted code lines and fence marks instead of runs and lines inside fences.
+                let counts: Vec<_> = [
+                    line.u("run").map(|n| format!("longest run of {n} lines of code")),
+                    line.u("fenced").map(|n| format!("{n} lines across fenced blocks")),
+                    line.u("code_lines").map(|n| format!("{n} lines of code in all")),
+                    line.u("fences").map(|n| format!("{n} fence marks in all")),
+                ].into_iter().flatten().collect();
+                let shape = if counts.is_empty() { "line counts unavailable".to_string() } else { counts.join(", ") };
                 let tokens = line.u("tokens_before").map_or_else(|| "?".to_string(), |n| format!("~{n}"));
                 let kept = match line.v["reasoning_kept"].as_bool() {
                     Some(true) => ", reasoning kept",
@@ -871,6 +874,24 @@ mod tests {
     }
 
     #[test]
+    fn draft_stop_reports_only_the_line_counts_recorded_by_the_writer() {
+        for (counts, expected) in [
+            (json!({"run":25,"fenced":100}), "longest run of 25 lines of code, 100 lines across fenced blocks"),
+            (json!({"run":39,"fenced":60}), "longest run of 39 lines of code, 60 lines across fenced blocks"),
+            (json!({"fenced":0}), "0 lines across fenced blocks"),
+            (json!({"code_lines":12,"fences":2}), "12 lines of code in all, 2 fence marks in all"),
+            (json!({"code_lines":5}), "5 lines of code in all"),
+            (json!({}), "line counts unavailable"),
+        ] {
+            let mut line = counts;
+            line["ev"] = json!("intervention");
+            line["kind"] = json!("draft_stop");
+            let printed = report(&text(&[line]), None);
+            assert!(printed.contains(&format!("before the stop ({expected})")), "{printed}");
+        }
+    }
+
+    #[test]
     fn request_counts_distinguish_estimates_from_reported_zero_and_missing_usage() {
         let lines = [
             json!({"ev":"request", "turn":1, "req":"s/1", "role":"main", "tokens_est":27}),
@@ -881,7 +902,7 @@ mod tests {
         let printed = report(&text(&lines), None);
         let written: Vec<_> = printed.lines().filter_map(|line| line.split_once(" wrote ")?.1.split_whitespace().next()).collect();
         assert_eq!(written[..3], ["~27", "0", "-"]);
-        assert!(printed.contains("~27 tokens generated") && printed.contains(", reasoning kept)"));
+        assert!(printed.contains("~27 tokens generated before the stop (line counts unavailable, reasoning kept)"));
         assert!(printed.contains("next: /2 wrote 0 tokens"));
     }
 
@@ -922,7 +943,7 @@ mod tests {
         assert!(said.contains("   /1 main") && said.contains("stopped_app:draft_stop") && said.contains("cached  36%"), "{said}");
         assert!(said.contains("index.html"), "{said}");
         // What the stop cost: the tokens thrown away and the time, and what the request after it did.
-        assert!(said.contains("draft_stop at /1: ~8328 tokens generated in 103.0 s before the stop (a run of 61 lines of code)"), "{said}");
+        assert!(said.contains("draft_stop at /1: ~8328 tokens generated in 103.0 s before the stop (longest run of 61 lines of code)"), "{said}");
         assert!(said.contains("next: /2 wrote 2714 tokens in 37.0 s, cached 36%, ended tool_calls"), "{said}");
         assert!(said.contains("signs of going round in circles\n  none"), "{said}");
     }
