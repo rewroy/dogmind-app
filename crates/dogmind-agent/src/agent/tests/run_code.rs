@@ -105,7 +105,7 @@ fn run_code_is_offered_when_code_mode_is_on_with_a_line_for_each_tool_a_program_
     assert_eq!(function["parameters"]["required"], serde_json::json!(["code", "description"]));
     assert!(function["parameters"]["properties"].get("timeout_seconds").is_some());
     let description = function["description"].as_str().unwrap();
-    for line in ["tools.read_file({path, start_line?, limit?}) — ", "tools.search_files({pattern, literal?, path?, file_glob?}) — ", "tools.apply_patch({edits: [{path, old_string, new_string, count?}]}) — ", "tools.show_diff({scope: \"session\"|\"workspace\"|\"staged\"|\"unstaged\", paths?: [string]}) — ", "tools.execute_command({command, "] {
+    for line in ["tools.read_file({path, start_line?, limit?}) — ", "tools.search_files({pattern, literal?, path?, file_glob?, timeout_seconds?}) — ", "tools.apply_patch({edits: [{path, old_string, new_string, count?}]}) — ", "tools.show_diff({scope: \"session\"|\"workspace\"|\"staged\"|\"unstaged\", paths?: [string]}) — ", "tools.execute_command({command, "] {
         assert!(description.contains(line), "{line}\n{description}");
     }
     for left_out in ["run_code", "submit_plan", "ask_user", "explore", "wake_at", "web_read", "web_search"] {

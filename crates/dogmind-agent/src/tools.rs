@@ -143,11 +143,12 @@ pub fn schemas() -> Value {
             "start_line": {"type": "integer", "description": "1-based. -N starts N lines from the end."},
             "limit": {"type": "integer", "description": "Lines. Default and max 2000."}
         }), &["path"]),
-        function("search_files", "Search file contents by regex, ignoring case unless the pattern has capitals. Skips what .gitignore skips. Find what a change touches with it first, then read only the lines needed.", json!({
+        function("search_files", "Search file contents by regex, ignoring case unless the pattern has capitals. Respects .gitignore. Search first, then read the lines you need.", json!({
             "pattern": {"type": "string"},
             "literal": {"type": "boolean", "description": "The pattern is plain text."},
             "path": {"type": "string"},
-            "file_glob": {"type": "string"}
+            "file_glob": {"type": "string"},
+            "timeout_seconds": {"type": "integer", "description": "1-300 seconds, default 30. Returns partial matches on timeout."}
         }), &["pattern"]),
         function("show_diff", "Show file changes.", json!({
             "scope": {"type": "string", "enum": ["session", "workspace", "staged", "unstaged"], "description": "session: since this session began. workspace: against HEAD, or outside git as session. staged, unstaged: git's index."},
