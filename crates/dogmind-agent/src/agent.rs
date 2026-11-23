@@ -5241,7 +5241,9 @@ mod tests {
     fn a_look_again_at_a_quiet_command_says_its_end_wakes_the_session() {
         let dir = crate::in_container::tempdir().unwrap();
         let (client, bodies) = server(vec![
-            call_answer("execute_command", serde_json::json!({"command": "ping -n 30 127.0.0.1 >nul", "background": true})),
+            // (quiet for half a minute in the sandbox too: a ping there fails at once, "Unable to contact IP driver", and the test passed only while the looks came sooner; and what PowerShell says of its drives there
+            // goes nowhere)
+            call_answer("execute_command", serde_json::json!({"command": "powershell -NoProfile -Command Start-Sleep -Seconds 30 >nul 2>&1", "background": true})),
             call_answer("command_status", serde_json::json!({"id": "job1"})),
             call_answer("command_status", serde_json::json!({"id": "job1"})),
             text_answer("waiting for it"),

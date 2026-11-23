@@ -131,65 +131,64 @@ impl Transport {
     }
 
     /// All of these bytes, with an ear for a stop: a server that has stopped reading would otherwise hold up the person's Stop for as long as it likes. Without a timeout on the
-    /// socket, as Windows calls a socket whose send timed out indeterminate. A TLS stream cannot be left in the middle of a record, so that one blocks.
-    fn send(&mut self, mut bytes: &[u8], cancel: &AtomicBool) -> Result<(), Failure> {
+    /// socket, as Windows calls a socket whose send timed out indeterminate. The write blocks, and is ended from beside it (`with_an_ear_for_a_stop`), which ends the connection:
+    /// that is what a stop means here. A TLS stream cannot be left in the middle of a record; and a plain one made non-blocking is no surer, as on Windows a send on it blocked all
+    /// the same once the server had stopped reading (2 MB of a 16 MB body in), until the server closed, and the Stop was not heard for those ten seconds.
+    fn send(&mut self, bytes: &[u8], cancel: &AtomicBool) -> Result<(), Failure> {
         let failed = |error: io::Error| Failure::Stream(error.to_string());
-        let Transport::Plain(stream) = self else {
-            // (what blocks can still be ended from beside it, which ends the connection: that is what a stop means here)
-            let socket = match self {
-                Transport::Tls(stream) => stream.get_ref().try_clone().map_err(failed)?,
-                Transport::Plain(_) => unreachable!("just looked at"),
-            };
-            let sent = with_an_ear_for_a_stop(&socket, cancel, || self.write_all(bytes));
-            return sent.map_err(|error| if cancel.load(Ordering::Relaxed) { Failure::Cancelled } else { failed(error) });
+        let socket = match self {
+            Transport::Plain(stream) => stream.try_clone().map_err(failed)?,
+            Transport::Tls(stream) => stream.get_ref().try_clone().map_err(failed)?,
         };
-        stream.set_nonblocking(true).map_err(failed)?;
-        let started = Instant::now();
-        while !bytes.is_empty() {
+        let (sent, gave_up) = with_an_ear_for_a_stop(&socket, cancel, IDLE_LIMIT, || self.write_all(bytes));
+        sent.map_err(|error| {
             if cancel.load(Ordering::Relaxed) {
-                return Err(Failure::Cancelled);
+                Failure::Cancelled
+            } else if gave_up {
+                Failure::Stream("the server took nothing for 30 minutes".into())
+            } else {
+                failed(error)
             }
-            match stream.write(bytes) {
-                Ok(0) => return Err(Failure::Stream("the connection closed".into())),
-                Ok(count) => bytes = &bytes[count..],
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if started.elapsed() > IDLE_LIMIT {
-                        return Err(Failure::Stream("the server took nothing for 30 minutes".into()));
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(failed(error)),
-            }
-        }
-        stream.set_nonblocking(false).map_err(failed)
+        })
     }
 }
 
-/// Runs a blocking write, and if a stop comes while it blocks, shuts the socket under it: a server that has stopped reading would otherwise hold up the person's Stop for as long as it likes.
-fn with_an_ear_for_a_stop<T>(socket: &TcpStream, cancel: &AtomicBool, write: impl FnOnce() -> T) -> T {
-    let done = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            while !done.load(Ordering::Relaxed) {
-                if cancel.load(Ordering::Relaxed) {
+/// Runs a blocking write, and if a stop comes while it blocks, or it has gone on for `limit`, shuts the socket under it: a server that has stopped reading would otherwise hold up
+/// the person's Stop for as long as it likes. What the write came to, and whether it was the limit that ended it.
+fn with_an_ear_for_a_stop<T>(socket: &TcpStream, cancel: &AtomicBool, limit: Duration, write: impl FnOnce() -> T) -> (T, bool) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let gave_up = AtomicBool::new(false);
+    let given_up = &gave_up;
+    let started = Instant::now();
+    // (the write's end is said on a channel, which wakes the watcher at once: a request waits for it to have gone, and a sleep of its own was that much more of every send)
+    let (finished, ended) = std::sync::mpsc::channel::<()>();
+    let result = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            while matches!(ended.recv_timeout(Duration::from_millis(20)), Err(RecvTimeoutError::Timeout)) {
+                let too_long = started.elapsed() > limit;
+                if too_long {
+                    given_up.store(true, Ordering::Relaxed);
+                }
+                if too_long || cancel.load(Ordering::Relaxed) {
                     let _ = socket.shutdown(Shutdown::Both);
                     // (on Windows the shutdown alone leaves a send that blocks where it is: what it waits on is cancelled too, and it then fails as
                     // shut down; again until it has, as one that had not yet begun to wait when the first went is not reached by it)
                     #[cfg(windows)]
-                    while !done.load(Ordering::Relaxed) {
+                    loop {
                         cancel_waiting_io(socket);
-                        std::thread::sleep(Duration::from_millis(20));
+                        if !matches!(ended.recv_timeout(Duration::from_millis(20)), Err(RecvTimeoutError::Timeout)) {
+                            break;
+                        }
                     }
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(20));
             }
         });
         let result = write();
-        done.store(true, Ordering::Relaxed);
+        drop(finished);
         result
-    })
+    });
+    (result, gave_up.load(Ordering::Relaxed))
 }
 
 /// The socket's I/O that waits, from every thread, cancelled.
@@ -623,12 +622,12 @@ pub(crate) mod tests {
                 std::thread::sleep(Duration::from_millis(300));
                 cancel.store(true, Ordering::Relaxed);
             });
-            let written = with_an_ear_for_a_stop(&socket, &cancel, || loop {
+            let (written, gave_up) = with_an_ear_for_a_stop(&socket, &cancel, Duration::from_secs(600), || loop {
                 if let Err(error) = stream.write_all(&block) {
                     break error;
                 }
             });
-            assert!(!written.to_string().is_empty());
+            assert!(!written.to_string().is_empty() && !gave_up);
         });
         assert!(began.elapsed() < Duration::from_secs(20), "{:?}", began.elapsed());
     }
