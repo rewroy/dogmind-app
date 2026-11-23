@@ -12634,13 +12634,14 @@ impl App {
         } else {
             (config.command.clone(), dogmind_agent::mcp::lines_of_pairs(&config.env, '='))
         };
-        let was = [name.clone().unwrap_or_default(), target, dogmind_agent::mcp::line_of_args(&config.args), vars];
-        for (field, text) in self.fields[..3].iter().zip(&was) {
+        let values = [name.clone().unwrap_or_default(), target, dogmind_agent::mcp::line_of_args(&config.args)];
+        for (field, text) in self.fields[..3].iter().zip(&values) {
             set_text(*field, text);
         }
-        set_text(self.mcp_vars, &was[3]);
+        set_text(self.mcp_vars, &vars);
         self.mcp_form_url = config.is_http();
-        self.mcp_form_was = was;
+        // Compare text as the controls return it, including normalized multiline headers and variables.
+        self.mcp_form_was = self.mcp_form_typed();
         let new = name.is_none();
         self.mcp_form = Some(name);
         self.panel_log.clear();
