@@ -519,7 +519,7 @@ const COMMANDS: [(&str, &str); 47] = [
     ("/plan", "Look and plan first, and change nothing until you say"),
     ("/skills", "The skills of this folder, from Claude's and Codex's folders too"),
     ("/memory", "What is kept between sessions"),
-    ("/mcp", "MCP servers: /mcp shows them, /mcp import takes Claude's and Codex's"),
+    ("/mcp", "MCP server status, /mcp candidates, /mcp import [NAME]"),
     ("/permissions", "What may always run in this folder"),
     ("/think", "Show or hide the thinking"),
     ("/tools", "Open another program's folder on PATH to sandboxed commands, with one Windows prompt"),
@@ -2827,6 +2827,42 @@ fn mcp_state_words(state: Option<&dogmind_agent::mcp::State>) -> String {
 /// Why an MCP server did not start, with the words the app has for a program not found in the person's language.
 fn mcp_why(why: &str) -> String {
     why.replace(dogmind_agent::mcp::NOT_FOUND, t(dogmind_agent::mcp::NOT_FOUND))
+}
+
+/// Read the external server lists for a user command. Only a successful addition calls for reloading the hub.
+fn mcp_import(home: &Path, file: &Path, argument: &str) -> Result<(usize, String), String> {
+    use dogmind_agent::mcp;
+    let (action, name) = argument.split_once(char::is_whitespace).map_or((argument, ""), |(action, name)| (action, name.trim()));
+    let preview = action.eq_ignore_ascii_case("candidates") && name.is_empty();
+    if !preview && !action.eq_ignore_ascii_case("import") {
+        return Err(t("Use /mcp for status, /mcp candidates to list names, or /mcp import [NAME].").into());
+    }
+    let mut found = mcp::servers_of_claude(&std::fs::read_to_string(home.join(".claude.json")).unwrap_or_default());
+    for (name, server) in mcp::servers_of_codex(&std::fs::read_to_string(home.join(".codex/config.toml")).unwrap_or_default()) {
+        found.entry(name).or_insert(server);
+    }
+    if preview {
+        let configured = mcp::readable_config(file)?.servers;
+        let names: Vec<_> = found.into_keys().filter(|name| !configured.contains_key(name)).collect();
+        let message = if names.is_empty() {
+            t("Claude and Codex list no server that is not here already.").into()
+        } else {
+            tf("Available to import with /mcp import NAME:\n{0}", &[&names.join("\n")])
+        };
+        return Ok((0, message));
+    }
+    if !name.is_empty() {
+        let selected = found.remove_entry(name).ok_or_else(|| tf("No import candidate named {0}. Use /mcp candidates to list names.", &[&name]))?;
+        found = std::collections::BTreeMap::from([selected]);
+    }
+    let added = mcp::import(file, found)?;
+    let message = match (added, name.is_empty()) {
+        (0, true) => t("Claude and Codex list no server that is not here already.").into(),
+        (0, false) => tf("{0} is already configured in Dogmind.", &[&name]),
+        (_, false) => tf("Added {0}. The server is starting.", &[&name]),
+        (_, true) => tf("{0} servers added to {1}. They are starting.", &[&added, &file.display()]),
+    };
+    Ok((added, message))
 }
 
 /// What an MCP server runs, or where it is, as its row says it. Its headers are not said: a key is among them.
@@ -6316,14 +6352,14 @@ impl App {
             "skills" => self.set_panel(Panel::Skills),
             "mcp" => {
                 let file = self.folder.join("mcp.json");
-                if argument.eq_ignore_ascii_case("import") {
-                    let said = self.mcp_servers_imported();
+                if !argument.is_empty() {
+                    let said = self.mcp_servers_imported(argument);
                     self.say(&said);
                 } else if let Some(why) = self.mcp.unreadable() {
                     self.say(&tf("The list of servers could not be read, and none was started: {0}", &[&why]));
                 } else {
                     let lines: Vec<String> = self.mcp.states().iter().map(|(name, state)| format!("{name}: {}", mcp_state_words(Some(state)))).collect();
-                    self.say(&if lines.is_empty() { tf("No server yet. {0} lists them, and /mcp import copies Claude's and Codex's in.", &[&file.display()]) } else { lines.join("\n") });
+                    self.say(&if lines.is_empty() { tf("No server yet. {0} lists configured servers. Use /mcp candidates to find one to import.", &[&file.display()]) } else { lines.join("\n") });
                 }
             }
             "plan" => self.on_menu(M_MODE + 3),
@@ -12385,26 +12421,21 @@ impl App {
         self.layout();
     }
 
-    /// What Claude's and Codex's settings list goes in with this app's, started at once, and how that went.
-    unsafe fn mcp_servers_imported(&mut self) -> String {
-        let file = self.folder.join("mcp.json");
-        let home = std::env::var_os("USERPROFILE").map_or(PathBuf::new(), PathBuf::from);
-        let mut found = dogmind_agent::mcp::servers_of_claude(&std::fs::read_to_string(home.join(".claude.json")).unwrap_or_default());
-        for (name, server) in dogmind_agent::mcp::servers_of_codex(&std::fs::read_to_string(home.join(".codex").join("config.toml")).unwrap_or_default()) {
-            found.entry(name).or_insert(server);
-        }
-        match dogmind_agent::mcp::import(&file, found) {
-            Ok(0) => t("Claude and Codex list no server that is not here already.").to_string(),
-            Ok(added) => {
-                self.mcp_changed();
-                tf("{0} servers added to {1}. They are starting.", &[&added, &file.display()])
+    unsafe fn mcp_servers_imported(&mut self, argument: &str) -> String {
+        let Some(home) = std::env::var_os("USERPROFILE") else { return t("The user profile could not be located.").into() };
+        match mcp_import(Path::new(&home), &self.folder.join("mcp.json"), argument) {
+            Ok((added, message)) => {
+                if added > 0 {
+                    self.mcp_changed();
+                }
+                message
             }
             Err(error) => error,
         }
     }
 
     unsafe fn import_mcp_servers(&mut self) {
-        let said = self.mcp_servers_imported();
+        let said = self.mcp_servers_imported("import");
         self.say_in_panel(&said);
     }
 
@@ -19124,6 +19155,30 @@ mod tests {
         assert!(approval_takes_focus(true, true, Some(Duration::from_secs(60))));
         assert!(!approval_takes_focus(true, false, Some(Duration::from_secs(60))), "a draft in it: the next key belongs to it");
         assert!(!approval_takes_focus(true, true, Some(Duration::from_millis(300))), "typing now, its first word about to come");
+    }
+
+    #[test]
+    fn mcp_import_lists_names_and_only_adds_the_server_chosen() {
+        use dogmind_agent::mcp;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".claude.json"), r#"{"mcpServers":{"Unity Editor":{"command":"first"},"other":{"command":"private-launch-command"}}}"#).unwrap();
+        std::fs::write(home.path().join(".codex/config.toml"), "[mcp_servers.'Unity Editor']\ncommand='second'\n[mcp_servers.disabled]\ncommand='off'\nenabled=false").unwrap();
+        let file = home.path().join("dogmind/mcp.json");
+        let run = |argument| mcp_import(home.path(), &file, argument);
+        let (added, choices) = run("candidates").unwrap();
+        assert_eq!(added, 0);
+        assert!(choices.contains("Unity Editor") && choices.contains("other") && !choices.contains("disabled") && !choices.contains("private-launch-command"));
+        assert!(run("import Unity").is_err() && run("typo").is_err());
+        assert!(!file.exists());
+        assert_eq!(run("IMPORT  Unity Editor").unwrap().0, 1);
+        let config = mcp::readable_config(&file).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers["Unity Editor"].command, "first");
+        assert_eq!(run("import Unity Editor").unwrap().0, 0);
+        assert!(!run("candidates").unwrap().1.contains("Unity Editor"));
+        assert_eq!(run("import").unwrap().0, 1);
+        assert_eq!(mcp::readable_config(&file).unwrap().servers.len(), 2);
     }
 
     #[test]
