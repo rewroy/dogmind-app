@@ -5938,8 +5938,7 @@ mod tests {
 
     #[test]
     fn a_command_reports_its_output_and_exit_code() {
-        // Under the target folder: on Windows this writes real ACEs, and they should not go on the temp folder.
-        let dir = tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")).unwrap();
+        let dir = crate::in_container::folder_for_commands();
         let (mut bench, cancel) = (Workbench::default(), AtomicBool::new(false));
         let out = bench.run("execute_command", &json!({"command": "echo hello"}), dir.path(), &cancel).unwrap();
         assert!(out.contains("hello") && out.contains("exit_code: 0"), "{out}");

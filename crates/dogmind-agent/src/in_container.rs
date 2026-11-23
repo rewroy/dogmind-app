@@ -24,6 +24,15 @@ pub(crate) fn tempdir() -> std::io::Result<tempfile::TempDir> {
     tempfile::tempdir()
 }
 
+/// Commands on Windows can grant access to their workspace. Give each test its own folder under the checkout,
+/// even when Cargo writes its build artifacts elsewhere. Keep `..` out of the path used in approval checks.
+pub(crate) fn folder_for_commands() -> tempfile::TempDir {
+    let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap();
+    let parent = checkout.join("target");
+    std::fs::create_dir_all(&parent).unwrap();
+    tempfile::tempdir_in(parent).unwrap()
+}
+
 /// A temp folder beside the test program (in the workspace's target folder, which the container was given), and git kept from looking above it for a
 /// repository: it lies in the workspace's own, which a test's folder in the temp folder never did.
 fn in_reach() {

@@ -5109,6 +5109,8 @@ mod calibration;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use crate::in_container::folder_for_commands;
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -6292,12 +6294,6 @@ note: the helper took")), "{log:?}");
         assert!(bodies[0]["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "web_read"));
     }
 
-    /// A folder to run commands in, under the target folder: a command that runs puts real ACEs on its folder, and they should not go on the temp folder.
-    #[cfg(windows)]
-    fn folder_for_commands() -> tempfile::TempDir {
-        tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")).unwrap()
-    }
-
     // (`attrib` and `hostname` are Windows's own, in System32 on every PATH: the programs these tests put a file in the place of)
     const PLANTED_NOTE: &str = "`attrib` here is the file attrib.cmd in this folder, not the installed program";
 
@@ -6551,12 +6547,6 @@ note: the helper took")), "{log:?}");
         assert_eq!(approvals_and_reasons(&run, Decision::Reject), [command(true), command(false), command(false)], "\"always\" was on offer before the page, and not after it");
     }
 
-    /// `folder_for_commands` with no `..` in its path: the gate weighs a path as it is spelled, and a look is a look only in a workspace that holds its folder.
-    #[cfg(windows)]
-    fn plain_folder_for_commands() -> tempfile::TempDir {
-        tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target")).unwrap()
-    }
-
     /// The cards of a turn as what "always" would allow, whether it is on the card, and why not, each answered by the next of `decisions` (and "reject" once they run out).
     fn cards(run: &Run, decisions: &[Decision]) -> Vec<(Option<AlwaysScope>, bool, Option<String>)> {
         let mut asked = Vec::new();
@@ -6579,7 +6569,7 @@ note: the helper took")), "{log:?}");
     #[cfg(windows)]
     #[test]
     fn a_line_of_several_commands_is_allowed_part_by_part() {
-        let dir = plain_folder_for_commands();
+        let dir = folder_for_commands();
         let site = "http://127.0.0.1:9";
         let command = |line: String| calls(&[("execute_command", serde_json::json!({"command": line}))]);
         let steps = vec![
@@ -6615,7 +6605,7 @@ note: the helper took")), "{log:?}");
     #[cfg(windows)]
     #[test]
     fn in_the_default_mode_each_part_of_a_line_gets_its_own_rule() {
-        let dir = plain_folder_for_commands();
+        let dir = folder_for_commands();
         let command = |line: &str| calls(&[("execute_command", serde_json::json!({"command": line}))]);
         let steps = vec![command("where cmd & ver"), command("attrib now & hostname"), says("done"), command("attrib now && ver"), says("again")];
         let (run, _) = scripted(dir.path(), steps, Mode::Default);
