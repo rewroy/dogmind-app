@@ -2918,6 +2918,15 @@ fn normalized_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn read_instruction_file(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Err(t("Save instructions.md as UTF-8 to edit it here.").to_string()),
+        Err(error) => Err(tf("Could not read instructions.md: {0}", &[&error.to_string()])),
+    }
+}
+
 /// WM_SETREDRAW, on a window that is showing only. Turned back on it sets WS_VISIBLE, so a transcript hidden behind Settings would come up over
 /// them with every word of an answer, until the next layout hid it again. A hidden window has nothing to draw anyway.
 unsafe fn redraw(window: HWND, on: bool) {
@@ -8022,7 +8031,13 @@ impl App {
                     return true;
                 }
                 let file = self.folder.join("instructions.md");
-                let known = std::fs::read_to_string(&file).unwrap_or_default();
+                let known = match read_instruction_file(&file) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        self.problem_in_panel(&error);
+                        return false;
+                    }
+                };
                 let normalized = normalized_newlines(&known);
                 let text = get_text(self.doc);
                 if text == normalized {
@@ -9428,13 +9443,18 @@ impl App {
             }
             Panel::Instructions => {
                 self.panel_title = t("Your instructions").into();
-                let text = std::fs::read_to_string(self.folder.join("instructions.md")).unwrap_or_default();
-                self.show_document(&normalized_newlines(&text).replace('\n', "\r\n"));
-                SendMessageW(self.doc, EM_SETREADONLY, 0, 0);
+                let loaded = read_instruction_file(&self.folder.join("instructions.md"));
+                let editable = loaded.is_ok();
+                match loaded {
+                    Ok(text) => self.show_document(&normalized_newlines(&text).replace('\n', "\r\n")),
+                    Err(error) => self.show_document(&error),
+                }
+                SendMessageW(self.doc, EM_SETREADONLY, usize::from(!editable), 0);
                 SendMessageW(self.doc, EM_SETMODIFY, 0, 0);
                 SendMessageW(self.doc, EM_SETBKGNDCOLOR, 0, theme::surface() as LPARAM);
                 set_text(self.buttons[0], t("Save"));
                 self.set_button_kinds(&[ButtonKind::Primary]);
+                EnableWindow(self.buttons[0], i32::from(editable));
             }
             Panel::Diff if self.trajectory.is_some() => {
                 self.panel_title = t("Trajectory").into();
@@ -18776,6 +18796,18 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_instruction_file_can_be_created_but_read_errors_are_reported() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let path = dir.path().join("instructions.md");
+        assert_eq!(read_instruction_file(&path).unwrap(), "");
+        std::fs::write(&path, "日本語\r\n").unwrap();
+        assert_eq!(read_instruction_file(&path).unwrap(), "日本語\r\n");
+        std::fs::write(&path, [0xff, 0xfe, 0x41, 0x00]).unwrap();
+        assert!(read_instruction_file(&path).unwrap_err().contains("UTF-8"));
+        assert!(read_instruction_file(dir.path()).is_err());
+    }
 
     #[test]
     fn clipboard_line_breaks_preserve_existing_windows_endings() {

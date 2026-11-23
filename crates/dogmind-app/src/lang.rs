@@ -1000,6 +1000,8 @@ const JA: &[(&str, &str)] = &[
     ("Dashboard", "ダッシュボード"),
     ("Name", "名前"),
     ("Save", "保存"),
+    ("Save instructions.md as UTF-8 to edit it here.", "ここで指示を編集するには、instructions.md を UTF-8 で保存してください。"),
+    ("Could not read instructions.md: {0}", "instructions.md を読み込めませんでした（{0}）。"),
     ("Cancel", "キャンセル"),
     ("Open a session", "セッションを開く"),
     ("Open", "開く"),
