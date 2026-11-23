@@ -503,7 +503,7 @@ impl Spent {
         let rest = self.wall.saturating_sub(accounted);
         let _ = writeln!(out, "{indent}wall {}{}", secs(self.wall), if self.unfinished { " (the run ended here: no turn_end)" } else { "" });
         let _ = writeln!(out, "{indent}model {} ({}): prefill to the first word {}, generation {}", secs(model), share(model, self.wall), secs(self.prefill), secs(self.generation));
-        let by_name: Vec<String> = self.tools.iter().map(|(name, (calls, ms))| format!("{name} {calls} x {}", secs(*ms))).collect();
+        let by_name: Vec<String> = self.tools.iter().map(|(name, (calls, ms))| format!("{name} (calls: {calls}, total: {})", secs(*ms))).collect();
         let nested = if self.nested_ms > 0 { " (individual times include nested calls)" } else { "" };
         let parallel = if self.parallel_overlap_ms > 0 { " (parallel calls overlap)" } else { "" };
         let _ = writeln!(out, "{indent}tools {} ({}){}{nested}{parallel}{}", secs(tools), share(tools, self.wall), if by_name.is_empty() { String::new() } else { format!(": {}", by_name.join(", ")) }, if self.helpers > 0 { format!("; of which an explore helper's own requests {}", secs(self.helpers)) } else { String::new() });
@@ -821,7 +821,7 @@ mod tests {
         assert!(said.contains("turn 1: 40 characters"), "{said}");
         // Time: 140 s of the 150 in the model (3 of them before the first words), 40 ms of tools, 4 s of waiting.
         assert!(said.contains("wall 150.0 s") && said.contains("model 140.0 s (93%): prefill to the first word 3.0 s, generation 137.0 s"), "{said}");
-        assert!(said.contains("create_file 1 x 0.0 s") && said.contains("waiting for the person 4.0 s"), "{said}");
+        assert!(said.contains("create_file (calls: 1, total: 0.0 s)") && said.contains("waiting for the person 4.0 s"), "{said}");
         // Each request, with its cached share.
         assert!(said.contains("   /1 main") && said.contains("stopped_app:draft_stop") && said.contains("cached  36%"), "{said}");
         assert!(said.contains("index.html"), "{said}");
@@ -880,7 +880,7 @@ mod tests {
         let all = said.total();
         assert_eq!((all.prefill_ms, all.tools_ms), (3000, 40));
         // The printed report is of the same trajectory, and says the same of it.
-        assert!(report(&text(&lines), None).contains("tools 0.0 s (0%): create_file 1 x 0.0 s"));
+        assert!(report(&text(&lines), None).contains("tools 0.0 s (0%): create_file (calls: 1, total: 0.0 s)"));
     }
 
     #[test]
@@ -914,7 +914,7 @@ mod tests {
         assert_eq!(details.turns[0].tools.len(), 6);
         assert_eq!(details.turns[0].tools_ms, 2100);
         let said = report(&input, None);
-        assert!(said.contains("tools 2.1 s") && said.contains("read_file 6 x 2.7 s"), "{said}");
+        assert!(said.contains("tools 2.1 s") && said.contains("read_file (calls: 6, total: 2.7 s)"), "{said}");
     }
 
     #[test]
@@ -932,7 +932,7 @@ mod tests {
         assert_eq!(details.turns[0].tools[0].ms, 800);
         assert_eq!(details.total().tools_ms, 1500);
         let said = report(&input, None);
-        assert!(said.contains("tools 1.5 s") && said.contains("read_file 3 x 1.3 s"), "{said}");
+        assert!(said.contains("tools 1.5 s") && said.contains("read_file (calls: 3, total: 1.3 s)"), "{said}");
     }
 
     #[test]
