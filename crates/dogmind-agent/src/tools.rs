@@ -116,7 +116,7 @@ pub(crate) fn redeclare_run_code(schemas: &mut Value) {
 pub fn schemas() -> Value {
     let function = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"type": "function", "function": {"name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required}}});
     json!([
-        function("apply_patch", "Edit existing files by exact text replacement. All edits land together or none do. Read a file before editing it. old_string must occur exactly once (or `count` times) and has no line numbers. After a failure the file is unchanged, so correct old_string instead of reading again.", json!({
+        function("apply_patch", "Replace exact text in existing files. Set path inside each edit to the file containing its old_string. All edits land together or none do. Read the target if you need its exact text. old_string must match once (or `count` times), without line numbers.", json!({
             "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "count": {"type": "integer", "minimum": 0}}, "required": ["path", "old_string", "new_string"]}}
         }), &["edits"]),
         function("create_file", CREATE_FILE_IN_PARTS, json!({
@@ -1709,7 +1709,7 @@ fn walker_matching(root: &Path, deep: bool, glob: Option<ignore::overrides::Over
 /// Match locations refer to the working text for this edit, including earlier edits in the same patch.
 fn patch_count_hint(text: &str, old: &str, found: usize, expected: usize) -> String {
     if found == 0 {
-        return format!("Read the exact text; do not include line numbers{}", nearest_line(text, old));
+        return format!("Check this edit's path. If the file is correct, use its exact text without line numbers{}", nearest_line(text, old));
     }
     let mut lines = Vec::new();
     let (mut previous, mut line) = (0, 1);
