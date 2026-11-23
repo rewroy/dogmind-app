@@ -2595,7 +2595,7 @@ struct App {
     code_comment: bool,
     table: Vec<String>,
     bold: bool,
-    inline_code: bool,
+    inline_ticks: usize,
     thinking: String,
     activity: String,
     /// When the work the activity line tells of began: what it shows, with a turning ring, so that waiting is seen to be waiting.
@@ -4017,7 +4017,7 @@ impl App {
                 self.bold = false;
                 self.italic = false;
                 self.struck = false;
-                self.inline_code = false;
+                self.inline_ticks = 0;
                 self.heading = 0;
                 self.inline_before = None;
                 if std::mem::take(&mut self.quote) {
@@ -4027,12 +4027,26 @@ impl App {
                 return;
             }
             if c == '`' {
-                self.flush_run(&mut run);
-                self.inline_code = !self.inline_code;
+                let mut length = 1;
+                while chars.next_if(|(_, next)| *next == '`').is_some() {
+                    length += 1;
+                }
+                if chars.peek().is_none() {
+                    // More ticks in the next chunk may change this run's meaning.
+                    self.flush_run(&mut run);
+                    self.pending_text = text[at..].to_string();
+                    return;
+                }
+                if self.inline_ticks == 0 || self.inline_ticks == length {
+                    self.flush_run(&mut run);
+                    self.inline_ticks = if self.inline_ticks == 0 { length } else { 0 };
+                } else {
+                    run.push_str(&text[at..at + length]);
+                }
                 self.inline_before = Some(c);
                 continue;
             }
-            if !self.inline_code {
+            if self.inline_ticks == 0 {
                 let next = chars.peek().map(|(_, next)| *next);
                 let rest = &text[at..];
                 // What may mean more than it says, and has its meaning in what has not come.
@@ -4136,7 +4150,7 @@ impl App {
             1 => Style::Title,
             2 => Style::Heading,
             3..=6 => Style::Subheading,
-            _ if self.inline_code => Style::InlineCode,
+            _ if self.inline_ticks > 0 => Style::InlineCode,
             _ if self.bold => Style::Strong,
             _ if self.italic => Style::Emphasis,
             _ if self.struck => Style::Struck,
@@ -4171,6 +4185,10 @@ impl App {
             self.block_edge("");
             self.open_block = None;
             self.line_start = true;
+        } else if self.inline_ticks > 0 && !rest.is_empty() && rest.bytes().all(|byte| byte == b'`') {
+            if rest.len() != self.inline_ticks {
+                self.append(&rest, Style::InlineCode);
+            }
         } else if markdown::is_rule(rest.trim()) {
             self.rule_row();
         } else if let markdown::BareUrl::Whole(length) = markdown::bare_url(&format!("{rest} ")) {
@@ -4189,7 +4207,7 @@ impl App {
         self.italic = false;
         self.struck = false;
         self.quote = false;
-        self.inline_code = false;
+        self.inline_ticks = 0;
         self.heading = 0;
     }
 
@@ -18461,7 +18479,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             code_comment: false,
             table: Vec::new(),
             bold: false,
-            inline_code: false,
+            inline_ticks: 0,
             thinking: String::new(),
             activity: String::new(),
             activity_since: None,
