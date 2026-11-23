@@ -1265,17 +1265,23 @@ impl Workbench {
             let as_written = (old.to_string(), new.to_string());
             // (a new_string written with CRLF already keeps them, not one CR more)
             let with_crlf = (old.contains('\n') && !old.contains("\r\n") && text.contains("\r\n")).then(|| (old.replace('\n', "\r\n"), new.replace("\r\n", "\n").replace('\n', "\r\n")));
-            let (old, new) = match with_crlf {
-                Some(crlf) if text.matches(as_written.0.as_str()).count() != count => crlf,
-                _ => as_written,
+            let written_count = text.matches(&as_written.0).count();
+            let (old, new, found) = match with_crlf {
+                Some((old, new)) if written_count != count => {
+                    let found = text.matches(&old).count();
+                    if found == count || written_count == 0 {
+                        (old, new, found)
+                    } else {
+                        (as_written.0, as_written.1, written_count)
+                    }
+                }
+                _ => (as_written.0, as_written.1, written_count),
             };
-            let found = text.matches(&old).count();
             if found != count {
-                // What it took to find the place is what a retry needs: the same line, spaced differently, is the usual cause.
-                let hint = if found == 0 { nearest_line(text, &old) } else { String::new() };
                 // (edit 1 is the first: a model takes it either way, and goes looking in the wrong one)
                 let start: String = old.trim().chars().take(40).collect();
-                return Err(format!("edit {} of {} (`{start}`): old_string occurs {found} times in {given}, not {count}: nothing was changed. Read the exact text; do not include line numbers{hint}", number + 1, edits.len()));
+                let hint = patch_count_hint(text, &old, found, count);
+                return Err(format!("edit {} of {} (`{start}`): old_string occurs {found} times in {given}, not {count}: nothing was changed. {hint}", number + 1, edits.len()));
             }
             let changed = replace_with_the_line_end_there(text, &old, &new);
             if changed.is_empty() && !edit.get("allow_empty_file").and_then(Value::as_bool).unwrap_or(false) {
@@ -1670,6 +1676,25 @@ fn walker_matching(root: &Path, deep: bool, glob: Option<ignore::overrides::Over
             && !glob.as_ref().is_some_and(|glob| glob.matched(entry.path(), entry.file_type().is_some_and(|kind| kind.is_dir())).is_ignore())
     });
     walk
+}
+
+/// Match locations refer to the working text for this edit, including earlier edits in the same patch.
+fn patch_count_hint(text: &str, old: &str, found: usize, expected: usize) -> String {
+    if found == 0 {
+        return format!("Read the exact text; do not include line numbers{}", nearest_line(text, old));
+    }
+    let mut lines = Vec::new();
+    let (mut previous, mut line) = (0, 1);
+    for (offset, _) in text.match_indices(old).take(5) {
+        line += text.as_bytes()[previous..offset].iter().filter(|&&b| b == b'\n').count();
+        lines.push(line.to_string());
+        previous = offset;
+    }
+    if found > lines.len() {
+        lines.push("...".to_string());
+    }
+    let advice = if found > expected { "Include surrounding text to identify the intended matches." } else { "Check the requested count and the text of the missing matches." };
+    format!("Match start lines at this edit: {}. {advice}", lines.join(", "))
 }
 
 /// Where the first line of an edit that did not match is, if its words are there with other spacing.
@@ -4950,13 +4975,39 @@ mod tests {
     }
 
     #[test]
+    fn an_ambiguous_patch_shows_bounded_match_locations_after_prior_edits() {
+        let (dir, mut bench, cancel) = bench();
+        let file = dir.path().join("a.txt");
+        let before = "導入\r\n猫 猫\n猫\n猫\n猫\n猫\n";
+        std::fs::write(&file, before).unwrap();
+        let patch = json!({"edits":[
+            {"path":"a.txt", "old_string":"導入", "new_string":"導入\n詳細"},
+            {"path":"a.txt", "old_string":"猫", "new_string":"犬"}
+        ]});
+        let error = bench.run("apply_patch", &patch, dir.path(), &cancel).unwrap_err();
+        assert!(error.contains("occurs 6 times") && error.contains("lines at this edit: 3, 3, 4, 5, 6, ..."), "{error}");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), before);
+    }
+
+    #[test]
+    fn a_line_ending_fallback_does_not_hide_matches_in_a_mixed_file() {
+        let (dir, mut bench, cancel) = bench();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "header\r\nx\ny\nx\ny\n").unwrap();
+        let patch = json!({"edits":[{"path":"a.txt","old_string":"x\ny","new_string":"z"}]});
+        let error = bench.run("apply_patch", &patch, dir.path(), &cancel).unwrap_err();
+        assert!(error.contains("occurs 2 times") && error.contains("lines at this edit: 2, 4"), "{error}");
+    }
+
+    #[test]
     fn a_patch_written_with_lf_fits_a_crlf_file_and_counts_its_matches() {
         let (dir, mut bench, cancel) = bench();
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "x\r\ny\r\nx\r\ny\r\n").unwrap();
         bench.run("read_file", &json!({"path": "a.txt"}), dir.path(), &cancel).unwrap();
         let once = json!({"edits": [{"path": "a.txt", "old_string": "x\ny", "new_string": "z\nw"}], "expected_files": ["a.txt"]});
-        assert!(bench.run("apply_patch", &once, dir.path(), &cancel).unwrap_err().contains("occurs 2 times"));
+        let error = bench.run("apply_patch", &once, dir.path(), &cancel).unwrap_err();
+        assert!(error.contains("occurs 2 times") && error.contains("lines at this edit: 1, 3"), "{error}");
         let twice = json!({"edits": [{"path": "a.txt", "old_string": "x\ny", "new_string": "z\nw", "count": 2}], "expected_files": ["a.txt"]});
         bench.run("apply_patch", &twice, dir.path(), &cancel).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "z\r\nw\r\nz\r\nw\r\n");
