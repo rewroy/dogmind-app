@@ -8169,8 +8169,9 @@ Body").unwrap();
         let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("big.txt"), format!("{}\n", "y".repeat(100)).repeat(2000)).unwrap();
         let (run, provider) = scripted(dir.path(), vec![calls(&[("read_file", serde_json::json!({"path": "big.txt", "limit": 2000}))]), says("done")], Mode::Default);
-        // A context that holds the prompt and not this file on top of it.
-        run.handle.commands.send(Command::Provider(provider.clone(), "model".into(), 7_600)).unwrap();
+        // A context that holds the prompt and not this file on top of it (some 50,000 tokens). At 7,600 it held the prompt until the answering rules of
+        // 633fe30 took it past what that leaves, and the turn was said to be too long before anything was sent.
+        run.handle.commands.send(Command::Provider(provider.clone(), "model".into(), 8_000)).unwrap();
         run.handle.commands.send(Command::Send("read it".into())).unwrap();
         let (failed, _) = turn_said(&run);
         assert!(failed.is_empty(), "{failed:?}");
