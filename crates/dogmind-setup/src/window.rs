@@ -259,7 +259,7 @@ fn words(japanese: bool, english: &str, in_japanese: &str) -> String {
 
 /// What the page of a failure says and offers. An update that fails is of an app that is not running, and the page lets its person start it as it was; but a placing that could not put every
 /// file back leaves the folder part of one version and part of the other (`Failure::NotPutBack`), and nothing on its page starts the program: only the update again, which finishes it, or a way out.
-fn failed_view(failure: &Failure, updating: bool, japanese: bool) -> View {
+fn failed_view(failure: &Failure, updating: bool, japanese: bool, relaunch: bool) -> View {
     let w = |english: &str, in_japanese: &str| words(japanese, english, in_japanese);
     if let Failure::NotPutBack(names) = failure {
         let detail = if japanese {
@@ -287,9 +287,13 @@ fn failed_view(failure: &Failure, updating: bool, japanese: bool) -> View {
     if updating {
         return View {
             heading: w("The update did not finish", "更新を完了できませんでした"),
-            detail: format!("{why} {}", w("Start Dogmind as it is, or try the update again.", "Dogmind をそのまま起動するか、もう一度更新を試してください。")),
+            detail: if relaunch {
+                format!("{why} {}", w("Start Dogmind as it is, or try the update again.", "Dogmind をそのまま起動するか、もう一度更新を試してください。"))
+            } else {
+                why
+            },
             primary: Some(w("Try again", "もう一度試す")),
-            secondary: Some(w("Start Dogmind", "Dogmind を起動")),
+            secondary: Some(if relaunch { w("Start Dogmind", "Dogmind を起動") } else { w("Close", "閉じる") }),
             problem: true,
             ..View::default()
         };
@@ -406,7 +410,7 @@ impl App {
                     ..View::default()
                 }
             }
-            Page::Failed { failure } => failed_view(failure, self.updating, self.japanese),
+            Page::Failed { failure } => failed_view(failure, self.updating, self.japanese, !self.options.skip_update_relaunch),
             Page::Installed { update } => View {
                 heading: if *update { self.w("Dogmind is updated", "Dogmind を更新しました") } else { self.w("Dogmind is ready", "Dogmind の準備ができました") },
                 detail: self.w("You can start it from the Start menu. To remove it: Settings > Apps > Installed apps, or Settings > General in the app.", "スタート メニューから起動できます。削除するには: Windows の設定 > アプリ > インストールされているアプリ、またはアプリの 設定 > 一般。"),
@@ -746,8 +750,7 @@ impl App {
         });
     }
 
-    /// Complete an update with its original exit code. A normal update or a test with a named stand-in
-    /// restarts that program. An unattended package check has no app to restart.
+    /// Complete an update with its original exit code and the requested relaunch behavior.
     unsafe fn finish_update(&mut self, code: i32) -> bool {
         if !self.options.skip_update_relaunch && system::start_program(&self.folder().join(&self.options.app_name), "", self.options.test).is_err() {
             return false;
@@ -1154,7 +1157,7 @@ mod tests {
         for japanese in [false, true] {
             let start = if japanese { "起動" } else { "Start" };
             for updating in [true, false] {
-                let view = failed_view(&not_put_back(&["b.dll"]), updating, japanese);
+                let view = failed_view(&not_put_back(&["b.dll"]), updating, japanese, true);
                 let page = all_of(&view);
                 assert!(!page.contains(start) && !page.contains("as it is") && !page.contains("そのまま"), "nothing on it starts the program (updating {updating}, japanese {japanese}): {page}");
                 assert!(view.problem && page.contains("b.dll"), "{page}");
@@ -1169,15 +1172,15 @@ mod tests {
             }
         }
         // the words of the page are the one line, and it says that the folder is not as it was
-        let update = failed_view(&not_put_back(&["b.dll"]), true, false);
+        let update = failed_view(&not_put_back(&["b.dll"]), true, false, true);
         assert_eq!(update.heading, "The update did not finish");
         assert_eq!(update.detail, "This did not finish: b.dll could not be put back as it was, so the folder is not as it was. Running the setup again finishes it.");
-        let plain = failed_view(&not_put_back(&["b.dll"]), false, false);
+        let plain = failed_view(&not_put_back(&["b.dll"]), false, false, true);
         assert_eq!((plain.heading.as_str(), plain.detail.as_str()), ("It did not finish", update.detail.as_str()));
         // three files are named and the rest counted, in both languages
         let many = not_put_back(&["a", "b", "c", "d", "e"]);
-        assert!(failed_view(&many, true, false).detail.contains("a, b, c and 2 more could not be put back as they were"));
-        let japanese = failed_view(&many, true, true).detail;
+        assert!(failed_view(&many, true, false, true).detail.contains("a, b, c and 2 more could not be put back as they were"));
+        let japanese = failed_view(&many, true, true, true).detail;
         assert!(japanese.contains("a、b、c ほか 2 件 を元に戻せなかったため") && japanese.contains("フォルダーは元の状態ではありません"), "{japanese}");
     }
 
@@ -1185,12 +1188,15 @@ mod tests {
     fn the_page_of_any_other_failure_of_an_update_still_offers_to_start_the_app_as_it_was() {
         // (so that the test above is of something: this is what the page of an update offers when the folder is as it was)
         for failure in [Failure::Said("a failure".to_string()), Failure::InUse("b.dll".to_string()), Failure::TooLittleRoom { needed: 2_000_000_000, free: 1_000_000_000 }] {
-            let view = failed_view(&failure, true, false);
+            let view = failed_view(&failure, true, false, true);
+            let closed = failed_view(&failure, true, false, false);
+            assert_eq!(closed.secondary.as_deref(), Some("Close"));
+            assert!(!closed.detail.contains("Start Dogmind"));
             assert_eq!(view.secondary.as_deref(), Some("Start Dogmind"), "{failure:?}");
             assert!(view.detail.ends_with("Start Dogmind as it is, or try the update again."), "{failure:?}");
             assert_eq!(view.primary.as_deref(), Some("Try again"));
             // and the page of a setup run by hand has not changed either
-            let plain = failed_view(&failure, false, false);
+            let plain = failed_view(&failure, false, false, true);
             assert_eq!((plain.primary.as_deref(), plain.secondary.as_deref()), (Some("Try again"), Some("Close")));
         }
     }

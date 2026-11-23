@@ -257,6 +257,28 @@ fn an_unattended_test_update_does_not_start_the_default_app() {
 }
 
 #[test]
+fn no_launch_leaves_a_closed_app_closed_after_an_update() {
+    let scene = Scene::new();
+    let folder = scene.installed("1.0.0");
+    let update = pack(scene.path(), "2.0.0");
+    for (setting, code, version) in [
+        (Some(("DOGMIND_SETUP_PRESS", "cancel-at-once")), 2, "1.0.0"),
+        (Some(("DOGMIND_SETUP_FAIL_AFTER", "0")), 1, "1.0.0"),
+        (None, 0, "2.0.0"),
+    ] {
+        let mut command = setup(&update);
+        if let Some((name, value)) = setting {
+            command.env(name, value);
+        }
+        let status = command.args(["--update", "--test", "--auto", "--no-launch", "--dir"]).arg(&folder).status().unwrap();
+        assert_eq!(status.code(), Some(code));
+        assert_eq!(manifest_version(&folder), version);
+        assert_eq!(version_of(&folder), version);
+        assert!(running_from(&folder).is_empty(), "--no-launch started the test app on exit {code}");
+    }
+}
+
+#[test]
 fn an_update_waits_for_the_app_replaces_its_files_and_starts_it_again() {
     let scene = Scene::new();
     let folder = scene.installed("1.0.0");

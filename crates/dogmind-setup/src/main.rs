@@ -8,6 +8,7 @@
 //!     DogmindSetup.exe --update --dir FOLDER [--wait-pid PID]...         what the app runs for an update it has downloaded: no question is asked. It waits for those
 //!                                                                        programs to end, updates the install in FOLDER (which must hold one), and starts the app again. If it
 //!                                                                        does not finish (it is cancelled or closed, or fails), the app is started as it is in FOLDER all the same
+//!     DogmindSetup.exe --update --dir FOLDER --no-launch                 updates a closed app and leaves it closed, including when the update does not finish
 //!     dogmind-uninstall.exe --uninstall                                  what Installed apps runs: clears the way, and opens the app's own page for removing it
 //!
 //! `--test` is for trying it out: no real Start menu entry or registry key is written, what would be goes in files in the folder, `--dir` must be named, and only what runs from that
@@ -82,6 +83,7 @@ struct Arguments {
     finish_removal: bool,
     /// The app runs this for an update it has fetched: the install in `dir` is updated without a first page, and the app is started again after it.
     update: bool,
+    no_launch: bool,
     wait_pids: Vec<u32>,
 }
 
@@ -106,6 +108,7 @@ fn parse(mut words: impl Iterator<Item = std::ffi::OsString>) -> Result<Argument
             "--after-remove" => found.after_remove = true,
             "--finish-removal" => found.finish_removal = true,
             "--update" => found.update = true,
+            "--no-launch" => found.no_launch = true,
             other => return Err(format!("{other}: not something this understands")),
         }
     }
@@ -114,6 +117,9 @@ fn parse(mut words: impl Iterator<Item = std::ffi::OsString>) -> Result<Argument
 
 /// The test switch's checks: it cannot fall back on the real folder, or on another program's registry.
 fn check(found: &Arguments) -> Result<(), String> {
+    if found.no_launch && !found.update {
+        return Err("--no-launch needs --update".to_string());
+    }
     if found.test && found.dir.is_none() && !found.after_remove && !found.uninstall {
         return Err("--test needs --dir: it must not go in the real folder".to_string());
     }
@@ -125,7 +131,7 @@ fn check(found: &Arguments) -> Result<(), String> {
             return Err("--update needs --dir: the folder of the install to update".to_string());
         }
         if found.pack.is_some() || found.verify.is_some() || found.uninstall || found.after_remove || found.finish_removal {
-            return Err("--update goes with --dir, --wait-pid, --test and --auto, and with nothing else".to_string());
+            return Err("--update goes with --dir, --wait-pid, --no-launch, --test and --auto, and with nothing else".to_string());
         }
     }
     Ok(())
@@ -292,7 +298,7 @@ fn main() {
         update: found.update,
         auto: found.auto,
         wait_pids: found.wait_pids.clone(),
-        skip_update_relaunch: test && found.auto && test_app.is_none(),
+        skip_update_relaunch: found.no_launch || (test && found.auto && test_app.is_none()),
         app_name: test_app.unwrap_or_else(|| "dogmind-app.exe".to_string()),
         fail_after: number_from("DOGMIND_SETUP_FAIL_AFTER", test).map(|count| count as usize),
         slowly: Duration::from_millis(number_from("DOGMIND_SETUP_SLOW_MS", test).unwrap_or(0)),
@@ -364,6 +370,9 @@ mod tests {
 
     #[test]
     fn an_update_names_its_folder_and_is_for_nothing_else() {
+        let closed = args(&["--no-launch", "--update", "--dir", "x"]).unwrap();
+        assert!(closed.no_launch && check(&closed).is_ok());
+        assert!(check(&args(&["--no-launch", "--dir", "x"]).unwrap()).unwrap_err().contains("--update"));
         assert!(args(&["--update"]).unwrap().update);
         assert!(check(&args(&["--update"]).unwrap()).unwrap_err().contains("--dir"), "an update with no folder has nothing to update");
         assert!(check(&args(&["--update", "--wait-pid", "5"]).unwrap()).is_err());
