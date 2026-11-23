@@ -196,7 +196,7 @@ fn calibrate_the_draft_stop() {
 /// The sizes of a draft the stop could be set at, below and at `DRAFT_LINES`.
 const STOP_AT: [usize; 7] = [20, 30, 40, 50, 60, 80, 100];
 
-/// Where, in characters of the reasoning, its run of code of its own first reached each of [`STOP_AT`]: the point a stop at that size would have
+/// Byte offsets where the run of code first reached each of [`STOP_AT`]: the point a stop at that size would have
 /// fired, fed as it streams, a line at a time. None where it never did.
 fn reached(shown: BTreeSet<String>, reasoning: &str) -> [Option<usize>; 7] {
     let mut watch = DraftWatch::new(shown, DRAFT_LINES);
@@ -212,6 +212,19 @@ fn reached(shown: BTreeSet<String>, reasoning: &str) -> [Option<usize>; 7] {
         }
     }
     at
+}
+
+/// The watch slices UTF-8 at byte boundaries. The tables report positions in characters.
+fn character_cell(reasoning: &str, byte: Option<usize>) -> String {
+    byte.map_or_else(|| "-".to_string(), |end| reasoning[..end].chars().count().to_string())
+}
+
+#[test]
+fn calibration_positions_count_multibyte_characters() {
+    let text = "あ🦊b";
+    assert_eq!(character_cell(text, Some("あ🦊".len())), "2");
+    assert_eq!(character_cell(text, Some(0)), "0");
+    assert_eq!(character_cell(text, None), "-");
 }
 
 #[test]
@@ -245,8 +258,9 @@ fn calibrate_where_a_draft_reaches_each_size() {
                 let mut whole = DraftWatch::new(shown.clone(), DRAFT_LINES);
                 whole.is_a_draft(&format!("{reasoning}\n"));
                 let at_sizes = reached(shown, reasoning);
-                let cell = |value: Option<usize>| value.map_or("-".to_string(), |chars| chars.to_string());
-                println!("{name}\t{at}\t{}\t{}\t{}\t{}\t{}\t{}", reasoning.len(), whole.stats(), u8::from(true_draft), u8::from(watched), whole.began_at(), at_sizes.map(cell).join("\t"));
+                let began = character_cell(reasoning, Some(whole.began_at()));
+                let sizes = at_sizes.map(|byte| character_cell(reasoning, byte)).join("\t");
+                println!("{name}\t{at}\t{}\t{}\t{}\t{}\t{began}\t{sizes}", reasoning.chars().count(), whole.stats(), u8::from(true_draft), u8::from(watched));
             }
         }
     }
@@ -318,8 +332,7 @@ fn calibrate_the_line_after_a_stop() {
                     seen += 1;
                     lower[kind] += usize::from(at_lower.is_some());
                     long[kind] += usize::from(at_long.is_some());
-                    let cell = |value: Option<usize>| value.map_or("-".to_string(), |chars| chars.to_string());
-                    println!("{name}\t{at}\t{}\t{}\t{}\t{}\t{}", reasoning.len(), ["stopped", "true draft", "other"][kind], u8::from(wrote_since), cell(at_lower), cell(at_long));
+                    println!("{name}\t{at}\t{}\t{}\t{}\t{}\t{}", reasoning.chars().count(), ["stopped", "true draft", "other"][kind], u8::from(wrote_since), character_cell(reasoning, at_lower), character_cell(reasoning, at_long));
                 }
                 if !wrote.trim().is_empty() {
                     wrote_since = true;
