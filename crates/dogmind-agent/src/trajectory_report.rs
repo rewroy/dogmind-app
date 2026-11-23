@@ -399,6 +399,8 @@ struct Spent {
     generation: u64,
     helpers: u64,
     tools: BTreeMap<String, (u64, u64)>,
+    // Time also present in a recorded parent call, retained in the per-tool breakdown.
+    nested_ms: u64,
     waits: u64,
     compaction: u64,
     retries: u64,
@@ -415,6 +417,9 @@ impl Spent {
             _ => 0,
         });
         spent.unfinished = lines.iter().any(|line| line.ev() == "turn_start") && ended.is_none();
+        // Children finish first. Match their parent within this request, even if its row comes later.
+        let tool_ids: std::collections::HashSet<_> = lines.iter().filter(|line| line.ev() == "tool")
+            .filter_map(|line| Some((line.req(), line.v["id"].as_str()?))).collect();
         for line in lines {
             match line.ev() {
                 "request" => {
@@ -432,7 +437,11 @@ impl Spent {
                 "tool" => {
                     let entry = spent.tools.entry(line.s("name").to_string()).or_default();
                     entry.0 += 1;
-                    entry.1 += line.u("ms").unwrap_or(0);
+                    let ms = line.u("ms").unwrap_or(0);
+                    entry.1 += ms;
+                    if line.v["parent"].as_str().is_some_and(|parent| tool_ids.contains(&(line.req(), parent))) {
+                        spent.nested_ms += ms;
+                    }
                 }
                 "approval" => spent.waits += line.u("wait_ms").unwrap_or(0),
                 "compaction" => spent.compaction += line.u("ms").unwrap_or(0),
@@ -444,6 +453,7 @@ impl Spent {
 
     fn add(&mut self, other: &Spent) {
         self.wall += other.wall;
+        self.nested_ms += other.nested_ms;
         self.prefill += other.prefill;
         self.generation += other.generation;
         self.helpers += other.helpers;
@@ -457,15 +467,20 @@ impl Spent {
         }
     }
 
+    fn tool_ms(&self) -> u64 {
+        self.tools.values().map(|(_, ms)| ms).sum::<u64>() - self.nested_ms
+    }
+
     fn print(&self, out: &mut String, indent: &str) {
-        let tools: u64 = self.tools.values().map(|(_, ms)| ms).sum();
+        let tools = self.tool_ms();
         let model = self.prefill + self.generation;
         let accounted = model + tools + self.waits + self.compaction + self.retries;
         let rest = self.wall.saturating_sub(accounted);
         let _ = writeln!(out, "{indent}wall {}{}", secs(self.wall), if self.unfinished { " (the run ended here: no turn_end)" } else { "" });
         let _ = writeln!(out, "{indent}model {} ({}): prefill to the first word {}, generation {}", secs(model), share(model, self.wall), secs(self.prefill), secs(self.generation));
         let by_name: Vec<String> = self.tools.iter().map(|(name, (calls, ms))| format!("{name} {calls} x {}", secs(*ms))).collect();
-        let _ = writeln!(out, "{indent}tools {} ({}){}{}", secs(tools), share(tools, self.wall), if by_name.is_empty() { String::new() } else { format!(": {}", by_name.join(", ")) }, if self.helpers > 0 { format!("; of which an explore helper's own requests {}", secs(self.helpers)) } else { String::new() });
+        let nested = if self.nested_ms > 0 { " (individual times include nested calls)" } else { "" };
+        let _ = writeln!(out, "{indent}tools {} ({}){}{nested}{}", secs(tools), share(tools, self.wall), if by_name.is_empty() { String::new() } else { format!(": {}", by_name.join(", ")) }, if self.helpers > 0 { format!("; of which an explore helper's own requests {}", secs(self.helpers)) } else { String::new() });
         let _ = writeln!(out, "{indent}waiting for the person {}, compaction {}, waiting to retry {}", secs(self.waits), secs(self.compaction), secs(self.retries));
         let _ = writeln!(out, "{indent}the rest {} ({}): the app's own work, and what is between one step and the next", secs(rest), share(rest, self.wall));
     }
@@ -672,7 +687,7 @@ pub fn summary(trajectory: &str) -> Summary {
             woken: began.is_some_and(|line| line.v["woken"] == true),
             prefill_ms: spent.prefill,
             generation_ms: spent.generation,
-            tools_ms: spent.tools.values().map(|(_, ms)| ms).sum(),
+            tools_ms: spent.tool_ms(),
             wall_ms: spent.wall,
             waits_ms: spent.waits,
             compaction_ms: spent.compaction,
@@ -856,6 +871,24 @@ mod tests {
         assert!(said.contains("\nfailures\n  turn 1 at /1: server_gone, the server said: Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory)\n  turn 1 at /1: unfinished\n"), "{said}");
         // A run that did not fail has no such section.
         assert!(!report(&text(&lines[..2]), None).contains("failures"));
+    }
+
+    #[test]
+    fn nested_tool_time_is_included_once_and_orphan_calls_still_count() {
+        let input = text(&[
+            json!({"ev":"tool", "turn":1, "req":"s/1", "id":"c.1", "parent":"c", "name":"read_file", "ms":800}),
+            json!({"ev":"tool", "turn":1, "req":"s/1", "id":"c", "name":"run_code", "ms":1000}),
+            // A different request reused the id. Its own parent never finished.
+            json!({"ev":"tool", "turn":1, "req":"s/2", "id":"c.1", "parent":"c", "name":"read_file", "ms":300}),
+            json!({"ev":"tool", "turn":2, "name":"read_file", "ms":200}),
+        ]);
+        let details = summary(&input);
+        assert_eq!(details.turns[0].tools_ms, 1300);
+        assert_eq!(details.turns[0].tools.len(), 3);
+        assert_eq!(details.turns[0].tools[0].ms, 800);
+        assert_eq!(details.total().tools_ms, 1500);
+        let said = report(&input, None);
+        assert!(said.contains("tools 1.5 s") && said.contains("read_file 3 x 1.3 s"), "{said}");
     }
 
     #[test]
