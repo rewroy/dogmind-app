@@ -19621,6 +19621,41 @@ mod tests {
     }
 
     #[test]
+    fn mcp_candidates_have_names_that_can_be_copied_into_a_named_import() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("dogmind/mcp.json");
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".claude.json"), r#"{"mcpServers":{
+            "":{"command":"blank"}, " Editor Tools":{"command":"padded"},
+            "Editor Tools":{"command":"editor"}, "split\nname":{"command":"split"}
+        }}"#).unwrap();
+        std::fs::write(home.path().join(".codex/config.toml"), r#"
+            [mcp_servers." "]
+            command="blank"
+            [mcp_servers."Clock "]
+            command="padded"
+            [mcp_servers.Clock]
+            command="clock"
+        "#).unwrap();
+
+        let run = |args| mcp_import(home.path(), None, &file, args);
+        let (_, list) = run("candidates").unwrap();
+        assert!(!file.exists());
+        assert!(list.contains(".claude.json") && list.contains(".codex/config.toml"), "{list}");
+        assert!(list.lines().any(|line| line == "Editor Tools") && list.lines().any(|line| line == "Clock"), "{list}");
+        assert!(!list.lines().any(|line| line.trim().is_empty() || line != line.trim() || line == "split" || line == "name"), "{list}");
+
+        assert_eq!(run("import Editor Tools").unwrap().0, 1);
+        let selected = dogmind_agent::mcp::readable_config(&file).unwrap().servers;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected["Editor Tools"].command, "editor");
+        assert_eq!(run("import").unwrap().0, 1);
+        let all = dogmind_agent::mcp::readable_config(&file).unwrap().servers;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["Clock"].command, "clock");
+    }
+
+    #[test]
     fn mcp_import_lists_names_and_only_adds_the_server_chosen() {
         use dogmind_agent::mcp;
         let home = tempfile::tempdir().unwrap();

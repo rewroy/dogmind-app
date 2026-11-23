@@ -44,6 +44,7 @@ deletes it.
 To connect an MCP server already set up in Claude or Codex, type `/mcp candidates` in the conversation.
 Copy a name from the list and type `/mcp import NAME` to start that server. For example, if the list shows
 `Project Files`, type `/mcp import Project Files`. To add all available servers at once, use `/mcp import`.
+If an expected name is missing, check its spelling in the source settings. Import skips empty names, names with leading or trailing whitespace, and names containing line breaks.
 Use `/mcp` to check the connection. If a configured server disconnected or failed to start, fix the cause and run `/mcp import NAME` to retry it. Once connected, its tools are available in the open conversation.
 To add a server manually, open *Settings > Tools > MCP servers > Add a server*.
 For a local server that opens scripts or data by a relative path, enter its folder in *Working directory (optional)*. You can also edit this field on an existing server.

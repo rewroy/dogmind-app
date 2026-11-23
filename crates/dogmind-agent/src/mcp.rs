@@ -118,6 +118,12 @@ struct ParsedServers {
 
 impl ParsedServers {
     fn add(&mut self, name: String, config: ServerConfig) {
+        // The preview lists one name per line, and the import command trims its argument.
+        // Keep each external identifier exact so a padded entry cannot select a different server.
+        if name.is_empty() || name.trim() != name || name.contains(['\r', '\n']) {
+            self.skipped_invalid = true;
+            return;
+        }
         if config.problem().is_none() {
             self.servers.insert(name, config);
         } else if matches!(config.kind.as_str(), "" | "http" | "sse") {
