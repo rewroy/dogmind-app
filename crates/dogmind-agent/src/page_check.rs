@@ -1327,16 +1327,19 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
 /// A page of the workspace, by its path; or, by `url`, what a server on this machine gives, as one the model started in the background.
 pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let said = check(arguments, workspace, cancel)?;
-    let served = arguments.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty());
-    Ok(match served.and_then(|url| opened_from_its_file(url, workspace)) {
+    Ok(match served_url(arguments).and_then(|url| opened_from_its_file(url, workspace)) {
         Some(first) => format!("{first}{said}"),
         None => said,
     })
 }
 
+pub(crate) fn served_url(arguments: &Value) -> Option<&str> {
+    arguments.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty())
+}
+
 fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let steps = arguments.get("steps").and_then(Value::as_str).filter(|steps| !steps.trim().is_empty());
-    let served = arguments.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty());
+    let served = served_url(arguments);
     let plain = |path: &Path| path.display().to_string().trim_start_matches("\\\\?\\").to_string();
     let root = std::fs::canonicalize(workspace).map_err(|error| format!("{}: {error}", workspace.display()))?;
     let (page, name, mut needs) = match served {

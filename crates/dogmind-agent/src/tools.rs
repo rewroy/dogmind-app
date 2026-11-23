@@ -182,9 +182,9 @@ pub fn schemas() -> Value {
             "pattern": {"type": "string"},
             "path": {"type": "string"}
         }), &["pattern"]),
-        function("check_page", "Open a page in a headless browser: what its scripts printed and threw, what it shows, pictures. Open the page itself, never a copy changed for checking; steps click and type as a person would. Scripts, styles and fonts from well-known CDNs load, nothing else from the network: never download, vendor or build a library to check a page.", json!({
+        function("check_page", "Check a workspace page by path (required for steps, no server needed). Reports console output, errors, visible content and pictures. Test the original page, clicking and typing as a user would. Only scripts, styles and fonts from well-known CDNs load from the network. Never download, vendor or build a library to check a page.", json!({
             "path": {"type": "string"},
-            "url": {"type": "string", "description": "Instead of path: http://localhost:PORT/ of a server you started"},
+            "url": {"type": "string", "description": "Instead of path: http://localhost:PORT/ on a running server, without steps."},
             "views": {"type": "array", "items": {"type": "string"}, "description": "desktop (default), mobile, or WxH"},
             "wait_ms": {"type": "integer", "description": "At most 10000"},
             "steps": {"type": "string", "description": "JS run after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results. A reload (await reload()) starts the next part in the new load; variables do not carry over."}
@@ -3950,7 +3950,11 @@ pub fn command_exit_status(output: &str) -> Option<&str> {
 pub fn summary(tool: &str, arguments: &Value) -> String {
     let text = |name: &str| arguments.get(name).and_then(Value::as_str).unwrap_or("");
     match tool {
-        "read_file" | "list_files" | "create_file" | "check_page" => text("path").to_string(),
+        "read_file" | "list_files" | "create_file" => text("path").to_string(),
+        "check_page" => match crate::page_check::served_url(arguments) {
+            Some(url) => url.split(['?', '#']).next().unwrap_or(url).to_string(),
+            None => text("path").to_string(),
+        },
         "search_files" => format!("{} in {}", text("pattern"), arguments.get("path").and_then(Value::as_str).unwrap_or(".")),
         "execute_command" => text("command").lines().next().unwrap_or("").to_string(),
         "apply_patch" => {
@@ -5425,6 +5429,15 @@ mod tests {
         let edit = json!({"edits": [{"path": "c.txt", "old_string": "重ねた", "new_string": "透过"}]});
         let said = bench.run("apply_patch", &edit, dir.path(), &cancel).unwrap();
         assert!(said.contains("note: 透过 in this text is Chinese") || said.contains("note: 过 in this text is Chinese"), "{said}");
+    }
+
+    #[test]
+    fn a_page_check_summary_names_the_target_the_browser_uses() {
+        let url = "http://127.0.0.1:8765/index.html";
+        assert_eq!(summary("check_page", &json!({"url": url})), url);
+        assert_eq!(summary("check_page", &json!({"url": format!(" {url}?q=one#part "), "path": "other.html"})), url);
+        assert_eq!(summary("check_page", &json!({"url": "  ", "path": "index.html"})), "index.html");
+        assert_eq!(summary("check_page", &json!({"path": "index.html"})), "index.html");
     }
 
     #[test]
