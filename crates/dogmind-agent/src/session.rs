@@ -800,11 +800,32 @@ pub fn rename(path: &Path, title: &str) -> Result<(), String> {
 /// of the conversation, not of the files. A branch of an encrypted session is encrypted, under the same key, with an id of its own; one of a conversation with lines that did not open is
 /// refused, as it would leave them out without a word.
 pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf, String> {
-    // (as `open` reads it: a line a crash cut in the middle of a character is one line lost, not the whole session refused)
-    let Loaded { workspace, mut messages, damaged, .. } = load(path)?;
-    if !damaged.is_empty() {
-        return Err(format!("{}: {}", path.display(), damage_words(&damaged)));
+    fork_loaded(path, load_for_fork(path)?, through, title)
+}
+
+/// Fork at the selected answer in the same snapshot used to find it. A restored row knows its message number.
+/// A streamed row is identified by its displayed words and the number of earlier matching answers.
+pub fn fork_answer(path: &Path, words: &str, saved_index: Option<usize>, earlier_matches: usize, title: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let loaded = load_for_fork(path)?;
+    let words = words.trim();
+    let matches = |message: &Message| message.role == "assistant" && message.content.as_deref().is_some_and(|text| crate::agent::shown_answer(text).trim() == words);
+    let through = match saved_index {
+        Some(index) => loaded.messages.get(index).filter(|message| matches(message)).map(|_| index),
+        None => loaded.messages.iter().enumerate().filter(|(_, message)| matches(message)).nth(earlier_matches).map(|(index, _)| index),
+    };
+    through.map(|index| fork_loaded(path, loaded, index, title)).transpose()
+}
+
+fn load_for_fork(path: &Path) -> Result<Loaded, String> {
+    let loaded = load(path)?;
+    if !loaded.damaged.is_empty() {
+        return Err(format!("{}: {}", path.display(), damage_words(&loaded.damaged)));
     }
+    Ok(loaded)
+}
+
+fn fork_loaded(path: &Path, loaded: Loaded, through: usize, title: Option<&str>) -> Result<PathBuf, String> {
+    let Loaded { workspace, mut messages, .. } = loaded;
     if through >= messages.len() {
         return Err(format!("{}: it has {} messages, not {}", path.display(), messages.len(), through + 1));
     }
@@ -1016,6 +1037,23 @@ mod tests {
         let listed = list(dir.path());
         assert!(listed.iter().any(|summary| summary.path == branch && summary.title == "a title (branch)"), "{listed:?}");
         assert!(fork(&path, 9, None).is_err());
+    }
+
+    #[test]
+    fn a_branch_from_a_repeated_answer_keeps_the_selected_turn() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261103-1").unwrap();
+        for (role, text) in [("user", "first"), ("assistant", "Done"), ("user", "second"), ("assistant", " Done "), ("user", "later")] {
+            session.append(&Message::text(role, text)).unwrap();
+        }
+        for (saved_index, earlier_matches) in [(Some(3), 0), (None, 1)] {
+            let branch = fork_answer(&session.path, " Done ", saved_index, earlier_matches, None).unwrap().unwrap();
+            let messages = read(&branch).unwrap();
+            assert_eq!(messages.iter().map(|m| m.content.as_deref().unwrap()).collect::<Vec<_>>(), ["first", "Done", "second", " Done "]);
+        }
+        assert!(fork_answer(&session.path, "Done", Some(2), 0, None).unwrap().is_none());
+        assert!(fork_answer(&session.path, "unsaved", None, 0, None).unwrap().is_none());
+        assert!(fork_answer(&dir.path().join("absent.jsonl"), "Done", None, 0, None).is_err());
     }
 
     #[cfg(windows)]

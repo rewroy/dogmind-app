@@ -1846,8 +1846,8 @@ enum Shown {
     /// has room for. A width kept from when it was sent kept a card narrow for ever: one sent while the window was minimized, whose column was no width at all,
     /// stood one character to a line once the window was back.
     Person { text: String, pictures: Vec<(PathBuf, (i32, i32))> },
-    /// An answer's text, for its copy button, and when it was given, as its row says it (or nothing).
-    Answer(String, String),
+    /// An answer's text, time, and original message index when restored from a saved session.
+    Answer(String, String, Option<usize>),
     /// A line of code, coloured when it is drawn: `open` is whether a block comment runs into it.
     Code { line: String, language: String, open: bool },
     /// A Markdown table: its first row is the heading, and how each column lines up. Drawn afresh each time, as its colours and widths depend on the moment.
@@ -2090,8 +2090,8 @@ struct App {
     overlay_tip_for: Option<(OverlayKey, RECT)>,
     proxies: Vec<HWND>,
     proxy_keys: Vec<Option<OverlayKey>>,
-    /// Where each answer ends in the transcript, and its text.
-    answers: Vec<(i32, String)>,
+    /// Where each answer ends in the transcript, its text, and its index in the saved conversation when known.
+    answers: Vec<(i32, String, Option<usize>)>,
     /// Each card of what the person wrote, in order: its corners are drawn over.
     user_cards: Vec<UserCard>,
     /// The person's messages, in order, for the rail of turns.
@@ -3696,7 +3696,7 @@ impl App {
                     self.append_row(&rtf::Row { lines: &lines, face, points: *points, color: *color, back: *back, width, right: *right, column: self.text_twips, padding: *padding });
                 }
                 Shown::Person { text, pictures } => self.user_card(text, pictures),
-                Shown::Answer(text, at) => self.answer_row(text, at),
+                Shown::Answer(text, at, index) => self.answer_row(text, at, *index),
                 Shown::Table(rows, aligns) => self.table_rows(rows, aligns),
                 Shown::Code { line, language, open } => {
                     self.code_row(line, language, *open);
@@ -4194,10 +4194,10 @@ impl App {
 
     /// A run begins right under an answer: that was a remark on the way, and its copy row goes. What ends a turn keeps one.
     unsafe fn run_follows(&mut self, at: usize) {
-        if let Some(Shown::Answer(_, at)) = self.shown.last() {
+        if let Some(Shown::Answer(_, at, _)) = self.shown.last() {
             // (the row's tab and time, and its end)
             let length = if at.is_empty() { 1 } else { at.encode_utf16().count() as i32 + 2 };
-            if let Some((first, _)) = self.answers.pop() {
+            if let Some((first, _, _)) = self.answers.pop() {
                 self.shown.pop();
                 self.at_end(|edit| {
                     let row = CharRange { first, last: first + length };
@@ -4211,18 +4211,18 @@ impl App {
     }
 
     /// Below an answer, a row for its copy button, and when it was given (`at`, as it is to read: or nothing).
-    unsafe fn mark_answer(&mut self, text: &str, at: &str) {
+    unsafe fn mark_answer(&mut self, text: &str, at: &str, saved_index: Option<usize>) {
         self.end_line();
-        self.shown.push(Shown::Answer(text.to_string(), at.to_string()));
-        self.answer_row(text, at);
+        self.shown.push(Shown::Answer(text.to_string(), at.to_string(), saved_index));
+        self.answer_row(text, at, saved_index);
     }
 
-    unsafe fn answer_row(&mut self, text: &str, at: &str) {
+    unsafe fn answer_row(&mut self, text: &str, at: &str, saved_index: Option<usize>) {
         let mut end = CharRange { first: 0, last: 0 };
         self.at_end(|edit| {
             SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(end) as LPARAM);
         });
-        self.answers.push((end.first, text.to_string()));
+        self.answers.push((end.first, text.to_string(), saved_index));
         // (the answer has its own place in `shown`, which writes this row again)
         self.unkept = true;
         if !at.is_empty() {
@@ -4250,31 +4250,23 @@ impl App {
     /// A new session with the conversation through this answer, opened: to go on from there another way. The answer is found in the saved
     /// session by its words, and by how many answers before it have the same.
     unsafe fn fork_from_answer(&mut self, at: usize) {
-        if at >= self.answers.len() {
-            return;
-        }
-        let Some(path) = self.current_session.clone() else { return };
-        let words = self.answers[at].1.clone();
-        let same_before = self.answers[..at].iter().filter(|(_, other)| *other == words).count();
-        let messages = session::read(&path).unwrap_or_default();
-        let found = messages.iter().enumerate().filter(|(_, message)| message.role == "assistant" && message.content.as_deref().map(|text| dogmind_agent::agent::shown_answer(text).trim()) == Some(words.trim())).nth(same_before).map(|(place, _)| place);
-        let Some(through) = found else {
-            self.say(t("This answer is not in the saved session yet, so there is nothing to branch from. Try again once it is."));
-            return;
-        };
+        let Some((_, words, saved_index)) = self.answers.get(at) else { return };
+        let Some(path) = self.current_session.as_deref() else { return };
+        let same_before = self.answers[..at].iter().filter(|(_, other, _)| other.trim() == words.trim()).count();
         // (one with no name yet is named by its first message, as the original is)
         let title = (!self.session_title.trim().is_empty()).then(|| tf("{0} (branch)", &[&self.session_title.trim()]));
-        match session::fork(&path, through, title.as_deref()) {
-            Ok(branch) => {
+        match session::fork_answer(path, words, *saved_index, same_before, title.as_deref()) {
+            Ok(Some(branch)) => {
                 self.refresh_sessions();
                 self.open_session(branch);
             }
+            Ok(None) => self.say(t("This answer is not in the saved session yet, so there is nothing to branch from. Try again once it is.")),
             Err(error) => self.say(&tf("The branch could not be made: {0}", &[&error])),
         }
     }
 
     unsafe fn copy_answer(&mut self, at: usize) {
-        let Some((_, text)) = self.answers.get(at) else { return };
+        let Some((_, text, _)) = self.answers.get(at) else { return };
         let text = text.clone();
         self.copy_to_clipboard(&text);
         self.copied(OverlayKey::Copy(at));
@@ -4456,7 +4448,7 @@ impl App {
         if !self.answer.is_empty() {
             self.last_answer = std::mem::take(&mut self.answer);
             let answer = self.last_answer.clone();
-            self.mark_answer(&answer, &clock_now());
+            self.mark_answer(&answer, &clock_now(), None);
         }
     }
 
@@ -4621,7 +4613,7 @@ impl App {
         };
         moved(&mut selection.first);
         moved(&mut selection.last);
-        self.answers.iter_mut().for_each(|(place, _)| moved(place));
+        self.answers.iter_mut().for_each(|(place, _, _)| moved(place));
         self.user_cards.iter_mut().for_each(|card| moved(&mut card.start));
         self.rail_turns.iter_mut().for_each(|turn| moved(&mut turn.start));
         self.picture_blocks.iter_mut().for_each(|block| {
@@ -8794,7 +8786,7 @@ impl App {
     fn rail_tip(&self, at: usize) -> String {
         let Some(turn) = self.rail_turns.get(at) else { return String::new() };
         let end = self.rail_turns.get(at + 1).map_or(i32::MAX, |next| next.start);
-        let answer = self.answers.iter().rev().find(|(place, _)| *place > turn.start && *place < end).map(|(_, text)| rail_words(text, 120)).unwrap_or_default();
+        let answer = self.answers.iter().rev().find(|(place, _, _)| *place > turn.start && *place < end).map(|(_, text, _)| rail_words(text, 120)).unwrap_or_default();
         if answer.is_empty() { turn.prompt.clone() } else { format!("{}\n{answer}", turn.prompt) }
     }
 
@@ -13332,7 +13324,7 @@ impl App {
                         self.append_answer(&crate::mask::hide_keys(text));
                         self.finish_answer();
                         self.last_answer = text.to_string();
-                        self.mark_answer(text, &written_words(message));
+                        self.mark_answer(text, &written_words(message), Some(index));
                     }
                     for call in message.tool_calls.iter().flatten() {
                         // A question put to the person, a plan and a helper's look are cards of their own, with what came of them.
