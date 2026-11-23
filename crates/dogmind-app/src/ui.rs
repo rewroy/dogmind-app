@@ -7808,6 +7808,7 @@ impl App {
                 form.note(t("This cannot be undone. Files in the folder stay."), theme::muted());
                 form.y += s(ds::space::XS);
                 form.buttons(0, &[self.buttons[0], self.buttons[1]]);
+                form.note(&log, log_color);
             }
             Panel::ConfirmRemove => {
                 match &self.leaving {
@@ -14984,16 +14985,33 @@ impl App {
                 self.set_panel(Panel::Chat);
             }
             (Panel::ConfirmDelete, 0) => {
-                self.set_panel(Panel::Chat);
-                if let Some((path, _)) = self.delete_target.take() {
-                    let current = self.current_session.as_ref() == Some(&path);
-                    let _ = std::fs::remove_file(&path);
-                    let _ = dogmind_agent::checkpoint::remove_for(&path);
-                    if current {
-                        let workspace = self.workspace.clone();
-                        self.start_session(workspace);
+                if let Some((path, title)) = self.delete_target.take() {
+                    use dogmind_agent::checkpoint::{delete_session, DeleteError};
+                    let leftover = match delete_session(&path) {
+                        Err(DeleteError::Conversation(error)) => {
+                            self.delete_target = Some((path, title));
+                            self.problem_in_panel(&tf("The deletion could not be completed: {0}", &[&error]));
+                            return;
+                        }
+                        Err(DeleteError::RemainingFiles(error)) => Some(error),
+                        Ok(()) => None,
+                    };
+                    self.set_panel(Panel::Chat);
+                    if self.current_session.as_ref() == Some(&path) {
+                        self.start_session(self.workspace.clone());
                     }
                     self.refresh_sessions();
+                    if !self.side_query.is_empty() {
+                        self.search_now();
+                    }
+                    if let Some(error) = leftover {
+                        self.delete_target = Some((path, title));
+                        self.set_panel(Panel::ConfirmDelete);
+                        self.panel_title = t("Remove remaining session files").into();
+                        set_text(self.buttons[0], t("Try again"));
+                        set_text(self.buttons[1], t("Close"));
+                        self.problem_in_panel(&tf("The conversation was deleted. Some files remain: {0}", &[&error]));
+                    }
                 }
             }
             (Panel::Privacy, 0) => self.set_panel(if self.crypt.keystore.is_some() { Panel::CryptoPassphrase } else { Panel::CryptoOn }),

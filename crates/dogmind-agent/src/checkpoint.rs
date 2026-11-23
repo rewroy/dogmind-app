@@ -185,16 +185,34 @@ fn put_back(copy: &Path, path: &Path) -> std::io::Result<()> {
 
 /// With a session that is deleted.
 pub fn remove_for(session: &Path) -> Result<(), String> {
-    // (its pictures too: nothing else reads them)
-    let _ = std::fs::remove_dir_all(crate::images::folder_of(session));
-    let _ = std::fs::remove_dir_all(crate::baseline::folder_of(session));
-    crate::trajectory::remove_for(session);
-    crate::session::remove_helpers(session);
-    let folder = folder_of(session);
-    match std::fs::remove_dir_all(&folder) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {error}", folder.display())),
+    for folder in [crate::images::folder_of(session), crate::baseline::folder_of(session), folder_of(session)] {
+        removal_result(&folder, std::fs::remove_dir_all(&folder))?;
+    }
+    let trace = crate::trajectory::file_of(session);
+    removal_result(&trace, std::fs::remove_file(&trace))?;
+    for (_, helper) in crate::session::helpers_of(session) {
+        removal_result(&helper, std::fs::remove_file(&helper))?;
+    }
+    Ok(())
+}
+
+fn removal_result(path: &Path, result: std::io::Result<()>) -> Result<(), String> {
+    match result {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {error}", path.display())),
         _ => Ok(()),
     }
+}
+
+#[derive(Debug)]
+pub enum DeleteError {
+    Conversation(String),
+    RemainingFiles(String),
+}
+
+/// Delete the conversation first. If it is locked, all data needed to reopen or restore it stays in place.
+pub fn delete_session(session: &Path) -> Result<(), DeleteError> {
+    removal_result(session, std::fs::remove_file(session)).map_err(DeleteError::Conversation)?;
+    remove_for(session).map_err(DeleteError::RemainingFiles)
 }
 
 /// One more than the largest `N` of the `N.bin` copies in a folder: where the numbering goes on when the index that held it is not there to say.
@@ -578,6 +596,28 @@ mod tests {
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deleting_a_locked_conversation_preserves_its_data_and_cleanup_can_be_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let trace = crate::trajectory::file_of(&path);
+        std::fs::write(&path, "chat").unwrap();
+        std::fs::write(&trace, "trace").unwrap();
+        let lock = |p: &Path| std::fs::OpenOptions::new().read(true).share_mode(0).open(p).unwrap();
+        let held = lock(&path);
+        assert!(matches!(delete_session(&path), Err(DeleteError::Conversation(_))));
+        assert_eq!(std::fs::read_to_string(&trace).unwrap(), "trace");
+        drop(held);
+        let held = lock(&trace);
+        assert!(matches!(delete_session(&path), Err(DeleteError::RemainingFiles(_))));
+        assert!(!path.exists() && trace.exists());
+        drop(held);
+        delete_session(&path).unwrap();
+        assert!(!trace.exists());
     }
 
     /// A folder made a junction to somewhere else after its files were saved takes nothing a rewind would have put back, and loses
