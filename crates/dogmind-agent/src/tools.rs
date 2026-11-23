@@ -117,7 +117,7 @@ pub fn schemas() -> Value {
     let function = |name: &str, description: &str, properties: Value, required: &[&str]| json!({"type": "function", "function": {"name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required}}});
     json!([
         function("apply_patch", "Edit existing files by exact text replacement. All edits land together or none do. Read a file before editing it. old_string must occur exactly once (or `count` times) and has no line numbers. After a failure the file is unchanged, so correct old_string instead of reading again.", json!({
-            "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "count": {"type": "integer"}}, "required": ["path", "old_string", "new_string"]}}
+            "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "count": {"type": "integer", "minimum": 0}}, "required": ["path", "old_string", "new_string"]}}
         }), &["edits"]),
         function("create_file", CREATE_FILE_IN_PARTS, json!({
             "path": {"type": "string"},
@@ -1235,7 +1235,11 @@ impl Workbench {
             }
             let old = text_arg(edit, "old_string").map_err(|error| format!("edit {}: {error}", number + 1))?;
             let new = text_arg(edit, "new_string").map_err(|error| format!("edit {}: {error}", number + 1))?;
-            let count = edit.get("count").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let count = match edit.get("count") {
+                None => 1,
+                Some(value) => value.as_u64().and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| format!("edit {}: count must be a non-negative integer, for example 2: nothing was changed", number + 1))?,
+            };
             if old.is_empty() {
                 return Err(format!("edit {}: old_string is empty", number + 1));
             }
@@ -4997,6 +5001,25 @@ mod tests {
         bench.run("create_file", &write, dir.path(), &cancel).unwrap();
         bench.run("create_file", &json!({"path": "new.txt", "content": "made\n"}), dir.path(), &cancel).unwrap();
         assert_eq!((std::fs::read_to_string(&file).unwrap(), std::fs::read_to_string(dir.path().join("new.txt")).unwrap()), ("omega\n".to_string(), "made\n".to_string()));
+    }
+
+    #[test]
+    fn an_invalid_patch_count_leaves_every_file_unchanged() {
+        let (dir, mut bench, cancel) = bench();
+        let first = dir.path().join("a.txt");
+        let second = dir.path().join("b.txt");
+        std::fs::write(&first, b"first\r\n").unwrap();
+        std::fs::write(&second, b"second\n").unwrap();
+        for count in [json!("2"), json!(-1), json!(1.5), json!(null), json!(true)] {
+            let patch = json!({"edits": [
+                {"path": "a.txt", "old_string": "first", "new_string": "edited"},
+                {"path": "b.txt", "old_string": "second", "new_string": "changed", "count": count}
+            ]});
+            let why = bench.run("apply_patch", &patch, dir.path(), &cancel).unwrap_err();
+            assert!(why.contains("edit 2: count"), "{count}: {why}");
+            assert_eq!(std::fs::read(&first).unwrap(), b"first\r\n");
+            assert_eq!(std::fs::read(&second).unwrap(), b"second\n");
+        }
     }
 
     #[test]
