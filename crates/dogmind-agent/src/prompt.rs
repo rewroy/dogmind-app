@@ -311,9 +311,11 @@ pub fn scratch_files(files: &[String], goal: bool) -> String {
 /// After a page has passed check_page with no error, and has been changed and passed again and again, and the model has looked at its latest picture: to go through what was
 /// asked against that picture, and answer if nothing is missing. Two lottery turns went on so until their 25 minutes were up, with no answer written; and the owner: speed
 /// matters, and so does quality, so it is not told to stop, but to see whether all that was asked is there.
-pub fn polished(page: &str, checks: u32, goal: bool) -> String {
+pub fn polished(page: &str, checks: u32, goal: bool, pictures: bool) -> String {
     let close = if goal { ", closing the goal with finish_goal" } else { "" };
-    format!("{DRAFT_NOTE}{page} has passed check_page with no error {checks} more times since it first did, with changes between, and you have looked at its latest picture. Go through what the user asked for, one thing at a time, against that picture and the page. If each is there and right, stop changing it and answer now{close}; if one is missing or wrong, fix that one and check it again.")
+    // (a model that is shown no pictures has what the checks printed, and the page's code)
+    let (seen, against) = if pictures { (", and you have looked at its latest picture", "that picture and the page") } else { ("", "what the checks printed and the page's code") };
+    format!("{DRAFT_NOTE}{page} has passed check_page with no error {checks} more times since it first did, with changes between{seen}. Go through what the user asked for, one thing at a time, against {against}. If each is there and right, stop changing it and answer now{close}; if one is missing or wrong, fix that one and check it again.")
 }
 pub const CONTINUE_NUDGE: &str = "Your last answer was cut off by the output limit. Continue exactly where it stopped.";
 /// What the model is told when its connection broke while it was making calls: they were not made, and nothing says so otherwise.

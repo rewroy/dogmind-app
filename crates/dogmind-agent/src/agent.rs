@@ -1040,6 +1040,12 @@ struct Polish {
 /// How many more checks with no error, each after a change to the page, before the model is told the page works and to answer.
 const POLISHED_AFTER: u32 = 3;
 
+/// Whether the word about a page that keeps passing is due: enough checks with no error, each after a change, and the latest picture looked at, where the model can
+/// be shown one at all.
+fn polish_due(polish: &Polish, pictures: bool) -> bool {
+    polish.checks >= POLISHED_AFTER && (polish.looked || !pictures)
+}
+
 /// Whether what check_page said is of a page that ran with nothing wrong: none of what it says of an error, a script that did not run or load, a file missing, a page
 /// that does not run opened from its file, or a check that could not be made.
 fn page_ran_clean(said: &str) -> bool {
@@ -3339,13 +3345,16 @@ impl Agent {
                 }
                 unchecked = still_unchecked(unchecked, &[calls.as_slice(), nested.as_slice()].concat());
                 unchecked_code = unchecked_files(unchecked_code, &[calls.as_slice(), nested.as_slice()].concat());
-                // (only once it has looked at the page as it is now: what it is told is to go through what was asked against that picture)
-                if !self.polish.told && self.polish.checks >= POLISHED_AFTER && self.polish.looked {
+                // (only once it has looked at the page as it is now: what it is told is to go through what was asked against that picture; a model that cannot be shown
+                // one goes by what the checks printed, and is told at the same point, or it never was: a lottery turn of the Homelab's DeepSeek, which reads no
+                // pictures, went on through 24 checks to its 30 minutes)
+                let pictures = self.sees_pictures();
+                if !self.polish.told && polish_due(&self.polish, pictures) {
                     self.polish.told = true;
                     let (page, checks) = (self.polish.page.clone().unwrap_or_default(), self.polish.checks);
                     let goal = self.round_goal.as_ref().is_some_and(|goal| goal.finished.is_none());
-                    self.intervened("polished", json!({"page": page, "checks": checks}));
-                    self.push(Message::text("user", prompt::polished(&page, checks, goal)));
+                    self.intervened("polished", json!({"page": page, "checks": checks, "pictures": pictures}));
+                    self.push(Message::text("user", prompt::polished(&page, checks, goal, pictures)));
                 }
                 continue;
             }
@@ -4015,13 +4024,17 @@ impl Agent {
         Some(files)
     }
 
+    /// Whether a check's pictures can be shown to the model under its call: the server takes a picture in a tool's result, and the model reads them.
+    fn sees_pictures(&self) -> bool {
+        self.provider.as_ref().is_some_and(|provider| provider.images_in_tool_results() && provider.reads_pictures() != Some(false))
+    }
+
     /// The pictures a check_page took, kept with the conversation as a picture read with read_file is (see `read_picture`), to go with its result: in the
     /// comparison runs, 80 checks were followed by a read_file of their own picture, a round of 3.6 s each (8.9 s at p90). The lines that name them stay, for a look
     /// later. Made in this turn, each goes at the smaller size of a model's own picture. A model or server that cannot be shown one is left with the lines alone.
     fn with_check_pictures(&mut self, result: Result<String, String>, mut images: Vec<ImageRef>) -> (Result<String, String>, Vec<ImageRef>) {
         let Ok(said) = result else { return (result, images) };
-        let shown_here = self.provider.as_ref().is_some_and(|provider| provider.images_in_tool_results() && provider.reads_pictures() != Some(false));
-        let Some(session) = self.session.as_ref().map(|session| session.path.clone()).filter(|_| shown_here) else { return (Ok(said), images) };
+        let Some(session) = self.session.as_ref().map(|session| session.path.clone()).filter(|_| self.sees_pictures()) else { return (Ok(said), images) };
         let limit = self.image_limit();
         let limit = ImageLimit { side: limit.side.min(OWN_PICTURE_SIDE), ..limit };
         let before = images.len();
@@ -7385,6 +7398,19 @@ note: the helper took")), "{log:?}");
         for line in ["findstr /s TODO *.rs", "git status", "python inventory.py", "dir /b", "where cargo", "type latest.txt"] {
             assert!(!is_check(line), "{line}");
         }
+    }
+
+    /// The word about a page that keeps passing is due after its checks, once the latest picture has been looked at; for a model that cannot be shown pictures, after
+    /// its checks alone, in words that go by what the checks printed.
+    #[test]
+    fn a_page_that_keeps_passing_gets_its_word_from_a_model_that_cannot_see_pictures_too() {
+        let polish = |checks: u32, looked: bool| Polish { page: Some("index.html".into()), checks, looked, ..Polish::default() };
+        assert!(!polish_due(&polish(2, true), true) && !polish_due(&polish(3, false), true) && polish_due(&polish(3, true), true), "with pictures: checks, and a look");
+        assert!(!polish_due(&polish(2, false), false) && polish_due(&polish(3, false), false), "without: the checks alone");
+        let (seen, printed) = (prompt::polished("index.html", 3, false, true), prompt::polished("index.html", 3, false, false));
+        assert!(seen.contains("latest picture") && !printed.contains("picture"), "{printed}");
+        assert!(printed.contains("what the checks printed") && printed.contains("answer now"), "{printed}");
+        assert!(prompt::is_nudge(&printed));
     }
 
     #[test]
