@@ -756,7 +756,7 @@ fn request_detail(line: &Line) -> RequestDetail {
         prompt: line.u("prompt"),
         cached: line.u("cached"),
         completion: line.u("completion"),
-        tps: line.v["tps"].as_f64(),
+        tps: crate::trajectory::request_rate(&line.v),
         end: line.s("end").to_string(),
         reasoning_chars: line.u("reasoning_chars").unwrap_or(0),
         content_chars: line.u("content_chars").unwrap_or(0),

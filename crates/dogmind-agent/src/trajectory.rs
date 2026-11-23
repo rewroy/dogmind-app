@@ -165,6 +165,11 @@ pub struct SessionUsage {
     pub last_cache_percent: Option<u64>,
 }
 
+/// The provider's generation speed, including providers that send timings without token counts.
+pub(crate) fn request_rate(fields: &Value) -> Option<f64> {
+    fields["tps"].as_f64().filter(|rate| *rate > 0.0).or_else(|| crate::llm::reported_rate(&fields["server"]))
+}
+
 impl SessionUsage {
     fn record_request(&mut self, fields: &Value) {
         if fields["role"] != "main" {
@@ -175,7 +180,7 @@ impl SessionUsage {
         if let Some(end) = fields["end"].as_str() {
             if end == "error:unfinished" || !(end.starts_with("error:") || end.starts_with("stopped_app:") || end == "cancelled_person") {
                 self.last_cache_percent = fields["prompt"].as_u64().and_then(|prompt| crate::llm::cache_percent(prompt, fields["cached"].as_u64()));
-                self.last_rate = fields["tps"].as_f64().filter(|rate| *rate > 0.0).or_else(|| crate::llm::reported_rate(&fields["server"]));
+                self.last_rate = request_rate(fields);
             }
         }
         let (Some(prompt), Some(completion)) = (fields["prompt"].as_u64(), fields["completion"].as_u64()) else { return };

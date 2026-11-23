@@ -41,6 +41,14 @@ impl Line {
     fn cache_percent(&self) -> Option<u64> {
         crate::llm::cache_percent(self.u("prompt")?, self.u("cached"))
     }
+    /// The request table uses a counted speed only if the provider did not report one.
+    fn table_rate(&self, generation_ms: u64) -> (Option<f64>, bool) {
+        if let Some(rate) = crate::trajectory::request_rate(&self.v) {
+            return (Some(rate), false);
+        }
+        let counted = self.u("completion").filter(|_| generation_ms > 0).map(|tokens| tokens as f64 * 1000.0 / generation_ms as f64);
+        (counted, counted.is_some())
+    }
     pub(crate) fn turn(&self) -> u64 {
         self.u("turn").unwrap_or(0)
     }
@@ -243,7 +251,8 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         let (ms, first) = (line.u("ms").unwrap_or(0), line.u("first_ms"));
         let generation = first.map_or(ms, |first| ms.saturating_sub(first));
         let completion = line.u("completion");
-        let rate = line.v["tps"].as_f64().map(|rate| format!("{rate:.1}")).or_else(|| completion.filter(|_| generation > 0).map(|tokens| format!("~{:.1}", tokens as f64 * 1000.0 / generation as f64))).unwrap_or_else(|| "-".to_string());
+        let (rate, counted) = line.table_rate(generation);
+        let rate = rate.map_or_else(|| "-".to_string(), |rate| if counted { format!("~{rate:.1}") } else { format!("{rate:.1}") });
         let cached = line.cache_percent().map_or_else(|| "-".to_string(), |value| format!("{value}%"));
         let calls: Vec<&str> = line.v["calls"].as_array().map(|calls| calls.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
         let _ = writeln!(out, "  {:>5} {:<10} first {:>8} gen {:>8} prompt {:>6} cached {:>4} wrote {:>6} tok at {:>6} tok/s  {}{}{}{}",
@@ -759,10 +768,7 @@ pub fn summary(trajectory: &str) -> Summary {
                     let (ms, first) = (line.u("ms").unwrap_or(0), line.u("first_ms"));
                     let generation = first.map_or(ms, |first| ms.saturating_sub(first));
                     let completion = line.u("completion");
-                    let (rate, counted) = match line.v["tps"].as_f64() {
-                        Some(rate) => (Some(rate), false),
-                        None => (completion.filter(|_| generation > 0).map(|tokens| tokens as f64 * 1000.0 / generation as f64), true),
-                    };
+                    let (rate, counted) = line.table_rate(generation);
                     let estimate = line.estimated_tokens();
                     row.requests.push(RequestRow {
                         id: short(line.req()),
@@ -774,7 +780,7 @@ pub fn summary(trajectory: &str) -> Summary {
                         tokens: completion.or(estimate),
                         tokens_estimated: completion.is_none() && estimate.is_some(),
                         rate,
-                        counted: counted && rate.is_some(),
+                        counted,
                         end: line.s("end").to_string(),
                         calls: line.v["calls"].as_array().map(|calls| calls.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default(),
                         retry_of: line.v["retry_of"].as_str().map(|of| (short(of), line.s("retry_why").to_string())),
@@ -871,6 +877,26 @@ mod tests {
             line["edit_hash"] = json!(hash);
         }
         line
+    }
+
+    #[test]
+    fn request_speeds_agree_across_the_report_table_and_timeline() {
+        for (tps, server, tokens, measured, expected, display) in [
+            (None, json!({"decode_tokens_per_second":12.5}), None, Some(12.5), Some(12.5), "12.5"),
+            (Some(0.0), json!({"predicted_per_second":15.0}), Some(20), Some(15.0), Some(15.0), "15.0"),
+            (Some(9.0), json!({"decode_tokens_per_second":12.5}), Some(20), Some(9.0), Some(9.0), "9.0"),
+            (None, json!({}), Some(20), None, Some(20.0), "~20.0"),
+            (None, json!({}), None, None, None, "-"),
+        ] {
+            let trace = text(&[json!({"ev":"turn_start","turn":1}), json!({"ev":"request","turn":1,"req":"s/1","role":"main","end":"stop","ms":1100,"first_ms":100,"tps":tps,"completion":tokens,"server":server})]);
+            let printed = report(&trace, None);
+            let row = &summary(&trace).turns[0].requests[0];
+            assert!(printed.contains(&format!("tok at {display:>6} tok/s")), "{printed}");
+            assert_eq!((row.rate, row.counted), (expected, measured.is_none() && expected.is_some()));
+            let timeline = crate::timeline::build(&[], &trace);
+            let detail = timeline.turns[0].steps.iter().find_map(|step| step.request.as_ref()).unwrap();
+            assert_eq!(detail.tps, measured);
+        }
     }
 
     #[test]
