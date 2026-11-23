@@ -28,10 +28,27 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowTextW}
 
 /// The container commands run in. The tests have one of their own: what their runs leave (the grants on its temp folder, what their commands leave in it) was in the
 /// container of the app the person uses on the same PC, which is not a place for tests; 667 grants their restricted commands had left there were inherited by all in it.
-#[cfg(not(test))]
-const PROFILE: &str = "DogmindApp.Exec";
-#[cfg(test)]
-const PROFILE: &str = "DogmindApp.Exec.Tests";
+/// A development build is given another by `DOGMIND_SANDBOX_PROFILE`, for a run of the app that is a check (a dogfood run, a measurement) and not the person's own: their
+/// container is no place for checks either.
+fn profile_name() -> &'static str {
+    #[cfg(test)]
+    return "DogmindApp.Exec.Tests";
+    #[cfg(not(test))]
+    {
+        #[cfg(debug_assertions)]
+        {
+            static NAMED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+            // (a name Windows takes for a container: 64 characters at most, of letters, digits, `.`, `-` and `_`)
+            let named = NAMED.get_or_init(|| {
+                std::env::var("DOGMIND_SANDBOX_PROFILE").ok().filter(|name| !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+            });
+            if let Some(name) = named {
+                return name;
+            }
+        }
+        "DogmindApp.Exec"
+    }
+}
 pub(crate) const READ_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
 /// Going through a folder, and nothing of what is in it.
 pub(crate) const TRAVERSE: u32 = FILE_GENERIC_EXECUTE;
@@ -651,7 +668,7 @@ pub(crate) unsafe fn workspace_capability(root: &Path) -> Result<PSID, String> {
 
 /// The name a workspace's capability is made from: the container's, and a hash of the folder's key that stays the same from one version of the app to the next.
 fn capability_name(place: &str) -> String {
-    format!("{PROFILE}.Workspace.{:016x}", fnv(place))
+    format!("{}.Workspace.{:016x}", profile_name(), fnv(place))
 }
 
 /// FNV-1a, 64 bits: a short name made from a long one, the same each time.
@@ -818,7 +835,7 @@ pub(crate) unsafe fn profile_sid() -> Result<PSID, String> {
     if let Some(sid) = &*slot {
         return Ok(sid.0);
     }
-    let (name, display, description) = (wide(PROFILE), wide("Dogmind commands"), wide("Where Dogmind runs the commands you approve"));
+    let (name, display, description) = (wide(profile_name()), wide("Dogmind commands"), wide("Where Dogmind runs the commands you approve"));
     let mut sid: PSID = std::ptr::null_mut();
     let created = CreateAppContainerProfile(name.as_ptr(), display.as_ptr(), description.as_ptr(), std::ptr::null(), 0, &mut sid);
     if created < 0 && DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) < 0 {
@@ -3384,7 +3401,7 @@ mod tests {
         let plain = command(&format!("type \"{}\\a.txt\" & echo x> \"{}\\plain.txt\"", a.display(), a.display()), &b, false);
         assert!(!decode(&plain.stdout).contains("SECRET-OF-A") && !a.join("plain.txt").exists(), "B cannot reach A at all, before anything is claimed");
         std::fs::copy(std::env::current_exe().unwrap(), b.join("probe.exe")).unwrap();
-        std::fs::write(b.join("probe-args.txt"), format!("{}\n{PROFILE}\n{}", a.display(), capability_name(&key(&real(&a))))).unwrap();
+        std::fs::write(b.join("probe-args.txt"), format!("{}\n{}\n{}", a.display(), profile_name(), capability_name(&key(&real(&a))))).unwrap();
         let done = command("probe.exe --exact sandbox::tests::capability_probe --ignored --nocapture --test-threads 1", &b, false);
         let said = format!("{}{}", decode(&done.stdout), decode(&done.stderr));
         println!("{said}");
