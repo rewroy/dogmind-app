@@ -5398,6 +5398,28 @@ mod tests {
         run.handle.commands.send(Command::Quit).unwrap();
     }
 
+    /// The look after the one that said not to look again at a quiet command waits for it: here its end, which that look then tells, saying it waited.
+    #[test]
+    fn a_third_look_at_a_quiet_command_waits_for_its_end() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (client, bodies) = server(vec![
+            call_answer("execute_command", serde_json::json!({"command": "powershell -NoProfile -Command Start-Sleep -Seconds 6 >nul 2>&1", "background": true})),
+            call_answer("command_status", serde_json::json!({"id": "job1"})),
+            call_answer("command_status", serde_json::json!({"id": "job1"})),
+            call_answer("command_status", serde_json::json!({"id": "job1"})),
+            text_answer("it ended"),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("run it".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let bodies = bodies.lock().unwrap();
+        let last_of = |at: usize| bodies[at]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string();
+        assert!(last_of(3).contains("do not look again to wait for it") && !last_of(3).contains("this look waited"), "{}", last_of(3));
+        assert!(last_of(4).contains("job1 has ended") && last_of(4).contains("this look waited"), "{}", last_of(4));
+        drop(bodies);
+        run.handle.commands.send(Command::Quit).unwrap();
+    }
+
     /// A goal out of rounds ends with one step that answers, in which no call is made.
     #[test]
     fn a_goal_out_of_rounds_ends_with_an_answer_and_no_call() {

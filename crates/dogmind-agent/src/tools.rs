@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -277,6 +277,8 @@ pub struct Job {
     looked: AtomicU64,
     /// Whether command_status has told of it while it runs: a look after that with nothing new is a wait.
     looked_at: AtomicBool,
+    /// Looks in a row since then with nothing new: after `QUIET_LOOKS_BEFORE_WAITING` of them a look waits for it (`LOOK_WAITS`).
+    quiet_looks: AtomicU32,
     /// It was ended on purpose (`command_stop`, the person's Stop or a stop of the list, a session that was left): that wakes nothing.
     stopped: AtomicBool,
     /// Its end has been looked at for a notice, which was made or was not due (the model had read the end already).
@@ -287,7 +289,7 @@ pub struct Job {
 
 impl Job {
     pub(crate) fn new(id: &str, command: &str, started: Instant, cancel: Arc<AtomicBool>, result: CommandResult, live: Arc<Live>, wake_on: Option<String>) -> Job {
-        Job { id: id.to_string(), command: command.to_string(), started, started_at: chrono::Local::now().format("%H:%M").to_string(), cancel, result, in_scratch: false, told: AtomicBool::new(false), live, looked: AtomicU64::new(0), looked_at: AtomicBool::new(false), stopped: AtomicBool::new(false), announced: AtomicBool::new(false), wake_on }
+        Job { id: id.to_string(), command: command.to_string(), started, started_at: chrono::Local::now().format("%H:%M").to_string(), cancel, result, in_scratch: false, told: AtomicBool::new(false), live, looked: AtomicU64::new(0), looked_at: AtomicBool::new(false), quiet_looks: AtomicU32::new(0), stopped: AtomicBool::new(false), announced: AtomicBool::new(false), wake_on }
     }
 
     #[cfg(test)]
@@ -420,6 +422,11 @@ impl Live {
 
     /// What came after its first `from` bytes, at most the last `most` of it, and where the next look starts: not past a character that has come only in part, which is kept for the next look
     /// and shown whole then.
+    /// How many bytes it has printed in all.
+    pub(crate) fn total(&self) -> u64 {
+        self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).1
+    }
+
     pub(crate) fn since(&self, from: u64, most: usize) -> (String, u64) {
         let kept = self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (buffer, total) = (&kept.0, kept.1);
@@ -853,7 +860,7 @@ impl Workbench {
             }
             #[cfg(windows)]
             "check_page" => crate::page_check::check_page(arguments, workspace, cancel),
-            "command_status" => self.job_status(arguments),
+            "command_status" => self.job_status(arguments, cancel),
             "command_stop" => self.job_stop(arguments),
             "wake_at" => self.wake_at(arguments),
             "todo" => self.todo(arguments),
@@ -970,6 +977,11 @@ impl Workbench {
             None => {
                 let (printed, next) = job.live.since(job.looked.load(Ordering::Relaxed), LIVE_SHOWN);
                 let first = job.looked.swap(next, Ordering::Relaxed) == 0 && !job.looked_at.swap(true, Ordering::Relaxed);
+                if printed.is_empty() && !first {
+                    job.quiet_looks.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    job.quiet_looks.store(0, Ordering::Relaxed);
+                }
                 let said = match (printed.is_empty(), first) {
                     (true, true) => "it has printed nothing yet".to_string(),
                     // (a look again with nothing new is a wait: a session on Dogmind's own source looked 15 times in three minutes at a test run, each a request)
@@ -982,9 +994,22 @@ impl Workbench {
         }
     }
 
-    fn job_status(&self, arguments: &Value) -> Result<String, String> {
+    fn job_status(&self, arguments: &Value, cancel: &AtomicBool) -> Result<String, String> {
         let wanted = arguments.get("id").and_then(Value::as_str);
+        // (a look again and again at a running job that prints nothing new is a wait, each a request: a dogfood turn looked at a cargo test 14 times in a row, though the
+        // second look already said its end wakes the session. From the third such look, the look waits for it, up to `LOOK_WAITS`, and the person's Stop ends that)
+        let mut waited = None;
+        if let Some(job) = wanted.and_then(|id| self.jobs.0.iter().find(|job| job.id == id)).filter(|job| !job.has_ended() && job.quiet_looks.load(Ordering::Relaxed) >= QUIET_LOOKS_BEFORE_WAITING) {
+            let (from, began) = (job.looked.load(Ordering::Relaxed), Instant::now());
+            while began.elapsed() < LOOK_WAITS && !job.has_ended() && !cancel.load(Ordering::Relaxed) && job.live.total() <= from {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            waited = Some(began.elapsed());
+        }
         let mut lines: Vec<String> = self.jobs.0.iter().filter(|job| wanted.is_none_or(|id| job.id == id)).map(|job| Workbench::job_report(job, wanted.is_none())).collect();
+        if let (Some(waited), Some(id)) = (waited, wanted) {
+            lines.push(format!("(this look waited {} s for {id} to end or print more. Its end wakes you with what it came to: end your turn, or do other work, rather than look again.)", waited.as_secs()));
+        }
         lines.extend(self.background.wait_lines(wanted));
         if lines.is_empty() {
             return Ok(wanted.map_or("no command has been started in the background, and no wait is set".to_string(), |id| format!("there is no {id}")));
@@ -2889,6 +2914,10 @@ fn says_no_connection(err: &str) -> bool {
         || err.contains("接続を拒否")
 }
 
+/// Looks at a running job with nothing new, after the first, before a look waits for it (the look after the one that said not to look again), and how long it waits at most.
+const QUIET_LOOKS_BEFORE_WAITING: u32 = 1;
+const LOOK_WAITS: Duration = Duration::from_secs(60);
+
 /// What says a file or folder could not be opened for want of the right, in the words of cargo, git, cmd, PowerShell and Windows in Japanese.
 const DENIED_WORDS: [&str; 4] = ["Access is denied", "アクセスが拒否されました", "Permission denied", "is denied"];
 
@@ -3833,9 +3862,9 @@ mod power_tests {
         let mut bench = Workbench::default();
         let done: CommandResult = Arc::new(Mutex::new(Some(Ok("BUILD OUTPUT".to_string()))));
         bench.add_job(&json!({"command": "cargo build"}), Instant::now(), Arc::new(AtomicBool::new(false)), done, Arc::default()).unwrap();
-        let first = bench.job_status(&json!({})).unwrap();
-        let second = bench.job_status(&json!({})).unwrap();
-        let by_id = bench.job_status(&json!({"id": "job1"})).unwrap();
+        let first = bench.job_status(&json!({}), &AtomicBool::new(false)).unwrap();
+        let second = bench.job_status(&json!({}), &AtomicBool::new(false)).unwrap();
+        let by_id = bench.job_status(&json!({"id": "job1"}), &AtomicBool::new(false)).unwrap();
         assert!(first.contains("BUILD OUTPUT") && !second.contains("BUILD OUTPUT") && second.contains("as reported before") && by_id.contains("BUILD OUTPUT"), "{first}\n{second}\n{by_id}");
         let given = background_arguments(&json!({"command": "cargo build", "background": true, "timeout_seconds": 60}));
         assert!(given.get("timeout_seconds").is_none() && given["command"] == "cargo build");
@@ -3847,13 +3876,13 @@ mod power_tests {
         let mut bench = Workbench::default();
         let live: Arc<Live> = Arc::default();
         bench.add_job(&json!({"command": "npm run dev"}), Instant::now(), Arc::new(AtomicBool::new(false)), Arc::default(), live.clone()).unwrap();
-        assert!(bench.job_status(&json!({})).unwrap().ends_with("it has printed nothing yet"));
+        assert!(bench.job_status(&json!({}), &AtomicBool::new(false)).unwrap().ends_with("it has printed nothing yet"));
         live.push("compiling\nlistening on http://localhost:5173\n".as_bytes());
-        let first = bench.job_status(&json!({"id": "job1"})).unwrap();
+        let first = bench.job_status(&json!({"id": "job1"}), &AtomicBool::new(false)).unwrap();
         assert!(first.contains("is running") && first.contains("listening on http://localhost:5173"), "{first}");
-        assert!(bench.job_status(&json!({})).unwrap().contains("it has printed nothing since the last look. Its end wakes you"), "a look again with nothing new is a wait");
+        assert!(bench.job_status(&json!({}), &AtomicBool::new(false)).unwrap().contains("it has printed nothing since the last look. Its end wakes you"), "a look again with nothing new is a wait");
         live.push("GET / 200\n".as_bytes());
-        let next = bench.job_status(&json!({})).unwrap();
+        let next = bench.job_status(&json!({}), &AtomicBool::new(false)).unwrap();
         assert!(next.contains("since the last look:\nGET / 200") && !next.contains("listening"), "{next}");
         // (a look starting in the middle of a character starts after it)
         live.push("あ".as_bytes());
@@ -3884,7 +3913,7 @@ mod power_tests {
         bench.run("execute_command", &json!({"command": line, "background": true}), dir.path(), &cancel).unwrap();
         let started = Instant::now();
         let seen = loop {
-            let said = bench.job_status(&json!({"id": "job1"})).unwrap();
+            let said = bench.job_status(&json!({"id": "job1"}), &AtomicBool::new(false)).unwrap();
             if said.contains("ready-now") || started.elapsed() > Duration::from_secs(120) {
                 break said;
             }
@@ -3904,7 +3933,7 @@ mod power_tests {
         assert!(waited.contains("background: true") && waited.contains("not started"), "{waited}");
         let bad = bench.run("execute_command", &json!({"command": "echo x", "background": true, "wake_on": "("}), dir.path(), &cancel).unwrap_err();
         assert!(bad.contains("regular expression") && bad.contains("not started"), "{bad}");
-        assert!(bench.job_status(&json!({})).unwrap().starts_with("no command"), "nothing was started");
+        assert!(bench.job_status(&json!({}), &AtomicBool::new(false)).unwrap().starts_with("no command"), "nothing was started");
         let schemas = schemas();
         let tool = |name: &str| schemas.as_array().unwrap().iter().find(|tool| tool["function"]["name"] == name).unwrap_or_else(|| panic!("no {name}")).clone();
         assert!(tool("execute_command")["function"]["parameters"]["properties"].get("wake_on").is_some());
@@ -3914,7 +3943,7 @@ mod power_tests {
     #[test]
     fn a_session_with_no_background_command_says_so() {
         let bench = Workbench::default();
-        assert!(bench.job_status(&json!({})).unwrap().starts_with("no command"));
+        assert!(bench.job_status(&json!({}), &AtomicBool::new(false)).unwrap().starts_with("no command"));
         assert!(bench.job_stop(&json!({"id": "job1"})).is_err());
     }
 }
@@ -5231,7 +5260,7 @@ mod tests {
         // (a job that is running, which began a while before it was left in the background)
         let began = Instant::now().checked_sub(Duration::from_secs(42)).unwrap();
         let at_work = bench.add_job(&json!({"command": "build"}), began, Arc::new(AtomicBool::new(false)), running, Arc::new(Live::default())).unwrap();
-        let status = bench.job_status(&json!({"id": at_work})).unwrap();
+        let status = bench.job_status(&json!({"id": at_work}), &AtomicBool::new(false)).unwrap();
         let seconds: u64 = status.split("for ").nth(1).and_then(|rest| rest.split(" s").next()).and_then(|number| number.parse().ok()).unwrap();
         assert!((42..50).contains(&seconds), "counted from its real start, not from when it was left: {status}");
         assert_eq!(bench.job_stop(&json!({"id": at_work})).unwrap(), format!("{at_work} is being ended; it will not wake you"));
