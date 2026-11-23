@@ -1051,8 +1051,15 @@ fn polish_due(polish: &Polish, pictures: bool) -> bool {
 /// Whether what check_page said is of a page that ran with nothing wrong: none of what it says of an error, a script that did not run or load, a file missing, a page
 /// that does not run opened from its file, or a check that could not be made.
 fn page_ran_clean(said: &str) -> bool {
-    const WRONG: [&str; 10] = ["Uncaught", "Error", "error:", "DID NOT RUN", "NOT CHECKED", "NOT LOADED", "MISSING", "COULD NOT BE LOADED", "AS THE USER OPENS IT", "Failed to"];
-    !WRONG.iter().any(|word| said.contains(word)) || said.contains("so no errors") && !said.contains("DID NOT RUN") && !said.contains("AS THE USER OPENS IT") && !said.contains("NOT LOADED")
+    const INCOMPLETE: &[&str] = &["MISSING:", "DID NOT RUN,", "NOT CHECKED:", "NOT LOADED,", "THE PAGE COULD NOT BE LOADED:", "AS THE USER OPENS IT:",
+        "STEPS FAILED:", "STEPS DID NOT END:", "Steps: they had not ended", "The steps reload the page "];
+    const ERRORS: &[&str] = &["Uncaught", "Error", "error:", "Failed to"];
+    let has_error = |line: &str| ERRORS.iter().any(|word| line.contains(word));
+    // The main console uses bullets. Output specific to another view is indented.
+    if said.lines().any(|line| INCOMPLETE.iter().any(|prefix| line.starts_with(prefix)) || (line.starts_with("- ") || line.starts_with("  ")) && has_error(line)) {
+        return false;
+    }
+    said.lines().any(|line| line.starts_with("Console") && line.ends_with(": nothing, so no errors.")) || !has_error(said)
 }
 
 /// Whether two paths as calls name them are one file: the same once their slashes and case are made alike, or one the other's end (a full path and the workspace's).
@@ -11033,6 +11040,10 @@ Body").unwrap();
         agent.note_outcome("apply_patch", &patch("other.css"), &Ok("--- applied".into()));
         agent.note_outcome("check_page", &check("kuji.html"), &clean);
         assert_eq!(agent.polish.checks, 4, "a change to another file is not one to the page");
+        agent.note_outcome("check_page", &check("kuji.html"), &Ok("MISSING: missing.css.\nConsole: nothing, so no errors.".into()));
+        assert_eq!((agent.polish.checks, agent.polish.page.is_none()), (0, true), "a missing stylesheet ends the clean run");
+        agent.note_outcome("check_page", &check("kuji.html"), &clean);
+        assert_eq!(agent.polish.page.as_deref(), Some("kuji.html"), "a repaired page starts a new run");
         agent.note_outcome("apply_patch", &patch("kuji.html"), &Ok("--- applied".into()));
         agent.note_outcome("check_page", &check("kuji.html"), &Ok("Console:\n- kuji.html:3: Uncaught TypeError: x".into()));
         assert_eq!((agent.polish.checks, agent.polish.page.is_none()), (0, true), "an error starts it over");
@@ -11048,6 +11059,11 @@ Body").unwrap();
     /// What says a page ran clean, the files a command made by its result, and one file named two ways.
     #[test]
     fn a_clean_check_a_commands_files_and_one_file_named_two_ways() {
+        for other in ["MISSING: missing.css.", "STEPS FAILED: nothing matches #draw", "STEPS DID NOT END: part 1 began twice",
+            "Steps: they had not ended when the page was read", "Console at mobile:\n  page.html:3: Uncaught TypeError: x"] {
+            assert!(!page_ran_clean(&format!("Console: nothing, so no errors.\n{other}")), "{other}");
+        }
+        assert!(page_ran_clean("Console (as read at 1280x800): nothing, so no errors.\nShows: title \"Error examples\""));
         assert!(page_ran_clean("page.html in headless Edge, with no network.\nRan: the page's script 1.\nConsole: nothing, so no errors.\nShows: title \"t\""));
         assert!(page_ran_clean("Console:\n- page.html:10: ready 3\nShows: title \"t\""), "the page's own logs are not errors");
         assert_eq!(picture_of_check("Ran.\nHow it looks at desktop (1280x800): `read_file` C:\\x\\p.png\nConsole at 480"), Some("C:\\x\\p.png".to_string()));
