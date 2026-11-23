@@ -2582,7 +2582,7 @@ struct App {
     /// Thinking has gone into the transcript and no answer has followed it yet: the answer begins on a line of its own, whether the thinking
     /// is shown by then or not.
     thinking_written: bool,
-    in_code: bool,
+    code_fence: Option<markdown::CodeFence>,
     /// The level of the heading being written; none is 0.
     heading: u8,
     italic: bool,
@@ -3893,11 +3893,11 @@ impl App {
                 return;
             }
             if self.line_start {
-                if !self.in_code && !self.table.is_empty() && !pending.trim_start_matches([' ', '\t']).starts_with('|') {
+                if self.code_fence.is_none() && !self.table.is_empty() && !pending.trim_start_matches([' ', '\t']).starts_with('|') {
                     // Anything else on the line, a blank one too, ends the table.
                     self.flush_table();
                 }
-                if !self.in_code && pending.starts_with('\n') {
+                if self.code_fence.is_none() && pending.starts_with('\n') {
                     // (a blank line after an item: what follows, an item too, keeps a little away)
                     if matches!(self.para, Para::Item(..)) && self.para_next.is_none() {
                         self.para_next = Some(Para::AfterList);
@@ -3912,15 +3912,15 @@ impl App {
                     self.pending_text = pending;
                     return;
                 }
-                if trimmed.starts_with("```") {
+                if let Some((fence, info)) = markdown::CodeFence::opening(trimmed).filter(|_| self.code_fence.is_none_or(|open| open.closes(trimmed))) {
                     let Some(at) = newline else {
                         self.pending_text = pending;
                         return;
                     };
-                    self.in_code = !self.in_code;
                     self.pending_text = pending[at + 1..].to_string();
-                    if self.in_code {
-                        self.code_language = trimmed.trim_start_matches('`').trim().to_lowercase();
+                    if self.code_fence.take().is_none() {
+                        self.code_fence = Some(fence);
+                        self.code_language = info.to_lowercase();
                         self.code_comment = false;
                         let label = self.code_language.clone();
                         self.room_over_a_block();
@@ -3933,12 +3933,12 @@ impl App {
                     }
                     continue;
                 }
-                if !self.in_code && newline.is_some() && markdown::is_rule(trimmed) {
+                if self.code_fence.is_none() && newline.is_some() && markdown::is_rule(trimmed) {
                     self.pending_text = pending[newline.unwrap_or(0) + 1..].to_string();
                     self.rule_row();
                     continue;
                 }
-                if !self.in_code && trimmed.starts_with('|') {
+                if self.code_fence.is_none() && trimmed.starts_with('|') {
                     // A table is drawn when it has ended, as a column's width depends on all its rows.
                     let Some(at) = newline else {
                         self.pending_text = pending;
@@ -3948,7 +3948,7 @@ impl App {
                     self.pending_text = pending[at + 1..].to_string();
                     continue;
                 }
-                if self.in_code {
+                if self.code_fence.is_some() {
                     // A block is added to by the row, so a line waits until it is whole.
                     let Some(at) = newline else {
                         self.pending_text = pending;
@@ -3962,7 +3962,7 @@ impl App {
                 self.line_start = false;
                 self.heading = 0;
                 self.inline_before = None;
-                if !self.in_code {
+                if self.code_fence.is_none() {
                     let indent = pending.len() - pending.trim_start().len();
                     let marker = list_marker(trimmed);
                     if marker.is_none() {
@@ -4157,15 +4157,15 @@ impl App {
     /// The end of an answer: what was waiting for more goes out as it is.
     unsafe fn finish_answer(&mut self) {
         let mut rest = std::mem::take(&mut self.pending_text);
-        if !self.in_code && !self.table.is_empty() && rest.trim_start().starts_with('|') {
+        if self.code_fence.is_none() && !self.table.is_empty() && rest.trim_start().starts_with('|') {
             // The answer ended on its table's last line.
             self.table.push(std::mem::take(&mut rest).trim_end().to_string());
         }
         self.flush_table();
         self.para_next = None;
-        if self.in_code {
+        if let Some(fence) = self.code_fence {
             // An answer that ended inside its block, or with the fence still on its last line.
-            if !rest.is_empty() && !rest.trim_start().starts_with("```") {
+            if !rest.is_empty() && !fence.closes(&rest) {
                 self.code_line(rest.trim_end_matches(['\r', '\n']));
             }
             self.block_edge("");
@@ -4184,7 +4184,7 @@ impl App {
             self.append(&rest, Style::Body);
         }
         self.end_line();
-        self.in_code = false;
+        self.code_fence = None;
         self.bold = false;
         self.italic = false;
         self.struck = false;
@@ -13286,7 +13286,7 @@ impl App {
         self.reveal.clear();
         self.follow_end = true;
         self.line_start = true;
-        self.in_code = false;
+        self.code_fence = None;
         self.pending_text.clear();
         self.table.clear();
         self.heading = 0;
@@ -18450,7 +18450,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             scrolled_up_at: None,
             line_start: true,
             thinking_written: false,
-            in_code: false,
+            code_fence: None,
             heading: 0,
             italic: false,
             struck: false,
