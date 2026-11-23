@@ -500,7 +500,7 @@ fn sweep_file(file: &Path, named_by_sessions: &[PathBuf], listed: &[PathBuf]) ->
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// In a temp folder, which goes with the test.
     struct Stand {
@@ -553,14 +553,6 @@ mod tests {
 
     fn container() -> PSID {
         unsafe { sandbox::profile_sid().unwrap() }
-    }
-
-    fn wait_for(what: &str, done: impl Fn() -> bool) {
-        let until = Instant::now() + Duration::from_secs(30);
-        while !done() {
-            assert!(Instant::now() < until, "waited for {what}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
     }
 
     /// A workspace's grant is to its capability, and stays when the session moves on: the other workspace's commands can neither write nor read there all the same. Taken

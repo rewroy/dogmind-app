@@ -18,6 +18,7 @@ use windows_sys::Win32::Security::Authorization::*;
 use windows_sys::Win32::Security::Isolation::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Storage::FileSystem::*;
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, CreateDesktopW, CreateWindowStationW, EnumDesktopWindows, GetProcessWindowStation, GetUserObjectInformationW, SetProcessWindowStation, HDESK, UOI_NAME};
@@ -1855,15 +1856,19 @@ pub struct Timings {
     pub relabel: Duration,
     pub relabel_walked: usize,
     pub relabel_changed: usize,
+    /// Whether what it made was seen as it made it (`ChangeWatch`), and how many changes that was; when not, the walk was of the whole workspace.
+    pub relabel_watched: bool,
+    pub relabel_seen: usize,
 }
 
 /// What a command in the container makes is labelled low, as the container itself is. A program it made (a build's .exe, .dll or .node) then runs at low integrity whoever
 /// starts it: the person's own build after the model's, in the same target folder, ran cargo's build scripts low, and they were refused their own output folder ("Access is
 /// denied", every time until cargo clean); and an app the model built and the person starts could not write its own settings. Low is for the commands of the sandbox, and
-/// says nothing of what the person runs. So after each command the workspace is walked for such programs made or changed since the command began, and those labelled low
-/// are given the person's level. Links and junctions are not gone through (what they lead to is not the workspace's), only what the listing of a folder says is looked at,
-/// and nothing is opened but what is changed. The walk has a twentieth of the command's time, or 200 ms, whichever is more; where it stops, the next command's walk goes on
-/// from there, and then walks the whole again for what that command made.
+/// says nothing of what the person runs. So after each command the programs it made or changed are given the person's level, those labelled low. Which they are, the
+/// changes Windows told of while it ran say (`ChangeWatch`); where they cannot say all of it, the workspace is walked for programs made or changed since the command began.
+/// Links and junctions are not gone through (what they lead to is not the workspace's), only what the listing of a folder says is looked at, and nothing is opened but what
+/// is changed. The walk has a twentieth of the command's time, or 200 ms, whichever is more; where it stops, the next command's walk goes on from there, and then walks the
+/// whole again for what that command made, unless that one was watched.
 pub(crate) struct Relabeled {
     pub walked: usize,
     pub changed: usize,
@@ -1887,28 +1892,52 @@ const PROGRAMS: [&str; 3] = ["exe", "dll", "node"];
 const LEAST_WALK: Duration = Duration::from_millis(200);
 const WALK_SHARE: u32 = 20;
 
-/// The walk after a command in `root` that began at `began` and took `took` (`Relabeled`).
-pub(crate) fn programs_to_medium(root: &Path, began: std::time::SystemTime, took: Duration) -> Relabeled {
-    walk_for_programs(root, began, (took / WALK_SHARE).max(LEAST_WALK))
+/// After a command in `root` that began at `began` and took `took`, with what was seen of what it made, if all of it was (`Relabeled`).
+pub(crate) fn programs_to_medium(root: &Path, began: std::time::SystemTime, took: Duration, seen: Option<Seen>) -> Relabeled {
+    walk_for_programs(root, began, (took / WALK_SHARE).max(LEAST_WALK), seen)
 }
 
 /// As `programs_to_medium`, with the time it has. A folder is walked each time, however little that is.
-fn walk_for_programs(root: &Path, began: std::time::SystemTime, budget: Duration) -> Relabeled {
+fn walk_for_programs(root: &Path, began: std::time::SystemTime, budget: Duration, seen: Option<Seen>) -> Relabeled {
     let started = Instant::now();
     // (a little before it began: a file's times are kept to two seconds on some drives)
     let began = began.checked_sub(Duration::from_secs(2)).unwrap_or(began);
     let mut walks = WALKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut walk = match walks.iter().position(|(at, _)| at == root) {
-        Some(at) => {
-            let (_, mut left) = walks.remove(at);
+    let left = walks.iter().position(|(at, _)| at == root).map(|at| walks.remove(at).1);
+    let mut walk = match (left, seen.is_some()) {
+        // (what was seen is all this command made: a walk left over goes on as it was)
+        (Some(mut left), true) => {
+            left.since = left.since.min(began);
+            left
+        }
+        (Some(mut left), false) => {
             left.since = left.since.min(began);
             left.again = true;
             left
         }
-        None => ProgramWalk { since: began, folders: vec![root.to_path_buf()], again: false },
+        (None, true) => ProgramWalk { since: began, folders: Vec::new(), again: false },
+        (None, false) => ProgramWalk { since: began, folders: vec![root.to_path_buf()], again: false },
     };
     let person = PersonSid::now();
     let (mut walked, mut changed, mut folders) = (0, 0, 0);
+    if let Some(seen) = seen {
+        // (what came in whole, with what it held: it is walked as the workspace would be)
+        walk.folders.extend(seen.folders_to_walk(root));
+        for path in seen.programs {
+            walked += 1;
+            // (a link, as in the walk, is passed over; and so is what is in a repository's own folder)
+            let Ok(data) = std::fs::symlink_metadata(&path) else { continue };
+            if !data.is_file() || path.strip_prefix(root).is_ok_and(|inside| inside.components().any(|part| part.as_os_str() == ".git")) {
+                continue;
+            }
+            // SAFETY: the SID lives as long as `person`.
+            if let Some(person) = &person {
+                if unsafe { to_medium(&path, person.sid()) }.unwrap_or(false) {
+                    changed += 1;
+                }
+            }
+        }
+    }
     loop {
         if folders > 0 && started.elapsed() > budget {
             walks.push((root.to_path_buf(), walk));
@@ -1938,7 +1967,7 @@ fn walk_for_programs(root: &Path, began: std::time::SystemTime, budget: Duration
                 continue;
             }
             let path = entry.path();
-            if !path.extension().and_then(|ending| ending.to_str()).is_some_and(|ending| PROGRAMS.iter().any(|program| ending.eq_ignore_ascii_case(program))) {
+            if !is_program(&path) {
                 continue;
             }
             // (made, or written again: a program copied in keeps the time it was written, and has the time it was made here)
@@ -1955,6 +1984,216 @@ fn walk_for_programs(root: &Path, began: std::time::SystemTime, budget: Duration
         }
     }
     Relabeled { walked, changed, took: started.elapsed() }
+}
+
+/// What runs, by its name.
+fn is_program(path: &Path) -> bool {
+    path.extension().and_then(|ending| ending.to_str()).is_some_and(|ending| PROGRAMS.iter().any(|program| ending.eq_ignore_ascii_case(program)))
+}
+
+/// The changes in a workspace while a command runs, as Windows tells of them (ReadDirectoryChangesExW, for the whole tree, with each one's attributes): the programs the
+/// command made are then known without a walk, and a command that made nothing costs nothing after it, however large the workspace (a walk of one of 330,000 files had
+/// up to 200 ms after each command). What a folder that came in whole held (one moved in from outside the workspace) was not told of, and that folder is walked. Where
+/// the watch cannot say all of it (what Windows keeps between two reads ran over, the drive does not tell of changes so, a read failed), it says nothing, and the
+/// workspace is walked as before.
+struct ChangeWatch {
+    stop: Handle,
+    thread: Option<std::thread::JoinHandle<Option<Seen>>>,
+}
+
+/// What a `ChangeWatch` saw: the programs made, written or renamed to, where they are now; the folders that came in (made, or moved in), with whether anything was seen made
+/// in them; and how many changes it read.
+#[derive(Default)]
+pub(crate) struct Seen {
+    programs: HashSet<PathBuf>,
+    came: HashMap<PathBuf, bool>,
+    renamed_from: Option<PathBuf>,
+    changes: usize,
+}
+
+/// The changes a watch is told of: names made, taken away and renamed, of files and folders, and what is written.
+const WATCHED: u32 = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_CREATION;
+
+/// What a read of the changes takes at most, which is also what Windows keeps of them between two reads.
+const WATCH_BUFFER: usize = 256 << 10;
+
+impl ChangeWatch {
+    /// Watching `root` from now, before the command starts; nothing where it cannot be.
+    fn start(root: &Path) -> Option<ChangeWatch> {
+        // SAFETY: the folder's handle is given to the thread, which closes it; the stop's is closed after the thread has ended (`Drop`).
+        unsafe {
+            let folder = CreateFileW(wide_path(root).as_ptr(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, std::ptr::null_mut());
+            if folder == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let stop = Handle(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()));
+            if stop.0.is_null() {
+                CloseHandle(folder);
+                return None;
+            }
+            let (told, ready) = std::sync::mpsc::channel();
+            let (root, folder_at, stop_at) = (root.to_path_buf(), folder as usize, stop.0 as usize);
+            let spawned = std::thread::Builder::new().name("change-watch".into()).spawn(move || {
+                let folder = Handle(folder_at as HANDLE);
+                watch(&root, folder.0, stop_at as HANDLE, &told)
+            });
+            let Ok(thread) = spawned else {
+                CloseHandle(folder);
+                return None;
+            };
+            let watch = ChangeWatch { stop, thread: Some(thread) };
+            // (from the first read on, Windows keeps what changes: the command starts after it)
+            ready.recv().unwrap_or(false).then_some(watch)
+        }
+    }
+
+    /// What it saw, with the command and all it started ended; nothing where it could not see all of it.
+    fn finish(mut self) -> Option<Seen> {
+        // SAFETY: the event is this value's.
+        unsafe { SetEvent(self.stop.0) };
+        self.thread.take()?.join().ok().flatten()
+    }
+}
+
+impl Drop for ChangeWatch {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            // SAFETY: the event is this value's, and is closed after the thread has ended.
+            unsafe { SetEvent(self.stop.0) };
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The thread of a `ChangeWatch`: it reads until the stop, then what Windows kept for it to then, and says what it saw, or nothing where it could not see all of it. That
+/// the first read was asked is told on `told`.
+unsafe fn watch(root: &Path, folder: HANDLE, stop: HANDLE, told: &std::sync::mpsc::Sender<bool>) -> Option<Seen> {
+    let mut seen = Seen::default();
+    let mut buffer = vec![0u64; WATCH_BUFFER / 8];
+    let event = Handle(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()));
+    let (mut first, mut stopping) = (true, false);
+    loop {
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        overlapped.hEvent = event.0;
+        let asked = !event.0.is_null() && ReadDirectoryChangesExW(folder, buffer.as_mut_ptr().cast(), WATCH_BUFFER as u32, 1, WATCHED, std::ptr::null_mut(), &mut overlapped, None, ReadDirectoryNotifyExtendedInformation) != 0;
+        if first {
+            first = false;
+            let _ = told.send(asked);
+        }
+        if !asked {
+            return None;
+        }
+        if !stopping {
+            let both = [event.0, stop];
+            stopping = WaitForMultipleObjects(2, both.as_ptr(), 0, INFINITE) != WAIT_OBJECT_0;
+        }
+        let mut got = 0u32;
+        // (after the stop, what was kept since the last read comes at once; a read with nothing to give waits, and is called off)
+        if GetOverlappedResult(folder, &overlapped, &mut got, 0) == 0 {
+            if GetLastError() != ERROR_IO_INCOMPLETE {
+                return None;
+            }
+            CancelIoEx(folder, &overlapped);
+            if GetOverlappedResult(folder, &overlapped, &mut got, 1) == 0 {
+                return (GetLastError() == ERROR_OPERATION_ABORTED).then_some(seen);
+            }
+        }
+        // (none: the changes ran over what is kept of them, and all of it was let go)
+        if got == 0 {
+            return None;
+        }
+        seen.read(root, &buffer, got as usize);
+    }
+}
+
+impl Seen {
+    /// The changes of one read, `got` bytes of `buffer`.
+    unsafe fn read(&mut self, root: &Path, buffer: &[u64], got: usize) {
+        use std::os::windows::ffi::OsStringExt;
+        let bytes = buffer.as_ptr().cast::<u8>();
+        let name_at = std::mem::offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileName);
+        let mut at = 0;
+        while at + name_at <= got {
+            let entry = bytes.add(at).cast::<FILE_NOTIFY_EXTENDED_INFORMATION>();
+            let next = std::ptr::addr_of!((*entry).NextEntryOffset).read_unaligned() as usize;
+            let action = std::ptr::addr_of!((*entry).Action).read_unaligned();
+            let attributes = std::ptr::addr_of!((*entry).FileAttributes).read_unaligned();
+            let length = std::ptr::addr_of!((*entry).FileNameLength).read_unaligned() as usize / 2;
+            if at + name_at + length * 2 > got {
+                break;
+            }
+            let mut name = vec![0u16; length];
+            std::ptr::copy_nonoverlapping(bytes.add(at + name_at), name.as_mut_ptr().cast::<u8>(), length * 2);
+            self.changes += 1;
+            self.note(action, attributes, root.join(std::ffi::OsString::from_wide(&name)));
+            if next == 0 {
+                break;
+            }
+            at += next;
+        }
+    }
+
+    /// One change.
+    fn note(&mut self, action: u32, attributes: u32, path: PathBuf) {
+        let folder = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        // (a link to a folder leads out of the workspace, and is not walked)
+        let link = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        // (something made in a folder that came in: what is in that one is seen as it is made)
+        if let Some(inside) = path.parent().and_then(|parent| self.came.get_mut(parent)) {
+            *inside = true;
+        }
+        match action {
+            FILE_ACTION_RENAMED_OLD_NAME => {
+                self.renamed_from = Some(path);
+                return;
+            }
+            // (a folder renamed: what was seen in it is where it is now; what it held from before, its own commands were seen to)
+            FILE_ACTION_RENAMED_NEW_NAME if folder => match self.renamed_from.take() {
+                Some(from) => self.moved(&from, &path),
+                None if !link => {
+                    self.came.insert(path, false);
+                }
+                None => {}
+            },
+            FILE_ACTION_ADDED if folder && !link => {
+                self.came.insert(path, false);
+            }
+            FILE_ACTION_ADDED | FILE_ACTION_MODIFIED | FILE_ACTION_RENAMED_NEW_NAME if !folder && is_program(&path) => {
+                self.programs.insert(path);
+            }
+            _ => {}
+        }
+        self.renamed_from = None;
+    }
+
+    /// What was seen in `from`, renamed to `to`.
+    fn moved(&mut self, from: &Path, to: &Path) {
+        let now = |path: PathBuf| match path.strip_prefix(from) {
+            Ok(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
+            Ok(rest) => to.join(rest),
+            Err(_) => path,
+        };
+        self.programs = std::mem::take(&mut self.programs).into_iter().map(now).collect();
+        self.came = std::mem::take(&mut self.came).into_iter().map(|(path, inside)| (now(path), inside)).collect();
+    }
+
+    /// The folders that came in with nothing seen made in them, which hold what came with them: one in another is in that one's walk. Not what is now a link, nor a
+    /// repository's own folder.
+    fn folders_to_walk(&self, root: &Path) -> Vec<PathBuf> {
+        let mut unseen: Vec<&PathBuf> = self.came.iter().filter(|(_, inside)| !**inside).map(|(path, _)| path).collect();
+        // (in the order of their parts, a folder's own come right after it)
+        unseen.sort();
+        let mut walked: Vec<PathBuf> = Vec::new();
+        for path in unseen {
+            if walked.last().is_some_and(|above| path.starts_with(above)) || path.strip_prefix(root).is_ok_and(|inside| inside.components().any(|part| part.as_os_str() == ".git")) {
+                continue;
+            }
+            if std::fs::symlink_metadata(path).is_ok_and(|data| data.is_dir()) {
+                walked.push(path.clone());
+            }
+        }
+        walked
+    }
 }
 
 /// The person this app runs as: their SID, in the buffer the token gave it in.
@@ -2428,6 +2667,8 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         }
         // (from here to the look after it, a repository that shows up in the workspace may be what it makes)
         let _at_work = AtWork::start(&root);
+        // (what it makes, as it makes it: see `programs_to_medium`)
+        let watch = if token == Token::Container && !nested { ChangeWatch::start(&root) } else { None };
         let (out_read, out_write) = pipe()?;
         let (err_read, err_write) = pipe()?;
         let nul = wide("NUL");
@@ -2616,7 +2857,9 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         times.after = after_began.elapsed();
         // (what it made that runs: from the container it is low, and so would be what anyone starts of it; a restricted token and the person's own run at the person's level)
         if token == Token::Container && !nested {
-            let relabeled = programs_to_medium(&root, began_at, times.run);
+            let seen = watch.and_then(ChangeWatch::finish);
+            (times.relabel_watched, times.relabel_seen) = (seen.is_some(), seen.as_ref().map_or(0, |seen| seen.changes));
+            let relabeled = programs_to_medium(&root, began_at, times.run, seen);
             (times.relabel, times.relabel_walked, times.relabel_changed) = (relabeled.took, relabeled.walked, relabeled.changed);
         }
         TIMINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(times);
@@ -2872,7 +3115,7 @@ mod tests {
         let list = |path: &Path| unsafe { Dacl::read(path).unwrap().aces };
         let lists: Vec<_> = made.iter().map(|path| list(path)).collect();
         let began = std::time::SystemTime::now() - Duration::from_secs(60);
-        let done = programs_to_medium(&work, began, Duration::from_secs(1));
+        let done = programs_to_medium(&work, began, Duration::from_secs(1), None);
         assert_eq!(done.changed, 3, "{} looked at", done.walked);
         for (path, before) in made.iter().zip(lists) {
             assert!(!low(path), "{}", path.display());
@@ -2880,8 +3123,64 @@ mod tests {
         }
         assert!(low(&old) && low(&words) && low(&away), "what was there before, what is not a program, and what is outside are as they were");
         // (and a second walk changes nothing)
-        assert_eq!(programs_to_medium(&work, began, Duration::from_secs(1)).changed, 0);
+        assert_eq!(programs_to_medium(&work, began, Duration::from_secs(1), None).changed, 0);
         let _ = std::fs::remove_dir(work.join("linked"));
+    }
+
+    /// What is made while a watch runs is what it says: a program made, one in a folder made, one renamed to a program's name, one in a folder renamed after it was made
+    /// there (where it is now), a folder moved in whole from outside (walked, with what it held), and what is not a program, or is in a repository's own folder, left out.
+    /// Those labelled low are then given the person's level, and a walk of the whole after it finds nothing left.
+    #[test]
+    fn what_a_watch_sees_made_is_given_the_persons_level_and_a_walk_finds_nothing_more() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let (work, outside) = (outside_folder("watch-work"), outside_folder("watch-outside"));
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        let began = std::time::SystemTime::now();
+        let watch = ChangeWatch::start(&work).expect("a watch on a folder of the temp drive");
+        let program = |path: &Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"MZ").unwrap();
+            label(path, "S:(ML;;NW;;;LW)");
+        };
+        program(&work.join("made.exe"));
+        program(&work.join("deps").join("made.dll"));
+        program(&work.join("named.tmp"));
+        std::fs::rename(work.join("named.tmp"), work.join("named.node")).unwrap();
+        program(&work.join("working").join("in.exe"));
+        std::fs::rename(work.join("working"), work.join("final")).unwrap();
+        program(&outside.join("whole").join("deeper").join("came.exe"));
+        std::fs::rename(outside.join("whole"), work.join("whole")).unwrap();
+        program(&work.join("notes.txt"));
+        program(&work.join(".git").join("kept.exe"));
+        let seen = watch.finish().expect("all of it seen");
+        let mut programs: Vec<String> = seen.programs.iter().map(|path| path.strip_prefix(&work).unwrap().display().to_string()).collect();
+        programs.sort();
+        assert_eq!(programs, [".git\\kept.exe", "deps\\made.dll", "final\\in.exe", "made.exe", "named.node"]);
+        assert_eq!(seen.folders_to_walk(&work), [work.join("whole")], "the folder moved in whole is walked; those made here are not");
+        let done = programs_to_medium(&work, began, Duration::from_secs(1), Some(seen));
+        assert_eq!(done.changed, 5, "{} looked at", done.walked);
+        for path in [work.join("made.exe"), work.join("deps").join("made.dll"), work.join("named.node"), work.join("final").join("in.exe"), work.join("whole").join("deeper").join("came.exe")] {
+            assert!(!low(&path), "{}", path.display());
+        }
+        assert!(low(&work.join("notes.txt")) && low(&work.join(".git").join("kept.exe")));
+        assert_eq!(walk_for_programs(&work, began, Duration::from_secs(60), None).changed, 0, "a walk of the whole finds nothing left");
+    }
+
+    /// A command in the container that made nothing has nothing walked after it, and what one made is given the person's level, from what was seen of it.
+    #[test]
+    fn a_command_is_watched_and_what_it_made_that_runs_is_given_the_persons_level() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let work = work_folder("watched-command");
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let made = command(&format!("mkdir out & copy /y \"{system}\\System32\\whoami.exe\" out\\who.exe >NUL & echo x> words.txt"), &work, false);
+        assert_eq!(made.status, Some(0), "{}", decode(&made.stderr));
+        assert!(!low(&work.join("out").join("who.exe")), "the program it made is at the person's level");
+        assert!(low(&work.join("words.txt")), "what is not a program is as it was made");
+        assert_eq!(walk_for_programs(&work, std::time::SystemTime::now() - Duration::from_secs(600), Duration::from_secs(60), None).changed, 0);
     }
 
     /// A walk out of time goes on after the next command from where it stopped, and then walks the whole again for what that one made.
@@ -2899,12 +3198,12 @@ mod tests {
         }
         let began = std::time::SystemTime::now() - Duration::from_secs(60);
         // (no time at all: one folder each time)
-        let first = walk_for_programs(&work, began, Duration::ZERO);
+        let first = walk_for_programs(&work, began, Duration::ZERO, None);
         assert_eq!(first.changed, 0, "the top folder alone, which holds none");
         assert!(WALKS.lock().unwrap().iter().any(|(at, _)| at == &work), "what is left is kept");
         let mut changed = 0;
         for _ in 0..40 {
-            changed += walk_for_programs(&work, began, Duration::ZERO).changed;
+            changed += walk_for_programs(&work, began, Duration::ZERO, None).changed;
             if !WALKS.lock().unwrap().iter().any(|(at, _)| at == &work) {
                 break;
             }
