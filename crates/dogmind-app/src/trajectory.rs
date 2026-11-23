@@ -104,7 +104,7 @@ fn request_row(request: &RequestRow) -> Row {
         parts.push(tf("cached {0}%", &[&cached]));
     }
     if let Some(tokens) = request.tokens {
-        parts.push(tf("{0} tokens", &[&tokens]));
+        parts.push(tf(if request.tokens_estimated { "about {0} tokens" } else { "{0} tokens" }, &[&tokens]));
     }
     if let Some(rate) = request.rate {
         parts.push(tf("{0} tok/s", &[&format!("{}{rate:.1}", if request.counted { "~" } else { "" })]));
@@ -214,6 +214,17 @@ mod tests {
             let tool = ToolRow { outcome: outcome.to_string(), ..ToolRow::default() };
             assert_eq!(tool_row(&tool).note, expected);
         }
+    }
+
+    #[test]
+    fn only_a_local_token_estimate_is_marked_as_approximate() {
+        let run = summary(r#"{"ev":"request","turn":1,"tokens_est":19}
+{"ev":"request","turn":1,"tokens_est":19,"completion":0}
+{"ev":"request","turn":1}"#);
+        let requests = &run.turns[0].requests;
+        assert!(request_row(&requests[0]).note.contains("about 19 tokens"));
+        assert!(request_row(&requests[1]).note.starts_with("0 tokens"));
+        assert!(!request_row(&requests[2]).note.contains("tokens"));
     }
 
     #[test]

@@ -31,6 +31,9 @@ impl Line {
     pub(crate) fn u(&self, key: &str) -> Option<u64> {
         self.v[key].as_u64()
     }
+    fn written_tokens(&self) -> Option<String> {
+        self.u("completion").map(|n| n.to_string()).or_else(|| self.u("tokens_est").map(|n| format!("~{n}")))
+    }
     fn cache_percent(&self) -> Option<u64> {
         crate::llm::cache_percent(self.u("prompt")?, self.u("cached"))
     }
@@ -175,7 +178,7 @@ fn lines_by_turn(lines: &[Line]) -> BTreeMap<u64, Vec<&Line>> {
 fn request_summary(line: &Line) -> String {
     let cached = line.cache_percent().map_or_else(|| "cached ?".to_string(), |value| format!("cached {value}%"));
     let calls: Vec<&str> = line.v["calls"].as_array().map(|calls| calls.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-    format!("{} wrote {} tokens in {}, {cached}, ended {}{}", short(line.req()), line.u("completion").or(line.u("tokens_est")).map_or("?".to_string(), |tokens| tokens.to_string()), secs(line.u("ms").unwrap_or(0)), line.s("end"), if calls.is_empty() { String::new() } else { format!(", called {}", calls.join(", ")) })
+    format!("{} wrote {} tokens in {}, {cached}, ended {}{}", short(line.req()), line.written_tokens().unwrap_or_else(|| "?".into()), secs(line.u("ms").unwrap_or(0)), line.s("end"), if calls.is_empty() { String::new() } else { format!(", called {}", calls.join(", ")) })
 }
 
 /// The report for a trajectory, and with the engine's log (as text) the engine's lines beside the requests.
@@ -222,7 +225,7 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         }
     }
 
-    let _ = writeln!(out, "\nrequests (first = time to the first word; gen = the rest; tok/s is the server's where it said, else counted)");
+    let _ = writeln!(out, "\nrequests (first = time to the first word; gen = the rest; ~ before tokens means estimated; tok/s is the server's where it said, else counted)");
     for (at, line) in &requests {
         let (ms, first) = (line.u("ms").unwrap_or(0), line.u("first_ms"));
         let generation = first.map_or(ms, |first| ms.saturating_sub(first));
@@ -232,7 +235,7 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         let calls: Vec<&str> = line.v["calls"].as_array().map(|calls| calls.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
         let _ = writeln!(out, "  {:>5} {:<10} first {:>8} gen {:>8} prompt {:>6} cached {:>4} wrote {:>6} tok at {:>6} tok/s  {}{}{}{}",
             short(line.req()), line.s("role"), first.map_or("-".to_string(), secs), secs(generation), line.u("prompt").map_or("-".to_string(), |tokens| tokens.to_string()), cached,
-            completion.or(line.u("tokens_est")).map_or("-".to_string(), |tokens| tokens.to_string()), rate, line.s("end"), if calls.is_empty() { String::new() } else { format!(" [{}]", calls.join(", ")) },
+            line.written_tokens().unwrap_or_else(|| "-".into()), rate, line.s("end"), if calls.is_empty() { String::new() } else { format!(" [{}]", calls.join(", ")) },
             match line.v["retry_of"].as_str() { Some(of) => format!("  (repeats {} after {}, {})", short(of), secs(line.u("wait_ms").unwrap_or(0)), line.s("retry_why")), None => String::new() },
             match line.v["helper_file"].as_str() { Some(file) => format!("  (the helper's steps are in {file})"), None => String::new() });
         if let Some(server) = line.v.get("server").filter(|server| server.is_object()) {
@@ -324,7 +327,13 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
                     Some(run) => format!("a run of {run} lines of code"),
                     None => format!("{} lines of code and {} fence marks in all", line.u("code_lines").unwrap_or(0), line.u("fences").unwrap_or(0)),
                 };
-                format!("{} tokens thrown away{spent} ({shape})", line.u("tokens_before").unwrap_or(0))
+                let tokens = line.u("tokens_before").map_or_else(|| "?".to_string(), |n| format!("~{n}"));
+                let kept = match line.v["reasoning_kept"].as_bool() {
+                    Some(true) => ", reasoning kept",
+                    Some(false) => ", reasoning discarded",
+                    None => "",
+                };
+                format!("{tokens} tokens generated{spent} before the stop ({shape}{kept})")
             }
             "cut_write" => format!("{} bytes of {} cut ({}), after {} tokens", line.u("bytes").unwrap_or(0), line.s("path"), line.s("why"), line.u("tokens_before").unwrap_or(0)),
             "cost_note" => format!("{} tokens generated", line.u("generated").unwrap_or(0)),
@@ -620,6 +629,7 @@ pub struct RequestRow {
     pub cached_percent: Option<u64>,
     /// What it wrote, counted where the server did not say.
     pub tokens: Option<u64>,
+    pub tokens_estimated: bool,
     /// Tokens a second: the server's where it said, else counted (and then `counted`).
     pub rate: Option<f64>,
     pub counted: bool,
@@ -735,6 +745,7 @@ pub fn summary(trajectory: &str) -> Summary {
                         prompt: line.u("prompt"),
                         cached_percent: line.cache_percent(),
                         tokens: completion.or(line.u("tokens_est")),
+                        tokens_estimated: completion.is_none() && line.u("tokens_est").is_some(),
                         rate,
                         counted: counted && rate.is_some(),
                         end: line.s("end").to_string(),
@@ -809,6 +820,21 @@ mod tests {
     }
 
     #[test]
+    fn request_counts_distinguish_estimates_from_reported_zero_and_missing_usage() {
+        let lines = [
+            json!({"ev":"request", "turn":1, "req":"s/1", "role":"main", "tokens_est":27}),
+            json!({"ev":"intervention", "turn":1, "req":"s/1", "kind":"draft_stop", "tokens_before":27, "reasoning_kept":true}),
+            json!({"ev":"request", "turn":1, "req":"s/2", "role":"main", "completion":0, "tokens_est":15}),
+            json!({"ev":"request", "turn":1, "req":"s/3", "role":"main"}),
+        ];
+        let printed = report(&text(&lines), None);
+        let written: Vec<_> = printed.lines().filter_map(|line| line.split_once(" wrote ")?.1.split_whitespace().next()).collect();
+        assert_eq!(written[..3], ["~27", "0", "-"]);
+        assert!(printed.contains("~27 tokens generated") && printed.contains(", reasoning kept)"));
+        assert!(printed.contains("next: /2 wrote 0 tokens"));
+    }
+
+    #[test]
     fn a_run_is_told_by_its_requests_its_tools_its_stops_and_where_the_time_went() {
         let lines = [
             json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 40, "images": 0}),
@@ -828,7 +854,7 @@ mod tests {
         assert!(said.contains("   /1 main") && said.contains("stopped_app:draft_stop") && said.contains("cached  36%"), "{said}");
         assert!(said.contains("index.html"), "{said}");
         // What the stop cost: the tokens thrown away and the time, and what the request after it did.
-        assert!(said.contains("draft_stop at /1: 8328 tokens thrown away in 103.0 s (a run of 61 lines of code)"), "{said}");
+        assert!(said.contains("draft_stop at /1: ~8328 tokens generated in 103.0 s before the stop (a run of 61 lines of code)"), "{said}");
         assert!(said.contains("next: /2 wrote 2714 tokens in 37.0 s, cached 36%, ended tool_calls"), "{said}");
         assert!(said.contains("signs of going round in circles\n  none"), "{said}");
     }

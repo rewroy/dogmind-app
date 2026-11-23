@@ -11197,7 +11197,7 @@ Body").unwrap();
         let session = std::fs::read_dir(run._sessions.path()).unwrap().flatten().map(|entry| entry.path()).find(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !trajectory::is_trajectory(path)).unwrap();
         let said = crate::trajectory_report::report_files(&trajectory::file_of(&session), None).unwrap();
         assert!(said.contains("turn 1: 8 characters, 0 pictures") && said.contains("wall "), "{said}");
-        assert!(said.contains("stopped_app:draft_stop") && said.contains("draft_stop at /1:") && said.contains("tokens thrown away"), "{said}");
+        assert!(said.contains("stopped_app:draft_stop") && said.contains("draft_stop at /1:") && said.contains("before the stop"), "{said}");
         assert!(said.contains("next: /2 wrote") && said.contains("called create_file, execute_command"), "{said}");
         assert!(said.contains("create_file") && said.contains("page.html") && said.contains("declined_person") && said.contains("python"), "{said}");
         assert!(said.contains("waiting for the person 0.1 s") || said.contains("waiting for the person 0.0 s"), "{said}");
