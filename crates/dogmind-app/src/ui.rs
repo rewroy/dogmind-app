@@ -2835,7 +2835,7 @@ fn mcp_why(why: &str) -> String {
     why.replace(dogmind_agent::mcp::NOT_FOUND, t(dogmind_agent::mcp::NOT_FOUND))
 }
 
-/// Read the external server lists for a user command. Only a successful addition calls for reloading the hub.
+/// Read the external server lists for a user command and report how many servers were added.
 fn mcp_import(home: &Path, file: &Path, argument: &str) -> Result<(usize, String), String> {
     use dogmind_agent::mcp;
     let (action, name) = argument.split_once(char::is_whitespace).map_or((argument, ""), |(action, name)| (action, name.trim()));
@@ -12570,7 +12570,9 @@ impl App {
         let Some(home) = std::env::var_os("USERPROFILE") else { return t("The user profile could not be located.").into() };
         match mcp_import(Path::new(&home), &self.folder.join("mcp.json"), argument) {
             Ok((added, message)) => {
-                if added > 0 {
+                // A file repaired after startup can already contain the requested server while the hub still has its read error.
+                let recovered = !argument.trim().eq_ignore_ascii_case("candidates") && self.mcp.unreadable().is_some();
+                if added > 0 || recovered {
                     self.mcp_changed(None);
                 }
                 message
