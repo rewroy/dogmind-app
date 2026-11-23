@@ -1062,9 +1062,20 @@ fn same_file(one: &str, other: &str) -> bool {
     one == other || one.ends_with(&format!("/{other}")) || other.ends_with(&format!("/{one}"))
 }
 
-/// Whether a file's name is one a model gives a try of its own: `_probe.html`, `_t3.html`, `_tmp_make.py`, `scratch.js`, `debug_page.html`.
 /// How much of a file is looked through for the names of the files it takes in: a page, a script or a stylesheet is far less; a bundled library is some 600 KB.
 const TAKEN_IN_LOOKED_AT: usize = 4 << 20;
+const MAX_PAGE_DEPENDENCIES: usize = 64;
+
+fn dependency_text(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > TAKEN_IN_LOOKED_AT as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(TAKEN_IN_LOOKED_AT as u64 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= TAKEN_IN_LOOKED_AT).then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
 
 /// The files a page takes in by the paths its text gives them (src and href, a script's import and from, a stylesheet's url()), each relative to the folder of the
 /// file that names it, and what those take in in turn: what the page is made of. Not what is on the web, nor a data: URL. At most 64.
@@ -1075,10 +1086,11 @@ fn taken_in_by(page: &Path) -> Vec<PathBuf> {
     });
     let mut found: Vec<PathBuf> = vec![lexical(page)];
     let mut at = 0;
-    while at < found.len() && found.len() <= 64 {
+    // The first entry is the page itself and does not count towards the dependency limit.
+    while at < found.len() && found.len() <= MAX_PAGE_DEPENDENCIES {
         let file = found[at].clone();
         at += 1;
-        let Some(text) = std::fs::read(&file).ok().filter(|bytes| bytes.len() <= TAKEN_IN_LOOKED_AT).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()) else { continue };
+        let Some(text) = dependency_text(&file) else { continue };
         let folder = file.parent().unwrap_or(Path::new(".")).to_path_buf();
         for named in paths.captures_iter(&text).filter_map(|found| (1..=4).find_map(|group| found.get(group))).map(|named| named.as_str().trim()) {
             if named.is_empty() || named.contains("://") || named.starts_with("//") || named.to_ascii_lowercase().starts_with("data:") {
@@ -1087,6 +1099,9 @@ fn taken_in_by(page: &Path) -> Vec<PathBuf> {
             let part = lexical(&folder.join(named));
             if part.is_file() && !found.iter().any(|known| same_place(known, &part)) {
                 found.push(part);
+                if found.len() > MAX_PAGE_DEPENDENCIES {
+                    break;
+                }
             }
         }
     }
@@ -3845,12 +3860,16 @@ impl Agent {
         }
         // (a change to what the page takes in is a change to the page: a lottery turn patched its app.js and style.css 13 times and checked index.html 24 times, and
         // the count never moved, nor the word came)
-        if let Some(page) = self.polish.page.clone() {
-            let parts = taken_in_by(&crate::safety::resolve(&self.workspace, &page));
-            if changed.iter().any(|path| same_file(path, &page) || parts.iter().any(|part| same_place(part, &crate::safety::resolve(&self.workspace, path)))) {
-                self.polish.changed = true;
-            }
+        if changed.is_empty() || self.polish.changed {
+            return;
         }
+        let Some(page) = self.polish.page.as_deref() else { return };
+        if changed.iter().any(|path| same_file(path, page)) {
+            self.polish.changed = true;
+            return;
+        }
+        let parts = taken_in_by(&resolve(&self.workspace, page));
+        self.polish.changed = changed.iter().map(|path| resolve(&self.workspace, path)).any(|path| parts.iter().any(|part| same_place(part, &path)));
     }
 
     /// The files this turn made that are still there and that `named` (an answer, an objective) and the person's last message do not name.
@@ -3863,7 +3882,7 @@ impl Agent {
         let mut kept: Vec<String> = self.made_this_turn.iter().filter(|path| { let file = file_of(path); !file.is_empty() && (named.contains(&file) || asked.contains(&file)) }).cloned().collect();
         let mut at = 0;
         while at < kept.len() {
-            let text = std::fs::read(resolve(&self.workspace, &kept[at])).ok().filter(|bytes| bytes.len() <= TAKEN_IN_LOOKED_AT).map(|bytes| String::from_utf8_lossy(&bytes).to_lowercase()).unwrap_or_default();
+            let text = dependency_text(&resolve(&self.workspace, &kept[at])).unwrap_or_default().to_lowercase();
             for path in &self.made_this_turn {
                 let file = file_of(path);
                 if !file.is_empty() && text.contains(&file) && !kept.iter().any(|known| same_file(known, path)) {
@@ -10915,6 +10934,29 @@ Body").unwrap();
             assert_eq!((kept.unwrap(), images.len()), (said.clone(), 0), "a model that cannot be shown one");
         }
         assert!(agent.with_check_pictures(Err("no such page".into()), Vec::new()).0.is_err());
+    }
+
+    #[test]
+    fn page_dependencies_stop_at_the_file_and_byte_limits() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let page = dir.path().join("index.html");
+        let mut html = String::new();
+        for n in 0..MAX_PAGE_DEPENDENCIES + 5 {
+            let name = format!("{n}.js");
+            std::fs::write(dir.path().join(&name), "").unwrap();
+            html.push_str(&format!("<script src='{name}'></script>"));
+        }
+        std::fs::write(&page, html).unwrap();
+        let found = taken_in_by(&page);
+        assert_eq!(found.len(), MAX_PAGE_DEPENDENCIES);
+        assert!(found.last().unwrap().ends_with(format!("{}.js", MAX_PAGE_DEPENDENCIES - 1)));
+
+        let limit = TAKEN_IN_LOOKED_AT as u64;
+        let file = std::fs::File::create(&page).unwrap();
+        file.set_len(limit).unwrap();
+        assert_eq!(dependency_text(&page).unwrap().len(), TAKEN_IN_LOOKED_AT);
+        file.set_len(limit + 1).unwrap();
+        assert!(dependency_text(&page).is_none());
     }
 
     /// What a page takes in: its stylesheet in a folder, its scripts (one named with `./`), a module a script imports and one it loads later, an image a stylesheet
