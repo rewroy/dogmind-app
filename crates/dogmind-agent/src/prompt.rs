@@ -575,7 +575,8 @@ fn names_the_whole_work(object: &str) -> bool {
 pub const SUGGESTION_NOTICE: &str = "Read as a suggestion: no files will be changed in this turn. Say \"go ahead\" to have it done.";
 
 /// The phrase of a suggestion put as a question, if what the person typed is one and asks for nothing to be done: 「〜したほうがよくない?」, 「〜はどう?」, 「〜したらどうかな」,
-/// "how about…?", "wouldn't it be better to…?". Not where it asks as well (「〜して」, 「お願い」, 「やって」, 「〜しておいて」, "please", "can you…?"), nor in what is quoted.
+/// "how about…?", "wouldn't it be better to…?". Not where it asks as well (「〜して」, 「お願い」, 「やって」, 「〜しておいて」, "please", "can you…?"), nor in what is quoted. A て or
+/// で that asks ends its clause (。, !, a space, the end): one with a comma after it is as often a particle (「ログ画面で、…したほうがよくない?」).
 /// (Told in the system prompt that such a suggestion is a question, the Homelab's DeepSeek still changed the code on the first, three runs of three: 「ctx の表示はある
 /// のだから、キャッシュヒット率も表示したほうがよくないかなあ。」, where the owner had answered it by asking for it themselves.)
 pub fn suggestion_phrase(text: &str) -> Option<String> {
@@ -583,7 +584,7 @@ pub fn suggestion_phrase(text: &str) -> Option<String> {
     let (japanese, japanese_asks, english, english_asks) = RULES.get_or_init(|| {
         (
             Regex::new(r"(?:ほうが|方が)(?:よく|良く)ない|(?:ほうが|方が)(?:いい|良い)(?:かな|のでは|んじゃ)|(?:は|って|のは)どう(?:かな|だろう|でしょう|ですか)?\s*(?:[?？]|$)|(?:たら|れば|ては)どう(?:かな|だろう|でしょう|です|か)?").unwrap(),
-            Regex::new(r"(?:て|で)(?:ください|下さい|ほしい|欲しい|くれ|もらえ|おいて|おけ|いただけ)|(?:て|で)(?:[。！!．.、,\s]|$)|お願い|頼む|よろしく|やっといて|しといて").unwrap(),
+            Regex::new(r"(?:て|で)(?:ください|下さい|ほしい|欲しい|くれ|もらえ|おいて|おけ|いただけ)|(?:て|で)(?:[。！!．.\s]|$)|お願い|頼む|よろしく|やっといて|しといて").unwrap(),
             Regex::new(r"(?i)\b(?:how|what)\s+about\b|\bwould(?:n't|\s+not)\s+it\s+be\s+(?:better|nicer|good|nice|worth)|\bwould\s+it\s+(?:be\s+)?(?:better|make\s+sense)|\b(?:should|shall)\s+we\b|\bmaybe\s+(?:we|you)\s+should\b").unwrap(),
             Regex::new(r"(?i)\bplease\b|\bgo\s+ahead\b|^\s*(?:can|could|would|will)\s+you\b|\bdo\s+it\b").unwrap(),
         )
@@ -748,6 +749,9 @@ mod tests {
             "Wouldn't it be better to cache the result?",
             "Should we add a retry here?",
             "Maybe we should log the request id too?",
+            // (a particle で, a comma after it: no request)
+            "ログ画面で、エラーを赤くしたほうがよくない？",
+            "設定で、検索を付けるのはどう？",
         ];
         const REQUESTS: &[&str] = &[
             "キャッシュヒット率を表示して。",
