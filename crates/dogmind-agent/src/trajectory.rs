@@ -151,10 +151,48 @@ pub struct RequestNote<'a> {
     pub draft_marks: Option<Value>,
 }
 
+/// Provider-reported usage of the main conversation across all of its turns.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SessionUsage {
+    pub requests: u64,
+    pub prompt: u64,
+    pub completion: u64,
+    pub cached: u64,
+    /// Prompt tokens from requests whose provider supplied a cache count.
+    pub cache_prompt: u64,
+    pub last_rate: Option<f64>,
+}
+
+impl SessionUsage {
+    fn record_request(&mut self, fields: &Value) {
+        if fields["role"] != "main" {
+            return;
+        }
+        let (Some(prompt), Some(completion)) = (fields["prompt"].as_u64(), fields["completion"].as_u64()) else { return };
+        // Providers can send timing information with empty token counters.
+        if prompt == 0 && completion == 0 {
+            return;
+        }
+        self.requests = self.requests.saturating_add(1);
+        self.prompt = self.prompt.saturating_add(prompt);
+        self.completion = self.completion.saturating_add(completion);
+        if let Some(cached) = fields["cached"].as_u64() {
+            self.cache_prompt = self.cache_prompt.saturating_add(prompt);
+            self.cached = self.cached.saturating_add(cached.min(prompt));
+        }
+        self.last_rate = fields["tps"].as_f64();
+    }
+
+    pub fn cache_percent(&self) -> Option<u64> {
+        crate::llm::cache_percent(self.cache_prompt, Some(self.cached))
+    }
+}
+
 pub struct Trajectory {
     file: Option<File>,
     session_id: String,
     pub turn: u64,
+    pub usage: SessionUsage,
     requests: u64,
     warm: u64,
     /// What happened before the session had a file (the engine warming up), kept for it.
@@ -177,7 +215,7 @@ const HELD_MOST: usize = 64;
 
 impl Trajectory {
     pub fn new() -> Trajectory {
-        Trajectory { file: None, session_id: String::new(), turn: 0, requests: 0, warm: 0, held: Vec::new(), turn_requests: 0, turn_tools: 0, waiting: None }
+        Trajectory { file: None, session_id: String::new(), turn: 0, usage: SessionUsage::default(), requests: 0, warm: 0, held: Vec::new(), turn_requests: 0, turn_tools: 0, waiting: None }
     }
 
     /// Begins writing beside this session. A session that is opened again goes on where its file left off: its turns and its requests keep counting.
@@ -185,11 +223,15 @@ impl Trajectory {
         let path = file_of(session);
         self.session_id = session.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
         (self.turn, self.requests) = (0, 0);
+        self.usage = SessionUsage::default();
         let mut ends_a_line = true;
         if let Ok(bytes) = fs::read(&path) {
             ends_a_line = bytes.last().is_none_or(|last| *last == b'\n');
             for line in String::from_utf8_lossy(&bytes).lines() {
                 let Ok(event) = serde_json::from_str::<Value>(line) else { continue };
+                if event["ev"] == "request" {
+                    self.usage.record_request(&event);
+                }
                 self.turn = self.turn.max(event.get("turn").and_then(Value::as_u64).unwrap_or(0));
                 if let Some((id, number)) = event.get("req").and_then(Value::as_str).and_then(|req| req.rsplit_once('/')) {
                     if id == self.session_id {
@@ -213,6 +255,7 @@ impl Trajectory {
         self.write_waiting();
         self.file = None;
         self.session_id.clear();
+        self.usage = SessionUsage::default();
         (self.turn, self.requests, self.turn_requests, self.turn_tools) = (0, 0, 0, 0);
     }
 
@@ -323,6 +366,7 @@ impl Trajectory {
             "calls": note.calls,
             "end": note.end,
         });
+        self.usage.record_request(&fields);
         if let Some(watch) = note.draft_watch {
             fields["draft_watch"] = json!(watch);
         }
@@ -397,6 +441,39 @@ mod tests {
         again.open(&session);
         assert_eq!(again.turn, 1);
         assert_eq!(again.request_id(), "20261105-120000/3", "the second was written, and the numbers do not begin again");
+    }
+
+    #[test]
+    fn resumed_usage_adds_metered_main_requests_once_and_weights_only_reported_cache() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let session = dir.path().join("s.jsonl");
+        let mut traj = Trajectory::new();
+        traj.open(&session);
+        traj.write("request", None, json!({"role":"main","prompt":500,"completion":3}));
+        traj.write("request", None, json!({"role":"main","tokens_est":300}));
+        traj.write("request", None, json!({"role":"main","prompt":0,"completion":0,"tps":37.0}));
+        traj.write("request", None, json!({"role":"helper","prompt":800,"cached":800,"completion":5}));
+        traj.write("turn_end", None, json!({"role":"main","prompt":200,"completion":1}));
+        traj.close();
+        traj.open(&session);
+        assert_eq!(traj.usage.requests, 1);
+        assert_eq!(traj.usage.cache_percent(), None);
+
+        let clock = Clock::start();
+        let missed = Usage { prompt: 10, cached: Some(0), completion: 5, ..Usage::default() };
+        let note = RequestNote { id: "s/2", role: "main", clock: &clock, end: "stop".into(), usage: Some(&missed), timings: None, reasoning_chars: 0, content_chars: 0, calls: vec![], tokens_est: None, retry: None, draft_watch: None, helper_file: None, draft_marks: None };
+        traj.request_waiting(note);
+        assert_eq!(traj.usage.cache_percent(), Some(0));
+        traj.message_at(4);
+        let hit = Usage { prompt: 90, cached: Some(90), completion: 7, tokens_per_second: Some(19.5), ..Usage::default() };
+        traj.request_waiting(RequestNote { id: "s/3", role: "main", clock: &clock, end: "stop".into(), usage: Some(&hit), timings: None, reasoning_chars: 0, content_chars: 0, calls: vec![], tokens_est: None, retry: None, draft_watch: None, helper_file: None, draft_marks: None });
+        let expected = SessionUsage { requests: 3, prompt: 600, completion: 15, cached: 90, cache_prompt: 100, last_rate: Some(19.5) };
+        assert_eq!(traj.usage, expected);
+        assert_eq!(traj.usage.cache_percent(), Some(90));
+        traj.close();
+        assert_eq!(traj.usage, SessionUsage::default());
+        traj.open(&session);
+        assert_eq!(traj.usage, expected);
     }
 
     #[test]

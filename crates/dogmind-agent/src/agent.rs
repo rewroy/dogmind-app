@@ -405,6 +405,8 @@ pub enum Event {
     /// The agent changed the mode (a plan approved ends plan mode): the window shows and keeps it.
     ModeChanged(Mode),
     Usage { used: u64, window: u64, usage: Usage },
+    /// All metered main requests, including requests recorded before a resume.
+    SessionUsage(trajectory::SessionUsage),
     /// Cache reuse for the latest completed model request, if usage was reported.
     RequestCache(Option<u64>),
     Todos(Vec<Value>),
@@ -2326,6 +2328,7 @@ impl Agent {
         self.counted = 0;
         self.web_rules_due = false;
         self.emit(Event::SessionStarted { path: PathBuf::new(), workspace: self.workspace.clone(), transcript: Vec::new() });
+        self.emit(Event::SessionUsage(self.traj.usage));
         self.report_usage(None);
     }
 
@@ -2386,6 +2389,7 @@ impl Agent {
                 self.always_networks.clear();
                 self.use_estimate();
                 self.emit(Event::SessionStarted { path: path.to_path_buf(), workspace: self.workspace.clone(), transcript: self.messages.clone() });
+                self.emit(Event::SessionUsage(self.traj.usage));
                 // (lines of an encrypted conversation that did not open are left out of what is shown and sent, and that is said, not hidden)
                 if !damaged.is_empty() {
                     self.emit(Event::Notice(crate::session::damage_words(&damaged)));
@@ -3208,6 +3212,9 @@ impl Agent {
             let saved = if cuts { cut_answer(&written, &reasoned, &calling, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) } else { None };
             // (its line waits for the message it makes, to say where that is in the session: a reader puts the step beside what the model said)
             self.traj.request_waiting(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: Some(meter.tokens), retry: retry.take(), draft_watch: Some(watch_is), helper_file: None, draft_marks: watch.as_ref().and_then(|watch| watch.marks_of(&reasoned)) });
+            if usage.is_some() {
+                self.emit(Event::SessionUsage(self.traj.usage));
+            }
             // Writing a file out in its reasoning: every token of it is typed again in the call. It goes on from what it had decided, in a request of which all but the last few tokens are
             // read already. Whatever it was thinking about before is left to it, however long: only this is stopped, and what it is told is to write. Its connection has closed by now, so
             // the engine is not writing into nothing. (The tokens it wrote were spent all the same.)

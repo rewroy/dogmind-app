@@ -22,6 +22,7 @@ use dogmind_agent::rules;
 use dogmind_agent::read_folders;
 use dogmind_agent::safety::{AlwaysScope, Mode};
 use dogmind_agent::session;
+use dogmind_agent::trajectory::SessionUsage;
 use dogmind_agent::tools::{FileChange, GitInfo};
 use dogmind_agent::conversation_key::{self, Cipher, KeyError, Keystore, Pending, Policy};
 use dogmind_agent::conversion;
@@ -1492,7 +1493,7 @@ struct Parked {
     used: u64,
     window_tokens: u64,
     rate: Option<f64>,
-    totals: (u64, u64, u64, u32),
+    totals: SessionUsage,
     /// What it said that no file keeps, for when it is opened.
     notices: Vec<(String, Style)>,
     /// Its turn ended in a failure.
@@ -2321,7 +2322,7 @@ struct App {
     crypt: Crypt,
     branch: Option<String>,
     session_title: String,
-    totals: (u64, u64, u64, u32), // prompt, cached, completion, requests
+    totals: SessionUsage,
     side_target: Option<usize>,
     rename_target: Option<PathBuf>,
     rename_seed: Option<String>,
@@ -6427,9 +6428,23 @@ impl App {
                 _ => self.say(t("This session has no trajectory yet: it is written as the session runs.")),
             },
             "usage" => {
-                let (prompt, cached, completion, requests) = self.totals;
-                let rate = self.rate.map_or(String::new(), |rate| tf(", last answer at {0} tok/s", &[&format!("{rate:.1}")]));
-                self.say(&tf("{0} requests: {1} prompt tokens, {2} of them from the cache, {3} written{4}. The conversation is {5} of {6}.", &[&requests, &prompt, &cached, &completion, &rate, &self.used, &self.window_tokens]));
+                let totals = self.totals;
+                let rate = totals.last_rate.or(self.rate).map_or(String::new(), |rate| tf(", last answer at {0} tok/s", &[&format!("{rate:.1}")]));
+                let usage = if totals.requests == 0 {
+                    t("No token usage has been reported for this session.").to_string()
+                } else {
+                    tf("{0} metered requests: {1} prompt tokens, {2} written{3}.", &[&totals.requests, &totals.prompt, &totals.completion, &rate])
+                };
+                let cache = match totals.cache_percent() {
+                    Some(percent) => tf("Cache hit rate: {0}% ({1} of {2} prompt tokens with cache data).", &[&percent, &totals.cached, &totals.cache_prompt]),
+                    None => t("Cache hit rate: unavailable.").to_string(),
+                };
+                let context = if self.window_tokens > 0 {
+                    tf("Conversation length: {0} of {1} tokens.", &[&self.used, &self.window_tokens])
+                } else {
+                    tf("Conversation length: {0} tokens (limit unknown).", &[&self.used])
+                };
+                self.say(&format!("{usage}\n{cache}\n{context}"));
             }
             "init" => {
                 self.send_or_wait(Outgoing { text: INIT_PROMPT.to_string(), images: Vec::new(), card: "/init".to_string() }, false);
@@ -11588,7 +11603,7 @@ impl App {
         self.workspace = folder.clone();
         self.preview_follows_workspace();
         self.session_title.clear();
-        self.totals = (0, 0, 0, 0);
+        self.totals = SessionUsage::default();
         self.rate = None;
         let _ = self.agent.commands.send(Command::NewSession(folder.clone()));
         // (its first message need not wait for the prompt and the tools: a Straydog reads them now, while the message is written)
@@ -11760,7 +11775,7 @@ impl App {
             self.find_opened();
             return;
         }
-        self.totals = (0, 0, 0, 0);
+        self.totals = SessionUsage::default();
         self.rate = None;
         self.current_session = Some(path.clone());
         let _ = self.agent.commands.send(Command::Resume(path));
@@ -13640,10 +13655,8 @@ impl App {
                 if usage.tokens_per_second.is_some() {
                     parked.rate = usage.tokens_per_second;
                 }
-                if usage.prompt > 0 {
-                    parked.totals = (parked.totals.0 + usage.prompt, parked.totals.1 + usage.cached.unwrap_or_default(), parked.totals.2 + usage.completion, parked.totals.3 + 1);
-                }
             }
+            Event::SessionUsage(totals) => parked.totals = totals,
             Event::RequestCache(percent) => remember_request_cache(&mut self.session_cache_percent, parked.path.as_deref(), percent),
             Event::Interjected(text) => {
                 if let Some(place) = parked.interjected.iter().position(|known| *known == text) {
@@ -14119,9 +14132,6 @@ impl App {
                 if let Some(open) = self.run_open.filter(|_| usage.tokens_per_second.is_some()) {
                     self.runs[open].live_rate = usage.tokens_per_second;
                 }
-                if usage.prompt > 0 {
-                    self.totals = (self.totals.0 + usage.prompt, self.totals.1 + usage.cached.unwrap_or_default(), self.totals.2 + usage.completion, self.totals.3 + 1);
-                }
                 if live_report {
                     InvalidateRect(self.window, &self.status_area, 0);
                 } else {
@@ -14131,6 +14141,7 @@ impl App {
                     self.layout();
                 }
             }
+            Event::SessionUsage(totals) => self.totals = totals,
             Event::RequestCache(percent) => {
                 remember_request_cache(&mut self.session_cache_percent, self.current_session.as_deref(), percent);
                 InvalidateRect(self.window, &self.status_area, 0);
@@ -18500,7 +18511,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             crypt,
             branch: None,
             session_title: String::new(),
-            totals: (0, 0, 0, 0),
+            totals: SessionUsage::default(),
             side_target: None,
             rename_target: None,
             rename_seed: None,
