@@ -161,12 +161,21 @@ pub struct SessionUsage {
     /// Prompt tokens from requests whose provider supplied a cache count.
     pub cache_prompt: u64,
     pub last_rate: Option<f64>,
+    /// Cache reuse of the last completed main request, even when it reported no usage.
+    pub last_cache_percent: Option<u64>,
 }
 
 impl SessionUsage {
     fn record_request(&mut self, fields: &Value) {
         if fields["role"] != "main" {
             return;
+        }
+        // A stopped or failed request leaves the previous completed request on the status bar.
+        // An empty answer still came back from the provider; the live worker reports its cache data.
+        if let Some(end) = fields["end"].as_str() {
+            if end == "error:unfinished" || !(end.starts_with("error:") || end.starts_with("stopped_app:") || end == "cancelled_person") {
+                self.last_cache_percent = fields["prompt"].as_u64().and_then(|prompt| crate::llm::cache_percent(prompt, fields["cached"].as_u64()));
+            }
         }
         let (Some(prompt), Some(completion)) = (fields["prompt"].as_u64(), fields["completion"].as_u64()) else { return };
         // Providers can send timing information with empty token counters.
@@ -467,13 +476,43 @@ mod tests {
         traj.message_at(4);
         let hit = Usage { prompt: 90, cached: Some(90), completion: 7, tokens_per_second: Some(19.5), ..Usage::default() };
         traj.request_waiting(RequestNote { id: "s/3", role: "main", clock: &clock, end: "stop".into(), usage: Some(&hit), timings: None, reasoning_chars: 0, content_chars: 0, calls: vec![], tokens_est: None, retry: None, draft_watch: None, helper_file: None, draft_marks: None });
-        let expected = SessionUsage { requests: 3, prompt: 600, completion: 15, cached: 90, cache_prompt: 100, last_rate: Some(19.5) };
+        let expected = SessionUsage { requests: 3, prompt: 600, completion: 15, cached: 90, cache_prompt: 100, last_rate: Some(19.5), last_cache_percent: Some(100) };
         assert_eq!(traj.usage, expected);
         assert_eq!(traj.usage.cache_percent(), Some(90));
         traj.close();
         assert_eq!(traj.usage, SessionUsage::default());
         traj.open(&session);
         assert_eq!(traj.usage, expected);
+    }
+
+    #[test]
+    fn resumed_cache_follows_the_last_completed_main_request_in_each_session() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let session = dir.path().join("a.jsonl");
+        let mut traj = Trajectory::new();
+        traj.open(&session);
+        let request = |role: &str, end: &str, cached: Option<u64>| json!({"role":role,"end":end,"prompt":100,"completion":8,"cached":cached});
+        traj.write("request", None, request("main", "stop", Some(25)));
+        traj.write("request", None, request("main", "cancelled_person", None));
+        traj.write("request", None, request("main", "error:transient", None));
+        traj.write("request", None, request("main", "stopped_app:draft_stop", None));
+        traj.write("request", None, request("warm", "stop", Some(100)));
+        traj.write("request", None, request("helper", "stop", Some(100)));
+        traj.close();
+        traj.open(&session);
+        assert_eq!(traj.usage.last_cache_percent, Some(25));
+        traj.write("request", None, request("main", "tool_calls", Some(0)));
+        traj.close();
+        traj.open(&session);
+        assert_eq!(traj.usage.last_cache_percent, Some(0));
+        traj.write("request", None, json!({"role":"main","end":"stop","tokens_est":12}));
+        traj.close();
+        traj.open(&session);
+        assert_eq!(traj.usage.last_cache_percent, None);
+        assert!(traj.usage.cache_percent().is_some());
+        traj.close();
+        traj.open(&dir.path().join("b.jsonl"));
+        assert_eq!(traj.usage, SessionUsage::default());
     }
 
     #[test]

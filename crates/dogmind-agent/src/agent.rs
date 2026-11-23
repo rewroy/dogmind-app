@@ -2390,6 +2390,7 @@ impl Agent {
                 self.use_estimate();
                 self.emit(Event::SessionStarted { path: path.to_path_buf(), workspace: self.workspace.clone(), transcript: self.messages.clone() });
                 self.emit(Event::SessionUsage(self.traj.usage));
+                self.emit(Event::RequestCache(self.traj.usage.last_cache_percent));
                 // (lines of an encrypted conversation that did not open are left out of what is shown and sent, and that is said, not hidden)
                 if !damaged.is_empty() {
                     self.emit(Event::Notice(crate::session::damage_words(&damaged)));
@@ -3395,7 +3396,7 @@ impl Agent {
                 self.window = usage.window.unwrap_or(self.window);
                 self.report_usage(Some(usage.clone()));
             }
-            self.emit(Event::RequestCache(completion.usage.as_ref().and_then(|usage| llm::cache_percent(usage.prompt, usage.cached))));
+            self.emit(Event::RequestCache(self.traj.usage.last_cache_percent));
             let has_calls = !completion.tool_calls.is_empty();
             if completion.finish.is_empty() && !has_calls && completion.content.is_empty() {
                 return Ended::Failed(llm::UNFINISHED.into());
