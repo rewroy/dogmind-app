@@ -447,20 +447,30 @@ impl Session {
     /// A new session, under this key if there is one.
     pub fn create_with(folder: &Path, workspace: &Path, now: &str, stamp: &str, writer: Option<&Arc<Cipher>>) -> Result<Session, String> {
         fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
-        // (two chats begun in one second must not share a file: their lines would make one conversation of the two)
-        let mut path = folder.join(format!("{stamp}.jsonl"));
-        let mut again = 1;
-        let file = loop {
+        // A helper, image folder or other companion can outlive its conversation. Its stem still belongs
+        // to that conversation, even when there is no .jsonl file to collide with.
+        let at_folder = |error: std::io::Error| format!("{}: {error}", folder.display());
+        let mut taken = std::collections::HashSet::new();
+        for entry in fs::read_dir(folder).map_err(at_folder)? {
+            let name = entry.map_err(at_folder)?.file_name();
+            if let Some((suffix, _)) = name.to_str().and_then(|name| name.strip_prefix(stamp)).and_then(|tail| tail.split_once('.')) {
+                taken.insert(suffix.to_owned());
+            }
+        }
+        for number in 1_u64.. {
+            let suffix = if number == 1 { String::new() } else { format!("-{number}") };
+            if taken.contains(&suffix) {
+                continue;
+            }
+            let path = folder.join(format!("{stamp}{suffix}.jsonl"));
+            // Other creators may have chosen this number since the directory was read.
             match OpenOptions::new().create_new(true).append(true).open(&path) {
-                Ok(file) => break file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    again += 1;
-                    path = folder.join(format!("{stamp}-{again}.jsonl"));
-                }
+                Ok(file) => return Session::begin(path, file, workspace, now, writer),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(format!("{}: {error}", path.display())),
             }
-        };
-        Session::begin(path, file, workspace, now, writer)
+        }
+        Err(format!("{}: no available session number for {stamp}", folder.display()))
     }
 
     /// A file just made, with what every session starts with: for an encrypted one its plain first line, then its first line of meta.
@@ -1168,6 +1178,33 @@ mod tests {
         let first = Session::create(dir.path(), Path::new("w"), "now", "same").unwrap();
         let second = Session::create(dir.path(), Path::new("w"), "now", "same").unwrap();
         assert_ne!(first.path, second.path);
+    }
+
+    #[test]
+    fn simultaneous_new_sessions_leave_orphaned_companions_with_their_original_names() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let folder = dir.path();
+        let stamp = "20261123-172000";
+        let helper = helper_file_of(&folder.join(format!("{stamp}.jsonl")), 1);
+        fs::write(&helper, b"old helper").unwrap();
+        let images = crate::images::folder_of(&folder.join(format!("{stamp}-2.jsonl")));
+        fs::create_dir(&images).unwrap();
+        fs::write(images.join("old.png"), b"old image").unwrap();
+        let start = std::sync::Barrier::new(4);
+        let mut names = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4).map(|_| scope.spawn(|| {
+                start.wait();
+                let new = Session::create(folder, folder, "now", stamp).unwrap();
+                assert!(helpers_of(&new.path).is_empty());
+                assert!(!crate::images::folder_of(&new.path).exists());
+                new.path.file_stem().unwrap().to_owned()
+            })).collect();
+            workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+        });
+        names.sort();
+        assert_eq!(names, (3..=6).map(|n| std::ffi::OsString::from(format!("{stamp}-{n}"))).collect::<Vec<_>>());
+        assert_eq!(fs::read(helper).unwrap(), b"old helper");
+        assert_eq!(fs::read(images.join("old.png")).unwrap(), b"old image");
     }
 
     #[test]
