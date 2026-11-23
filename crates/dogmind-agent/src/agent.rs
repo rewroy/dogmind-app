@@ -1407,7 +1407,11 @@ fn cut_would_lose(closed_arguments: &str, path: &str, workspace: &Path, bench: &
 
 /// Whether a command's report ends in anything but success. One left at work in the background has no end yet.
 fn command_failed(output: &str) -> bool {
-    output.rsplit_once("exit_code: ").is_some_and(|(_, code)| code.trim() != "0")
+    // The status leads current reports. Older reports put it after stderr, before any file-change notes.
+    let mut lines = output.lines();
+    let status = lines.next().and_then(|first| first.strip_prefix("exit_code: "))
+        .or_else(|| lines.rev().find_map(|line| line.strip_prefix("exit_code: ")));
+    status.is_some_and(|code| code.trim() != "0")
 }
 
 /// Whether the person's message asks for what was written not to be run: then the app does not ask the model to check it (it is the person's call).
@@ -9920,6 +9924,10 @@ Body").unwrap();
         assert!(command_failed("stdout:\n\nstderr:\nbad\n\nexit_code: 1"));
         assert!(command_failed("stdout:\n\nstderr:\n\nexit_code: none, timed out after 30 s"));
         assert!(!command_failed("stdout:\nexit_code: 9 was printed\nstderr:\n\nexit_code: 0"), "the report's own last line");
+        let changes = "\nfiles changed by this command:\n- created result.txt (1 bytes)\n";
+        assert!(!command_failed(&format!("exit_code: 0\nstdout:\nok\nstderr:\n\nexit_code: 0{changes}")));
+        assert!(command_failed(&format!("exit_code: 1\nstdout:\n\nstderr:\nbad\nexit_code: 1{changes}")));
+        assert!(!command_failed(&format!("stdout:\n\nstderr:\n\nexit_code: 0{changes}")));
         assert!(!command_failed("still running after 180 s, so it goes on in the background as job1."));
     }
 
