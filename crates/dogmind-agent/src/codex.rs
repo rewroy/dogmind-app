@@ -82,8 +82,13 @@ pub fn find_executable() -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).find_map(|folder| names.iter().map(|name| folder.join(name)).find(|path| path.is_file()))
 }
 
+/// The Codex settings folder explicitly selected for this process, if any.
+pub fn configured_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME").filter(|path| !path.is_empty()).map(PathBuf::from)
+}
+
 fn codex_home() -> Option<PathBuf> {
-    std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|home| Path::new(&home).join(".codex")))
+    configured_home().or_else(|| std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|home| Path::new(&home).join(".codex")))
 }
 
 enum Incoming {

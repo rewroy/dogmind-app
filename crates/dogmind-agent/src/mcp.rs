@@ -158,11 +158,20 @@ fn parse_codex_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
 
 /// Read the optional import sources in priority order. Report only filenames so malformed lines never expose settings.
 pub fn external_servers(home: &Path) -> (BTreeMap<String, ServerConfig>, Vec<&'static str>) {
+    external_servers_in(home, crate::codex::configured_home().as_deref())
+}
+
+/// An explicit Codex configuration directory replaces the default source. Claude still uses the user profile.
+pub fn external_servers_in(home: &Path, codex_home: Option<&Path>) -> (BTreeMap<String, ServerConfig>, Vec<&'static str>) {
     let mut found = BTreeMap::new();
     let mut unreadable = Vec::new();
     type Parser = fn(&str) -> Option<BTreeMap<String, ServerConfig>>;
-    for (file, parse) in [(".claude.json", parse_claude_servers as Parser), (".codex/config.toml", parse_codex_servers)] {
-        let servers = match std::fs::read_to_string(home.join(file)) {
+    let (codex_file, label) = match codex_home {
+        Some(folder) => (folder.join("config.toml"), "$CODEX_HOME/config.toml"),
+        None => (home.join(".codex/config.toml"), ".codex/config.toml"),
+    };
+    for (path, file, parse) in [(home.join(".claude.json"), ".claude.json", parse_claude_servers as Parser), (codex_file, label, parse_codex_servers)] {
+        let servers = match std::fs::read_to_string(path) {
             Ok(text) => parse(&text),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => None,

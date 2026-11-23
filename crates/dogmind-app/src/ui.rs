@@ -2837,14 +2837,14 @@ fn mcp_why(why: &str) -> String {
 }
 
 /// Read the external server lists for a user command and report how many servers were added.
-fn mcp_import(home: &Path, file: &Path, argument: &str) -> Result<(usize, String), String> {
+fn mcp_import(home: &Path, codex_home: Option<&Path>, file: &Path, argument: &str) -> Result<(usize, String), String> {
     use dogmind_agent::mcp;
     let (action, name) = argument.split_once(char::is_whitespace).map_or((argument, ""), |(action, name)| (action, name.trim()));
     let preview = action.eq_ignore_ascii_case("candidates") && name.is_empty();
     if !preview && !action.eq_ignore_ascii_case("import") {
         return Err(t("Use /mcp for status, /mcp candidates to list names, or /mcp import [NAME].").into());
     }
-    let (mut found, unreadable) = mcp::external_servers(home);
+    let (mut found, unreadable) = mcp::external_servers_in(home, codex_home);
     let warning = if unreadable.is_empty() { String::new() } else {
         tf("Could not read MCP settings from {0}. Check the file format and permissions.", &[&unreadable.join(", ")])
     };
@@ -12591,7 +12591,7 @@ impl App {
 
     unsafe fn mcp_servers_imported(&mut self, argument: &str) -> String {
         let Some(home) = std::env::var_os("USERPROFILE") else { return t("The user profile could not be located.").into() };
-        match mcp_import(Path::new(&home), &self.folder.join("mcp.json"), argument) {
+        match mcp_import(Path::new(&home), dogmind_agent::codex::configured_home().as_deref(), &self.folder.join("mcp.json"), argument) {
             Ok((added, message)) => {
                 // A file repaired after startup can already contain the requested server while the hub still has its read error.
                 let recovered = !argument.trim().eq_ignore_ascii_case("candidates") && self.mcp.unreadable().is_some();
@@ -19474,7 +19474,7 @@ mod tests {
     fn mcp_import_identifies_unreadable_sources_and_keeps_valid_candidates() {
         let home = tempfile::tempdir().unwrap();
         let file = home.path().join("dogmind/mcp.json");
-        let run = |argument| mcp_import(home.path(), &file, argument);
+        let run = |argument| mcp_import(home.path(), None, &file, argument);
         assert!(run("candidates").is_ok());
         std::fs::create_dir(home.path().join(".codex")).unwrap();
         let codex = home.path().join(".codex/config.toml");
@@ -19498,6 +19498,29 @@ mod tests {
     }
 
     #[test]
+    fn mcp_import_uses_the_selected_codex_home_for_preview_and_import() {
+        let home = tempfile::tempdir().unwrap();
+        let custom = home.path().join("Codex 設定");
+        let default = home.path().join(".codex");
+        std::fs::create_dir(&default).unwrap();
+        std::fs::write(default.join("config.toml"), "[mcp_servers.default_clock]\ncommand='clock'").unwrap();
+        std::fs::write(home.path().join(".claude.json"), r#"{"mcpServers":{"claude_clock":{"command":"clock"}}}"#).unwrap();
+        let file = home.path().join("dogmind/mcp.json");
+        let run = |action| mcp_import(home.path(), Some(&custom), &file, action);
+        assert!(!run("candidates").unwrap().1.contains("default_clock"));
+        std::fs::create_dir(&custom).unwrap();
+        std::fs::write(custom.join("config.toml"), "[mcp_servers.custom_clock]\ncommand='clock'").unwrap();
+        let (_, choices) = run("candidates").unwrap();
+        assert!(choices.contains("custom_clock") && choices.contains("claude_clock") && !choices.contains("default_clock"));
+        assert!(!file.exists());
+        assert_eq!(run("import custom_clock").unwrap().0, 1);
+        assert_eq!(dogmind_agent::mcp::readable_config(&file).unwrap().servers.len(), 1);
+        std::fs::write(custom.join("config.toml"), "[malformed").unwrap();
+        let (_, warning) = run("candidates").unwrap();
+        assert!(warning.contains("$CODEX_HOME/config.toml") && !warning.contains("[malformed"));
+    }
+
+    #[test]
     fn mcp_import_lists_names_and_only_adds_the_server_chosen() {
         use dogmind_agent::mcp;
         let home = tempfile::tempdir().unwrap();
@@ -19505,7 +19528,7 @@ mod tests {
         std::fs::write(home.path().join(".claude.json"), r#"{"mcpServers":{"Unity Editor":{"command":"first"},"other":{"command":"private-launch-command"}}}"#).unwrap();
         std::fs::write(home.path().join(".codex/config.toml"), "[mcp_servers.'Unity Editor']\ncommand='second'\n[mcp_servers.disabled]\ncommand='off'\nenabled=false").unwrap();
         let file = home.path().join("dogmind/mcp.json");
-        let run = |argument| mcp_import(home.path(), &file, argument);
+        let run = |argument| mcp_import(home.path(), None, &file, argument);
         let (added, choices) = run("candidates").unwrap();
         assert_eq!(added, 0);
         assert!(choices.contains("Unity Editor") && choices.contains("other") && !choices.contains("disabled") && !choices.contains("private-launch-command"));
