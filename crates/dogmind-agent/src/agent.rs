@@ -1597,6 +1597,8 @@ struct Agent {
     skills_on: Vec<String>,
     memory: Option<PathBuf>,
     mcp: Option<Arc<mcp::Hub>>,
+    /// Last connection facts reported in this conversation.
+    last_mcp_facts: Option<String>,
     policy: Arc<crate::conversation_key::Policy>,
     interject: Arc<Mutex<Vec<String>>>,
     /// Calls of this response that have run before unchanged: their results say so.
@@ -1856,6 +1858,7 @@ impl Agent {
             skills_on: config.skills_on,
             memory: config.memory,
             mcp: config.mcp,
+            last_mcp_facts: None,
             policy: config.policy,
             interject: Arc::default(),
             web: config.web,
@@ -2126,6 +2129,7 @@ impl Agent {
 
     /// What depends on the workspace and the settings: its skills, the notes' folder, and so the tools on offer.
     fn load_extras(&mut self) {
+        self.last_mcp_facts = None;
         let found = self.allowed(skills::discover(&self.workspace, self.home.as_deref()));
         self.extras_with(found);
         // (a conversation that begins is offered every server's tools)
@@ -2782,9 +2786,13 @@ impl Agent {
         }
     }
 
-    fn mcp_note(&self, text: &str, first_message: bool) -> Option<String> {
-        let hub = self.mcp.as_ref()?;
-        (first_message || text.to_ascii_lowercase().contains("mcp")).then(|| hub.connection_facts())
+    fn mcp_note(&mut self, text: &str, first_message: bool) -> Option<String> {
+        let facts = self.mcp.as_ref()?.connection_facts();
+        if !first_message && self.last_mcp_facts.as_ref() == Some(&facts) && !text.to_ascii_lowercase().contains("mcp") {
+            return None;
+        }
+        self.last_mcp_facts = Some(facts.clone());
+        Some(facts)
     }
 
     /// `/name what to do` for a skill the person may start: its instructions go with the message.
@@ -2839,6 +2847,7 @@ impl Agent {
         let text = prompt::typed_text(self.messages[at].content.as_deref().unwrap_or("")).to_string();
         let kept = self.messages[at].images.clone();
         self.messages.truncate(at);
+        self.last_mcp_facts = None;
         self.bench.forget_reads();
         if let Some(marks) = &mut self.marks {
             marks.conversation_cut(at);
@@ -2869,6 +2878,7 @@ impl Agent {
                 Some(at) => {
                     typed = Some(prompt::typed_text(self.messages[at].content.as_deref().unwrap_or("")).to_string());
                     self.messages.truncate(at);
+                    self.last_mcp_facts = None;
                     marks.conversation_cut(at);
                     self.added_due |= self.added_untold();
                     self.use_estimate();
@@ -4820,6 +4830,9 @@ impl Agent {
         let result = self.compact_conversation(forced, refused);
         let (after, req) = (self.expected_use(), self.last_req.clone());
         let first_changed = compaction::first_difference(&was, &self.messages);
+        if first_changed.is_some() {
+            self.last_mcp_facts = None;
+        }
         let unchanged = was.iter().take(first_changed.unwrap_or(was.len())).map(Message::chars).sum::<usize>();
         self.traj.write("compaction", req.as_deref(), json!({"forced": forced, "refused": refused, "stage": self.compaction_stage, "before_tokens": before, "after_tokens": after, "window": self.window, "ms": began.elapsed().as_millis() as u64, "outcome": if result.is_ok() { "ok" } else { "error" },
             "messages_before": was.len(), "messages_after": self.messages.len(), "first_changed": first_changed, "unchanged_tokens_est": unchanged / CHARS_A_TOKEN}));
@@ -10053,6 +10066,10 @@ Body").unwrap();
         let bodies = bodies.lock().unwrap();
         let told = |body: &Value| body["messages"].as_array().unwrap().iter().filter(|message| message["content"].as_str().is_some_and(|text| text.contains("`mcp__late__u`"))).count();
         assert_eq!((told(&bodies[1]), told(&bodies[2]), told(&bodies[3])), (1, 1, 1), "told in the second turn, again in the fork's first, and not a third time");
+        let reports_connection = |body: &Value| body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("late: connected");
+        assert!(reports_connection(&bodies[1]), "a state change reaches an ordinary follow-up");
+        assert!(reports_connection(&bodies[2]), "the fork predates the new server");
+        assert!(!reports_connection(&bodies[3]), "unchanged facts are already in this conversation");
     }
 
     /// A server the person adds while a conversation goes on is told of in their next turn, whose tools offered stay as they were, and its tool is called
