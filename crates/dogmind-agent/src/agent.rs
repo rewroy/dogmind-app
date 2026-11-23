@@ -1840,7 +1840,7 @@ impl Agent {
         gate.records = records(&config.sessions, &config.rules, std::env::current_exe().ok().as_deref().and_then(Path::parent));
         // (and opened to commands, to read: not for a test's, whose folders are made and gone by the hundred, nor where this runs in a command of the app's)
         #[cfg(all(windows, not(test)))]
-        if !crate::sandbox::in_the_sandbox() {
+        if !crate::sandbox::in_a_container() {
             crate::sandbox::records_readable(&gate.records);
         }
         gate.code_mode = config.code_mode;
@@ -2566,7 +2566,7 @@ impl Agent {
                 }
             }
             #[cfg(all(windows, not(test)))]
-            if !crate::sandbox::in_the_sandbox() {
+            if !crate::sandbox::in_a_container() {
                 notes.extend(records_note(&self.gate.records));
             }
         }
@@ -7448,15 +7448,13 @@ note: the helper took")), "{log:?}");
             let bodies = bodies.lock().unwrap().clone();
             bodies.last().unwrap()["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string()
         };
-        // (cargo given a Cargo.toml that is not there: a check that fails, as a test run that fails does. Not one with none: in the sandbox the test's folder
-        // lies in this workspace, and cargo found its Cargo.toml above and waited for the build this test runs in, for ever)
-        const FAILING: &str = "cargo test -q --manifest-path absent/Cargo.toml";
-        let told = turn(true, FAILING);
-        assert!(told.starts_with("[From the app, not the user]") && told.contains(&format!("`{FAILING}`")), "{told}");
+        // (cargo in a folder with no Cargo.toml: a check that fails, as a test run that fails does)
+        let told = turn(true, "cargo test -q");
+        assert!(told.starts_with("[From the app, not the user]") && told.contains("`cargo test -q`"), "{told}");
         let (cause, fix, leave) = (told.find("whether your change caused").unwrap(), told.find("What your change broke, fix").unwrap(), told.find("What failed before your change, do not fix").unwrap());
         assert!(cause < fix && fix < leave && told[leave..].contains("at the start of your answer"), "the cause first, then fix, then leave and say: {told}");
         assert!(prompt::is_nudge(&told));
-        for (write, line) in [(true, "echo cargo test"), (true, "findstr /c:nothing lib.rs"), (false, FAILING)] {
+        for (write, line) in [(true, "echo cargo test"), (true, "findstr /c:nothing lib.rs"), (false, "cargo test -q")] {
             let last = turn(write, line);
             assert!(!last.contains("The last check after your change failed"), "{write} {line}: {last}");
         }

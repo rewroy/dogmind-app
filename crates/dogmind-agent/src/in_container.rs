@@ -1,5 +1,4 @@
-//! What this crate's tests do when they run inside the sandbox themselves (an AppContainer, or the restricted token cargo is run with), as a session on the
-//! app's own source runs them, by a command of the app's:
+//! What this crate's tests do when they run inside an AppContainer themselves, as a session on the app's own source runs them, by a command of the app's:
 //! a temp folder a container can work in, and the tests that need what no container can do left out, counted, and said so at the end of the run.
 #![allow(dead_code)] // (each crate's tests give some of the reasons and not others)
 
@@ -11,9 +10,6 @@ pub(crate) const FOLDERS: &str = "change who may read or write a folder, which o
 pub(crate) const SANDBOX: &str = "make the sandbox's own desktops, guards and runs as the person, which no container can";
 pub(crate) const PROGRAMS: &str = "start and end programs with jobs or terminals of their own, or reach the network";
 pub(crate) const SYSTEM: &str = "look at a drive's root and facts, or draw on a desktop, which a container cannot";
-/// Why a test cannot run with a restricted token: what it holds a command from is kept from it by a container alone, and a command started with that token
-/// has its caller's token (`sandbox::in_the_sandbox`), which reads as the person and reaches the network.
-pub(crate) const KEPT_BY_A_CONTAINER: &str = "hold a command from the person's files or the network, which a container does and a restricted token, as its caller has, does not";
 
 /// The tests left out, each with why.
 static LEFT_OUT: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
@@ -22,7 +18,7 @@ static LEFT_OUT: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 /// system gives it whatever TEMP says), and git looks at every folder of a path from the drive down before it makes one, C:\Users too, which a container
 /// cannot: no test could make a repository there ("cannot lock ref 'HEAD': unable to create directory"). Outside a container it is `tempfile::tempdir`.
 pub(crate) fn tempdir() -> std::io::Result<tempfile::TempDir> {
-    if crate::sandbox::in_the_sandbox() {
+    if crate::sandbox::in_a_container() {
         in_reach();
     }
     tempfile::tempdir()
@@ -54,16 +50,9 @@ fn in_reach() {
 /// Whether this test cannot run where it runs, inside a container: it needs what no container can do (`why`). It is then counted, said at the end of the
 /// run, and the test returns at once.
 pub(crate) fn cannot_run(why: &'static str) -> bool {
-    crate::sandbox::in_the_sandbox() && left_out(why)
-}
-
-/// Whether this test cannot run where it runs, with a restricted token (`KEPT_BY_A_CONTAINER`): counted and said as `cannot_run` says it. In a container it runs.
-pub(crate) fn cannot_run_with_a_restricted_token(why: &'static str) -> bool {
-    crate::sandbox::with_a_restricted_token() && left_out(why)
-}
-
-/// Counts a test left out, for the end of the run; always true.
-fn left_out(why: &'static str) -> bool {
+    if !crate::sandbox::in_a_container() {
+        return false;
+    }
     static SAY: Once = Once::new();
     // SAFETY: the C runtime calls it once, as the process ends; it only reads the list and writes a line.
     SAY.call_once(|| unsafe {
