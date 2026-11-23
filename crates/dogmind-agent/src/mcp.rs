@@ -84,7 +84,7 @@ fn read_server_url<'de, D: serde::Deserializer<'de>>(data: D) -> Result<String, 
 }
 
 /// Shown before invalid endpoint settings replace a working registration.
-pub const INVALID_SERVER_URL: &str = "Enter a valid http:// or https:// server URL. Check the host, port, and IPv6 brackets.";
+pub const INVALID_SERVER_URL: &str = "Enter a valid http:// or https:// server URL. Check the host name for spaces, the port number, and the brackets around IPv6 addresses.";
 
 impl ServerConfig {
     /// A server at a URL, and not a program.
@@ -1852,10 +1852,10 @@ mod tests {
         let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         let remote = |url: &str| ServerConfig { url: url.into(), ..Default::default() };
-        let good = "https://[::1]:8443/McP?session=example";
+        let good = "https://[::1]:8443/My%20Server/McP?session=example";
         save_server(&file, None, "editor", remote(good)).unwrap();
         let before = std::fs::read(&file).unwrap();
-        for bad in ["https://", "http://?key=private-fixture", "http://host:no", "https://host:65536", "http://[::1/mcp"] {
+        for bad in ["https://", "http://?key=private-fixture", "http://host:no", "https://host:65536", "http://[::1/mcp", "http://local host/mcp", "https://local\u{3000}host:443/mcp"] {
             let error = save_server(&file, Some("editor"), "editor", remote(bad)).unwrap_err();
             assert!(!error.contains("private-fixture"));
             assert_eq!(std::fs::read(&file).unwrap(), before);

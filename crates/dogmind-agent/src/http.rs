@@ -54,6 +54,9 @@ impl Url {
         if host.is_empty() {
             return Err(format!("{url}: no host"));
         }
+        if host.contains(char::is_whitespace) {
+            return Err("a URL host cannot contain whitespace".to_string());
+        }
         // The path is kept as it was given, final slash included: a site may answer `/a` with a redirect to `/a/`, and an address without its slash
         // would be asked for again and again.
         let mut path = if path.is_empty() { "/".to_string() } else { path.to_string() };
