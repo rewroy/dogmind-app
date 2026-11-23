@@ -344,6 +344,14 @@ pub fn cut_write_as_text(path: &str) -> String {
     format!("[From the app, not the user] Your answer went on with `{path}` as text, and an answer's text writes nothing: the file still ends where its write was cut. Write the rest with create_file, the same path: it goes on from the end of the file. Put none of the file in your answer.")
 }
 
+/// What the model is told when its turn would end with the last check since its change to code failed (`agent::is_check`): first, whether the change caused it; what the
+/// change broke is fixed; what failed before it is not touched, and is said at the start of the answer with what shows it. (Told to fix what it found, a model fixed a
+/// function nobody had asked about, whose test had failed before its change: doing what was not asked, which the user has objected to.)
+pub fn check_failed(line: &str, status: &str) -> String {
+    let line: String = if line.chars().count() > 200 { line.chars().take(200).chain(['…']).collect() } else { line.to_string() };
+    format!("[From the app, not the user] The last check after your change failed: `{line}` ended with {status}. First find out whether your change caused the failure: does it fail the same way without your change? What your change broke, fix, and run the check again. What failed before your change, do not fix: at the start of your answer, say which check fails and what shows it failed before your change.")
+}
+
 /// What the model is told when its answer ended with a tool call written out as text, which the server could not read as a call: nothing ran, and the turn would
 /// have ended with that markup as its answer.
 pub fn call_as_text(tool: Option<&str>) -> String {

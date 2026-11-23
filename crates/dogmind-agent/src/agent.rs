@@ -1405,6 +1405,19 @@ fn cut_would_lose(closed_arguments: &str, path: &str, workspace: &Path, bench: &
     target.exists() && !appends && !bench.goes_on_with(&target)
 }
 
+/// Whether a command line is a check: it tests, builds, type-checks or lints, by the tools that do. Not a command that only looks for something, whose 1 says it found nothing
+/// (`findstr`, `grep`, `where`).
+fn is_check(line: &str) -> bool {
+    const CHECKS: [&str; 41] = ["cargo test", "cargo build", "cargo check", "cargo clippy", "cargo nextest", "npm test", "npm run test", "npm run build", "npm run lint",
+        "npm run check", "npm run typecheck", "pnpm test", "pnpm run test", "pnpm run build", "yarn test", "yarn build", "npx tsc", "npx jest", "npx vitest", "npx eslint",
+        "npx playwright test", "tsc ", "pytest", "-m pytest", "-m unittest", "go test", "go build", "go vet", "dotnet test", "dotnet build", "msbuild", "mvn test",
+        "gradle test", "gradlew test", "ctest", "node --test", "deno test", "bun test", "ruff check", "mypy", "cmake --build"];
+    let lower = line.to_ascii_lowercase();
+    // (a test script run by name: `python test_inventory.py`, `node tests.js`)
+    let test_script = lower.split([' ', '"', '\'', '/', '\\']).any(|word| word.contains("test") && [".py", ".js", ".mjs", ".cjs", ".ts"].iter().any(|ending| word.ends_with(ending)));
+    CHECKS.iter().any(|check| lower.contains(check)) || lower.trim_end() == "tsc" || test_script
+}
+
 /// Whether a command's report ends in anything but success. One left at work in the background has no end yet.
 fn command_failed(output: &str) -> bool {
     tools::command_exit_status(output).is_some_and(|status| status != "0")
@@ -1481,6 +1494,10 @@ struct Agent {
     round_goal: Option<RoundGoal>,
     /// The files this turn made, as the calls named them, and whether the model was told of those its answer does not name (`prompt::scratch_files`).
     made_this_turn: Vec<String>,
+    /// Whether the model has changed code in this session, and the check (a test, build, type check or lint: `is_check`) it ran last since its last change, in this
+    /// turn, when that failed: the line and how it ended (`prompt::check_failed`).
+    changed_code: bool,
+    failed_check: Option<(String, String)>,
     scratch_told: bool,
     /// The files put before the person this turn, by present or as a version in the making.
     put_before: Vec<String>,
@@ -1801,6 +1818,8 @@ impl Agent {
             goal_due: false,
             round_goal: None,
             made_this_turn: Vec::new(),
+            changed_code: false,
+            failed_check: None,
             put_before: Vec::new(),
             in_the_making: None,
             explored: false,
@@ -2445,6 +2464,7 @@ impl Agent {
         self.traj.begin_turn();
         self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": pictures.len() + kept.len(), "first": new_session}));
         (self.made_this_turn, self.scratch_told, self.polish, self.put_before, self.explored) = (Vec::new(), false, Polish::default(), Vec::new(), false);
+        self.failed_check = None;
         let added = if new_session { None } else { self.servers_caught_up() };
         let mut images = kept;
         if let Some(session) = self.session.as_ref().map(|session| session.path.clone()) {
@@ -2899,7 +2919,7 @@ impl Agent {
         // (the person asked for it not to be run: the word about checking is not said, as it was once against their word)
         let not_to_run = self.messages.iter().rev().filter(|message| message.role == "user").map(|message| message.content.as_deref().unwrap_or(""))
             .find(|text| !text.starts_with("[From the app")).is_some_and(asks_not_to_run);
-        let (mut unchecked, mut asked_to_check) = (false, not_to_run);
+        let (mut unchecked, mut asked_to_check, mut told_of_failed_check) = (false, not_to_run, false);
         // (the code files that are so, by name: whether they are only the model's own, for a question that asked for no change)
         let mut unchecked_code: Vec<String> = Vec::new();
         let (mut said, mut asked_about_slips) = (String::new(), false);
@@ -3375,6 +3395,17 @@ impl Agent {
                     continue;
                 }
             }
+            // Once a turn: a model whose last check since its change to code failed, and which would end there. (A user's session ended so twice: once with "it shows
+            // the cache's share now" and the failing tests not named, once with the failure named and nothing done about it; the user's next words were 「テストしました。
+            // 失敗でした。終わりっていったい何を考えているの？」.)
+            if !told_of_failed_check && self.changed_code && self.mode != Mode::Plan {
+                if let Some((line, status)) = self.failed_check.clone() {
+                    told_of_failed_check = true;
+                    self.intervened("check_failed_nudge", json!({"status": status}));
+                    self.push(Message::text("user", prompt::check_failed(&line, &status)));
+                    continue;
+                }
+            }
             // Once a turn, and only when it comes to something: letters no Japanese is written with, which a model cannot see in its own answer. It stays as written; the corrected lines follow it.
             if !asked_about_slips && self.bench.in_japanese {
                 let letters = self.slips_in(&said);
@@ -3677,6 +3708,26 @@ impl Agent {
     }
 
     /// What a call that ended says for the notes before an answer: the files it made, and how a page's checks have gone.
+    /// A change to code, after which the checks count again; and a check that ended, which passed or failed (one still running in the background has not).
+    fn note_check(&mut self, name: &str, arguments: &Value, said: &str) {
+        let code_changed = match name {
+            "create_file" => arguments.get("path").and_then(Value::as_str).is_some_and(is_code),
+            "apply_patch" => arguments.get("edits").and_then(Value::as_array).is_some_and(|edits| edits.iter().filter_map(|edit| edit.get("path")?.as_str()).any(is_code)),
+            "edit" => arguments.get("file_path").and_then(Value::as_str).is_some_and(is_code),
+            _ => false,
+        };
+        if code_changed {
+            (self.changed_code, self.failed_check) = (true, None);
+            return;
+        }
+        let Some(line) = arguments.get("command").and_then(Value::as_str).filter(|line| name == "execute_command" && is_check(line)) else { return };
+        match tools::command_exit_status(said) {
+            Some("0") => self.failed_check = None,
+            Some(status) => self.failed_check = Some((line.to_string(), status.to_string())),
+            None => {}
+        }
+    }
+
     fn note_outcome(&mut self, name: &str, arguments: &Value, result: &Result<String, String>) {
         let Ok(said) = result else {
             if name == "check_page" {
@@ -3685,6 +3736,7 @@ impl Agent {
             return;
         };
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        self.note_check(name, arguments, said);
         let mut changed: Vec<String> = Vec::new();
         match name {
             "create_file" => {
@@ -7274,6 +7326,47 @@ note: the helper took")), "{log:?}");
         let messages = bodies[1]["messages"].as_array().unwrap();
         assert_eq!(messages[3]["content"], "part");
         assert_eq!(messages[4]["content"], prompt::CONTINUE_NUDGE);
+    }
+
+    /// A turn whose last check since a change to code failed gets one word before it ends: first whether the change caused it; fix what the change broke; leave what
+    /// failed before it and say so at the start of the answer. Not when the last check passed, nor for a command that only looked for something and found nothing, nor where no code was changed.
+    #[test]
+    fn a_turn_whose_last_check_after_a_change_failed_gets_one_word_about_it() {
+        let call = |id: &str, name: &str, arguments: Value| sse(&[serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": id, "type": "function", "function": {"name": name, "arguments": arguments.to_string()}}]}, "finish_reason": "tool_calls"}]})]);
+        let turn = |write: bool, line: &str| {
+            let dir = crate::in_container::tempdir().unwrap();
+            let mut answers = Vec::new();
+            if write {
+                answers.push(call("w", "create_file", serde_json::json!({"path": "lib.rs", "content": "fn b() {}\n"})));
+            }
+            answers.extend([call("c", "execute_command", serde_json::json!({"command": line})), text_answer("It shows the cache's share now."), text_answer("The test still fails: …")]);
+            let (client, bodies) = server(answers);
+            let run = run_agent(dir.path(), client, Mode::Auto);
+            run.handle.commands.send(Command::Send("show the cache's share".into())).unwrap();
+            until_end(&run, Decision::Approve);
+            let bodies = bodies.lock().unwrap().clone();
+            bodies.last().unwrap()["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap_or("").to_string()
+        };
+        // (cargo in a folder with no Cargo.toml: a check that fails, as a test run that fails does)
+        let told = turn(true, "cargo test -q");
+        assert!(told.starts_with("[From the app, not the user]") && told.contains("`cargo test -q`"), "{told}");
+        let (cause, fix, leave) = (told.find("whether your change caused").unwrap(), told.find("What your change broke, fix").unwrap(), told.find("What failed before your change, do not fix").unwrap());
+        assert!(cause < fix && fix < leave && told[leave..].contains("at the start of your answer"), "the cause first, then fix, then leave and say: {told}");
+        assert!(prompt::is_nudge(&told));
+        for (write, line) in [(true, "echo cargo test"), (true, "findstr /c:nothing lib.rs"), (false, "cargo test -q")] {
+            let last = turn(write, line);
+            assert!(!last.contains("The last check after your change failed"), "{write} {line}: {last}");
+        }
+    }
+
+    #[test]
+    fn what_a_check_is() {
+        for line in ["cargo test -p dogmind-agent", "npm run build", "python -m pytest -q", "pytest", "python test_inventory.py", "node tests/run.test.js", "npx tsc --noEmit", "go vet ./...", "dotnet build"] {
+            assert!(is_check(line), "{line}");
+        }
+        for line in ["findstr /s TODO *.rs", "git status", "python inventory.py", "dir /b", "where cargo", "type latest.txt"] {
+            assert!(!is_check(line), "{line}");
+        }
     }
 
     #[test]
