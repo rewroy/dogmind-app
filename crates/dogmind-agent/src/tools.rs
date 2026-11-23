@@ -3013,7 +3013,8 @@ fn sandbox_notes(line: &str, workspace: &Path, status: Option<i32>, err: &str) -
     // (a command that is cargo itself, in such a workspace, runs with a restricted token where it can: this is cargo started through something else)
     if err.contains("failed to load manifest for workspace member") && err.contains('*') {
         notes.push_str("note: cargo could not expand this workspace's `members` pattern: it looks at each folder from the drive's root, and the sandbox may not look at C:\\Users on the way. \
-                        A command that is cargo itself is run where it can: run cargo directly, not through a script or another program. \
+                        A command that is cargo itself is run where it can: run cargo directly, not through a script or another program, and with nothing else on its line (no `&&`, `&`, `|`, or `>` to a file; it may end with `2>&1` or `> nul`). \
+                        Do not change the workspace's Cargo.toml to get round this. \
                         If that cannot be done, say what could not be built or run, for the user to run themselves.\n");
     }
     // (cl, link and nmake are in no PATH of a person's unless they started from a Developer prompt; the app gives a command their folders when it finds them, and says here why it did not)
@@ -3230,10 +3231,12 @@ pub(crate) fn cargo_reads_above(line: &str, cwd: &Path, root: &Path, home: Optio
 }
 
 /// Whether the line is cargo and nothing else: its first word names cargo, and it has none of what lets cmd run more than one program or put something else in its words
-/// (`& | ( ) < > ^ % ! ;`, a line break). A line of more, as `cargo build & del x`, would run all of it with what cargo is given, and is the container's.
+/// (`& | ( ) < > ^ % ! ;`, a line break). A line of more, as `cargo build & del x`, would run all of it with what cargo is given, and is the container's. It may end by
+/// putting cargo's errors with its output, or by letting either go (`CARGO_LINE_ENDS`): a model's `cargo test -p app --lib 2>&1` ran in the container for its `2>&1`,
+/// failed on the workspace's `crates/*`, and the model rewrote the workspace's members in Cargo.toml to get round it.
 #[cfg(windows)]
 pub(crate) fn one_cargo_command(line: &str) -> bool {
-    let line = line.trim();
+    let line = without_harmless_ends(line.trim());
     if line.contains(['&', '|', '(', ')', '<', '>', '^', '%', '!', ';', '\n', '\r', '`']) {
         return false;
     }
@@ -3243,6 +3246,23 @@ pub(crate) fn one_cargo_command(line: &str) -> bool {
     };
     let name = word.rsplit(['\\', '/']).next().unwrap_or(word);
     name.eq_ignore_ascii_case("cargo") || name.eq_ignore_ascii_case("cargo.exe")
+}
+
+/// What may end a line that is still cargo alone: its errors put with its output, or either let go. None of them runs a program, and NUL and the screen are all they write
+/// to. (The longer ones first: `2> nul` ends with `> nul` too.)
+const CARGO_LINE_ENDS: [&str; 8] = ["2> nul", "1> nul", "2>nul", "1>nul", "2>&1", "> nul", ">nul", ">&2"];
+
+/// The line without the `CARGO_LINE_ENDS` it ends with, each a word of its own (`x2>&1` is not).
+fn without_harmless_ends(mut line: &str) -> &str {
+    loop {
+        let lower = line.to_ascii_lowercase();
+        let Some(end) = CARGO_LINE_ENDS.iter().find(|end| lower.ends_with(*end)) else { return line };
+        let rest = &line[..line.len() - end.len()];
+        if !rest.ends_with([' ', '\t']) {
+            return line;
+        }
+        line = rest.trim_end();
+    }
 }
 
 /// What cargo's config in the workspace or above it, up to the user folder, runs besides cargo and the compiler: a wrapper of rustc, a runner or a linker it names. They run with what
@@ -4049,6 +4069,13 @@ mod change_tests {
     #[test]
     fn cargo_in_a_workspace_of_member_patterns_under_the_user_folder_runs_restricted() {
         assert!(one_cargo_command("cargo test -p a") && one_cargo_command("  cargo.exe build --release ") && one_cargo_command("\"C:\\Program Files\\x\\cargo.exe\" test -- --nocapture"));
+        // (its errors put with its output, or either let go: nothing more runs, and nothing is written but to NUL)
+        for line in ["cargo test -p dogmind-app --lib 2>&1", "cargo metadata --no-deps --format-version 1 > nul", "cargo build 2>nul", "cargo check 2>&1 >NUL", "cargo test 2> nul"] {
+            assert!(one_cargo_command(line), "{line}");
+        }
+        for more in ["cargo test 2>&1 | findstr error", "cargo build x2>&1", "cargo build 2>&1 & del x", "cargo build >nul & echo x", "cargo build 2>errors.txt"] {
+            assert!(!one_cargo_command(more), "{more}");
+        }
         // (a line of more than cargo would run all of it with what cargo is given: never)
         for more in ["cargo build & echo x", "cargo build && del x", "cargo test | more", "echo x && cargo build", "(cargo fmt)", "cargo build > out.txt", "cargo build ^& x",
                      "cargo run %PATH%", "cargo run !x!", "cargo build; x", "cargo build\necho x", "python cargo.py", "echo cargo", "cargo-nextest run"] {
@@ -4092,6 +4119,11 @@ mod change_tests {
         assert!(said.contains("exit_code: 0") && said.contains("\"name\":\"a\"") && said.contains("\"name\":\"b\""), "{said}");
         let under_users = std::env::var_os("USERPROFILE").map(PathBuf::from).and_then(|home| home.parent().map(Path::to_path_buf)).is_some_and(|users| root.starts_with(users));
         assert_eq!(said.contains("with a restricted token"), under_users, "{said}");
+        // (the same with its errors put with its output, as a model writes it: a dogfood run's `2>&1` ran in the container, failed on `crates/*`, and the model rewrote
+        // the workspace's members)
+        let merged = execute_command(&json!({"command": "cargo metadata --offline --no-deps --format-version 1 2>&1", "cwd": "crates/b"}), root, &AtomicBool::new(false), None).unwrap();
+        assert!(merged.contains("exit_code: 0") && merged.contains("\"name\":\"a\""), "{merged}");
+        assert_eq!(merged.contains("with a restricted token"), under_users, "{merged}");
     }
 
     /// Run as the model wrote them, both failed: cmd refuses a `cd` by full path under the user folder ("Access is denied"), and a cwd the command would make is no place to start.
@@ -5513,6 +5545,7 @@ mod tests {
                    failed to read `C:\\Users\\a\\work\\crates\\*\\Cargo.toml`\n\nCaused by:\n  ファイル名、ディレクトリ名、またはボリューム ラベルの構文が間違っています。 (os error 123)\n";
         let note = sandbox_notes("cargo test -p app", dir.path(), Some(101), err);
         assert!(note.contains("`members` pattern") && note.contains("run cargo directly") && note.contains("for the user to run themselves"), "{note}");
+        assert!(note.contains("nothing else on its line") && note.contains("Do not change the workspace's Cargo.toml"), "{note}");
         // a member named as it is, which is missing, is the project's own
         let named = "error: failed to load manifest for workspace member `C:\\Users\\a\\work\\crates\\gone`\n";
         assert!(!sandbox_notes("cargo build", dir.path(), Some(101), named).contains("`members` pattern"));
