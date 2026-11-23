@@ -1887,8 +1887,8 @@ fn search_files_until(arguments: &Value, workspace: &Path, secrets_besides: &[Pa
                 stopped = "the time ran out";
                 break 'files;
             }
-            if regex.is_match(line) {
-                let shown: String = line.chars().take(300).collect();
+            if let Some(found) = regex.find(line) {
+                let shown = search_excerpt(line, found);
                 out.push_str(&format!("{name}:{}:{shown}\n", number + 1));
                 matches += 1;
                 if matches >= MATCH_LIMIT {
@@ -1917,6 +1917,25 @@ fn search_files_until(arguments: &Value, workspace: &Path, secrets_besides: &[Pa
         }
     }
     Ok(cap(&out, MAX_OUTPUT))
+}
+
+/// Show the start of a matching line when the hit fits there, otherwise show the hit in context.
+fn search_excerpt(line: &str, found: regex::Match<'_>) -> String {
+    const LIMIT: usize = 300;
+    let first_end = line.char_indices().nth(LIMIT).map_or(line.len(), |(at, _)| at);
+    if first_end == line.len() {
+        return line.to_owned();
+    }
+    if found.end() <= first_end {
+        return format!("{}…", &line[..first_end]);
+    }
+    let match_len = found.as_str().chars().take(LIMIT).count();
+    let before = ((LIMIT - match_len) / 2).min(40);
+    let start = line[..found.start()].chars().rev().take(before).fold(found.start(), |at, ch| at - ch.len_utf8());
+    let end = line[start..].char_indices().nth(LIMIT).map_or(line.len(), |(at, _)| start + at);
+    let suffix = if end < line.len() { "…" } else { "" };
+    let prefix = if start > 0 { "…" } else { "" };
+    format!("{prefix}{}{suffix}", &line[start..end])
 }
 
 /// The workspace's files, as `@` offers them: what git ignores is left out.
@@ -5720,6 +5739,18 @@ mod tests {
         assert_eq!(lines, ["be.txt:1:日本語", "bom.txt:1:日本語", "cp932.txt:1:日本語", "le.txt:1:日本語"]);
         #[cfg(not(windows))]
         assert_eq!(lines, ["be.txt:1:日本語", "bom.txt:1:日本語", "le.txt:1:日本語"]);
+    }
+
+    #[test]
+    fn a_search_shows_the_match_even_near_the_end_of_a_long_line() {
+        let (dir, mut bench, cancel) = bench();
+        let needle = "検索🐕".repeat(95);
+        let contents = format!("見出し\n{}{}末尾\n", "前".repeat(400), needle);
+        std::fs::write(dir.path().join("long.txt"), contents).unwrap();
+        let result = bench.run("search_files", &json!({"pattern": needle}), dir.path(), &cancel).unwrap();
+        assert!(result.starts_with("long.txt:2:…"));
+        assert!(result.contains(&needle));
+        assert!(result.contains("末尾"));
     }
 
     #[test]
