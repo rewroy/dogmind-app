@@ -862,11 +862,25 @@ pub fn complete_tool_calls(messages: &mut Vec<Message>) {
     }
 }
 
+/// Files created in the same second are named STAMP, STAMP-2, ..., STAMP-10.
+fn session_order(path: &Path) -> (&std::ffi::OsStr, u64) {
+    let stem = path.file_stem().unwrap_or_default();
+    if let Some((stamp, sequence)) = stem.to_str().and_then(|name| name.rsplit_once('-')) {
+        if let Some((day, time)) = stamp.split_once('-') {
+            if day.len() == 8 && time.len() == 6 && day.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit()) {
+                if let Ok(number) = sequence.parse() {
+                    return (std::ffi::OsStr::new(stamp), number);
+                }
+            }
+        }
+    }
+    (stem, 1)
+}
+
 fn session_paths(folder: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !crate::trajectory::is_trajectory(path) && !is_helper(path)).collect();
-    paths.sort();
-    paths.reverse();
+    paths.sort_unstable_by(|a, b| session_order(b).cmp(&session_order(a)).then_with(|| b.cmp(a)));
     paths
 }
 
@@ -1049,6 +1063,22 @@ mod tests {
         let first = Session::create(dir.path(), Path::new("w"), "now", "same").unwrap();
         let second = Session::create(dir.path(), Path::new("w"), "now", "same").unwrap();
         assert_ne!(first.path, second.path);
+    }
+
+    #[test]
+    fn sessions_in_the_same_second_are_newest_first_in_lists_and_searches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        for (index, stamp) in std::iter::once("20261123-175959")
+            .chain(std::iter::repeat_n("20261123-180000", 12)).chain(std::iter::once("20261123-180001")).enumerate() {
+            let title = format!("chat {index}");
+            let mut session = Session::create(dir.path(), dir.path(), "now", stamp).unwrap();
+            session.append(&Message::text("user", &title)).unwrap();
+            expected.push(title);
+        }
+        expected.reverse();
+        assert_eq!(list(dir.path()).into_iter().map(|s| s.title).collect::<Vec<_>>(), expected);
+        assert_eq!(search(dir.path(), "chat").into_iter().map(|s| s.title).collect::<Vec<_>>(), expected);
     }
 
     #[test]
