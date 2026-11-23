@@ -814,6 +814,21 @@ pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf,
     let now = chrono::Local::now();
     let writer = sealed_of(path).map_err(|error| format!("{}: {error}", path.display()))?.map(|sealed| sealed.cipher);
     let mut copy = Session::create_with(folder, &workspace, &now.format("%Y-%m-%d %H:%M:%S %:z").to_string(), &now.format("%Y%m%d-%H%M%S").to_string(), writer.as_ref())?;
+    let result = write_branch(&mut copy, path, &messages, title);
+    let branch = copy.path.clone();
+    drop(copy);
+    if let Err(error) = result {
+        if let Err(cleanup) = crate::checkpoint::delete_session(&branch) {
+            use crate::checkpoint::DeleteError;
+            let (DeleteError::Conversation(why) | DeleteError::RemainingFiles(why)) = cleanup;
+            return Err(format!("{error}; could not remove incomplete branch {}: {why}", branch.display()));
+        }
+        return Err(error);
+    }
+    Ok(branch)
+}
+
+fn write_branch(copy: &mut Session, path: &Path, messages: &[Message], title: Option<&str>) -> Result<(), String> {
     if let Some(tools) = tools_of(path) {
         copy.set_tools(&tools)?;
     }
@@ -823,27 +838,34 @@ pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf,
     if web_seen(path) {
         copy.mark_web_seen()?;
     }
-    for message in &messages {
-        copy.append(message)?;
-    }
-    if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
-        copy.write(&Line::Title { title: title.to_string() })?;
-    }
     // The helpers the kept messages came from go with them, under the branch's own name and the numbers they had (the messages say them): copied as they are, line for line, so that
     // an encrypted one needs no key to be copied and a line that did not open is not lost in the copy.
     for number in messages.iter().filter_map(|message| message.helper.as_ref().map(|helper| helper.number)) {
-        if let Some(from) = helper_path(path, number) {
-            fs::copy(&from, helper_file_of(&copy.path, number)).map_err(|error| format!("{}: {error}", from.display()))?;
+        let from = helper_file_of(path, number);
+        match fs::copy(&from, helper_file_of(&copy.path, number)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !from.try_exists().unwrap_or(true) => {}
+            Err(error) => return Err(format!("{}: {error}", from.display())),
         }
     }
     let from = crate::images::folder_of(path);
     for image in messages.iter().flat_map(|message| &message.images) {
         // (one gone from the original is gone from the branch too: it says so where it would show)
-        if let Ok(bytes) = crate::images::read_stored(&from.join(&image.file)) {
-            crate::images::store(&copy.path, &image.file, &bytes)?;
-        }
+        let file = from.join(&image.file);
+        match crate::images::read_stored(&file) {
+            Ok(bytes) => crate::images::store(&copy.path, &image.file, &bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", file.display())),
+        };
     }
-    Ok(copy.path)
+    // A session becomes visible in history when its first message is appended. Copy everything it refers to first.
+    for message in messages {
+        copy.append(message)?;
+    }
+    if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+        copy.write(&Line::Title { title: title.to_string() })?;
+    }
+    Ok(())
 }
 
 /// Stub results for calls that have none, right after their assistant message; and no result for a call that is not there (its line
@@ -994,6 +1016,39 @@ mod tests {
         let listed = list(dir.path());
         assert!(listed.iter().any(|summary| summary.path == branch && summary.title == "a title (branch)"), "{listed:?}");
         assert!(fork(&path, 9, None).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_branch_with_an_unreadable_attachment_fails_cleanly_and_can_be_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), dir.path(), "now", "parent").unwrap();
+        let mut message = Message::text("user", "two pictures");
+        for name in ["first.png", "locked.png", "already-missing.png"] {
+            message.images.push(crate::message::ImageRef { file: name.into(), media_type: "image/png".into(), width: 1, height: 1 });
+        }
+        session.append(&message).unwrap();
+        let images = crate::images::folder_of(&session.path);
+        fs::create_dir_all(&images).unwrap();
+        fs::write(images.join("first.png"), b"first").unwrap();
+        fs::write(images.join("locked.png"), b"second").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(images.join("locked.png")).unwrap();
+        let entries = || {
+            let mut files: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+            files.sort();
+            files
+        };
+        let before = entries();
+        assert!(fork(&session.path, 0, None).unwrap_err().contains("locked.png"));
+        assert_eq!(entries(), before);
+        drop(held);
+        let copy = fork(&session.path, 0, None).unwrap();
+        let copied = crate::images::folder_of(&copy);
+        assert_eq!(fs::read(copied.join("first.png")).unwrap(), b"first");
+        assert_eq!(fs::read(copied.join("locked.png")).unwrap(), b"second");
+        assert!(!copied.join("already-missing.png").exists());
+        assert_eq!(list(dir.path()).len(), 2);
     }
 
     #[test]
