@@ -7767,7 +7767,8 @@ impl App {
             }
             Panel::Tools => {
                 form.toggle(t("Web search and reading"), self.toggle_web);
-                form.toggle(t("Code Mode: let the model run a short program that calls several tools at once"), self.toggle_code_mode);
+                form.toggle(t("Code Mode"), self.toggle_code_mode);
+                form.note(t("Lets the model run a short program that calls several tools at once."), theme::muted());
                 let setting = self.settings.search_key.clone();
                 self.key_rows(form, &setting, t("Brave Search key"));
                 form.section(t("MCP servers"));
