@@ -371,6 +371,8 @@ fn lines_of(path: &Path) -> std::io::Result<impl Iterator<Item = String>> {
 
 /// What a session file comes to when it is read whole.
 struct Loaded {
+    /// The original first user line, or the last explicit name, even after compaction. Absent until a message was appended.
+    title: Option<String>,
     workspace: PathBuf,
     messages: Vec<Message>,
     /// The lines that did not open, by their number in the file from 1 (an encrypted file's only).
@@ -381,6 +383,15 @@ struct Loaded {
 
 fn load(path: &Path) -> Result<Loaded, String> {
     let entries = entries_of(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(load_entries(entries))
+}
+
+fn first_words(message: &Message) -> String {
+    message.content.as_deref().and_then(|text| typed_text(text).lines().next()).unwrap_or("").chars().take(70).collect()
+}
+
+fn load_entries(entries: impl Iterator<Item = (u64, Entry)>) -> Loaded {
+    let (mut title, mut named) = (None, None);
     let (mut workspace, mut messages, mut damaged, mut lines) = (PathBuf::new(), Vec::new(), Vec::new(), 0);
     for (number, entry) in entries {
         lines = number + 1;
@@ -388,14 +399,21 @@ fn load(path: &Path) -> Result<Loaded, String> {
             Entry::Damaged => damaged.push(number as usize + 1),
             Entry::Text(line) => match serde_json::from_str(&line) {
                 Ok(Line::Meta { workspace: place, .. }) => workspace = place,
-                Ok(Line::Message { message }) => messages.push(message),
+                Ok(Line::Message { message }) => {
+                    let first = title.get_or_insert_with(String::new);
+                    if first.is_empty() && named.is_none() && message.role == "user" {
+                        *first = first_words(&message);
+                    }
+                    messages.push(message);
+                }
+                Ok(Line::Title { title: name }) => named = Some(name),
                 Ok(Line::Snapshot { messages: all }) => messages = all,
-                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. } | Line::Seen { .. } | Line::SeenForgotten | Line::Stopped { .. }) => {}
+                Ok(Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. } | Line::Seen { .. } | Line::SeenForgotten | Line::Stopped { .. }) => {}
                 Err(_) => {} // a line cut short by a crash, or of a kind that is not known
             },
         }
     }
-    Ok(Loaded { workspace, messages, damaged, lines })
+    Loaded { title: title.map(|first| named.unwrap_or(first)), workspace, messages, damaged, lines }
 }
 
 /// What is said when lines of a conversation could not be read: followed by their numbers.
@@ -696,27 +714,52 @@ fn place_of(text: &str, word: &[char]) -> Option<usize> {
 /// The sessions with every word of `query` in their name or in what was said (not in the tools' output, and not in the
 /// system prompt, which every session has), the newest first.
 pub fn search(folder: &Path, query: &str) -> Vec<Hit> {
+    search_while(folder, query, || true).unwrap_or_default()
+}
+
+/// Stops between records when the caller has moved to another query. An obsolete search returns no result to publish.
+pub fn search_while(folder: &Path, query: &str, current: impl Fn() -> bool) -> Option<Vec<Hit>> {
     let words: Vec<Vec<char>> = query.split_whitespace().map(|word| word.chars().flat_map(char::to_lowercase).collect()).collect();
+    let mut hits = Vec::new();
     if words.is_empty() {
-        return Vec::new();
+        return Some(hits);
     }
-    list(folder).into_iter().filter_map(|summary| {
-        let mut said = vec![summary.title.clone()];
-        for message in read(&summary.path).ok()? {
-            match (message.role.as_str(), message.content) {
-                ("user", Some(text)) if crate::prompt::is_nudge(&text) => {}
-                ("user", Some(text)) => said.push(typed_text(&text).to_string()),
-                ("assistant", Some(text)) => said.push(text),
-                _ => {}
-            }
+    for path in session_paths(folder) {
+        if !current() {
+            return None;
         }
+        let Ok(entries) = entries_of(&path) else { continue };
+        let loaded = load_entries(entries.take_while(|_| current()));
+        if !current() {
+            return None;
+        }
+        let Some(title) = loaded.title else { continue };
+        let spoken = loaded.messages.iter().filter_map(|message| {
+            let text = message.content.as_deref()?;
+            match message.role.as_str() {
+                "user" if !crate::prompt::is_nudge(text) => Some(typed_text(text)),
+                "assistant" => Some(text),
+                _ => None,
+            }
+        });
         let mut shown = None;
         for word in &words {
-            let (at, text) = said.iter().find_map(|text| place_of(text, word).map(|at| (at, text)))?;
+            let found = std::iter::once(title.as_str()).chain(spoken.clone()).take_while(|_| current())
+                .find_map(|text| place_of(text, word).map(|at| (text, at)));
+            if !current() {
+                return None;
+            }
+            let Some((text, at)) = found else {
+                shown = None;
+                break;
+            };
             shown.get_or_insert_with(|| snippet(text, at));
         }
-        Some(Hit { path: summary.path, title: summary.title, snippet: shown.unwrap_or_default() })
-    }).collect()
+        if let Some(snippet) = shown {
+            hits.push(Hit { path, title, snippet });
+        }
+    }
+    Some(hits)
 }
 
 /// A name for a session, as the person chose it.
@@ -819,13 +862,17 @@ pub fn complete_tool_calls(messages: &mut Vec<Message>) {
     }
 }
 
-/// The sessions in a folder, the newest first. An encrypted one whose key is not here is listed too, saying so: it is not left out of the list as if it were gone.
-pub fn list(folder: &Path) -> Vec<Summary> {
+fn session_paths(folder: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !crate::trajectory::is_trajectory(path) && !is_helper(path)).collect();
     paths.sort();
     paths.reverse();
-    paths.into_iter().filter_map(|path| {
+    paths
+}
+
+/// The sessions in a folder, the newest first. An encrypted one whose key is not here is listed too, saying so: it is not left out of the list as if it were gone.
+pub fn list(folder: &Path) -> Vec<Summary> {
+    session_paths(folder).into_iter().filter_map(|path| {
         let (mut workspace, mut created, mut title, mut messages, mut named) = (PathBuf::new(), String::new(), String::new(), 0, None);
         let entries = match entries_of(&path) {
             Ok(entries) => entries,
@@ -854,7 +901,7 @@ pub fn list(folder: &Path) -> Vec<Summary> {
                 Ok(Line::Message { message }) => {
                     messages += 1;
                     if title.is_empty() && message.role == "user" {
-                        title = message.content.as_deref().map(|text| typed_text(text).lines().next().unwrap_or("").chars().take(70).collect()).unwrap_or_default();
+                        title = first_words(&message);
                     }
                 }
                 _ => {}
@@ -1083,6 +1130,41 @@ mod tests {
         assert!(titles("   ").is_empty());
         let hit = search(dir.path(), "BUCKET").remove(0);
         assert!(hit.snippet.contains("bucket"), "{}", hit.snippet);
+    }
+
+    #[test]
+    fn a_history_search_uses_the_list_title_and_the_current_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
+        session.append(&Message::text("user", "original name")).unwrap();
+        session.append(&Message::text("assistant", "discarded answer")).unwrap();
+        session.snapshot(&[Message::text("user", "kept question")]).unwrap();
+        let hit = search(dir.path(), "original question").remove(0);
+        assert_eq!(hit.title, list(dir.path())[0].title);
+        assert!(hit.snippet.contains("original"));
+        assert!(search(dir.path(), "discarded").is_empty());
+        rename(&session.path, "new title").unwrap();
+        assert!(search(dir.path(), "original").is_empty());
+        assert_eq!(search(dir.path(), "new question")[0].title, "new title");
+        let empty = Session::create(dir.path(), Path::new("w"), "now", "2").unwrap();
+        rename(&empty.path, "invisible").unwrap();
+        assert!(search(dir.path(), "invisible").is_empty());
+    }
+
+    #[test]
+    fn an_obsolete_search_stops_inside_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
+        for _ in 0..20 {
+            session.append(&Message::text("user", "needle")).unwrap();
+        }
+        let remaining = std::cell::Cell::new(6usize);
+        assert!(search_while(dir.path(), "needle", || {
+            let left = remaining.get();
+            remaining.set(left.saturating_sub(1));
+            left > 0
+        }).is_none());
+        assert_eq!(search(dir.path(), "needle").len(), 1);
     }
 
     #[test]

@@ -2276,7 +2276,7 @@ struct App {
     side_search: HWND,
     side_query: String,
     side_hits: Option<Vec<session::Hit>>,
-    search_generation: u64,
+    search_generation: Arc<AtomicU64>,
     suggest: HWND,
     suggestions: Vec<Suggestion>,
     suggest_hover: Option<usize>,
@@ -11780,14 +11780,18 @@ impl App {
     unsafe fn search_now(&mut self) {
         KillTimer(self.window, TIMER_SEARCH);
         self.side_query = get_text(self.side_search).trim().to_string();
-        self.search_generation += 1;
+        let generation = self.search_generation.fetch_add(1, Ordering::Relaxed) + 1;
         if self.side_query.is_empty() {
             self.side_hits = None;
             self.fill_side();
             return;
         }
-        let (poster, folder, query, generation) = (self.poster.clone(), self.folder.join("sessions"), self.side_query.clone(), self.search_generation);
-        std::thread::spawn(move || poster.send(Note::Found(generation, session::search(&folder, &query))));
+        let (poster, folder, query, latest) = (self.poster.clone(), self.folder.join("sessions"), self.side_query.clone(), self.search_generation.clone());
+        std::thread::spawn(move || {
+            if let Some(hits) = session::search_while(&folder, &query, || latest.load(Ordering::Relaxed) == generation) {
+                poster.send(Note::Found(generation, hits));
+            }
+        });
     }
 
     /// The sidebar's list, read on another thread: there may be many sessions.
@@ -14281,7 +14285,7 @@ impl App {
                 }
             }
             Note::Found(generation, hits) => {
-                if generation == self.search_generation && !self.side_query.is_empty() {
+                if generation == self.search_generation.load(Ordering::Relaxed) && !self.side_query.is_empty() {
                     self.side_hits = Some(hits);
                     self.fill_side();
                 }
@@ -16694,7 +16698,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             }
             if lparam as HWND == app.side_search {
                 if code == EN_CHANGE as usize {
-                    // Each file of each session is read: after the typing pauses.
+                    // Stop reading the old query now; start the next one after typing pauses.
+                    app.search_generation.fetch_add(1, Ordering::Relaxed);
                     SetTimer(window, TIMER_SEARCH, 200, None);
                 }
                 return 0;
@@ -17040,6 +17045,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_DESTROY => {
+            app.search_generation.fetch_add(1, Ordering::Relaxed);
             let data = app.tray_data();
             Shell_NotifyIconW(NIM_DELETE, &data);
             app.remember_place();
@@ -18183,7 +18189,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             side_search: control(window, "EDIT", "", edit_style, 0, 0),
             side_query: String::new(),
             side_hits: None,
-            search_generation: 0,
+            search_generation: Arc::new(AtomicU64::new(0)),
             suggest: control(window, "LISTBOX", "", list_style, 0, ID_SUGGEST),
             suggestions: Vec::new(),
             suggest_hover: None,
