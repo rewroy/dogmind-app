@@ -3757,29 +3757,31 @@ impl Agent {
     }
 
     fn run_reads(&mut self, calls: &[crate::message::ToolCall]) -> usize {
-        let started = Instant::now();
         // (each parsed as free_read did when it let it through, so what runs is what the gate saw)
         let parsed: Vec<Value> = calls.iter().map(|call| arguments_of(call).unwrap_or_default()).collect();
-        for (call, arguments) in calls.iter().zip(&parsed) {
-            self.tool_started(&call.id, &call.function.name, Some(arguments), &call.function.arguments, calls.len());
-        }
         let (workspace, baseline, cancel, secrets) = (self.workspace.clone(), self.bench.baseline.clone(), self.cancel.clone(), self.gate.secrets.clone());
         let results: Vec<_> = std::thread::scope(|scope| {
             let running: Vec<_> = calls.iter().zip(&parsed).map(|(call, arguments)| {
                 let (workspace, baseline, cancel, secrets) = (&workspace, &baseline, &cancel, &secrets);
-                scope.spawn(move || Workbench::run_read(&call.function.name, arguments, workspace, baseline.as_deref(), secrets, cancel))
+                self.tool_started(&call.id, &call.function.name, Some(arguments), &call.function.arguments, calls.len());
+                let started = Instant::now();
+                scope.spawn(move || {
+                    let result = std::panic::catch_unwind(|| Workbench::run_read(&call.function.name, arguments, workspace, baseline.as_deref(), secrets, cancel))
+                        .unwrap_or_else(|_| (Err("the tool panicked".into()), None));
+                    (result, started.elapsed())
+                })
             }).collect();
-            running.into_iter().map(|thread| thread.join().unwrap_or((Err("the tool panicked".into()), None))).collect()
+            running.into_iter().map(|thread| thread.join().expect("read panics are caught in the worker")).collect()
         });
         let mut failures = 0;
-        for ((call, arguments), (result, seen)) in calls.iter().zip(&parsed).zip(results) {
+        for ((call, arguments), ((result, seen), elapsed)) in calls.iter().zip(&parsed).zip(results) {
             let result = match seen {
                 Some((path, hash)) => self.bench.after_read(arguments, path, hash, result),
                 None => result,
             };
             failures += usize::from(result.is_err());
             self.note_outcome(&call.function.name, arguments, &result);
-            self.finish_call(&call.id, result, false, started.elapsed());
+            self.finish_call(&call.id, result, false, elapsed);
         }
         failures
     }
