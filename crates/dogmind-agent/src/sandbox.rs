@@ -2633,6 +2633,123 @@ mod tests {
         run(line, folder, folder, network, Duration::from_secs(60), &AtomicBool::new(false)).unwrap()
     }
 
+    /// A workspace's capability is a SID anyone can make from its name, which is the app's and a hash of the folder's key. A command of another workspace that makes it and
+    /// claims it, by the attribute CreateProcess takes or by a token NtCreateLowBoxToken makes from its own, does not reach that workspace: if either did, a workspace's
+    /// grant could not stay. This program, copied into B and run by B's command, is the one that tries (`capability_probe`), and says what each way came to.
+    #[test]
+    fn a_command_cannot_claim_another_workspaces_capability() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (a, b) = (work_folder("claimed-a"), work_folder("claiming-b"));
+        std::fs::write(a.join("a.txt"), "SECRET-OF-A").unwrap();
+        // A's grant is given, and stays; B's own commands cannot reach A.
+        assert_eq!(command("echo x> mine.txt", &a, false).status, Some(0));
+        let plain = command(&format!("type \"{}\\a.txt\" & echo x> \"{}\\plain.txt\"", a.display(), a.display()), &b, false);
+        assert!(!decode(&plain.stdout).contains("SECRET-OF-A") && !a.join("plain.txt").exists(), "B cannot reach A at all, before anything is claimed");
+        std::fs::copy(std::env::current_exe().unwrap(), b.join("probe.exe")).unwrap();
+        std::fs::write(b.join("probe-args.txt"), format!("{}\n{PROFILE}\n{}", a.display(), capability_name(&key(&real(&a))))).unwrap();
+        let done = command("probe.exe --exact sandbox::tests::capability_probe --ignored --nocapture --test-threads 1", &b, false);
+        let said = format!("{}{}", decode(&done.stdout), decode(&done.stderr));
+        println!("{said}");
+        assert!(said.contains("PROBE-DONE"), "the probe ran to its end: {said}");
+        assert!(!said.contains("SECRET-OF-A"), "A's file was read: {said}");
+        assert!(!a.join("probe-1.txt").exists() && !a.join("probe-2.txt").exists() && !a.join("probe-3.txt").exists(), "a file was written in A: {said}");
+    }
+
+    /// The trying half of the test above: run in B's command by a copy of this program, told by a file there what to try. Nothing when that file is not there.
+    #[test]
+    #[ignore]
+    fn capability_probe() {
+        let Ok(args) = std::fs::read_to_string("probe-args.txt") else { return };
+        let mut lines = args.lines();
+        let (a, profile, name) = (PathBuf::from(lines.next().unwrap()), lines.next().unwrap().to_string(), lines.next().unwrap().to_string());
+        // SAFETY: what each call is given lives through it.
+        unsafe {
+            let mut container: PSID = std::ptr::null_mut();
+            assert!(DeriveAppContainerSidFromAppContainerName(wide(&profile).as_ptr(), &mut container) >= 0);
+            let (mut groups, mut group_count, mut capabilities, mut capability_count): (*mut PSID, u32, *mut PSID, u32) = (std::ptr::null_mut(), 0, std::ptr::null_mut(), 0);
+            assert_ne!(DeriveCapabilitySidsFromName(wide(&name).as_ptr(), &mut groups, &mut group_count, &mut capabilities, &mut capability_count), 0);
+            let claimed = *capabilities;
+            println!("claiming {} in {}", sid_text(claimed), sid_text(container));
+            // 1. A child started with A's capability, by the attribute.
+            let mut list_size = 0usize;
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut list_size);
+            let mut list_memory = vec![0u8; list_size];
+            let list = list_memory.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+            assert_ne!(InitializeProcThreadAttributeList(list, 1, 0, &mut list_size), 0);
+            let mut wanted = [SID_AND_ATTRIBUTES { Sid: claimed, Attributes: SE_GROUP_ENABLED as u32 }];
+            let security = SECURITY_CAPABILITIES { AppContainerSid: container, Capabilities: wanted.as_mut_ptr(), CapabilityCount: 1, Reserved: 0 };
+            assert_ne!(UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize, std::ptr::addr_of!(security).cast(), std::mem::size_of_val(&security), std::ptr::null_mut(), std::ptr::null()), 0);
+            let mut startup: STARTUPINFOEXW = std::mem::zeroed();
+            startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            startup.StartupInfo.hStdOutput = std::os::windows::io::AsRawHandle::as_raw_handle(&std::io::stdout()) as HANDLE;
+            startup.StartupInfo.hStdError = startup.StartupInfo.hStdOutput;
+            startup.lpAttributeList = list;
+            let mut line = wide(&format!("cmd.exe /d /c \"type \"{}\\a.txt\" & echo x> \"{}\\probe-1.txt\"\"", a.display(), a.display()));
+            let mut info: PROCESS_INFORMATION = std::mem::zeroed();
+            if CreateProcessW(std::ptr::null(), line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, EXTENDED_STARTUPINFO_PRESENT, std::ptr::null(), std::ptr::null(), std::ptr::addr_of!(startup.StartupInfo), &mut info) == 0 {
+                println!("way 1, CreateProcess with the attribute: refused, error {}", GetLastError());
+            } else {
+                WaitForSingleObject(info.hProcess, 20_000);
+                let mut code = 0u32;
+                GetExitCodeProcess(info.hProcess, &mut code);
+                println!("way 1, CreateProcess with the attribute: started, exit {code}");
+                CloseHandle(info.hThread);
+                CloseHandle(info.hProcess);
+            }
+            DeleteProcThreadAttributeList(list);
+            // 2. A token made from its own, with A's capability.
+            #[link(name = "ntdll", kind = "raw-dylib")]
+            extern "system" {
+                fn NtCreateLowBoxToken(token: *mut HANDLE, existing: HANDLE, access: u32, attributes: *const core::ffi::c_void, package: PSID, capability_count: u32, capabilities: *const SID_AND_ATTRIBUTES, handle_count: u32, handles: *const HANDLE) -> i32;
+            }
+            let create = NtCreateLowBoxToken;
+            let mut own: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT, &mut own) == 0 {
+                println!("way 2: its own token could not be opened, error {}", GetLastError());
+            } else {
+                let mut made: HANDLE = std::ptr::null_mut();
+                let status = create(&mut made, own, TOKEN_ALL_ACCESS, std::ptr::null(), container, 1, wanted.as_ptr(), 0, std::ptr::null());
+                if status < 0 {
+                    println!("way 2, NtCreateLowBoxToken: refused, status 0x{:08x}", status as u32);
+                } else {
+                    // As the token on this thread: A's file read, and one written there.
+                    if ImpersonateLoggedOnUser(made) == 0 {
+                        println!("way 2, NtCreateLowBoxToken: made, and could not be taken on, error {}", GetLastError());
+                    } else {
+                        let read = std::fs::read_to_string(a.join("a.txt"));
+                        let wrote = std::fs::write(a.join("probe-2.txt"), "x");
+                        RevertToSelf();
+                        println!("way 2, NtCreateLowBoxToken: made and taken on: read {:?}, write {:?}", read, wrote.map_err(|error| error.to_string()));
+                    }
+                    // And a child started with it.
+                    let mut line = wide(&format!("cmd.exe /d /c \"type \"{}\\a.txt\" & echo x> \"{}\\probe-3.txt\"\"", a.display(), a.display()));
+                    let mut plain: STARTUPINFOW = std::mem::zeroed();
+                    plain.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+                    plain.dwFlags = STARTF_USESTDHANDLES;
+                    plain.hStdOutput = startup.StartupInfo.hStdOutput;
+                    plain.hStdError = startup.StartupInfo.hStdOutput;
+                    let mut info: PROCESS_INFORMATION = std::mem::zeroed();
+                    if CreateProcessAsUserW(made, std::ptr::null(), line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, 0, std::ptr::null(), std::ptr::null(), &plain, &mut info) == 0 {
+                        println!("way 2, a child with it: refused, error {}", GetLastError());
+                    } else {
+                        WaitForSingleObject(info.hProcess, 20_000);
+                        let mut code = 0u32;
+                        GetExitCodeProcess(info.hProcess, &mut code);
+                        println!("way 2, a child with it: started, exit {code}");
+                        CloseHandle(info.hThread);
+                        CloseHandle(info.hProcess);
+                    }
+                    CloseHandle(made);
+                }
+                CloseHandle(own);
+            }
+        }
+        println!("PROBE-DONE");
+    }
+
     /// The other half of `a_browsers_input_is_a_pipe_that_its_children_are_handed`, run in the container as a copy of this program: `parent` starts `child` with its own input handed
     /// on, as Edge starts its crash handler, and `child` says what kind of handle its input is.
     #[test]
