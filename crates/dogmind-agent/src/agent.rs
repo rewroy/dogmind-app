@@ -3831,7 +3831,7 @@ impl Agent {
         let code_changed = match name {
             "create_file" => arguments.get("path").and_then(Value::as_str).is_some_and(is_code),
             "apply_patch" => arguments.get("edits").and_then(Value::as_array).is_some_and(|edits| edits.iter().filter_map(|edit| edit.get("path")?.as_str()).any(is_code)),
-            "edit" => arguments.get("file_path").and_then(Value::as_str).is_some_and(is_code),
+            "edit" => tools::edit_path(arguments).is_some_and(is_code),
             _ => false,
         };
         if code_changed {
@@ -3864,7 +3864,7 @@ impl Agent {
                 changed.push(path);
             }
             "apply_patch" => changed.extend(arguments.get("edits").and_then(Value::as_array).into_iter().flatten().filter_map(|edit| edit.get("path").and_then(Value::as_str)).map(str::to_string)),
-            "edit" => changed.extend(arguments.get("file_path").and_then(Value::as_str).map(str::to_string)),
+            "edit" => changed.extend(tools::edit_path(arguments).map(str::to_string)),
             "execute_command" => self.made_this_turn.extend(made_by_command(said)),
             "read_file" if self.polish.picture.as_deref().is_some_and(|picture| same_file(picture, &path)) => self.polish.looked = true,
             "check_page" if !path.is_empty() => {
@@ -4476,7 +4476,11 @@ impl Agent {
     /// A call's line in the trajectory is begun, with no word to the window (a program's calls are told to it by their program's: `parent` is the call of that program).
     fn call_begun(&mut self, id: &str, name: &str, arguments: Option<&Value>, raw: &str, parallel: usize, parent: Option<&str>) {
         let path = arguments.and_then(|arguments| {
-            let named = arguments.get("path").and_then(Value::as_str).or_else(|| arguments.pointer("/edits/0/path").and_then(Value::as_str)).or_else(|| arguments.pointer("/expected_files/0").and_then(Value::as_str));
+            let named = if name == "edit" {
+                tools::edit_path(arguments)
+            } else {
+                arguments.get("path").and_then(Value::as_str).or_else(|| arguments.pointer("/edits/0/path").and_then(Value::as_str)).or_else(|| arguments.pointer("/expected_files/0").and_then(Value::as_str))
+            };
             named.map(|path| path_for_trajectory(path, &self.workspace))
         });
         let cmd0 = if name == "execute_command" { arguments.and_then(|arguments| arguments.get("command")?.as_str()).and_then(first_word_of) } else { None };
@@ -4537,7 +4541,7 @@ impl Agent {
             line["exit_code"] = json!(status.parse::<i64>().ok());
         }
         // What each file it wrote is now, as a short hash: a file that comes back to a state it had is what the reader looks for.
-        if ok && matches!(meta.name.as_str(), "create_file" | "apply_patch") {
+        if ok && !meta.edited.is_empty() {
             let edited: Vec<Value> = meta.edited.iter().filter_map(|file| {
                 let bytes = std::fs::read(file).ok()?;
                 Some(json!({"path": path_for_trajectory(&file.to_string_lossy(), &self.workspace), "hash": trajectory::short_hash(&bytes)}))
@@ -5157,6 +5161,7 @@ enum Permission {
 fn edited_paths(tool: &str, arguments: &Value, workspace: &Path) -> Vec<PathBuf> {
     let mut paths = match tool {
         "create_file" => arguments.get("path").and_then(Value::as_str).into_iter().map(|path| resolve(workspace, path)).collect(),
+        "edit" => tools::edit_path(arguments).into_iter().map(|path| resolve(workspace, path)).collect(),
         "apply_patch" => {
             let expected: Vec<&str> = arguments.get("expected_files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
             let edits = arguments.get("edits").and_then(Value::as_array).into_iter().flatten();
@@ -10608,6 +10613,30 @@ Body").unwrap();
     fn trajectory_of(run: &Run) -> Vec<Value> {
         let file = std::fs::read_dir(run._sessions.path()).unwrap().flatten().map(|entry| entry.path()).find(|path| trajectory::is_trajectory(path)).expect("a trajectory beside the session");
         std::fs::read_to_string(file).unwrap().lines().map(|line| serde_json::from_str(line).expect("a line that is JSON")).collect()
+    }
+
+    #[test]
+    fn edit_records_the_file_it_used_and_the_hash_only_on_success() {
+        let dir = crate::in_container::tempdir().unwrap();
+        std::fs::write(dir.path().join("target.txt"), "before").unwrap();
+        let args = json!({"file_path":"target.txt","path":"other.txt","old_string":"before","new_string":"after"});
+        assert_eq!(tools::summary("edit", &args), "target.txt");
+        let (client, _) = server(vec![
+            call_answer("edit", args),
+            call_answer("edit", json!({"path":"target.txt","old_string":"missing","new_string":"after"})),
+            text_answer("Edited target.txt."),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::AcceptEdits);
+        run.handle.commands.send(Command::Send("Edit target.txt".into())).unwrap();
+        until_end(&run, Decision::Approve);
+        let lines = trajectory_of(&run);
+        let edits = of_kind(&lines, "tool");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0]["path"], "target.txt");
+        assert_eq!(edits[0]["edit_hash"], trajectory::short_hash(b"after"));
+        assert_eq!(edits[1]["path"], "target.txt");
+        assert_eq!(edits[1]["outcome"], "error");
+        assert!(edits[1].get("edit_hash").is_none());
     }
 
     fn of_kind<'a>(lines: &'a [Value], ev: &str) -> Vec<&'a Value> {

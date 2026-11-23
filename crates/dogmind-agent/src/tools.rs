@@ -210,9 +210,13 @@ pub fn edit_schema() -> Value {
     }, "required": ["file_path", "old_string", "new_string"]}}})
 }
 
+pub(crate) fn edit_path(arguments: &Value) -> Option<&str> {
+    arguments.get("file_path").or_else(|| arguments.get("path")).and_then(Value::as_str)
+}
+
 /// An `edit` call as the apply_patch call it is: its one edit, as many times as old_string is there when it asks for all of them.
 pub fn edit_as_patch(arguments: &Value, workspace: &Path) -> Value {
-    let path = arguments.get("file_path").or_else(|| arguments.get("path")).and_then(Value::as_str).unwrap_or("");
+    let path = edit_path(arguments).unwrap_or("");
     let old = arguments.get("old_string").and_then(Value::as_str).unwrap_or("");
     let new = arguments.get("new_string").cloned().unwrap_or(Value::Null);
     let mut edit = json!({"path": path, "old_string": old, "new_string": new});
@@ -3987,6 +3991,7 @@ pub fn summary(tool: &str, arguments: &Value) -> String {
     let text = |name: &str| arguments.get(name).and_then(Value::as_str).unwrap_or("");
     match tool {
         "read_file" | "list_files" | "create_file" => text("path").to_string(),
+        "edit" => edit_path(arguments).unwrap_or("").to_string(),
         "check_page" => match crate::page_check::served_url(arguments) {
             Some(url) => url.split(['?', '#']).next().unwrap_or(url).to_string(),
             None => text("path").to_string(),

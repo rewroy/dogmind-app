@@ -59,6 +59,10 @@ impl Line {
         self.tool_outcome() != "ok"
     }
 
+    fn is_file_edit(&self) -> bool {
+        matches!(self.s("name"), "create_file" | "apply_patch" | "edit")
+    }
+
     fn target_paths(&self) -> impl Iterator<Item = &str> {
         let edited = self.v["edited"].as_array().into_iter().flatten().filter_map(|entry| entry["path"].as_str());
         self.v["path"].as_str().into_iter().chain(edited).filter(|path| !path.is_empty())
@@ -543,7 +547,7 @@ fn circles(out: &mut String, lines: &[Line]) {
     let mut found = false;
     // Edits to one file that failed: in a row, and in all.
     let mut failed_edits: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
-    for line in tools.iter().filter(|line| matches!(line.s("name"), "create_file" | "apply_patch")) {
+    for line in tools.iter().filter(|line| line.is_file_edit()) {
         if line.failed() {
             let path = line.s("path");
             if path.is_empty() { continue; }
@@ -591,7 +595,7 @@ fn circles(out: &mut String, lines: &[Line]) {
     let mut since_edit: HashMap<(String, String), (usize, Option<String>)> = HashMap::new();
     let mut shown = std::collections::HashSet::new();
     for line in &tools {
-        if matches!(line.s("name"), "create_file" | "apply_patch") && !line.failed() {
+        if line.is_file_edit() && !line.failed() {
             since_edit.clear();
             continue;
         }
