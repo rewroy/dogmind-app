@@ -41,6 +41,8 @@ pub struct ServerConfig {
     pub command: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -113,6 +115,7 @@ fn parse_codex_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
     struct CodexServer {
         command: String,
         args: Vec<String>,
+        cwd: Option<PathBuf>,
         env: BTreeMap<String, String>,
         url: String,
         http_headers: BTreeMap<String, String>,
@@ -128,7 +131,7 @@ fn parse_codex_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
             return None;
         }
         let config = ServerConfig {
-            command: server.command, args: server.args, env: server.env, url: server.url,
+            command: server.command, args: server.args, cwd: server.cwd, env: server.env, url: server.url,
             headers: server.http_headers, ..Default::default()
         };
         config.problem().is_none().then_some((name, config))
@@ -1232,6 +1235,13 @@ fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Res
         };
     }
     let (path, script) = program(&config.command);
+    // Resolve explicit relative executable paths before spawning: Windows looks them up from the parent process.
+    let path = match &config.cwd {
+        Some(cwd) if path.is_relative() && Path::new(&config.command).components().count() > 1 => {
+            std::path::absolute(cwd.join(&path)).map_err(|error| format!("{}: {error}", cwd.display()))?
+        }
+        _ => path,
+    };
     let mut command = if script {
         let mut shell = Command::new("cmd.exe");
         shell.arg("/c").arg(&path);
@@ -1247,15 +1257,23 @@ fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Res
     // (the protocol's messages are UTF-8: a Python server reads and writes its pipes in the machine's own code page otherwise, cp932 on a Japanese
     // Windows, and Japanese in a call came to it garbled; what the configuration says comes after, and wins)
     command.env("PYTHONIOENCODING", "utf-8");
+    if let Some(cwd) = &config.cwd {
+        command.current_dir(cwd);
+    }
     command.args(&config.args).envs(&config.env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let child = command.spawn().map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => format!("{}: {NOT_FOUND}", config.command),
-        _ => format!("{}: {error}", config.command),
+    let child = command.spawn().map_err(|error| {
+        if let Some(cwd) = config.cwd.as_ref().filter(|cwd| !cwd.is_dir()) {
+            return format!("{}: {error}", cwd.display());
+        }
+        match error.kind() {
+            std::io::ErrorKind::NotFound => format!("{}: {NOT_FOUND}", config.command),
+            _ => format!("{}: {error}", config.command),
+        }
     })?;
     #[cfg(windows)]
     let ending = if job { ends_with_this_process(&child) } else { None };
@@ -2595,6 +2613,21 @@ enabled = false
 
     /// A server that answers the handshake, lists a tool `read` and answers a call of it with its own name (the first argument).
     const ANSWERING: &str = "import json, os, sys\nwho = sys.argv[1]\nopen(sys.argv[2], 'w').write(str(os.getpid()))\nfor line in sys.stdin:\n    try:\n        m = json.loads(line)\n    except ValueError:\n        continue\n    if 'id' not in m:\n        continue\n    how = m.get('method')\n    if how == 'tools/list':\n        r = {'tools': [{'name': 'read', 'description': who, 'inputSchema': {'type': 'object'}}]}\n    elif how == 'tools/call':\n        r = {'content': [{'type': 'text', 'text': 'from ' + who}]}\n    else:\n        r = {'protocolVersion': '2025-06-18', 'capabilities': {'tools': {}}}\n    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': r}), flush=True)\n";
+
+    #[test]
+    fn imported_stdio_server_reads_relative_files_in_its_working_directory() {
+        let temp = crate::in_container::tempdir().unwrap();
+        let cwd = temp.path().join("server files");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("server.py"), ANSWERING).unwrap();
+        let python = serde_json::to_string(&fake("", &[]).command).unwrap();
+        let folder = serde_json::to_string(&cwd).unwrap();
+        let source = format!("[mcp_servers.fixture]\ncommand = {python}\ncwd = {folder}\nargs = ['-I', 'server.py', 'fixture', 'pid']");
+        let imported = servers_of_codex(&source).remove("fixture").unwrap();
+        assert_eq!(imported.cwd.as_ref(), Some(&cwd));
+        let _server = start_server_within(&imported, Duration::from_secs(10), true).unwrap();
+        assert!(pid_in(&cwd.join("pid")).is_some());
+    }
 
     fn pid_in(file: &Path) -> Option<u32> {
         std::fs::read_to_string(file).ok()?.trim().parse().ok()

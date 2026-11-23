@@ -2899,7 +2899,8 @@ fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Optio
                 Some(config) if !config.is_http() && original_args == args => config.args.clone(),
                 _ => mcp::args_of_line(args),
             };
-            mcp::ServerConfig { command: target, args, env: pairs, trusted, ..Default::default() }
+            let cwd = was.filter(|config| !config.is_http()).and_then(|config| config.cwd.clone());
+            mcp::ServerConfig { command: target, args, env: pairs, cwd, trusted, ..Default::default() }
         }
     }
 }
