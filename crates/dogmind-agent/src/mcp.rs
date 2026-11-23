@@ -80,11 +80,16 @@ pub fn load_config(file: &Path) -> Config {
     std::fs::read_to_string(file).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }
 
-/// Claude Code's own list of servers: the `mcpServers` of `~/.claude.json`, programs and HTTP ones (an SSE one, of the protocol's older transport, is left out).
+/// Claude Code's own list of servers: the `mcpServers` of `~/.claude.json`, stdio, HTTP and SSE servers.
 pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
-    let value: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    parse_claude_servers(text).unwrap_or_default()
+}
+
+fn parse_claude_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
+    let mut value = serde_json::from_str::<serde_json::Map<String, Value>>(text).ok()?;
+    let servers = value.remove("mcpServers").unwrap_or_else(|| Value::Object(Default::default()));
     let mut found = BTreeMap::new();
-    for (name, server) in value.get("mcpServers").and_then(Value::as_object).into_iter().flatten() {
+    for (name, server) in servers.as_object()? {
         if let Ok(mut config) = serde_json::from_value::<ServerConfig>(server.clone()) {
             if config.kind == "stdio" {
                 config.kind.clear();
@@ -94,11 +99,15 @@ pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
             }
         }
     }
-    found
+    Some(found)
 }
 
 /// Import the launch settings of individual servers from Codex's TOML configuration.
 pub fn servers_of_codex(text: &str) -> BTreeMap<String, ServerConfig> {
+    parse_codex_servers(text).unwrap_or_default()
+}
+
+fn parse_codex_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
     #[derive(Default, Deserialize)]
     #[serde(default)]
     struct CodexServer {
@@ -110,9 +119,10 @@ pub fn servers_of_codex(text: &str) -> BTreeMap<String, ServerConfig> {
         enabled: Option<bool>,
     }
 
-    let Ok(mut config) = toml::from_str::<toml::Table>(text) else { return BTreeMap::new() };
-    let Some(toml::Value::Table(servers)) = config.remove("mcp_servers") else { return BTreeMap::new() };
-    servers.into_iter().filter_map(|(name, value)| {
+    let mut config = toml::from_str::<toml::Table>(text).ok()?;
+    let Some(servers) = config.remove("mcp_servers") else { return Some(BTreeMap::new()) };
+    let toml::Value::Table(servers) = servers else { return None };
+    Some(servers.into_iter().filter_map(|(name, value)| {
         let server: CodexServer = value.try_into().ok()?;
         if server.enabled == Some(false) {
             return None;
@@ -122,7 +132,30 @@ pub fn servers_of_codex(text: &str) -> BTreeMap<String, ServerConfig> {
             headers: server.http_headers, ..Default::default()
         };
         config.problem().is_none().then_some((name, config))
-    }).collect()
+    }).collect())
+}
+
+/// Read the optional import sources in priority order. Report only filenames so malformed lines never expose settings.
+pub fn external_servers(home: &Path) -> (BTreeMap<String, ServerConfig>, Vec<&'static str>) {
+    let mut found = BTreeMap::new();
+    let mut unreadable = Vec::new();
+    type Parser = fn(&str) -> Option<BTreeMap<String, ServerConfig>>;
+    for (file, parse) in [(".claude.json", parse_claude_servers as Parser), (".codex/config.toml", parse_codex_servers)] {
+        let servers = match std::fs::read_to_string(home.join(file)) {
+            Ok(text) => parse(&text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => None,
+        };
+        match servers {
+            Some(servers) => {
+                for (name, server) in servers {
+                    found.entry(name).or_insert(server);
+                }
+            }
+            None => unreadable.push(file),
+        }
+    }
+    (found, unreadable)
 }
 
 /// The person's server, as they gave it in Settings, in place of the one called `before` (none for a new one). The file is written whole, through a partial one, so

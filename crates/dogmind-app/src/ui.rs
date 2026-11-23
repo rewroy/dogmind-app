@@ -2837,10 +2837,14 @@ fn mcp_import(home: &Path, file: &Path, argument: &str) -> Result<(usize, String
     if !preview && !action.eq_ignore_ascii_case("import") {
         return Err(t("Use /mcp for status, /mcp candidates to list names, or /mcp import [NAME].").into());
     }
-    let mut found = mcp::servers_of_claude(&std::fs::read_to_string(home.join(".claude.json")).unwrap_or_default());
-    for (name, server) in mcp::servers_of_codex(&std::fs::read_to_string(home.join(".codex/config.toml")).unwrap_or_default()) {
-        found.entry(name).or_insert(server);
+    let (mut found, unreadable) = mcp::external_servers(home);
+    let warning = if unreadable.is_empty() { String::new() } else {
+        tf("Could not read MCP settings from {0}. Check the file format and permissions.", &[&unreadable.join(", ")])
+    };
+    if found.is_empty() && !warning.is_empty() {
+        return Err(warning);
     }
+    let report = |message: String| if warning.is_empty() { message } else { format!("{message}\n{warning}") };
     if preview {
         let configured = mcp::readable_config(file)?.servers;
         let names: Vec<_> = found.into_keys().filter(|name| !configured.contains_key(name)).collect();
@@ -2849,10 +2853,10 @@ fn mcp_import(home: &Path, file: &Path, argument: &str) -> Result<(usize, String
         } else {
             tf("Available to import with /mcp import NAME:\n{0}", &[&names.join("\n")])
         };
-        return Ok((0, message));
+        return Ok((0, report(message)));
     }
     if !name.is_empty() {
-        let selected = found.remove_entry(name).ok_or_else(|| tf("No import candidate named {0}. Use /mcp candidates to list names.", &[&name]))?;
+        let selected = found.remove_entry(name).ok_or_else(|| report(tf("No import candidate named {0}. Use /mcp candidates to list names.", &[&name])))?;
         found = std::collections::BTreeMap::from([selected]);
     }
     let added = mcp::import(file, found)?;
@@ -2862,7 +2866,7 @@ fn mcp_import(home: &Path, file: &Path, argument: &str) -> Result<(usize, String
         (_, false) => tf("Added {0}. The server is starting.", &[&name]),
         (_, true) => tf("{0} servers added to {1}. They are starting.", &[&added, &file.display()]),
     };
-    Ok((added, message))
+    Ok((added, report(message)))
 }
 
 /// What an MCP server runs, or where it is, as its row says it. Its headers are not said: a key is among them.
@@ -19155,6 +19159,33 @@ mod tests {
         assert!(approval_takes_focus(true, true, Some(Duration::from_secs(60))));
         assert!(!approval_takes_focus(true, false, Some(Duration::from_secs(60))), "a draft in it: the next key belongs to it");
         assert!(!approval_takes_focus(true, true, Some(Duration::from_millis(300))), "typing now, its first word about to come");
+    }
+
+    #[test]
+    fn mcp_import_identifies_unreadable_sources_and_keeps_valid_candidates() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("dogmind/mcp.json");
+        let run = |argument| mcp_import(home.path(), &file, argument);
+        assert!(run("candidates").is_ok());
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        let codex = home.path().join(".codex/config.toml");
+        std::fs::write(&codex, "[private-fixture").unwrap();
+        let problem = run("candidates").unwrap_err();
+        assert!(problem.contains(".codex/config.toml") && !problem.contains("private-fixture"));
+        assert!(!file.exists());
+        std::fs::write(home.path().join(".claude.json"), r#"{"mcpServers":{"editor":{"command":"fixture"}}}"#).unwrap();
+        let (_, candidates) = run("candidates").unwrap();
+        assert!(candidates.contains("editor") && candidates.contains(".codex/config.toml"));
+        assert!(run("import typo").unwrap_err().contains(".codex/config.toml"));
+        let (added, message) = run("import editor").unwrap();
+        assert_eq!(added, 1);
+        assert!(message.contains(".codex/config.toml") && !message.contains("private-fixture"));
+        std::fs::write(home.path().join(".claude.json"), "[").unwrap();
+        std::fs::remove_file(&codex).unwrap();
+        std::fs::create_dir(&codex).unwrap();
+        let both = run("import").unwrap_err();
+        assert!(both.contains(".claude.json") && both.contains(".codex/config.toml"));
+        assert_eq!(dogmind_agent::mcp::readable_config(&file).unwrap().servers.len(), 1);
     }
 
     #[test]
