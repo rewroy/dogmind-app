@@ -4,7 +4,7 @@
 //! With the engine's log (as `GET /dashboard/logs` gives it, `{"lines": [...]}`) it also puts each request beside the engine's own line for it: by the id the app sent (`Straydog request: id
 //! <req>, ...`), and, for a server that does not log ids yet, by time and the size of the prompt.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -369,10 +369,15 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
 /// What a tool's line says besides its name, time and outcome: its file or program, the exit code, the bytes, the wait for the person, a command's parts, a browser's runs.
 fn tool_notes(line: &Line) -> Vec<String> {
     let mut more = Vec::new();
-    for key in ["path", "cmd0"] {
-        if let Some(text) = line.v[key].as_str() {
-            more.push(text.to_string());
+    let edited = line.v["edited"].as_array().into_iter().flatten().filter_map(|entry| entry["path"].as_str());
+    let mut seen = HashSet::new();
+    for path in line.v["path"].as_str().into_iter().chain(edited) {
+        if !path.is_empty() && seen.insert(path) {
+            more.push(path.to_string());
         }
+    }
+    if let Some(program) = line.v["cmd0"].as_str() {
+        more.push(program.to_string());
     }
     if let Some(code) = line.v["exit_code"].as_i64().filter(|code| *code != 0) {
         more.push(format!("exit {code}"));
@@ -807,6 +812,20 @@ mod tests {
 
     fn text(lines: &[Value]) -> String {
         lines.iter().map(|line| format!("{line}\n")).collect()
+    }
+
+    #[test]
+    fn a_tool_row_lists_every_edited_path_once_in_recorded_order() {
+        let mut patch = tool(1, "apply_patch", 5, "ok", Some("src/main.js"), None, "args");
+        patch["edited"] = json!([{"path":"src/main.js"}, {"path":"styles.css"}, {"path":"src/main.js"}]);
+        let legacy = tool(2, "apply_patch", 4, "ok", Some("README.md"), None, "args2");
+        let trajectory = text(&[patch, legacy]);
+        let model = summary(&trajectory);
+        let tools = &model.turns[0].tools;
+        assert_eq!(tools[0].notes[..2], ["src/main.js", "styles.css"]);
+        assert_eq!(tools[0].notes.iter().filter(|note| *note == "src/main.js").count(), 1);
+        assert_eq!(tools[1].notes[0], "README.md");
+        assert!(report(&trajectory, None).lines().any(|line| line.contains("apply_patch") && line.contains("src/main.js, styles.css,")));
     }
 
     fn request(n: u64, at: &str, role: &str, first: u64, ms: u64, prompt: u64, cached: u64, completion: u64, end: &str) -> Value {
