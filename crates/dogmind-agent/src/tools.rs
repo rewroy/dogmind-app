@@ -1177,13 +1177,19 @@ impl Workbench {
         }
         // In the file's own form: its encoding, its byte order mark and its line ends. Appended as bytes, words went onto UTF-16 as UTF-8, and
         // LF lines onto CRLF ones; written over, a mark PowerShell 5.1 needs to read Japanese went.
-        let written = if exists {
+        // (a new file is all ASCII before it is written)
+        let was_ascii = before.is_ascii();
+        let mut written = if exists {
             let form = Form::of(&before);
             let new = form.bytes(content, !append).map_err(|why| format!("{given}: {why}. Nothing was written"))?;
             if append { [before, new].concat() } else { new }
         } else {
             content.as_bytes().to_vec()
         };
+        let marked = powershell_wants_a_mark(&path, was_ascii, &written);
+        if marked {
+            written.splice(0..0, UTF8_MARK.iter().copied());
+        }
         written_whole(&path, &written, exists).map_err(|error| format!("{given}: {error}: {}", if exists { "the file is as it was" } else { "it was not made" }))?;
         let lines = file_text(&written).0.lines().count();
         self.saw(path.clone(), sha16(&written));
@@ -1193,6 +1199,9 @@ impl Workbench {
         self.covered.insert(path, seen_in_part.unwrap_or(lines));
         let word = if !exists { "created" } else if append { "added to" } else { "replaced" };
         let mut said = format!("{word} {given}: now {lines} lines, {} bytes", written.len());
+        if marked {
+            said.push_str(POWERSHELL_MARK_NOTE);
+        }
         if !append && lines >= WRITTEN_WHOLE_LINES && is_a_page(Path::new(given)) {
             said.push_str(&not_opened_yet(lines));
         }
@@ -1274,6 +1283,11 @@ impl Workbench {
             }
             *text = changed;
         }
+        for file in &mut files {
+            if file.form.encoding == "utf-8" && file.form.mark.is_empty() && powershell_wants_a_mark(&file.path, file.before.is_ascii(), file.after.as_bytes()) {
+                file.form.mark = UTF8_MARK;
+            }
+        }
         let writes = files.iter().map(|file| {
             let bytes = file.form.encode(&file.after, true)
                 .map_err(|error| format!("{}: {error}: nothing was changed", file.path.display()))?;
@@ -1287,6 +1301,9 @@ impl Workbench {
             let diff = similar::TextDiff::from_lines(before, after).unified_diff().context_radius(2).to_string();
             let name = path.strip_prefix(workspace).unwrap_or(path).display().to_string();
             report.push_str(&format!("--- applied_diff {name} ---\n{}\n", cap(&diff, MAX_APPLIED_DIFF)));
+            if bytes.starts_with(UTF8_MARK) && !file.original.starts_with(UTF8_MARK) {
+                report.push_str(&format!("{name} was{}\n", POWERSHELL_MARK_NOTE.trim_start_matches(" (written").trim_end_matches(')')));
+            }
             // (seen whole before, it is seen whole after: the model wrote what changed)
             if self.covered.get(path).is_some_and(|covered| *covered >= before.lines().count()) {
                 self.covered.insert(path.clone(), after.lines().count());
@@ -1395,6 +1412,23 @@ fn rewrites_from_the_top(path: &Path, content: &str) -> bool {
     let three: usize = text.split_inclusive('\n').take(3).map(str::len).sum();
     let head: String = text[..three].chars().take(120).collect();
     head.trim().chars().count() >= 20 && content.starts_with(&head)
+}
+
+/// UTF-8's byte order mark.
+const UTF8_MARK: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// What a write says when it gave a PowerShell script the mark (`powershell_wants_a_mark`).
+const POWERSHELL_MARK_NOTE: &str = " (written with a UTF-8 byte order mark: Windows PowerShell 5.1 reads a script without one in the ANSI code page, and its non-ASCII text would break)";
+
+/// Whether a PowerShell script written as these bytes takes a UTF-8 byte order mark: it has text beyond ASCII in UTF-8, has no mark, and was all
+/// ASCII before (or is new). Windows PowerShell 5.1 reads a script without a mark in the ANSI code page (932 on a Japanese Windows): written as plain
+/// UTF-8, 「こんにちは。短い一文で返してください。」 came out as 「縺薙ｓ…」 and ended the string early (TerminatorExpectedAtEndOfString, two runs of
+/// two, and each time the model put the words into English to get past it). The mark is what PSScriptAnalyzer's PSUseBOMForUnicodeEncodedFile asks
+/// for and what the PowerShell extension of VS Code writes; PowerShell 7 reads the file the same with it. A script that already had more than ASCII
+/// without one was written so on purpose (for PowerShell 7) and keeps its form, as Shift_JIS and UTF-16 ones do.
+fn powershell_wants_a_mark(path: &Path, was_ascii: bool, bytes: &[u8]) -> bool {
+    let script = path.extension().and_then(|kind| kind.to_str()).is_some_and(|kind| ["ps1", "psm1", "psd1"].iter().any(|one| kind.eq_ignore_ascii_case(one)));
+    script && was_ascii && !bytes.is_ascii() && !bytes.starts_with(UTF8_MARK) && std::str::from_utf8(bytes).is_ok()
 }
 
 /// How a file is written, for what is written to it to be written the same way: its encoding, whether it begins with a byte order mark,
@@ -4557,6 +4591,59 @@ mod tests {
 
     /// What is written to a file is written in its form: UTF-16 with its mark, appended to as UTF-16; CRLF lines; a UTF-8 mark kept;
     /// Shift_JIS, or nothing written when a character has no form there.
+    /// A PowerShell script that comes to have more than ASCII is written with UTF-8's mark, which Windows PowerShell 5.1 needs to read it; other
+    /// files, scripts of ASCII, and scripts that had more than ASCII without the mark (or in another encoding) are written as they were.
+    #[test]
+    fn a_powershell_script_with_more_than_ascii_is_written_with_the_mark() {
+        let (dir, mut bench, cancel) = bench();
+        let bytes = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
+        let marked = |text: &str| [UTF8_MARK, text.as_bytes()].concat();
+        let read = |bench: &mut Workbench, name: &str| bench.run("read_file", &json!({"path": name}), dir.path(), &cancel).unwrap();
+        // new: with Japanese, the mark; of ASCII, none; not a script, none
+        let said = bench.run("create_file", &json!({"path": "say.ps1", "content": "Write-Output 'こんにちは'\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("say.ps1"), marked("Write-Output 'こんにちは'\n"));
+        assert!(said.contains("byte order mark"), "{said}");
+        let said = bench.run("create_file", &json!({"path": "Tools/Mod.PSM1", "content": "# 日本語\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("Tools/Mod.PSM1"), marked("# 日本語\n"), "{said}");
+        let said = bench.run("create_file", &json!({"path": "plain.ps1", "content": "Write-Output 'hello'\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("plain.ps1"), b"Write-Output 'hello'\n");
+        assert!(!said.contains("byte order mark"), "{said}");
+        bench.run("create_file", &json!({"path": "note.txt", "content": "こんにちは\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("note.txt"), "こんにちは\n".as_bytes());
+        // (a mark the model wrote itself is not doubled)
+        bench.run("create_file", &json!({"path": "own.ps1", "content": "\u{feff}# 日本語\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("own.ps1"), marked("# 日本語\n"));
+        // read back, the mark is not shown, and an edit of the first line finds it
+        let shown = read(&mut bench, "say.ps1");
+        assert!(!shown.contains('\u{feff}') && shown.contains("Write-Output 'こんにちは'"), "{shown}");
+        bench.run("apply_patch", &json!({"edits": [{"path": "say.ps1", "old_string": "Write-Output 'こんにちは'", "new_string": "Write-Output 'こんばんは'"}]}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("say.ps1"), marked("Write-Output 'こんばんは'\n"));
+        // an ASCII script patched or added to with Japanese takes the mark
+        let said = bench.run("apply_patch", &json!({"edits": [{"path": "plain.ps1", "old_string": "'hello'", "new_string": "'こんにちは'"}]}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("plain.ps1"), marked("Write-Output 'こんにちは'\n"));
+        assert!(said.contains("plain.ps1 was with a UTF-8 byte order mark"), "{said}");
+        std::fs::write(dir.path().join("log.ps1"), "Write-Output 'a'\r\n").unwrap();
+        read(&mut bench, "log.ps1");
+        bench.run("create_file", &json!({"path": "log.ps1", "content": "Write-Output 'あ'\n", "append": true}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("log.ps1"), marked("Write-Output 'a'\r\nWrite-Output 'あ'\r\n"));
+        // a script that had Japanese without the mark (written for PowerShell 7), and one in Shift_JIS or UTF-16, keep their form
+        std::fs::write(dir.path().join("seven.ps1"), "Write-Output 'あ'\n").unwrap();
+        read(&mut bench, "seven.ps1");
+        bench.run("apply_patch", &json!({"edits": [{"path": "seven.ps1", "old_string": "'あ'", "new_string": "'い'"}]}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("seven.ps1"), "Write-Output 'い'\n".as_bytes());
+        read(&mut bench, "seven.ps1");
+        bench.run("create_file", &json!({"path": "seven.ps1", "content": "Write-Output 'う'\n"}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("seven.ps1"), "Write-Output 'う'\n".as_bytes());
+        // (「日本」 in Shift_JIS, then 「日本語」)
+        std::fs::write(dir.path().join("sjis.ps1"), [b"# ".as_slice(), &[0x93, 0xFA, 0x96, 0x7B], b"\n"].concat()).unwrap();
+        bench.run("apply_patch", &json!({"edits": [{"path": "sjis.ps1", "old_string": "日本", "new_string": "日本語"}]}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("sjis.ps1"), [b"# ".as_slice(), &[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA], b"\n"].concat());
+        let utf16 = |text: &str| [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect::<Vec<u8>>();
+        std::fs::write(dir.path().join("wide.ps1"), utf16("# a\r\n")).unwrap();
+        bench.run("apply_patch", &json!({"edits": [{"path": "wide.ps1", "old_string": "# a", "new_string": "# あ"}]}), dir.path(), &cancel).unwrap();
+        assert_eq!(bytes("wide.ps1"), utf16("# あ\r\n"));
+    }
+
     #[test]
     fn a_file_is_written_in_its_own_encoding_and_line_ends() {
         let (dir, mut bench, cancel) = bench();
