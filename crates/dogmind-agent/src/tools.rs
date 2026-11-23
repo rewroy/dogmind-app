@@ -1485,7 +1485,7 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
     // (read whole to number its lines: one larger than memory would end the app, with all that is going on in it)
     let size = std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?.len();
     if size > MOST_READ_WHOLE {
-        return Err(format!("{} is too large to read here, at {} MB: use search_files for what is in it, or a command that prints a part of it", path.display(), size / 1_048_576));
+        return Err(format!("{} is too large to read here, at {} MB: use a command that reads just the part you need", path.display(), size / 1_048_576));
     }
     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let Some((text, encoding)) = text_of_file(&bytes) else {
@@ -1831,12 +1831,23 @@ fn search_files_until(arguments: &Value, workspace: &Path, secrets_besides: &[Pa
     let walk = walker_matching(&root, true, glob);
     let mut out = note.to_string();
     let (mut matches, mut stopped, mut secrets) = (0usize, "", 0usize);
-    'files: for entry in walk.build().flatten() {
+    'files: for entry in walk.build() {
         if time_is_up()? {
             stopped = "the time ran out";
             break;
         }
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) || entry.metadata().map_or(0, |data| data.len()) > SEARCH_FILE_LIMIT {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.depth() == Some(0) => return Err(error.to_string()),
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if entry.metadata().is_ok_and(|data| data.len() > SEARCH_FILE_LIMIT) {
+            if entry.depth() == 0 {
+                return Err(format!("{} exceeds the {} MiB search limit: use a command that reads just the part you need", root.display(), SEARCH_FILE_LIMIT >> 20));
+            }
             continue;
         }
         // `read_file` asks a person before it opens one of these, and a pattern of `.` would otherwise print it without asking. Searching a place that is itself one has been asked about.
@@ -1846,8 +1857,17 @@ fn search_files_until(arguments: &Value, workspace: &Path, secrets_besides: &[Pa
             secrets += 1;
             continue;
         }
-        let Ok(bytes) = std::fs::read(entry.path()) else { continue };
-        let Some((text, encoding)) = readable_file_text(&bytes) else { continue };
+        let bytes = match std::fs::read(entry.path()) {
+            Ok(bytes) => bytes,
+            Err(error) if entry.depth() == 0 => return Err(format!("{}: {error}", root.display())),
+            Err(_) => continue,
+        };
+        let Some((text, encoding)) = readable_file_text(&bytes) else {
+            if entry.depth() == 0 {
+                return Err(format!("{} is binary: search_files reads text", root.display()));
+            }
+            continue;
+        };
         let text = if encoding == "utf-8" { text.strip_prefix('\u{feff}').unwrap_or(&text) } else { &text };
         let name = entry.path().strip_prefix(workspace).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
         for (number, line) in text.lines().enumerate() {
@@ -5637,6 +5657,26 @@ mod tests {
         assert!(said.contains("the home's, for the model") && !said.contains("for the person"), "{said}");
         let none = bench.run("skill", &json!({"name": "manual"}), &work, &cancel).unwrap_err();
         assert!(none.contains("no skill is called manual"), "{none}");
+    }
+
+    #[test]
+    fn a_named_file_that_cannot_be_searched_is_not_reported_as_no_matches() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let search = |path: &str| search_files(&json!({"path": path, "pattern": "absent"}), dir.path(), &[], &AtomicBool::new(false));
+        assert!(search("missing.txt").unwrap_err().contains("missing.txt"));
+        std::fs::File::create(dir.path().join("large.txt")).unwrap().set_len(SEARCH_FILE_LIMIT + 1).unwrap();
+        assert!(search("large.txt").unwrap_err().contains("16 MiB"));
+        std::fs::write(dir.path().join("binary"), b"absent\0binary").unwrap();
+        assert!(search("binary").unwrap_err().contains("binary"));
+        std::fs::write(dir.path().join("plain.txt"), "ordinary text").unwrap();
+        assert_eq!(search("plain.txt").unwrap(), "no matches\n");
+        assert_eq!(search(".").unwrap(), "no matches\n");
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let _locked = std::fs::OpenOptions::new().read(true).share_mode(0).open(dir.path().join("plain.txt")).unwrap();
+            assert!(search("plain.txt").unwrap_err().contains("plain.txt"));
+        }
     }
 
     #[test]
