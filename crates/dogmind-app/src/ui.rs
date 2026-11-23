@@ -2911,7 +2911,11 @@ unsafe fn get_text(window: HWND) -> String {
     let length = GetWindowTextLengthW(window);
     let mut buffer = vec![0u16; length as usize + 1];
     let read = GetWindowTextW(window, buffer.as_mut_ptr(), length + 1);
-    String::from_utf16_lossy(&buffer[..read.max(0) as usize]).replace("\r\n", "\n").replace('\r', "\n")
+    normalized_newlines(&String::from_utf16_lossy(&buffer[..read.max(0) as usize]))
+}
+
+fn normalized_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// WM_SETREDRAW, on a window that is showing only. Turned back on it sets WS_VISIBLE, so a transcript hidden behind Settings would come up over
@@ -8014,14 +8018,24 @@ impl App {
             },
             Panel::Tools => self.keep_search_key() && self.mcp_keep_form(),
             Panel::Instructions => {
-                let text = get_text(self.doc).replace("\r\n", "\n").replace('\r', "\n");
-                let known = std::fs::read_to_string(self.folder.join("instructions.md")).unwrap_or_default();
-                if text.trim_end() == known.trim_end() {
+                if SendMessageW(self.doc, EM_GETMODIFY, 0, 0) == 0 {
                     return true;
                 }
+                let file = self.folder.join("instructions.md");
+                let known = std::fs::read_to_string(&file).unwrap_or_default();
+                let normalized = normalized_newlines(&known);
+                let text = get_text(self.doc);
+                if text == normalized {
+                    SendMessageW(self.doc, EM_SETMODIFY, 0, 0);
+                    return true;
+                }
+                let text = if known.contains("\r\n") && normalized.replace('\n', "\r\n") == known { text.replace('\n', "\r\n") } else { text };
                 // (whole or not at all: written over in place, a power cut leaves the person's instructions as zeros)
-                match settings::write_whole(&self.folder.join("instructions.md"), text.as_bytes()) {
-                    Ok(()) => true,
+                match settings::write_whole(&file, text.as_bytes()) {
+                    Ok(()) => {
+                        SendMessageW(self.doc, EM_SETMODIFY, 0, 0);
+                        true
+                    }
                     Err(error) => {
                         self.problem_in_panel(&error.to_string());
                         false
@@ -9415,8 +9429,9 @@ impl App {
             Panel::Instructions => {
                 self.panel_title = t("Your instructions").into();
                 let text = std::fs::read_to_string(self.folder.join("instructions.md")).unwrap_or_default();
-                self.show_document(&text.replace('\n', "\r\n"));
+                self.show_document(&normalized_newlines(&text).replace('\n', "\r\n"));
                 SendMessageW(self.doc, EM_SETREADONLY, 0, 0);
+                SendMessageW(self.doc, EM_SETMODIFY, 0, 0);
                 SendMessageW(self.doc, EM_SETBKGNDCOLOR, 0, theme::surface() as LPARAM);
                 set_text(self.buttons[0], t("Save"));
                 self.set_button_kinds(&[ButtonKind::Primary]);
