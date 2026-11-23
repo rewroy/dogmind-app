@@ -862,7 +862,11 @@ pub(crate) unsafe fn profile_sid() -> Result<PSID, String> {
     }
     let (name, display, description) = (wide(profile_name()), wide("Dogmind commands"), wide("Where Dogmind runs the commands you approve"));
     let mut sid: PSID = std::ptr::null_mut();
-    let created = CreateAppContainerProfile(name.as_ptr(), display.as_ptr(), description.as_ptr(), std::ptr::null(), 0, &mut sid);
+    // In the sandbox already, the profile is only named, never made: CreateAppContainerProfile called with a restricted token, for a profile that was there,
+    // left the container's PowerShell unable to start in every later command of the process that had used the profile first (exit 1, nothing printed: the
+    // `del` of `what_the_prompt_offers_for_dir_and_del_works`, after a test's restricted program had run a command), until the next process made it again.
+    // A debug build of the app run by a session's cargo names the person's own profile, and would have done the same to the app they have open.
+    let created = if in_the_sandbox() { -1 } else { CreateAppContainerProfile(name.as_ptr(), display.as_ptr(), description.as_ptr(), std::ptr::null(), 0, &mut sid) };
     if created < 0 && DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) < 0 {
         return Err(format!("the AppContainer profile could not be made (0x{created:08x})"));
     }
@@ -3136,6 +3140,11 @@ mod tests {
             assert!(said.contains(line), "{line}: {said}");
         }
         assert!(!elsewhere.path().join("planted.txt").exists(), "a command started in the sandbox wrote where its caller could not");
+        // (and the container is as it was for this process's own commands: PowerShell still starts in it, which it did not once the restricted program had
+        // made the profile again)
+        let folder = work_folder("after-a-restricted-program");
+        let after = command("powershell -NoProfile -NonInteractive -Command \"[Console]::Out.WriteLine('still starts')\"", &folder, false);
+        assert!(decode(&after.stdout).contains("still starts"), "{:?} {} {}", after.status, decode(&after.stdout), decode(&after.stderr));
     }
 
     /// The tests' commands run in a container of their own: nothing a run of them leaves is in the one of the app the person uses on the same PC.
