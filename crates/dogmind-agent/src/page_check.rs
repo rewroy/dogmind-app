@@ -781,13 +781,9 @@ fn file_part(address: &str) -> String {
 }
 
 /// Through the page's import map, the longest name that fits first.
-fn mapped(name: &str, map: &[(String, String)]) -> String {
-    let fits = map.iter().filter(|(from, _)| from == name || (from.ends_with('/') && name.starts_with(from.as_str()))).max_by_key(|(from, _)| from.len());
-    match fits {
-        Some((from, to)) if from == name => to.clone(),
-        Some((from, to)) => format!("{to}{}", &name[from.len()..]),
-        None => name.to_string(),
-    }
+fn mapped(name: &str, map: &[(String, String)]) -> Option<String> {
+    let (from, to) = map.iter().filter(|(from, _)| from == name || (from.ends_with('/') && name.starts_with(from.as_str()))).max_by_key(|(from, _)| from.len())?;
+    Some(format!("{to}{}", &name[from.len()..]))
 }
 
 /// The remote addresses a module needs, following its imports through the files beside it.
@@ -806,13 +802,16 @@ fn imports_of(text: &str, folder: &Path, map: &[(String, String)], seen: &mut Ha
     let pattern = Regex::new(r#"(?m)(?:^|[\s;])(?:import|export)\s[^'"\n;]*?from\s*['"]([^'"]+)['"]|(?:^|[\s;])import\s*['"]([^'"]+)['"]|\bimport\(\s*['"]([^'"]+)['"]"#).expect("the pattern is valid");
     for found in pattern.captures_iter(text) {
         let Some(name) = found.get(1).or(found.get(2)).or(found.get(3)) else { continue };
-        let target = mapped(name.as_str(), map);
-        if is_remote(&target) {
-            if !remote.contains(&target) {
-                remote.push(target);
+        // Map targets are relative to the page that declares the map; other imports are relative to the importing module.
+        let mapped = mapped(name.as_str(), map);
+        let (target, base) = mapped.as_deref().map_or((name.as_str(), folder), |target| (target, root));
+        if is_remote(target) {
+            if !remote.iter().any(|address| address == target) {
+                remote.push(target.to_string());
             }
         } else if target.starts_with('.') || target.starts_with('/') {
-            let local = if let Some(from_root) = target.strip_prefix('/') { root.join(from_root) } else { folder.join(&target) };
+            let path = target.split(['?', '#']).next().unwrap_or(target);
+            let local = if let Some(from_root) = path.strip_prefix('/') { root.join(from_root) } else { base.join(path) };
             follow(&local, map, seen, remote, missing, root);
         }
     }
@@ -1989,6 +1988,17 @@ mod tests {
         let (dir, _) = page(&[("a%CMDCMDLINE:~45,1%calc%CMDCMDLINE:~45,1%.html".replace(':', "_").as_str(), "<p>x</p>")]);
         let said = check_page(&serde_json::json!({"path": "a%CMDCMDLINE_~45,1%calc%CMDCMDLINE_~45,1%.html"}), dir.path(), &AtomicBool::new(false)).unwrap_err();
         assert!(said.contains("% in it"), "{said}");
+    }
+
+    #[test]
+    fn nested_modules_resolve_local_urls_from_the_module_or_its_import_map() {
+        let (_dir, index) = page(&[
+            ("index.html", r#"<script type="importmap">{"imports":{"label":"./lib/label.js?rev=2","parts/":"./lib/"}}</script><script type="module" src="src/main.js"></script>"#),
+            ("src/main.js", "import './number.js?v=2#v';\nimport 'label';\nimport 'parts/part.js#one';\nimport '/root.js#v';"),
+            ("src/number.js", ""), ("lib/label.js", ""), ("lib/part.js", "import './absent.js?rev=1';"), ("root.js", ""),
+        ]);
+        let needs = needs_of(&index);
+        assert_eq!(needs.missing.iter().map(|name| name.replace('\\', "/")).collect::<Vec<_>>(), ["lib/absent.js"]);
     }
 
     #[test]
