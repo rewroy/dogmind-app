@@ -955,8 +955,11 @@ fn console_lines(err: &str, folder_url: &str) -> Vec<String> {
         if text.starts_with("Error with Permissions-Policy header: Unrecognized feature") {
             return;
         }
-        let place = source.replace(folder_url, "").replace('\\', "/");
-        let place = place.rsplit('/').next().unwrap_or("").to_string();
+        let relative = source.strip_prefix(folder_url).unwrap_or(source);
+        let path = relative.split(['?', '#']).next().unwrap_or(relative);
+        let name = path.rsplit(['/', '\\']).next().unwrap_or("");
+        let decoded = percent_decoded(name);
+        let place = if decoded.chars().any(|c| c.is_control() || matches!(c, '/' | '\\')) { name } else { &decoded };
         let said: String = text.trim().chars().take(MOST_LINE).collect();
         lines.push(if place.is_empty() { said } else { format!("{place}:{line}: {said}") });
     };
@@ -2096,6 +2099,21 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[1].starts_with("a.js:9: shader says: ERROR: 0:1: 'nonsense'"), "{lines:?}");
         assert!(lines[1].contains("syntax error"), "{lines:?}");
+    }
+
+    #[test]
+    fn console_source_names_come_from_the_script_path() {
+        let root = "http://localhost:8000/";
+        for (source, expected) in [
+            ("main.js?next=/detail.html", "main.js:7: ready"),
+            ("sub/main.js#/detail.html", "main.js:7: ready"),
+            ("sub/%E6%8A%BD%E9%81%B8%20%231.js?v=1", "抽選 #1.js:7: ready"),
+            ("main%0Aextra.js", "main%0Aextra.js:7: ready"),
+            ("?next=/detail.html", "ready"),
+        ] {
+            let err = format!(r#"[browser:INFO:CONSOLE:7] "ready", source: {root}{source} (7)"#);
+            assert_eq!(console_lines(&err, root), [expected], "{source}");
+        }
     }
 
     #[test]
