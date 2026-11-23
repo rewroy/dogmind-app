@@ -6429,12 +6429,15 @@ impl App {
             },
             "usage" => {
                 let totals = self.totals;
-                let rate = totals.last_rate.or(self.rate).map_or(String::new(), |rate| tf(", last answer at {0} tok/s", &[&format!("{rate:.1}")]));
-                let usage = if totals.requests == 0 {
+                let mut usage = if totals.requests == 0 {
                     t("No token usage has been reported for this session.").to_string()
                 } else {
-                    tf("{0} metered requests: {1} prompt tokens, {2} written{3}.", &[&totals.requests, &totals.prompt, &totals.completion, &rate])
+                    tf("{0} metered requests: {1} prompt tokens, {2} written.", &[&totals.requests, &totals.prompt, &totals.completion])
                 };
+                if let Some(rate) = totals.last_rate {
+                    usage.push(' ');
+                    usage.push_str(&tf("Last answer: {0} tok/s.", &[&format!("{rate:.1}")]));
+                }
                 let cache = match totals.cache_percent() {
                     Some(percent) => tf("Cache hit rate: {0}% ({1} of {2} prompt tokens with cache data).", &[&percent, &totals.cached, &totals.cache_prompt]),
                     None => t("Cache hit rate: unavailable.").to_string(),

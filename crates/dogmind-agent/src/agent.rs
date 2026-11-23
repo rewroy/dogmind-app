@@ -3213,9 +3213,7 @@ impl Agent {
             let saved = if cuts { cut_answer(&written, &reasoned, &calling, base).filter(|(answer, path, _)| !answer.tool_calls.last().is_some_and(|call| cut_would_lose(&call.function.arguments, path, &self.workspace, &self.bench))) } else { None };
             // (its line waits for the message it makes, to say where that is in the session: a reader puts the step beside what the model said)
             self.traj.request_waiting(RequestNote { id: &req_id, role: "main", clock: &clock, end, usage, timings, reasoning_chars: reasoned.chars().count(), content_chars: written.chars().count(), calls: named, tokens_est: Some(meter.tokens), retry: retry.take(), draft_watch: Some(watch_is), helper_file: None, draft_marks: watch.as_ref().and_then(|watch| watch.marks_of(&reasoned)) });
-            if usage.is_some() {
-                self.emit(Event::SessionUsage(self.traj.usage));
-            }
+            self.emit(Event::SessionUsage(self.traj.usage));
             // Writing a file out in its reasoning: every token of it is typed again in the call. It goes on from what it had decided, in a request of which all but the last few tokens are
             // read already. Whatever it was thinking about before is left to it, however long: only this is stopped, and what it is told is to write. Its connection has closed by now, so
             // the engine is not writing into nothing. (The tokens it wrote were spent all the same.)

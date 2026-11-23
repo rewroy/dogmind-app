@@ -217,6 +217,10 @@ pub struct Usage {
     pub window: Option<u64>,
 }
 
+pub(crate) fn reported_rate(timings: &Value) -> Option<f64> {
+    ["predicted_per_second", "decode_tokens_per_second"].iter().find_map(|name| timings.get(*name)?.as_f64().filter(|rate| *rate > 0.0))
+}
+
 pub(crate) fn cache_percent(prompt: u64, cached: Option<u64>) -> Option<u64> {
     let cached = cached?;
     (prompt > 0).then(|| (u128::from(cached.min(prompt)) * 100 / u128::from(prompt)) as u64)
@@ -299,7 +303,7 @@ impl Assembly {
         if let Some(whole) = timings.filter(|whole| whole.is_object()) {
             self.completion.timings = Some(whole.clone());
         }
-        if let Some(rate) = ["predicted_per_second", "decode_tokens_per_second"].iter().find_map(|name| timings?.get(*name)?.as_f64()) {
+        if let Some(rate) = timings.and_then(reported_rate) {
             self.rate = Some(rate);
         }
         if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {

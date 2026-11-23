@@ -175,6 +175,7 @@ impl SessionUsage {
         if let Some(end) = fields["end"].as_str() {
             if end == "error:unfinished" || !(end.starts_with("error:") || end.starts_with("stopped_app:") || end == "cancelled_person") {
                 self.last_cache_percent = fields["prompt"].as_u64().and_then(|prompt| crate::llm::cache_percent(prompt, fields["cached"].as_u64()));
+                self.last_rate = fields["tps"].as_f64().filter(|rate| *rate > 0.0).or_else(|| crate::llm::reported_rate(&fields["server"]));
             }
         }
         let (Some(prompt), Some(completion)) = (fields["prompt"].as_u64(), fields["completion"].as_u64()) else { return };
@@ -189,7 +190,6 @@ impl SessionUsage {
             self.cache_prompt = self.cache_prompt.saturating_add(prompt);
             self.cached = self.cached.saturating_add(cached.min(prompt));
         }
-        self.last_rate = fields["tps"].as_f64();
     }
 
     pub fn cache_percent(&self) -> Option<u64> {
@@ -375,7 +375,6 @@ impl Trajectory {
             "calls": note.calls,
             "end": note.end,
         });
-        self.usage.record_request(&fields);
         if let Some(watch) = note.draft_watch {
             fields["draft_watch"] = json!(watch);
         }
@@ -400,6 +399,7 @@ impl Trajectory {
         if let Some(server) = note.timings.and_then(kept_timings) {
             fields["server"] = server;
         }
+        self.usage.record_request(&fields);
         fields
     }
 
@@ -513,6 +513,19 @@ mod tests {
         traj.close();
         traj.open(&dir.path().join("b.jsonl"));
         assert_eq!(traj.usage, SessionUsage::default());
+    }
+
+    #[test]
+    fn last_answer_speed_tracks_completed_requests_even_without_token_counts() {
+        let mut usage = SessionUsage::default();
+        usage.record_request(&json!({"role":"main","end":"stop","prompt":100,"completion":10,"tps":67.3}));
+        usage.record_request(&json!({"role":"main","end":"cancelled_person","tps":null}));
+        assert_eq!(usage.last_rate, Some(67.3));
+        usage.record_request(&json!({"role":"main","end":"stop","tokens_est":3}));
+        assert_eq!(usage.last_rate, None);
+        usage.record_request(&json!({"role":"main","end":"stop","server":{"decode_tokens_per_second":12.5}}));
+        assert_eq!(usage.last_rate, Some(12.5));
+        assert_eq!(usage.requests, 1);
     }
 
     #[test]
