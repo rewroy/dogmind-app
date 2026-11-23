@@ -675,7 +675,7 @@ pub fn band(turn: &TurnPath) -> Option<Band> {
             if wait > 0 {
                 band.parts.push(BandPart { lane: Lane::Calls, from, to: from + wait, part: Part::Person });
             }
-            let part = if call.outcome == "ok" { Part::Call } else { Part::CallFailed };
+            let part = if call.outcome == "ok" && !call.exit_code.is_some_and(|code| code != 0) { Part::Call } else { Part::CallFailed };
             band.parts.push(BandPart { lane: Lane::Calls, from: from + wait, to: from + wait + call.ms.max(1), part });
         }
     }
@@ -1351,7 +1351,8 @@ mod tests {
             .map(|(name, seconds)| (name.to_string(), serde_json::json!(seconds))).chain([("resumed_from".to_string(), serde_json::json!("none"))]).collect();
         let request = RequestDetail { started: at("01.000"), first_ms: Some(3000), ms: 5000, writing_ms: Some(4000), server, ..RequestDetail::default() };
         let call = CallRow { id: "c".into(), name: "execute_command".into(), started: at("06.000"), ms: 800, wait_ms: Some(1200), outcome: "ok".into(), ..CallRow::default() };
-        let model = Step { kind: StepKind::Model, started: at("01.000"), ms: 5000, why: None, request: Some(request), calls: vec![call], fields: Map::new() };
+        let failed = CallRow { id: "d".into(), started: at("08.000"), ms: 100, exit_code: Some(7), wait_ms: None, ..call.clone() };
+        let model = Step { kind: StepKind::Model, started: at("01.000"), ms: 5000, why: None, request: Some(request), calls: vec![call, failed], fields: Map::new() };
         let retry = Step { kind: StepKind::Retry { why: "transient".into(), wait_ms: 500 }, started: at("09.000"), ms: 0, why: None, request: None, calls: Vec::new(), fields: Map::new() };
         let turn = TurnPath { turn: 1, started: at("00.000"), steps: vec![model, retry], ended: Some(TurnEnd { ms: 10_000, cancelled: false, failed: false }), ..TurnPath::default() };
         let band = band(&turn).expect("a band");
@@ -1366,6 +1367,7 @@ mod tests {
             (Lane::Requests, 5000, 6000, Part::Writing),
             (Lane::Calls, 6000, 7200, Part::Person),
             (Lane::Calls, 7200, 8000, Part::Call),
+            (Lane::Calls, 8000, 8100, Part::CallFailed),
         ]);
         assert_eq!((band.marks, band.length), (vec![9000], 10_000));
     }
