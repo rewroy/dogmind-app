@@ -1412,6 +1412,7 @@ fn reads_as_command(line: &str) -> bool {
 /// The fields of a page with a key.
 const KEY_FIELD: usize = 3;
 const VARIABLE_FIELD: usize = 4;
+const MCP_CWD_FIELD: usize = 5;
 
 /// The help, in sections: a `# ` line begins one.
 fn help_sections() -> Vec<(String, String)> {
@@ -2188,7 +2189,7 @@ struct App {
     /// Whether what the form runs is a URL: it asks for headers then, and not for arguments and variables.
     mcp_form_url: bool,
     /// What the form said when it opened: leaving the page keeps a change, and only a change.
-    mcp_form_was: [String; 4],
+    mcp_form_was: [String; 5],
     /// The server just saved, while the page waits to say how its start went.
     mcp_saved: Option<String>,
     /// The sizes of the conversation's words, on the Appearance page.
@@ -2416,7 +2417,7 @@ struct App {
     list_rows: Vec<ListRow>,
     list_hover: Option<usize>,
     /// The first ones as a panel says; `KEY_FIELD` and `VARIABLE_FIELD` on the pages with a key.
-    fields: [HWND; 5],
+    fields: [HWND; 6],
     labels: [String; 4],
     buttons: [HWND; 5],
     kind_chip: HWND,
@@ -2911,6 +2912,13 @@ fn mcp_form_pairs(was: Option<&dogmind_agent::mcp::ServerConfig>, http: bool, or
         return Ok(if http { config.headers.clone() } else { config.env.clone() });
     }
     dogmind_agent::mcp::pairs_of_lines(typed, if http { ':' } else { '=' })
+}
+
+fn mcp_working_directory(typed: &str) -> Option<PathBuf> {
+    let typed = typed.trim();
+    // Windows Explorer's Copy as path places double quotes around the folder name.
+    let folder = typed.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(typed);
+    (!folder.is_empty()).then(|| PathBuf::from(folder))
 }
 
 fn mcp_url(typed: &str) -> Option<String> {
@@ -7770,6 +7778,7 @@ impl App {
                             form.note(t("A line each, as Name: value. An Authorization header goes here."), theme::muted());
                         } else {
                             form.field(t("Arguments"), self.fields[2]);
+                            form.field(t("Working directory (optional)"), self.fields[MCP_CWD_FIELD]);
                             form.area(t("Environment variables"), self.mcp_vars, 3);
                             form.note(t("A line each, as NAME=value."), theme::muted());
                         }
@@ -12657,6 +12666,7 @@ impl App {
             set_text(*field, text);
         }
         set_text(self.mcp_vars, &vars);
+        set_text(self.fields[MCP_CWD_FIELD], &config.cwd.as_deref().map_or_else(Default::default, |path| path.to_string_lossy()));
         self.mcp_form_url = config.is_http();
         // Compare text as the controls return it, including normalized multiline headers and variables.
         self.mcp_form_was = self.mcp_form_typed();
@@ -12675,12 +12685,13 @@ impl App {
             set_text(*field, "");
         }
         set_text(self.mcp_vars, "");
+        set_text(self.fields[MCP_CWD_FIELD], "");
         self.layout();
     }
 
     /// What the form says now.
-    unsafe fn mcp_form_typed(&self) -> [String; 4] {
-        [get_text(self.fields[0]), get_text(self.fields[1]), get_text(self.fields[2]), get_text(self.mcp_vars)]
+    unsafe fn mcp_form_typed(&self) -> [String; 5] {
+        [get_text(self.fields[0]), get_text(self.fields[1]), get_text(self.fields[2]), get_text(self.mcp_vars), get_text(self.fields[MCP_CWD_FIELD])]
     }
 
     /// What the form runs is a URL now, or is no longer one: it asks for what that needs.
@@ -12696,7 +12707,7 @@ impl App {
     unsafe fn mcp_save_form(&mut self) -> bool {
         use dogmind_agent::mcp;
         let Some(before) = self.mcp_form.clone() else { return true };
-        let [name, target, args, vars] = self.mcp_form_typed();
+        let [name, target, args, vars, cwd] = self.mcp_form_typed();
         let (name, target) = (name.trim().to_string(), target.trim().to_string());
         if name.is_empty() {
             self.problem_in_panel(t("Give the server a name."));
@@ -12720,7 +12731,10 @@ impl App {
                 return false;
             }
         };
-        let config = mcp_config_of_form(was, url, target, &self.mcp_form_was[2], &args, pairs);
+        let mut config = mcp_config_of_form(was, url, target, &self.mcp_form_was[2], &args, pairs);
+        if !config.is_http() && cwd != self.mcp_form_was[4] {
+            config.cwd = mcp_working_directory(&cwd);
+        }
         if let Err(error) = mcp::save_server(&self.folder.join("mcp.json"), before.as_deref(), &name, config) {
             self.problem_in_panel(&error);
             return false;
@@ -18815,6 +18829,14 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_working_directory_accepts_pasted_paths_and_can_be_cleared() {
+        assert_eq!(mcp_working_directory("  \"C:\\Test Folder\\資料\"  "), Some(PathBuf::from("C:\\Test Folder\\資料")));
+        assert_eq!(mcp_working_directory("relative folder"), Some(PathBuf::from("relative folder")));
+        assert_eq!(mcp_working_directory("   "), None);
+        assert_eq!(mcp_working_directory("\"\""), None);
+    }
 
     #[test]
     fn mcp_form_preserves_line_endings_in_unedited_arguments() {
