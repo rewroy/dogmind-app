@@ -31,6 +31,9 @@ impl Line {
     pub(crate) fn u(&self, key: &str) -> Option<u64> {
         self.v[key].as_u64()
     }
+    fn cache_percent(&self) -> Option<u64> {
+        crate::llm::cache_percent(self.u("prompt")?, self.u("cached"))
+    }
     pub(crate) fn turn(&self) -> u64 {
         self.u("turn").unwrap_or(0)
     }
@@ -151,11 +154,7 @@ pub(crate) fn load(trajectory: &str) -> (Vec<Line>, usize) {
 
 /// What a request cost and did, in a line: used in the interventions, for the request after one.
 fn request_summary(line: &Line) -> String {
-    let prompt = line.u("prompt");
-    let cached = match (prompt, line.u("cached")) {
-        (Some(prompt), Some(cached)) => format!("cached {}", share(cached, prompt)),
-        _ => "cached ?".to_string(),
-    };
+    let cached = line.cache_percent().map_or_else(|| "cached ?".to_string(), |value| format!("cached {value}%"));
     let calls: Vec<&str> = line.v["calls"].as_array().map(|calls| calls.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     format!("{} wrote {} tokens in {}, {cached}, ended {}{}", short(line.req()), line.u("completion").or(line.u("tokens_est")).map_or("?".to_string(), |tokens| tokens.to_string()), secs(line.u("ms").unwrap_or(0)), line.s("end"), if calls.is_empty() { String::new() } else { format!(", called {}", calls.join(", ")) })
 }
@@ -217,10 +216,7 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
         let generation = first.map_or(ms, |first| ms.saturating_sub(first));
         let completion = line.u("completion");
         let rate = line.v["tps"].as_f64().map(|rate| format!("{rate:.1}")).or_else(|| completion.filter(|_| generation > 0).map(|tokens| format!("~{:.1}", tokens as f64 * 1000.0 / generation as f64))).unwrap_or_else(|| "-".to_string());
-        let cached = match (line.u("prompt"), line.u("cached")) {
-            (Some(prompt), Some(cached)) => share(cached, prompt),
-            _ => "-".to_string(),
-        };
+        let cached = line.cache_percent().map_or_else(|| "-".to_string(), |value| format!("{value}%"));
         let calls: Vec<&str> = line.v["calls"].as_array().map(|calls| calls.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
         let _ = writeln!(out, "  {:>5} {:<10} first {:>8} gen {:>8} prompt {:>6} cached {:>4} wrote {:>6} tok at {:>6} tok/s  {}{}{}{}",
             short(line.req()), line.s("role"), first.map_or("-".to_string(), secs), secs(generation), line.u("prompt").map_or("-".to_string(), |tokens| tokens.to_string()), cached,
@@ -693,7 +689,7 @@ pub fn summary(trajectory: &str) -> Summary {
                         first_ms: first,
                         generation_ms: generation,
                         prompt: line.u("prompt"),
-                        cached_percent: line.u("prompt").zip(line.u("cached")).filter(|(prompt, _)| *prompt > 0).map(|(prompt, cached)| cached * 100 / prompt),
+                        cached_percent: line.cache_percent(),
                         tokens: completion.or(line.u("tokens_est")),
                         rate,
                         counted: counted && rate.is_some(),
@@ -791,6 +787,17 @@ mod tests {
         assert!(said.contains("draft_stop at /1: 8328 tokens thrown away in 103.0 s (a run of 61 lines of code)"), "{said}");
         assert!(said.contains("next: /2 wrote 2714 tokens in 37.0 s, cached 36%, ended tool_calls"), "{said}");
         assert!(said.contains("signs of going round in circles\n  none"), "{said}");
+    }
+
+    #[test]
+    fn a_report_bounds_cache_reuse_and_distinguishes_a_missing_count_from_zero() {
+        for (cached, expected, shown) in [(Some(9600), Some(100), "100%"), (Some(0), Some(0), "0%"), (None, None, "-")] {
+            let mut entry = request(1, "2026-11-05T10:00:01+09:00", "main", 200, 1000, 8000, 0, 10, "stop");
+            entry["cached"] = json!(cached);
+            let input = text(&[entry]);
+            assert_eq!(summary(&input).turns[0].requests[0].cached_percent, expected);
+            assert!(report(&input, None).contains(&format!("cached {shown:>4} wrote")));
+        }
     }
 
     #[test]

@@ -217,22 +217,19 @@ pub struct Usage {
     pub window: Option<u64>,
 }
 
-impl Usage {
-    pub(crate) fn cache_percent(&self) -> Option<u64> {
-        let cached = self.cached?;
-        (self.prompt > 0).then(|| (u128::from(cached.min(self.prompt)) * 100 / u128::from(self.prompt)) as u64)
-    }
+pub(crate) fn cache_percent(prompt: u64, cached: Option<u64>) -> Option<u64> {
+    let cached = cached?;
+    (prompt > 0).then(|| (u128::from(cached.min(prompt)) * 100 / u128::from(prompt)) as u64)
 }
 
 #[cfg(test)]
 #[test]
 fn cache_percent_distinguishes_unavailable_usage_from_a_miss() {
-    let percent = |prompt, cached| Usage { prompt, cached, ..Usage::default() }.cache_percent();
-    assert_eq!(percent(0, Some(0)), None);
-    assert_eq!(percent(100, None), None);
-    assert_eq!(percent(100, Some(0)), Some(0));
-    assert_eq!(percent(300, Some(290)), Some(96));
-    assert_eq!(percent(u64::MAX, Some(u64::MAX)), Some(100));
+    assert_eq!(cache_percent(0, Some(0)), None);
+    assert_eq!(cache_percent(100, None), None);
+    assert_eq!(cache_percent(100, Some(0)), Some(0));
+    assert_eq!(cache_percent(300, Some(290)), Some(96));
+    assert_eq!(cache_percent(u64::MAX, Some(u64::MAX)), Some(100));
 }
 
 #[derive(Debug, Clone, Default)]

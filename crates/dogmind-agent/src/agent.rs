@@ -3339,7 +3339,7 @@ impl Agent {
                 self.window = usage.window.unwrap_or(self.window);
                 self.report_usage(Some(usage.clone()));
             }
-            self.emit(Event::RequestCache(completion.usage.as_ref().and_then(Usage::cache_percent)));
+            self.emit(Event::RequestCache(completion.usage.as_ref().and_then(|usage| llm::cache_percent(usage.prompt, usage.cached))));
             let has_calls = !completion.tool_calls.is_empty();
             if completion.finish.is_empty() && !has_calls && completion.content.is_empty() {
                 return Ended::Failed(llm::UNFINISHED.into());
