@@ -1851,6 +1851,193 @@ pub struct Timings {
     pub run: Duration,
     /// The look through the workspace for repositories after it.
     pub after: Duration,
+    /// The walk after it for the programs it made, which are given the person's level (`programs_to_medium`): its time, the entries it looked at, and the programs changed.
+    pub relabel: Duration,
+    pub relabel_walked: usize,
+    pub relabel_changed: usize,
+}
+
+/// What a command in the container makes is labelled low, as the container itself is. A program it made (a build's .exe, .dll or .node) then runs at low integrity whoever
+/// starts it: the person's own build after the model's, in the same target folder, ran cargo's build scripts low, and they were refused their own output folder ("Access is
+/// denied", every time until cargo clean); and an app the model built and the person starts could not write its own settings. Low is for the commands of the sandbox, and
+/// says nothing of what the person runs. So after each command the workspace is walked for such programs made or changed since the command began, and those labelled low
+/// are given the person's level. Links and junctions are not gone through (what they lead to is not the workspace's), only what the listing of a folder says is looked at,
+/// and nothing is opened but what is changed. The walk has a twentieth of the command's time, or 200 ms, whichever is more; where it stops, the next command's walk goes on
+/// from there, and then walks the whole again for what that command made.
+pub(crate) struct Relabeled {
+    pub walked: usize,
+    pub changed: usize,
+    pub took: Duration,
+}
+
+/// A walk not finished: the oldest start of the commands it is for, the folders left, and whether the whole is to be walked again after them.
+struct ProgramWalk {
+    since: std::time::SystemTime,
+    folders: Vec<PathBuf>,
+    again: bool,
+}
+
+/// The walks left over, by workspace.
+static WALKS: Mutex<Vec<(PathBuf, ProgramWalk)>> = Mutex::new(Vec::new());
+
+/// What runs, by its name's ending: what a build makes that is started, or loaded by what is.
+const PROGRAMS: [&str; 3] = ["exe", "dll", "node"];
+
+/// The least a walk is given, and the share of the command's own time it has beyond that.
+const LEAST_WALK: Duration = Duration::from_millis(200);
+const WALK_SHARE: u32 = 20;
+
+/// The walk after a command in `root` that began at `began` and took `took` (`Relabeled`).
+pub(crate) fn programs_to_medium(root: &Path, began: std::time::SystemTime, took: Duration) -> Relabeled {
+    walk_for_programs(root, began, (took / WALK_SHARE).max(LEAST_WALK))
+}
+
+/// As `programs_to_medium`, with the time it has. A folder is walked each time, however little that is.
+fn walk_for_programs(root: &Path, began: std::time::SystemTime, budget: Duration) -> Relabeled {
+    let started = Instant::now();
+    // (a little before it began: a file's times are kept to two seconds on some drives)
+    let began = began.checked_sub(Duration::from_secs(2)).unwrap_or(began);
+    let mut walks = WALKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut walk = match walks.iter().position(|(at, _)| at == root) {
+        Some(at) => {
+            let (_, mut left) = walks.remove(at);
+            left.since = left.since.min(began);
+            left.again = true;
+            left
+        }
+        None => ProgramWalk { since: began, folders: vec![root.to_path_buf()], again: false },
+    };
+    let person = PersonSid::now();
+    let (mut walked, mut changed, mut folders) = (0, 0, 0);
+    loop {
+        if folders > 0 && started.elapsed() > budget {
+            walks.push((root.to_path_buf(), walk));
+            break;
+        }
+        folders += 1;
+        let Some(folder) = walk.folders.pop() else {
+            if walk.again {
+                walk.again = false;
+                walk.folders.push(root.to_path_buf());
+                continue;
+            }
+            break;
+        };
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        for entry in entries.flatten() {
+            walked += 1;
+            let Ok(kind) = entry.file_type() else { continue };
+            // (a link or a junction, to a file or a folder: what it leads to is not the workspace's)
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if entry.file_name() != ".git" {
+                    walk.folders.push(entry.path());
+                }
+                continue;
+            }
+            let path = entry.path();
+            if !path.extension().and_then(|ending| ending.to_str()).is_some_and(|ending| PROGRAMS.iter().any(|program| ending.eq_ignore_ascii_case(program))) {
+                continue;
+            }
+            // (made, or written again: a program copied in keeps the time it was written, and has the time it was made here)
+            let Ok(data) = entry.metadata() else { continue };
+            if ![data.created(), data.modified()].into_iter().flatten().any(|time| time >= walk.since) {
+                continue;
+            }
+            // SAFETY: the SID lives as long as `person`.
+            if let Some(person) = &person {
+                if unsafe { to_medium(&path, person.sid()) }.unwrap_or(false) {
+                    changed += 1;
+                }
+            }
+        }
+    }
+    Relabeled { walked, changed, took: started.elapsed() }
+}
+
+/// The person this app runs as: their SID, in the buffer the token gave it in.
+struct PersonSid(Vec<u64>);
+
+impl PersonSid {
+    fn now() -> Option<PersonSid> {
+        // SAFETY: the token is this function's, and the buffer is as long as the call is told.
+        unsafe {
+            let mut token = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return None;
+            }
+            let token = Handle(token);
+            let mut needed = 0u32;
+            GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+            let mut user = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+            (GetTokenInformation(token.0, TokenUser, user.as_mut_ptr().cast(), needed, &mut needed) != 0).then_some(PersonSid(user))
+        }
+    }
+
+    fn sid(&self) -> PSID {
+        // SAFETY: the buffer holds a TOKEN_USER, whose SID is in it.
+        unsafe { (*(self.0.as_ptr() as *const TOKEN_USER)).User.Sid }
+    }
+}
+
+/// The label of the low integrity level, as an ACE of a SACL says it.
+const LABEL_ACE: u8 = 0x11;
+const LOW_RID: u32 = 0x1000;
+
+/// Whether this file is labelled low.
+unsafe fn labelled_low(name: &[u16]) -> Result<bool, String> {
+    let (mut sacl, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
+    let read = GetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut sacl, &mut descriptor);
+    if read != 0 {
+        return Err(format!("its label cannot be read (error {read})"));
+    }
+    let mut low = false;
+    if !sacl.is_null() {
+        for at in 0..u32::from((*sacl).AceCount) {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(sacl, at, &mut ace) == 0 || (*(ace as *const ACE_HEADER)).AceType != LABEL_ACE {
+                continue;
+            }
+            let label = std::ptr::addr_of!((*(ace as *const SYSTEM_MANDATORY_LABEL_ACE)).SidStart) as PSID;
+            let count = *GetSidSubAuthorityCount(label);
+            low = count > 0 && *GetSidSubAuthority(label, u32::from(count) - 1) == LOW_RID;
+        }
+    }
+    LocalFree(descriptor as HLOCAL);
+    Ok(low)
+}
+
+/// The person's level for a program labelled low, as `labelled_low` says: true when it was changed. A label is changed with WRITE_OWNER, which the lists of a workspace do
+/// not give the person (as its owner they have READ_CONTROL and WRITE_DAC, and no more): it is given them on this file for the change, and the list is then as it was.
+unsafe fn to_medium(path: &Path, person: PSID) -> Result<bool, String> {
+    let name = wide_path(path);
+    if !labelled_low(&name)? {
+        return Ok(false);
+    }
+    let before = Dacl::read(path)?;
+    before.with_exact(person, WRITE_OWNER, 0).write_alone(path)?;
+    let label = wide("S:(ML;;NW;;;ME)");
+    let mut medium: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let labelled = if ConvertStringSecurityDescriptorToSecurityDescriptorW(label.as_ptr(), 1, &mut medium, std::ptr::null_mut()) == 0 {
+        Err(last_error("the person's label"))
+    } else {
+        let (mut present, mut sacl, mut defaulted): (BOOL, *mut ACL, BOOL) = (0, std::ptr::null_mut(), 0);
+        let set = if GetSecurityDescriptorSacl(medium, &mut present, &mut sacl, &mut defaulted) == 0 {
+            Err(last_error("the person's label"))
+        } else {
+            match SetNamedSecurityInfoW(name.as_ptr() as *mut u16, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), sacl) {
+                0 => Ok(()),
+                error => Err(format!("{}: its label could not be set (error {error})", path.display())),
+            }
+        };
+        LocalFree(medium as HLOCAL);
+        set
+    };
+    // (the list as it was, whatever came of the label)
+    let restored = before.write_alone(path);
+    labelled.and(restored).map(|()| true)
 }
 
 /// The timings of the commands run since `forget_timings`, for the trajectory's line of the call.
@@ -2196,6 +2383,8 @@ pub fn run_browser(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, 
 #[allow(clippy::too_many_arguments)]
 fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, closed_stdin: bool, live: Option<Arc<crate::tools::Live>>, token: Token) -> Result<Output, String> {
     let asked_at = Instant::now();
+    // (what it makes from here is what is looked for after it: see `programs_to_medium`)
+    let began_at = std::time::SystemTime::now();
     // (the build tools are looked for while the folder is made ready below, and the environment then usually finds them ready)
     crate::msvc::look_ahead();
     no_error_boxes();
@@ -2425,6 +2614,11 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let after_began = Instant::now();
         let looked = if nested { Looked { said: Vec::new(), refused: None } } else { look_after_repositories(&root, grantee, Look::AfterACommand) };
         times.after = after_began.elapsed();
+        // (what it made that runs: from the container it is low, and so would be what anyone starts of it; a restricted token and the person's own run at the person's level)
+        if token == Token::Container && !nested {
+            let relabeled = programs_to_medium(&root, began_at, times.run);
+            (times.relabel, times.relabel_walked, times.relabel_changed) = (relabeled.took, relabeled.walked, relabeled.changed);
+        }
         TIMINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(times);
         disarmed.extend(looked.said);
         Ok(Output { stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default(), status, ended, shown, disarmed, out_of_memory, unguarded: looked.refused })
@@ -2627,6 +2821,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::canonicalize(&folder).map_or(folder, |full| PathBuf::from(full.to_string_lossy().trim_start_matches("\\\\?\\")))
+    }
+
+    /// A label, as SDDL gives it, on a file of the person's (whose list gives them all, WRITE_OWNER too).
+    fn label(path: &Path, sddl: &str) {
+        // SAFETY: the descriptor is freed here, and the name lives through the call.
+        unsafe {
+            let (text, name) = (wide(sddl), wide_path(path));
+            let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            assert_ne!(ConvertStringSecurityDescriptorToSecurityDescriptorW(text.as_ptr(), 1, &mut descriptor, std::ptr::null_mut()), 0);
+            let (mut present, mut sacl, mut defaulted): (BOOL, *mut ACL, BOOL) = (0, std::ptr::null_mut(), 0);
+            GetSecurityDescriptorSacl(descriptor, &mut present, &mut sacl, &mut defaulted);
+            assert_eq!(SetNamedSecurityInfoW(name.as_ptr() as *mut u16, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), sacl), 0, "{}", path.display());
+            LocalFree(descriptor as HLOCAL);
+        }
+    }
+
+    fn low(path: &Path) -> bool {
+        // SAFETY: the name lives through the call.
+        unsafe { labelled_low(&wide_path(path)).unwrap() }
+    }
+
+    /// Written an hour ago, as far as its times say: made before the command it is looked at after.
+    fn from_before(path: &Path) {
+        use std::os::windows::fs::FileTimesExt;
+        let then = std::time::SystemTime::now() - Duration::from_secs(3600);
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(then).set_accessed(then).set_created(then)).unwrap();
+    }
+
+    /// After a command, what it made that runs is at the person's level: its programs, and not what was there before it, nor what is not a program, nor what a link in the
+    /// workspace leads to outside it. The file's list is as it was.
+    #[test]
+    fn what_a_command_made_that_runs_is_given_the_persons_level_after_it() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let (work, outside) = (outside_folder("relabel-work"), outside_folder("relabel-outside"));
+        std::fs::create_dir_all(work.join("target").join("debug").join("build")).unwrap();
+        let made = [work.join("target").join("debug").join("app.exe"), work.join("target").join("debug").join("lib.DLL"), work.join("target").join("debug").join("build").join("addon.node")];
+        let (old, words, away) = (work.join("old.exe"), work.join("notes.txt"), outside.join("away.exe"));
+        for path in made.iter().chain([&old, &words, &away]) {
+            std::fs::write(path, b"MZ").unwrap();
+            label(path, "S:(ML;;NW;;;LW)");
+        }
+        from_before(&old);
+        let linked = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"]).arg(work.join("linked")).arg(&outside).output().unwrap();
+        assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
+        // SAFETY: read only.
+        let list = |path: &Path| unsafe { Dacl::read(path).unwrap().aces };
+        let lists: Vec<_> = made.iter().map(|path| list(path)).collect();
+        let began = std::time::SystemTime::now() - Duration::from_secs(60);
+        let done = programs_to_medium(&work, began, Duration::from_secs(1));
+        assert_eq!(done.changed, 3, "{} looked at", done.walked);
+        for (path, before) in made.iter().zip(lists) {
+            assert!(!low(path), "{}", path.display());
+            assert_eq!(list(path), before, "the list of {} is as it was", path.display());
+        }
+        assert!(low(&old) && low(&words) && low(&away), "what was there before, what is not a program, and what is outside are as they were");
+        // (and a second walk changes nothing)
+        assert_eq!(programs_to_medium(&work, began, Duration::from_secs(1)).changed, 0);
+        let _ = std::fs::remove_dir(work.join("linked"));
+    }
+
+    /// A walk out of time goes on after the next command from where it stopped, and then walks the whole again for what that one made.
+    #[test]
+    fn a_walk_out_of_time_goes_on_after_the_next_command() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let work = outside_folder("relabel-resume");
+        let programs: Vec<PathBuf> = (0..6).map(|at| work.join(format!("d{at}")).join("x.exe")).collect();
+        for path in &programs {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"MZ").unwrap();
+            label(path, "S:(ML;;NW;;;LW)");
+        }
+        let began = std::time::SystemTime::now() - Duration::from_secs(60);
+        // (no time at all: one folder each time)
+        let first = walk_for_programs(&work, began, Duration::ZERO);
+        assert_eq!(first.changed, 0, "the top folder alone, which holds none");
+        assert!(WALKS.lock().unwrap().iter().any(|(at, _)| at == &work), "what is left is kept");
+        let mut changed = 0;
+        for _ in 0..40 {
+            changed += walk_for_programs(&work, began, Duration::ZERO).changed;
+            if !WALKS.lock().unwrap().iter().any(|(at, _)| at == &work) {
+                break;
+            }
+        }
+        assert_eq!(changed, programs.len());
+        assert!(programs.iter().all(|path| !low(path)));
     }
 
     /// A folder no workspace holds, for what a command must not reach. The target folder is not one: it is in the workspace of this source, and once Dogmind has

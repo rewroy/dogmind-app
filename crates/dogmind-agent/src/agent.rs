@@ -4362,6 +4362,11 @@ impl Agent {
                 line["repos_ms"] = ms(times.repos);
                 line["toolchains_ms"] = ms(times.toolchains);
                 line["env_ms"] = ms(times.env);
+                if times.relabel_walked > 0 {
+                    line["relabel_ms"] = ms(times.relabel);
+                    line["relabel_walked"] = json!(times.relabel_walked);
+                    line["relabel_changed"] = json!(times.relabel_changed);
+                }
                 line["run_ms"] = ms(times.run);
                 line["after_ms"] = ms(times.after);
             }
