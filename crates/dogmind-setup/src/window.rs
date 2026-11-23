@@ -509,7 +509,7 @@ impl App {
     /// An end that is not the work done. An update the app asked for is of an app that quit for it, and its person chose to update, not to close it: whichever page this is on and whichever way
     /// it ends (Cancel, the window's close, a failure), the app comes back as it is in the folder, and the code still says how it ended. If it cannot be started, or this is no update, it ends as it says.
     unsafe fn end_without_success(&mut self, code: i32) {
-        if !(self.updating && self.start_the_app_and_close(code)) {
+        if !(self.updating && self.finish_update(code)) {
             self.finish(code);
         }
     }
@@ -746,15 +746,14 @@ impl App {
         });
     }
 
-    /// The app, started from the folder as the Installed page's button starts it; and this has done its work. `false`, with the window as it was, when the app cannot be started.
-    unsafe fn start_the_app_and_close(&mut self, code: i32) -> bool {
-        match system::start_program(&self.folder().join(&self.options.app_name), "", self.options.test) {
-            Ok(()) => {
-                self.finish(code);
-                true
-            }
-            Err(_) => false,
+    /// Complete an update with its original exit code. A normal update or a test with a named stand-in
+    /// restarts that program. An unattended package check has no app to restart.
+    unsafe fn finish_update(&mut self, code: i32) -> bool {
+        if !self.options.skip_update_relaunch && system::start_program(&self.folder().join(&self.options.app_name), "", self.options.test).is_err() {
+            return false;
         }
+        self.finish(code);
+        true
     }
 
     /// Who is running, and on to `then` if no one is.
@@ -875,7 +874,7 @@ impl App {
                 }
                 Message::Installed(update) => {
                     // (an update the app asked for does not wait to be told it is done: the app is back, and this is gone)
-                    if self.updating && self.start_the_app_and_close(0) {
+                    if self.updating && self.finish_update(0) {
                         continue;
                     }
                     self.page = Page::Installed { update };

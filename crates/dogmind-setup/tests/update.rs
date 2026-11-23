@@ -170,6 +170,31 @@ fn short_lived(scene: &Path) -> Child {
 }
 
 #[test]
+fn an_unattended_test_update_does_not_start_the_default_app() {
+    let scene = Scene::new();
+    let folder = scene.installed("1.0.0");
+    // A harmless stand-in with the product's default name makes an unintended launch observable.
+    std::fs::copy(folder.join(APP), folder.join("dogmind-app.exe")).unwrap();
+    let update = pack(scene.path(), "2.0.0");
+    for (setting, code, version) in [
+        (Some(("DOGMIND_SETUP_PRESS", "cancel-at-once")), 2, "1.0.0"),
+        (Some(("DOGMIND_SETUP_FAIL_AFTER", "0")), 1, "1.0.0"),
+        (None, 0, "2.0.0"),
+    ] {
+        let mut command = setup(&update);
+        command.env_remove("DOGMIND_SETUP_APP_NAME").env("DOGMIND_DATA", scene.path().join("profile"));
+        if let Some((name, value)) = setting {
+            command.env(name, value);
+        }
+        let status = command.args(["--update", "--test", "--auto", "--dir"]).arg(&folder).status().unwrap();
+        assert_eq!(status.code(), Some(code));
+        assert_eq!(manifest_version(&folder), version);
+        assert!(folder.join("dogmind-app.exe").is_file());
+        assert!(running_from(&folder).is_empty(), "test update started the default app with exit code {code}");
+    }
+}
+
+#[test]
 fn an_update_waits_for_the_app_replaces_its_files_and_starts_it_again() {
     let scene = Scene::new();
     let folder = scene.installed("1.0.0");

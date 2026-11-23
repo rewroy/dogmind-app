@@ -12,6 +12,7 @@
 //!
 //! `--test` is for trying it out: no real Start menu entry or registry key is written, what would be goes in files in the folder, `--dir` must be named, and only what runs from that
 //! folder is looked at. With it `--auto` presses what a person would press, and the exit code says how it ended.
+//! An unattended test update finishes without starting Dogmind; set DOGMIND_SETUP_APP_NAME to exercise the restart with a test executable.
 //! An update or a removal of an install that was made with it is a test as well, whoever starts it (the app does, without the switch): off the screen, taking no focus.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -33,6 +34,7 @@ pub struct Options {
     pub auto: bool,
     pub wait_pids: Vec<u32>,
     pub app_name: String,
+    pub skip_update_relaunch: bool,
     /// What a test asks to go wrong, or to go slowly enough to be seen.
     pub fail_after: Option<usize>,
     pub slowly: Duration,
@@ -279,13 +281,15 @@ fn main() {
     if found.after_remove {
         std::process::exit(hand_over_to_a_copy(&found, &folder, test));
     }
+    let test_app = if test { std::env::var("DOGMIND_SETUP_APP_NAME").ok().filter(|name| !name.is_empty()) } else { None };
     let options = Options {
         folder: folder.clone(),
         test,
         update: found.update,
         auto: found.auto,
         wait_pids: found.wait_pids.clone(),
-        app_name: if test { std::env::var("DOGMIND_SETUP_APP_NAME").unwrap_or_else(|_| "dogmind-app.exe".to_string()) } else { "dogmind-app.exe".to_string() },
+        skip_update_relaunch: test && found.auto && test_app.is_none(),
+        app_name: test_app.unwrap_or_else(|| "dogmind-app.exe".to_string()),
         fail_after: number_from("DOGMIND_SETUP_FAIL_AFTER", test).map(|count| count as usize),
         slowly: Duration::from_millis(number_from("DOGMIND_SETUP_SLOW_MS", test).unwrap_or(0)),
         pick: if test { std::env::var_os("DOGMIND_SETUP_PICK").map(PathBuf::from) } else { None },
