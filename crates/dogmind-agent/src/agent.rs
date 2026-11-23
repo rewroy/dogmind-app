@@ -2473,6 +2473,9 @@ impl Agent {
         self.bench.in_japanese = language == Some("Japanese");
         // What the app knows of this moment goes in a message of its own after what was typed, and stays out of the prefix every session shares.
         let mut notes: Vec<String> = Vec::new();
+        if let Some(note) = self.mcp_note(text, first_message) {
+            notes.push(note);
+        }
         if first_message {
             notes.push(prompt::workspace_state(&self.workspace));
             // What the person has opened to commands, as the prefix every session shares must not depend on it.
@@ -2700,6 +2703,11 @@ impl Agent {
         }
     }
 
+    fn mcp_note(&self, text: &str, first_message: bool) -> Option<String> {
+        let hub = self.mcp.as_ref()?;
+        (first_message || text.to_ascii_lowercase().contains("mcp")).then(|| hub.connection_facts())
+    }
+
     /// `/name what to do` for a skill the person may start: its instructions go with the message.
     fn asked_skill(&self, text: &str) -> Option<String> {
         let rest = text.strip_prefix('/')?;
@@ -2718,7 +2726,8 @@ impl Agent {
             let language = self.language_for(&text);
             self.bench.in_japanese = language == Some("Japanese");
             // (what is added can make the turn read-only; it cannot lift it: that is a request of its own)
-            let notes: Vec<String> = self.make_read_only(&text).into_iter().collect();
+            let mut notes: Vec<String> = self.make_read_only(&text).into_iter().collect();
+            notes.extend(self.mcp_note(&text, false));
             self.push(Message::text("user", text.clone()));
             self.push(Message::text("user", prompt::app_facts(&now(), language, &notes)));
             self.emit(Event::Interjected(text));
@@ -9828,6 +9837,30 @@ Body").unwrap();
         let told: Vec<String> = bodies[1]["messages"].as_array().unwrap().iter().filter_map(|message| message["content"].as_str()).filter(|text| text.contains("## Tools Added")).map(str::to_string).collect();
         assert_eq!(told.len(), 1, "{told:?}");
         assert!(told[0].contains("`mcp__late__u`") && told[0].contains("From the MCP server late."), "{}", told[0]);
+    }
+
+    #[test]
+    fn an_unconfigured_client_explains_setup_then_reports_the_connected_server() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let tool = |name: &str| [serde_json::json!({"name": name, "description": "d", "inputSchema": {"type": "object"}})];
+        let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "the late one answered"}]}});
+        let hub = Arc::new(mcp::Hub::default());
+        let (client, bodies) = server(vec![text_answer("one"), call_answer("mcp__late__u", serde_json::json!({})), text_answer("done")]);
+        let (sender, events) = channel();
+        let sessions = crate::in_container::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub.clone()), policy: Default::default(), code_mode: true }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("Can Dogmind connect to a running MCP server?".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        hub.add_scripted("late", &tool("u"), &[answer], true);
+        run.handle.commands.send(Command::Send("Use the MCP tool".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("the late one answered")), "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let facts = |turn: usize| bodies[turn]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();
+        assert!(facts(0).contains("built-in MCP client") && facts(0).contains("No servers configured") && facts(0).contains("/mcp import"), "{}", facts(0));
+        assert!(facts(1).contains("late: connected, tools: 1") && facts(1).contains("`mcp__late__u`"), "{}", facts(1));
     }
 
     #[test]

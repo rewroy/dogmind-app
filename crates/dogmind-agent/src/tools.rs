@@ -1736,7 +1736,8 @@ fn list_files(arguments: &Value, workspace: &Path) -> Result<String, String> {
     let recursive = arguments.get("recursive").and_then(Value::as_bool).unwrap_or(false);
     let mut walk = walker(&root, recursive);
     if !recursive {
-        walk.max_depth(Some(1));
+        // A direct listing shows the folder's actual children, including ignored build and package folders.
+        walk.standard_filters(false).max_depth(Some(1));
     }
     let mut names = Vec::new();
     let (mut files, mut bytes) = (0usize, 0u64);
@@ -4189,13 +4190,18 @@ mod tests {
     fn a_walk_stays_out_of_what_no_one_wrote_and_a_look_still_shows_it() {
         let (dir, mut bench, cancel) = bench();
         std::fs::create_dir_all(dir.path().join("node_modules/x")).unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/Library/\n").unwrap();
+        std::fs::create_dir(dir.path().join("Library")).unwrap();
         std::fs::write(dir.path().join("node_modules/x/a.js"), "needle").unwrap();
         std::fs::write(dir.path().join("b.js"), "needle").unwrap();
         let deep = bench.run("list_files", &json!({"recursive": true}), dir.path(), &cancel).unwrap();
         assert!(!deep.contains("node_modules"), "{deep}");
+        assert!(!deep.contains("Library/"), "{deep}");
         let found = bench.run("search_files", &json!({"pattern": "needle"}), dir.path(), &cancel).unwrap();
         assert!(found.contains("b.js") && !found.contains("a.js"), "{found}");
-        assert!(bench.run("list_files", &json!({}), dir.path(), &cancel).unwrap().contains("node_modules/"), "one level shows it");
+        let shallow = bench.run("list_files", &json!({}), dir.path(), &cancel).unwrap();
+        assert!(shallow.contains("node_modules/") && shallow.contains("Library/") && !shallow.contains(".git/"), "{shallow}");
         let named = bench.run("search_files", &json!({"pattern": "needle", "path": "node_modules"}), dir.path(), &cancel).unwrap();
         assert!(named.contains("a.js"), "asked for by name: {named}");
     }

@@ -97,42 +97,32 @@ pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
     found
 }
 
-/// Codex's: the `[mcp_servers.NAME]` tables of `~/.codex/config.toml`, of which only these simple forms are read.
+/// Import the launch settings of individual servers from Codex's TOML configuration.
 pub fn servers_of_codex(text: &str) -> BTreeMap<String, ServerConfig> {
-    let unquote = |value: &str| value.trim().trim_matches('"').replace("\\\\", "\\").replace("\\\"", "\"");
-    let mut found: BTreeMap<String, ServerConfig> = BTreeMap::new();
-    let (mut current, mut in_env, mut in_headers) = (None, false, false);
-    for line in text.lines().map(str::trim) {
-        if let Some(table) = line.strip_prefix('[').and_then(|line| line.strip_suffix(']')) {
-            (current, in_env, in_headers) = match table.strip_prefix("mcp_servers.") {
-                Some(rest) => match (rest.strip_suffix(".env"), rest.strip_suffix(".http_headers")) {
-                    (Some(name), _) => (Some(name.trim_matches('"').to_string()), true, false),
-                    (_, Some(name)) => (Some(name.trim_matches('"').to_string()), false, true),
-                    _ if rest.contains('.') => (None, false, false),
-                    _ => (Some(rest.trim_matches('"').to_string()), false, false),
-                },
-                None => (None, false, false),
-            };
-            continue;
-        }
-        let (Some(name), Some((key, value))) = (&current, line.split_once('=')) else { continue };
-        let (key, value) = (key.trim(), value.trim());
-        let server = found.entry(name.clone()).or_default();
-        if in_env {
-            server.env.insert(key.to_string(), unquote(value));
-        } else if in_headers {
-            server.headers.insert(key.trim_matches('"').to_string(), unquote(value));
-        } else if key == "url" {
-            server.url = unquote(value);
-        } else if key == "command" {
-            server.command = unquote(value);
-        } else if key == "args" {
-            let inner = value.trim_start_matches('[').trim_end_matches(']');
-            server.args = inner.split("\",").map(unquote).filter(|arg| !arg.is_empty()).collect();
-        }
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct CodexServer {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        url: String,
+        http_headers: BTreeMap<String, String>,
+        enabled: Option<bool>,
     }
-    found.retain(|_, server| server.problem().is_none());
-    found
+
+    let Ok(mut config) = toml::from_str::<toml::Table>(text) else { return BTreeMap::new() };
+    let Some(toml::Value::Table(servers)) = config.remove("mcp_servers") else { return BTreeMap::new() };
+    servers.into_iter().filter_map(|(name, value)| {
+        let server: CodexServer = value.try_into().ok()?;
+        if server.enabled == Some(false) {
+            return None;
+        }
+        let config = ServerConfig {
+            command: server.command, args: server.args, env: server.env, url: server.url,
+            headers: server.http_headers, ..Default::default()
+        };
+        config.problem().is_none().then_some((name, config))
+    }).collect()
 }
 
 /// The person's server, as they gave it in Settings, in place of the one called `before` (none for a new one). The file is written whole, through a partial one, so
@@ -1578,6 +1568,28 @@ impl Hub {
         self.slots.lock().unwrap().push(Slot { name: server.into(), part: name_part(server), running: Some(running), trusted, ..Slot::default() });
     }
 
+    /// The desktop client's current view. Keep launch arguments, headers and server error messages out of the prompt.
+    pub(crate) fn connection_facts(&self) -> String {
+        let states: Vec<String> = self.states().into_iter().map(|(name, state)| {
+            let state = match state {
+                State::Up(count) => format!("connected, tools: {count}"),
+                State::Starting => "starting".into(),
+                State::Failed(_) => "failed to start".into(),
+            };
+            format!("{name}: {state}")
+        }).collect();
+        let mut status = states.join("; ");
+        if self.unreadable().is_some() {
+            if !status.is_empty() {
+                status.push_str(". ");
+            }
+            status.push_str("Dogmind could not read its MCP configuration");
+        } else if status.is_empty() {
+            status.push_str("No servers configured in Dogmind. For a connection question, give the setup steps directly. Probing ports from the sandbox cannot establish this client's connection status");
+        }
+        format!("Dogmind has a built-in MCP client outside the command sandbox. {status}. The only MCP chat commands are `/mcp` (show status) and `/mcp import` (import and start servers configured in Claude or Codex). To add one manually, the user opens Settings > Tools > MCP servers > Add a server. On connection its tools join this open conversation automatically, without a restart or reconnect command.")
+    }
+
     /// One line a server, for the person.
     pub fn status(&self) -> Vec<String> {
         self.states().into_iter().map(|(name, state)| match state {
@@ -1678,6 +1690,24 @@ mod tests {
         assert_eq!(found["unity_mcp"].command, "C:\\tools\\unity.exe");
         assert_eq!(found["unity_mcp"].args, ["--stdio", "--port", "6400"]);
         assert_eq!(found["unity_mcp"].env["KEY"], "value");
+    }
+
+    #[test]
+    fn codex_import_preserves_literal_windows_paths_and_argument_boundaries() {
+        let text = r#"
+[mcp_servers.unity_mcp]
+command = "node"
+args = [
+    'C:\Tools\Unity MCP\build\index.js', # literal backslashes
+    "--name=a,b", "",
+]
+[mcp_servers.off]
+command = "node"
+enabled = false
+"#;
+        let found = servers_of_codex(text);
+        assert_eq!(found["unity_mcp"].args, [r"C:\Tools\Unity MCP\build\index.js", "--name=a,b", ""]);
+        assert!(!found.contains_key("off"));
     }
 
     #[test]
