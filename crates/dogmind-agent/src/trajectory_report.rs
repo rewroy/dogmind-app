@@ -266,7 +266,7 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
                 // A call comes whole when the server has written it, so for an answer that was only a call the app's first word is the end of the generation, not the first token: the time
                 // the server took to write it (its tokens at its speed) is not a wait. It is taken where the app saw much less of the generation than the server says it made.
                 let after_ms = generation as f64;
-                let made_ms = completion.zip(server.get("decode_tokens_per_second").and_then(Value::as_f64)).filter(|(_, rate)| *rate > 0.0).map(|(tokens, rate)| tokens as f64 * 1000.0 / rate);
+                let made_ms = completion.zip(crate::trajectory::request_rate(&line.v)).map(|(tokens, rate)| tokens as f64 * 1000.0 / rate);
                 let unseen_ms = made_ms.filter(|made| after_ms * 2.0 < *made).map_or(0.0, |made| made - after_ms);
                 let queued = (first_ms - ttft * 1000.0 - unseen_ms) / 1000.0;
                 // (no speed from the server to take its writing from the wait: the first word of an answer that was only a call comes at the end of it)
@@ -280,7 +280,7 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
                 }
             }
             let pick = |key: &str| server.get(key).and_then(Value::as_f64).map(|value| format!("{key} {value:.2}"));
-            let said: Vec<String> = ["prefill_seconds", "ttft_seconds", "request_seconds", "decode_tokens_per_second"].iter().filter_map(|key| pick(key)).chain(server.get("resumed_from").and_then(Value::as_str).map(|from| format!("resumed_from {from}"))).collect();
+            let said: Vec<String> = ["prefill_seconds", "ttft_seconds", "request_seconds", "decode_tokens_per_second", "predicted_per_second"].iter().filter_map(|key| pick(key)).chain(server.get("resumed_from").and_then(Value::as_str).map(|from| format!("resumed_from {from}"))).collect();
             if !said.is_empty() {
                 let _ = writeln!(out, "        server said: {}", said.join(", "));
             }
@@ -1233,6 +1233,13 @@ mod tests {
         // the same behind a request of 20 s
         let said = report(&text(&[begin.clone(), call_only(1, 27_300, 305, speed.clone())]), None);
         assert!(said.contains("queued at the server: 20.0 s (the app's first word came after 27.3 s, when the server had written the answer, which took it 7.3 s after its first token 0.05 s after it began)"), "{said}");
+        let alternate = call_only(1, 27_300, 305, json!({"ttft_seconds": 0.05, "predicted_per_second": 42.0}));
+        let said = report(&text(&[begin.clone(), alternate]), None);
+        assert!(said.contains("queued at the server: 20.0 s") && said.contains("predicted_per_second 42.00"), "{said}");
+        let mut saved = call_only(1, 27_300, 305, json!({"ttft_seconds": 0.05}));
+        saved["tps"] = json!(42.0);
+        let said = report(&text(&[begin.clone(), saved]), None);
+        assert!(said.contains("queued at the server: 20.0 s"), "{said}");
         // no speed told: a first word that long cannot be taken for a wait, nor for none
         let said = report(&text(&[begin.clone(), call_only(1, 7300, 305, json!({"ttft_seconds": 0.05}))]), None);
         assert!(said.contains("queued at the server: cannot be told") && !said.contains("queued at the server: 7"), "{said}");
