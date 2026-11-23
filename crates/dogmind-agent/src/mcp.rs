@@ -129,8 +129,7 @@ impl ParsedServers {
         }
         if config.problem().is_none() {
             self.servers.insert(name, config);
-        } else if matches!(config.kind.as_str(), "" | "http" | "sse") {
-            // Other transports can have settings of their own without a command or URL.
+        } else {
             self.skipped_invalid = true;
         }
     }
@@ -146,6 +145,17 @@ fn parse_claude_servers(text: &str) -> Option<ParsedServers> {
     let servers = value.remove("mcpServers").unwrap_or_else(|| Value::Object(Default::default()));
     let mut found = ParsedServers::default();
     for (name, server) in servers.as_object()? {
+        // Inspect the declared transport before interpreting its settings. Other transports have their own schemas.
+        let required = match server.get("type").and_then(Value::as_str) {
+            None | Some("") => None,
+            Some("stdio") => Some("command"),
+            Some("http" | "sse") => Some("url"),
+            Some(_) => continue,
+        };
+        if required.is_some_and(|key| server[key].as_str().is_none_or(|value| value.trim().is_empty())) {
+            found.skipped_invalid = true;
+            continue;
+        }
         let Ok(mut config) = serde_json::from_value::<ServerConfig>(server.clone()) else {
             found.skipped_invalid = true;
             continue;
@@ -1872,6 +1882,32 @@ mod tests {
         assert_eq!(readable_config(&file).unwrap().servers["editor"].url, "https://");
         save_server(&file, Some("editor"), "editor", remote(good)).unwrap();
         assert_eq!(readable_config(&file).unwrap().servers["editor"].url, good);
+    }
+
+    #[test]
+    fn claude_import_respects_the_transport_declared_for_each_server() {
+        let source = json!({"mcpServers": {
+            "implicit": {"url": "http://localhost/mcp"},
+            "process": {"type": "stdio", "command": "editor"},
+            "stream": {"type": "http", "url": "http://localhost/mcp"},
+            "events": {"type": "sse", "url": "http://localhost/events"},
+            "other": {"type": "custom", "url": "http://localhost/other"},
+            "other-schema": {"type": "custom", "args": {"layout": "custom"}}
+        }});
+        let good = parse_claude_servers(&source.to_string()).unwrap();
+        assert!(!good.skipped_invalid);
+        assert_eq!(good.servers.keys().map(String::as_str).collect::<Vec<_>>(), ["events", "implicit", "process", "stream"]);
+        for bad in [
+            json!({"type": "stdio", "url": "http://localhost/mcp"}),
+            json!({"type": "http", "command": "editor"}),
+            json!({"type": "sse", "command": "editor"}),
+        ] {
+            let mut mixed = source.clone();
+            mixed["mcpServers"]["mismatch"] = bad;
+            let parsed = parse_claude_servers(&mixed.to_string()).unwrap();
+            assert!(parsed.skipped_invalid);
+            assert_eq!(parsed.servers, good.servers);
+        }
     }
 
     #[test]
