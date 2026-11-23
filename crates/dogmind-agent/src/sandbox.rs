@@ -816,11 +816,12 @@ static GRANTED: Mutex<Option<HashSet<(String, u32, bool)>>> = Mutex::new(None);
 /// than its caller, which is what the sandbox is for, and the caller's own command is what was granted and looked after. (Only the container was asked,
 /// and the app's own tests, run by a session as cargo is, failed 97 times for what they could not do there, 94 of the agent's and 3 of the app's.)
 pub fn in_the_sandbox() -> bool {
-    in_a_container() || restricted()
+    in_a_container() || with_a_restricted_token()
 }
 
-/// Whether this process's token is a restricted one (`restricted_token`): the person's, with SIDs every access must also pass.
-fn restricted() -> bool {
+/// Whether this process's token is a restricted one (`restricted_token`): the person's, with SIDs every access must also pass. It reads what the person can,
+/// and writes in its workspace and its own temp folder alone.
+pub fn with_a_restricted_token() -> bool {
     static IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *IN.get_or_init(|| {
         // SAFETY: the token is this process's own, opened for asking and closed here.
@@ -2473,8 +2474,12 @@ unsafe fn hold_out_secrets(folder: &Path, sid: PSID) {
     }
 }
 
-/// The sandbox's own temp folder: what a command leaves there, the app can read.
+/// The sandbox's own temp folder: what a command leaves there, the app can read. With a restricted token, the profile's folder is not this process's to write
+/// in, and its own temp folder is what it has (`restricted_temp`), as a command it starts does.
 pub(crate) fn temp_folder() -> Option<PathBuf> {
+    if with_a_restricted_token() {
+        return std::env::var_os("TEMP").map(PathBuf::from);
+    }
     // SAFETY: the SID lives as long as the process.
     unsafe { profile_folder(profile_sid().ok()?) }
 }
@@ -3754,6 +3759,9 @@ mod tests {
 
     #[test]
     fn a_command_cannot_read_the_users_files_or_see_keys() {
+        if crate::in_container::cannot_run_with_a_restricted_token(crate::in_container::KEPT_BY_A_CONTAINER) {
+            return;
+        }
         let folder = work_folder("secrets");
         std::env::set_var("DOGMIND_APP_TEST_SECRET", "sekret");
         let seen = command("echo [%DOGMIND_APP_TEST_SECRET%]", &folder, false);
@@ -3765,6 +3773,9 @@ mod tests {
 
     #[test]
     fn the_network_needs_its_capability() {
+        if crate::in_container::cannot_run_with_a_restricted_token(crate::in_container::KEPT_BY_A_CONTAINER) {
+            return;
+        }
         let folder = work_folder("network");
         let script = "powershell -NoProfile -Command \"try { (New-Object Net.Sockets.TcpClient).Connect('1.1.1.1', 443); 'connected' } catch { 'refused' }\"";
         let closed = command(script, &folder, false);
