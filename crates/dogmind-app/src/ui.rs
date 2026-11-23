@@ -2890,21 +2890,26 @@ fn mcp_runs(config: &dogmind_agent::mcp::ServerConfig) -> String {
 /// one of the older transport stays one, its stream asked for first: saved as `http`, it was asked with a POST of Streamable HTTP first, as a new one is.
 fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Option<String>, target: String, original_args: &str, args: &str, pairs: std::collections::BTreeMap<String, String>) -> dogmind_agent::mcp::ServerConfig {
     use dogmind_agent::mcp;
-    let trusted = was.is_some_and(|config| config.trusted);
-    let tool_selection = was.map(|config| config.tool_selection.clone()).unwrap_or_default();
-    let kind = if was.is_some_and(|config| config.kind == "sse") { "sse" } else { "http" };
-    match url {
-        Some(url) => mcp::ServerConfig { kind: kind.into(), url, headers: pairs, trusted, tool_selection, ..Default::default() },
-        None => {
-            // The edit control normalizes line endings even when the person only changes another field.
-            let args = match was {
-                Some(config) if !config.is_http() && original_args == args => config.args.clone(),
-                _ => mcp::args_of_line(args),
-            };
-            let cwd = was.filter(|config| !config.is_http()).and_then(|config| config.cwd.clone());
-            mcp::ServerConfig { command: target, args, env: pairs, cwd, trusted, tool_selection, ..Default::default() }
+    let previous = was.filter(|config| config.is_http() == url.is_some());
+    // Keep the saved transport spelling and fields the editor cannot display. A different config restarts the connection.
+    let mut config = previous.cloned().unwrap_or_else(|| mcp::ServerConfig {
+        kind: if url.is_some() { "http".into() } else { String::new() },
+        trusted: was.is_some_and(|config| config.trusted),
+        tool_selection: was.map(|config| config.tool_selection.clone()).unwrap_or_default(),
+        ..Default::default()
+    });
+    if let Some(url) = url {
+        config.url = url;
+        config.headers = pairs;
+    } else {
+        config.command = target;
+        config.env = pairs;
+        // The edit control normalizes line endings even when the person only changes another field.
+        if previous.is_none() || original_args != args {
+            config.args = mcp::args_of_line(args);
         }
     }
+    config
 }
 
 /// The line editor cannot represent every stored value, such as a newline inside one variable.
@@ -18924,6 +18929,20 @@ mod tests {
         assert_eq!(mcp_config_of_form(None, url, target, "", "", Default::default()).kind, "http", "a new one");
         let program = mcp_config_of_form(Some(&older), None, "node".into(), "", "server.js --port 1", Default::default());
         assert_eq!((program.command.as_str(), program.args.join(" "), program.kind.as_str(), program.trusted), ("node", "server.js --port 1".to_string(), "", true));
+    }
+
+    #[test]
+    fn saving_an_unchanged_mcp_form_preserves_the_connection_config() {
+        use dogmind_agent::mcp::ServerConfig;
+        let remote = ServerConfig { url: "http://127.0.0.1:9/mcp".into(), ..Default::default() };
+        let local = ServerConfig { kind: "stdio".into(), command: "clock".into(), args: vec!["arg".into()], ..Default::default() };
+        let edited = |config: &ServerConfig, url: Option<String>, target: &str| {
+            mcp_config_of_form(Some(config), url, target.into(), "arg", "arg", Default::default())
+        };
+        assert_eq!(edited(&remote, Some(remote.url.clone()), &remote.url), remote);
+        assert_eq!(edited(&local, None, &local.command), local);
+        let next = "http://127.0.0.1:9/next";
+        assert_eq!(edited(&remote, Some(next.into()), next), ServerConfig { url: next.into(), ..remote });
     }
 
     #[test]
