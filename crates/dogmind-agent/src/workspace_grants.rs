@@ -1,6 +1,9 @@
-//! The write grant a workspace has for commands, for as long as something uses it. A command needs the container's ACE on its workspace, and that ACE lasts until it is taken
-//! away: without this, commands could go on writing in every folder ever worked in. So what is granted is written down first, what uses a folder is counted, and when the count
-//! comes to nothing the grant goes, on a thread of its own, as a tree can take minutes. What a chat has open, or a command running or in the background, counts.
+//! The write grant a workspace has for commands, for as long as the person keeps it on their list of workspaces. A command needs an ACE on its workspace for its workspace's
+//! capability (`sandbox::workspace_capability`), which only that workspace's commands have: another workspace's can neither write nor read there, so the grant can stay, and
+//! the next session in the folder does not wait for it to be given again (Windows rewrites the list of everything in a folder to give it: a first command waited 49.6 s for
+//! one of 329,000). What is granted is written down first, and taken back when the folder leaves the person's list, when the app leaves the PC, and at a start for a folder
+//! that is not on it; what uses a folder is counted, and a folder in use is not taken back. An earlier version's grants were to the container, which every command has, and
+//! went whenever a folder went out of use: one on a folder still on the list is moved to its capability at the start, in one walk, and the others are taken back.
 //!
 //! Only what the list says, or what can be proved, is taken back: the SID is this app's alone, so its exact write ACE on a folder this app's own sessions name can only be this
 //! app's. What it cannot prove it leaves. The traverse ACEs on the way to a workspace, which show nothing of what is in a folder, stay.
@@ -27,6 +30,9 @@ struct Guarded {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Grant {
     root: PathBuf,
+    /// What it is to, as a SID's text: the workspace's capability, or a restricted command's workspace SID. None: the container, as an earlier version gave it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sid: Option<String>,
     #[serde(default)]
     guarded: Vec<Guarded>,
     /// What it is whatever it comes to be called: a folder renamed or moved on its drive takes its ACE with it.
@@ -111,26 +117,17 @@ pub fn still_granted(folder: &Path) -> Vec<PathBuf> {
     read(&folder.join(FILE_NAME)).grants.into_iter().map(|grant| grant.root).collect()
 }
 
-/// Something that uses a folder, for as long as this lasts: a chat open on it, or a command running in it.
+/// Something that uses a folder, for as long as this lasts: a chat open on it, or a command running in it. A folder in use is not taken back.
 pub struct Use {
     place: String,
-    path: PathBuf,
-    file: Option<PathBuf>,
 }
 
 impl Use {
     pub fn new(path: &Path) -> Use {
-        // (the chat gives the folder as the person opened it, and a command gives the real one `writable_root` works out: either is the same folder, or the grant went when the command ended)
-        let path = real(path);
-        let place = sandbox::key(&path);
+        // (the chat gives the folder as the person opened it, and a command gives the real one `writable_root` works out: either is the same folder)
+        let place = sandbox::key(&real(path));
         *users().get_or_insert_with(HashMap::new).entry(place.clone()).or_insert(0) += 1;
-        Use { place, path, file: the_file() }
-    }
-
-    /// What this leaves behind is not taken back, as in a test's own temp folder or a command's process ending with the app.
-    #[cfg(test)]
-    fn file(&self) -> Option<&Path> {
-        self.file.as_deref()
+        Use { place }
     }
 }
 
@@ -145,19 +142,23 @@ impl Drop for Use {
                 }
             }
         }
-        if *CLOSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
-            return;
-        }
-        let Some(file) = self.file.take() else { return };
-        // (a folder that was only ever passed through has nothing on the list to go, and no thread is started for it)
-        let path = std::mem::take(&mut self.path);
-        if !is_in_use(&path) && recorded_at(&file, &path) {
-            std::thread::spawn(move || {
-                in_the_background();
-                let _ = release(&file, &path);
-            });
-        }
+        // (the grant stays: it is the workspace's own, and goes when the folder leaves the person's list, `forget`)
     }
+}
+
+/// The person no longer has this folder on their list of workspaces: what commands were given there is taken back, unless something uses it now (then the next start
+/// does it). The roots whose take-back left something behind, which stay on the list to be tried again.
+pub fn forget(folder: &Path, path: &Path) -> Vec<PathBuf> {
+    // (the app is ending: it goes at the next start)
+    if *CLOSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+        return Vec::new();
+    }
+    in_the_background();
+    let file = folder.join(FILE_NAME);
+    if !recorded_at(&file, path) {
+        return Vec::new();
+    }
+    release(&file, path).failed
 }
 
 /// What a take-back came to.
@@ -207,18 +208,29 @@ fn recorded_at(file: &Path, path: &Path) -> bool {
 
 /// A command is about to run with its folder writable: on the list before anything is granted, and on it too if an earlier version of the app gave it. Then what changes it waits for this.
 /// What cannot be written down is not given: nothing could take it back.
-pub(crate) fn before_grant(root: &Path) -> Result<MutexGuard<'static, ()>, String> {
+/// `sid`: what the grant is to.
+pub(crate) fn before_grant(root: &Path, sid: PSID) -> Result<MutexGuard<'static, ()>, String> {
     let one = WORK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(file) = the_file() {
         let mut journal = read(&file);
         let root = real(root);
         let place = sandbox::key(&root);
-        if !journal.grants.iter().any(|grant| sandbox::key(&real(&grant.root)) == place) {
-            journal.grants.push(Grant { root: root.clone(), guarded: Vec::new(), id: sandbox::file_id(&root) });
+        // SAFETY: the SID is the caller's, alive through the call.
+        let to = Some(unsafe { sandbox::sid_text(sid) });
+        if !journal.grants.iter().any(|grant| sandbox::key(&real(&grant.root)) == place && grant.sid == to) {
+            journal.grants.push(Grant { root: root.clone(), sid: to, guarded: Vec::new(), id: sandbox::file_id(&root) });
             write(&file, &journal)?;
         }
     }
     Ok(one)
+}
+
+/// What a grant is to, to take it back by: its own SID, or the container's for an earlier version's.
+unsafe fn sid_of(grant: &Grant) -> Option<sandbox::OwnedSid> {
+    match &grant.sid {
+        Some(text) => sandbox::OwnedSid::from_text(text).ok(),
+        None => None,
+    }
 }
 
 /// An access list about to be changed to guard a repository, with what it was, so that it can be put back. `protected`: it keeps its own list now, which is what this leaves it doing, so that
@@ -294,6 +306,24 @@ unsafe fn strip_tree(root: &Path, watch: &Path, sid: PSID, masks: &[u32]) -> Opt
     Some(failed)
 }
 
+/// As `release`, for the start's sweep: what is listed of a folder still on the person's list is left, but for an earlier version's grant to the container.
+fn release_unlisted(file: &Path, path: &Path, on_the_list: &dyn Fn(&Path) -> bool) -> Released {
+    if !on_the_list(path) {
+        return release(file, path);
+    }
+    // (only the container's: the capability's stays)
+    let journal = read(file);
+    let mut only_old = journal.clone();
+    only_old.grants.retain(|grant| grant.sid.is_none());
+    let kept: Vec<Grant> = journal.grants.into_iter().filter(|grant| grant.sid.is_some()).collect();
+    let _ = write(file, &only_old);
+    let outcome = release(file, path);
+    let mut after = read(file);
+    after.grants.extend(kept);
+    let _ = write(file, &after);
+    outcome
+}
+
 /// Takes back all that the list says of this folder, if nothing uses it by the time this can begin. `done` if it did. A grant whose take-back left something behind stays on the list, and its
 /// root is in `failed`: the next start tries again.
 fn release(file: &Path, path: &Path) -> Released {
@@ -301,7 +331,7 @@ fn release(file: &Path, path: &Path) -> Released {
     let mut failed = Vec::new();
     // SAFETY: what each call below is given lives until it returns.
     unsafe {
-        let Ok(sid) = sandbox::profile_sid() else { return Released { done: false, failed } };
+        let Ok(container) = sandbox::profile_sid() else { return Released { done: false, failed } };
         let mut journal = read(file);
         let place = sandbox::key(path);
         let roots: Vec<Grant> = journal.grants.iter().filter(|grant| {
@@ -322,12 +352,13 @@ fn release(file: &Path, path: &Path) -> Released {
             match whereabouts {
                 sandbox::Located::At(place) => {
                     // Where it has gone, its guarded paths with it; if something uses it there, it stays.
-                    let moved = Grant { guarded: grant.guarded.iter().map(|item| Guarded { path: item.path.strip_prefix(&grant.root).map_or_else(|_| item.path.clone(), |inside| place.join(inside)), sddl: item.sddl.clone() }).collect(), root: place, id: grant.id.clone() };
+                    let moved = Grant { guarded: grant.guarded.iter().map(|item| Guarded { path: item.path.strip_prefix(&grant.root).map_or_else(|_| item.path.clone(), |inside| place.join(inside)), sddl: item.sddl.clone() }).collect(), root: place, sid: grant.sid.clone(), id: grant.id.clone() };
                     if is_in_use(&moved.root) {
                         all_done = false;
                         continue;
                     }
-                    match take_back(&moved, sid) {
+                    let own = sid_of(&grant);
+                    match take_back(&moved, own.as_ref().map_or(container, |own| own.0)) {
                         Taken::Whole => {}
                         Taken::InUse => {
                             all_done = false;
@@ -349,7 +380,7 @@ fn release(file: &Path, path: &Path) -> Released {
                 }
             }
             let root = sandbox::key(&grant.root);
-            journal.grants.retain(|known| sandbox::key(&known.root) != root);
+            journal.grants.retain(|known| sandbox::key(&known.root) != root || known.sid != grant.sid);
             let _ = write(file, &journal);
         }
         sandbox::forget_grants();
@@ -371,10 +402,11 @@ unsafe fn take_back(grant: &Grant, sid: PSID) -> Taken {
         return Taken::Partly;
     }
     let Some(mut failed) = strip_tree(&grant.root, &grant.root, sid, &[READ_WRITE_EXECUTE]) else { return Taken::InUse };
-    // Under a guarded folder what inherited was made read-only, and with what it inherited from put back that is left over.
+    // Under a guarded folder what inherited was made read-only, and with what it inherited from put back that is left over; and in a repository's own folder, what the guard
+    // handed down for a workspace inside another (`sandbox::guard_repository`).
     for item in &grant.guarded {
         if item.path.is_dir() {
-            let Some(more) = strip_tree(&item.path, &grant.root, sid, &[READ_EXECUTE]) else { return Taken::InUse };
+            let Some(more) = strip_tree(&item.path, &grant.root, sid, &[READ_EXECUTE, READ_WRITE_EXECUTE]) else { return Taken::InUse };
             failed += more;
         }
     }
@@ -385,16 +417,41 @@ unsafe fn take_back(grant: &Grant, sid: PSID) -> Taken {
     }
 }
 
-/// When the app starts, off the window's thread: what earlier runs left. All that the list has, and what an earlier version left on a folder this app's sessions name, if its exact
-/// write ACE is there to prove it. A folder in use is left. Says the folders whose take-back left something behind: they stay on the list, and the person is told ([`NOT_TAKEN_BACK`]).
-pub fn sweep(folder: &Path, named_by_sessions: &[PathBuf]) -> Vec<PathBuf> {
+/// When the app starts, off the window's thread: what earlier runs left. A grant on a folder that is not on the person's list (`listed`) is taken back; an earlier version's grant
+/// to the container on one that is is moved to the folder's capability (`migrate`); and what an earlier version left on a folder this app's sessions name, if its exact write ACE is
+/// there to prove it, is found and dealt with so. A folder in use is left. With nothing listed, as when the app leaves the PC, all of it goes. Says the folders whose take-back left
+/// something behind: they stay on the list, and the person is told ([`NOT_TAKEN_BACK`]).
+pub fn sweep(folder: &Path, named_by_sessions: &[PathBuf], listed: &[PathBuf]) -> Vec<PathBuf> {
     in_the_background();
     let file = folder.join(FILE_NAME);
-    sweep_file(&file, named_by_sessions).1
+    sweep_file(&file, named_by_sessions, listed).1
 }
 
-/// How many were let go of, and which are left with something behind.
-fn sweep_file(file: &Path, named_by_sessions: &[PathBuf]) -> (usize, Vec<PathBuf>) {
+/// An earlier version's grant to the container on a folder the person still has: its guarded paths put back as they were (the next command guards them again, for the
+/// capability), and on the folder the container's ACE out and the capability's in, in one walk (`sandbox::move_grant`). Then it is the capability's, on the list.
+unsafe fn migrate(file: &Path, grant: &Grant, container: PSID) -> Taken {
+    for item in &grant.guarded {
+        if Dacl::read(&item.path).is_ok_and(|dacl| dacl.protected()) && sandbox::restore_dacl_text(&item.path, &item.sddl).is_err() {
+            return Taken::Partly;
+        }
+    }
+    let Ok(capability) = sandbox::workspace_capability(&grant.root) else { return Taken::Partly };
+    if sandbox::move_grant(&grant.root, container, capability).is_err() {
+        return Taken::Partly;
+    }
+    let mut journal = read(file);
+    let root = sandbox::key(&grant.root);
+    journal.grants.retain(|known| !(sandbox::key(&known.root) == root && known.sid.is_none()));
+    let to = Some(sandbox::sid_text(capability));
+    if !journal.grants.iter().any(|known| sandbox::key(&known.root) == root && known.sid == to) {
+        journal.grants.push(Grant { root: grant.root.clone(), sid: to, guarded: Vec::new(), id: grant.id.clone() });
+    }
+    let _ = write(file, &journal);
+    Taken::Whole
+}
+
+/// How many were let go of or moved, and which are left with something behind.
+fn sweep_file(file: &Path, named_by_sessions: &[PathBuf], listed: &[PathBuf]) -> (usize, Vec<PathBuf>) {
     // SAFETY: the SID lives as long as the process.
     let Ok(sid) = (unsafe { sandbox::profile_sid() }) else { return (0, Vec::new()) };
     {
@@ -408,17 +465,29 @@ fn sweep_file(file: &Path, named_by_sessions: &[PathBuf]) -> (usize, Vec<PathBuf
             }
             // SAFETY: as above.
             if unsafe { Dacl::read(path).is_ok_and(|dacl| dacl.has_exact(sid, READ_WRITE_EXECUTE, TO_ALL)) } {
-                journal.grants.push(Grant { root: path.clone(), guarded: Vec::new(), id: sandbox::file_id(path) });
+                journal.grants.push(Grant { root: path.clone(), sid: None, guarded: Vec::new(), id: sandbox::file_id(path) });
             }
         }
         if journal.grants.len() != before {
             let _ = write(file, &journal);
         }
     }
-    let roots: Vec<PathBuf> = read(file).grants.into_iter().map(|grant| grant.root).collect();
+    let kept: Vec<String> = listed.iter().map(|path| sandbox::key(&real(path))).collect();
+    let on_the_list = |root: &Path| kept.contains(&sandbox::key(&real(root)));
     let (mut released, mut failed) = (0, Vec::new());
+    // An earlier version's on a folder still listed: moved, in one walk, before anything is taken back (what is taken back can wait; a command in this folder waits for this).
+    for grant in read(file).grants.into_iter().filter(|grant| grant.sid.is_none() && on_the_list(&grant.root) && grant.root.is_dir() && !is_in_use(&grant.root)) {
+        let _one = WORK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: the SID lives as long as the process.
+        match unsafe { migrate(file, &grant, sid) } {
+            Taken::Whole => released += 1,
+            _ => failed.push(grant.root.clone()),
+        }
+        sandbox::forget_grants();
+    }
+    let roots: Vec<PathBuf> = read(file).grants.into_iter().filter(|grant| grant.sid.is_none() || !on_the_list(&grant.root)).map(|grant| grant.root).collect();
     for root in roots.iter().filter(|root| !is_in_use(root)) {
-        let outcome = release(file, root);
+        let outcome = release_unlisted(file, root, &on_the_list);
         released += usize::from(outcome.done);
         failed.extend(outcome.failed);
     }
@@ -473,8 +542,17 @@ mod tests {
         all
     }
 
+    /// Whether a list has a grant of this app's: the container's, as an earlier version gave it, or a workspace's capability (all of which are made from a name, S-1-15-3-1024-…).
+    fn granted_in(list: &str) -> bool {
+        list.contains(&sandbox::profile_sid_text()) || list.contains("S-1-15-3-1024-")
+    }
+
     fn holds_grant(path: &Path) -> bool {
-        sandbox::dacl_text(path).unwrap().contains(&sandbox::profile_sid_text())
+        granted_in(&sandbox::dacl_text(path).unwrap())
+    }
+
+    fn container() -> PSID {
+        unsafe { sandbox::profile_sid().unwrap() }
     }
 
     fn wait_for(what: &str, done: impl Fn() -> bool) {
@@ -485,8 +563,10 @@ mod tests {
         }
     }
 
+    /// A workspace's grant is to its capability, and stays when the session moves on: the other workspace's commands can neither write nor read there all the same. Taken
+    /// back when it leaves the person's list, exactly.
     #[test]
-    fn moving_on_takes_back_the_write_grant_exactly_and_the_other_workspace_is_untouched() {
+    fn a_workspaces_grant_stays_and_another_workspaces_commands_can_neither_write_nor_read_there() {
         if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
             return;
         }
@@ -494,32 +574,36 @@ mod tests {
         let (first, second) = (folder(&stand, "first"), folder(&stand, "second"));
         let before = lists(&first);
         let chat = Use::new(&first);
-        assert!(chat.file().is_some());
         assert_eq!(command(&first, "echo made> made.txt & mkdir madefolder & echo x> madefolder\\c.txt").0, Some(0));
-        assert!(read(&stand.file).grants.iter().any(|grant| grant.root == first), "written down");
+        let capability = unsafe { sandbox::sid_text(sandbox::workspace_capability(&first).unwrap()) };
+        assert!(read(&stand.file).grants.iter().any(|grant| grant.root == first && grant.sid.as_ref() == Some(&capability)), "written down, with what it is to");
         assert!(holds_grant(&first) && holds_grant(&first.join("a.txt")) && holds_grant(&first.join("made.txt")));
-        // The session moves to the other folder.
+        assert!(!sandbox::dacl_text(&first).unwrap().contains(&sandbox::profile_sid_text()), "nothing for the container, which every command has");
+        // The session moves to the other folder: the grant stays.
         let moved = Use::new(&second);
         drop(chat);
-        wait_for("the grant to go", || !holds_grant(&first));
-        wait_for("what is under it", || !holds_grant(&first.join("sub").join("b.txt")) && !holds_grant(&first.join("made.txt")) && !holds_grant(&first.join("madefolder").join("c.txt")));
-        wait_for("the list", || read(&stand.file).grants.iter().all(|grant| grant.root != first));
-        // From the other workspace it can be neither written nor read, and that one works.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(holds_grant(&first) && holds_grant(&first.join("madefolder").join("c.txt")), "it stays");
+        // From the other workspace it can be neither written nor read, while it does, and that one works.
         assert_eq!(command(&second, "echo here> mine.txt").0, Some(0));
         command(&second, &format!("echo x> \"{}\\from-second.txt\"", first.display()));
         assert!(!first.join("from-second.txt").exists());
         assert!(!command(&second, &format!("type \"{}\\a.txt\"", first.display())).1.contains('A'));
-        // Back as it was, to the byte, what the command made aside.
+        // Off the person's list: taken back, and back as it was, to the byte, what the command made aside.
+        assert!(release(&stand.file, &first).done);
+        assert!(!holds_grant(&first) && !holds_grant(&first.join("sub").join("b.txt")) && !holds_grant(&first.join("made.txt")) && !holds_grant(&first.join("madefolder").join("c.txt")));
+        assert!(read(&stand.file).grants.iter().all(|grant| grant.root != first));
         std::fs::remove_file(first.join("made.txt")).unwrap();
         std::fs::remove_dir_all(first.join("madefolder")).unwrap();
         assert_eq!(lists(&first), before);
         assert!(holds_grant(&second));
         drop(moved);
-        wait_for("the second to go too", || !holds_grant(&second));
+        assert!(release(&stand.file, &second).done);
+        assert!(!holds_grant(&second));
     }
 
     #[test]
-    fn two_chats_in_one_folder_keep_it_until_the_last_has_gone() {
+    fn a_folder_in_use_is_not_taken_back_until_nothing_uses_it() {
         if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
             return;
         }
@@ -528,11 +612,11 @@ mod tests {
         let (one, two) = (Use::new(&place), Use::new(&place));
         assert_eq!(command(&place, "echo x> first.txt").0, Some(0));
         drop(one);
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(holds_grant(&place), "another chat is on it");
+        assert!(!release(&stand.file, &place).done && holds_grant(&place), "another chat is on it");
         assert_eq!(command(&place, "echo x> second.txt").0, Some(0));
         drop(two);
-        wait_for("the grant to go", || !holds_grant(&place));
+        assert!(release(&stand.file, &place).done);
+        assert!(!holds_grant(&place));
     }
 
     #[test]
@@ -552,11 +636,12 @@ mod tests {
         // Until it has begun.
         std::thread::sleep(Duration::from_millis(800));
         drop(chat);
-        std::thread::sleep(Duration::from_millis(600));
+        assert!(!release(&stand.file, &place).done);
         assert!(holds_grant(&place), "a command is running in it");
         assert_eq!(command_thread.join().unwrap(), Some(0));
         assert_eq!(std::fs::read_to_string(place.join("after.txt")).unwrap().trim(), "after", "it could still write at its end");
-        wait_for("the grant to go after it", || !holds_grant(&place));
+        assert!(release(&stand.file, &place).done);
+        assert!(!holds_grant(&place));
     }
 
     /// As `Documents` is: a list that says nothing of auto-inheritance, where what is handed down carries no mark.
@@ -573,10 +658,10 @@ mod tests {
         assert_eq!(command(&place, "echo x> made.txt & mkdir madefolder & echo y> madefolder\\c.txt").0, Some(0));
         assert!(holds_grant(&place) && holds_grant(&place.join("made.txt")));
         drop(chat);
-        wait_for("the list", || read(&stand.file).grants.is_empty());
-        let sid = sandbox::profile_sid_text();
+        assert!(release(&stand.file, &place).done);
+        assert!(read(&stand.file).grants.is_empty());
         for (path, list) in lists(&place) {
-            assert!(!list.contains(&sid), "{}: {list}", path.display());
+            assert!(!granted_in(&list), "{}: {list}", path.display());
         }
     }
 
@@ -596,11 +681,11 @@ mod tests {
         std::fs::create_dir_all(&place).unwrap();
         let other = lists(&place);
         drop(chat);
-        wait_for("the list", || read(&stand.file).grants.is_empty());
+        assert!(release(&stand.file, &place).done);
+        assert!(read(&stand.file).grants.is_empty());
         assert_eq!(lists(&place), other);
-        let sid = sandbox::profile_sid_text();
         for (path, list) in lists(&renamed) {
-            assert!(!list.contains(&sid), "{}: {list}", path.display());
+            assert!(!granted_in(&list), "{}: {list}", path.display());
         }
     }
 
@@ -632,7 +717,8 @@ mod tests {
         assert_eq!(command(&place, "echo x> made.txt").0, Some(0));
         assert!(sandbox::dacl_text(&place.join(".git").join("config")).unwrap().starts_with("D:P"), "guarded");
         drop(chat);
-        wait_for("the list", || read(&stand.file).grants.is_empty());
+        assert!(release(&stand.file, &place).done);
+        assert!(read(&stand.file).grants.is_empty());
         std::fs::remove_file(place.join("made.txt")).unwrap();
         // (what git itself wrote meanwhile has no bearing: only the lists of what was there)
         let after = lists(&place);
@@ -640,7 +726,7 @@ mod tests {
             let now = after.iter().find(|(known, _)| known == path).map(|(_, list)| list.as_str());
             assert_eq!(now, Some(list.as_str()), "{}", path.display());
         }
-        assert!(after.iter().all(|(_, list)| !list.contains(&sandbox::profile_sid_text())));
+        assert!(after.iter().all(|(_, list)| !granted_in(list)));
     }
 
     #[test]
@@ -666,7 +752,7 @@ mod tests {
         let (other_before, plain_before, not_named_before) = (lists(&other_shape), lists(&plain), lists(&not_named));
         let held = Use::new(&in_use);
         let gone = stand.base.join("gone-now");
-        let swept = sweep_file(&stand.file, &[old.clone(), other_shape.clone(), in_use.clone(), plain.clone(), gone]).0;
+        let swept = sweep_file(&stand.file, &[old.clone(), other_shape.clone(), in_use.clone(), plain.clone(), gone], &[]).0;
         assert_eq!(swept, 1);
         assert!(!holds_grant(&old) && !holds_grant(&old.join("a.txt")) && !holds_grant(&old.join("sub").join("b.txt")), "proved, and nothing uses it");
         assert_eq!(lists(&other_shape), other_before, "not the shape of a write grant: not provably one of these");
@@ -676,8 +762,68 @@ mod tests {
         // It stays on the list, and goes when that has ended.
         assert!(read(&stand.file).grants.iter().any(|grant| grant.root == in_use));
         drop(held);
-        wait_for("the one in use to go", || !holds_grant(&in_use));
+        assert_eq!(sweep_file(&stand.file, &[], &[]).0, 1, "at the next start");
+        assert!(!holds_grant(&in_use) && !holds_grant(&in_use.join("sub").join("b.txt")));
         unsafe { Dacl::read(&other_shape).unwrap().without_exact(sid, READ_EXECUTE, TO_ALL).write_alone(&other_shape).unwrap() };
+    }
+
+    /// A workspace inside another, with a repository the outer one's command made: the inner one's commands use git there all the same (what is in `.git` is handed its
+    /// capability), and taking the inner one back leaves nothing of its own in the repository.
+    #[test]
+    fn a_workspace_inside_another_uses_its_repository_and_leaves_nothing_there_when_taken_back() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let stand = stand();
+        let outer = folder(&stand, "outer");
+        let inner = outer.join("sub");
+        crate::tools::git(&inner, &["init", "-q"]).unwrap();
+        assert_eq!(command(&outer, "echo x> made.txt").0, Some(0));
+        let status = command(&inner, "git status --short");
+        assert_eq!(status.0, Some(0), "{}", status.1);
+        let capability = unsafe { sandbox::sid_text(sandbox::workspace_capability(&inner).unwrap()) };
+        assert!(sandbox::dacl_text(&inner.join(".git").join("HEAD")).unwrap().contains(&capability), "handed down");
+        assert!(release(&stand.file, &inner).done);
+        for (path, list) in lists(&inner.join(".git")) {
+            assert!(!list.contains(&capability), "{}: {list}", path.display());
+        }
+        assert_eq!(command(&outer, "echo y> again.txt").0, Some(0), "the outer one goes on");
+        assert!(release(&stand.file, &outer).done);
+    }
+
+    /// An earlier version's grant to the container on a folder still on the person's list: moved to the folder's capability at the start, in one walk, and on the list as
+    /// that; what is not on the list is taken back.
+    #[test]
+    fn an_earlier_grant_on_a_listed_folder_moves_to_its_capability_and_an_unlisted_one_goes() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let stand = stand();
+        let sid = container();
+        let (kept, left) = (folder(&stand, "kept"), folder(&stand, "left"));
+        for path in [&kept, &left] {
+            unsafe {
+                Dacl::read(path).unwrap().with_exact(sid, READ_WRITE_EXECUTE, TO_ALL).write_alone(path).unwrap();
+                for (child, flags) in [(path.join("a.txt"), INHERITED_ACE as u8), (path.join("sub"), INHERITED_ACE as u8 | TO_ALL), (path.join("sub").join("b.txt"), INHERITED_ACE as u8)] {
+                    Dacl::read(&child).unwrap().with_inherited(sid, READ_WRITE_EXECUTE, flags).write_alone(&child).unwrap();
+                }
+            }
+        }
+        let left_before = lists(&left);
+        let (moved, failed) = sweep_file(&stand.file, &[kept.clone(), left.clone()], &[kept.clone()]);
+        assert_eq!((moved, failed.len()), (2, 0), "one moved, one taken back");
+        let capability = unsafe { sandbox::sid_text(sandbox::workspace_capability(&kept).unwrap()) };
+        let container = sandbox::profile_sid_text();
+        for (path, list) in lists(&kept) {
+            assert!(list.contains(&capability) && !list.contains(&container), "{}: {list}", path.display());
+        }
+        assert!(read(&stand.file).grants.iter().any(|grant| grant.root == kept && grant.sid.as_ref() == Some(&capability)));
+        assert!(lists(&left).iter().all(|(_, list)| !granted_in(list)) && left_before.len() == lists(&left).len());
+        assert!(read(&stand.file).grants.iter().all(|grant| grant.root != left));
+        // (and a command there finds its grant given)
+        sandbox::forget_grants();
+        assert_eq!(command(&kept, "echo x> made.txt").0, Some(0));
+        assert!(release(&stand.file, &kept).done);
     }
 
     #[test]
@@ -686,8 +832,7 @@ mod tests {
         TEST_FILE.with(|known| *known.borrow_mut() = None);
         let place = folder(&stand, "unlisted");
         let chat = Use::new(&place);
-        assert!(chat.file().is_none());
-        drop(before_grant(&place).unwrap());
+        drop(before_grant(&place, container()).unwrap());
         drop(chat);
         assert!(!stand.file.exists());
     }
@@ -699,7 +844,7 @@ mod tests {
         let place = folder(&stand, "work");
         std::fs::create_dir_all(stand.file.parent().unwrap()).unwrap();
         std::fs::write(&stand.file, "{ not json").unwrap();
-        drop(before_grant(&place).unwrap());
+        drop(before_grant(&place, container()).unwrap());
         let kept: Vec<String> = std::fs::read_dir(stand.file.parent().unwrap()).unwrap().flatten().filter(|item| item.file_name().to_string_lossy().contains("damaged")).map(|item| std::fs::read_to_string(item.path()).unwrap()).collect();
         assert_eq!(kept, ["{ not json"], "what it said is still there to look at");
         assert_eq!(read(&stand.file).grants.len(), 1);
@@ -707,7 +852,7 @@ mod tests {
         let blocked = stand.base.join("blocked");
         std::fs::write(&blocked, "").unwrap();
         TEST_FILE.with(|known| *known.borrow_mut() = Some(blocked.join(FILE_NAME)));
-        assert!(before_grant(&place).is_err());
+        assert!(before_grant(&place, container()).is_err());
     }
 
     #[test]
@@ -724,7 +869,7 @@ mod tests {
         unsafe { Dacl::read(&git).unwrap().as_explicit_and_protected(sid).write_alone(&git).unwrap() };
         let before = sandbox::dacl_text(&git).unwrap();
         assert!(before.starts_with("D:P"), "{before}");
-        drop(before_grant(&place).unwrap());
+        drop(before_grant(&place, sid).unwrap());
         unsafe { sandbox::guard_repository(&place, &git, sid).unwrap() };
         assert!(holds_grant(&git), "guarded");
         // Guarded again, as before each command: the list it had before stays what is written down.
@@ -746,7 +891,7 @@ mod tests {
         link.arg("/c").arg("mklink").arg("/J").arg(place.join(".git")).arg(&elsewhere).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         crate::tools::no_window(&mut link);
         assert!(link.status().unwrap().success());
-        drop(before_grant(&place).unwrap());
+        drop(before_grant(&place, container()).unwrap());
         let sid = unsafe { sandbox::profile_sid().unwrap() };
         let refused = unsafe { sandbox::guard_repository(&place, &place.join(".git"), sid) }.unwrap_err();
         assert!(refused.contains("is a link"), "{refused}");
@@ -767,7 +912,7 @@ mod tests {
         std::fs::write(git.join("commondir"), "..\\evil\n").unwrap();
         std::fs::write(git.join("worktrees").join("w").join("commondir"), "../..\n").unwrap();
         let sid = unsafe { sandbox::profile_sid().unwrap() };
-        drop(before_grant(&place).unwrap());
+        drop(before_grant(&place, sid).unwrap());
         unsafe { sandbox::guard_repository(&place, &git, sid).unwrap() };
         assert!(!git.join("commondir").exists());
         assert!(git.join("worktrees").join("w").join("commondir").exists(), "a real worktree's");
@@ -784,7 +929,7 @@ mod tests {
         let git = place.join(".git");
         std::fs::write(&git, "gitdir: C:\\elsewhere\\.git\\worktrees\\w\n").unwrap();
         let before = sandbox::dacl_text(&git).unwrap();
-        drop(before_grant(&place).unwrap());
+        drop(before_grant(&place, container()).unwrap());
         let sid = unsafe { sandbox::profile_sid().unwrap() };
         unsafe { sandbox::guard_repository(&place, &git, sid).unwrap() };
         let guarded = sandbox::dacl_text(&git).unwrap();
@@ -846,7 +991,7 @@ mod tests {
         assert_eq!(command(&first, "echo made> made.txt").0, Some(0));
         let a = first.join("a.txt");
         let text = sandbox::dacl_text(&a).unwrap();
-        assert!(text.contains(&sandbox::profile_sid_text()), "it was granted: {text}");
+        assert!(granted_in(&text), "it was granted: {text}");
         // The stand-in: nobody may write its list (Everyone is denied WRITE_DAC, and an OWNER RIGHTS entry takes from its owner the right the owner has without one), though it can be read. It
         // is in a temp folder, which can still be emptied: the folder lets its owner delete what is in it.
         let at = text.find('(').unwrap();
@@ -858,7 +1003,7 @@ mod tests {
         assert!(read(&stand.file).grants.iter().any(|grant| sandbox::key(&grant.root) == sandbox::key(&first)), "it stays on the list");
         assert!(holds_grant(&a), "and the ACE is still where it could not be taken off");
         // (the person is told through what the start of the app does with it)
-        assert_eq!(sweep_file(&stand.file, &[]).1.len(), 1);
+        assert_eq!(sweep_file(&stand.file, &[], &[]).1.len(), 1);
         // Once what refused is gone, the next try takes back the rest and lets the grant go.
         std::fs::remove_file(&a).unwrap();
         let outcome = release(&stand.file, &first);
@@ -892,7 +1037,8 @@ mod tests {
         // And a second command does not walk the tree again: the grant is there already.
         assert_eq!(command(&first, "echo again> again.txt").0, Some(0));
         drop(chat);
-        wait_for("the grant to go once nothing uses it", || !holds_grant(&first) && !holds_grant(&first.join("again.txt")));
+        assert!(release(&stand.file, &first).done);
+        assert!(!holds_grant(&first) && !holds_grant(&first.join("again.txt")));
         std::fs::remove_dir(&link).unwrap();
         assert!(first.join("a.txt").is_file(), "the folder itself is there");
     }

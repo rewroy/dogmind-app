@@ -831,6 +831,8 @@ enum Note {
     ReadFolderProgress(u64),
     /// It has ended, with what to say of it, and whether that is a problem.
     ReadFolderDone(String, bool),
+    /// A workspace's grant for commands, begun when it was opened (`ready_folder`), has been given.
+    FolderReady(PathBuf),
     /// How many conversations and notes are changed, of how many.
     CryptProgress(usize, usize),
     CryptDone(CryptOutcome),
@@ -2332,6 +2334,9 @@ struct App {
     right_toggle: HWND,
     /// The title bar's button for the terminal panel, beside the one for the panel on the right.
     terminal_toggle: HWND,
+    /// The workspace whose grant for commands is being given, while it is (`ready_folder`), and the workspaces it has been given for in this run, by key.
+    readying: Option<PathBuf>,
+    readied: HashSet<String>,
     right_hits: Vec<(RECT, usize)>,
     /// What Windows sends when the taskbar comes back, and the tray has to be told again.
     taskbar_created: u32,
@@ -6056,8 +6061,9 @@ impl App {
         SendMessageW(self.note, EM_SETSEL, 0, 0);
     }
 
-    /// The folder's files for `@`, and its branch: on another thread, as a large tree takes a while.
-    unsafe fn look_at_workspace(&self) {
+    /// The folder's files for `@`, and its branch: on another thread, as a large tree takes a while. And its grant for commands, begun now (`ready_folder`).
+    unsafe fn look_at_workspace(&mut self) {
+        self.ready_folder(self.workspace.clone());
         let (poster, path) = (self.poster.clone(), self.workspace.clone());
         std::thread::spawn(move || {
             let files = dogmind_agent::tools::workspace_files(&path, 20000);
@@ -6430,6 +6436,25 @@ impl App {
         let efforts = self.efforts();
         let effort = efforts.iter().find(|(known, _)| *known == self.settings.effort.as_deref()).map_or("Default", |(_, name)| name);
         set_text_if_changed(self.effort_chip, &tf("Effort: {0}", &[&t(effort)]));
+    }
+
+    /// The write grant of a workspace for commands, begun when a session opens in it, on a thread of its own: Windows rewrites the list of everything in a folder to give it
+    /// (0.1 to 0.15 ms a thing: 49.6 s for one of 329,000), and a first command that gave it waited all that time. Begun here, it is mostly done before the model's first
+    /// command, which waits only for what is left; given once, it stays while the folder is on the person's list, and the next session finds it at once. Meanwhile the status
+    /// row says so.
+    unsafe fn ready_folder(&mut self, folder: PathBuf) {
+        let key = folder.to_string_lossy().to_lowercase();
+        if folder == Path::new(".") || !folder.is_dir() || !self.readied.insert(key) {
+            return;
+        }
+        self.readying = Some(folder.clone());
+        InvalidateRect(self.window, &self.status_area, 0);
+        let poster = self.poster.clone();
+        std::thread::spawn(move || {
+            // (what goes wrong is said by the command that needs it, which gives it again)
+            let _ = dogmind_agent::sandbox::ready_workspace(&folder);
+            poster.send(Note::FolderReady(folder));
+        });
     }
 
     unsafe fn update_status(&mut self) {
@@ -8920,16 +8945,29 @@ impl App {
         } else {
             Some(self.setup_status.as_str()).filter(|words| self.drafter_fetch.is_some() && !words.is_empty())
         };
+        // (while the workspace's grant for commands is being given: said beside what else is said, as it comes when the app or a session opens, often while it connects)
+        let readying = self.readying.as_ref().is_some_and(|folder| folder.to_string_lossy().eq_ignore_ascii_case(&self.workspace.to_string_lossy()));
         if !self.connected {
             let dot = s(ds::space::S);
             let color = if matches!(self.connection.as_str(), "not connected" | "no engine") { theme::bad() } else { theme::warn() };
             rounded(device, rect(x, middle - dot / 2, dot, dot), dot / 2, Some(color), None);
             x += dot + s(ds::space::S);
-            draw_text(device, t(self.connection.as_str()), RECT { left: x, right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+            let words = t(self.connection.as_str());
+            draw_text(device, words, RECT { left: x, right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+            if readying {
+                let after = x + text_width(self.fonts.small, words) + s(ds::space::L);
+                let tall = area.bottom - area.top;
+                icon::draw(device, "info", rect(after, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
+                draw_text(device, t("Getting the folder ready for commands…"), RECT { left: after + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(after), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+            }
         } else if let Some(words) = beside {
             let tall = area.bottom - area.top;
             icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
             draw_text(device, words, RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+        } else if readying {
+            let tall = area.bottom - area.top;
+            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
+            draw_text(device, t("Getting the folder ready for commands…"), RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
         } else if self.web_seen {
             let tall = area.bottom - area.top;
             icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::warn());
@@ -11006,7 +11044,8 @@ impl App {
             }
             let mut named = settings.workspaces.clone();
             named.extend(session::list(&data.join("sessions")).into_iter().map(|summary| summary.workspace));
-            dogmind_agent::workspace_grants::sweep(&data, &named);
+            // (nothing is kept: the app is leaving the PC)
+            dogmind_agent::workspace_grants::sweep(&data, &named, &[]);
             // (the list of what was given goes with the folder: what could not be taken back, the person hears of now)
             for folder in dogmind_agent::workspace_grants::still_granted(&data) {
                 problems.push(tf("{0} may still be open to commands: what was given could not be taken back.", &[&shown_path(&folder)]));
@@ -11360,7 +11399,16 @@ impl App {
     unsafe fn start_session(&mut self, folder: PathBuf) {
         self.park_if_working();
         self.queued_back_to_composer();
-        self.settings.use_workspace(folder.clone());
+        // (what falls off the list has what commands were given there taken back, off this thread)
+        let fallen = self.settings.use_workspace(folder.clone());
+        if !fallen.is_empty() {
+            let data = self.folder.clone();
+            std::thread::spawn(move || {
+                for gone in fallen {
+                    dogmind_agent::workspace_grants::forget(&data, &gone);
+                }
+            });
+        }
         self.settings.set_up = true;
         self.onboarding = false;
         self.save();
@@ -11891,11 +11939,12 @@ impl App {
     /// What earlier runs left writable, now that what this one uses is counted: the workspaces of the conversations are among what is counted, so it waits for the key.
     unsafe fn sweep_grants(&self) {
         let (data, mut named, poster) = (self.folder.clone(), self.settings.workspaces.clone(), self.poster.clone());
+        let listed = self.settings.workspaces.clone();
         std::thread::spawn(move || {
             named.extend(session::list(&data.join("sessions")).into_iter().map(|summary| summary.workspace));
             named.sort();
             named.dedup();
-            let left: Vec<String> = dogmind_agent::workspace_grants::sweep(&data, &named).iter().map(|folder| format!("{}: {}", folder.display(), t(dogmind_agent::workspace_grants::NOT_TAKEN_BACK))).collect();
+            let left: Vec<String> = dogmind_agent::workspace_grants::sweep(&data, &named, &listed).iter().map(|folder| format!("{}: {}", folder.display(), t(dogmind_agent::workspace_grants::NOT_TAKEN_BACK))).collect();
             if !left.is_empty() {
                 poster.send(Note::ReadFolderDone(left.join("\n"), true));
             }
@@ -14300,6 +14349,12 @@ impl App {
                 }
             }
             Note::CryptDone(outcome) => self.crypt_finished(outcome),
+            Note::FolderReady(folder) => {
+                if self.readying.as_ref() == Some(&folder) {
+                    self.readying = None;
+                    InvalidateRect(self.window, &self.status_area, 0);
+                }
+            }
             Note::ReadFolderDone(words, problem) => {
                 self.read_folder_work = None;
                 self.read_folder_said = (words, problem);
@@ -17867,12 +17922,13 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         // What earlier runs left writable, now that what this one uses is counted. (With the key to ask for, the conversations' workspaces are not known yet: after it.)
         if !crypt.sweep_due {
             let (data, mut named, poster) = (folder.clone(), saved.workspaces.clone(), poster.clone());
+            let listed = saved.workspaces.clone();
             std::thread::spawn(move || {
                 named.extend(session::list(&data.join("sessions")).into_iter().map(|summary| summary.workspace));
                 named.sort();
                 named.dedup();
                 // (a folder whose take-back left something behind stays on the list and is tried again at each start; the person is told, as they are of a folder they named for commands)
-                let left: Vec<String> = dogmind_agent::workspace_grants::sweep(&data, &named).iter().map(|folder| format!("{}: {}", folder.display(), t(dogmind_agent::workspace_grants::NOT_TAKEN_BACK))).collect();
+                let left: Vec<String> = dogmind_agent::workspace_grants::sweep(&data, &named, &listed).iter().map(|folder| format!("{}: {}", folder.display(), t(dogmind_agent::workspace_grants::NOT_TAKEN_BACK))).collect();
                 if !left.is_empty() {
                     poster.send(Note::ReadFolderDone(left.join("\n"), true));
                 }
@@ -18168,6 +18224,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             right_width: 0,
             right_toggle: make_button(window, ID_PANEL_TOGGLE, "panel-right", ButtonKind::Icon, theme::background()),
             terminal_toggle: make_button(window, ID_TERM_TOGGLE, "terminal", ButtonKind::Icon, theme::background()),
+            readying: None,
+            readied: HashSet::new(),
             right_hits: Vec::new(),
             please_quit: {
                 let name = wide("DogmindApp.PleaseQuit");

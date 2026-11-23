@@ -228,6 +228,9 @@ pub fn holds_a_key_itself(value: &str) -> bool {
     OPENINGS.iter().any(|opening| value.starts_with(opening)) || (value.chars().count() >= 24 && !value.contains('.'))
 }
 
+/// How many workspaces the list keeps: what commands were given in one that falls off it is taken back (`dogmind_agent::workspace_grants`).
+pub const WORKSPACES_KEPT: usize = 30;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -518,13 +521,14 @@ impl Settings {
         }
     }
 
-    /// Remembers a folder as the latest one.
-    pub fn use_workspace(&mut self, folder: PathBuf) {
+    /// Remembers a folder as the latest one. What falls off the end of the list, which keeps 30, for what commands were given there to be taken back.
+    pub fn use_workspace(&mut self, folder: PathBuf) -> Vec<PathBuf> {
         let same = |known: &PathBuf| known.to_string_lossy().to_lowercase() == folder.to_string_lossy().to_lowercase();
         self.workspaces.retain(|known| !same(known));
         self.workspaces.insert(0, folder.clone());
-        self.workspaces.truncate(30);
+        let fallen = self.workspaces.split_off(self.workspaces.len().min(WORKSPACES_KEPT));
         self.workspace = Some(folder);
+        fallen
     }
 
     /// Makes the provider of this kind the active one, with these details, adding it if there is none.
@@ -847,6 +851,18 @@ mod tests {
         settings.use_workspace(PathBuf::from("c:\\A"));
         assert_eq!(settings.workspaces, [PathBuf::from("c:\\A"), PathBuf::from("C:\\b")]);
         assert_eq!(settings.workspace, Some(PathBuf::from("c:\\A")));
+    }
+
+    /// What falls off the end of the list is said, for what commands were given there to be taken back; nothing else does.
+    #[test]
+    fn the_folder_that_falls_off_the_list_is_said() {
+        let mut settings = Settings::default();
+        for at in 0..WORKSPACES_KEPT {
+            assert!(settings.use_workspace(PathBuf::from(format!("C:\\w{at}"))).is_empty());
+        }
+        assert!(settings.use_workspace(PathBuf::from("C:\\w3")).is_empty(), "one already on it moves up");
+        assert_eq!(settings.use_workspace(PathBuf::from("C:\\new")), [PathBuf::from("C:\\w0")]);
+        assert_eq!(settings.workspaces.len(), WORKSPACES_KEPT);
     }
 
     #[test]

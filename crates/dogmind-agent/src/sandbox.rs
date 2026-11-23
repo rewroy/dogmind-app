@@ -543,10 +543,10 @@ unsafe impl Send for Sid {}
 unsafe impl Sync for Sid {}
 
 /// A SID made from its text, freed with it.
-struct OwnedSid(PSID);
+pub(crate) struct OwnedSid(pub(crate) PSID);
 
 impl OwnedSid {
-    unsafe fn from_text(text: &str) -> Result<OwnedSid, String> {
+    pub(crate) unsafe fn from_text(text: &str) -> Result<OwnedSid, String> {
         let mut sid: PSID = std::ptr::null_mut();
         if ConvertStringSidToSidW(wide(text).as_ptr(), &mut sid) == 0 {
             return Err(last_error("a workspace's SID"));
@@ -560,6 +560,93 @@ impl Drop for OwnedSid {
         // SAFETY: a SID that ConvertStringSidToSidW allocated for this value.
         unsafe { LocalFree(self.0 as HLOCAL) };
     }
+}
+
+/// The write grant of a workspace, given ahead of its first command: when the person opens it, on a thread of the app's, as Windows takes a while over a large folder (it
+/// rewrites the list of everything in it, 0.1 to 0.15 ms a thing). A command waits for it to be done (`workspace_grants::before_grant`), and finds it given. A folder that has
+/// it already, as one kept on the person's list does from the first time, takes a look at its list and no more.
+pub fn ready_workspace(workspace: &Path) -> Result<(), String> {
+    if in_a_container() {
+        return Ok(());
+    }
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let root = writable_root(workspace, workspace, home.as_deref())?;
+    // SAFETY: the capability lives as long as the process, and the call below is given nothing else.
+    unsafe {
+        let capability = workspace_capability(&root)?;
+        let _one = crate::workspace_grants::before_grant(&root, capability)?;
+        grant(&root, capability, READ_WRITE_EXECUTE, true)
+    }
+}
+
+/// An earlier grant to `old` on this folder moved to `new`: one out and the other in, in one write of the folder's list that Windows hands down to all under it, as when a
+/// grant is given. One walk of the tree, where taking one back and giving the other would be two.
+pub(crate) unsafe fn move_grant(root: &Path, old: PSID, new: PSID) -> Result<(), String> {
+    let name = wide_path(root);
+    let (mut list, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
+    let read = GetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), &mut list, std::ptr::null_mut(), &mut descriptor);
+    if read != 0 {
+        return Err(format!("{}: its access list cannot be read (error {read})", root.display()));
+    }
+    let mut access: [EXPLICIT_ACCESS_W; 2] = std::mem::zeroed();
+    for (entry, (sid, mode)) in access.iter_mut().zip([(old, REVOKE_ACCESS), (new, GRANT_ACCESS)]) {
+        entry.grfAccessPermissions = READ_WRITE_EXECUTE;
+        entry.grfAccessMode = mode;
+        entry.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        entry.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        entry.Trustee.ptstrName = sid as *mut u16;
+    }
+    let mut changed: *mut ACL = std::ptr::null_mut();
+    let merged = SetEntriesInAclW(2, access.as_ptr(), list, &mut changed);
+    let written = if merged != 0 { merged } else { SetNamedSecurityInfoW(name.as_ptr() as *mut u16, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), changed, std::ptr::null()) };
+    if !changed.is_null() {
+        LocalFree(changed as HLOCAL);
+    }
+    LocalFree(descriptor as HLOCAL);
+    if written != 0 {
+        return Err(format!("{}: the grant could not be moved (error {written})", root.display()));
+    }
+    Ok(())
+}
+
+/// What a command run in the container in this workspace is given besides the container, and what the workspace's write grant is to: a capability of the workspace's own,
+/// made from the app's name and the folder's key. Every command runs in the one container, whose SID has what all of them read (the toolchains, the bundled tools, the app's
+/// records, the folders the person opened, the way through the folders above); the write grant on a workspace is to its capability, which no command of another
+/// workspace has, so a grant can stay on a workspace for as long as the person keeps it on their list (`workspace_grants`) and another workspace's commands can neither write
+/// nor read there. A container's grant was taken back whenever a workspace went out of use, and given again with its first command next time: Windows rewrites the list of
+/// everything under a folder for each, 0.1 to 0.15 ms a thing, and a first command waited 49.6 s for a workspace of 329,000.
+pub(crate) unsafe fn workspace_capability(root: &Path) -> Result<PSID, String> {
+    static MADE: Mutex<Option<HashMap<String, Sid>>> = Mutex::new(None);
+    let place = key(&real(root));
+    let mut made = MADE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let made = made.get_or_insert_with(HashMap::new);
+    if let Some(sid) = made.get(&place) {
+        return Ok(sid.0);
+    }
+    let name = wide(&capability_name(&place));
+    let (mut groups, mut group_count, mut capabilities, mut capability_count): (*mut PSID, u32, *mut PSID, u32) = (std::ptr::null_mut(), 0, std::ptr::null_mut(), 0);
+    if DeriveCapabilitySidsFromName(name.as_ptr(), &mut groups, &mut group_count, &mut capabilities, &mut capability_count) == 0 || capability_count == 0 {
+        return Err(last_error("a workspace's capability"));
+    }
+    // (the group SIDs that come with it are a service's, and of no use here: they go, and the capability is kept for the process)
+    for at in 0..group_count as usize {
+        LocalFree(*groups.add(at) as HLOCAL);
+    }
+    LocalFree(groups as HLOCAL);
+    let capability = *capabilities;
+    for at in 1..capability_count as usize {
+        LocalFree(*capabilities.add(at) as HLOCAL);
+    }
+    LocalFree(capabilities as HLOCAL);
+    made.insert(place, Sid(capability));
+    Ok(capability)
+}
+
+/// The name a workspace's capability is made from: the container's, and a hash of the folder's key that stays the same from one version of the app to the next.
+fn capability_name(place: &str) -> String {
+    let hash = place.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3));
+    format!("{PROFILE}.Workspace.{hash:016x}")
 }
 
 /// The SID a workspace's commands that run with a restricted token write as ([`restricted_token`]): a random one in the form of a domain account's, made once for
@@ -1107,7 +1194,7 @@ unsafe fn account_name(sid: PSID) -> Option<String> {
 }
 
 /// A SID as its text (S-1-...); empty if the system cannot say it.
-unsafe fn sid_text(sid: PSID) -> String {
+pub(crate) unsafe fn sid_text(sid: PSID) -> String {
     let mut text: *mut u16 = std::ptr::null_mut();
     if ConvertSidToStringSidW(sid, &mut text) == 0 || text.is_null() {
         return String::new();
@@ -1146,14 +1233,23 @@ pub(crate) fn forget_grants() {
     *GRANTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
+/// Whether what is under an object follows its list when `limit_to` writes it: never, always, or the first time the SID is put on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    No,
+    Yes,
+    WhenNew,
+}
+
 /// This object's list, with exactly this for the container and nothing else for it, keeping its own list from now on. Windows does not honour a deny ACE for a container's SID: what
-/// keeps a container out is not being let in. `walk`: what is under it follows.
-unsafe fn limit_to(root: &Path, path: &Path, sid: PSID, keep: &[(u32, u8)], walk: bool) -> Result<(), String> {
+/// keeps a container out is not being let in.
+unsafe fn limit_to(root: &Path, path: &Path, sid: PSID, keep: &[(u32, u8)], walk: Walk) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
     let dacl = Dacl::read(path)?;
     let has = dacl.aces.iter().filter(|ace| Dacl::is_allowed_for(ace, sid)).count();
+    let walk = walk == Walk::Yes || (walk == Walk::WhenNew && has == 0);
     if dacl.protected() && has == keep.len() && keep.iter().all(|(mask, flags)| dacl.has_exact(sid, *mask, *flags)) {
         return Ok(());
     }
@@ -1199,7 +1295,7 @@ pub(crate) unsafe fn guard_repository(root: &Path, git: &Path, sid: PSID) -> Res
     refuse_links(&[git, &git.join("config"), &git.join("hooks")])?;
     // A worktree's or a submodule's: one line, which says where git's folder is. A command that rewrites it has a repository of its own making, hooks and all.
     if !what.is_dir() {
-        return limit_to(root, git, sid, &[(READ_EXECUTE, 0)], false);
+        return limit_to(root, git, sid, &[(READ_EXECUTE, 0)], Walk::No);
     }
     // In a repository's own `.git` this has no business: only a worktree's folder under `worktrees` has one. It tells git to read its config and hooks from wherever it says, past all of this.
     // Taken away before each command: the folder has to stay open for git's own new files, so nothing can stop it being made.
@@ -1208,9 +1304,11 @@ pub(crate) unsafe fn guard_repository(root: &Path, git: &Path, sid: PSID) -> Res
         return Err(format!("{} would send git elsewhere for its config, and could not be taken away: no command is run until it has been", elsewhere.display()));
     }
     let everything = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
-    limit_to(root, git, sid, &[(READ_WRITE_EXECUTE & !DELETE, 0), (READ_WRITE_EXECUTE, everything | INHERIT_ONLY_ACE as u8)], false)?;
-    limit_to(root, &git.join("config"), sid, &[(READ_EXECUTE, 0)], false)?;
-    limit_to(root, &git.join("hooks"), sid, &[(READ_EXECUTE, everything)], true)
+    // (handed down to what is in it the first time it is guarded for this SID: a workspace inside another has a capability of its own, and what the folder held had only the
+    // other's, given by that one's grant before the folder kept its own list; the inner workspace's grant does not reach into a list kept to itself, and git there found nothing)
+    limit_to(root, git, sid, &[(READ_WRITE_EXECUTE & !DELETE, 0), (READ_WRITE_EXECUTE, everything | INHERIT_ONLY_ACE as u8)], Walk::WhenNew)?;
+    limit_to(root, &git.join("config"), sid, &[(READ_EXECUTE, 0)], Walk::No)?;
+    limit_to(root, &git.join("hooks"), sid, &[(READ_EXECUTE, everything)], Walk::Yes)
 }
 
 /// How far under the workspace a repository is looked for. A hook in one deeper or in what is skipped runs only for a person who goes there and uses git.
@@ -1613,8 +1711,8 @@ unsafe fn guard_with_what_it_leads_to(root: &Path, git: &Path, sid: PSID) -> Res
             } else {
                 refuse_links(&[&folder, &folder.join("config"), &folder.join("hooks")])?;
                 let everything = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
-                limit_to(root, &folder.join("config"), sid, &[(READ_EXECUTE, 0)], false)?;
-                limit_to(root, &folder.join("hooks"), sid, &[(READ_EXECUTE, everything)], true)?;
+                limit_to(root, &folder.join("config"), sid, &[(READ_EXECUTE, 0)], Walk::No)?;
+                limit_to(root, &folder.join("hooks"), sid, &[(READ_EXECUTE, everything)], Walk::Yes)?;
             }
         }
     }
@@ -1766,13 +1864,14 @@ pub fn take_timings() -> Vec<Timings> {
     std::mem::take(&mut *TIMINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
 }
 
-unsafe fn prepare(workspace: &Path, sid: PSID, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
+/// `sid` is the container's, `writer` the workspace's capability (`workspace_capability`).
+unsafe fn prepare(workspace: &Path, sid: PSID, writer: PSID, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
     let began = Instant::now();
-    grant(workspace, sid, READ_WRITE_EXECUTE, true)?;
+    grant(workspace, writer, READ_WRITE_EXECUTE, true)?;
     times.grant += began.elapsed();
     // Each repository in the workspace. If one cannot be guarded the command does not run, as with any other containment.
     let began = Instant::now();
-    let looked = look_after_repositories(workspace, sid, Look::BeforeACommand);
+    let looked = look_after_repositories(workspace, writer, Look::BeforeACommand);
     times.repos += began.elapsed();
     *disarmed = looked.said;
     if let Some(refusal) = looked.refused {
@@ -2114,17 +2213,21 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         let sid = profile_sid()?;
         // (a restricted token's command writes as its workspace's own SID, and is given what it writes and what is guarded as that SID: see `restricted_token`)
         let writer = if token == Token::Restricted && !nested { Some(OwnedSid::from_text(&workspace_sid_text(&root))?) } else { None };
-        let grantee = writer.as_ref().map_or(sid, |writer| writer.0);
+        // (a command in the container writes as its workspace's capability, and is given that besides the container: see `workspace_capability`)
+        let capability = if token == Token::Container && !nested { Some(workspace_capability(&root)?) } else { None };
+        // (what the workspace's grant and its guards are to; the desktop and the rest are the container's, or the restricted token's own SID)
+        let grantee = writer.as_ref().map(|writer| writer.0).or(capability).unwrap_or(sid);
+        let runner = writer.as_ref().map_or(sid, |writer| writer.0);
         let temp = if nested { std::env::var_os("TEMP").map(PathBuf::from) } else { profile_folder(sid) };
         let mut disarmed = Vec::new();
         let mut times = Timings::default();
         // (as the person, nothing is to be granted: it can do what they can)
         if token != Token::Person && !nested {
-            let _one = crate::workspace_grants::before_grant(&root)?;
+            let _one = crate::workspace_grants::before_grant(&root, grantee)?;
             if let Some(writer) = &writer {
                 prepare_restricted(&root, writer.0, temp.as_deref(), &mut disarmed, &mut times)?;
             } else {
-                prepare(&root, sid, &mut disarmed, &mut times)?;
+                prepare(&root, sid, grantee, &mut disarmed, &mut times)?;
                 // (a file held out of a folder commands can read, saved anew since by an editor, inherited what the folder gives: it is held out again before this command can read it)
                 if let Some(folder) = crate::workspace_grants::data_folder() {
                     crate::read_folders::hold_out_again(&crate::read_folders::file_in(&folder));
@@ -2174,7 +2277,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         if (!nested || ui_limits == 0) && SetInformationJobObject(job.0, JobObjectBasicUIRestrictions, std::ptr::addr_of!(ui).cast(), std::mem::size_of_val(&ui) as u32) == 0 {
             return Err(last_error("the limits on what it can do to the screen"));
         }
-        let desktop = if nested { None } else { Some(Desktop::new(grantee)?) };
+        let desktop = if nested { None } else { Some(Desktop::new(runner)?) };
         // (what runs in a container of the app's own is given that container and its capabilities; in a container already, it is in that one)
         let contained = token == Token::Container && !nested;
 
@@ -2189,7 +2292,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
                 capability_sids.push(capability);
             }
         }
-        let mut capabilities: Vec<SID_AND_ATTRIBUTES> = capability_sids.iter().map(|&capability| SID_AND_ATTRIBUTES { Sid: capability, Attributes: SE_GROUP_ENABLED as u32 }).collect();
+        let mut capabilities: Vec<SID_AND_ATTRIBUTES> = capability_sids.iter().chain(capability.iter().filter(|_| contained)).map(|&capability| SID_AND_ATTRIBUTES { Sid: capability, Attributes: SE_GROUP_ENABLED as u32 }).collect();
         let security = SECURITY_CAPABILITIES { AppContainerSid: sid, Capabilities: if capabilities.is_empty() { std::ptr::null_mut() } else { capabilities.as_mut_ptr() }, CapabilityCount: capabilities.len() as u32, Reserved: 0 };
         let handles = [input.0, out_write.0, err_write.0];
         let jobs = [job.0];

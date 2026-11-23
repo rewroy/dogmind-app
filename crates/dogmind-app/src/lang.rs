@@ -1348,6 +1348,7 @@ const JA: &[(&str, &str)] = &[
     ("Close the terminal", "ターミナルを閉じる"),
     ("Open the terminal under the conversation", "会話の下にターミナルを開きます"),
     ("Show or hide the terminal", "ターミナルの表示を切り替える"),
+    ("Getting the folder ready for commands…", "フォルダーをコマンド用に準備しています…"),
     ("Exited with code {0}", "終了コード {0} で終了しました"),
     ("Exited with code 0x{0}", "終了コード 0x{0} で終了しました"),
     ("{0} terminals are open: close one to open another.", "ターミナルが {0} 個開いています。新しく開くには、どれかを閉じてください。"),
