@@ -18,6 +18,8 @@ pub mod conversation_key;
 pub mod conversion;
 pub mod http;
 #[cfg(test)]
+mod test_net;
+#[cfg(test)]
 mod in_container;
 pub mod images;
 pub mod llm;

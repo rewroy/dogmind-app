@@ -8632,27 +8632,34 @@ Body").unwrap();
         Waits { quiet_restart: quiet, server_every: Duration::from_millis(50), server_most: Duration::from_secs(60), ..short_waits(bound) }
     }
 
-    /// A server as `routed`'s that stops listening once it has answered `posts` requests for an answer, for `down` (connections refused, as nothing is there), and then
-    /// listens on the same port again: a server stopped and started again, which says nothing in between.
-    fn routed_with_a_stop(answer: impl Fn(&str, &str, usize) -> (u16, &'static str, String) + Send + Sync + 'static, posts: usize, down: Duration)
-                          -> (Client, Arc<Mutex<Vec<String>>>) {
+    /// Close the listener after the first completed POST. Tests observe the close, then decide when it may listen again.
+    fn routed_with_a_stop(answer: impl Fn(&str, &str, usize) -> (u16, &'static str, String) + Send + Sync + 'static)
+                          -> (Client, Receiver<()>, Sender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
-        let (answer, seen) = (Arc::new(answer), Arc::new(Mutex::new(Vec::<String>::new())));
-        let kept = seen.clone();
+        let answer = Arc::new(answer);
+        let answered = Arc::new(AtomicBool::new(false));
+        let (tell_stopped, stopped) = channel();
+        let (resume, await_resume) = channel();
         let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         std::thread::spawn(move || {
             let (mut listener, mut stopped) = (Some(listener), false);
             loop {
-                let posted = kept.lock().unwrap().iter().filter(|line| line.starts_with("POST")).count();
-                if !stopped && posted >= posts && open.load(Ordering::SeqCst) == 0 {
+                if !stopped && answered.load(Ordering::SeqCst) && open.load(Ordering::SeqCst) == 0 {
                     stopped = true;
                     drop(listener.take());
-                    std::thread::sleep(down);
-                    let again = TcpListener::bind(("127.0.0.1", port)).unwrap();
+                    let (paused, _) = crate::test_net::bound_loopback(port);
+                    if tell_stopped.send(()).is_err() || await_resume.recv().is_err() {
+                        return;
+                    }
+                    paused.listen(128).unwrap();
+                    let again = TcpListener::from(paused);
                     again.set_nonblocking(true).unwrap();
                     listener = Some(again);
+                }
+                if matches!(await_resume.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)) {
+                    return;
                 }
                 let Some(listening) = listener.as_ref() else { return };
                 let mut stream = match listening.accept() {
@@ -8664,7 +8671,7 @@ Body").unwrap();
                     Err(_) => return,
                 };
                 stream.set_nonblocking(false).unwrap();
-                let (answer, kept, open) = (answer.clone(), kept.clone(), open.clone());
+                let (answer, answered, open) = (answer.clone(), answered.clone(), open.clone());
                 open.fetch_add(1, Ordering::SeqCst);
                 std::thread::spawn(move || {
                     let (mut request, mut block) = (Vec::new(), [0u8; 65536]);
@@ -8690,12 +8697,14 @@ Body").unwrap();
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                     while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
                     // (counted once it is answered and closed: the stop comes after the answer, as a server that is stopped between two messages)
-                    kept.lock().unwrap().push(format!("{method} {path}"));
+                    if method == "POST" {
+                        answered.store(true, Ordering::SeqCst);
+                    }
                     open.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
-        (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), seen)
+        (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), stopped, resume)
     }
 
     /// The Homelab's DeepSeek, stopped and started again between two messages: nothing listened for a while, and the turn failed in 24 s of retries. A server that answered
@@ -8704,12 +8713,11 @@ Body").unwrap();
     fn a_server_that_answered_and_then_refuses_is_waited_for_and_the_request_goes_when_it_listens_again() {
         let dir = crate::in_container::tempdir().unwrap();
         let answers = std::sync::atomic::AtomicUsize::new(0);
-        let (client, seen) = routed_with_a_stop(move |method, path, _| match (method, path) {
+        let (client, stopped, resume) = routed_with_a_stop(move |method, path, _| match (method, path) {
             ("POST", _) => (200, "text/event-stream", text_answer(if answers.fetch_add(1, Ordering::SeqCst) == 0 { "one" } else { "two" })),
             ("GET", "/health") => (200, "application/json", r#"{"status": "ok"}"#.to_string()),
             _ => (404, "application/json", "{}".to_string()),
-        // (longer than Windows tries a refused connection for, some 2 s: a server back before that is never seen refusing)
-        }, 1, Duration::from_secs(5));
+        });
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Waits(quiet_waits(Duration::from_secs(60), Duration::from_secs(20)))).unwrap();
         let turn = |text: &str| {
@@ -8717,7 +8725,10 @@ Body").unwrap();
             let (mut content, mut waiting) = (String::new(), Vec::new());
             loop {
                 match run.events.recv_timeout(Duration::from_secs(30)).expect("the turn ended") {
-                    Event::ServerRestarting(progress) => waiting.push(progress),
+                    Event::ServerRestarting(progress) => {
+                        waiting.push(progress);
+                        resume.send(()).unwrap();
+                    }
                     Event::Content(text) => content.push_str(&text),
                     Event::Failed(text) => panic!("the turn failed: {text}"),
                     Event::TurnEnded { cancelled } => {
@@ -8730,10 +8741,7 @@ Body").unwrap();
         };
         assert_eq!(turn("hello"), ("one".to_string(), Vec::new()));
         // (the server stops once the answer is closed: the next message finds nothing listening)
-        while seen.lock().unwrap().iter().filter(|line| line.starts_with("POST")).count() < 1 {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::thread::sleep(Duration::from_millis(200));
+        stopped.recv_timeout(Duration::from_secs(30)).expect("server stopped listening");
         let (content, waiting) = turn("again");
         assert_eq!(content, "two");
         assert_eq!(waiting, vec![Value::Null], "the wait is shown, once, as a restart's with nothing said of its loading");
@@ -8749,14 +8757,14 @@ Body").unwrap();
     #[test]
     fn a_refusing_server_that_stays_away_is_given_up_and_one_that_never_answered_is_not_waited_for() {
         let dir = crate::in_container::tempdir().unwrap();
-        let (client, _) = routed_with_a_stop(|method, path, _| match (method, path) {
+        let (client, stopped, _resume) = routed_with_a_stop(|method, path, _| match (method, path) {
             ("POST", _) => (200, "text/event-stream", text_answer("one")),
             _ => (404, "application/json", "{}".to_string()),
-        }, 1, Duration::from_secs(600));
+        });
         // (the events up to the `retries`-th retry, then the person's Stop: how many times the wait was shown, and the retries' reasons)
         let until_retries = |run: &Run, text: &str, retries: usize| {
             run.handle.commands.send(Command::Send(text.into())).unwrap();
-            let (mut waiting, mut why) = (0, Vec::new());
+            let (mut waiting, mut why, mut content) = (0, Vec::new(), String::new());
             loop {
                 match run.events.recv_timeout(Duration::from_secs(60)).expect("the turn ended") {
                     Event::ServerRestarting(_) => waiting += 1,
@@ -8766,23 +8774,24 @@ Body").unwrap();
                             run.handle.cancel.store(true, Ordering::Relaxed);
                         }
                     }
-                    Event::TurnEnded { .. } => return (waiting, why),
+                    Event::Content(part) => content.push_str(&part),
+                    Event::TurnEnded { .. } => return (waiting, why, content),
                     _ => {}
                 }
             }
         };
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Waits(quiet_waits(Duration::from_secs(60), Duration::from_millis(400)))).unwrap();
-        assert_eq!(until_retries(&run, "hello", 1), (0, Vec::new()), "answered");
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(until_retries(&run, "again", 2), (1, vec!["transient".to_string(), "transient".to_string()]), "waited for once in the turn, then the retries as before");
+        assert_eq!(until_retries(&run, "hello", 1), (0, Vec::new(), "one".into()), "answered");
+        stopped.recv_timeout(Duration::from_secs(30)).expect("server stopped listening");
+        assert_eq!(until_retries(&run, "again", 2), (1, vec!["transient".to_string(), "transient".to_string()], String::new()), "waited for once in the turn, then the retries as before");
         let lines = trajectory_of(&run);
         assert!(of_kind(&lines, "intervention").iter().any(|line| line["kind"] == "server_restart_wait" && line["outcome"] == "gave_up"), "{lines:?}");
         // A conversation of its own, with a server that is not there: no wait.
-        let gone = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (_reserved, gone) = crate::test_net::bound_loopback(0);
         let dir = crate::in_container::tempdir().unwrap();
         let run = run_agent(dir.path(), Client::new(&format!("http://127.0.0.1:{gone}/v1"), None).unwrap(), Mode::Default);
-        assert_eq!(until_retries(&run, "hello", 1), (0, vec!["transient".to_string()]));
+        assert_eq!(until_retries(&run, "hello", 1), (0, vec!["transient".to_string()], String::new()));
     }
 
     /// A server that answered and then stayed away past the turn's time for it: the turn fails, the person is told the session waits for the server, the wait is listed,
@@ -8791,12 +8800,11 @@ Body").unwrap();
     fn a_turn_that_failed_as_the_server_stayed_away_goes_on_by_itself_when_it_is_back() {
         let dir = crate::in_container::tempdir().unwrap();
         let answers = std::sync::atomic::AtomicUsize::new(0);
-        // (away for longer than the turn's wait and its three retries, some 20 s with the refused connections Windows tries for 2 s each)
-        let (client, seen) = routed_with_a_stop(move |method, path, _| match (method, path) {
+        let (client, stopped, resume) = routed_with_a_stop(move |method, path, _| match (method, path) {
             ("POST", _) => (200, "text/event-stream", text_answer(if answers.fetch_add(1, Ordering::SeqCst) == 0 { "one" } else { "back" })),
             ("GET", "/health") => (200, "application/json", r#"{"status": "ok"}"#.to_string()),
             _ => (404, "application/json", "{}".to_string()),
-        }, 1, Duration::from_secs(30));
+        });
         let run = run_agent(dir.path(), client, Mode::Default);
         run.handle.commands.send(Command::Waits(quiet_waits(Duration::from_secs(60), Duration::from_millis(400)))).unwrap();
         run.handle.commands.send(Command::Send("hello".into())).unwrap();
@@ -8806,10 +8814,7 @@ Body").unwrap();
             }
         }
         // (the server stops once the answer is closed: the next message finds nothing listening)
-        while seen.lock().unwrap().iter().filter(|line| line.starts_with("POST")).count() < 1 {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::thread::sleep(Duration::from_millis(200));
+        stopped.recv_timeout(Duration::from_secs(30)).expect("server stopped listening");
         run.handle.commands.send(Command::Send("again".into())).unwrap();
         let (mut failed, mut told, mut listed, mut woken, mut content) = (Vec::new(), Vec::new(), false, Vec::new(), String::new());
         let mut ended = 0;
@@ -8817,7 +8822,10 @@ Body").unwrap();
             match run.events.recv_timeout(Duration::from_secs(90)).expect("the turns ended") {
                 Event::Failed(text) => failed.push(text),
                 Event::Notice(text) => told.push(text),
-                Event::Waiting(waiting) => listed |= waiting.waits.iter().any(|wait| wait.note == background::SERVER_WAIT_NOTE),
+                Event::Waiting(waiting) if !listed && waiting.waits.iter().any(|wait| wait.note == background::SERVER_WAIT_NOTE) => {
+                    listed = true;
+                    resume.send(()).unwrap();
+                }
                 Event::Woken(wakes) => woken.extend(wakes),
                 Event::Content(text) if ended == 1 => content.push_str(&text),
                 Event::TurnEnded { .. } => ended += 1,
@@ -9003,7 +9011,7 @@ Body").unwrap();
         assert_eq!(ask(500, "text/plain", "oops"), llm::Restart::Unknown);
         assert_eq!(ask(200, "application/json", r#"{"status": "error"}"#), llm::Restart::Unknown);
         // (nothing listens)
-        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (_reserved, port) = crate::test_net::bound_loopback(0);
         let gone = Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap();
         assert_eq!(llm::Provider::restart(&gone, &AtomicBool::new(false)), llm::Restart::Silent);
     }

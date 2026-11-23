@@ -1948,7 +1948,7 @@ mod tests {
     /// The app's own engine: nothing listening there is said at once. A person's own server on this machine is asked again, as any server is: it may be on its way back.
     #[test]
     fn no_listener_here_is_no_use_asking_again_and_says_nothing_of_the_socket() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (_reserved, port) = crate::test_net::bound_loopback(0);
         let client = Client { own_engine: true, ..Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap() };
         let cancel = AtomicBool::new(false);
         let request = Request { model: "m", messages: &[], tools: None, effort: None, images: None, japanese_letters: false, request_id: None };
