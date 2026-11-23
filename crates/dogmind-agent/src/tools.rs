@@ -1588,10 +1588,16 @@ const HEAVY: [&str; 6] = ["node_modules", ".venv", "__pycache__", ".mypy_cache",
 
 /// `deep`: going down through folders. A folder named as the place to look is looked in, and one level shows what is there.
 pub(crate) fn walker(root: &Path, deep: bool) -> ignore::WalkBuilder {
+    walker_matching(root, deep, None)
+}
+
+/// Apply the search glob after the walker's ignore rules. An override on the walker would restore ignored files.
+fn walker_matching(root: &Path, deep: bool, glob: Option<ignore::overrides::Override>) -> ignore::WalkBuilder {
     let mut walk = ignore::WalkBuilder::new(root);
     walk.hidden(false).filter_entry(move |entry| {
         let name = entry.file_name();
         name != ".git" && !(deep && entry.depth() > 0 && HEAVY.iter().any(|heavy| name == *heavy))
+            && !glob.as_ref().is_some_and(|glob| glob.matched(entry.path(), entry.file_type().is_some_and(|kind| kind.is_dir())).is_ignore())
     });
     walk
 }
@@ -1789,12 +1795,14 @@ fn search_files(arguments: &Value, workspace: &Path, secrets_besides: &[PathBuf]
         })
     }.map_err(|error| error.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(arguments.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(30).clamp(1, 300));
-    let mut walk = walker(&root, true);
-    if let Some(glob) = arguments.get("file_glob").and_then(Value::as_str) {
-        let mut overrides = ignore::overrides::OverrideBuilder::new(&root);
-        overrides.add(glob).map_err(|error| format!("file_glob: {error}"))?;
-        walk.overrides(overrides.build().map_err(|error| format!("file_glob: {error}"))?);
-    }
+    let glob = if let Some(pattern) = arguments.get("file_glob").and_then(Value::as_str) {
+        let mut builder = ignore::overrides::OverrideBuilder::new(&root);
+        builder.add(pattern).map_err(|error| format!("file_glob: {error}"))?;
+        Some(builder.build().map_err(|error| format!("file_glob: {error}"))?)
+    } else {
+        None
+    };
+    let walk = walker_matching(&root, true, glob);
     let mut out = note.to_string();
     let (mut matches, mut stopped, mut secrets) = (0usize, "", 0usize);
     for entry in walk.build().flatten() {
@@ -5572,6 +5580,27 @@ mod tests {
         assert!(!glob.contains("a.rs") && glob.contains("b.txt"), "{glob}");
         let bad = bench.run("search_files", &json!({"pattern": "fn(x"}), dir.path(), &cancel).unwrap();
         assert!(bad.contains("searched as literal") && bad.contains("a.rs:2:"), "{bad}");
+    }
+
+    #[test]
+    fn a_search_glob_filters_the_files_left_by_gitignore() {
+        let (dir, mut bench, cancel) = bench();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "generated.json\ncache/\n").unwrap();
+        for folder in ["cache", "notes"] {
+            std::fs::create_dir(root.join(folder)).unwrap();
+        }
+        for path in ["config.json", "generated.json", "cache/copy.json", "notes/item.json", "notes/item.txt"] {
+            std::fs::write(root.join(path), "match").unwrap();
+        }
+        let mut search = |path, glob| bench.run("search_files", &json!({"path":path, "pattern":"match", "file_glob":glob}), root, &cancel).unwrap();
+        let json = search(".", "*.json");
+        assert!(json.contains("config.json") && json.contains("notes/item.json"), "{json}");
+        assert!(!json.contains("generated.json") && !json.contains("copy.json") && !json.contains("item.txt"), "{json}");
+        let remaining = search(".", "!notes/");
+        assert!(remaining.contains("config.json") && !remaining.contains("notes/") && !remaining.contains("generated.json"), "{remaining}");
+        assert!(search("generated.json", "*.json").contains(":1:match"));
     }
 
     #[test]
