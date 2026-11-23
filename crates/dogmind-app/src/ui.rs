@@ -1098,6 +1098,22 @@ struct TrajectoryPage {
     summary: dogmind_agent::trajectory_report::Summary,
     open: std::collections::BTreeSet<u64>,
     rows: Vec<crate::trajectory::Row>,
+    across: i32,
+    content_width: Option<i32>,
+}
+
+impl TrajectoryPage {
+    unsafe fn columns(&self, font: HFONT) -> ([(i32, i32); 6], i32) {
+        let headings = std::array::from_fn(|i| text_width(font, &self.rows[0].cells[i]));
+        crate::trajectory::column_bounds(text_width(font, "0").max(1), headings)
+    }
+
+    /// Measure the open rows only when the person first scrolls across this table.
+    unsafe fn measure_width(&self, font: HFONT) -> i32 {
+        let (_, notes) = self.columns(font);
+        let widest = self.rows.iter().filter(|row| !row.note.is_empty()).map(|row| text_width(font, &row.note)).max().unwrap_or(0);
+        notes + widest
+    }
 }
 
 /// The model's question that waits for the person: where the answer goes, the question as it was asked, and the card that shows it.
@@ -9754,7 +9770,7 @@ impl App {
     unsafe fn show_trajectory(&mut self, summary: dogmind_agent::trajectory_report::Summary) {
         let open = std::collections::BTreeSet::new();
         let rows = crate::trajectory::rows(&summary, &open);
-        self.trajectory = Some(TrajectoryPage { summary, open, rows });
+        self.trajectory = Some(TrajectoryPage { summary, open, rows, across: 0, content_width: None });
         self.diff_scroll = 0;
         self.set_panel(Panel::Diff);
     }
@@ -9766,6 +9782,7 @@ impl App {
             page.open.insert(turn);
         }
         page.rows = crate::trajectory::rows(&page.summary, &page.open);
+        page.content_width = (page.across > 0).then(|| page.measure_width(self.fonts.code));
         self.clamp_diff();
         InvalidateRect(self.diff_view, std::ptr::null(), 0);
     }
@@ -9833,19 +9850,27 @@ impl App {
         self.copy_to_clipboard(&text.join("\r\n"));
     }
 
-    /// Sideways, as far as the longest line of the file wants and no further.
+    /// Sideways, bounded by the displayed table or file.
     unsafe fn diff_sideways(&mut self, steps: i32) {
         let room = child_area(self.diff_view, self.window).2;
-        // (what goes before a line's words, as near as it matters here)
-        let most = (diffview::longest(&self.diff_rows) as i32 * text_width(self.fonts.code, "0") + scale(self.dpi, 100) - room).max(0);
-        self.diff_across = (self.diff_across + steps * 2 * scale(self.dpi, ds::space::XXL)).clamp(0, most);
+        let step = steps * 2 * scale(self.dpi, ds::space::XXL);
+        if let Some(page) = &mut self.trajectory {
+            let width = page.content_width.unwrap_or_else(|| page.measure_width(self.fonts.code));
+            page.content_width = Some(width);
+            let most = (width + scale(self.dpi, ds::space::M) - room).max(0);
+            page.across = (page.across.min(most) + step).clamp(0, most);
+        } else {
+            // (what goes before a line's words, as near as it matters here)
+            let most = (diffview::longest(&self.diff_rows) as i32 * text_width(self.fonts.code, "0") + scale(self.dpi, 100) - room).max(0);
+            self.diff_across = (self.diff_across + step).clamp(0, most);
+        }
         InvalidateRect(self.diff_view, std::ptr::null(), 0);
     }
 
     /// Up and down, or with Shift across what is too long for the window.
     unsafe fn diff_wheel(&mut self, wparam: WPARAM) {
         let notches = i32::from(((wparam >> 16) & 0xFFFF) as u16 as i16) / 120;
-        if GetKeyState(VK_SHIFT as i32) < 0 {
+        if wparam & 0x0004 != 0 { // MK_SHIFT in the wheel message
             self.diff_sideways(-notches);
         } else {
             self.diff_to(self.diff_scroll - notches * 3 * scale(self.dpi, ds::size::DIFF_ROW));
@@ -9854,21 +9879,23 @@ impl App {
 
     /// The trajectory's table: each column at its own place across, in the characters of the monospace face, the header kept at the top, the rows in view under it.
     unsafe fn paint_trajectory(&self, device: HDC, client: RECT) {
-        use crate::trajectory::{column_bounds, RowKind, COLUMNS};
+        use crate::trajectory::{RowKind, COLUMNS};
         let Some(page) = &self.trajectory else { return };
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let row = s(ds::size::DIFF_ROW);
         let face = self.fonts.code;
-        let character = text_width(face, "0").max(1);
         let Some(header) = page.rows.first() else { return };
-        let headings = std::array::from_fn(|i| text_width(face, &header.cells[i]));
-        let (bounds, notes) = column_bounds(character, headings);
-        let bar = s(ds::space::M);
-        let width = client.right - bar;
+        let (bounds, notes) = page.columns(face);
+        let width = client.right - s(ds::space::M);
+        let across = page.across.min((page.content_width.unwrap_or(0) - width).max(0));
         SetBkMode(device, TRANSPARENT as _);
         let cell = |device: HDC, text: &str, column: usize, y: i32, color: u32| {
             let (left, right) = bounds[column];
+            let (left, right) = (left - across, right - across);
+            if right <= 0 {
+                return;
+            }
             let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | if COLUMNS[column].right { DT_RIGHT } else { 0 };
             draw_text(device, text, RECT { left, right, top: y, bottom: y + row }, face, color, flags);
         };
@@ -9896,13 +9923,13 @@ impl App {
                     _ => theme::muted(),
                 };
                 if let RowKind::Turn { open, .. } = line.kind {
-                    icon::draw(device, if open { "chevron-down" } else { "chevron-right" }, rect(0, y, s(ds::size::ICON), row), s(ds::size::ICON_SMALL), theme::muted());
+                    icon::draw(device, if open { "chevron-down" } else { "chevron-right" }, rect(-across, y, s(ds::size::ICON), row), s(ds::size::ICON_SMALL), theme::muted());
                 }
                 for (column, text) in line.cells.iter().enumerate() {
                     cell(device, text, column, y, color);
                 }
                 if !line.note.is_empty() {
-                    draw_text(device, &line.note, RECT { left: notes, right: width, top: y, bottom: y + row }, face, theme::faint(), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                    draw_text(device, &line.note, RECT { left: notes - across, right: width, top: y, bottom: y + row }, face, theme::faint(), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
                 }
             }
             y += row;
@@ -16530,6 +16557,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         WM_DPICHANGED => {
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
+            if let Some(page) = &mut app.trajectory {
+                page.across = 0;
+                page.content_width = None;
+            }
             set_button_fonts(app.fonts);
             for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.term.rename_field, app.timeline.search, app.picker_search, app.mcp_vars]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
