@@ -405,6 +405,8 @@ pub enum Event {
     /// The agent changed the mode (a plan approved ends plan mode): the window shows and keeps it.
     ModeChanged(Mode),
     Usage { used: u64, window: u64, usage: Usage },
+    /// Cache reuse for the latest completed model request, if usage was reported.
+    RequestCache(Option<u64>),
     Todos(Vec<Value>),
     /// Files of the workspace put before the person: the call, and the files from the workspace's root. The model's own `present`; or, `interim`, the app's,
     /// for a page this turn made that a check has just found running with no error, while the model goes on with it.
@@ -3337,6 +3339,7 @@ impl Agent {
                 self.window = usage.window.unwrap_or(self.window);
                 self.report_usage(Some(usage.clone()));
             }
+            self.emit(Event::RequestCache(completion.usage.as_ref().and_then(Usage::cache_percent)));
             let has_calls = !completion.tool_calls.is_empty();
             if completion.finish.is_empty() && !has_calls && completion.content.is_empty() {
                 return Ended::Failed(llm::UNFINISHED.into());

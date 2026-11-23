@@ -2619,6 +2619,8 @@ struct App {
     model: String,
     used: u64,
     window_tokens: u64,
+    /// Latest measured cache reuse for each conversation during this app run.
+    session_cache_percent: HashMap<PathBuf, u64>,
     rate: Option<f64>,
     catalog: Vec<CatalogEntry>,
     /// This PC, as Straydog sees it, for who is choosing a model.
@@ -2933,6 +2935,15 @@ fn mcp_path_text(typed: &str) -> &str {
 fn mcp_working_directory(typed: &str) -> Option<PathBuf> {
     let folder = mcp_path_text(typed);
     (!folder.is_empty()).then(|| PathBuf::from(folder))
+}
+
+fn remember_request_cache(known: &mut HashMap<PathBuf, u64>, session: Option<&std::path::Path>, percent: Option<u64>) {
+    let Some(path) = session else { return };
+    if let Some(percent) = percent {
+        known.insert(path.to_owned(), percent);
+    } else {
+        known.remove(path);
+    }
 }
 
 unsafe fn set_text(window: HWND, text: &str) {
@@ -9010,42 +9021,6 @@ impl App {
             return;
         }
         let middle = (area.top + area.bottom) / 2;
-        let mut x = area.left + s(ds::space::S);
-        // Only what needs saying: at work, the stop button and the line above the input say so, and when all is well nothing does. (The engine that goes on while the faster-writing data
-        // is fetched says how far that has come, and then that it starts again.)
-        let beside = if self.drafter_restart_waits {
-            Some(drafter_restart_words())
-        } else {
-            Some(self.setup_status.as_str()).filter(|words| self.drafter_fetch.is_some() && !words.is_empty())
-        };
-        // (while the workspace's grant for commands is being given: said beside what else is said, as it comes when the app or a session opens, often while it connects)
-        let readying = self.readying.as_ref().is_some_and(|folder| folder.to_string_lossy().eq_ignore_ascii_case(&self.workspace.to_string_lossy()));
-        if !self.connected {
-            let dot = s(ds::space::S);
-            let color = if matches!(self.connection.as_str(), "not connected" | "no engine") { theme::bad() } else { theme::warn() };
-            rounded(device, rect(x, middle - dot / 2, dot, dot), dot / 2, Some(color), None);
-            x += dot + s(ds::space::S);
-            let words = t(self.connection.as_str());
-            draw_text(device, words, RECT { left: x, right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
-            if readying {
-                let after = x + text_width(self.fonts.small, words) + s(ds::space::L);
-                let tall = area.bottom - area.top;
-                icon::draw(device, "info", rect(after, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
-                draw_text(device, t("Getting the folder ready for commands…"), RECT { left: after + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(after), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
-            }
-        } else if let Some(words) = beside {
-            let tall = area.bottom - area.top;
-            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
-            draw_text(device, words, RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
-        } else if readying {
-            let tall = area.bottom - area.top;
-            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
-            draw_text(device, t("Getting the folder ready for commands…"), RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
-        } else if self.web_seen {
-            let tall = area.bottom - area.top;
-            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::warn());
-            draw_text(device, t("Web content is here: network commands ask"), RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::warn(), ONE_LINE);
-        }
         let wide = area.right - area.left;
         let mut right = area.right - s(ds::space::S);
         let share = if self.window_tokens > 0 { (self.used as f64 / self.window_tokens as f64).clamp(0.0, 1.0) } else { 0.0 };
@@ -9064,9 +9039,54 @@ impl App {
                 right -= across + s(ds::space::M);
             }
         }
+        if wide >= s(250) {
+            let percent = self.current_session.as_ref().and_then(|path| self.session_cache_percent.get(path));
+            let words = percent.map_or_else(|| t("cached —").to_string(), |percent| tf("cached {0}%", &[&percent]));
+            let across = text_width(self.fonts.small, &words);
+            draw_text(device, &words, RECT { left: right - across, right, ..area }, self.fonts.small, theme::faint(), DT_RIGHT | ONE_LINE);
+            right -= across + s(ds::space::M);
+        }
         if let Some(rate) = self.rate.filter(|_| wide >= s(300)) {
             let block = s(70);
             draw_text(device, &format!("{rate:.1} tok/s"), RECT { left: right - block, right, ..area }, self.fonts.small, theme::faint(), DT_RIGHT | ONE_LINE);
+            right -= block + s(ds::space::M);
+        }
+        let notice_right = right.min(area.right - s(190));
+        let mut x = area.left + s(ds::space::S);
+        // Only what needs saying: at work, the stop button and the line above the input say so, and when all is well nothing does. (The engine that goes on while the faster-writing data
+        // is fetched says how far that has come, and then that it starts again.)
+        let beside = if self.drafter_restart_waits {
+            Some(drafter_restart_words())
+        } else {
+            Some(self.setup_status.as_str()).filter(|words| self.drafter_fetch.is_some() && !words.is_empty())
+        };
+        // (while the workspace's grant for commands is being given: said beside what else is said, as it comes when the app or a session opens, often while it connects)
+        let readying = self.readying.as_ref().is_some_and(|folder| folder.to_string_lossy().eq_ignore_ascii_case(&self.workspace.to_string_lossy()));
+        if !self.connected {
+            let dot = s(ds::space::S);
+            let color = if matches!(self.connection.as_str(), "not connected" | "no engine") { theme::bad() } else { theme::warn() };
+            rounded(device, rect(x, middle - dot / 2, dot, dot), dot / 2, Some(color), None);
+            x += dot + s(ds::space::S);
+            let words = t(self.connection.as_str());
+            draw_text(device, words, RECT { left: x, right: notice_right.max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+            let after = x + text_width(self.fonts.small, words) + s(ds::space::L);
+            if readying && after + s(ds::size::RIGHT_INDENT) < notice_right {
+                let tall = area.bottom - area.top;
+                icon::draw(device, "info", rect(after, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
+                draw_text(device, t("Getting the folder ready for commands…"), RECT { left: after + s(ds::size::RIGHT_INDENT), right: notice_right.max(after), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+            }
+        } else if let Some(words) = beside {
+            let tall = area.bottom - area.top;
+            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
+            draw_text(device, words, RECT { left: x + s(ds::size::RIGHT_INDENT), right: notice_right.max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+        } else if readying {
+            let tall = area.bottom - area.top;
+            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
+            draw_text(device, t("Getting the folder ready for commands…"), RECT { left: x + s(ds::size::RIGHT_INDENT), right: notice_right.max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+        } else if self.web_seen {
+            let tall = area.bottom - area.top;
+            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::warn());
+            draw_text(device, t("Web content is here: network commands ask"), RECT { left: x + s(ds::size::RIGHT_INDENT), right: notice_right.max(x), ..area }, self.fonts.small, theme::warn(), ONE_LINE);
         }
     }
 
@@ -13548,9 +13568,10 @@ impl App {
                     parked.rate = usage.tokens_per_second;
                 }
                 if usage.prompt > 0 {
-                    parked.totals = (parked.totals.0 + usage.prompt, parked.totals.1 + usage.cached, parked.totals.2 + usage.completion, parked.totals.3 + 1);
+                    parked.totals = (parked.totals.0 + usage.prompt, parked.totals.1 + usage.cached.unwrap_or_default(), parked.totals.2 + usage.completion, parked.totals.3 + 1);
                 }
             }
+            Event::RequestCache(percent) => remember_request_cache(&mut self.session_cache_percent, parked.path.as_deref(), percent),
             Event::Interjected(text) => {
                 if let Some(place) = parked.interjected.iter().position(|known| *known == text) {
                     parked.interjected.remove(place);
@@ -14026,7 +14047,7 @@ impl App {
                     self.runs[open].live_rate = usage.tokens_per_second;
                 }
                 if usage.prompt > 0 {
-                    self.totals = (self.totals.0 + usage.prompt, self.totals.1 + usage.cached, self.totals.2 + usage.completion, self.totals.3 + 1);
+                    self.totals = (self.totals.0 + usage.prompt, self.totals.1 + usage.cached.unwrap_or_default(), self.totals.2 + usage.completion, self.totals.3 + 1);
                 }
                 if live_report {
                     InvalidateRect(self.window, &self.status_area, 0);
@@ -14036,6 +14057,10 @@ impl App {
                 if self.right_width > 0 && (!live_report || panel_changed) {
                     self.layout();
                 }
+            }
+            Event::RequestCache(percent) => {
+                remember_request_cache(&mut self.session_cache_percent, self.current_session.as_deref(), percent);
+                InvalidateRect(self.window, &self.status_area, 0);
             }
             Event::WebSeen(on) => {
                 self.web_seen = on;
@@ -15098,6 +15123,9 @@ impl App {
                         Ok(_) => None,
                     };
                     self.set_panel(Panel::Chat);
+                    if !restored {
+                        self.session_cache_percent.remove(&path);
+                    }
                     if !retry && self.current_session.as_ref() == Some(&path) {
                         self.start_session(self.workspace.clone());
                     }
@@ -18609,6 +18637,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             model: String::new(),
             used: 0,
             window_tokens: 0,
+            session_cache_percent: HashMap::new(),
             rate: None,
             catalog: Vec::new(),
             machine_line: String::new(),

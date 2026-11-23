@@ -210,11 +210,29 @@ fn prefill_said(comment: &str) -> Option<(u64, u64)> {
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
     pub prompt: u64,
-    pub cached: u64,
+    pub cached: Option<u64>,
     pub completion: u64,
     pub tokens_per_second: Option<f64>,
     /// The context, when the provider says it with its usage.
     pub window: Option<u64>,
+}
+
+impl Usage {
+    pub(crate) fn cache_percent(&self) -> Option<u64> {
+        let cached = self.cached?;
+        (self.prompt > 0).then(|| (u128::from(cached.min(self.prompt)) * 100 / u128::from(self.prompt)) as u64)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn cache_percent_distinguishes_unavailable_usage_from_a_miss() {
+    let percent = |prompt, cached| Usage { prompt, cached, ..Usage::default() }.cache_percent();
+    assert_eq!(percent(0, Some(0)), None);
+    assert_eq!(percent(100, None), None);
+    assert_eq!(percent(100, Some(0)), Some(0));
+    assert_eq!(percent(300, Some(290)), Some(96));
+    assert_eq!(percent(u64::MAX, Some(u64::MAX)), Some(100));
 }
 
 #[derive(Debug, Clone, Default)]
@@ -291,7 +309,7 @@ impl Assembly {
             let count = |value: Option<&Value>| value.and_then(Value::as_u64).unwrap_or(0);
             self.completion.usage = Some(Usage {
                 prompt: count(usage.get("prompt_tokens")),
-                cached: count(usage.pointer("/prompt_tokens_details/cached_tokens")),
+                cached: usage.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64),
                 completion: count(usage.get("completion_tokens")),
                 tokens_per_second: None,
                 window: usage.get("model_context_window").and_then(Value::as_u64),
@@ -1218,7 +1236,7 @@ mod tests {
         assert_eq!(completion.tool_calls[0].function.arguments, "{\"path\":1}");
         assert_eq!(completion.finish, "tool_calls");
         let usage = completion.usage.unwrap();
-        assert_eq!((usage.prompt, usage.cached, usage.completion, usage.tokens_per_second), (7, 5, 3, Some(41.5)));
+        assert_eq!((usage.prompt, usage.cached, usage.completion, usage.tokens_per_second), (7, Some(5), 3, Some(41.5)));
     }
 
     /// What Straydog sends of a call being written is told as it comes (the name once, the arguments in pieces), and the call that comes whole after is the call: its name, and only

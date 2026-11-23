@@ -333,7 +333,7 @@ fn usage_of(raw: &Value) -> Option<Usage> {
     let count = |name: &str| last.get(name).and_then(Value::as_u64).unwrap_or(0);
     Some(Usage {
         prompt: count("inputTokens"),
-        cached: count("cachedInputTokens"),
+        cached: last.get("cachedInputTokens").and_then(Value::as_u64),
         completion: count("outputTokens"),
         tokens_per_second: None,
         window: raw.get("modelContextWindow").and_then(Value::as_u64).filter(|&window| window > 0),
@@ -799,7 +799,7 @@ mod tests {
     #[test]
     fn usage_comes_with_the_context() {
         let usage = usage_of(&json!({"last": {"inputTokens": 10, "cachedInputTokens": 4, "outputTokens": 2}, "modelContextWindow": 1000})).unwrap();
-        assert_eq!((usage.prompt, usage.cached, usage.completion, usage.window), (10, 4, 2, Some(1000)));
+        assert_eq!((usage.prompt, usage.cached, usage.completion, usage.window), (10, Some(4), 2, Some(1000)));
     }
 
     /// The app's facts and notes go to Codex in the role `app`, and the person's words as the user's: whose a message is rests on its role.
