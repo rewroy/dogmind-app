@@ -700,12 +700,20 @@ fn browser() -> Option<(PathBuf, &'static str)> {
 /// and a model made a page that ran only so: the person opened it from its folder, by a double-click, and nothing of it ran.
 const LOCAL_MODULE_WORDS: &str = "Opened from its file, as the user opens a page by a double-click, its module scripts that load its own files do not run at all: a browser refuses them from file://, which this check allows. Unless the user is to open it from a server, put that code in plain <script> tags, or import only from CDN addresses.";
 
+/// Origin and path of a validated local server URL. A slash in a query or fragment belongs to neither.
+fn served_origin_and_path(url: &str) -> (&str, &str) {
+    let location = url.split(['?', '#']).next().unwrap_or(url);
+    let authority_start = location.find("://").map_or(0, |at| at + 3);
+    match location[authority_start..].find('/') {
+        Some(at) => location.split_at(authority_start + at),
+        None => (location, "/"),
+    }
+}
+
 /// The page of the workspace that a local server's address gives, where one can be told: the address's path under the workspace, or the one file whose path ends so (a server
 /// started in a folder of the workspace), or of several the one written last. None for an address of no page that is there.
 fn page_of_address(url: &str, workspace: &Path) -> Option<PathBuf> {
-    let rest = url.split_once("://")?.1;
-    let path = rest.find('/').map_or("/", |at| &rest[at..]);
-    let path = path.split(['?', '#']).next().unwrap_or("/");
+    let (_, path) = served_origin_and_path(url);
     let wanted = if path.ends_with('/') { format!("{path}index.html") } else { path.to_string() };
     let wanted = wanted.trim_start_matches('/').replace('/', "\\");
     if wanted.is_empty() || wanted.split('\\').any(|part| part == "..") {
@@ -1508,7 +1516,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     };
     // (what its console names is said from the workspace, or from the server's root)
     let base_url = match served {
-        Some(url) => url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/") + "/",
+        Some(url) => format!("{}/", served_origin_and_path(url).0),
         None => format!("file:///{}/", plain(&root).replace('\\', "/")),
     };
     // Each picture by a name of its own: one name for every call had a later check, or another session's, write over a picture an answer
@@ -2044,6 +2052,23 @@ mod tests {
         assert!(first.starts_with("AS THE USER OPENS IT: gacha") && first.contains("do not run at all") && !first.contains("http.server"), "{first}");
         assert_eq!(opened_from_its_file("http://127.0.0.1:8765/plain.html", root), None);
         assert_eq!(opened_from_its_file("http://127.0.0.1:8765/cdn.html", root), None);
+    }
+
+    #[test]
+    fn a_query_or_fragment_on_the_server_root_keeps_the_root_pages_file_diagnosis() {
+        let (dir, _) = page(&[
+            ("index.html", r#"<script type="module" src="./main.js"></script>"#),
+            ("main.js", "export const value = 1;"),
+            ("plain.html", "<p>Plain page</p>"),
+        ]);
+        let root = dir.path();
+        let expected = opened_from_its_file("http://localhost:8000/", root).unwrap();
+        for suffix in ["?next=/plain.html", "#/plain.html", "?next=/plain.html#here"] {
+            let url = format!("http://localhost:8000{suffix}");
+            assert_eq!(served_origin_and_path(&url), ("http://localhost:8000", "/"));
+            assert_eq!(opened_from_its_file(&url, root).as_deref(), Some(expected.as_str()), "{suffix}");
+        }
+        assert_eq!(opened_from_its_file("http://localhost:8000/plain.html?next=/index.html", root), None);
     }
 
     #[test]
