@@ -1333,6 +1333,11 @@ impl Hub {
     /// The file read again, as the person changed it in Settings: a server no longer there ends, a new one starts, and one whose configuration changed starts
     /// again with it; one that did not change goes on as it was (its trust as the file now says). Says the names of those started.
     pub fn reload(&self) -> Vec<String> {
+        self.reload_retrying(None)
+    }
+
+    /// Reload settings and retry the named server if its last connection attempt failed.
+    pub fn reload_retrying(&self, failed_server: Option<&str>) -> Vec<String> {
         let Some(file) = self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else { return Vec::new() };
         // (a file that cannot be read, as one written by hand can be, starts nothing and ends nothing: it is said, for the person to mend)
         let read = readable_config(&file);
@@ -1348,7 +1353,8 @@ impl Hub {
             if let Some(slot) = at.map(|at| &mut slots[at]) {
                 let mut same = config.clone();
                 same.trusted = slot.config.as_ref().map_or(config.trusted, |was| was.trusted);
-                if slot.config.as_ref() == Some(&same) && slot.part == part {
+                let retry = failed_server == Some(name.as_str()) && slot.failed.is_some();
+                if !retry && slot.config.as_ref() == Some(&same) && slot.part == part {
                     slot.trusted = config.trusted;
                     slot.config = Some(config);
                     continue;
@@ -2165,6 +2171,22 @@ enabled = false
         save_server(&file, None, "d", at(&one)).unwrap();
         assert_eq!(load_config(&file).servers.keys().collect::<Vec<_>>(), ["d"]);
         assert!(save_server(&file, None, "x", at("ftp://x")).unwrap_err().contains("http"));
+    }
+
+    #[test]
+    fn saving_a_failed_server_retries_only_that_server() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        std::fs::write(&file, r#"{"mcpServers":{"a":{},"b":{}}}"#).unwrap();
+        let hub = Hub::start(&file);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !hub.states().iter().all(|(_, state)| matches!(state, State::Failed(_))) {
+            assert!(Instant::now() < deadline, "waiting for the invalid configurations to fail");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(hub.reload().is_empty());
+        assert_eq!(hub.reload_retrying(Some("a")), ["a"]);
+        assert!(matches!(&hub.states()[1].1, State::Failed(_)));
     }
 
     /// Arguments go to a line and back as they were, as Windows quotes them; a line typed by hand is read the same way.

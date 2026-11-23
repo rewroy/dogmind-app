@@ -2825,7 +2825,7 @@ fn mcp_state_words(state: Option<&dogmind_agent::mcp::State>) -> String {
     match state {
         Some(dogmind_agent::mcp::State::Up(1)) => t("1 tool").to_string(),
         Some(dogmind_agent::mcp::State::Up(tools)) => tf("{0} tools", &[tools]),
-        Some(dogmind_agent::mcp::State::Failed(why)) => tf("Did not start: {0}", &[&mcp_why(why)]),
+        Some(dogmind_agent::mcp::State::Failed(why)) => tf("Did not start: {0}. To retry, open this server in Settings > Tools and choose Save.", &[&mcp_why(why)]),
         _ => t("Starting…").to_string(),
     }
 }
@@ -12571,7 +12571,7 @@ impl App {
         match mcp_import(Path::new(&home), &self.folder.join("mcp.json"), argument) {
             Ok((added, message)) => {
                 if added > 0 {
-                    self.mcp_changed();
+                    self.mcp_changed(None);
                 }
                 message
             }
@@ -12605,8 +12605,8 @@ impl App {
     }
 
     /// mcp.json changed here: the servers start and end to match it at once, and the Tools page follows them as they come up.
-    unsafe fn mcp_changed(&mut self) {
-        self.mcp.reload();
+    unsafe fn mcp_changed(&mut self, retry_failed: Option<&str>) {
+        self.mcp.reload_retrying(retry_failed);
         self.mcp_controls();
         SetTimer(self.window, TIMER_MCP, 500, None);
     }
@@ -12715,7 +12715,7 @@ impl App {
             self.problem_in_panel(&error);
             return false;
         }
-        self.mcp_changed();
+        self.mcp_changed(Some(&name));
         self.mcp_close_form();
         self.say_in_panel(&tf("{0} was saved. Once it is up, its tools join the conversation from your next message.", &[&name]));
         self.mcp_saved = Some(name);
@@ -12730,7 +12730,7 @@ impl App {
             self.problem_in_panel(&error);
             return;
         }
-        self.mcp_changed();
+        self.mcp_changed(None);
         self.mcp_close_form();
         self.say_in_panel(&tf("{0} was removed.", &[&name]));
         // (the page is scrolled to the form: what it says is under it)
