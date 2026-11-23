@@ -52,15 +52,7 @@ pub fn t(english: &str) -> &str {
 
 /// The same, with values for `{0}`, `{1}`...
 pub fn tf(english: &str, values: &[&dyn Display]) -> String {
-    fill(t(english), values)
-}
-
-fn fill(words: &str, values: &[&dyn Display]) -> String {
-    let mut text = words.to_string();
-    for (at, value) in values.iter().enumerate() {
-        text = text.replace(&format!("{{{at}}}"), &value.to_string());
-    }
-    text
+    dogmind_agent::fill_template(t(english), values)
 }
 
 /// A reason on an approval card, which the gate gives in English as a template with what varies in it (a path, a word, a number), joined by "; " where there are several. The same
@@ -80,7 +72,7 @@ fn reason_part(part: &str) -> String {
     for template in dogmind_agent::safety::REASONS {
         let Some(found) = fill_of(template, part) else { continue };
         if let Some(words) = japanese().get(template) {
-            return found.iter().enumerate().fold((*words).to_string(), |text, (at, value)| text.replace(&format!("{{{at}}}"), value));
+            return dogmind_agent::fill_template(words, &found);
         }
     }
     part.to_string()
@@ -1613,8 +1605,18 @@ mod tests {
 
     #[test]
     fn values_go_where_the_language_wants_them() {
-        assert_eq!(fill("{1} / {0}", &[&1, &"b"]), "b / 1");
-        assert_eq!(fill("no value", &[]), "no value");
+        assert_eq!(tf("{1} / {0}", &[&1, &"b"]), "b / 1");
+        assert_eq!(tf("no value", &[]), "no value");
+        assert_eq!(tf("{1} / {0} / {0}", &[&"Unity {1}", &"offline"]), "offline / Unity {1} / Unity {1}");
+        assert_eq!(tf("{00} {+1} {9} {{0}}", &[&"x", &"y"]), "{00} {+1} {9} {x}");
+    }
+
+    #[test]
+    fn a_servers_name_stays_literal_in_its_startup_error_in_either_language() {
+        let template = "{0} did not start: {1}";
+        let values = ["Unity {1}", "offline"];
+        assert_eq!(dogmind_agent::fill_template(template, &values), "Unity {1} did not start: offline");
+        assert_eq!(dogmind_agent::fill_template(japanese()[template], &values), "Unity {1} を起動できませんでした: offline");
     }
 
     #[test]

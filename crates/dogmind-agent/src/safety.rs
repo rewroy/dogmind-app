@@ -159,7 +159,7 @@ fn cargo_lifted(command: &str, cwd: &Path, workspace: &Path) -> Vec<String> {
 
 /// A reason from its template: `{0}` and `{1}` are what the call adds.
 pub fn reason_of(template: &str, parts: &[&str]) -> String {
-    parts.iter().enumerate().fold(template.to_string(), |text, (at, part)| text.replace(&format!("{{{at}}}"), part))
+    crate::fill_template(template, parts)
 }
 
 /// What cmd takes to end a word of a command: whitespace, and its own separators, a `,` too.

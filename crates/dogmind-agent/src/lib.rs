@@ -4,6 +4,27 @@
 //! the model reads (the system prompt in `prompt`, the tool schemas in `tools`) is this app's own, as small as a local model needs it. What Dogmind itself says is
 //! generated into `assets/dogmind`, to read when it changes; only its checkpoint prompt and its Codex policy are taken from there as they are.
 
+/// Fill numbered slots in interface messages. Values are literal text, including any braces they contain.
+pub fn fill_template(template: &str, values: &[impl std::fmt::Display]) -> String {
+    use std::fmt::Write;
+    let mut parts = template.split('{');
+    let mut text = String::from(parts.next().unwrap_or_default());
+    for part in parts {
+        if let Some((digits, rest)) = part.split_once('}') {
+            if digits == "0" || digits.as_bytes().first().is_some_and(|c| matches!(c, b'1'..=b'9')) {
+                if let Some(value) = digits.parse::<usize>().ok().and_then(|index| values.get(index)) {
+                    write!(text, "{value}").expect("writing to a String");
+                    text.push_str(rest);
+                    continue;
+                }
+            }
+        }
+        text.push('{');
+        text.push_str(part);
+    }
+    text
+}
+
 pub mod agent;
 pub mod anthropic;
 pub mod background;
