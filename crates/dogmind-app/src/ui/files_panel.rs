@@ -38,7 +38,6 @@ impl MenuItem {
 pub(super) enum MenuFor {
     Nothing,
     Files,
-    Shells,
     Terminal,
 }
 
@@ -551,10 +550,6 @@ impl App {
         }
         match whose {
             MenuFor::Nothing => {}
-            MenuFor::Shells => {
-                self.files_menu_close(true);
-                self.terminal_shell_chosen(at);
-            }
             MenuFor::Terminal => {
                 self.files_menu_close(true);
                 self.terminal_menu_chosen(at);

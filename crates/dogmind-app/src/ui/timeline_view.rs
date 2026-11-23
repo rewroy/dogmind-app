@@ -202,7 +202,7 @@ unsafe fn fill(device: HDC, area: RECT, color: u32) {
 impl App {
     /// The panel shows the Timeline view.
     pub(super) fn timeline_shown(&self) -> bool {
-        self.panel == Panel::Chat && !self.onboarding && self.settings.center_view == CenterView::Timeline
+        self.panel == Panel::Chat && !self.onboarding && self.has_messages && self.settings.center_view == CenterView::Timeline
     }
 
     /// What the window knows of the present besides the events: whether a turn is at work, what the person is asked, and how much waits in the background.

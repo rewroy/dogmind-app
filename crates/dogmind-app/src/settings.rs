@@ -46,11 +46,10 @@ pub enum RightView {
     Overview,
 }
 
-/// What the central panel shows within a session.
+/// What the central panel shows within a session. (The terminal was a third, `terminal`, before it became the panel under them: a file that says it reads as the conversation.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CenterView {
-    Terminal,
     Timeline,
     #[default]
     #[serde(other)]
@@ -264,8 +263,6 @@ pub struct Settings {
     /// What it shows. (Before the Terminal view the choice was `right_files`, true for the files: `Settings::load` reads that key where it is, see `migrate`.)
     pub right_view: RightView,
     pub center_view: CenterView,
-    /// The shell the last new terminal was started with, by its name in `term::shells` (`pwsh`, `powershell`, `cmd`, `git-bash`); empty before one was chosen.
-    pub terminal_shell: String,
     pub web_tools: bool,
     /// Code Mode: the model may run a short program that calls several tools at once (`run_code`) instead of calling them one at a time. Off by default. A conversation that has begun keeps the tools it began with.
     pub code_mode: bool,
@@ -369,7 +366,6 @@ impl Default for Settings {
             right_panel: true,
             right_view: RightView::Overview,
             center_view: CenterView::Conversation,
-            terminal_shell: String::new(),
             web_tools: true,
             code_mode: false,
             language: "auto".into(),
@@ -1132,7 +1128,7 @@ mod tests {
         assert_eq!(loaded(r#"{"right_files": false}"#).right_view, RightView::Overview);
         assert_eq!(loaded("{}").right_view, RightView::Overview);
         // (the new key wins over the old when a file somehow has both)
-        assert_eq!(loaded(r#"{"right_files": true, "right_view": "terminal"}"#).center_view, CenterView::Terminal);
+        assert_eq!(loaded(r#"{"right_files": true, "right_view": "terminal"}"#).center_view, CenterView::Conversation);
         assert_eq!(loaded(r#"{"right_view": "files"}"#).right_view, RightView::Files);
         assert_eq!(loaded(r#"{"right_view": "timeline"}"#).center_view, CenterView::Timeline);
         // (a view that a later version has is the overview here, and the file is not refused for it)
@@ -1147,16 +1143,17 @@ mod tests {
         assert!(!path.with_extension("json.broken").exists(), "nothing was refused");
     }
 
+    /// A file from when the terminal was a view of its own, and its shell was chosen: it opens on the conversation, is not refused, and is written again without the shell.
     #[test]
-    fn the_shell_last_chosen_is_kept() {
+    fn a_file_from_the_terminal_view_opens_on_the_conversation_and_keeps_no_shell() {
         let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let mut settings = Settings::default();
-        assert_eq!(settings.terminal_shell, "");
-        settings.terminal_shell = "git-bash".into();
-        settings.center_view = CenterView::Terminal;
-        settings.save(&path).unwrap();
+        std::fs::write(&path, r#"{"center_view": "terminal", "terminal_shell": "git-bash", "right_panel": false}"#).unwrap();
         let back = Settings::load(&path);
-        assert_eq!((back.terminal_shell.as_str(), back.center_view), ("git-bash", CenterView::Terminal));
+        assert_eq!((back.center_view, back.right_panel), (CenterView::Conversation, false));
+        assert!(!path.with_extension("json.broken").exists(), "nothing was refused");
+        back.save(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("terminal_shell") && !written.contains("\"terminal\""), "{written}");
     }
 }

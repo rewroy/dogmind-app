@@ -1338,9 +1338,9 @@ const JA: &[(&str, &str)] = &[
     // The central terminal.
     ("Terminal", "ターミナル"),
     ("New terminal", "新しいターミナル"),
-    ("Choose a shell", "シェルを選ぶ"),
     ("Close the terminal", "ターミナルを閉じる"),
-    ("Switch to Terminal or open a shell", "ターミナルに切り替えます。シェルがなければ開きます"),
+    ("Open the terminal under the conversation", "会話の下にターミナルを開きます"),
+    ("Show or hide the terminal", "ターミナルの表示を切り替える"),
     ("Exited with code {0}", "終了コード {0} で終了しました"),
     ("Exited with code 0x{0}", "終了コード 0x{0} で終了しました"),
     ("{0} terminals are open: close one to open another.", "ターミナルが {0} 個開いています。新しく開くには、どれかを閉じてください。"),

@@ -1,4 +1,4 @@
-# The driver of the running app for the Terminal view's tests: windows by messages, a picture through PrintWindow, a data folder of its own for each run,
+# The driver of the running app for the terminal panel's tests: windows by messages, a picture through PrintWindow, a data folder of its own for each run,
 # the window shown off every screen and never given the focus, and the hooks of a debug build that has DOGMIND_TEST_TERMINAL set (see ui/term_panel/hooks.rs).
 # Dot-source it. Build first with `cargo build -p dogmind-app`; what is written (pictures, data folders, what a hook read) goes to $env:TERM_UI_OUT, or to `out` beside this file.
 # Drives the app with messages only, off screen from the first moment. Dot-source it.

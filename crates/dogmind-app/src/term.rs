@@ -1,4 +1,4 @@
-//! A terminal: the person's own shell, in a pseudo console, its output read into a screen with a scrollback. Nothing here knows the window; the Terminal view of the panel on the right
+//! A terminal: the person's own shell, in a pseudo console, its output read into a screen with a scrollback. Nothing here knows the window; the terminal panel under the conversation
 //! (`ui::term_panel`) draws what `Terminal::with_screen` gives and sends what `Terminal::write` is given.
 //!
 //! - `shells`: which shells are on this PC, and how each is started.

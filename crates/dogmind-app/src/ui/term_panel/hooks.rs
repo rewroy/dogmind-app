@@ -271,15 +271,24 @@ impl App {
             }
             "menu" => {
                 match rest.split_once(' ').unwrap_or((rest, "")) {
-                    ("shells", _) => {
-                        let anchor = if self.term.terminals.is_empty() { self.term.start_shells } else { self.term.shells_button };
-                        self.terminal_shells_menu(anchor);
-                    }
                     ("terminal", _) => self.terminal_context_menu((scale(self.dpi, 40), scale(self.dpi, 40))),
                     ("choose", number) => self.files_menu_choose(number.trim().parse().unwrap_or(usize::MAX)),
                     _ => self.files_menu_close(true),
                 }
                 1
+            }
+            // The words of the tip of a window of the app, named by its handle as a number, in the language now: what the pointer resting on it shows.
+            "tip" => {
+                let window = first.parse::<isize>().unwrap_or(0) as HWND;
+                let mut text = vec![0u16; 512];
+                let mut tool: TTTOOLINFOW = std::mem::zeroed();
+                tool.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+                tool.hwnd = GetParent(window);
+                tool.uId = window as usize;
+                tool.lpszText = text.as_mut_ptr();
+                SendMessageW(self.tooltip, TTM_GETTEXTW, text.len(), std::ptr::addr_of_mut!(tool) as LPARAM);
+                let end = text.iter().position(|unit| *unit == 0).unwrap_or(text.len());
+                wrote(after, &String::from_utf16_lossy(&text[..end]))
             }
             "shot" => isize::from(own_picture(self.window).and_then(|picture| picture.save(rest.trim()).map_err(|error| error.to_string())).is_ok()),
             // The window is drawn now, so that a picture taken after it is of what the screen holds and not of what the system last kept of the window.

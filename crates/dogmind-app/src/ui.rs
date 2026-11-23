@@ -262,13 +262,13 @@ const ID_ATTACHED: isize = 9060; // ..+ attach::MOST_IMAGES
 /// The list of the Files view of the panel on the right, and the little menu of a row of it.
 const ID_FILES: isize = 9070;
 const ID_FILES_MENU: isize = 9071;
-/// The Terminal view's controls: a tab and its close for each terminal there can be, a new terminal and the shells beside it, the page's own two and the bar's one, and the field a tab is renamed in.
+/// The terminal panel's controls: a tab and its close for each terminal there can be, a new terminal, the title bar's button that opens and closes the panel, the page's own
+/// button and the bar's one, and the field a tab is renamed in.
 const ID_TERM_TAB: isize = 11000; // ..+ term::MOST_TERMINALS
 const ID_TERM_CLOSE: isize = 11010; // ..+ term::MOST_TERMINALS
 const ID_TERM_NEW: isize = 11020;
-const ID_TERM_SHELLS: isize = 11021;
+const ID_TERM_TOGGLE: isize = 11021;
 const ID_TERM_START: isize = 11022;
-const ID_TERM_START_SHELLS: isize = 11023;
 const ID_TERM_AGAIN: isize = 11024;
 const ID_TERM_RENAME: isize = 11025;
 /// How many pictures of a transcript are drawn at once: more than any view holds, and fewer than the small copies that are kept.
@@ -528,7 +528,7 @@ const COMMANDS: [(&str, &str); 47] = [
     ("/panel", "Show or hide the panel on the right"),
     ("/preview", "Show a web page or picture of the folder beside the conversation"),
     ("/files", "Show the files of the folder in the panel on the right"),
-    ("/terminal", "Switch to Terminal or open a shell"),
+    ("/terminal", "Open the terminal under the conversation"),
     ("/theme", "As Windows is set, dark, or light: the next of them"),
     ("/safe", "Allow safe commands without asking, or not"),
     ("/workspace", "Start a session in another folder"),
@@ -682,6 +682,16 @@ fn always_places(scope: &Option<AlwaysScope>) -> String {
         Some(AlwaysScope::Network(reach)) => reach.clone(),
         Some(AlwaysScope::Parts(parts)) => parts.join(", "),
         None => String::new(),
+    }
+}
+
+/// The views the row over a session offers, by their words: none while nothing has been said in it (a new session is its conversation alone), and then the conversation and
+/// the timeline. The terminal is none of them: it is the panel under them, which the title bar's button opens.
+fn center_views(has_messages: bool) -> &'static [(&'static str, CenterView)] {
+    if has_messages {
+        &[("Conversation", CenterView::Conversation), ("Timeline", CenterView::Timeline)]
+    } else {
+        &[]
     }
 }
 
@@ -2026,7 +2036,7 @@ struct App {
     tree_menu_hover: Option<usize>,
     /// What the little list on screen offers and whose it is (a row of the tree, the shells a terminal can be started in, or what a right click on a terminal offers).
     panel_menu: files_panel::PanelMenu,
-    /// The Terminal view of the panel on the right (`term_panel`): its windows and its terminals.
+    /// The terminal panel under the conversation (`term_panel`): its windows and its terminals.
     term: term_panel::TermView,
     /// The central Timeline view (`timeline_view`): its window, the session's path read from its files, and what the events say between two reads.
     timeline: timeline_view::TimelineView,
@@ -2297,6 +2307,8 @@ struct App {
     // The panel on the right.
     right_width: i32,
     right_toggle: HWND,
+    /// The title bar's button for the terminal panel, beside the one for the panel on the right.
+    terminal_toggle: HWND,
     right_hits: Vec<(RECT, usize)>,
     /// What Windows sends when the taskbar comes back, and the tray has to be told again.
     taskbar_created: u32,
@@ -6473,6 +6485,8 @@ impl App {
         // (no switch for what could not show)
         let toggles = chat && !bare && (self.preview_file.is_some() || self.steps.is_some() || room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS));
         show(self.right_toggle, toggles);
+        // (the terminal's is there in every session, a new one too: it is the way to a shell)
+        show(self.terminal_toggle, chat && !bare);
         show(self.folder_chip, conversation && !bare);
         if !conversation {
             show(self.start_folder, false);
@@ -6493,17 +6507,19 @@ impl App {
             // (at the right end of the conversation's own area, beside the panel it opens, not at the end of the column the words keep to)
             let toggle_x = main_left + main_width - toggle - s(ds::space::M);
             place(self.right_toggle, toggle_x, (strip - toggle) / 2, toggle, toggle);
+            // (the terminal's to the left of it, or in its place where it is not shown)
+            let terminal_x = if toggles { toggle_x - toggle - s(ds::space::XS) } else { toggle_x };
+            if !bare {
+                place(self.terminal_toggle, terminal_x, (strip - toggle) / 2, toggle, toggle);
+            }
             // (an empty session has no name to tell it by, and the dog says what it is)
             let (name, color) = if !self.session_title.is_empty() { (self.session_title.clone(), theme::text()) } else if self.has_messages { (t("New session").to_string(), theme::faint()) } else { (String::new(), theme::faint()) };
-            let title_room = if toggles { column.min(toggle_x - s(ds::space::S) - left) } else { column };
+            let title_room = if bare { column } else { column.min(terminal_x - s(ds::space::S) - left) };
             self.title_area = rect(left, 0, title_room, strip);
             shapes.push(Shape::Text { area: self.title_area, text: name, font: FontKind::Strong, color, flags: ONE_LINE });
-            if !bare {
-                let tabs = [
-                    (t("Conversation"), PanelTab::Center(CenterView::Conversation)),
-                    (t("Terminal"), PanelTab::Center(CenterView::Terminal)),
-                    (t("Timeline"), PanelTab::Center(CenterView::Timeline)),
-                ];
+            let views = center_views(self.has_messages);
+            if !bare && !views.is_empty() {
+                let tabs: Vec<(&str, PanelTab)> = views.iter().map(|(words, view)| (t(words), PanelTab::Center(*view))).collect();
                 self.layout_tabs(&mut shapes, left, column, strip, FontKind::Small, &tabs);
                 content_top += s(ds::size::NAV_ROW);
                 shapes.push(Shape::Fill { area: rect(main_left, content_top - s(ds::space::PIXEL), main_width, s(ds::space::PIXEL)), color: theme::line() });
@@ -6517,10 +6533,17 @@ impl App {
             self.status_area = rect(0, 0, 0, 0);
         }
         let margin = s(ds::size::RIGHT_GAP);
-        if self.terminal_shown() {
-            self.layout_terminal_view(&mut shapes, main_left + margin, main_width - 2 * margin, content_top, height);
-        } else if self.timeline_shown() {
-            self.layout_timeline_view(&mut shapes, main_left + margin, main_width - 2 * margin, content_top, height);
+        // The terminal panel, when it is open: at the foot of the conversation's area, with the conversation (or the timeline) over it in what is left. Its height is of the
+        // area under the title, with or without the row of views: the row comes with the first thing written in a session (a note of the app's too), and a terminal open
+        // then would lose a row of its own under the person.
+        let panel_room = if self.terminal_shown() { term_panel::terminal_panel_height(height - strip, dpi) } else { 0 };
+        if panel_room > 0 {
+            let panel_top = height - panel_room;
+            shapes.push(Shape::Fill { area: rect(main_left, panel_top, main_width, s(ds::space::PIXEL)), color: theme::line() });
+            self.layout_terminal_view(&mut shapes, main_left + margin, main_width - 2 * margin, panel_top, height);
+        }
+        if self.timeline_shown() {
+            self.layout_timeline_view(&mut shapes, main_left + margin, main_width - 2 * margin, content_top, height - panel_room);
         }
 
         for window in [self.composer, self.send, self.attach_button, self.model_chip, self.mode_chip, self.effort_chip] {
@@ -6559,6 +6582,8 @@ impl App {
             show(window, finding);
         }
         if conversation {
+            // (over the terminal panel, when it is open)
+            let height = height - panel_room;
             let status_height = s(ds::size::STATUS);
             let inner = s(ds::size::COMPOSER_INSET);
             // Two lines' room to begin with; it grows with what is typed, up to about half the window, and then scrolls.
@@ -8257,6 +8282,9 @@ impl App {
     }
 
     unsafe fn layout_tabs(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32, font: FontKind, views: &[(&str, PanelTab)]) {
+        if views.len() < 2 {
+            return;
+        }
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let words_top = top + s(ds::space::XS);
@@ -8278,8 +8306,10 @@ impl App {
         }
     }
 
+    /// The conversation is what the central panel shows: the view chosen, or a session in which nothing has been said yet, which has no row of views to choose another by
+    /// (`center_views`).
     fn conversation_shown(&self) -> bool {
-        self.panel == Panel::Chat && (self.onboarding || self.settings.center_view == CenterView::Conversation)
+        self.panel == Panel::Chat && (self.onboarding || !self.has_messages || self.settings.center_view == CenterView::Conversation)
     }
 
     unsafe fn set_center_view(&mut self, view: CenterView) {
@@ -14960,6 +14990,7 @@ impl App {
             (self.help_button, t("Help")),
             (self.goal_clear, t("Clear the goal")),
             (self.right_toggle, t("Show or hide the panel on the right")),
+            (self.terminal_toggle, t("Show or hide the terminal")),
             (self.attach_button, t("Attach a picture")),
             (self.preview_reload, t("Reload")),
             (self.preview_browser, t("Open in browser")),
@@ -16571,6 +16602,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_PANEL_TOGGLE => app.toggle_right_panel(),
+                ID_TERM_TOGGLE => app.terminal_toggle(),
                 ID_PREVIEW_RELOAD => {
                     if let Some(shown) = &app.preview {
                         shown.reload();
@@ -16593,8 +16625,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_TERM_NEW | ID_TERM_START | ID_TERM_AGAIN => {
                     app.terminal_new(None);
                 }
-                ID_TERM_SHELLS => app.terminal_shells_menu(app.term.shells_button),
-                ID_TERM_START_SHELLS => app.terminal_shells_menu(app.term.start_shells),
                 _ if (ID_TERM_TAB..ID_TERM_TAB + crate::term::MOST_TERMINALS as isize).contains(&id) => app.terminal_tab_pressed((id - ID_TERM_TAB) as usize),
                 _ if (ID_TERM_CLOSE..ID_TERM_CLOSE + crate::term::MOST_TERMINALS as isize).contains(&id) => {
                     if let Some(terminal) = app.term.ids().get((id - ID_TERM_CLOSE) as usize).copied() {
@@ -18076,6 +18106,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             goal_clear: make_button(window, ID_GOAL_CLEAR, "x", ButtonKind::Icon, theme::surface()),
             right_width: 0,
             right_toggle: make_button(window, ID_PANEL_TOGGLE, "panel-right", ButtonKind::Icon, theme::background()),
+            terminal_toggle: make_button(window, ID_TERM_TOGGLE, "terminal", ButtonKind::Icon, theme::background()),
             right_hits: Vec::new(),
             please_quit: {
                 let name = wide("DogmindApp.PleaseQuit");
@@ -18501,6 +18532,15 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_session_has_no_row_of_views_and_one_that_has_begun_has_the_conversation_and_the_timeline() {
+        assert!(center_views(false).is_empty());
+        let views: Vec<CenterView> = center_views(true).iter().map(|(_, view)| *view).collect();
+        assert_eq!(views, [CenterView::Conversation, CenterView::Timeline]);
+        // (each has its Japanese, as the row shows it)
+        assert!(center_views(true).iter().all(|(words, _)| crate::lang::has_japanese(words)));
+    }
 
     /// A server of the older transport edited in Settings stays one, and the person's word on it goes with it: saved as `http`, it was asked with a POST of
     /// Streamable HTTP first. A new server at a URL, and one that was `http`, are `http`; a program is a program.
