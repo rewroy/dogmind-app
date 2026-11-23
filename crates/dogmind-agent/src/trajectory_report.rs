@@ -401,6 +401,8 @@ struct Spent {
     tools: BTreeMap<String, (u64, u64)>,
     // Time also present in a recorded parent call, retained in the per-tool breakdown.
     nested_ms: u64,
+    // Time shared by parallel calls in one request, also retained in their individual rows.
+    parallel_overlap_ms: u64,
     waits: u64,
     compaction: u64,
     retries: u64,
@@ -418,6 +420,7 @@ impl Spent {
         });
         spent.unfinished = lines.iter().any(|line| line.ev() == "turn_start") && ended.is_none();
         // Children finish first. Match their parent within this request, even if its row comes later.
+        let mut parallel = HashMap::<&str, Vec<(i64, i64)>>::new();
         let tool_ids: std::collections::HashSet<_> = lines.iter().filter(|line| line.ev() == "tool")
             .filter_map(|line| Some((line.req(), line.v["id"].as_str()?))).collect();
         for line in lines {
@@ -441,11 +444,27 @@ impl Spent {
                     entry.1 += ms;
                     if line.v["parent"].as_str().is_some_and(|parent| tool_ids.contains(&(line.req(), parent))) {
                         spent.nested_ms += ms;
+                    } else if line.u("parallel").unwrap_or(0) > 1 && !line.req().is_empty() && line.u("wait_ms").unwrap_or(0) == 0 {
+                        if let Ok(started) = DateTime::parse_from_rfc3339(line.s("started")) {
+                            let start = started.timestamp_millis();
+                            parallel.entry(line.req()).or_default().push((start, start.saturating_add_unsigned(ms)));
+                        }
                     }
                 }
                 "approval" => spent.waits += line.u("wait_ms").unwrap_or(0),
                 "compaction" => spent.compaction += line.u("ms").unwrap_or(0),
                 _ => {}
+            }
+        }
+        // Completions can be written out of order. Count only the part of each interval already covered.
+        for intervals in parallel.values_mut() {
+            intervals.sort_unstable();
+            let mut covered_until = i64::MIN;
+            for &(start, end) in intervals.iter() {
+                if start < covered_until {
+                    spent.parallel_overlap_ms += start.abs_diff(end.min(covered_until));
+                }
+                covered_until = covered_until.max(end);
             }
         }
         spent
@@ -454,6 +473,7 @@ impl Spent {
     fn add(&mut self, other: &Spent) {
         self.wall += other.wall;
         self.nested_ms += other.nested_ms;
+        self.parallel_overlap_ms += other.parallel_overlap_ms;
         self.prefill += other.prefill;
         self.generation += other.generation;
         self.helpers += other.helpers;
@@ -468,7 +488,7 @@ impl Spent {
     }
 
     fn tool_ms(&self) -> u64 {
-        self.tools.values().map(|(_, ms)| ms).sum::<u64>() - self.nested_ms
+        self.tools.values().map(|(_, ms)| ms).sum::<u64>() - self.nested_ms - self.parallel_overlap_ms
     }
 
     fn print(&self, out: &mut String, indent: &str) {
@@ -480,7 +500,8 @@ impl Spent {
         let _ = writeln!(out, "{indent}model {} ({}): prefill to the first word {}, generation {}", secs(model), share(model, self.wall), secs(self.prefill), secs(self.generation));
         let by_name: Vec<String> = self.tools.iter().map(|(name, (calls, ms))| format!("{name} {calls} x {}", secs(*ms))).collect();
         let nested = if self.nested_ms > 0 { " (individual times include nested calls)" } else { "" };
-        let _ = writeln!(out, "{indent}tools {} ({}){}{nested}{}", secs(tools), share(tools, self.wall), if by_name.is_empty() { String::new() } else { format!(": {}", by_name.join(", ")) }, if self.helpers > 0 { format!("; of which an explore helper's own requests {}", secs(self.helpers)) } else { String::new() });
+        let parallel = if self.parallel_overlap_ms > 0 { " (parallel calls overlap)" } else { "" };
+        let _ = writeln!(out, "{indent}tools {} ({}){}{nested}{parallel}{}", secs(tools), share(tools, self.wall), if by_name.is_empty() { String::new() } else { format!(": {}", by_name.join(", ")) }, if self.helpers > 0 { format!("; of which an explore helper's own requests {}", secs(self.helpers)) } else { String::new() });
         let _ = writeln!(out, "{indent}waiting for the person {}, compaction {}, waiting to retry {}", secs(self.waits), secs(self.compaction), secs(self.retries));
         let _ = writeln!(out, "{indent}the rest {} ({}): the app's own work, and what is between one step and the next", secs(rest), share(rest, self.wall));
     }
@@ -871,6 +892,26 @@ mod tests {
         assert!(said.contains("\nfailures\n  turn 1 at /1: server_gone, the server said: Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory)\n  turn 1 at /1: unfinished\n"), "{said}");
         // A run that did not fail has no such section.
         assert!(!report(&text(&lines[..2]), None).contains("failures"));
+    }
+
+    #[test]
+    fn parallel_calls_share_only_the_overlapping_time_in_the_same_request() {
+        let call = |req: &str, start: &str, ms: u64| json!({
+            "ev":"tool", "turn":1, "req":req, "name":"read_file", "parallel":3, "started":start, "ms":ms,
+        });
+        let input = text(&[
+            call("s/1", "2026-11-23T10:00:00.500Z", 1000),
+            call("s/1", "2026-11-23T10:00:00.000Z", 1000),
+            call("s/1", "2026-11-23T10:00:00.600Z", 100),
+            call("s/1", "2026-11-23T10:00:02.000Z", 200),
+            call("s/2", "2026-11-23T10:00:00.000Z", 100),
+            call("s/1", "", 300),
+        ]);
+        let details = summary(&input);
+        assert_eq!(details.turns[0].tools.len(), 6);
+        assert_eq!(details.turns[0].tools_ms, 2100);
+        let said = report(&input, None);
+        assert!(said.contains("tools 2.1 s") && said.contains("read_file 6 x 2.7 s"), "{said}");
     }
 
     #[test]
