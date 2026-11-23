@@ -207,6 +207,7 @@ enum Page {
     Working { progress: Option<Progress>, stopping: bool, update: bool },
     Failed { failure: Failure },
     Installed { update: bool },
+    InstalledAppFailedToStart(String),
     AppWontStart(String),
     Removing { fraction: f64 },
     Gone { left: Vec<String> },
@@ -418,6 +419,14 @@ impl App {
                 secondary: Some(self.w("Close", "閉じる")),
                 ..View::default()
             },
+            Page::InstalledAppFailedToStart(why) => View {
+                heading: self.w("Dogmind is installed but could not start", "Dogmind のインストールは完了しましたが、起動できませんでした"),
+                detail: why.clone(),
+                primary: Some(self.w("Try starting Dogmind again", "もう一度 Dogmind を起動")),
+                secondary: Some(self.w("Close", "閉じる")),
+                problem: true,
+                ..View::default()
+            },
             Page::AppWontStart(why) => View {
                 heading: self.w("The app cannot be started", "アプリを起動できません"),
                 detail: if self.japanese { format!("設定や保存したキーの削除はアプリが行います ({why})。プログラムだけを削除すると、それらは %LOCALAPPDATA%\\DogmindApp と資格情報マネージャーに残ります。") } else { format!("It is the app that takes away its settings and saved keys ({why}). Removing only the program leaves those in %LOCALAPPDATA%\\DogmindApp and Credential Manager.") },
@@ -499,6 +508,7 @@ impl App {
             Page::Failed { .. } if self.updating => {
                 PostMessageW(self.window, WM_COMMAND, 2, 0);
             }
+            Page::InstalledAppFailedToStart(_) => { PostMessageW(self.window, WM_CLOSE, 0, 0); }
             Page::Failed { .. } | Page::RemoveFailed(_) | Page::Refused(..) => self.finish(1),
             Page::Installed { .. } | Page::Gone { .. } => self.finish(0),
             _ => {}
@@ -513,7 +523,9 @@ impl App {
     /// An end that is not the work done. An update the app asked for is of an app that quit for it, and its person chose to update, not to close it: whichever page this is on and whichever way
     /// it ends (Cancel, the window's close, a failure), the app comes back as it is in the folder, and the code still says how it ended. If it cannot be started, or this is no update, it ends as it says.
     unsafe fn end_without_success(&mut self, code: i32) {
-        if !(self.updating && self.finish_update(code)) {
+        if self.updating {
+            self.finish_with_app(code);
+        } else {
             self.finish(code);
         }
     }
@@ -750,13 +762,18 @@ impl App {
         });
     }
 
-    /// Complete an update with its original exit code and the requested relaunch behavior.
-    unsafe fn finish_update(&mut self, code: i32) -> bool {
-        if !self.options.skip_update_relaunch && system::start_program(&self.folder().join(&self.options.app_name), "", self.options.test).is_err() {
-            return false;
+    /// Finish with the installed app running, or let the person retry its launch after a successful install.
+    unsafe fn finish_with_app(&mut self, code: i32) {
+        if !(self.updating && self.options.skip_update_relaunch) {
+            if let Err(error) = system::start_program(&self.folder().join(&self.options.app_name), "", self.options.test) {
+                if code == 0 {
+                    self.page = Page::InstalledAppFailedToStart(error.to_string());
+                    self.refresh();
+                    return;
+                }
+            }
         }
         self.finish(code);
-        true
     }
 
     /// Who is running, and on to `then` if no one is.
@@ -828,10 +845,7 @@ impl App {
                 self.refresh();
             }
             Page::Failed { .. } => self.clear_the_way(After::Install),
-            Page::Installed { .. } => {
-                let _ = system::start_program(&self.folder().join(&self.options.app_name), "", self.options.test);
-                self.finish(0);
-            }
+            Page::Installed { .. } | Page::InstalledAppFailedToStart(_) => self.finish_with_app(0),
             Page::AppWontStart(_) | Page::RemoveFailed(_) => self.start_removal(),
             _ => {}
         }
@@ -846,6 +860,7 @@ impl App {
             }
             Page::Removing { .. } => {}
             Page::Gone { .. } | Page::Installed { .. } => self.finish(0),
+            Page::InstalledAppFailedToStart(_) => self.finish(1),
             // (an update that failed is of an app that is not running: its button starts it as it was, and so does the window's own close; but not of a folder that is part of two versions)
             Page::Failed { failure } if !app_comes_back_after(failure) => self.finish(1),
             Page::Failed { .. } | Page::RemoveFailed(_) | Page::Refused(..) => self.end_without_success(1),
@@ -877,7 +892,8 @@ impl App {
                 }
                 Message::Installed(update) => {
                     // (an update the app asked for does not wait to be told it is done: the app is back, and this is gone)
-                    if self.updating && self.finish_update(0) {
+                    if self.updating {
+                        self.finish_with_app(0);
                         continue;
                     }
                     self.page = Page::Installed { update };

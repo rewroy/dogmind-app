@@ -257,6 +257,19 @@ fn an_unattended_test_update_does_not_start_the_default_app() {
 }
 
 #[test]
+fn a_completed_update_reports_when_the_app_could_not_start() {
+    let scene = Scene::new();
+    let folder = scene.installed("1.0.0");
+    let update = pack(scene.path(), "2.0.0");
+    let status = setup(&update).env("DOGMIND_SETUP_APP_NAME", "missing-app.exe")
+        .args(["--update", "--test", "--auto", "--dir"]).arg(&folder).status().unwrap();
+    assert_eq!(manifest_version(&folder), "2.0.0");
+    assert_eq!(version_of(&folder), "2.0.0");
+    assert_eq!(status.code(), Some(1), "setup must report the requested launch failure");
+    assert!(running_from(&folder).is_empty());
+}
+
+#[test]
 fn no_launch_leaves_a_closed_app_closed_after_an_update() {
     let scene = Scene::new();
     let folder = scene.installed("1.0.0");
