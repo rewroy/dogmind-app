@@ -79,6 +79,20 @@ pub fn rows(summary: &Summary, open: &BTreeSet<u64>) -> Vec<Row> {
     rows
 }
 
+/// Copy the table as it is expanded, with the full text even where a cell is clipped on screen.
+pub fn table_text(rows: &[Row]) -> String {
+    let mut table = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            table.push_str("\r\n");
+        }
+        table.push_str(&row.cells.join("\t"));
+        table.push('\t');
+        table.push_str(if row.kind == RowKind::Header { t("Details") } else { &row.note });
+    }
+    table
+}
+
 /// What a turn says besides its figures: how much was written to begin it, that it has no end, how it failed.
 fn turn_note(turn: &TurnSummary) -> String {
     let mut parts = vec![if turn.woken { t("woken by background work").to_string() } else { tf("{0} characters", &[&turn.chars]) }];
@@ -164,6 +178,21 @@ mod tests {
             r#"{"t":"2026-11-05T10:03:21.000+09:00","ev":"turn_end","turn":2,"cancelled":false,"requests":1,"tools":0,"ms":21000}"#,
         ];
         summary(&lines.join("\n"))
+    }
+
+    #[test]
+    fn copying_a_trajectory_includes_only_expanded_details_and_keeps_full_notes() {
+        let summary = run();
+        let closed = table_text(&rows(&summary, &BTreeSet::new()));
+        assert!(closed.starts_with("Turn\tRequests\tPrefill s\tGeneration s\tTools s\tWall s\tDetails\r\n"));
+        assert_eq!(closed.lines().count(), 4);
+        assert!(!closed.contains("create_file"));
+
+        let open = rows(&summary, &BTreeSet::from([1]));
+        let copied = table_text(&open);
+        assert_eq!(copied.lines().count(), open.len());
+        assert!(copied.contains(&open[2].note) && copied.contains("[create_file]"));
+        assert!(!copied.contains("31.5 tok/s"));
     }
 
     #[test]

@@ -9814,8 +9814,13 @@ impl App {
         }
     }
 
-    /// The rows chosen, or the whole of the file, as text.
+    /// Copy the table on the trajectory page, or the selected lines (or whole file) on the changes page.
     unsafe fn copy_from_diff(&mut self) {
+        if let Some(page) = &self.trajectory {
+            let text = crate::trajectory::table_text(&page.rows);
+            self.copy_to_clipboard(&text);
+            return;
+        }
         let chosen = self.diff_chosen.map(|(a, b)| (a.min(b), a.max(b)));
         let text: Vec<String> = self.diff_rows.iter().enumerate().filter(|(at, row)| chosen.map_or(true, |(a, b)| *at >= a && *at <= b) && !matches!(row.kind, RowKind::Hunk | RowKind::Note)).map(|(_, row)| {
             let mark = match row.kind {
