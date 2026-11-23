@@ -1,5 +1,6 @@
 //! The tools, each behaving as its Dogmind namesake says it does in the schema the model reads.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 #[cfg(not(windows))]
 use std::io::Read;
@@ -1441,30 +1442,39 @@ fn in_code_page_932(text: &str) -> Option<Vec<u8>> {
 
 /// A file's text and the name of what it was in. On a Japanese Windows that may be Shift_JIS, and what PowerShell's `>` writes is UTF-16.
 pub(crate) fn file_text(bytes: &[u8]) -> (String, &'static str) {
+    let (text, encoding) = decode_file_text(bytes);
+    (text.into_owned(), encoding)
+}
+
+fn decode_file_text(bytes: &[u8]) -> (Cow<'_, str>, &'static str) {
     let wide = |pair: fn([u8; 2]) -> u16| String::from_utf16_lossy(&bytes[2..].chunks_exact(2).map(|two| pair([two[0], two[1]])).collect::<Vec<u16>>());
     if bytes.starts_with(&[0xFF, 0xFE]) {
-        return (wide(u16::from_le_bytes), "utf-16");
+        return (Cow::Owned(wide(u16::from_le_bytes)), "utf-16");
     }
     if bytes.starts_with(&[0xFE, 0xFF]) {
-        return (wide(u16::from_be_bytes), "utf-16");
+        return (Cow::Owned(wide(u16::from_be_bytes)), "utf-16");
     }
     if let Ok(text) = std::str::from_utf8(bytes) {
-        return (text.to_string(), "utf-8");
+        return (Cow::Borrowed(text), "utf-8");
     }
     match crate::web::from_code_page(bytes, 932) {
-        Some(text) => (text, "shift_jis"),
-        None => (String::from_utf8_lossy(bytes).into_owned(), "unknown"),
+        Some(text) => (Cow::Owned(text), "shift_jis"),
+        None => (String::from_utf8_lossy(bytes), "unknown"),
     }
 }
 
 /// A file's bytes as text to be shown, as the agent reads files (`file_text`): UTF-16 with its mark, else UTF-8, else code page 932, with the name of what it was. None for a binary, which is
 /// a NUL in the first 8 KB of what is not UTF-16.
 pub fn text_of_file(bytes: &[u8]) -> Option<(String, &'static str)> {
+    readable_file_text(bytes).map(|(text, encoding)| (text.into_owned(), encoding))
+}
+
+fn readable_file_text(bytes: &[u8]) -> Option<(Cow<'_, str>, &'static str)> {
     let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
     if !utf16 && bytes.iter().take(8192).any(|&byte| byte == 0) {
         return None;
     }
-    Some(file_text(bytes))
+    Some(decode_file_text(bytes))
 }
 
 fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, String)), String> {
@@ -1837,10 +1847,8 @@ fn search_files_until(arguments: &Value, workspace: &Path, secrets_besides: &[Pa
             continue;
         }
         let Ok(bytes) = std::fs::read(entry.path()) else { continue };
-        if bytes.iter().take(8192).any(|&byte| byte == 0) {
-            continue;
-        }
-        let text = String::from_utf8_lossy(&bytes);
+        let Some((text, encoding)) = readable_file_text(&bytes) else { continue };
+        let text = if encoding == "utf-8" { text.strip_prefix('\u{feff}').unwrap_or(&text) } else { &text };
         let name = entry.path().strip_prefix(workspace).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
         for (number, line) in text.lines().enumerate() {
             // A single large log can take the entire budget. Avoid reading the clock on every short line.
@@ -5629,6 +5637,27 @@ mod tests {
         assert!(said.contains("the home's, for the model") && !said.contains("for the person"), "{said}");
         let none = bench.run("skill", &json!({"name": "manual"}), &work, &cancel).unwrap_err();
         assert!(none.contains("no skill is called manual"), "{none}");
+    }
+
+    #[test]
+    fn search_reads_utf16_and_utf8_bom_files_and_ignores_binaries() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let line = "日本語\r\nsecond";
+        let le = [0xFF, 0xFE].into_iter().chain(line.encode_utf16().flat_map(u16::to_le_bytes)).collect::<Vec<_>>();
+        let be = [0xFE, 0xFF].into_iter().chain(line.encode_utf16().flat_map(u16::to_be_bytes)).collect::<Vec<_>>();
+        std::fs::write(dir.path().join("le.txt"), le).unwrap();
+        std::fs::write(dir.path().join("be.txt"), be).unwrap();
+        std::fs::write(dir.path().join("bom.txt"), format!("\u{feff}{line}")).unwrap();
+        std::fs::write(dir.path().join("binary"), "日本語\n\0binary").unwrap();
+        #[cfg(windows)]
+        std::fs::write(dir.path().join("cp932.txt"), [0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA]).unwrap();
+        let found = search_files(&json!({"pattern": "^日本語$"}), dir.path(), &[], &AtomicBool::new(false)).unwrap();
+        let mut lines: Vec<_> = found.lines().collect();
+        lines.sort_unstable();
+        #[cfg(windows)]
+        assert_eq!(lines, ["be.txt:1:日本語", "bom.txt:1:日本語", "cp932.txt:1:日本語", "le.txt:1:日本語"]);
+        #[cfg(not(windows))]
+        assert_eq!(lines, ["be.txt:1:日本語", "bom.txt:1:日本語", "le.txt:1:日本語"]);
     }
 
     #[test]
