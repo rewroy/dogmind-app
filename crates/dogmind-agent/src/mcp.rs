@@ -6,7 +6,7 @@
 //! returns may come from anywhere, so it goes to the model marked as data, as a web page does. A server the person says they trust
 //! still has that mark, and its tools still ask as they did; only what it returns no longer counts as web content in the conversation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -32,6 +32,20 @@ const ENDED: &str = "the server has ended";
 const PIPE: &str = "the server's pipe";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolSelection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled_tools: Option<BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    disabled_tools: BTreeSet<String>,
+}
+
+impl ToolSelection {
+    fn allows(&self, name: &str) -> bool {
+        self.enabled_tools.as_ref().is_none_or(|enabled| enabled.contains(name)) && !self.disabled_tools.contains(name)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// `http` for a server at `url` (Streamable HTTP, or the older transport if it answers as one of those), `sse` for one of the older transport (HTTP
     /// with server-sent events, before Streamable HTTP); none, or `stdio`, for a program.
@@ -50,6 +64,8 @@ pub struct ServerConfig {
     /// Sent with every request to `url`: an `Authorization` among them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub tool_selection: ToolSelection,
     /// The person's word that what this server returns is not a stranger's. In this app's own file, which neither a model's tools nor a command can write.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trusted: bool,
@@ -119,6 +135,8 @@ fn parse_codex_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
         env: BTreeMap<String, String>,
         url: String,
         http_headers: BTreeMap<String, String>,
+        #[serde(flatten)]
+        tool_selection: ToolSelection,
         enabled: Option<bool>,
     }
 
@@ -132,7 +150,7 @@ fn parse_codex_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
         }
         let config = ServerConfig {
             command: server.command, args: server.args, cwd: server.cwd, env: server.env, url: server.url,
-            headers: server.http_headers, ..Default::default()
+            headers: server.http_headers, tool_selection: server.tool_selection, ..Default::default()
         };
         config.problem().is_none().then_some((name, config))
     }).collect())
@@ -1314,7 +1332,7 @@ fn schema_of(server: &str, part: &str, tool: &Value) -> Option<(String, String, 
 /// A server's tools under the names the model knows them by, in an order that does not depend on the server's mood. A cut or a cleaning that gives two tools
 /// one name gets the second a number: the services refuse the whole request over a name twice, and so every request. A server's own part (see `name_parts`) keeps its
 /// names from another server's.
-fn place_tools(server: &str, part: &str, tools: &[Value]) -> (BTreeMap<String, String>, Vec<Value>) {
+fn place_tools(server: &str, part: &str, tools: &[Value], selection: Option<&ToolSelection>) -> (BTreeMap<String, String>, Vec<Value>) {
     let mut listed: Vec<(String, String, Value)> = tools.iter().filter_map(|tool| schema_of(server, part, tool)).collect();
     listed.sort_by(|a, b| a.1.cmp(&b.1));
     let (mut names, mut schemas) = (BTreeMap::new(), Vec::new());
@@ -1329,13 +1347,18 @@ fn place_tools(server: &str, part: &str, tools: &[Value]) -> (BTreeMap<String, S
         names.insert(known, real);
         schemas.push(schema);
     }
+    // Assign aliases before filtering so excluding a tool cannot give its name to a different tool.
+    if let Some(selection) = selection.filter(|s| s.enabled_tools.is_some() || !s.disabled_tools.is_empty()) {
+        names.retain(|_, original| selection.allows(original));
+        schemas.retain(|schema| schema["function"]["name"].as_str().is_some_and(|name| names.contains_key(name)));
+    }
     (names, schemas)
 }
 
 fn ready(name: &str, part: &str, config: &ServerConfig) -> Result<Arc<Running>, String> {
     let mut running = start_server(config)?;
     let tools = std::mem::take(&mut running.schemas);
-    (running.names, running.schemas) = place_tools(name, part, &tools);
+    (running.names, running.schemas) = place_tools(name, part, &tools, Some(&config.tool_selection));
     Ok(Arc::new(running))
 }
 
@@ -1516,7 +1539,7 @@ impl Hub {
         let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(slot) = slots.iter_mut().find(|slot| slot.running.as_ref().is_some_and(|now| now.is(running))) else { return };
         let Some(now) = slot.running.clone() else { return };
-        let (names, schemas) = place_tools(&slot.name, &slot.part, &tools);
+        let (names, schemas) = place_tools(&slot.name, &slot.part, &tools, slot.config.as_ref().map(|c| &c.tool_selection));
         if names == now.names && schemas == now.schemas {
             return;
         }
@@ -1621,7 +1644,7 @@ impl Hub {
 
     #[cfg(test)]
     fn add_running(&self, server: &str, tools: &[Value], writer: Box<dyn Write + Send>, reader: impl BufRead + Send + 'static, trusted: bool) {
-        let (names, schemas) = place_tools(server, &name_part(server), tools);
+        let (names, schemas) = place_tools(server, &name_part(server), tools, None);
         let running = Arc::new(Running { names, schemas, ..Running::new(Rpc::over(writer, reader), Vec::new(), None) });
         self.slots.lock().unwrap().push(Slot { name: server.into(), part: name_part(server), running: Some(running), trusted, ..Slot::default() });
     }
@@ -2379,22 +2402,53 @@ enabled = false
     }
 
     #[test]
+    fn imported_tool_selection_applies_to_a_refreshed_catalog() {
+        let config = servers_of_codex("[mcp_servers.clock]\ncommand='clock'\nenabled_tools=['time.local','time_local','zone']\ndisabled_tools=['time.local']").remove("clock").unwrap();
+        let hub = Hub::scripted("clock", &[tool("zone")], &[], false);
+        let running = {
+            let mut slots = hub.slots.lock().unwrap();
+            slots[0].config = Some(config);
+            slots[0].running.clone().unwrap()
+        };
+        hub.relisted(&running, Ok(vec![tool("date"), tool("time.local"), tool("time_local"), tool("zone")]));
+        let schemas = hub.schemas();
+        let shown: Vec<_> = schemas.iter().map(|schema| schema["function"]["name"].as_str().unwrap()).collect();
+        assert_eq!(shown, ["mcp__clock__time_local_2", "mcp__clock__zone"]);
+        let slots = hub.slots.lock().unwrap();
+        let names = &slots[0].running.as_ref().unwrap().names;
+        assert_eq!(names.len(), shown.len());
+        assert_eq!(names["mcp__clock__time_local_2"], "time_local");
+        assert_eq!(names["mcp__clock__zone"], "zone");
+    }
+
+    #[test]
+    fn an_empty_allow_list_disables_all_tools_and_an_absent_one_allows_unlisted_tools() {
+        for (settings, expected_count) in [("enabled_tools=[]", 0), ("disabled_tools=['date']", 1), ("", 2)] {
+            let config = servers_of_codex(&format!("[mcp_servers.clock]\nurl='http://localhost'\n{settings}")).remove("clock").unwrap();
+            let (names, schemas) = place_tools("clock", "clock", &[tool("date"), tool("time")], Some(&config.tool_selection));
+            assert_eq!(names.len(), expected_count, "{settings}");
+            assert_eq!(schemas.len(), expected_count, "{settings}");
+            assert_eq!(names.contains_key("mcp__clock__time"), expected_count > 0);
+        }
+    }
+
+    #[test]
     fn two_tools_never_share_a_name_and_the_order_is_the_tools_own() {
         let long = "t".repeat(70);
         let tools = [tool(&format!("{long}b")), tool(&format!("{long}a")), tool("do.it"), tool("do_it")];
-        let (names, schemas) = place_tools("srv", "srv", &tools);
+        let (names, schemas) = place_tools("srv", "srv", &tools, None);
         assert_eq!((names.len(), schemas.len()), (4, 4), "{names:?}");
         assert!(names.keys().all(|name| name.len() <= 64), "{names:?}");
         let spelled: Vec<&str> = schemas.iter().map(|schema| schema["function"]["name"].as_str().unwrap()).collect();
         assert!(spelled.iter().all(|name| names.contains_key(*name)));
-        let (_, reversed) = place_tools("srv", "srv", &[tool("do_it"), tool("do.it"), tool(&format!("{long}a")), tool(&format!("{long}b"))]);
+        let (_, reversed) = place_tools("srv", "srv", &[tool("do_it"), tool("do.it"), tool(&format!("{long}a")), tool(&format!("{long}b"))], None);
         assert_eq!(serde_json::to_string(&schemas).unwrap(), serde_json::to_string(&reversed).unwrap(), "whatever order it lists them in");
         assert_eq!(schemas[0]["function"]["parameters"]["type"], "object");
     }
 
     fn running(lines: &[Value], names: &[&str]) -> Arc<Running> {
         let script: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        let (names, schemas) = place_tools("srv", "srv", &names.iter().map(|name| tool(name)).collect::<Vec<_>>());
+        let (names, schemas) = place_tools("srv", "srv", &names.iter().map(|name| tool(name)).collect::<Vec<_>>(), None);
         Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(script.into_bytes())), Vec::new(), None) })
     }
 
@@ -2519,7 +2573,7 @@ enabled = false
         let both = Hub::default();
         let named = ["a b".to_string(), "a_b".to_string()];
         for ((name, trusted), part) in named.iter().zip([false, true]).zip(name_parts(&named)) {
-            let (names, schemas) = place_tools(name, &part, &[tool("t")]);
+            let (names, schemas) = place_tools(name, &part, &[tool("t")], None);
             let server = Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(Vec::new())), Vec::new(), None) });
             both.slots.lock().unwrap().push(Slot { name: name.clone(), running: Some(server), trusted, ..Slot::default() });
         }

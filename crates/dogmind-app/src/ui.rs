@@ -2891,9 +2891,10 @@ fn mcp_runs(config: &dogmind_agent::mcp::ServerConfig) -> String {
 fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Option<String>, target: String, original_args: &str, args: &str, pairs: std::collections::BTreeMap<String, String>) -> dogmind_agent::mcp::ServerConfig {
     use dogmind_agent::mcp;
     let trusted = was.is_some_and(|config| config.trusted);
+    let tool_selection = was.map(|config| config.tool_selection.clone()).unwrap_or_default();
     let kind = if was.is_some_and(|config| config.kind == "sse") { "sse" } else { "http" };
     match url {
-        Some(url) => mcp::ServerConfig { kind: kind.into(), url, headers: pairs, trusted, ..Default::default() },
+        Some(url) => mcp::ServerConfig { kind: kind.into(), url, headers: pairs, trusted, tool_selection, ..Default::default() },
         None => {
             // The edit control normalizes line endings even when the person only changes another field.
             let args = match was {
@@ -2901,7 +2902,7 @@ fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Optio
                 _ => mcp::args_of_line(args),
             };
             let cwd = was.filter(|config| !config.is_http()).and_then(|config| config.cwd.clone());
-            mcp::ServerConfig { command: target, args, env: pairs, cwd, trusted, ..Default::default() }
+            mcp::ServerConfig { command: target, args, env: pairs, cwd, trusted, tool_selection, ..Default::default() }
         }
     }
 }

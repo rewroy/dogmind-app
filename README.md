@@ -47,6 +47,7 @@ Copy a name from the list and type `/mcp import NAME` to start that server. For 
 Use `/mcp` to check the connection. Once connected, its tools are available in the open conversation.
 To add a server manually, open *Settings > Tools > MCP servers > Add a server*.
 For a local server that opens scripts or data by a relative path, enter its folder in *Working directory (optional)*. You can also edit this field on an existing server.
+New imports from Codex keep its `enabled_tools` and `disabled_tools` lists. Existing Dogmind entries keep their saved settings when imported again.
 
 While the model works, Enter puts what you type into the work before its next step, and Ctrl+Enter keeps it for after the work. Each
 waiting message has buttons to send it into the work now, to edit it, or to discard it. Each message shows its time; an answer's
