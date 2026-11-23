@@ -13268,6 +13268,7 @@ impl App {
 
     unsafe fn show_transcript(&mut self, messages: &[Message]) {
         set_text(self.transcript, "");
+        self.last_answer.clear();
         // (what the panel on the right showed of the session before is of it)
         self.steps = None;
         self.timeline_session_changed();
@@ -15259,7 +15260,7 @@ impl App {
                     let _ = self.agent.commands.send(Command::Compact);
                 }
             }
-            M_COPY => self.copy_to_clipboard(&self.last_answer.clone()),
+            M_COPY if !self.last_answer.is_empty() => self.copy_to_clipboard(&self.last_answer),
             M_MODELS => self.set_panel(Panel::Models),
             M_PROVIDERS => self.set_panel(Panel::Providers),
             M_RESTART => self.connect(),
