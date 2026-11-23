@@ -860,7 +860,15 @@ pub(crate) unsafe fn profile_sid() -> Result<PSID, String> {
     if let Some(sid) = &*slot {
         return Ok(sid.0);
     }
-    let (name, display, description) = (wide(profile_name()), wide("Dogmind commands"), wide("Where Dogmind runs the commands you approve"));
+    let sid = profile_sid_named(profile_name())?;
+    *slot = Some(Sid(sid));
+    Ok(sid)
+}
+
+/// The SID of the container profile of this name: made where it is not there yet, outside the sandbox, as on a PC the app has never run on; in it, only
+/// named, whatever the name.
+unsafe fn profile_sid_named(name: &str) -> Result<PSID, String> {
+    let (name, display, description) = (wide(name), wide("Dogmind commands"), wide("Where Dogmind runs the commands you approve"));
     let mut sid: PSID = std::ptr::null_mut();
     // In the sandbox already, the profile is only named, never made: CreateAppContainerProfile called with a restricted token, for a profile that was there,
     // left the container's PowerShell unable to start in every later command of the process that had used the profile first (exit 1, nothing printed: the
@@ -870,7 +878,6 @@ pub(crate) unsafe fn profile_sid() -> Result<PSID, String> {
     if created < 0 && DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) < 0 {
         return Err(format!("the AppContainer profile could not be made (0x{created:08x})"));
     }
-    *slot = Some(Sid(sid));
     Ok(sid)
 }
 
@@ -3088,10 +3095,19 @@ mod tests {
     #[ignore = "run by the_sandbox_is_told_by_the_token_alone_and_a_run_in_it_starts_as_its_caller"]
     fn a_sandbox_probe() {
         let mode = std::env::args().last().unwrap_or_default();
-        if mode != "ask" && mode != "nested" {
+        if mode != "ask" && mode != "nested" && mode != "names" {
             return;
         }
         println!("PROBE in the sandbox: {}", in_the_sandbox());
+        if mode == "names" {
+            let here = std::env::current_dir().unwrap();
+            for name in std::fs::read_to_string(here.join("names.txt")).unwrap().lines() {
+                // SAFETY: the SID is only read, and left for the process's end.
+                let sid = unsafe { profile_sid_named(name).map(|sid| sid_text(sid)) };
+                println!("PROBE named {name}: {sid:?}");
+            }
+            return;
+        }
         if mode == "nested" {
             let here = std::env::current_dir().unwrap();
             let inner = here.join("inner");
@@ -3145,6 +3161,49 @@ mod tests {
         let folder = work_folder("after-a-restricted-program");
         let after = command("powershell -NoProfile -NonInteractive -Command \"[Console]::Out.WriteLine('still starts')\"", &folder, false);
         assert!(decode(&after.stdout).contains("still starts"), "{:?} {} {}", after.status, decode(&after.stdout), decode(&after.stderr));
+    }
+
+    /// Outside the sandbox a profile that is not there yet is made, as on a PC the app has never run on. A process with a restricted token only names one,
+    /// whatever its name (the person's own, `DogmindApp.Exec`, is one it may meet, in a debug build of the app run by a session's cargo): one that is not
+    /// there stays not there, and one that is there is not made again (`profile_sid`).
+    #[test]
+    fn a_profile_is_made_outside_the_sandbox_and_only_named_with_a_restricted_token() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let unique = format!("DogmindApp.Exec.Tests.P{}", std::process::id());
+        let (absent, present) = (format!("{unique}.Absent"), format!("{unique}.Present"));
+        let folder_of = |name: &str| PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("Packages").join(name.to_lowercase());
+        // SAFETY: the SIDs are only read, and left for the process's end.
+        let named = |name: &str| unsafe { profile_sid_named(name).map(|sid| sid_text(sid)) };
+        // (outside the sandbox: made)
+        let made = named(&present).unwrap();
+        assert!(folder_of(&present).join("AC").is_dir(), "{} was not made", folder_of(&present).display());
+        let list = dacl_text(&folder_of(&present).join("AC")).unwrap();
+        // (with a restricted token: named alone, the same SIDs)
+        let work = crate::in_container::tempdir().unwrap();
+        let probe = work.path().join("bin").join("probe.exe");
+        std::fs::create_dir_all(probe.parent().unwrap()).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+        std::fs::write(work.path().join("names.txt"), format!("{absent}\n{present}\n")).unwrap();
+        let line = format!("\"{}\" sandbox::tests::a_sandbox_probe --exact --ignored --nocapture --test-threads=1 names", probe.display());
+        let done = run_live_restricted(&line, work.path(), work.path(), false, Duration::from_secs(120), &AtomicBool::new(false), None).unwrap();
+        let said = format!("{}{}", decode(&done.stdout), decode(&done.stderr));
+        // SAFETY: as above.
+        let derived = |name: &str| unsafe {
+            let mut sid: PSID = std::ptr::null_mut();
+            assert!(DeriveAppContainerSidFromAppContainerName(wide(name).as_ptr(), &mut sid) >= 0);
+            sid_text(sid)
+        };
+        for name in [&absent, &present] {
+            assert!(said.contains(&format!("PROBE named {name}: Ok({:?})", derived(name))), "{name}: {said}");
+        }
+        assert_eq!(made, derived(&present));
+        assert!(!folder_of(&absent).exists(), "a restricted process made {absent}");
+        assert_eq!(dacl_text(&folder_of(&present).join("AC")).unwrap(), list, "a restricted process made {present} again");
+        // SAFETY: the name lives through the call; the profile is this test's own.
+        unsafe { DeleteAppContainerProfile(wide(&present).as_ptr()) };
+        assert!(!folder_of(&present).exists());
     }
 
     /// The tests' commands run in a container of their own: nothing a run of them leaves is in the one of the app the person uses on the same PC.
