@@ -1763,7 +1763,8 @@ fn list_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Resul
         walk.standard_filters(false).max_depth(Some(1));
     }
     let mut names = Vec::new();
-    let (mut files, mut bytes) = (0usize, 0u64);
+    const COUNT_LIMIT: usize = 50_000;
+    let (mut entries, mut files, mut bytes) = (0usize, 0usize, 0u64);
     for entry in walk.build().flatten() {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
@@ -1771,12 +1772,19 @@ fn list_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Resul
         if entry.depth() == 0 {
             continue;
         }
-        let name = entry.path().strip_prefix(&root).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
-        let folder = entry.file_type().is_some_and(|kind| kind.is_dir());
-        let size = entry.metadata().map_or(0, |data| data.len());
-        files += 1;
-        bytes += size;
+        entries += 1;
+        let kind = entry.file_type();
+        let size = if kind.is_some_and(|kind| kind.is_file()) {
+            files += 1;
+            let size = entry.metadata().map_or(0, |data| data.len());
+            bytes += size;
+            size
+        } else {
+            0
+        };
         if names.len() < LIST_LIMIT {
+            let folder = kind.is_some_and(|kind| kind.is_dir());
+            let name = entry.path().strip_prefix(&root).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
             // (a large one says so here: a model about to read a log first asks how long it is, in a round of its own)
             names.push(match (folder, size >= BIG_FILE) {
                 (true, _) => format!("{name}/"),
@@ -1785,7 +1793,7 @@ fn list_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Resul
                 (false, false) => name,
             });
         }
-        if files >= 50_000 {
+        if entries >= COUNT_LIMIT {
             break;
         }
     }
@@ -1795,8 +1803,10 @@ fn list_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Resul
         return Ok(format!("{} is empty", root.display()));
     }
     let mut out = names.join("\n");
-    if files > LIST_LIMIT {
-        out.push_str(&format!("\n--- truncated: showing first {LIST_LIMIT} of {files} files ({bytes} bytes); use search_files for targeted lookup ---"));
+    if entries > LIST_LIMIT {
+        let lower_bound = if entries == COUNT_LIMIT { "at least " } else { "" };
+        let unit = if files == 1 { "file" } else { "files" };
+        out.push_str(&format!("\n--- truncated: showing first {LIST_LIMIT} of {lower_bound}{entries} entries; counted {files} {unit} ({bytes} bytes); use search_files for targeted lookup ---"));
     }
     Ok(out)
 }
@@ -5657,6 +5667,17 @@ mod tests {
         assert!(said.contains("the home's, for the model") && !said.contains("for the person"), "{said}");
         let none = bench.run("skill", &json!({"name": "manual"}), &work, &cancel).unwrap_err();
         assert!(none.contains("no skill is called manual"), "{none}");
+    }
+
+    #[test]
+    fn a_truncated_listing_counts_files_separately_from_directories() {
+        let dir = crate::in_container::tempdir().unwrap();
+        for i in 0..LIST_LIMIT {
+            std::fs::create_dir(dir.path().join(i.to_string())).unwrap();
+        }
+        std::fs::write(dir.path().join("one.txt"), b"abc").unwrap();
+        let out = list_files(&json!({"recursive": true}), dir.path(), &AtomicBool::new(false)).unwrap();
+        assert!(out.contains(&format!("of {} entries; counted 1 file (3 bytes)", LIST_LIMIT + 1)), "{}", out.lines().last().unwrap());
     }
 
     #[test]
