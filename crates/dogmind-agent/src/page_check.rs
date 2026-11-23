@@ -1998,7 +1998,7 @@ mod tests {
             ("src/number.js", ""), ("lib/label.js", ""), ("lib/part.js", "import './absent.js?rev=1';"), ("root.js", ""),
         ]);
         let needs = needs_of(&index);
-        assert_eq!(needs.missing.iter().map(|name| name.replace('\\', "/")).collect::<Vec<_>>(), ["lib/absent.js"]);
+        assert_eq!(needs.missing.iter().map(Path::new).collect::<Vec<_>>(), [Path::new("lib/absent.js")]);
     }
 
     #[test]
