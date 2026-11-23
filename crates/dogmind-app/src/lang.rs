@@ -690,6 +690,7 @@ const JA: &[(&str, &str)] = &[
     ("Stop the work first.", "先に作業を止めてください。"),
     ("Asking again.", "もう一度送ります。"),
     ("Copied the last answer.", "最後の回答をコピーしました。"),
+    ("Could not copy to the clipboard. Try again.", "クリップボードにコピーできませんでした。もう一度お試しください。"),
     (", last answer at {0} tok/s", "、最後の回答は {0} tok/s"),
     ("{0} requests: {1} prompt tokens, {2} of them from the cache, {3} written{4}. The conversation is {5} of {6}.", "{0} リクエスト: プロンプト {1} トークン (うちキャッシュ {2})、生成 {3}{4}。会話の長さは {5} / {6} です。"),
     ("Nothing to show yet. Name a file: /preview page.html", "表示できるものがまだありません。ファイルを指定してください: /preview page.html"),

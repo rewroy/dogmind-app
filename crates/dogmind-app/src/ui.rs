@@ -3800,8 +3800,9 @@ impl App {
     unsafe fn copy_block(&mut self, at: usize) {
         let Some(block) = self.blocks.get(at) else { return };
         let text = block.text.clone();
-        self.copy_to_clipboard(text.trim_end_matches('\n'));
-        self.copied(OverlayKey::Block(at));
+        if self.copy_to_clipboard(text.trim_end_matches('\n')) {
+            self.copied(OverlayKey::Block(at));
+        }
     }
 
     /// What opens and closes a block: a little space, and what the code is in if it says.
@@ -4287,8 +4288,9 @@ impl App {
     unsafe fn copy_answer(&mut self, at: usize) {
         let Some((_, text, _)) = self.answers.get(at) else { return };
         let text = text.clone();
-        self.copy_to_clipboard(&text);
-        self.copied(OverlayKey::Copy(at));
+        if self.copy_to_clipboard(&text) {
+            self.copied(OverlayKey::Copy(at));
+        }
     }
 
     /// An icon has copied: it shows a check mark for a moment.
@@ -6279,8 +6281,7 @@ impl App {
             "copy" => {
                 if self.last_answer.is_empty() {
                     self.say(t("There is no answer to copy yet."));
-                } else {
-                    self.copy_to_clipboard(&self.last_answer.clone());
+                } else if self.copy_to_clipboard(&self.last_answer.clone()) {
                     self.say(t("Copied the last answer."));
                 }
             }
@@ -9698,7 +9699,7 @@ impl App {
     }
 
     /// The rows chosen, or the whole of the file, as text.
-    unsafe fn copy_from_diff(&self) {
+    unsafe fn copy_from_diff(&mut self) {
         let chosen = self.diff_chosen.map(|(a, b)| (a.min(b), a.max(b)));
         let text: Vec<String> = self.diff_rows.iter().enumerate().filter(|(at, row)| chosen.map_or(true, |(a, b)| *at >= a && *at <= b) && !matches!(row.kind, RowKind::Hunk | RowKind::Note)).map(|(_, row)| {
             let mark = match row.kind {
@@ -14837,20 +14838,15 @@ impl App {
         preview::choose_folder(self.window as isize, t("Choose a folder"))
     }
 
-    unsafe fn copy_to_clipboard(&self, text: &str) {
-        let units: Vec<u16> = text.replace('\n', "\r\n").encode_utf16().chain(std::iter::once(0)).collect();
-        if OpenClipboard(self.window) == 0 {
-            return;
+    unsafe fn copy_to_clipboard(&mut self, text: &str) -> bool {
+        if put_clipboard_text(self.window, text) {
+            return true;
         }
-        EmptyClipboard();
-        let memory = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2);
-        if !memory.is_null() {
-            let target = GlobalLock(memory) as *mut u16;
-            std::ptr::copy_nonoverlapping(units.as_ptr(), target, units.len());
-            GlobalUnlock(memory);
-            SetClipboardData(13, memory); // CF_UNICODETEXT
+        if let Some(key) = self.overlay_copied.take() {
+            self.invalidate_overlay(key);
         }
-        CloseClipboard();
+        self.warn(t("Could not copy to the clipboard. Try again."));
+        false
     }
 
     unsafe fn on_button(&mut self, at: usize) {
@@ -15260,7 +15256,9 @@ impl App {
                     let _ = self.agent.commands.send(Command::Compact);
                 }
             }
-            M_COPY if !self.last_answer.is_empty() => self.copy_to_clipboard(&self.last_answer),
+            M_COPY if !self.last_answer.is_empty() => {
+                self.copy_to_clipboard(&self.last_answer.clone());
+            }
             M_MODELS => self.set_panel(Panel::Models),
             M_PROVIDERS => self.set_panel(Panel::Providers),
             M_RESTART => self.connect(),
@@ -17771,6 +17769,32 @@ fn send_command(out: Outgoing) -> Command {
     } else {
         Command::SendWith(out.text, out.images.into_iter().map(|attached| attached.picture).collect())
     }
+}
+
+/// Windows takes ownership of the movable allocation only when SetClipboardData succeeds.
+unsafe fn put_clipboard_text(window: HWND, text: &str) -> bool {
+    let units: Vec<u16> = text.replace('\n', "\r\n").encode_utf16().chain(std::iter::once(0)).collect();
+    let memory = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of_val(units.as_slice()));
+    if memory.is_null() {
+        return false;
+    }
+    let target = GlobalLock(memory) as *mut u16;
+    if target.is_null() {
+        GlobalFree(memory);
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(units.as_ptr(), target, units.len());
+    GlobalUnlock(memory);
+    if OpenClipboard(window) == 0 {
+        GlobalFree(memory);
+        return false;
+    }
+    let copied = EmptyClipboard() != 0 && !SetClipboardData(13, memory).is_null(); // CF_UNICODETEXT
+    CloseClipboard();
+    if !copied {
+        GlobalFree(memory);
+    }
+    copied
 }
 
 /// The files of a drop, or of what the Explorer put on the clipboard.
