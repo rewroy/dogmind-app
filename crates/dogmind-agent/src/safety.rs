@@ -2162,6 +2162,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_short_name_for_a_secret_folder_is_seen_through() {
+        // (a container cannot have the full names of the folders above its own, which is how a short name is seen through; the gate does this in the app, not in one)
+        if crate::in_container::cannot_run(crate::in_container::SYSTEM) {
+            return;
+        }
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
         let dir = crate::in_container::tempdir().unwrap();
         let ssh = dir.path().join(".ssh");

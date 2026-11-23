@@ -2629,6 +2629,16 @@ mod tests {
         std::fs::canonicalize(&folder).map_or(folder, |full| PathBuf::from(full.to_string_lossy().trim_start_matches("\\\\?\\")))
     }
 
+    /// A folder no workspace holds, for what a command must not reach. The target folder is not one: it is in the workspace of this source, and once Dogmind has
+    /// worked there, its container may change all of that workspace (the grant on it stays, and the target folder inherits it), so that whatever a test put there as
+    /// being outside was reached by every command, in a run of the tests outside the sandbox as well.
+    fn outside_folder(name: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join("dogmind-sandbox-tests").join(name);
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::canonicalize(&folder).map_or(folder, |full| PathBuf::from(full.to_string_lossy().trim_start_matches("\\\\?\\")))
+    }
+
     fn command(line: &str, folder: &Path, network: bool) -> Output {
         run(line, folder, folder, network, Duration::from_secs(60), &AtomicBool::new(false)).unwrap()
     }
@@ -2935,7 +2945,11 @@ mod tests {
     /// what is held closed (`HELD_CLOSED`) above all.
     #[test]
     fn a_command_reads_the_apps_records_and_nothing_else_of_its_folder() {
-        let (work, app) = (work_folder("records-work"), work_folder("records-app"));
+        // (in a container, a command the test runs stays in the test's own container, which no grant of the app's opens or closes)
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (work, app) = (work_folder("records-work"), outside_folder("records-app"));
         let sessions = app.join("sessions");
         std::fs::create_dir_all(sessions.join("a.checkpoints")).unwrap();
         std::fs::write(sessions.join("a.trajectory.jsonl"), "RECORD-ONE\n").unwrap();
@@ -3004,7 +3018,7 @@ mod tests {
             return;
         }
         let folder = work_folder("as-person");
-        let outside = work_folder("as-person-outside");
+        let outside = outside_folder("as-person-outside");
         std::fs::write(outside.join("old.txt"), "a").unwrap();
         let line = format!("del /q \"{}\"", outside.join("old.txt").display());
         let time = Duration::from_secs(60);
@@ -3026,7 +3040,7 @@ mod tests {
             return;
         }
         let folder = work_folder("del-missing");
-        let outside = work_folder("del-outside");
+        let outside = outside_folder("del-outside");
         std::fs::write(outside.join("kept.txt"), "a").unwrap();
         assert_eq!(command("echo a> a.log & echo b> b.log & echo c> c.txt", &folder, false).status, Some(0));
         let run = |line: &str| command(&crate::tools::line_that_runs(line), &folder, false);
