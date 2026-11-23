@@ -589,7 +589,7 @@ impl Drop for OwnedSid {
 /// rewrites the list of everything in it, 0.1 to 0.15 ms a thing). A command waits for it to be done (`workspace_grants::before_grant`), and finds it given. A folder that has
 /// it already, as one kept on the person's list does from the first time, takes a look at its list and no more.
 pub fn ready_workspace(workspace: &Path) -> Result<(), String> {
-    if in_a_container() {
+    if in_the_sandbox() {
         return Ok(());
     }
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
@@ -809,11 +809,35 @@ unsafe fn prepare_restricted(workspace: &Path, writer: PSID, temp: Option<&Path>
 static PROFILE_SID: Mutex<Option<Sid>> = Mutex::new(None);
 static GRANTED: Mutex<Option<HashSet<(String, u32, bool)>>> = Mutex::new(None);
 
-/// Whether this process runs in an AppContainer itself: a project's own tests that run commands, run by a command of the app's, or the app built and run
-/// so. A container cannot make a window station, a desktop or a container of its own, nor write a grant on anything, and every command that was run so
-/// failed before it started ("a window station for commands: access is denied"). A command is then run in the container it is in, with what that one was
-/// given: it can do no more than its caller, which is what the sandbox is for, and the caller's own command is what was granted and looked after.
-pub fn in_a_container() -> bool {
+/// Whether this process runs in the sandbox itself: a project's own tests that run commands, run by a command of the app's, or the app built and run so,
+/// in a container or with the restricted token cargo is run with (`run_live_restricted`). Neither can make a window station, a desktop or a container of its
+/// own, nor write a grant on anything: every command that was run so failed before it started ("a window station for commands: access is denied", "access
+/// could not be set (error 5)"). A command is then run as its caller is, in its container or with its token, with what that one was given: it can do no more
+/// than its caller, which is what the sandbox is for, and the caller's own command is what was granted and looked after. (Only the container was asked,
+/// and the app's own tests, run by a session as cargo is, failed 97 times for what they could not do there, 94 of the agent's and 3 of the app's.)
+pub fn in_the_sandbox() -> bool {
+    in_a_container() || restricted()
+}
+
+/// Whether this process's token is a restricted one (`restricted_token`): the person's, with SIDs every access must also pass.
+fn restricted() -> bool {
+    static IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IN.get_or_init(|| {
+        // SAFETY: the token is this process's own, opened for asking and closed here.
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let restricted = IsTokenRestricted(token) != 0;
+            CloseHandle(token);
+            restricted
+        }
+    })
+}
+
+/// Whether this process runs in an AppContainer itself (`in_the_sandbox`).
+fn in_a_container() -> bool {
     static IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *IN.get_or_init(|| {
         // SAFETY: the token is this process's own, opened for asking and closed here; the answer is a 32-bit value.
@@ -2236,7 +2260,7 @@ impl Seen {
 /// Taken off at the app's start, off its thread, in one write of the folder's list, which Windows carries down; nothing puts one there again (`restricted_temp`), and a
 /// restricted command meanwhile does not wait, in a folder of its own. How many there were, and how long it took; nothing when there were none.
 pub fn clear_old_restricted_grants() -> Option<(usize, Duration)> {
-    if in_a_container() {
+    if in_the_sandbox() {
         return None;
     }
     // SAFETY: the SIDs live through the calls.
@@ -2714,8 +2738,10 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
     if let Some(reason) = volume_of(&root).and_then(|volume| drive_refusal(&volume, &root)) {
         return Err(reason);
     }
-    // (in a container already, nothing is granted, made or looked after: see `in_a_container`)
-    let nested = in_a_container();
+    // (in the sandbox already, nothing is granted, made or looked after, and the command is started as this process is: see `in_the_sandbox`. It then has
+    // this process's own token, a container's or a restricted one, and can reach no more than this process can: no grant is written and no folder's list
+    // changed for it, which that token could not do anyway.)
+    let nested = in_the_sandbox();
     // It counts as in use from before it is granted to when all it started has ended.
     let _in_use = (!nested).then(|| crate::workspace_grants::Use::new(&root));
     // SAFETY: every pointer below lives until the call that takes it returns, and the attribute list's buffers until the process is started.
@@ -3044,6 +3070,67 @@ mod tests {
         let after = run_live("echo in-the-container> after.txt", work.path(), work.path(), false, time, &cancel, None).unwrap();
         assert_eq!(after.status, Some(0), "{}", String::from_utf8_lossy(&after.stderr));
         assert!(work.path().join("after.txt").is_file());
+    }
+
+    /// The other half of `the_sandbox_is_told_by_the_token_alone_and_a_run_in_it_starts_as_its_caller`, run by it as a copy of this program: it says whether it
+    /// is in the sandbox; with `nested`, it also runs a command in a folder of its own and one that writes in the folder `outside.txt` names, and says what
+    /// each wrote and whether a folder's list changed.
+    #[test]
+    #[ignore = "run by the_sandbox_is_told_by_the_token_alone_and_a_run_in_it_starts_as_its_caller"]
+    fn a_sandbox_probe() {
+        let mode = std::env::args().last().unwrap_or_default();
+        if mode != "ask" && mode != "nested" {
+            return;
+        }
+        println!("PROBE in the sandbox: {}", in_the_sandbox());
+        if mode == "nested" {
+            let here = std::env::current_dir().unwrap();
+            let inner = here.join("inner");
+            std::fs::create_dir_all(&inner).unwrap();
+            let outside = PathBuf::from(std::fs::read_to_string(here.join("outside.txt")).unwrap().trim());
+            let lists = || [&here, &inner, &outside].map(|folder| dacl_text(folder).unwrap());
+            let before = lists();
+            let (cancel, time) = (AtomicBool::new(false), Duration::from_secs(60));
+            let made = run("echo inside> made.txt", &inner, &inner, false, time, &cancel).unwrap();
+            let planted = run(&format!("echo no> \"{}\"", outside.join("planted.txt").display()), &inner, &inner, false, time, &cancel).unwrap();
+            println!("PROBE wrote inside: {}", made.status == Some(0) && inner.join("made.txt").is_file());
+            println!("PROBE wrote outside: {}", planted.status == Some(0) || outside.join("planted.txt").exists());
+            println!("PROBE lists as they were: {}", lists() == before);
+        }
+    }
+
+    /// Whether a process is in the sandbox is its token's alone (`in_the_sandbox`): given the variables a command in the sandbox has, a program is where its
+    /// token puts it, and one given the restricted token is in it. A command it runs then starts as it does, with its token (`run_limited`'s `nested`): it
+    /// writes in its own folder and not where its caller could not, and no folder's list is changed for it: it can do no more than its caller could.
+    #[test]
+    fn the_sandbox_is_told_by_the_token_alone_and_a_run_in_it_starts_as_its_caller() {
+        let (work, elsewhere) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
+        // (in a folder of its own: a folder that holds the program a command is run from is no place for its commands)
+        let probe = work.path().join("bin").join("probe.exe");
+        std::fs::create_dir_all(probe.parent().unwrap()).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+        std::fs::write(work.path().join("outside.txt"), elsewhere.path().display().to_string()).unwrap();
+        let args = ["sandbox::tests::a_sandbox_probe", "--exact", "--ignored", "--nocapture", "--test-threads=1"];
+        // (the variables alone: a profile's name, temp folders in a container's own, and what a sandbox might be told by)
+        let container_temp = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_default().join("Packages").join("dogmindapp.exec.probe").join("AC").join("Temp");
+        let mut asked = std::process::Command::new(&probe);
+        asked.args(args).arg("ask").current_dir(work.path()).env("DOGMIND_SANDBOX_PROFILE", "DogmindApp.Exec.Probe").env("TEMP", &container_temp).env("TMP", &container_temp)
+            .env("DOGMIND_IN_SANDBOX", "1").env("CARGO_NET_OFFLINE", "true").env("HTTPS_PROXY", "http://127.0.0.1:9");
+        crate::tools::no_window(&mut asked);
+        let said = asked.output().unwrap();
+        let said = String::from_utf8_lossy(&said.stdout);
+        assert!(said.contains(&format!("PROBE in the sandbox: {}", in_the_sandbox())), "{said}");
+        // (from a process in the sandbox already, a restricted token is not made: the run below would be its own token's)
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let line = format!("\"{}\" {} nested", probe.display(), args.join(" "));
+        let done = run_live_restricted(&line, work.path(), work.path(), false, Duration::from_secs(120), &AtomicBool::new(false), None).unwrap();
+        let said = format!("{}{}", decode(&done.stdout), decode(&done.stderr));
+        for line in ["PROBE in the sandbox: true", "PROBE wrote inside: true", "PROBE wrote outside: false", "PROBE lists as they were: true"] {
+            assert!(said.contains(line), "{line}: {said}");
+        }
+        assert!(!elsewhere.path().join("planted.txt").exists(), "a command started in the sandbox wrote where its caller could not");
     }
 
     /// The tests' commands run in a container of their own: nothing a run of them leaves is in the one of the app the person uses on the same PC.
