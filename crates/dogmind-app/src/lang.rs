@@ -65,6 +65,34 @@ pub fn tool_outcome_words(outcome: &str, failed_exit: bool) -> String {
     }
 }
 
+/// How a model request ended, as shown in both the trajectory and the timeline.
+pub fn request_end_words(end: &str) -> String {
+    match end {
+        "stop" => t("It finished").into(),
+        "tool_calls" => t("It asked for calls").into(),
+        "length" => t("It ran out of room and was cut off").into(),
+        "cancelled_person" => t("You stopped it").into(),
+        "stopped_app:draft_stop" => t("Stopped a draft that went on too long").into(),
+        "stopped_app:warm_up" => t("Warm-up finished").into(),
+        other => match other.split_once(':') {
+            Some(("error", kind)) => {
+                let reason = match kind {
+                    "unfinished" => t("the answer did not finish"),
+                    "transient" => t("the connection broke"),
+                    "overflow" => t("the conversation is too long"),
+                    "rejected" => t("the server refused the request"),
+                    "down" => t("the server could not be reached"),
+                    "no_vision" => t("the model cannot read pictures"),
+                    _ => kind,
+                };
+                tf("It failed: {0}", &[&reason])
+            }
+            Some(("stopped_app", why)) => tf("Dogmind stopped it: {0}", &[&why]),
+            _ => other.to_string(),
+        },
+    }
+}
+
 /// The same, with values for `{0}`, `{1}`...
 pub fn tf(english: &str, values: &[&dyn Display]) -> String {
     dogmind_agent::fill_template(t(english), values)
@@ -1323,6 +1351,8 @@ const JA: &[(&str, &str)] = &[
     ("Went on from", "続きの元"),
     ("yes", "はい"),
     ("no", "いいえ"),
+    ("Warm-up finished", "ウォームアップが完了しました"),
+    ("the server could not be reached", "サーバーに接続できませんでした"),
     ("It finished", "終わりました"),
     ("It asked for calls", "呼び出しを求めました"),
     ("It ran out of room and was cut off", "長さの上限で途中で切れました"),

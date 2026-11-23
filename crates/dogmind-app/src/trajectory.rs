@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use dogmind_agent::trajectory_report::{RequestRow, Summary, ToolRow, TurnSummary};
 
-use crate::lang::{t, tf, tool_outcome_words};
+use crate::lang::{request_end_words, t, tf, tool_outcome_words};
 
 /// A column: its title, its minimum width in characters of the table's monospace face, and whether its figures stand at its right edge.
 pub struct Column {
@@ -109,7 +109,12 @@ fn request_row(request: &RequestRow) -> Row {
     if let Some(rate) = request.rate {
         parts.push(tf("{0} tok/s", &[&format!("{}{rate:.1}", if request.counted { "~" } else { "" })]));
     }
-    parts.push(if request.calls.is_empty() { request.end.clone() } else { format!("{} [{}]", request.end, request.calls.join(", ")) });
+    let end = request_end_words(&request.end);
+    if !request.calls.is_empty() {
+        parts.push(format!("{end} [{}]", request.calls.join(", ")));
+    } else if !end.is_empty() {
+        parts.push(end);
+    }
     if let Some((of, why)) = &request.retry_of {
         parts.push(tf("repeats {0} ({1})", &[of, why]));
     }
@@ -186,13 +191,13 @@ mod tests {
         assert_eq!(kinds, [RowKind::Header, RowKind::Turn { turn: 1, open: true }, RowKind::Request, RowKind::Tool, RowKind::Turn { turn: 2, open: false }, RowKind::Total]);
         let request = &page[2];
         assert_eq!(request.cells, ["  /1 main", "", "2.0", "101.0", "", "103.0"]);
-        assert_eq!(request.note, "prompt 5000, cached 0%, 8328 tokens, ~82.5 tok/s, tool_calls [create_file]");
+        assert_eq!(request.note, "prompt 5000, cached 0%, 8328 tokens, ~82.5 tok/s, It asked for calls [create_file]");
         let tool = &page[3];
         assert_eq!(tool.cells, ["  /1 create_file", "", "", "", "0.0", "0.0"]);
         assert_eq!(tool.note, "Done, index.html, 10 bytes out");
         // (the server's own rate is not marked as counted)
         let page = rows(&run(), &BTreeSet::from([2]));
-        assert_eq!(page[3].note, "prompt 9000, cached 90%, 300 tokens, 31.5 tok/s, stop");
+        assert_eq!(page[3].note, "prompt 9000, cached 90%, 300 tokens, 31.5 tok/s, It finished");
     }
 
     /// A turn nobody sent says so, where a turn of the person's says how much they wrote.
@@ -213,6 +218,21 @@ mod tests {
         ] {
             let tool = ToolRow { outcome: outcome.to_string(), ..ToolRow::default() };
             assert_eq!(tool_row(&tool).note, expected);
+        }
+    }
+
+    #[test]
+    fn request_end_notes_distinguish_person_app_and_server() {
+        for (end, expected) in [
+            ("cancelled_person", "You stopped it"),
+            ("stopped_app:draft_stop", "Stopped a draft that went on too long"),
+            ("stopped_app:warm_up", "Warm-up finished"),
+            ("error:no_vision", "It failed: the model cannot read pictures"),
+            ("error:future_reason", "It failed: future_reason"),
+            ("future_provider_reason", "future_provider_reason"),
+        ] {
+            let request = RequestRow { end: end.into(), ..RequestRow::default() };
+            assert_eq!(request_row(&request).note, expected);
         }
     }
 

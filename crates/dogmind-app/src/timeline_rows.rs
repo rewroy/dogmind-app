@@ -12,7 +12,7 @@ use dogmind_agent::timeline::{self, Band, BandPart, CallRow, Heading, Lane, Part
 use serde_json::Value;
 
 use crate::cards::{duration_words, is_asking, token_count_words};
-use crate::lang::{t, tf, tool_outcome_words};
+use crate::lang::{request_end_words, t, tf, tool_outcome_words};
 use crate::toolrun::{partial_value, size_text};
 use crate::ui::tool_name;
 
@@ -1140,7 +1140,7 @@ fn request_facts(request: &RequestDetail, indent: u8, fold: (Key, bool)) -> Vec<
         facts.push(fact(indent, t("Speed"), tf("{0} tokens per second", &[&format!("{speed:.1}")])));
     }
     if !request.end.is_empty() {
-        facts.push(fact(indent, t("Ended"), end_words(&request.end)));
+        facts.push(fact(indent, t("Ended"), request_end_words(&request.end)));
     }
     if request.reasoning_chars > 0 {
         facts.push(fact(indent, t("Thought"), tf("{0} characters", &[&request.reasoning_chars])));
@@ -1244,21 +1244,6 @@ fn value_words(value: &Value) -> String {
         Value::Bool(false) => t("no").to_string(),
         Value::Null => String::new(),
         other => cap(&other.to_string(), 160),
-    }
-}
-
-/// How a request ended, in words: what the trajectory calls it is kept at the end of them.
-fn end_words(end: &str) -> String {
-    match end {
-        "stop" => t("It finished").to_string(),
-        "tool_calls" => t("It asked for calls").to_string(),
-        "length" => t("It ran out of room and was cut off").to_string(),
-        "cancelled_person" => t("You stopped it").to_string(),
-        other => match other.split_once(':') {
-            Some(("error", kind)) => tf("It failed: {0}", &[&kind.replace('_', " ")]),
-            Some(("stopped_app", why)) => tf("Dogmind stopped it: {0}", &[&why.replace('_', " ")]),
-            _ => other.replace('_', " "),
-        },
     }
 }
 
