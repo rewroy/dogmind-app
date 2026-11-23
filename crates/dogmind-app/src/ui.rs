@@ -2897,6 +2897,14 @@ fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Optio
     }
 }
 
+/// The line editor cannot represent every stored value, such as a newline inside one variable.
+fn mcp_form_pairs(was: Option<&dogmind_agent::mcp::ServerConfig>, http: bool, original: &str, typed: &str) -> Result<std::collections::BTreeMap<String, String>, (usize, String)> {
+    if let Some(config) = was.filter(|config| config.is_http() == http && typed == original) {
+        return Ok(if http { config.headers.clone() } else { config.env.clone() });
+    }
+    dogmind_agent::mcp::pairs_of_lines(typed, if http { ':' } else { '=' })
+}
+
 fn mcp_url(typed: &str) -> Option<String> {
     let lower = typed.to_ascii_lowercase();
     ["http://", "https://"].into_iter().find(|scheme| lower.starts_with(scheme)).map(|scheme| format!("{scheme}{}", &typed[scheme.len()..]))
@@ -12694,14 +12702,14 @@ impl App {
             return false;
         }
         let url = mcp_url(&target);
-        let pairs = match mcp::pairs_of_lines(&vars, if url.is_some() { ':' } else { '=' }) {
+        let was = before.as_ref().and_then(|before| configs.iter().find(|(known, _)| known == before)).map(|(_, config)| config);
+        let pairs = match mcp_form_pairs(was, url.is_some(), &self.mcp_form_was[3], &vars) {
             Ok(pairs) => pairs,
             Err((line, said)) => {
                 self.problem_in_panel(&if url.is_some() { tf("Line {0} of the headers is not Name: value: {1}", &[&line, &said]) } else { tf("Line {0} of the variables is not NAME=value: {1}", &[&line, &said]) });
                 return false;
             }
         };
-        let was = before.as_ref().and_then(|before| configs.iter().find(|(known, _)| known == before)).map(|(_, config)| config);
         let config = mcp_config_of_form(was, url, target, &args, pairs);
         if let Err(error) = mcp::save_server(&self.folder.join("mcp.json"), before.as_deref(), &name, config) {
             self.problem_in_panel(&error);
@@ -18797,6 +18805,20 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_form_reuses_raw_values_only_for_an_unchanged_field_of_the_same_transport() {
+        use dogmind_agent::mcp::{lines_of_pairs, ServerConfig};
+        use std::collections::BTreeMap;
+        let env = BTreeMap::from([("MESSAGE".into(), "  first\nNEXT=literal  ".into())]);
+        let server = ServerConfig { command: "example".into(), env: env.clone(), ..Default::default() };
+        let original = lines_of_pairs(&env, '=');
+        assert_eq!(mcp_form_pairs(Some(&server), false, &original, &original).unwrap(), env);
+        let edited = mcp_form_pairs(Some(&server), false, &original, "MESSAGE=edited").unwrap();
+        assert_eq!(edited, BTreeMap::from([("MESSAGE".into(), "edited".into())]));
+        assert!(mcp_form_pairs(Some(&server), true, &original, &original).is_err());
+        assert!(mcp_form_pairs(None, false, "invalid", "invalid").is_err());
+    }
 
     #[test]
     fn a_missing_instruction_file_can_be_created_but_read_errors_are_reported() {
