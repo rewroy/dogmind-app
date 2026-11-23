@@ -911,18 +911,18 @@ pub fn list(folder: &Path) -> Vec<Summary> {
             Entry::Text(text) => Some(text),
             Entry::Damaged => None,
         }) {
-            // Once it has its title, a message is only counted: its text may be megabytes.
-            if line.starts_with("{\"kind\":\"title\"") {
-                if let Ok(Line::Title { title }) = serde_json::from_str(&line) {
-                    named = Some(title);
-                }
-                continue;
-            }
+            // The writer puts kind first. Count its ordinary message lines without decoding megabytes of content.
+            // Other JSON writers may order or space the same fields differently.
             if !title.is_empty() {
-                messages += usize::from(line.starts_with("{\"kind\":\"message\""));
-                continue;
+                if let Some(kind) = line.strip_prefix("{\"kind\":\"") {
+                    if !kind.starts_with("title\"") {
+                        messages += usize::from(kind.starts_with("message\""));
+                        continue;
+                    }
+                }
             }
             match serde_json::from_str(&line) {
+                Ok(Line::Title { title: name }) => named = Some(name),
                 Ok(Line::Meta { workspace: place, created: at }) => (workspace, created) = (place, at),
                 Ok(Line::Message { message }) => {
                     messages += 1;
@@ -1236,6 +1236,23 @@ mod tests {
         let summary = list(dir.path()).remove(0);
         assert_eq!((summary.title.as_str(), summary.messages), ("my name", 2));
         assert_eq!(Session::open(&path).unwrap().2.len(), 2);
+    }
+
+    #[test]
+    fn the_history_list_reads_reordered_record_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("20261123-171000.jsonl");
+        let lines = [
+            r#"{"workspace":"work","created":"today","kind":"meta"}"#,
+            r#"{"message":{"content":"first words","role":"user"},"kind":"message"}"#,
+            r#"{"message":{"content":"answer","role":"assistant"},"kind":"message"}"#,
+            r#"{"kind": "title","title":"earlier name"}"#,
+            r#"{"title":"renamed","kind":"title"}"#,
+        ];
+        std::fs::write(path, lines.join("\n")).unwrap();
+        let summary = list(dir.path()).remove(0);
+        assert_eq!((summary.title.as_str(), summary.messages), ("renamed", 2));
+        assert_eq!(search(dir.path(), "answer")[0].title, summary.title);
     }
 
     #[test]
