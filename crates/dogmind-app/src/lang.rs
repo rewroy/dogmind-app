@@ -729,6 +729,7 @@ const JA: &[(&str, &str)] = &[
     ("Safe commands run without asking.", "安全なコマンドは確認なしで実行します。"),
     ("Every command asks.", "すべてのコマンドで確認します。"),
     ("No such command: {0}. /help lists them.", "{0} というコマンドはありません。/help で一覧を見られます。"),
+    ("Enter /usage alone to show usage. To send this draft to the model, put backticks around /usage.", "使用量を見るには /usage だけを入力してください。この文をモデルに送るには、/usage をバッククォートで囲んでください。"),
     ("There is nothing to find in yet.", "検索できる内容がまだありません。"),
     ("This session has nothing to go back to yet.", "このセッションにはまだ戻れる地点がありません。"),
     ("This workbook cannot be shown: {0}", "このブックは表示できません: {0}"),

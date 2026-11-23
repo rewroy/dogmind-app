@@ -13189,6 +13189,10 @@ impl App {
             return;
         }
         if reads_as_command(&text) {
+            if text.strip_prefix("/usage").is_some_and(|rest| rest.starts_with(char::is_whitespace)) {
+                self.say(t("Enter /usage alone to show usage. To send this draft to the model, put backticks around /usage."));
+                return;
+            }
             set_text(self.composer, "");
             if !self.run_command(&text) {
                 // (nothing written is lost for a slip of the first word)
