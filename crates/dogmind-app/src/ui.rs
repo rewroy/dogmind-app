@@ -2887,13 +2887,20 @@ fn mcp_runs(config: &dogmind_agent::mcp::ServerConfig) -> String {
 /// What was typed as a server's URL, with its scheme as the protocol writes it; none for what is not one.
 /// The server the Settings form says, as mcp.json keeps it, `was` the one it edits. The person's word on what it returns goes with it, under a new name too; and
 /// one of the older transport stays one, its stream asked for first: saved as `http`, it was asked with a POST of Streamable HTTP first, as a new one is.
-fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Option<String>, target: String, args: &str, pairs: std::collections::BTreeMap<String, String>) -> dogmind_agent::mcp::ServerConfig {
+fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Option<String>, target: String, original_args: &str, args: &str, pairs: std::collections::BTreeMap<String, String>) -> dogmind_agent::mcp::ServerConfig {
     use dogmind_agent::mcp;
     let trusted = was.is_some_and(|config| config.trusted);
     let kind = if was.is_some_and(|config| config.kind == "sse") { "sse" } else { "http" };
     match url {
         Some(url) => mcp::ServerConfig { kind: kind.into(), url, headers: pairs, trusted, ..Default::default() },
-        None => mcp::ServerConfig { command: target, args: mcp::args_of_line(args), env: pairs, trusted, ..Default::default() },
+        None => {
+            // The edit control normalizes line endings even when the person only changes another field.
+            let args = match was {
+                Some(config) if !config.is_http() && original_args == args => config.args.clone(),
+                _ => mcp::args_of_line(args),
+            };
+            mcp::ServerConfig { command: target, args, env: pairs, trusted, ..Default::default() }
+        }
     }
 }
 
@@ -12712,7 +12719,7 @@ impl App {
                 return false;
             }
         };
-        let config = mcp_config_of_form(was, url, target, &args, pairs);
+        let config = mcp_config_of_form(was, url, target, &self.mcp_form_was[2], &args, pairs);
         if let Err(error) = mcp::save_server(&self.folder.join("mcp.json"), before.as_deref(), &name, config) {
             self.problem_in_panel(&error);
             return false;
@@ -18809,6 +18816,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mcp_form_preserves_line_endings_in_unedited_arguments() {
+        use dogmind_agent::mcp;
+        let was = mcp::ServerConfig { command: "old".into(), args: vec!["a\r\nb".into(), "c\rd".into(), "".into()], ..Default::default() };
+        let displayed = normalized_newlines(&mcp::line_of_args(&was.args));
+        let save = |args: &str| mcp_config_of_form(Some(&was), None, "new".into(), &displayed, args, Default::default());
+        assert_eq!(save(&displayed).args, was.args);
+        assert_eq!(save("--port 2").args, ["--port", "2"]);
+        assert!(save("").args.is_empty());
+    }
+
+    #[test]
     fn mcp_form_reuses_raw_values_only_for_an_unchanged_field_of_the_same_transport() {
         use dogmind_agent::mcp::{lines_of_pairs, ServerConfig};
         use std::collections::BTreeMap;
@@ -18874,13 +18892,13 @@ mod tests {
         let at = |url: &str| (Some(url.to_string()), url.to_string());
         let older = ServerConfig { kind: "sse".into(), url: "http://127.0.0.1:9/sse".into(), trusted: true, ..Default::default() };
         let (url, target) = at("http://127.0.0.1:9/sse");
-        let edited = mcp_config_of_form(Some(&older), url, target, "", Default::default());
+        let edited = mcp_config_of_form(Some(&older), url, target, "", "", Default::default());
         assert_eq!((edited.kind.as_str(), edited.url.as_str(), edited.trusted), ("sse", "http://127.0.0.1:9/sse", true));
         let newer = ServerConfig { kind: "http".into(), url: "http://127.0.0.1:9/mcp".into(), ..Default::default() };
         let (url, target) = at("http://127.0.0.1:9/mcp");
-        assert_eq!(mcp_config_of_form(Some(&newer), url.clone(), target.clone(), "", Default::default()).kind, "http");
-        assert_eq!(mcp_config_of_form(None, url, target, "", Default::default()).kind, "http", "a new one");
-        let program = mcp_config_of_form(Some(&older), None, "node".into(), "server.js --port 1", Default::default());
+        assert_eq!(mcp_config_of_form(Some(&newer), url.clone(), target.clone(), "", "", Default::default()).kind, "http");
+        assert_eq!(mcp_config_of_form(None, url, target, "", "", Default::default()).kind, "http", "a new one");
+        let program = mcp_config_of_form(Some(&older), None, "node".into(), "", "server.js --port 1", Default::default());
         assert_eq!((program.command.as_str(), program.args.join(" "), program.kind.as_str(), program.trusted), ("node", "server.js --port 1".to_string(), "", true));
     }
 
