@@ -2193,6 +2193,7 @@ struct App {
     mcp_form_was: [String; 5],
     /// The server just saved, while the page waits to say how its start went.
     mcp_saved: Option<String>,
+    mcp_page_states: Vec<(String, dogmind_agent::mcp::State)>,
     /// The sizes of the conversation's words, on the Appearance page.
     size_segments: [HWND; TEXT_SIZES.len()],
     /// A switch for each skill found, made when the Skills page first needs it.
@@ -2825,10 +2826,11 @@ unsafe fn control(parent: HWND, class: &str, text: &str, style: u32, ex: u32, id
 }
 
 /// How an MCP server is, in the person's words: for its row in Settings and for /mcp.
-fn mcp_state_words(state: Option<&dogmind_agent::mcp::State>) -> String {
+fn mcp_state_words(name: &str, state: Option<&dogmind_agent::mcp::State>) -> String {
     match state {
         Some(dogmind_agent::mcp::State::Up(1)) => t("1 tool").to_string(),
         Some(dogmind_agent::mcp::State::Up(tools)) => tf("{0} tools", &[tools]),
+        Some(dogmind_agent::mcp::State::Disconnected) => tf("Disconnected. Use /mcp import {0} to reconnect.", &[&name]),
         Some(dogmind_agent::mcp::State::Failed(why)) => tf("Did not start: {0}. To retry, open this server in Settings > Tools and choose Save.", &[&mcp_why(why)]),
         _ => t("Starting…").to_string(),
     }
@@ -6438,7 +6440,7 @@ impl App {
                 } else if let Some(why) = self.mcp.unreadable() {
                     self.say(&tf("The list of servers could not be read, and none was started: {0}", &[&why]));
                 } else {
-                    let lines: Vec<String> = self.mcp.states().iter().map(|(name, state)| format!("{name}: {}", mcp_state_words(Some(state)))).collect();
+                    let lines: Vec<String> = self.mcp.states().iter().map(|(name, state)| format!("{name}: {}", mcp_state_words(name, Some(state)))).collect();
                     self.say(&if lines.is_empty() { tf("No server yet. {0} lists configured servers. Use /mcp candidates to find one to import.", &[&file.display()]) } else { lines.join("\n") });
                 }
             }
@@ -7785,7 +7787,7 @@ impl App {
                     form.toggle_beside(name, *toggle, t("Trust what it returns"));
                     let runs = configs.iter().find(|(known, _)| known == name).map_or(String::new(), |(_, config)| mcp_runs(config));
                     // (why one did not start needs the room of the page)
-                    let state = mcp_state_words(states.iter().find(|(known, _)| known == name).map(|(_, state)| state));
+                    let state = mcp_state_words(name, states.iter().find(|(known, _)| known == name).map(|(_, state)| state));
                     form.note_with_button(&format!("{runs}\n{state}"), *edit);
                 }
                 if !servers.is_empty() {
@@ -9311,7 +9313,8 @@ impl App {
                 set_text(self.mcp_cancel, t("Cancel"));
                 self.mcp_form = None;
                 self.mcp_controls();
-                if self.mcp.states().iter().any(|(_, state)| *state == dogmind_agent::mcp::State::Starting) {
+                self.mcp_page_states = self.mcp.states();
+                if !self.mcp_page_states.is_empty() {
                     SetTimer(self.window, TIMER_MCP, 500, None);
                 }
             }
@@ -12662,17 +12665,16 @@ impl App {
     }
 
     /// mcp.json changed here: the servers start and end to match it at once, and the Tools page follows them as they come up.
-    unsafe fn mcp_changed(&mut self, retry_failed: Option<&str>) -> Vec<String> {
-        let started = self.mcp.reload_retrying(retry_failed);
+    unsafe fn mcp_changed(&mut self, retry_server: Option<&str>) -> Vec<String> {
+        let started = self.mcp.reload_retrying(retry_server);
         self.mcp_controls();
         SetTimer(self.window, TIMER_MCP, 500, None);
         started
     }
 
-    /// While a server is starting, the Tools page is laid out again as it comes up.
+    /// Refresh the open Tools page when a server starts, changes its list, or disconnects.
     unsafe fn mcp_tick(&mut self) {
         let states = self.mcp.states();
-        let starting = states.iter().any(|(_, state)| *state == dogmind_agent::mcp::State::Starting);
         // (what was said when it was saved is no longer true of one that did not start: the page says that instead)
         if let Some(name) = self.mcp_saved.clone() {
             match states.iter().find(|(known, _)| *known == name).map(|(_, state)| state) {
@@ -12684,10 +12686,11 @@ impl App {
                 _ => self.mcp_saved = None,
             }
         }
-        if self.panel == Panel::Tools {
+        if self.panel == Panel::Tools && self.mcp_page_states != states {
+            self.mcp_page_states = states;
             self.layout();
         }
-        if !starting || self.panel != Panel::Tools {
+        if self.panel != Panel::Tools || !self.mcp_page_states.iter().any(|(_, state)| matches!(state, dogmind_agent::mcp::State::Up(_) | dogmind_agent::mcp::State::Starting)) {
             KillTimer(self.window, TIMER_MCP);
         }
     }
@@ -18339,6 +18342,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             mcp_form_url: false,
             mcp_form_was: Default::default(),
             mcp_saved: None,
+            mcp_page_states: Vec::new(),
             size_segments: std::array::from_fn(|at| make_button(pane, ID_TEXT_SIZE + at as isize, "", ButtonKind::Segment, theme::surface())),
             skill_toggles: Vec::new(),
             skill_toggle_areas: Vec::new(),

@@ -564,6 +564,7 @@ const JA: &[(&str, &str)] = &[
     ("Separated by spaces", "スペース区切り"),
     ("{0} tools", "ツール {0} 個"),
     ("1 tool", "ツール 1 個"),
+    ("Disconnected. Use /mcp import {0} to reconnect.", "接続が切れました。/mcp import {0} で再接続できます。"),
     ("Did not start: {0}. To retry, open this server in Settings > Tools and choose Save.", "起動できませんでした: {0}。再接続するには、設定の「ツール」でこのサーバーを編集し、「保存」を押してください。"),
     ("{0} did not start: {1}", "{0} を起動できませんでした: {1}"),
     ("the program is not there, nor in a folder on PATH", "指定の場所にも PATH のフォルダーにもプログラムがありません"),

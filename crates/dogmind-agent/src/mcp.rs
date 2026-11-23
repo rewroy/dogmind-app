@@ -400,6 +400,8 @@ struct Rpc {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     answers: Receiver<Value>,
     next: u64,
+    /// The persistent incoming stream, for stdio and legacy SSE. Streamable HTTP uses per-request responses.
+    reader: Option<std::thread::JoinHandle<()>>,
     http: Option<Mutex<HttpLink>>,
     /// Set as the server says its list of tools changed (`LIST_CHANGED`), whenever it says it.
     changed: Arc<AtomicBool>,
@@ -749,10 +751,11 @@ impl Rpc {
     fn over(writer: Box<dyn Write + Send>, reader: impl BufRead + Send + 'static) -> Rpc {
         let writer = Arc::new(Mutex::new(writer));
         let (sender, answers) = channel();
-        let replies = writer.clone();
+        // Closing the last RPC writer lets a peer waiting for input leave, and its reader see EOF.
+        let replies = Arc::downgrade(&writer);
         let changed = Arc::new(AtomicBool::new(false));
         let told = changed.clone();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             let mut reader = reader;
             let mut line = Vec::new();
             loop {
@@ -771,6 +774,7 @@ impl Rpc {
                     },
                 };
                 if let Some(reply) = answer_to_server(&message) {
+                    let Some(replies) = replies.upgrade() else { return };
                     let mut out = replies.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let _ = writeln!(out, "{reply}").and_then(|()| out.flush());
                     continue;
@@ -785,14 +789,14 @@ impl Rpc {
                 }
             }
         });
-        Rpc { writer, answers, next: 1, http: None, changed }
+        Rpc { writer, answers, next: 1, reader: Some(thread), http: None, changed }
     }
 
     /// For a server at a URL: its messages go by HTTP, and the pipes are none.
     fn http(link: HttpLink) -> Rpc {
         let (_, answers) = channel();
         let changed = link.changed.clone();
-        Rpc { writer: Arc::new(Mutex::new(Box::new(std::io::sink()))), answers, next: 1, http: Some(Mutex::new(link)), changed }
+        Rpc { writer: Arc::new(Mutex::new(Box::new(std::io::sink()))), answers, next: 1, reader: None, http: Some(Mutex::new(link)), changed }
     }
 
     fn send(&self, message: &Value) -> Result<(), String> {
@@ -1212,6 +1216,7 @@ impl Drop for Process {
 /// A server that is up, with its tools as it last listed them. One that lists them again (see `Hub::relisted`) is another of these, on the same connection
 /// and process, which end with the last that has them.
 struct Running {
+    reader: Option<Arc<std::thread::JoinHandle<()>>>,
     rpc: Arc<Mutex<Rpc>>,
     /// The connection's `Rpc::changed`, to be read without waiting for a call that holds it.
     changed: Arc<AtomicBool>,
@@ -1223,13 +1228,17 @@ struct Running {
 
 impl Running {
     /// Up, with the tools it listed as `schemas` (under its own names, and none placed yet).
-    fn new(rpc: Rpc, schemas: Vec<Value>, process: Option<Process>) -> Running {
-        Running { changed: rpc.changed.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, process: process.map(Arc::new) }
+    fn new(mut rpc: Rpc, schemas: Vec<Value>, process: Option<Process>) -> Running {
+        Running { reader: rpc.reader.take().map(Arc::new), changed: rpc.changed.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, process: process.map(Arc::new) }
     }
 
     /// The same server with its tools as it lists them now.
     fn with_tools(&self, names: BTreeMap<String, String>, schemas: Vec<Value>) -> Running {
-        Running { rpc: self.rpc.clone(), changed: self.changed.clone(), names, schemas, process: self.process.clone() }
+        Running { reader: self.reader.clone(), rpc: self.rpc.clone(), changed: self.changed.clone(), names, schemas, process: self.process.clone() }
+    }
+
+    fn disconnected(&self) -> bool {
+        self.reader.as_ref().is_some_and(|reader| reader.is_finished())
     }
 
     fn is(&self, other: &Running) -> bool {
@@ -1265,6 +1274,8 @@ pub enum State {
     Starting,
     /// Up, with this many tools.
     Up(usize),
+    /// Its persistent incoming stream ended after startup.
+    Disconnected,
     /// It did not start, or did not start again, and why.
     Failed(String),
 }
@@ -1428,8 +1439,8 @@ impl Hub {
         self.reload_retrying(None)
     }
 
-    /// Reload settings and retry the named server if its last connection attempt failed.
-    pub fn reload_retrying(&self, failed_server: Option<&str>) -> Vec<String> {
+    /// Reload settings and retry the named server if startup failed or its connection ended.
+    pub fn reload_retrying(&self, retry_server: Option<&str>) -> Vec<String> {
         let Some(file) = self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else { return Vec::new() };
         // (a file that cannot be read, as one written by hand can be, starts nothing and ends nothing: it is said, for the person to mend)
         let read = readable_config(&file);
@@ -1445,7 +1456,7 @@ impl Hub {
             if let Some(slot) = at.map(|at| &mut slots[at]) {
                 let mut same = config.clone();
                 same.trusted = slot.config.as_ref().map_or(config.trusted, |was| was.trusted);
-                let retry = failed_server == Some(name.as_str()) && slot.failed.is_some();
+                let retry = retry_server == Some(name.as_str()) && (slot.failed.is_some() || slot.running.as_ref().is_some_and(|server| server.disconnected()));
                 if !retry && slot.config.as_ref() == Some(&same) && slot.part == part {
                     slot.trusted = config.trusted;
                     slot.config = Some(config);
@@ -1506,7 +1517,7 @@ impl Hub {
     pub fn schemas(&self) -> Vec<Value> {
         let told: Vec<Arc<Running>> = {
             let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            slots.iter().filter_map(|slot| slot.running.clone()).filter(|running| running.changed.load(Ordering::Relaxed)).collect()
+            slots.iter().filter_map(|slot| slot.running.clone()).filter(|running| !running.disconnected() && running.changed.load(Ordering::Relaxed)).collect()
         };
         for running in told {
             let Ok(mut rpc) = running.rpc.try_lock() else { continue };
@@ -1515,7 +1526,7 @@ impl Hub {
             self.relisted(&running, listed);
         }
         let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        slots.iter().filter_map(|slot| slot.running.as_ref()).flat_map(|running| running.schemas.iter().cloned()).collect()
+        slots.iter().filter_map(|slot| slot.running.as_ref()).filter(|running| !running.disconnected()).flat_map(|running| running.schemas.iter().cloned()).collect()
     }
 
     pub fn call(&self, tool: &str, arguments: &Value, cancel: &AtomicBool) -> Result<String, String> {
@@ -1679,8 +1690,8 @@ impl Hub {
     /// One more server, up with these tools, that answers with these lines: as one the person added while a session went on.
     #[cfg(test)]
     pub(crate) fn add_scripted(&self, server: &str, tools: &[Value], lines: &[Value], trusted: bool) {
-        let script: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        self.add_running(server, tools, Box::new(std::io::sink()), std::io::Cursor::new(script.into_bytes()), trusted);
+        let (writer, reader) = scripted_transport(lines);
+        self.add_running(server, tools, Box::new(writer), reader, trusted);
     }
 
     /// A server, up with these tools, that says each of `turns` as it is sent a request, in order: what it says in a call is said in it, and not before.
@@ -1706,6 +1717,7 @@ impl Hub {
             let state = match state {
                 State::Up(count) => format!("connected, tools: {count}"),
                 State::Starting => "starting".into(),
+                State::Disconnected => "disconnected".into(),
                 State::Failed(_) => "failed to start".into(),
             };
             format!("{name}: {state}")
@@ -1719,7 +1731,7 @@ impl Hub {
         } else if status.is_empty() {
             status.push_str("No servers configured in Dogmind. For a connection question, give the setup steps directly. Probing ports from the sandbox cannot establish this client's connection status");
         }
-        format!("Dogmind has a built-in MCP client outside the command sandbox. {status}. The user can enter `/mcp` for status, `/mcp candidates` for importable names, and `/mcp import NAME` to add and start one or retry it after fixing a startup failure. Bare `/mcp import` imports all available servers from Claude and Codex. To add one manually, the user opens Settings > Tools > MCP servers > Add a server. On connection its tools join this open conversation automatically, without a restart or reconnect command.")
+        format!("Dogmind has a built-in MCP client outside the command sandbox. {status}. The user can enter `/mcp` for status, `/mcp candidates` for importable names, and `/mcp import NAME` to add and start one or retry it after disconnection or a startup failure. Bare `/mcp import` imports all available servers from Claude and Codex. To add one manually, the user opens Settings > Tools > MCP servers > Add a server. On connection its tools join this open conversation automatically, without a restart or reconnect command.")
     }
 
     /// One line a server, for the person.
@@ -1728,6 +1740,7 @@ impl Hub {
             State::Up(tools) => format!("{name}: {tools} tools"),
             State::Failed(error) => format!("{name}: did not start: {error}"),
             State::Starting => format!("{name}: starting"),
+            State::Disconnected => format!("{name}: disconnected"),
         }).collect()
     }
 
@@ -1735,6 +1748,7 @@ impl Hub {
     pub fn states(&self) -> Vec<(String, State)> {
         self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().map(|slot| {
             let state = match (&slot.running, &slot.failed) {
+                (Some(running), _) if running.disconnected() => State::Disconnected,
                 (Some(running), _) => State::Up(running.names.len()),
                 (_, Some(error)) => State::Failed(error.clone()),
                 _ => State::Starting,
@@ -1742,6 +1756,16 @@ impl Hub {
             (slot.name.clone(), state)
         }).collect()
     }
+}
+
+/// Queue the scripted replies and keep the connection open until its writer is dropped.
+#[cfg(test)]
+fn scripted_transport(lines: &[Value]) -> (Turns, BufReader<Heard>) {
+    let (said, heard) = channel();
+    for line in lines {
+        said.send(format!("{line}\n").into_bytes()).unwrap();
+    }
+    (Turns { turns: Default::default(), said, written: Vec::new() }, BufReader::new(Heard { from: heard, pending: Vec::new() }))
 }
 
 /// The side of `Hub::answering`'s server that is written to: each request it is sent lets the next of its turns be said.
@@ -2155,6 +2179,8 @@ enabled = false
         assert_eq!(hub.schemas()[0]["function"]["name"], "mcp__remote__echo", "{:?}", hub.status());
         let said = hub.call("mcp__remote__echo", &json!({"a": 1}), &AtomicBool::new(false)).unwrap();
         assert!(said.starts_with(r#"{"a":1} with"#), "{said}");
+        assert_eq!(hub.states(), [("remote".into(), State::Up(1))]);
+        assert!(hub.reload_retrying(Some("remote")).is_empty());
         let lower = said.to_ascii_lowercase();
         assert!(lower.contains("authorization: bearer secret") && lower.contains("mcp-session-id: s-1") && lower.contains(&format!("mcp-protocol-version: {PROTOCOL}")), "{said}");
         let seen = seen.lock().unwrap();
@@ -2517,9 +2543,27 @@ enabled = false
     }
 
     fn running(lines: &[Value], names: &[&str]) -> Arc<Running> {
-        let script: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        let (writer, reader) = scripted_transport(lines);
         let (names, schemas) = place_tools("srv", "srv", &names.iter().map(|name| tool(name)).collect::<Vec<_>>(), None);
-        Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(script.into_bytes())), Vec::new(), None) })
+        Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(writer), reader), Vec::new(), None) })
+    }
+
+    fn disconnected_server() -> Arc<Running> {
+        let (names, schemas) = place_tools("srv", "srv", &[tool("t")], None);
+        Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(Vec::new())), Vec::new(), None) })
+    }
+
+    #[test]
+    fn an_idle_disconnect_is_visible_before_a_tool_call() {
+        let (peer, incoming) = channel();
+        let hub = Hub::default();
+        hub.add_running("srv", &[tool("t")], Box::new(std::io::sink()), BufReader::new(Heard { from: incoming, pending: Vec::new() }), false);
+        assert_eq!(hub.status(), ["srv: 1 tools"]);
+        assert_eq!(hub.schemas().len(), 1);
+        drop(peer);
+        waited("the idle connection to close", || hub.status() == ["srv: disconnected"]);
+        assert!(hub.connection_facts().contains("srv: disconnected"));
+        assert!(hub.schemas().is_empty());
     }
 
     /// A server that says in a call that its tools changed is asked for them as the call ends: the new one is offered, and one it no longer lists is said to be gone.
@@ -2567,7 +2611,7 @@ enabled = false
         let again = json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "back"}]}});
         let start: Starter = Arc::new(move || Ok(running(std::slice::from_ref(&again), &["t"])));
         let hub = Hub::default();
-        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(running(&[], &["t"])), ..Slot::default() });
+        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(disconnected_server()), ..Slot::default() });
         let cancel = AtomicBool::new(false);
         let said = hub.call("mcp__srv__t", &json!({}), &cancel).unwrap_err();
         assert!(said.contains("has ended") && said.contains("started again"), "{said}");
@@ -2586,7 +2630,7 @@ enabled = false
             Ok(running(std::slice::from_ref(&again), &["t"]))
         });
         let hub = Hub::default();
-        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(running(&[], &["t"])), ..Slot::default() });
+        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(disconnected_server()), ..Slot::default() });
         let cancel = AtomicBool::new(false);
         let said = hub.call("mcp__srv__t", &json!({}), &cancel).unwrap_err();
         assert!(said.contains("has ended") && said.contains("being started again") && said.contains("in a moment"), "{said}");
@@ -2601,7 +2645,7 @@ enabled = false
     fn a_server_that_will_not_start_again_says_so_and_why() {
         let start: Starter = Arc::new(|| Err("no such program".to_string()));
         let hub = Hub::default();
-        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(running(&[], &["t"])), ..Slot::default() });
+        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(disconnected_server()), ..Slot::default() });
         let cancel = AtomicBool::new(false);
         let said = hub.call("mcp__srv__t", &json!({}), &cancel).unwrap_err();
         assert!(said.contains("has ended") && said.contains("started again"), "{said}");
