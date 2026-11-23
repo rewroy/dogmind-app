@@ -1410,6 +1410,15 @@ fn reads_as_command(line: &str) -> bool {
     first.strip_prefix('/').is_some_and(|name| !name.is_empty() && name.is_ascii() && !name.contains('/'))
 }
 
+/// A built-in typed with text its handler cannot use. Skills accept their whole line.
+fn command_with_unused_text(line: &str) -> Option<&str> {
+    let (name, _) = line.trim().split_once(char::is_whitespace)?;
+    if matches!(name, "/find" | "/search" | "/rename" | "/goal" | "/attach" | "/model" | "/effort" | "/mode" | "/preview" | "/mcp") {
+        return None;
+    }
+    (name == "/exit" || COMMANDS.iter().any(|(command, _)| *command == name)).then_some(name)
+}
+
 /// The fields of a page with a key.
 const KEY_FIELD: usize = 3;
 const VARIABLE_FIELD: usize = 4;
@@ -13189,8 +13198,8 @@ impl App {
             return;
         }
         if reads_as_command(&text) {
-            if text.strip_prefix("/usage").is_some_and(|rest| rest.starts_with(char::is_whitespace)) {
-                self.say(t("Enter /usage alone to show usage. To send this draft to the model, put backticks around /usage."));
+            if let Some(name) = command_with_unused_text(&text) {
+                self.say(&tf("Enter {0} alone to run it. To send this draft to the model, put backticks around {0}.", &[&name]));
                 return;
             }
             set_text(self.composer, "");
@@ -19690,6 +19699,17 @@ mod tests {
         }
         for message in ["", "hello", "/usr/bin/env は何？", "/ は何", "/日本語", "/etc/hosts"] {
             assert!(!reads_as_command(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn text_after_an_argumentless_command_stays_in_the_composer() {
+        for command in ["/new", "/clear", "/usage", "/quit", "/exit", "/delete"] {
+            assert_eq!(command_with_unused_text(&format!("{command}\n動作を説明して")), Some(command));
+            assert_eq!(command_with_unused_text(&format!("{command}  ")), None);
+        }
+        for command in ["/find", "/search", "/rename", "/goal", "/attach", "/model", "/effort", "/mode", "/preview", "/mcp", "/my-skill", "/unknown"] {
+            assert_eq!(command_with_unused_text(&format!("{command} example")), None, "{command}");
         }
     }
 
