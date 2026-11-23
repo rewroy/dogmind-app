@@ -1134,6 +1134,25 @@ const PICTURES_LINE: i32 = 330;
 /// The room a block of pictures has at its sides and above them, in twips.
 const PICTURES_ACROSS: i32 = 200;
 const PICTURES_DOWN: i32 = 100;
+/// The room a person's card keeps inside it, in twips: about 16 pixels at each side and 15 over and under at 100%, where the words had been tight against the card.
+const USER_CARD_PADDING: (i32, i32) = (240, 220);
+
+/// How wide a person's card is, in twips, in a column `column` twips wide: as its words want (`words`, without the card's room), or its pictures (their sizes), whichever
+/// is wider, and at most four fifths of the column. Taken from the column each time the card is written, so that one sent while the column was narrower (or no width at
+/// all, the window minimized) has the room of the column it is in.
+fn user_card_width(column: i32, dpi: u32, words: i32, sizes: &[(i32, i32)]) -> i32 {
+    let most = (column * 4 / 5).max(800);
+    let wanted = if words > 0 { words + 2 * USER_CARD_PADDING.0 + 120 } else { 0 };
+    let pictures = if sizes.is_empty() {
+        0
+    } else {
+        let room = i64::from(most - 2 * USER_CARD_PADDING.0) * i64::from(dpi) / 1440;
+        let tiles = attach::Tiles::of(sizes, room as i32, dpi);
+        (i64::from(tiles.total_width()) * 1440 / i64::from(dpi)) as i32 + 2 * USER_CARD_PADDING.0 + 40
+    };
+    wanted.max(pictures).clamp(800, most)
+}
+
 /// How wide the row of a call's pictures is while they are put away: room for the line that says how many, and no more.
 const PICTURES_SHUT_WIDTH: i32 = 1800;
 
@@ -1821,6 +1840,10 @@ enum Shown {
     Link(String, String, Para),
     /// `width`: none for the column's.
     Row { lines: Vec<String>, face: String, points: i32, color: u32, back: u32, width: Option<i32>, right: bool, padding: (i32, i32) },
+    /// What the person sent: its words and its pictures, a card sized from the column each time it is written (`user_card`), as the column's width now is what it
+    /// has room for. A width kept from when it was sent kept a card narrow for ever: one sent while the window was minimized, whose column was no width at all,
+    /// stood one character to a line once the window was back.
+    Person { text: String, pictures: Vec<(PathBuf, (i32, i32))> },
     /// An answer's text, for its copy button, and when it was given, as its row says it (or nothing).
     Answer(String, String),
     /// A line of code, coloured when it is drawn: `open` is whether a block comment runs into it.
@@ -1830,7 +1853,7 @@ enum Shown {
     /// A block of code begins here: all of it, for its copy button.
     Block(String),
     /// The pictures of a message and their sizes, at the top of its card. `alone`: no text under them.
-    /// `right`: what the person sent; otherwise what a tool opened for the model.
+    /// `right`: what the person sent (kept as their `Person`, and not here); otherwise what a tool opened for the model.
     Pictures { pictures: Vec<(PathBuf, (i32, i32))>, width: i32, alone: bool, right: bool, folds: bool },
     /// Tool calls as one row: which of `runs`.
     Run(usize),
@@ -3412,7 +3435,7 @@ impl App {
 
     /// One row of a shaded block.
     unsafe fn append_row(&mut self, row: &rtf::Row) {
-        if !self.replaying {
+        if !self.replaying && !row.right {
             self.shown.push(Shown::Row { lines: row.lines.iter().map(|line| line.to_string()).collect(), face: row.face.to_string(), points: row.points, color: row.color, back: row.back, width: row.right.then_some(row.width), right: row.right, padding: row.padding });
         }
         let first = self.insert_rtf(rtf::row(row), Some(row.color));
@@ -3627,6 +3650,7 @@ impl App {
                     let width = width.map_or(self.text_twips, |width| width.min((self.text_twips * 4 / 5).max(800)));
                     self.append_row(&rtf::Row { lines: &lines, face, points: *points, color: *color, back: *back, width, right: *right, column: self.text_twips, padding: *padding });
                 }
+                Shown::Person { text, pictures } => self.user_card(text, pictures),
                 Shown::Answer(text, at) => self.answer_row(text, at),
                 Shown::Table(rows, aligns) => self.table_rows(rows, aligns),
                 Shown::Code { line, language, open } => {
@@ -4660,32 +4684,11 @@ impl App {
         if matches!(self.shown.last(), Some(Shown::Run(_) | Shown::Card(_))) {
             self.append("\n", Style::Gap);
         }
-        let lines: Vec<&str> = text.trim().lines().collect();
-        let device = GetDC(self.transcript);
-        let previous = SelectObject(device, self.fonts.body);
-        let widest = lines.iter().map(|line| width_on(device, self.fonts.body, line)).max().unwrap_or(0);
-        SelectObject(device, previous);
-        ReleaseDC(self.transcript, device);
-        // The body font is drawn a size larger in the transcript than it was measured here, and at the size the settings chose.
-        // (in twips: about 16 pixels at each side and 15 over and under at 100%, where the words had been tight against the card)
-        let padding = (240, 220);
-        let wanted = i64::from(widest) * 1440 * 115 * i64::from(text_scale()) / 10000 / i64::from(self.dpi) + i64::from(padding.0) * 2 + 120;
-        let most = (self.text_twips * 4 / 5).max(800);
-        let wanted = if images.is_empty() {
-            wanted as i32
-        } else {
-            let room = i64::from(most - 2 * padding.0) * i64::from(self.dpi) / 1440;
-            let sizes: Vec<(i32, i32)> = images.iter().map(|(_, size)| *size).collect();
-            let tiles = attach::Tiles::of(&sizes, room as i32, self.dpi);
-            let across = i64::from(tiles.total_width()) * 1440 / i64::from(self.dpi) + i64::from(padding.0) * 2 + 40;
-            (if lines.is_empty() { across } else { across.max(wanted) }) as i32
-        };
-        let width = wanted.clamp(800, most);
-        if !images.is_empty() {
-            self.append_pictures(images, width, lines.is_empty(), true, false);
-        }
-        if !lines.is_empty() {
-            self.append_row(&rtf::Row { lines: &lines, face: UI_FACE, points: 11, color: theme::text(), back: theme::user_back(), width, right: true, column: self.text_twips, padding });
+        if !text.trim().is_empty() || !images.is_empty() {
+            if !self.replaying {
+                self.shown.push(Shown::Person { text: text.to_string(), pictures: images.to_vec() });
+            }
+            self.user_card(text, images);
         }
         if at.is_empty() {
             self.append("\n", Style::Tool);
@@ -4703,6 +4706,27 @@ impl App {
                 self.reflow();
                 self.place_thumb();
             }
+        }
+    }
+
+    /// The card of what the person sent, against the right edge, as wide as its words and pictures want and the column now has room for (`user_card_width`):
+    /// its pictures at the top, its words under them.
+    unsafe fn user_card(&mut self, text: &str, images: &[(PathBuf, (i32, i32))]) {
+        let lines: Vec<&str> = text.trim().lines().collect();
+        let device = GetDC(self.transcript);
+        let previous = SelectObject(device, self.fonts.body);
+        let widest = lines.iter().map(|line| width_on(device, self.fonts.body, line)).max().unwrap_or(0);
+        SelectObject(device, previous);
+        ReleaseDC(self.transcript, device);
+        // The body font is drawn a size larger in the transcript than it was measured here, and at the size the settings chose.
+        let words = if lines.is_empty() { 0 } else { (i64::from(widest) * 1440 * 115 * i64::from(text_scale()) / 10000 / i64::from(self.dpi)) as i32 };
+        let sizes: Vec<(i32, i32)> = images.iter().map(|(_, size)| *size).collect();
+        let width = user_card_width(self.text_twips, self.dpi, words, &sizes);
+        if !images.is_empty() {
+            self.append_pictures(images, width, lines.is_empty(), true, false);
+        }
+        if !lines.is_empty() {
+            self.append_row(&rtf::Row { lines: &lines, face: UI_FACE, points: 11, color: theme::text(), back: theme::user_back(), width, right: true, column: self.text_twips, padding: USER_CARD_PADDING });
         }
     }
 
@@ -4755,7 +4779,8 @@ impl App {
     /// which are a line that says how many until it is pressed (they were a picture of each in the conversation, 37 in a session of a day). Those the person sent or an
     /// answer shows are shown as they are.
     unsafe fn append_pictures(&mut self, pictures: &[(PathBuf, (i32, i32))], width: i32, alone: bool, right: bool, folds: bool) {
-        if !self.replaying {
+        // (the person's are their card's, which is kept whole: `Shown::Person`)
+        if !self.replaying && !right {
             self.shown.push(Shown::Pictures { pictures: pictures.to_vec(), width, alone, right, folds });
         }
         let room = i64::from(width - 2 * PICTURES_ACROSS) * i64::from(self.dpi) / 1440;
@@ -6835,7 +6860,8 @@ impl App {
             let (text_left, text_column) = (left + inset, column - 2 * inset);
             // The width text goes in at, whether or not there is any yet: what is written first would have to be written again, as soon as it had gone in.
             let twips = (i64::from(text_column) * 1440 / i64::from(self.dpi)) as i32;
-            if twips != self.text_twips {
+            // (a minimized window has no width to lay anything out in: what comes while it is so is written at the column it had, and is not all written again twice)
+            if twips != self.text_twips && IsIconic(self.window) == 0 {
                 self.text_twips = twips;
                 // Once the window has stopped moving: it writes the whole conversation again.
                 if self.has_messages {
@@ -18532,6 +18558,21 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The owner's card of 11-22, sent while the window was minimized: its column then was no width, and it kept a width of 800 twips, one character to a line, once
+    /// the window was back. Its width is the column's of the moment it is written.
+    #[test]
+    fn a_persons_card_has_the_room_of_the_column_it_is_written_in() {
+        let picture = [(1566, 745)];
+        // (a minimized window's column: the least a card is)
+        assert_eq!(user_card_width(0, 168, 3000, &picture), 800);
+        // (the same card in the column of a window of ordinary width: its words or its picture, whichever is wider, and no more than four fifths of the column)
+        let wide = user_card_width(13000, 168, 3000, &picture);
+        assert!(wide > 3000 && wide <= 13000 * 4 / 5, "{wide}");
+        assert_eq!(user_card_width(13000, 168, 3000, &[]), 3000 + 2 * USER_CARD_PADDING.0 + 120, "words alone are as wide as they want");
+        assert_eq!(user_card_width(13000, 168, 40000, &[]), 13000 * 4 / 5, "long words wrap at four fifths of the column");
+        assert_eq!(user_card_width(13000, 168, 0, &[]), 800);
+    }
 
     #[test]
     fn a_new_session_has_no_row_of_views_and_one_that_has_begun_has_the_conversation_and_the_timeline() {

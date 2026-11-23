@@ -97,6 +97,16 @@ function Shot($a, [string]$Name, [int]$Flag = 3) {
   $g.Dispose()
   $file = "$Shots\$Name.png"; $b.Save($file, [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose(); $file
 }
+# A picture to send, as a screenshot is: wider than tall, a dark window with a light panel and a few words on it.
+function New-Picture([string]$Path, [int]$Width = 1200, [int]$Height = 720) {
+  $b = New-Object System.Drawing.Bitmap $Width, $Height; $g = [System.Drawing.Graphics]::FromImage($b)
+  $g.Clear([System.Drawing.Color]::FromArgb(32, 32, 30))
+  $g.FillRectangle((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(24, 24, 22))), 0, 0, [int]($Width / 5), $Height)
+  $g.FillRectangle((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(236, 232, 224))), [int]($Width * 0.35), [int]($Height * 0.3), [int]($Width * 0.3), [int]($Height * 0.25))
+  $font = New-Object System.Drawing.Font 'Segoe UI', 28
+  $g.DrawString('A test picture', $font, [System.Drawing.Brushes]::Black, [single]($Width * 0.37), [single]($Height * 0.37))
+  $g.Dispose(); $b.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose()
+}
 function Kids($a) { @([UI]::Kids($a.Window)) }
 function Rich($a) { $a.Rich }
 function Buttons($a) { Kids $a | ? { [UI]::Cls($_) -eq 'DogButton' -and [UI]::IsWindowVisible($_) } | % { [UI]::Txt($_) } }
