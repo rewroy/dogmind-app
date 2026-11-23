@@ -12778,7 +12778,7 @@ impl App {
             config.cwd = mcp_working_directory(&cwd);
         }
         if let Err(error) = mcp::save_server(&self.folder.join("mcp.json"), before.as_deref(), &name, config) {
-            self.problem_in_panel(&error);
+            self.problem_in_panel(t(&error));
             return false;
         }
         self.mcp_changed(Some(&name));

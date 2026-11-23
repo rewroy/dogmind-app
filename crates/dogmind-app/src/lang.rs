@@ -567,6 +567,7 @@ const JA: &[(&str, &str)] = &[
     ("Disconnected. Use /mcp import {0} to reconnect.", "接続が切れました。/mcp import {0} で再接続できます。"),
     ("Did not start: {0}. To retry, open this server in Settings > Tools and choose Save.", "起動できませんでした: {0}。再接続するには、設定の「ツール」でこのサーバーを編集し、「保存」を押してください。"),
     ("{0} did not start: {1}", "{0} を起動できませんでした: {1}"),
+    (dogmind_agent::mcp::INVALID_SERVER_URL, "http:// または https:// のサーバー URL を入力してください。ホスト名、ポート番号、IPv6 アドレスの角括弧を確認してください。"),
     ("the program is not there, nor in a folder on PATH", "指定の場所にも PATH のフォルダーにもプログラムがありません"),
     ("The list of servers could not be read, and none was started: {0}", "サーバーの一覧を読み込めなかったため、どれも起動していません: {0}"),
     ("Give the server a name.", "サーバーの名前を入力してください。"),

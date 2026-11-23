@@ -83,6 +83,9 @@ fn read_server_url<'de, D: serde::Deserializer<'de>>(data: D) -> Result<String, 
     Ok(mcp_url(&url).unwrap_or(url))
 }
 
+/// Shown before invalid endpoint settings replace a working registration.
+pub const INVALID_SERVER_URL: &str = "Enter a valid http:// or https:// server URL. Check the host, port, and IPv6 brackets.";
+
 impl ServerConfig {
     /// A server at a URL, and not a program.
     pub fn is_http(&self) -> bool {
@@ -94,7 +97,7 @@ impl ServerConfig {
         match (self.command.trim().is_empty(), self.url.trim().is_empty()) {
             (true, true) => Some("a command to run, or the URL of a server, is needed".to_string()),
             (false, false) => Some("a command or a URL, not both".to_string()),
-            (true, false) if !(self.url.starts_with("http://") || self.url.starts_with("https://")) => Some(format!("{}: a URL begins with http:// or https://", self.url)),
+            (true, false) if crate::http::Url::parse(&self.url).is_err() => Some(INVALID_SERVER_URL.to_string()),
             _ => None,
         }
     }
@@ -1842,6 +1845,33 @@ mod tests {
         std::fs::write(&file, "\u{feff}{broken}").unwrap();
         assert!(readable_config(&file).is_err());
         assert!(parse_claude_servers("\u{feff}{broken}").is_none());
+    }
+
+    #[test]
+    fn a_url_the_transport_cannot_read_does_not_replace_a_saved_server_or_become_an_import_candidate() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        let remote = |url: &str| ServerConfig { url: url.into(), ..Default::default() };
+        let good = "https://[::1]:8443/McP?session=example";
+        save_server(&file, None, "editor", remote(good)).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        for bad in ["https://", "http://?key=private-fixture", "http://host:no", "https://host:65536", "http://[::1/mcp"] {
+            let error = save_server(&file, Some("editor"), "editor", remote(bad)).unwrap_err();
+            assert!(!error.contains("private-fixture"));
+            assert_eq!(std::fs::read(&file).unwrap(), before);
+            let claude = json!({"mcpServers":{"editor":{"url":good},"bad":{"url":bad}}});
+            let codex = format!("[mcp_servers.editor]\nurl='{good}'\n[mcp_servers.bad]\nurl='{bad}'");
+            for parsed in [parse_claude_servers(&claude.to_string()).unwrap(), parse_codex_servers(&codex).unwrap()] {
+                assert!(parsed.skipped_invalid);
+                assert_eq!(parsed.servers.len(), 1);
+                assert_eq!(parsed.servers["editor"].url, good);
+            }
+        }
+        // An older version may already have saved the invalid URL. The form can still read and repair it.
+        std::fs::write(&file, r#"{"mcpServers":{"editor":{"url":"https://"}}}"#).unwrap();
+        assert_eq!(readable_config(&file).unwrap().servers["editor"].url, "https://");
+        save_server(&file, Some("editor"), "editor", remote(good)).unwrap();
+        assert_eq!(readable_config(&file).unwrap().servers["editor"].url, good);
     }
 
     #[test]
