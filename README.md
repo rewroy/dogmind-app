@@ -41,6 +41,12 @@ The first run asks how to reach a model and where to work; `/setup` goes through
 starts a session, Ctrl+, opens the settings, Ctrl+Shift+C copies the last answer. A right click on a session renames or
 deletes it.
 
+To connect an MCP server already set up in Claude or Codex, type `/mcp candidates` in the conversation.
+Copy a name from the list and type `/mcp import NAME` to start that server. For example, if the list shows
+`Project Files`, type `/mcp import Project Files`. To add all available servers at once, use `/mcp import`.
+Use `/mcp` to check the connection. Once connected, its tools are available in the open conversation.
+To add a server manually, open *Settings > Tools > MCP servers > Add a server*.
+
 While the model works, Enter puts what you type into the work before its next step, and Ctrl+Enter keeps it for after the work. Each
 waiting message has buttons to send it into the work now, to edit it, or to discard it. Each message shows its time; an answer's
 branch button starts a new session with the conversation up to that answer, to go on from there another way. From the second turn,
