@@ -395,6 +395,7 @@ const JA: &[(&str, &str)] = &[
     ("Branch from here: a new session with the conversation up to this answer", "ここから分岐: この回答までの会話で新しいセッションを始めます"),
     ("This answer is not in the saved session yet, so there is nothing to branch from. Try again once it is.", "この回答はまだセッションに保存されていないため、分岐できません。保存されてからもう一度試してください。"),
     ("{0} (branch)", "{0} (分岐)"),
+    ("The session could not be renamed: {0}", "会話の名前を保存できませんでした。{0}"),
     ("The branch could not be made: {0}", "分岐を作れませんでした: {0}"),
     ("Discard", "破棄"),
     ("Optional. Kept in Credential Manager", "任意。資格情報マネージャーに保存"),

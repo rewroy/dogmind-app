@@ -6229,10 +6229,7 @@ impl App {
                         self.rename_target = Some(path);
                         self.set_panel(Panel::Rename);
                     } else {
-                        let _ = session::rename(&path, argument);
-                        self.session_title = argument.to_string();
-                        self.refresh_sessions();
-                        self.layout();
+                        self.save_session_name(path, argument);
                     }
                 } else {
                     self.say(t("This session has no messages yet."));
@@ -12224,6 +12221,31 @@ impl App {
         self.set_panel(Panel::ConfirmDelete);
     }
 
+    unsafe fn save_session_name(&mut self, path: PathBuf, name: &str) {
+        if let Err(error) = session::rename(&path, name) {
+            self.rename_target = Some(path);
+            if self.panel != Panel::Rename {
+                self.rename_seed = Some(name.to_string());
+                self.set_panel(Panel::Rename);
+            }
+            self.problem_in_panel(&tf("The session could not be renamed: {0}", &[&error]));
+            return;
+        }
+        self.rename_target = None;
+        if self.current_session.as_ref() == Some(&path) {
+            self.session_title = name.to_string();
+        }
+        self.refresh_sessions();
+        if !self.side_query.is_empty() {
+            self.search_now();
+        }
+        if self.panel == Panel::Rename {
+            self.set_panel(Panel::Chat);
+        } else {
+            self.layout();
+        }
+    }
+
     unsafe fn session_title_for_rename(&mut self, title: String) {
         if self.current_session != self.rename_target {
             self.rename_seed = Some(title);
@@ -14991,14 +15013,11 @@ impl App {
             (Panel::Rename, 0) => {
                 let name = get_text(self.fields[0]);
                 let name = name.trim().to_string();
-                if let (Some(path), false) = (self.rename_target.take(), name.is_empty()) {
-                    let _ = session::rename(&path, &name);
-                    if self.current_session.as_ref() == Some(&path) {
-                        self.session_title = name;
-                    }
-                    self.refresh_sessions();
+                if let Some(path) = self.rename_target.take().filter(|_| !name.is_empty()) {
+                    self.save_session_name(path, &name);
+                } else {
+                    self.set_panel(Panel::Chat);
                 }
-                self.set_panel(Panel::Chat);
             }
             (Panel::Sessions, 0) => {
                 if let Some(path) = self.list_selection().and_then(|at| self.resume_paths.get(at)).cloned() {
