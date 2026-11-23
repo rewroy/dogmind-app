@@ -286,10 +286,14 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
             }
         }
         if let Some((entry, how)) = joined.get(at) {
-            let drafts = entry.drafts.map_or(String::new(), |(kept, tried)| format!(", drafts {kept}/{tried}"));
             // (the engine writes its line as the request ends, and the app writes its own when it has read the stream's last word)
             let apart = line.at.zip(entry.at).map_or(String::new(), |(ours, theirs)| format!(", the app's line is {:+} ms from the engine's (the two machines' clocks differ a little)", (ours.with_timezone(&Utc) - theirs).num_milliseconds()));
-            let _ = writeln!(out, "        engine ({how}): prompt {}, reused {} from {}, prefilled {} in {} ms, first token {:.2} s, {} tokens at {:.1} tok/s{drafts}{apart}", entry.prompt, entry.reused, entry.from, entry.new, entry.prefill_ms, entry.first_s, entry.tokens, entry.tokens_per_second);
+            if entry.failed {
+                let _ = writeln!(out, "        engine ({how}): request failed{apart}");
+            } else {
+                let drafts = entry.drafts.map_or(String::new(), |(kept, tried)| format!(", drafts {kept}/{tried}"));
+                let _ = writeln!(out, "        engine ({how}): prompt {}, reused {} from {}, prefilled {} in {} ms, first token {:.2} s, {} tokens at {:.1} tok/s{drafts}{apart}", entry.prompt, entry.reused, entry.from, entry.new, entry.prefill_ms, entry.first_s, entry.tokens, entry.tokens_per_second);
+            }
         } else if !engine.is_empty() && line.s("role") != "warm" {
             let _ = writeln!(out, "        engine: no line for this request");
         }
@@ -1162,13 +1166,16 @@ mod tests {
             json!({"t": "2026-11-05T10:00:00.000+09:00", "ev": "turn_start", "turn": 1, "chars": 4, "images": 0}),
             request(1, "2026-11-05T10:00:10.600+09:00", "main", 900, 10_000, 5000, 4000, 300, "stop"),
             request(2, "2026-11-05T10:00:20.400+09:00", "main", 5000, 9000, 7000, 0, 20, "stop"),
+            json!({"t":"2026-11-05T10:00:30.300+09:00","ev":"request","turn":1,"req":"s/9","role":"main","end":"error:down"}),
             request(3, "2026-11-05T10:01:40.000+09:00", "main", 5000, 9000, 1, 0, 20, "stop"),
         ];
         let said = report(&text(&lines), Some(&log));
         assert!(said.contains("engine (id): prompt 5000, reused 4000 from live, prefilled 1000 in 900 ms, first token 0.90 s, 300 tokens at 70.0 tok/s, drafts 150/200"), "{said}");
         assert!(said.contains("engine (time): prompt 7000, reused 0 from root, prefilled 7000 in 5000 ms"), "{said}");
         assert!(said.contains("engine: no line for this request"), "{said}");
-        assert!(said.contains("2 of 3 requests joined to the engine's log: 1 by id, 1 by time"), "{said}");
+        assert!(said.contains("engine (id): request failed, the app's line is +300 ms"), "{said}");
+        assert!(!said.contains("engine (id): prompt 0"), "{said}");
+        assert!(said.contains("3 of 4 requests joined to the engine's log: 2 by id, 1 by time"), "{said}");
     }
 
     #[test]
