@@ -593,16 +593,21 @@ pub fn said_at(message: &str) -> Option<&str> {
 
 /// What a person typed, out of a message: itself, or, in a session saved before the app's facts went on their own, the part after the app's words.
 pub fn typed_text(message: &str) -> &str {
-    // (a session saved before the language moved has this, and perhaps no mark)
-    if let Some(at) = message.find("## Response Language\n") {
-        let rest = &message[at + "## Response Language\n".len()..];
-        let text = rest.split_once('\n').map_or(rest, |(_, text)| text);
-        return text.strip_prefix(TYPED_MARK).unwrap_or(text);
-    }
-    if !message.starts_with(NOW_MARK) {
-        return message;
-    }
-    message.split_once(TYPED_MARK).map_or(message, |(_, text)| text)
+    const LANGUAGE: &str = "## Response Language\n";
+    let rule = if message.starts_with(NOW_MARK) {
+        if let Some((wrapper, typed)) = message.split_once(TYPED_MARK) {
+            if !wrapper.contains(LANGUAGE) {
+                return typed;
+            }
+        }
+        message.split_once(LANGUAGE).map(|(_, rest)| rest)
+    } else {
+        // The oldest short form begins with the heading and a single language-rule bullet.
+        message.strip_prefix(LANGUAGE).filter(|rest| rest.starts_with("- "))
+    };
+    let Some(rule) = rule else { return message };
+    let text = rule.split_once('\n').map_or(rule, |(_, text)| text);
+    text.strip_prefix(TYPED_MARK).unwrap_or(text)
 }
 
 #[cfg(test)]
@@ -984,6 +989,16 @@ mod tests {
         assert_eq!(app_facts("2026-11-02 20:01:18 +09:00", None, &[]), format!("{APP_FACTS}\n- Now: 2026-11-02 20:01 +09:00"));
         assert_eq!(typed_text("hi"), "hi");
         assert_eq!(typed_text("## The User's Message\nnot the app's"), "## The User's Message\nnot the app's", "what the person typed is what they typed");
+    }
+
+    #[test]
+    fn a_language_heading_in_the_persons_message_remains_part_of_the_message() {
+        let quoted = "文例を比較してください。\n## Response Language\nEnglish\n最後の段落です。";
+        assert_eq!(typed_text(quoted), quoted);
+        let headed = "## Response Language\nEnglish\n最後の段落です。";
+        assert_eq!(typed_text(headed), headed);
+        let wrapped = format!("{NOW_MARK}2026-11-02 20:01 +09:00]\n{TYPED_MARK}{quoted}");
+        assert_eq!(typed_text(&wrapped), quoted);
     }
 
     #[test]
