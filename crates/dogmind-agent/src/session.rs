@@ -692,6 +692,8 @@ pub struct Hit {
     pub path: PathBuf,
     pub title: String,
     pub snippet: String,
+    /// The original text to find after opening this conversation. Absent when only its title matched.
+    pub find_in_conversation: Option<String>,
 }
 
 const SNIPPET_BEFORE: usize = 24;
@@ -704,10 +706,15 @@ fn snippet(text: &str, at: usize) -> String {
 }
 
 /// Where a word is, by the original text's bytes, whatever its case.
-fn place_of(text: &str, word: &[char]) -> Option<usize> {
-    text.char_indices().map(|(at, _)| at).find(|at| {
-        let mut rest = text[*at..].chars().flat_map(char::to_lowercase);
-        word.iter().all(|wanted| rest.next() == Some(*wanted))
+fn place_of(text: &str, word: &[char]) -> Option<std::ops::Range<usize>> {
+    text.char_indices().find_map(|(start, _)| {
+        let mut end = start;
+        let mut rest = text[start..].chars().flat_map(|ch| {
+            end += ch.len_utf8();
+            ch.to_lowercase()
+        });
+        let matched = word.iter().all(|wanted| rest.next() == Some(*wanted));
+        matched.then_some(start..end)
     })
 }
 
@@ -724,7 +731,7 @@ pub fn search_while(folder: &Path, query: &str, current: impl Fn() -> bool) -> O
     if words.is_empty() {
         return Some(hits);
     }
-    for path in session_paths(folder) {
+    'sessions: for path in session_paths(folder) {
         if !current() {
             return None;
         }
@@ -742,22 +749,27 @@ pub fn search_while(folder: &Path, query: &str, current: impl Fn() -> bool) -> O
                 _ => None,
             }
         });
-        let mut shown = None;
+        let mut body_match = None;
+        let mut title_match = None;
         for word in &words {
-            let found = std::iter::once(title.as_str()).chain(spoken.clone()).take_while(|_| current())
-                .find_map(|text| place_of(text, word).map(|at| (text, at)));
+            let found = spoken.clone().take_while(|_| current())
+                .find_map(|text| place_of(text, word).map(|range| (text, range)));
             if !current() {
                 return None;
             }
-            let Some((text, at)) = found else {
-                shown = None;
-                break;
-            };
-            shown.get_or_insert_with(|| snippet(text, at));
+            if let Some(found) = found {
+                body_match.get_or_insert(found);
+            } else if let Some(range) = place_of(&title, word) {
+                title_match.get_or_insert(range.start);
+            } else {
+                continue 'sessions;
+            }
         }
-        if let Some(snippet) = shown {
-            hits.push(Hit { path, title, snippet });
-        }
+        let (snippet, find_in_conversation) = match body_match {
+            Some((text, range)) => (snippet(text, range.start), Some(text[range].to_owned())),
+            None => (snippet(&title, title_match.unwrap_or(0)), None),
+        };
+        hits.push(Hit { path, title, snippet, find_in_conversation });
     }
     Some(hits)
 }
@@ -1171,11 +1183,18 @@ mod tests {
         session.snapshot(&[Message::text("user", "kept question")]).unwrap();
         let hit = search(dir.path(), "original question").remove(0);
         assert_eq!(hit.title, list(dir.path())[0].title);
-        assert!(hit.snippet.contains("original"));
+        assert!(hit.snippet.contains("kept question"));
+        assert_eq!(hit.find_in_conversation.as_deref(), Some("question"));
+        assert!(search(dir.path(), "original")[0].find_in_conversation.is_none());
         assert!(search(dir.path(), "discarded").is_empty());
         rename(&session.path, "new title").unwrap();
         assert!(search(dir.path(), "original").is_empty());
-        assert_eq!(search(dir.path(), "new question")[0].title, "new title");
+        let renamed = search(dir.path(), "new question").remove(0);
+        assert_eq!(renamed.title, "new title");
+        assert_eq!(renamed.find_in_conversation.as_deref(), Some("question"));
+        session.append(&Message::text("assistant", "İstanbul")).unwrap();
+        let expanded = search(dir.path(), "new i\u{307}s").remove(0);
+        assert_eq!(expanded.find_in_conversation.as_deref(), Some("İs"));
         let empty = Session::create(dir.path(), Path::new("w"), "now", "2").unwrap();
         rename(&empty.path, "invisible").unwrap();
         assert!(search(dir.path(), "invisible").is_empty());

@@ -12155,7 +12155,7 @@ impl App {
             // (the three dots a row shows under the pointer: what the right button offers)
             Some(SideRow::Session { .. }) if x > client.right - scale(self.dpi, 34) => self.on_side_menu(index),
             Some(SideRow::Session { path, .. }) => {
-                self.find_after_open = self.side_hits.as_ref().and_then(|_| self.side_query.split_whitespace().next().map(str::to_string));
+                self.find_after_open = self.side_hits.as_ref().and_then(|hits| hits.iter().find(|hit| hit.path == path)).and_then(|hit| hit.find_in_conversation.clone());
                 self.open_session(path);
             }
             _ => {}
