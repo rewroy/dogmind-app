@@ -3539,22 +3539,26 @@ impl Agent {
         self.read_only
     }
 
-    /// Judge what the person typed: if it plainly asks for no changes to the work, the turn is read-only. Says so on the screen and in the trajectory, once, opens the scratch folder,
-    /// and gives the note for the model. None for a request that does not, and in plan mode.
+    /// Judge what the person typed: if it plainly asks for no changes to the work, or is a suggestion put as a question (`prompt::suggestion_phrase`), the turn is read-only.
+    /// Says so on the screen and in the trajectory, once, opens the scratch folder, and gives the note for the model. None for a request that does not, and in plan mode.
     fn make_read_only(&mut self, typed: &str) -> Option<String> {
         if self.mode == Mode::Plan {
             return None;
         }
-        let phrase = prompt::read_only_phrase(typed)?;
+        let (phrase, suggestion) = match prompt::read_only_phrase(typed) {
+            Some(phrase) => (phrase, false),
+            None => (prompt::suggestion_phrase(typed)?, true),
+        };
         if !std::mem::replace(&mut self.read_only, true) {
-            self.traj.intervention("no_change_guard", None, json!({"what": "turn_read_only", "phrase": phrase}));
-            self.emit(Event::Notice(prompt::READ_ONLY_NOTICE.into()));
+            let what = if suggestion { "turn_read_only_suggestion" } else { "turn_read_only" };
+            self.traj.intervention("no_change_guard", None, json!({"what": what, "phrase": phrase}));
+            self.emit(Event::Notice(if suggestion { prompt::SUGGESTION_NOTICE } else { prompt::READ_ONLY_NOTICE }.into()));
         }
         let folder = self.scratch_folder();
         forget_old_scratch_folders(&folder);
         std::fs::create_dir_all(&folder).ok()?;
         self.scratch_made = Some(folder.clone());
-        let note = prompt::no_change_note(&folder);
+        let note = if suggestion { prompt::suggestion_note(&folder) } else { prompt::no_change_note(&folder) };
         self.bench.scratch = Some(folder);
         Some(note)
     }
@@ -9116,6 +9120,29 @@ Body").unwrap();
                 _ => {}
             }
         }
+    }
+
+    /// A suggestion put as a question makes its turn read-only, with its own line on the screen and its own note for the model; the change is refused there. The person's
+    /// 「じゃあやって。」 after it is a request, and the change is made.
+    #[test]
+    fn a_suggestion_turn_is_read_only_and_the_go_ahead_after_it_is_not() {
+        let dir = crate::in_container::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+        let patch = |from: &str, to: &str| calls(&[("apply_patch", serde_json::json!({"edits": [{"path": "a.txt", "old_string": from, "new_string": to}], "expected_files": ["a.txt"]}))]);
+        let (run, provider) = scripted(dir.path(), vec![patch("before", "after"), says("It would change a.txt."), patch("before", "after"), says("done")], Mode::Auto);
+        run.handle.commands.send(Command::Send("a.txt も after にしたほうがよくないかなあ。".into())).unwrap();
+        let said = said_in_order(&run);
+        let notices: Vec<&String> = said.iter().filter(|line| line.starts_with("notice:")).collect();
+        assert_eq!(notices, [&format!("notice:{}", prompt::SUGGESTION_NOTICE)], "{said:?}");
+        assert!(said.iter().any(|line| line.starts_with("ended:false:true:")), "the change was refused: {said:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "before\n");
+        assert!(user_text(&provider.messages(0)[2]).contains("## A Suggestion"));
+        let lines = trajectory_of(&run);
+        assert!(of_kind(&lines, "intervention").iter().any(|line| line["kind"] == "no_change_guard" && line["what"] == "turn_read_only_suggestion" && line["phrase"] == "ほうがよくない"), "{lines:?}");
+        run.handle.commands.send(Command::Send("じゃあやって。".into())).unwrap();
+        let said = said_in_order(&run);
+        assert!(!said.iter().any(|line| line.starts_with("notice:")), "{said:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "after\n");
     }
 
     /// A read-only turn is seen before anything is refused: one line, ahead of the first tool, in the trajectory with the words that made it so. The next request, which says no such

@@ -571,6 +571,37 @@ fn names_the_whole_work(object: &str) -> bool {
     })
 }
 
+/// What the app says on the screen when what the person wrote reads as a suggestion put as a question: nothing is changed in this turn, and how to have it done.
+pub const SUGGESTION_NOTICE: &str = "Read as a suggestion: no files will be changed in this turn. Say \"go ahead\" to have it done.";
+
+/// The phrase of a suggestion put as a question, if what the person typed is one and asks for nothing to be done: 「〜したほうがよくない?」, 「〜はどう?」, 「〜したらどうかな」,
+/// "how about…?", "wouldn't it be better to…?". Not where it asks as well (「〜して」, 「お願い」, 「やって」, 「〜しておいて」, "please", "can you…?"), nor in what is quoted.
+/// (Told in the system prompt that such a suggestion is a question, the Homelab's DeepSeek still changed the code on the first, three runs of three: 「ctx の表示はある
+/// のだから、キャッシュヒット率も表示したほうがよくないかなあ。」, where the owner had answered it by asking for it themselves.)
+pub fn suggestion_phrase(text: &str) -> Option<String> {
+    static RULES: OnceLock<(Regex, Regex, Regex, Regex)> = OnceLock::new();
+    let (japanese, japanese_asks, english, english_asks) = RULES.get_or_init(|| {
+        (
+            Regex::new(r"(?:ほうが|方が)(?:よく|良く)ない|(?:ほうが|方が)(?:いい|良い)(?:かな|のでは|んじゃ)|(?:は|って|のは)どう(?:かな|だろう|でしょう|ですか)?\s*(?:[?？]|$)|(?:たら|れば|ては)どう(?:かな|だろう|でしょう|です|か)?").unwrap(),
+            Regex::new(r"(?:て|で)(?:ください|下さい|ほしい|欲しい|くれ|もらえ|おいて|おけ|いただけ)|(?:て|で)(?:[。！!．.、,\s]|$)|お願い|頼む|よろしく|やっといて|しといて").unwrap(),
+            Regex::new(r"(?i)\b(?:how|what)\s+about\b|\bwould(?:n't|\s+not)\s+it\s+be\s+(?:better|nicer|good|nice|worth)|\bwould\s+it\s+(?:be\s+)?(?:better|make\s+sense)|\b(?:should|shall)\s+we\b|\bmaybe\s+(?:we|you)\s+should\b").unwrap(),
+            Regex::new(r"(?i)\bplease\b|\bgo\s+ahead\b|^\s*(?:can|could|would|will)\s+you\b|\bdo\s+it\b").unwrap(),
+        )
+    });
+    let typed = without_quoted_code(text);
+    let typed = typed.trim();
+    if let Some(found) = japanese.find(typed).filter(|_| !japanese_asks.is_match(typed)) {
+        return Some(found.as_str().to_string());
+    }
+    english.find(typed).filter(|_| typed.ends_with(['?', '？']) && !english_asks.is_match(typed)).map(|found| found.as_str().to_string())
+}
+
+/// The turn's note while what the person wrote is a suggestion put as a question (`suggestion_phrase`): what to answer, and the folder open for experiments.
+pub fn suggestion_note(scratch: &std::path::Path) -> String {
+    format!("## A Suggestion
+The user's message is a suggestion put as a question, not a request: answer it with your view, the plan, and what it would change (which files, what the user would see). Nothing is changed in this turn: create_file and apply_patch are refused in the workspace. If they ask for it next, do it then. For an experiment use the scratch folder `{}`.", scratch.display())
+}
+
 /// The turn's note while the person has asked for no changes to the files: what is closed, and the folder that is open for experiments.
 pub fn no_change_note(scratch: &std::path::Path) -> String {
     format!("## No Changes
@@ -702,6 +733,49 @@ mod tests {
     ];
 
     /// What a person says that does not: a thing is named, or there is no refusal, or it is a setting to make. The request is followed as written.
+    /// A suggestion put as a question makes its turn read-only; what asks as well, or asks outright, does not.
+    #[test]
+    fn a_suggestion_put_as_a_question_is_told_from_a_request() {
+        const SUGGESTIONS: &[&str] = &[
+            "ctx の表示はあるのだから、キャッシュヒット率も表示したほうがよくないかなあ。",
+            "キャッシュヒット率も出したほうがいいかな？",
+            "このテストも足したほうがよくない?",
+            "ボタンを右に寄せるのはどう？",
+            "ログを残したらどうかな",
+            "エラーのときは赤で出すっていうのはどうだろう",
+            "設定画面に検索を付けてみたらどうでしょう？",
+            "How about showing the cache hit rate next to ctx?",
+            "Wouldn't it be better to cache the result?",
+            "Should we add a retry here?",
+            "Maybe we should log the request id too?",
+        ];
+        const REQUESTS: &[&str] = &[
+            "キャッシュヒット率を表示して。",
+            "ctx の隣にキャッシュヒット率を表示して",
+            "表示したほうがいいので、表示して。",
+            "修正したほうがいいので修正して",
+            "キャッシュヒット率も出しておいて",
+            "キャッシュヒット率も出したほうがいいよね、お願い",
+            "それ、やっといて。たぶんそのほうがよくないかなと思う",
+            "キャッシュヒット率を表示してくれない？",
+            "キャッシュヒット率を表示してもらえますか？",
+            "どうして失敗するの？",
+            "これはどうして遅いの？",
+            "テストを直して。",
+            "Can you show the cache hit rate?",
+            "Could you add a retry here?",
+            "Please add the cache hit rate. How about next to ctx?",
+            "Add the cache hit rate next to ctx.",
+            "Is the cache hit rate shown anywhere?",
+            "How about this: add the cache hit rate next to ctx.",
+        ];
+        let mut wrong: Vec<String> = SUGGESTIONS.iter().filter(|said| super::suggestion_phrase(said).is_none()).map(|said| format!("should be a suggestion: {said}")).collect();
+        wrong.extend(REQUESTS.iter().filter_map(|said| super::suggestion_phrase(said).map(|phrase| format!("should not be: {said} (read as {phrase:?})"))));
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // (what is quoted is not what was said)
+        assert!(super::suggestion_phrase("このエラー「表示したほうがよくない?」は何?").is_none());
+    }
+
     const NOT_READ_ONLY: &[&str] = &[
         // (the two requests of 2026-11-07: the phrase limits the tests, not the task)
         "Fix the failing test in calc.py without changing the tests",

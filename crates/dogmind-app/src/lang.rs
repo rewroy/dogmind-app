@@ -1123,6 +1123,7 @@ const JA: &[(&str, &str)] = &[
     ("There is nothing to compact yet: the conversation is short.", "会話がまだ短いので、圧縮するものはありません。"),
     ("Session compacted: the oldest turns were dropped", "セッションを圧縮しました: いちばん古いターンを削除しました"),
     ("Read-only: no files will be changed in this turn. Say so if that is not what you meant.", "読み取り専用: このターンではファイルを変更しません。意図と違う場合は、そう伝えてください。"),
+    ("Read as a suggestion: no files will be changed in this turn. Say \"go ahead\" to have it done.", "相談として受け取りました: このターンではファイルを変更しません。進めるときは「やって」と伝えてください。"),
     ("the engine stopped answering: /log shows why, and writing again tries once more", "エンジンの応答が止まりました。原因は /log で確認できます。もう一度入力すると再試行します。"),
     ("another Straydog is running on this PC (process {0}). Two on one GPU fight over its memory and the machine's, so this one was not started. Close it and restart the engine, or reach it as an OpenAI-compatible provider.", "この PC で別の Straydog が動いています (プロセス {0})。1 つの GPU で 2 つ動かすとメモリを奪い合うため、起動しませんでした。それを閉じてからエンジンを起動し直すか、OpenAI 互換の接続先として接続してください。"),
     ("port {0} on this PC is taken. Choose another port for the engine in settings.json, or close what holds it.", "この PC のポート {0} は使用中です。settings.json でエンジンの別のポートを選ぶか、使っているものを閉じてください。"),
