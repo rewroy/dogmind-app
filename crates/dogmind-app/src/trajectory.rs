@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use dogmind_agent::trajectory_report::{RequestRow, Summary, ToolRow, TurnSummary};
 
-use crate::lang::{t, tf};
+use crate::lang::{t, tf, tool_outcome_words};
 
 /// A column: its title, its minimum width in characters of the table's monospace face, and whether its figures stand at its right edge.
 pub struct Column {
@@ -126,7 +126,7 @@ fn request_row(request: &RequestRow) -> Row {
 
 /// A tool call of an open turn: its time under Tools, and how it ended and what it did in the note.
 fn tool_row(tool: &ToolRow) -> Row {
-    let mut parts = vec![tool.outcome.clone()];
+    let mut parts = vec![tool_outcome_words(&tool.outcome, false)];
     parts.extend(tool.notes.iter().cloned());
     Row { kind: RowKind::Tool, cells: [format!("  {} {}", tool.id, tool.name), String::new(), String::new(), String::new(), seconds(tool.ms), seconds(tool.ms)], note: parts.join(", ") }
 }
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(request.note, "prompt 5000, cached 0%, 8328 tokens, ~82.5 tok/s, tool_calls [create_file]");
         let tool = &page[3];
         assert_eq!(tool.cells, ["  /1 create_file", "", "", "", "0.0", "0.0"]);
-        assert_eq!(tool.note, "ok, index.html, 10 bytes out");
+        assert_eq!(tool.note, "Done, index.html, 10 bytes out");
         // (the server's own rate is not marked as counted)
         let page = rows(&run(), &BTreeSet::from([2]));
         assert_eq!(page[3].note, "prompt 9000, cached 90%, 300 tokens, 31.5 tok/s, stop");
@@ -198,6 +198,18 @@ mod tests {
         let page = rows(&woken, &BTreeSet::new());
         assert_eq!(page[1].note, "woken by background work, no end: the run stopped here");
         assert!(woken.turns[0].woken);
+    }
+
+    #[test]
+    fn tool_result_notes_distinguish_an_error_from_a_refusal() {
+        for (outcome, expected) in [
+            ("failed", "Failed"), ("timeout", "Timed out"), ("declined_person", "You declined"),
+            ("refused_gate", "Blocked by Dogmind"), ("refused_no_change", "Changes disabled for this turn"),
+            ("future_outcome", "future outcome"),
+        ] {
+            let tool = ToolRow { outcome: outcome.to_string(), ..ToolRow::default() };
+            assert_eq!(tool_row(&tool).note, expected);
+        }
     }
 
     #[test]

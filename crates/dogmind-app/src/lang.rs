@@ -50,6 +50,21 @@ pub fn t(english: &str) -> &str {
     }
 }
 
+/// The result shown for a tool in both session views. Older records can carry a nonzero exit alongside an ok outcome.
+pub fn tool_outcome_words(outcome: &str, failed_exit: bool) -> String {
+    match outcome {
+        "ok" if failed_exit => t("Failed").to_string(),
+        "ok" => t("Done").to_string(),
+        "failed" | "error" => t("Failed").to_string(),
+        "timeout" => t("Timed out").to_string(),
+        "declined_person" => t("You declined").to_string(),
+        "refused_gate" => t("Blocked by Dogmind").to_string(),
+        "refused_no_change" => t("Changes disabled for this turn").to_string(),
+        "cancelled" => t("Stopped").to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
 /// The same, with values for `{0}`, `{1}`...
 pub fn tf(english: &str, values: &[&dyn Display]) -> String {
     dogmind_agent::fill_template(t(english), values)
@@ -1283,6 +1298,8 @@ const JA: &[(&str, &str)] = &[
     ("Output", "出力"),
     ("Timed out", "時間切れ"),
     ("You declined", "却下しました"),
+    ("Blocked by Dogmind", "Dogmind が拒否"),
+    ("Changes disabled for this turn", "このターンでは変更不可"),
     ("Time to the first word", "最初の応答までの時間"),
     ("Total time", "合計時間"),
     ("Prompt", "プロンプト"),

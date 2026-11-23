@@ -12,7 +12,7 @@ use dogmind_agent::timeline::{self, Band, BandPart, CallRow, Heading, Lane, Part
 use serde_json::Value;
 
 use crate::cards::{duration_words, is_asking, token_count_words};
-use crate::lang::{t, tf};
+use crate::lang::{t, tf, tool_outcome_words};
 use crate::toolrun::{partial_value, size_text};
 use crate::ui::tool_name;
 
@@ -1015,7 +1015,7 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
         "" if is_live => ("clock", Tone::Muted, String::new()),
         "" => ("square", Tone::Muted, t("did not run").to_string()),
         "ok" if !failed_exit => ("check", Tone::Good, if call.ms > 0 { ms_words(call.ms) } else { String::new() }),
-        other => ("x", Tone::Bad, outcome_words(other, failed_exit)),
+        other => ("x", Tone::Bad, tool_outcome_words(other, failed_exit)),
     };
     let indent = if nested { 3 } else { 2 };
     let name = t(tool_name(&call.name)).to_string();
@@ -1029,7 +1029,7 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
     }
     let inner = indent + 1;
     if !call.outcome.is_empty() && call.outcome != "ok" {
-        out.push(fact(inner, t("Result"), outcome_words(&call.outcome, false)));
+        out.push(fact(inner, t("Result"), tool_outcome_words(&call.outcome, false)));
     }
     if let Some(code) = call.exit_code {
         out.push(fact(inner, t("Exit code"), code.to_string()));
@@ -1062,17 +1062,6 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
     if let Some(output) = call.output.as_deref().filter(|output| !output.is_empty()) {
         out.push(Row { kind: Kind::Caption, text: t("Output").to_string(), indent: inner, ..Row::default() });
         out.extend(code_rows(plain_lines(&safe(output)), inner, if call.outcome == "ok" || call.outcome.is_empty() { Tone::Plain } else { Tone::Bad }));
-    }
-}
-
-fn outcome_words(outcome: &str, failed_exit: bool) -> String {
-    match outcome {
-        "ok" if failed_exit => t("Failed").to_string(),
-        "error" => t("Failed").to_string(),
-        "timeout" => t("Timed out").to_string(),
-        "declined_person" => t("You declined").to_string(),
-        "cancelled" => t("Stopped").to_string(),
-        other => other.replace('_', " "),
     }
 }
 
