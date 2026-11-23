@@ -719,6 +719,24 @@ struct PatchFile {
     after: String,
 }
 
+/// An edit replaces a directory entry. On Windows, different casing can name that same entry.
+fn same_patch_path(one: &Path, other: &Path) -> bool {
+    if one == other {
+        return true;
+    }
+    if !cfg!(windows) {
+        return false;
+    }
+    let (a, b) = (one.as_os_str(), other.as_os_str());
+    if a.is_ascii() && b.is_ascii() && !a.eq_ignore_ascii_case(b) {
+        return false;
+    }
+    // Ask the filesystem about Unicode casing and case-sensitive directories.
+    // A symlink is itself replaced by a patch, so its target cannot identify the entry.
+    !one.is_symlink() && !other.is_symlink()
+        && matches!((one.canonicalize(), other.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
 /// Head and tail, with what is left out said between them.
 const MAX_APPLIED_DIFF: usize = 3000;
 
@@ -1230,7 +1248,7 @@ impl Workbench {
             let given = edit.get("path").and_then(Value::as_str).or(if expected.len() == 1 { expected.first().copied() } else { None })
                 .ok_or_else(|| format!("edit {}: path is required", number + 1))?;
             let path = resolve(workspace, given);
-            if !expected.is_empty() && !expected.iter().any(|name| resolve(workspace, name) == path) {
+            if !expected.is_empty() && !expected.iter().any(|name| same_patch_path(&resolve(workspace, name), &path)) {
                 return Err(format!("{given} is not in expected_files: nothing was changed"));
             }
             let old = text_arg(edit, "old_string").map_err(|error| format!("edit {}: {error}", number + 1))?;
@@ -1243,7 +1261,7 @@ impl Workbench {
             if old.is_empty() {
                 return Err(format!("edit {}: old_string is empty", number + 1));
             }
-            let slot = match files.iter().position(|file| file.path == path) {
+            let slot = match files.iter().position(|file| same_patch_path(&file.path, &path)) {
                 Some(slot) => slot,
                 None => {
                     if !path.exists() {
@@ -5001,6 +5019,31 @@ mod tests {
         bench.run("create_file", &write, dir.path(), &cancel).unwrap();
         bench.run("create_file", &json!({"path": "new.txt", "content": "made\n"}), dir.path(), &cancel).unwrap();
         assert_eq!((std::fs::read_to_string(&file).unwrap(), std::fs::read_to_string(dir.path().join("new.txt")).unwrap()), ("omega\n".to_string(), "made\n".to_string()));
+    }
+
+    #[test]
+    fn patch_paths_follow_the_case_rules_of_the_directory() {
+        let (dir, mut bench, cancel) = bench();
+        let original = dir.path().join("ReadMe.txt");
+        let other = dir.path().join("README.TXT");
+        std::fs::write(&original, "one\ntwo\n").unwrap();
+        let same_entry = other.exists();
+        if !same_entry {
+            std::fs::write(&other, "separate\n").unwrap();
+        }
+        let expected = if same_entry { vec!["ReadMe.txt"] } else { vec!["ReadMe.txt", "README.TXT"] };
+        let patch = json!({"expected_files": expected, "edits": [
+            {"path": "ReadMe.txt", "old_string": "one", "new_string": "first"},
+            {"path": "README.TXT", "old_string": if same_entry { "first" } else { "separate" }, "new_string": "final"}
+        ]});
+        let report = bench.run("apply_patch", &patch, dir.path(), &cancel).unwrap();
+        if same_entry {
+            assert_eq!(std::fs::read_to_string(original).unwrap(), "final\ntwo\n");
+            assert_eq!(report.matches("--- applied_diff ").count(), 1);
+        } else {
+            assert_eq!(std::fs::read_to_string(original).unwrap(), "first\ntwo\n");
+            assert_eq!(std::fs::read_to_string(other).unwrap(), "final\n");
+        }
     }
 
     #[test]
