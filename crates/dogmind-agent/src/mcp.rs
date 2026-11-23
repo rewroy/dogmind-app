@@ -77,7 +77,7 @@ pub struct Config {
 }
 
 pub fn load_config(file: &Path) -> Config {
-    std::fs::read_to_string(file).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+    readable_config(file).unwrap_or_default()
 }
 
 /// Claude Code's own list of servers: the `mcpServers` of `~/.claude.json`, stdio, HTTP and SSE servers.
@@ -86,7 +86,7 @@ pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
 }
 
 fn parse_claude_servers(text: &str) -> Option<BTreeMap<String, ServerConfig>> {
-    let mut value = serde_json::from_str::<serde_json::Map<String, Value>>(text).ok()?;
+    let mut value = serde_json::from_str::<serde_json::Map<String, Value>>(text.strip_prefix('\u{feff}').unwrap_or(text)).ok()?;
     let servers = value.remove("mcpServers").unwrap_or_else(|| Value::Object(Default::default()));
     let mut found = BTreeMap::new();
     for (name, server) in servers.as_object()? {
@@ -289,7 +289,7 @@ pub fn readable_config(file: &Path) -> Result<Config, String> {
     match std::fs::read_to_string(file) {
         // (all a power cut left of it, which has nothing in it to keep)
         Ok(text) if crate::images::left_by_a_power_cut(text.as_bytes()) => Ok(Config::default()),
-        Ok(text) => serde_json::from_str(&text).map_err(|error| format!("{}: {error}", file.display())),
+        Ok(text) => serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)).map_err(|error| format!("{}: {error}", file.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(error) => Err(format!("{}: {error}", file.display())),
     }
@@ -1705,6 +1705,22 @@ impl std::io::Read for Heard {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn mcp_json_settings_accept_a_leading_utf8_bom() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        let text = "\u{feff}{\"mcpServers\":{\"editor\":{\"command\":\"local\",\"args\":[\"a\u{feff}b\"]}}}";
+        std::fs::write(&file, text).unwrap();
+        let own = readable_config(&file).unwrap().servers;
+        assert_eq!(own["editor"].args, ["a\u{feff}b"]);
+        assert_eq!(load_config(&file).servers, own);
+        assert_eq!(servers_of_claude(text), own);
+
+        std::fs::write(&file, "\u{feff}{broken}").unwrap();
+        assert!(readable_config(&file).is_err());
+        assert!(parse_claude_servers("\u{feff}{broken}").is_none());
+    }
 
     #[test]
     fn claudes_file_is_read_as_it_is() {
