@@ -1212,12 +1212,18 @@ impl Workbench {
     /// write fails, those already written go back.
     fn apply_patch(&mut self, arguments: &Value, workspace: &Path) -> Result<String, String> {
         // (a list written as a string of JSON is the list: a model sent its edits so twice in one conversation, and each was refused and sent again)
-        let unwrapped = match arguments.get("edits") {
-            Some(Value::String(text)) => serde_json::from_str::<Value>(text).ok().filter(Value::is_array),
-            _ => None,
+        let supplied = arguments.get("edits").ok_or("edits is required: a list of {path, old_string, new_string}")?;
+        let decoded;
+        let value = if let Some(text) = supplied.as_str() {
+            decoded = serde_json::from_str::<Value>(text).map_err(|error| format!("edits contains invalid JSON: {error}. Send edits as an array of {{path, old_string, new_string}}."))?;
+            &decoded
+        } else {
+            supplied
         };
-        let edits = unwrapped.as_ref().or(arguments.get("edits")).and_then(Value::as_array).filter(|edits| !edits.is_empty())
-            .ok_or("edits is required: a list of {path, old_string, new_string}")?;
+        let edits = value.as_array().ok_or("edits must be an array of {path, old_string, new_string}")?;
+        if edits.is_empty() {
+            return Err("edits is empty: provide at least one edit".into());
+        }
         let expected: Vec<&str> = arguments.get("expected_files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
         let mut files: Vec<PatchFile> = Vec::new();
         for (number, edit) in edits.iter().enumerate() {
@@ -4677,7 +4683,22 @@ mod tests {
         let listed = serde_json::to_string(&json!([{"path": "page.html", "old_string": "<p>two</p>", "new_string": "<p>2</p>"}])).unwrap();
         bench.run("apply_patch", &json!({"edits": listed}), dir.path(), &cancel).unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("page.html")).unwrap(), "<p>one</p>\n<p>2</p>\n");
-        assert!(bench.run("apply_patch", &json!({"edits": "not a list"}), dir.path(), &cancel).unwrap_err().contains("edits is required"));
+    }
+
+    #[test]
+    fn a_patch_explains_why_its_edit_list_cannot_be_read() {
+        let (dir, mut bench, cancel) = bench();
+        for (arguments, reason) in [
+            (json!({}), "edits is required"),
+            (json!({"edits": []}), "edits is empty"),
+            (json!({"edits": "[]"}), "edits is empty"),
+            (json!({"edits": null}), "edits must be an array"),
+            (json!({"edits": "{}"}), "edits must be an array"),
+            (json!({"edits": "[{\"new_string\" string=\"true\""}), "expected `:` at line 1 column 16"),
+        ] {
+            let error = bench.run("apply_patch", &arguments, dir.path(), &cancel).unwrap_err();
+            assert!(error.contains(reason), "{error}");
+        }
     }
 
     /// An edit whose line differs by a word is shown the line it differs from, not a longer line that only holds the same letters.
