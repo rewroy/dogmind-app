@@ -337,7 +337,6 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
     }
     for at in guards {
         let line = &lines[at];
-        let next = lines[at + 1..].iter().find(|later| later.ev() == "request" && later.s("role") == "main");
         if line.ev() == "compaction" {
             let window = line.u("window").map_or(String::new(), |window| format!(", of a window of {window}"));
             let _ = writeln!(out, "  compaction ({}): {} tokens to {} in {}{window}", line.s("stage"), line.u("before_tokens").unwrap_or(0), line.u("after_tokens").unwrap_or(0), secs(line.u("ms").unwrap_or(0)));
@@ -372,6 +371,9 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
             what = "-".to_string();
         }
         let _ = writeln!(out, "  {kind} at {}: {what}", short(line.req()));
+        let next = lines[at + 1..].iter()
+            .take_while(|later| !matches!(later.ev(), "turn_start" | "turn_end"))
+            .find(|later| later.turn() == line.turn() && later.ev() == "request" && later.s("role") == "main");
         if let Some(next) = next {
             let _ = writeln!(out, "      next: {}", request_summary(next));
         }
@@ -934,6 +936,26 @@ mod tests {
         assert_eq!(written[..3], ["~27", "0", "-"]);
         assert!(printed.contains("~27 tokens generated before the stop (line counts unavailable, reasoning kept)"));
         assert!(printed.contains("next: /2 wrote 0 tokens"));
+    }
+
+    #[test]
+    fn an_intervention_cannot_claim_a_later_turns_request() {
+        let guard = json!({"ev":"intervention","turn":1,"req":"s/1","kind":"draft_stop"});
+        let main = json!({"ev":"request","turn":1,"req":"s/2","role":"main","completion":36});
+        let other = json!({"ev":"request","turn":2,"req":"s/3","role":"main","completion":18});
+        for tail in [
+            vec![json!({"ev":"turn_end","turn":1}), main.clone()],
+            vec![json!({"ev":"turn_start","turn":1}), main.clone()],
+            vec![other],
+        ] {
+            let mut lines = vec![guard.clone()];
+            lines.extend(tail);
+            let said = report(&text(&lines), None);
+            assert!(!said.contains("next:"), "{said}");
+        }
+        let helper = json!({"ev":"request","turn":1,"req":"s/helper","role":"helper"});
+        let said = report(&text(&[guard, helper, main]), None);
+        assert!(said.contains("next: /2 wrote 36 tokens"), "{said}");
     }
 
     #[test]
