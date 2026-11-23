@@ -217,7 +217,17 @@ pub fn edit_as_patch(arguments: &Value, workspace: &Path) -> Value {
     let new = arguments.get("new_string").cloned().unwrap_or(Value::Null);
     let mut edit = json!({"path": path, "old_string": old, "new_string": new});
     if arguments.get("replace_all").and_then(Value::as_bool) == Some(true) && !old.is_empty() {
-        let found = std::fs::read_to_string(resolve(workspace, path)).map_or(0, |text| text.matches(old).count());
+        let found = std::fs::read(resolve(workspace, path)).ok().and_then(|bytes| {
+            let (text, encoding) = readable_file_text(&bytes)?;
+            let body = if encoding == "utf-8" { text.strip_prefix('\u{feff}').unwrap_or(&text) } else { &text };
+            let exact = body.matches(old).count();
+            // Prefer the literal text, as apply_patch does in a mixed-ending file.
+            Some(if exact == 0 && patch_has_crlf_variant(old, body) {
+                body.matches(&old.replace('\n', "\r\n")).count()
+            } else {
+                exact
+            })
+        }).unwrap_or(0);
         if found > 1 {
             edit["count"] = json!(found);
         }
@@ -1292,7 +1302,7 @@ impl Workbench {
             // than one line of its LF part could be found: a real model gave up and wrote the whole file again.)
             let as_written = (old.to_string(), new.to_string());
             // (a new_string written with CRLF already keeps them, not one CR more)
-            let with_crlf = (old.contains('\n') && !old.contains("\r\n") && text.contains("\r\n")).then(|| (old.replace('\n', "\r\n"), new.replace("\r\n", "\n").replace('\n', "\r\n")));
+            let with_crlf = patch_has_crlf_variant(old, text).then(|| (old.replace('\n', "\r\n"), new.replace("\r\n", "\n").replace('\n', "\r\n")));
             let written_count = text.matches(&as_written.0).count();
             let (old, new, found) = match with_crlf {
                 Some((old, new)) if written_count != count => {
@@ -1429,6 +1439,10 @@ fn replace_with_the_line_end_there(text: &str, old: &str, new: &str) -> String {
     }
     out.push_str(&text[from..]);
     out
+}
+
+fn patch_has_crlf_variant(old: &str, text: &str) -> bool {
+    old.contains('\n') && !old.contains("\r\n") && text.contains("\r\n")
 }
 
 /// Whether the line `text` has at `at` ends with CRLF; a last line with no end takes the one before it.
@@ -4699,6 +4713,28 @@ mod tests {
         assert_eq!(all["edits"][0]["count"], 2);
         bench.run("apply_patch", &all, dir.path(), &cancel).unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("a.js")).unwrap(), "let x = 1;\nconst y = 2;\nlet z = 2;\n");
+    }
+
+    #[test]
+    fn edit_all_counts_in_the_files_own_encoding_and_line_endings() {
+        let (dir, mut bench, cancel) = bench();
+        let path = dir.path().join("a.txt");
+        let before = "日本\r\n語\r\n日本\r\n語";
+        let after = "完了\r\n済\r\n完了\r\n済";
+        let encode = |text: &str, mark: &[u8]| -> Vec<u8> {
+            match mark {
+                [0xff, 0xfe] => mark.iter().copied().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect(),
+                [0xfe, 0xff] => mark.iter().copied().chain(text.encode_utf16().flat_map(u16::to_be_bytes)).collect(),
+                [] => in_code_page_932(text).unwrap(),
+                _ => [mark, text.as_bytes()].concat(),
+            }
+        };
+        for mark in [&[0xff, 0xfe][..], &[0xfe, 0xff], &[], UTF8_MARK] {
+            std::fs::write(&path, encode(before, mark)).unwrap();
+            let patch = edit_as_patch(&json!({"file_path":"a.txt", "old_string":"日本\n語", "new_string":"完了\n済", "replace_all":true}), dir.path());
+            bench.run("apply_patch", &patch, dir.path(), &cancel).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), encode(after, mark));
+        }
     }
 
     /// Edits written as a string of JSON are taken as the list they are, and a patch to a file not read in the session goes through where its text is there.
