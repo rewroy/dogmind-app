@@ -204,6 +204,34 @@ fn installs_and_updates_keep_out_of_default_and_custom_session_folders() {
 }
 
 #[test]
+fn an_unattended_uninstall_requires_a_named_test_app() {
+    let scene = Scene::new();
+    let folder = scene.installed("1.0");
+    let uninstall = |fixture: Option<&str>| {
+        let mut command = setup(Path::new(SETUP));
+        command.env_remove("DOGMIND_SETUP_APP_NAME").env("DOGMIND_DATA", scene.path().join("profile"));
+        if let Some(name) = fixture {
+            command.env("DOGMIND_SETUP_APP_NAME", name);
+        }
+        command.args(["--uninstall", "--test", "--auto", "--dir"]).arg(&folder).status().unwrap().code()
+    };
+    let default_app = folder.join("dogmind-app.exe");
+    std::fs::copy(folder.join(APP), &default_app).unwrap();
+    let before = contents(&folder);
+    let code = uninstall(None);
+    assert_eq!((code, running_from(&folder).len()), (Some(1), 0));
+    assert_eq!(contents(&folder), before);
+
+    // A missing default program must not turn the unattended check into a program-only removal.
+    std::fs::remove_file(&default_app).unwrap();
+    let before = contents(&folder);
+    assert_eq!(uninstall(None), Some(1));
+    assert_eq!(contents(&folder), before);
+    assert_eq!(uninstall(Some(APP)), Some(0));
+    assert_eq!(wait_for_the_app(&folder).len(), 1);
+}
+
+#[test]
 fn an_unattended_test_update_does_not_start_the_default_app() {
     let scene = Scene::new();
     let folder = scene.installed("1.0.0");

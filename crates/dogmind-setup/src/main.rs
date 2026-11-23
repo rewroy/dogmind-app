@@ -13,6 +13,7 @@
 //! `--test` is for trying it out: no real Start menu entry or registry key is written, what would be goes in files in the folder, `--dir` must be named, and only what runs from that
 //! folder is looked at. With it `--auto` presses what a person would press, and the exit code says how it ended.
 //! An unattended test update finishes without starting Dogmind; set DOGMIND_SETUP_APP_NAME to exercise the restart with a test executable.
+//! An unattended test uninstall needs that variable to name the test executable that receives `--remove`.
 //! An update or a removal of an install that was made with it is a test as well, whoever starts it (the app does, without the switch): off the screen, taking no focus.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -282,6 +283,9 @@ fn main() {
         std::process::exit(hand_over_to_a_copy(&found, &folder, test));
     }
     let test_app = if test { std::env::var("DOGMIND_SETUP_APP_NAME").ok().filter(|name| !name.is_empty()) } else { None };
+    if found.uninstall && found.auto && test_app.is_none() {
+        std::process::exit(fail("--uninstall --test --auto needs DOGMIND_SETUP_APP_NAME to name a test executable"));
+    }
     let options = Options {
         folder: folder.clone(),
         test,
