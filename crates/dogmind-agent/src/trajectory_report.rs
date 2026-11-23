@@ -159,6 +159,18 @@ pub(crate) fn load(trajectory: &str) -> (Vec<Line>, usize) {
     (lines, bad)
 }
 
+/// Connections and warm-up before the first turn have no turn of their own.
+fn lines_by_turn(lines: &[Line]) -> BTreeMap<u64, Vec<&Line>> {
+    let mut turns: BTreeMap<u64, Vec<&Line>> = BTreeMap::new();
+    for line in lines {
+        let turn = line.turn();
+        if turn != 0 {
+            turns.entry(turn).or_default().push(line);
+        }
+    }
+    turns
+}
+
 /// What a request cost and did, in a line: used in the interventions, for the request after one.
 fn request_summary(line: &Line) -> String {
     let cached = line.cache_percent().map_or_else(|| "cached ?".to_string(), |value| format!("cached {value}%"));
@@ -181,16 +193,9 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
     let joined = join(&requests, &engine);
 
     // Turns, each with where its time went.
-    let mut turns: BTreeMap<u64, Vec<&Line>> = BTreeMap::new();
-    for line in &lines {
-        turns.entry(line.turn()).or_default().push(line);
-    }
+    let turns = lines_by_turn(&lines);
     let mut total = Spent::default();
     for (turn, in_turn) in &turns {
-        // (what comes before the first turn is the connection and the engine's warm-up, which are told below)
-        if *turn == 0 {
-            continue;
-        }
         let spent = Spent::of(in_turn);
         let began = in_turn.iter().find(|line| line.ev() == "turn_start");
         let shown = match began {
@@ -690,15 +695,9 @@ impl Summary {
 /// The trajectory's turns, each with where its time went (as the report adds it up), its requests and its tools: what a page draws as a table.
 pub fn summary(trajectory: &str) -> Summary {
     let (lines, bad) = load(trajectory);
-    let mut turns: BTreeMap<u64, Vec<&Line>> = BTreeMap::new();
-    for line in &lines {
-        turns.entry(line.turn()).or_default().push(line);
-    }
+    let turns = lines_by_turn(&lines);
     let mut out = Summary { turns: Vec::new(), lines: lines.len(), unreadable: bad };
     for (turn, in_turn) in &turns {
-        if *turn == 0 {
-            continue;
-        }
         let spent = Spent::of(in_turn);
         let began = in_turn.iter().find(|line| line.ev() == "turn_start");
         let mut row = TurnSummary {
@@ -856,6 +855,10 @@ mod tests {
             json!({"t": "2026-11-05T10:03:00.000+09:00", "ev": "turn_start", "turn": 2, "chars": 4, "images": 0}),
             json!({"t": "2026-11-05T10:03:05.000+09:00", "ev": "failed", "turn": 2, "req": "s/3", "kind": "server_gone"}),
         ];
+        let single = report(&text(&lines[..7]), None);
+        assert!(single.contains("turn 1:") && single.contains("connections"));
+        assert!(!single.contains("all turns"));
+        assert!(report(&text(&lines), None).contains("all turns"));
         let said = summary(&text(&lines));
         // (the connection before the first turn is not a turn)
         assert_eq!(said.turns.len(), 2);
