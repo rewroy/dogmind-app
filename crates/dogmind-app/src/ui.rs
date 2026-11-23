@@ -17771,9 +17771,23 @@ fn send_command(out: Outgoing) -> Command {
     }
 }
 
+fn clipboard_units(text: &str) -> Vec<u16> {
+    const CR: u16 = b'\r' as u16;
+    const LF: u16 = b'\n' as u16;
+    let mut units = Vec::with_capacity(text.len() + 1);
+    for unit in text.encode_utf16() {
+        if unit == LF && units.last() != Some(&CR) {
+            units.push(CR);
+        }
+        units.push(unit);
+    }
+    units.push(0);
+    units
+}
+
 /// Windows takes ownership of the movable allocation only when SetClipboardData succeeds.
 unsafe fn put_clipboard_text(window: HWND, text: &str) -> bool {
-    let units: Vec<u16> = text.replace('\n', "\r\n").encode_utf16().chain(std::iter::once(0)).collect();
+    let units = clipboard_units(text);
     let memory = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of_val(units.as_slice()));
     if memory.is_null() {
         return false;
@@ -18747,6 +18761,14 @@ mod read_folder_words_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_line_breaks_preserve_existing_windows_endings() {
+        let diff = ["-before", "+after"].join("\r\n");
+        assert_eq!(clipboard_units(&diff), wide("-before\r\n+after"));
+        assert_eq!(clipboard_units("日本語🐕\n\nA\r\nB\rC\n"), wide("日本語🐕\r\n\r\nA\r\nB\rC\r\n"));
+        assert_eq!(clipboard_units(""), vec![0]);
+    }
 
     /// The owner's card of 11-22, sent while the window was minimized: its column then was no width, and it kept a width of 800 twips, one character to a line, once
     /// the window was back. Its width is the column's of the moment it is written.
