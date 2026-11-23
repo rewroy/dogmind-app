@@ -58,6 +58,11 @@ impl Line {
     fn failed(&self) -> bool {
         self.tool_outcome() != "ok"
     }
+
+    fn target_paths(&self) -> impl Iterator<Item = &str> {
+        let edited = self.v["edited"].as_array().into_iter().flatten().filter_map(|entry| entry["path"].as_str());
+        self.v["path"].as_str().into_iter().chain(edited).filter(|path| !path.is_empty())
+    }
 }
 
 fn secs(ms: u64) -> String {
@@ -369,10 +374,9 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
 /// What a tool's line says besides its name, time and outcome: its file or program, the exit code, the bytes, the wait for the person, a command's parts, a browser's runs.
 fn tool_notes(line: &Line) -> Vec<String> {
     let mut more = Vec::new();
-    let edited = line.v["edited"].as_array().into_iter().flatten().filter_map(|entry| entry["path"].as_str());
     let mut seen = HashSet::new();
-    for path in line.v["path"].as_str().into_iter().chain(edited) {
-        if !path.is_empty() && seen.insert(path) {
+    for path in line.target_paths() {
+        if seen.insert(path) {
             more.push(path.to_string());
         }
     }
@@ -539,14 +543,20 @@ fn circles(out: &mut String, lines: &[Line]) {
     let mut found = false;
     // Edits to one file that failed: in a row, and in all.
     let mut failed_edits: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
-    for line in tools.iter().filter(|line| matches!(line.s("name"), "create_file" | "apply_patch") && !line.s("path").is_empty()) {
-        let entry = failed_edits.entry(line.s("path")).or_default();
+    for line in tools.iter().filter(|line| matches!(line.s("name"), "create_file" | "apply_patch")) {
         if line.failed() {
+            let path = line.s("path");
+            if path.is_empty() { continue; }
+            let entry = failed_edits.entry(path).or_default();
             entry.0 += 1;
             entry.1 = entry.1.max(entry.0);
             entry.2 += 1;
         } else {
-            entry.0 = 0;
+            for path in line.target_paths() {
+                if let Some(entry) = failed_edits.get_mut(path) {
+                    entry.0 = 0;
+                }
+            }
         }
     }
     for (path, (_, in_a_row, in_all)) in &failed_edits {
@@ -826,6 +836,19 @@ mod tests {
         assert_eq!(tools[0].notes.iter().filter(|note| *note == "src/main.js").count(), 1);
         assert_eq!(tools[1].notes[0], "README.md");
         assert!(report(&trajectory, None).lines().any(|line| line.contains("apply_patch") && line.contains("src/main.js, styles.css,")));
+    }
+
+    #[test]
+    fn a_multi_file_success_breaks_each_targets_failure_streak() {
+        let fail = |n, path| tool(n, "apply_patch", 5, "error", Some(path), None, "bad");
+        let mut ok = tool(4, "apply_patch", 5, "ok", Some("main.js"), None, "fix");
+        ok["edited"] = json!([{"path":"main.js"}, {"path":"styles.css"}]);
+        let mut lines = vec![fail(1, "styles.css"), fail(2, "other.txt"), ok, fail(5, "styles.css"), fail(6, "other.txt")];
+        let result = report(&text(&lines), None);
+        assert!(!result.contains("edits to styles.css that failed"), "{result}");
+        assert!(result.contains("edits to other.txt that failed: 2 in a row, 2 in all"), "{result}");
+        lines.push(fail(7, "styles.css"));
+        assert!(report(&text(&lines), None).contains("edits to styles.css that failed: 2 in a row, 3 in all"));
     }
 
     fn request(n: u64, at: &str, role: &str, first: u64, ms: u64, prompt: u64, cached: u64, completion: u64, end: &str) -> Value {
