@@ -1719,7 +1719,7 @@ impl Hub {
         } else if status.is_empty() {
             status.push_str("No servers configured in Dogmind. For a connection question, give the setup steps directly. Probing ports from the sandbox cannot establish this client's connection status");
         }
-        format!("Dogmind has a built-in MCP client outside the command sandbox. {status}. The user can enter `/mcp` for status, `/mcp candidates` for importable names, and `/mcp import NAME` to add and start one. Bare `/mcp import` imports all available servers from Claude and Codex. To add one manually, the user opens Settings > Tools > MCP servers > Add a server. On connection its tools join this open conversation automatically, without a restart or reconnect command.")
+        format!("Dogmind has a built-in MCP client outside the command sandbox. {status}. The user can enter `/mcp` for status, `/mcp candidates` for importable names, and `/mcp import NAME` to add and start one or retry it after fixing a startup failure. Bare `/mcp import` imports all available servers from Claude and Codex. To add one manually, the user opens Settings > Tools > MCP servers > Add a server. On connection its tools join this open conversation automatically, without a restart or reconnect command.")
     }
 
     /// One line a server, for the person.

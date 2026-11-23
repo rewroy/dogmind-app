@@ -699,6 +699,7 @@ const JA: &[(&str, &str)] = &[
     ("Available to import with /mcp import NAME:\n{0}", "/mcp import 名前 で取り込めるサーバー\n{0}"),
     ("No import candidate named {0}. Use /mcp candidates to list names.", "{0} という取り込み候補はありません。/mcp candidates で名前を確認できます。"),
     ("{0} is already configured in Dogmind.", "{0} は Dogmind に登録済みです。"),
+    ("Starting {0}.", "{0} を起動しています。"),
     ("Added {0}. The server is starting.", "{0} を追加しました。サーバーを起動しています。"),
     ("Use /mcp for status, /mcp candidates to list names, or /mcp import [NAME].", "状態は /mcp、候補一覧は /mcp candidates、取り込みは /mcp import [名前] で確認・操作できます。"),
     ("{0} servers added to {1}. They are starting.", "{0} 個のサーバーを {1} に追加しました。起動しています。"),

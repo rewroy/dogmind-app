@@ -2839,10 +2839,14 @@ fn mcp_why(why: &str) -> String {
     why.replace(dogmind_agent::mcp::NOT_FOUND, t(dogmind_agent::mcp::NOT_FOUND))
 }
 
+fn mcp_action_and_name(argument: &str) -> (&str, &str) {
+    argument.split_once(char::is_whitespace).map_or((argument, ""), |(action, name)| (action, name.trim()))
+}
+
 /// Read the external server lists for a user command and report how many servers were added.
 fn mcp_import(home: &Path, codex_home: Option<&Path>, file: &Path, argument: &str) -> Result<(usize, String), String> {
     use dogmind_agent::mcp;
-    let (action, name) = argument.split_once(char::is_whitespace).map_or((argument, ""), |(action, name)| (action, name.trim()));
+    let (action, name) = mcp_action_and_name(argument);
     let preview = action.eq_ignore_ascii_case("candidates") && name.is_empty();
     if !preview && !action.eq_ignore_ascii_case("import") {
         return Err(t("Use /mcp for status, /mcp candidates to list names, or /mcp import [NAME].").into());
@@ -12616,10 +12620,15 @@ impl App {
     unsafe fn mcp_servers_imported(&mut self, argument: &str) -> String {
         let Some(home) = std::env::var_os("USERPROFILE") else { return t("The user profile could not be located.").into() };
         match mcp_import(Path::new(&home), dogmind_agent::codex::configured_home().as_deref(), &self.folder.join("mcp.json"), argument) {
-            Ok((_, message)) => {
-                // An import also picks up edits made to mcp.json since startup, even if every entry was already saved.
-                if !argument.trim().eq_ignore_ascii_case("candidates") {
-                    self.mcp_changed(None);
+            Ok((added, mut message)) => {
+                let (action, name) = mcp_action_and_name(argument);
+                if action.eq_ignore_ascii_case("import") {
+                    // Reload edits to mcp.json even when nothing was added. A named import can also recover a failed connection.
+                    let started = self.mcp_changed((!name.is_empty()).then_some(name));
+                    if added == 0 && started.iter().any(|server| server == name) {
+                        message.push('\n');
+                        message.push_str(&tf("Starting {0}.", &[&name]));
+                    }
                 }
                 message
             }
@@ -12653,10 +12662,11 @@ impl App {
     }
 
     /// mcp.json changed here: the servers start and end to match it at once, and the Tools page follows them as they come up.
-    unsafe fn mcp_changed(&mut self, retry_failed: Option<&str>) {
-        self.mcp.reload_retrying(retry_failed);
+    unsafe fn mcp_changed(&mut self, retry_failed: Option<&str>) -> Vec<String> {
+        let started = self.mcp.reload_retrying(retry_failed);
         self.mcp_controls();
         SetTimer(self.window, TIMER_MCP, 500, None);
+        started
     }
 
     /// While a server is starting, the Tools page is laid out again as it comes up.
