@@ -1410,13 +1410,17 @@ fn reads_as_command(line: &str) -> bool {
     first.strip_prefix('/').is_some_and(|name| !name.is_empty() && name.is_ascii() && !name.contains('/'))
 }
 
+fn is_builtin_command(word: &str) -> bool {
+    word == "/exit" || COMMANDS.iter().any(|(command, _)| *command == word)
+}
+
 /// A built-in typed with text its handler cannot use. Skills accept their whole line.
 fn command_with_unused_text(line: &str) -> Option<&str> {
     let (name, _) = line.trim().split_once(char::is_whitespace)?;
     if matches!(name, "/find" | "/search" | "/rename" | "/goal" | "/attach" | "/model" | "/effort" | "/mode" | "/preview" | "/mcp") {
         return None;
     }
-    (name == "/exit" || COMMANDS.iter().any(|(command, _)| *command == name)).then_some(name)
+    is_builtin_command(name).then_some(name)
 }
 
 /// The fields of a page with a key.
@@ -6244,8 +6248,21 @@ impl App {
 
     /// A line starting with `/`: `true` when it was a command, and has been done.
     unsafe fn run_command(&mut self, line: &str) -> bool {
-        let Some(rest) = line.strip_prefix('/') else { return false };
-        let (name, argument) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(name, argument)| (name, argument.trim()));
+        let (word, argument) = line.split_once(char::is_whitespace).map_or((line, ""), |(word, argument)| (word, argument.trim()));
+        let Some(name) = word.strip_prefix('/') else { return false };
+        if !is_builtin_command(word) {
+            if !self.skills.iter().any(|skill| skill.for_the_person && skill.name.eq_ignore_ascii_case(name)) {
+                return false;
+            }
+            if self.skill_enabled(name) {
+                set_text(self.composer, "");
+                self.send_or_wait(Outgoing::words(line.to_string()), false);
+            } else {
+                self.say(t("That skill is turned off. Settings > Skills turns it on."));
+            }
+            return true;
+        }
+        set_text(self.composer, "");
         match name {
             "help" => self.set_panel(Panel::Help),
             "report" => self.write_report(),
@@ -6492,13 +6509,6 @@ impl App {
             "log" => self.on_menu(M_LOG),
             "quit" | "exit" => {
                 DestroyWindow(self.window);
-            }
-            known if self.skills.iter().any(|skill| skill.for_the_person && skill.name.eq_ignore_ascii_case(known)) => {
-                if self.skill_enabled(known) {
-                    self.send_or_wait(Outgoing::words(line.to_string()), false);
-                } else {
-                    self.say(t("That skill is turned off. Settings > Skills turns it on."));
-                }
             }
             _ => return false,
         }
@@ -13202,11 +13212,7 @@ impl App {
                 self.say(&tf("Enter {0} alone to run it. To send this draft to the model, put backticks around {0}.", &[&name]));
                 return;
             }
-            set_text(self.composer, "");
             if !self.run_command(&text) {
-                // (nothing written is lost for a slip of the first word)
-                set_text(self.composer, &text);
-                SendMessageW(self.composer, EM_SETSEL, usize::MAX, -1);
                 self.say(&tf("No such command: {0}. /help lists them.", &[&text.split_whitespace().next().unwrap_or("")]));
             }
             return;
