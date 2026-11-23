@@ -1055,6 +1055,9 @@ fn same_file(one: &str, other: &str) -> bool {
 }
 
 /// Whether a file's name is one a model gives a try of its own: `_probe.html`, `_t3.html`, `_tmp_make.py`, `scratch.js`, `debug_page.html`.
+/// How much of a file is looked through for the names of the files it takes in: a page, a script or a stylesheet is far less; a bundled library is some 600 KB.
+const TAKEN_IN_LOOKED_AT: usize = 4 << 20;
+
 fn looks_like_a_try(path: &str) -> bool {
     let file = path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase();
     file.starts_with('_') || ["tmp", "temp", "probe", "scratch", "debug"].iter().any(|word| file.contains(word))
@@ -3775,12 +3778,27 @@ impl Agent {
     fn scratch_left(&self, named: &str) -> Vec<String> {
         let asked = self.messages.iter().rev().find(|message| Self::of_the_person(message)).and_then(|message| message.content.as_deref()).map_or("", prompt::typed_text).to_lowercase();
         let named = named.to_lowercase();
+        let file_of = |path: &str| path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase();
+        // What a file the answer or the request names takes in, by name in its text (a page's src and href, a script's import), and what those take in: the work's
+        // own. (A lottery page's three.min.js and style.css were told of as files to delete, the page needing both.)
+        let mut kept: Vec<String> = self.made_this_turn.iter().filter(|path| { let file = file_of(path); !file.is_empty() && (named.contains(&file) || asked.contains(&file)) }).cloned().collect();
+        let mut at = 0;
+        while at < kept.len() {
+            let text = std::fs::read(resolve(&self.workspace, &kept[at])).ok().filter(|bytes| bytes.len() <= TAKEN_IN_LOOKED_AT).map(|bytes| String::from_utf8_lossy(&bytes).to_lowercase()).unwrap_or_default();
+            for path in &self.made_this_turn {
+                let file = file_of(path);
+                if !file.is_empty() && text.contains(&file) && !kept.iter().any(|known| same_file(known, path)) {
+                    kept.push(path.clone());
+                }
+            }
+            at += 1;
+        }
         let mut left: Vec<String> = Vec::new();
         for path in &self.made_this_turn {
-            let file = path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase();
+            let file = file_of(path);
             // (in the workspace alone: a file written outside it was asked for there, and the person allowed it)
             let full = resolve(&self.workspace, path);
-            if file.is_empty() || named.contains(&file) || asked.contains(&file) || !full.is_file() || !crate::safety::inside(&self.workspace, &full) || left.iter().any(|kept| same_file(kept, path)) {
+            if file.is_empty() || kept.iter().any(|known| same_file(known, path)) || !full.is_file() || !crate::safety::inside(&self.workspace, &full) || left.iter().any(|known| same_file(known, path)) {
                 continue;
             }
             left.push(path.clone());
@@ -10646,6 +10664,38 @@ Body").unwrap();
         let told: Vec<&Value> = of_kind(&lines, "intervention").into_iter().filter(|line| line["kind"] == "scratch_files").collect();
         assert_eq!(told.len(), 1, "once: {told:?}");
         assert_eq!(told[0]["files"], serde_json::json!(["_probe.html"]));
+    }
+
+    /// What a page the answer names takes in, and what that takes in in turn (its stylesheet, its script, a library the script imports, beside it or in a folder),
+    /// is the work's own, not a file made for checking: only the try is told of.
+    #[test]
+    fn what_a_named_page_takes_in_is_not_told_of_as_made_for_checking() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (client, bodies) = server(vec![
+            call_answer("create_file", serde_json::json!({"path": "index.html", "content": "<link href=\"style.css\" rel=\"stylesheet\">\n<script src=\"vendor/three.min.js\"></script>\n<script type=\"module\" src=\"app.js\"></script>\n"})),
+            call_answer("create_file", serde_json::json!({"path": "style.css", "content": "body { margin: 0; }\n"})),
+            call_answer("create_file", serde_json::json!({"path": "vendor/three.min.js", "content": "var THREE = {};\n"})),
+            call_answer("create_file", serde_json::json!({"path": "app.js", "content": "import { draw } from './lib/draw.js';\ndraw();\n"})),
+            call_answer("create_file", serde_json::json!({"path": "lib/draw.js", "content": "export function draw() {}\n"})),
+            call_answer("create_file", serde_json::json!({"path": "_probe.html", "content": "<p>a try</p>\n"})),
+            // (a command after the code, so that the word about checking it has nothing to say)
+            call_answer("execute_command", serde_json::json!({"command": "echo checked"})),
+            text_answer("index.html is ready."),
+            call_answer("execute_command", serde_json::json!({"command": "del _probe.html"})),
+            text_answer("index.html is ready, and the try is gone."),
+            text_answer("It runs."),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Auto);
+        run.handle.commands.send(Command::Send("make a lottery page".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Approve);
+        let lines = trajectory_of(&run);
+        let told: Vec<&Value> = of_kind(&lines, "intervention").into_iter().filter(|line| line["kind"] == "scratch_files").collect();
+        assert_eq!(told.len(), 1, "{log:?}");
+        assert_eq!(told[0]["files"], serde_json::json!(["_probe.html"]), "only the try");
+        drop(bodies);
+        for kept in ["index.html", "style.css", "vendor/three.min.js", "app.js", "lib/draw.js"] {
+            assert!(dir.path().join(kept).is_file(), "{kept}");
+        }
     }
 
     /// With a goal, the files are told of when it is marked done, which is refused once for them while calls can still be made; the second finish closes it.
