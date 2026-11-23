@@ -1792,6 +1792,13 @@ fn list_files(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Resul
 }
 
 fn search_files(arguments: &Value, workspace: &Path, secrets_besides: &[PathBuf], cancel: &AtomicBool) -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(arguments.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(30).clamp(1, 300));
+    search_files_until(arguments, workspace, secrets_besides, || {
+        if cancel.load(Ordering::Relaxed) { Err("cancelled".into()) } else { Ok(Instant::now() >= deadline) }
+    })
+}
+
+fn search_files_until(arguments: &Value, workspace: &Path, secrets_besides: &[PathBuf], mut time_is_up: impl FnMut() -> Result<bool, String>) -> Result<String, String> {
     let pattern = text_arg(arguments, "pattern")?;
     let literal = arguments.get("literal").and_then(Value::as_bool).unwrap_or(false);
     let root = resolve(workspace, arguments.get("path").and_then(Value::as_str).unwrap_or("."));
@@ -1804,7 +1811,6 @@ fn search_files(arguments: &Value, workspace: &Path, secrets_besides: &[PathBuf]
             build(&regex::escape(pattern))
         })
     }.map_err(|error| error.to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(arguments.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(30).clamp(1, 300));
     let glob = if let Some(pattern) = arguments.get("file_glob").and_then(Value::as_str) {
         let mut builder = ignore::overrides::OverrideBuilder::new(&root);
         builder.add(pattern).map_err(|error| format!("file_glob: {error}"))?;
@@ -1815,11 +1821,8 @@ fn search_files(arguments: &Value, workspace: &Path, secrets_besides: &[PathBuf]
     let walk = walker_matching(&root, true, glob);
     let mut out = note.to_string();
     let (mut matches, mut stopped, mut secrets) = (0usize, "", 0usize);
-    for entry in walk.build().flatten() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
-        }
-        if Instant::now() > deadline {
+    'files: for entry in walk.build().flatten() {
+        if time_is_up()? {
             stopped = "the time ran out";
             break;
         }
@@ -1840,19 +1843,24 @@ fn search_files(arguments: &Value, workspace: &Path, secrets_besides: &[PathBuf]
         let text = String::from_utf8_lossy(&bytes);
         let name = entry.path().strip_prefix(workspace).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
         for (number, line) in text.lines().enumerate() {
+            // A single large log can take the entire budget. Avoid reading the clock on every short line.
+            if number % 256 == 0 && time_is_up()? {
+                stopped = "the time ran out";
+                break 'files;
+            }
             if regex.is_match(line) {
                 let shown: String = line.chars().take(300).collect();
                 out.push_str(&format!("{name}:{}:{shown}\n", number + 1));
                 matches += 1;
                 if matches >= MATCH_LIMIT {
                     stopped = "the match limit was reached";
-                    break;
+                    break 'files;
                 }
             }
         }
-        if matches >= MATCH_LIMIT {
-            break;
-        }
+    }
+    if time_is_up()? && stopped.is_empty() {
+        stopped = "the time ran out";
     }
     if matches == 0 {
         out.push_str("no matches\n");
@@ -3618,6 +3626,26 @@ pub fn summary(tool: &str, arguments: &Value) -> String {
 #[cfg(test)]
 mod power_tests {
     use super::*;
+
+    #[test]
+    fn a_search_stops_within_one_file_and_keeps_matches_on_timeout() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let file = dir.path().join("rows.txt");
+        std::fs::write(&file, format!("needle\n{}needle\n", "row\n".repeat(1024))).unwrap();
+        let args = json!({"path": "rows.txt", "pattern": "needle"});
+        let search = |expired: Result<bool, String>| {
+            let mut checks = 0;
+            search_files_until(&args, dir.path(), &[], || {
+                checks += 1;
+                if checks >= 3 { expired.clone() } else { Ok(false) }
+            })
+        };
+        let partial = search(Ok(true)).unwrap();
+        assert!(partial.contains("rows.txt:1:needle") && partial.contains("the time ran out; 1 matches so far"), "{partial}");
+        assert_eq!(search(Err("cancelled".into())), Err("cancelled".into()));
+        let complete = search(Ok(false)).unwrap();
+        assert!(complete.contains("rows.txt:1026:needle"));
+    }
 
     #[test]
     fn stopping_a_file_walk_returns_cancellation_even_without_matches() {
