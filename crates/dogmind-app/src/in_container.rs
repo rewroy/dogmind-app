@@ -1,4 +1,5 @@
-//! What this crate's tests do when they run inside an AppContainer themselves, as a session on the app's own source runs them, by a command of the app's:
+//! What this crate's tests do when they run inside the sandbox themselves (an AppContainer, or the restricted token cargo is run with), as a session on the
+//! app's own source runs them, by a command of the app's:
 //! a temp folder a container can work in, and the tests that need what no container can do left out, counted, and said so at the end of the run.
 #![allow(dead_code)] // (each crate's tests give some of the reasons and not others)
 
@@ -18,7 +19,7 @@ static LEFT_OUT: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 /// system gives it whatever TEMP says), and git looks at every folder of a path from the drive down before it makes one, C:\Users too, which a container
 /// cannot: no test could make a repository there ("cannot lock ref 'HEAD': unable to create directory"). Outside a container it is `tempfile::tempdir`.
 pub(crate) fn tempdir() -> std::io::Result<tempfile::TempDir> {
-    if dogmind_agent::sandbox::in_a_container() {
+    if dogmind_agent::sandbox::in_the_sandbox() {
         in_reach();
     }
     tempfile::tempdir()
@@ -41,7 +42,7 @@ fn in_reach() {
 /// Whether this test cannot run where it runs, inside a container: it needs what no container can do (`why`). It is then counted, said at the end of the
 /// run, and the test returns at once.
 pub(crate) fn cannot_run(why: &'static str) -> bool {
-    if !dogmind_agent::sandbox::in_a_container() {
+    if !dogmind_agent::sandbox::in_the_sandbox() {
         return false;
     }
     static SAY: Once = Once::new();

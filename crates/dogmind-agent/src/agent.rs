@@ -1842,7 +1842,7 @@ impl Agent {
         gate.records = records(&config.sessions, &config.rules, std::env::current_exe().ok().as_deref().and_then(Path::parent));
         // (and opened to commands, to read: not for a test's, whose folders are made and gone by the hundred, nor where this runs in a command of the app's)
         #[cfg(all(windows, not(test)))]
-        if !crate::sandbox::in_a_container() {
+        if !crate::sandbox::in_the_sandbox() {
             crate::sandbox::records_readable(&gate.records);
         }
         gate.code_mode = config.code_mode;
@@ -2570,7 +2570,7 @@ impl Agent {
                 }
             }
             #[cfg(all(windows, not(test)))]
-            if !crate::sandbox::in_a_container() {
+            if !crate::sandbox::in_the_sandbox() {
                 notes.extend(records_note(&self.gate.records));
             }
         }
