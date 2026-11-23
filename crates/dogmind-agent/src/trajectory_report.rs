@@ -205,12 +205,12 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
             None => format!("turn {turn}"),
         };
         let _ = writeln!(out, "\n{shown}");
-        spent.print(&mut out, "  ");
+        spent.print(&mut out, " (no turn_end recorded, timed through the last event)");
         total.add(&spent);
     }
     if turns.len() > 1 {
         let _ = writeln!(out, "\nall turns");
-        total.print(&mut out, "  ");
+        total.print(&mut out, " (unfinished turns timed through their last event)");
     }
 
     let connections: Vec<&Line> = lines.iter().filter(|line| line.ev() == "connection").collect();
@@ -477,6 +477,7 @@ impl Spent {
 
     fn add(&mut self, other: &Spent) {
         self.wall += other.wall;
+        self.unfinished |= other.unfinished;
         self.nested_ms += other.nested_ms;
         self.parallel_overlap_ms += other.parallel_overlap_ms;
         self.prefill += other.prefill;
@@ -496,12 +497,13 @@ impl Spent {
         self.tools.values().map(|(_, ms)| ms).sum::<u64>() - self.nested_ms - self.parallel_overlap_ms
     }
 
-    fn print(&self, out: &mut String, indent: &str) {
+    fn print(&self, out: &mut String, unfinished_note: &str) {
+        let indent = "  ";
         let tools = self.tool_ms();
         let model = self.prefill + self.generation;
         let accounted = model + tools + self.waits + self.compaction + self.retries;
         let rest = self.wall.saturating_sub(accounted);
-        let _ = writeln!(out, "{indent}wall {}{}", secs(self.wall), if self.unfinished { " (the run ended here: no turn_end)" } else { "" });
+        let _ = writeln!(out, "{indent}wall {}{}", secs(self.wall), if self.unfinished { unfinished_note } else { "" });
         let _ = writeln!(out, "{indent}model {} ({}): prefill to the first word {}, generation {}", secs(model), share(model, self.wall), secs(self.prefill), secs(self.generation));
         let by_name: Vec<String> = self.tools.iter().map(|(name, (calls, ms))| format!("{name} (calls: {calls}, total: {})", secs(*ms))).collect();
         let nested = if self.nested_ms > 0 { " (individual times include nested calls)" } else { "" };
@@ -657,7 +659,7 @@ pub struct TurnSummary {
     pub waits_ms: u64,
     pub compaction_ms: u64,
     pub retries_ms: u64,
-    /// The run ended in it: there is no end of the turn.
+    /// A turn start was recorded without a matching end.
     pub unfinished: bool,
     /// How it failed, where it did.
     pub failed: Option<String>,
@@ -858,7 +860,7 @@ mod tests {
         let single = report(&text(&lines[..7]), None);
         assert!(single.contains("turn 1:") && single.contains("connections"));
         assert!(!single.contains("all turns"));
-        assert!(report(&text(&lines), None).contains("all turns"));
+        assert!(report(&text(&lines), None).contains("all turns\n  wall 155.0 s (unfinished turns timed through their last event)"));
         let said = summary(&text(&lines));
         // (the connection before the first turn is not a turn)
         assert_eq!(said.turns.len(), 2);
@@ -985,7 +987,7 @@ mod tests {
         assert!(said.contains("a.rs came back to the state it had after /3 (hash 111111111111), at /5"), "{said}");
         assert!(said.contains("read_file called again with the same arguments (hash same), nothing edited between: at /7"), "{said}");
         assert!(said.contains("3 failed calls in a row, the longest run ending at /12"), "{said}");
-        assert!(said.contains("the run ended here: no turn_end"), "{said}");
+        assert!(said.contains("no turn_end recorded, timed through the last event"), "{said}");
     }
 
     /// A program's loop calls a tool again by design (here a page timed four times): that is not going round. A call again from the model's next step is.
@@ -1098,7 +1100,7 @@ mod tests {
     #[test]
     fn a_trajectory_that_is_not_all_there_is_read_as_far_as_it_goes() {
         let said = report("{\"t\":\"2026-11-05T10:00:00.000+09:00\",\"ev\":\"turn_start\",\"turn\":1,\"chars\":3,\"images\":0}\nnot json\n{\"t\":\"2026-11-05T10:00:01.000+09:00\",\"ev\":\"request\",\"turn\":1,\"req\":\"s/1\",\"role\":\"main\",\"ms\":1000,\"first_ms\":null,\"end\":\"cancelled_person\",\"completion\":null,\"tokens_est\":12", None);
-        assert!(said.starts_with("1 lines") && said.contains("2 that could not be read") && said.contains("the run ended here"), "{said}");
+        assert!(said.starts_with("1 lines") && said.contains("2 that could not be read") && said.contains("no turn_end recorded"), "{said}");
         assert!(report("", None).starts_with("0 lines, no times"));
     }
 }

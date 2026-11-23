@@ -73,7 +73,7 @@ pub fn rows(summary: &Summary, open: &BTreeSet<u64>) -> Vec<Row> {
         rows.push(Row {
             kind: RowKind::Total,
             cells: [t("All turns").to_string(), requests.to_string(), seconds(all.prefill_ms), seconds(all.generation_ms), seconds(all.tools_ms), seconds(all.wall_ms)],
-            note: String::new(),
+            note: if all.unfinished { t("incomplete turns use last event").into() } else { String::new() },
         });
     }
     rows
@@ -86,7 +86,7 @@ fn turn_note(turn: &TurnSummary) -> String {
         parts.push(tf("{0} pictures", &[&turn.pictures]));
     }
     if turn.unfinished {
-        parts.push(t("no end: the run stopped here").to_string());
+        parts.insert(0, t("no end recorded (to last event)").to_string());
     }
     if let Some(kind) = &turn.failed {
         parts.push(kind.clone());
@@ -173,6 +173,10 @@ mod tests {
         assert_eq!(page.len(), 4);
         assert_eq!((page[0].kind, page[1].kind, page[3].kind), (RowKind::Header, RowKind::Turn { turn: 1, open: false }, RowKind::Total));
         assert_eq!(page[1].note, "40 characters");
+        assert!(page[3].note.is_empty());
+        let mut partial = run();
+        partial.turns[0].unfinished = true;
+        assert_eq!(rows(&partial, &BTreeSet::new())[3].note, "incomplete turns use last event");
     }
 
     #[test]
@@ -196,7 +200,7 @@ mod tests {
     fn a_turn_that_woke_itself_says_so_and_not_how_much_was_written() {
         let woken = summary(r#"{"t":"2026-11-05T10:00:00.000+09:00","ev":"turn_start","turn":1,"chars":900,"images":0,"woken":true}"#);
         let page = rows(&woken, &BTreeSet::new());
-        assert_eq!(page[1].note, "woken by background work, no end: the run stopped here");
+        assert_eq!(page[1].note, "no end recorded (to last event), woken by background work");
         assert!(woken.turns[0].woken);
     }
 
@@ -217,7 +221,7 @@ mod tests {
         let one = summary(r#"{"t":"2026-11-05T10:00:00.000+09:00","ev":"turn_start","turn":1,"chars":4,"images":0}"#);
         let page = rows(&one, &BTreeSet::new());
         assert_eq!(page.len(), 2);
-        assert_eq!(page[1].note, "4 characters, no end: the run stopped here");
+        assert_eq!(page[1].note, "no end recorded (to last event), 4 characters");
         assert_eq!(rows(&Summary::default(), &BTreeSet::new()).len(), 1);
     }
 
