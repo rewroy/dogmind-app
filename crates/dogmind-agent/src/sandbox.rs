@@ -1886,9 +1886,12 @@ pub fn also_readable(folder: &Path) {
 }
 
 /// What of the app's folder stays closed to commands, whatever of it is opened ([`records_readable`]): the settings, which may hold a key, and what was set aside of them,
-/// the folders the person has granted and opened, the engine's own settings, and the person's notes, instructions and attachments. Nothing opens these; a test reads each
+/// the folders the person has granted and opened, the engine's own settings, the person's notes, instructions and attachments, the MCP servers' list (their headers and their
+/// programs' environments), and the key of the conversations wrapped, with its copies. Nothing opens these; a test reads each
 /// from a command once the records are open, and is refused.
-pub const HELD_CLOSED: [&str; 10] = ["settings.json", "settings.json.broken", "workspace-grants.json", "read-folders.json", "engine.toml", "engine.toml.old", "instructions.md", "memory", "attachments", "updates"];
+pub const HELD_CLOSED: [&str; 14] = ["settings.json", "settings.json.broken", "workspace-grants.json", "read-folders.json", "engine.toml", "engine.toml.old", "instructions.md", "memory", "attachments", "updates",
+    // (what holds keys too: the servers' headers and the environments of their programs, and the key of the conversations wrapped, which a passphrase can be tried against)
+    "mcp.json", "conversation-key.json", "conversation-key.json.copy", "conversation-key.json.damaged"];
 
 /// Dogmind's own records that commands may read, besides the workspace: its conversations, each with its trajectory, and the engine's log.
 static RECORDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
