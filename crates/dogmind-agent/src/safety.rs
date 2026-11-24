@@ -855,8 +855,10 @@ impl Gate {
         let command = command.replace('^', "");
         // (a word alone can be about them, in `git log --grep=credentials`, but not to a program that prints a file)
         let prints_files = ["type", "more", "findstr"].iter().any(|program| command.trim_start().get(..program.len()).is_some_and(|start| start.eq_ignore_ascii_case(program)));
-        // (cmd's own separators are a `,` too. In `HEAD:.env` what follows the `:` is the path, and in `C:\x` the whole word is.)
-        command.split(separates_words).filter(|word| !word.is_empty() && (prints_files || !word.eq_ignore_ascii_case("credentials"))).any(|word| {
+        // (cmd's own separators are a `,` too. In `HEAD:.env` what follows the `:` is the path, and in `C:\x` the whole word is. What is in quotes is one word as well,
+        // spaces and all: the stores of browsers are in `User Data`, which split at its space is no store.)
+        let quoted = ['"', '\''].into_iter().flat_map(|quote| command.split(quote).skip(1).step_by(2));
+        quoted.chain(command.split(separates_words)).filter(|word| !word.is_empty() && (prints_files || !word.eq_ignore_ascii_case("credentials"))).any(|word| {
             let path = Path::new(word);
             let rooted = |path: &Path| if path.is_absolute() { path.to_path_buf() } else { Path::new("/").join(path) };
             let after_a_revision = word.rsplit_once(':').map(|(_, path)| Path::new(path));
@@ -2034,6 +2036,10 @@ mod tests {
         ] {
             for tool in READS {
                 assert!(matches!(gate.check(tool, &json!({"path": path}), root), Verdict::Ask { risk: Risk::High, reason: Some(_) }), "{tool} {path}");
+            }
+            // (and a command's, the path in quotes as one with spaces must be)
+            for line in [format!("type \"{path}\""), format!("findstr x \"{path}\""), format!("mklink /H here \"{path}\""), format!("Get-Content '{path}'")] {
+                assert_eq!(gate.command_risk(&line, None), Ok(Risk::High), "{line}");
             }
             assert!(matches!(gate.check("create_file", &json!({"path": path, "content": ""}), root), Verdict::Deny(_)), "written: {path}");
         }
