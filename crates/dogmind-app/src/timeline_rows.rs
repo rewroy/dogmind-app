@@ -1010,6 +1010,7 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
     let nested = call.id.contains('.');
     let running = is_live && context.live.is_running(&call.id);
     let failed_exit = call.exit_code.is_some_and(|code| code != 0);
+    let failed = !call.outcome.is_empty() && (call.outcome != "ok" || failed_exit);
     let (icon, tone, right) = match call.outcome.as_str() {
         _ if running => ("clock", Tone::App, t("running").to_string()),
         "" if is_live => ("clock", Tone::Muted, String::new()),
@@ -1028,8 +1029,8 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
         out.push(Row { kind: Kind::Pictures, indent: indent + 1, pictures: call.images.clone(), ..Row::default() });
     }
     let inner = indent + 1;
-    if !call.outcome.is_empty() && call.outcome != "ok" {
-        out.push(fact(inner, t("Result"), tool_outcome_words(&call.outcome, false)));
+    if failed {
+        out.push(fact(inner, t("Result"), tool_outcome_words(&call.outcome, failed_exit)));
     }
     if let Some(code) = call.exit_code {
         out.push(fact(inner, t("Exit code"), code.to_string()));
@@ -1062,7 +1063,7 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
     }
     if let Some(output) = call.output.as_deref().filter(|output| !output.is_empty()) {
         out.push(Row { kind: Kind::Caption, text: t("Output").to_string(), indent: inner, ..Row::default() });
-        out.extend(code_rows(plain_lines(&safe(output)), inner, if call.outcome == "ok" || call.outcome.is_empty() { Tone::Plain } else { Tone::Bad }));
+        out.extend(code_rows(plain_lines(&safe(output)), inner, if failed { Tone::Bad } else { Tone::Plain }));
     }
 }
 
@@ -1379,6 +1380,27 @@ mod tests {
 
     fn started(id: &str, tool: &str, summary: &str) -> Event {
         Event::ToolStarted { id: id.into(), tool: tool.into(), summary: summary.into() }
+    }
+
+    #[test]
+    fn command_results_agree_in_the_call_heading_and_its_open_details() {
+        for (outcome, code, reason) in [
+            ("ok", Some(7), Some("Failed")), ("ok", Some(0), None), ("ok", None, None),
+            ("timeout", None, Some("Timed out")), ("", None, None),
+        ] {
+            let call = CallRow { exit_code: code, output: Some("program output".into()), ..call("c", "execute_command", "python", outcome) };
+            let timeline = Timeline { turns: vec![turn(1, "Go", vec![model(None, vec![call])], done(100))], heading: None };
+            let rows = rows_for(&timeline, &Live::new(Instant::now()), &HashMap::from([(Key::Step(1, 0), true)]));
+            let heading = rows.iter().find(|row| row.kind == Kind::Call).unwrap();
+            let result = rows.iter().find(|row| row.label == t("Result"));
+            assert_eq!(result.map(|row| row.text.as_str()), reason.map(t), "{outcome} {code:?}");
+            if let Some(reason) = reason {
+                assert_eq!(heading.right, t(reason));
+            }
+            let output = rows.iter().find(|row| row.kind == Kind::Code && row.text == "program output").unwrap();
+            assert_eq!(output.tone, if reason.is_some() { Tone::Bad } else { Tone::Plain });
+            assert_eq!(rows.iter().find(|row| row.label == t("Exit code")).map(|row| row.text.clone()), code.map(|n| n.to_string()));
+        }
     }
 
     #[test]
