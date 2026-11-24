@@ -2563,10 +2563,24 @@ mod tests {
         }
     }
 
+    /// The Python the servers of these tests run on: the bundled one (`DOGMIND_TOOLS`), opened to this test's container. A test has no other there: the app opens the person's
+    /// toolchains to commands, and a test does not, so `python` was not found and the browser was refused the address.
+    fn python_for_the_sandbox() {
+        let root = PathBuf::from(std::env::var_os("DOGMIND_TOOLS").expect("DOGMIND_TOOLS names the bundled tools (python -I scripts/package.py --tools-only FOLDER): no other Python is open to a test's sandbox"));
+        // (to this profile itself: a bundle the app opened once has a mark that says so, and is not opened again for a test's profile)
+        // SAFETY: the SID lives as long as the process.
+        unsafe {
+            let sid = crate::sandbox::profile_sid().unwrap();
+            crate::sandbox::grant(&root.join("python"), sid, crate::sandbox::READ_EXECUTE, true).unwrap();
+            crate::sandbox::grant_way_to(&root.join("python"), sid);
+        }
+    }
+
     /// With the real browser and a real server, both in the real sandbox: what a command serves on this machine, the check can read.
     #[test]
     #[ignore = "starts a server and Edge in the sandbox"]
     fn a_page_a_local_server_gives_is_checked_by_its_url() {
+        python_for_the_sandbox();
         let (dir, _) = page(&[
             ("index.html", "<!DOCTYPE html><title>served</title><style>body{background:red}body.ready{background:lime}@media(width:390px) and (height:844px){body.ready{background:blue}}</style><div id=o>wait</div><script type=module src=app.mjs></script>"),
             ("app.mjs", "import { word } from './word.mjs'; document.getElementById('o').textContent = word; console.log('module ran: ' + location.origin); console.log('DOM viewport ' + innerWidth + 'x' + innerHeight); setTimeout(() => document.body.className = 'ready', 600);"),
@@ -2601,6 +2615,7 @@ mod tests {
     #[test]
     #[ignore = "starts Edge and a server in the sandbox"]
     fn a_page_a_local_server_gives_runs_its_animation_frames() {
+        python_for_the_sandbox();
         let (dir, _) = page(&[(
             "index.html",
             "<!DOCTYPE html><title>served</title><div id=o>start</div><script>let frames = 0; function step() { frames++; document.getElementById('o').textContent = 'frames ' + (frames > 30 ? 'many' : frames); requestAnimationFrame(step); } requestAnimationFrame(step);</script>",
