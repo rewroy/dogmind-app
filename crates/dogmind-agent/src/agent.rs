@@ -4798,7 +4798,7 @@ impl Agent {
                 Ok((Decision::Reject, feedback)) => {
                     break ("reject", Permission::Refused(match feedback {
                         Some(text) if !text.trim().is_empty() => format!("the user declined this call and said: {text}"),
-                        _ => "the user declined this call".to_string(),
+                        _ => "the user declined this call. Continue without this call. Report any check you could not run. Do not ask for the same permission again unless the user requests a retry.".to_string(),
                     }, "declined_person"));
                 }
                 Err(_) if self.cancelled() => break ("stopped", Permission::Refused("the user stopped the turn".into(), "cancelled")),
@@ -5853,6 +5853,23 @@ note: the helper took")), "{log:?}");
         assert!(log[1].starts_with("tool:false:true:") && log[1].contains("not that"), "{log:?}");
         assert!(!dir.path().join("x.txt").exists());
         assert!(bodies.lock().unwrap()[1]["messages"][4]["content"].as_str().unwrap().contains("not that"));
+    }
+
+    #[test]
+    fn a_plain_rejection_tells_the_model_to_continue_without_the_declined_permission() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (client, bodies) = server(vec![
+            call_answer("execute_command", json!({"command": "python -m unittest", "outside_sandbox": true, "purpose": "run the project tests"})),
+            text_answer("The tests were not run."),
+        ]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("test the project".into())).unwrap();
+        until_end_deciding(&run, Duration::ZERO, |_| Decision::Reject);
+        let bodies = bodies.lock().unwrap();
+        let result = bodies[1]["messages"].as_array().unwrap().iter()
+            .find(|message| message["role"] == "tool").unwrap()["content"].as_str().unwrap();
+        assert!(result.contains("the user declined this call"), "{result}");
+        assert!(result.contains("Continue without this call") && result.contains("same permission again"), "{result}");
     }
 
     #[test]
