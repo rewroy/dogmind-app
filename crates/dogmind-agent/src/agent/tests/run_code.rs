@@ -386,7 +386,7 @@ fn what_a_program_reads_from_the_web_comes_back_marked_as_a_pages_text_is() {
     let (run, provider) = code_run(dir.path(), vec![a_program(&code, "read the page"), says("done")], Mode::Auto, true);
     run.handle.commands.send(Command::Send(format!("read {page} please"))).unwrap();
     let told = the_turn(&run, Decision::Reject, None);
-    assert!(told.ended[0].contains("<untrusted_web_content") && told.ended[0].contains("read it: ") && told.ended[0].contains("The block above came from the web"), "{}", told.ended[0]);
+    assert!(told.ended[0].contains("<untrusted_web_content") && told.ended[0].contains("read it: ") && told.ended[0].contains("The block above came from the tools a program called"), "{}", told.ended[0]);
     assert!(results_in(&provider.messages(1))[0].contains("<untrusted_web_content"));
     // The conversation has web content in it from now on, as if the model had read the page itself.
     assert!(told.web_seen);
