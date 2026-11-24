@@ -339,6 +339,17 @@ pub(crate) fn keys_folder(path: &Path) -> bool {
     SECRET_FOLDERS.iter().any(|mark| text.contains(mark) || text.ends_with(mark.trim_end_matches('/')))
 }
 
+/// Whether a folder holds one of those folders a level or more down, as `C:\Users\x\.config` holds `.config\gcloud` and `AppData\Local\Google`
+/// holds Chrome's: opened with what is in it, it would open that. (One right in a folder, as `.ssh` in the home, is the caller's to know.)
+pub(crate) fn holds_keys_folder(path: &Path) -> bool {
+    let text = as_opened(&path.to_string_lossy().replace('\\', "/").to_lowercase());
+    let text = text.trim_end_matches('/');
+    SECRET_FOLDERS.iter().any(|mark| {
+        let mark = mark.trim_end_matches('/');
+        mark.match_indices('/').skip(1).any(|(at, _)| text.ends_with(&mark[..at]))
+    })
+}
+
 /// A path as the system gives it, as a person would write it. A mapped drive comes back as `\\?\UNC\server\share`, which is `\\server\share`: with only the `\\?\` off it would read as a relative
 /// path, and a network folder would no longer be known for one.
 fn without_verbatim(text: &str) -> String {
@@ -1205,6 +1216,22 @@ pub fn delegated(mode: Mode, tool: &str, risk: Risk, reason: Option<&str>, safe_
         Mode::AcceptEdits => matches!(tool, "create_file" | "apply_patch"),
         Mode::Auto => true,
         Mode::Plan => false,
+    }
+}
+
+#[cfg(test)]
+mod keys_folders {
+    use super::holds_keys_folder;
+    use std::path::Path;
+
+    #[test]
+    fn a_folder_that_holds_a_folder_of_keys_is_known() {
+        for holder in ["C:\\Users\\x\\.config", "C:\\Users\\x\\AppData\\Local\\Google", "C:\\Users\\x\\AppData\\Local\\Google\\Chrome\\", "C:\\Users\\x\\.dogmind"] {
+            assert!(holds_keys_folder(Path::new(holder)), "{holder}");
+        }
+        for plain in ["C:\\Users\\x\\.cargo\\bin", "C:\\Users\\x\\AppData\\Roaming\\nvm\\v20.11.0", "C:\\Users\\x\\.ssh"] {
+            assert!(!holds_keys_folder(Path::new(plain)), "{plain}");
+        }
     }
 }
 
