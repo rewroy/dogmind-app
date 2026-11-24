@@ -710,15 +710,40 @@ fn served_origin_and_path(url: &str) -> (&str, &str) {
     }
 }
 
-/// The page of the workspace that a local server's address gives, where one can be told: the address's path under the workspace, or the one file whose path ends so (a server
-/// started in a folder of the workspace), or of several the one written last. None for an address of no page that is there.
-fn page_of_address(url: &str, workspace: &Path) -> Option<PathBuf> {
+/// The local path suggested by a served URL, relative to the server's root.
+fn served_relative_path(url: &str) -> Option<String> {
     let (_, path) = served_origin_and_path(url);
     let wanted = if path.ends_with('/') { format!("{path}index.html") } else { path.to_string() };
     let wanted = wanted.trim_start_matches('/').replace('/', "\\");
     if wanted.is_empty() || wanted.split('\\').any(|part| part == "..") {
         return None;
     }
+    Some(wanted)
+}
+
+/// A matching HTML or SVG file is a hint for the renderer. A dynamic route or a server rooted
+/// elsewhere can have no matching file. Keep the normal CPU path for those addresses.
+fn served_draws_webgl(url: &str, root: &Path) -> bool {
+    let Some(relative) = served_relative_path(url) else { return false };
+    let relative = Path::new(&relative);
+    if !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+        return false;
+    }
+    let ext = relative.extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+    if !["html", "htm", "xhtml", "svg"].iter().any(|kind| ext.eq_ignore_ascii_case(kind)) {
+        return false;
+    }
+    let Ok(file) = root.join(relative).canonicalize() else { return false };
+    if !file.starts_with(root) || !file.metadata().is_ok_and(|meta| meta.is_file() && meta.len() < 4 << 20) {
+        return false;
+    }
+    page_html(&file).is_ok_and(|html| draws_webgl(&[html]))
+}
+
+/// The page of the workspace that a local server's address gives, where one can be told: the address's path under the workspace, or the one file whose path ends so (a server
+/// started in a folder of the workspace), or of several the one written last. None for an address of no page that is there.
+fn page_of_address(url: &str, workspace: &Path) -> Option<PathBuf> {
+    let wanted = served_relative_path(url)?;
     let direct = workspace.join(&wanted);
     if direct.is_file() {
         return Some(direct);
@@ -1482,7 +1507,8 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         texts.extend(needs.iter().flat_map(|needs| needs.run.iter()).filter_map(|script| std::fs::read_to_string(folder.join(script)).ok()).filter(|text| text.len() < 4 << 20));
         draws_webgl(&texts)
     });
-    let on_gpu = AtomicBool::new(webgl && GPU_FAILURES.load(Ordering::Relaxed) < 2 && !ENGINE_HERE.load(Ordering::Relaxed));
+    let gpu_available = GPU_FAILURES.load(Ordering::Relaxed) < 2 && !ENGINE_HERE.load(Ordering::Relaxed);
+    let on_gpu = AtomicBool::new(gpu_available && (webgl || served.is_some_and(|url| served_draws_webgl(url, &root))));
     let extensions = extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
     let browser_flags = || flags(on_gpu.load(Ordering::Relaxed)) + &extensions;
     // (a run on the GPU that did not end well: the rest of the check draws on the CPU, and it is said whether this one is to be tried again for that)
@@ -2080,6 +2106,20 @@ mod tests {
         assert!(first.starts_with("AS THE USER OPENS IT: gacha") && first.contains("do not run at all") && !first.contains("http.server"), "{first}");
         assert_eq!(opened_from_its_file("http://127.0.0.1:8765/plain.html", root), None);
         assert_eq!(opened_from_its_file("http://127.0.0.1:8765/cdn.html", root), None);
+    }
+
+    #[test]
+    fn a_served_url_uses_webgl_only_with_a_matching_page_in_the_workspace() {
+        let (dir, _) = page(&[
+            ("index.html", "<canvas></canvas><script>canvas.getContext('webgl2')</script>"),
+            ("plain.html", "<p>hello</p>"),
+            ("source.txt", "webgl2"),
+        ]);
+        let root = dir.path().canonicalize().unwrap();
+        assert!(served_draws_webgl("http://localhost:8123/?next=/plain.html", &root));
+        for path in ["plain.html?next=/index.html", "other/", "source.txt", "../index.html"] {
+            assert!(!served_draws_webgl(&format!("http://localhost:8123/{path}"), &root), "{path}");
+        }
     }
 
     #[test]
