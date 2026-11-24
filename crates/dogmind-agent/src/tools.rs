@@ -843,7 +843,12 @@ fn kept_whole(out: &str, err: &str) -> Option<PathBuf> {
 /// A long result, whole, in a file of its own kind (`command`, `search`, `trimmed`) in the temporary folder.
 pub(crate) fn keep_whole_as(kind: &str, whole: &str) -> Option<PathBuf> {
     const KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
-    let folder = std::env::temp_dir().join("dogmind-output");
+    // (in the app's folder for the sandbox, where commands can read it and nothing in the sandbox can write; the temporary folder where there is none)
+    #[cfg(windows)]
+    let base = crate::sandbox::app_folder_for_sandbox().ok().flatten().unwrap_or_else(std::env::temp_dir);
+    #[cfg(not(windows))]
+    let base = std::env::temp_dir();
+    let folder = base.join("dogmind-output");
     std::fs::create_dir_all(&folder).ok()?;
     for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
         if entry.metadata().ok().and_then(|meta| meta.modified().ok()).and_then(|at| at.elapsed().ok()).is_some_and(|age| age > KEPT) {

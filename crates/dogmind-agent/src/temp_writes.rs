@@ -1,7 +1,8 @@
-//! What the app writes into a folder a program in the sandbox can write too (the sandbox's temp folder): the page a check opens, the CDN files it
-//! keeps, the copies of attached pictures, the scratch folder. A program there could have made a folder on the way a junction, or a name a link, to a
-//! place outside it, where the app (which is not in the sandbox) would then write. So a file's folder must be under that temp folder as the file
-//! system has it, and a name already there that leads elsewhere is not written through.
+//! What the app writes for commands and the check's browser to read: the page a check opens, the CDN files it keeps, the copies of attached pictures.
+//! They go in the app's own folder for them (`sandbox::for_sandbox_folder`), where nothing in the sandbox can write; this is the second guard, and the
+//! one where the app runs in the sandbox itself and writes in its temp folder, which a program there can write too. A program could have made a folder
+//! on the way a junction, or a name a link, to a place outside, where the app would then write. So the folder written in is not a link or a junction
+//! itself, a file's folder must be under it as the file system has it, and a name already there that leads elsewhere is not written through.
 
 use std::path::{Path, PathBuf};
 
@@ -28,6 +29,9 @@ fn real(path: &Path) -> Result<PathBuf, String> {
 /// its way leads outside `temp`, and `file` is not a link or a junction already. The folders on the way that are there are looked at before any is
 /// made, so that none is made through a junction either.
 pub fn place_for(temp: &Path, file: &Path) -> Result<(), String> {
+    if std::fs::symlink_metadata(temp).is_ok_and(|metadata| leads_elsewhere(&metadata)) {
+        return Err(format!("{} is a link or a junction", temp.display()));
+    }
     let real_temp = real(temp)?;
     let folder = file.parent().ok_or_else(|| format!("{}: no folder", file.display()))?;
     // (the nearest folder on the way that is there: what is made below it stays where it is)
@@ -44,6 +48,15 @@ pub fn place_for(temp: &Path, file: &Path) -> Result<(), String> {
     }
     if std::fs::symlink_metadata(file).is_ok_and(|metadata| leads_elsewhere(&metadata)) {
         return Err(format!("{} is a link or a junction", file.display()));
+    }
+    Ok(())
+}
+
+/// `folder` made, as [`place_for`] makes a file's: under `temp` as the file system has it, and not a link or a junction itself.
+pub fn folder_for(temp: &Path, folder: &Path) -> Result<(), String> {
+    place_for(temp, &folder.join("_"))?;
+    if std::fs::symlink_metadata(folder).is_ok_and(|metadata| leads_elsewhere(&metadata)) {
+        return Err(format!("{} is a link or a junction", folder.display()));
     }
     Ok(())
 }
@@ -84,5 +97,8 @@ mod tests {
         let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&named).arg(outside.path()).output().unwrap();
         assert!(made.status.success());
         assert!(write(temp.path(), &named, "x").is_err());
+        // A folder that is a junction itself is not made or used.
+        assert!(folder_for(temp.path(), &link).is_err());
+        assert!(folder_for(temp.path(), &temp.path().join("fresh")).is_ok() && temp.path().join("fresh").is_dir());
     }
 }

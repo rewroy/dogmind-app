@@ -739,6 +739,9 @@ pub struct Gate {
     pub secrets: Vec<PathBuf>,
     /// Dogmind's own records in its folder, which are not kept secret: its conversations with their trajectories, and the engine's log (`records`).
     pub records: Vec<PathBuf>,
+    /// The app's folder for what it writes for commands to read (a check's pictures, long outputs, copies of attachments), which is not kept secret either: what is in it
+    /// was the model's already.
+    pub for_sandbox: Option<PathBuf>,
     denied: RegexSet,
     safe: Regex,
     look: Regex,
@@ -764,6 +767,7 @@ impl Gate {
         Gate {
             secrets: Vec::new(),
             records: Vec::new(),
+            for_sandbox: None,
             // Never, whoever asks.
             denied: set(&[
                 r"^\s*sudo\b", r"\bmkfs", r"\bformat\s+[a-z]:", r"\bdd\b.*\bof=/dev/", r":\(\)\s*\{", r"\b(curl|wget|iwr|irm|invoke-webrequest)\b.*\|\s*(sh|bash|cmd|powershell|pwsh|iex)\b",
@@ -862,7 +866,7 @@ impl Gate {
 
     /// Under a place that holds keys, as the app's folder does, and not one of the records in it.
     fn kept_secret(&self, path: &Path) -> bool {
-        self.secrets.iter().any(|secret| inside(secret, path)) && !self.records.iter().any(|record| inside(record, path))
+        self.secrets.iter().any(|secret| inside(secret, path)) && !self.records.iter().chain(&self.for_sandbox).any(|record| inside(record, path))
     }
 
     /// A place secrets are kept, as it is spelled or where it really leads: `..`, a link, a junction and a short name all end up here.
@@ -2125,6 +2129,11 @@ mod tests {
         assert_eq!(read_verdict(&gate, "D:\\keys\\other.txt", root), Verdict::Allow);
         // (its records are not: they are read as any file outside the workspace is, by the tools and by a command, and the rest of the folder still asks)
         gate.records = vec![PathBuf::from("C:\\Data\\DogmindApp\\sessions"), PathBuf::from("C:\\Data\\DogmindApp\\engine.log")];
+        // (nor is what the app writes for commands to read: a check's pictures, long outputs)
+        gate.for_sandbox = Some(PathBuf::from("C:\\Data\\DogmindApp\\for-sandbox"));
+        assert!(!gate.is_secret(Path::new("C:\\Data\\DogmindApp\\for-sandbox\\dogmind-page-1-mobile.png")));
+        assert!(!gate.is_secret(Path::new("C:\\Data\\DogmindApp\\for-sandbox\\dogmind-output\\mcp-1.txt")));
+        assert!(gate.is_secret(Path::new("C:\\Data\\DogmindApp\\settings.json")));
         for path in ["C:\\Data\\DogmindApp\\sessions\\a.jsonl", "c:\\data\\dogmindapp\\SESSIONS\\a.trajectory.jsonl", "C:\\Data\\DogmindApp\\engine.log"] {
             assert_eq!(read_verdict(&gate, path, root), Verdict::Allow, "{path}");
         }

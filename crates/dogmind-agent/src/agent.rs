@@ -1902,6 +1902,11 @@ impl Agent {
         if !crate::sandbox::in_the_sandbox() {
             crate::sandbox::records_readable(&gate.records);
         }
+        // (what the app writes for commands to read, in its folder: it was the model's already, and is read as a record is)
+        #[cfg(windows)]
+        {
+            gate.for_sandbox = config.rules.parent().map(|data| data.join(crate::sandbox::FOR_SANDBOX));
+        }
         gate.code_mode = config.code_mode;
         // (Visual Studio's build tools are looked for from here, in the background: the gate weighs a command without waiting for them, and its environment then usually finds them ready)
         #[cfg(windows)]
@@ -2690,7 +2695,7 @@ impl Agent {
         }
         // What was attached, as files: the model sees the pictures, but a page that shows one needs it in the workspace.
         #[cfg(windows)]
-        if let (false, Some(folder), Some(session)) = (pictures.is_empty(), crate::sandbox::temp_folder(), self.session.as_ref()) {
+        if let (false, Some(folder), Some(session)) = (pictures.is_empty(), crate::sandbox::for_sandbox_folder(), self.session.as_ref()) {
             let name = session.path.file_stem().map_or(String::new(), |stem| stem.to_string_lossy().into_owned());
             let copies = images::copies_for_commands(&folder.join("attachments"), &name, &pictures);
             let lines: Vec<String> = copies.iter().zip(&pictures).map(|(path, picture)| format!("- `{}`: {}x{}, {}", path.display(), picture.width, picture.height, picture.media_type)).collect();
@@ -3656,7 +3661,17 @@ impl Agent {
         }
         let folder = self.scratch_folder();
         forget_old_scratch_folders(&folder);
-        std::fs::create_dir_all(&folder).ok()?;
+        // (in the sandbox's temp, where a program can make a junction: the folder is made only where it is under that folder as the file system has it)
+        #[cfg(windows)]
+        let made = match crate::sandbox::temp_folder() {
+            Some(temp) if folder.starts_with(&temp) => crate::temp_writes::folder_for(&temp, &folder).is_ok(),
+            _ => std::fs::create_dir_all(&folder).is_ok(),
+        };
+        #[cfg(not(windows))]
+        let made = std::fs::create_dir_all(&folder).is_ok();
+        if !made {
+            return None;
+        }
         self.scratch_made = Some(folder.clone());
         let note = if suggestion { prompt::suggestion_note(&folder) } else { prompt::no_change_note(&folder) };
         self.bench.scratch = Some(folder);

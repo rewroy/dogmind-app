@@ -1905,6 +1905,82 @@ pub fn records_readable(records: &[PathBuf]) {
     }
 }
 
+/// The name of the app's folder for what it writes for commands and the check's browser to read ([`app_folder_for_sandbox`]), in its data folder.
+pub const FOR_SANDBOX: &str = "for-sandbox";
+
+/// The app's own folder for what it writes for commands and the check's browser to read: the copies of a page a check opens and their frames, the CDN files and the
+/// frames extension the browser loads, the pictures it takes, the copies of attached pictures, long outputs kept whole. These were in the sandbox's temp folder, where a
+/// program in the sandbox can write too: a folder on the way made a junction, or a name a link, and the app, which is not in the sandbox, would write where the program
+/// could not. This folder has a list of its own, which nothing above it adds to: the person, the system and the administrators, and the container to read and to run, so
+/// that no command writes in it, nor makes a junction or a file there. None where the app has no folder of its own (a test's) or runs in the sandbox itself (it can write
+/// no list then); an error where the folder could not be made so, and nothing is to be written for commands then.
+pub(crate) fn app_folder_for_sandbox() -> Result<Option<PathBuf>, String> {
+    static MADE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    if in_the_sandbox() {
+        return Ok(None);
+    }
+    let Some(data) = crate::workspace_grants::data_folder() else { return Ok(None) };
+    let folder = data.join(FOR_SANDBOX);
+    let mut made = MADE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let made = made.get_or_insert_with(HashSet::new);
+    // (made once a process; and looked at each time, as a folder another took away and put a junction in place of is no longer this one)
+    if made.contains(&key(&folder)) && std::fs::symlink_metadata(&folder).is_ok_and(|metadata| metadata.is_dir() && !leads_elsewhere(&metadata)) {
+        return Ok(Some(folder));
+    }
+    // SAFETY: the SID lives as long as the process.
+    unsafe { made_for_sandbox(&folder, profile_sid()?)? };
+    made.insert(key(&folder));
+    Ok(Some(folder))
+}
+
+/// Where the app writes what commands and the check's browser read: its own folder for them ([`app_folder_for_sandbox`]), or the sandbox's temp folder where it has
+/// none (in the sandbox itself, it writes only where it could anyway). None where its own could not be made: nothing is written for them then.
+pub(crate) fn for_sandbox_folder() -> Option<PathBuf> {
+    match app_folder_for_sandbox() {
+        Ok(Some(folder)) => Some(folder),
+        Ok(None) => temp_folder(),
+        Err(_) => None,
+    }
+}
+
+/// Whether what `metadata` is of is a link or a junction.
+fn leads_elsewhere(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || metadata.file_type().is_symlink()
+}
+
+/// A well-known SID, in a buffer of its own.
+unsafe fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<[usize; 12], String> {
+    let mut sid = [0usize; 12];
+    let mut size = std::mem::size_of_val(&sid) as u32;
+    if CreateWellKnownSid(kind, std::ptr::null_mut(), sid.as_mut_ptr().cast(), &mut size) == 0 {
+        return Err(last_error("a well-known SID"));
+    }
+    Ok(sid)
+}
+
+/// `folder`, made if it is not there, with the list [`app_folder_for_sandbox`] says, written each time for what is made in it from then on to inherit, and the folders
+/// above it to pass through for `sid`. A folder there that is a link or a junction is not used.
+pub(crate) unsafe fn made_for_sandbox(folder: &Path, sid: PSID) -> Result<(), String> {
+    std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
+    let metadata = std::fs::symlink_metadata(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
+    if leads_elsewhere(&metadata) || !metadata.is_dir() {
+        return Err(format!("{} is a link or a junction", folder.display()));
+    }
+    let person = PersonSid::now().ok_or("the app's own SID")?;
+    let (mut system, mut administrators) = (well_known_sid(WinLocalSystemSid)?, well_known_sid(WinBuiltinAdministratorsSid)?);
+    let all = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+    let aces = vec![
+        Dacl::allowed_ace(person.sid(), FILE_ALL_ACCESS, all),
+        Dacl::allowed_ace(system.as_mut_ptr().cast(), FILE_ALL_ACCESS, all),
+        Dacl::allowed_ace(administrators.as_mut_ptr().cast(), FILE_ALL_ACCESS, all),
+        Dacl::allowed_ace(sid, READ_EXECUTE, all),
+    ];
+    Dacl { aces, revision: ACL_REVISION, control: SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED }.write_alone(folder)?;
+    grant_way_to(folder, sid);
+    Ok(())
+}
+
 /// Where the time of a command went apart from the program's own: what the app does before the process starts (`prepare`, in the parts of it that take time), the program from its start to its
 /// end, and the look after it. A command's one duration says none of this, and a data job's seven Python commands took 30% of it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3887,6 +3963,50 @@ mod tests {
         assert_eq!(std::fs::read_to_string(sessions.join("a.trajectory.jsonl")).unwrap(), "RECORD-ONE\n", "a record is not written");
         let made = command(&format!("echo x> \"{}\"", sessions.join("c.jsonl").display()), &work, false);
         assert!(made.status != Some(0) && !sessions.join("c.jsonl").exists(), "nothing is made among them");
+    }
+
+    /// The app's folder for what it writes for commands (`app_folder_for_sandbox`): a command reads what the app put there, and writes nothing, nor makes a folder or a
+    /// junction there, in the container and with the restricted token. It is made here in a workspace, whose list gives commands all it has, and keeps its own list.
+    #[test]
+    fn a_command_reads_the_apps_folder_for_it_and_writes_nothing_there() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (work, outside) = (work_folder("for-sandbox-work"), work_folder("for-sandbox-outside"));
+        let folder = work.join("data").join(FOR_SANDBOX);
+        // SAFETY: the SID lives as long as the process.
+        unsafe { made_for_sandbox(&folder, profile_sid().unwrap()) }.unwrap();
+        std::fs::create_dir_all(folder.join("cdn")).unwrap();
+        let file = folder.join("cdn").join("a.js");
+        std::fs::write(&file, "FOR-SANDBOX\n").unwrap();
+        let restricted = |line: &str| run_live_restricted(line, &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false), None).unwrap();
+        let read = format!("type \"{}\"", file.display());
+        let out = command(&read, &work, false);
+        assert!(decode(&out.stdout).contains("FOR-SANDBOX"), "{:?} {}", out.status, decode(&out.stderr));
+        let out = restricted(&read);
+        assert!(decode(&out.stdout).contains("FOR-SANDBOX"), "with the restricted token: {:?} {}", out.status, decode(&out.stderr));
+        let lines = [
+            format!("echo x> \"{}\"", folder.join("b.txt").display()),
+            format!("echo x>> \"{}\"", file.display()),
+            format!("md \"{}\"", folder.join("c").display()),
+            format!("mklink /J \"{}\" \"{}\"", folder.join("j").display(), outside.display()),
+            format!("mklink /J \"{}\" \"{}\"", folder.join("cdn").join("j").display(), outside.display()),
+        ];
+        for line in &lines {
+            let done = command(line, &work, false);
+            assert_ne!(done.status, Some(0), "{line}: {}", decode(&done.stdout));
+            let done = restricted(line);
+            assert_ne!(done.status, Some(0), "{line} with the restricted token: {}", decode(&done.stdout));
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "FOR-SANDBOX\n");
+        assert!(["b.txt", "c", "j"].iter().all(|name| !folder.join(name).exists()) && !folder.join("cdn").join("j").exists());
+        // A junction where the folder would be is not used.
+        let link = work.join("data2").join(FOR_SANDBOX);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&outside).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        // SAFETY: as above.
+        assert!(unsafe { made_for_sandbox(&link, profile_sid().unwrap()) }.is_err());
     }
 
     #[test]

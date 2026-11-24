@@ -470,9 +470,8 @@ fn frames_extension(temp: &Path) -> Option<PathBuf> {
     for (name, contents) in [("manifest.json", FRAMES_MANIFEST), ("frames.js", frames_js!())] {
         let file = folder.join(name);
         if std::fs::read_to_string(&file).ok().as_deref() != Some(contents) {
-            std::fs::create_dir_all(&folder).ok()?;
-            // (another process may be writing the same: what it writes is the same)
-            if std::fs::write(&file, contents).is_err() && std::fs::read_to_string(&file).ok().as_deref() != Some(contents) {
+            // (another process may be writing the same: what it writes is the same; and nothing through a junction a program in the sandbox made)
+            if crate::temp_writes::write(temp, &file, contents).is_err() && std::fs::read_to_string(&file).ok().as_deref() != Some(contents) {
                 return None;
             }
         }
@@ -1490,9 +1489,12 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     let cwd = page.as_deref().and_then(Path::parent).unwrap_or(workspace).to_path_buf();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp = crate::sandbox::temp_folder();
-    if let Some(temp) = &temp {
-        forget_old_pictures(temp);
-        forget_old_leftovers(temp, LEFTOVER_KEPT);
+    // What the app writes for the browser to read (the page's copies and frames, the CDN files, the frames extension) and the pictures go in the app's own folder for
+    // the sandbox, where no program there can write or put a junction; the browser writes its profiles and its shots in its temp folder.
+    let ours = crate::sandbox::for_sandbox_folder();
+    for folder in temp.iter().chain(ours.iter()) {
+        forget_old_pictures(folder);
+        forget_old_leftovers(folder, LEFTOVER_KEPT);
     }
     // (what this check makes in that folder goes when it ends, whichever way)
     let mut made = Removing(Vec::new());
@@ -1500,10 +1502,10 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     // on localhost either), and the page's copy pointing there. A page of three.js from unpkg was never run in a check, and a real model downloaded the
     // library and ran Chrome outside the sandbox to see it.
     let (mut source, mut fetched) = (None, None);
-    if let (Some(page), Some(temp)) = (&page, &temp) {
+    if let (Some(page), Some(ours)) = (&page, &ours) {
         if let Ok(html) = page_html(page) {
             let also = needs.as_ref().map_or(Vec::new(), |needs| needs.remote.clone());
-            let got = cdn::for_page(&html, &also, temp, &mut |address| cdn::get(address, cancel));
+            let got = cdn::for_page(&html, &also, ours, &mut |address| cdn::get(address, cancel));
             if let Some(needs) = needs.as_mut() {
                 needs.remote.retain(|address| !cdn::allowed(address).is_ok_and(|whole| got.loaded.contains(&whole)));
                 if needs.remote.is_empty() {
@@ -1519,7 +1521,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     // copy too, with a script that says the words the browser shows of it (the DOM a dump gives does not know a rule of a style sheet); a page that cannot be copied is opened as it is.
     let (mut copy_name, mut opened) = (None, page.clone());
     if let (Some(page), Some(steps)) = (&page, steps) {
-        let temp = temp.as_ref().ok_or("the sandbox's folder could not be found, so the steps could not be run")?;
+        let ours = ours.as_ref().ok_or("the app's folder for the sandbox could not be made, so the steps could not be run")?;
         let html = match source.take() {
             Some(html) => html,
             None => page_html(page).map_err(|error| format!("{name}: {error}"))?,
@@ -1527,18 +1529,18 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         let base = file_url(page.parent().unwrap_or(workspace)) + "/";
         let run = next_run();
         let file_name = steps_page_of(&run);
-        let copy = temp.join(&file_name);
+        let copy = ours.join(&file_name);
         made.0.push(copy.clone());
-        std::fs::write(&copy, with_steps(&html, &base, steps, &format!("dogmind-steps-{run}"))).map_err(|error| format!("{}: {error}", copy.display()))?;
+        crate::temp_writes::write(ours, &copy, with_steps(&html, &base, steps, &format!("dogmind-steps-{run}")))?;
         (copy_name, opened) = (Some(file_name), Some(copy));
-    } else if let (Some(page), Some(temp), None) = (&page, &temp, steps) {
+    } else if let (Some(page), Some(ours), None) = (&page, &ours, steps) {
         let html_page = page.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm"));
         if let (true, Ok(html)) = (html_page, source.take().map_or_else(|| page_html(page), Ok)) {
             let base = file_url(page.parent().unwrap_or(workspace)) + "/";
             let file_name = steps_page_of(&next_run());
-            let copy = temp.join(&file_name);
+            let copy = ours.join(&file_name);
             made.0.push(copy.clone());
-            if std::fs::write(&copy, with_script(&html, &base, &reading_script(wait))).is_ok() {
+            if crate::temp_writes::write(ours, &copy, with_script(&html, &base, &reading_script(wait))).is_ok() {
                 (copy_name, opened) = (Some(file_name), Some(copy));
             }
         }
@@ -1560,7 +1562,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     });
     let gpu_available = GPU_FAILURES.load(Ordering::Relaxed) < 2 && !ENGINE_HERE.load(Ordering::Relaxed);
     let on_gpu = AtomicBool::new(gpu_available && (webgl || served.is_some_and(|url| served_draws_webgl(url, &root))));
-    let extensions = extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
+    let extensions = extension_flags(ours.as_deref().and_then(frames_extension).as_deref());
     let virtual_screen = supports_virtual_screen(&program);
     let browser_flags = || flags(on_gpu.load(Ordering::Relaxed)) + &extensions;
     // (a run on the GPU that did not end well: the rest of the check draws on the CPU, and it is said whether this one is to be tried again for that)
@@ -1632,17 +1634,17 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     // One view's picture, at `wait` of the page's time: a run of the browser of its own, with a profile, frame and shot of its own.
     let take = |view: &View, wait: u64| -> Taken {
         let mut taken = Taken { picture: None, hangs: 0, limit: Duration::ZERO, said_there: Vec::new(), stopped: false, runs: Vec::new() };
-        let Some(temp) = temp.as_deref() else { return taken };
+        let (Some(temp), Some(ours)) = (temp.as_deref(), ours.as_deref()) else { return taken };
         let tag = view.label.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
         let run = next_run();
-        let (frame, shot, picture) = (temp.join(frame_of(&run)), temp.join(shot_of(&run)), temp.join(format!("dogmind-page-{taken_at}-{tag}.png")));
+        let (frame, shot, picture) = (ours.join(frame_of(&run)), temp.join(shot_of(&run)), ours.join(format!("dogmind-page-{taken_at}-{tag}.png")));
         let _ = std::fs::remove_file(&picture);
         // A local server page in a file iframe can stay at its initial frame while the DOM read advances.
         // As the top-level page on a virtual fullscreen display it gets both the clock and the exact viewport.
         let capture = if direct_url_picture {
             address.clone()
         } else {
-            if std::fs::write(&frame, frame_page(&src, view)).is_err() { return taken; }
+            if crate::temp_writes::write(ours, &frame, frame_page(&src, view)).is_err() { return taken; }
             plain(&frame)
         };
         let window = view_window(view.width, view.height, direct_url_picture);
@@ -1674,7 +1676,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             #[cfg(test)]
             note_run(true, shot_image.is_err());
             if let Ok(whole) = shot_image {
-                if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
+                if crate::temp_writes::place_for(ours, &picture).is_ok() && whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
                     taken.picture = Some(picture.clone());
                     taken.said_there = done.map(|done| page_console(&browser_stderr(&done.stderr), &base_url, page.as_deref().zip(copy_name.as_deref()))).unwrap_or_default();
                     break;
@@ -1703,7 +1705,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         // The pictures need nothing of the read but its wait: they are taken with it, each view in a run of its own, [`AT_ONCE`] runs at a time. A picture
         // taken at a wait the read then leaves is taken again.
         let start = |wait: u64| -> Vec<std::thread::ScopedJoinHandle<'_, Taken>> {
-            if temp.is_none() {
+            if temp.is_none() || ours.is_none() {
                 return Vec::new();
             }
             views.iter().map(|view| scope.spawn(move || take(view, wait))).collect()
@@ -1757,9 +1759,9 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             drop(kept.take());
             stop.store(false, Ordering::Relaxed);
             // (the copy that says the page's words waits for its time to be up: for this wait now)
-            if let (Some(page), Some(copy)) = (&page, opened.as_ref().filter(|_| copy_name.is_some())) {
+            if let (Some(page), Some(copy), Some(ours)) = (&page, opened.as_ref().filter(|_| copy_name.is_some()), ours.as_deref()) {
                 if let Ok(html) = page_html(page) {
-                    let _ = std::fs::write(copy, with_script(&html, &(file_url(page.parent().unwrap_or(workspace)) + "/"), &reading_script(wait)));
+                    let _ = crate::temp_writes::write(ours, copy, with_script(&html, &(file_url(page.parent().unwrap_or(workspace)) + "/"), &reading_script(wait)));
                 }
             }
             let read;
@@ -1832,7 +1834,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         // otherwise, and a model that wanted to see a scene of three.js ran a browser outside the sandbox for it.
         // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. What a page draws with WebGL is in it, drawn on the CPU: a picture said
         // otherwise, and a model that wanted to see a scene of three.js ran a browser outside the sandbox for it.
-        if temp.is_none() {
+        if temp.is_none() || ours.is_none() {
             return Ok(said);
         }
         let mut out = said;
@@ -2768,6 +2770,9 @@ mod tests {
     #[test]
     #[ignore = "starts Edge in the sandbox"]
     fn a_picture_at_a_phones_width_is_laid_out_at_it() {
+        // (with a folder of the app's own, as the app has: what it writes for the browser, and the pictures, are there)
+        let data = crate::in_container::tempdir().unwrap();
+        crate::workspace_grants::use_test_folder(data.path());
         let (dir, _) = page(&[("index.html", "<!DOCTYPE html><title>w</title><style>body{margin:0}.w{height:40px;background:#cc3333}@media(max-width:600px){.w{background:#3366cc}}</style><div class=w id=w></div><script>document.getElementById('w').textContent=innerWidth;console.log('width ' + innerWidth)</script>")]);
         let said = check_page(&serde_json::json!({"path": "index.html", "views": ["desktop", "mobile"]}), dir.path(), &AtomicBool::new(false)).unwrap();
         println!("{said}");
@@ -2779,6 +2784,7 @@ mod tests {
             assert!(read.contains("width 1280") && read.contains("text: 1280"), "{read}");
         }
         let path = |label: &str| said.lines().find(|line| line.starts_with(&format!("How it looks at {label} "))).and_then(|line| line.split("`read_file` ").nth(1)).map(PathBuf::from).unwrap_or_else(|| panic!("{label}: {said}"));
+        assert!(path("mobile").starts_with(data.path().join(crate::sandbox::FOR_SANDBOX)), "{}", path("mobile").display());
         let (desktop, mobile) = (image::open(path("desktop")).unwrap().to_rgb8(), image::open(path("mobile")).unwrap().to_rgb8());
         assert_eq!((desktop.width(), desktop.height(), mobile.width(), mobile.height()), (1280, 800, 390, 844));
         assert_eq!(mobile.get_pixel(370, 20).0, [0x33, 0x66, 0xcc], "the phone's rules, across the whole of its width");
@@ -3045,6 +3051,9 @@ mod tests {
     #[test]
     #[ignore = "starts Edge in the sandbox"]
     fn a_page_is_driven_by_its_steps() {
+        // (the copy with the steps in it, in a folder of the app's own, as the app has)
+        let data = crate::in_container::tempdir().unwrap();
+        crate::workspace_grants::use_test_folder(data.path());
         let (dir, _) = page(&[
             ("index.html", "<!DOCTYPE html><title>todo</title><link rel=stylesheet href=style.css><input id=t><button id=add>add</button><ul id=l></ul><script src=app.js></script>"),
             ("style.css", "li{color:#c33}"),

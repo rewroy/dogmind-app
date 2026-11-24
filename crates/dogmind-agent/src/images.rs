@@ -133,7 +133,9 @@ pub fn is_picture(path: &Path) -> bool {
 /// which it could not from the session's own folder. Named by the session and their place in the message, with a name a command line takes
 /// as it is. Copies older than a week go as new ones come.
 pub fn copies_for_commands(folder: &Path, session: &str, pictures: &[Attachment]) -> Vec<PathBuf> {
-    if std::fs::create_dir_all(folder).is_err() {
+    // (the folder is in the sandbox's temp, where a program can make a junction: nothing is made or written through one)
+    let temp = folder.parent().unwrap_or(folder);
+    if crate::temp_writes::folder_for(temp, folder).is_err() {
         return Vec::new();
     }
     let week = std::time::Duration::from_secs(7 * 24 * 3600);
@@ -147,7 +149,7 @@ pub fn copies_for_commands(folder: &Path, session: &str, pictures: &[Attachment]
     for (at, picture) in pictures.iter().enumerate() {
         let stem = Path::new(&picture.name).file_stem().map(|stem| plain(&stem.to_string_lossy())).filter(|stem| stem.chars().any(|c| c.is_ascii_alphanumeric())).unwrap_or_else(|| "picture".to_string());
         let path = folder.join(format!("{}-{}-{stem}.{}", plain(session), at + 1, extension_of(&picture.media_type)));
-        if std::fs::write(&path, &picture.bytes).is_ok() {
+        if crate::temp_writes::write(temp, &path, &picture.bytes).is_ok() {
             written.push(path);
         }
     }
@@ -391,6 +393,20 @@ pub(crate) fn openai_content_held(message: &Message, folder: Option<&Path>, mut 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The attachments' folder in the sandbox's temp made a junction to a place outside (as a program in the sandbox could make one): no copy is written there.
+    #[cfg(windows)]
+    #[test]
+    fn no_copy_is_written_through_a_junction_in_the_temp_folder() {
+        let temp = crate::in_container::tempdir().unwrap();
+        let outside = crate::in_container::tempdir().unwrap();
+        let folder = temp.path().join("attachments");
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&folder).arg(outside.path()).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stdout));
+        let picture = Attachment { name: "a.png".into(), bytes: b"png".to_vec(), media_type: "image/png".into(), width: 1, height: 1 };
+        assert!(copies_for_commands(&folder, "s", &[picture]).is_empty());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0, "nothing written outside");
+    }
     use image::RgbImage;
 
     /// A JPEG with an EXIF segment that says its orientation (1 to 8), as a phone's photo has: after its SOI, an APP1 with a little-endian TIFF header and one entry.
