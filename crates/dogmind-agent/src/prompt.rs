@@ -125,9 +125,26 @@ fn folder_contents(entries: impl Iterator<Item = std::io::Result<std::fs::DirEnt
         if name == ".git" {
             continue;
         }
-        // (a big file's size, which is all a model lists the folder again to learn: a round of a real job, for "app.log (1.5 MB)")
-        let big = entry.metadata().ok().map(|data| data.len()).filter(|size| *size >= 100 * 1024).map_or(String::new(), |size| format!(" ({:.1} MB)", size as f64 / (1024.0 * 1024.0)));
-        names.push(if entry.path().is_dir() { format!("{name}/") } else { format!("{name}{big}") });
+        let metadata = entry.metadata().ok();
+        // Directory enumeration on Windows already supplies the attributes. Follow links
+        // and other reparse points by path so that a dangling target is not shown as a folder.
+        let plain = metadata.as_ref().filter(|data| {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                data.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT == 0
+            }
+            #[cfg(not(windows))]
+            {
+                !data.is_symlink()
+            }
+        });
+        if plain.map_or_else(|| entry.path().is_dir(), |data| data.is_dir()) {
+            names.push(format!("{name}/"));
+        } else {
+            let big = metadata.map(|data| data.len()).filter(|size| *size >= 100 * 1024).map_or(String::new(), |size| format!(" ({:.1} MB)", size as f64 / (1024.0 * 1024.0)));
+            names.push(format!("{name}{big}"));
+        }
     }
     names.sort();
     if names.is_empty() {
@@ -1022,6 +1039,30 @@ mod tests {
         assert!(state.contains("a.txt, src/.") && !state.contains("The workspace is empty") && !state.contains(".git/"), "{state}");
         std::fs::write(folder.path().join("big.log"), vec![b'x'; 300 * 1024]).unwrap();
         assert!(workspace_state(folder.path()).contains("a.txt, big.log (0.3 MB), src/."), "a big file says how big");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn the_folder_listing_follows_a_directory_link_and_recognizes_a_dangling_one() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let link = work.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        {
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/d", "/c", "mklink", "/J"]).arg(&link).arg(&target);
+            crate::tools::no_window(&mut command);
+            assert!(command.output().unwrap().status.success());
+        }
+        let listing = || folder_contents(std::fs::read_dir(&work).unwrap());
+        assert!(listing().ends_with("link/."));
+        std::fs::rename(&target, dir.path().join("moved")).unwrap();
+        assert!(listing().ends_with("link."));
     }
 
     #[test]
