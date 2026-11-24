@@ -257,6 +257,15 @@ pub fn describe_tools_listing(named: &[Value]) -> Value {
     }, "required": ["names"]}}})
 }
 
+/// A tool told by name, in the list as a direct call needs it: its first sentence, and arguments of any shape (`describe_tools` gives the real ones). Without
+/// code mode a model calls tools directly, and a provider that offers only the tools in the list (Claude's, Codex's) could not call one that is not there.
+pub fn listed_by_name(tool: &Value) -> Value {
+    let name = tool.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
+    let line = crate::prompt::told_by_its_name(tool);
+    let about = line.split_once("`: ").map_or("", |(_, about)| about);
+    json!({"type": "function", "function": {"name": name, "description": format!("{about} Its arguments: ask describe_tools first."), "parameters": {"type": "object"}}})
+}
+
 /// The tools a list's `describe_tools` tells of by name: callable as the list's own are.
 pub fn named_in_list(list: &Value) -> std::collections::HashSet<String> {
     let description = list.as_array().into_iter().flatten().find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some(crate::prompt::DESCRIBE_TOOLS)).and_then(|tool| tool.pointer("/function/description")?.as_str());

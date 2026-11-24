@@ -2222,7 +2222,13 @@ impl Agent {
         let by_name = prompt::told_by_name(&servers);
         let (named, mut servers): (Vec<Value>, Vec<Value>) = servers.into_iter().partition(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name| by_name.contains(name)));
         if !named.is_empty() {
-            servers.push(tools::describe_tools_listing(&named));
+            // (from a program a call reaches any tool; without code mode it is made directly, and some providers offer only the tools in the list)
+            if self.code_mode {
+                servers.push(tools::describe_tools_listing(&named));
+            } else {
+                servers.extend(named.iter().map(tools::listed_by_name));
+                servers.push(tools::describe_tools_schema());
+            }
         }
         self.tool_schemas = tools::schemas_for(self.web.enabled, found.iter().any(|skill| skill.for_the_model), self.memory.is_some(), servers, self.code_mode);
         // (DeepSeek was taught to change a file with one exact replacement, by these names: offered it beside apply_patch, it wrote its edits as a list in a
@@ -10387,6 +10393,39 @@ Body").unwrap();
         let before_person = |body: &Value| body["messages"].as_array().unwrap().iter().take_while(|message| message["role"] != "user").cloned().collect::<Vec<_>>();
         assert!(!before_person(&bodies[0]).is_empty());
         assert_eq!(before_person(&bodies[3]), before_person(&bodies[0]));
+    }
+
+    /// Without code mode a big server's tools are in the list, each with its first sentence and arguments of any shape, so that a provider that offers
+    /// only the listed tools can call one; describe_tools gives the real arguments, and the list stays small.
+    #[test]
+    fn without_code_mode_a_big_servers_tools_are_listed_small_and_called_directly() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let listed: Vec<Value> = (0..196).map(|at| serde_json::json!({"name": format!("tool_{at}"), "description": format!("Tool {at}. {}", "It does a thing in the editor, with options. ".repeat(7)), "inputSchema": {"type": "object", "properties": {"x": {"type": "string", "description": "y".repeat(350)}}}})).collect();
+        let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "tool 7 answered"}]}});
+        let hub = mcp::Hub::scripted("editor", &listed, &[answer], true);
+        let (client, bodies) = server(vec![
+            call_answer("describe_tools", serde_json::json!({"names": ["mcp__editor__tool_7"]})),
+            call_answer("mcp__editor__tool_7", serde_json::json!({"x": "a"})),
+            text_answer("done"),
+        ]);
+        let (sender, events) = channel();
+        let sessions = crate::in_container::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("Arguments (JSON Schema)")), "{log:?}");
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("tool 7 answered")), "{log:?}");
+        let bodies = bodies.lock().unwrap();
+        let tools = bodies[0]["tools"].as_array().unwrap();
+        let seven = tools.iter().find(|tool| tool["function"]["name"] == "mcp__editor__tool_7").expect("in the list");
+        assert_eq!(seven["function"]["parameters"], serde_json::json!({"type": "object"}));
+        assert!(seven["function"]["description"].as_str().unwrap().starts_with("Tool 7.") && seven["function"]["description"].as_str().unwrap().ends_with("Its arguments: ask describe_tools first."), "{seven}");
+        assert!(tools.iter().any(|tool| tool["function"]["name"] == "describe_tools"));
+        let size = bodies[0]["tools"].to_string().chars().count();
+        assert!(size < 60_000, "the list {size} characters");
+        assert!(!bodies[0]["messages"].to_string().contains(prompt::TOOLS_ADDED));
     }
 
     /// A fork of the conversation cut before an added server's tools were told of tells of them again in its next turn, and once.
