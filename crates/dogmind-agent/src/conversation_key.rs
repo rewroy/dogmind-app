@@ -573,7 +573,9 @@ impl Keystore {
         Keystore::load(folder)
     }
 
-    /// Whole or not at all, with its check, and its copy beside it written the same: a copy that could not be written leaves the file as it is.
+    /// Whole or not at all, with its check, and its copy beside it written the same, first. A copy that could not be written is taken away, and the
+    /// file is written without one; one that can be neither written nor taken away keeps the file as it was, and says so: a copy left as it was would
+    /// offer, when the file is damaged, a key that opens with a passphrase or a recovery code changed since.
     fn save(&self) -> Result<(), KeyError> {
         let mut stored = self.stored.clone();
         stored.check = Some(check_of(&stored));
@@ -581,9 +583,15 @@ impl Keystore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| KeyError::Failed(format!("{}: {error}", parent.display())))?;
         }
-        write_whole(&self.path, &text).map_err(|error| KeyError::Failed(format!("{}: {error}", self.path.display())))?;
-        let _ = write_whole(&self.copy_path(), &text);
-        Ok(())
+        let copy = self.copy_path();
+        if write_whole(&copy, &text).is_err() {
+            match std::fs::remove_file(&copy) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(KeyError::Failed(format!("{}: {error}", copy.display()))),
+            }
+        }
+        write_whole(&self.path, &text).map_err(|error| KeyError::Failed(format!("{}: {error}", self.path.display())))
     }
 
     fn copy_path(&self) -> PathBuf {
@@ -958,6 +966,31 @@ mod tests {
         // a copy that is damaged too is not offered
         std::fs::write(&copy, "{not json").unwrap();
         assert!(!Keystore::copy_opens(dir.path()));
+    }
+
+    /// A copy that cannot be written does not stay as it was, with the passphrase of before: it is taken away and the file is written; one that can be
+    /// neither written nor taken away keeps the file as it was, and the change fails.
+    #[test]
+    fn a_copy_that_cannot_be_written_never_keeps_the_passphrase_of_before() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (mut store, cipher, _) = create(dir.path(), false);
+        let copy = dir.path().join(KEYSTORE_COPY);
+        // (its new one cannot be made: a folder in the way of what is written beside it)
+        let part = dir.path().join(format!("{KEYSTORE_COPY}.part"));
+        std::fs::create_dir_all(&part).unwrap();
+        store.change_passphrase(&cipher, "the second passphrase").unwrap();
+        assert!(!copy.exists(), "the copy with the first passphrase is gone");
+        assert_eq!(Keystore::load(dir.path()).unwrap().unlock("the second passphrase").unwrap().fingerprint(), cipher.fingerprint());
+        std::fs::remove_dir(&part).unwrap();
+        // (a folder where the copy is: it can be neither written nor taken away)
+        std::fs::create_dir_all(&copy).unwrap();
+        assert!(matches!(store.change_passphrase(&cipher, "the third passphrase"), Err(KeyError::Failed(_))));
+        let kept = Keystore::load(dir.path()).unwrap();
+        assert_eq!(kept.unlock("the second passphrase").unwrap().fingerprint(), cipher.fingerprint(), "the file as it was");
+        assert_eq!(kept.unlock("the third passphrase").unwrap_err(), KeyError::Wrong);
+        std::fs::remove_dir(&copy).unwrap();
+        store.change_passphrase(&cipher, "the third passphrase").unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(path_in(dir.path())).unwrap(), "and again the same as the file");
     }
 
     /// A key made now has scrypt's cost of now; one of the Python Dogmind's (2^15, no check, no copy) opens as it was, gets a copy when it opens, and a
