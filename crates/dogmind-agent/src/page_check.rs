@@ -72,14 +72,24 @@ fn extension_flags(frames: Option<&Path>) -> String {
     }
 }
 
+/// Space for the window's frame, with a virtual display of exactly the requested size when supported.
+fn view_window(width: u32, height: u32, virtual_screen: bool) -> String {
+    let mut options = format!("--window-size={},{}", width.max(600) + 64, height + 160);
+    if virtual_screen {
+        options.push_str(&format!(" --kiosk --screen-info={{{width}x{height}}}"));
+    }
+    options
+}
+
 /// The command line of a run that dumps the page's DOM, as the sandbox's shell is given it: `%TEMP%` is the container's own folder, where the run's profile is.
-fn page_line(program: &Path, flags: &str, wait: u64, profile: &str, address: &str) -> String {
-    format!("\"{}\" {flags} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --dump-dom \"{address}\"", program.display())
+fn page_line(program: &Path, flags: &str, virtual_screen: bool, wait: u64, profile: &str, address: &str) -> String {
+    let window = if virtual_screen { view_window(1280, 800, true) } else { "--window-size=1280,800".to_string() };
+    format!("\"{}\" {flags} {window} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --dump-dom \"{address}\"", program.display())
 }
 
 /// The command line of a run that takes a picture of `frame` (a path) into `shot`, in a window of `window`.
-fn shot_line(program: &Path, flags: &str, window: (u32, u32), wait: u64, profile: &str, shot: &Path, frame: &str) -> String {
-    format!("\"{}\" {flags} --window-size={},{} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --screenshot=\"{}\" \"{frame}\"", program.display(), window.0, window.1, shot.display())
+fn shot_line(program: &Path, flags: &str, window: &str, wait: u64, profile: &str, shot: &Path, frame: &str) -> String {
+    format!("\"{}\" {flags} {window} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --screenshot=\"{}\" \"{frame}\"", program.display(), shot.display())
 }
 
 /// How long a page runs before it is read, unless the model asks for longer, for an animation, and the most it may.
@@ -1290,8 +1300,8 @@ struct Reading {
     not_loaded: Option<String>,
     /// Said in place of the browser's crash when it was the steps that did not end (they began, and the browser was stopped with them still going).
     steps_lost: Option<String>,
-    /// What heads the console, if not `Console`: the console is that of the run that reads the page, at 1280x800, whatever views were asked for. (The words it shows are read there too.)
-    console_head: Option<String>,
+    /// Where the console and page text were read when the requested pictures omit the desktop.
+    read_view_note: Option<&'static str>,
     /// The words the page said it shows, at the end of the steps or of its time, where they ended; none where the browser was not asked to say them.
     seen: Option<String>,
     /// The last run was stopped by its time, still running the page: what it draws took longer than a run may, and it did not crash.
@@ -1315,10 +1325,9 @@ struct CdnWords {
     refused: Vec<(String, String)>,
 }
 
-/// The console's heading when none of the views asked for is the desktop's: the first block is still the console of a run at 1280x800, and under a plain "Console" a model that asked
-/// only for a phone's width read it as the phone's.
-fn console_head(views: &[View]) -> Option<String> {
-    (!views.iter().any(|view| view.label == "desktop")).then(|| "Console (as read at 1280x800)".to_string())
+/// Identify the desktop read when only other views were requested. Only a virtual screen guarantees its exact dimensions.
+fn read_view_note(views: &[View], exact: bool) -> Option<&'static str> {
+    (!views.iter().any(|view| view.label == "desktop")).then_some(if exact { "read at 1280x800" } else { "read in the desktop window" })
 }
 
 fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Needs>, console: &[String], dom: &str, reading: &Reading) -> String {
@@ -1367,7 +1376,7 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
     } else if !needs.run.is_empty() {
         out.push_str(&format!("Ran: {}.\n", needs.run.join(", ")));
     }
-    let head = reading.console_head.as_deref().unwrap_or("Console");
+    let head = reading.read_view_note.map_or_else(|| "Console".to_string(), |note| format!("Console (as {note})"));
     if console.is_empty() {
         out.push_str(&if needs.remote.is_empty() && finished { format!("{head}: nothing, so no errors.\n") } else { format!("{head}: nothing, which says little with that not loaded.\n") });
     } else {
@@ -1388,9 +1397,7 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
         let text = reading.seen.clone().unwrap_or_else(|| from_dom);
         // (where the words were read, when that is not what a person looking at the page would have: the window that was not asked for, and the DOM, which no style sheet is applied to)
         let mut notes = Vec::new();
-        if reading.console_head.is_some() {
-            notes.push("read at 1280x800");
-        }
+        notes.extend(reading.read_view_note);
         if reading.seen.is_none() {
             notes.push("from the page's DOM, with no style sheet applied: what a class or a media query hides is counted as shown");
         }
@@ -1533,6 +1540,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     let gpu_available = GPU_FAILURES.load(Ordering::Relaxed) < 2 && !ENGINE_HERE.load(Ordering::Relaxed);
     let on_gpu = AtomicBool::new(gpu_available && (webgl || served.is_some_and(|url| served_draws_webgl(url, &root))));
     let extensions = extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
+    let virtual_screen = supports_virtual_screen(&program);
     let browser_flags = || flags(on_gpu.load(Ordering::Relaxed)) + &extensions;
     // (a run on the GPU that did not end well: the rest of the check draws on the CPU, and it is said whether this one is to be tried again for that)
     let off_the_gpu = |ended_badly: bool| -> bool {
@@ -1557,7 +1565,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         for _ in 0..TRIES {
             let started = std::time::Instant::now();
             let profile = profiles.next();
-            let line = page_line(&program, &browser_flags(), run_wait, &profile, &address);
+            let line = page_line(&program, &browser_flags(), virtual_screen, run_wait, &profile, &address);
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel)?;
             (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
             #[cfg(debug_assertions)]
@@ -1595,7 +1603,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     // (set when the turn is stopped, or when what the pictures were taking is of no use: each picture's run ends at it)
     let stop = AtomicBool::new(false);
     let slots = Slots::new(AT_ONCE);
-    let direct_url_picture = served.is_some() && supports_virtual_screen(&program);
+    let direct_url_picture = served.is_some() && virtual_screen;
     // (the read's own turn is never refused)
     let never = AtomicBool::new(false);
     // (what the read took, in ms, for the pictures begun after it: none while it goes on)
@@ -1616,8 +1624,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             if std::fs::write(&frame, frame_page(&src, view)).is_err() { return taken; }
             plain(&frame)
         };
-        // Leave room for the browser frame. In kiosk mode the virtual screen itself bounds the viewport.
-        let window = (view.width.max(600) + 64, view.height + 160);
+        let window = view_window(view.width, view.height, direct_url_picture);
         let (mut trying, mut profiles) = (None, Profiles::new(&cwd, workspace));
         for _ in 0..TRIES {
             // (its turn among the check's runs: waiting for it is no part of the tries' time)
@@ -1631,11 +1638,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             let limit = picture_limit(wait, (read != u64::MAX).then(|| Duration::from_millis(read)));
             taken.limit = limit;
             let profile = profiles.next();
-            let mut flags = browser_flags();
-            if direct_url_picture {
-                flags.push_str(&format!(" --kiosk --screen-info={{{}x{}}}", view.width, view.height));
-            }
-            let line = shot_line(&program, &flags, window, wait, &profile, &shot, &capture);
+            let line = shot_line(&program, &browser_flags(), &window, wait, &profile, &shot, &capture);
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, &stop);
             let end = done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32)));
             taken.runs.push(BrowserRun { of: "picture", end, ms: started.elapsed().as_millis() as u64 });
@@ -1796,7 +1799,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         // (the words that the page the steps left said at their end are not of the page that is shown)
         let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
         let cdn = fetched.map(|fetched| CdnWords { loaded: fetched.loaded, files: fetched.files, refused: fetched.refused });
-        let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen, timed_out: how == "timed out", cdn, on_gpu: on_gpu.load(Ordering::Relaxed) };
+        let reading = Reading { not_loaded, steps_lost, read_view_note: read_view_note(&views, virtual_screen), seen, timed_out: how == "timed out", cdn, on_gpu: on_gpu.load(Ordering::Relaxed) };
         let said = format!("{}{wait_cut}{shortened}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
         if !finished {
             ended(pictures, true);
@@ -2368,9 +2371,9 @@ mod tests {
         assert_eq!(says(&Reading { seen: Some("from the browser".to_string()), ..Reading::default() }), "Shows: title \"T\"; text: from the browser", "the browser's own account needs no note");
         let from_dom = says(&Reading::default());
         assert!(from_dom.starts_with("Shows (from the page's DOM, with no style sheet applied") && from_dom.ends_with("text: from the dom CLASS"), "{from_dom}");
-        let phone = says(&Reading { console_head: Some("Console (as read at 1280x800)".to_string()), seen: Some("x".to_string()), ..Reading::default() });
+        let phone = says(&Reading { read_view_note: Some("read at 1280x800"), seen: Some("x".to_string()), ..Reading::default() });
         assert_eq!(phone, "Shows (read at 1280x800): title \"T\"; text: x");
-        let both = says(&Reading { console_head: Some("Console (as read at 1280x800)".to_string()), ..Reading::default() });
+        let both = says(&Reading { read_view_note: Some("read at 1280x800"), ..Reading::default() });
         assert!(both.starts_with("Shows (read at 1280x800; from the page's DOM"), "{both}");
     }
 
@@ -2497,7 +2500,7 @@ mod tests {
     fn a_page_a_local_server_gives_is_checked_by_its_url() {
         let (dir, _) = page(&[
             ("index.html", "<!DOCTYPE html><title>served</title><style>body{background:red}body.ready{background:lime}@media(width:390px) and (height:844px){body.ready{background:blue}}</style><div id=o>wait</div><script type=module src=app.mjs></script>"),
-            ("app.mjs", "import { word } from './word.mjs'; document.getElementById('o').textContent = word; console.log('module ran: ' + location.origin); setTimeout(() => document.body.className = 'ready', 600);"),
+            ("app.mjs", "import { word } from './word.mjs'; document.getElementById('o').textContent = word; console.log('module ran: ' + location.origin); console.log('DOM viewport ' + innerWidth + 'x' + innerHeight); setTimeout(() => document.body.className = 'ready', 600);"),
             ("word.mjs", "export const word = 'from a module';"),
         ]);
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -2514,6 +2517,7 @@ mod tests {
         assert!(!said.contains("Permissions-Policy"), "the browser's own words are not the page's: {said}");
         assert!(said.contains("How it looks at desktop"), "{said}");
         if browser().is_some_and(|(program, _)| supports_virtual_screen(&program)) {
+            assert!(said.split("How it looks at").next().unwrap().contains("DOM viewport 1280x800"), "{said}");
             for (label, size, color) in [("desktop", (1280, 800), [0, 255, 0]), ("mobile", (390, 844), [0, 0, 255])] {
                 let line = said.lines().find(|line| line.starts_with(&format!("How it looks at {label} "))).unwrap();
                 let (_, path) = line.split_once("`read_file` ").unwrap();
@@ -2703,6 +2707,10 @@ mod tests {
         // (what a script measures at the phone's width is said for it; at the desktop's too, where the picture's frame is not the window the
         // console above was read in)
         assert!(said.contains("Console at mobile:\n  index.html:1: width 390"), "{said}");
+        if browser().is_some_and(|(program, _)| supports_virtual_screen(&program)) {
+            let read = said.split("How it looks at").next().unwrap();
+            assert!(read.contains("width 1280") && read.contains("text: 1280"), "{read}");
+        }
         let path = |label: &str| said.lines().find(|line| line.starts_with(&format!("How it looks at {label} "))).and_then(|line| line.split("`read_file` ").nth(1)).map(PathBuf::from).unwrap_or_else(|| panic!("{label}: {said}"));
         let (desktop, mobile) = (image::open(path("desktop")).unwrap().to_rgb8(), image::open(path("mobile")).unwrap().to_rgb8());
         assert_eq!((desktop.width(), desktop.height(), mobile.width(), mobile.height()), (1280, 800, 390, 844));
@@ -2851,15 +2859,19 @@ mod tests {
 
     #[test]
     fn the_first_console_says_it_is_of_the_desktops_size_when_the_desktop_was_not_asked_for() {
-        let heads = |views: Value| console_head(&views_of(&serde_json::json!({ "views": views })).unwrap());
-        assert_eq!(heads(serde_json::json!(["320x568"])).as_deref(), Some("Console (as read at 1280x800)"));
-        assert_eq!(heads(serde_json::json!(["mobile", "1024x768"])).as_deref(), Some("Console (as read at 1280x800)"));
+        let heads = |views: Value| read_view_note(&views_of(&serde_json::json!({ "views": views })).unwrap(), true);
+        assert_eq!(heads(serde_json::json!(["320x568"])), Some("read at 1280x800"));
+        assert_eq!(heads(serde_json::json!(["mobile", "1024x768"])), Some("read at 1280x800"));
         assert_eq!(heads(serde_json::json!(["mobile", "desktop"])), None);
         assert_eq!(heads(serde_json::json!(["desktop"])), None);
-        assert_eq!(console_head(&views_of(&serde_json::json!({})).unwrap()), None, "no views: the desktop");
+        assert_eq!(read_view_note(&views_of(&serde_json::json!({})).unwrap(), true), None, "no views: the desktop");
         let (needs, lines) = (Needs::default(), vec!["a.js:1: scrollW: 1248".to_string()]);
         let said = |reading: &Reading, console: &[String]| report("index.html", "Edge", true, Some(&needs), console, "<html><body>hi</body></html>", reading);
-        let labelled = Reading { console_head: Some("Console (as read at 1280x800)".to_string()), ..Reading::default() };
+        let mobile = views_of(&serde_json::json!({"views":["mobile"]})).unwrap();
+        let legacy = Reading { read_view_note: read_view_note(&mobile, false), ..Reading::default() };
+        let legacy_report = said(&legacy, &lines);
+        assert!(legacy_report.contains("Console (as read in the desktop window)") && legacy_report.contains("Shows (read in the desktop window"), "{legacy_report}");
+        let labelled = Reading { read_view_note: Some("read at 1280x800"), ..Reading::default() };
         assert!(said(&Reading::default(), &lines).contains("Console:\n- a.js:1: scrollW: 1248\n"), "{}", said(&Reading::default(), &lines));
         assert!(said(&labelled, &lines).contains("Console (as read at 1280x800):\n- a.js:1: scrollW: 1248\n"), "{}", said(&labelled, &lines));
         assert!(said(&Reading::default(), &[]).contains("Console: nothing, so no errors.\n"));
@@ -3108,10 +3120,10 @@ mod tests {
             let _ = std::fs::remove_file(&shot);
             let profile = profiles.next();
             let line = match mode.as_str() {
-                "shot" => shot_line(&program, &flags, (1344, 960), wait, &profile, &shot, &frame.display().to_string()),
-                "steps" => page_line(&program, &flags, 2 * wait, &profile, &steps_copy.display().to_string()),
-                "read" => page_line(&program, &flags, wait + READ_MARGIN_MS, &profile, &read_copy.display().to_string()),
-                _ => page_line(&program, &flags, wait, &profile, &index.display().to_string()),
+                "shot" => shot_line(&program, &flags, &view_window(1280, 800, false), wait, &profile, &shot, &frame.display().to_string()),
+                "steps" => page_line(&program, &flags, supports_virtual_screen(&program), 2 * wait, &profile, &steps_copy.display().to_string()),
+                "read" => page_line(&program, &flags, supports_virtual_screen(&program), wait + READ_MARGIN_MS, &profile, &read_copy.display().to_string()),
+                _ => page_line(&program, &flags, supports_virtual_screen(&program), wait, &profile, &index.display().to_string()),
             };
             let started = std::time::Instant::now();
             // (as the check runs it, when asked to with DOGMIND_PROBE_LIKE_THE_CHECK: with the limit its wait gives, and a run that hung tried once more)
