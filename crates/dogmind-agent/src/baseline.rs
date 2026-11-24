@@ -397,9 +397,13 @@ impl Baseline {
                 }
             };
             let entry = self.files.get(name);
+            let same_metadata = matches!((entry, &now), (Some(entry), Some(data))
+                if !entry.gone && entry.size == data.len() && entry.modified == modified(data));
             match (entry, &now) {
                 (Some(entry), None) if entry.gone => continue,
-                (Some(entry), Some(data)) if !entry.gone && entry.size == data.len() && entry.modified == modified(data) => continue,
+                // A copy can preserve the timestamp and size of a different file.
+                // Compare bytes whenever the original contents are available.
+                (Some(entry), _) if same_metadata && entry.copy.is_none() => continue,
                 (None, None) if self.head.is_none() => continue,
                 (None, Some(data)) if self.head.is_none() && !self.whole => {
                     lines.push(format!("present {name} ({} bytes): its starting contents are unknown because the initial file list was incomplete", data.len()));
@@ -424,6 +428,7 @@ impl Baseline {
                 Some(entry) if entry.gone => Before::Absent,
                 Some(entry) => match entry.copy.as_ref().and_then(|copy| std::fs::read(folder_of(&self.session).join(copy)).ok()) {
                     Some(bytes) => Before::Bytes(bytes),
+                    None if same_metadata && after.is_some() => continue,
                     None => Before::Unknown(entry.size),
                 },
                 None => match &self.head {
@@ -861,6 +866,28 @@ mod tests {
         assert!(known.changes(&work, &[]).is_empty());
         std::fs::remove_file(file).unwrap();
         assert!(known.changes(&work, &[]).contains("deleted notes.txt"));
+    }
+
+    #[test]
+    fn replacing_bytes_and_preserving_the_timestamp_still_shows_the_edit() {
+        let (work, _keep, session) = fixture();
+        let path = work.path().join("notes.txt");
+        std::fs::write(&path, "old line\n").unwrap();
+        let original_time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        Baseline::for_session(&session, work.path());
+
+        std::fs::write(&path, "new line\n").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(original_time).unwrap();
+        let reopened = Baseline::for_session(&session, work.path());
+        let report = reopened.changes(work.path(), &[]);
+        assert!(report.contains("-old line") && report.contains("+new line"), "{report}");
+
+        std::fs::write(&path, "old line\n").unwrap();
+        assert!(reopened.changes(work.path(), &[]).is_empty());
+        let copy = reopened.files["notes.txt"].copy.as_ref().unwrap();
+        std::fs::remove_file(folder_of(&session).join(copy)).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(original_time).unwrap();
+        assert!(reopened.changes(work.path(), &[]).is_empty());
     }
 
     #[test]
