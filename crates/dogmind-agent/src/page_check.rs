@@ -754,20 +754,25 @@ fn served_relative_path(url: &str) -> Option<String> {
     Some(wanted)
 }
 
-/// A matching HTML or SVG file is a hint for the renderer. A dynamic route or a server rooted
-/// elsewhere can have no matching file. Keep the normal CPU path for those addresses.
-fn served_draws_webgl(url: &str, root: &Path) -> bool {
-    let Some(relative) = served_relative_path(url) else { return false };
+/// The URL's workspace-relative page name and its verified canonical file, assuming the server is rooted here.
+fn direct_served_page(url: &str, root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let relative = served_relative_path(url)?;
     let relative = Path::new(&relative);
     if !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
-        return false;
+        return None;
     }
-    let ext = relative.extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+    let ext = relative.extension()?.to_str()?;
     if !["html", "htm", "xhtml", "svg"].iter().any(|kind| ext.eq_ignore_ascii_case(kind)) {
-        return false;
+        return None;
     }
-    let Ok(file) = root.join(relative).canonicalize() else { return false };
-    if !file.starts_with(root) || !file.metadata().is_ok_and(|meta| meta.is_file() && meta.len() < 4 << 20) {
+    let file = root.join(relative).canonicalize().ok()?;
+    (file.starts_with(root) && file.is_file()).then(|| (relative.to_path_buf(), file))
+}
+
+/// A dynamic route or a server rooted elsewhere may have no matching file. Keep the normal CPU path there.
+fn served_draws_webgl(url: &str, root: &Path) -> bool {
+    let Some((_, file)) = direct_served_page(url, root) else { return false };
+    if !file.metadata().is_ok_and(|meta| meta.len() < 4 << 20) {
         return false;
     }
     page_html(&file).is_ok_and(|html| draws_webgl(&[html]))
@@ -1440,10 +1445,15 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     let root = std::fs::canonicalize(workspace).map_err(|error| format!("{}: {error}", workspace.display()))?;
     let (page, name, mut needs) = match served {
         Some(url) => {
+            let address = served_address(url)?;
             if steps.is_some() {
-                return Err("steps run in a page file of the workspace: give its path rather than a url".to_string());
+                let retry = direct_served_page(url, &root).map_or_else(
+                    || "remove url and set path to the workspace page file".to_string(),
+                    |(path, _)| format!("replace url with path {} if this is the intended page file", serde_json::json!(path)),
+                );
+                return Err(format!("steps run in a workspace page file: {retry}. To inspect the running server, keep url and omit steps."));
             }
-            (None, served_address(url)?, None)
+            (None, address, None)
         }
         None => {
             let given = arguments.get("path").and_then(Value::as_str).filter(|path| !path.is_empty()).ok_or("path is required: the page, under the workspace, or url: a server's on this machine")?;
@@ -2159,6 +2169,23 @@ mod tests {
         assert!(first.starts_with("AS THE USER OPENS IT: gacha") && first.contains("do not run at all") && !first.contains("http.server"), "{first}");
         assert_eq!(opened_from_its_file("http://127.0.0.1:8765/plain.html", root), None);
         assert_eq!(opened_from_its_file("http://127.0.0.1:8765/cdn.html", root), None);
+    }
+
+    #[test]
+    fn steps_on_a_server_suggest_a_matching_workspace_file_or_a_server_check() {
+        let (dir, _) = page(&[("index.html", "<p>sample</p>"), ("pages/demo.svg", "<svg/>"), ("api.json", "{}")]);
+        let cancel = AtomicBool::new(false);
+        for (suffix, file) in [("/?next=/api.json", Some("index.html")), ("/pages/demo.svg", Some("pages/demo.svg")), ("/app", None), ("/missing.html", None), ("/api.json", None)] {
+            let args = serde_json::json!({"url": format!("http://localhost:8765{suffix}"), "steps": "console.log(1)"});
+            let error = check_page(&args, dir.path(), &cancel).unwrap_err();
+            assert!(error.contains("keep url and omit steps"), "{error}");
+            if let Some(file) = file {
+                let relative = PathBuf::from(file.replace('/', std::path::MAIN_SEPARATOR_STR));
+                assert!(error.contains(&format!("path {}", serde_json::json!(relative))), "{error}");
+            } else {
+                assert!(error.contains("set path to the workspace page file"), "{error}");
+            }
+        }
     }
 
     #[test]

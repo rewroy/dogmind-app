@@ -182,12 +182,12 @@ pub fn schemas() -> Value {
             "pattern": {"type": "string"},
             "path": {"type": "string"}
         }), &["pattern"]),
-        function("check_page", "Check a workspace page by path (required for steps, no server needed). Reports console output, errors, visible content and pictures. Test the original page, clicking and typing as a user would. Only scripts, styles and fonts from well-known CDNs load from the network. Never download, vendor or build a library to check a page.", json!({
+        function("check_page", "Check a workspace page by path (no server needed). Reports console output, errors, visible content and pictures. Test the original page, clicking and typing as a user would. Only scripts, styles and fonts from well-known CDNs load from the network. Never download, vendor or build a library to check a page.", json!({
             "path": {"type": "string"},
             "url": {"type": "string", "description": "Instead of path: http://localhost:PORT/ on a running server, without steps."},
             "views": {"type": "array", "items": {"type": "string"}, "description": "desktop (default), mobile, or WxH"},
             "wait_ms": {"type": "integer", "description": "Virtual ms incl. waits. Default 1500 (steps 3000). Max 10000."},
-            "steps": {"type": "string", "description": "JS run after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results. A reload (await reload()) starts the next part in the new load; variables do not carry over."}
+            "steps": {"type": "string", "description": "With path only. JS after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results. A reload (await reload()) starts the next part in the new load; variables do not carry over."}
         }), &[]),
         function("command_status", "A background command's state, and what it printed since the last look. Also your waits.", json!({"id": {"type": "string"}}), &[]),
         function("command_stop", "End a background command, or cancel a wait, by its id.", json!({"id": {"type": "string"}}), &["id"]),
