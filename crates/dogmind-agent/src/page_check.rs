@@ -752,7 +752,7 @@ fn page_of_address(url: &str, workspace: &Path) -> Option<PathBuf> {
 /// check, and opened from that folder by the person it ran nothing.
 fn opened_from_its_file(url: &str, workspace: &Path) -> Option<String> {
     let page = page_of_address(url, workspace)?;
-    needs_of(&page).local_module.then(|| format!("AS THE USER OPENS IT: {} is in the workspace. {LOCAL_MODULE_WORDS}\n", page.strip_prefix(workspace).unwrap_or(&page).display()))
+    inspect_page(&page, ModuleScan::Direct).local_module.then(|| format!("AS THE USER OPENS IT: {} is in the workspace. {LOCAL_MODULE_WORDS}\n", page.strip_prefix(workspace).unwrap_or(&page).display()))
 }
 
 /// What in a page cannot load or run with no network, worked out from its text, as nothing the browser prints says so.
@@ -794,19 +794,33 @@ fn mapped(name: &str, map: &[(String, String)]) -> Option<String> {
     Some(format!("{to}{}", &name[from.len()..]))
 }
 
-/// The remote addresses a module needs, following its imports through the files beside it.
-fn follow(file: &Path, map: &[(String, String)], seen: &mut HashSet<PathBuf>, remote: &mut Vec<String>, missing: &mut Vec<String>, root: &Path) {
-    if !seen.insert(file.to_path_buf()) || seen.len() > 200 || crate::safety::reaches_out(file) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModuleScan {
+    /// A direct local import is enough to explain how a served page would behave under file://.
+    Direct,
+    Dependencies,
+}
+
+#[derive(Default)]
+struct ModuleImports {
+    local: HashSet<PathBuf>,
+    remote: Vec<String>,
+    missing: Vec<String>,
+}
+
+/// Record the import. Only a file check needs to open it and inspect its dependencies.
+fn follow(file: &Path, map: &[(String, String)], imports: &mut ModuleImports, root: &Path, scan: ModuleScan) {
+    if !imports.local.insert(file.to_path_buf()) || scan == ModuleScan::Direct || imports.local.len() > 200 || crate::safety::reaches_out(file) {
         return;
     }
     let Ok(text) = std::fs::read_to_string(file) else {
-        missing.push(file.strip_prefix(root).unwrap_or(file).display().to_string());
+        imports.missing.push(file.strip_prefix(root).unwrap_or(file).display().to_string());
         return;
     };
-    imports_of(&text, file.parent().unwrap_or(root), map, seen, remote, missing, root);
+    imports_of(&text, file.parent().unwrap_or(root), map, imports, root, scan);
 }
 
-fn imports_of(text: &str, folder: &Path, map: &[(String, String)], seen: &mut HashSet<PathBuf>, remote: &mut Vec<String>, missing: &mut Vec<String>, root: &Path) {
+fn imports_of(text: &str, folder: &Path, map: &[(String, String)], imports: &mut ModuleImports, root: &Path, scan: ModuleScan) {
     let pattern = Regex::new(r#"(?m)(?:^|[\s;])(?:import|export)\s[^'"\n;]*?from\s*['"]([^'"]+)['"]|(?:^|[\s;])import\s*['"]([^'"]+)['"]|\bimport\(\s*['"]([^'"]+)['"]"#).expect("the pattern is valid");
     for found in pattern.captures_iter(text) {
         let Some(name) = found.get(1).or(found.get(2)).or(found.get(3)) else { continue };
@@ -814,18 +828,22 @@ fn imports_of(text: &str, folder: &Path, map: &[(String, String)], seen: &mut Ha
         let mapped = mapped(name.as_str(), map);
         let (target, base) = mapped.as_deref().map_or((name.as_str(), folder), |target| (target, root));
         if is_remote(target) {
-            if !remote.iter().any(|address| address == target) {
-                remote.push(target.to_string());
+            if !imports.remote.iter().any(|address| address == target) {
+                imports.remote.push(target.to_string());
             }
         } else if target.starts_with('.') || target.starts_with('/') {
             let path = target.split(['?', '#']).next().unwrap_or(target);
             let local = if let Some(from_root) = path.strip_prefix('/') { root.join(from_root) } else { base.join(path) };
-            follow(&local, map, seen, remote, missing, root);
+            follow(&local, map, imports, root, scan);
         }
     }
 }
 
 fn needs_of(page: &Path) -> Needs {
+    inspect_page(page, ModuleScan::Dependencies)
+}
+
+fn inspect_page(page: &Path, scan: ModuleScan) -> Needs {
     let mut needs = Needs::default();
     let Ok((text, _)) = page_text(page) else { return needs };
     let root = page.parent().unwrap_or(Path::new("."));
@@ -876,25 +894,25 @@ fn needs_of(page: &Path) -> Needs {
             needs.run.push(label);
             continue;
         }
-        let (mut remote, mut missing, mut seen) = (Vec::new(), Vec::new(), HashSet::new());
+        let mut imports = ModuleImports::default();
         match &source {
-            Some(address) => follow(&root.join(file_part(address)), &map, &mut seen, &mut remote, &mut missing, root),
-            None => imports_of(body, root, &map, &mut seen, &mut remote, &mut missing, root),
+            Some(address) => follow(&root.join(file_part(address)), &map, &mut imports, root, scan),
+            None => imports_of(body, root, &map, &mut imports, root, scan),
         }
         // (a module written in the page that imports a file of its own is refused from file:// as one with a `src` is: a three.js page that imported the library and its
         // add-ons from its folder ran nothing when the person opened it, and the check, through a server and with file access allowed, never said so)
-        needs.local_module |= !seen.is_empty();
-        if remote.is_empty() {
+        needs.local_module |= !imports.local.is_empty();
+        if imports.remote.is_empty() {
             needs.run.push(label);
         } else {
             needs.did_not_run.push(label);
-            for address in remote {
+            for address in imports.remote {
                 if !needs.remote.contains(&address) {
                     needs.remote.push(address);
                 }
             }
         }
-        needs.missing.extend(missing);
+        needs.missing.extend(imports.missing);
     }
     needs
 }
@@ -2037,11 +2055,18 @@ mod tests {
         let (dir, index) = page(&[
             ("gacha/index.html", r#"<script type="importmap">{"imports":{"three":"./three.module.js"}}</script><script type="module">import * as THREE from 'three'; import { a } from './post/pass.js';</script>"#),
             ("gacha/three.module.js", "export const REVISION = '169';\n"),
-            ("gacha/post/pass.js", "export const a = 1;\n"),
+            ("gacha/post/pass.js", "import './absent.js'; export const a = 1;\n"),
             ("cdn.html", r#"<script type="module">import * as THREE from 'https://unpkg.com/three@0.161.0/build/three.module.js';</script>"#),
             ("plain.html", r#"<script>console.log(1)</script>"#),
         ]);
         let root = dir.path();
+        let local = root.join("gacha/index.html");
+        let direct = inspect_page(&local, ModuleScan::Direct);
+        assert!(direct.local_module && direct.missing.is_empty());
+        assert!(needs_of(&local).missing.iter().any(|name| name.ends_with("absent.js")));
+        for name in ["plain.html", "cdn.html"] {
+            assert!(!inspect_page(&root.join(name), ModuleScan::Direct).local_module);
+        }
         assert!(needs_of(&root.join("gacha").join("index.html")).local_module);
         assert!(!needs_of(&root.join("cdn.html")).local_module && !needs_of(&root.join("plain.html")).local_module);
         let _ = index;
