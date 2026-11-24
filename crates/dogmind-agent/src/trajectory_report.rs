@@ -234,12 +234,12 @@ pub fn report(trajectory: &str, engine_log: Option<&str>) -> String {
             None => format!("turn {turn}"),
         };
         let _ = writeln!(out, "\n{shown}");
-        spent.print(&mut out, " (no turn_end recorded, timed through the last event)");
+        spent.print(&mut out, " (no turn_end recorded, timed through the last turn event)");
         total.add(&spent);
     }
     if turns.len() > 1 {
         let _ = writeln!(out, "\nall turns");
-        total.print(&mut out, " (unfinished turns timed through their last event)");
+        total.print(&mut out, " (unfinished turns timed through their last turn event)");
     }
 
     let connections: Vec<&Line> = lines.iter().filter(|line| line.ev() == "connection").collect();
@@ -470,10 +470,15 @@ impl Spent {
     fn of(lines: &[&Line]) -> Spent {
         let mut spent = Spent::default();
         let ended = lines.iter().find(|line| line.ev() == "turn_end");
-        let timed: Vec<DateTime<FixedOffset>> = lines.iter().filter_map(|line| line.at).collect();
-        spent.wall = ended.and_then(|end| end.u("ms")).unwrap_or_else(|| match (timed.first(), timed.last()) {
-            (Some(first), Some(last)) => (*last - *first).num_milliseconds().max(0) as u64,
-            _ => 0,
+        spent.wall = ended.and_then(|end| end.u("ms")).unwrap_or_else(|| {
+            // Reconnecting or warming the engine between turns can still carry the preceding turn's number.
+            let mut timed = lines.iter()
+                .filter(|line| line.ev() != "connection" && !(line.ev() == "request" && line.s("role") == "warm"))
+                .filter_map(|line| line.at);
+            match (timed.next(), timed.next_back()) {
+                (Some(first), Some(last)) => (last - first).num_milliseconds().max(0) as u64,
+                _ => 0,
+            }
         });
         spent.unfinished = lines.iter().any(|line| line.ev() == "turn_start") && ended.is_none();
         // Children finish first. Match their parent within this request, even if its row comes later.
@@ -1038,7 +1043,7 @@ mod tests {
         let single = report(&text(&lines[..7]), None);
         assert!(single.contains("turn 1:") && single.contains("connections"));
         assert!(!single.contains("all turns"));
-        assert!(report(&text(&lines), None).contains("all turns\n  wall 155.0 s (unfinished turns timed through their last event)"));
+        assert!(report(&text(&lines), None).contains("all turns\n  wall 155.0 s (unfinished turns timed through their last turn event)"));
         let said = summary(&text(&lines));
         // (the connection before the first turn is not a turn)
         assert_eq!(said.turns.len(), 2);
@@ -1094,6 +1099,24 @@ mod tests {
         assert!(said.contains("\nfailures\n  turn 1 at /1: server_gone, the server said: Straydog's worker exited (exit code 0xC0000017 STATUS_NO_MEMORY: out of memory)\n  turn 1 at /1: unfinished\n"), "{said}");
         // A run that did not fail has no such section.
         assert!(!report(&text(&lines[..2]), None).contains("failures"));
+    }
+
+    #[test]
+    fn later_connections_and_warmups_do_not_extend_an_unfinished_turn() {
+        let mut lines = vec![
+            json!({"t":"2026-11-05T08:00:00Z","turn":1,"ev":"connection","what":"connect","ms":20,"outcome":"ok"}),
+            json!({"t":"2026-11-05T10:00:00Z","turn":1,"ev":"turn_start"}),
+            json!({"t":"2026-11-05T10:00:02Z","turn":1,"ev":"tool","name":"read_file","ms":100}),
+            json!({"t":"2026-11-05T12:00:00Z","turn":1,"ev":"connection","what":"connect","ms":50,"outcome":"error:no_answer"}),
+            json!({"t":"2026-11-05T12:00:05Z","turn":1,"ev":"request","role":"warm","ms":5000}),
+        ];
+        let unfinished = summary(&text(&lines));
+        assert!(unfinished.turns[0].unfinished);
+        assert_eq!(unfinished.total().wall_ms, 2000);
+        assert_eq!(summary(&text(&lines[..2])).total().wall_ms, 0);
+        assert!(report(&text(&lines), None).contains("error:no_answer"));
+        lines.push(json!({"t":"2026-11-05T12:00:10Z","turn":1,"ev":"turn_end","ms":12345}));
+        assert_eq!(summary(&text(&lines)).total().wall_ms, 12345);
     }
 
     #[test]
@@ -1184,7 +1207,7 @@ mod tests {
         assert!(said.contains("a.rs came back to the state it had after /3 (hash 111111111111), at /5"), "{said}");
         assert!(said.contains("read_file called again with the same arguments (hash same), nothing edited between: at /7"), "{said}");
         assert!(said.contains("3 failed calls in a row, the longest run ending at /12"), "{said}");
-        assert!(said.contains("no turn_end recorded, timed through the last event"), "{said}");
+        assert!(said.contains("no turn_end recorded, timed through the last turn event"), "{said}");
     }
 
     /// A program's loop calls a tool again by design (here a page timed four times): that is not going round. A call again from the model's next step is.
