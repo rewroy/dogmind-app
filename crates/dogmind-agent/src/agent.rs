@@ -451,7 +451,8 @@ struct WritingCall {
     index: usize,
     name: String,
     pending: String,
-    told: bool,
+    name_sent: bool,
+    arguments_sent: bool,
 }
 
 impl StreamMeter {
@@ -474,7 +475,7 @@ impl StreamMeter {
 
     fn call(&mut self, index: usize) -> &mut WritingCall {
         let place = self.calls.iter().position(|call| call.index == index).unwrap_or_else(|| {
-            self.calls.push(WritingCall { index, name: String::new(), pending: String::new(), told: false });
+            self.calls.push(WritingCall { index, name: String::new(), pending: String::new(), name_sent: false, arguments_sent: false });
             self.calls.len() - 1
         });
         &mut self.calls[place]
@@ -495,8 +496,10 @@ impl StreamMeter {
         let mut events = Vec::new();
         let time_for_pieces = now.duration_since(self.writing_told) >= Self::WRITING_EVERY;
         for call in &mut self.calls {
-            if !call.name.is_empty() && (!call.told || (time_for_pieces && !call.pending.is_empty())) {
-                call.told = true;
+            let has_arguments = !call.pending.is_empty();
+            if !call.name.is_empty() && (!call.name_sent || (has_arguments && (!call.arguments_sent || time_for_pieces))) {
+                call.name_sent = true;
+                call.arguments_sent |= has_arguments;
                 events.push(Event::ToolWriting { index: call.index, tool: call.name.clone(), piece: std::mem::take(&mut call.pending) });
             }
         }
@@ -7702,6 +7705,23 @@ note: the helper took")), "{log:?}");
         fn shows_calls_as_written(&self) -> bool {
             self.streams
         }
+    }
+
+    #[test]
+    fn first_argument_bytes_reach_the_window_without_waiting_for_another_delta() {
+        let start = Instant::now();
+        let mut meter = StreamMeter::new(0, start);
+        for index in [0, 1] {
+            meter.call(index).name = "read_file".into();
+            assert!(matches!(meter.due(start, 100).as_slice(), [Event::ToolWriting { index: at, piece, .. }] if *at == index && piece.is_empty()));
+            meter.call(index).pending.push_str(r#"{"path":"file.rs""#);
+            assert!(matches!(meter.due(start, 100).as_slice(), [Event::ToolWriting { index: at, piece, .. }] if *at == index && piece == r#"{"path":"file.rs""#));
+            meter.call(index).pending.push('}');
+            assert!(meter.due(start, 100).is_empty(), "later fragments are still batched");
+        }
+        let rest = meter.due(start + StreamMeter::WRITING_EVERY, 100);
+        assert_eq!(rest.len(), 2);
+        assert!(rest.iter().all(|event| matches!(event, Event::ToolWriting { piece, .. } if piece == "}")));
     }
 
     #[test]
