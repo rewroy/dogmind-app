@@ -559,7 +559,18 @@ pub fn command_lines(output: &str) -> (usize, Vec<String>) {
 
 /// What a diff changed, without its file names.
 pub fn diff_lines(text: &str) -> Vec<&str> {
-    dogmind_agent::tools::diff_lines_without_file_headers(text).map(|line| line.strip_suffix('\r').unwrap_or(line)).collect()
+    let lines = text.lines().map(|line| {
+        // The tool can cut a hunk in two. Show the omission as a note between the pieces.
+        if let Some(note) = line.strip_prefix("--- ").and_then(|s| s.strip_suffix(" ---")) {
+            if let Some((count, rest)) = note.strip_prefix("truncated: ").and_then(|s| s.split_once(" bytes left out")) {
+                if count.parse::<usize>().is_ok() && (rest.is_empty() || rest.starts_with("; ")) {
+                    return note;
+                }
+            }
+        }
+        line
+    });
+    dogmind_agent::tools::diff_lines_without_file_headers(lines).collect()
 }
 
 /// What a call that went well keeps for when its run is opened.
@@ -871,6 +882,8 @@ mod tests {
     fn header_like_content_stays_in_saved_patch_output() {
         let diff = "--- a/one\n+++ b/one\n@@ -1 +1 @@\n--- old\n+++ new\n--- a/two\n+++ b/two\n@@ -0,0 +1 @@\n+++ another\n";
         assert_eq!(kept_output("apply_patch", diff), ["@@ -1 +1 @@", "--- old", "+++ new", "@@ -0,0 +1 @@", "+++ another"]);
+        let capped = "--- applied_diff doc ---\n@@ -1,6 +1,6 @@\n--- old\n--- truncated: 128 bytes left out ---\n+last\n";
+        assert_eq!(kept_output("apply_patch", capped), ["@@ -1,6 +1,6 @@", "--- old", "truncated: 128 bytes left out", "+last"]);
     }
 
     #[test]

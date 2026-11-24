@@ -2213,7 +2213,7 @@ impl FileChange {
 
     fn counted(path: String, diff: String) -> FileChange {
         let (mut added, mut removed) = (0, 0);
-        for line in diff_lines_without_file_headers(&diff) {
+        for line in diff_lines_without_file_headers(diff.split_terminator('\n')) {
             match line.as_bytes().first() {
                 Some(b'+') => added += 1,
                 Some(b'-') => removed += 1,
@@ -2226,9 +2226,9 @@ impl FileChange {
 
 /// Omit file headers and keep the original carriage returns. In a hunk, even
 /// `--- old` and `+++ new` are content. Its two ranges tell where headers can resume.
-pub fn diff_lines_without_file_headers(diff: &str) -> impl Iterator<Item = &str> {
+pub fn diff_lines_without_file_headers<'a>(lines: impl Iterator<Item = &'a str>) -> impl Iterator<Item = &'a str> {
     let mut remaining = 0usize;
-    diff.split_terminator('\n').filter(move |&line| {
+    lines.filter(move |&line| {
         if let Some(header) = line.strip_prefix("@@ -") {
             let ranges = header.split_once(" @@").and_then(|(ranges, _)| ranges.split_once(" +"));
             let length = |range: &str| range.split_once(',').map_or(Some(1), |(_, count)| count.parse::<usize>().ok());
@@ -2237,7 +2237,8 @@ pub fn diff_lines_without_file_headers(diff: &str) -> impl Iterator<Item = &str>
         }
         if remaining > 0 {
             match line.as_bytes().first() {
-                Some(b' ') => remaining = remaining.saturating_sub(2),
+                // Git can omit the context prefix on an empty line (diff.suppressBlankEmpty).
+                Some(b' ') | None => remaining = remaining.saturating_sub(2),
                 Some(b'+' | b'-') => remaining -= 1,
                 Some(b'\\') => {} // The no-newline marker consumes neither side.
                 _ => remaining = 0,
@@ -4324,7 +4325,7 @@ mod change_tests {
     fn header_like_content_counts_as_file_changes() {
         let change = FileChange::between("notes.patch", Some("-- old\n---\n"), Some("++ new\n+++\n"));
         assert_eq!((change.added, change.removed), (2, 2));
-        let diff = "diff --git a/notes.patch b/notes.patch\n--- a/notes.patch\n+++ b/notes.patch\n@@ -1 +1 @@\n--- a/old\n+++ b/new\n";
+        let diff = "diff --git a/notes.patch b/notes.patch\n--- a/notes.patch\n+++ b/notes.patch\n@@ -1,2 +1,2 @@\n\n--- a/old\n+++ b/new\n";
         let changes = split_git_diff(diff);
         assert_eq!((&changes[0].path[..], changes[0].added, changes[0].removed), ("notes.patch", 1, 1));
     }

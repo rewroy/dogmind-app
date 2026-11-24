@@ -3,7 +3,7 @@
 
 use crate::highlight::{self, Kind};
 use crate::lang::t;
-use dogmind_agent::tools::diff_lines_without_file_headers as diff_lines;
+use dogmind_agent::tools::diff_lines_without_file_headers;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
@@ -48,6 +48,11 @@ fn drawn(line: &str, show_tabs: bool) -> String {
     } else {
         text
     }
+}
+
+// Keep the carriage returns so an edit to a line ending stays visible.
+fn diff_lines(diff: &str) -> impl Iterator<Item = &str> {
+    diff_lines_without_file_headers(diff.split_terminator('\n'))
 }
 
 /// A line of the diff, and what is told of it by the one it is set against.
