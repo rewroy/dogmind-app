@@ -1600,16 +1600,19 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
         return Err(format!("{} is too large to read here, at {} MB: use a command that reads just the part you need", path.display(), size / 1_048_576));
     }
     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let Some((text, encoding)) = text_of_file(&bytes) else {
+    let Some((text, encoding)) = readable_file_text(&bytes) else {
         return Err(format!("{} is binary: unsupported binaries are refused", path.display()));
     };
     let hash = sha16(&bytes);
     let text = if encoding == "utf-8" { text.strip_prefix('\u{feff}').unwrap_or(&text) } else { &text };
-    let lines: Vec<&str> = text.lines().collect();
     // A large file asked for with no place in it: where its parts begin, to read the one wanted, and not its first 500 lines, which stay
     // in the context for the rest of the conversation whether they were the part or not.
     let placed = arguments.get("start_line").is_some() || arguments.get("limit").is_some();
-    if !placed && (lines.len() > OUTLINE_PAST || text.len() > MAX_READ) {
+    // As in str::lines, a trailing newline terminates the last line.
+    let line_count = memchr::memchr_iter(b'\n', text.as_bytes()).count()
+        + usize::from(!text.is_empty() && !text.ends_with('\n'));
+    if !placed && (line_count > OUTLINE_PAST || text.len() > MAX_READ) {
+        let lines: Vec<_> = text.lines().collect();
         let parts = outline(&lines);
         if !parts.is_empty() {
             return Ok((outlined(&lines, &parts, size), (path, hash)));
@@ -1617,15 +1620,16 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
     }
     let limit = arguments.get("limit").and_then(Value::as_i64).unwrap_or(READ_LINES as i64).clamp(1, READ_LINES as i64) as usize;
     let start = arguments.get("start_line").and_then(Value::as_i64).unwrap_or(1);
-    let first = if start < 0 { lines.len().saturating_sub(start.unsigned_abs() as usize) } else { (start.max(1) as usize) - 1 };
+    let first = if start < 0 { line_count.saturating_sub(start.unsigned_abs() as usize) } else { (start.max(1) as usize) - 1 };
     // (the guard on edits keeps its own hash: the model has no use for one)
     let mut out = if encoding == "utf-8" { String::new() } else { format!("--- encoding={encoding} ---\n") };
-    if first >= lines.len() {
+    if first >= line_count {
         // (nothing below this line could mean a file that ends here or a read that went past it)
-        out.push_str(&if lines.is_empty() { "--- the file is empty ---\n".to_string() } else { format!("--- the file has only {} lines ---\n", lines.len()) });
+        out.push_str(&if line_count == 0 { "--- the file is empty ---\n".to_string() } else { format!("--- the file has only {} lines ---\n", line_count) });
+        return Ok((out, (path, hash)));
     }
     let mut next = first;
-    for (at, line) in lines.iter().enumerate().skip(first).take(limit) {
+    for (at, line) in text.lines().enumerate().skip(first).take(limit) {
         let shown = if line.len() > MAX_LINE {
             let mut cut = MAX_LINE;
             while !line.is_char_boundary(cut) {
@@ -1633,7 +1637,7 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
             }
             format!("{}... ({} more bytes on this line)", &line[..cut], line.len() - cut)
         } else {
-            (*line).to_string()
+            line.to_string()
         };
         if out.len() + shown.len() > MAX_READ && next > first {
             break;
@@ -1641,8 +1645,8 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
         out.push_str(&format!("{}|{shown}\n", at + 1));
         next = at + 1;
     }
-    if next > first && next < lines.len() {
-        out.push_str(&format!("--- {} more lines; continue with start_line={} ---\n", lines.len() - next, next + 1));
+    if next > first && next < line_count {
+        out.push_str(&format!("--- {} more lines; continue with start_line={} ---\n", line_count - next, next + 1));
     }
     Ok((out, (path, hash)))
 }

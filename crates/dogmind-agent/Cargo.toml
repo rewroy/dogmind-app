@@ -12,6 +12,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 flate2 = "1"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+memchr = "2"
 native-tls = "0.2"
 regex = "1"
 ring = "0.17"
