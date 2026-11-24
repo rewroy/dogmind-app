@@ -1141,6 +1141,8 @@ struct PictureBlock {
     /// The pictures a call gave the model, with whether they are shown: a line with their number stands over them, and they are put away until it is pressed. None: a
     /// message's or an answer's, shown as they are.
     fold: Option<bool>,
+    /// How wide the line that says how many is, in twips, as `pictures_row_width` takes it: 0 without one.
+    words: i32,
     /// Where its row is in the transcript, and what it was made with, to make it again at another height.
     span: (i32, i32),
     width: i32,
@@ -1172,8 +1174,17 @@ fn user_card_width(column: i32, dpi: u32, words: i32, sizes: &[(i32, i32)]) -> i
     wanted.max(pictures).clamp(800, most)
 }
 
-/// How wide the row of a call's pictures is while they are put away: room for the line that says how many, and no more.
-const PICTURES_SHUT_WIDTH: i32 = 1800;
+/// The room after the words of the line over a call's pictures, in design pixels: as much as the chevron has before it, so the shade under the line is even at its ends.
+const PICTURES_LINE_END: i32 = 10;
+
+/// How wide the row of a call's pictures is, and the line over them that says how many, in twips. `words`: the line's chevron, words and room after them. Shut, the row
+/// is the line and its padding, and no more; open, it is the pictures' `width`, or the line's where that is wider. No row is wider than the `column`, and the line is cut to
+/// the inside of its row: the shade under it never goes past the card.
+fn pictures_row_width(width: i32, words: i32, open: bool, column: i32) -> (i32, i32) {
+    let least = words + 2 * PICTURES_ACROSS;
+    let row = if open { width.max(least) } else { least }.min(column);
+    (row, words.min(row - 2 * PICTURES_ACROSS).max(0))
+}
 
 /// A small copy, and when it was last asked for.
 struct KeptThumb {
@@ -4940,10 +4951,11 @@ impl App {
         let fold = folds.then(|| self.pictures_opened.contains(&paths));
         let height = self.pictures_height(&tiles, alone, fold);
         let back = if right { theme::user_back() } else { theme::code_back() };
-        let shown_width = if fold == Some(false) { width.min(PICTURES_SHUT_WIDTH) } else { width };
+        let words = if folds { self.pictures_words(paths.len()) } else { 0 };
+        let shown_width = fold.map_or(width, |open| pictures_row_width(width, words, open, self.text_twips).0);
         let span = self.insert_rtf_span(rtf::spacer_row(shown_width, self.text_twips, height, back, (PICTURES_ACROSS, PICTURES_DOWN), right), None);
         let start = text_start(self.transcript, span.0);
-        self.picture_blocks.push(PictureBlock { start, paths, tiles, fold, span, width, alone, right });
+        self.picture_blocks.push(PictureBlock { start, paths, tiles, fold, words, span, width, alone, right });
         // (a message's card begins at its pictures, whether words follow them or not)
         if alone || right {
             self.user_cards.push(UserCard { start, kind: if right { CardKind::Person } else { CardKind::Block }, shape: None, looked_at: None });
@@ -4965,6 +4977,13 @@ impl App {
         line + shown + if alone { 2 * PICTURES_DOWN } else { PICTURES_DOWN }
     }
 
+    /// How wide the line over `count` pictures a call gave the model is, in twips: its chevron, its words as they are drawn, and the room after them.
+    unsafe fn pictures_words(&self, count: usize) -> i32 {
+        let pixels = scale(self.dpi, ds::size::ICON) + scale(self.dpi, ds::space::S) + text_width(self.fonts.small, &tf("{0} pictures", &[&count])) + scale(self.dpi, PICTURES_LINE_END);
+        // (rounded up, so the line made again in pixels is not narrower than its words)
+        ((i64::from(pixels) * 1440 + i64::from(self.dpi) - 1) / i64::from(self.dpi)) as i32
+    }
+
     /// A call's pictures shown or put away where they stand. The row is made again at its new height in its place: it is as many characters as it was, so that
     /// nothing after it moves in the text, and the view stays where it is.
     unsafe fn toggle_pictures(&mut self, at: usize) {
@@ -4979,7 +4998,7 @@ impl App {
         let block = &self.picture_blocks[at];
         let height = self.pictures_height(&block.tiles, block.alone, Some(open));
         let back = if block.right { theme::user_back() } else { theme::code_back() };
-        let shown_width = if open { block.width } else { block.width.min(PICTURES_SHUT_WIDTH) };
+        let shown_width = pictures_row_width(block.width, block.words, open, self.text_twips).0;
         let row = rtf::spacer_row(shown_width, self.text_twips, height, back, (PICTURES_ACROSS, PICTURES_DOWN), block.right);
         let (first, last) = block.span;
         let edit = self.transcript;
@@ -5676,8 +5695,11 @@ impl App {
             }
             // (a call's: the line that says how many, and the pictures under it when they are shown)
             let line = if block.fold.is_some() { (i64::from(PICTURES_LINE) * i64::from(dpi) / 1440) as i32 } else { 0 };
-            if block.fold.is_some() {
-                found.push(OverlayHit { area: picture_area(point, (0, 0), (scale(dpi, 160), line), dpi), key: OverlayKey::Pictures(at) });
+            if let Some(open) = block.fold {
+                // (as wide as its words, inside its row's padding: the shade under it stays in the card)
+                let words = pictures_row_width(block.width, block.words, open, self.text_twips).1;
+                let across = (i64::from(words) * i64::from(dpi) / 1440) as i32;
+                found.push(OverlayHit { area: picture_area(point, (0, 0), (across, line), dpi), key: OverlayKey::Pictures(at) });
             }
             if block.fold == Some(false) {
                 continue;
@@ -19314,6 +19336,26 @@ mod tests {
         assert_eq!(waiting_words("a\nb", 0), "a");
         assert_eq!(waiting_words("a", 2), format!("a  ·  {}", tf("{0} pictures", &[&2])));
         assert_eq!(waiting_words("", 1), tf("{0} pictures", &[&1]));
+    }
+
+    #[test]
+    fn the_line_over_a_call_s_pictures_stays_inside_its_row() {
+        let (words, column) = (1500, 9000);
+        // Shut, the row is the line and its padding: the line's shade ends where the row's padding begins.
+        assert_eq!(pictures_row_width(5000, words, false, column), (words + 2 * PICTURES_ACROSS, words));
+        // Open, the row is the pictures' width, or the line's where a small picture is narrower than the line.
+        assert_eq!(pictures_row_width(5000, words, true, column), (5000, words));
+        assert_eq!(pictures_row_width(800, words, true, column), (words + 2 * PICTURES_ACROSS, words));
+        // In a column narrower than the line, the row is the column and the line is cut to its inside.
+        assert_eq!(pictures_row_width(800, words, false, 1200), (1200, 1200 - 2 * PICTURES_ACROSS));
+        assert_eq!(pictures_row_width(800, words, false, 300), (300, 0));
+        // A line of any width, shut or open, is inside its row's padding.
+        for words in [0, 400, 1400, 2600, 8800] {
+            for open in [false, true] {
+                let (row, line) = pictures_row_width(2000, words, open, column);
+                assert!(line + 2 * PICTURES_ACROSS <= row, "{words} {open}: {line} in {row}");
+            }
+        }
     }
 
     #[test]
