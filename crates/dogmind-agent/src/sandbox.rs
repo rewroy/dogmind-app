@@ -1875,14 +1875,88 @@ pub(crate) unsafe fn grant(path: &Path, sid: PSID, mask: u32, inherit: bool) -> 
     Ok(())
 }
 
-/// Folders commands may read and run from besides the toolchains: a skill's scripts, once it is in use.
-static ALSO_READABLE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// Folders commands may read and run from besides the toolchains: a skill's scripts, once it is in use. Each with where it really was when it was
+/// opened: one that leads elsewhere since, a junction a program put in its place or on its way, would take the grant of the next command to its end.
+static ALSO_READABLE: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
 
 pub fn also_readable(folder: &Path) {
+    let Some(real) = crate::safety::real_path(folder) else { return };
     let mut folders = ALSO_READABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !folders.iter().any(|known| key(known) == key(folder)) {
-        folders.push(folder.to_path_buf());
+    if !folders.iter().any(|(known, _)| key(known) == key(folder)) {
+        folders.push((folder.to_path_buf(), real));
     }
+}
+
+/// The path a handle has, as `safety::real_path` spells one: with no `\\?\` in front.
+unsafe fn final_path(handle: HANDLE) -> Option<PathBuf> {
+    let mut text = vec![0u16; 4096];
+    let length = GetFinalPathNameByHandleW(handle, text.as_mut_ptr(), text.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) as usize;
+    if length == 0 || length >= text.len() {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&text[..length]);
+    Some(PathBuf::from(match path.strip_prefix("\\\\?\\UNC\\") {
+        Some(share) => format!("\\\\{share}"),
+        None => path.strip_prefix("\\\\?\\").unwrap_or(&path).to_string(),
+    }))
+}
+
+/// `grant` of a folder opened to commands, inherited by what is in it, by a handle opened on the folder itself, with no link or junction followed:
+/// granted only where that handle is no link or junction and is where the folder really was when it was opened (`real`). Between the look and the
+/// grant there is no other way then for it to lead, as there was by its name.
+unsafe fn grant_where_it_was(folder: &Path, real: &Path, sid: PSID, mask: u32) -> Result<(), String> {
+    let memo = (format!("{}|{}", sid_text(sid), key(folder)), mask, true);
+    if GRANTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashSet::new).contains(&memo) {
+        return Ok(());
+    }
+    let name = wide_path(folder);
+    if !has_grant(&name, sid, mask, true) {
+        let handle = Handle(CreateFileW(name.as_ptr(), WRITE_DAC | READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut()));
+        if handle.0 == INVALID_HANDLE_VALUE {
+            return Err(last_error(&folder.display().to_string()));
+        }
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(handle.0, &mut info) == 0 {
+            return Err(last_error(&folder.display().to_string()));
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!("{}: a link or a junction", folder.display()));
+        }
+        if final_path(handle.0).as_deref() != Some(real) {
+            return Err(format!("{}: it leads elsewhere than when it was opened", folder.display()));
+        }
+        let (mut old, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let read = GetSecurityInfo(handle.0, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), &mut old, std::ptr::null_mut(), &mut descriptor);
+        if read != 0 {
+            return Err(format!("{}: its access list cannot be read (error {read})", folder.display()));
+        }
+        let mut access: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        access.grfAccessPermissions = mask;
+        access.grfAccessMode = GRANT_ACCESS;
+        access.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        access.Trustee.ptstrName = sid as *mut u16;
+        let mut new: *mut ACL = std::ptr::null_mut();
+        let merged = SetEntriesInAclW(1, &access, old, &mut new);
+        let written = if merged != 0 { merged } else { SetSecurityInfo(handle.0, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), new, std::ptr::null()) };
+        if !new.is_null() {
+            LocalFree(new as HLOCAL);
+        }
+        LocalFree(descriptor as HLOCAL);
+        if written != 0 {
+            return Err(format!("{}: access could not be set (error {written})", folder.display()));
+        }
+    }
+    GRANTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashSet::new).insert(memo);
+    Ok(())
+}
+
+/// Whether a folder opened to commands is still where it was when it was opened: the same place through links, and no link or junction on its way.
+fn still_where_it_was(folder: &Path, real: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    let leads_elsewhere = |place: &Path| std::fs::symlink_metadata(place).is_ok_and(|found| found.file_type().is_symlink() || found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0);
+    crate::safety::real_path(folder).as_deref() == Some(real) && !folder.ancestors().any(leads_elsewhere)
 }
 
 /// What of the app's folder stays closed to commands, whatever of it is opened ([`records_readable`]): the settings, which may hold a key, and what was set aside of them,
@@ -2502,8 +2576,14 @@ unsafe fn prepare(workspace: &Path, sid: PSID, writer: PSID, disarmed: &mut Vec<
         return Err(if disarmed.is_empty() { refusal } else { format!("{refusal}. The app also did this, in a repository made since the last command: {}", disarmed.join(" ")) });
     }
     let began = Instant::now();
-    for folder in ALSO_READABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter() {
-        let _ = grant(folder, sid, READ_EXECUTE, true);
+    let mut opened = ALSO_READABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // (one that leads elsewhere now than when it was opened is let go and not granted; one in the workspace is readable already)
+    opened.retain(|(folder, real)| still_where_it_was(folder, real));
+    for (folder, real) in opened.iter().filter(|(folder, _)| !crate::safety::inside(workspace, folder)) {
+        // (by a handle on the folder itself, looked at once more: between the look above and the grant, a program could put a junction in its place)
+        if grant_where_it_was(folder, real, sid, READ_EXECUTE).is_err() {
+            continue;
+        }
         for ancestor in folder.ancestors().skip(1).filter(|above| above.parent().is_some()) {
             let _ = grant(ancestor, sid, FILE_GENERIC_EXECUTE, false);
         }
@@ -4024,6 +4104,45 @@ mod tests {
         assert!(made.status.success(), "{}", decode(&made.stdout));
         // SAFETY: as above.
         assert!(unsafe { made_for_sandbox(&link, profile_sid().unwrap()) }.is_err());
+    }
+
+    /// A skill's folder opened to commands, made a junction to a place outside since (as a program in the sandbox could): the next commands, in the
+    /// container and with the restricted token, are not granted its end, and the folder is let go. Its scripts are read as before until then. And the
+    /// grant by the handle itself refuses a junction, and a folder that leads elsewhere than it did.
+    #[test]
+    fn a_folder_opened_to_commands_and_made_a_junction_since_is_not_granted() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (work, skill, target) = (work_folder("opened-swap-work"), outside_folder("opened-swap-skill"), outside_folder("opened-swap-target"));
+        std::fs::write(skill.join("script.txt"), "SKILL-SCRIPT\n").unwrap();
+        std::fs::write(target.join("secret.txt"), "SECRET\n").unwrap();
+        also_readable(&skill);
+        let out = command(&format!("type \"{}\"", skill.join("script.txt").display()), &work, false);
+        assert!(decode(&out.stdout).contains("SKILL-SCRIPT"), "{:?} {}", out.status, decode(&out.stderr));
+        std::fs::remove_dir_all(&skill).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&skill).arg(&target).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        let out = command(&format!("type \"{}\"", skill.join("secret.txt").display()), &work, false);
+        assert!(!decode(&out.stdout).contains("SECRET"), "read through the junction: {}", decode(&out.stdout));
+        let _ = run_live_restricted("echo x", &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false), None).unwrap();
+        // SAFETY: the SID lives as long as the process; the list is read and let go.
+        let sid = unsafe { profile_sid() }.unwrap();
+        let list = unsafe { Dacl::read(&target) }.unwrap();
+        assert!(!list.aces.iter().any(|ace| unsafe { Dacl::is_allowed_for(ace, sid) }), "no grant at the junction's end");
+        assert!(!ALSO_READABLE.lock().unwrap().iter().any(|(folder, _)| key(folder) == key(&skill)), "let go");
+        // SAFETY: as above.
+        // (a junction granted nothing before, and so not in the memo of what was granted, which never writes again)
+        let link = outside_folder("opened-swap-link");
+        std::fs::remove_dir_all(&link).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&target).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        unsafe {
+            assert!(grant_where_it_was(&link, &target, sid, READ_EXECUTE).is_err(), "a junction, even to where it was");
+            let other = outside_folder("opened-swap-other");
+            assert!(grant_where_it_was(&other, &target, sid, READ_EXECUTE).is_err(), "a folder that is not where it was");
+            assert!(grant_where_it_was(&other, &other, sid, READ_EXECUTE).is_ok(), "and one that is");
+        }
     }
 
     #[test]
