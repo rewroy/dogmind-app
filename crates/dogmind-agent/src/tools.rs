@@ -1604,49 +1604,77 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
     };
     let hash = sha16(&bytes);
     let text = if encoding == "utf-8" { text.strip_prefix('\u{feff}').unwrap_or(&text) } else { &text };
-    // A large file asked for with no place in it: where its parts begin, to read the one wanted, and not its first 500 lines, which stay
+    // A large file asked for with no place in it: where its parts begin, to read the one wanted, and not a full first page, which stays
     // in the context for the rest of the conversation whether they were the part or not.
     let placed = arguments.get("start_line").is_some() || arguments.get("limit").is_some();
     // As in str::lines, a trailing newline terminates the last line.
     let line_count = memchr::memchr_iter(b'\n', text.as_bytes()).count()
         + usize::from(!text.is_empty() && !text.ends_with('\n'));
+    let mut out = if encoding == "utf-8" { String::new() } else { format!("--- encoding={encoding} ---\n") };
     if !placed && (line_count > OUTLINE_PAST || text.len() > MAX_READ) {
         let parts = outline(text);
         if !parts.is_empty() {
-            return Ok((outlined(text, line_count, &parts, size), (path, hash)));
+            return Ok((outlined(text, line_count, &parts, size, &out), (path, hash)));
         }
     }
     let limit = arguments.get("limit").and_then(Value::as_i64).unwrap_or(READ_LINES as i64).clamp(1, READ_LINES as i64) as usize;
     let start = arguments.get("start_line").and_then(Value::as_i64).unwrap_or(1);
     let first = if start < 0 { line_count.saturating_sub(start.unsigned_abs() as usize) } else { (start.max(1) as usize) - 1 };
     // (the guard on edits keeps its own hash: the model has no use for one)
-    let mut out = if encoding == "utf-8" { String::new() } else { format!("--- encoding={encoding} ---\n") };
     if first >= line_count {
         // (nothing below this line could mean a file that ends here or a read that went past it)
         out.push_str(&if line_count == 0 { "--- the file is empty ---\n".to_string() } else { format!("--- the file has only {} lines ---\n", line_count) });
         return Ok((out, (path, hash)));
     }
-    let mut next = first;
-    for (at, line) in text.lines().enumerate().skip(first).take(limit) {
-        let shown = if line.len() > MAX_LINE {
-            let mut cut = MAX_LINE;
-            while !line.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            format!("{}... ({} more bytes on this line)", &line[..cut], line.len() - cut)
-        } else {
-            line.to_string()
-        };
-        if out.len() + shown.len() > MAX_READ && next > first {
-            break;
-        }
-        out.push_str(&format!("{}|{shown}\n", at + 1));
-        next = at + 1;
-    }
+    let next = append_read_page(&mut text.lines().skip(first).peekable(), first, limit, &mut out);
     if next > first && next < line_count {
         out.push_str(&format!("--- {} more lines; continue with start_line={} ---\n", line_count - next, next + 1));
     }
     Ok((out, (path, hash)))
+}
+
+/// Append one page to its encoding header. Leave the first line of the next page in the iterator.
+fn append_read_page<'a>(lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>, first: usize, limit: usize, out: &mut String) -> usize {
+    use std::fmt::Write;
+    let mut next = first;
+    while next - first < limit {
+        let Some(&line) = lines.peek() else { break };
+        let shown = if line.len() > MAX_LINE {
+            let cut = line.floor_char_boundary(MAX_LINE);
+            Cow::Owned(format!("{}... ({} more bytes on this line)", &line[..cut], line.len() - cut))
+        } else {
+            Cow::Borrowed(line)
+        };
+        if next > first && out.len() + shown.len() > MAX_READ {
+            break;
+        }
+        lines.next();
+        next += 1;
+        let _ = writeln!(out, "{next}|{shown}");
+    }
+    next
+}
+
+/// Count short reads using the same pages we send. For large jobs give a proven lower bound
+/// without formatting the entire file just to show the outline.
+fn outline_read_count(text: &str, line_count: usize, header: &str) -> String {
+    const COUNT_UP_TO: usize = 8;
+    let minimum = line_count.div_ceil(READ_LINES);
+    if minimum > COUNT_UP_TO {
+        return format!("at least {minimum} reads");
+    }
+    let mut lines = text.lines().peekable();
+    let mut page = String::new();
+    let mut first = 0;
+    for count in 1..=COUNT_UP_TO {
+        page.clear();
+        page.push_str(header);
+        first = append_read_page(&mut lines, first, READ_LINES, &mut page);
+        if first == line_count {
+            return if count == 1 { "1 read".into() } else { format!("{count} reads") };
+        }
+    }
+    format!("at least {} reads", COUNT_UP_TO + (line_count - first).div_ceil(READ_LINES))
 }
 
 /// Where a file's parts begin, by line: functions, types, classes, sections, in the languages a project is mostly written in. Empty
@@ -1685,13 +1713,13 @@ fn outline(text: &str) -> Vec<(usize, &str)> {
 }
 
 /// A large file, as its head and its outline: each part's first line with its number, to read with `start_line` and `limit`.
-fn outlined(text: &str, line_count: usize, parts: &[(usize, &str)], size: u64) -> String {
+fn outlined(text: &str, line_count: usize, parts: &[(usize, &str)], size: u64, header: &str) -> String {
     let shown = |line: &str| -> String { if line.len() > 160 { format!("{}…", &line[..line.floor_char_boundary(160)]) } else { line.to_string() } };
     // (and the way to all of it, for a task that needs all of it, such as summing a document up: a model given only the outline once took
     // the long way round, a helper that read it all again, 105 s of a 186-s task)
-    let reads = line_count.div_ceil(READ_LINES).max((size as usize).div_ceil(MAX_READ));
+    let reads = outline_read_count(text, line_count, header);
     let mut out = format!(
-        "--- {} lines, {} KB: more than to read whole at once. Its first lines, then where its parts begin. All of it is {reads} reads: read_file with start_line=1, then from where each one says to go on ---\n",
+        "--- {} lines, {} KB: first lines and outline. For all numbered lines ({reads}), use read_file with start_line=1, then follow each continuation. Lines over {MAX_LINE} bytes are shortened ---\n",
         line_count,
         size / 1024
     );
@@ -5360,6 +5388,20 @@ mod tests {
         assert_eq!(parts.last(), Some(&(2 * OUTLINE_MOST - 1, "# next")));
     }
 
+    #[test]
+    fn the_outline_counts_numbered_pages_instead_of_source_bytes() {
+        // Line numbers push this file over the second page's byte limit.
+        let text = format!("# note\n{}", format!("{}\n", "x".repeat(32)).repeat(3700));
+        assert_eq!(outline_read_count(&text, text.lines().count(), ""), "3 reads");
+        // A single long line is abbreviated by a ranged read.
+        let text = format!("# note\n{}\n", "語".repeat(MAX_READ));
+        assert_eq!(outline_read_count(&text, 2, ""), "1 read");
+        // Beyond the counting budget the wording promises only a lower bound.
+        assert_eq!(outline_read_count(&"row\n".repeat(20_001), 20_001, ""), "at least 11 reads");
+        let text = format!("{}\n", "x".repeat(MAX_LINE)).repeat(300);
+        assert_eq!(outline_read_count(&text, 300, ""), "at least 9 reads");
+    }
+
     /// A long file read with no place in it comes as its head and where its parts begin; asked for a place, it comes as lines, as before;
     /// a long file of no language the outline knows is read as lines too. One that fits in a read, a page of a thousand lines, comes whole.
     #[test]
@@ -5387,8 +5429,7 @@ mod tests {
         assert!(!out.contains("let v7 = x + 129;"), "the bodies are not in it");
         assert!(out.len() < 12000, "{}", out.len());
         // (and how to read all of it, where all of it is wanted: in reads of 2000 lines and 64 KB)
-        let reads = source.lines().count().div_ceil(READ_LINES).max(source.len().div_ceil(MAX_READ));
-        assert!(out.lines().next().unwrap().contains(&format!("All of it is {reads} reads: read_file with start_line=1")), "{}", out.lines().next().unwrap());
+        assert!(out.lines().next().unwrap().contains("all numbered lines (2 reads), use read_file with start_line=1"), "{}", out.lines().next().unwrap());
         // A place asked for is read as it was.
         let part = bench.run("read_file", &json!({"path": "big.rs", "start_line": 100, "limit": 5}), dir.path(), &cancel).unwrap();
         assert!(part.starts_with("100|") && !part.contains("outline"), "{part}");
