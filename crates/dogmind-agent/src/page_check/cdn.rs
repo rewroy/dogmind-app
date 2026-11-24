@@ -76,10 +76,30 @@ pub(super) fn allowed(address: &str) -> Result<String, String> {
     if tail.contains('?') && !QUERY_HOSTS.contains(&host) {
         return Err("a query, which this CDN's files do not need".into());
     }
-    if tail.split(['/', '?']).any(|part| part == "..") {
+    if tail.split(['/', '?']).any(dots_only) {
         return Err("a `..` in its path".into());
     }
     Ok(format!("https://{host}{}", if tail.is_empty() { "/" } else { tail }))
+}
+
+/// A part of a path that Windows opens as `.` or `..`: it drops a name's trailing dots and spaces, so `.. ` and `... ` are `..` to it, and a file kept
+/// along such a path would be written above the folder it is kept in.
+fn dots_only(part: &str) -> bool {
+    !part.is_empty() && part.trim_end_matches(['.', ' ']).is_empty()
+}
+
+/// Whether `path` is under `root`, as it is written: no part of it climbs (the parts are cleaned before, so none is a `..` that Windows would make one).
+fn under(root: &Path, path: &Path) -> bool {
+    path.starts_with(root) && !path.components().any(|part| part == std::path::Component::ParentDir)
+}
+
+/// A kept file as the index names it, where it is a file under the folder: relative, no part climbing or one Windows would open as `..`. The index is in
+/// the sandbox's temp, and a program there can write it.
+fn kept_file(root: &Path, file: &str) -> Option<PathBuf> {
+    let path = Path::new(file);
+    let plain = path.components().all(|part| matches!(part, std::path::Component::Normal(name) if !dots_only(&name.to_string_lossy())));
+    let file = root.join(path);
+    (plain && under(root, &file)).then_some(file)
 }
 
 /// `https://host/path?query` as its host, its path (with `/` first) and its query.
@@ -98,7 +118,8 @@ fn place(root: &Path, address: &str, kind: Kind) -> PathBuf {
     let (host, path, query) = parts(address);
     let mut place = root.join(host);
     let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty() && *part != ".").collect();
-    let clean = |part: &str| part.chars().map(|c| if "<>:\"|?*\\".contains(c) || c.is_control() { '_' } else { c }).collect::<String>();
+    // (a part Windows would open as `.` or `..` is `_`: the file stays where its host's folder is)
+    let clean = |part: &str| if dots_only(part) { "_".to_string() } else { part.chars().map(|c| if "<>:\"|?*\\".contains(c) || c.is_control() { '_' } else { c }).collect::<String>() };
     for part in segments.iter().take(segments.len().saturating_sub(1)) {
         place.push(clean(part));
     }
@@ -128,7 +149,7 @@ fn folder_place(root: &Path, address: &str) -> PathBuf {
     let (host, path, _) = parts(address);
     let mut place = root.join(host);
     for part in path.split('/').filter(|part| !part.is_empty() && *part != ".") {
-        place.push(part);
+        place.push(if dots_only(part) { "_".to_string() } else { part.chars().map(|c| if "<>:\"|?*\\".contains(c) || c.is_control() { '_' } else { c }).collect::<String>() });
     }
     place
 }
@@ -291,7 +312,15 @@ pub(super) fn for_page(html: &str, also: &[String], temp: &Path, get: &mut dyn F
         if !seen.insert(address.clone()) || seen.len() > MOST_FILES {
             continue;
         }
-        if let Some((file, names)) = index.files.get(&address).filter(|(file, _)| root.join(file).is_file()) {
+        // (an address from the index, which a program in the sandbox can write, is one to fetch only as any other is)
+        let address = match allowed(&address) {
+            Ok(address) => address,
+            Err(why) => {
+                fetched.refused.push((address, why));
+                continue;
+            }
+        };
+        if let Some((file, names)) = index.files.get(&address).filter(|(file, _)| kept_file(&root, file).is_some_and(|file| file.is_file())) {
             kept.insert(address.clone(), super::file_url(&root.join(file)));
             queue.extend(names.iter().cloned());
             continue;
@@ -348,15 +377,16 @@ pub(super) fn for_page(html: &str, also: &[String], temp: &Path, get: &mut dyn F
     }
     // (written once every file's place is known, each pointing at the others)
     for (_, at, kind, file, body) in &fresh {
-        let content = if *kind == Kind::Other { body.clone() } else { pointed(&String::from_utf8_lossy(body), at, *kind, &kept).into_bytes() };
-        if let Some(folder) = file.parent() {
-            let _ = std::fs::create_dir_all(folder);
+        // (nothing is written but under the folder the files are kept in, whatever an address came to, and nothing through a junction or a link a
+        // program in the sandbox put there)
+        if !under(&root, file) {
+            continue;
         }
-        let _ = std::fs::write(file, content);
+        let content = if *kind == Kind::Other { body.clone() } else { pointed(&String::from_utf8_lossy(body), at, *kind, &kept).into_bytes() };
+        let _ = crate::temp_writes::write(temp, file, content);
     }
     if !fresh.is_empty() {
-        let _ = std::fs::create_dir_all(&root);
-        let _ = std::fs::write(&index_file, serde_json::to_vec(&index).unwrap_or_default());
+        let _ = crate::temp_writes::write(temp, &index_file, serde_json::to_vec(&index).unwrap_or_default());
     }
     let mut html = html.to_string();
     for (written, whole) in &page_own {
@@ -378,9 +408,15 @@ pub(super) fn for_page(html: &str, also: &[String], temp: &Path, get: &mut dyn F
 
 /// One address, over the network: GET, no sign-in, its bytes up to `MOST_FILE`.
 pub(super) fn get(address: &str, cancel: &AtomicBool) -> Result<Got, String> {
-    let url = crate::http::Url::parse(address)?;
+    // (the CDNs alone, and only where their names lead off this machine and its network, as the web tools are)
+    let address = allowed(address)?;
+    let url = crate::http::Url::parse(&address)?;
+    let addresses: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(url.host.as_str(), url.port)).map_err(|error| format!("{}: {error}", url.host))?.collect();
+    if let Some(bad) = addresses.iter().find(|address| crate::web::blocked_address(address.ip())) {
+        return Err(format!("{} is at {}: this machine and its network are not fetched from", url.host, bad.ip()));
+    }
     let headers = vec![("User-Agent".to_string(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0 Safari/537.36".to_string()), ("Accept".to_string(), "*/*".to_string())];
-    let mut response = crate::http::request_within("GET", &url, &headers, CONNECT, cancel, EACH).map_err(|error| error.to_string())?;
+    let mut response = crate::http::request_at_within(&addresses, "GET", &url, &headers, CONNECT, cancel, EACH).map_err(|error| error.to_string())?;
     if response.header("content-encoding").is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity")) {
         return Err("a compressed answer".into());
     }
@@ -399,6 +435,21 @@ pub(super) fn get(address: &str, cancel: &AtomicBool) -> Result<Got, String> {
 mod tests {
     use super::*;
 
+    /// A place is under its root whatever an address came to: a part Windows would open as `..` is `_`, and `..%20` is a name.
+    #[test]
+    fn a_place_stays_under_its_root() {
+        let root = Path::new("C:\\temp\\dogmind-cdn");
+        for address in ["https://unpkg.com/.. /x.js", "https://unpkg.com/... /... /x.js", "https://unpkg.com/..%20/x.js", "https://unpkg.com/a/. /b.js"] {
+            let file = place(root, address, Kind::Script);
+            assert!(under(root, &file) && file.starts_with(root.join("unpkg.com")), "{address}: {}", file.display());
+            assert!(!file.components().any(|part| part.as_os_str().to_string_lossy().trim_end_matches(['.', ' ']).is_empty()), "{address}: {}", file.display());
+            let folder = folder_place(root, address);
+            assert!(under(root, &folder), "{address}: {}", folder.display());
+        }
+        assert!(!under(root, Path::new("C:\\temp\\dogmind-cdn\\..\\x.js")));
+        assert!(!under(root, Path::new("C:\\temp\\x.js")));
+    }
+
     #[test]
     fn only_the_cdns_over_https_with_a_query_only_where_one_is_needed() {
         assert_eq!(allowed("https://unpkg.com/three@0.160.0/build/three.module.js").unwrap(), "https://unpkg.com/three@0.160.0/build/three.module.js");
@@ -410,6 +461,12 @@ mod tests {
         assert!(allowed("https://user@unpkg.com/a.js").is_err());
         assert!(allowed("https://unpkg.com.evil.example/a.js").is_err());
         assert!(allowed("https://unpkg.com/../x").is_err());
+        // (Windows opens a part with trailing dots and spaces without them: `.. ` is `..`)
+        for climbing in ["https://unpkg.com/.. /x.js", "https://unpkg.com/... /x.js", "https://unpkg.com/. /x.js", "https://unpkg.com/a/.. /.. /x.js"] {
+            assert!(allowed(climbing).is_err(), "{climbing}");
+        }
+        assert!(allowed("https://unpkg.com/..%20/x.js").is_ok(), "a name with %20 in it, as written");
+        assert!(allowed("https://unpkg.com/a.b./x.js").is_ok(), "a name that ends in a dot is a name");
         assert!(allowed("file:///C:/x.js").is_err());
     }
 
@@ -470,6 +527,51 @@ mod tests {
         let again = for_page(html, &also, temp.path(), &mut none);
         assert_eq!(again.files, 4);
         assert_eq!(again.html, fetched.html);
+    }
+
+    /// The index is in the sandbox's temp, and a program there can write it: an entry naming an address off the CDNs is not fetched, and one whose file
+    /// climbs out of the folder is not used.
+    #[test]
+    fn what_the_index_says_is_fetched_and_used_only_as_any_address_and_file_are() {
+        let temp = crate::in_container::tempdir().unwrap();
+        let root = temp.path().join(FOLDER);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(temp.path().join("x.js"), "outside").unwrap();
+        let index = r#"{"files": {"https://unpkg.com/a.js": ["..\\x.js", ["http://127.0.0.1:9/x", "https://unpkg.com/b.js"]]}}"#;
+        std::fs::write(root.join("index.json"), index).unwrap();
+        let html = r#"<script src="https://unpkg.com/a.js"></script>"#;
+        let mut asked: Vec<String> = Vec::new();
+        let mut get = |address: &str| -> Result<Got, String> {
+            asked.push(address.to_string());
+            Ok(Got { status: 200, location: None, content_type: Some("text/javascript".into()), body: b"window.a = 1;".to_vec() })
+        };
+        let fetched = for_page(html, &[], temp.path(), &mut get);
+        assert!(!asked.iter().any(|address| address.contains("127.0.0.1")), "{asked:?}");
+        assert_eq!(asked, ["https://unpkg.com/a.js"], "the entry's file was not used, so it was fetched again");
+        assert!(!fetched.html.contains(&crate::page_check::file_url(&temp.path().join("x.js"))), "{}", fetched.html);
+        assert!(get_refuses_this_machine());
+    }
+
+    /// The fetch itself refuses what is not a CDN, and a name that leads to this machine or its network.
+    fn get_refuses_this_machine() -> bool {
+        let cancel = AtomicBool::new(false);
+        get("http://127.0.0.1:9/x.js", &cancel).is_err_and(|why| why.contains("not one of the CDNs"))
+    }
+
+    /// A folder under the CDN folder made a junction to a place outside (as a program in the sandbox could make one): nothing is written there.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_in_the_cdn_folder_is_not_written_through() {
+        let temp = crate::in_container::tempdir().unwrap();
+        let outside = crate::in_container::tempdir().unwrap();
+        let root = temp.path().join(FOLDER);
+        std::fs::create_dir_all(&root).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(root.join("unpkg.com")).arg(outside.path()).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stdout));
+        let html = r#"<script src="https://unpkg.com/a.js"></script>"#;
+        let mut get = |_: &str| -> Result<Got, String> { Ok(Got { status: 200, location: None, content_type: Some("text/javascript".into()), body: b"window.a = 1;".to_vec() }) };
+        for_page(html, &[], temp.path(), &mut get);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0, "nothing written outside");
     }
 
     #[test]

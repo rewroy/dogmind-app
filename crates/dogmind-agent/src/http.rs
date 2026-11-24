@@ -239,6 +239,11 @@ pub fn request_within<'a>(method: &str, url: &Url, headers: &[(String, String)],
     request_at_until(&addresses, method, url, headers, None, connect, cancel, Some(deadline))
 }
 
+/// As `request_within`, to the addresses given (looked up, and looked at, before): a caller that refuses some keeps the lookup it judged.
+pub fn request_at_within<'a>(addresses: &[SocketAddr], method: &str, url: &Url, headers: &[(String, String)], connect: Duration, cancel: &'a AtomicBool, within: Duration) -> Result<Response<'a>, Failure> {
+    request_at_until(addresses, method, url, headers, None, connect, cancel, Some(Instant::now() + within))
+}
+
 /// How long an address with others after it is given. Many machines have an IPv6 address and no IPv6 route, and a name's IPv6 addresses come first:
 /// they would take the whole of `connect`, for each of them, before the one that answers.
 const BEFORE_THE_NEXT_ADDRESS: Duration = Duration::from_millis(1500);
