@@ -4166,12 +4166,20 @@ impl Agent {
         let limit = self.image_limit();
         let limit = ImageLimit { side: limit.side.min(OWN_PICTURE_SIDE), ..limit };
         let before = images.len();
+        let mut missing = Vec::new();
         for path in said.lines().filter_map(picture_of_line) {
-            if let Ok(image) = images::attach_file(Path::new(&path)).and_then(|picture| images::save(&session, &picture, limit)) {
-                images.push(image);
+            match images::attach_file(Path::new(&path)).and_then(|picture| images::save(&session, &picture, limit)) {
+                Ok(image) => images.push(image),
+                Err(why) => missing.push(format!("{path}: {why}")),
             }
         }
-        if images.len() == before {
+        let attached = images.len() - before;
+        if !missing.is_empty() {
+            let total = attached + missing.len();
+            let missing = missing.join("\n");
+            return (Ok(format!("{said}Attached {attached} of {total} page pictures. Could not attach:\n{missing}\n")), images);
+        }
+        if attached == 0 {
             return (Ok(said), images);
         }
         (Ok(format!("{said}{PICTURES_SHOWN}\n")), images)
@@ -11034,6 +11042,35 @@ Body").unwrap();
             assert_eq!((kept.unwrap(), images.len()), (said.clone(), 0), "a model that cannot be shown one");
         }
         assert!(agent.with_check_pictures(Err("no such page".into()), Vec::new()).0.is_err());
+    }
+
+    #[test]
+    fn a_check_reports_the_pictures_it_could_not_attach() {
+        let (mut agent, _, _, dirs) = agent_holding(Vec::new(), 100_000, Vec::new());
+        agent.provider = Some(Arc::new(Scripted { tool_pictures: true, ..Scripted::default() }));
+        agent.session = Some(Session::create_under(&agent.policy, &agent.sessions, &agent.workspace, &now(), "20261122-000000").unwrap());
+        let desktop = dirs[0].path().join("desktop.png");
+        let mobile = dirs[0].path().join("mobile.png");
+        std::fs::write(&mobile, images::tests::encoded(12, 16, image::ImageFormat::Png)).unwrap();
+        let desktop_line = format!("How it looks at desktop (1280x800): `read_file` {}\n", desktop.display());
+        let mobile_line = format!("How it looks at mobile (390x844): `read_file` {}\n", mobile.display());
+        for lines in [format!("{desktop_line}{mobile_line}"), format!("{mobile_line}{desktop_line}")] {
+            let report = format!("Console: nothing, so no errors.\n{lines}");
+            let (said, images) = agent.with_check_pictures(Ok(report.clone()), Vec::new());
+            let said = said.unwrap();
+            assert_eq!(images.len(), 1);
+            assert_eq!((images[0].width, images[0].height), (12, 16));
+            assert!(!said.contains(PICTURES_SHOWN), "{said}");
+            let note = said.strip_prefix(&report).unwrap();
+            assert!(note.contains("1 of 2") && note.contains(desktop.to_string_lossy().as_ref()), "{note}");
+            agent.note_outcome("check_page", &serde_json::json!({"path": "index.html"}), &Ok(said));
+            assert!(!agent.polish.looked);
+        }
+        std::fs::write(&mobile, b"not an image").unwrap();
+        let (said, images) = agent.with_check_pictures(Ok(format!("{desktop_line}{mobile_line}")), Vec::new());
+        assert!(images.is_empty());
+        let said = said.unwrap();
+        assert!(said.contains("0 of 2") && !said.contains(PICTURES_SHOWN), "{said}");
     }
 
     #[test]
