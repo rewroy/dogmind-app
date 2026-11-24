@@ -2387,7 +2387,11 @@ fn show_diff(arguments: &Value, workspace: &Path, baseline: Option<&crate::basel
     if scope == "session" || !repository {
         let baseline = baseline.ok_or("this session has nothing to compare with yet: read the files themselves")?;
         let changes = baseline.changes(workspace, &paths);
-        return Ok(if changes.is_empty() { format!("no differences ({scope}): nothing has changed since this session began") } else { spill("diff", &changes, MAX_OUTPUT) });
+        if changes.is_empty() {
+            let within = if paths.is_empty() { "" } else { " in the requested paths" };
+            return Ok(format!("no differences ({scope}): nothing has changed{within} since this session began"));
+        }
+        return Ok(spill("diff", &changes, MAX_OUTPUT));
     }
     // (only what is under the workspace: a workspace that is a folder of a larger repository saw that repository's every change, which is
     // not its work and may be what its owner never meant to show)
@@ -4285,6 +4289,25 @@ mod power_tests {
 #[cfg(test)]
 mod change_tests {
     use super::*;
+
+    #[test]
+    fn session_diff_matches_path_components_and_scopes_its_empty_result() {
+        let work = crate::in_container::tempdir().unwrap();
+        let session = crate::in_container::tempdir().unwrap();
+        let baseline = crate::baseline::Baseline::for_session(&session.path().join("s.jsonl"), work.path());
+        for dir in ["src", "src-extra"] {
+            std::fs::create_dir(work.path().join(dir)).unwrap();
+            std::fs::write(work.path().join(dir).join("item.txt"), dir).unwrap();
+        }
+        let report = |paths: &[&str]| show_diff(&json!({"scope":"session", "paths": paths}), work.path(), Some(&baseline)).unwrap();
+        assert_eq!(report(&["./"]), report(&[]));
+        let src = report(&[r".\src\.\item.txt"]);
+        assert!(src.contains("created src/item.txt") && !src.contains("src-extra"), "{src}");
+        assert_eq!(src, report(&["src//./"]));
+        for path in ["", "/", "absent"] {
+            assert!(report(&[path]).contains("nothing has changed in the requested paths"), "{path}");
+        }
+    }
 
     #[cfg(windows)]
     #[test]

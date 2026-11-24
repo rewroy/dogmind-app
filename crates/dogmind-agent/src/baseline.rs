@@ -268,11 +268,12 @@ impl Baseline {
 
     /// What has changed under the workspace since the session began: a line for each file, then what can be shown of them. Empty when nothing has.
     pub fn changes(&self, workspace: &Path, paths: &[&str]) -> String {
-        let wanted = |name: &str| paths.is_empty() || paths.iter().any(|path| {
-            let path = path.replace('\\', "/");
-            let path = path.trim_start_matches("./").trim_end_matches('/');
-            path == "." || name == path || name.starts_with(&format!("{path}/"))
-        });
+        let filters: Vec<PathBuf> = paths.iter().filter(|path| !path.is_empty()).map(|path| {
+            let normalized = path.replace('\\', "/");
+            let path = Path::new(&normalized);
+            path.strip_prefix(".").unwrap_or(path).to_path_buf()
+        }).collect();
+        let wanted = |name: &str| paths.is_empty() || filters.iter().any(|dir_or_file| Path::new(name).starts_with(dir_or_file));
         let (names, whole) = self.candidates(workspace);
         let (mut lines, mut shown): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         // (of what the agent itself edited, the session has a first copy whatever its size)
