@@ -2658,13 +2658,13 @@ unsafe fn prepare(workspace: &Path, named: &Path, sid: PSID, writer: PSID, disar
     Ok(())
 }
 
-/// A folder of PATH in `workspace`, as written or where it really is (a short name, or a junction of the person's into it, is in it too), is not opened: it is
-/// readable already, and a command could make it a junction to a place outside. The others are opened where they really are, by a handle on that
-/// folder itself ([`grant_where_it_was`]): one that is a link (nvm-windows' `C:\Program Files\nodejs`), outside every folder commands write in, was
-/// made by the person or what they installed, and what runs is where it leads. That is looked at as `toolchain_folders` looks at what is written
-/// (a link can lead past what it named, as one into the workspace whose folder a command has made a junction to `.ssh`), and nothing is opened that
-/// is in a folder commands write in, or the app writes for them: any workspace it remembers, the container's own folder (which holds the restricted
-/// commands' temp folders), and the folder for the sandbox.
+/// A folder of PATH in `workspace`, as written or where it really is (a short name is in it too), is not opened: it is readable already, and a
+/// command could make it a junction to a place outside. Nor is one that is a link or a junction, or is reached through one (a folder above it is
+/// one): a link can lead on through another, as one into a workspace whose folder a command has made a junction to the person's documents, and
+/// every rule for where such a chain may go has had a way past it. nvm-windows' `C:\Program Files\nodejs` is one, and the bundled Node stands for
+/// it. The others are looked at as `toolchain_folders` looks at what is written, where they really are, and nothing is opened that is in a folder
+/// commands write in or the app writes for them (any workspace it remembers, the container's own folder, which holds the restricted commands' temp
+/// folders, and the folder for the sandbox); what is, is opened by a handle on the folder itself ([`grant_where_it_was`]).
 pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: Option<crate::bundled::Present>, sid: PSID, workspace: Option<&Path>) {
     // (in it as written, or where both really are)
     let in_workspace = |folder: &Path| workspace.is_some_and(|workspace| {
@@ -2681,7 +2681,7 @@ pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: 
                 || (present.python && folder_key.contains("python"))
                 || (present.node && (folder_key.contains("npm") || folder_key.contains("nvm")))
         });
-        if folder.exists() && !replaced {
+        if folder.exists() && !replaced && !through_a_link(&folder) {
             let Some(real) = crate::safety::real_path(&folder) else { continue };
             if !a_toolchain_place(&folder, &key(&real), &home_key) || written.iter().any(|place| crate::safety::inside(place, &real)) {
                 continue;
@@ -2691,6 +2691,11 @@ pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: 
             }
         }
     }
+}
+
+/// Whether a folder, as written, is a link or a junction, or is reached through one: it, or a folder above it, is one (looked at, not gone through).
+fn through_a_link(written: &Path) -> bool {
+    written.ancestors().any(|place| std::fs::symlink_metadata(place).is_ok_and(|found| found.file_type().is_symlink()))
 }
 
 /// What reads as a secret directly in a toolchain's folder is not given with it: `.cargo\credentials.toml` holds a person's token for crates.io, and is written anew by `cargo login`, so
@@ -4261,11 +4266,11 @@ mod tests {
         std::fs::remove_dir(&link).unwrap();
     }
 
-    /// PATH's folders: one in the workspace, written by its short name, is not opened, nor one that is a junction into it. One that is a junction or a
-    /// link to a folder outside (as nvm-windows makes `nodejs`) opens where it leads, and what is there runs in the container through it. A plain
-    /// one opens as before.
+    /// PATH's folders: one in the workspace, written by its short name, is not opened. Nor is one that is a junction or a link, or is reached through
+    /// one: to a folder outside (as nvm-windows makes `nodejs`), into the workspace, on from there to the person's documents or keys, to the home.
+    /// A plain one opens as before, and what is in it runs.
     #[test]
-    fn a_toolchain_folder_in_the_workspace_is_not_opened_and_one_that_is_a_link_opens_where_it_leads() {
+    fn a_toolchain_folder_in_the_workspace_or_through_a_link_is_not_opened() {
         if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
             return;
         }
@@ -4273,19 +4278,23 @@ mod tests {
         let work = home.join("project-with-a-long-name");
         let (plain, real_tools, junction, link) = (home.join("tools"), home.join("real-tools"), home.join("tools-junction"), home.join("tools-link"));
         let (inner, into_work) = (work.join("inner"), home.join("into-work"));
-        // (a link into the workspace whose folder a command has made a junction to the keys of `.aws`, which nothing about the name written says, and
-        // one to the home itself)
+        // (a link into the workspace whose folder a command has made a junction to the person's documents, one so to the keys of `.aws`, and one to
+        // the home itself)
+        let (documents, documents_in_work, to_documents) = (home.join("Documents"), work.join("documents"), home.join("to-documents"));
         let (keys, keys_in_work, to_keys, to_home) = (home.join(".aws"), work.join("keys"), home.join("to-keys"), home.join("to-home"));
-        for folder in [work.join(".venv").join("Scripts"), plain.clone(), real_tools.clone(), inner.clone(), keys.clone()] {
+        for folder in [work.join(".venv").join("Scripts"), plain.clone(), real_tools.join("bin"), inner.clone(), keys.clone(), documents.clone()] {
             std::fs::create_dir_all(&folder).unwrap();
         }
         let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
-        std::fs::copy(system.join("cmd.exe"), real_tools.join("node.exe")).unwrap();
-        for (made_at, to) in [(&junction, &real_tools), (&into_work, &inner), (&keys_in_work, &keys), (&to_keys, &keys_in_work), (&to_home, &home)] {
+        for folder in [&real_tools, &plain] {
+            std::fs::copy(system.join("cmd.exe"), folder.join("node.exe")).unwrap();
+        }
+        let junctions = [(&junction, &real_tools), (&into_work, &inner), (&documents_in_work, &documents), (&to_documents, &documents_in_work), (&keys_in_work, &keys), (&to_keys, &keys_in_work), (&to_home, &home)];
+        for (made_at, to) in junctions {
             let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(made_at).arg(to).output().unwrap();
             assert!(made.status.success(), "{}", decode(&made.stdout));
         }
-        // (a symbolic link wants developer mode or an administrator: where neither is, the junction stands for it)
+        // (a symbolic link wants developer mode or an administrator: where neither is, the junctions stand for it)
         let linked = std::os::windows::fs::symlink_dir(&real_tools, &link).is_ok();
         // (the short name Windows has for the workspace's folder, where the volume keeps them)
         let scripts = work.join(".venv").join("Scripts");
@@ -4297,10 +4306,8 @@ mod tests {
             assert!(length > 0 && length < text.len());
             PathBuf::from(String::from_utf16_lossy(&text[..length]).trim_start_matches("\\\\?\\").to_string())
         };
-        let ws = work_folder("toolchains-run");
-        let through = |folder: &Path| command(&format!("\"{}\" /c echo ran", folder.join("node.exe").display()), &ws, false);
-        assert_ne!(through(&junction).status, Some(0), "closed before it is opened");
-        let mut entries = vec![short.clone(), plain.clone(), junction.clone(), into_work.clone(), to_keys.clone(), to_home.clone()];
+        // (one link, one folder below one, and the chains)
+        let mut entries = vec![short.clone(), plain.clone(), junction.clone(), junction.join("bin"), into_work.clone(), to_documents.clone(), to_keys.clone(), to_home.clone()];
         if linked {
             entries.push(link.clone());
         }
@@ -4310,20 +4317,19 @@ mod tests {
         unsafe { open_toolchains(&path.to_string_lossy(), &home, None, sid, Some(&work)) };
         let id = profile_sid_text();
         assert!(!dacl_text(&scripts).unwrap().contains(&id), "in the workspace, by {}", short.display());
-        assert!(!dacl_text(&inner).unwrap().contains(&id), "a junction into the workspace is not gone through");
-        assert!(!dacl_text(&keys).unwrap().contains(&id), "nor one that leads on from it to the keys");
-        assert!(!dacl_text(&home).unwrap().contains(&id), "nor one to the home");
-        assert!(dacl_text(&real_tools).unwrap().contains(&id), "a junction outside opens where it leads");
-        assert!(dacl_text(&plain).unwrap().contains(&id), "a plain one is opened");
-        let ran = through(&junction);
-        assert_eq!((ran.status, decode(&ran.stdout).trim()), (Some(0), "ran"), "{}", decode(&ran.stderr));
-        if linked {
-            let ran = through(&link);
-            assert_eq!((ran.status, decode(&ran.stdout).trim()), (Some(0), "ran"), "{}", decode(&ran.stderr));
-        } else {
-            eprintln!("no symbolic link could be made here (no developer mode): the junction stood for it");
+        for (what, folder) in [("a junction", &real_tools), ("a folder below one", &real_tools.join("bin")), ("into the workspace", &inner), ("on to the documents", &documents), ("on to the keys", &keys), ("to the home", &home)] {
+            assert!(!dacl_text(folder).unwrap().contains(&id), "{what}: {}", folder.display());
         }
-        for made_at in [&junction, &into_work, &link, &to_keys, &to_home, &keys_in_work] {
+        assert!(dacl_text(&plain).unwrap().contains(&id), "a plain one is opened");
+        let ws = work_folder("toolchains-run");
+        let through = |folder: &Path| command(&format!("\"{}\" /c echo ran", folder.join("node.exe").display()), &ws, false);
+        let ran = through(&plain);
+        assert_eq!((ran.status, decode(&ran.stdout).trim()), (Some(0), "ran"), "{}", decode(&ran.stderr));
+        assert_ne!(through(&junction).status, Some(0), "nothing through the junction");
+        if !linked {
+            eprintln!("no symbolic link could be made here (no developer mode): the junctions stood for it");
+        }
+        for made_at in [&junction, &into_work, &link, &to_documents, &documents_in_work, &to_keys, &keys_in_work, &to_home] {
             let _ = std::fs::remove_dir(made_at);
         }
     }
