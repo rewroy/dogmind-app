@@ -1672,7 +1672,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
                 }
             }
             // (a browser that fell over while writing it leaves an empty file, or one that cannot be read)
-            let shot_image = image::open(&shot);
+            let shot_image = written_by_the_sandbox(&shot).map_err(image::ImageError::IoError).and_then(|bytes| image::load_from_memory(&bytes));
             #[cfg(test)]
             note_run(true, shot_image.is_err());
             if let Ok(whole) = shot_image {
@@ -1948,6 +1948,28 @@ fn forget_old_leftovers(temp: &Path, kept: Duration) {
     }
 }
 
+/// A file the browser in the sandbox wrote, as it is there: not through a link, nor one with another name too (a hard link). Its folder is the sandbox's, and a
+/// program there could put in the shot's place a link to a picture it cannot read itself: the app, which is not in the sandbox, would read it, and the picture cut from
+/// it would be put where commands read. What is read is read from the handle that was looked at.
+fn written_by_the_sandbox(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
+    let mut file = std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)?;
+    // SAFETY: the handle is the file's, open through the call, and the struct is written by it.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || info.nNumberOfLinks != 1 {
+        return Err(std::io::Error::other(format!("{} is a link, or has another name too", path.display())));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// The pictures of checks more than a week old: each has a name of its own, and they would gather in the sandbox's temporary folder.
 fn forget_old_pictures(temp: &Path) {
     const KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -1963,6 +1985,24 @@ fn forget_old_pictures(temp: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shot is read as the browser wrote it: a link or a second name put in its place, as a program in the sandbox could, to a picture it cannot read, is not read.
+    #[test]
+    fn a_shot_that_is_a_link_or_has_another_name_is_not_read() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (own, elsewhere) = (dir.path().join("shot.png"), dir.path().join("elsewhere.png"));
+        std::fs::write(&own, b"PNG-OWN").unwrap();
+        std::fs::write(&elsewhere, b"PNG-ELSEWHERE").unwrap();
+        assert_eq!(written_by_the_sandbox(&own).unwrap(), b"PNG-OWN");
+        let hard = dir.path().join("hard.png");
+        std::fs::hard_link(&elsewhere, &hard).unwrap();
+        assert!(written_by_the_sandbox(&hard).is_err(), "a second name");
+        let soft = dir.path().join("soft.png");
+        // (a symbolic link takes a privilege or Developer Mode: where neither is, the hard link above stands for it)
+        if std::os::windows::fs::symlink_file(&elsewhere, &soft).is_ok() {
+            assert!(written_by_the_sandbox(&soft).is_err(), "a link");
+        }
+    }
 
     #[test]
     fn the_runs_of_a_check_are_told_in_order_once_and_not_to_the_next_check() {
