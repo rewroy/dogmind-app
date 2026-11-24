@@ -1,13 +1,13 @@
 //! The trajectory page's table: its columns, and its rows for the turns of a session, each open (with its requests and its tools) or shut. Nothing here draws: the window draws what these say,
-//! each cell in a column of its own of a fixed width in the characters of its monospace face, which is what makes it a table and not words lined up with tabs.
+//! each cell in a column of its own wide enough for its heading and monospace values, which is what makes it a table and not words lined up with tabs.
 
 use std::collections::BTreeSet;
 
 use dogmind_agent::trajectory_report::{RequestRow, Summary, ToolRow, TurnSummary};
 
-use crate::lang::{t, tf};
+use crate::lang::{request_end_words, t, tf, tool_outcome_words};
 
-/// A column: its title, the room it has in characters of the table's monospace face, and whether its figures stand at its right edge.
+/// A column: its title, its minimum width in characters of the table's monospace face, and whether its figures stand at its right edge.
 pub struct Column {
     pub title: &'static str,
     pub chars: usize,
@@ -73,10 +73,24 @@ pub fn rows(summary: &Summary, open: &BTreeSet<u64>) -> Vec<Row> {
         rows.push(Row {
             kind: RowKind::Total,
             cells: [t("All turns").to_string(), requests.to_string(), seconds(all.prefill_ms), seconds(all.generation_ms), seconds(all.tools_ms), seconds(all.wall_ms)],
-            note: String::new(),
+            note: if all.unfinished { t("incomplete turns use last event").into() } else { String::new() },
         });
     }
     rows
+}
+
+/// Copy the table as it is expanded, with the full text even where a cell is clipped on screen.
+pub fn table_text(rows: &[Row]) -> String {
+    let mut table = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            table.push_str("\r\n");
+        }
+        table.push_str(&row.cells.join("\t"));
+        table.push('\t');
+        table.push_str(if row.kind == RowKind::Header { t("Details") } else { &row.note });
+    }
+    table
 }
 
 /// What a turn says besides its figures: how much was written to begin it, that it has no end, how it failed.
@@ -86,7 +100,7 @@ fn turn_note(turn: &TurnSummary) -> String {
         parts.push(tf("{0} pictures", &[&turn.pictures]));
     }
     if turn.unfinished {
-        parts.push(t("no end: the run stopped here").to_string());
+        parts.insert(0, t("no end recorded (to last event)").to_string());
     }
     if let Some(kind) = &turn.failed {
         parts.push(kind.clone());
@@ -104,12 +118,17 @@ fn request_row(request: &RequestRow) -> Row {
         parts.push(tf("cached {0}%", &[&cached]));
     }
     if let Some(tokens) = request.tokens {
-        parts.push(tf("{0} tokens", &[&tokens]));
+        parts.push(tf(if request.tokens_estimated { "about {0} tokens" } else { "{0} tokens" }, &[&tokens]));
     }
     if let Some(rate) = request.rate {
         parts.push(tf("{0} tok/s", &[&format!("{}{rate:.1}", if request.counted { "~" } else { "" })]));
     }
-    parts.push(if request.calls.is_empty() { request.end.clone() } else { format!("{} [{}]", request.end, request.calls.join(", ")) });
+    let end = request_end_words(&request.end);
+    if !request.calls.is_empty() {
+        parts.push(format!("{end} [{}]", request.calls.join(", ")));
+    } else if !end.is_empty() {
+        parts.push(end);
+    }
     if let Some((of, why)) = &request.retry_of {
         parts.push(tf("repeats {0} ({1})", &[of, why]));
     }
@@ -126,21 +145,21 @@ fn request_row(request: &RequestRow) -> Row {
 
 /// A tool call of an open turn: its time under Tools, and how it ended and what it did in the note.
 fn tool_row(tool: &ToolRow) -> Row {
-    let mut parts = vec![tool.outcome.clone()];
+    let mut parts = vec![tool_outcome_words(&tool.outcome, false)];
     parts.extend(tool.notes.iter().cloned());
     Row { kind: RowKind::Tool, cells: [format!("  {} {}", tool.id, tool.name), String::new(), String::new(), String::new(), seconds(tool.ms), seconds(tool.ms)], note: parts.join(", ") }
 }
 
-/// The left edge of each column in a row, in characters from the left of the table (after the margin, where a turn's chevron stands), and where the notes begin: the columns side by side with
-/// a character between each.
-pub fn column_starts() -> ([usize; 6], usize) {
-    let mut starts = [0; 6];
-    let mut at = MARGIN;
-    for (place, column) in COLUMNS.iter().enumerate() {
-        starts[place] = at;
-        at += column.chars + 1;
-    }
-    (starts, at)
+/// Pixel bounds shared by headings and data, followed by the start of the notes column.
+pub fn column_bounds(character: i32, headings: [i32; 6]) -> ([(i32, i32); 6], i32) {
+    let mut left = MARGIN as i32 * character;
+    let bounds = std::array::from_fn(|i| {
+        let right = left + (COLUMNS[i].chars as i32 * character).max(headings[i]);
+        let cell = (left, right);
+        left = right + character;
+        cell
+    });
+    (bounds, left)
 }
 
 #[cfg(test)]
@@ -162,6 +181,21 @@ mod tests {
     }
 
     #[test]
+    fn copying_a_trajectory_includes_only_expanded_details_and_keeps_full_notes() {
+        let summary = run();
+        let closed = table_text(&rows(&summary, &BTreeSet::new()));
+        assert!(closed.starts_with("Turn\tRequests\tPrefill s\tGeneration s\tTools s\tWall s\tDetails\r\n"));
+        assert_eq!(closed.lines().count(), 4);
+        assert!(!closed.contains("create_file"));
+
+        let open = rows(&summary, &BTreeSet::from([1]));
+        let copied = table_text(&open);
+        assert_eq!(copied.lines().count(), open.len());
+        assert!(copied.contains(&open[2].note) && copied.contains("[create_file]"));
+        assert!(!copied.contains("31.5 tok/s"));
+    }
+
+    #[test]
     fn the_page_has_a_header_a_row_for_each_turn_and_all_of_them_added_up() {
         let page = rows(&run(), &BTreeSet::new());
         let cells: Vec<Vec<&str>> = page.iter().map(|row| row.cells.iter().map(String::as_str).collect()).collect();
@@ -173,6 +207,10 @@ mod tests {
         assert_eq!(page.len(), 4);
         assert_eq!((page[0].kind, page[1].kind, page[3].kind), (RowKind::Header, RowKind::Turn { turn: 1, open: false }, RowKind::Total));
         assert_eq!(page[1].note, "40 characters");
+        assert!(page[3].note.is_empty());
+        let mut partial = run();
+        partial.turns[0].unfinished = true;
+        assert_eq!(rows(&partial, &BTreeSet::new())[3].note, "incomplete turns use last event");
     }
 
     #[test]
@@ -182,13 +220,13 @@ mod tests {
         assert_eq!(kinds, [RowKind::Header, RowKind::Turn { turn: 1, open: true }, RowKind::Request, RowKind::Tool, RowKind::Turn { turn: 2, open: false }, RowKind::Total]);
         let request = &page[2];
         assert_eq!(request.cells, ["  /1 main", "", "2.0", "101.0", "", "103.0"]);
-        assert_eq!(request.note, "prompt 5000, cached 0%, 8328 tokens, ~82.5 tok/s, tool_calls [create_file]");
+        assert_eq!(request.note, "prompt 5000, cached 0%, 8328 tokens, ~82.5 tok/s, It asked for calls [create_file]");
         let tool = &page[3];
         assert_eq!(tool.cells, ["  /1 create_file", "", "", "", "0.0", "0.0"]);
-        assert_eq!(tool.note, "ok, index.html, 10 bytes out");
+        assert_eq!(tool.note, "Done, index.html, 10 bytes out");
         // (the server's own rate is not marked as counted)
         let page = rows(&run(), &BTreeSet::from([2]));
-        assert_eq!(page[3].note, "prompt 9000, cached 90%, 300 tokens, 31.5 tok/s, stop");
+        assert_eq!(page[3].note, "prompt 9000, cached 90%, 300 tokens, 31.5 tok/s, It finished");
     }
 
     /// A turn nobody sent says so, where a turn of the person's says how much they wrote.
@@ -196,8 +234,46 @@ mod tests {
     fn a_turn_that_woke_itself_says_so_and_not_how_much_was_written() {
         let woken = summary(r#"{"t":"2026-11-05T10:00:00.000+09:00","ev":"turn_start","turn":1,"chars":900,"images":0,"woken":true}"#);
         let page = rows(&woken, &BTreeSet::new());
-        assert_eq!(page[1].note, "woken by background work, no end: the run stopped here");
+        assert_eq!(page[1].note, "no end recorded (to last event), woken by background work");
         assert!(woken.turns[0].woken);
+    }
+
+    #[test]
+    fn tool_result_notes_distinguish_an_error_from_a_refusal() {
+        for (outcome, expected) in [
+            ("failed", "Failed"), ("timeout", "Timed out"), ("declined_person", "You declined"),
+            ("refused_gate", "Blocked by Dogmind"), ("refused_no_change", "Changes disabled for this turn"),
+            ("future_outcome", "future outcome"),
+        ] {
+            let tool = ToolRow { outcome: outcome.to_string(), ..ToolRow::default() };
+            assert_eq!(tool_row(&tool).note, expected);
+        }
+    }
+
+    #[test]
+    fn request_end_notes_distinguish_person_app_and_server() {
+        for (end, expected) in [
+            ("cancelled_person", "You stopped it"),
+            ("stopped_app:draft_stop", "Stopped a draft that went on too long"),
+            ("stopped_app:warm_up", "Warm-up finished"),
+            ("error:no_vision", "It failed: the model cannot read pictures"),
+            ("error:future_reason", "It failed: future_reason"),
+            ("future_provider_reason", "future_provider_reason"),
+        ] {
+            let request = RequestRow { end: end.into(), ..RequestRow::default() };
+            assert_eq!(request_row(&request).note, expected);
+        }
+    }
+
+    #[test]
+    fn only_a_local_token_estimate_is_marked_as_approximate() {
+        let run = summary(r#"{"ev":"request","turn":1,"tokens_est":19}
+{"ev":"request","turn":1,"tokens_est":19,"completion":0}
+{"ev":"request","turn":1}"#);
+        let requests = &run.turns[0].requests;
+        assert!(request_row(&requests[0]).note.contains("about 19 tokens"));
+        assert!(request_row(&requests[1]).note.starts_with("0 tokens"));
+        assert!(!request_row(&requests[2]).note.contains("tokens"));
     }
 
     #[test]
@@ -205,18 +281,21 @@ mod tests {
         let one = summary(r#"{"t":"2026-11-05T10:00:00.000+09:00","ev":"turn_start","turn":1,"chars":4,"images":0}"#);
         let page = rows(&one, &BTreeSet::new());
         assert_eq!(page.len(), 2);
-        assert_eq!(page[1].note, "4 characters, no end: the run stopped here");
+        assert_eq!(page[1].note, "no end recorded (to last event), 4 characters");
         assert_eq!(rows(&Summary::default(), &BTreeSet::new()).len(), 1);
     }
 
     #[test]
     fn the_columns_stand_side_by_side_each_after_the_one_before_with_a_character_between() {
-        let (starts, notes) = column_starts();
-        assert_eq!(starts[0], MARGIN);
-        for place in 1..6 {
-            assert_eq!(starts[place], starts[place - 1] + COLUMNS[place - 1].chars + 1);
+        let character = 10;
+        let (bounds, notes) = column_bounds(character, [20, 125, 90, 90, 85, 60]);
+        assert_eq!(bounds[0], (30, 250));
+        assert_eq!(bounds[1], (260, 385)); // The localized heading is wider than eight digits.
+        assert_eq!(bounds[4].1 - bounds[4].0, 85);
+        for pair in bounds.windows(2) {
+            assert_eq!(pair[1].0, pair[0].1 + character);
         }
-        assert_eq!(notes, starts[5] + COLUMNS[5].chars + 1);
+        assert_eq!(notes, bounds[5].1 + character);
         // (a figure of a tenth of a second in any of the hours a run can take fits its column)
         assert!(seconds(99_999_000).chars().count() <= COLUMNS[5].chars);
     }

@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn a_crash_is_told_once() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         assert_eq!(untold(dir.path()), None);
         let folder = dir.path().join(FOLDER);
         std::fs::create_dir_all(&folder).unwrap();
@@ -241,7 +241,7 @@ mod tests {
     /// The report has a section for the last line an engine or a server said of a failure, with the time: the latest one, cut, and with no key or header in it.
     #[test]
     fn a_report_has_the_last_engine_error_with_its_time_and_no_key() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let section = |text: &str| -> String {
             let (_, after) = text.split_once("\n--- the last engine error ---\n").expect("the section is there");
             after.split_once("\n--- the last of the engine's log ---").expect("and before the engine's log").0.trim_end().to_string()
@@ -286,7 +286,7 @@ mod tests {
     /// log's last "Straydog starting:" line, with or without a terminal's colours.
     #[test]
     fn an_engine_error_from_before_the_engines_current_start_says_so() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let section = |text: &str| -> String {
             let (_, after) = text.split_once("\n--- the last engine error ---\n").expect("the section is there");
             after.split_once("\n--- the last of the engine's log ---").expect("and before the engine's log").0.trim_end().to_string()
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn a_gpu_wait_timeout_refused_is_kept_for_the_report() {
         use dogmind_agent::llm;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let wait = "The GPU wait exceeded its limit. The memory budget was lowered and this request was stopped. You can retry with the next request.";
         let told = format!("{}{wait}", llm::REFUSED);
         assert_eq!(llm::line_under(&told), None, "not a line under a sentence");
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn a_report_has_what_helps_and_not_the_person() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let log: String = (0..300).map(|at| format!("line {at}\n")).collect();
         std::fs::write(crate::engine::log_path(dir.path()), log).unwrap();
         let folder = dir.path().join(FOLDER);

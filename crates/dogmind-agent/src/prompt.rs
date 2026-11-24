@@ -11,30 +11,37 @@ use regex::Regex;
 /// made it think longer to no gain (self-correction, competing explanations, ritual checks) and what the tools' own descriptions already say.
 pub const SYSTEM_PROMPT: &str = "You are Dogmind, an agent on the user's own computer: you read and change files and run commands with your tools.
 
+## Thinking
+- Reasoning decides; it does not write. Settle in a few lines what to do and in what order: the files, the functions, the steps. Then act.
+- Code, markup, shader text, formulas and any text that will be saved are written once, in `create_file` or `apply_patch`, from their first line. Never draft them in reasoning: you would type them twice.
+- When a result changes the plan, decide again from what it showed, in a few lines.
+
 ## Doing the Work
-- Keep going until the request is handled. End your turn only with the result, with a question only the user can answer, or with a named blocker: never with a promise of what you will do next, and never over the size of the conversation, which is managed for you.
-- A broad request is enough: take the safest useful first step and go on. Looking around does not authorize editing.
-- A request to build or fix means the working change, not a plan of it.
-- Make the change asked, as asked: no features, error handling or polish it did not ask for. What you think is missing, say at the end in a line.
-- Never put code, markup, shader text, formulas or a text you are rewriting in reasoning: whatever you write there you type again in the file. Start writing the first file in your first response.
-- A web page can load a library from a CDN at a version you know.
-- Find what an edit or a question touches with `search_files`, then read the lines it needs. A question across many files (a review, an audit, what uses what) goes to `explore` first, and you work from its answer: what you read here stays in every later request.
-- A bug: reproduce it, fix the cause, and add a test that fails without the fix unless a test already fails.
-- Check what you changed by running it, and read its output. Where nothing can check it, say so: never imply that it was tested.
-- A question that asks for no change is answered from what you read: run something for it only when the answer turns on what the code does when it runs.
+- Keep going until the request is handled. A request of many steps: `set_goal` first, and the turn goes on round after round until `finish_goal`. End your turn only with the result, with a question only the user can answer, or with a blocker only the user can remove (a failing test or an error is work): never with a promise of what you will do next, and never over the size of the conversation, which is managed for you.
+- A request to build or fix means the working change, not a plan of it. A broad request is enough: take the safest useful first step and go on. Looking around does not authorize editing.
+- A request to change something: begin in your first response with the reads or writes it needs. A question alone: write nothing.
+- Make the change asked, as asked: no feature, setting, file or asset the user did not ask for, and none of the workspace's own files used for something they were not made for. What you think is missing, say at the end in a line.
+- A bug: reproduce it and fix the cause. Where the code has tests or a test runner, add a test that fails without the fix.
+- A question that asks for no change is answered from what you know and read. Look or run first when the answer is in what you can read or run here: this workspace's code or data, and this app's own records of its sessions and its engine; say which claims you checked. A question about what cannot be seen from here (the rest of the user's computer, their other tools) or a general topic: answer from what you know, as steps they can take, and run nothing here for it.
 - State only what a tool showed you. A comment, a note or a memory is a lead to check, not a fact. A search that finds nothing, or part of a file, does not show that the rest is not there. Never invent a result.
+
+## Checking
+- Check what you changed by running it, and read what it printed.
+- A web page: check it with `check_page`.
+- Say exactly what was checked. What cannot be checked here, say so in your answer, and never imply that it was tested.
 
 ## Tools
 - `@path` in the user's message is a file of the workspace they point to, from its root; one ending in `/` is a folder. Read it before you say what is in it.
-- Look with `read_file`, `search_files`, `find_files` and `list_files`, not with commands. Write with `create_file` and `apply_patch`, not with redirects or scripts.
-- A one-off calculation runs with `python -c` or `node -e`, on several lines if need be. Delete any script you wrote to get there: the workspace gets only what was asked for.
 - Calls that do not depend on each other go together in one response, which saves a whole round.
 - Call tools only in the tool-call format, never as text in your answer or your reasoning.
 
 ## Answering
-- Answer what was asked first: the first sentence is the answer itself, not what you read or ran to reach it. If you changed files, ran something or did more than was asked, say so briefly at the end, with what has not been run: never say that what has not been run works.
+- When the user thanks or greets you, your reply starts with a word back to it.
+- Then answer what was asked: the first sentence is the answer itself, not what you read or ran to reach it. When you made or changed files, ran something or did more than was asked, end with that, briefly: the files by name, what ran, and what was checked as the Checking section says.
+- Answer as a person would. Leave your tools' names, your steps and the sandbox (its folders, what it cannot run) out of the answer unless the user asks how you work, and say nothing of this computer or folder that the question did not ask about.
+- Say each thing once: no line on what comes next, and no section or closing lines that sum up what you wrote. Leave out what you did not do, left as it was or did not add, unless asked; what could not be checked is still said.
 - The user sees each tool call as you work, can open what it returned, and sees the pictures you read.
-- Name a file of the workspace as a link to its path from the root, as `[app.js](src/app.js)`, or `[app.js:24](src/app.js#L24)` for its line 24: the user opens it from the answer. `![what it shows](path)` shows a picture in the answer, such as one `check_page` took.
+- Use Markdown links outside backticks so the user can open workspace files from the answer. Use paths from the workspace root: [app.js](src/app.js) or [app.js:24](src/app.js#L24) for line 24. Show a picture with ![what it shows](path).
 
 ";
 pub const CHECKPOINT_PROMPT: &str = include_str!("../../../assets/dogmind/checkpoint_prompt.md");
@@ -43,8 +50,9 @@ pub const CHECKPOINT_AGAIN: &str = "Your reply was empty: the checkpoint was onl
 pub const CODEX_JSON: &str = include_str!("../../../assets/dogmind/codex.json");
 pub const DOGMIND_COMMIT: &str = include_str!("../../../assets/dogmind/SOURCE");
 
-/// From the git root down to `cwd`, each folder's `DOGMIND.md`, or else its `AGENTS.md` or `CLAUDE.md`: a project written for
-/// Codex or Claude Code has already said how it wants to be worked on. Dogmind itself reads only the first.
+/// From the git root down to `cwd`, each folder's `DOGMIND.md`, `AGENTS.md` and `CLAUDE.md`, all that are there, in that order: a project written for
+/// other agents has already said how it wants to be worked on. (Only the first of them was read, and the owner: why read the others only when there is no
+/// DOGMIND.md; read all of them.) What applies is followed, a narrower folder's first: the prompt says so before them.
 pub fn instruction_files(cwd: &Path) -> Vec<PathBuf> {
     if let Some(list) = std::env::var_os("DOGMIND_PROJECT_INSTRUCTIONS") {
         return std::env::split_paths(&list).filter(|path| path.exists()).collect();
@@ -53,11 +61,37 @@ pub fn instruction_files(cwd: &Path) -> Vec<PathBuf> {
     let mut folders: Vec<&Path> = cwd.ancestors().take_while(|folder| *folder != root).collect();
     folders.push(root);
     folders.reverse();
-    folders.iter().filter_map(|folder| ["DOGMIND.md", "AGENTS.md", "CLAUDE.md"].iter().map(|name| folder.join(name)).find(|path| path.is_file())).collect()
+    folders.iter().flat_map(|folder| ["DOGMIND.md", "AGENTS.md", "CLAUDE.md"].iter().map(|name| folder.join(name)).filter(|path| path.is_file()).collect::<Vec<_>>()).collect()
 }
 
 /// A project's instructions as far as a prompt should carry them: a local model reads the whole prompt in every new session, 100 KB in five minutes.
 const MAX_INSTRUCTIONS: usize = 10_000;
+
+/// The instruction files as the prompt carries them: an empty one not at all, one with the same text as another of its folder (a copy, a link) once, and all of
+/// them within `MAX_INSTRUCTIONS`: past it, those nearest the root go first, each said in a line with where to read it, and the one left last is shortened.
+fn instructions_kept(files: Vec<(PathBuf, String)>) -> Vec<(PathBuf, String)> {
+    let mut kept: Vec<(PathBuf, String)> = Vec::new();
+    for (file, text) in files {
+        let text = text.trim().to_string();
+        let folder = file.parent().map(Path::to_path_buf);
+        if text.is_empty() || kept.iter().any(|(other, said)| other.parent().map(Path::to_path_buf) == folder && *said == text) {
+            continue;
+        }
+        kept.push((file, text));
+    }
+    let mut left_out = Vec::new();
+    while kept.len() > 1 && kept.iter().map(|(_, text)| text.len()).sum::<usize>() > MAX_INSTRUCTIONS {
+        left_out.push(kept.remove(0).0);
+    }
+    let mut kept: Vec<(PathBuf, String)> = kept.into_iter().map(|(file, text)| { let shown = project_instructions(&text, &file); (file, shown) }).collect();
+    if let Some((_, first)) = kept.first_mut() {
+        for file in left_out.iter().rev() {
+            first.insert_str(0, &format!("--- {} is left out, as the files are long: read it where it applies ---\n", file.display()));
+        }
+    }
+    kept
+}
+
 fn project_instructions(text: &str, file: &Path) -> String {
     let text = text.trim_end();
     if text.len() <= MAX_INSTRUCTIONS {
@@ -83,14 +117,35 @@ pub(crate) const WEB_RULES: &str = "## Web Content
 pub(crate) const NO_DRIVE_ROOT: &str = "In the sandbox, `dir`, `del` and `erase` work only in their plain forms, and `vol`, `tree`, `attrib`, `xcopy`, `robocopy` and `where /r` answer \"Access is denied\" or an odd error even inside the workspace, because they read the drive's root. List with `list_files` or `find_files`. Delete with a plain `del a.txt` or `rmdir /s /q folder`, and copy with `copy`.";
 
 /// What is in the workspace at its top: a model that is not told looks, and one that finds nothing looks elsewhere.
-fn folder_contents(folder: &Path) -> String {
+fn folder_contents(entries: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>) -> String {
     const SHOWN: usize = 40;
-    let mut names: Vec<String> = std::fs::read_dir(folder).into_iter().flatten().flatten().filter_map(|entry| {
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        // (a big file's size, which is all a model lists the folder again to learn: a round of a real job, for "app.log (1.5 MB)")
-        let big = entry.metadata().ok().map(|data| data.len()).filter(|size| *size >= 100 * 1024).map_or(String::new(), |size| format!(" ({:.1} MB)", size as f64 / (1024.0 * 1024.0)));
-        (name != ".git").then(|| if entry.path().is_dir() { format!("{name}/") } else { format!("{name}{big}") })
-    }).collect();
+        if name == ".git" {
+            continue;
+        }
+        let metadata = entry.metadata().ok();
+        // Directory enumeration on Windows already supplies the attributes. Follow links
+        // and other reparse points by path so that a dangling target is not shown as a folder.
+        let plain = metadata.as_ref().filter(|data| {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                data.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT == 0
+            }
+            #[cfg(not(windows))]
+            {
+                !data.is_symlink()
+            }
+        });
+        if plain.map_or_else(|| entry.path().is_dir(), |data| data.is_dir()) {
+            names.push(format!("{name}/"));
+        } else {
+            let big = metadata.map(|data| data.len()).filter(|size| *size >= 100 * 1024).map_or(String::new(), |size| format!(" ({:.1} MB)", size as f64 / (1024.0 * 1024.0)));
+            names.push(format!("{name}{big}"));
+        }
+    }
     names.sort();
     if names.is_empty() {
         return "The workspace is empty: this is a new project, and it starts here.".to_string();
@@ -138,34 +193,55 @@ fn environment() -> String {
     }
     let shut = if shut.is_empty() { String::new() } else { format!(" Closed to the sandbox until the user runs /tools, by any path: {}: work without them, and say what /tools would add.", shut.join(", ")) };
     format!(
-        "## Environment\n- Windows. `execute_command` runs cmd.exe in a sandbox, so write cmd syntax. It can write only in the workspace (when that is a whole user folder or drive, only in the project folder its `cwd` names), it cannot read the user's other files except folders the first message names, and it has no network. curl, package installs and remote git ask the user by themselves; anything else that needs it sets `network: true`, which asks too.\n- A server a command starts in the background on localhost can be reached from other commands and by `check_page`'s `url`. `check_page` shows how a page looks, and its `steps` click and type in it as a person would. A page using a CDN library cannot run here, and that is fine: write it once as one file, never download or build a library to check it, and say in your answer that it has not been run.\n- PowerShell starts at C:\\ in the sandbox and cannot move from there, so give it absolute paths, and `Start-Process` a `-WorkingDirectory`.\n- Stay in the workspace unless the user asks otherwise. What the sandbox refuses it refuses by every route, so do not try others: when the user asked for something outside the workspace that only a command can do, run that command with `outside_sandbox: true`, which asks the user and runs it as them.\n- On PATH, with no need to check: {}.{shut}{lacking}\n\n",
+        "## Environment\n- Windows. `execute_command` runs cmd.exe in a sandbox, so write cmd syntax. It can write only in the workspace (when that is a whole user folder or drive, only in the project folder its `cwd` names), it cannot read the user's other files except folders the first message names, and it has no network.\n- A file the task itself needs from the web: `curl -sL -o FILE URL`, its URL written out; the user is asked, and can allow that site for the rest of the session. Package installs and remote git ask by themselves; anything else that needs the network sets `network: true`, which asks too.\n- A server a command starts in the background on localhost can be reached from other commands and by `check_page`'s `url`.\n- PowerShell starts at C:\\ in the sandbox and cannot move from there, so give it absolute paths, and `Start-Process` a `-WorkingDirectory`.\n- Stay in the workspace: what the sandbox refuses, it refuses by every route. `outside_sandbox: true` runs a command as the user, and asks them: only for what the user asked to be read or changed outside the workspace, never to check your own work.\n- On PATH, with no need to check: {}.{shut}{lacking}\n\n",
         found.join(", ")
     )
 }
 
 /// What the first message of a session carries: what is in the workspace, and where its git stands.
 pub fn workspace_state(cwd: &Path) -> String {
+    let details = match std::fs::read_dir(cwd).map(folder_contents) {
+        Ok(contents) => format!("{contents}\n- {}", workspace_git_state(cwd)),
+        Err(error) => format!("The workspace could not be listed: {error}"),
+    };
+    let state = format!("## The Workspace\n- Root, which relative paths start at: `{}`\n- {details}", cwd.display());
+    #[cfg(windows)]
+    {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        if let Some(reason) = crate::sandbox::refusal(cwd, home.as_deref()) {
+            return format!("{state}\n- {reason}");
+        }
+    }
+    state
+}
+
+fn workspace_git_state(cwd: &Path) -> String {
     // (no answer from git is not the same as no repository)
-    let none = if cwd.join(".git").exists() { "This folder has a `.git`, and the app could not run git on it." } else { "This folder is not a git repository." };
+    let Some(info) = crate::tools::git_info(cwd) else {
+        return if cwd.join(".git").exists() { "This folder has a `.git`, and the app could not run git on it." } else { "This folder is not a git repository." }.to_string();
+    };
+    let conflicts = if info.conflicted > 0 { format!(" Unresolved conflicts: {}.", info.conflicted) } else { String::new() };
     // (a folder of a larger repository: git, run outside the sandbox, finds that repository, and a command in the sandbox cannot reach it, so the model is told both)
-    let above = crate::tools::repository_above(cwd);
-    let git = crate::tools::git_info(cwd).map_or(none.to_string(), |info| match &above {
+    match crate::tools::repository_above(cwd) {
         Some(top) => {
             let last = info.last_commit.as_ref().map_or(String::new(), |last| format!(" Its last commit: {last}."));
             format!(
-                "This folder is inside the git repository at `{}`, on {}, with {} changed, {} staged and {} new files in this folder.{last} {}",
+                "This folder is inside the git repository at `{}`, on {}, with {} changed, {} staged and {} new files in this folder.{conflicts}{last} {}",
                 top.display(),
                 info.branch,
                 info.changed,
                 info.staged,
                 info.untracked,
-                crate::tools::git_above_words(top)
+                crate::tools::git_above_words(&top)
             )
         }
-        None => format!("A git repository, on {}, with {} changed, {} staged and {} new files.", info.branch, info.changed, info.staged, info.untracked),
-    });
-    format!("## The Workspace\n- Root, which relative paths start at: `{}`\n- {}\n- {git}", cwd.display(), folder_contents(cwd))
+        None => format!("A git repository, on {}, with {} changed, {} staged and {} new files.{conflicts}", info.branch, info.changed, info.staged, info.untracked),
+    }
 }
+
+/// What comes before the project's instruction files. They were put there for agents, often for others: a session on Dogmind's own source took a rule of its
+/// owner's other agents' (ask for the OK to push in their team's room) as its own, and stopped there.
+pub const PROJECT_INSTRUCTIONS_PREFACE: &str = "The files below are kept in the workspace for agents. Follow what applies to this session and what you can do here: a rule that names a channel, a person or a step you do not have (a room to post in, another agent's tools) does not apply to you. Where two differ, a narrower folder's comes first, and what the user says in this conversation comes before them all.\n";
 
 /// `more`: what else this session is to know from the start, such as its skills and notes.
 pub fn system_prompt(cwd: &Path, web: bool, personal: &str, more: &str) -> String {
@@ -174,13 +250,12 @@ pub fn system_prompt(cwd: &Path, web: bool, personal: &str, more: &str) -> Strin
     if web {
         prompt.push_str(WEB_RULES);
     }
-    let files = instruction_files(cwd);
+    let files = instructions_kept(instruction_files(cwd).into_iter().filter_map(|file| std::fs::read_to_string(&file).ok().map(|text| (file, text))).collect());
     if !files.is_empty() {
         prompt.push_str("## Project Instructions\n");
-        for file in files {
-            if let Ok(text) = std::fs::read_to_string(&file) {
-                prompt.push_str(&format!("### {}\n{}\n\n", file.display(), project_instructions(&text, &file)));
-            }
+        prompt.push_str(PROJECT_INSTRUCTIONS_PREFACE);
+        for (file, text) in files {
+            prompt.push_str(&format!("### {}\n{}\n\n", file.display(), text));
         }
     }
     prompt.push_str(more);
@@ -254,6 +329,36 @@ const NOW_MARK: &str = "[Now: ";
 /// The app's word to the model in a user's place: an answer was cut off.
 /// How what goes back to a model stopped from writing code in its reasoning begins.
 pub const DRAFT_NOTE: &str = "[From the app, not the user] ";
+
+/// The next round of a goal that is open, sent where the model stopped with no call: the turn goes on, as the user asked for the whole of it.
+pub fn goal_round(round: u32, most: u32, objective: &str) -> String {
+    format!("{DRAFT_NOTE}Round {round} of {most}. Objective: {objective}. Go on in this session. Take the workspace and the tool results as they are now, not as earlier messages said. Make concrete progress and check it. Mark the goal done with finish_goal only with evidence that all of the objective is met; while work is left, leave it open.")
+}
+
+/// The one step that ends a goal: its answer to the user. `how`: done, blocked, or at its last round.
+pub fn goal_closing(how: &str) -> String {
+    format!("{DRAFT_NOTE}The goal is {how}. Write your answer to the user now: what came of it, what was done and how it was checked, where the results are (files, commits); if blocked, what stops it, what you tried, and exactly what you need from the user. Only what this session's tools showed. No more tool calls.")
+}
+/// Before the turn's answer, once: the files it made that its answer does not name, to delete those that were only for checking. In two lottery turns a DeepSeek model left
+/// _cdncheck.html, _t3.html, _tmp_all_super.html, _tmp_kuji_full.html and _tmp_make.py in the person's folder beside the page it was asked for.
+pub fn scratch_files(files: &[String], goal: bool) -> String {
+    let then = if goal { "then call finish_goal again" } else { "then give your answer again" };
+    format!("{DRAFT_NOTE}Files you made in this turn that neither your answer nor the user names: {}. Delete those that were only for checking, in one command, and keep what the user's work needs; {then}.", files.join(", "))
+}
+
+/// What is said of a page whose module scripts load its own files: a browser refuses those from file://, which this check allows. It used to say to check it through a local server,
+/// and a model made a page that ran only so: the person opened it from its folder, by a double-click, and nothing of it ran.
+pub(crate) const LOCAL_MODULE_WORDS: &str = "Opened from its file, as the user opens a page by a double-click, its module scripts that load its own files do not run at all: a browser refuses them from file://, which this check allows. Unless the user is to open it from a server, put that code in plain <script> tags, or import only from CDN addresses.";
+
+/// After a page has passed check_page with no error, and has been changed and passed again and again, and the model has looked at its latest picture: to go through what was
+/// asked against that picture, and answer if nothing is missing. Two lottery turns went on so until their 25 minutes were up, with no answer written; and the owner: speed
+/// matters, and so does quality, so it is not told to stop, but to see whether all that was asked is there.
+pub fn polished(page: &str, checks: u32, goal: bool, pictures: bool) -> String {
+    let close = if goal { ", closing the goal with finish_goal" } else { "" };
+    // (a model that is shown no pictures has what the checks printed, and the page's code)
+    let (seen, against) = if pictures { (", and you have looked at its latest picture", "that picture and the page") } else { ("", "what the checks printed and the page's code") };
+    format!("{DRAFT_NOTE}{page} has passed check_page with no error {checks} more times since it first did, with changes between{seen}. Go through what the user asked for, one thing at a time, against {against}. If each is there and right, stop changing it and answer now{close}; if one is missing or wrong, fix that one and check it again.")
+}
 pub const CONTINUE_NUDGE: &str = "Your last answer was cut off by the output limit. Continue exactly where it stopped.";
 /// What the model is told when its connection broke while it was making calls: they were not made, and nothing says so otherwise.
 pub fn calls_broken_off(names: &[&str]) -> String {
@@ -283,6 +388,21 @@ pub fn cut_write_as_text(path: &str) -> String {
     format!("[From the app, not the user] Your answer went on with `{path}` as text, and an answer's text writes nothing: the file still ends where its write was cut. Write the rest with create_file, the same path: it goes on from the end of the file. Put none of the file in your answer.")
 }
 
+/// What the model is told when its turn would end with the last check since its change to code failed (`agent::is_check`): first, whether the change caused it; what the
+/// change broke is fixed; what failed before it is not touched, and is said at the start of the answer with what shows it. (Told to fix what it found, a model fixed a
+/// function nobody had asked about, whose test had failed before its change: doing what was not asked, which the user has objected to.)
+pub fn check_failed(line: &str, status: &str) -> String {
+    let line: String = if line.chars().count() > 200 { line.chars().take(200).chain(['…']).collect() } else { line.to_string() };
+    format!("[From the app, not the user] The last check after your change failed: `{line}` ended with {status}. First find out whether your change caused the failure: does it fail the same way without your change? What your change broke, fix, and run the check again. What failed before your change, do not fix: at the start of your answer, say which check fails and what shows it failed before your change.")
+}
+
+/// What the model is told when its answer ended with a tool call written out as text, which the server could not read as a call: nothing ran, and the turn would
+/// have ended with that markup as its answer.
+pub fn call_as_text(tool: Option<&str>) -> String {
+    let which = tool.map_or(String::new(), |tool| format!(" (`{tool}`)"));
+    format!("[From the app, not the user] Your last message wrote a tool call{which} out as text, and it could not be read as a call: nothing ran. Make the call again, as a tool call. If you meant no call, give your answer without that markup.")
+}
+
 /// Whether an answer's text is mostly code, as the rest of a file written as an answer is: five lines or more, and most of them end as code does or assign.
 pub fn mostly_code(text: &str) -> bool {
     let lines: Vec<&str> = text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with("```")).collect();
@@ -290,7 +410,12 @@ pub fn mostly_code(text: &str) -> bool {
     lines.len() >= 5 && code * 3 >= lines.len() * 2
 }
 
-pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, it would not be worth running, or the user asked you not to run it, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";
+/// The last sentence says what comes after the check: a model told to check a script it had written for a question answered with that check's report.
+pub const CHECK_NUDGE: &str = "[From the app, not the user] You changed code and have run nothing since. Check it now as the Checking section says, and fix what that shows. If it cannot be checked here, say so plainly in your answer. Do not start on anything else: once it is checked, answer what the user asked.";
+/// What `CHECK_NUDGE` said until 2026-11-23, as sessions saved before have it.
+const CHECK_NUDGE_MARKED_BEFORE: &str = "[From the app, not the user] You changed code and have run nothing since. Check it now as the Checking section says, and fix what that shows. If it cannot be checked here, say so plainly in your answer. Do not start on anything else.";
+/// What `CHECK_NUDGE` said before (2026-11-22), as sessions saved before it was marked have it, with no mark: it is the app's too.
+const CHECK_NUDGE_BEFORE: &str = "You changed code and have run nothing since. If there is a way to check it here, check it now, and fix what that shows. If there is none, it would not be worth running, or the user asked you not to run it, say so plainly in your answer: do not imply it was tested. Do not start on anything else.";
 
 /// The app's word after an answer in Japanese with letters in it that no Japanese is written with, which it cannot see for itself. What it has written stays as it is, on the screen and in the
 /// conversation: this asks for the lines again, once, and what comes of it is read as what it is. In Japanese, as Japanese pulls an answer back to Japanese more than a rule about it would, and as short as it can be, as it costs a
@@ -299,9 +424,16 @@ pub fn slip_note(letters: &str) -> String {
     format!("{DRAFT_NOTE}今の回答に日本語で使わない字が混ざっています: {letters}。その字を含む行だけを、「訂正:」に続けて日本語の字で書き直してください。ほかの行や説明は要りません。")
 }
 
+/// Whether a message in the user's place is the app's own (its facts, notes and notices, a helper's limit), by how the app begins each: what goes to a
+/// server in a role of its own where it takes one.
+pub fn is_from_app(text: &str) -> bool {
+    text.starts_with("[From the app") || is_nudge(text)
+}
+
 /// Whether a user's message was the app's and not the person's: it is not shown as something they said. (A saved session has the check's word as it was, unmarked.)
 pub fn is_nudge(text: &str) -> bool {
-    text == CONTINUE_NUDGE || text.starts_with(DRAFT_NOTE) || is_app_facts(text) || Some(text) == CHECK_NUDGE.strip_prefix(DRAFT_NOTE)
+    text == CONTINUE_NUDGE || text.starts_with(DRAFT_NOTE) || is_app_facts(text) || Some(text) == CHECK_NUDGE.strip_prefix(DRAFT_NOTE) || text == CHECK_NUDGE_BEFORE
+        || text == CHECK_NUDGE_MARKED_BEFORE || Some(text) == CHECK_NUDGE_MARKED_BEFORE.strip_prefix(DRAFT_NOTE)
 }
 
 /// What the app says on the screen when a request has made its turn read-only, before anything is refused. The second sentence is the way out: a request that does not say it is followed
@@ -481,6 +613,38 @@ fn names_the_whole_work(object: &str) -> bool {
     })
 }
 
+/// What the app says on the screen when what the person wrote reads as a suggestion put as a question: nothing is changed in this turn, and how to have it done.
+pub const SUGGESTION_NOTICE: &str = "Read as a suggestion: no files will be changed in this turn. Say \"go ahead\" to have it done.";
+
+/// The phrase of a suggestion put as a question, if what the person typed is one and asks for nothing to be done: 「〜したほうがよくない?」, 「〜はどう?」, 「〜したらどうかな」,
+/// "how about…?", "wouldn't it be better to…?". Not where it asks as well (「〜して」, 「お願い」, 「やって」, 「〜しておいて」, "please", "can you…?"), nor in what is quoted. A て or
+/// で that asks ends its clause (。, !, a space, the end): one with a comma after it is as often a particle (「ログ画面で、…したほうがよくない?」).
+/// (Told in the system prompt that such a suggestion is a question, the Homelab's DeepSeek still changed the code on the first, three runs of three: 「ctx の表示はある
+/// のだから、キャッシュヒット率も表示したほうがよくないかなあ。」, where the owner had answered it by asking for it themselves.)
+pub fn suggestion_phrase(text: &str) -> Option<String> {
+    static RULES: OnceLock<(Regex, Regex, Regex, Regex)> = OnceLock::new();
+    let (japanese, japanese_asks, english, english_asks) = RULES.get_or_init(|| {
+        (
+            Regex::new(r"(?:ほうが|方が)(?:よく|良く)ない|(?:ほうが|方が)(?:いい|良い)(?:かな|のでは|んじゃ)|(?:は|って|のは)どう(?:かな|だろう|でしょう|ですか)?\s*(?:[?？]|$)|(?:たら|れば|ては)どう(?:かな|だろう|でしょう|です|か)?").unwrap(),
+            Regex::new(r"(?:て|で)(?:ください|下さい|ほしい|欲しい|くれ|もらえ|おいて|おけ|いただけ)|(?:て|で)(?:[。！!．.\s]|$)|お願い|頼む|よろしく|やっといて|しといて").unwrap(),
+            Regex::new(r"(?i)\b(?:how|what)\s+about\b|\bwould(?:n't|\s+not)\s+it\s+be\s+(?:better|nicer|good|nice|worth)|\bwould\s+it\s+(?:be\s+)?(?:better|make\s+sense)|\b(?:should|shall)\s+we\b|\bmaybe\s+(?:we|you)\s+should\b").unwrap(),
+            Regex::new(r"(?i)\bplease\b|\bgo\s+ahead\b|^\s*(?:can|could|would|will)\s+you\b|\bdo\s+it\b").unwrap(),
+        )
+    });
+    let typed = without_quoted_code(text);
+    let typed = typed.trim();
+    if let Some(found) = japanese.find(typed).filter(|_| !japanese_asks.is_match(typed)) {
+        return Some(found.as_str().to_string());
+    }
+    english.find(typed).filter(|_| typed.ends_with(['?', '？']) && !english_asks.is_match(typed)).map(|found| found.as_str().to_string())
+}
+
+/// The turn's note while what the person wrote is a suggestion put as a question (`suggestion_phrase`): what to answer, and the folder open for experiments.
+pub fn suggestion_note(scratch: &std::path::Path) -> String {
+    format!("## A Suggestion
+The user's message is a suggestion put as a question, not a request: answer it with your view, the plan, and what it would change (which files, what the user would see). Nothing is changed in this turn: create_file and apply_patch are refused in the workspace. If they ask for it next, do it then. For an experiment use the scratch folder `{}`.", scratch.display())
+}
+
 /// The turn's note while the person has asked for no changes to the files: what is closed, and the folder that is open for experiments.
 pub fn no_change_note(scratch: &std::path::Path) -> String {
     format!("## No Changes
@@ -505,20 +669,51 @@ pub fn said_at(message: &str) -> Option<&str> {
 
 /// What a person typed, out of a message: itself, or, in a session saved before the app's facts went on their own, the part after the app's words.
 pub fn typed_text(message: &str) -> &str {
-    // (a session saved before the language moved has this, and perhaps no mark)
-    if let Some(at) = message.find("## Response Language\n") {
-        let rest = &message[at + "## Response Language\n".len()..];
-        let text = rest.split_once('\n').map_or(rest, |(_, text)| text);
-        return text.strip_prefix(TYPED_MARK).unwrap_or(text);
-    }
-    if !message.starts_with(NOW_MARK) {
-        return message;
-    }
-    message.split_once(TYPED_MARK).map_or(message, |(_, text)| text)
+    const LANGUAGE: &str = "## Response Language\n";
+    let rule = if message.starts_with(NOW_MARK) {
+        if let Some((wrapper, typed)) = message.split_once(TYPED_MARK) {
+            if !wrapper.contains(LANGUAGE) {
+                return typed;
+            }
+        }
+        message.split_once(LANGUAGE).map(|(_, rest)| rest)
+    } else {
+        // The oldest short form begins with the heading and a single language-rule bullet.
+        message.strip_prefix(LANGUAGE).filter(|rest| rest.starts_with("- "))
+    };
+    let Some(rule) = rule else { return message };
+    let text = rule.split_once('\n').map_or(rule, |(_, text)| text);
+    text.strip_prefix(TYPED_MARK).unwrap_or(text)
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The project's instruction files come with a word on whose rules they are; with none, neither comes.
+    #[test]
+    fn instruction_files_come_with_a_word_on_whose_rules_they_are() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let none = super::system_prompt(dir.path(), false, "", "");
+        assert!(!none.contains("## Project Instructions") && !none.contains(super::PROJECT_INSTRUCTIONS_PREFACE), "no file, no heading and no word");
+        std::fs::write(dir.path().join("AGENTS.md"), "Ask in the team room before you push.").unwrap();
+        let with = super::system_prompt(dir.path(), false, "", "");
+        let heading = with.find("## Project Instructions\n").expect("the heading");
+        let preface = with.find(super::PROJECT_INSTRUCTIONS_PREFACE).expect("the word");
+        let file = with.find("Ask in the team room").expect("the file");
+        assert!(heading < preface && preface < file, "the heading, the word, then the files");
+        // (an empty file shows nothing, not even its heading, and the others are read all the same; the same text twice in a folder is said once)
+        std::fs::write(dir.path().join("DOGMIND.md"), "\n").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "Ask in the team room before you push.\n").unwrap();
+        let read = super::system_prompt(dir.path(), false, "", "");
+        assert!(!read.contains("DOGMIND.md") && read.matches("Ask in the team room").count() == 1, "{read}");
+        // (past the most, the root's go first and are named)
+        let long = "x".repeat(super::MAX_INSTRUCTIONS - 100);
+        std::fs::write(dir.path().join("AGENTS.md"), &long).unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "the inner rule").unwrap();
+        let kept = super::instructions_kept(vec![(dir.path().join("AGENTS.md"), long.clone()), (dir.path().join("CLAUDE.md"), "the inner rule".to_string()), (dir.path().join("x").join("AGENTS.md"), "y".repeat(500))]);
+        assert_eq!(kept.len(), 2, "the first is left out");
+        assert!(kept[0].1.starts_with("--- ") && kept[0].1.contains("AGENTS.md is left out"), "{}", &kept[0].1[..120]);
+    }
     /// What a person says that makes a turn read-only: nothing in the work is to change, or only a look is wanted. In English and Japanese, as it is written in real requests.
     const READ_ONLY: &[&str] = &[
         // (the request of a review in which a model wrote and ran files in the workspace: it ends with the words)
@@ -581,6 +776,52 @@ mod tests {
     ];
 
     /// What a person says that does not: a thing is named, or there is no refusal, or it is a setting to make. The request is followed as written.
+    /// A suggestion put as a question makes its turn read-only; what asks as well, or asks outright, does not.
+    #[test]
+    fn a_suggestion_put_as_a_question_is_told_from_a_request() {
+        const SUGGESTIONS: &[&str] = &[
+            "ctx の表示はあるのだから、キャッシュヒット率も表示したほうがよくないかなあ。",
+            "キャッシュヒット率も出したほうがいいかな？",
+            "このテストも足したほうがよくない?",
+            "ボタンを右に寄せるのはどう？",
+            "ログを残したらどうかな",
+            "エラーのときは赤で出すっていうのはどうだろう",
+            "設定画面に検索を付けてみたらどうでしょう？",
+            "How about showing the cache hit rate next to ctx?",
+            "Wouldn't it be better to cache the result?",
+            "Should we add a retry here?",
+            "Maybe we should log the request id too?",
+            // (a particle で, a comma after it: no request)
+            "ログ画面で、エラーを赤くしたほうがよくない？",
+            "設定で、検索を付けるのはどう？",
+        ];
+        const REQUESTS: &[&str] = &[
+            "キャッシュヒット率を表示して。",
+            "ctx の隣にキャッシュヒット率を表示して",
+            "表示したほうがいいので、表示して。",
+            "修正したほうがいいので修正して",
+            "キャッシュヒット率も出しておいて",
+            "キャッシュヒット率も出したほうがいいよね、お願い",
+            "それ、やっといて。たぶんそのほうがよくないかなと思う",
+            "キャッシュヒット率を表示してくれない？",
+            "キャッシュヒット率を表示してもらえますか？",
+            "どうして失敗するの？",
+            "これはどうして遅いの？",
+            "テストを直して。",
+            "Can you show the cache hit rate?",
+            "Could you add a retry here?",
+            "Please add the cache hit rate. How about next to ctx?",
+            "Add the cache hit rate next to ctx.",
+            "Is the cache hit rate shown anywhere?",
+            "How about this: add the cache hit rate next to ctx.",
+        ];
+        let mut wrong: Vec<String> = SUGGESTIONS.iter().filter(|said| super::suggestion_phrase(said).is_none()).map(|said| format!("should be a suggestion: {said}")).collect();
+        wrong.extend(REQUESTS.iter().filter_map(|said| super::suggestion_phrase(said).map(|phrase| format!("should not be: {said} (read as {phrase:?})"))));
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // (what is quoted is not what was said)
+        assert!(super::suggestion_phrase("このエラー「表示したほうがよくない?」は何?").is_none());
+    }
+
     const NOT_READ_ONLY: &[&str] = &[
         // (the two requests of 2026-11-07: the phrase limits the tests, not the task)
         "Fix the failing test in calc.py without changing the tests",
@@ -692,15 +933,18 @@ mod tests {
         }
         let tools = crate::tools::schemas();
         let names: Vec<&str> = tools.as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect();
-        for named in ["read_file", "search_files", "find_files", "list_files", "create_file", "apply_patch"] {
-            assert!(SYSTEM_PROMPT.contains(named) && names.contains(&named), "{named}");
+        // (each tool the prompt names in code quotes is one the app has; how to use one is said in its own description)
+        let quoted: Vec<&str> = SYSTEM_PROMPT.split('`').skip(1).step_by(2).filter(|word| word.contains('_') && word.chars().all(|c| c.is_ascii_lowercase() || c == '_')).collect();
+        assert!(quoted.len() >= 4, "{quoted:?}");
+        for named in quoted {
+            assert!(names.contains(&named), "{named}");
         }
     }
 
     /// What a new session's prefill pays for, in characters of the prompt and the tools. A sentence added here is read by every session, at 200 tokens a second.
     #[test]
     fn what_every_session_reads_stays_small() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let prompt = system_prompt(folder.path(), false, "", "");
         assert!(prompt.len() < 5_500, "the system prompt has grown to {} characters", prompt.len());
         let tools = crate::tools::schemas_for(false, false, false, Vec::new(), false).to_string();
@@ -714,7 +958,12 @@ mod tests {
         // build that ends ten minutes later waits for the person to type)
         // (then present, to put the files of the work before the person as a card: some 380 characters, under 100 tokens once a session)
         // (then outside_sandbox, about 150 characters, under 40 tokens once a session: without it what the person asked to have done outside the workspace could only be refused)
-        assert!(tools.len() < 7_900, "the tools have grown to {} characters", tools.len());
+        // (then a sentence on fetching files with a plain curl each, some 120 characters, 30 tokens once a session: a URL in a variable or a for over files leaves "always" for the site
+        // of no use, and a person was asked about each of five downloads from one site)
+        // (then set_goal, goal_status and finish_goal, some 1,180 characters, about 300 tokens once a session: without them a request of many steps ended at the
+        // model's first stop, a failing test reported as the end of a turn three turns in a row)
+        // (then the lines of the prompt that were about one tool, moved into that tool's description, some 600 characters: the prompt is smaller by as much)
+        assert!(tools.len() < 9_950, "the tools have grown to {} characters", tools.len());
         assert!(app_facts("2026-11-02 20:01:18 +09:00", Some("Japanese"), &[]).len() < 200, "what rides on every message");
     }
 
@@ -729,31 +978,32 @@ mod tests {
 
     #[test]
     fn instructions_come_from_the_git_root_down() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::in_container::tempdir().unwrap();
         let inner = root.path().join("a");
         std::fs::create_dir_all(root.path().join(".git")).unwrap();
         std::fs::create_dir_all(&inner).unwrap();
         std::fs::write(root.path().join("DOGMIND.md"), "top").unwrap();
         std::fs::write(inner.join("DOGMIND.md"), "inner").unwrap();
-        std::fs::write(root.path().join("CLAUDE.md"), "not this").unwrap();
-        std::fs::write(root.path().join("AGENTS.md"), "not this either").unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("CLAUDE.md"), "the third").unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "the second").unwrap();
+        let elsewhere = crate::in_container::tempdir().unwrap();
         std::fs::write(elsewhere.path().join("AGENTS.md"), "from codex").unwrap();
         assert!(system_prompt(elsewhere.path(), false, "", "").contains("from codex"));
         let prompt = system_prompt(&inner, false, "", "SKILLS HERE");
-        assert!(prompt.contains("SKILLS HERE") && !prompt.contains("not this either"));
+        assert!(prompt.contains("SKILLS HERE"));
+        // (all of a folder's files, the root's before the inner folder's, DOGMIND.md, AGENTS.md, CLAUDE.md in a folder)
+        let at = |said: &str| prompt.find(said).unwrap_or_else(|| panic!("{said} is not in it"));
+        assert!(at("top\n") < at("the second\n") && at("the second\n") < at("the third\n") && at("the third\n") < at("inner\n"));
         assert!(!prompt.contains("untrusted_web_content") && !prompt.contains("Own Instructions"));
         assert!(system_prompt(&inner, true, "", "").contains("untrusted_web_content"));
         assert!(system_prompt(&inner, false, "  語尾はにゃん  ", "").contains("語尾はにゃん\n"));
-        assert!(prompt.find("top").unwrap() < prompt.find("inner\n").unwrap());
-        assert!(!prompt.contains("not this"));
     }
 
     /// Only what of the bundle is there is offered, and what is not is said so.
     #[cfg(windows)]
     #[test]
     fn a_bundle_in_part_offers_what_is_there_and_says_what_is_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = dir.path().join("tools");
         std::fs::create_dir_all(root.join("git\\cmd")).unwrap();
         std::fs::write(root.join("git\\cmd\\git.exe"), "").unwrap();
@@ -777,7 +1027,7 @@ mod tests {
 
     #[test]
     fn the_prompt_says_what_the_sandbox_refuses_and_keeps_to_the_workspace() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let prompt = system_prompt(folder.path(), false, "", "");
         assert!(prompt.contains("PowerShell starts at C:\\") && prompt.contains("it cannot read the user's other files") && prompt.contains("every route"));
         assert!(workspace_state(folder.path()).contains("The workspace is empty"));
@@ -791,10 +1041,96 @@ mod tests {
         assert!(workspace_state(folder.path()).contains("a.txt, big.log (0.3 MB), src/."), "a big file says how big");
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn the_folder_listing_follows_a_directory_link_and_recognizes_a_dangling_one() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let link = work.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        {
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/d", "/c", "mklink", "/J"]).arg(&link).arg(&target);
+            crate::tools::no_window(&mut command);
+            assert!(command.output().unwrap().status.success());
+        }
+        let listing = || folder_contents(std::fs::read_dir(&work).unwrap());
+        assert!(listing().ends_with("link/."));
+        std::fs::rename(&target, dir.path().join("moved")).unwrap();
+        assert!(listing().ends_with("link."));
+    }
+
+    #[test]
+    fn an_unreadable_entry_keeps_the_files_before_and_after_it_in_the_listing() {
+        let dir = crate::in_container::tempdir().unwrap();
+        for name in ["alpha.txt", "omega.txt"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let mut entries = std::fs::read_dir(dir.path()).unwrap();
+        let first = entries.next().unwrap();
+        let failed = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let contents = folder_contents([first, failed].into_iter().chain(entries));
+        assert!(contents.contains("alpha.txt, omega.txt"), "{contents}");
+    }
+
+    #[test]
+    fn an_unavailable_workspace_is_not_described_as_a_new_project() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let missing = dir.path().join("moved");
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "contents").unwrap();
+        for path in [&missing, &file] {
+            let error = std::fs::read_dir(path).unwrap_err().to_string();
+            let facts = workspace_state(path);
+            assert!(facts.contains(&error), "{facts}");
+            assert!(!facts.contains("new project") && !facts.contains("not a git repository"), "{facts}");
+        }
+        assert!(!missing.exists());
+        let empty = crate::in_container::tempdir().unwrap();
+        assert!(workspace_state(empty.path()).contains("The workspace is empty"));
+    }
+
+    #[test]
+    fn workspace_facts_count_only_unresolved_conflicts_in_the_open_folder() {
+        let repo = crate::in_container::tempdir().unwrap();
+        let root = repo.path();
+        let module = root.join("module");
+        let git = |args: &[&str]| crate::tools::git(root, args).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::create_dir(&module).unwrap();
+        let commit_files = |value: &str| {
+            std::fs::write(root.join("top.txt"), value).unwrap();
+            std::fs::write(module.join("part.txt"), value).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", value]);
+        };
+        commit_files("base");
+        git(&["checkout", "-qb", "other"]);
+        commit_files("other");
+        git(&["checkout", "-q", "main"]);
+        commit_files("main");
+        assert!(crate::tools::git(root, &["merge", "--no-edit", "other"]).is_err());
+        assert_eq!(crate::tools::git_info(root).unwrap().conflicted, 2);
+        assert!(workspace_state(root).contains("Unresolved conflicts: 2."));
+        assert!(workspace_state(&module).contains("Unresolved conflicts: 1."));
+
+        std::fs::write(module.join("part.txt"), "resolved").unwrap();
+        git(&["add", "module/part.txt"]);
+        assert!(!workspace_state(&module).contains("Unresolved conflicts"));
+        assert!(workspace_state(root).contains("Unresolved conflicts: 1."));
+    }
+
     /// A folder of a larger repository: the first message names the repository and says that git cannot reach it from the sandbox; the top of a repository keeps the sentence it had.
     #[test]
     fn a_folder_of_a_larger_repository_is_told_so_and_the_top_of_one_is_not() {
-        let repo = tempfile::tempdir().unwrap();
+        let repo = crate::in_container::tempdir().unwrap();
         let run = |args: &[&str]| {
             crate::tools::git(repo.path(), args).unwrap();
         };
@@ -817,7 +1153,7 @@ mod tests {
 
     #[test]
     fn work_in_the_workspace_leaves_the_system_prompt_as_it_was() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let (before, state) = (system_prompt(folder.path(), false, "", ""), workspace_state(folder.path()));
         std::fs::write(folder.path().join("new.txt"), "x").unwrap();
         assert_eq!(system_prompt(folder.path(), false, "", ""), before, "the engine would read all of it again");
@@ -834,15 +1170,15 @@ mod tests {
 
     #[test]
     fn the_prompt_says_how_to_ask_for_the_network_and_to_write_rather_than_plan() {
-        let prompt = system_prompt(tempfile::tempdir().unwrap().path(), false, "", "");
+        let prompt = system_prompt(crate::in_container::tempdir().unwrap().path(), false, "", "");
         assert!(prompt.contains("`network: true`"));
-        assert!(prompt.contains("Never put code, markup, shader text, formulas or a text you are rewriting in reasoning"));
+        assert!(prompt.contains("## Thinking\n- Reasoning decides; it does not write.") && prompt.contains("Never draft them in reasoning"));
         assert!(!prompt.contains("under node or python"), "node may be closed to the sandbox");
     }
 
     #[test]
     fn the_prompt_does_not_offer_what_it_then_says_fails() {
-        let prompt = system_prompt(tempfile::tempdir().unwrap().path(), false, "", "");
+        let prompt = system_prompt(crate::in_container::tempdir().unwrap().path(), false, "", "");
         assert!(!prompt.contains("cmd syntax: `dir`"), "`dir` is refused in the sandbox");
         assert!(!TOOLS.contains(&"py"), "its launcher does not start in the sandbox");
     }
@@ -861,6 +1197,16 @@ mod tests {
         assert_eq!(app_facts("2026-11-02 20:01:18 +09:00", None, &[]), format!("{APP_FACTS}\n- Now: 2026-11-02 20:01 +09:00"));
         assert_eq!(typed_text("hi"), "hi");
         assert_eq!(typed_text("## The User's Message\nnot the app's"), "## The User's Message\nnot the app's", "what the person typed is what they typed");
+    }
+
+    #[test]
+    fn a_language_heading_in_the_persons_message_remains_part_of_the_message() {
+        let quoted = "文例を比較してください。\n## Response Language\nEnglish\n最後の段落です。";
+        assert_eq!(typed_text(quoted), quoted);
+        let headed = "## Response Language\nEnglish\n最後の段落です。";
+        assert_eq!(typed_text(headed), headed);
+        let wrapped = format!("{NOW_MARK}2026-11-02 20:01 +09:00]\n{TYPED_MARK}{quoted}");
+        assert_eq!(typed_text(&wrapped), quoted);
     }
 
     #[test]
@@ -890,6 +1236,8 @@ mod tests {
     fn the_apps_own_words_are_told_from_the_persons() {
         assert!(is_nudge(CONTINUE_NUDGE) && is_nudge(CHECK_NUDGE) && is_nudge(&slip_note("员")));
         assert!(is_nudge(CHECK_NUDGE.strip_prefix(DRAFT_NOTE).unwrap()), "as a session saved before it was marked has it");
+        assert!(is_nudge(CHECK_NUDGE_BEFORE), "and as it was worded before");
+        assert!(is_nudge(CHECK_NUDGE_MARKED_BEFORE) && is_nudge(CHECK_NUDGE_MARKED_BEFORE.strip_prefix(DRAFT_NOTE).unwrap()), "and as it was until 11-23");
         assert!(!is_nudge("continue"));
         let facts = app_facts("now", None, &[]);
         assert!(is_nudge(&facts) && is_app_facts(&facts), "the app's facts are the app's");

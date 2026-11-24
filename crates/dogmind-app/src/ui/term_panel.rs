@@ -1,5 +1,6 @@
-//! The central Terminal view: the person's own shells, as tabs, each a window drawn in the app's own paint. This file is the view's page and tabs, its one window (which
-//! shows the terminal of the tab chosen, and takes the keys, the pointer and an IME), the menus, and what it asks of the rest of the app; the shells themselves are `term`.
+//! The terminal panel: the person's own shells, as tabs, each a window drawn in the app's own paint, in a panel under the conversation that the title bar's button opens and
+//! closes. This file is the panel's page and tabs, its one window (which shows the terminal of the tab chosen, and takes the keys, the pointer and an IME), the menus, and what it
+//! asks of the rest of the app; the shells themselves are `term`. Its shell is PowerShell: PowerShell 7 where the PC has it, Windows PowerShell where not.
 //!
 //! A terminal is the person's, with the person's own rights: nothing it shows goes to the model, and nothing here is given to the agent.
 
@@ -11,7 +12,7 @@ use crate::render::{self, TermCursor, TermCursorShape, TermFont, TermGround, Ter
 use crate::term::keymap::{self, Keyed, Mods};
 use crate::term::palette;
 use crate::term::screen::{Paint, SelectBy, Shape as CursorShape, Snapshot, Underline};
-use crate::term::shells::{self, Shell};
+use crate::term::shells;
 use crate::term::{self, Terminal, Wake, MOST_TERMINALS};
 use windows_sys::Win32::UI::Input::Ime::*;
 
@@ -57,15 +58,13 @@ pub(super) enum TermKey {
     Pass,
 }
 
-/// The windows of the Terminal view, and the terminals themselves.
+/// The windows of the terminal panel, and the terminals themselves.
 pub(super) struct TermView {
     pub window: HWND,
     tab_buttons: Vec<HWND>,
     close_buttons: Vec<HWND>,
     new_button: HWND,
-    pub shells_button: HWND,
     start_button: HWND,
-    pub start_shells: HWND,
     again_button: HWND,
     pub rename_field: HWND,
     terminals: Vec<Terminal>,
@@ -76,8 +75,8 @@ pub(super) struct TermView {
     font_dpi: u32,
     /// How many cells the window has, which a terminal started now begins with.
     cells: (u16, u16),
-    /// The shells the menu that is open lists, in its order.
-    shells_listed: Vec<Shell>,
+    /// The panel is open, under the conversation: the title bar's button and `/terminal` open it, the button closes it, and so does closing its last terminal.
+    pub open: bool,
     /// What the tip of each tab says, as last told to the tool tips.
     tab_tips: Vec<String>,
     /// The first half of a character that is two UTF-16 units.
@@ -114,9 +113,7 @@ impl TermView {
             tab_buttons: (0..MOST_TERMINALS as isize).map(|at| button(ID_TERM_TAB + at, "", ButtonKind::Segment)).collect(),
             close_buttons: (0..MOST_TERMINALS as isize).map(|at| button(ID_TERM_CLOSE + at, "x", ButtonKind::Icon)).collect(),
             new_button: button(ID_TERM_NEW, "plus", ButtonKind::Icon),
-            shells_button: button(ID_TERM_SHELLS, "chevron-down", ButtonKind::Icon),
             start_button: button(ID_TERM_START, "", ButtonKind::Primary),
-            start_shells: button(ID_TERM_START_SHELLS, "chevron-down|", ButtonKind::Secondary),
             again_button: button(ID_TERM_AGAIN, "", ButtonKind::Secondary),
             rename_field: control(parent, "EDIT", "", WS_BORDER | ES_AUTOHSCROLL as u32, 0, ID_TERM_RENAME),
             terminals: Vec::new(),
@@ -126,7 +123,7 @@ impl TermView {
             font: None,
             font_dpi: 0,
             cells: (80, 24),
-            shells_listed: Vec::new(),
+            open: false,
             tab_tips: Vec::new(),
             high_surrogate: None,
             selecting: false,
@@ -147,7 +144,7 @@ impl TermView {
     fn others(&self) -> Vec<HWND> {
         let mut all = self.tab_buttons.clone();
         all.extend(&self.close_buttons);
-        all.extend([self.new_button, self.shells_button, self.start_button, self.start_shells, self.again_button]);
+        all.extend([self.new_button, self.start_button, self.again_button]);
         all
     }
 
@@ -176,6 +173,17 @@ pub(super) fn opens_a_terminal(vk: u16, mods: Mods) -> bool {
     mods.ctrl && !mods.alt && vk == VK_OEM_3
 }
 
+/// How tall the terminal panel is, in a conversation's area `room` high: two fifths of it, and never so much that what is typed for the model has no room over it.
+pub(super) fn terminal_panel_height(room: i32, dpi: u32) -> i32 {
+    let s = |value: i32| scale(dpi, value);
+    (room * 2 / 5).clamp(s(PANEL_LEAST), (room - s(PANEL_LEAVES)).max(s(PANEL_LEAST)))
+}
+
+/// The panel is at least this tall (unscaled pixels): its strip of tabs and a few lines.
+const PANEL_LEAST: i32 = 170;
+/// And leaves at least this much over it: the input card, its row of chips, and a few lines of the conversation.
+const PANEL_LEAVES: i32 = 300;
+
 /// What the terminal's ground is: the panel's own, so that it is of the theme.
 fn ground() -> u32 {
     theme::sidebar()
@@ -191,17 +199,14 @@ impl App {
     pub(super) unsafe fn terminal_words(&self) {
         set_text(self.term.window, t("Terminal"));
         self.tip(self.term.new_button, t("New terminal"));
-        for window in [self.term.shells_button, self.term.start_shells] {
-            self.tip(window, t("Choose a shell"));
-        }
         for window in &self.term.close_buttons {
             self.tip(*window, t("Close the terminal"));
         }
     }
 
-    /// The panel shows the Terminal view.
+    /// The terminal panel is on screen, under the conversation or the timeline.
     pub(super) fn terminal_shown(&self) -> bool {
-        self.panel == Panel::Chat && !self.onboarding && self.settings.center_view == CenterView::Terminal
+        self.panel == Panel::Chat && !self.onboarding && self.term.open
     }
 
     /// What `look` makes of the terminal that is shown on its tab, when there is one. The terminal is borrowed for no longer than that, so that what comes of it can be acted on.
@@ -220,7 +225,7 @@ impl App {
 
     /// Nothing of the view is on screen: its windows go, and the terminals go on.
     pub(super) unsafe fn terminal_hidden(&mut self) {
-        if matches!(self.panel_menu.whose, MenuFor::Shells | MenuFor::Terminal) {
+        if matches!(self.panel_menu.whose, MenuFor::Terminal) {
             self.files_menu_close(false);
         }
         if self.term.renaming.is_some() {
@@ -237,8 +242,8 @@ impl App {
         }
     }
 
-    /// The Terminal view, from `top` to the foot of the window: the page that says what it is while there is no terminal, and otherwise the tabs, the terminal under them, and, for one that
-    /// has ended, what it ended with and the way to a new one.
+    /// The terminal panel, from `top` to `bottom`: the way to a terminal while there is none, and otherwise the tabs, the terminal under them, and, for one that has ended,
+    /// what it ended with and the way to a new one.
     pub(super) unsafe fn layout_terminal_view(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32, bottom: i32) {
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
@@ -258,18 +263,17 @@ impl App {
         }
         if self.term.terminals.is_empty() {
             show(self.term.window, false);
-            for window in self.term.tab_buttons.clone().into_iter().chain(self.term.close_buttons.clone()).chain([self.term.new_button, self.term.shells_button, self.term.again_button]) {
+            for window in self.term.tab_buttons.clone().into_iter().chain(self.term.close_buttons.clone()).chain([self.term.new_button, self.term.again_button]) {
                 show(window, false);
             }
             self.layout_terminal_page(shapes, x, width, top);
             return;
         }
         show(self.term.start_button, false);
-        show(self.term.start_shells, false);
 
-        // The tabs, and at their end a new terminal and the shells to choose from.
-        let (plus, arrow) = (s(ds::size::ICON_BUTTON), s(ds::size::ICON_BUTTON) - s(ds::space::XS));
-        let tabs_room = (width - plus - arrow - s(ds::space::XS)).max(s(60));
+        // The tabs, and at their end a new terminal.
+        let plus = s(ds::size::ICON_BUTTON);
+        let tabs_room = (width - plus - s(ds::space::XS)).max(s(60));
         let count = self.term.terminals.len() as i32;
         // With room, each tab has its words and its cross. Without, the one shown keeps its words and its cross and the others share what is left, as far as their first letters.
         let roomy = tabs_room / count >= s(72);
@@ -307,13 +311,10 @@ impl App {
             show(self.term.tab_buttons[index], false);
             show(self.term.close_buttons[index], false);
         }
-        let (new_button, shells_button) = (self.term.new_button, self.term.shells_button);
-        place(new_button, x + width - plus - arrow, strip_top, plus, s(TAB_HEIGHT));
-        place(shells_button, x + width - arrow, strip_top, arrow, s(TAB_HEIGHT));
-        for button in [new_button, shells_button] {
-            set_button_style(button, ButtonKind::Icon, ground());
-            show(button, true);
-        }
+        let new_button = self.term.new_button;
+        place(new_button, x + width - plus, strip_top, plus, s(TAB_HEIGHT));
+        set_button_style(new_button, ButtonKind::Icon, ground());
+        show(new_button, true);
 
         // The terminal itself.
         let rect = (left, window_top, span, (window_bottom - window_top).max(s(60)));
@@ -341,21 +342,16 @@ impl App {
         }
     }
 
-    /// The page of a view with no terminal in it: the way to begin one, alone. (The view's name is over it already: a prompt's mark and the
-    /// name again under it read as a stray `>`.)
+    /// The page of a panel with no terminal in it (one could not be started when it opened): the way to begin one, alone.
     unsafe fn layout_terminal_page(&mut self, _shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32) {
         let s = |value: i32| scale(self.dpi, value);
-        let y = top + s(ds::space::XL);
-        // The button for a new terminal, in the shell last used, and the arrow beside it for the others.
+        let y = top + s(ds::space::L);
         let words = t("New terminal");
-        let button_width = (text_width(self.fonts.strong, words) + s(ds::size::BUTTON_PADDING)).min(width - s(ds::size::CONTROL) - s(ds::space::XS));
+        let button_width = (text_width(self.fonts.strong, words) + s(ds::size::BUTTON_PADDING)).min(width);
         set_text_if_changed(self.term.start_button, words);
         place(self.term.start_button, x, y, button_width, s(ds::size::CONTROL));
-        place(self.term.start_shells, x + button_width + s(ds::space::XS), y, s(ds::size::CONTROL), s(ds::size::CONTROL));
         set_button_style(self.term.start_button, ButtonKind::Primary, ground());
-        set_button_style(self.term.start_shells, ButtonKind::Secondary, ground());
         show(self.term.start_button, true);
-        show(self.term.start_shells, true);
     }
 
     /// The window now has `cols` by `rows` cells: every terminal is told, the one that is not shown as well, so that each is as it will be when it is.
@@ -369,16 +365,19 @@ impl App {
 
     // ---- Starting, choosing and closing.
 
-    /// The view is on screen, as `/terminal` and a new terminal want it: the central panel on Terminal.
+    /// The panel is on screen, as `/terminal`, the title bar's button and a new terminal want it: under the conversation, which stays as it is.
     pub(super) unsafe fn show_terminal_view(&mut self) -> bool {
         if self.panel != Panel::Chat {
             self.set_panel(Panel::Chat);
         }
-        self.set_center_view(CenterView::Terminal);
+        if !self.term.open {
+            self.term.open = true;
+            self.layout();
+        }
         self.terminal_shown()
     }
 
-    /// `/terminal` and Ctrl+`: the view, with a terminal in it: the one there is, or a new one when there is none.
+    /// `/terminal`: the panel, with a terminal in it: the one there is, or a new one when there is none.
     pub(super) unsafe fn terminal_command(&mut self) {
         if self.show_terminal_view() && self.term.terminals.is_empty() {
             self.terminal_new(None);
@@ -387,7 +386,23 @@ impl App {
         }
     }
 
-    /// A new terminal, in the shell named, or in the one last chosen where none is. Its tab is shown and has the keys.
+    /// The title bar's button: the panel opens, as `/terminal` opens it, or, open, it closes. Its terminals go on while it is closed, and are there when it opens again.
+    pub(super) unsafe fn terminal_toggle(&mut self) {
+        if self.terminal_shown() {
+            self.terminal_panel_close();
+        } else {
+            self.terminal_command();
+        }
+    }
+
+    /// The panel closes; the keys go back to what is typed for the model.
+    unsafe fn terminal_panel_close(&mut self) {
+        self.term.open = false;
+        self.layout();
+        self.focus_composer();
+    }
+
+    /// A new terminal, in PowerShell, or (for a test of the running app) in the shell named. Its tab is shown and has the keys.
     pub(super) unsafe fn terminal_new(&mut self, shell: Option<&str>) -> Option<u64> {
         if self.term.terminals.len() >= MOST_TERMINALS {
             self.say(&tf("{0} terminals are open: close one to open another.", &[&MOST_TERMINALS]));
@@ -400,17 +415,13 @@ impl App {
         let installed = shells::discover(&shells::Places::from_env());
         let chosen = match shell {
             Some(id) => installed.iter().find(|candidate| candidate.id == id),
-            None => shells::chosen(&installed, &self.settings.terminal_shell),
+            None => shells::powershell(&installed),
         }
         .cloned();
         let Some(chosen) = chosen else {
             self.say(t("No shell was found on this PC."));
             return None;
         };
-        if self.settings.terminal_shell != chosen.id {
-            self.settings.terminal_shell = chosen.id.to_string();
-            self.save();
-        }
         let folder = term::start_folder(&self.workspace, term::home_folder().as_deref());
         let id = self.term.next_id;
         let window = self.window as isize;
@@ -464,11 +475,14 @@ impl App {
         // (its job closes here: the shell and what it started end)
         drop(gone);
         let had_the_keys = GetFocus() == self.term.window;
+        // (a panel with no terminal left is closed with it, and the next press of the button opens one again)
+        if self.term.terminals.is_empty() {
+            self.terminal_panel_close();
+            return;
+        }
         self.layout();
         InvalidateRect(self.term.window, std::ptr::null(), 0);
-        if self.term.terminals.is_empty() {
-            self.focus_composer();
-        } else if had_the_keys {
+        if had_the_keys {
             SetFocus(self.term.window);
         }
     }
@@ -477,28 +491,6 @@ impl App {
     pub(super) fn terminals_end(&mut self) {
         self.term.terminals.clear();
         self.term.active = None;
-    }
-
-    /// The menu of shells, under the arrow beside the new terminal: what this PC has, with the one last chosen marked. Discovery is of the moment; it starts nothing.
-    pub(super) unsafe fn terminal_shells_menu(&mut self, anchor: HWND) {
-        let installed = shells::discover(&shells::Places::from_env());
-        if installed.is_empty() {
-            self.say(t("No shell was found on this PC."));
-            return;
-        }
-        let marked = shells::chosen(&installed, &self.settings.terminal_shell).map(|shell| shell.id);
-        let items: Vec<MenuItem> = installed.iter().map(|shell| MenuItem { checked: Some(shell.id) == marked, ..MenuItem::new(t(shell.name)) }).collect();
-        self.term.shells_listed = installed;
-        // (under the arrow, where the menu of the others is)
-        let (left, top, _, height) = child_area(anchor, self.window);
-        self.panel_menu_show(items, MenuFor::Shells, (left, top + height));
-    }
-
-    /// A shell is chosen from the menu: it is remembered, and opened.
-    pub(super) unsafe fn terminal_shell_chosen(&mut self, at: usize) {
-        if let Some(id) = self.term.shells_listed.get(at).map(|shell| shell.id) {
-            self.terminal_new(Some(id));
-        }
     }
 
     // ---- Names.
@@ -596,9 +588,9 @@ impl App {
         if mods.alt && matches!(vk, VK_F4 | VK_SPACE | VK_TAB | VK_ESCAPE) {
             return TermKey::Dispatch;
         }
-        // F6 is the way out of the terminal by keys: every other key is the shell's.
+        // F6 is the way out of the terminal by keys, to what is typed for the model, with the panel left open: every other key is the shell's.
         if vk == VK_F6 && !mods.ctrl && !mods.alt {
-            self.set_center_view(CenterView::Conversation);
+            self.focus_composer();
             return TermKey::Taken;
         }
         let Some((over, modes, selected, rows)) = self.with_active(|terminal| {
@@ -674,7 +666,7 @@ impl App {
         }
     }
 
-    /// Ctrl+` : another terminal, in the shell last chosen.
+    /// Ctrl+` : another terminal, in PowerShell.
     pub(super) unsafe fn terminal_command_new(&mut self) {
         self.terminal_new(None);
     }

@@ -7,7 +7,7 @@ use crate::session::{self, helper_file_of, helpers_of, is_helper};
 
 fn run_under(workspace: &Path, client: Client, policy: Arc<Policy>) -> Run {
     let (sender, events) = channel();
-    let sessions = tempfile::tempdir().unwrap();
+    let sessions = crate::in_container::tempdir().unwrap();
     let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: None, policy, code_mode: false }, sender, Box::new(|| {}));
     handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
     Run { handle, events, _sessions: sessions }
@@ -41,7 +41,7 @@ fn looking_server() -> (Client, Arc<Mutex<Vec<Value>>>) {
 }
 
 fn workspace() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "the xylophone is here\n").unwrap();
     dir
 }
@@ -169,9 +169,11 @@ fn the_persons_stop_on_the_helper_ends_it_with_the_stated_result_and_the_parents
 #[test]
 fn a_stop_pressed_on_a_helper_that_has_ended_is_not_for_the_next() {
     let dir = workspace();
+    // (one helper a turn: the second in a turn of its own)
     let (client, _) = server(vec![
         call_answer("explore", serde_json::json!({"task": "One"})),
         text_answer("first answer"),
+        text_answer("done once"),
         call_answer("explore", serde_json::json!({"task": "Two"})),
         text_answer("second answer"),
         text_answer("done"),
@@ -179,10 +181,12 @@ fn a_stop_pressed_on_a_helper_that_has_ended_is_not_for_the_next() {
     let run = run_agent(dir.path(), client, Mode::Default);
     // (the same call id each time, as this server gives: a stop left over from the first would end the second at once)
     run.handle.helper_stop.stop("call-1");
-    run.handle.commands.send(Command::Send("look twice".into())).unwrap();
+    run.handle.commands.send(Command::Send("look".into())).unwrap();
+    let (_, first) = until_over(&run);
+    run.handle.commands.send(Command::Send("look again".into())).unwrap();
     let (_, told) = until_over(&run);
-    assert!(told.iter().filter(|line| line.starts_with("ended")).all(|line| line.contains("Answered")), "{told:?}");
-    assert!(told.iter().any(|line| line == "tool call-1 true second answer"), "{told:?}");
+    assert!(first.iter().chain(&told).filter(|line| line.starts_with("ended")).all(|line| line.contains("Answered")), "{first:?} {told:?}");
+    assert!(told.iter().any(|line| line.starts_with("tool call-1 true second answer")), "{told:?}");
 }
 
 #[test]
@@ -283,7 +287,7 @@ fn parent_with_helpers(folder: &Path, key: Option<&Arc<Cipher>>) -> (PathBuf, [P
 #[test]
 fn a_branch_carries_the_helpers_of_the_messages_it_keeps_and_leaves_the_rest() {
     for encrypted in [false, true] {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let key = Cipher::generate().unwrap();
         let (parent, [first, second]) = parent_with_helpers(folder.path(), encrypted.then_some(&key));
         let before = (std::fs::read(&parent).unwrap(), std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap());
@@ -310,7 +314,7 @@ fn a_branch_carries_the_helpers_of_the_messages_it_keeps_and_leaves_the_rest() {
 
 #[test]
 fn naming_a_session_leaves_its_helpers_where_they_are_and_deleting_it_takes_them() {
-    let folder = tempfile::tempdir().unwrap();
+    let folder = crate::in_container::tempdir().unwrap();
     let (parent, [first, second]) = parent_with_helpers(folder.path(), None);
     let other = session::Session::create(folder.path(), Path::new("C:/w"), "now", "20261107-090000-2").unwrap().path;
     let mut other_session = session::Session::open(&other).unwrap().0;
@@ -333,7 +337,7 @@ fn naming_a_session_leaves_its_helpers_where_they_are_and_deleting_it_takes_them
 
 #[test]
 fn a_helpers_number_goes_on_from_the_files_there_are_and_a_file_name_that_is_no_helpers_is_none() {
-    let folder = tempfile::tempdir().unwrap();
+    let folder = crate::in_container::tempdir().unwrap();
     let (parent, _) = parent_with_helpers(folder.path(), None);
     let (made, number) = session::Session::create_helper(&Policy::default(), &parent, Path::new("C:/w"), "now").unwrap();
     assert_eq!(number, 3);
@@ -346,7 +350,7 @@ fn a_helpers_number_goes_on_from_the_files_there_are_and_a_file_name_that_is_no_
 
 #[test]
 fn turning_conversations_on_later_seals_the_helpers_files_with_the_sessions() {
-    let data = tempfile::tempdir().unwrap();
+    let data = crate::in_container::tempdir().unwrap();
     let sessions = data.path().join("sessions");
     let (parent, [first, _]) = parent_with_helpers(&sessions, None);
     assert!(!session::is_encrypted(&first));

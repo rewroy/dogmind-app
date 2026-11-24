@@ -8,10 +8,14 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::safety::{command_words, Gate, Risk};
+use crate::safety::{after_settings, command_words, Gate, Risk};
 
 /// Programs whose second word can be any code at all: a rule for them would allow anything.
-const INTERPRETERS: &[&str] = &["python", "python3", "py", "node", "deno", "bun", "ruby", "perl", "php", "lua", "cmd", "powershell", "pwsh", "bash", "sh", "wsl", "npx", "uvx", "cscript", "wscript", "mshta", "rundll32", "regsvr32"];
+const INTERPRETERS: &[&str] = &["python", "python3", "py", "node", "deno", "bun", "ruby", "perl", "php", "lua", "cmd", "powershell", "pwsh", "bash", "sh", "wsl", "cscript", "wscript", "mshta", "rundll32", "regsvr32"];
+/// Programs that run a package by its name: what they run is that package, so a rule goes up to it (`npx -y modern-web-guidance@1.0.1`), and the words after it vary. With any
+/// switch but these before the package (`-c` runs a line of the shell, `-p` names another package) the call is allowed to the letter or not at all.
+const RUNNERS: &[&str] = &["npx", "pnpx", "bunx", "uvx"];
+const RUNNER_SWITCHES: &[&str] = &["-y", "--yes", "-q", "--quiet", "--no-install"];
 const EDIT: &str = "edit";
 const COMMAND: &str = "execute_command";
 
@@ -74,29 +78,45 @@ fn plain(gate: &Gate, command: &str) -> bool {
     !gate.is_compound(command) && !command.contains(['\n', '\r', '^'])
 }
 
+/// A command as a rule reads it: the settings before it, as written (`safety::after_settings`), if there are any, and the one command after them. None for a line that is more.
+fn split(gate: &Gate, command: &str) -> Option<(Option<String>, String)> {
+    match after_settings(command) {
+        Some((settings, rest)) => plain(gate, &rest).then_some((Some(settings), rest)),
+        None => plain(gate, command).then(|| (None, command.to_string())),
+    }
+}
+
+/// What a rule of a package runner is: the runner, its switches that only say how it runs, and the package. None where another switch comes first, or no package.
+fn runner_prefix(words: &[String]) -> Option<String> {
+    let at = words.iter().skip(1).position(|word| !RUNNER_SWITCHES.contains(&word.to_ascii_lowercase().as_str()))? + 1;
+    let package = words.get(at).filter(|word| !word.starts_with(['-', '/']))?;
+    Some(joined(&[words[..at].to_vec(), vec![package.clone()]].concat()))
+}
+
 /// The rule to offer for a call, or none: then only this exact call can be allowed, for this session.
 pub fn proposed(gate: &Gate, workspace: &Path, tool: &str, arguments: &Value, risk: Risk) -> Option<Rule> {
     let family = family(tool)?;
     if family == EDIT {
         return Some(Rule { workspace: workspace.to_path_buf(), tool: EDIT.to_string(), prefix: String::new(), exact: false });
     }
-    let command = arguments.get("command")?.as_str()?;
-    if !plain(gate, command) {
-        return None;
-    }
-    let all = command_words(command);
+    let (settings, command) = split(gate, arguments.get("command")?.as_str()?)?;
+    let all = command_words(&command);
     let mut parts = all.iter();
     let first = parts.next().filter(|first| !first.is_empty())?;
-    // What deletes, moves or stops things, and what runs code it was handed, is allowed to the letter or not at all.
-    let exact = risk >= Risk::Medium || INTERPRETERS.contains(&program_of(first).as_str());
-    let prefix = if exact {
-        joined(&all)
-    } else {
-        match parts.next().filter(|second| !second.starts_with(['-', '/'])) {
+    let program = program_of(first);
+    // What deletes, moves or stops things, and what runs code it was handed, is allowed to the letter or not at all. A package runner runs the package it names.
+    let runner = (risk < Risk::Medium && RUNNERS.contains(&program.as_str())).then(|| runner_prefix(&all)).flatten();
+    let exact = runner.is_none() && (risk >= Risk::Medium || INTERPRETERS.contains(&program.as_str()) || RUNNERS.contains(&program.as_str()));
+    let prefix = match (runner, exact) {
+        (Some(runner), _) => runner,
+        (None, true) => joined(&all),
+        (None, false) => match parts.next().filter(|second| !second.starts_with(['-', '/'])) {
             Some(second) => joined(&[first.clone(), second.clone()]),
             None => joined(std::slice::from_ref(first)),
-        }
+        },
     };
+    // (the settings go with it, as written: the same command with other settings, `PATH` or `NODE_OPTIONS` among them, can run something else)
+    let prefix = settings.map_or(prefix.clone(), |settings| format!("{settings} {prefix}"));
     Some(Rule { workspace: workspace.to_path_buf(), tool: COMMAND.to_string(), prefix, exact })
 }
 
@@ -107,11 +127,9 @@ fn matches(rule: &Rule, gate: &Gate, workspace: &Path, tool: &str, arguments: &V
     if rule.tool == EDIT {
         return true;
     }
-    let Some(command) = arguments.get("command").and_then(Value::as_str) else { return false };
-    if !plain(gate, command) {
-        return false;
-    }
-    let all = joined(&command_words(command));
+    let Some((settings, command)) = arguments.get("command").and_then(Value::as_str).and_then(|command| split(gate, command)) else { return false };
+    let all = joined(&command_words(&command));
+    let all = settings.map_or(all.clone(), |settings| format!("{settings} {all}"));
     all == rule.prefix || (!rule.exact && all.starts_with(&format!("{} ", rule.prefix)))
 }
 
@@ -193,7 +211,7 @@ mod tests {
     /// A rules file that does not read as rules is moved aside before the next rule is written, not written over with that one alone.
     #[test]
     fn rules_that_do_not_read_are_kept_aside_and_not_written_over() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("permissions.json");
         std::fs::write(&path, b"[{\"workspace\": \"C:\\\\w\", \"tool\"\0\0\0\0").unwrap();
         let rule = Rule { workspace: PathBuf::from("C:\\w"), tool: COMMAND.to_string(), prefix: "npm test".into(), exact: false };
@@ -209,7 +227,7 @@ mod tests {
     #[test]
     fn rules_that_cannot_be_read_are_not_written_over() {
         use std::os::windows::fs::OpenOptionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("permissions.json");
         let kept = Rule { workspace: PathBuf::from("C:\\w"), tool: COMMAND.to_string(), prefix: "npm test".into(), exact: false };
         add(&path, kept.clone()).unwrap();
@@ -231,7 +249,7 @@ mod tests {
     #[test]
     fn rules_that_do_not_read_and_cannot_be_moved_aside_are_not_written_over() {
         use std::os::windows::fs::OpenOptionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("permissions.json");
         std::fs::write(&path, b"[{\"workspace\": \"C:\\\\w\", \"tool\"\0\0\0\0").unwrap();
         let rule = Rule { workspace: PathBuf::from("C:\\w"), tool: COMMAND.to_string(), prefix: "npm test".into(), exact: false };
@@ -352,7 +370,7 @@ mod tests {
 
     #[test]
     fn rules_outlive_the_program_and_go_when_removed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("deep").join("permissions.json");
         let gate = Gate::new();
         let root = Path::new("C:\\w");
@@ -366,9 +384,48 @@ mod tests {
         assert!(!allows(&path, &gate, root, COMMAND, &command("make all")));
     }
 
+    /// "Always" to a command keeps the program and its first word (`git status`, `cargo test`), and of a package runner the package (`npx -y some-cli@2.0.0`): the same with
+    /// other words after it is allowed. What deletes or sends, and a runner given a line of the shell or another package, stays the exact call.
+    #[test]
+    fn a_rule_keeps_the_program_and_its_first_word_and_of_a_runner_the_package() {
+        let gate = Gate::new();
+        let root = Path::new("C:\\w");
+        let kept = |line: &str, risk: Risk| proposed(&gate, root, COMMAND, &command(line), risk).map(|rule| (rule.prefix, rule.exact));
+        assert_eq!(kept("git status -s", Risk::Low), Some(("git status".into(), false)));
+        assert_eq!(kept("cargo test --release -p a", Risk::Low), Some(("cargo test".into(), false)));
+        assert_eq!(kept(r#"npx -y some-cli@2.0.0 search "one two""#, Risk::Low), Some(("npx -y some-cli@2.0.0".into(), false)));
+        assert_eq!(kept("npx.cmd --yes some-cli@2.0.0 list", Risk::Low), Some(("npx.cmd --yes some-cli@2.0.0".into(), false)));
+        let rule = proposed(&gate, root, COMMAND, &command(r#"npx -y some-cli@2.0.0 search "one two""#), Risk::Low).unwrap();
+        assert!(matches(&rule, &gate, root, COMMAND, &command(r#"npx -y some-cli@2.0.0 retrieve "three,four""#)));
+        assert!(matches(&rule, &gate, root, COMMAND, &command("npx -y some-cli@2.0.0")));
+        assert!(!matches(&rule, &gate, root, COMMAND, &command("npx -y some-cli@2.0.1 search one")));
+        assert!(!matches(&rule, &gate, root, COMMAND, &command("npx -y other search one")));
+        for (line, risk) in [(r#"npx -c "del x""#, Risk::Low), ("npx --package=evil some-cli run", Risk::Low), ("npx -y", Risk::Low), ("del build.log", Risk::Medium),
+                             ("git push origin main", Risk::Medium), ("npx -y some-cli@2.0.0 search one", Risk::Medium), ("python a.py", Risk::Low)] {
+            assert_eq!(kept(line, risk).map(|(_, exact)| exact), Some(true), "{line}");
+        }
+    }
+
+    /// Settings before one command (`set NAME=VALUE&&`) go in its rule as written: the same command with other words after it is allowed with them, not with other
+    /// settings and not with none.
+    #[test]
+    fn settings_before_a_command_are_part_of_its_rule() {
+        let gate = Gate::new();
+        let root = Path::new("C:\\w");
+        let rule = proposed(&gate, root, COMMAND, &command(r#"set DISABLE_TELEMETRY=1&& npx -y some-cli@2.0.0 search "one""#), Risk::Low).unwrap();
+        assert_eq!((rule.prefix.as_str(), rule.exact), ("set DISABLE_TELEMETRY=1&& npx -y some-cli@2.0.0", false));
+        assert!(matches(&rule, &gate, root, COMMAND, &command(r#"set DISABLE_TELEMETRY=1&& npx -y some-cli@2.0.0 retrieve "two""#)));
+        assert!(!matches(&rule, &gate, root, COMMAND, &command("set NODE_OPTIONS=--require=x&& npx -y some-cli@2.0.0 retrieve two")));
+        assert!(!matches(&rule, &gate, root, COMMAND, &command("npx -y some-cli@2.0.0 retrieve two")));
+        assert!(!matches(&rule, &gate, root, COMMAND, &command("set DISABLE_TELEMETRY=1&& npx -y some-cli@2.0.0 retrieve two && del x")));
+        let plain_rule = proposed(&gate, root, COMMAND, &command("git status"), Risk::Low).unwrap();
+        assert!(!matches(&plain_rule, &gate, root, COMMAND, &command("set PATH=C:\\x&& git status")), "a rule without settings is not one with them");
+        assert_eq!(proposed(&gate, root, COMMAND, &command("set A=1 && git status"), Risk::Low), None, "a space before && is in the value: two commands");
+    }
+
     #[test]
     fn a_damaged_file_allows_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("permissions.json");
         std::fs::write(&path, "{ not json").unwrap();
         assert!(!allows(&path, &Gate::new(), Path::new("C:\\w"), COMMAND, &command("make")));

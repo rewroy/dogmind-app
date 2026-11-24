@@ -3,7 +3,8 @@
 //! The turns are the lines of the file (a blank line is skipped), each sent when the one before it has ended. Approvals are given, as a person at the keyboard would who trusts the job;
 //! with `--refuse` every approval is answered no, so that no command runs. A call being written is shown as its pieces come, with the time into the turn.
 //! `--code-mode` offers the model `run_code`, a short program that calls the tools; the calls it makes are lines of the trajectory with the program's call as their `parent`.
-//! `--wake-for` goes on after the last turn for as long as the session has a background command or a wait, up to that many seconds, and shows the turns it wakes itself for.
+//! `--wake-for` goes on after the last turn for as long as the session has a background command or a wait, up to that many seconds, and shows the turns it wakes itself for;
+//! `--limit` is of the whole run, the turns it wakes itself for with the rest.
 //! The session, and the trajectory beside it (`dogmind-app --trajectory`), are in `--data\sessions`. It never touches the app's own data folder.
 
 use std::path::PathBuf;
@@ -33,11 +34,20 @@ fn main() {
     let mut code_mode = false;
     // `--effort LEVEL`: the thinking level the app sends (`reasoning_effort`), as the person's setting would; none sends nothing.
     let mut effort: Option<String> = None;
+    // `--instructions FILE`, `--language LANG`, `--skills-off a,b`: the person's own instructions, answer language and skills turned off, as their settings
+    // give them, to run a job as they would.
+    let (mut instructions, mut language, mut skills_off): (Option<PathBuf>, String, Vec<String>) = (None, "auto".to_string(), Vec::new());
+    // `--web`: web search and reading are offered, as with the person's setting on.
+    let mut web = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--refuse" => refuse = true,
             "--code-mode" => code_mode = true,
             "--effort" => effort = args.next().filter(|level| !level.is_empty()),
+            "--instructions" => instructions = args.next().map(PathBuf::from),
+            "--web" => web = true,
+            "--language" => language = args.next().unwrap_or_else(|| "auto".to_string()),
+            "--skills-off" => skills_off = args.next().unwrap_or_default().split(',').map(str::trim).filter(|name| !name.is_empty()).map(str::to_string).collect(),
             "--warm-wait" => warm_wait = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
             "--between" => between = args.next().and_then(|text| text.parse().ok()).unwrap_or(0),
             "--warm-between" => warm_between = true,
@@ -75,6 +85,8 @@ fn main() {
     client.replay_reasoning = info.straydog;
     client.suppresses_letters = info.suppresses_letters;
     client.tool_writing = info.tool_writing;
+    client.image_digests = info.image_digests;
+    client.app_role = info.app_role();
     client.vision = info.vision;
     println!("server: model {} window {} straydog {}", info.model, info.context, info.straydog);
 
@@ -85,12 +97,12 @@ fn main() {
         rules: data.join("permissions.json"),
         mode,
         effort: effort.clone(),
-        web: WebSettings::default(),
-        language: "auto".into(),
+        web: WebSettings { enabled: web, ..WebSettings::default() },
+        language: language.clone(),
         japanese_system: false,
-        instructions: None,
+        instructions: instructions.clone(),
         home: None,
-        skills_off: Vec::new(),
+        skills_off: skills_off.clone(),
         skills_on: Vec::new(),
         memory: None,
         mcp: None,
@@ -155,6 +167,12 @@ fn main() {
         let mut seen = Seen { began: turn_began, refuse, ..Seen::default() };
         let mut in_a_turn = false;
         while waiting_since.elapsed() < Duration::from_secs(wake_for) {
+            if began.elapsed() > Duration::from_secs(limit) {
+                println!("time limit: stopping (woken turns: {woken_turns})");
+                handle.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                send(Command::Quit);
+                return;
+            }
             if !in_a_turn && handle.background.snapshot().is_empty() && !handle.background.has_pending() {
                 println!("nothing is left going or waiting");
                 break;

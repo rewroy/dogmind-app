@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn the_state_is_what_is_on_the_disk() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (_, read) = setup(dir.path(), "");
         assert_eq!(state(&read), State::Absent);
         // Beside the bundle's folder, where setup puts Qwen's.
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn deepseeks_file_with_its_shards_counts_and_an_unfinished_one_does_not() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (_, read) = setup(dir.path(), "");
         file(&read.model.join("DeepSeek-V4.1-Flash-1017-Vision-BF16.gguf.part"));
         file(&read.model.join("DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS.gguf"));
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn turning_it_off_keeps_the_file_where_the_engine_will_not_find_it_and_back() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (config, read) = setup(dir.path(), "");
         let beside = dir.path().join("Qwen").join("mmproj-x.gguf");
         file(&beside);
@@ -210,7 +210,7 @@ mod tests {
     /// nothing to move says so.
     #[test]
     fn turning_it_on_puts_back_every_file_and_says_when_there_was_nothing_to_do() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (config, read) = setup(dir.path(), "");
         let (beside, inside) = (dir.path().join("Qwen").join("mmproj-a.gguf"), read.model.join("mmproj-b.gguf"));
         file(&beside);
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn a_file_named_by_hand_is_turned_off_in_the_settings() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let elsewhere = dir.path().join("mine").join("encoder.gguf");
         file(&elsewhere);
         let (config, read) = setup(dir.path(), &format!("model_vision = '{}'\n", elsewhere.display()));

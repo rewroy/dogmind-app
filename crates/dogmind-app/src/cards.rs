@@ -72,8 +72,9 @@ pub enum Card {
     Notice { wakes: Vec<Wake>, at: String },
     /// An `explore` helper: the call it is of, its task as a line, which of the session's helper files holds its steps (none when they were not kept), and where it stands.
     Helper { call: String, task: String, number: Option<u32>, state: HelperState },
-    /// Files of the workspace the model put before the person (`present`), from its root.
-    Presented { files: Vec<String> },
+    /// Files of the workspace put before the person, from its root: by the model's `present`, or, `interim`, by the app, for a page this turn made that a check
+    /// found running, while the model goes on with it. The model's own present of those files takes an interim card's place, and the turn's end takes its mark off.
+    Presented { files: Vec<String>, interim: bool },
 }
 
 /// How many files a card lists: the rest are counted, and the Changes page has all of them.
@@ -236,7 +237,7 @@ impl Card {
                         files.push(path);
                     }
                 }
-                (!files.is_empty()).then_some(Card::Presented { files })
+                (!files.is_empty()).then_some(Card::Presented { files, interim: false })
             }
             _ => None,
         }
@@ -698,7 +699,7 @@ second")), Some("first line".to_string()));
         assert!(is_asking("ask_user") && is_asking("submit_plan") && is_asking("present"));
         // (files put before the person are a card of theirs, and a call that failed put nothing there)
         let paths = serde_json::json!({"paths": ["web/index.html", "web\\index.html", "notes.md"]});
-        assert_eq!(Card::of_call(1, "present", &paths, Some("The person sees a card with web/index.html, notes.md.")), Some(Card::Presented { files: vec!["web/index.html".into(), "notes.md".into()] }));
+        assert_eq!(Card::of_call(1, "present", &paths, Some("The person sees a card with web/index.html, notes.md.")), Some(Card::Presented { files: vec!["web/index.html".into(), "notes.md".into()], interim: false }));
         assert_eq!(Card::of_call(1, "present", &paths, Some("error: gone.txt is not a file of the workspace")), None);
         assert_eq!(Card::of_call(1, "present", &paths, None), None, "a call with no result yet");
         assert!(!is_asking("read_file") && !is_asking("todo"));

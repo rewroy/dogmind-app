@@ -290,20 +290,43 @@ pub(crate) fn loaded(message: &Message, folder: Option<&Path>) -> (Vec<Loaded>, 
     let mut text = message.content.clone().unwrap_or_default();
     let mut pictures = Vec::new();
     for image in &message.images {
-        // (what a power cut can leave, nothing or zeros: a service refuses a picture that is not one, and with it every later request of this conversation)
-        match folder.and_then(|folder| read_stored(&folder.join(&image.file)).ok()).filter(|bytes| !left_by_a_power_cut(bytes)) {
-            Some(bytes) => pictures.push(Loaded { media_type: image.media_type.clone(), data: base64(&bytes) }),
-            None => {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                // (a file that is there and does not open is not one that is gone: a sealed picture that is damaged, or whose key is not here)
-                let there = folder.is_some_and(|folder| std::fs::metadata(folder.join(&image.file)).is_ok_and(|file| file.is_file() && file.len() > 0));
-                text.push_str(&if there { unreadable_note(&image.file) } else { gone_note(&image.file) });
-            }
+        match read_picture(image, folder) {
+            Ok(bytes) => pictures.push(Loaded { media_type: image.media_type.clone(), data: base64(&bytes) }),
+            Err(note) => add_note(&mut text, &note),
         }
     }
     (pictures, text)
+}
+
+/// A picture's bytes from its file, or what is said in its place when it cannot be had.
+fn read_picture(image: &ImageRef, folder: Option<&Path>) -> Result<Vec<u8>, String> {
+    // (what a power cut can leave, nothing or zeros: a service refuses a picture that is not one, and with it every later request of this conversation)
+    match folder.and_then(|folder| read_stored(&folder.join(&image.file)).ok()).filter(|bytes| !left_by_a_power_cut(bytes)) {
+        Some(bytes) => Ok(bytes),
+        None => {
+            // (a file that is there and does not open is not one that is gone: a sealed picture that is damaged, or whose key is not here)
+            let there = folder.is_some_and(|folder| std::fs::metadata(folder.join(&image.file)).is_ok_and(|file| file.is_file() && file.len() > 0));
+            Err(if there { unreadable_note(&image.file) } else { gone_note(&image.file) })
+        }
+    }
+}
+
+fn add_note(text: &mut String, note: &str) {
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(note);
+}
+
+/// What a server that keeps the pictures it was sent (Straydog's `image_digests`) knows a picture by: the SHA-256 of its bytes, 64 lowercase hex digits.
+pub(crate) fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The digests of the pictures sent, by their files: a picture's file is never written again once it is, and a picture sent by its digest is then not read at all.
+fn known_digests() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, String>> {
+    static KNOWN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, String>>> = std::sync::OnceLock::new();
+    KNOWN.get_or_init(Default::default)
 }
 
 fn gone_note(file: &str) -> String {
@@ -320,12 +343,44 @@ pub(crate) fn note_for(file: &str, why: &str) -> String {
 }
 
 /// The content of an OpenAI-style message with pictures: they come first, then the words.
+#[cfg(test)]
 pub(crate) fn openai_content(message: &Message, folder: Option<&Path>) -> Value {
-    let (pictures, text) = loaded(message, folder);
-    if pictures.is_empty() {
+    openai_content_held(message, folder, None)
+}
+
+/// `openai_content`, for a server that keeps the pictures it was sent: one of those it holds (`held`, by digest) goes as `sha256:` and its digest, and its file is
+/// not read. `sent` is given the digest of every picture that goes, either way.
+pub(crate) fn openai_content_held(message: &Message, folder: Option<&Path>, mut held: Option<(&std::collections::HashSet<String>, &mut Vec<String>)>) -> Value {
+    let mut text = message.content.clone().unwrap_or_default();
+    let mut parts: Vec<Value> = Vec::new();
+    for image in &message.images {
+        let file = folder.map(|folder| folder.join(&image.file));
+        let known = file.as_ref().and_then(|file| known_digests().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(file).cloned());
+        if let (Some((holds, sent)), Some(digest)) = (held.as_mut(), known.as_ref()) {
+            if holds.contains(digest) {
+                sent.push(digest.clone());
+                parts.push(json!({"type": "image_url", "image_url": {"url": format!("sha256:{digest}")}}));
+                continue;
+            }
+        }
+        match read_picture(image, folder) {
+            Ok(bytes) => {
+                if let Some((_, sent)) = held.as_mut() {
+                    let digest = known.unwrap_or_else(|| digest(&bytes));
+                    if let Some(file) = file {
+                        known_digests().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(file, digest.clone());
+                    }
+                    sent.push(digest);
+                }
+                let picture = Loaded { media_type: image.media_type.clone(), data: base64(&bytes) };
+                parts.push(json!({"type": "image_url", "image_url": {"url": picture.data_url()}}));
+            }
+            Err(note) => add_note(&mut text, &note),
+        }
+    }
+    if parts.is_empty() {
         return Value::String(text);
     }
-    let mut parts: Vec<Value> = pictures.iter().map(|picture| json!({"type": "image_url", "image_url": {"url": picture.data_url()}})).collect();
     // (a message that is only pictures has no text part: some servers refuse an empty one, and anthropic.rs leaves it out as well)
     if !text.is_empty() {
         parts.push(json!({"type": "text", "text": text}));
@@ -372,7 +427,7 @@ pub(crate) mod tests {
         let upright = attach_bytes("u.jpg", with_orientation(&red_then_blue(40, 20), 6)).unwrap();
         assert_eq!((upright.width, upright.height), (20, 40), "width and height are swapped for a quarter turn");
         // (the bytes are the original ones, EXIF and all, when they fit)
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let kept = save(&session, &upright, ImageLimit::WIDE).unwrap();
         assert_eq!((kept.width, kept.height), (20, 40));
@@ -394,7 +449,7 @@ pub(crate) mod tests {
 
     #[test]
     fn attached_pictures_are_copied_as_they_were_under_names_a_command_takes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let picture = |name: &str, bytes: &[u8], media_type: &str| Attachment { name: name.into(), bytes: bytes.to_vec(), media_type: media_type.into(), width: 4, height: 3 };
         let folder = dir.path().join("attachments");
         let written = copies_for_commands(&folder, "20261103-151658", &[picture("レウ の写真.JPG", b"jpeg bytes", "image/jpeg"), picture("", b"png bytes", "image/png"), picture("my photo (2).webp", b"webp", "image/webp")]);
@@ -456,7 +511,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_message_of_only_pictures_has_no_empty_text_part() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), encoded(4, 4, ImageFormat::Png)).unwrap();
         let image = ImageRef { file: "a.png".into(), media_type: "image/png".into(), width: 4, height: 4 };
         let only = Message { images: vec![image.clone()], ..Message::text("user", "") };
@@ -470,7 +525,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_picture_with_nothing_in_it_goes_as_one_that_has_gone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), "").unwrap();
         let message = Message { images: vec![ImageRef { file: "a.png".into(), media_type: "image/png".into(), width: 1, height: 1 }], ..Message::text("user", "look") };
         let (pictures, text) = loaded(&message, Some(dir.path()));
@@ -481,7 +536,7 @@ pub(crate) mod tests {
     /// What a power cut left of two pictures of a session written just before it: their length, all zeros. Such a one is not sent, and saved again it is written over.
     #[test]
     fn a_picture_a_power_cut_left_as_zeros_is_not_sent_and_saved_again_is_written_over() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let picture = attach_bytes("a.png", encoded(8, 8, ImageFormat::Png)).unwrap();
         let kept = save(&session, &picture, ImageLimit::WIDE).unwrap();
@@ -518,7 +573,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_file_is_told_by_its_bytes_and_keeps_its_name() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (picture, text) = (dir.path().join("named.txt"), dir.path().join("a.png"));
         std::fs::write(&picture, encoded(8, 8, ImageFormat::Png)).unwrap();
         std::fs::write(&text, "not a picture").unwrap();
@@ -528,7 +583,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_picture_that_fits_is_the_same_bytes_and_one_that_does_not_is_made_smaller_once() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let bytes = encoded(300, 100, ImageFormat::Png);
         let picture = attach_bytes("a", bytes.clone()).unwrap();
@@ -549,7 +604,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_picture_too_heavy_goes_as_a_jpeg_and_smaller_until_it_fits() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let picture = attach_bytes("a", encoded(600, 600, ImageFormat::Png)).unwrap();
         let most = picture.bytes.len() / 8;
@@ -570,7 +625,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_message_goes_pictures_first_and_a_lost_picture_is_said_in_words() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let bytes = encoded(8, 8, ImageFormat::Png);
         let kept = save(&session, &attach_bytes("a", bytes.clone()).unwrap(), ImageLimit::WIDE).unwrap();

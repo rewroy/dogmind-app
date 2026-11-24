@@ -41,6 +41,16 @@ The first run asks how to reach a model and where to work; `/setup` goes through
 starts a session, Ctrl+, opens the settings, Ctrl+Shift+C copies the last answer. A right click on a session renames or
 deletes it.
 
+To connect an MCP server already set up in Claude or Codex, type `/mcp candidates` in the conversation.
+Copy a name from the list and type `/mcp import NAME` to start that server. For example, if the list shows
+`Project Files`, type `/mcp import Project Files`. To add all available servers at once, use `/mcp import`.
+If an expected name is missing, check its spelling in the source settings. Import skips empty names, names with leading or trailing whitespace, and names containing line breaks.
+Use `/mcp` to check the connection. If a configured server disconnected or failed to start, fix the cause and run `/mcp import NAME` to retry it. Once connected, its tools are available in the open conversation.
+To add a server manually, open *Settings > Tools > MCP servers > Add a server*.
+For a local server that opens scripts or data by a relative path, enter its folder in *Working directory (optional)*. You can also edit this field on an existing server.
+When `CODEX_HOME` is set, preview and import use the `config.toml` in that directory.
+New imports from Codex keep its `enabled_tools` and `disabled_tools` lists. Existing Dogmind entries keep their saved settings when imported again.
+
 While the model works, Enter puts what you type into the work before its next step, and Ctrl+Enter keeps it for after the work. Each
 waiting message has buttons to send it into the work now, to edit it, or to discard it. Each message shows its time; an answer's
 branch button starts a new session with the conversation up to that answer, to go on from there another way. From the second turn,
@@ -67,17 +77,17 @@ beside the conversation (Markdown, HTML, pictures, code and text, CSV and TSV as
 click opens it in its app, and a right click opens it, shows it in Explorer, copies its path or mentions it in your message
 (`@path`). A helper's steps take the panel's place while they are shown, and a preview opened after them takes theirs.
 
-Below the session title, switch between *Conversation*, *Terminal* and *Timeline*. The timeline shows current activity and the session history.
+Once something has been said in a session, switch between *Conversation* and *Timeline* below its title. The timeline shows current
+activity and the session history.
 
-*Terminal* (`/terminal`, or Ctrl+`` ` ``) is your own shell: PowerShell 7, Windows PowerShell, the Command
-Prompt, and Git Bash where a full Git for Windows is installed (the Git that comes with Dogmind has no bash). **New terminal** opens
-the shell you chose last, the arrow beside it lists the others, and it starts in the session's folder (your own folder when there is
-none). Programs behave as in Windows Terminal (it is a pseudo console, ConPTY): colours in 16, 256 and true colour, bold,
+The terminal button in the title bar (or `/terminal`) opens your own shell in a panel under the conversation, which stays in view;
+the button closes the panel again, and its terminals go on running while it is closed. The shell is PowerShell: PowerShell 7 where it
+is installed, and Windows PowerShell otherwise. It starts in the session's folder (your own folder when there is none). Programs behave as in Windows Terminal (it is a pseudo console, ConPTY): colours in 16, 256 and true colour, bold,
 underline, the cursor, wide Japanese characters, git, python, vim, a progress bar. The shell has your own environment, so a
 `NO_COLOR` in it (a variable some tools set for what they start) is the shell's too, and programs that honour it print plain text.
-Each terminal is a tab, up to 8: double click a
-tab to rename it, and its cross closes it, which ends the shell and everything it started, as quitting Dogmind does. A terminal goes
-on running while another view is shown or you open another session. A shell that has ended stays on the
+Each terminal is a tab, up to 8 (the + beside the tabs, or Ctrl+`` ` ``, opens
+another): double click a tab to rename it, and its cross closes it, which ends the shell and everything it started, as quitting Dogmind
+does; closing the last one closes the panel. A terminal goes on running while the panel is closed or you open another session. A shell that has ended stays on the
 screen with its exit code and a *New terminal* button, and never starts again by itself. While it has the keys, every key is the
 shell's (Tab, the arrows, F-keys, Ctrl and Alt with a letter) except Ctrl+`` ` `` (another terminal), Ctrl+Tab and Ctrl+1 to 9 (the
 sessions) and F6, which leaves the terminal for the message box. Ctrl+C copies what is selected, and otherwise is the shell's ^C;
@@ -119,6 +129,8 @@ nothing about you but the app's version. A copy that the installer put in its fo
 (*Settings > About* shows its progress and a *Cancel*). Then a card at the top of the main screen, whatever page is open, says the update is ready, with *Update now (Dogmind restarts)* and *Later* (while the window is hidden, the tray says so once for each new version): only that press, when no work is going on or when it ends, runs the setup
 (`DogmindSetup-VERSION.exe --update --dir FOLDER --wait-pid PID`, which asks nothing, waits for the app to end, updates the folder, puts back what was there if it fails, and starts the app again). A copy unpacked from the zip
 is only told, with a button that opens the release's page. To update by hand, run the new `DogmindSetup-VERSION.exe`: it asks a running copy to close (one that is working stays open and says so; nothing is ended by force), checks each file by its hash, replaces only what changed and takes away only what the last version put there. Every file takes its place or none does: a failure puts back what was there, so the program is as it was, and running it again goes on from there. From a zip: quit from the tray (closing the window leaves the app running), and extract the new zip over the old folder. Settings and sessions are in `%LOCALAPPDATA%\DogmindApp` and stay.
+
+To update a closed installation and leave Dogmind closed, run `DogmindSetup-VERSION.exe --update --dir "FOLDER" --no-launch` with the installation folder in place of `FOLDER`.
 
 The setup that is downloaded is not always all of it. A release also has `DogmindSetup-VERSION.parts` beside its setup, which says where each file is in it, and the installer writes down, in the manifest of the install, the hash, size and last-write time of each file it put there (an install made before 0.1.5 has none, and its first update downloads the whole setup, and reads every file of the folder once). When the release lists the `.parts` file with its size and SHA-256 as well and the manifest has those records, the app downloads only the program and the files that are new or have changed, by HTTP ranges, and puts a setup together in the `updates` folder that leaves the other files to the install. The `.parts` file is checked by the size and SHA-256 GitHub published for it, and each part by what it says: the program by its hash, each file by inflating it and comparing its size and SHA-256. The installer finds the files left out in the folder, by their records, or by their hashes where a file's time is not the one written down, and if one is not as it was it changes nothing and says to download the full setup from the release page. Whatever is not as it should be on the way, the whole setup is downloaded as above, and nothing more is said of it. The installer trusts those records only on the app's own update (`--update`): a file that still has the size and time written down for it is not read again. Running the setup yourself checks every file, and is the way to repair an install.
 

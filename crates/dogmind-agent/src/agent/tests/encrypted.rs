@@ -6,7 +6,7 @@ use crate::conversation_key::{Cipher, Policy, LOCKED};
 
 fn run_under(workspace: &Path, client: Client, policy: Arc<Policy>, memory: Option<PathBuf>) -> Run {
     let (sender, events) = channel();
-    let sessions = tempfile::tempdir().unwrap();
+    let sessions = crate::in_container::tempdir().unwrap();
     let handle = start(Config { workspace: workspace.to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory, mcp: None, policy, code_mode: false }, sender, Box::new(|| {}));
     handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
     Run { handle, events, _sessions: sessions }
@@ -22,8 +22,8 @@ fn session_file(run: &Run) -> PathBuf {
 
 #[test]
 fn while_the_key_is_not_unlocked_no_session_is_opened_or_written() {
-    let dir = tempfile::tempdir().unwrap();
-    let plain = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
+    let plain = crate::in_container::tempdir().unwrap();
     let old = {
         let mut session = crate::session::Session::create(plain.path(), dir.path(), "now", "1").unwrap();
         session.append(&Message::text("user", "an old plain conversation")).unwrap();
@@ -70,8 +70,8 @@ fn while_the_key_is_not_unlocked_no_session_is_opened_or_written() {
 
 #[test]
 fn a_new_session_is_sealed_once_the_key_is_here_and_what_the_model_keeps_is_sealed_with_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let notes = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
+    let notes = crate::in_container::tempdir().unwrap();
     let key = Cipher::generate().unwrap();
     let policy = Policy::locked();
     let remember = serde_json::json!({"note": "the person prefers answers in Japanese", "scope": "user"});
@@ -108,9 +108,9 @@ fn a_new_session_is_sealed_once_the_key_is_here_and_what_the_model_keeps_is_seal
 
 #[test]
 fn a_session_opened_with_lines_that_did_not_open_says_so() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let key = Cipher::generate().unwrap();
-    let session_folder = tempfile::tempdir().unwrap();
+    let session_folder = crate::in_container::tempdir().unwrap();
     let path = {
         let mut session = crate::session::Session::create_with(session_folder.path(), dir.path(), "now", "1", Some(&key)).unwrap();
         session.append(&Message::text("system", "s")).unwrap();

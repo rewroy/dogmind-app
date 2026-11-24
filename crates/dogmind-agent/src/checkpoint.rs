@@ -75,12 +75,49 @@ impl Saved {
     /// Whether the path leads somewhere else than when it was saved. One saved before that was kept has no "then" to compare with: a link or a junction on its way now is taken to lead
     /// elsewhere, as nothing says it did not.
     fn leads_elsewhere(&self) -> bool {
-        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
+        // (exactly: both are the names the file system gave, so the same place reads the same, and any difference, of case or of anything
+        // else, is taken for somewhere else: a name the comparison only thought equal must not keep a restore going through a new link)
         match &self.real {
-            Some(then) => crate::safety::real_path(&self.path).is_none_or(|now| key(&now) != key(then)),
+            Some(then) => crate::safety::real_path(&self.path).is_none_or(|now| now != *then),
             None => has_a_link_on_its_way(&self.path),
         }
     }
+}
+
+/// A path as Windows compares names: each UTF-16 unit in the OS's invariant upper case (LCMapStringEx, LCMAP_UPPERCASE: the table NTFS and
+/// CompareStringOrdinal's ignore-case compare by), a surrogate left as it is (that table has no entry for one). On an NTFS volume, every
+/// BMP character's case partners and six beyond the BMP (1,229 pairs, each made as two files) were the same or apart for NTFS as for this
+/// key. Rust's case mappings are newer than that table: one character at a time they joined 278 of the pairs NTFS keeps apart or parted
+/// ones it joins (ı and I, ſ and S, µ and Μ, ǅ and Ǆ), and `to_lowercase` of the whole name made "İ" one with "i̇", so that of two files
+/// Windows keeps apart, the edits and the commands kept one. If the OS does not map the name, it is its own key (two names stay two).
+#[cfg(windows)]
+fn path_key(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{LCMapStringEx, LCMAP_UPPERCASE, LOCALE_NAME_INVARIANT};
+    let units: Vec<u16> = path.as_os_str().encode_wide().map(|unit| if unit == u16::from(b'/') { u16::from(b'\\') } else { unit }).collect();
+    let (Ok(length), false) = (i32::try_from(units.len()), units.is_empty()) else { return units };
+    let mut upper = vec![0u16; units.len()];
+    // SAFETY: both buffers hold `length` units; the invariant locale and no version or sort handle.
+    let written = unsafe {
+        LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, units.as_ptr(), length, upper.as_mut_ptr(), length, std::ptr::null(),
+                      std::ptr::null(), 0)
+    };
+    if written != length {
+        return units;
+    }
+    units.iter().zip(upper).map(|(&unit, upper)| if (0xD800..=0xDFFF).contains(&unit) { unit } else { upper }).collect()
+}
+
+/// Elsewhere: each character upper-cased one for one, a character whose upper case is more than one left as it is.
+#[cfg(not(windows))]
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").chars().map(|c| {
+        let mut upper = c.to_uppercase();
+        match (upper.next(), upper.next()) {
+            (Some(one), None) => one,
+            _ => c,
+        }
+    }).collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,16 +222,51 @@ fn put_back(copy: &Path, path: &Path) -> std::io::Result<()> {
 
 /// With a session that is deleted.
 pub fn remove_for(session: &Path) -> Result<(), String> {
-    // (its pictures too: nothing else reads them)
-    let _ = std::fs::remove_dir_all(crate::images::folder_of(session));
-    let _ = std::fs::remove_dir_all(crate::baseline::folder_of(session));
-    crate::trajectory::remove_for(session);
-    crate::session::remove_helpers(session);
-    let folder = folder_of(session);
-    match std::fs::remove_dir_all(&folder) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {error}", folder.display())),
+    for folder in [crate::images::folder_of(session), crate::baseline::folder_of(session), folder_of(session)] {
+        removal_result(&folder, std::fs::remove_dir_all(&folder))?;
+    }
+    let trace = crate::trajectory::file_of(session);
+    removal_result(&trace, std::fs::remove_file(&trace))?;
+    for (_, helper) in crate::session::helpers_of(session) {
+        removal_result(&helper, std::fs::remove_file(&helper))?;
+    }
+    Ok(())
+}
+
+fn removal_result(path: &Path, result: std::io::Result<()>) -> Result<(), String> {
+    match result {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {error}", path.display())),
         _ => Ok(()),
     }
+}
+
+#[derive(Debug)]
+pub enum DeleteError {
+    Conversation(String),
+    RemainingFiles(String),
+}
+
+/// Delete the conversation first. If it is locked, all data needed to reopen or restore it stays in place.
+pub fn delete_session(session: &Path) -> Result<(), DeleteError> {
+    removal_result(session, std::fs::remove_file(session)).map_err(DeleteError::Conversation)?;
+    remove_for(session).map_err(DeleteError::RemainingFiles)
+}
+
+/// Retry the Windows app's cleanup of an already deleted session. If its name has been taken again,
+/// leave the replacement and its companions together and return false.
+#[cfg(windows)]
+pub fn remove_remaining_if_absent(session: &Path) -> Result<bool, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE;
+    // Reserve the name through cleanup so a new session cannot acquire these files mid-operation.
+    // Windows removes only this empty reservation on close, including if the app exits.
+    let _reservation = match std::fs::OpenOptions::new().write(true).create_new(true).share_mode(0).custom_flags(FILE_FLAG_DELETE_ON_CLOSE).open(session) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(format!("{}: {error}", session.display())),
+    };
+    remove_for(session)?;
+    Ok(true)
 }
 
 /// One more than the largest `N` of the `N.bin` copies in a folder: where the numbering goes on when the index that held it is not there to say.
@@ -289,7 +361,7 @@ impl Checkpoints {
     /// already, is left as it is (the first word on a file is what it was before the turn).
     pub fn commanded(&mut self, touched: Vec<Touched>) -> Result<(), String> {
         let Some(turn) = self.index.turns.last_mut() else { return Ok(()) };
-        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
+        let key = |path: &Path| path_key(path);
         let mut added = false;
         for one in touched {
             let known = turn.files.iter().any(|saved| key(&saved.path) == key(&one.path)) || turn.commanded.iter().any(|named| key(&named.path) == key(&one.path));
@@ -362,12 +434,13 @@ impl Checkpoints {
     /// no whole-file read; what is shown of the change is the text as the agent reads files (UTF-16, UTF-8, Shift_JIS). A file over what is read for a comparison (as `baseline` has it) or a binary
     /// one is said to have changed, with no diff.
     pub fn session_changes(&self, workspace: &Path) -> Vec<FileChange> {
-        self.session_changes_within(workspace, crate::baseline::MOST_READ)
+        self.session_changes_matching(workspace, crate::baseline::MOST_READ, |_| true)
     }
 
-    fn session_changes_within(&self, workspace: &Path, most_read: u64) -> Vec<FileChange> {
+    /// Select workspace-relative paths before opening files or rendering their patches.
+    pub(crate) fn session_changes_matching(&self, workspace: &Path, most_read: u64, wanted: impl Fn(&Path) -> bool) -> Vec<FileChange> {
         // (each file from the first word on it: what the agent saved, or what a command did to it, turn by turn)
-        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
+        let key = |path: &Path| path_key(path);
         let mut seen = HashSet::new();
         let mut first: Vec<Result<Saved, &Touched>> = Vec::new();
         for turn in &self.index.turns {
@@ -383,8 +456,11 @@ impl Checkpoints {
             }
         }
         first.into_iter().filter_map(|first| {
-            let path = match &first { Ok(saved) => saved.path.clone(), Err(touched) => touched.path.clone() };
-            let now = std::fs::metadata(&path).ok().filter(std::fs::Metadata::is_file).map(|_| path.clone());
+            let path = match &first { Ok(saved) => &saved.path, Err(touched) => &touched.path };
+            if !wanted(path.strip_prefix(workspace).unwrap_or(path)) {
+                return None;
+            }
+            let now = std::fs::metadata(path).ok().filter(std::fs::Metadata::is_file).map(|_| path.clone());
             match first {
                 Ok(saved) => self.change_of(&saved, now, workspace, most_read),
                 Err(touched) => self.touched_change(touched, now, workspace, most_read),
@@ -569,7 +645,7 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("a.txt");
         let other = dir.path().join("b.txt");
         let marks = Checkpoints::open(&dir.path().join("session.jsonl"));
@@ -580,12 +656,97 @@ mod tests {
         std::fs::read_to_string(path).unwrap()
     }
 
+    /// Decides: two names are one key where NTFS takes them for the same entry and two where it keeps two (each pair made as two
+    /// files on an NTFS volume: the case partners Rust's newer case mappings join or part otherwise, a character beyond the BMP, and ones
+    /// that differ only in ASCII case or in their separators).
+    #[cfg(windows)]
+    #[test]
+    fn names_are_one_key_where_ntfs_takes_them_for_one_file() {
+        let same = |a: &str, b: &str| path_key(Path::new(a)) == path_key(Path::new(b));
+        for (a, b) in [("\u{130}.txt", "i\u{307}.txt"), ("\u{131}.txt", "I.txt"), ("\u{17F}.txt", "S.txt"), ("\u{B5}.txt", "\u{39C}.txt"),
+                       ("\u{1C5}.txt", "\u{1C4}.txt"), ("\u{261}.txt", "\u{A7AC}.txt"), ("\u{10428}.txt", "\u{10400}.txt")] {
+            assert!(!same(a, b), "{a:?} and {b:?} are two files on NTFS");
+        }
+        for (a, b) in [("Sample.txt", "sAmPle.txt"), ("src/a.rs", "SRC\\A.RS"), ("\u{3B1}.txt", "\u{391}.txt"), ("\u{E9}.txt", "\u{C9}.txt")] {
+            assert!(same(a, b), "{a:?} and {b:?} are one file on NTFS");
+        }
+    }
+
+    /// Decides: of two files Windows keeps apart that a case-folded key joined ("İ.txt" and "i̇.txt" for `to_lowercase`, "ı.txt" and
+    /// "I.txt" for a character's own upper case), the session's changes keep both, one saved by an edit and one named by a command, and a name
+    /// differing only in ASCII case is still the file it names.
+    #[cfg(windows)]
+    #[test]
+    fn two_files_windows_keeps_apart_stay_two_in_the_changes() {
+        let mut f = fixture();
+        let root = f.file.parent().unwrap().to_path_buf();
+        let dotted = root.join("\u{130}.txt");
+        let combined = root.join("i\u{307}.txt");
+        let dotless = root.join("\u{131}.txt");
+        let capital = root.join("I.txt");
+        for path in [&dotted, &combined, &dotless, &capital] {
+            std::fs::write(path, "before").unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".txt")).count(), 4,
+                   "NTFS keeps all four names");
+        f.marks.begin("edit", "t", None).unwrap();
+        f.marks.before_edit(&[dotted.clone(), dotless.clone()]).unwrap();
+        f.marks.commanded(vec![Touched { path: combined.clone(), made: true }, Touched { path: capital.clone(), made: true },
+                               Touched { path: root.join("\u{130}.TXT"), made: false }]).unwrap();
+        for path in [&dotted, &combined, &dotless, &capital] {
+            std::fs::write(path, "after").unwrap();
+        }
+        let mut paths: Vec<String> = f.marks.session_changes(&root).iter().map(|change| change.path.clone()).collect();
+        paths.sort();
+        let mut expected = vec!["\u{130}.txt".to_string(), "i\u{307}.txt".to_string(), "\u{131}.txt".to_string(), "I.txt".to_string()];
+        expected.sort();
+        assert_eq!(paths, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deleting_a_locked_conversation_preserves_its_data_and_cleanup_can_be_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let trace = crate::trajectory::file_of(&path);
+        std::fs::write(&path, "chat").unwrap();
+        std::fs::write(&trace, "trace").unwrap();
+        let lock = |p: &Path| std::fs::OpenOptions::new().read(true).share_mode(0).open(p).unwrap();
+        let held = lock(&path);
+        assert!(matches!(delete_session(&path), Err(DeleteError::Conversation(_))));
+        assert_eq!(std::fs::read_to_string(&trace).unwrap(), "trace");
+        drop(held);
+        let held = lock(&trace);
+        assert!(matches!(delete_session(&path), Err(DeleteError::RemainingFiles(_))));
+        assert!(!path.exists() && trace.exists());
+        drop(held);
+        delete_session(&path).unwrap();
+        assert!(!trace.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_of_a_deleted_session_preserves_a_restored_conversation_and_its_files() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let helper = crate::session::helper_file_of(&path, 1);
+        std::fs::write(&path, b"restored conversation").unwrap();
+        std::fs::write(&helper, b"restored helper").unwrap();
+        assert!(!remove_remaining_if_absent(&path).unwrap());
+        assert_eq!(read(&path), "restored conversation");
+        assert_eq!(read(&helper), "restored helper");
+        std::fs::remove_file(&path).unwrap();
+        assert!(remove_remaining_if_absent(&path).unwrap());
+        assert!(!path.exists() && !helper.exists());
+    }
+
     /// A folder made a junction to somewhere else after its files were saved takes nothing a rewind would have put back, and loses
     /// nothing it would have taken away; the rest of the rewind goes on.
     #[cfg(windows)]
     #[test]
     fn a_rewind_puts_nothing_where_a_junction_now_leads() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (work, elsewhere) = (dir.path().join("work"), dir.path().join("elsewhere"));
         std::fs::create_dir_all(work.join("sub")).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
@@ -612,7 +773,7 @@ mod tests {
     /// The index is gone bad (a cut, a bad disk): it is kept aside and not written over, and none of the copies it named is overwritten by the next one.
     #[test]
     fn a_damaged_index_keeps_the_copies_it_named_and_is_put_aside() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("session.jsonl");
         let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
         std::fs::write(&a, "first").unwrap();
@@ -641,7 +802,7 @@ mod tests {
     /// A copy never goes over a file that is there, whatever the numbering says.
     #[test]
     fn a_copy_takes_the_next_name_that_is_free() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("session.jsonl");
         let folder = folder_of(&session);
         std::fs::create_dir_all(&folder).unwrap();
@@ -654,6 +815,27 @@ mod tests {
         marks.begin("one", "t", Some(1)).unwrap();
         marks.before_edit(&[file]).unwrap();
         assert_eq!((read(&folder.join("0.bin")), read(&folder.join("1.bin")), read(&folder.join("2.bin"))), ("old zero".to_string(), "old one".to_string(), "now".to_string()));
+    }
+
+    #[test]
+    fn a_directory_filter_selects_saved_and_commanded_files_by_path_component() {
+        let mut f = fixture();
+        let root = f.file.parent().unwrap();
+        let src = root.join("src");
+        std::fs::create_dir(&src).unwrap();
+        let kept = src.join("saved.txt");
+        let command = src.join("command.txt");
+        let outside = root.join("src-extra.txt");
+        f.marks.begin("edit", "t", None).unwrap();
+        f.marks.before_edit(&[kept.clone(), outside.clone()]).unwrap();
+        f.marks.commanded(vec![Touched { path: command.clone(), made: true }]).unwrap();
+        for path in [kept, command, outside] {
+            std::fs::write(path, "new").unwrap();
+        }
+        let changes = f.marks.session_changes_matching(root, crate::baseline::MOST_READ, |path| path.starts_with("src"));
+        let paths: Vec<_> = changes.iter().map(|change| Path::new(&change.path)).collect();
+        assert_eq!(paths, [Path::new("src/saved.txt"), Path::new("src/command.txt")]);
+        assert_eq!(f.marks.session_changes(root).len(), 3);
     }
 
     /// Two Shift_JIS files that differ, and that the lossy text of both is the same for (every byte of both is a bad UTF-8 byte), are told apart, and shown as they read.
@@ -685,7 +867,7 @@ mod tests {
         std::fs::write(&big, format!("{}last\n", "line\n".repeat(19_999))).unwrap();
         std::fs::write(&f.other, [b'M', b'Z', 0, 0, 1, 2, 4]).unwrap();
         let root = big.parent().unwrap();
-        let small_cap = f.marks.session_changes_within(root, 1024);
+        let small_cap = f.marks.session_changes_matching(root, 1024, |_| true);
         assert_eq!(small_cap.len(), 2, "both are changed");
         assert!(small_cap.iter().all(|change| change.diff.is_empty() && change.added == 0), "{small_cap:?}");
         let whole = f.marks.session_changes(root);
@@ -697,7 +879,7 @@ mod tests {
     /// Two files are told apart by their size, or by the first block that differs, and the same bytes are the same.
     #[test]
     fn two_files_are_compared_by_size_and_then_by_blocks() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (a, b) = (dir.path().join("a"), dir.path().join("b"));
         let body = vec![7u8; 200_000];
         std::fs::write(&a, &body).unwrap();
@@ -743,7 +925,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_older_record_is_not_written_through_a_junction_that_is_there_now() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (work, elsewhere) = (dir.path().join("work"), dir.path().join("elsewhere"));
         std::fs::create_dir_all(work.join("sub")).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
@@ -774,7 +956,7 @@ mod tests {
     /// A path with no link on its way is no concern of the guard's, whether its record says where it led or not.
     #[test]
     fn a_plain_path_has_no_link_on_its_way() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("a").join("b")).unwrap();
         assert!(!has_a_link_on_its_way(&dir.path().join("a").join("b").join("c.txt")));
         let record = Saved { path: dir.path().join("a").join("b").join("c.txt"), copy: None, real: None };
@@ -885,7 +1067,7 @@ mod tests {
 
     #[test]
     fn they_come_back_with_the_session_and_go_with_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("session.jsonl");
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "x").unwrap();
@@ -976,7 +1158,7 @@ mod sealed_tests {
     /// The index of an encrypted session's checkpoints is sealed (the turns' titles are the first words of what was asked), the copies are not, and a session changed from one form to the other has its index changed with it.
     #[test]
     fn the_index_of_an_encrypted_session_is_sealed_and_follows_the_session_between_the_two_forms() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let key = Cipher::generate().unwrap();
         let session = Session::create_with(dir.path(), Path::new("w"), "now", "1", Some(&key)).unwrap().path.clone();
         let mut marks = Checkpoints::open(&session);
@@ -1003,7 +1185,7 @@ mod sealed_tests {
     /// with what it holds, a changed one with no text. A file the turn saved itself stays its own; a rewind puts back nothing of a command's.
     #[test]
     fn what_a_command_made_or_changed_is_shown_with_the_turn_and_not_put_back() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("node_modules")).unwrap();
         std::fs::create_dir_all(work.join("sub")).unwrap();

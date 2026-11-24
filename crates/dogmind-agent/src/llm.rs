@@ -1,6 +1,7 @@
 //! Chat completions over SSE, as Dogmind speaks to Straydog: `tool_choice` only when it is one Straydog takes, no
 //! `/tokenize`, no `max_tokens` or `temperature` on a main turn, the reasoning effort by name.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -209,11 +210,30 @@ fn prefill_said(comment: &str) -> Option<(u64, u64)> {
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
     pub prompt: u64,
-    pub cached: u64,
+    pub cached: Option<u64>,
     pub completion: u64,
     pub tokens_per_second: Option<f64>,
     /// The context, when the provider says it with its usage.
     pub window: Option<u64>,
+}
+
+pub(crate) fn reported_rate(timings: &Value) -> Option<f64> {
+    ["predicted_per_second", "decode_tokens_per_second"].iter().find_map(|name| timings.get(*name)?.as_f64().filter(|rate| *rate > 0.0))
+}
+
+pub(crate) fn cache_percent(prompt: u64, cached: Option<u64>) -> Option<u64> {
+    let cached = cached?;
+    (prompt > 0).then(|| (u128::from(cached.min(prompt)) * 100 / u128::from(prompt)) as u64)
+}
+
+#[cfg(test)]
+#[test]
+fn cache_percent_distinguishes_unavailable_usage_from_a_miss() {
+    assert_eq!(cache_percent(0, Some(0)), None);
+    assert_eq!(cache_percent(100, None), None);
+    assert_eq!(cache_percent(100, Some(0)), Some(0));
+    assert_eq!(cache_percent(300, Some(290)), Some(96));
+    assert_eq!(cache_percent(u64::MAX, Some(u64::MAX)), Some(100));
 }
 
 #[derive(Debug, Clone, Default)]
@@ -283,14 +303,14 @@ impl Assembly {
         if let Some(whole) = timings.filter(|whole| whole.is_object()) {
             self.completion.timings = Some(whole.clone());
         }
-        if let Some(rate) = ["predicted_per_second", "decode_tokens_per_second"].iter().find_map(|name| timings?.get(*name)?.as_f64()) {
+        if let Some(rate) = timings.and_then(reported_rate) {
             self.rate = Some(rate);
         }
         if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
             let count = |value: Option<&Value>| value.and_then(Value::as_u64).unwrap_or(0);
             self.completion.usage = Some(Usage {
                 prompt: count(usage.get("prompt_tokens")),
-                cached: count(usage.pointer("/prompt_tokens_details/cached_tokens")),
+                cached: usage.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64),
                 completion: count(usage.get("completion_tokens")),
                 tokens_per_second: None,
                 window: usage.get("model_context_window").and_then(Value::as_u64),
@@ -404,8 +424,9 @@ fn classify(status: u16, body: &str) -> LlmError {
 
 /// A message as a server reads it back. Arguments that are no JSON object (a call cut off, a model's slip) are kept in the session and go here as
 /// none: Straydog's template refuses a request that holds them, and so every request after one such call. The same each time, so the prefix holds.
-/// With no pictures it is the message as it is; with them its content is parts, read from the session's folder.
-fn as_sent(message: &Message, folder: Option<&Path>) -> Value {
+/// With no pictures it is the message as it is; with them its content is parts, read from the session's folder. `held`: the digests of the pictures the server
+/// keeps, which go as those, and where the digest of each picture sent goes.
+fn as_sent(message: &Message, folder: Option<&Path>, held: Option<(&HashSet<String>, &mut Vec<String>)>) -> Value {
     let mut sent = message.without_provider_blocks();
     for call in sent.tool_calls.iter_mut().flatten() {
         let text = call.function.arguments.trim();
@@ -413,7 +434,7 @@ fn as_sent(message: &Message, folder: Option<&Path>) -> Value {
             call.function.arguments = "{}".to_string();
         }
     }
-    let content = (!sent.images.is_empty()).then(|| images::openai_content(&sent, folder));
+    let content = (!sent.images.is_empty()).then(|| images::openai_content_held(&sent, folder, held));
     sent.images.clear();
     let mut value = serde_json::to_value(&sent).unwrap_or(Value::Null);
     if let Some(content) = content {
@@ -429,7 +450,72 @@ pub fn request_body(model: &str, messages: &[Message], tools: Option<&Value>, ef
 
 /// `folder`: where the session keeps its pictures.
 pub fn request_body_in(model: &str, messages: &[Message], tools: Option<&Value>, effort: Option<&str>, folder: Option<&Path>) -> Value {
-    let messages: Vec<Value> = messages.iter().map(|message| as_sent(message, folder)).collect();
+    request_body_held(model, messages, tools, effort, folder, None, Reminders::AS_USER)
+}
+
+/// How the app's own messages (its facts beside the person's message, its notes and notices) go to a server: in a role of their own (`role`), so that
+/// whose a message is rests on its role and not only on its words, or as the user's (none), marked in their words only; and the facts after the person's
+/// message or before it (`before`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Reminders {
+    pub role: Option<&'static str>,
+    pub before: bool,
+}
+
+impl Reminders {
+    pub const AS_USER: Reminders = Reminders { role: None, before: false };
+}
+
+/// The role a server that says so takes them in (`/props`'s `latest_reminder`: Straydog's, for DeepSeek, whose template has it).
+pub const REMINDER_ROLE: &str = "latest_reminder";
+/// The role Straydog is sent them in for any other model: a chat API's own role for what is not the user's, which its templates place where it is in the
+/// conversation. A server whose templates are not known (one may take a system message only first, or move it there) is sent them as the user's, marked
+/// in their words; one that refuses the role is sent them so from then on.
+pub const APP_ROLE: &str = "system";
+/// OpenAI's own API: its role for what the application says, as opposed to the user.
+pub const OPENAI_APP_ROLE: &str = "developer";
+
+/// The switch that puts the app's facts before the person's message, to compare where a model takes them best (DeepSeek's own example puts the date and
+/// the place before the user's turn).
+pub const REMINDER_BEFORE_VARIABLE: &str = "DOGMIND_REMINDER_BEFORE";
+
+/// The app's messages in the role `reminders` names, and its facts before the person's message where it says so.
+fn as_reminders(messages: &mut [Value], reminders: Reminders) {
+    let Some(role) = reminders.role else { return };
+    for at in 0..messages.len() {
+        let message = &messages[at];
+        if message["role"] != "user" || !message["content"].as_str().is_some_and(crate::prompt::is_from_app) {
+            continue;
+        }
+        // (latest_reminder is the facts that go with the person's message, right after it: its template opens the answer after that message, and a reminder
+        // with nothing of the person's before it, as the note after a stopped draft is, was the last thing in the prompt with no answer opened. DeepSeek went on
+        // writing the note itself, 47,000 characters of it as its answer, before its call. Every other note of the app's stays the user's, marked in its words.)
+        let after_the_person = at > 0 && messages[at - 1]["role"] == "user" && !messages[at - 1]["content"].as_str().is_some_and(crate::prompt::is_from_app);
+        if role == REMINDER_ROLE && !(after_the_person && message["content"].as_str().is_some_and(crate::prompt::is_app_facts)) {
+            continue;
+        }
+        messages[at]["role"] = json!(role);
+    }
+    if reminders.before {
+        for at in 1..messages.len() {
+            let facts = messages[at]["content"].as_str().is_some_and(crate::prompt::is_app_facts);
+            if facts && messages[at]["role"] == role && messages[at - 1]["role"] == "user" {
+                messages.swap(at - 1, at);
+            }
+        }
+    }
+}
+
+/// Whether a body holds a message of the app's in a role of its own, as `as_reminders` gives it.
+fn has_app_role(body: &Value) -> bool {
+    body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message| matches!(message["role"].as_str(), Some(REMINDER_ROLE | APP_ROLE | OPENAI_APP_ROLE)) && message["content"].as_str().is_some_and(crate::prompt::is_from_app)))
+}
+
+/// `request_body_in`, for a server that keeps the pictures it was sent (`/props`'s `image_digests`): those it holds (`held`, by their digests) go as `sha256:`
+/// and the digest, and the digest of every picture sent goes in `sent`.
+fn request_body_held(model: &str, messages: &[Message], tools: Option<&Value>, effort: Option<&str>, folder: Option<&Path>, mut held: Option<(&HashSet<String>, &mut Vec<String>)>, reminders: Reminders) -> Value {
+    let mut messages: Vec<Value> = messages.iter().map(|message| as_sent(message, folder, held.as_mut().map(|(holds, sent)| (*holds, &mut **sent)))).collect();
+    as_reminders(&mut messages, reminders);
     let mut body = json!({"model": model, "messages": messages, "stream": true, "stream_options": {"include_usage": true}});
     if let Some(tools) = tools {
         body["tools"] = tools.clone();
@@ -499,6 +585,11 @@ pub trait Provider: Send + Sync {
     fn close_thinking_once(&self) -> bool {
         false
     }
+    /// The next request, the first after a draft stop, is to answer with a call (`tool_choice: "required"`), where the server is one that closes thinking: one that
+    /// cannot write its thinking on in the answer's text. Says whether it will be.
+    fn require_call_once(&self) -> bool {
+        false
+    }
     /// Whether a call it was still writing can join the conversation as far as it had come. A provider with blocks of its own to send back cannot make those up.
     fn keeps_cut_writes(&self) -> bool {
         false
@@ -513,6 +604,16 @@ pub trait Provider: Send + Sync {
     fn waits_out_silence(&self) -> bool {
         false
     }
+    /// Whether the server is on this machine, by a loopback address: the app's own engine, or one the person runs here, which has the GPU's memory.
+    fn on_this_machine(&self) -> bool {
+        false
+    }
+}
+
+/// Whether an address is of this machine: `localhost`, or a loopback IP.
+pub fn is_loopback(url: &Url) -> bool {
+    let host = url.host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// What a server that refused a request says, when asked, of whether it is on its way back.
@@ -531,7 +632,38 @@ pub enum Restart {
 
 impl Provider for Client {
     fn stream(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
-        self.post(&self.body_for(request), request.request_id, cancel, on)
+        // (a conversation's pictures go by their digests to a server that keeps them, once a request of it has sent them: what it is known by is the request's id)
+        let conversation = request.request_id.and_then(|id| id.split('/').next()).filter(|id| self.image_digests && !id.is_empty());
+        let Some(conversation) = conversation else {
+            return match self.post_with_app_role(&self.body_for(request), &mut || self.body_for(request), request.request_id, cancel, on) {
+                Ok(completion) => Ok(completion),
+                Err(Refused::Failed(error)) => Err(error),
+                Err(Refused::ImageNotHeld) => Err(LlmError::Rejected(IMAGE_NOT_HELD.to_string())),
+            };
+        };
+        let holds = self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(conversation).cloned().unwrap_or_default();
+        let mut sent = Vec::new();
+        let body = self.body_with(request, Some((&holds, &mut sent)));
+        let mut again_sent = Vec::new();
+        let first = self.post_with_app_role(&body, &mut || { again_sent.clear(); self.body_with(request, Some((&holds, &mut again_sent))) }, request.request_id, cancel, on);
+        if !again_sent.is_empty() {
+            sent = again_sent;
+        }
+        let answered = match first {
+            // (it started again, or let one go: none of it is known to be held any more, and the request goes again with all the bytes)
+            Err(Refused::ImageNotHeld) => {
+                self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(conversation);
+                sent.clear();
+                let body = self.body_with(request, Some((&HashSet::new(), &mut sent)));
+                self.post(&body, request.request_id, cancel, on)
+            }
+            Err(Refused::Failed(error)) => Err(error),
+            Ok(completion) => Ok(completion),
+        };
+        if answered.is_ok() && !sent.is_empty() {
+            self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(conversation.to_string()).or_default().extend(sent);
+        }
+        answered
     }
 
     /// Straydog's: its body's `straydog.reasoning`, which a server that cannot close the thinking ignores.
@@ -540,6 +672,14 @@ impl Provider for Client {
             self.close_next.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.replay_reasoning
+    }
+
+    fn require_call_once(&self) -> bool {
+        let will = self.replay_reasoning && !self.required_refused.load(std::sync::atomic::Ordering::Relaxed);
+        if will {
+            self.require_next.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        will
     }
 
     /// Straydog's API takes them, and its template shows them inside the tool's response. The services' chat completions take text there.
@@ -586,7 +726,11 @@ impl Provider for Client {
     /// Straydog keeps of a request that says `checkpoint: false` only its system prompt's checkpoint: the checkpoints another
     /// conversation resumes from (where its last reply began) stay as they were.
     fn warm(&self, request: &Request, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
-        self.post(&self.warm_body(request), request.request_id, cancel, on)
+        match self.post_with_app_role(&self.warm_body(request), &mut || self.warm_body(request), request.request_id, cancel, on) {
+            Ok(completion) => Ok(completion),
+            Err(Refused::Failed(error)) => Err(error),
+            Err(Refused::ImageNotHeld) => Err(LlmError::Rejected(IMAGE_NOT_HELD.to_string())),
+        }
     }
 
     fn answers(&self) -> bool {
@@ -599,6 +743,10 @@ impl Provider for Client {
 
     fn waits_out_silence(&self) -> bool {
         !self.own_engine
+    }
+
+    fn on_this_machine(&self) -> bool {
+        self.own_engine || is_loopback(&self.base)
     }
 
     fn restart(&self, cancel: &AtomicBool) -> Restart {
@@ -655,9 +803,45 @@ pub struct Client {
     pub vision_asked: std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Option<bool>)>>>,
     /// The next request's thinking is to be closed ([`Provider::close_thinking_once`]).
     pub close_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The next request is to answer with a call ([`Provider::require_call_once`]); and the server refused that once, so it is not asked again.
+    pub require_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub required_refused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The engine this app starts and watches: nothing listening there is said at once, as the app knows why and starts it again. Any other server, on this
     /// machine too, may be on its way back, and is waited for as one.
     pub own_engine: bool,
+    /// The server keeps the pictures it was sent, and takes one again by its digest (`/props`'s `image_digests`, Straydog's): a conversation sent all its
+    /// pictures with every request, 97% of 4.33 GB in a day of page checks.
+    pub image_digests: bool,
+    /// The role the server takes the app's own messages in: `latest_reminder` where `/props` says so, `system` for any other model of Straydog's
+    /// ([`ServerInfo::app_role`]); none for a server whose templates are not known. (Whose a message is then rests on its role, not only on its words.)
+    pub app_role: Option<&'static str>,
+    /// The server refused a request with the app's messages in a role of their own, and took it with them as the user's: they go so from then on.
+    pub app_role_refused: std::sync::Arc<AtomicBool>,
+    /// The digests of the pictures each conversation (by its id, the first part of a request's) sent this server in a request that went well: those go by
+    /// their digests from then on. Forgotten when the server says it no longer holds one (`image_not_held`).
+    pub held: std::sync::Arc<std::sync::Mutex<HashMap<String, HashSet<String>>>>,
+}
+
+/// The error type of a request that names by digest a picture the server no longer keeps (it started again, or let it go): nothing of it ran, and the same
+/// request goes again with the pictures' bytes.
+const IMAGE_NOT_HELD: &str = "image_not_held";
+
+/// How a request was refused: as any refusal, or because a picture it named by digest is not held.
+enum Refused {
+    Failed(LlmError),
+    ImageNotHeld,
+}
+
+impl From<LlmError> for Refused {
+    fn from(error: LlmError) -> Refused {
+        Refused::Failed(error)
+    }
+}
+
+impl From<http::Failure> for Refused {
+    fn from(failure: http::Failure) -> Refused {
+        Refused::Failed(LlmError::from(failure))
+    }
 }
 
 /// How long an answer of `/props` that the model reads no pictures holds before it is asked again ([`Client::reads_pictures`]).
@@ -666,7 +850,7 @@ const VISION_ASKED_AGAIN: Duration = Duration::from_secs(10);
 impl Client {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Client, String> {
         Ok(Client { base: Url::parse(base_url)?, key, replay_reasoning: true, suppresses_letters: false, tool_writing: false, vision: None,
-                    vision_asked: Default::default(), close_next: Default::default(), own_engine: false })
+                    vision_asked: Default::default(), close_next: Default::default(), require_next: Default::default(), required_refused: Default::default(), own_engine: false, image_digests: false, app_role: None, app_role_refused: Default::default(), held: Default::default() })
     }
 
     /// The request a model's turn is sent as, for this server.
@@ -683,11 +867,67 @@ impl Client {
     }
 
     fn body_for(&self, request: &Request) -> Value {
+        self.body_with(request, None)
+    }
+
+    /// How the app's own messages go to this server: in the role it is known to take them in, as `developer` messages to OpenAI's API, and as the user's
+    /// to any other server or once it refused a role of their own.
+    fn reminders(&self) -> Reminders {
+        let role = if self.app_role_refused.load(std::sync::atomic::Ordering::Relaxed) {
+            None
+        } else if self.app_role.is_some() {
+            self.app_role
+        } else if self.base.host.eq_ignore_ascii_case("api.openai.com") {
+            Some(OPENAI_APP_ROLE)
+        } else {
+            None
+        };
+        Reminders { role, before: std::env::var(REMINDER_BEFORE_VARIABLE).is_ok_and(|value| value == "1") }
+    }
+
+    /// `post_once`, and for a body with the app's messages in a role of their own that the server refused: once more with them as the user's (`again`
+    /// makes that body), which, taken, is how they go to it from then on.
+    fn post_with_app_role(&self, body: &Value, again: &mut dyn FnMut() -> Value, id: Option<&str>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, Refused> {
+        let refused = match self.post_or_without_required(body, id, cancel, on) {
+            // (a request it would not take, not a key it refused or an address it does not have)
+            Err(Refused::Failed(LlmError::Rejected(said))) if said.starts_with(REFUSED) && has_app_role(body) && !cancel.load(std::sync::atomic::Ordering::SeqCst) => said,
+            other => return other,
+        };
+        self.app_role_refused.store(true, std::sync::atomic::Ordering::Relaxed);
+        let answered = self.post_once(&again(), id, cancel, on);
+        // (refused again: it was not the role, and the first refusal is the one to tell)
+        if matches!(answered, Err(Refused::Failed(LlmError::Rejected(_)))) {
+            self.app_role_refused.store(false, std::sync::atomic::Ordering::Relaxed);
+            return Err(Refused::Failed(LlmError::Rejected(refused)));
+        }
+        answered
+    }
+
+    /// A request asked to answer with a call (`tool_choice: "required"`) that the server refuses for that: sent again without it, the same request in all else,
+    /// and not asked so again. (Not `again`: what closed its thinking is in this body alone.)
+    fn post_or_without_required(&self, body: &Value, id: Option<&str>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, Refused> {
+        let answered = self.post_once(body, id, cancel, on);
+        match answered {
+            Err(Refused::Failed(LlmError::Rejected(said))) if body.get("tool_choice") == Some(&json!("required")) && said.contains("tool_choice") && !cancel.load(std::sync::atomic::Ordering::SeqCst) => {
+                self.required_refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                let mut plain = body.clone();
+                if let Some(fields) = plain.as_object_mut() {
+                    fields.remove("tool_choice");
+                }
+                self.post_once(&plain, id, cancel, on)
+            }
+            other => other,
+        }
+    }
+
+    /// The body of a request, with the pictures the server holds of this conversation named by their digests (`held`), whose digests go in `sent`.
+    fn body_with(&self, request: &Request, held: Option<(&HashSet<String>, &mut Vec<String>)>) -> Value {
+        let reminders = self.reminders();
         let mut body = if self.replay_reasoning {
-            request_body_in(request.model, request.messages, request.tools, request.effort, request.images)
+            request_body_held(request.model, request.messages, request.tools, request.effort, request.images, held, reminders)
         } else {
             let messages: Vec<Message> = request.messages.iter().map(|message| Message { reasoning_content: None, ..message.clone() }).collect();
-            request_body_in(request.model, &messages, request.tools, request.effort, request.images)
+            request_body_held(request.model, &messages, request.tools, request.effort, request.images, held, reminders)
         };
         if request.japanese_letters && self.suppresses_letters {
             body["suppress"] = json!(NOT_CP932_HAN);
@@ -696,11 +936,17 @@ impl Client {
         if self.tool_writing && request.tools.is_some() {
             body["straydog"] = json!({"tool_writing": true});
         }
+        let require = self.require_next.swap(false, std::sync::atomic::Ordering::Relaxed);
         if self.close_next.swap(false, std::sync::atomic::Ordering::Relaxed) {
             if !body.get("straydog").is_some_and(Value::is_object) {
                 body["straydog"] = json!({});
             }
             body["straydog"]["reasoning"] = json!(false);
+            // (with no thinking, the first after a draft stop: a DeepSeek model went on with its thinking in the answer's text, 37,248 characters of it and "</think>" at
+            // its end, shown to the person as the answer. Asked for a call, the server holds its first token to a call's form.)
+            if require && request.tools.is_some() {
+                body["tool_choice"] = json!("required");
+            }
         }
         body
     }
@@ -733,6 +979,16 @@ impl Client {
     }
 
     fn post(&self, body: &Value, id: Option<&str>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, LlmError> {
+        match self.post_once(body, id, cancel, on) {
+            Ok(completion) => Ok(completion),
+            Err(Refused::Failed(error)) => Err(error),
+            // (not one that named a picture by digest: the server's words for it, as any refusal of a request)
+            Err(Refused::ImageNotHeld) => Err(LlmError::Rejected(IMAGE_NOT_HELD.to_string())),
+        }
+    }
+
+    /// `post`, with a refusal for a picture named by digest that the server does not hold told apart.
+    fn post_once(&self, body: &Value, id: Option<&str>, cancel: &AtomicBool, on: &mut dyn FnMut(Delta)) -> Result<Completion, Refused> {
         let text = body.to_string();
         let url = self.base.join("chat/completions");
         // (OpenAI-compatible servers ignore a header they do not know; Straydog writes it in its own line for the request)
@@ -741,7 +997,12 @@ impl Client {
         let mut response = http::request("POST", &url, &headers, Some(&text), Duration::from_secs(10), cancel).map_err(|failure| self.unreached(failure))?;
         if response.status != 200 {
             let status = response.status;
-            return Err(self.without_key(classify(status, &response.text()?)));
+            let said = response.text()?;
+            let error_type = serde_json::from_str::<Value>(&said).ok().and_then(|said| said.pointer("/error/type").and_then(Value::as_str).map(str::to_string));
+            if status == 400 && error_type.as_deref() == Some(IMAGE_NOT_HELD) {
+                return Err(Refused::ImageNotHeld);
+            }
+            return Err(Refused::Failed(self.without_key(classify(status, &said))));
         }
         let mut assembly = Assembly::default();
         let mut pending = Vec::new();
@@ -766,7 +1027,7 @@ impl Client {
         // No [DONE] and no reason to end: a server that closes its connection to end a body died here, not finished.
         let completion = assembly.finish();
         if completion.finish.is_empty() {
-            return Err(LlmError::Transient(SERVER_GONE.to_string()));
+            return Err(Refused::Failed(LlmError::Transient(SERVER_GONE.to_string())));
         }
         Ok(completion)
     }
@@ -837,7 +1098,9 @@ impl Client {
         let vision = props.pointer("/modalities/vision").and_then(Value::as_bool);
         let suppresses_letters = props.get("suppress").and_then(Value::as_array).is_some_and(|names| names.iter().any(|name| name.as_str() == Some(NOT_CP932_HAN)));
         let tool_writing = props.get("tool_writing").and_then(Value::as_bool) == Some(true);
-        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing })
+        let image_digests = props.get("image_digests").and_then(Value::as_bool) == Some(true);
+        let latest_reminder = props.get("latest_reminder").and_then(Value::as_bool) == Some(true);
+        Ok(ServerInfo { model, context, straydog, vision, suppresses_letters, tool_writing, image_digests, latest_reminder })
     }
 }
 
@@ -867,6 +1130,24 @@ pub struct ServerInfo {
     pub suppresses_letters: bool,
     /// Whether the server sends the calls as the model writes them.
     pub tool_writing: bool,
+    /// Whether the server keeps the pictures it was sent and takes one again by its digest.
+    pub image_digests: bool,
+    /// Whether the server takes the app's own messages in the role `latest_reminder`.
+    pub latest_reminder: bool,
+}
+
+impl ServerInfo {
+    /// The role the app's own messages go to this server in: `latest_reminder` where it says it takes that, `system` for Straydog's other models, none for
+    /// a server whose templates are not known.
+    pub fn app_role(&self) -> Option<&'static str> {
+        if self.latest_reminder {
+            Some(REMINDER_ROLE)
+        } else if self.straydog {
+            Some(APP_ROLE)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -874,6 +1155,52 @@ mod tests {
     use super::*;
 
     /// Straydog's comment while it reads a prompt is read as how far it has got; other comments, and a malformed one, are nothing.
+    /// A server that refuses to be asked for a call is sent the same request without it, its thinking closed still, and not asked so again.
+    #[test]
+    fn a_refused_required_call_is_sent_again_without_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let kept = bodies.clone();
+        std::thread::spawn(move || {
+            for (at, stream) in listener.incoming().take(3).enumerate() {
+                let mut stream = stream.unwrap();
+                let (mut request, mut block) = (Vec::new(), [0u8; 65536]);
+                let body = loop {
+                    let count = std::io::Read::read(&mut stream, &mut block).unwrap();
+                    request.extend_from_slice(&block[..count]);
+                    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break serde_json::from_slice::<Value>(&request[end + 4..end + 4 + length]).unwrap();
+                    }
+                };
+                kept.lock().unwrap().push(body);
+                let answer = if at == 0 {
+                    let said = r#"{"error":{"message":"tool_choice must be auto or none"}}"#;
+                    format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{said}", said.len())
+                } else {
+                    let said = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{said}", said.len())
+                };
+                let _ = std::io::Write::write_all(&mut stream, answer.as_bytes());
+            }
+        });
+        let mut client = Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap();
+        client.replay_reasoning = true;
+        let tools = json!([{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]);
+        let messages = [Message::text("user", "go")];
+        let request = Request { model: "m", messages: &messages, tools: Some(&tools), effort: None, images: None, japanese_letters: false, request_id: None };
+        assert!(client.close_thinking_once() && client.require_call_once());
+        let answered = client.stream(&request, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(answered.content, "ok");
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!((sent[0]["tool_choice"].clone(), sent[1].get("tool_choice").cloned()), (json!("required"), None));
+        assert_eq!(sent[1]["straydog"]["reasoning"], false, "its thinking closed still: {}", sent[1]);
+        assert!(!client.require_call_once(), "not asked so again");
+    }
+
     #[test]
     fn the_prompts_reading_is_read_from_the_streams_comments() {
         assert_eq!(prefill_said(" prefill 4096/90724"), Some((4096, 90724)));
@@ -910,7 +1237,7 @@ mod tests {
         assert_eq!(completion.tool_calls[0].function.arguments, "{\"path\":1}");
         assert_eq!(completion.finish, "tool_calls");
         let usage = completion.usage.unwrap();
-        assert_eq!((usage.prompt, usage.cached, usage.completion, usage.tokens_per_second), (7, 5, 3, Some(41.5)));
+        assert_eq!((usage.prompt, usage.cached, usage.completion, usage.tokens_per_second), (7, Some(5), 3, Some(41.5)));
     }
 
     /// What Straydog sends of a call being written is told as it comes (the name once, the arguments in pieces), and the call that comes whole after is the call: its name, and only
@@ -935,6 +1262,17 @@ mod tests {
         ]);
         assert_eq!(seen, ["t:read_file", "a0:{\"path\": \"a\"}", "t:read_file", "a1:{\"path\": \"b", "t:read_file", "t:read_file", "a1:\"}"]);
         assert_eq!(completion.tool_calls.iter().map(|call| call.function.arguments.as_str()).collect::<Vec<_>>(), [r#"{"path": "a"}"#, r#"{"path": "b"}"#]);
+    }
+
+    /// A server on this machine is one at a loopback address, or the app's own engine: pages that draw with WebGL are then drawn on the CPU.
+    #[test]
+    fn a_server_at_a_loopback_address_is_on_this_machine() {
+        for here in ["http://127.0.0.1:8080", "http://localhost:8080/v1", "http://[::1]:8080", "http://127.0.0.2:1", "http://LOCALHOST", "http://engine.localhost:9"] {
+            assert!(is_loopback(&Url::parse(here).unwrap()), "{here}");
+        }
+        for there in ["http://192.168.0.100:8080", "https://api.example.com", "http://localhost.example.com", "http://10.0.0.1"] {
+            assert!(!is_loopback(&Url::parse(there).unwrap()), "{there}");
+        }
     }
 
     /// The pieces are a partial string: a call that never comes whole (the server released the markup as text) is no call, a final call that is not what the pieces began is told
@@ -1150,6 +1488,99 @@ mod tests {
         heard.recv_timeout(Duration::from_secs(5)).unwrap()
     }
 
+    /// A server that answers each request by `answers` in turn (a status and a body), and tells each request's body as it read it.
+    fn answering_in_turn(answers: Vec<(u16, String)>) -> (Client, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (told, heard) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, answer) in answers {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let (mut request, mut block) = (Vec::new(), [0u8; 65536]);
+                let body = loop {
+                    let count = stream.read(&mut block).unwrap();
+                    request.extend_from_slice(&block[..count]);
+                    let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&request[..at]).to_lowercase();
+                    let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length: ")?.parse().ok()).unwrap_or(0);
+                    if request.len() >= at + 4 + length {
+                        break String::from_utf8_lossy(&request[at + 4..at + 4 + length]).into_owned();
+                    }
+                };
+                told.send(body).unwrap();
+                let kind = if status == 200 { "text/event-stream" } else { "application/json" };
+                let reason = if status == 200 { "OK" } else { "Bad Request" };
+                let _ = stream.write_all(format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n{answer}", answer.len()).as_bytes());
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                while matches!(stream.read(&mut block), Ok(count) if count > 0) {}
+            }
+        });
+        (Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap(), heard)
+    }
+
+    /// The app's facts and notes go in the role a server is known to take them in (`latest_reminder` after the person's message or, with the switch, before
+    /// it; `system`; `developer` for OpenAI's API), and as the user's to any other or once it refused them; the person's own words stay the user's.
+    #[test]
+    fn the_apps_own_messages_go_in_a_role_of_their_own() {
+        let facts = format!("{} The time: 03:00.", crate::prompt::APP_FACTS);
+        let messages = [Message::text("system", "s"), Message::text("user", "make a page"), Message::text("user", &facts), Message::text("assistant", "ok"), Message::text("user", crate::prompt::CHECK_NUDGE)];
+        let roles = |reminders: Reminders| -> Vec<String> {
+            request_body_held("m", &messages, None, None, None, None, reminders)["messages"].as_array().unwrap().iter().map(|message| format!("{}:{}", message["role"].as_str().unwrap(), message["content"].as_str().unwrap().chars().take(4).collect::<String>())).collect()
+        };
+        assert_eq!(roles(Reminders::AS_USER), ["system:s", "user:make", "user:[Fro", "assistant:ok", "user:[Fro"]);
+        // (latest_reminder only for the facts right after the person's message: a note after an answer stays the user's, as the template opens no answer after it)
+        assert_eq!(roles(Reminders { role: Some(REMINDER_ROLE), before: false }), ["system:s", "user:make", "latest_reminder:[Fro", "assistant:ok", "user:[Fro"]);
+        assert_eq!(roles(Reminders { role: Some(REMINDER_ROLE), before: true }), ["system:s", "latest_reminder:[Fro", "user:make", "assistant:ok", "user:[Fro"]);
+        assert_eq!(roles(Reminders { role: Some(APP_ROLE), before: false }), ["system:s", "user:make", "system:[Fro", "assistant:ok", "system:[Fro"]);
+        // (the person's own words that only look like it stay theirs: a message of theirs never begins so, as it is what they typed)
+        let client = Client::new("http://127.0.0.1:1/v1", None).unwrap();
+        assert_eq!(client.reminders().role, None, "a server whose templates are not known");
+        assert_eq!(Client::new("https://api.openai.com/v1", None).unwrap().reminders().role, Some(OPENAI_APP_ROLE));
+        assert_eq!(Client { app_role: Some(REMINDER_ROLE), ..client.clone() }.reminders().role, Some(REMINDER_ROLE));
+        client.app_role_refused.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(Client { app_role: Some(REMINDER_ROLE), ..client }.reminders().role, None);
+    }
+
+    /// A server that keeps the pictures it was sent (`image_digests`) is sent a conversation's picture once, and then its digest; one that says it no longer
+    /// holds it (`image_not_held`, nothing run) has the same request again with the bytes, and the digest again after that. Another conversation sends its bytes.
+    /// A server that does not say it keeps them is never sent a digest.
+    #[test]
+    fn a_picture_sent_once_goes_by_its_digest_and_again_with_its_bytes_when_the_server_no_longer_holds_it() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(4, 4).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        std::fs::write(dir.path().join("a.png"), &png).unwrap();
+        let digest = images::digest(&png);
+        let messages = [Message { images: vec![crate::message::ImageRef { file: "a.png".into(), media_type: "image/png".into(), width: 4, height: 4 }], ..Message::text("user", "what is this")}];
+        let ok = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string();
+        let gone = r#"{"error": {"message": "Straydog does not hold 1 of the images named by digest; send their bytes", "type": "image_not_held"}}"#.to_string();
+        let (mut client, heard) = answering_in_turn(vec![(200, ok.clone()), (400, gone), (200, ok.clone()), (200, ok.clone()), (200, ok.clone())]);
+        client.image_digests = true;
+        let ask = |client: &Client, id: &str| {
+            let request = Request { model: "m", messages: &messages, tools: None, effort: None, images: Some(dir.path()), japanese_letters: false, request_id: Some(id) };
+            client.stream(&request, &AtomicBool::new(false), &mut |_| {}).map(|done| done.content)
+        };
+        let by_digest = format!("\"sha256:{digest}\"");
+        let bytes = "\"data:image/png;base64,";
+        assert_eq!(ask(&client, "talk/1").unwrap(), "a");
+        assert!(heard.recv().unwrap().contains(bytes), "the first time, its bytes");
+        assert_eq!(ask(&client, "talk/2").unwrap(), "a", "refused for a picture not held, and then sent again");
+        let (named, again) = (heard.recv().unwrap(), heard.recv().unwrap());
+        assert!(named.contains(&by_digest) && !named.contains(bytes), "{named}");
+        assert!(again.contains(bytes) && !again.contains("sha256:"), "{again}");
+        assert_eq!(ask(&client, "talk/3").unwrap(), "a");
+        assert!(heard.recv().unwrap().contains(&by_digest), "held again once its bytes went");
+        assert_eq!(ask(&client, "other/1").unwrap(), "a");
+        assert!(heard.recv().unwrap().contains(bytes), "another conversation has sent nothing yet");
+        // (a server that does not say so)
+        let (plain, heard) = answering_in_turn(vec![(200, ok.clone()), (200, ok)]);
+        for id in ["talk/1", "talk/2"] {
+            assert_eq!(ask(&plain, id).unwrap(), "a");
+            assert!(!heard.recv().unwrap().contains("sha256:"));
+        }
+    }
+
     #[test]
     fn a_request_is_named_to_the_server_in_a_header_and_unnamed_has_none() {
         let head = head_seen_by_a_server(Some("20261105-120000/3"));
@@ -1213,7 +1644,7 @@ mod tests {
 
     #[test]
     fn a_picture_goes_as_parts_and_the_same_bytes_each_time() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let bytes = images::tests::encoded(8, 8, image::ImageFormat::Png);
         let kept = images::save(&session, &images::attach_bytes("a", bytes.clone()).unwrap(), ImageLimit::WIDE).unwrap();
@@ -1536,7 +1967,7 @@ mod tests {
     /// The app's own engine: nothing listening there is said at once. A person's own server on this machine is asked again, as any server is: it may be on its way back.
     #[test]
     fn no_listener_here_is_no_use_asking_again_and_says_nothing_of_the_socket() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (_reserved, port) = crate::test_net::bound_loopback(0);
         let client = Client { own_engine: true, ..Client::new(&format!("http://127.0.0.1:{port}/v1"), None).unwrap() };
         let cancel = AtomicBool::new(false);
         let request = Request { model: "m", messages: &[], tools: None, effort: None, images: None, japanese_letters: false, request_id: None };

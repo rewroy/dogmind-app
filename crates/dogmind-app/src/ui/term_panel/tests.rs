@@ -19,6 +19,18 @@ fn screen_with(text: &str) -> Screen {
 }
 
 #[test]
+fn the_panel_is_two_fifths_of_the_conversations_area_and_leaves_room_over_it() {
+    // (at 96 dpi a pixel is a pixel)
+    assert_eq!(terminal_panel_height(1000, 96), 400);
+    assert_eq!(terminal_panel_height(400, 96), PANEL_LEAST, "a short window keeps the strip and a few lines");
+    assert_eq!(terminal_panel_height(1000, 192), 400, "two fifths at any scale");
+    assert_eq!(terminal_panel_height(300, 192), 2 * PANEL_LEAST);
+    // (where two fifths would leave less than the input card needs, it is what leaves that much)
+    let room = 2 * PANEL_LEAST + PANEL_LEAVES - 100;
+    assert!(terminal_panel_height(room, 96) <= room - PANEL_LEAVES || terminal_panel_height(room, 96) == PANEL_LEAST);
+}
+
+#[test]
 fn plain_characters_of_one_style_are_one_run_and_a_wide_one_is_a_run_of_its_own() {
     let scene = scene(&screen_with("hello world\r\nあいう abc"), true);
     let row = |row: usize| scene.runs.iter().filter(move |run| run.row == row).map(|run| (run.col, run.cells, run.text.as_str())).collect::<Vec<_>>();

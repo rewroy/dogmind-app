@@ -139,19 +139,74 @@ pub struct RequestNote<'a> {
     pub content_chars: usize,
     pub calls: Vec<String>,
     /// What the stream's own pieces came to, counted roughly: for a request that ended with no count from the server.
-    pub tokens_est: u64,
+    pub tokens_est: Option<u64>,
     /// The request this one repeats, why, and how long it waited: after a connection that dropped, or an answer with nothing in it.
     pub retry: Option<(String, &'static str, u64)>,
     /// Whether the app was watching this request's reasoning for a draft: `on`, or `off:` and why (the person asked for no change, a file has been written, it has stopped one this turn).
     pub draft_watch: Option<&'static str>,
     /// For a helper's request: the name of the file its conversation is kept in, beside the session.
     pub helper_file: Option<&'a str>,
+    /// Where the draft watch saw its reasoning come to a mark (its fenced lines past 40, 60 and 80, a line saying it writes the code now): the
+    /// characters and seconds into the reasoning, for a later look at where a draft could have been stopped.
+    pub draft_marks: Option<Value>,
+}
+
+/// Provider-reported usage of the main conversation across all of its turns.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SessionUsage {
+    pub requests: u64,
+    pub prompt: u64,
+    pub completion: u64,
+    pub cached: u64,
+    /// Prompt tokens from requests whose provider supplied a cache count.
+    pub cache_prompt: u64,
+    pub last_rate: Option<f64>,
+    /// Cache reuse of the last completed main request, even when it reported no usage.
+    pub last_cache_percent: Option<u64>,
+}
+
+/// The provider's generation speed, including providers that send timings without token counts.
+pub(crate) fn request_rate(fields: &Value) -> Option<f64> {
+    fields["tps"].as_f64().filter(|rate| *rate > 0.0).or_else(|| crate::llm::reported_rate(&fields["server"]))
+}
+
+impl SessionUsage {
+    fn record_request(&mut self, fields: &Value) {
+        if fields["role"] != "main" {
+            return;
+        }
+        // A stopped or failed request leaves the previous completed request on the status bar.
+        // An empty answer still came back from the provider; the live worker reports its cache data.
+        if let Some(end) = fields["end"].as_str() {
+            if end == "error:unfinished" || !(end.starts_with("error:") || end.starts_with("stopped_app:") || end == "cancelled_person") {
+                self.last_cache_percent = fields["prompt"].as_u64().and_then(|prompt| crate::llm::cache_percent(prompt, fields["cached"].as_u64()));
+                self.last_rate = request_rate(fields);
+            }
+        }
+        let (Some(prompt), Some(completion)) = (fields["prompt"].as_u64(), fields["completion"].as_u64()) else { return };
+        // Providers can send timing information with empty token counters.
+        if prompt == 0 && completion == 0 {
+            return;
+        }
+        self.requests = self.requests.saturating_add(1);
+        self.prompt = self.prompt.saturating_add(prompt);
+        self.completion = self.completion.saturating_add(completion);
+        if let Some(cached) = fields["cached"].as_u64() {
+            self.cache_prompt = self.cache_prompt.saturating_add(prompt);
+            self.cached = self.cached.saturating_add(cached.min(prompt));
+        }
+    }
+
+    pub fn cache_percent(&self) -> Option<u64> {
+        crate::llm::cache_percent(self.cache_prompt, Some(self.cached))
+    }
 }
 
 pub struct Trajectory {
     file: Option<File>,
     session_id: String,
     pub turn: u64,
+    pub usage: SessionUsage,
     requests: u64,
     warm: u64,
     /// What happened before the session had a file (the engine warming up), kept for it.
@@ -174,7 +229,7 @@ const HELD_MOST: usize = 64;
 
 impl Trajectory {
     pub fn new() -> Trajectory {
-        Trajectory { file: None, session_id: String::new(), turn: 0, requests: 0, warm: 0, held: Vec::new(), turn_requests: 0, turn_tools: 0, waiting: None }
+        Trajectory { file: None, session_id: String::new(), turn: 0, usage: SessionUsage::default(), requests: 0, warm: 0, held: Vec::new(), turn_requests: 0, turn_tools: 0, waiting: None }
     }
 
     /// Begins writing beside this session. A session that is opened again goes on where its file left off: its turns and its requests keep counting.
@@ -182,11 +237,15 @@ impl Trajectory {
         let path = file_of(session);
         self.session_id = session.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
         (self.turn, self.requests) = (0, 0);
+        self.usage = SessionUsage::default();
         let mut ends_a_line = true;
         if let Ok(bytes) = fs::read(&path) {
             ends_a_line = bytes.last().is_none_or(|last| *last == b'\n');
             for line in String::from_utf8_lossy(&bytes).lines() {
                 let Ok(event) = serde_json::from_str::<Value>(line) else { continue };
+                if event["ev"] == "request" {
+                    self.usage.record_request(&event);
+                }
                 self.turn = self.turn.max(event.get("turn").and_then(Value::as_u64).unwrap_or(0));
                 if let Some((id, number)) = event.get("req").and_then(Value::as_str).and_then(|req| req.rsplit_once('/')) {
                     if id == self.session_id {
@@ -210,6 +269,7 @@ impl Trajectory {
         self.write_waiting();
         self.file = None;
         self.session_id.clear();
+        self.usage = SessionUsage::default();
         (self.turn, self.requests, self.turn_requests, self.turn_tools) = (0, 0, 0, 0);
     }
 
@@ -326,6 +386,9 @@ impl Trajectory {
         if let Some(file) = note.helper_file {
             fields["helper_file"] = json!(file);
         }
+        if let Some(marks) = note.draft_marks {
+            fields["draft_marks"] = marks;
+        }
         // (when it began to write a call and its answer, from its start: what is before them after the first word is thinking)
         if let Some(writing) = note.clock.writing_ms() {
             fields["writing_ms"] = json!(writing);
@@ -341,6 +404,7 @@ impl Trajectory {
         if let Some(server) = note.timings.and_then(kept_timings) {
             fields["server"] = server;
         }
+        self.usage.record_request(&fields);
         fields
     }
 
@@ -376,7 +440,7 @@ mod tests {
 
     #[test]
     fn requests_are_counted_from_one_in_a_session_and_go_on_when_it_is_opened_again() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("20261105-120000.jsonl");
         let mut traj = Trajectory::new();
         assert_eq!(traj.request_id(), "warm/1", "before a session has a name");
@@ -394,8 +458,84 @@ mod tests {
     }
 
     #[test]
+    fn resumed_usage_adds_metered_main_requests_once_and_weights_only_reported_cache() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let session = dir.path().join("s.jsonl");
+        let mut traj = Trajectory::new();
+        traj.open(&session);
+        traj.write("request", None, json!({"role":"main","prompt":500,"completion":3}));
+        traj.write("request", None, json!({"role":"main","tokens_est":300}));
+        traj.write("request", None, json!({"role":"main","prompt":0,"completion":0,"tps":37.0}));
+        traj.write("request", None, json!({"role":"helper","prompt":800,"cached":800,"completion":5}));
+        traj.write("turn_end", None, json!({"role":"main","prompt":200,"completion":1}));
+        traj.close();
+        traj.open(&session);
+        assert_eq!(traj.usage.requests, 1);
+        assert_eq!(traj.usage.cache_percent(), None);
+
+        let clock = Clock::start();
+        let missed = Usage { prompt: 10, cached: Some(0), completion: 5, ..Usage::default() };
+        let note = RequestNote { id: "s/2", role: "main", clock: &clock, end: "stop".into(), usage: Some(&missed), timings: None, reasoning_chars: 0, content_chars: 0, calls: vec![], tokens_est: None, retry: None, draft_watch: None, helper_file: None, draft_marks: None };
+        traj.request_waiting(note);
+        assert_eq!(traj.usage.cache_percent(), Some(0));
+        traj.message_at(4);
+        let hit = Usage { prompt: 90, cached: Some(90), completion: 7, tokens_per_second: Some(19.5), ..Usage::default() };
+        traj.request_waiting(RequestNote { id: "s/3", role: "main", clock: &clock, end: "stop".into(), usage: Some(&hit), timings: None, reasoning_chars: 0, content_chars: 0, calls: vec![], tokens_est: None, retry: None, draft_watch: None, helper_file: None, draft_marks: None });
+        let expected = SessionUsage { requests: 3, prompt: 600, completion: 15, cached: 90, cache_prompt: 100, last_rate: Some(19.5), last_cache_percent: Some(100) };
+        assert_eq!(traj.usage, expected);
+        assert_eq!(traj.usage.cache_percent(), Some(90));
+        traj.close();
+        assert_eq!(traj.usage, SessionUsage::default());
+        traj.open(&session);
+        assert_eq!(traj.usage, expected);
+    }
+
+    #[test]
+    fn resumed_cache_follows_the_last_completed_main_request_in_each_session() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let session = dir.path().join("a.jsonl");
+        let mut traj = Trajectory::new();
+        traj.open(&session);
+        let request = |role: &str, end: &str, cached: Option<u64>| json!({"role":role,"end":end,"prompt":100,"completion":8,"cached":cached});
+        traj.write("request", None, request("main", "stop", Some(25)));
+        traj.write("request", None, request("main", "cancelled_person", None));
+        traj.write("request", None, request("main", "error:transient", None));
+        traj.write("request", None, request("main", "stopped_app:draft_stop", None));
+        traj.write("request", None, request("warm", "stop", Some(100)));
+        traj.write("request", None, request("helper", "stop", Some(100)));
+        traj.close();
+        traj.open(&session);
+        assert_eq!(traj.usage.last_cache_percent, Some(25));
+        traj.write("request", None, request("main", "tool_calls", Some(0)));
+        traj.close();
+        traj.open(&session);
+        assert_eq!(traj.usage.last_cache_percent, Some(0));
+        traj.write("request", None, json!({"role":"main","end":"stop","tokens_est":12}));
+        traj.close();
+        traj.open(&session);
+        assert_eq!(traj.usage.last_cache_percent, None);
+        assert!(traj.usage.cache_percent().is_some());
+        traj.close();
+        traj.open(&dir.path().join("b.jsonl"));
+        assert_eq!(traj.usage, SessionUsage::default());
+    }
+
+    #[test]
+    fn last_answer_speed_tracks_completed_requests_even_without_token_counts() {
+        let mut usage = SessionUsage::default();
+        usage.record_request(&json!({"role":"main","end":"stop","prompt":100,"completion":10,"tps":67.3}));
+        usage.record_request(&json!({"role":"main","end":"cancelled_person","tps":null}));
+        assert_eq!(usage.last_rate, Some(67.3));
+        usage.record_request(&json!({"role":"main","end":"stop","tokens_est":3}));
+        assert_eq!(usage.last_rate, None);
+        usage.record_request(&json!({"role":"main","end":"stop","server":{"decode_tokens_per_second":12.5}}));
+        assert_eq!(usage.last_rate, Some(12.5));
+        assert_eq!(usage.requests, 1);
+    }
+
+    #[test]
     fn what_happens_before_a_session_has_a_file_waits_for_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let mut traj = Trajectory::new();
         traj.write("request", Some("warm/1"), json!({"role": "warm"}));
@@ -416,12 +556,12 @@ mod tests {
 
     #[test]
     fn a_request_says_where_the_message_it_made_is_and_a_request_that_made_none_says_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let mut traj = Trajectory::new();
         traj.open(&session);
         let clock = Clock::start();
-        let note = |id: &'static str| RequestNote { id, role: "main", clock: &clock, end: "tool_calls".into(), usage: None, timings: None, reasoning_chars: 0, content_chars: 0, calls: vec!["read_file".into()], tokens_est: 0, retry: None, draft_watch: None, helper_file: None };
+        let note = |id: &'static str| RequestNote { id, role: "main", clock: &clock, end: "tool_calls".into(), usage: None, timings: None, reasoning_chars: 0, content_chars: 0, calls: vec!["read_file".into()], tokens_est: Some(0), retry: None, draft_watch: None, helper_file: None, draft_marks: None };
         traj.request_waiting(note("s/1"));
         traj.message_at(2);
         // (the second makes none: the next line writes it as it is, before itself)
@@ -435,7 +575,7 @@ mod tests {
 
     #[test]
     fn a_session_cut_in_the_middle_of_a_line_goes_on_on_a_line_of_its_own() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         fs::write(file_of(&session), "{\"t\":\"x\",\"ev\":\"turn_st").unwrap();
         let mut traj = Trajectory::new();

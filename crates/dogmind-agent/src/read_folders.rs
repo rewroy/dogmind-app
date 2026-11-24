@@ -521,7 +521,7 @@ mod tests {
     }
 
     fn stand() -> Stand {
-        let holder = tempfile::tempdir().unwrap();
+        let holder = crate::in_container::tempdir().unwrap();
         let base = real(holder.path());
         // Each under a folder of its own: running a command in the workspace puts traverse on the workspace's way, and the way to the named folder must be this module's alone to prove.
         let (work, named, outside) = (base.join("w").join("work"), base.join("n").join("named"), base.join("o").join("outside"));
@@ -568,6 +568,9 @@ mod tests {
 
     #[test]
     fn a_named_folder_can_be_read_and_nothing_else_changes_and_removing_it_puts_all_back() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let parent = stand.named.parent().unwrap().to_path_buf();
         // The workspace is made ready by this first command, and nothing has been named.
@@ -629,6 +632,9 @@ mod tests {
     /// What the person changed in a held file's list since the folder was named survives the folder going.
     #[test]
     fn a_held_file_whose_list_was_changed_since_keeps_the_change_when_the_folder_goes() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let before = lists(&[&stand.named]);
         let added = add(&stand.journal, &stand.named, &[], &mut no_word, &AtomicBool::new(false)).unwrap();
@@ -652,6 +658,9 @@ mod tests {
     /// A held file saved anew by an editor (written new, renamed over the old) inherits the folder's ACE for the container; it is held out again before the next command runs.
     #[test]
     fn a_held_file_saved_anew_by_an_editor_is_held_out_again_before_the_next_command() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         // (the commands of this test find the app's folder where the list is)
         crate::workspace_grants::use_test_folder(stand.journal.parent().unwrap());
@@ -684,6 +693,9 @@ mod tests {
     /// What looking at the held list before a command costs, with one held file and with twenty (nothing to hold out again: the common case).
     #[test]
     fn looking_at_the_held_list_costs_little_before_a_command() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         for held in [1usize, 20] {
             let stand = stand();
             for at in 0..held {
@@ -704,6 +716,9 @@ mod tests {
 
     #[test]
     fn stopping_midway_undoes_it_all() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         for at in 0..400 {
             std::fs::write(stand.named.join(format!("many{at}.txt")), "x").unwrap();
@@ -726,6 +741,9 @@ mod tests {
 
     #[test]
     fn after_a_crash_the_list_is_enough_to_undo_or_finish() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         for left in [State::Adding, State::Removing] {
             let stand = stand();
             let before = lists(&[&stand.named]);
@@ -754,6 +772,9 @@ mod tests {
 
     #[test]
     fn what_was_there_before_stays_when_a_folder_goes() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         // The folder is on the way to another's workspace, and has a traverse ACE of its own from that: it keeps it.
         let stand = stand();
         let sid = unsafe { sandbox::profile_sid().unwrap() };
@@ -770,6 +791,9 @@ mod tests {
 
     #[test]
     fn what_keeps_its_own_list_is_left_with_it() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let own = stand.named.join("own");
         std::fs::create_dir(&own).unwrap();
@@ -788,6 +812,9 @@ mod tests {
 
     #[test]
     fn what_is_too_long_for_an_ordinary_path_is_given_and_taken_back_too() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let mut deep = stand.named.clone();
         while deep.as_os_str().len() < 300 {
@@ -809,6 +836,9 @@ mod tests {
     /// changed, though nothing on them has, and a walk that believed it left them all out.
     #[test]
     fn a_tree_whose_lists_say_nothing_of_inheritance_is_opened_and_put_back_to_the_byte() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let text = sandbox::dacl_text(&stand.named).unwrap();
         sandbox::restore_dacl_text(&stand.named, &text.replacen("D:AI", "D:", 1)).unwrap();
@@ -864,6 +894,9 @@ mod tests {
 
     #[test]
     fn a_named_folder_renamed_or_moved_on_its_drive_is_found_and_leaves_no_grant() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let before = lists(&[&stand.named]);
         add(&stand.journal, &stand.named, &[], &mut no_word, &AtomicBool::new(false)).unwrap();
@@ -878,6 +911,9 @@ mod tests {
 
     #[test]
     fn a_folder_no_longer_on_its_drive_is_said_to_be_not_found() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         add(&stand.journal, &stand.named, &[], &mut no_word, &AtomicBool::new(false)).unwrap();
         std::fs::remove_dir_all(&stand.named).unwrap();
@@ -889,6 +925,9 @@ mod tests {
 
     #[test]
     fn a_drive_that_is_not_here_keeps_the_folder_on_the_list_until_it_is() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let before = lists(&[&stand.named]);
         add(&stand.journal, &stand.named, &[], &mut no_word, &AtomicBool::new(false)).unwrap();
@@ -918,6 +957,9 @@ mod tests {
     /// Commands reach it only by a way through the folders above it, as the workspace's own folders are.
     #[test]
     fn a_file_moved_out_while_named_keeps_its_entry_and_can_be_read_only_where_commands_can_reach() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         add(&stand.journal, &stand.named, &[], &mut no_word, &AtomicBool::new(false)).unwrap();
         let (far, near) = (stand.outside.join("moved-out.txt"), stand.work.join("moved-in.txt"));
@@ -931,6 +973,9 @@ mod tests {
 
     #[test]
     fn a_link_inside_is_not_gone_through() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let mut link = std::process::Command::new("cmd");
         link.arg("/c").arg("mklink").arg("/J").arg(stand.named.join("through")).arg(&stand.outside).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -946,6 +991,9 @@ mod tests {
 
     #[test]
     fn what_is_too_wide_or_holds_keys_or_overlaps_is_refused_and_nothing_is_written() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let attempt = |folder: &Path, secrets: &[PathBuf]| add(&stand.journal, folder, secrets, &mut no_word, &AtomicBool::new(false)).unwrap_err();
         assert_eq!(attempt(&stand.named.join("a.txt"), &[]), NOT_A_FOLDER);
@@ -970,6 +1018,9 @@ mod tests {
 
     #[test]
     fn a_folder_named_through_a_link_is_the_folder_it_leads_to() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         let link = stand.named.parent().unwrap().join("the-link");
         let mut made = std::process::Command::new("cmd");
@@ -989,6 +1040,9 @@ mod tests {
 
     #[test]
     fn a_list_that_cannot_be_read_is_kept_and_said_and_is_not_written_over() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         std::fs::create_dir_all(stand.journal.parent().unwrap()).unwrap();
         std::fs::write(&stand.journal, "").unwrap();
@@ -1004,6 +1058,9 @@ mod tests {
 
     #[test]
     fn a_held_file_that_has_gone_and_a_folder_that_has_gone_do_not_stop_the_rest() {
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
         let stand = stand();
         add(&stand.journal, &stand.named, &[], &mut no_word, &AtomicBool::new(false)).unwrap();
         std::fs::remove_file(stand.named.join(".env")).unwrap();

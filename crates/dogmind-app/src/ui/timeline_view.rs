@@ -77,6 +77,10 @@ pub(super) struct TimelineView {
     placed: Vec<Placed>,
     total: i32,
     laid_for: Option<(i32, u32, u64)>,
+    /// The rows as they were when `placed` was found for them.
+    laid_rows: Vec<path::Row>,
+    /// What the wheel has turned that has not yet made a whole pixel (in 120ths of one).
+    wheel_rest: i32,
     /// How tall the part that stays at the top was when it was last drawn.
     head_height: i32,
     pub scroll: i32,
@@ -93,6 +97,12 @@ pub(super) struct TimelineView {
 }
 
 impl TimelineView {
+    /// Show the first match of a search, or keep the latest rows in sight when showing the whole session.
+    fn reset_scroll(&mut self) {
+        self.scroll = 0;
+        self.follow = self.query.is_empty();
+    }
+
     pub(super) unsafe fn new(parent: HWND) -> TimelineView {
         let instance = GetModuleHandleW(std::ptr::null());
         let class_name = wide(TIMELINE_CLASS);
@@ -123,6 +133,8 @@ impl TimelineView {
             placed: Vec::new(),
             total: 0,
             laid_for: None,
+            laid_rows: Vec::new(),
+            wheel_rest: 0,
             head_height: 0,
             scroll: 0,
             follow: true,
@@ -175,7 +187,19 @@ fn who_icon(who: path::Who) -> &'static str {
     }
 }
 
+/// What a turn of the wheel by `delta` (120 a notch, up) moves the path by, at `per_notch` pixels a notch, with `rest` (in 120ths of a pixel) kept from before: the pixels
+/// down, and what is kept for the next.
+fn wheel_pixels(rest: i32, delta: i32, per_notch: i32) -> (i32, i32) {
+    let rest = rest - delta * per_notch;
+    let pixels = rest / 120;
+    (pixels, rest - pixels * 120)
+}
+
 unsafe fn fill(device: HDC, area: RECT, color: u32) {
+    // (with Direct2D, in the paint drawn as one: a band is many of these, and with GDI each would write all of the paint out and have it read in again)
+    if crate::render::rounded(device, area, 0, Some(color), None) {
+        return;
+    }
     let brush = CreateSolidBrush(color);
     FillRect(device, &area, brush);
     DeleteObject(brush);
@@ -184,7 +208,7 @@ unsafe fn fill(device: HDC, area: RECT, color: u32) {
 impl App {
     /// The panel shows the Timeline view.
     pub(super) fn timeline_shown(&self) -> bool {
-        self.panel == Panel::Chat && !self.onboarding && self.settings.center_view == CenterView::Timeline
+        self.panel == Panel::Chat && !self.onboarding && self.has_messages && self.settings.center_view == CenterView::Timeline
     }
 
     /// What the window knows of the present besides the events: whether a turn is at work, what the person is asked, and how much waits in the background.
@@ -198,8 +222,9 @@ impl App {
         } else {
             None
         };
-        // (the time now, for the band of the turn at work to reach)
-        let wall_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
+        // (the time now, for the band of the turn at work to reach: with no turn at work it is none, as nothing reaches it. The rows are made again whenever what they are
+        // made from changes, and a clock in it had them made, and every row measured again, at each paint: 9 ms of the 44 a paint took with a turn of 199 rows open)
+        let wall_ms = if self.running { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64) } else { None };
         path::Inputs { running: self.running, wait, background: self.waiting.commands.len() + self.waiting.waits.len(), wall_ms, query: self.timeline.query.clone(), spans: self.timeline.spans.clone() }
     }
 
@@ -239,8 +264,7 @@ impl App {
     /// What is looked for has changed: the path shows only what has it, at once (it is read from what is already there).
     pub(super) unsafe fn timeline_query_changed(&mut self) {
         self.timeline.query = get_text(self.timeline.search).trim().to_lowercase();
-        self.timeline.scroll = 0;
-        self.timeline.follow = self.timeline.query.is_empty();
+        self.timeline.reset_scroll();
         InvalidateRect(self.timeline.window, std::ptr::null(), 0);
     }
 
@@ -255,8 +279,7 @@ impl App {
         self.timeline.band_drag = None;
         self.timeline.selected = None;
         self.timeline.serial += 1;
-        self.timeline.follow = true;
-        self.timeline.scroll = 0;
+        self.timeline.reset_scroll();
         self.timeline.stale = true;
         self.timeline.first_request_due = false;
         // (calls the session had under way while it was out of sight, which no event said to this)
@@ -385,16 +408,24 @@ impl App {
         if self.timeline.laid_for == Some(key) {
             return;
         }
+        // (a row that is what it was when it was last measured, at this width and scale, is as tall as it was: while a turn is at work the rows are made again at each paint,
+        // and only those that changed are measured again. The step at work is one line that counts on, and is measured each time all the same)
+        let same_measure = self.timeline.laid_for.is_some_and(|(laid_width, laid_dpi, _)| laid_width == width && laid_dpi == self.dpi);
         let mut placed = Vec::with_capacity(self.timeline.rows.len());
         let mut top = 0;
         for (at, row) in self.timeline.rows.iter().enumerate() {
-            let height = self.timeline_row(None, row, 0, 0, width, at == 0, frame);
+            let kept = same_measure && row.kind != path::Kind::Live && self.timeline.laid_rows.get(at) == Some(row);
+            let height = match self.timeline.placed.get(at) {
+                Some(before) if kept => before.height,
+                _ => self.timeline_row(None, row, 0, 0, width, at == 0, frame),
+            };
             placed.push(Placed { top, height });
             top += height;
         }
         self.timeline.placed = placed;
         self.timeline.total = top;
         self.timeline.laid_for = Some(key);
+        self.timeline.laid_rows = self.timeline.rows.clone();
     }
 
     /// The most the path can be scrolled in the window it is in.
@@ -429,7 +460,14 @@ impl App {
         if across {
             return;
         }
-        self.timeline_to(self.timeline.scroll - (notches * 3.0) as i32 * scale(self.dpi, ds::size::TEXT_ROW));
+        // (a notch goes three rows, in pixels, and what a fine wheel or a touchpad sends is kept until it adds up: counted in rows, a part of a notch was lost, and such a wheel
+        // moved the path in jumps or not at all)
+        let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+        let pixels;
+        (pixels, self.timeline.wheel_rest) = wheel_pixels(self.timeline.wheel_rest, delta, 3 * scale(self.dpi, ds::size::TEXT_ROW));
+        if pixels != 0 {
+            self.timeline_to(self.timeline.scroll + pixels);
+        }
     }
 
     /// Where a band row's band lies across the window: its left and its width (a row's, at its indent).
@@ -1129,7 +1167,8 @@ unsafe extern "system" fn timeline_procedure(window: HWND, message: u32, wparam:
                 let device = CreateCompatibleDC(target);
                 let bitmap = CreateCompatibleBitmap(target, client.right, client.bottom);
                 let previous = SelectObject(device, bitmap);
-                app.paint_timeline(device, client);
+                // (drawn as one, as the path is many small drawings of Direct2D: see `render::batch`)
+                crate::render::batch(device, client, || app.paint_timeline(device, client));
                 BitBlt(target, 0, 0, client.right, client.bottom, device, 0, 0, SRCCOPY);
                 SelectObject(device, previous);
                 DeleteObject(bitmap);
@@ -1218,5 +1257,32 @@ unsafe extern "system" fn timeline_procedure(window: HWND, message: u32, wparam:
             0
         }
         _ => DefWindowProcW(window, message, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wheel_pixels;
+
+    /// A notch is its pixels; a fine wheel's or a touchpad's small turns add up to as much, and none is lost. (Counted in whole rows, a fifth of a notch was none.)
+    #[test]
+    fn a_fine_wheel_moves_the_path_as_far_as_a_notch_does() {
+        assert_eq!(wheel_pixels(0, -120, 138), (138, 0));
+        assert_eq!(wheel_pixels(0, 120, 138), (-138, 0));
+        let (mut moved, mut rest) = (0, 0);
+        for _ in 0..5 {
+            let pixels;
+            (pixels, rest) = wheel_pixels(rest, -24, 138);
+            assert!(pixels > 0, "each fifth of a notch moves it");
+            moved += pixels;
+        }
+        assert_eq!((moved, rest), (138, 0));
+        let (mut moved, mut rest) = (0, 0);
+        for _ in 0..120 {
+            let pixels;
+            (pixels, rest) = wheel_pixels(rest, -1, 138);
+            moved += pixels;
+        }
+        assert_eq!(moved, 138, "the smallest turns too");
     }
 }

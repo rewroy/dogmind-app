@@ -1,4 +1,4 @@
-# The pictures of the Terminal view: the empty page, the shell menu, a PowerShell with colours, Japanese output and an exited shell, in the dark and the light theme.
+# The pictures of the terminal panel: a PowerShell with colours, Japanese output and an exited shell, in the dark and the light theme.
 . "$PSScriptRoot\lib.ps1"
 $ErrorActionPreference = 'Stop'
 $env:DOGMIND_TERM_QUIET = '1'
@@ -15,12 +15,8 @@ foreach ($theme in 'dark', 'light') {
   Set-Content "$work\alpha.txt" 'a'; Set-Content "$work\beta.txt" 'b'
   $a = Start-App -Data $data -Width 1280 -Height 860 -Env $envs
   Start-Sleep -Milliseconds 900
-  Shot $a "term-1-empty-$theme" | Out-Null
-  Check "empty page $theme has the panel on the Terminal view" ((Term-Read $a 'list' 'list.txt') -eq '' -or $true)
-  # the shell menu on the empty page
-  Term $a 'menu shells' | Out-Null; Start-Sleep -Milliseconds 300
-  Shot $a "term-2-menu-$theme" | Out-Null
-  Term $a 'menu close' | Out-Null
+  # (no terminal writes an empty list, which reads back as nothing)
+  Check "no terminal before one is opened ($theme)" ([string]::IsNullOrEmpty((Term-Read $a 'list' 'list.txt')))
   # a PowerShell with colours
   $shell = 'pwsh'; $id = Term $a 'new pwsh'
   if ($id -le 0) { $shell = 'powershell'; $id = Term $a 'new powershell' }

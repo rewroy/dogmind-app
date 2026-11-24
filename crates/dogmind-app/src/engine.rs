@@ -694,8 +694,18 @@ impl Drop for Job {
     }
 }
 
-/// The last lines an engine wrote to its error stream.
-type Said = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+/// What an engine wrote to its error stream: its last lines, and whether the stream has ended.
+#[derive(Default)]
+struct Heard {
+    lines: std::collections::VecDeque<String>,
+    /// Read to its end: every process that held it has ended.
+    at_end: bool,
+}
+
+type Said = std::sync::Arc<std::sync::Mutex<Heard>>;
+
+/// How long the last lines of an engine that has ended are waited for, when its stream has not ended with it (a worker of its may hold it a moment longer).
+const LAST_WORDS: Duration = Duration::from_secs(2);
 
 /// How many of those lines are kept: a panic is three lines, and what an engine says after it is little.
 const LINES_KEPT: usize = 20;
@@ -711,14 +721,15 @@ fn listen(stderr: std::process::ChildStderr) -> Said {
         while matches!(reader.read_until(b'\n', &mut line), Ok(count) if count > 0) {
             let text = String::from_utf8_lossy(&line);
             if !text.trim().is_empty() {
-                let mut lines = kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                lines.push_back(text.trim_end().to_string());
-                while lines.len() > LINES_KEPT {
-                    lines.pop_front();
+                let mut heard = kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                heard.lines.push_back(text.trim_end().to_string());
+                while heard.lines.len() > LINES_KEPT {
+                    heard.lines.pop_front();
                 }
             }
             line.clear();
         }
+        kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).at_end = true;
     });
     said
 }
@@ -751,6 +762,8 @@ pub struct Engine {
     pub not_held: Option<String>,
     /// The last lines it wrote to its error stream (see `listen`).
     said: Said,
+    /// How it ended, and when that was seen: why is said once its last lines have been read.
+    exited: Option<(std::process::ExitStatus, std::time::Instant)>,
     /// Where it listens: not always the port asked for.
     pub port: u16,
 }
@@ -770,7 +783,7 @@ impl Engine {
         };
         let said = child.stderr.take().map_or_else(Said::default, listen);
         let stop = child.stdin.take();
-        Ok(Engine { child: Some(child), _job: job, stop, stop_limit: ENGINE_STOP, not_held, said, port: settings.port })
+        Ok(Engine { child: Some(child), _job: job, stop, stop_limit: ENGINE_STOP, not_held, said, exited: None, port: settings.port })
     }
 
     /// Its process number: an installer that is to replace its files waits for it to end.
@@ -783,12 +796,21 @@ impl Engine {
         self.stop.is_some()
     }
 
-    /// Why it ended, if it has.
+    /// Why it ended, once it has and its last lines have been read: until its error stream has been read to its end (or for [`LAST_WORDS`], if a process of its
+    /// holds it longer), None. It is asked on a timer, and its last words come after its end on the thread that reads them: a tenth of a second's wait, the
+    /// window's, was not always enough for them, and the reason then said nothing of what had happened.
     pub fn ended(&mut self) -> Option<String> {
-        let status = self.child.as_mut()?.try_wait().ok()??;
-        // (its last words may still be on their way to the reader)
-        std::thread::sleep(Duration::from_millis(100));
-        let lines: Vec<String> = self.said.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().cloned().collect();
+        if self.exited.is_none() {
+            let status = self.child.as_mut()?.try_wait().ok()??;
+            self.exited = Some((status, std::time::Instant::now()));
+        }
+        let (status, seen) = self.exited?;
+        let heard = self.said.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !heard.at_end && seen.elapsed() < LAST_WORDS {
+            return None;
+        }
+        let lines: Vec<String> = heard.lines.iter().cloned().collect();
+        drop(heard);
         Some(why_it_did_not_begin(status.code()).or_else(|| why_it_said(&lines)).unwrap_or_else(|| format!("the engine ended ({status})")))
     }
 }
@@ -1712,6 +1734,9 @@ mod tests {
     /// that does not end within the limit is killed after the limit, and not before.
     #[test]
     fn a_graceful_stop_waits_for_the_engine_and_kills_it_after_the_limit() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
         let (mut child, stop) = stoppable(false);
         let began = std::time::Instant::now();
         assert!(end_gracefully(&mut child, stop, Duration::from_secs(20)), "an engine that ends when told is waited for");
@@ -1737,9 +1762,12 @@ mod tests {
     /// of the app, what needs the engine gone) waits for it; an engine that is not to keep it is killed at once, as it was.
     #[test]
     fn a_dropped_engine_that_keeps_the_conversation_ends_on_its_own_and_is_waited_for() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
         let (child, stop) = stoppable(false);
         let id = child.id();
-        let engine = Engine { child: Some(child), _job: None, stop: Some(stop), stop_limit: Duration::from_secs(20), not_held: None, said: Said::default(), port: 0 };
+        let engine = Engine { child: Some(child), _job: None, stop: Some(stop), stop_limit: Duration::from_secs(20), not_held: None, said: Said::default(), exited: None, port: 0 };
         assert!(engine.stops_gracefully());
         let began = std::time::Instant::now();
         drop(engine);
@@ -1748,14 +1776,14 @@ mod tests {
         assert!(!is_running(id), "it has ended by the time the app may go");
         // one that does not end: killed after the limit it was given
         let (child, stop) = stoppable(true);
-        let engine = Engine { child: Some(child), _job: None, stop: Some(stop), stop_limit: Duration::from_millis(500), not_held: None, said: Said::default(), port: 0 };
+        let engine = Engine { child: Some(child), _job: None, stop: Some(stop), stop_limit: Duration::from_millis(500), not_held: None, said: Said::default(), exited: None, port: 0 };
         let began = std::time::Instant::now();
         drop(engine);
         wait_for_endings();
         assert!(began.elapsed() >= Duration::from_millis(500) && began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
         // not asked to keep it: killed at once
         let (child, _) = stoppable(true);
-        let engine = Engine { child: Some(child), _job: None, stop: None, stop_limit: ENGINE_STOP, not_held: None, said: Said::default(), port: 0 };
+        let engine = Engine { child: Some(child), _job: None, stop: None, stop_limit: ENGINE_STOP, not_held: None, said: Said::default(), exited: None, port: 0 };
         assert!(!engine.stops_gracefully());
         let began = std::time::Instant::now();
         drop(engine);
@@ -1771,7 +1799,7 @@ mod tests {
         hidden(&mut command);
         let mut child = command.spawn().unwrap();
         let said = child.stderr.take().map_or_else(Said::default, listen);
-        Engine { child: Some(child), _job: None, stop: None, stop_limit: ENGINE_STOP, not_held: None, said, port: 0 }
+        Engine { child: Some(child), _job: None, stop: None, stop_limit: ENGINE_STOP, not_held: None, said, exited: None, port: 0 }
     }
 
     fn why_it_ended(lines: &[&str], code: i32) -> String {
@@ -1819,7 +1847,7 @@ mod tests {
         while engine.ended().is_none() {
             std::thread::sleep(Duration::from_millis(50));
         }
-        let kept: Vec<String> = engine.said.lock().unwrap().iter().cloned().collect();
+        let kept: Vec<String> = engine.said.lock().unwrap().lines.iter().cloned().collect();
         assert_eq!((kept.len(), kept.first().map(String::as_str), kept.last().map(String::as_str)), (LINES_KEPT, Some("line 11"), Some("line 30")));
     }
 
@@ -1865,6 +1893,9 @@ mod tests {
 
     #[test]
     fn a_setup_can_be_cancelled_with_all_it_started() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
         let (lines, _seen) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
@@ -1939,7 +1970,7 @@ mod tests {
     /// drafter itself, as it always did; every other argument stays, and so do the arguments of a program that is not setup.
     #[test]
     fn an_option_an_older_straydog_does_not_know_is_not_passed_to_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let program = |name: &str, lines: &[&str]| {
             let file = dir.path().join(format!("{name}.cmd"));
             std::fs::write(&file, format!("@echo off\r\n{}\r\n", lines.iter().map(|line| format!("echo {line}")).collect::<Vec<_>>().join("\r\n"))).unwrap();

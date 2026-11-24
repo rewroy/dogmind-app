@@ -1,4 +1,4 @@
-# The driver of the running app for the Terminal view's tests: windows by messages, a picture through PrintWindow, a data folder of its own for each run,
+# The driver of the running app for the terminal panel's tests: windows by messages, a picture through PrintWindow, a data folder of its own for each run,
 # the window shown off every screen and never given the focus, and the hooks of a debug build that has DOGMIND_TEST_TERMINAL set (see ui/term_panel/hooks.rs).
 # Dot-source it. Build first with `cargo build -p dogmind-app`; what is written (pictures, data folders, what a hook read) goes to $env:TERM_UI_OUT, or to `out` beside this file.
 # Drives the app with messages only, off screen from the first moment. Dot-source it.
@@ -77,6 +77,11 @@ function Stop-App($a) { if ($a -and $a.Process -and -not $a.Process.HasExited) {
 function Shot($a, [string]$Name, [int]$Flag = 3) {
   # (the app draws first: the system keeps what a window last drew, and a picture taken in the moment after a change can be of the one before)
   if ($env:DOGMIND_TEST_TERMINAL) { [void][Hook]::Send($a.Window, 'repaint'); Start-Sleep -Milliseconds 250 }
+  # (a window on a station with no display, as a command's in the sandbox is, is on no screen: the app draws its own picture of its client area, which the hook writes)
+  if ($env:DOGMIND_TEST_TERMINAL -and ($Flag -band 1)) {
+    $own = "$Shots\$Name.png"
+    if ([Hook]::Send($a.Window, "shot $own") -eq 1) { return $own }
+  }
   $r = New-Object UI+RECT; if ($Flag -band 1) { [void][UI]::GetClientRect($a.Window, [ref]$r) } else { [void][UI]::GetWindowRect($a.Window, [ref]$r) }
   $b = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T); $g = [System.Drawing.Graphics]::FromImage($b); $d = $g.GetHdc(); [void][UI]::PrintWindow($a.Window, $d, $Flag); $g.ReleaseHdc($d)
   # The terminal's window is asked for its own picture (it draws itself on the device it is given), and put where it stands: of what it holds now, and not of what the system last composed of it.
@@ -91,6 +96,16 @@ function Shot($a, [string]$Name, [int]$Flag = 3) {
   }
   $g.Dispose()
   $file = "$Shots\$Name.png"; $b.Save($file, [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose(); $file
+}
+# A picture to send, as a screenshot is: wider than tall, a dark window with a light panel and a few words on it.
+function New-Picture([string]$Path, [int]$Width = 1200, [int]$Height = 720) {
+  $b = New-Object System.Drawing.Bitmap $Width, $Height; $g = [System.Drawing.Graphics]::FromImage($b)
+  $g.Clear([System.Drawing.Color]::FromArgb(32, 32, 30))
+  $g.FillRectangle((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(24, 24, 22))), 0, 0, [int]($Width / 5), $Height)
+  $g.FillRectangle((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(236, 232, 224))), [int]($Width * 0.35), [int]($Height * 0.3), [int]($Width * 0.3), [int]($Height * 0.25))
+  $font = New-Object System.Drawing.Font 'Segoe UI', 28
+  $g.DrawString('A test picture', $font, [System.Drawing.Brushes]::Black, [single]($Width * 0.37), [single]($Height * 0.37))
+  $g.Dispose(); $b.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose()
 }
 function Kids($a) { @([UI]::Kids($a.Window)) }
 function Rich($a) { $a.Rich }

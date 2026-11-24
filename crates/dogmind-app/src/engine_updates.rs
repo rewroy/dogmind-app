@@ -851,7 +851,7 @@ mod tests {
     /// the move can: written unflushed, as it was, a cut just after the move left the name on zeros.)
     #[test]
     fn the_selection_is_on_the_disk_before_it_takes_its_name() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         FLUSHED.with(|flushed| flushed.borrow_mut().clear());
         atomic_selection(dir.path(), "0.1.13\n0.1.12").unwrap();
         assert_eq!(FLUSHED.with(|flushed| flushed.borrow().clone()), vec![dir.path().join("selected.partial")]);
@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn a_new_cublas_major_is_found_even_if_an_old_name_is_in_the_binary() {
-        let folder = tempfile::tempdir().unwrap();
+        let folder = crate::in_container::tempdir().unwrap();
         let exe = folder.path().join("straydog.exe");
         fs::write(&exe, b"error cublas64_13.dll\0import cublas64_14.dll\0").unwrap();
         assert_eq!(
@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn a_new_cublas_major_comes_only_from_the_verified_release_zip() {
         use std::io::Write;
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::in_container::tempdir().unwrap();
         let old = data.path().join("old");
         let partial = data.path().join("partial");
         fs::create_dir(&old).unwrap();
@@ -985,7 +985,7 @@ mod tests {
 
     #[test]
     fn a_missing_same_major_library_does_not_trigger_the_full_zip() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::in_container::tempdir().unwrap();
         let old = data.path().join("old");
         let partial = data.path().join("partial");
         fs::create_dir(&old).unwrap();
@@ -1048,7 +1048,7 @@ mod tests {
 
     #[test]
     fn a_failed_engine_returns_to_the_previous_selected_version() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::in_container::tempdir().unwrap();
         let folder = root(data.path());
         for version in ["0.1.11", "0.1.12"] {
             let location = folder.join(format!("v{version}"));
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[test]
     fn an_engine_that_ends_before_it_is_ready_returns_to_the_previous_version() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::in_container::tempdir().unwrap();
         let folder = root(data.path());
         for version in ["0.1.10", "0.1.11"] {
             let location = folder.join(format!("v{version}"));
@@ -1138,7 +1138,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn staged_engine_and_libraries_get_the_workers_acl() {
-        let data = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let data = crate::in_container::tempdir().unwrap();
         let folder = data.path().join("v0.1.11.partial");
         fs::create_dir(&folder).unwrap();
         for name in ["straydog.exe", "cublas64_13.dll", "cublasLt64_13.dll"] {
@@ -1166,7 +1169,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_new_engine_must_confirm_the_model_before_it_can_be_selected() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::in_container::tempdir().unwrap();
         let source = data.path().join("fake.rs");
         fs::write(&source, r#"
             fn main() {
@@ -1212,7 +1215,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn failed_digest_or_model_check_cannot_replace_the_running_engine() {
-        let data = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::FOLDERS) {
+            return;
+        }
+        let data = crate::in_container::tempdir().unwrap();
         let source = data.path().join("candidate.rs");
         fs::write(&source, r#"
             fn main() {

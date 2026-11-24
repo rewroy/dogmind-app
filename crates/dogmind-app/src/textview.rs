@@ -663,8 +663,11 @@ unsafe extern "system" fn create_caret(this: *mut Host, bitmap: HBITMAP, _width:
     CreateCaret(window, picture, width, height)
 }
 
+/// A text that is only read (the conversation) shows no caret: it is read and selected, never typed in, and a caret blinking in it was in the way (the
+/// owner, 2026-11-22). Its selection is drawn as before.
 unsafe extern "system" fn show_caret(this: *mut Host, show: i32) -> i32 {
-    if show != 0 { ShowCaret(host(this).window) } else { HideCaret(host(this).window) }
+    let host = host(this);
+    if show != 0 && host.style() & ES_READONLY == 0 { ShowCaret(host.window) } else { HideCaret(host.window) }
 }
 unsafe extern "system" fn set_caret_pos(_this: *mut Host, x: i32, y: i32) -> i32 {
     SetCaretPos(x, y)
@@ -2066,7 +2069,7 @@ mod tests {
         let Some(file) = std::env::var_os("DOGMIND_TEST_LENT_FACE") else {
             let regular = crate::paint::BUNDLED_FILES[0];
             let Some(folder) = crate::paint::font_folders().into_iter().find(|folder| folder.join(regular).is_file()) else { return };
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::in_container::tempdir().unwrap();
             let copy = dir.path().join("QZXUDGothic-Regular.ttf");
             std::fs::write(&copy, renamed(&std::fs::read(folder.join(regular)).unwrap(), "BIZ", "QZX")).unwrap();
             let run = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", NAME, "--nocapture", "--test-threads=1"]).env("DOGMIND_TEST_LENT_FACE", &copy).output().unwrap();

@@ -1,4 +1,4 @@
-# The pointer and the buttons, as window messages: the empty page's New terminal and its arrow, a tab's cross, a drag that selects, a double click that takes a word, a right click and its menu, the wheel.
+# The pointer and the buttons, as window messages: the title bar's terminal button, a tab's cross, a drag that selects, a double click that takes a word, a right click and its menu, the wheel.
 . "$PSScriptRoot\lib.ps1"
 $ErrorActionPreference = 'Stop'
 $results = @()
@@ -9,20 +9,20 @@ function Ids($a) { @((Term-Read $a 'list' 'l.txt') -split "`r?`n" | ? { $_ } | %
 $data = New-Data "pointer" -Display 'en' -Theme 'dark' -Extra @{ right_view = 'terminal' }
 $a = Start-App -Data $data -Width 1280 -Height 860 -Env @{ DOGMIND_TEST_DPI = '96'; DOGMIND_TEST_TERMINAL = '1' }
 Start-Sleep -Milliseconds 900
-# The empty page: New terminal opens the shell last used (none yet: the first this PC has), and the choice from the menu is remembered.
+# The title bar's button opens the panel with PowerShell in it; closing its one terminal closes the panel, and the button opens another.
 Check 'no terminal yet' ((Ids $a).Count -eq 0)
-Press $a 'chevron-down*'; Start-Sleep -Milliseconds 400
-Shot $a 'term-2-menu-by-press' | Out-Null
-Term $a 'menu choose 2' | Out-Null   # the third of the list (a PC with PowerShell 7 lists four: Command Prompt is third)
-Check 'a shell chosen from the menu opens' (Wait-Until { (Ids $a).Count -eq 1 })
+Press $a 'terminal'
+Check 'the button opens a terminal' (Wait-Until { (Ids $a).Count -eq 1 })
 $first = (Ids $a)[0]
-$settings = Get-Content "$data\settings.json" -Raw | ConvertFrom-Json
-Check 'and is remembered' ($settings.terminal_shell -eq (Info $a $first).shell) "$($settings.terminal_shell)"
+Check 'in PowerShell' ((Info $a $first).shell -in 'pwsh', 'powershell') (Info $a $first).shell
 Term $a "close $first" | Out-Null
-Check 'with none open the page is back' (Wait-Until { (Ids $a).Count -eq 0 })
-Press $a 'New terminal'
-Check 'New terminal opens the shell last used' (Wait-Until { (Ids $a).Count -eq 1 -and (Info $a (Ids $a)[0]).shell -eq $settings.terminal_shell })
-$id = (Ids $a)[0]
+Check 'closing it closes the panel' (Wait-Until { (Ids $a).Count -eq 0 -and -not [bool](Kids $a | ? { [UI]::Cls($_) -eq 'DogTerm' -and [UI]::IsWindowVisible($_) }) })
+Press $a 'terminal'
+Check 'and the button opens another' (Wait-Until { (Ids $a).Count -eq 1 -and (Ids $a)[0] -ne $first })
+# (what follows is written for the Command Prompt's echo and for: a terminal in it, by the hook that names a shell, in place of the PowerShell)
+Term $a "close $((Ids $a)[0])" | Out-Null
+$id = Term $a 'new cmd'
+Check 'a Command Prompt for the rest' ($id -gt 0 -and (Wait-Until { (Ids $a).Count -eq 1 })) $id
 Check 'it has the keys' (Wait-Until { (Info $a $id).active -eq 'true' })
 $hw = ([UI]::Kids($a.Window) | ? { [UI]::Cls($_) -eq 'DogTerm' } | Select-Object -First 1)
 Term $a "input $id echo alpha beta あいう gamma\r" | Out-Null
@@ -51,10 +51,13 @@ Check 'select all in the menu selects the screen' ((Term-Read $a "selected $id" 
 Term $a 'menu close' | Out-Null
 # the wheel: back, as the lines are written
 Term $a "input $id for /l %i in (1,1,120) do @echo n%i\r" | Out-Null
-Check 'lines written' (Wait-Until { (Term-Read $a "grid $id" 'g.txt') -match 'n120' })
+# (and the prompt after them: a line that comes after the notch moves what is shown back by one more)
+Check 'lines written' (Wait-Until { (Term-Read $a "grid $id" 'g.txt') -match '(?s)n120.*>\s*$' })
 $wheel = [IntPtr]((120 -shl 16) -band 0xFFFFFFFF)   # one notch up
+$before = Info $a $id
 [void][UI]::PostMessageW($hw, 0x020A, [IntPtr]([int64]120 -shl 16), (Lparam 100 100)); Start-Sleep -Milliseconds 300
-Check 'a notch of the wheel goes back three lines' ([int](Info $a $id).offset -eq 3) "offset $((Info $a $id).offset)"
+$after = Info $a $id
+Check 'a notch of the wheel goes back three lines' ([int]$after.offset - [int]$before.offset -eq 3) "offset $($before.offset) to $($after.offset), rows $($before.rows) to $($after.rows), history $($before.history) to $($after.history), selected $($before.selected)"
 # a tab's cross, by a press on the button
 Term $a 'new cmd' | Out-Null; Start-Sleep -Milliseconds 800
 Check 'two tabs' ((Ids $a).Count -eq 2)

@@ -1,6 +1,9 @@
 //! Opening a page of the workspace in a headless browser, inside the sandbox: what its scripts printed and threw, and what it shows. It is the same sandbox as any command's, with no
 //! network, so what a page takes from a CDN does not load; this says so plainly, as nothing else would tell: the page just sits there with no error.
 
+mod cdn;
+
+use crate::prompt::LOCAL_MODULE_WORDS;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -19,15 +22,44 @@ const LIMIT: Duration = Duration::from_secs(20);
 /// null when the registration it makes fails, which it does in a container: the browser ended with 0xc0000005 in about 6 runs of 10 on this machine, always there, and in none of
 /// 90 with the feature off. A browser that does not know the name (Chrome) ignores it. `DisableLoadExtensionCommandLineSwitch` is off for a branded Chrome, which since 137 loads no
 /// extension from the command line otherwise: the one extension a run loads is that of [`FRAMES`], and every other is off (`extension_flags`).
-/// The flags, with what a debug build is told to add (for a look at what the browser does in the sandbox).
-fn flags() -> String {
+/// The flags for a run that draws on the GPU (`gpu`) or on the CPU, with what a debug build is told to add (for a look at what the browser does in the sandbox).
+fn flags(gpu: bool) -> String {
+    let drawn = if gpu { ON_THE_GPU } else { ON_THE_CPU };
     #[cfg(debug_assertions)]
     if let Ok(more) = std::env::var("DOGMIND_PAGE_FLAGS") {
-        return format!("{FLAGS} {more}");
+        return format!("{FLAGS}{drawn} {more}");
     }
-    FLAGS.to_string()
+    format!("{FLAGS}{drawn}")
 }
-const FLAGS: &str = "--headless=new --no-sandbox --disable-gpu --no-first-run --disable-background-networking --disable-sync --disable-component-update --disable-features=msWindowsTaskManager,DisableLoadExtensionCommandLineSwitch --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
+
+/// How a page that draws with WebGL is drawn: on the machine's GPU, through ANGLE's Direct3D 11, which a run in the sandbox reaches (its WebGL said "ANGLE (NVIDIA,
+/// NVIDIA GeForce RTX 5070 Ti ... Direct3D11 ...)" where it had said SwiftShader). A three.js page with steps at a 10 s wait was checked in 5.7 s, where on the CPU
+/// it had taken 21, and with two views in 8.5 s against 25; with two views at the usual wait, 5.0 against 8.5.
+const ON_THE_GPU: &str = " --use-angle=d3d11";
+/// How any other page is drawn: on the CPU, with no GPU process to start, which costs a run of a page with no WebGL 0.3 to 0.4 s (1.3 s against 1.7).
+const ON_THE_CPU: &str = " --disable-gpu";
+
+/// Checks that went back to the CPU after a run on the GPU crashed or hung: past two, a machine whose GPU will not draw for the sandbox is not asked again in this
+/// run of the app.
+static GPU_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// The model's server is on this machine, and so, with a CUDA build, on its GPU. Its weights fill the GPU's memory (a partially resident model is made to), and
+/// a browser drawing there takes some of it, which may page the engine's out before its next request or fail an allocation of its: pages are then drawn on the
+/// CPU, as they were before the GPU was used. (Not measured: it is left alone until it is.)
+static ENGINE_HERE: AtomicBool = AtomicBool::new(false);
+
+/// Says whether the model's server is on this machine ([`ENGINE_HERE`]).
+pub fn engine_on_this_machine(here: bool) {
+    ENGINE_HERE.store(here, Ordering::Relaxed);
+}
+
+/// Whether a page draws with WebGL, from its HTML and the scripts of its own it loads: a context of it named, or a library that draws with it (three.js by its
+/// file or its import name, Babylon.js, PixiJS, A-Frame, regl).
+fn draws_webgl(texts: &[String]) -> bool {
+    let pattern = Regex::new(r#"(?i)webgl|three(\.module)?(\.min)?\.js|from\s*["']three["']|["']three["']\s*:|babylon|pixi(\.min)?\.js|aframe(\.min)?\.js|\bregl\b"#).expect("the pattern is valid");
+    texts.iter().any(|text| pattern.is_match(text))
+}
+const FLAGS: &str = "--headless=new --no-sandbox --no-first-run --disable-background-networking --disable-sync --disable-component-update --disable-features=msWindowsTaskManager,DisableLoadExtensionCommandLineSwitch --enable-logging=stderr --log-level=0 --allow-file-access-from-files";
 
 /// What is added to [`FLAGS`] for the extensions: the frames' alone when its folder is there (`frames_extension`), and none at all when it is not.
 fn extension_flags(frames: Option<&Path>) -> String {
@@ -41,14 +73,24 @@ fn extension_flags(frames: Option<&Path>) -> String {
     }
 }
 
+/// Space for the window's frame, with a virtual display of exactly the requested size when supported.
+fn view_window(width: u32, height: u32, virtual_screen: bool) -> String {
+    let mut options = format!("--window-size={},{}", width.max(600) + 64, height + 160);
+    if virtual_screen {
+        options.push_str(&format!(" --kiosk --screen-info={{{width}x{height}}}"));
+    }
+    options
+}
+
 /// The command line of a run that dumps the page's DOM, as the sandbox's shell is given it: `%TEMP%` is the container's own folder, where the run's profile is.
-fn page_line(program: &Path, flags: &str, wait: u64, profile: &str, address: &str) -> String {
-    format!("\"{}\" {flags} --window-size=1280,800 --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --dump-dom \"{address}\"", program.display())
+fn page_line(program: &Path, flags: &str, virtual_screen: bool, wait: u64, profile: &str, address: &str) -> String {
+    let window = if virtual_screen { view_window(1280, 800, true) } else { "--window-size=1280,800".to_string() };
+    format!("\"{}\" {flags} {window} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --dump-dom \"{address}\"", program.display())
 }
 
 /// The command line of a run that takes a picture of `frame` (a path) into `shot`, in a window of `window`.
-fn shot_line(program: &Path, flags: &str, window: (u32, u32), wait: u64, profile: &str, shot: &Path, frame: &str) -> String {
-    format!("\"{}\" {flags} --window-size={},{} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --screenshot=\"{}\" \"{frame}\"", program.display(), window.0, window.1, shot.display())
+fn shot_line(program: &Path, flags: &str, window: &str, wait: u64, profile: &str, shot: &Path, frame: &str) -> String {
+    format!("\"{}\" {flags} {window} --virtual-time-budget={wait} --user-data-dir=\"%TEMP%\\{profile}\" --screenshot=\"{}\" \"{frame}\"", program.display(), shot.display())
 }
 
 /// How long a page runs before it is read, unless the model asks for longer, for an animation, and the most it may.
@@ -144,7 +186,34 @@ const STEPS_PRELUDE: &str = r#"<script>
   };
   const text = (selector) => find(selector).textContent.trim();
   const count = (selector) => document.querySelectorAll(selector).length;
-  const visible = (selector) => { const found = document.querySelector(selector); if (!found) return false; const box = found.getBoundingClientRect(); return box.width > 0 && box.height > 0 && getComputedStyle(found).visibility !== 'hidden'; };
+  // (seen as a person sees it: not of no size, not hidden, not wholly transparent by itself or what holds it, and not where no one can see or scroll to: moved off the window by a
+  // transform, or cut off by what holds it. A panel kept out of sight by a transform or opacity 0 was taken for shown, and a wait for it ended before it came.)
+  const visible = (selector) => {
+    const found = document.querySelector(selector); if (!found) return false;
+    const box = found.getBoundingClientRect(); if (!(box.width > 0 && box.height > 0)) return false;
+    const style = getComputedStyle(found); if (style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+    let [left, top, right, bottom, fixed] = [box.left, box.top, box.right, box.bottom, false];
+    for (let at = found; at && at.nodeType === 1; at = at.parentElement) {
+      const its = at === found ? style : getComputedStyle(at);
+      if (Number(its.opacity) === 0) return false;
+      if (its.position === 'fixed') fixed = true;
+      // (what holds it cuts it off where it hides its overflow; where it scrolls, what is past its edge is still to be scrolled to)
+      if (at !== found && at !== document.documentElement && at !== document.body) {
+        const cuts = (overflow) => overflow === 'hidden' || overflow === 'clip';
+        const clip = at.getBoundingClientRect();
+        if (cuts(its.overflowX)) { left = Math.max(left, clip.left); right = Math.min(right, clip.right); }
+        if (cuts(its.overflowY)) { top = Math.max(top, clip.top); bottom = Math.min(bottom, clip.bottom); }
+        if (right <= left || bottom <= top) return false;
+      }
+    }
+    // (what is fixed is seen in the window; the rest where the page scrolls to, or in the window too when the page does not scroll that way)
+    const held = (axis) => [document.documentElement, document.body].some((at) => at && ['hidden', 'clip'].includes(getComputedStyle(at)['overflow' + axis]));
+    const page = document.scrollingElement || document.documentElement;
+    const [x, y] = fixed ? [0, 0] : [scrollX, scrollY];
+    const width = fixed || held('X') ? innerWidth : Math.max(innerWidth, page.scrollWidth);
+    const height = fixed || held('Y') ? innerHeight : Math.max(innerHeight, page.scrollHeight);
+    return right + x > 0 && bottom + y > 0 && left + x < width && top + y < height;
+  };
   // (what a model writes of Playwright, on the helpers above; `evaluate` runs the function in this page itself, as the steps are, and gives what it gives)
   const evaluate = async (fn, ...args) => { const made = typeof fn === 'string' ? (0, eval)(fn) : fn; return typeof made === 'function' ? made(...args) : made; };
   const locator = (selector) => ({ click: () => click(selector), fill: (value) => fill(selector, value), press: (key) => press(selector, key), check: () => check(selector), textContent: async () => find(selector).textContent, isVisible: async () => visible(selector), count: async () => count(selector) });
@@ -470,6 +539,87 @@ fn run_limit(wait: u64) -> Duration {
     (RUN_BASE + Duration::from_millis(wait)).min(LIMIT)
 }
 
+/// The most a picture's run may take, for a page whose read took long: a picture draws the same page at the same wait, in a frame.
+const MOST_PICTURE: Duration = Duration::from_secs(40);
+
+/// How long one run for a picture may take. Begun while the page's read goes on, with no knowing what that will take and sharing the CPU with it: twice
+/// [`run_limit`] (a picture of 12 s by itself took 17 s beside its read), and never more than [`MOST_PICTURE`], as a run that hangs waits for all of it. Begun after it: what the read took, and half again, where that is more than [`run_limit`]. A three.js page with bloom, drawn on the CPU, was read with its steps in
+/// 14 s and each picture's run was stopped at the 17 s of `run_limit`: the check said there was no picture, and the model went looking for a browser of its own outside
+/// the sandbox to see it, nine commands that would each have asked the person.
+fn picture_limit(wait: u64, read_took: Option<Duration>) -> Duration {
+    match read_took {
+        None => (run_limit(wait) * 2).min(MOST_PICTURE),
+        Some(took) => run_limit(wait).max((took * 3 / 2 + Duration::from_secs(3)).min(MOST_PICTURE)),
+    }
+}
+
+/// The wait past which CPU or multi-view checks with steps take their pictures after the read: measured with nothing else running, a WebGL
+/// page drawn on the CPU with steps at a 10 s wait had its picture beside the read stopped at its limit, 36 s, in 2 of 4 checks (48 and 53 s in all, against
+/// 21 to 25 s one after another), where every other form was quicker beside it.
+const STEPS_AT_LENGTH: u64 = 2 * WAIT_MS;
+
+/// A read longer than this is of a page that is slow to draw (WebGL on the CPU, at a long wait or with steps), and its pictures are taken one at a time: two of them
+/// at once with the read just over shared the CPU so that one was stopped at its limit (a read of 14.8 s, a picture of 12 s by itself stopped at 30 s).
+const SLOW_READ: Duration = Duration::from_secs(8);
+
+/// Runs of the browser at once in one check: the page's read and one picture, then the pictures two at a time. Three at once, each drawing WebGL on the CPU, were
+/// slower than one after another, and lost a picture: a check with steps and a 10 s wait took 43 and 61 s, with picture runs stopped at their limit, where it had
+/// taken 26 s. The read and one picture at once took a light page's check from 2.7 s to 1.6 s.
+const AT_ONCE: usize = 2;
+
+/// The turns of a check's runs of the browser ([`AT_ONCE`] at a time).
+struct Slots {
+    free: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// A run's turn, given back when it is dropped.
+struct Slot<'a>(&'a Slots);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+impl Slots {
+    fn new(count: usize) -> Self {
+        Slots { free: Mutex::new(count), freed: std::sync::Condvar::new() }
+    }
+
+    /// A turn, waited for: none when `stop` is set first.
+    fn take(&self, stop: &AtomicBool) -> Option<Slot<'_>> {
+        let mut free = self.free.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            if *free > 0 {
+                *free -= 1;
+                return Some(Slot(self));
+            }
+            free = self.freed.wait_timeout(free, Duration::from_millis(25)).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+        }
+    }
+}
+
+/// What came of one view's picture.
+struct Taken {
+    /// Where it is, when it was taken.
+    picture: Option<PathBuf>,
+    /// Runs stopped by their time.
+    hangs: usize,
+    /// The time each run had.
+    limit: Duration,
+    /// What the page said in the run that took it.
+    said_there: Vec<String>,
+    /// Not taken, as the turn was stopped or the read made it of no use.
+    stopped: bool,
+    /// Its runs of the browser, for the check's own list of them (`RUNS_OF_THIS_CHECK`, of the thread that runs the check).
+    runs: Vec<BrowserRun>,
+}
+
 /// Whether a run that did not give what was wanted is tried again, when it hung: once. A hang is the browser's and not the page's when the page's other run went well (a picture) or when it
 /// printed nothing at all (a page's own console would have been heard), and the browser that hangs once does not hang the next time, as far as 60 runs here say.
 fn tries_again_after_a_hang(hangs: usize) -> bool {
@@ -557,6 +707,115 @@ fn browser() -> Option<(PathBuf, &'static str)> {
     PLACES.iter().find_map(|(variable, path, name)| Some((PathBuf::from(std::env::var_os(variable)?).join(path), *name)).filter(|(found, _)| found.is_file()))
 }
 
+/// Headless virtual screens are supported from Chromium 142. Older installations keep the framed viewport.
+fn supports_virtual_screen(program: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO};
+
+    let wide: Vec<u16> = program.as_os_str().encode_wide().chain(Some(0)).collect();
+    // All pointers refer to the executable's name or to the version block held here until the fixed information is read.
+    unsafe {
+        let size = GetFileVersionInfoSizeW(wide.as_ptr(), std::ptr::null_mut());
+        if size == 0 { return false; }
+        let mut block = vec![0u32; (size as usize).div_ceil(4)];
+        let data = block.as_mut_ptr().cast();
+        if GetFileVersionInfoW(wide.as_ptr(), 0, size, data) == 0 { return false; }
+        let mut fixed = std::ptr::null_mut();
+        let mut length = 0;
+        if VerQueryValueW(data, [b'\\' as u16, 0].as_ptr(), &mut fixed, &mut length) == 0
+            || fixed.is_null() || (length as usize) < std::mem::size_of::<VS_FIXEDFILEINFO>() {
+            return false;
+        }
+        (*fixed.cast::<VS_FIXEDFILEINFO>()).dwFileVersionMS >> 16 >= 142
+    }
+}
+
+/// Origin and path of a validated local server URL. A slash in a query or fragment belongs to neither.
+fn served_origin_and_path(url: &str) -> (&str, &str) {
+    let location = url.split(['?', '#']).next().unwrap_or(url);
+    let authority_start = location.find("://").map_or(0, |at| at + 3);
+    match location[authority_start..].find('/') {
+        Some(at) => location.split_at(authority_start + at),
+        None => (location, "/"),
+    }
+}
+
+/// A supported page name relative to the server root. A directory URL names its index.
+fn served_page_path(url: &str) -> Option<PathBuf> {
+    let (_, path) = served_origin_and_path(url);
+    let wanted = if path.ends_with('/') { format!("{path}index.html") } else { path.to_string() };
+    let relative = PathBuf::from(wanted.trim_start_matches('/').replace('/', "\\"));
+    if !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+        return None;
+    }
+    let ext = relative.extension()?.to_str()?;
+    ["html", "htm", "xhtml", "svg"].iter().any(|kind| ext.eq_ignore_ascii_case(kind)).then_some(relative)
+}
+
+/// The URL's workspace-relative page name and its verified canonical file, assuming the server is rooted here.
+fn direct_served_page(url: &str, root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let relative = served_page_path(url)?;
+    let file = root.join(&relative).canonicalize().ok()?;
+    (file.starts_with(root) && file.is_file()).then_some((relative, file))
+}
+
+/// A dynamic route or a server rooted elsewhere may have no matching file. Keep the normal CPU path there.
+fn served_draws_webgl(url: &str, root: &Path) -> bool {
+    let Some((_, file)) = direct_served_page(url, root) else { return false };
+    if !file.metadata().is_ok_and(|meta| meta.len() < 4 << 20) {
+        return false;
+    }
+    page_html(&file).is_ok_and(|html| draws_webgl(&[html]))
+}
+
+/// Prefer the path under the workspace root. A server started in a subdirectory may match
+/// a suffix instead. A partial search or multiple matches cannot identify the served page.
+fn page_of_address(url: &str, workspace: &Path) -> Option<PathBuf> {
+    let wanted = served_page_path(url)?;
+    let direct = workspace.join(&wanted);
+    if direct.is_file() {
+        let root = workspace.canonicalize().ok()?;
+        return direct.canonicalize().ok()?.starts_with(root).then_some(direct);
+    }
+    let ending = format!("\\{}", wanted.to_str()?.to_ascii_lowercase());
+    let mut found = None;
+    let mut folders = vec![workspace.to_path_buf()];
+    let mut looked = 0usize;
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(folder).ok()? {
+            looked += 1;
+            if looked > 20_000 {
+                return None;
+            }
+            let entry = entry.ok()?;
+            let kind = entry.file_type().ok()?;
+            if kind.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if !matches!(name.as_str(), "node_modules" | ".git" | "target" | "dist" | "build") {
+                    folders.push(entry.path());
+                }
+            } else if kind.is_file() {
+                let path = entry.path();
+                if !path.to_string_lossy().to_ascii_lowercase().ends_with(&ending) {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(path);
+            }
+        }
+    }
+    found
+}
+
+/// For a check through a local server: what the page does opened from its file, as the user opens it, where it differs. A three.js page served from its folder ran in every
+/// check, and opened from that folder by the person it ran nothing.
+fn opened_from_its_file(url: &str, workspace: &Path) -> Option<String> {
+    let page = page_of_address(url, workspace)?;
+    inspect_page(&page, ModuleScan::Direct).local_module.then(|| format!("AS THE USER OPENS IT: {} is in the workspace. {LOCAL_MODULE_WORDS}\n", page.strip_prefix(workspace).unwrap_or(&page).display()))
+}
+
 /// What in a page cannot load or run with no network, worked out from its text, as nothing the browser prints says so.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Needs {
@@ -591,44 +850,61 @@ fn file_part(address: &str) -> String {
 }
 
 /// Through the page's import map, the longest name that fits first.
-fn mapped(name: &str, map: &[(String, String)]) -> String {
-    let fits = map.iter().filter(|(from, _)| from == name || (from.ends_with('/') && name.starts_with(from.as_str()))).max_by_key(|(from, _)| from.len());
-    match fits {
-        Some((from, to)) if from == name => to.clone(),
-        Some((from, to)) => format!("{to}{}", &name[from.len()..]),
-        None => name.to_string(),
-    }
+fn mapped(name: &str, map: &[(String, String)]) -> Option<String> {
+    let (from, to) = map.iter().filter(|(from, _)| from == name || (from.ends_with('/') && name.starts_with(from.as_str()))).max_by_key(|(from, _)| from.len())?;
+    Some(format!("{to}{}", &name[from.len()..]))
 }
 
-/// The remote addresses a module needs, following its imports through the files beside it.
-fn follow(file: &Path, map: &[(String, String)], seen: &mut HashSet<PathBuf>, remote: &mut Vec<String>, missing: &mut Vec<String>, root: &Path) {
-    if !seen.insert(file.to_path_buf()) || seen.len() > 200 || crate::safety::reaches_out(file) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModuleScan {
+    /// A direct local import is enough to explain how a served page would behave under file://.
+    Direct,
+    Dependencies,
+}
+
+#[derive(Default)]
+struct ModuleImports {
+    local: HashSet<PathBuf>,
+    remote: Vec<String>,
+    missing: Vec<String>,
+}
+
+/// Record the import. Only a file check needs to open it and inspect its dependencies.
+fn follow(file: &Path, map: &[(String, String)], imports: &mut ModuleImports, root: &Path, scan: ModuleScan) {
+    if !imports.local.insert(file.to_path_buf()) || scan == ModuleScan::Direct || imports.local.len() > 200 || crate::safety::reaches_out(file) {
         return;
     }
     let Ok(text) = std::fs::read_to_string(file) else {
-        missing.push(file.strip_prefix(root).unwrap_or(file).display().to_string());
+        imports.missing.push(file.strip_prefix(root).unwrap_or(file).display().to_string());
         return;
     };
-    imports_of(&text, file.parent().unwrap_or(root), map, seen, remote, missing, root);
+    imports_of(&text, file.parent().unwrap_or(root), map, imports, root, scan);
 }
 
-fn imports_of(text: &str, folder: &Path, map: &[(String, String)], seen: &mut HashSet<PathBuf>, remote: &mut Vec<String>, missing: &mut Vec<String>, root: &Path) {
+fn imports_of(text: &str, folder: &Path, map: &[(String, String)], imports: &mut ModuleImports, root: &Path, scan: ModuleScan) {
     let pattern = Regex::new(r#"(?m)(?:^|[\s;])(?:import|export)\s[^'"\n;]*?from\s*['"]([^'"]+)['"]|(?:^|[\s;])import\s*['"]([^'"]+)['"]|\bimport\(\s*['"]([^'"]+)['"]"#).expect("the pattern is valid");
     for found in pattern.captures_iter(text) {
         let Some(name) = found.get(1).or(found.get(2)).or(found.get(3)) else { continue };
-        let target = mapped(name.as_str(), map);
-        if is_remote(&target) {
-            if !remote.contains(&target) {
-                remote.push(target);
+        // Map targets are relative to the page that declares the map; other imports are relative to the importing module.
+        let mapped = mapped(name.as_str(), map);
+        let (target, base) = mapped.as_deref().map_or((name.as_str(), folder), |target| (target, root));
+        if is_remote(target) {
+            if !imports.remote.iter().any(|address| address == target) {
+                imports.remote.push(target.to_string());
             }
         } else if target.starts_with('.') || target.starts_with('/') {
-            let local = if let Some(from_root) = target.strip_prefix('/') { root.join(from_root) } else { folder.join(&target) };
-            follow(&local, map, seen, remote, missing, root);
+            let path = target.split(['?', '#']).next().unwrap_or(target);
+            let local = if let Some(from_root) = path.strip_prefix('/') { root.join(from_root) } else { base.join(path) };
+            follow(&local, map, imports, root, scan);
         }
     }
 }
 
 fn needs_of(page: &Path) -> Needs {
+    inspect_page(page, ModuleScan::Dependencies)
+}
+
+fn inspect_page(page: &Path, scan: ModuleScan) -> Needs {
     let mut needs = Needs::default();
     let Ok((text, _)) = page_text(page) else { return needs };
     let root = page.parent().unwrap_or(Path::new("."));
@@ -679,22 +955,25 @@ fn needs_of(page: &Path) -> Needs {
             needs.run.push(label);
             continue;
         }
-        let (mut remote, mut missing, mut seen) = (Vec::new(), Vec::new(), HashSet::new());
+        let mut imports = ModuleImports::default();
         match &source {
-            Some(address) => follow(&root.join(file_part(address)), &map, &mut seen, &mut remote, &mut missing, root),
-            None => imports_of(body, root, &map, &mut seen, &mut remote, &mut missing, root),
+            Some(address) => follow(&root.join(file_part(address)), &map, &mut imports, root, scan),
+            None => imports_of(body, root, &map, &mut imports, root, scan),
         }
-        if remote.is_empty() {
+        // (a module written in the page that imports a file of its own is refused from file:// as one with a `src` is: a three.js page that imported the library and its
+        // add-ons from its folder ran nothing when the person opened it, and the check, through a server and with file access allowed, never said so)
+        needs.local_module |= !imports.local.is_empty();
+        if imports.remote.is_empty() {
             needs.run.push(label);
         } else {
             needs.did_not_run.push(label);
-            for address in remote {
+            for address in imports.remote {
                 if !needs.remote.contains(&address) {
                     needs.remote.push(address);
                 }
             }
         }
-        needs.missing.extend(missing);
+        needs.missing.extend(imports.missing);
     }
     needs
 }
@@ -755,8 +1034,11 @@ fn console_lines(err: &str, folder_url: &str) -> Vec<String> {
         if text.starts_with("Error with Permissions-Policy header: Unrecognized feature") {
             return;
         }
-        let place = source.replace(folder_url, "").replace('\\', "/");
-        let place = place.rsplit('/').next().unwrap_or("").to_string();
+        let relative = source.strip_prefix(folder_url).unwrap_or(source);
+        let path = relative.split(['?', '#']).next().unwrap_or(relative);
+        let name = path.rsplit(['/', '\\']).next().unwrap_or("");
+        let decoded = percent_decoded(name);
+        let place = if decoded.chars().any(|c| c.is_control() || matches!(c, '/' | '\\')) { name } else { &decoded };
         let said: String = text.trim().chars().take(MOST_LINE).collect();
         lines.push(if place.is_empty() { said } else { format!("{place}:{line}: {said}") });
     };
@@ -782,6 +1064,19 @@ fn console_lines(err: &str, folder_url: &str) -> Vec<String> {
         }
     }
     lines
+}
+
+/// Chromium writes page console messages in UTF-8, while Windows diagnostics on
+/// the same pipe may use the system code page.
+fn browser_stderr(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let mut text = String::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        text.push_str(&crate::sandbox::decode(line));
+    }
+    text
 }
 
 /// Elements that have no end tag.
@@ -1021,32 +1316,64 @@ struct Reading {
     not_loaded: Option<String>,
     /// Said in place of the browser's crash when it was the steps that did not end (they began, and the browser was stopped with them still going).
     steps_lost: Option<String>,
-    /// What heads the console, if not `Console`: the console is that of the run that reads the page, at 1280x800, whatever views were asked for. (The words it shows are read there too.)
-    console_head: Option<String>,
+    /// Where the console and page text were read when the requested pictures omit the desktop.
+    read_view_note: Option<&'static str>,
     /// The words the page said it shows, at the end of the steps or of its time, where they ended; none where the browser was not asked to say them.
     seen: Option<String>,
+    /// The last run was stopped by its time, still running the page: what it draws took longer than a run may, and it did not crash.
+    timed_out: bool,
+    /// What the app fetched from CDNs for the page, and what it did not and why.
+    cdn: Option<CdnWords>,
+    /// It was drawn on the GPU (`ON_THE_GPU`), and not on the CPU.
+    on_gpu: bool,
 }
 
-/// The console's heading when none of the views asked for is the desktop's: the first block is still the console of a run at 1280x800, and under a plain "Console" a model that asked
-/// only for a phone's width read it as the phone's.
-fn console_head(views: &[View]) -> Option<String> {
-    (!views.iter().any(|view| view.label == "desktop")).then(|| "Console (as read at 1280x800)".to_string())
+/// Where a page's WebGL was drawn, as a check says it.
+fn drawn_on(gpu: bool) -> &'static str {
+    if gpu { "on this machine's GPU" } else { "on the CPU, with no GPU" }
+}
+
+/// What `cdn::for_page` came to, as the report says it.
+#[derive(Debug, Default)]
+struct CdnWords {
+    loaded: Vec<String>,
+    files: usize,
+    refused: Vec<(String, String)>,
+}
+
+/// Identify the desktop read when only other views were requested. Only a virtual screen guarantees its exact dimensions.
+fn read_view_note(views: &[View], exact: bool) -> Option<&'static str> {
+    (!views.iter().any(|view| view.label == "desktop")).then_some(if exact { "read at 1280x800" } else { "read in the desktop window" })
 }
 
 fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Needs>, console: &[String], dom: &str, reading: &Reading) -> String {
     let served = needs.is_none();
     let unknown = Needs::default();
     let needs = needs.unwrap_or(&unknown);
-    let mut out = if served { format!("{page_name} in headless {browser_name}, with no network but this machine's own servers.\n") } else { format!("{page_name} in headless {browser_name}, with no network.\n") };
+    let loaded = reading.cdn.as_ref().filter(|cdn| !cdn.loaded.is_empty());
+    let mut out = if served {
+        format!("{page_name} in headless {browser_name}, with no network but this machine's own servers.\n")
+    } else if loaded.is_some() {
+        format!("{page_name} in headless {browser_name}, with no network but the CDN files the app fetched for it.\n")
+    } else {
+        format!("{page_name} in headless {browser_name}, with no network.\n")
+    };
+    if let Some(cdn) = loaded {
+        out.push_str(&format!("Loaded from CDNs, fetched by the app: {} ({} files in all, with what they import).\n", cdn.loaded.join(", "), cdn.files));
+    }
     if let (false, Some(lost)) = (finished, &reading.steps_lost) {
         out.push_str(lost);
     } else if let (false, Some(words)) = (finished, &reading.not_loaded) {
         out.push_str(words);
+    } else if !finished && reading.timed_out {
+        out.push_str(&format!("NOT CHECKED: the browser was stopped each time it was tried, still running the page when its time was up, at the usual wait too: it draws more than a run of the browser may take here (WebGL is drawn {}). This is not the page failing, and not the browser crashing. Check it at a smaller view, or a page with less to draw. Do not run a browser yourself to see it instead: Chrome does not start in the sandbox, and outside it the user is asked each time. If it cannot be checked, say in your answer that the page was not checked.\n", drawn_on(reading.on_gpu)));
     } else if !finished {
         out.push_str("NOT CHECKED: the browser crashed or was stopped each time it was tried. This browser sometimes crashes in the sandbox, whatever the page, and a big WebGL drawing stops it too, so this says nothing about the page. What it had said by then is below. Running this check again changes nothing, and do not install anything to check it another way: say in your answer that the page was not checked.\n");
     }
     if !needs.remote.is_empty() {
-        out.push_str(&format!("NOT LOADED, as a CDN library cannot load under this check: {}.\n", needs.remote.join(", ")));
+        let why = |address: &String| reading.cdn.as_ref().and_then(|cdn| cdn.refused.iter().find(|(refused, _)| refused == address)).map_or(String::new(), |(_, why)| format!(" ({why})"));
+        let listed: Vec<String> = needs.remote.iter().map(|address| format!("{address}{}", why(address))).collect();
+        out.push_str(&format!("NOT LOADED, as a check fetches only from well-known CDNs, and only what answers: {}.\n", listed.join(", ")));
     }
     if !needs.did_not_run.is_empty() {
         out.push_str(&format!("DID NOT RUN, as they need those, and nothing about them is known: {}. Do not set up another way to check them: say in your answer that they have not been run.\n", needs.did_not_run.join(", ")));
@@ -1055,7 +1382,8 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
         out.push_str(&format!("MISSING: {}.\n", needs.missing.join(", ")));
     }
     if needs.local_module {
-        out.push_str("A browser refuses a module script from file:// when the page is opened by double-click, which this check allows: that page needs a local server to be opened, or a plain script. To check it as served, start one in the background (as `python -m http.server 8000 --bind 127.0.0.1`) and give this its `url`.\n");
+        out.push_str(LOCAL_MODULE_WORDS);
+        out.push('\n');
     }
     if served {
         // (what a server gives is not read here beforehand: its console says what ran)
@@ -1064,7 +1392,7 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
     } else if !needs.run.is_empty() {
         out.push_str(&format!("Ran: {}.\n", needs.run.join(", ")));
     }
-    let head = reading.console_head.as_deref().unwrap_or("Console");
+    let head = reading.read_view_note.map_or_else(|| "Console".to_string(), |note| format!("Console (as {note})"));
     if console.is_empty() {
         out.push_str(&if needs.remote.is_empty() && finished { format!("{head}: nothing, so no errors.\n") } else { format!("{head}: nothing, which says little with that not loaded.\n") });
     } else {
@@ -1085,9 +1413,7 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
         let text = reading.seen.clone().unwrap_or_else(|| from_dom);
         // (where the words were read, when that is not what a person looking at the page would have: the window that was not asked for, and the DOM, which no style sheet is applied to)
         let mut notes = Vec::new();
-        if reading.console_head.is_some() {
-            notes.push("read at 1280x800");
-        }
+        notes.extend(reading.read_view_note);
         if reading.seen.is_none() {
             notes.push("from the page's DOM, with no style sheet applied: what a class or a media query hides is counted as shown");
         }
@@ -1099,16 +1425,33 @@ fn report(page_name: &str, browser_name: &str, finished: bool, needs: Option<&Ne
 
 /// A page of the workspace, by its path; or, by `url`, what a server on this machine gives, as one the model started in the background.
 pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    let said = check(arguments, workspace, cancel)?;
+    Ok(match served_url(arguments).and_then(|url| opened_from_its_file(url, workspace)) {
+        Some(first) => format!("{first}{said}"),
+        None => said,
+    })
+}
+
+pub(crate) fn served_url(arguments: &Value) -> Option<&str> {
+    arguments.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty())
+}
+
+fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let steps = arguments.get("steps").and_then(Value::as_str).filter(|steps| !steps.trim().is_empty());
-    let served = arguments.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty());
+    let served = served_url(arguments);
     let plain = |path: &Path| path.display().to_string().trim_start_matches("\\\\?\\").to_string();
     let root = std::fs::canonicalize(workspace).map_err(|error| format!("{}: {error}", workspace.display()))?;
-    let (page, name, needs) = match served {
+    let (page, name, mut needs) = match served {
         Some(url) => {
+            let address = served_address(url)?;
             if steps.is_some() {
-                return Err("steps run in a page file of the workspace: give its path rather than a url".to_string());
+                let retry = direct_served_page(url, &root).map_or_else(
+                    || "remove url and set path to the workspace page file".to_string(),
+                    |(path, _)| format!("replace url with path {} if this is the intended page file", serde_json::json!(path)),
+                );
+                return Err(format!("steps run in a workspace page file: {retry}. To inspect the running server, keep url and omit steps."));
             }
-            (None, served_address(url)?, None)
+            (None, address, None)
         }
         None => {
             let given = arguments.get("path").and_then(Value::as_str).filter(|path| !path.is_empty()).ok_or("path is required: the page, under the workspace, or url: a server's on this machine")?;
@@ -1142,7 +1485,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     let (parts, more_parts) = steps.map_or((Vec::new(), 0), step_parts);
     // (each load after the first costs time of its own: a page's own, as a plain page is given)
     let asked_wait = arguments.get("wait_ms").and_then(Value::as_u64);
-    let wait = asked_wait.unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS) + parts.len().saturating_sub(1) as u64 * WAIT_MS;
+    let mut wait = asked_wait.unwrap_or(if steps.is_some() { 2 * WAIT_MS } else { WAIT_MS }).min(MOST_WAIT_MS) + parts.len().saturating_sub(1) as u64 * WAIT_MS;
     let wait_cut = wait_cut(asked_wait);
     let cwd = page.as_deref().and_then(Path::parent).unwrap_or(workspace).to_path_buf();
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1153,12 +1496,34 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
     }
     // (what this check makes in that folder goes when it ends, whichever way)
     let mut made = Removing(Vec::new());
+    // What the page loads from well-known CDNs, fetched by the app into the sandbox's folder (the check's browser has no network, and cannot reach the app
+    // on localhost either), and the page's copy pointing there. A page of three.js from unpkg was never run in a check, and a real model downloaded the
+    // library and ran Chrome outside the sandbox to see it.
+    let (mut source, mut fetched) = (None, None);
+    if let (Some(page), Some(temp)) = (&page, &temp) {
+        if let Ok(html) = page_html(page) {
+            let also = needs.as_ref().map_or(Vec::new(), |needs| needs.remote.clone());
+            let got = cdn::for_page(&html, &also, temp, &mut |address| cdn::get(address, cancel));
+            if let Some(needs) = needs.as_mut() {
+                needs.remote.retain(|address| !cdn::allowed(address).is_ok_and(|whole| got.loaded.contains(&whole)));
+                if needs.remote.is_empty() {
+                    let ran = std::mem::take(&mut needs.did_not_run);
+                    needs.run.extend(ran);
+                }
+            }
+            source = Some(got.html.clone());
+            fetched = Some(got);
+        }
+    }
     // With steps, what is opened is a copy of the page with them in it, in the sandbox's own folder, that reads the page's own files from where they are. A plain page of HTML is opened in a
     // copy too, with a script that says the words the browser shows of it (the DOM a dump gives does not know a rule of a style sheet); a page that cannot be copied is opened as it is.
     let (mut copy_name, mut opened) = (None, page.clone());
     if let (Some(page), Some(steps)) = (&page, steps) {
         let temp = temp.as_ref().ok_or("the sandbox's folder could not be found, so the steps could not be run")?;
-        let html = page_html(page).map_err(|error| format!("{name}: {error}"))?;
+        let html = match source.take() {
+            Some(html) => html,
+            None => page_html(page).map_err(|error| format!("{name}: {error}"))?,
+        };
         let base = file_url(page.parent().unwrap_or(workspace)) + "/";
         let run = next_run();
         let file_name = steps_page_of(&run);
@@ -1168,7 +1533,7 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         (copy_name, opened) = (Some(file_name), Some(copy));
     } else if let (Some(page), Some(temp), None) = (&page, &temp, steps) {
         let html_page = page.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm"));
-        if let (true, Ok(html)) = (html_page, page_html(page)) {
+        if let (true, Ok(html)) = (html_page, source.take().map_or_else(|| page_html(page), Ok)) {
             let base = file_url(page.parent().unwrap_or(workspace)) + "/";
             let file_name = steps_page_of(&next_run());
             let copy = temp.join(&file_name);
@@ -1184,135 +1549,124 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
         None => (name.clone(), name.clone()),
     };
     // (the script that reads a plain page's words waits for the page's time to be up, so the browser is given a little more of it than that)
-    let run_wait = if steps.is_none() && copy_name.is_some() { wait + READ_MARGIN_MS } else { wait };
-    let browser_flags = flags() + &extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
-    // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
-    let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
-    let mut ended_as = EndOfRun::Stopped;
-    let mut hangs = 0;
-    // (a page with steps may take as long as its steps do; one without has a limit of its own, and a run that hangs is ended early)
-    let limit = if steps.is_some() { LIMIT } else { run_limit(run_wait) };
-    let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
-    let mut before = None;
-    for _ in 0..TRIES {
-        let started = std::time::Instant::now();
-        let profile = profiles.next();
-        let line = page_line(&program, &browser_flags, run_wait, &profile, &address);
-        let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel)?;
-        (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
-        #[cfg(debug_assertions)]
-        if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
-            eprintln!("--- browser, {:?} {:?}:\n{err}\n--- dom: {} bytes", done.status, done.ended, dom.len());
+    let run_wait_of = |wait: u64| if steps.is_none() && copy_name.is_some() { wait + READ_MARGIN_MS } else { wait };
+    // A page that draws with WebGL is drawn on the GPU (`ON_THE_GPU`), and any other on the CPU. A run on the GPU that crashes or hangs, of the read or of a
+    // picture, sends this check's later runs to the CPU, and is tried again there.
+    let webgl = page.as_deref().is_some_and(|page| {
+        let mut texts: Vec<String> = page_html(page).into_iter().collect();
+        let folder = page.parent().unwrap_or(workspace);
+        texts.extend(needs.iter().flat_map(|needs| needs.run.iter()).filter_map(|script| std::fs::read_to_string(folder.join(script)).ok()).filter(|text| text.len() < 4 << 20));
+        draws_webgl(&texts)
+    });
+    let gpu_available = GPU_FAILURES.load(Ordering::Relaxed) < 2 && !ENGINE_HERE.load(Ordering::Relaxed);
+    let on_gpu = AtomicBool::new(gpu_available && (webgl || served.is_some_and(|url| served_draws_webgl(url, &root))));
+    let extensions = extension_flags(temp.as_deref().and_then(frames_extension).as_deref());
+    let virtual_screen = supports_virtual_screen(&program);
+    let browser_flags = || flags(on_gpu.load(Ordering::Relaxed)) + &extensions;
+    // (a run on the GPU that did not end well: the rest of the check draws on the CPU, and it is said whether this one is to be tried again for that)
+    let off_the_gpu = |ended_badly: bool| -> bool {
+        if !ended_badly || !on_gpu.swap(false, Ordering::Relaxed) {
+            return false;
         }
-        ended_as = end_of_run(done.status, &dom, &err);
-        finished = ended_as == EndOfRun::Read;
-        how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
-        note_browser_run("page", how.clone(), started);
-        #[cfg(test)]
-        note_run(false, !finished);
-        // (a run that hung and printed nothing, not so much as a console line of the page's, is the browser's: it is tried once more)
-        let silent_hang = hung(&done) && !page_wrote_to_console(&err);
-        hangs += usize::from(silent_hang);
-        let again = silent_hang && tries_again_after_a_hang(hangs);
-        if finished || cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING || (!again && (started.elapsed() > LIMIT / 2 || crash_repeats(&mut before, &err))) {
-            break;
-        }
-    }
-    profiles.clear();
-    // (what its console names is said from the workspace, or from the server's root)
-    let base_url = match served {
-        Some(url) => url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/") + "/",
-        None => format!("file:///{}/", plain(&root).replace('\\', "/")),
+        GPU_FAILURES.fetch_add(1, Ordering::Relaxed);
+        true
     };
-    let mut console = console_lines(&err, &base_url);
-    let (mut steps_said, mut steps_lost) = (String::new(), None);
-    if let (Some(page), Some(copy)) = (&page, &copy_name) {
-        // (the copy's lines are the page's own; and whether the steps got to their end is said apart)
-        let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
-        let done = console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE"));
-        let failed = console.iter().find_map(|line| line.split_once("DOGMIND-STEPS-FAILED: ").map(|(_, why)| why.to_string()));
-        let began = parts_begun(&err);
-        let left = if steps.is_some() { steps_left(&err) } else { None };
-        // (a part that began more than once is the page loading itself again, and with it the steps, from where it was: not the browser's doing, and not a crash)
-        let again = began.iter().find(|part| began.iter().filter(|other| other == part).count() > 1).copied();
-        console.retain(|line| !line.contains("DOGMIND-STEPS-"));
-        console.iter_mut().for_each(|line| *line = line.replace(copy.as_str(), &file_name));
-        if steps.is_some() {
-            let in_parts = if parts.len() > 1 { format!(" (in {} parts, one after each reload they make)", parts.len()) } else { String::new() };
-            steps_said = match (done, failed, again) {
-                // (the steps that went on in the page they left, until it was gone, may have failed on what the new page does not have, or have ended: the page they left is what happened)
-                _ if left.is_some() => left.as_ref().map_or(String::new(), |left| left_words(left, &base_url, copy, &name)),
-                (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
-                (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
-                (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
-                (false, None, None) if asked_wait.unwrap_or(0) >= MOST_WAIT_MS => format!("Steps: they had not ended when the page was read, after {wait} ms of its time, the longest a check gives: shorten the waits in them, or check a part of them at a time.\n"),
-                (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms (at most {MOST_WAIT_MS}).\n"),
-            };
-            let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
-            steps_said.push_str(&more_note);
-            // (stopped with them going on: that says what the steps and the page did, and nothing of a crash)
-            if !finished && (again.is_some() || how == "timed out") {
-                if again.is_none() {
-                    steps_said = more_note;
-                }
-                steps_lost = Some(match (again, began.is_empty()) {
-                    (Some(_), _) => "NOT CHECKED: the steps began again and again until the browser was stopped, which is not the browser crashing: see the steps below. Running this check again changes nothing until that is changed.\n".to_string(),
-                    (None, true) => format!("NOT CHECKED: the browser was stopped after {} s and the steps had not begun: the page had not finished loading, with its own scripts and anything it waits for (or it loads itself again and again). This is not the browser crashing.\n", LIMIT.as_secs()),
-                    (None, false) => format!("NOT CHECKED: the browser was stopped after {} s with the steps still going: the page or the steps are slow or do not end (a wait, a loop, a load that waits for the network). This is not the browser crashing. Shorter steps, or a page that settles, will be read.\n", LIMIT.as_secs()),
-                });
+    // (how long the last run that read the page took, for what is said of a picture that took too long)
+    let read_took = std::cell::Cell::new(Duration::ZERO);
+    // The page read, at `run_wait` of its time: its DOM, what the browser said, whether it was read, how the last run ended (`exit code 0x0`, `timed out`) and as what.
+    let read_at = |run_wait: u64| -> Result<(String, String, bool, String, EndOfRun), String> {
+        // (the browser sometimes crashes in the sandbox, whatever the page, so one crash says nothing of the page: it is tried again)
+        let (mut dom, mut err, mut finished, mut how) = (String::new(), String::new(), false, String::new());
+        let mut ended_as = EndOfRun::Stopped;
+        let mut hangs = 0;
+        // (a page with steps may take as long as its steps do; one without has a limit of its own, and a run that hangs is ended early)
+        let limit = if steps.is_some() { LIMIT } else { run_limit(run_wait) };
+        let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
+        let mut before = None;
+        for _ in 0..TRIES {
+            let started = std::time::Instant::now();
+            let profile = profiles.next();
+            let line = page_line(&program, &browser_flags(), virtual_screen, run_wait, &profile, &address);
+            let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel)?;
+            (dom, err) = (crate::sandbox::decode(&done.stdout), browser_stderr(&done.stderr));
+            #[cfg(debug_assertions)]
+            if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
+                eprintln!("--- browser, {:?} {:?}:\n{err}\n--- dom: {} bytes", done.status, done.ended, dom.len());
+            }
+            ended_as = end_of_run(done.status, &dom, &err);
+            finished = ended_as == EndOfRun::Read;
+            read_took.set(started.elapsed());
+            how = done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32));
+            note_browser_run("page", how.clone(), started);
+            #[cfg(test)]
+            note_run(false, !finished);
+            // (a run that hung and printed nothing, not so much as a console line of the page's, is the browser's: it is tried once more)
+            let silent_hang = hung(&done) && !page_wrote_to_console(&err);
+            hangs += usize::from(silent_hang);
+            // (a crash or a hang on the GPU is tried again on the CPU, whatever else would end the tries)
+            let to_the_cpu = !finished && off_the_gpu(silent_hang || ended_as == EndOfRun::Crashed);
+            let again = to_the_cpu || (silent_hang && tries_again_after_a_hang(hangs));
+            if finished || cancel.load(Ordering::Relaxed) || (trying.elapsed() > MOST_TRYING && !to_the_cpu) || (!again && (started.elapsed() > LIMIT / 2 || crash_repeats(&mut before, &err))) {
+                break;
             }
         }
-    }
-    // (a run that ended well with nothing to read is a page that did not load, and not a crash: unless the steps say what the page did)
-    let not_loaded = match &ended_as {
-        EndOfRun::NotLoaded(reason) if steps_lost.is_none() => Some(not_loaded_words(reason.as_deref())),
-        _ => None,
+        profiles.clear();
+        Ok((dom, err, finished, how, ended_as))
     };
-    // (the words that the page the steps left said at their end are not of the page that is shown)
-    let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
-    let reading = Reading { not_loaded, steps_lost, console_head: console_head(&views), seen };
-    let said = format!("{}{wait_cut}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
-    if !finished {
-        return Ok(format!("{said}The browser's end: {how}.\n"));
-    }
-    // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. Not of a page that draws with WebGL, which ends the browser here.
-    let Some(temp) = temp else { return Ok(said) };
-    let mut out = said;
+    // (what its console names is said from the workspace, or from the server's root)
+    let base_url = match served {
+        Some(url) => format!("{}/", served_origin_and_path(url).0),
+        None => format!("file:///{}/", plain(&root).replace('\\', "/")),
+    };
     // Each picture by a name of its own: one name for every call had a later check, or another session's, write over a picture an answer
     // still showed.
     let taken_at = chrono::Local::now().format("%Y%m%d-%H%M%S%3f").to_string();
-    for view in &views {
-        if cancel.load(Ordering::Relaxed) {
-            out.push_str(&format!("No picture at {} was taken: the turn was stopped.\n", view.label));
-            continue;
-        }
+    // (set when the turn is stopped, or when what the pictures were taking is of no use: each picture's run ends at it)
+    let stop = AtomicBool::new(false);
+    let slots = Slots::new(AT_ONCE);
+    let direct_url_picture = served.is_some() && virtual_screen;
+    // (the read's own turn is never refused)
+    let never = AtomicBool::new(false);
+    // (what the read took, in ms, for the pictures begun after it: none while it goes on)
+    let read_ms = AtomicU64::new(u64::MAX);
+    // One view's picture, at `wait` of the page's time: a run of the browser of its own, with a profile, frame and shot of its own.
+    let take = |view: &View, wait: u64| -> Taken {
+        let mut taken = Taken { picture: None, hangs: 0, limit: Duration::ZERO, said_there: Vec::new(), stopped: false, runs: Vec::new() };
+        let Some(temp) = temp.as_deref() else { return taken };
         let tag = view.label.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
         let run = next_run();
         let (frame, shot, picture) = (temp.join(frame_of(&run)), temp.join(shot_of(&run)), temp.join(format!("dogmind-page-{taken_at}-{tag}.png")));
         let _ = std::fs::remove_file(&picture);
-        // (with steps, each picture is of the page after them, as they run again in its load)
-        if std::fs::write(&frame, frame_page(&src, view)).is_err() {
-            out.push_str(&format!("No picture at {} could be taken.\n", view.label));
-            continue;
-        }
-        // (a window larger than the frame by what the browser takes of it, and at least its least width)
-        let (window_width, window_height) = (view.width.max(600) + 64, view.height + 160);
-        let (mut taken, mut said_there, mut picture_hangs) = (false, Vec::new(), 0);
-        let (trying, mut profiles) = (std::time::Instant::now(), Profiles::new(&cwd, workspace));
+        // A local server page in a file iframe can stay at its initial frame while the DOM read advances.
+        // As the top-level page on a virtual fullscreen display it gets both the clock and the exact viewport.
+        let capture = if direct_url_picture {
+            address.clone()
+        } else {
+            if std::fs::write(&frame, frame_page(&src, view)).is_err() { return taken; }
+            plain(&frame)
+        };
+        let window = view_window(view.width, view.height, direct_url_picture);
+        let (mut trying, mut profiles) = (None, Profiles::new(&cwd, workspace));
         for _ in 0..TRIES {
-            if cancel.load(Ordering::Relaxed) || trying.elapsed() > MOST_TRYING {
+            // (its turn among the check's runs: waiting for it is no part of the tries' time)
+            let Some(_slot) = slots.take(&stop) else { break };
+            if trying.get_or_insert_with(std::time::Instant::now).elapsed() > MOST_TRYING {
                 break;
             }
             let _ = std::fs::remove_file(&shot);
             let started = std::time::Instant::now();
+            let read = read_ms.load(Ordering::Relaxed);
+            let limit = picture_limit(wait, (read != u64::MAX).then(|| Duration::from_millis(read)));
+            taken.limit = limit;
             let profile = profiles.next();
-            let line = shot_line(&program, &browser_flags, (window_width, window_height), wait, &profile, &shot, &plain(&frame));
-            let done = crate::sandbox::run_browser(&line, &cwd, workspace, run_limit(wait), cancel);
-            note_browser_run("picture", done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32))), started);
+            let line = shot_line(&program, &browser_flags(), &window, wait, &profile, &shot, &capture);
+            let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, &stop);
+            let end = done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32)));
+            taken.runs.push(BrowserRun { of: "picture", end, ms: started.elapsed().as_millis() as u64 });
             #[cfg(debug_assertions)]
             if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
                 if let Ok(done) = &done {
-                    eprintln!("--- picture, {:?} {:?}: shot {} bytes\n{}", done.status, done.ended, std::fs::metadata(&shot).map_or(0, |meta| meta.len()), crate::sandbox::decode(&done.stderr));
+                    eprintln!("--- picture, {:?} {:?}: shot {} bytes\n{}", done.status, done.ended, std::fs::metadata(&shot).map_or(0, |meta| meta.len()), browser_stderr(&done.stderr));
                 }
             }
             // (a browser that fell over while writing it leaves an empty file, or one that cannot be read)
@@ -1321,36 +1675,191 @@ pub fn check_page(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> R
             note_run(true, shot_image.is_err());
             if let Ok(whole) = shot_image {
                 if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
-                    taken = true;
-                    said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref().zip(copy_name.as_deref()))).unwrap_or_default();
+                    taken.picture = Some(picture.clone());
+                    taken.said_there = done.map(|done| page_console(&browser_stderr(&done.stderr), &base_url, page.as_deref().zip(copy_name.as_deref()))).unwrap_or_default();
                     break;
                 }
             }
             // (a sandbox that could not run it will not do better the next time; a run that hung is the browser's, as the page's own run went well, and is tried once more)
             let hung_now = done.as_ref().is_ok_and(hung);
-            picture_hangs += usize::from(hung_now);
-            if done.is_err() || (hung_now && !tries_again_after_a_hang(picture_hangs)) || (!hung_now && started.elapsed() > LIMIT / 2) {
+            taken.hangs += usize::from(hung_now);
+            // (a picture on the GPU that hung or left none is taken again on the CPU, once)
+            if done.is_ok() && !stop.load(Ordering::Relaxed) && off_the_gpu(true) {
+                taken.hangs = 0;
+                continue;
+            }
+            if done.is_err() || (hung_now && !tries_again_after_a_hang(taken.hangs)) || (!hung_now && started.elapsed() > limit / 2) {
                 break;
             }
         }
+        taken.stopped = taken.picture.is_none() && stop.load(Ordering::Relaxed);
         profiles.clear();
         let _ = std::fs::remove_file(&shot);
         let _ = std::fs::remove_file(&frame);
-        out.push_str(&if taken {
-            format!("How it looks at {} ({}x{}), without WebGL drawing: `read_file` {}\n", view.label, view.width, view.height, picture.display())
-        } else {
-            format!("No picture at {} could be taken: the browser ended without one each time it was tried, which says nothing of the page. Do not build other pages to measure the layout instead; say in your answer that there is no picture.\n", view.label)
-        });
-        // What the page said at this size, where it says other than above: the console above is of the desktop's width, and a model that
-        // measured a phone's layout from a script was given the desktop's numbers.
-        if taken && !said_there.is_empty() && distinct(&said_there) != distinct(&console) {
-            out.push_str(&format!("Console at {}:\n", view.label));
-            for said in counted(&said_there).iter().take(MOST_LINES) {
-                out.push_str(&format!("  {said}\n"));
+        taken
+    };
+    let take = &take;
+    std::thread::scope(|scope| -> Result<String, String> {
+        // The pictures need nothing of the read but its wait: they are taken with it, each view in a run of its own, [`AT_ONCE`] runs at a time. A picture
+        // taken at a wait the read then leaves is taken again.
+        let start = |wait: u64| -> Vec<std::thread::ScopedJoinHandle<'_, Taken>> {
+            if temp.is_none() {
+                return Vec::new();
+            }
+            views.iter().map(|view| scope.spawn(move || take(view, wait))).collect()
+        };
+        // (what was being taken, ended and waited for; the turn stopped meanwhile ends it too)
+        let ended = |handles: Vec<std::thread::ScopedJoinHandle<'_, Taken>>, end_now: bool| -> Vec<Taken> {
+            if end_now {
+                stop.store(true, Ordering::Relaxed);
+            }
+            while !handles.iter().all(|handle| handle.is_finished()) {
+                if cancel.load(Ordering::Relaxed) {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let mut all: Vec<Taken> = handles.into_iter().map(|handle| handle.join().unwrap_or(Taken { picture: None, hangs: 0, limit: Duration::ZERO, said_there: Vec::new(), stopped: false, runs: Vec::new() })).collect();
+            RUNS_OF_THIS_CHECK.with(|runs| runs.borrow_mut().extend(all.iter_mut().flat_map(|taken| std::mem::take(&mut taken.runs))));
+            all
+        };
+        // The read, with the pictures begun beside it. Its turn is taken first, so that the pictures do not take both before it; a slow read keeps it until the
+        // pictures are done, and they go one at a time (`SLOW_READ`).
+        let long_steps = steps.is_some() && wait > STEPS_AT_LENGTH;
+        let read_with_pictures = |wait: u64| {
+            // A single GPU-rendered view can take its picture alongside the read even for long steps.
+            // Check again on a retry, since the first run may have switched to the CPU.
+            let beside = !long_steps || (views.len() == 1 && on_gpu.load(Ordering::Relaxed));
+            read_ms.store(u64::MAX, Ordering::Relaxed);
+            let reading = slots.take(&never);
+            let pictures = if beside { start(wait) } else { Vec::new() };
+            let read = read_at(run_wait_of(wait));
+            read_ms.store(read_took.get().as_millis() as u64, Ordering::Relaxed);
+            let kept = reading.filter(|_| !beside || read_took.get() > SLOW_READ);
+            let pictures = if beside { pictures } else { start(wait) };
+            (read, pictures, kept)
+        };
+        let (read, mut pictures, mut kept) = read_with_pictures(wait);
+        let (mut dom, mut err, mut finished, mut how, mut ended_as) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                ended(pictures, true);
+                return Err(error);
+            }
+        };
+        // A page that draws much with WebGL is drawn here on the CPU, with no GPU, a frame every 16 ms of its time: at a long wait that takes longer than a run may, and
+        // each run was stopped (a three.js scene with bloom took 60 s for 5 s of its time). It is read once more at the usual wait, and its pictures are taken at that wait too.
+        let mut shortened = String::new();
+        if !finished && how == "timed out" && steps.is_none() && wait > WAIT_MS && !cancel.load(Ordering::Relaxed) {
+            let asked = wait;
+            wait = WAIT_MS;
+            ended(std::mem::take(&mut pictures), true);
+            drop(kept.take());
+            stop.store(false, Ordering::Relaxed);
+            // (the copy that says the page's words waits for its time to be up: for this wait now)
+            if let (Some(page), Some(copy)) = (&page, opened.as_ref().filter(|_| copy_name.is_some())) {
+                if let Ok(html) = page_html(page) {
+                    let _ = std::fs::write(copy, with_script(&html, &(file_url(page.parent().unwrap_or(workspace)) + "/"), &reading_script(wait)));
+                }
+            }
+            let read;
+            (read, pictures, kept) = read_with_pictures(wait);
+            (dom, err, finished, how, ended_as) = match read {
+                Ok(read) => read,
+                Err(error) => {
+                    ended(pictures, true);
+                    return Err(error);
+                }
+            };
+            if finished {
+                shortened = format!("At the {asked} ms of its time asked for, its drawing took longer than a run of the browser may here (WebGL is drawn {}): it was read, and its pictures taken, after {WAIT_MS} ms of its time instead. To see it later than that, ask for a smaller view or a page with less to draw.\n", drawn_on(on_gpu.load(Ordering::Relaxed)));
             }
         }
-    }
-    Ok(out)
+        let mut console = console_lines(&err, &base_url);
+        let (mut steps_said, mut steps_lost) = (String::new(), None);
+        if let (Some(page), Some(copy)) = (&page, &copy_name) {
+            // (the copy's lines are the page's own; and whether the steps got to their end is said apart)
+            let file_name = page.file_name().map_or(String::new(), |file| file.to_string_lossy().into_owned());
+            let done = console.iter().any(|line| line.ends_with("DOGMIND-STEPS-DONE"));
+            let failed = console.iter().find_map(|line| line.split_once("DOGMIND-STEPS-FAILED: ").map(|(_, why)| why.to_string()));
+            let began = parts_begun(&err);
+            let left = if steps.is_some() { steps_left(&err) } else { None };
+            // (a part that began more than once is the page loading itself again, and with it the steps, from where it was: not the browser's doing, and not a crash)
+            let again = began.iter().find(|part| began.iter().filter(|other| other == part).count() > 1).copied();
+            console.retain(|line| !line.contains("DOGMIND-STEPS-"));
+            console.iter_mut().for_each(|line| *line = line.replace(copy.as_str(), &file_name));
+            if steps.is_some() {
+                let in_parts = if parts.len() > 1 { format!(" (in {} parts, one after each reload they make)", parts.len()) } else { String::new() };
+                steps_said = match (done, failed, again) {
+                    // (the steps that went on in the page they left, until it was gone, may have failed on what the new page does not have, or have ended: the page they left is what happened)
+                    _ if left.is_some() => left.as_ref().map_or(String::new(), |left| left_words(left, &base_url, copy, &name)),
+                    (_, Some(why), _) => format!("STEPS FAILED: {why}. What it shows, and its pictures, are the page as the steps left it.\n"),
+                    (_, None, Some(part)) => format!("STEPS DID NOT END: part {part} of them began {} times, as the page was loaded again each time: the page reloads itself again and again, and the steps begin again with it. They cannot be run on a page that does that: look at it without steps, or take its own reload out for the check.\n", began.iter().filter(|other| **other == part).count()),
+                    (true, None, None) => format!("Steps: all ran{in_parts}. What it shows, and its pictures, are the page after them.\n"),
+                    (false, None, None) if asked_wait.unwrap_or(0) >= MOST_WAIT_MS => format!("Steps: they had not ended when the page was read, after {wait} ms of its time, the longest a check gives: shorten the waits in them, or check a part of them at a time.\n"),
+                    (false, None, None) => format!("Steps: they had not ended when the page was read, after {wait} ms of its time: give a larger wait_ms (at most {MOST_WAIT_MS}).\n"),
+                };
+                let more_note = if more_parts > 0 { format!("The steps reload the page {more_parts} more times than this runs them for: the parts after the {MOST_PARTS}th did not run.\n") } else { String::new() };
+                steps_said.push_str(&more_note);
+                // (stopped with them going on: that says what the steps and the page did, and nothing of a crash)
+                if !finished && (again.is_some() || how == "timed out") {
+                    if again.is_none() {
+                        steps_said = more_note;
+                    }
+                    steps_lost = Some(match (again, began.is_empty()) {
+                        (Some(_), _) => "NOT CHECKED: the steps began again and again until the browser was stopped, which is not the browser crashing: see the steps below. Running this check again changes nothing until that is changed.\n".to_string(),
+                        (None, true) => format!("NOT CHECKED: the browser was stopped after {} s and the steps had not begun: the page had not finished loading, with its own scripts and anything it waits for (or it loads itself again and again). This is not the browser crashing.\n", LIMIT.as_secs()),
+                        (None, false) => format!("NOT CHECKED: the browser was stopped after {} s with the steps still going: the page or the steps are slow or do not end (a wait, a loop, a load that waits for the network). This is not the browser crashing. Shorter steps, or a page that settles, will be read.\n", LIMIT.as_secs()),
+                    });
+                }
+            }
+        }
+        // (a run that ended well with nothing to read is a page that did not load, and not a crash: unless the steps say what the page did)
+        let not_loaded = match &ended_as {
+            EndOfRun::NotLoaded(reason) if steps_lost.is_none() => Some(not_loaded_words(reason.as_deref())),
+            _ => None,
+        };
+        // (the words that the page the steps left said at their end are not of the page that is shown)
+        let seen = copy_name.as_ref().filter(|_| steps.is_none() || steps_left(&err).is_none()).and_then(|_| steps_text(&err));
+        let cdn = fetched.map(|fetched| CdnWords { loaded: fetched.loaded, files: fetched.files, refused: fetched.refused });
+        let reading = Reading { not_loaded, steps_lost, read_view_note: read_view_note(&views, virtual_screen), seen, timed_out: how == "timed out", cdn, on_gpu: on_gpu.load(Ordering::Relaxed) };
+        let said = format!("{}{wait_cut}{shortened}{steps_said}", report(&name, browser_name, finished, needs.as_ref(), &console, &dom, &reading));
+        if !finished {
+            ended(pictures, true);
+            return Ok(format!("{said}The browser's end: {how}.\n"));
+        }
+        // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. What a page draws with WebGL is in it, drawn on the CPU: a picture said
+        // otherwise, and a model that wanted to see a scene of three.js ran a browser outside the sandbox for it.
+        // What it looks like, for a model that can see, and it costs that model nothing if it does not ask. What a page draws with WebGL is in it, drawn on the CPU: a picture said
+        // otherwise, and a model that wanted to see a scene of three.js ran a browser outside the sandbox for it.
+        if temp.is_none() {
+            return Ok(said);
+        }
+        let mut out = said;
+        if served.is_some() && !direct_url_picture {
+            out.push_str("On this browser the URL pictures use a frame and may show an earlier state than the DOM.\n");
+        }
+        let all = ended(pictures, false);
+        drop(kept);
+        for (view, taken) in views.iter().zip(all) {
+            out.push_str(&match &taken.picture {
+                Some(picture) => format!("How it looks at {} ({}x{}), WebGL drawn too ({}): `read_file` {}\n", view.label, view.width, view.height, drawn_on(on_gpu.load(Ordering::Relaxed)), picture.display()),
+                None if taken.stopped || cancel.load(Ordering::Relaxed) => format!("No picture at {} was taken: the turn was stopped.\n", view.label),
+                // (a run stopped by its time did not end by itself: to say the browser ended without one was not so, and a model took it for the sandbox's fault)
+                None if taken.hangs > 0 => format!("No picture at {} could be taken: each run that drew it was stopped after {} s, the page drawn on the CPU being slow (its read took {} s). What is read above is the page all the same. Do not run a browser yourself for it; say in your answer that there is no picture, or check it again with a shorter wait or shorter steps.\n", view.label, taken.limit.as_secs(), read_took.get().as_secs()),
+                None => format!("No picture at {} could be taken: the browser ended without one each time it was tried, which says nothing of the page. Do not build other pages to measure the layout instead; say in your answer that there is no picture.\n", view.label),
+            });
+            // What the page said at this size, where it says other than above: the console above is of the desktop's width, and a model that
+            // measured a phone's layout from a script was given the desktop's numbers.
+            if taken.picture.is_some() && !taken.said_there.is_empty() && distinct(&taken.said_there) != distinct(&console) {
+                out.push_str(&format!("Console at {}:\n", view.label));
+                for said in counted(&taken.said_there).iter().take(MOST_LINES) {
+                    out.push_str(&format!("  {said}\n"));
+                }
+            }
+        }
+        Ok(out)
+    })
 }
 
 /// What the page itself said in a run, as the check reports it: the steps' own markers left out, and the copy the steps ran in named as the page.
@@ -1474,7 +1983,7 @@ mod tests {
 
     #[test]
     fn a_week_old_picture_goes_and_a_new_one_and_other_files_stay() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (old, new, other) = (dir.path().join("dogmind-page-20261020-101010000-desktop.png"), dir.path().join("dogmind-page-20261103-101010000-mobile.png"), dir.path().join("notes.png"));
         for file in [&old, &new, &other] {
             std::fs::write(file, b"png").unwrap();
@@ -1508,7 +2017,7 @@ mod tests {
 
     #[test]
     fn the_tries_of_one_loop_each_have_a_profile_of_their_own() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut profiles = Profiles::new(dir.path(), dir.path());
         let names: Vec<String> = (0..TRIES).map(|_| profiles.next()).collect();
         assert_eq!(names.iter().collect::<HashSet<_>>().len(), TRIES);
@@ -1519,7 +2028,7 @@ mod tests {
 
     #[test]
     fn a_sweep_removes_only_old_names_a_run_makes_and_leaves_the_rest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (old_folders, old_files) = (["dogmind-profile-4242-7"], ["dogmind-frame-4242-7.html", "dogmind-shot-4242-7.png", "dogmind-steps-4242-7.html"]);
         // What is not a run's, however old: the names the browser's runs once had, a name that only begins as theirs, a picture, and what a command made.
         let kept_files = ["dogmind-frame.html", "dogmind-shot.png", "dogmind-steps.html", "dogmind-frame-4242-7.txt", "dogmind-frame-x-7.html", "dogmind-shot-4242-7-8.png", "dogmind-steps-4242-.html", "dogmind-page-20261020-101010000-desktop.png", "my-dogmind-frame-4242-7.html", "notes-4242-7"];
@@ -1556,7 +2065,7 @@ mod tests {
     }
 
     fn page(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         for (name, text) in files {
             let path = dir.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1598,6 +2107,17 @@ mod tests {
     }
 
     #[test]
+    fn nested_modules_resolve_local_urls_from_the_module_or_its_import_map() {
+        let (_dir, index) = page(&[
+            ("index.html", r#"<script type="importmap">{"imports":{"label":"./lib/label.js?rev=2","parts/":"./lib/"}}</script><script type="module" src="src/main.js"></script>"#),
+            ("src/main.js", "import './number.js?v=2#v';\nimport 'label';\nimport 'parts/part.js#one';\nimport '/root.js#v';"),
+            ("src/number.js", ""), ("lib/label.js", ""), ("lib/part.js", "import './absent.js?rev=1';"), ("root.js", ""),
+        ]);
+        let needs = needs_of(&index);
+        assert_eq!(needs.missing.iter().map(Path::new).collect::<Vec<_>>(), [Path::new("lib/absent.js")]);
+    }
+
+    #[test]
     fn a_module_that_needs_a_cdn_through_an_import_map_is_said_not_to_have_run() {
         let (_dir, index) = page(&[
             ("index.html", r#"<script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.161.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.161.0/examples/jsm/"}}</script><script type="module" src="main.js"></script><script>console.log(1)</script>"#),
@@ -1611,8 +2131,108 @@ mod tests {
         assert!(needs.local_module);
         let said = report("index.html", "Edge", true, Some(&needs), &[], "<html><body>hi</body></html>", &Reading::default());
         assert!(said.contains("DID NOT RUN"), "{said}");
-        assert!(said.contains("a CDN library cannot load"), "{said}");
+        assert!(said.contains("NOT LOADED, as a check fetches only from well-known CDNs"), "{said}");
         assert!(!said.contains("no errors"), "it does not say all is well of what did not run: {said}");
+    }
+
+    /// A module written in the page that imports its own files is one a browser refuses from file://, as one with a `src` is; one that imports only from a CDN is not.
+    /// Checked through a local server, the page of the workspace the address gives says so first.
+    #[test]
+    fn a_module_in_the_page_that_imports_its_own_files_is_said_not_to_run_from_its_file() {
+        let (dir, index) = page(&[
+            ("gacha/index.html", r#"<script type="importmap">{"imports":{"three":"./three.module.js"}}</script><script type="module">import * as THREE from 'three'; import { a } from './post/pass.js';</script>"#),
+            ("gacha/three.module.js", "export const REVISION = '169';\n"),
+            ("gacha/post/pass.js", "import './absent.js'; export const a = 1;\n"),
+            ("cdn.html", r#"<script type="module">import * as THREE from 'https://unpkg.com/three@0.161.0/build/three.module.js';</script>"#),
+            ("plain.html", r#"<script>console.log(1)</script>"#),
+        ]);
+        let root = dir.path();
+        let local = root.join("gacha/index.html");
+        let direct = inspect_page(&local, ModuleScan::Direct);
+        assert!(direct.local_module && direct.missing.is_empty());
+        assert!(needs_of(&local).missing.iter().any(|name| name.ends_with("absent.js")));
+        for name in ["plain.html", "cdn.html"] {
+            assert!(!inspect_page(&root.join(name), ModuleScan::Direct).local_module);
+        }
+        assert!(needs_of(&root.join("gacha").join("index.html")).local_module);
+        assert!(!needs_of(&root.join("cdn.html")).local_module && !needs_of(&root.join("plain.html")).local_module);
+        let _ = index;
+        // (the server was started in gacha: its address's path is the file's under it)
+        assert_eq!(page_of_address("http://127.0.0.1:8765/index.html", root), Some(root.join("gacha").join("index.html")));
+        assert_eq!(page_of_address("http://localhost:8000/gacha/", root), Some(root.join("gacha").join("index.html")));
+        assert_eq!(page_of_address("http://localhost:8000/gacha/index.html?x=1#top", root), Some(root.join("gacha").join("index.html")));
+        assert_eq!(page_of_address("http://localhost:8000/none.html", root), None);
+        assert_eq!(page_of_address("http://localhost:8000/../secret.html", root), None);
+        let first = opened_from_its_file("http://127.0.0.1:8765/index.html", root).unwrap();
+        assert!(first.starts_with("AS THE USER OPENS IT: gacha") && first.contains("do not run at all") && !first.contains("http.server"), "{first}");
+        assert_eq!(opened_from_its_file("http://127.0.0.1:8765/plain.html", root), None);
+        assert_eq!(opened_from_its_file("http://127.0.0.1:8765/cdn.html", root), None);
+    }
+
+    #[test]
+    fn steps_on_a_server_suggest_a_matching_workspace_file_or_a_server_check() {
+        let (dir, _) = page(&[("index.html", "<p>sample</p>"), ("pages/demo.svg", "<svg/>"), ("api.json", "{}")]);
+        let cancel = AtomicBool::new(false);
+        for (suffix, file) in [("/?next=/api.json", Some("index.html")), ("/pages/demo.svg", Some("pages/demo.svg")), ("/app", None), ("/missing.html", None), ("/api.json", None)] {
+            let args = serde_json::json!({"url": format!("http://localhost:8765{suffix}"), "steps": "console.log(1)"});
+            let error = check_page(&args, dir.path(), &cancel).unwrap_err();
+            assert!(error.contains("keep url and omit steps"), "{error}");
+            if let Some(file) = file {
+                let relative = PathBuf::from(file.replace('/', std::path::MAIN_SEPARATOR_STR));
+                assert!(error.contains(&format!("path {}", serde_json::json!(relative))), "{error}");
+            } else {
+                assert!(error.contains("set path to the workspace page file"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_served_url_uses_webgl_only_with_a_matching_page_in_the_workspace() {
+        let (dir, _) = page(&[
+            ("index.html", "<canvas></canvas><script>canvas.getContext('webgl2')</script>"),
+            ("plain.html", "<p>hello</p>"),
+            ("source.txt", "webgl2"),
+        ]);
+        let root = dir.path().canonicalize().unwrap();
+        assert!(served_draws_webgl("http://localhost:8123/?next=/plain.html", &root));
+        for path in ["plain.html?next=/index.html", "other/", "source.txt", "../index.html"] {
+            assert!(!served_draws_webgl(&format!("http://localhost:8123/{path}"), &root), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_server_check_does_not_guess_between_sites_or_treat_a_script_as_a_page() {
+        let (dir, _) = page(&[
+            ("site-a/index.html", "<p>Plain page</p>"),
+            ("site-b/index.html", r#"<script type="module" src="app.js"></script>"#),
+            ("site-b/app.js", "export const value = 1;"),
+            ("app.js", "export const value = 2;"),
+            ("template.js", r#"const example = '<script type="module" src="app.js"></script>';"#),
+        ]);
+        let root = dir.path();
+        assert_eq!(opened_from_its_file("http://localhost:8000/template.js", root), None);
+        assert_eq!(page_of_address("http://localhost:8000/", root), None);
+        assert!(opened_from_its_file("http://localhost:8000/site-b/", root).is_some());
+        assert_eq!(opened_from_its_file("http://localhost:8000/site-a/", root), None);
+        std::fs::remove_file(root.join("site-a/index.html")).unwrap();
+        assert!(opened_from_its_file("http://localhost:8000/", root).unwrap().contains("site-b"));
+    }
+
+    #[test]
+    fn a_query_or_fragment_on_the_server_root_keeps_the_root_pages_file_diagnosis() {
+        let (dir, _) = page(&[
+            ("index.html", r#"<script type="module" src="./main.js"></script>"#),
+            ("main.js", "export const value = 1;"),
+            ("plain.html", "<p>Plain page</p>"),
+        ]);
+        let root = dir.path();
+        let expected = opened_from_its_file("http://localhost:8000/", root).unwrap();
+        for suffix in ["?next=/plain.html", "#/plain.html", "?next=/plain.html#here"] {
+            let url = format!("http://localhost:8000{suffix}");
+            assert_eq!(served_origin_and_path(&url), ("http://localhost:8000", "/"));
+            assert_eq!(opened_from_its_file(&url, root).as_deref(), Some(expected.as_str()), "{suffix}");
+        }
+        assert_eq!(opened_from_its_file("http://localhost:8000/plain.html?next=/index.html", root), None);
     }
 
     #[test]
@@ -1640,6 +2260,30 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[1].starts_with("a.js:9: shader says: ERROR: 0:1: 'nonsense'"), "{lines:?}");
         assert!(lines[1].contains("syntax error"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_local_diagnostic_preserves_the_utf8_console_lines_around_it() {
+        let first = "日本語のエラー\r\n";
+        let diagnostic = b"Windows: \x83\x65\x83\x58\x83\x67\r\n";
+        let last = "超アタリ 的中！";
+        let bytes = [first.as_bytes(), diagnostic, last.as_bytes()].concat();
+        assert_eq!(browser_stderr(&bytes), format!("{first}{}{last}", crate::sandbox::decode(diagnostic)));
+    }
+
+    #[test]
+    fn console_source_names_come_from_the_script_path() {
+        let root = "http://localhost:8000/";
+        for (source, expected) in [
+            ("main.js?next=/detail.html", "main.js:7: ready"),
+            ("sub/main.js#/detail.html", "main.js:7: ready"),
+            ("sub/%E6%8A%BD%E9%81%B8%20%231.js?v=1", "抽選 #1.js:7: ready"),
+            ("main%0Aextra.js", "main%0Aextra.js:7: ready"),
+            ("?next=/detail.html", "ready"),
+        ] {
+            let err = format!(r#"[browser:INFO:CONSOLE:7] "ready", source: {root}{source} (7)"#);
+            assert_eq!(console_lines(&err, root), [expected], "{source}");
+        }
     }
 
     #[test]
@@ -1754,7 +2398,7 @@ mod tests {
 
     #[test]
     fn a_page_in_shift_jis_or_utf_16_is_read_and_says_it_is_utf_8() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let sjis = dir.path().join("sjis.html");
         let mut bytes = b"<!DOCTYPE html><html><head><meta charset=\"Shift_JIS\"><title>".to_vec();
         bytes.extend_from_slice(&[0x94, 0x84, 0x8F, 0xE3]);
@@ -1794,16 +2438,16 @@ mod tests {
         assert_eq!(says(&Reading { seen: Some("from the browser".to_string()), ..Reading::default() }), "Shows: title \"T\"; text: from the browser", "the browser's own account needs no note");
         let from_dom = says(&Reading::default());
         assert!(from_dom.starts_with("Shows (from the page's DOM, with no style sheet applied") && from_dom.ends_with("text: from the dom CLASS"), "{from_dom}");
-        let phone = says(&Reading { console_head: Some("Console (as read at 1280x800)".to_string()), seen: Some("x".to_string()), ..Reading::default() });
+        let phone = says(&Reading { read_view_note: Some("read at 1280x800"), seen: Some("x".to_string()), ..Reading::default() });
         assert_eq!(phone, "Shows (read at 1280x800): title \"T\"; text: x");
-        let both = says(&Reading { console_head: Some("Console (as read at 1280x800)".to_string()), ..Reading::default() });
+        let both = says(&Reading { read_view_note: Some("read at 1280x800"), ..Reading::default() });
         assert!(both.starts_with("Shows (read at 1280x800; from the page's DOM"), "{both}");
     }
 
     /// The frames' extension is written once into the folder, under a name of its contents, and is the one extension a run lets in; with none, a run has none at all.
     #[test]
     fn the_frames_extension_is_written_once_and_is_the_one_a_run_loads() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::in_container::tempdir().unwrap();
         let folder = frames_extension(temp.path()).unwrap();
         assert!(folder.file_name().unwrap().to_string_lossy().starts_with("dogmind-frames-"), "{}", folder.display());
         assert_eq!(std::fs::read_to_string(folder.join("frames.js")).unwrap(), frames_js!());
@@ -1922,8 +2566,8 @@ mod tests {
     #[ignore = "starts a server and Edge in the sandbox"]
     fn a_page_a_local_server_gives_is_checked_by_its_url() {
         let (dir, _) = page(&[
-            ("index.html", "<!DOCTYPE html><title>served</title><div id=o>wait</div><script type=module src=app.mjs></script>"),
-            ("app.mjs", "import { word } from './word.mjs'; document.getElementById('o').textContent = word; console.log('module ran: ' + location.origin);"),
+            ("index.html", "<!DOCTYPE html><title>served</title><style>body{background:red}body.ready{background:lime}@media(width:390px) and (height:844px){body.ready{background:blue}}</style><div id=o>wait</div><script type=module src=app.mjs></script>"),
+            ("app.mjs", "import { word } from './word.mjs'; document.getElementById('o').textContent = word; console.log('module ran: ' + location.origin); console.log('DOM viewport ' + innerWidth + 'x' + innerHeight); setTimeout(() => document.body.className = 'ready', 600);"),
             ("word.mjs", "export const word = 'from a module';"),
         ]);
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -1931,7 +2575,7 @@ mod tests {
         let server = std::thread::spawn(move || crate::sandbox::run("python -m http.server 8765 --bind 127.0.0.1", &folder, &folder, false, Duration::from_secs(90), &halt));
         // (Python in the sandbox takes a few seconds to be listening the first time)
         std::thread::sleep(Duration::from_secs(8));
-        let said = check_page(&serde_json::json!({"url": "http://127.0.0.1:8765/index.html"}), dir.path(), &AtomicBool::new(false));
+        let said = check_page(&serde_json::json!({"url": "http://127.0.0.1:8765/index.html", "views": ["desktop", "mobile"], "wait_ms": 2000}), dir.path(), &AtomicBool::new(false));
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = server.join();
         let said = said.unwrap();
@@ -1939,6 +2583,16 @@ mod tests {
         assert!(said.contains("module ran: http://127.0.0.1:8765") && said.contains("text: from a module"), "{said}");
         assert!(!said.contains("Permissions-Policy"), "the browser's own words are not the page's: {said}");
         assert!(said.contains("How it looks at desktop"), "{said}");
+        if browser().is_some_and(|(program, _)| supports_virtual_screen(&program)) {
+            assert!(said.split("How it looks at").next().unwrap().contains("DOM viewport 1280x800"), "{said}");
+            for (label, size, color) in [("desktop", (1280, 800), [0, 255, 0]), ("mobile", (390, 844), [0, 0, 255])] {
+                let line = said.lines().find(|line| line.starts_with(&format!("How it looks at {label} "))).unwrap();
+                let (_, path) = line.split_once("`read_file` ").unwrap();
+                let image = image::open(path).unwrap().to_rgb8();
+                assert_eq!(image.dimensions(), size);
+                assert_eq!(image.get_pixel(100, 100).0, color, "{label} at the requested virtual time");
+            }
+        }
     }
 
     /// With the real browser, in the real sandbox: a page a server gives runs its animation frames too, by the extension, as no copy of it is made.
@@ -1961,6 +2615,23 @@ mod tests {
         assert!(said.contains("text: frames many"), "{said}");
     }
 
+    /// A page is drawn on the GPU when it draws with WebGL, by a context of it or a library of it in its HTML or its own scripts, and on the CPU otherwise; the
+    /// flags say which, and the check says where it was drawn.
+    #[test]
+    fn a_page_that_draws_with_webgl_is_drawn_on_the_gpu() {
+        for text in ["const gl = canvas.getContext('webgl2');", "import * as THREE from \"three\";", "{\"imports\": {\"three\": \"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js\"}}",
+            "<script src=\"lib/three.min.js\"></script>", "const engine = new BABYLON.Engine(canvas);", "<script src=\"pixi.min.js\"></script>", "<script src=\"aframe.min.js\"></script>"] {
+            assert!(draws_webgl(&[text.to_string()]), "{text}");
+        }
+        for text in ["three cards in a row", "a grid of three columns", "pixies and fairies", "<canvas id=\"c\"></canvas> ctx = c.getContext('2d')", ""] {
+            assert!(!draws_webgl(&[text.to_string()]), "{text}");
+        }
+        assert!(draws_webgl(&["<p>plain</p>".to_string(), "renderer = new THREE.WebGLRenderer();".to_string()]), "in a script of its own");
+        assert!(flags(true).contains(ON_THE_GPU.trim()) && !flags(true).contains("--disable-gpu"));
+        assert!(flags(false).contains("--disable-gpu") && !flags(false).contains("--use-angle"));
+        assert_eq!((drawn_on(true), drawn_on(false)), ("on this machine's GPU", "on the CPU, with no GPU"));
+    }
+
     /// A run has a limit of its own from the wait it was given, a hang is tried once more and no more, and only a run that was ended by its time is a hang.
     #[test]
     fn a_run_that_hangs_is_ended_early_and_tried_once_more() {
@@ -1968,6 +2639,13 @@ mod tests {
         assert!(run_limit(0) < run_limit(WAIT_MS) && run_limit(WAIT_MS) < run_limit(5_000), "it follows the wait");
         assert_eq!(run_limit(MOST_WAIT_MS), Duration::from_secs(18), "at the longest wait a page may ask for");
         assert_eq!(run_limit(60_000), LIMIT, "and never more than the longest a run may take");
+        // (a picture of a page that was slow to read gets what its read took, and half again, up to its own most)
+        assert_eq!(picture_limit(WAIT_MS, None), run_limit(WAIT_MS) * 2, "begun beside the read, sharing the CPU with it");
+        assert_eq!(picture_limit(MOST_WAIT_MS, None), Duration::from_secs(36), "at the longest wait a page may ask for");
+        assert_eq!(picture_limit(60_000, None), MOST_PICTURE, "and never more than the most");
+        assert_eq!(picture_limit(WAIT_MS, Some(Duration::from_secs(2))), run_limit(WAIT_MS), "a quick page's picture has the run's limit");
+        assert_eq!(picture_limit(9_000, Some(Duration::from_secs(14))), Duration::from_secs(24), "the three.js page read in 14 s");
+        assert_eq!(picture_limit(9_000, Some(Duration::from_secs(60))), MOST_PICTURE, "never more than its most");
         assert!(tries_again_after_a_hang(1), "the first hang is tried again");
         assert!(!tries_again_after_a_hang(2), "and the second is not: the page's own bound is MOST_TRYING, and a browser that hangs twice will not do better");
         let ended = |status: Option<i32>, ended: &'static str| crate::sandbox::Output { status, ended, ..crate::sandbox::Output::default() };
@@ -1994,6 +2672,9 @@ mod tests {
         // a crash and a stop keep their words
         let crash = report("p", "Edge", false, None, &[], "", &Reading::default());
         assert!(crash.contains("NOT CHECKED: the browser crashed or was stopped"), "{crash}");
+        // stopped by its time, still drawing: said as that, and not as a crash that a browser run another way might get past (one was run outside the sandbox for it)
+        let slow = report("page.html", "Edge", false, Some(&Needs::default()), &[], "", &Reading { timed_out: true, ..Reading::default() });
+        assert!(slow.contains("not the browser crashing") && slow.contains("Do not run a browser yourself") && !slow.contains("crashed or was stopped"), "{slow}");
     }
 
     /// With the real browser, in the real sandbox: a server on this machine that no command started (this test's own, outside the sandbox)
@@ -2017,7 +2698,7 @@ mod tests {
                 let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             }
         });
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let said = check_page(&serde_json::json!({"url": format!("http://127.0.0.1:{port}/")}), dir.path(), &AtomicBool::new(false));
         println!("{said:?}");
         let text = match &said { Ok(text) | Err(text) => text.clone() };
@@ -2025,6 +2706,42 @@ mod tests {
         assert!(!text.contains("NOT CHECKED"), "the browser did not run, so this shows nothing: {text}");
         assert!(!text.contains("SECRET-OUTSIDE-THE-SANDBOX"), "{text}");
         assert!(!served.load(std::sync::atomic::Ordering::Relaxed), "the browser reached a server outside the sandbox");
+    }
+
+    /// What the steps' `visible(selector)` says of `#it` in a page, and of `#shown` beside it, with the real browser in the real sandbox: the console line `v IT SHOWN`.
+    fn visible_in(body: &str) -> String {
+        let html = format!("<!DOCTYPE html><title>v</title><style>body{{margin:0}}#shown{{width:100px;height:20px;background:#3366cc}}</style><div id=shown>shown</div>{body}");
+        let (dir, _) = page(&[("index.html", &html)]);
+        let said = check_page(&serde_json::json!({"path": "index.html", "steps": "console.log('v', visible('#it'), visible('#shown'))"}), dir.path(), &AtomicBool::new(false)).unwrap();
+        println!("{said}");
+        said.lines().find_map(|line| line.split_once(": v ").map(|(_, rest)| format!("v {rest}"))).unwrap_or_else(|| panic!("no line of visible(): {said}"))
+    }
+
+    /// With the real browser: an element made wholly transparent, by itself or by what holds it, is not visible. (A result panel at opacity 0 was said to be,
+    /// and a wait for it ended before it came.)
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn an_element_at_opacity_0_is_not_visible() {
+        assert_eq!(visible_in("<div id=it style=\"width:100px;height:20px;opacity:0\">faded</div>"), "v false true");
+        assert_eq!(visible_in("<div style=\"opacity:0\"><div id=it style=\"width:100px;height:20px\">in a faded one</div></div>"), "v false true");
+    }
+
+    /// With the real browser: an element a transform keeps out of the window, where the page does not scroll to, is not visible; one below the window that the
+    /// page scrolls to is.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn an_element_moved_off_the_window_by_a_transform_is_not_visible() {
+        assert_eq!(visible_in("<div id=it style=\"position:fixed;left:0;bottom:0;width:100%;height:120px;transform:translateY(120%)\">panel</div>"), "v false true");
+        assert_eq!(visible_in("<div id=it style=\"position:absolute;top:0;left:0;width:100px;height:20px;transform:translateX(-300px)\">left</div>"), "v false true");
+        assert_eq!(visible_in("<div style=\"height:3000px\"></div><div id=it style=\"width:100px;height:20px\">far below</div>"), "v true true");
+    }
+
+    /// With the real browser: an element of no size, or cut off by what holds it, is not visible.
+    #[test]
+    #[ignore = "starts Edge in the sandbox"]
+    fn an_element_of_no_size_or_cut_off_is_not_visible() {
+        assert_eq!(visible_in("<div id=it style=\"width:0;height:0;overflow:hidden\">none</div>"), "v false true");
+        assert_eq!(visible_in("<div style=\"width:100px;height:40px;overflow:hidden;position:relative\"><div id=it style=\"position:absolute;top:60px;width:100px;height:20px\">cut</div></div>"), "v false true");
     }
 
     /// With the real browser, in the real sandbox: a page drawn by `requestAnimationFrame` runs its frames in the check, in what is read of it and in its picture
@@ -2057,6 +2774,10 @@ mod tests {
         // (what a script measures at the phone's width is said for it; at the desktop's too, where the picture's frame is not the window the
         // console above was read in)
         assert!(said.contains("Console at mobile:\n  index.html:1: width 390"), "{said}");
+        if browser().is_some_and(|(program, _)| supports_virtual_screen(&program)) {
+            let read = said.split("How it looks at").next().unwrap();
+            assert!(read.contains("width 1280") && read.contains("text: 1280"), "{read}");
+        }
         let path = |label: &str| said.lines().find(|line| line.starts_with(&format!("How it looks at {label} "))).and_then(|line| line.split("`read_file` ").nth(1)).map(PathBuf::from).unwrap_or_else(|| panic!("{label}: {said}"));
         let (desktop, mobile) = (image::open(path("desktop")).unwrap().to_rgb8(), image::open(path("mobile")).unwrap().to_rgb8());
         assert_eq!((desktop.width(), desktop.height(), mobile.width(), mobile.height()), (1280, 800, 390, 844));
@@ -2141,7 +2862,7 @@ mod tests {
     #[test]
     #[ignore = "starts Edge in the sandbox"]
     fn a_page_in_shift_jis_is_checked_with_steps_and_without() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut bytes = b"<!DOCTYPE html><html><head><meta charset=\"Shift_JIS\"><title>".to_vec();
         bytes.extend_from_slice(&[0x94, 0x84, 0x8F, 0xE3]);
         bytes.extend_from_slice(b"</title></head><body><p id=t>");
@@ -2174,7 +2895,8 @@ mod tests {
         let (dir, _) = page(&[
             ("index.html", "<!DOCTYPE html><title>t</title><div id=ok>start</div><canvas id=c></canvas><script type=module src=bad.mjs></script><script>console.log('FROM-PAGE');document.getElementById('ok').textContent='ran';const gl=document.getElementById('c').getContext('webgl2');const s=gl.createShader(gl.FRAGMENT_SHADER);gl.shaderSource(s,'void main(){ nonsense }');gl.compileShader(s);console.log('shader: '+gl.getShaderInfoLog(s));missing.call();</script>"),
             ("bad.mjs", "let x = ;\n"),
-            ("cdn.html", "<!DOCTYPE html><title>c</title><script type=module>import * as T from 'https://unpkg.com/three@0.161.0/build/three.module.js'; console.log('NEVER')</script>"),
+            // (a host that is not a CDN the app fetches for the page: unpkg's files are fetched now, and run)
+            ("cdn.html", "<!DOCTYPE html><title>c</title><script type=module>import * as T from 'https://example.com/lib/three.module.js'; console.log('NEVER')</script>"),
         ]);
         let cancel = AtomicBool::new(false);
         let said = check_page(&serde_json::json!({"path": "index.html"}), dir.path(), &cancel).unwrap();
@@ -2204,15 +2926,19 @@ mod tests {
 
     #[test]
     fn the_first_console_says_it_is_of_the_desktops_size_when_the_desktop_was_not_asked_for() {
-        let heads = |views: Value| console_head(&views_of(&serde_json::json!({ "views": views })).unwrap());
-        assert_eq!(heads(serde_json::json!(["320x568"])).as_deref(), Some("Console (as read at 1280x800)"));
-        assert_eq!(heads(serde_json::json!(["mobile", "1024x768"])).as_deref(), Some("Console (as read at 1280x800)"));
+        let heads = |views: Value| read_view_note(&views_of(&serde_json::json!({ "views": views })).unwrap(), true);
+        assert_eq!(heads(serde_json::json!(["320x568"])), Some("read at 1280x800"));
+        assert_eq!(heads(serde_json::json!(["mobile", "1024x768"])), Some("read at 1280x800"));
         assert_eq!(heads(serde_json::json!(["mobile", "desktop"])), None);
         assert_eq!(heads(serde_json::json!(["desktop"])), None);
-        assert_eq!(console_head(&views_of(&serde_json::json!({})).unwrap()), None, "no views: the desktop");
+        assert_eq!(read_view_note(&views_of(&serde_json::json!({})).unwrap(), true), None, "no views: the desktop");
         let (needs, lines) = (Needs::default(), vec!["a.js:1: scrollW: 1248".to_string()]);
         let said = |reading: &Reading, console: &[String]| report("index.html", "Edge", true, Some(&needs), console, "<html><body>hi</body></html>", reading);
-        let labelled = Reading { console_head: Some("Console (as read at 1280x800)".to_string()), ..Reading::default() };
+        let mobile = views_of(&serde_json::json!({"views":["mobile"]})).unwrap();
+        let legacy = Reading { read_view_note: read_view_note(&mobile, false), ..Reading::default() };
+        let legacy_report = said(&legacy, &lines);
+        assert!(legacy_report.contains("Console (as read in the desktop window)") && legacy_report.contains("Shows (read in the desktop window"), "{legacy_report}");
+        let labelled = Reading { read_view_note: Some("read at 1280x800"), ..Reading::default() };
         assert!(said(&Reading::default(), &lines).contains("Console:\n- a.js:1: scrollW: 1248\n"), "{}", said(&Reading::default(), &lines));
         assert!(said(&labelled, &lines).contains("Console (as read at 1280x800):\n- a.js:1: scrollW: 1248\n"), "{}", said(&labelled, &lines));
         assert!(said(&Reading::default(), &[]).contains("Console: nothing, so no errors.\n"));
@@ -2443,7 +3169,7 @@ mod tests {
         let (program, _) = browser().expect("Edge or Chrome is on this machine");
         let (dir, index) = page(&[("index.html", "<!DOCTYPE html><title>plain</title><p>hello</p>")]);
         let temp = crate::sandbox::temp_folder().expect("the sandbox's folder");
-        let (flags, wait) = (flags(), WAIT_MS);
+        let (flags, wait) = (flags(false), WAIT_MS);
         let mut made = Removing(Vec::new());
         let own = next_run();
         let (steps_copy, frame, shot) = (temp.join(steps_page_of(&own)), temp.join(frame_of(&own)), temp.join(shot_of(&own)));
@@ -2461,10 +3187,10 @@ mod tests {
             let _ = std::fs::remove_file(&shot);
             let profile = profiles.next();
             let line = match mode.as_str() {
-                "shot" => shot_line(&program, &flags, (1344, 960), wait, &profile, &shot, &frame.display().to_string()),
-                "steps" => page_line(&program, &flags, 2 * wait, &profile, &steps_copy.display().to_string()),
-                "read" => page_line(&program, &flags, wait + READ_MARGIN_MS, &profile, &read_copy.display().to_string()),
-                _ => page_line(&program, &flags, wait, &profile, &index.display().to_string()),
+                "shot" => shot_line(&program, &flags, &view_window(1280, 800, false), wait, &profile, &shot, &frame.display().to_string()),
+                "steps" => page_line(&program, &flags, supports_virtual_screen(&program), 2 * wait, &profile, &steps_copy.display().to_string()),
+                "read" => page_line(&program, &flags, supports_virtual_screen(&program), wait + READ_MARGIN_MS, &profile, &read_copy.display().to_string()),
+                _ => page_line(&program, &flags, supports_virtual_screen(&program), wait, &profile, &index.display().to_string()),
             };
             let started = std::time::Instant::now();
             // (as the check runs it, when asked to with DOGMIND_PROBE_LIKE_THE_CHECK: with the limit its wait gives, and a run that hung tried once more)
@@ -2491,7 +3217,7 @@ mod tests {
             if let (Some(keep), Ok(done)) = (&keep, &done) {
                 let _ = std::fs::create_dir_all(keep);
                 let name = format!("{mode}-{at:03}-{}.txt", if well { "good" } else { "bad" });
-                let _ = std::fs::write(keep.join(name), format!("{:?} {:?}\n--- stdout {} bytes\n--- stderr\n{}", done.status, done.ended, done.stdout.len(), crate::sandbox::decode(&done.stderr)));
+                let _ = std::fs::write(keep.join(name), format!("{:?} {:?}\n--- stdout {} bytes\n--- stderr\n{}", done.status, done.ended, done.stdout.len(), browser_stderr(&done.stderr)));
             }
         }
         profiles.clear();

@@ -5,11 +5,24 @@
 
 use std::borrow::Cow;
 
-/// A maker's prefix, how many characters must follow it, and whether those must hold a digit (a word with a prefix like `sk-` is no key).
-const KINDS: [(&str, usize, bool); 14] = [
+/// A maker's prefix, how many characters must follow it, and whether those must hold a digit (a word with a prefix like `sk-` is no key). A longer prefix comes
+/// before one it begins with. (Stripe's secret and restricted keys, npm's, Docker's, Slack's of an app and of its other kinds, PyPI's and GitLab's runner and
+/// deploy tokens were shown whole: a review of the app found them missing, where the README says keys are hidden.)
+const KINDS: [(&str, usize, bool); 27] = [
     ("sk-ant-", 20, false),
     ("sk-proj-", 20, false),
     ("sk-", 20, true),
+    ("sk_live_", 20, false),
+    ("sk_test_", 20, false),
+    ("rk_live_", 20, false),
+    ("rk_test_", 20, false),
+    ("npm_", 30, false),
+    ("dckr_pat_", 20, false),
+    ("xapp-", 10, false),
+    ("xoxa-", 10, false),
+    ("xoxr-", 10, false),
+    ("xoxs-", 10, false),
+    ("pypi-", 50, false),
     ("github_pat_", 20, false),
     ("ghp_", 20, false),
     ("gho_", 20, false),
@@ -17,6 +30,8 @@ const KINDS: [(&str, usize, bool); 14] = [
     ("ghs_", 20, false),
     ("ghr_", 20, false),
     ("glpat-", 20, false),
+    ("glrt-", 20, false),
+    ("gldt-", 20, false),
     ("xoxb-", 10, false),
     ("xoxp-", 10, false),
     ("hf_", 30, false),
@@ -43,7 +58,10 @@ pub fn hide_keys(text: &str) -> Cow<'_, str> {
                 let key = &body[..length];
                 (length >= *least && (!digit || key.chars().any(|c| c.is_ascii_digit()))).then_some((prefix.len(), length))
             })
-        }).flatten().or_else(|| aws_key(rest).filter(|_| starts_word).map(|length| (4, length - 4)));
+        }).flatten()
+            .or_else(|| aws_key(rest).filter(|_| starts_word).map(|length| (4, length - 4)))
+            .or_else(|| dotted_key(rest).filter(|_| starts_word))
+            .or_else(|| labelled_secret(&text[..at], rest).filter(|_| starts_word));
         match found {
             Some((prefix, length)) => {
                 let shown = prefix + 4;
@@ -75,6 +93,9 @@ pub struct StreamMask {
 /// The longest a word that may be a key is waited for: no key is longer, and a word as long as this is not one.
 const LONGEST_WAIT: usize = 400;
 
+/// The longest a run of words and dots that may be a key of parts (`dotted_key`) is waited for: a JSON Web Token runs to a thousand characters and more.
+const LONGEST_DOTTED_WAIT: usize = 4000;
+
 impl StreamMask {
     /// `piece` of the reply, in; what may be shown now, out.
     pub fn push(&mut self, piece: &str) -> String {
@@ -102,14 +123,69 @@ impl StreamMask {
 /// How many bytes at the end of `text` are a word that may still turn out to be a key: it begins as a key's prefix does, or is the beginning of one.
 fn waiting_tail(text: &str) -> usize {
     let word = text.len() - text.trim_end_matches(key_char).len();
+    // (a word longer than any key is not waited for)
+    let word = if word > LONGEST_WAIT { 0 } else { word };
     let tail = &text[text.len() - word..];
-    if tail.is_empty() || word > LONGEST_WAIT {
-        return 0;
-    }
     // (a word starts where the one before it stops: what is inside a longer word is no key's beginning)
     let starts_word = text.len() == word || !text[..text.len() - word].chars().next_back().is_some_and(key_char);
-    let begins_like_a_key = KINDS.iter().map(|(prefix, ..)| *prefix).chain(std::iter::once("AKIA")).any(|prefix| tail.starts_with(prefix) || prefix.starts_with(tail));
-    if starts_word && begins_like_a_key { word } else { 0 }
+    let begins_like_a_key = !tail.is_empty() && KINDS.iter().map(|(prefix, ..)| *prefix).chain(std::iter::once("AKIA")).any(|prefix| tail.starts_with(prefix) || prefix.starts_with(tail));
+    let plain = if starts_word && begins_like_a_key { word } else { 0 };
+    // (a key of parts goes on past its dots: a run of words and dots that begins like one is waited for as well, longer)
+    let run = text.len() - text.trim_end_matches(|c: char| key_char(c) || c == '.').len();
+    let tail = &text[text.len() - run..];
+    let run_starts_word = text.len() == run || !text[..text.len() - run].chars().next_back().is_some_and(key_char);
+    let like_dotted = !tail.is_empty() && ["eyJ", "SG."].iter().any(|prefix| tail.starts_with(prefix) || prefix.starts_with(tail));
+    let dotted = if run <= LONGEST_DOTTED_WAIT && run_starts_word && like_dotted { run } else { 0 };
+    plain.max(dotted)
+}
+
+/// A key of parts with dots between at the start of `text`: a JSON Web Token (three parts of base64url, the first two `eyJ`, a JSON object's beginning) or a
+/// SendGrid key (`SG.` and two parts). The length of what is shown of its beginning, and of the rest. Told by its parts, as a dot is no key's character: cut at
+/// the first dot, the part after it, a token's claims and its signature, was shown.
+fn dotted_key(text: &str) -> Option<(usize, usize)> {
+    let part = |from: &str| from.find(|c: char| !key_char(c)).unwrap_or(from.len());
+    let parts = |from: &str, count: usize, least: usize| -> Option<usize> {
+        let mut at = 0;
+        for index in 0..count {
+            let length = part(&from[at..]);
+            if length < least {
+                return None;
+            }
+            at += length;
+            if index + 1 < count {
+                at += from[at..].strip_prefix('.').map(|_| 1)?;
+            }
+        }
+        // (the token ends here: a dot and more of it would be a longer one, which this is not)
+        (!from[at..].starts_with('.') || !from[at + 1..].starts_with(key_char)).then_some(at)
+    };
+    if text.starts_with("eyJ") {
+        let length = parts(text, 3, 10)?;
+        let claims = text[..length].split('.').nth(1)?;
+        return claims.starts_with("eyJ").then_some((3, length - 3));
+    }
+    let body = text.strip_prefix("SG.")?;
+    parts(body, 2, 16).map(|length| (3, length))
+}
+
+/// A secret with no maker's prefix that stands after the name it is given: an AWS secret access key, forty characters of base64 after `secret_access_key` (or
+/// `SecretAccessKey`) and what may stand between (`=`, `:`, quotes, spaces). `before`: the text before it. The length of what is shown of it, and of the rest.
+fn labelled_secret(before: &str, text: &str) -> Option<(usize, usize)> {
+    let named = before.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '=' | ':' | '"' | '\'' | ','));
+    if named.len() == before.len() {
+        return None;
+    }
+    // (the name's own end alone, as it is written in any case: this is asked at every word of a long output)
+    let mut from = named.len().saturating_sub(17);
+    while !named.is_char_boundary(from) {
+        from += 1;
+    }
+    let name = named[from..].to_ascii_lowercase();
+    if !["secret_access_key", "secretaccesskey", "aws_secret_key"].iter().any(|known| name.ends_with(known)) {
+        return None;
+    }
+    let length = text.bytes().take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'+')).count();
+    (length == 40).then_some((0, 40))
 }
 
 /// An AWS access key id at the start of `text`: AKIA and sixteen capitals or digits, the word ending there. Its whole length.
@@ -131,14 +207,67 @@ mod tests {
         assert_eq!(hide_keys("key: sk-ant-api03-0123456789abcdefghijklmnop"), "key: sk-ant-api0…(hidden)");
     }
 
+    /// The kinds a review found shown whole: Stripe's, npm's, Docker's, Slack's of an app, PyPI's, GitLab's runner tokens; a JSON Web Token and a SendGrid key
+    /// with their dots, all of them and not their first part alone; an AWS secret access key after its name.
+    #[test]
+    fn more_kinds_of_keys_are_hidden_too() {
+        // (each made-up key is put together from pieces, so that the source has no string in a key's form for a scanner of secrets to take for one)
+        for (said, shown) in [
+            (concat!("STRIPE=sk_", "live_", "51HqLyjWDarjtT1zdp7dcXYZ01234567 ok"), "STRIPE=sk_live_51Hq…(hidden) ok"),
+            (concat!("rk_", "test_", "51HqLyjWDarjtT1zdp7dc"), "rk_test_51Hq…(hidden)"),
+            (concat!("//registry.npmjs.org/:_authToken=npm", "_", "aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5"), "//registry.npmjs.org/:_authToken=npm_aB3d…(hidden)"),
+            (concat!("dckr_", "pat_", "2b3e36beeb386dfdaacb9b46004"), "dckr_pat_2b3e…(hidden)"),
+            (concat!("xapp", "-1-", "A0123456789-0123456789012-abcdef"), "xapp-1-A0…(hidden)"),
+            (concat!("password = pypi", "-", "AgEIcHlwaS5vcmcCJGUwYzI0ZjFhLTY0NmYtNDU0Zi04ZjM1LTk2ZDY0NjRmNjNhMQ"), "password = pypi-AgEI…(hidden)"),
+            (concat!("glrt", "-", "AbCdEfGhIjKlMnOpQrSt12"), "glrt-AbCd…(hidden)"),
+            (concat!("Authorization: Bearer ", jwt!(), "."), "Authorization: Bearer eyJhbGc…(hidden)."),
+            (concat!("SENDGRID=", sendgrid!(), "lmnopq end"), "SENDGRID=SG.abcd…(hidden) end"),
+            (concat!("aws_secret_access_key = ", aws_secret!()), "aws_secret_access_key = wJal…(hidden)"),
+            (concat!("\"SecretAccessKey\": \"", aws_secret!(), "\""), "\"SecretAccessKey\": \"wJal…(hidden)\""),
+        ] {
+            assert_eq!(hide_keys(said), shown, "{said}");
+        }
+        for text in ["eyJhbGciOiJIUzI1NiJ9 alone", "eyJhbGciOiJIUzI1NiJ9.notclaims123456.abcdefghijk", "SG. Then it goes on", "e.g. this", "secret_access_key = tooshort/abc",
+            concat!("my ", aws_secret!(), " has no name before it"), "npm_install_dependencies"] {
+            assert!(matches!(hide_keys(text), Cow::Borrowed(_)), "{text}");
+        }
+    }
+
+    /// A made-up JSON Web Token, put together from its parts.
+    macro_rules! jwt {
+        () => {
+            concat!("eyJhbGciOiJIUzI1NiJ9", ".", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", ".", "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c")
+        };
+    }
+    use jwt;
+
+    /// A made-up SendGrid key, put together from its parts, short of its last characters (each use adds them).
+    macro_rules! sendgrid {
+        () => {
+            concat!("SG", ".", "abcdefghijklmnopqrstuv", ".", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk")
+        };
+    }
+    use sendgrid;
+
+    /// The secret of AWS's own example of a key pair, put together from pieces.
+    macro_rules! aws_secret {
+        () => {
+            concat!("wJalrXUtnFEMI", "/K7MDENG/", "bPxRfiCYEXAMPLEKEY")
+        };
+    }
+    use aws_secret;
+
     const KEY: &str = "sk-proj-abcdEFGH1234ijklMNOP5678";
 
     /// The reply said in pieces of any size, cut anywhere, shows what the whole of it would, and no piece of a key is shown before it is known to be one.
     #[test]
     fn a_reply_in_pieces_hides_a_key_wherever_it_is_cut() {
-        let whole = format!("The file sets OPENAI_API_KEY={KEY} and DEBUG=1. The token {KEY}, ghp_ABCDEFGHIJKLMNOPQRSTuvwxyz12 and AKIAIOSFODNN7EXAMPLE are keys; sk-learn is not.");
+        let (jwt, sendgrid) = (jwt!(), sendgrid!());
+        let whole = format!("The file sets OPENAI_API_KEY={KEY} and DEBUG=1. The token {KEY}, ghp_ABCDEFGHIJKLMNOPQRSTuvwxyz12 and AKIAIOSFODNN7EXAMPLE are keys; sk-learn is not. \
+            Bearer {jwt} and {sendgrid} too.");
         let wanted = hide_keys(&whole).into_owned();
         assert!(wanted.contains("sk-proj-abcd…(hidden)") && !wanted.contains("EFGH1234"), "{wanted}");
+        assert!(!wanted.contains("eyJzdWIi") && !wanted.contains("SflKxw") && !wanted.contains("ABCDEFGHIJ"), "a key of parts, all of it: {wanted}");
         let characters: Vec<usize> = whole.char_indices().map(|(at, _)| at).chain([whole.len()]).collect();
         // (cut in two at every place)
         for &at in &characters {

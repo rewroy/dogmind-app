@@ -77,9 +77,11 @@ pub(super) struct Job<'a> {
 
 fn is_safe(relative: &str) -> bool {
     // (as `pack::is_safe` of `dogmind-setup`: Windows opens `a.` and `a ` as `a`, and a device has its name in any folder)
-    const DEVICES: [&str; 26] = ["con", "prn", "aux", "nul", "conin$", "conout$", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "com0", "lpt0"];
+    const DEVICES: [&str; 32] = ["con", "prn", "aux", "nul", "conin$", "conout$", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "com0", "lpt0", "com\u{b9}", "com\u{b2}", "com\u{b3}", "lpt\u{b9}", "lpt\u{b2}", "lpt\u{b3}"];
     !relative.is_empty()
-        && relative.split('\\').all(|part| !part.is_empty() && !part.ends_with(['.', ' ']) && !DEVICES.contains(&part.to_ascii_lowercase().as_str()))
+        // (a device by its name before any dot, its spaces at the end left out: Windows opens `NUL.txt`, `con .log` and `COM1.tar.gz` as the device, and what
+        // is written to one is gone with no error; COM and LPT with a superscript digit are ports too)
+        && relative.split('\\').all(|part| !part.is_empty() && !part.ends_with(['.', ' ']) && !DEVICES.contains(&part.split('.').next().unwrap_or(part).trim_end_matches(' ').to_lowercase().as_str()))
         && !relative.contains(['/', ':', '*', '?', '"', '<', '>', '|'])
         && !relative.chars().any(char::is_control)
 }
@@ -753,7 +755,7 @@ mod tests {
 
     #[test]
     fn the_program_ends_where_the_installer_finds_its_package() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mini = dir.path().join("mini.exe");
         std::fs::write(&mini, mini_exe()).unwrap();
         for program in [mini, std::env::current_exe().unwrap()] {
@@ -766,7 +768,7 @@ mod tests {
 
     #[test]
     fn a_name_is_judged_as_the_installer_judges_it() {
-        for name in ["..\\x", "a\\..\\..\\x", "C:\\x", "\\x", "a:stream", "a\\\\b", "", ".", "a/b", ".. \\x", "..\\ x\\..  \\y", "a\\... \\b", "a.", "a ", "NUL", "tools\\con", "a\nb", "a", "a\\b.txt", "\u{65e5}\u{672c}\\c d", "node_modules\\.bin\\x", "fonts\\BIZUDGothic-Regular.ttf"] {
+        for name in ["..\\x", "a\\..\\..\\x", "C:\\x", "\\x", "a:stream", "a\\\\b", "", ".", "a/b", ".. \\x", "..\\ x\\..  \\y", "a\\... \\b", "a.", "a ", "NUL", "tools\\con", "a\nb", "NUL.txt", "tools\\CON.log", "con .txt", "console.log", "com\u{b9}.x", "a", "a\\b.txt", "\u{65e5}\u{672c}\\c d", "node_modules\\.bin\\x", "fonts\\BIZUDGothic-Regular.ttf"] {
             assert_eq!(is_safe(name), setup_pack::is_safe(name), "{name:?}");
         }
     }
@@ -781,7 +783,7 @@ mod tests {
 
     #[test]
     fn the_installers_manifest_is_read_for_its_records_and_nothing_that_is_not_one() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         std::fs::write(
             dir.path().join(INSTALL_MANIFEST),
@@ -811,7 +813,7 @@ mod tests {
 
     /// A parts file as the installer's `--pack` writes it, of a folder, and the setup it describes.
     fn parts_of_a_setup() -> (tempfile::TempDir, std::path::PathBuf, serde_json::Value) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let exe = make_setup(dir.path(), "1.2.3", &[("a.txt", b"hello"), ("b.bin", &noisy(5000, 1)), ("c\\d.txt", &vec![b'x'; 9000]), ("empty", b"")]);
         let parts = serde_json::from_slice(&std::fs::read(setup_pack::parts_path(&exe)).unwrap()).unwrap();
         (dir, exe, parts)
@@ -869,7 +871,7 @@ mod tests {
         let (_dir, exe, parts) = parts_of_a_setup();
         let length = std::fs::metadata(&exe).unwrap().len();
         let parts = read_parts(&serde_json::to_vec(&parts).unwrap(), "1.2.3", length).unwrap();
-        let install = tempfile::tempdir().unwrap();
+        let install = crate::in_container::tempdir().unwrap();
         let files: [(&str, &[u8]); 4] = [("a.txt", b"hello"), ("b.bin", &noisy(5000, 1)), ("c\\d.txt", &[b'x'; 9000]), ("empty", b"")];
         make_install(install.path(), &files, true);
         let records = records_of(install.path());
@@ -919,7 +921,7 @@ mod tests {
         }
         assert_eq!(out.len() as u64, parts.base + layout.index_at);
         out.extend_from_slice(&layout.index);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let made = dir.path().join("Made.exe");
         std::fs::write(&made, out).unwrap();
         let mut package = Package::open(&made).unwrap();

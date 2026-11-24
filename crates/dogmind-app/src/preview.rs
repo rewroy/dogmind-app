@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn a_written_page_shows_what_hides_in_a_file_and_shows_the_rest_as_it_is() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("a.md");
         std::fs::write(&file, "# 見出し \u{202e}tluser\n\n```rust\nlet a = \"\u{2066}\";\n```\n\nplain 👍🏽 text\n").unwrap();
         let page = written_page(dir.path(), &file, &Written::Markdown, None).unwrap();
@@ -755,7 +755,7 @@ mod tests {
 
     #[test]
     fn a_written_page_lets_nothing_run_and_finds_its_pictures() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir(root.join("doc")).unwrap();
         let file = root.join("doc").join("a.md");
@@ -770,7 +770,7 @@ mod tests {
     /// A text file that PowerShell's `>` wrote (UTF-16 LE with its mark) and one that Excel or an older editor wrote in Shift_JIS are shown with their characters, and say what they were read as.
     #[test]
     fn a_utf16_file_and_a_shift_jis_file_are_shown_with_their_own_characters() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut utf16 = vec![0xFF, 0xFE];
         for unit in "# 見出し\r\n\r\n本文です\r\n".encode_utf16() {
             utf16.extend_from_slice(&unit.to_le_bytes());
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn a_long_file_is_cut_and_says_so_and_a_binary_one_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let long = dir.path().join("long.txt");
         std::fs::write(&long, "あ\n".repeat(200_000)).unwrap();
         let page = written_page(dir.path(), &long, &Written::Source("txt".to_string()), None).unwrap();
@@ -858,7 +858,7 @@ mod tests {
 
     #[test]
     fn what_a_page_loaded_from_a_folder_up_or_two_down_is_what_it_is_watched_by() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (page, style, picture) = (dir.path().join("pages").join("a.html"), dir.path().join("style.css"), dir.path().join("assets").join("img").join("x.png"));
         std::fs::create_dir_all(picture.parent().unwrap()).unwrap();
         std::fs::create_dir_all(page.parent().unwrap()).unwrap();
@@ -888,7 +888,7 @@ mod tests {
 
     #[test]
     fn a_file_that_is_deleted_is_gone_and_one_that_comes_back_is_a_change() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let page = dir.path().join("a.html");
         std::fs::write(&page, "x").unwrap();
         let shown = newest_of(&page, &[]);

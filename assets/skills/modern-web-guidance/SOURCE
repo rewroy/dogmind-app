@@ -3,4 +3,4 @@ File: skills/modern-web-guidance/SKILL.md
 Upstream Git blob: 7483c781ee0045cea7558cff21513ae0ef468669
 CLI: https://www.npmjs.com/package/modern-web-guidance/v/1.0.1
 License: Apache-2.0 (upstream LICENSE, Git blob d645695673349e3947e8e5ae42332d0ac3164cd7)
-Dogmind changes: pin the CLI and document the app's command runner, command approval and telemetry opt-out.
+Dogmind changes: pin the CLI and document the app's command runner, command approval and telemetry opt-out; it is looked up when unsure rather than first for every web task, and its advice is used only within what was asked; upstream's Step 4 (a "### Modern Web Guidance" section at the end of every answer that used it) is left out.

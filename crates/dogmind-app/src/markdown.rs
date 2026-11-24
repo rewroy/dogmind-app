@@ -132,6 +132,29 @@ pub fn quoted(line: &str) -> Option<&str> {
     Some(rest.strip_prefix(' ').unwrap_or(rest))
 }
 
+#[derive(Clone, Copy)]
+pub struct CodeFence {
+    marker: u8,
+    length: usize,
+}
+
+impl CodeFence {
+    pub fn opening(line: &str) -> Option<(Self, &str)> {
+        let marker = *line.as_bytes().first()?;
+        if !matches!(marker, b'`' | b'~') {
+            return None;
+        }
+        let length = line.bytes().take_while(|byte| *byte == marker).count();
+        let info = line[length..].trim();
+        (length >= 3 && !(marker == b'`' && info.contains('`'))).then_some((Self { marker, length }, info))
+    }
+
+    pub fn closes(self, line: &str) -> bool {
+        let line = line.trim();
+        line.len() >= self.length && line.bytes().all(|byte| byte == self.marker)
+    }
+}
+
 /// Whether the start of a line, with no line's end yet, cannot be told from a mark that means something: it waits for more.
 pub fn undecided(head: &str) -> bool {
     let count = head.chars().count();
@@ -144,7 +167,7 @@ pub fn undecided(head: &str) -> bool {
     if head.starts_with("- [") && count < 6 {
         return true;
     }
-    count < 4 && head.chars().all(|c| c.is_ascii_digit() || matches!(c, '`' | '#' | '-' | '*' | '.' | '>' | ' '))
+    count < 4 && head.chars().all(|c| c.is_ascii_digit() || matches!(c, '`' | '~' | '#' | '-' | '*' | '.' | '>' | ' '))
 }
 
 pub fn escape(text: &str) -> String {
@@ -291,11 +314,23 @@ pub fn escape_text(text: &str) -> String {
     out
 }
 
+/// Each run's byte offset and length, so an inline span can keep shorter or longer runs literally.
+fn backtick_runs(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        let start = offset + text[offset..].find('`')?;
+        let length = text[start..].bytes().take_while(|byte| *byte == b'`').count();
+        offset = start + length;
+        Some((start, length))
+    })
+}
+
 /// A line's text as HTML: emphasis, code, links, pictures.
 pub fn inline(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 16);
     let (mut bold, mut italic, mut struck) = (false, false, false);
     let mut before: Option<char> = None;
+    let mut last_backticks = None;
     let mut at = 0;
     while let Some(c) = text[at..].chars().next() {
         let rest = &text[at..];
@@ -309,12 +344,22 @@ pub fn inline(text: &str) -> String {
                 continue;
             }
             '`' => {
-                if let Some(end) = rest[1..].find('`') {
-                    out.push_str(&format!("<code>{}</code>", escape(&rest[1..1 + end])));
-                    at += end + 2;
-                    before = Some('`');
-                    continue;
+                let length = rest.bytes().take_while(|byte| *byte == b'`').count();
+                // Unmatched runs do not scan the whole remaining line again.
+                let last = last_backticks.get_or_insert_with(|| backtick_runs(text).map(|(start, count)| (count, start)).collect::<std::collections::HashMap<_, _>>());
+                let content = &rest[length..];
+                if last.get(&length).is_some_and(|end| *end > at) {
+                    if let Some((end, _)) = backtick_runs(content).find(|(_, count)| *count == length) {
+                        out.push_str(&format!("<code>{}</code>", escape(&content[..end])));
+                        at += length + end + length;
+                        before = Some('`');
+                        continue;
+                    }
                 }
+                out.push_str(&rest[..length]);
+                at += length;
+                before = Some('`');
+                continue;
             }
             '*' if next == Some('*') => {
                 out.push_str(if bold { "</strong>" } else { "<strong>" });
@@ -480,7 +525,7 @@ fn item_of(line: &str) -> Option<Item<'_>> {
 /// Whether a line begins something a paragraph stops for.
 fn starts_block(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed.is_empty() || trimmed.starts_with("```") || trimmed.starts_with("~~~") || heading_level(trimmed).is_some() || is_rule(trimmed) || trimmed.starts_with('>') || item_of(line).is_some() || trimmed.starts_with('|')
+    trimmed.is_empty() || CodeFence::opening(trimmed).is_some() || heading_level(trimmed).is_some() || is_rule(trimmed) || trimmed.starts_with('>') || item_of(line).is_some() || trimmed.starts_with('|')
 }
 
 /// A line with up to `columns` of its leading space taken off (a tab is four).
@@ -562,13 +607,12 @@ fn blocks(lines: &[&str], out: &mut String, depth: usize) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             at += 1;
-        } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let fence = &trimmed[..3];
-            let language = trimmed[3..].trim().to_lowercase();
+        } else if let Some((fence, info)) = CodeFence::opening(trimmed) {
+            let language = info.to_lowercase();
             at += 1;
             out.push_str("<pre><code>");
             let mut open = false;
-            while at < lines.len() && !lines[at].trim_start().starts_with(fence) {
+            while at < lines.len() && !fence.closes(lines[at]) {
                 open = code_line(lines[at], &language, open, out);
                 out.push('\n');
                 at += 1;
@@ -716,6 +760,30 @@ mod tests {
         for told in ["a", "1a", "#a", "- a", "1234", "#######", "**a", "- [ ] a"] {
             assert!(!undecided(told), "{told}");
         }
+    }
+
+    #[test]
+    fn a_code_fence_closes_only_on_a_matching_run_with_no_trailing_text() {
+        for marker in ['~', '`'] {
+            let short = marker.to_string().repeat(3);
+            let long = marker.to_string().repeat(4);
+            let other = if marker == '~' { "```" } else { "~~~" };
+            let (fence, info) = CodeFence::opening(&long).unwrap();
+            assert!(info.is_empty());
+            assert!(fence.closes(&format!(" {long}{marker} ")));
+            let body = format!("{short}\n{other}\n{long} example");
+            assert_eq!(to_html(&format!("{long}text\n{body}\n{long}\nafter")), format!("<pre><code>{body}\n</code></pre><p>after</p>"));
+        }
+        assert!(undecided("~") && undecided("~~"));
+        assert!(!undecided("~~word"));
+    }
+
+    #[test]
+    fn inline_code_at_the_start_of_a_line_keeps_literal_backticks_and_following_prose() {
+        assert_eq!(to_html("```MixCase`X```\nnext"), "<p><code>MixCase`X</code>\nnext</p>");
+        assert_eq!(inline("``a`b`` and `c`"), "<code>a`b</code> and <code>c</code>");
+        assert_eq!(inline("a `` then `b`"), "a `` then <code>b</code>");
+        assert_eq!(inline("``<a>``"), "<code>&lt;a&gt;</code>");
     }
 
     #[test]

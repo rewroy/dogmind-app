@@ -177,6 +177,13 @@ pub struct CallRow {
     pub images: Vec<String>,
 }
 
+impl CallRow {
+    /// A successful question or plan review returned only after the person answered.
+    pub fn answered_by_person(&self) -> bool {
+        crate::trajectory_report::answered_by_person(&self.name, &self.outcome)
+    }
+}
+
 /// A step of an `explore` helper's own conversation: why, in its words, and the calls it made (each its tool and what it was on).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HelperStep {
@@ -619,7 +626,7 @@ pub enum Part {
     Writing,
     /// After the first word, of a request kept before the band split it.
     Generating,
-    /// A call running, one that failed, and the person asked about a call before it ran.
+    /// A call running, one that failed, and time spent waiting for the person's answer or approval.
     Call,
     CallFailed,
     Person,
@@ -675,7 +682,13 @@ pub fn band(turn: &TurnPath) -> Option<Band> {
             if wait > 0 {
                 band.parts.push(BandPart { lane: Lane::Calls, from, to: from + wait, part: Part::Person });
             }
-            let part = if call.outcome == "ok" { Part::Call } else { Part::CallFailed };
+            let part = if call.answered_by_person() {
+                Part::Person
+            } else if call.outcome == "ok" && !call.exit_code.is_some_and(|code| code != 0) {
+                Part::Call
+            } else {
+                Part::CallFailed
+            };
             band.parts.push(BandPart { lane: Lane::Calls, from: from + wait, to: from + wait + call.ms.max(1), part });
         }
     }
@@ -756,7 +769,7 @@ fn request_detail(line: &Line) -> RequestDetail {
         prompt: line.u("prompt"),
         cached: line.u("cached"),
         completion: line.u("completion"),
-        tps: line.v["tps"].as_f64(),
+        tps: crate::trajectory::request_rate(&line.v),
         end: line.s("end").to_string(),
         reasoning_chars: line.u("reasoning_chars").unwrap_or(0),
         content_chars: line.u("content_chars").unwrap_or(0),
@@ -1207,7 +1220,7 @@ mod tests {
     /// Read from the files, an explore's call has the steps of its helper's own conversation: why in the helper's words, and what it called.
     #[test]
     fn an_explore_call_read_from_the_files_has_its_helpers_steps() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = session::Session::create(dir.path(), dir.path(), "2026-11-05 10:00:00 +09:00", "20261105-100000").unwrap();
         for message in [Message::text("system", "s"), user("find"), assistant("", "", vec![call("e1", "explore", json!({"task": "Where is the needle?"}))]), Message::tool_result("e1", "At a.txt:1."), assistant("Done", "", vec![])] {
             session.append(&message).unwrap();
@@ -1323,7 +1336,7 @@ mod tests {
 
     #[test]
     fn a_session_is_read_with_the_trajectory_beside_it_and_one_without_is_no_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = session::Session::create(dir.path(), dir.path(), "2026-11-05 10:00:00 +09:00", "20261105-100000").unwrap();
         for message in [Message::text("system", "s"), user("hello there"), assistant("Hi, I can help.", "", vec![])] {
             session.append(&message).unwrap();
@@ -1351,7 +1364,8 @@ mod tests {
             .map(|(name, seconds)| (name.to_string(), serde_json::json!(seconds))).chain([("resumed_from".to_string(), serde_json::json!("none"))]).collect();
         let request = RequestDetail { started: at("01.000"), first_ms: Some(3000), ms: 5000, writing_ms: Some(4000), server, ..RequestDetail::default() };
         let call = CallRow { id: "c".into(), name: "execute_command".into(), started: at("06.000"), ms: 800, wait_ms: Some(1200), outcome: "ok".into(), ..CallRow::default() };
-        let model = Step { kind: StepKind::Model, started: at("01.000"), ms: 5000, why: None, request: Some(request), calls: vec![call], fields: Map::new() };
+        let failed = CallRow { id: "d".into(), started: at("08.000"), ms: 100, exit_code: Some(7), wait_ms: None, ..call.clone() };
+        let model = Step { kind: StepKind::Model, started: at("01.000"), ms: 5000, why: None, request: Some(request), calls: vec![call, failed], fields: Map::new() };
         let retry = Step { kind: StepKind::Retry { why: "transient".into(), wait_ms: 500 }, started: at("09.000"), ms: 0, why: None, request: None, calls: Vec::new(), fields: Map::new() };
         let turn = TurnPath { turn: 1, started: at("00.000"), steps: vec![model, retry], ended: Some(TurnEnd { ms: 10_000, cancelled: false, failed: false }), ..TurnPath::default() };
         let band = band(&turn).expect("a band");
@@ -1366,6 +1380,7 @@ mod tests {
             (Lane::Requests, 5000, 6000, Part::Writing),
             (Lane::Calls, 6000, 7200, Part::Person),
             (Lane::Calls, 7200, 8000, Part::Call),
+            (Lane::Calls, 8000, 8100, Part::CallFailed),
         ]);
         assert_eq!((band.marks, band.length), (vec![9000], 10_000));
     }

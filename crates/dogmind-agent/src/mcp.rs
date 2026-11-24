@@ -6,7 +6,7 @@
 //! returns may come from anywhere, so it goes to the model marked as data, as a web page does. A server the person says they trust
 //! still has that mark, and its tools still ask as they did; only what it returns no longer counts as web content in the conversation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -32,6 +32,20 @@ const ENDED: &str = "the server has ended";
 const PIPE: &str = "the server's pipe";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolSelection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled_tools: Option<BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    disabled_tools: BTreeSet<String>,
+}
+
+impl ToolSelection {
+    fn allows(&self, name: &str) -> bool {
+        self.enabled_tools.as_ref().is_none_or(|enabled| enabled.contains(name)) && !self.disabled_tools.contains(name)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// `http` for a server at `url` (Streamable HTTP, or the older transport if it answers as one of those), `sse` for one of the older transport (HTTP
     /// with server-sent events, before Streamable HTTP); none, or `stdio`, for a program.
@@ -41,17 +55,36 @@ pub struct ServerConfig {
     pub command: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default, deserialize_with = "read_server_url", skip_serializing_if = "String::is_empty")]
     pub url: String,
     /// Sent with every request to `url`: an `Authorization` among them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub tool_selection: ToolSelection,
     /// The person's word that what this server returns is not a stranger's. In this app's own file, which neither a model's tools nor a command can write.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trusted: bool,
 }
+
+/// Normalize the HTTP scheme while preserving the exact server address, path and query.
+pub fn mcp_url(typed: &str) -> Option<String> {
+    let (scheme, rest) = typed.split_once("://")?;
+    let scheme = ["http", "https"].into_iter().find(|candidate| scheme.eq_ignore_ascii_case(candidate))?;
+    Some(format!("{scheme}://{rest}"))
+}
+
+fn read_server_url<'de, D: serde::Deserializer<'de>>(data: D) -> Result<String, D::Error> {
+    let url = String::deserialize(data)?;
+    Ok(mcp_url(&url).unwrap_or(url))
+}
+
+/// Shown before invalid endpoint settings replace a working registration.
+pub const INVALID_SERVER_URL: &str = "Enter a valid http:// or https:// server URL. Check the host name for spaces, the port number, and the brackets around IPv6 addresses.";
 
 impl ServerConfig {
     /// A server at a URL, and not a program.
@@ -64,7 +97,7 @@ impl ServerConfig {
         match (self.command.trim().is_empty(), self.url.trim().is_empty()) {
             (true, true) => Some("a command to run, or the URL of a server, is needed".to_string()),
             (false, false) => Some("a command or a URL, not both".to_string()),
-            (true, false) if !(self.url.starts_with("http://") || self.url.starts_with("https://")) => Some(format!("{}: a URL begins with http:// or https://", self.url)),
+            (true, false) if crate::http::Url::parse(&self.url).is_err() => Some(INVALID_SERVER_URL.to_string()),
             _ => None,
         }
     }
@@ -77,62 +110,143 @@ pub struct Config {
 }
 
 pub fn load_config(file: &Path) -> Config {
-    std::fs::read_to_string(file).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+    readable_config(file).unwrap_or_default()
 }
 
-/// Claude Code's own list of servers: the `mcpServers` of `~/.claude.json`, programs and HTTP ones (an SSE one, of the protocol's older transport, is left out).
-pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
-    let value: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-    let mut found = BTreeMap::new();
-    for (name, server) in value.get("mcpServers").and_then(Value::as_object).into_iter().flatten() {
-        if let Ok(mut config) = serde_json::from_value::<ServerConfig>(server.clone()) {
-            if config.kind == "stdio" {
-                config.kind.clear();
-            }
-            if config.problem().is_none() {
-                found.insert(name.clone(), config);
-            }
+#[derive(Default)]
+struct ParsedServers {
+    servers: BTreeMap<String, ServerConfig>,
+    skipped_invalid: bool,
+}
+
+impl ParsedServers {
+    fn add(&mut self, name: String, config: ServerConfig) {
+        // The preview lists one name per line, and the import command trims its argument.
+        // Keep each external identifier exact so a padded entry cannot select a different server.
+        if name.is_empty() || name.trim() != name || name.contains(['\r', '\n']) {
+            self.skipped_invalid = true;
+            return;
+        }
+        if config.problem().is_none() {
+            self.servers.insert(name, config);
+        } else {
+            self.skipped_invalid = true;
         }
     }
-    found
 }
 
-/// Codex's: the `[mcp_servers.NAME]` tables of `~/.codex/config.toml`, of which only these simple forms are read.
-pub fn servers_of_codex(text: &str) -> BTreeMap<String, ServerConfig> {
-    let unquote = |value: &str| value.trim().trim_matches('"').replace("\\\\", "\\").replace("\\\"", "\"");
-    let mut found: BTreeMap<String, ServerConfig> = BTreeMap::new();
-    let (mut current, mut in_env, mut in_headers) = (None, false, false);
-    for line in text.lines().map(str::trim) {
-        if let Some(table) = line.strip_prefix('[').and_then(|line| line.strip_suffix(']')) {
-            (current, in_env, in_headers) = match table.strip_prefix("mcp_servers.") {
-                Some(rest) => match (rest.strip_suffix(".env"), rest.strip_suffix(".http_headers")) {
-                    (Some(name), _) => (Some(name.trim_matches('"').to_string()), true, false),
-                    (_, Some(name)) => (Some(name.trim_matches('"').to_string()), false, true),
-                    _ if rest.contains('.') => (None, false, false),
-                    _ => (Some(rest.trim_matches('"').to_string()), false, false),
-                },
-                None => (None, false, false),
-            };
+/// Claude Code's own list of servers: the `mcpServers` of `~/.claude.json`, stdio, HTTP and SSE servers.
+pub fn servers_of_claude(text: &str) -> BTreeMap<String, ServerConfig> {
+    parse_claude_servers(text).unwrap_or_default().servers
+}
+
+fn parse_claude_servers(text: &str) -> Option<ParsedServers> {
+    let mut value = serde_json::from_str::<serde_json::Map<String, Value>>(text.strip_prefix('\u{feff}').unwrap_or(text)).ok()?;
+    let servers = value.remove("mcpServers").unwrap_or_else(|| Value::Object(Default::default()));
+    let mut found = ParsedServers::default();
+    for (name, server) in servers.as_object()? {
+        // Inspect the declared transport before interpreting its settings. Other transports have their own schemas.
+        let required = match server.get("type").and_then(Value::as_str) {
+            None | Some("") => None,
+            Some("stdio") => Some("command"),
+            Some("http" | "sse") => Some("url"),
+            Some(_) => continue,
+        };
+        if required.is_some_and(|key| server[key].as_str().is_none_or(|value| value.trim().is_empty())) {
+            found.skipped_invalid = true;
             continue;
         }
-        let (Some(name), Some((key, value))) = (&current, line.split_once('=')) else { continue };
-        let (key, value) = (key.trim(), value.trim());
-        let server = found.entry(name.clone()).or_default();
-        if in_env {
-            server.env.insert(key.to_string(), unquote(value));
-        } else if in_headers {
-            server.headers.insert(key.trim_matches('"').to_string(), unquote(value));
-        } else if key == "url" {
-            server.url = unquote(value);
-        } else if key == "command" {
-            server.command = unquote(value);
-        } else if key == "args" {
-            let inner = value.trim_start_matches('[').trim_end_matches(']');
-            server.args = inner.split("\",").map(unquote).filter(|arg| !arg.is_empty()).collect();
+        let Ok(mut config) = serde_json::from_value::<ServerConfig>(server.clone()) else {
+            found.skipped_invalid = true;
+            continue;
+        };
+        if config.kind == "stdio" {
+            config.kind.clear();
+        }
+        found.add(name.clone(), config);
+    }
+    Some(found)
+}
+
+/// Import the launch settings of individual servers from Codex's TOML configuration.
+pub fn servers_of_codex(text: &str) -> BTreeMap<String, ServerConfig> {
+    parse_codex_servers(text).unwrap_or_default().servers
+}
+
+fn parse_codex_servers(text: &str) -> Option<ParsedServers> {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct CodexServer {
+        command: String,
+        args: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: BTreeMap<String, String>,
+        #[serde(deserialize_with = "read_server_url")]
+        url: String,
+        http_headers: BTreeMap<String, String>,
+        #[serde(flatten)]
+        tool_selection: ToolSelection,
+    }
+
+    let mut config = toml::from_str::<toml::Table>(text).ok()?;
+    let mut found = ParsedServers::default();
+    let Some(servers) = config.remove("mcp_servers") else { return Some(found) };
+    let toml::Value::Table(servers) = servers else { return None };
+    for (name, value) in servers {
+        match value.get("enabled") {
+            Some(toml::Value::Boolean(false)) => continue,
+            None | Some(toml::Value::Boolean(true)) => {}
+            Some(_) => {
+                found.skipped_invalid = true;
+                continue;
+            }
+        }
+        let Ok(server) = value.try_into::<CodexServer>() else {
+            found.skipped_invalid = true;
+            continue;
+        };
+        let config = ServerConfig {
+            command: server.command, args: server.args, cwd: server.cwd, env: server.env, url: server.url,
+            headers: server.http_headers, tool_selection: server.tool_selection, ..Default::default()
+        };
+        found.add(name, config);
+    }
+    Some(found)
+}
+
+/// Read the optional import sources in priority order. Report only filenames so malformed lines never expose settings.
+pub fn external_servers(home: &Path) -> (BTreeMap<String, ServerConfig>, Vec<&'static str>) {
+    external_servers_in(home, crate::codex::configured_home().as_deref())
+}
+
+/// An explicit Codex configuration directory replaces the default source. Claude still uses the user profile.
+pub fn external_servers_in(home: &Path, codex_home: Option<&Path>) -> (BTreeMap<String, ServerConfig>, Vec<&'static str>) {
+    let mut found = BTreeMap::new();
+    let mut unreadable = Vec::new();
+    type Parser = fn(&str) -> Option<ParsedServers>;
+    let (codex_file, label) = match codex_home {
+        Some(folder) => (folder.join("config.toml"), "$CODEX_HOME/config.toml"),
+        None => (home.join(".codex/config.toml"), ".codex/config.toml"),
+    };
+    for (path, file, parse) in [(home.join(".claude.json"), ".claude.json", parse_claude_servers as Parser), (codex_file, label, parse_codex_servers)] {
+        let servers = match std::fs::read_to_string(path) {
+            Ok(text) => parse(&text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => None,
+        };
+        match servers {
+            Some(parsed) => {
+                if parsed.skipped_invalid {
+                    unreadable.push(file);
+                }
+                for (name, server) in parsed.servers {
+                    found.entry(name).or_insert(server);
+                }
+            }
+            None => unreadable.push(file),
         }
     }
-    found.retain(|_, server| server.problem().is_none());
-    found
+    (found, unreadable)
 }
 
 /// The person's server, as they gave it in Settings, in place of the one called `before` (none for a new one). The file is written whole, through a partial one, so
@@ -262,11 +376,11 @@ pub fn remove_server(file: &Path, name: &str) -> Result<(), String> {
 }
 
 /// The file's servers; a file that is there and cannot be read is an error, so that nothing is written over it.
-fn readable_config(file: &Path) -> Result<Config, String> {
+pub fn readable_config(file: &Path) -> Result<Config, String> {
     match std::fs::read_to_string(file) {
         // (all a power cut left of it, which has nothing in it to keep)
         Ok(text) if crate::images::left_by_a_power_cut(text.as_bytes()) => Ok(Config::default()),
-        Ok(text) => serde_json::from_str(&text).map_err(|error| format!("{}: {error}", file.display())),
+        Ok(text) => serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)).map_err(|error| format!("{}: {error}", file.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(error) => Err(format!("{}: {error}", file.display())),
     }
@@ -290,7 +404,8 @@ pub fn import(file: &Path, more: BTreeMap<String, ServerConfig>) -> Result<usize
     let mut config = readable_config(file)?;
     let before = config.servers.len();
     for (name, server) in more {
-        config.servers.entry(name).or_insert(server);
+        // Trust is chosen for this app. An existing local choice is kept on reimport.
+        config.servers.entry(name).or_insert(ServerConfig { trusted: false, ..server });
     }
     let added = config.servers.len() - before;
     if added > 0 {
@@ -304,6 +419,8 @@ struct Rpc {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     answers: Receiver<Value>,
     next: u64,
+    /// The persistent incoming stream, for stdio and legacy SSE. Streamable HTTP uses per-request responses.
+    reader: Option<std::thread::JoinHandle<()>>,
     http: Option<Mutex<HttpLink>>,
     /// Set as the server says its list of tools changed (`LIST_CHANGED`), whenever it says it.
     changed: Arc<AtomicBool>,
@@ -653,10 +770,11 @@ impl Rpc {
     fn over(writer: Box<dyn Write + Send>, reader: impl BufRead + Send + 'static) -> Rpc {
         let writer = Arc::new(Mutex::new(writer));
         let (sender, answers) = channel();
-        let replies = writer.clone();
+        // Closing the last RPC writer lets a peer waiting for input leave, and its reader see EOF.
+        let replies = Arc::downgrade(&writer);
         let changed = Arc::new(AtomicBool::new(false));
         let told = changed.clone();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             let mut reader = reader;
             let mut line = Vec::new();
             loop {
@@ -675,6 +793,7 @@ impl Rpc {
                     },
                 };
                 if let Some(reply) = answer_to_server(&message) {
+                    let Some(replies) = replies.upgrade() else { return };
                     let mut out = replies.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let _ = writeln!(out, "{reply}").and_then(|()| out.flush());
                     continue;
@@ -689,14 +808,14 @@ impl Rpc {
                 }
             }
         });
-        Rpc { writer, answers, next: 1, http: None, changed }
+        Rpc { writer, answers, next: 1, reader: Some(thread), http: None, changed }
     }
 
     /// For a server at a URL: its messages go by HTTP, and the pipes are none.
     fn http(link: HttpLink) -> Rpc {
         let (_, answers) = channel();
         let changed = link.changed.clone();
-        Rpc { writer: Arc::new(Mutex::new(Box::new(std::io::sink()))), answers, next: 1, http: Some(Mutex::new(link)), changed }
+        Rpc { writer: Arc::new(Mutex::new(Box::new(std::io::sink()))), answers, next: 1, reader: None, http: Some(Mutex::new(link)), changed }
     }
 
     fn send(&self, message: &Value) -> Result<(), String> {
@@ -909,7 +1028,7 @@ pub struct Picture {
 fn result_parts(result: &Value, pictures: bool) -> (String, Vec<Picture>) {
     let said = |part: &Value, field: &str| part.get(field).and_then(Value::as_str).unwrap_or("").to_string();
     let mut taken = Vec::new();
-    let parts: Vec<String> = result.get("content").and_then(Value::as_array).into_iter().flatten().map(|part| match part.get("type").and_then(Value::as_str) {
+    let mut parts: Vec<String> = result.get("content").and_then(Value::as_array).into_iter().flatten().map(|part| match part.get("type").and_then(Value::as_str) {
         Some("text") => said(part, "text"),
         Some("image") if pictures => {
             let data: String = said(part, "data").chars().filter(|c| !c.is_whitespace()).collect();
@@ -935,7 +1054,15 @@ fn result_parts(result: &Value, pictures: bool) -> (String, Vec<Picture>) {
         Some(kind) => format!("[{kind} content is not shown]"),
         None => part.to_string(),
     }).collect();
-    let text = if parts.is_empty() { result.get("structuredContent").map_or(String::new(), Value::to_string) } else { parts.join("\n") };
+    if let Some(structured) = result.get("structuredContent") {
+        // Servers can also send the same JSON as a text block for older clients.
+        let json = structured.to_string();
+        let already_shown = parts.iter().any(|part| part == &json || serde_json::from_str::<Value>(part).as_ref().ok() == Some(structured));
+        if !already_shown {
+            parts.push(json);
+        }
+    }
+    let text = parts.join("\n");
     (crate::tools::spill("mcp", &text, MAX_RESULT), taken)
 }
 
@@ -1116,6 +1243,7 @@ impl Drop for Process {
 /// A server that is up, with its tools as it last listed them. One that lists them again (see `Hub::relisted`) is another of these, on the same connection
 /// and process, which end with the last that has them.
 struct Running {
+    reader: Option<Arc<std::thread::JoinHandle<()>>>,
     rpc: Arc<Mutex<Rpc>>,
     /// The connection's `Rpc::changed`, to be read without waiting for a call that holds it.
     changed: Arc<AtomicBool>,
@@ -1127,13 +1255,17 @@ struct Running {
 
 impl Running {
     /// Up, with the tools it listed as `schemas` (under its own names, and none placed yet).
-    fn new(rpc: Rpc, schemas: Vec<Value>, process: Option<Process>) -> Running {
-        Running { changed: rpc.changed.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, process: process.map(Arc::new) }
+    fn new(mut rpc: Rpc, schemas: Vec<Value>, process: Option<Process>) -> Running {
+        Running { reader: rpc.reader.take().map(Arc::new), changed: rpc.changed.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, process: process.map(Arc::new) }
     }
 
     /// The same server with its tools as it lists them now.
     fn with_tools(&self, names: BTreeMap<String, String>, schemas: Vec<Value>) -> Running {
-        Running { rpc: self.rpc.clone(), changed: self.changed.clone(), names, schemas, process: self.process.clone() }
+        Running { reader: self.reader.clone(), rpc: self.rpc.clone(), changed: self.changed.clone(), names, schemas, process: self.process.clone() }
+    }
+
+    fn disconnected(&self) -> bool {
+        self.reader.as_ref().is_some_and(|reader| reader.is_finished())
     }
 
     fn is(&self, other: &Running) -> bool {
@@ -1169,6 +1301,8 @@ pub enum State {
     Starting,
     /// Up, with this many tools.
     Up(usize),
+    /// Its persistent incoming stream ended after startup.
+    Disconnected,
     /// It did not start, or did not start again, and why.
     Failed(String),
 }
@@ -1208,6 +1342,13 @@ fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Res
         };
     }
     let (path, script) = program(&config.command);
+    // Resolve explicit relative executable paths before spawning: Windows looks them up from the parent process.
+    let path = match &config.cwd {
+        Some(cwd) if path.is_relative() && Path::new(&config.command).components().count() > 1 => {
+            std::path::absolute(cwd.join(&path)).map_err(|error| format!("{}: {error}", cwd.display()))?
+        }
+        _ => path,
+    };
     let mut command = if script {
         let mut shell = Command::new("cmd.exe");
         shell.arg("/c").arg(&path);
@@ -1223,15 +1364,23 @@ fn start_server_within(config: &ServerConfig, limit: Duration, job: bool) -> Res
     // (the protocol's messages are UTF-8: a Python server reads and writes its pipes in the machine's own code page otherwise, cp932 on a Japanese
     // Windows, and Japanese in a call came to it garbled; what the configuration says comes after, and wins)
     command.env("PYTHONIOENCODING", "utf-8");
+    if let Some(cwd) = &config.cwd {
+        command.current_dir(cwd);
+    }
     command.args(&config.args).envs(&config.env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let child = command.spawn().map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => format!("{}: {NOT_FOUND}", config.command),
-        _ => format!("{}: {error}", config.command),
+    let child = command.spawn().map_err(|error| {
+        if let Some(cwd) = config.cwd.as_ref().filter(|cwd| !cwd.is_dir()) {
+            return format!("{}: {error}", cwd.display());
+        }
+        match error.kind() {
+            std::io::ErrorKind::NotFound => format!("{}: {NOT_FOUND}", config.command),
+            _ => format!("{}: {error}", config.command),
+        }
     })?;
     #[cfg(windows)]
     let ending = if job { ends_with_this_process(&child) } else { None };
@@ -1272,7 +1421,7 @@ fn schema_of(server: &str, part: &str, tool: &Value) -> Option<(String, String, 
 /// A server's tools under the names the model knows them by, in an order that does not depend on the server's mood. A cut or a cleaning that gives two tools
 /// one name gets the second a number: the services refuse the whole request over a name twice, and so every request. A server's own part (see `name_parts`) keeps its
 /// names from another server's.
-fn place_tools(server: &str, part: &str, tools: &[Value]) -> (BTreeMap<String, String>, Vec<Value>) {
+fn place_tools(server: &str, part: &str, tools: &[Value], selection: Option<&ToolSelection>) -> (BTreeMap<String, String>, Vec<Value>) {
     let mut listed: Vec<(String, String, Value)> = tools.iter().filter_map(|tool| schema_of(server, part, tool)).collect();
     listed.sort_by(|a, b| a.1.cmp(&b.1));
     let (mut names, mut schemas) = (BTreeMap::new(), Vec::new());
@@ -1287,13 +1436,18 @@ fn place_tools(server: &str, part: &str, tools: &[Value]) -> (BTreeMap<String, S
         names.insert(known, real);
         schemas.push(schema);
     }
+    // Assign aliases before filtering so excluding a tool cannot give its name to a different tool.
+    if let Some(selection) = selection.filter(|s| s.enabled_tools.is_some() || !s.disabled_tools.is_empty()) {
+        names.retain(|_, original| selection.allows(original));
+        schemas.retain(|schema| schema["function"]["name"].as_str().is_some_and(|name| names.contains_key(name)));
+    }
     (names, schemas)
 }
 
 fn ready(name: &str, part: &str, config: &ServerConfig) -> Result<Arc<Running>, String> {
     let mut running = start_server(config)?;
     let tools = std::mem::take(&mut running.schemas);
-    (running.names, running.schemas) = place_tools(name, part, &tools);
+    (running.names, running.schemas) = place_tools(name, part, &tools, Some(&config.tool_selection));
     Ok(Arc::new(running))
 }
 
@@ -1309,6 +1463,11 @@ impl Hub {
     /// The file read again, as the person changed it in Settings: a server no longer there ends, a new one starts, and one whose configuration changed starts
     /// again with it; one that did not change goes on as it was (its trust as the file now says). Says the names of those started.
     pub fn reload(&self) -> Vec<String> {
+        self.reload_retrying(None)
+    }
+
+    /// Reload settings and retry the named server if startup failed or its connection ended.
+    pub fn reload_retrying(&self, retry_server: Option<&str>) -> Vec<String> {
         let Some(file) = self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else { return Vec::new() };
         // (a file that cannot be read, as one written by hand can be, starts nothing and ends nothing: it is said, for the person to mend)
         let read = readable_config(&file);
@@ -1324,7 +1483,8 @@ impl Hub {
             if let Some(slot) = at.map(|at| &mut slots[at]) {
                 let mut same = config.clone();
                 same.trusted = slot.config.as_ref().map_or(config.trusted, |was| was.trusted);
-                if slot.config.as_ref() == Some(&same) && slot.part == part {
+                let retry = retry_server == Some(name.as_str()) && (slot.failed.is_some() || slot.running.as_ref().is_some_and(|server| server.disconnected()));
+                if !retry && slot.config.as_ref() == Some(&same) && slot.part == part {
                     slot.trusted = config.trusted;
                     slot.config = Some(config);
                     continue;
@@ -1384,7 +1544,7 @@ impl Hub {
     pub fn schemas(&self) -> Vec<Value> {
         let told: Vec<Arc<Running>> = {
             let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            slots.iter().filter_map(|slot| slot.running.clone()).filter(|running| running.changed.load(Ordering::Relaxed)).collect()
+            slots.iter().filter_map(|slot| slot.running.clone()).filter(|running| !running.disconnected() && running.changed.load(Ordering::Relaxed)).collect()
         };
         for running in told {
             let Ok(mut rpc) = running.rpc.try_lock() else { continue };
@@ -1393,7 +1553,7 @@ impl Hub {
             self.relisted(&running, listed);
         }
         let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        slots.iter().filter_map(|slot| slot.running.as_ref()).flat_map(|running| running.schemas.iter().cloned()).collect()
+        slots.iter().filter_map(|slot| slot.running.as_ref()).filter(|running| !running.disconnected()).flat_map(|running| running.schemas.iter().cloned()).collect()
     }
 
     pub fn call(&self, tool: &str, arguments: &Value, cancel: &AtomicBool) -> Result<String, String> {
@@ -1468,7 +1628,7 @@ impl Hub {
         let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(slot) = slots.iter_mut().find(|slot| slot.running.as_ref().is_some_and(|now| now.is(running))) else { return };
         let Some(now) = slot.running.clone() else { return };
-        let (names, schemas) = place_tools(&slot.name, &slot.part, &tools);
+        let (names, schemas) = place_tools(&slot.name, &slot.part, &tools, slot.config.as_ref().map(|c| &c.tool_selection));
         if names == now.names && schemas == now.schemas {
             return;
         }
@@ -1557,8 +1717,8 @@ impl Hub {
     /// One more server, up with these tools, that answers with these lines: as one the person added while a session went on.
     #[cfg(test)]
     pub(crate) fn add_scripted(&self, server: &str, tools: &[Value], lines: &[Value], trusted: bool) {
-        let script: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        self.add_running(server, tools, Box::new(std::io::sink()), std::io::Cursor::new(script.into_bytes()), trusted);
+        let (writer, reader) = scripted_transport(lines);
+        self.add_running(server, tools, Box::new(writer), reader, trusted);
     }
 
     /// A server, up with these tools, that says each of `turns` as it is sent a request, in order: what it says in a call is said in it, and not before.
@@ -1573,9 +1733,32 @@ impl Hub {
 
     #[cfg(test)]
     fn add_running(&self, server: &str, tools: &[Value], writer: Box<dyn Write + Send>, reader: impl BufRead + Send + 'static, trusted: bool) {
-        let (names, schemas) = place_tools(server, &name_part(server), tools);
+        let (names, schemas) = place_tools(server, &name_part(server), tools, None);
         let running = Arc::new(Running { names, schemas, ..Running::new(Rpc::over(writer, reader), Vec::new(), None) });
         self.slots.lock().unwrap().push(Slot { name: server.into(), part: name_part(server), running: Some(running), trusted, ..Slot::default() });
+    }
+
+    /// The desktop client's current view. Keep launch arguments, headers and server error messages out of the prompt.
+    pub(crate) fn connection_facts(&self) -> String {
+        let states: Vec<String> = self.states().into_iter().map(|(name, state)| {
+            let state = match state {
+                State::Up(count) => format!("connected, tools: {count}"),
+                State::Starting => "starting".into(),
+                State::Disconnected => "disconnected".into(),
+                State::Failed(_) => "failed to start".into(),
+            };
+            format!("{name}: {state}")
+        }).collect();
+        let mut status = states.join("; ");
+        if self.unreadable().is_some() {
+            if !status.is_empty() {
+                status.push_str(". ");
+            }
+            status.push_str("Dogmind could not read its MCP configuration");
+        } else if status.is_empty() {
+            status.push_str("No servers configured in Dogmind. For a connection question, give the setup steps directly. Probing ports from the sandbox cannot establish this client's connection status");
+        }
+        format!("Dogmind has a built-in MCP client outside the command sandbox. {status}. The user can enter `/mcp` for status, `/mcp candidates` for importable names, and `/mcp import NAME` to add and start one or retry it after disconnection or a startup failure. Bare `/mcp import` imports all available servers from Claude and Codex. To add one manually, the user opens Settings > Tools > MCP servers > Add a server. On connection its tools join this open conversation automatically, without a restart or reconnect command.")
     }
 
     /// One line a server, for the person.
@@ -1584,6 +1767,7 @@ impl Hub {
             State::Up(tools) => format!("{name}: {tools} tools"),
             State::Failed(error) => format!("{name}: did not start: {error}"),
             State::Starting => format!("{name}: starting"),
+            State::Disconnected => format!("{name}: disconnected"),
         }).collect()
     }
 
@@ -1591,6 +1775,7 @@ impl Hub {
     pub fn states(&self) -> Vec<(String, State)> {
         self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().map(|slot| {
             let state = match (&slot.running, &slot.failed) {
+                (Some(running), _) if running.disconnected() => State::Disconnected,
                 (Some(running), _) => State::Up(running.names.len()),
                 (_, Some(error)) => State::Failed(error.clone()),
                 _ => State::Starting,
@@ -1598,6 +1783,16 @@ impl Hub {
             (slot.name.clone(), state)
         }).collect()
     }
+}
+
+/// Queue the scripted replies and keep the connection open until its writer is dropped.
+#[cfg(test)]
+fn scripted_transport(lines: &[Value]) -> (Turns, BufReader<Heard>) {
+    let (said, heard) = channel();
+    for line in lines {
+        said.send(format!("{line}\n").into_bytes()).unwrap();
+    }
+    (Turns { turns: Default::default(), said, written: Vec::new() }, BufReader::new(Heard { from: heard, pending: Vec::new() }))
 }
 
 /// The side of `Hub::answering`'s server that is written to: each request it is sent lets the next of its turns be said.
@@ -1655,6 +1850,75 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn mcp_json_settings_accept_a_leading_utf8_bom() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        let text = "\u{feff}{\"mcpServers\":{\"editor\":{\"command\":\"local\",\"args\":[\"a\u{feff}b\"]}}}";
+        std::fs::write(&file, text).unwrap();
+        let own = readable_config(&file).unwrap().servers;
+        assert_eq!(own["editor"].args, ["a\u{feff}b"]);
+        assert_eq!(load_config(&file).servers, own);
+        assert_eq!(servers_of_claude(text), own);
+
+        std::fs::write(&file, "\u{feff}{broken}").unwrap();
+        assert!(readable_config(&file).is_err());
+        assert!(parse_claude_servers("\u{feff}{broken}").is_none());
+    }
+
+    #[test]
+    fn a_url_the_transport_cannot_read_does_not_replace_a_saved_server_or_become_an_import_candidate() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        let remote = |url: &str| ServerConfig { url: url.into(), ..Default::default() };
+        let good = "https://[::1]:8443/My%20Server/McP?session=example";
+        save_server(&file, None, "editor", remote(good)).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        for bad in ["https://", "http://?key=private-fixture", "http://host:no", "https://host:65536", "http://[::1/mcp", "http://local host/mcp", "https://local\u{3000}host:443/mcp"] {
+            let error = save_server(&file, Some("editor"), "editor", remote(bad)).unwrap_err();
+            assert!(!error.contains("private-fixture"));
+            assert_eq!(std::fs::read(&file).unwrap(), before);
+            let claude = json!({"mcpServers":{"editor":{"url":good},"bad":{"url":bad}}});
+            let codex = format!("[mcp_servers.editor]\nurl='{good}'\n[mcp_servers.bad]\nurl='{bad}'");
+            for parsed in [parse_claude_servers(&claude.to_string()).unwrap(), parse_codex_servers(&codex).unwrap()] {
+                assert!(parsed.skipped_invalid);
+                assert_eq!(parsed.servers.len(), 1);
+                assert_eq!(parsed.servers["editor"].url, good);
+            }
+        }
+        // An older version may already have saved the invalid URL. The form can still read and repair it.
+        std::fs::write(&file, r#"{"mcpServers":{"editor":{"url":"https://"}}}"#).unwrap();
+        assert_eq!(readable_config(&file).unwrap().servers["editor"].url, "https://");
+        save_server(&file, Some("editor"), "editor", remote(good)).unwrap();
+        assert_eq!(readable_config(&file).unwrap().servers["editor"].url, good);
+    }
+
+    #[test]
+    fn claude_import_respects_the_transport_declared_for_each_server() {
+        let source = json!({"mcpServers": {
+            "implicit": {"url": "http://localhost/mcp"},
+            "process": {"type": "stdio", "command": "editor"},
+            "stream": {"type": "http", "url": "http://localhost/mcp"},
+            "events": {"type": "sse", "url": "http://localhost/events"},
+            "other": {"type": "custom", "url": "http://localhost/other"},
+            "other-schema": {"type": "custom", "args": {"layout": "custom"}}
+        }});
+        let good = parse_claude_servers(&source.to_string()).unwrap();
+        assert!(!good.skipped_invalid);
+        assert_eq!(good.servers.keys().map(String::as_str).collect::<Vec<_>>(), ["events", "implicit", "process", "stream"]);
+        for bad in [
+            json!({"type": "stdio", "url": "http://localhost/mcp"}),
+            json!({"type": "http", "command": "editor"}),
+            json!({"type": "sse", "command": "editor"}),
+        ] {
+            let mut mixed = source.clone();
+            mixed["mcpServers"]["mismatch"] = bad;
+            let parsed = parse_claude_servers(&mixed.to_string()).unwrap();
+            assert!(parsed.skipped_invalid);
+            assert_eq!(parsed.servers, good.servers);
+        }
+    }
+
+    #[test]
     fn claudes_file_is_read_as_it_is() {
         let text = r#"{"numStartups": 3, "mcpServers": {"files": {"type": "stdio", "command": "npx", "args": ["-y", "server"], "env": {"K": "v"}}, "remote": {"type": "http", "url": "https://x", "headers": {"Authorization": "Bearer t"}}, "old": {"type": "sse", "url": "https://y"}}}"#;
         let found = servers_of_claude(text);
@@ -1666,6 +1930,25 @@ mod tests {
         assert!(found["remote"].is_http());
         assert_eq!(found["remote"].headers["Authorization"], "Bearer t");
         assert!(servers_of_claude("not json").is_empty());
+    }
+
+    #[test]
+    fn config_sources_preserve_everything_after_the_http_scheme() {
+        for (typed, scheme) in [("hTtP", "http"), ("HtTpS", "https")] {
+            let rest = "Example.org/Project/McP%2F?Mode=Live";
+            let url = format!("{typed}://{rest}");
+            let json = serde_json::json!({"mcpServers": {"remote": {"url": url}, "other": {"url": "Ws://Host/Path"}}});
+            let saved: Config = serde_json::from_value(json.clone()).unwrap();
+            let claude = servers_of_claude(&json.to_string());
+            let codex = servers_of_codex(&format!("[mcp_servers.remote]\nurl='{url}'\n[mcp_servers.other]\nurl='Ws://Host/Path'"));
+            for source in [&saved.servers, &claude, &codex] {
+                assert_eq!(source["remote"].url, format!("{scheme}://{rest}"));
+                assert!(source["remote"].problem().is_none());
+            }
+            assert_eq!(saved.servers["other"].url, "Ws://Host/Path");
+            assert!(saved.servers["other"].problem().is_some());
+            assert!(!claude.contains_key("other") && !codex.contains_key("other"));
+        }
     }
 
     #[test]
@@ -1681,8 +1964,43 @@ mod tests {
     }
 
     #[test]
+    fn codex_import_preserves_literal_windows_paths_and_argument_boundaries() {
+        let text = r#"
+[mcp_servers.unity_mcp]
+command = "node"
+args = [
+    'C:\Tools\Unity MCP\build\index.js', # literal backslashes
+    "--name=a,b", "",
+]
+[mcp_servers.off]
+command = "node"
+enabled = false
+"#;
+        let found = servers_of_codex(text);
+        assert_eq!(found["unity_mcp"].args, [r"C:\Tools\Unity MCP\build\index.js", "--name=a,b", ""]);
+        assert!(!found.contains_key("off"));
+    }
+
+    #[test]
+    fn imported_launch_settings_leave_trust_to_the_person_in_dogmind() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        let sources = servers_of_claude(r#"{"mcpServers":{"editor":{"command":"editor","args":["--stdio"],"trusted":true}}}"#);
+        assert_eq!(import(&file, sources.clone()).unwrap(), 1);
+        let mut editor = readable_config(&file).unwrap().servers.remove("editor").unwrap();
+        assert_eq!(editor.args, ["--stdio"]);
+        assert!(!editor.trusted);
+        editor.trusted = true;
+        save_server(&file, Some("editor"), "editor", editor).unwrap();
+        let mut repeated = sources;
+        repeated.get_mut("editor").unwrap().trusted = false;
+        assert_eq!(import(&file, repeated).unwrap(), 0);
+        assert!(readable_config(&file).unwrap().servers["editor"].trusted);
+    }
+
+    #[test]
     fn an_import_adds_and_keeps_what_was_there() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("deep/mcp.json");
         let one = |command: &str| ServerConfig { command: command.into(), ..ServerConfig::default() };
         assert_eq!(import(&file, BTreeMap::from([("a".to_string(), one("first"))])).unwrap(), 1);
@@ -1701,7 +2019,7 @@ mod tests {
     /// A file written by hand with a mistake in it: the hub says why, and starts nothing; mended, it starts what it lists.
     #[test]
     fn a_file_that_cannot_be_read_is_said_and_starts_nothing_until_it_can() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         std::fs::write(&file, "{\"mcpServers\": {\"a\": {\"command\": \"no-such-program-here\"},}}").unwrap();
         let hub = Hub::start(&file);
@@ -1792,7 +2110,7 @@ mod tests {
     fn a_server_of_the_older_transport_is_reached_as_its_configuration_says_or_as_its_url_answers() {
         for kind in ["sse", "http"] {
             let (url, seen) = older_server();
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::in_container::tempdir().unwrap();
             let file = dir.path().join("mcp.json");
             let headers = BTreeMap::from([("Authorization".to_string(), "Bearer t".to_string())]);
             save_server(&file, None, "old", ServerConfig { url, kind: kind.into(), headers, ..ServerConfig::default() }).unwrap();
@@ -1930,7 +2248,7 @@ mod tests {
         let (url, seen) = http_server("echo");
         let config = ServerConfig { url: url.clone(), kind: "http".into(), headers: BTreeMap::from([("Authorization".to_string(), "Bearer secret".to_string())]), ..ServerConfig::default() };
         assert!(config.is_http() && config.problem().is_none());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "remote", config).unwrap();
         let hub = Hub::start(&file);
@@ -1941,6 +2259,8 @@ mod tests {
         assert_eq!(hub.schemas()[0]["function"]["name"], "mcp__remote__echo", "{:?}", hub.status());
         let said = hub.call("mcp__remote__echo", &json!({"a": 1}), &AtomicBool::new(false)).unwrap();
         assert!(said.starts_with(r#"{"a":1} with"#), "{said}");
+        assert_eq!(hub.states(), [("remote".into(), State::Up(1))]);
+        assert!(hub.reload_retrying(Some("remote")).is_empty());
         let lower = said.to_ascii_lowercase();
         assert!(lower.contains("authorization: bearer secret") && lower.contains("mcp-session-id: s-1") && lower.contains(&format!("mcp-protocol-version: {PROTOCOL}")), "{said}");
         let seen = seen.lock().unwrap();
@@ -1954,7 +2274,7 @@ mod tests {
     #[test]
     fn what_a_server_at_a_url_asks_is_answered_in_its_session() {
         let (url, seen) = http_server("ask");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "remote", ServerConfig { url, ..ServerConfig::default() }).unwrap();
         let hub = Hub::start(&file);
@@ -1992,7 +2312,7 @@ mod tests {
     #[test]
     fn a_server_at_a_url_that_says_between_requests_that_its_tools_changed_is_heard() {
         let (url, seen) = http_server_with("echo", false, true);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "remote", ServerConfig { url, ..ServerConfig::default() }).unwrap();
         let hub = Hub::start(&file);
@@ -2021,7 +2341,7 @@ mod tests {
     #[test]
     fn a_session_the_server_let_go_is_begun_again_and_the_call_made_in_the_new_one() {
         let (url, seen) = http_server_with("echo", true, false);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "remote", ServerConfig { url, ..ServerConfig::default() }).unwrap();
         let hub = Hub::start(&file);
@@ -2043,7 +2363,7 @@ mod tests {
     #[test]
     fn a_change_to_the_servers_starts_and_ends_only_what_changed() {
         let ((one, _), (two, _)) = (http_server("first"), http_server("second"));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         let at = |url: &str| ServerConfig { url: url.to_string(), ..ServerConfig::default() };
         save_server(&file, None, "a", at(&one)).unwrap();
@@ -2084,6 +2404,22 @@ mod tests {
         save_server(&file, None, "d", at(&one)).unwrap();
         assert_eq!(load_config(&file).servers.keys().collect::<Vec<_>>(), ["d"]);
         assert!(save_server(&file, None, "x", at("ftp://x")).unwrap_err().contains("http"));
+    }
+
+    #[test]
+    fn saving_a_failed_server_retries_only_that_server() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        std::fs::write(&file, r#"{"mcpServers":{"a":{},"b":{}}}"#).unwrap();
+        let hub = Hub::start(&file);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !hub.states().iter().all(|(_, state)| matches!(state, State::Failed(_))) {
+            assert!(Instant::now() < deadline, "waiting for the invalid configurations to fail");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(hub.reload().is_empty());
+        assert_eq!(hub.reload_retrying(Some("a")), ["a"]);
+        assert!(matches!(&hub.states()[1].1, State::Failed(_)));
     }
 
     /// Arguments go to a line and back as they were, as Windows quotes them; a line typed by hand is read the same way.
@@ -2173,6 +2509,8 @@ mod tests {
         ]});
         assert_eq!(result_text(&resources), "[resource repo://o/r/contents/a.rs]\nfn main() {}\n[resource file:///x.png: image/png bytes, not shown]\n[resource link file:///y.txt (y.txt: the log)]");
         assert_eq!(result_text(&json!({"structuredContent": {"a": 1}})), r#"{"a":1}"#);
+        let mirrored = json!({"content": [{"type": "text", "text": "ready"}, {"type": "text", "text": "{ \"b\": 2, \"a\": 1 }"}], "structuredContent": {"a": 1, "b": 2}});
+        assert_eq!(result_text(&mirrored), "ready\n{ \"b\": 2, \"a\": 1 }");
     }
 
     #[test]
@@ -2242,23 +2580,72 @@ mod tests {
     }
 
     #[test]
+    fn imported_tool_selection_applies_to_a_refreshed_catalog() {
+        let config = servers_of_codex("[mcp_servers.clock]\ncommand='clock'\nenabled_tools=['time.local','time_local','zone']\ndisabled_tools=['time.local']").remove("clock").unwrap();
+        let hub = Hub::scripted("clock", &[tool("zone")], &[], false);
+        let running = {
+            let mut slots = hub.slots.lock().unwrap();
+            slots[0].config = Some(config);
+            slots[0].running.clone().unwrap()
+        };
+        hub.relisted(&running, Ok(vec![tool("date"), tool("time.local"), tool("time_local"), tool("zone")]));
+        let schemas = hub.schemas();
+        let shown: Vec<_> = schemas.iter().map(|schema| schema["function"]["name"].as_str().unwrap()).collect();
+        assert_eq!(shown, ["mcp__clock__time_local_2", "mcp__clock__zone"]);
+        let slots = hub.slots.lock().unwrap();
+        let names = &slots[0].running.as_ref().unwrap().names;
+        assert_eq!(names.len(), shown.len());
+        assert_eq!(names["mcp__clock__time_local_2"], "time_local");
+        assert_eq!(names["mcp__clock__zone"], "zone");
+    }
+
+    #[test]
+    fn an_empty_allow_list_disables_all_tools_and_an_absent_one_allows_unlisted_tools() {
+        for (settings, expected_count) in [("enabled_tools=[]", 0), ("disabled_tools=['date']", 1), ("", 2)] {
+            let config = servers_of_codex(&format!("[mcp_servers.clock]\nurl='http://localhost'\n{settings}")).remove("clock").unwrap();
+            let (names, schemas) = place_tools("clock", "clock", &[tool("date"), tool("time")], Some(&config.tool_selection));
+            assert_eq!(names.len(), expected_count, "{settings}");
+            assert_eq!(schemas.len(), expected_count, "{settings}");
+            assert_eq!(names.contains_key("mcp__clock__time"), expected_count > 0);
+        }
+    }
+
+    #[test]
     fn two_tools_never_share_a_name_and_the_order_is_the_tools_own() {
         let long = "t".repeat(70);
         let tools = [tool(&format!("{long}b")), tool(&format!("{long}a")), tool("do.it"), tool("do_it")];
-        let (names, schemas) = place_tools("srv", "srv", &tools);
+        let (names, schemas) = place_tools("srv", "srv", &tools, None);
         assert_eq!((names.len(), schemas.len()), (4, 4), "{names:?}");
         assert!(names.keys().all(|name| name.len() <= 64), "{names:?}");
         let spelled: Vec<&str> = schemas.iter().map(|schema| schema["function"]["name"].as_str().unwrap()).collect();
         assert!(spelled.iter().all(|name| names.contains_key(*name)));
-        let (_, reversed) = place_tools("srv", "srv", &[tool("do_it"), tool("do.it"), tool(&format!("{long}a")), tool(&format!("{long}b"))]);
+        let (_, reversed) = place_tools("srv", "srv", &[tool("do_it"), tool("do.it"), tool(&format!("{long}a")), tool(&format!("{long}b"))], None);
         assert_eq!(serde_json::to_string(&schemas).unwrap(), serde_json::to_string(&reversed).unwrap(), "whatever order it lists them in");
         assert_eq!(schemas[0]["function"]["parameters"]["type"], "object");
     }
 
     fn running(lines: &[Value], names: &[&str]) -> Arc<Running> {
-        let script: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        let (names, schemas) = place_tools("srv", "srv", &names.iter().map(|name| tool(name)).collect::<Vec<_>>());
-        Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(script.into_bytes())), Vec::new(), None) })
+        let (writer, reader) = scripted_transport(lines);
+        let (names, schemas) = place_tools("srv", "srv", &names.iter().map(|name| tool(name)).collect::<Vec<_>>(), None);
+        Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(writer), reader), Vec::new(), None) })
+    }
+
+    fn disconnected_server() -> Arc<Running> {
+        let (names, schemas) = place_tools("srv", "srv", &[tool("t")], None);
+        Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(Vec::new())), Vec::new(), None) })
+    }
+
+    #[test]
+    fn an_idle_disconnect_is_visible_before_a_tool_call() {
+        let (peer, incoming) = channel();
+        let hub = Hub::default();
+        hub.add_running("srv", &[tool("t")], Box::new(std::io::sink()), BufReader::new(Heard { from: incoming, pending: Vec::new() }), false);
+        assert_eq!(hub.status(), ["srv: 1 tools"]);
+        assert_eq!(hub.schemas().len(), 1);
+        drop(peer);
+        waited("the idle connection to close", || hub.status() == ["srv: disconnected"]);
+        assert!(hub.connection_facts().contains("srv: disconnected"));
+        assert!(hub.schemas().is_empty());
     }
 
     /// A server that says in a call that its tools changed is asked for them as the call ends: the new one is offered, and one it no longer lists is said to be gone.
@@ -2306,7 +2693,7 @@ mod tests {
         let again = json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "back"}]}});
         let start: Starter = Arc::new(move || Ok(running(std::slice::from_ref(&again), &["t"])));
         let hub = Hub::default();
-        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(running(&[], &["t"])), ..Slot::default() });
+        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(disconnected_server()), ..Slot::default() });
         let cancel = AtomicBool::new(false);
         let said = hub.call("mcp__srv__t", &json!({}), &cancel).unwrap_err();
         assert!(said.contains("has ended") && said.contains("started again"), "{said}");
@@ -2325,7 +2712,7 @@ mod tests {
             Ok(running(std::slice::from_ref(&again), &["t"]))
         });
         let hub = Hub::default();
-        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(running(&[], &["t"])), ..Slot::default() });
+        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(disconnected_server()), ..Slot::default() });
         let cancel = AtomicBool::new(false);
         let said = hub.call("mcp__srv__t", &json!({}), &cancel).unwrap_err();
         assert!(said.contains("has ended") && said.contains("being started again") && said.contains("in a moment"), "{said}");
@@ -2340,7 +2727,7 @@ mod tests {
     fn a_server_that_will_not_start_again_says_so_and_why() {
         let start: Starter = Arc::new(|| Err("no such program".to_string()));
         let hub = Hub::default();
-        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(running(&[], &["t"])), ..Slot::default() });
+        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), start: Some(start), running: Some(disconnected_server()), ..Slot::default() });
         let cancel = AtomicBool::new(false);
         let said = hub.call("mcp__srv__t", &json!({}), &cancel).unwrap_err();
         assert!(said.contains("has ended") && said.contains("started again"), "{said}");
@@ -2360,7 +2747,7 @@ mod tests {
 
     #[test]
     fn trust_is_the_persons_word_kept_in_the_file_and_for_the_server_a_call_reaches() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         std::fs::write(&file, r#"{"mcpServers": {"srv": {"command": "no-such-program-here", "args": ["a"]}}}"#).unwrap();
         let hub = Hub::start(&file);
@@ -2382,7 +2769,7 @@ mod tests {
         let both = Hub::default();
         let named = ["a b".to_string(), "a_b".to_string()];
         for ((name, trusted), part) in named.iter().zip([false, true]).zip(name_parts(&named)) {
-            let (names, schemas) = place_tools(name, &part, &[tool("t")]);
+            let (names, schemas) = place_tools(name, &part, &[tool("t")], None);
             let server = Arc::new(Running { names, schemas, ..Running::new(Rpc::over(Box::new(std::io::sink()), Cursor::new(Vec::new())), Vec::new(), None) });
             both.slots.lock().unwrap().push(Slot { name: name.clone(), running: Some(server), trusted, ..Slot::default() });
         }
@@ -2477,6 +2864,21 @@ mod tests {
     /// A server that answers the handshake, lists a tool `read` and answers a call of it with its own name (the first argument).
     const ANSWERING: &str = "import json, os, sys\nwho = sys.argv[1]\nopen(sys.argv[2], 'w').write(str(os.getpid()))\nfor line in sys.stdin:\n    try:\n        m = json.loads(line)\n    except ValueError:\n        continue\n    if 'id' not in m:\n        continue\n    how = m.get('method')\n    if how == 'tools/list':\n        r = {'tools': [{'name': 'read', 'description': who, 'inputSchema': {'type': 'object'}}]}\n    elif how == 'tools/call':\n        r = {'content': [{'type': 'text', 'text': 'from ' + who}]}\n    else:\n        r = {'protocolVersion': '2025-06-18', 'capabilities': {'tools': {}}}\n    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': r}), flush=True)\n";
 
+    #[test]
+    fn imported_stdio_server_reads_relative_files_in_its_working_directory() {
+        let temp = crate::in_container::tempdir().unwrap();
+        let cwd = temp.path().join("server files");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("server.py"), ANSWERING).unwrap();
+        let python = serde_json::to_string(&fake("", &[]).command).unwrap();
+        let folder = serde_json::to_string(&cwd).unwrap();
+        let source = format!("[mcp_servers.fixture]\ncommand = {python}\ncwd = {folder}\nargs = ['-I', 'server.py', 'fixture', 'pid']");
+        let imported = servers_of_codex(&source).remove("fixture").unwrap();
+        assert_eq!(imported.cwd.as_ref(), Some(&cwd));
+        let _server = start_server_within(&imported, Duration::from_secs(10), true).unwrap();
+        assert!(pid_in(&cwd.join("pid")).is_some());
+    }
+
     fn pid_in(file: &Path) -> Option<u32> {
         std::fs::read_to_string(file).ok()?.trim().parse().ok()
     }
@@ -2515,7 +2917,7 @@ mod tests {
 
     /// Starts a server that never answers, with 3 s to, and checks that its process has ended after.
     fn start_a_mute_one(job: bool) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mute.pid");
         let _reaper = Reaper(vec![file.clone()]);
         let config = fake(MUTE, &[&file.display().to_string()]);
@@ -2542,7 +2944,7 @@ mod tests {
         let Err(error) = start_server_within(&config, Duration::from_secs(20), false) else { panic!("a server that ends was started") };
         assert!(error.ends_with("It said: starting | ModuleNotFoundError: No module named mcp"), "{error}");
         let crashing = "import json, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n    if 'id' not in m:\n        continue\n    if m['method'] == 'tools/call':\n        sys.stderr.write('KeyError: token\\n')\n        sys.exit(1)\n    r = {'tools': [{'name': 't', 'inputSchema': {'type': 'object'}}]} if m['method'] == 'tools/list' else {'protocolVersion': '2025-06-18', 'capabilities': {}}\n    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': r}), flush=True)\n";
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
         save_server(&file, None, "srv", fake(crashing, &[])).unwrap();
         let hub = Hub::start(&file);
@@ -2559,7 +2961,7 @@ mod tests {
 
     #[test]
     fn two_servers_whose_names_clean_to_one_keep_their_own_tools() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (mut servers, mut files) = (BTreeMap::new(), Vec::new());
         for name in ["my.server", "my_server"] {
             let file = dir.path().join(format!("{name}.pid"));

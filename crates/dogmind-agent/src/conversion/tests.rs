@@ -8,7 +8,7 @@ const PICTURE: &[u8] = b"pretend this is a picture of a dog";
 
 /// A data folder as the app leaves one: sessions (one with a picture and checkpoints, one cut by a crash, one that only has a trajectory beside it), notes, and what is not conversation.
 fn folder() -> tempfile::TempDir {
-    let data = tempfile::tempdir().unwrap();
+    let data = crate::in_container::tempdir().unwrap();
     let sessions = data.path().join("sessions");
     let mut first = Session::create(&sessions, Path::new("C:/work"), "now", "20261101-000001").unwrap();
     first.set_tools(&serde_json::json!([{"function": {"name": "read_file"}}])).unwrap();

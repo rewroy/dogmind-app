@@ -207,6 +207,7 @@ enum Page {
     Working { progress: Option<Progress>, stopping: bool, update: bool },
     Failed { failure: Failure },
     Installed { update: bool },
+    InstalledAppFailedToStart(String),
     AppWontStart(String),
     Removing { fraction: f64 },
     Gone { left: Vec<String> },
@@ -259,7 +260,7 @@ fn words(japanese: bool, english: &str, in_japanese: &str) -> String {
 
 /// What the page of a failure says and offers. An update that fails is of an app that is not running, and the page lets its person start it as it was; but a placing that could not put every
 /// file back leaves the folder part of one version and part of the other (`Failure::NotPutBack`), and nothing on its page starts the program: only the update again, which finishes it, or a way out.
-fn failed_view(failure: &Failure, updating: bool, japanese: bool) -> View {
+fn failed_view(failure: &Failure, updating: bool, japanese: bool, relaunch: bool) -> View {
     let w = |english: &str, in_japanese: &str| words(japanese, english, in_japanese);
     if let Failure::NotPutBack(names) = failure {
         let detail = if japanese {
@@ -287,9 +288,13 @@ fn failed_view(failure: &Failure, updating: bool, japanese: bool) -> View {
     if updating {
         return View {
             heading: w("The update did not finish", "更新を完了できませんでした"),
-            detail: format!("{why} {}", w("Start Dogmind as it is, or try the update again.", "Dogmind をそのまま起動するか、もう一度更新を試してください。")),
+            detail: if relaunch {
+                format!("{why} {}", w("Start Dogmind as it is, or try the update again.", "Dogmind をそのまま起動するか、もう一度更新を試してください。"))
+            } else {
+                why
+            },
             primary: Some(w("Try again", "もう一度試す")),
-            secondary: Some(w("Start Dogmind", "Dogmind を起動")),
+            secondary: Some(if relaunch { w("Start Dogmind", "Dogmind を起動") } else { w("Close", "閉じる") }),
             problem: true,
             ..View::default()
         };
@@ -327,8 +332,8 @@ impl App {
         match notice {
             Notice::InSubfolder => self.w("That folder is not empty, so it goes in a Dogmind folder inside it.", "選んだフォルダーは空ではないため、その中の Dogmind フォルダーにインストールします。"),
             Notice::Refused(Refusal::SettingsFolder) => self.w(
-                "That is where the app keeps your settings and sessions (%LOCALAPPDATA%\\DogmindApp). Choose another folder.",
-                "そこはアプリの設定とセッションの保存先 (%LOCALAPPDATA%\\DogmindApp) です。別のフォルダーを選んでください。",
+                "That folder is reserved for app settings and sessions. Choose another folder.",
+                "そこはアプリの設定やセッションを保存する場所です。別のフォルダーを選んでください。",
             ),
             Notice::Refused(Refusal::NotWritable(why)) => {
                 if self.japanese {
@@ -406,12 +411,20 @@ impl App {
                     ..View::default()
                 }
             }
-            Page::Failed { failure } => failed_view(failure, self.updating, self.japanese),
+            Page::Failed { failure } => failed_view(failure, self.updating, self.japanese, !self.options.skip_update_relaunch),
             Page::Installed { update } => View {
                 heading: if *update { self.w("Dogmind is updated", "Dogmind を更新しました") } else { self.w("Dogmind is ready", "Dogmind の準備ができました") },
                 detail: self.w("You can start it from the Start menu. To remove it: Settings > Apps > Installed apps, or Settings > General in the app.", "スタート メニューから起動できます。削除するには: Windows の設定 > アプリ > インストールされているアプリ、またはアプリの 設定 > 一般。"),
                 primary: Some(self.w("Start it", "起動する")),
                 secondary: Some(self.w("Close", "閉じる")),
+                ..View::default()
+            },
+            Page::InstalledAppFailedToStart(why) => View {
+                heading: self.w("Dogmind is installed but could not start", "Dogmind のインストールは完了しましたが、起動できませんでした"),
+                detail: why.clone(),
+                primary: Some(self.w("Try starting Dogmind again", "もう一度 Dogmind を起動")),
+                secondary: Some(self.w("Close", "閉じる")),
+                problem: true,
                 ..View::default()
             },
             Page::AppWontStart(why) => View {
@@ -495,6 +508,7 @@ impl App {
             Page::Failed { .. } if self.updating => {
                 PostMessageW(self.window, WM_COMMAND, 2, 0);
             }
+            Page::InstalledAppFailedToStart(_) => { PostMessageW(self.window, WM_CLOSE, 0, 0); }
             Page::Failed { .. } | Page::RemoveFailed(_) | Page::Refused(..) => self.finish(1),
             Page::Installed { .. } | Page::Gone { .. } => self.finish(0),
             _ => {}
@@ -509,7 +523,9 @@ impl App {
     /// An end that is not the work done. An update the app asked for is of an app that quit for it, and its person chose to update, not to close it: whichever page this is on and whichever way
     /// it ends (Cancel, the window's close, a failure), the app comes back as it is in the folder, and the code still says how it ended. If it cannot be started, or this is no update, it ends as it says.
     unsafe fn end_without_success(&mut self, code: i32) {
-        if !(self.updating && self.start_the_app_and_close(code)) {
+        if self.updating {
+            self.finish_with_app(code);
+        } else {
             self.finish(code);
         }
     }
@@ -746,15 +762,18 @@ impl App {
         });
     }
 
-    /// The app, started from the folder as the Installed page's button starts it; and this has done its work. `false`, with the window as it was, when the app cannot be started.
-    unsafe fn start_the_app_and_close(&mut self, code: i32) -> bool {
-        match system::start_program(&self.folder().join(&self.options.app_name), "", self.options.test) {
-            Ok(()) => {
-                self.finish(code);
-                true
+    /// Finish with the installed app running, or let the person retry its launch after a successful install.
+    unsafe fn finish_with_app(&mut self, code: i32) {
+        if !(self.updating && self.options.skip_update_relaunch) {
+            if let Err(error) = system::start_program(&self.folder().join(&self.options.app_name), "", self.options.test) {
+                if code == 0 {
+                    self.page = Page::InstalledAppFailedToStart(error.to_string());
+                    self.refresh();
+                    return;
+                }
             }
-            Err(_) => false,
         }
+        self.finish(code);
     }
 
     /// Who is running, and on to `then` if no one is.
@@ -826,10 +845,7 @@ impl App {
                 self.refresh();
             }
             Page::Failed { .. } => self.clear_the_way(After::Install),
-            Page::Installed { .. } => {
-                let _ = system::start_program(&self.folder().join(&self.options.app_name), "", self.options.test);
-                self.finish(0);
-            }
+            Page::Installed { .. } | Page::InstalledAppFailedToStart(_) => self.finish_with_app(0),
             Page::AppWontStart(_) | Page::RemoveFailed(_) => self.start_removal(),
             _ => {}
         }
@@ -844,6 +860,7 @@ impl App {
             }
             Page::Removing { .. } => {}
             Page::Gone { .. } | Page::Installed { .. } => self.finish(0),
+            Page::InstalledAppFailedToStart(_) => self.finish(1),
             // (an update that failed is of an app that is not running: its button starts it as it was, and so does the window's own close; but not of a folder that is part of two versions)
             Page::Failed { failure } if !app_comes_back_after(failure) => self.finish(1),
             Page::Failed { .. } | Page::RemoveFailed(_) | Page::Refused(..) => self.end_without_success(1),
@@ -875,7 +892,8 @@ impl App {
                 }
                 Message::Installed(update) => {
                     // (an update the app asked for does not wait to be told it is done: the app is back, and this is gone)
-                    if self.updating && self.start_the_app_and_close(0) {
+                    if self.updating {
+                        self.finish_with_app(0);
                         continue;
                     }
                     self.page = Page::Installed { update };
@@ -1155,7 +1173,7 @@ mod tests {
         for japanese in [false, true] {
             let start = if japanese { "起動" } else { "Start" };
             for updating in [true, false] {
-                let view = failed_view(&not_put_back(&["b.dll"]), updating, japanese);
+                let view = failed_view(&not_put_back(&["b.dll"]), updating, japanese, true);
                 let page = all_of(&view);
                 assert!(!page.contains(start) && !page.contains("as it is") && !page.contains("そのまま"), "nothing on it starts the program (updating {updating}, japanese {japanese}): {page}");
                 assert!(view.problem && page.contains("b.dll"), "{page}");
@@ -1170,15 +1188,15 @@ mod tests {
             }
         }
         // the words of the page are the one line, and it says that the folder is not as it was
-        let update = failed_view(&not_put_back(&["b.dll"]), true, false);
+        let update = failed_view(&not_put_back(&["b.dll"]), true, false, true);
         assert_eq!(update.heading, "The update did not finish");
         assert_eq!(update.detail, "This did not finish: b.dll could not be put back as it was, so the folder is not as it was. Running the setup again finishes it.");
-        let plain = failed_view(&not_put_back(&["b.dll"]), false, false);
+        let plain = failed_view(&not_put_back(&["b.dll"]), false, false, true);
         assert_eq!((plain.heading.as_str(), plain.detail.as_str()), ("It did not finish", update.detail.as_str()));
         // three files are named and the rest counted, in both languages
         let many = not_put_back(&["a", "b", "c", "d", "e"]);
-        assert!(failed_view(&many, true, false).detail.contains("a, b, c and 2 more could not be put back as they were"));
-        let japanese = failed_view(&many, true, true).detail;
+        assert!(failed_view(&many, true, false, true).detail.contains("a, b, c and 2 more could not be put back as they were"));
+        let japanese = failed_view(&many, true, true, true).detail;
         assert!(japanese.contains("a、b、c ほか 2 件 を元に戻せなかったため") && japanese.contains("フォルダーは元の状態ではありません"), "{japanese}");
     }
 
@@ -1186,12 +1204,15 @@ mod tests {
     fn the_page_of_any_other_failure_of_an_update_still_offers_to_start_the_app_as_it_was() {
         // (so that the test above is of something: this is what the page of an update offers when the folder is as it was)
         for failure in [Failure::Said("a failure".to_string()), Failure::InUse("b.dll".to_string()), Failure::TooLittleRoom { needed: 2_000_000_000, free: 1_000_000_000 }] {
-            let view = failed_view(&failure, true, false);
+            let view = failed_view(&failure, true, false, true);
+            let closed = failed_view(&failure, true, false, false);
+            assert_eq!(closed.secondary.as_deref(), Some("Close"));
+            assert!(!closed.detail.contains("Start Dogmind"));
             assert_eq!(view.secondary.as_deref(), Some("Start Dogmind"), "{failure:?}");
             assert!(view.detail.ends_with("Start Dogmind as it is, or try the update again."), "{failure:?}");
             assert_eq!(view.primary.as_deref(), Some("Try again"));
             // and the page of a setup run by hand has not changed either
-            let plain = failed_view(&failure, false, false);
+            let plain = failed_view(&failure, false, false, true);
             assert_eq!((plain.primary.as_deref(), plain.secondary.as_deref()), (Some("Try again"), Some("Close")));
         }
     }

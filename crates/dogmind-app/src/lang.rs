@@ -50,17 +50,52 @@ pub fn t(english: &str) -> &str {
     }
 }
 
-/// The same, with values for `{0}`, `{1}`...
-pub fn tf(english: &str, values: &[&dyn Display]) -> String {
-    fill(t(english), values)
+/// The result shown for a tool in both session views. Older records can carry a nonzero exit alongside an ok outcome.
+pub fn tool_outcome_words(outcome: &str, failed_exit: bool) -> String {
+    match outcome {
+        "ok" if failed_exit => t("Failed").to_string(),
+        "ok" => t("Done").to_string(),
+        "failed" | "error" => t("Failed").to_string(),
+        "timeout" => t("Timed out").to_string(),
+        "declined_person" => t("You declined").to_string(),
+        "refused_gate" => t("Blocked by Dogmind").to_string(),
+        "refused_no_change" => t("Changes disabled for this turn").to_string(),
+        "cancelled" => t("Stopped").to_string(),
+        other => other.replace('_', " "),
+    }
 }
 
-fn fill(words: &str, values: &[&dyn Display]) -> String {
-    let mut text = words.to_string();
-    for (at, value) in values.iter().enumerate() {
-        text = text.replace(&format!("{{{at}}}"), &value.to_string());
+/// How a model request ended, as shown in both the trajectory and the timeline.
+pub fn request_end_words(end: &str) -> String {
+    match end {
+        "stop" => t("It finished").into(),
+        "tool_calls" => t("It asked for calls").into(),
+        "length" => t("It ran out of room and was cut off").into(),
+        "cancelled_person" => t("You stopped it").into(),
+        "stopped_app:draft_stop" => t("Stopped a draft that went on too long").into(),
+        "stopped_app:warm_up" => t("Warm-up finished").into(),
+        other => match other.split_once(':') {
+            Some(("error", kind)) => {
+                let reason = match kind {
+                    "unfinished" => t("the answer did not finish"),
+                    "transient" => t("the connection broke"),
+                    "overflow" => t("the conversation is too long"),
+                    "rejected" => t("the server refused the request"),
+                    "down" => t("the server could not be reached"),
+                    "no_vision" => t("the model cannot read pictures"),
+                    _ => kind,
+                };
+                tf("It failed: {0}", &[&reason])
+            }
+            Some(("stopped_app", why)) => tf("Dogmind stopped it: {0}", &[&why]),
+            _ => other.to_string(),
+        },
     }
-    text
+}
+
+/// The same, with values for `{0}`, `{1}`...
+pub fn tf(english: &str, values: &[&dyn Display]) -> String {
+    dogmind_agent::fill_template(t(english), values)
 }
 
 /// A reason on an approval card, which the gate gives in English as a template with what varies in it (a path, a word, a number), joined by "; " where there are several. The same
@@ -80,7 +115,7 @@ fn reason_part(part: &str) -> String {
     for template in dogmind_agent::safety::REASONS {
         let Some(found) = fill_of(template, part) else { continue };
         if let Some(words) = japanese().get(template) {
-            return found.iter().enumerate().fold((*words).to_string(), |text, (at, value)| text.replace(&format!("{{{at}}}"), value));
+            return dogmind_agent::fill_template(words, &found);
         }
     }
     part.to_string()
@@ -219,7 +254,6 @@ const JA: &[(&str, &str)] = &[
     ("waits for {0}", "{0} を待っています"),
     ("ended", "終了"),
     ("in {0}", "あと {0}"),
-    ("These end when Dogmind quits.", "ここにあるものは、Dogmind を終了すると終わります。"),
     ("Stop all", "すべて止める"),
     ("It goes on with what waits in the background, and says here when it has something for you. Quit it from the tray icon's menu to end all of it.", "バックグラウンドで待っているものは続きます。用があるときはここで通知します。すべて終えるには、トレイのアイコンのメニューから終了してください。"),
     ("Standing by", "待機中"),
@@ -255,14 +289,15 @@ const JA: &[(&str, &str)] = &[
     ("Look and plan first, and change nothing until you say", "まず調査して計画し、指示があるまで何も変更しない"),
     ("The skills of this folder, from Claude's and Codex's folders too", "このフォルダーのスキル (Claude と Codex のフォルダーも含む)"),
     ("What is kept between sessions", "セッションをまたいで保持される内容"),
-    ("MCP servers: /mcp shows them, /mcp import takes Claude's and Codex's", "MCP サーバー: /mcp で一覧、/mcp import で Claude と Codex の設定を取り込み"),
+    ("MCP server status, /mcp candidates, /mcp import [NAME]", "MCP の状態を表示。取り込み候補は /mcp candidates、取り込みは /mcp import [名前]"),
     ("What may always run in this folder", "このフォルダーで常に実行してよいもの"),
     ("Show or hide the thinking", "思考の表示を切り替える"),
     ("Open another program's folder on PATH to sandboxed commands, with one Windows prompt", "PATH にある別のプログラムのフォルダーをサンドボックス内のコマンドに開く (Windows の確認が 1 回出ます)"),
     ("Look into", "調査"),
     ("Run a program", "プログラムを実行"),
     ("From a program: {0}", "プログラムから: {0}"),
-    ("Code Mode: let the model run a short program that calls several tools at once", "コードモード: 複数のツールをまとめて呼ぶ短いプログラムをモデルに実行させる"),
+    ("Code Mode", "コードモード"),
+    ("Lets the model run a short program that calls several tools at once.", "モデルが短いプログラムを実行し、複数のツールをまとめて呼び出せます。"),
     ("Check a page", "ページを確認"),
     ("How the agent should talk and work, for every new session", "エージェントの話し方と進め方 (新しいセッションすべてに適用)"),
     ("Open Straydog's dashboard in the browser", "Straydog のダッシュボードをブラウザーで開く"),
@@ -396,6 +431,12 @@ const JA: &[(&str, &str)] = &[
     ("Branch from here: a new session with the conversation up to this answer", "ここから分岐: この回答までの会話で新しいセッションを始めます"),
     ("This answer is not in the saved session yet, so there is nothing to branch from. Try again once it is.", "この回答はまだセッションに保存されていないため、分岐できません。保存されてからもう一度試してください。"),
     ("{0} (branch)", "{0} (分岐)"),
+    ("Try again", "再試行"),
+    ("Remove remaining session files", "会話の残りのファイルを削除"),
+    ("The conversation was deleted. Some files remain: {0}", "会話を削除しました。次のファイルが残っています。{0}"),
+    ("A conversation now exists at this location. Its files were kept.", "同じ場所に会話があるため、会話と関連ファイルを保持しました。"),
+    ("The deletion could not be completed: {0}", "会話の削除を完了できませんでした。{0}"),
+    ("The session could not be renamed: {0}", "会話の名前を保存できませんでした。{0}"),
     ("The branch could not be made: {0}", "分岐を作れませんでした: {0}"),
     ("Discard", "破棄"),
     ("Optional. Kept in Credential Manager", "任意。資格情報マネージャーに保存"),
@@ -558,8 +599,10 @@ const JA: &[(&str, &str)] = &[
     ("Separated by spaces", "スペース区切り"),
     ("{0} tools", "ツール {0} 個"),
     ("1 tool", "ツール 1 個"),
-    ("Did not start: {0}", "起動できませんでした: {0}"),
+    ("Disconnected. Use /mcp import {0} to reconnect.", "接続が切れました。/mcp import {0} で再接続できます。"),
+    ("Did not start: {0}. To retry, open this server in Settings > Tools and choose Save.", "起動できませんでした: {0}。再接続するには、設定の「ツール」でこのサーバーを編集し、「保存」を押してください。"),
     ("{0} did not start: {1}", "{0} を起動できませんでした: {1}"),
+    (dogmind_agent::mcp::INVALID_SERVER_URL, "http:// または https:// のサーバー URL を入力してください。ホスト名に空白がないか、ポート番号と IPv6 アドレスの角括弧が正しいかを確認してください。"),
     ("the program is not there, nor in a folder on PATH", "指定の場所にも PATH のフォルダーにもプログラムがありません"),
     ("The list of servers could not be read, and none was started: {0}", "サーバーの一覧を読み込めなかったため、どれも起動していません: {0}"),
     ("Give the server a name.", "サーバーの名前を入力してください。"),
@@ -685,12 +728,26 @@ const JA: &[(&str, &str)] = &[
     ("Stop the work first.", "先に作業を止めてください。"),
     ("Asking again.", "もう一度送ります。"),
     ("Copied the last answer.", "最後の回答をコピーしました。"),
-    (", last answer at {0} tok/s", "、最後の回答は {0} tok/s"),
-    ("{0} requests: {1} prompt tokens, {2} of them from the cache, {3} written{4}. The conversation is {5} of {6}.", "{0} リクエスト: プロンプト {1} トークン (うちキャッシュ {2})、生成 {3}{4}。会話の長さは {5} / {6} です。"),
+    ("Could not copy to the clipboard. Try again.", "クリップボードにコピーできませんでした。もう一度お試しください。"),
+    ("Last answer: {0} tok/s.", "最後の回答は {0} tok/s です。"),
+    ("{0} metered requests: {1} prompt tokens, {2} written.", "実測 {0} リクエスト。入力 {1} トークン、生成 {2} トークン。"),
+    ("No token usage has been reported for this session.", "このセッションのトークン使用量はまだ報告されていません。"),
+    ("Cache hit rate: {0}% ({1} of {2} prompt tokens with cache data).", "キャッシュヒット率 {0}%（キャッシュ情報のある入力 {2} トークンのうち {1} トークン）。"),
+    ("Cache hit rate: unavailable.", "キャッシュヒット率は不明です。"),
+    ("Conversation length: {0} of {1} tokens.", "会話の長さは {0} / {1} トークンです。"),
+    ("Conversation length: {0} tokens (limit unknown).", "会話の長さは {0} トークンです（上限不明）。"),
     ("Nothing to show yet. Name a file: /preview page.html", "表示できるものがまだありません。ファイルを指定してください: /preview page.html"),
+    ("The user profile could not be located.", "ユーザープロファイルが見つかりません。"),
+    ("Available to import with /mcp import NAME:\n{0}", "/mcp import 名前 で取り込めるサーバー\n{0}"),
+    ("No import candidate named {0}. Use /mcp candidates to list names.", "{0} という取り込み候補はありません。/mcp candidates で名前を確認できます。"),
+    ("{0} is already configured in Dogmind.", "{0} は Dogmind に登録済みです。"),
+    ("Starting {0}.", "{0} を起動しています。"),
+    ("Added {0}. The server is starting.", "{0} を追加しました。サーバーを起動しています。"),
+    ("Use /mcp for status, /mcp candidates to list names, or /mcp import [NAME].", "状態は /mcp、候補一覧は /mcp candidates、取り込みは /mcp import [名前] で確認・操作できます。"),
     ("{0} servers added to {1}. They are starting.", "{0} 個のサーバーを {1} に追加しました。起動しています。"),
+    ("Could not read all MCP settings from {0}. Check the file format and permissions.", "{0} から読み込めなかった MCP 設定があります。ファイルの書式と読み取り権限を確認してください。"),
     ("Claude and Codex list no server that is not here already.", "Claude と Codex の設定に、まだ取り込んでいないサーバーはありません。"),
-    ("No server yet. {0} lists them, and /mcp import copies Claude's and Codex's in.", "サーバーはまだありません。{0} に記述するか、/mcp import で Claude と Codex の設定を取り込めます。"),
+    ("No server yet. {0} lists configured servers. Use /mcp candidates to find one to import.", "登録済みサーバーはありません。設定ファイルは {0} です。/mcp candidates で取り込み候補を確認できます。"),
     ("The notes in {0} could not be read ({1}). The file is left as it is.", "{0} のメモを読めませんでした（{1}）。ファイルはそのままにしてあります。"),
     ("Notes the model forgot are kept in {0}, so that you can get one back.", "モデルが忘れたメモは {0} に残してあります。戻したいときはそこからコピーしてください。"),
     ("Notes the model forgot are kept, encrypted, in {0}. The latest:\n{1}", "モデルが忘れたメモは、暗号化して {0} に残してあります。直近のもの:\n{1}"),
@@ -705,6 +762,7 @@ const JA: &[(&str, &str)] = &[
     ("Safe commands run without asking.", "安全なコマンドは確認なしで実行します。"),
     ("Every command asks.", "すべてのコマンドで確認します。"),
     ("No such command: {0}. /help lists them.", "{0} というコマンドはありません。/help で一覧を見られます。"),
+    ("Enter {0} alone to run it. To send this draft to the model, put backticks around {0}.", "コマンドを実行するには {0} だけを入力してください。この文をモデルに送るには、{0} をバッククォートで囲んでください。"),
     ("There is nothing to find in yet.", "検索できる内容がまだありません。"),
     ("This session has nothing to go back to yet.", "このセッションにはまだ戻れる地点がありません。"),
     ("This workbook cannot be shown: {0}", "このブックは表示できません: {0}"),
@@ -717,6 +775,7 @@ const JA: &[(&str, &str)] = &[
     ("Show in Explorer", "エクスプローラーで表示"),
     ("Show beside the conversation", "会話の横に表示"),
     ("Files for you", "確認してほしいファイル"),
+    ("a version in the making", "途中の版"),
     ("Question", "質問"),
     ("Send", "送信"),
     ("Suggested", "おすすめ"),
@@ -798,9 +857,12 @@ const JA: &[(&str, &str)] = &[
     ("All turns", "全ターン"),
     ("Turn {0}", "ターン {0}"),
     ("{0} characters", "{0} 文字"),
-    ("no end: the run stopped here", "終わりなし: ここで止まった"),
+    ("no end recorded (to last event)", "終了記録なし（最終記録まで）"),
+    ("incomplete turns use last event", "終了記録のない分は最終記録まで"),
     ("prompt {0}", "入力 {0}"),
     ("cached {0}%", "キャッシュ {0}%"),
+    ("cached —", "キャッシュ —"),
+    ("about {0} tokens", "約 {0} トークン"),
     ("{0} tokens", "{0} トークン"),
     ("{0} tok/s", "{0} トークン/秒"),
     ("repeats {0} ({1})", "{0} のやり直し ({1})"),
@@ -843,6 +905,8 @@ const JA: &[(&str, &str)] = &[
     ("Always saves: {0}", "常に許可で保存されるルール: {0}"),
     ("Always allows this file, for this session: {0}", "常に許可: このセッションの間、このファイル: {0}"),
     ("Always allows this on the network, for this session: {0}", "常に許可: このセッションの間、次のネットワーク利用: {0}"),
+    ("Always allows each part of this line (sites for this session): {0}", "常に許可: この行の部分ごとに(サイトはこのセッションの間): {0}"),
+    ("Always cannot be used for this line.", "この行には常に許可を使えません。"),
     ("Folders commands can read", "コマンドが読めるフォルダー"),
     ("Commands can read everything in these folders, and that includes any keys or passwords kept there. They cannot write there, and the network stays off unless you approve it. Files that look like keys are left out only if they are there when you add the folder, not ones made later.", "コマンドはこれらのフォルダーの中身をすべて読めます。そこに置かれた鍵やパスワードも読めます。書き込みはできず、ネットワークも許可しない限り使えません。鍵に見えるファイルを除外するのは、追加したときに既にあったものだけで、後から作られたものは除外されません。"),
     ("Add a folder...", "フォルダーを追加..."),
@@ -984,6 +1048,8 @@ const JA: &[(&str, &str)] = &[
     ("Dashboard", "ダッシュボード"),
     ("Name", "名前"),
     ("Save", "保存"),
+    ("Save instructions.md as UTF-8 to edit it here.", "ここで指示を編集するには、instructions.md を UTF-8 で保存してください。"),
+    ("Could not read instructions.md: {0}", "instructions.md を読み込めませんでした（{0}）。"),
     ("Cancel", "キャンセル"),
     ("Open a session", "セッションを開く"),
     ("Open", "開く"),
@@ -1105,6 +1171,7 @@ const JA: &[(&str, &str)] = &[
     ("There is nothing to compact yet: the conversation is short.", "会話がまだ短いので、圧縮するものはありません。"),
     ("Session compacted: the oldest turns were dropped", "セッションを圧縮しました: いちばん古いターンを削除しました"),
     ("Read-only: no files will be changed in this turn. Say so if that is not what you meant.", "読み取り専用: このターンではファイルを変更しません。意図と違う場合は、そう伝えてください。"),
+    ("Read as a suggestion: no files will be changed in this turn. Say \"go ahead\" to have it done.", "相談として受け取りました: このターンではファイルを変更しません。進めるときは「やって」と伝えてください。"),
     ("the engine stopped answering: /log shows why, and writing again tries once more", "エンジンの応答が止まりました。原因は /log で確認できます。もう一度入力すると再試行します。"),
     ("another Straydog is running on this PC (process {0}). Two on one GPU fight over its memory and the machine's, so this one was not started. Close it and restart the engine, or reach it as an OpenAI-compatible provider.", "この PC で別の Straydog が動いています (プロセス {0})。1 つの GPU で 2 つ動かすとメモリを奪い合うため、起動しませんでした。それを閉じてからエンジンを起動し直すか、OpenAI 互換の接続先として接続してください。"),
     ("port {0} on this PC is taken. Choose another port for the engine in settings.json, or close what holds it.", "この PC のポート {0} は使用中です。settings.json でエンジンの別のポートを選ぶか、使っているものを閉じてください。"),
@@ -1128,6 +1195,7 @@ const JA: &[(&str, &str)] = &[
     ("This model on this PC cannot see pictures: it has no vision file. Not every model has one. If yours does, put its mmproj-*.gguf beside the model, in {0}, and start the engine again.", "この PC のモデルにはビジョンファイルがないため、画像を読めません。ビジョンファイルのないモデルもあります。お使いのモデルにある場合は、mmproj-*.gguf をモデルと同じ場所 ({0} の中) に置いて、エンジンを起動し直してください。"),
     // The transcript and its controls.
     ("{0} pictures", "画像 {0} 枚"),
+    ("Show or hide the pictures the model looked at", "モデルが見た画像を表示する・しまう"),
     ("Delete this session", "このセッションを削除する"),
     ("Stopped\n", "停止しました\n"),
     ("Connecting…", "接続しています…"),
@@ -1262,9 +1330,12 @@ const JA: &[(&str, &str)] = &[
     ("A helper explores, step {0} of {1}: {2}", "ヘルパーが調べています({0}/{1}): {2}"),
     ("A program runs: {0}, call {1}: {2}", "プログラムを実行中: {0}({1} 回目の呼び出し: {2})"),
     ("Arguments", "引数"),
+    ("Working directory (optional)", "作業フォルダー（省略可）"),
     ("Output", "出力"),
     ("Timed out", "時間切れ"),
     ("You declined", "却下しました"),
+    ("Blocked by Dogmind", "Dogmind が拒否"),
+    ("Changes disabled for this turn", "このターンでは変更不可"),
     ("Time to the first word", "最初の応答までの時間"),
     ("Total time", "合計時間"),
     ("Prompt", "プロンプト"),
@@ -1285,6 +1356,8 @@ const JA: &[(&str, &str)] = &[
     ("Went on from", "続きの元"),
     ("yes", "はい"),
     ("no", "いいえ"),
+    ("Warm-up finished", "ウォームアップが完了しました"),
+    ("the server could not be reached", "サーバーに接続できませんでした"),
     ("It finished", "終わりました"),
     ("It asked for calls", "呼び出しを求めました"),
     ("It ran out of room and was cut off", "長さの上限で途中で切れました"),
@@ -1335,9 +1408,10 @@ const JA: &[(&str, &str)] = &[
     // The central terminal.
     ("Terminal", "ターミナル"),
     ("New terminal", "新しいターミナル"),
-    ("Choose a shell", "シェルを選ぶ"),
     ("Close the terminal", "ターミナルを閉じる"),
-    ("Switch to Terminal or open a shell", "ターミナルに切り替えます。シェルがなければ開きます"),
+    ("Open the terminal under the conversation", "会話の下にターミナルを開きます"),
+    ("Show or hide the terminal", "ターミナルの表示を切り替える"),
+    ("Getting the folder ready for commands…", "フォルダーをコマンド用に準備しています…"),
     ("Exited with code {0}", "終了コード {0} で終了しました"),
     ("Exited with code 0x{0}", "終了コード 0x{0} で終了しました"),
     ("{0} terminals are open: close one to open another.", "ターミナルが {0} 個開いています。新しく開くには、どれかを閉じてください。"),
@@ -1586,8 +1660,18 @@ mod tests {
 
     #[test]
     fn values_go_where_the_language_wants_them() {
-        assert_eq!(fill("{1} / {0}", &[&1, &"b"]), "b / 1");
-        assert_eq!(fill("no value", &[]), "no value");
+        assert_eq!(tf("{1} / {0}", &[&1, &"b"]), "b / 1");
+        assert_eq!(tf("no value", &[]), "no value");
+        assert_eq!(tf("{1} / {0} / {0}", &[&"Unity {1}", &"offline"]), "offline / Unity {1} / Unity {1}");
+        assert_eq!(tf("{00} {+1} {9} {{0}}", &[&"x", &"y"]), "{00} {+1} {9} {x}");
+    }
+
+    #[test]
+    fn a_servers_name_stays_literal_in_its_startup_error_in_either_language() {
+        let template = "{0} did not start: {1}";
+        let values = ["Unity {1}", "offline"];
+        assert_eq!(dogmind_agent::fill_template(template, &values), "Unity {1} did not start: offline");
+        assert_eq!(dogmind_agent::fill_template(japanese()[template], &values), "Unity {1} を起動できませんでした: offline");
     }
 
     #[test]

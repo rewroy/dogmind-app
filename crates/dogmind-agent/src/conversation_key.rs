@@ -738,7 +738,7 @@ mod tests {
 
     #[test]
     fn the_passphrase_and_the_recovery_code_each_open_the_key_and_a_wrong_one_does_not() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (store, cipher, code) = create(dir.path(), false);
         assert!(exists(dir.path()) && !store.is_remembered());
         let again = Keystore::load(dir.path()).unwrap();
@@ -752,7 +752,7 @@ mod tests {
         assert_eq!(again.unlock(&code).unwrap_err(), KeyError::Wrong);
         assert_eq!(again.unlock_with_recovery("a passphrase of the test").unwrap_err(), KeyError::Wrong);
         assert_eq!(Keystore::create(dir.path(), "x", false, None).unwrap_err(), KeyError::Exists);
-        assert_eq!(Keystore::create(tempfile::tempdir().unwrap().path(), "", false, None).unwrap_err(), KeyError::Empty);
+        assert_eq!(Keystore::create(crate::in_container::tempdir().unwrap().path(), "", false, None).unwrap_err(), KeyError::Empty);
         assert_eq!(again.unlock_remembered().unwrap_err(), KeyError::NotRemembered);
         // nothing of the secrets is in the file
         let text = std::fs::read_to_string(path_in(dir.path())).unwrap();
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn the_recovery_code_sets_a_new_passphrase_and_a_new_code_ends_the_old_one() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (_, cipher, code) = create(dir.path(), false);
         let mut store = Keystore::load(dir.path()).unwrap();
         let unlocked = store.reset_passphrase_with_recovery(&code, "the new passphrase").unwrap();
@@ -788,7 +788,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_copy_for_this_pc_opens_with_no_question_and_is_gone_when_cleared() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (mut store, cipher, code) = create(dir.path(), true);
         assert!(store.is_remembered());
         let text = std::fs::read_to_string(path_in(dir.path())).unwrap();
@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn a_changed_file_is_refused_in_words_and_a_costly_one_is_not_run() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (_, _, _) = create(dir.path(), false);
         let path = path_in(dir.path());
         let text = std::fs::read_to_string(&path).unwrap();
@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn what_is_pending_is_kept_in_the_file_and_the_key_file_goes_whole() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let (mut store, _, _) = Keystore::create(dir.path(), "p", false, Some(Pending::Encrypt)).unwrap();
         assert_eq!(Keystore::load(dir.path()).unwrap().pending(), Some(Pending::Encrypt));
         store.set_pending(Some(Pending::Decrypt)).unwrap();

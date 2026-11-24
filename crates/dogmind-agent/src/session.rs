@@ -38,6 +38,14 @@ enum Line {
     Goal { goal: Option<String> },
     /// The tools the conversation was told of after it began, callable as those it is offered (which stay as they were), the last of these lines counting.
     Added { tools: serde_json::Value },
+    /// A file the conversation has read or written, with the hash of it as it was then: reopened, the conversation has still read it. An edit checks the
+    /// file as it is against this, so one changed since is read again. The last line of a file counts.
+    Seen { path: PathBuf, hash: String },
+    /// What the conversation had read is forgotten: its files went back.
+    SeenForgotten,
+    /// The reasoning of a request the draft watch stopped, which the conversation goes on without: kept, as the conversation is, for a later look at where it
+    /// could have been stopped.
+    Stopped { request: String, reasoning: String },
 }
 
 /// The plain first line of an encrypted session.
@@ -363,6 +371,8 @@ fn lines_of(path: &Path) -> std::io::Result<impl Iterator<Item = String>> {
 
 /// What a session file comes to when it is read whole.
 struct Loaded {
+    /// The original first user line, or the last explicit name, even after compaction. Absent until a message was appended.
+    title: Option<String>,
     workspace: PathBuf,
     messages: Vec<Message>,
     /// The lines that did not open, by their number in the file from 1 (an encrypted file's only).
@@ -373,6 +383,15 @@ struct Loaded {
 
 fn load(path: &Path) -> Result<Loaded, String> {
     let entries = entries_of(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(load_entries(entries))
+}
+
+fn first_words(message: &Message) -> String {
+    message.content.as_deref().and_then(|text| typed_text(text).lines().next()).unwrap_or("").chars().take(70).collect()
+}
+
+fn load_entries(entries: impl Iterator<Item = (u64, Entry)>) -> Loaded {
+    let (mut title, mut named) = (None, None);
     let (mut workspace, mut messages, mut damaged, mut lines) = (PathBuf::new(), Vec::new(), Vec::new(), 0);
     for (number, entry) in entries {
         lines = number + 1;
@@ -380,14 +399,21 @@ fn load(path: &Path) -> Result<Loaded, String> {
             Entry::Damaged => damaged.push(number as usize + 1),
             Entry::Text(line) => match serde_json::from_str(&line) {
                 Ok(Line::Meta { workspace: place, .. }) => workspace = place,
-                Ok(Line::Message { message }) => messages.push(message),
+                Ok(Line::Message { message }) => {
+                    let first = title.get_or_insert_with(String::new);
+                    if first.is_empty() && named.is_none() && message.role == "user" {
+                        *first = first_words(&message);
+                    }
+                    messages.push(message);
+                }
+                Ok(Line::Title { title: name }) => named = Some(name),
                 Ok(Line::Snapshot { messages: all }) => messages = all,
-                Ok(Line::Title { .. } | Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. }) => {}
+                Ok(Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. } | Line::Seen { .. } | Line::SeenForgotten | Line::Stopped { .. }) => {}
                 Err(_) => {} // a line cut short by a crash, or of a kind that is not known
             },
         }
     }
-    Ok(Loaded { workspace, messages, damaged, lines })
+    Loaded { title: title.map(|first| named.unwrap_or(first)), workspace, messages, damaged, lines }
 }
 
 /// What is said when lines of a conversation could not be read: followed by their numbers.
@@ -421,20 +447,30 @@ impl Session {
     /// A new session, under this key if there is one.
     pub fn create_with(folder: &Path, workspace: &Path, now: &str, stamp: &str, writer: Option<&Arc<Cipher>>) -> Result<Session, String> {
         fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
-        // (two chats begun in one second must not share a file: their lines would make one conversation of the two)
-        let mut path = folder.join(format!("{stamp}.jsonl"));
-        let mut again = 1;
-        let file = loop {
+        // A helper, image folder or other companion can outlive its conversation. Its stem still belongs
+        // to that conversation, even when there is no .jsonl file to collide with.
+        let at_folder = |error: std::io::Error| format!("{}: {error}", folder.display());
+        let mut taken = std::collections::HashSet::new();
+        for entry in fs::read_dir(folder).map_err(at_folder)? {
+            let name = entry.map_err(at_folder)?.file_name();
+            if let Some((suffix, _)) = name.to_str().and_then(|name| name.strip_prefix(stamp)).and_then(|tail| tail.split_once('.')) {
+                taken.insert(suffix.to_owned());
+            }
+        }
+        for number in 1_u64.. {
+            let suffix = if number == 1 { String::new() } else { format!("-{number}") };
+            if taken.contains(&suffix) {
+                continue;
+            }
+            let path = folder.join(format!("{stamp}{suffix}.jsonl"));
+            // Other creators may have chosen this number since the directory was read.
             match OpenOptions::new().create_new(true).append(true).open(&path) {
-                Ok(file) => break file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    again += 1;
-                    path = folder.join(format!("{stamp}-{again}.jsonl"));
-                }
+                Ok(file) => return Session::begin(path, file, workspace, now, writer),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(format!("{}: {error}", path.display())),
             }
-        };
-        Session::begin(path, file, workspace, now, writer)
+        }
+        Err(format!("{}: no available session number for {stamp}", folder.display()))
     }
 
     /// A file just made, with what every session starts with: for an encrypted one its plain first line, then its first line of meta.
@@ -552,6 +588,47 @@ impl Session {
     pub fn snapshot(&mut self, messages: &[Message]) -> Result<(), String> {
         self.write(&Line::Snapshot { messages: messages.to_vec() })
     }
+
+    /// The conversation has read or written this file, which was then as `hash` says.
+    pub fn note_seen(&mut self, path: &Path, hash: &str) -> Result<(), String> {
+        self.write(&Line::Seen { path: path.to_path_buf(), hash: hash.to_string() })
+    }
+
+    /// Its files went back: what it had read is forgotten.
+    pub fn forget_seen(&mut self) -> Result<(), String> {
+        self.write(&Line::SeenForgotten)
+    }
+
+    /// The reasoning of request `request`, which the draft watch stopped.
+    pub fn keep_stopped(&mut self, request: &str, reasoning: &str) -> Result<(), String> {
+        self.write(&Line::Stopped { request: request.to_string(), reasoning: reasoning.to_string() })
+    }
+}
+
+/// The reasonings of a session's requests that the draft watch stopped, in order: the request, and what it had reasoned.
+pub fn stopped_of(path: &Path) -> Vec<(String, String)> {
+    let Ok(lines) = lines_of(path) else { return Vec::new() };
+    lines.filter(|line| line.starts_with("{\"kind\":\"stopped")).filter_map(|line| match serde_json::from_str(&line) {
+        Ok(Line::Stopped { request, reasoning }) => Some((request, reasoning)),
+        _ => None,
+    }).collect()
+}
+
+/// The files a session had read, each with the hash of it as the session last saw it: what its lines of them come to. (Tested in agent's
+/// `a_conversation_opened_again_has_read_what_it_read`, and below.)
+pub fn seen_of(path: &Path) -> std::collections::HashMap<PathBuf, String> {
+    let mut seen = std::collections::HashMap::new();
+    let Ok(lines) = lines_of(path) else { return seen };
+    for line in lines.filter(|line| line.starts_with("{\"kind\":\"seen")) {
+        match serde_json::from_str(&line) {
+            Ok(Line::Seen { path, hash }) => {
+                seen.insert(path, hash);
+            }
+            Ok(Line::SeenForgotten) => seen.clear(),
+            _ => {}
+        }
+    }
+    seen
 }
 
 /// Whether the file ends a line (or is empty): what is written after a cut line starts one of its own.
@@ -625,6 +702,8 @@ pub struct Hit {
     pub path: PathBuf,
     pub title: String,
     pub snippet: String,
+    /// The original text to find after opening this conversation. Absent when only its title matched.
+    pub find_in_conversation: Option<String>,
 }
 
 const SNIPPET_BEFORE: usize = 24;
@@ -637,37 +716,72 @@ fn snippet(text: &str, at: usize) -> String {
 }
 
 /// Where a word is, by the original text's bytes, whatever its case.
-fn place_of(text: &str, word: &[char]) -> Option<usize> {
-    text.char_indices().map(|(at, _)| at).find(|at| {
-        let mut rest = text[*at..].chars().flat_map(char::to_lowercase);
-        word.iter().all(|wanted| rest.next() == Some(*wanted))
+fn place_of(text: &str, word: &[char]) -> Option<std::ops::Range<usize>> {
+    text.char_indices().find_map(|(start, _)| {
+        let mut end = start;
+        let mut rest = text[start..].chars().flat_map(|ch| {
+            end += ch.len_utf8();
+            ch.to_lowercase()
+        });
+        let matched = word.iter().all(|wanted| rest.next() == Some(*wanted));
+        matched.then_some(start..end)
     })
 }
 
 /// The sessions with every word of `query` in their name or in what was said (not in the tools' output, and not in the
 /// system prompt, which every session has), the newest first.
 pub fn search(folder: &Path, query: &str) -> Vec<Hit> {
+    search_while(folder, query, || true).unwrap_or_default()
+}
+
+/// Stops between records when the caller has moved to another query. An obsolete search returns no result to publish.
+pub fn search_while(folder: &Path, query: &str, current: impl Fn() -> bool) -> Option<Vec<Hit>> {
     let words: Vec<Vec<char>> = query.split_whitespace().map(|word| word.chars().flat_map(char::to_lowercase).collect()).collect();
+    let mut hits = Vec::new();
     if words.is_empty() {
-        return Vec::new();
+        return Some(hits);
     }
-    list(folder).into_iter().filter_map(|summary| {
-        let mut said = vec![summary.title.clone()];
-        for message in read(&summary.path).ok()? {
-            match (message.role.as_str(), message.content) {
-                ("user", Some(text)) if crate::prompt::is_nudge(&text) => {}
-                ("user", Some(text)) => said.push(typed_text(&text).to_string()),
-                ("assistant", Some(text)) => said.push(text),
-                _ => {}
+    'sessions: for path in session_paths(folder) {
+        if !current() {
+            return None;
+        }
+        let Ok(entries) = entries_of(&path) else { continue };
+        let loaded = load_entries(entries.take_while(|_| current()));
+        if !current() {
+            return None;
+        }
+        let Some(title) = loaded.title else { continue };
+        let spoken = loaded.messages.iter().filter_map(|message| {
+            let text = message.content.as_deref()?;
+            match message.role.as_str() {
+                "user" if !crate::prompt::is_nudge(text) => Some(typed_text(text)),
+                "assistant" => Some(crate::agent::shown_answer(text)),
+                _ => None,
+            }
+        });
+        let mut body_match = None;
+        let mut title_match = None;
+        for word in &words {
+            let found = spoken.clone().take_while(|_| current())
+                .find_map(|text| place_of(text, word).map(|range| (text, range)));
+            if !current() {
+                return None;
+            }
+            if let Some(found) = found {
+                body_match.get_or_insert(found);
+            } else if let Some(range) = place_of(&title, word) {
+                title_match.get_or_insert(range.start);
+            } else {
+                continue 'sessions;
             }
         }
-        let mut shown = None;
-        for word in &words {
-            let (at, text) = said.iter().find_map(|text| place_of(text, word).map(|at| (at, text)))?;
-            shown.get_or_insert_with(|| snippet(text, at));
-        }
-        Some(Hit { path: summary.path, title: summary.title, snippet: shown.unwrap_or_default() })
-    }).collect()
+        let (snippet, find_in_conversation) = match body_match {
+            Some((text, range)) => (snippet(text, range.start), Some(text[range].to_owned())),
+            None => (snippet(&title, title_match.unwrap_or(0)), None),
+        };
+        hits.push(Hit { path, title, snippet, find_in_conversation });
+    }
+    Some(hits)
 }
 
 /// A name for a session, as the person chose it.
@@ -696,11 +810,32 @@ pub fn rename(path: &Path, title: &str) -> Result<(), String> {
 /// of the conversation, not of the files. A branch of an encrypted session is encrypted, under the same key, with an id of its own; one of a conversation with lines that did not open is
 /// refused, as it would leave them out without a word.
 pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf, String> {
-    // (as `open` reads it: a line a crash cut in the middle of a character is one line lost, not the whole session refused)
-    let Loaded { workspace, mut messages, damaged, .. } = load(path)?;
-    if !damaged.is_empty() {
-        return Err(format!("{}: {}", path.display(), damage_words(&damaged)));
+    fork_loaded(path, load_for_fork(path)?, through, title)
+}
+
+/// Fork at the selected answer in the same snapshot used to find it. A restored row knows its message number.
+/// A streamed row is identified by its displayed words and the number of earlier matching answers.
+pub fn fork_answer(path: &Path, words: &str, saved_index: Option<usize>, earlier_matches: usize, title: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let loaded = load_for_fork(path)?;
+    let words = words.trim();
+    let matches = |message: &Message| message.role == "assistant" && message.content.as_deref().is_some_and(|text| crate::agent::shown_answer(text).trim() == words);
+    let through = match saved_index {
+        Some(index) => loaded.messages.get(index).filter(|message| matches(message)).map(|_| index),
+        None => loaded.messages.iter().enumerate().filter(|(_, message)| matches(message)).nth(earlier_matches).map(|(index, _)| index),
+    };
+    through.map(|index| fork_loaded(path, loaded, index, title)).transpose()
+}
+
+fn load_for_fork(path: &Path) -> Result<Loaded, String> {
+    let loaded = load(path)?;
+    if !loaded.damaged.is_empty() {
+        return Err(format!("{}: {}", path.display(), damage_words(&loaded.damaged)));
     }
+    Ok(loaded)
+}
+
+fn fork_loaded(path: &Path, loaded: Loaded, through: usize, title: Option<&str>) -> Result<PathBuf, String> {
+    let Loaded { workspace, mut messages, .. } = loaded;
     if through >= messages.len() {
         return Err(format!("{}: it has {} messages, not {}", path.display(), messages.len(), through + 1));
     }
@@ -710,6 +845,21 @@ pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf,
     let now = chrono::Local::now();
     let writer = sealed_of(path).map_err(|error| format!("{}: {error}", path.display()))?.map(|sealed| sealed.cipher);
     let mut copy = Session::create_with(folder, &workspace, &now.format("%Y-%m-%d %H:%M:%S %:z").to_string(), &now.format("%Y%m%d-%H%M%S").to_string(), writer.as_ref())?;
+    let result = write_branch(&mut copy, path, &messages, title);
+    let branch = copy.path.clone();
+    drop(copy);
+    if let Err(error) = result {
+        if let Err(cleanup) = crate::checkpoint::delete_session(&branch) {
+            use crate::checkpoint::DeleteError;
+            let (DeleteError::Conversation(why) | DeleteError::RemainingFiles(why)) = cleanup;
+            return Err(format!("{error}; could not remove incomplete branch {}: {why}", branch.display()));
+        }
+        return Err(error);
+    }
+    Ok(branch)
+}
+
+fn write_branch(copy: &mut Session, path: &Path, messages: &[Message], title: Option<&str>) -> Result<(), String> {
     if let Some(tools) = tools_of(path) {
         copy.set_tools(&tools)?;
     }
@@ -719,27 +869,34 @@ pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf,
     if web_seen(path) {
         copy.mark_web_seen()?;
     }
-    for message in &messages {
-        copy.append(message)?;
-    }
-    if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
-        copy.write(&Line::Title { title: title.to_string() })?;
-    }
     // The helpers the kept messages came from go with them, under the branch's own name and the numbers they had (the messages say them): copied as they are, line for line, so that
     // an encrypted one needs no key to be copied and a line that did not open is not lost in the copy.
     for number in messages.iter().filter_map(|message| message.helper.as_ref().map(|helper| helper.number)) {
-        if let Some(from) = helper_path(path, number) {
-            fs::copy(&from, helper_file_of(&copy.path, number)).map_err(|error| format!("{}: {error}", from.display()))?;
+        let from = helper_file_of(path, number);
+        match fs::copy(&from, helper_file_of(&copy.path, number)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !from.try_exists().unwrap_or(true) => {}
+            Err(error) => return Err(format!("{}: {error}", from.display())),
         }
     }
     let from = crate::images::folder_of(path);
     for image in messages.iter().flat_map(|message| &message.images) {
         // (one gone from the original is gone from the branch too: it says so where it would show)
-        if let Ok(bytes) = crate::images::read_stored(&from.join(&image.file)) {
-            crate::images::store(&copy.path, &image.file, &bytes)?;
-        }
+        let file = from.join(&image.file);
+        match crate::images::read_stored(&file) {
+            Ok(bytes) => crate::images::store(&copy.path, &image.file, &bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", file.display())),
+        };
     }
-    Ok(copy.path)
+    // A session becomes visible in history when its first message is appended. Copy everything it refers to first.
+    for message in messages {
+        copy.append(message)?;
+    }
+    if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+        copy.write(&Line::Title { title: title.to_string() })?;
+    }
+    Ok(())
 }
 
 /// Stub results for calls that have none, right after their assistant message; and no result for a call that is not there (its line
@@ -770,13 +927,31 @@ pub fn complete_tool_calls(messages: &mut Vec<Message>) {
     }
 }
 
-/// The sessions in a folder, the newest first. An encrypted one whose key is not here is listed too, saying so: it is not left out of the list as if it were gone.
-pub fn list(folder: &Path) -> Vec<Summary> {
+/// Files created in the same second are named STAMP, STAMP-2, ..., STAMP-10.
+fn session_order(path: &Path) -> (&std::ffi::OsStr, u64) {
+    let stem = path.file_stem().unwrap_or_default();
+    if let Some((stamp, sequence)) = stem.to_str().and_then(|name| name.rsplit_once('-')) {
+        if let Some((day, time)) = stamp.split_once('-') {
+            if day.len() == 8 && time.len() == 6 && day.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit()) {
+                if let Ok(number) = sequence.parse() {
+                    return (std::ffi::OsStr::new(stamp), number);
+                }
+            }
+        }
+    }
+    (stem, 1)
+}
+
+fn session_paths(folder: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && !crate::trajectory::is_trajectory(path) && !is_helper(path)).collect();
-    paths.sort();
-    paths.reverse();
-    paths.into_iter().filter_map(|path| {
+    paths.sort_unstable_by(|a, b| session_order(b).cmp(&session_order(a)).then_with(|| b.cmp(a)));
+    paths
+}
+
+/// The sessions in a folder, the newest first. An encrypted one whose key is not here is listed too, saying so: it is not left out of the list as if it were gone.
+pub fn list(folder: &Path) -> Vec<Summary> {
+    session_paths(folder).into_iter().filter_map(|path| {
         let (mut workspace, mut created, mut title, mut messages, mut named) = (PathBuf::new(), String::new(), String::new(), 0, None);
         let entries = match entries_of(&path) {
             Ok(entries) => entries,
@@ -789,23 +964,23 @@ pub fn list(folder: &Path) -> Vec<Summary> {
             Entry::Text(text) => Some(text),
             Entry::Damaged => None,
         }) {
-            // Once it has its title, a message is only counted: its text may be megabytes.
-            if line.starts_with("{\"kind\":\"title\"") {
-                if let Ok(Line::Title { title }) = serde_json::from_str(&line) {
-                    named = Some(title);
-                }
-                continue;
-            }
+            // The writer puts kind first. Count its ordinary message lines without decoding megabytes of content.
+            // Other JSON writers may order or space the same fields differently.
             if !title.is_empty() {
-                messages += usize::from(line.starts_with("{\"kind\":\"message\""));
-                continue;
+                if let Some(kind) = line.strip_prefix("{\"kind\":\"") {
+                    if !kind.starts_with("title\"") {
+                        messages += usize::from(kind.starts_with("message\""));
+                        continue;
+                    }
+                }
             }
             match serde_json::from_str(&line) {
+                Ok(Line::Title { title: name }) => named = Some(name),
                 Ok(Line::Meta { workspace: place, created: at }) => (workspace, created) = (place, at),
                 Ok(Line::Message { message }) => {
                     messages += 1;
                     if title.is_empty() && message.role == "user" {
-                        title = message.content.as_deref().map(|text| typed_text(text).lines().next().unwrap_or("").chars().take(70).collect()).unwrap_or_default();
+                        title = first_words(&message);
                     }
                 }
                 _ => {}
@@ -824,9 +999,29 @@ mod tests {
         ToolCall { id: id.into(), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: "{}".into() } }
     }
 
+    /// What a session has read comes back from its file: the last hash of each file counts, files going back forget all of it, and the messages are
+    /// as they were (older builds skip these lines).
+    #[test]
+    fn what_a_session_read_comes_back_from_its_file() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261122-1").unwrap();
+        session.append(&Message::text("user", "hi")).unwrap();
+        session.note_seen(Path::new("C:/w/a.txt"), "1111").unwrap();
+        session.note_seen(Path::new("C:/w/b.txt"), "2222").unwrap();
+        session.forget_seen().unwrap();
+        session.note_seen(Path::new("C:/w/a.txt"), "3333").unwrap();
+        session.note_seen(Path::new("C:/w/a.txt"), "4444").unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let seen = seen_of(&path);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.get(Path::new("C:/w/a.txt")).map(String::as_str), Some("4444"));
+        assert_eq!(Session::open(&path).unwrap().2.len(), 1);
+    }
+
     #[test]
     fn a_branch_has_the_conversation_through_its_message_and_its_pictures_and_the_original_is_as_it_was() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261103-1").unwrap();
         session.set_tools(&serde_json::json!([{"function": {"name": "read_file"}}])).unwrap();
         session.append(&Message::text("system", "s")).unwrap();
@@ -855,8 +1050,58 @@ mod tests {
     }
 
     #[test]
-    fn a_session_comes_back_as_it_was_after_its_last_snapshot() {
+    fn a_branch_from_a_repeated_answer_keeps_the_selected_turn() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261103-1").unwrap();
+        for (role, text) in [("user", "first"), ("assistant", "Done"), ("user", "second"), ("assistant", " Done "), ("user", "later")] {
+            session.append(&Message::text(role, text)).unwrap();
+        }
+        for (saved_index, earlier_matches) in [(Some(3), 0), (None, 1)] {
+            let branch = fork_answer(&session.path, " Done ", saved_index, earlier_matches, None).unwrap().unwrap();
+            let messages = read(&branch).unwrap();
+            assert_eq!(messages.iter().map(|m| m.content.as_deref().unwrap()).collect::<Vec<_>>(), ["first", "Done", "second", " Done "]);
+        }
+        assert!(fork_answer(&session.path, "Done", Some(2), 0, None).unwrap().is_none());
+        assert!(fork_answer(&session.path, "unsaved", None, 0, None).unwrap().is_none());
+        assert!(fork_answer(&dir.path().join("absent.jsonl"), "Done", None, 0, None).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_branch_with_an_unreadable_attachment_fails_cleanly_and_can_be_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
         let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), dir.path(), "now", "parent").unwrap();
+        let mut message = Message::text("user", "two pictures");
+        for name in ["first.png", "locked.png", "already-missing.png"] {
+            message.images.push(crate::message::ImageRef { file: name.into(), media_type: "image/png".into(), width: 1, height: 1 });
+        }
+        session.append(&message).unwrap();
+        let images = crate::images::folder_of(&session.path);
+        fs::create_dir_all(&images).unwrap();
+        fs::write(images.join("first.png"), b"first").unwrap();
+        fs::write(images.join("locked.png"), b"second").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(images.join("locked.png")).unwrap();
+        let entries = || {
+            let mut files: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+            files.sort();
+            files
+        };
+        let before = entries();
+        assert!(fork(&session.path, 0, None).unwrap_err().contains("locked.png"));
+        assert_eq!(entries(), before);
+        drop(held);
+        let copy = fork(&session.path, 0, None).unwrap();
+        let copied = crate::images::folder_of(&copy);
+        assert_eq!(fs::read(copied.join("first.png")).unwrap(), b"first");
+        assert_eq!(fs::read(copied.join("locked.png")).unwrap(), b"second");
+        assert!(!copied.join("already-missing.png").exists());
+        assert_eq!(list(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn a_session_comes_back_as_it_was_after_its_last_snapshot() {
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261031-1").unwrap();
         session.append(&Message::text("system", "s")).unwrap();
         session.append(&Message::text("user", "old")).unwrap();
@@ -874,7 +1119,7 @@ mod tests {
     /// A name given after a line a crash cut short is on a line of its own, and read; a session with such a line can still be branched.
     #[test]
     fn a_cut_line_takes_neither_the_name_after_it_nor_a_branch() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261104-1").unwrap();
         session.append(&Message::text("user", "hello")).unwrap();
         session.append(&Message::text("assistant", "hi")).unwrap();
@@ -929,15 +1174,58 @@ mod tests {
 
     #[test]
     fn two_sessions_begun_in_one_second_have_a_file_each() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let first = Session::create(dir.path(), Path::new("w"), "now", "same").unwrap();
         let second = Session::create(dir.path(), Path::new("w"), "now", "same").unwrap();
         assert_ne!(first.path, second.path);
     }
 
     #[test]
-    fn the_tools_come_back_to_the_byte_and_the_last_ones_count() {
+    fn simultaneous_new_sessions_leave_orphaned_companions_with_their_original_names() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let folder = dir.path();
+        let stamp = "20261123-172000";
+        let helper = helper_file_of(&folder.join(format!("{stamp}.jsonl")), 1);
+        fs::write(&helper, b"old helper").unwrap();
+        let images = crate::images::folder_of(&folder.join(format!("{stamp}-2.jsonl")));
+        fs::create_dir(&images).unwrap();
+        fs::write(images.join("old.png"), b"old image").unwrap();
+        let start = std::sync::Barrier::new(4);
+        let mut names = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4).map(|_| scope.spawn(|| {
+                start.wait();
+                let new = Session::create(folder, folder, "now", stamp).unwrap();
+                assert!(helpers_of(&new.path).is_empty());
+                assert!(!crate::images::folder_of(&new.path).exists());
+                new.path.file_stem().unwrap().to_owned()
+            })).collect();
+            workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+        });
+        names.sort();
+        assert_eq!(names, (3..=6).map(|n| std::ffi::OsString::from(format!("{stamp}-{n}"))).collect::<Vec<_>>());
+        assert_eq!(fs::read(helper).unwrap(), b"old helper");
+        assert_eq!(fs::read(images.join("old.png")).unwrap(), b"old image");
+    }
+
+    #[test]
+    fn sessions_in_the_same_second_are_newest_first_in_lists_and_searches() {
         let dir = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        for (index, stamp) in std::iter::once("20261123-175959")
+            .chain(std::iter::repeat_n("20261123-180000", 12)).chain(std::iter::once("20261123-180001")).enumerate() {
+            let title = format!("chat {index}");
+            let mut session = Session::create(dir.path(), dir.path(), "now", stamp).unwrap();
+            session.append(&Message::text("user", &title)).unwrap();
+            expected.push(title);
+        }
+        expected.reverse();
+        assert_eq!(list(dir.path()).into_iter().map(|s| s.title).collect::<Vec<_>>(), expected);
+        assert_eq!(search(dir.path(), "chat").into_iter().map(|s| s.title).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn the_tools_come_back_to_the_byte_and_the_last_ones_count() {
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         assert_eq!(tools_of(&session.path), None);
         let tools = serde_json::json!([{"zebra": 1, "apple": {"é": "日本語\n"}}]);
@@ -958,7 +1246,7 @@ mod tests {
 
     #[test]
     fn a_call_cut_off_gets_a_result_and_a_cut_line_is_skipped() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "a").unwrap();
         session.append(&Message { role: "assistant".into(), tool_calls: Some(vec![call("1"), call("2")]), ..Message::default() }).unwrap();
         session.append(&Message::tool_result("1", "done")).unwrap();
@@ -984,7 +1272,7 @@ mod tests {
 
     #[test]
     fn a_reader_beside_the_writer_sees_a_running_call_as_it_is() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         session.append(&Message { role: "assistant".into(), tool_calls: Some(vec![call("1")]), ..Message::default() }).unwrap();
         assert_eq!(read(&session.path).unwrap().len(), 1);
@@ -994,7 +1282,7 @@ mod tests {
 
     #[test]
     fn a_search_finds_what_was_said_and_not_what_every_session_has() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut first = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         first.append(&Message::text("system", "the system prompt mentions Banana")).unwrap();
         first.append(&Message::text("user", "ハッシュテーブルの話")).unwrap();
@@ -1017,6 +1305,64 @@ mod tests {
     }
 
     #[test]
+    fn history_search_matches_the_visible_part_of_an_answer_and_its_code_examples() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
+        session.append(&Message::text("user", "Notes")).unwrap();
+        session.append(&Message::text("assistant", "Forecast\n<tool_call>internal-marker")).unwrap();
+        session.append(&Message::text("assistant", "Example:\n~~~text\n<tool_call>quoted-example\n~~~")).unwrap();
+
+        assert!(search(dir.path(), "internal-marker").is_empty());
+        assert!(search(dir.path(), "Forecast internal-marker").is_empty());
+        let hit = search(dir.path(), "forecast").remove(0);
+        assert_eq!(hit.snippet, "Forecast");
+        assert_eq!(hit.find_in_conversation.as_deref(), Some("Forecast"));
+        assert_eq!(search(dir.path(), "quoted-example").len(), 1);
+    }
+
+    #[test]
+    fn a_history_search_uses_the_list_title_and_the_current_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
+        session.append(&Message::text("user", "original name")).unwrap();
+        session.append(&Message::text("assistant", "discarded answer")).unwrap();
+        session.snapshot(&[Message::text("user", "kept question")]).unwrap();
+        let hit = search(dir.path(), "original question").remove(0);
+        assert_eq!(hit.title, list(dir.path())[0].title);
+        assert!(hit.snippet.contains("kept question"));
+        assert_eq!(hit.find_in_conversation.as_deref(), Some("question"));
+        assert!(search(dir.path(), "original")[0].find_in_conversation.is_none());
+        assert!(search(dir.path(), "discarded").is_empty());
+        rename(&session.path, "new title").unwrap();
+        assert!(search(dir.path(), "original").is_empty());
+        let renamed = search(dir.path(), "new question").remove(0);
+        assert_eq!(renamed.title, "new title");
+        assert_eq!(renamed.find_in_conversation.as_deref(), Some("question"));
+        session.append(&Message::text("assistant", "İstanbul")).unwrap();
+        let expanded = search(dir.path(), "new i\u{307}s").remove(0);
+        assert_eq!(expanded.find_in_conversation.as_deref(), Some("İs"));
+        let empty = Session::create(dir.path(), Path::new("w"), "now", "2").unwrap();
+        rename(&empty.path, "invisible").unwrap();
+        assert!(search(dir.path(), "invisible").is_empty());
+    }
+
+    #[test]
+    fn an_obsolete_search_stops_inside_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
+        for _ in 0..20 {
+            session.append(&Message::text("user", "needle")).unwrap();
+        }
+        let remaining = std::cell::Cell::new(6usize);
+        assert!(search_while(dir.path(), "needle", || {
+            let left = remaining.get();
+            remaining.set(left.saturating_sub(1));
+            left > 0
+        }).is_none());
+        assert_eq!(search(dir.path(), "needle").len(), 1);
+    }
+
+    #[test]
     fn a_snippet_stays_on_character_boundaries_and_on_one_line() {
         let long = format!("{}\n見つけた言葉{}", "前の文章".repeat(30), "後の文章".repeat(30));
         let at = long.find("見つけた").unwrap();
@@ -1027,7 +1373,7 @@ mod tests {
 
     #[test]
     fn a_new_name_replaces_the_first_words_and_leaves_the_conversation() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         session.append(&Message::text("user", "first words")).unwrap();
         let path = session.path.clone();
@@ -1039,8 +1385,25 @@ mod tests {
     }
 
     #[test]
-    fn the_list_counts_every_message_after_the_title() {
+    fn the_history_list_reads_reordered_record_fields() {
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("20261123-171000.jsonl");
+        let lines = [
+            r#"{"workspace":"work","created":"today","kind":"meta"}"#,
+            r#"{"message":{"content":"first words","role":"user"},"kind":"message"}"#,
+            r#"{"message":{"content":"answer","role":"assistant"},"kind":"message"}"#,
+            r#"{"kind": "title","title":"earlier name"}"#,
+            r#"{"title":"renamed","kind":"title"}"#,
+        ];
+        std::fs::write(path, lines.join("\n")).unwrap();
+        let summary = list(dir.path()).remove(0);
+        assert_eq!((summary.title.as_str(), summary.messages), ("renamed", 2));
+        assert_eq!(search(dir.path(), "answer")[0].title, summary.title);
+    }
+
+    #[test]
+    fn the_list_counts_every_message_after_the_title() {
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         session.append(&Message::text("system", "s")).unwrap();
         session.append(&Message::text("user", "title")).unwrap();
@@ -1052,7 +1415,7 @@ mod tests {
 
     #[test]
     fn the_list_is_newest_first_and_titled_by_what_was_typed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         for (stamp, text) in [("1", "first"), ("2", "second")] {
             let mut session = Session::create(dir.path(), Path::new("w"), "now", stamp).unwrap();
             session.append(&Message::text("user", text)).unwrap();
@@ -1076,7 +1439,7 @@ mod notice_tests {
     /// A session with a notice in it: it comes back as one, whether it is a line of its own or in a snapshot, it is not the person's words to the list, the search or the model's request.
     #[test]
     fn a_notice_is_kept_as_one_and_is_not_taken_for_the_persons_words() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         session.append(&Message::text("user", "build it")).unwrap();
         session.append(&Message::text("assistant", "started")).unwrap();
@@ -1117,7 +1480,7 @@ mod notice_tests {
         assert!(crate::prompt::is_nudge(message.content.as_deref().unwrap()), "it shows as the app's word, never as the person's bubble");
 
         // a line of a kind no reader has (what a later app may write): it is skipped by `read`, `open`, `list` and `fork`, and what is around it is read
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let mut session = Session::create(dir.path(), Path::new("w"), "now", "1").unwrap();
         session.append(&Message::text("user", "first")).unwrap();
         let path = session.path.clone();
@@ -1140,7 +1503,7 @@ mod crash_tests {
 
     #[test]
     fn a_file_cut_by_a_crash_opens_and_goes_on_cleanly() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("cut.jsonl");
         let whole = serde_json::to_string(&Line::Message { message: Message::text("user", "kept") }).unwrap();
         // A line cut in the middle of a character, with no newline after it.

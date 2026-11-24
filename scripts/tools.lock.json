@@ -16,7 +16,8 @@
   "version": "26.13.1",
   "file": "node-v26.13.1-win-x64.zip",
   "url": "https://nodejs.org/dist/v26.13.1/node-v26.13.1-win-x64.zip",
-  "sha256": "e2edda75bfb089654705cf65a13b58933bfd5f57148e8ebda916f58a2474f1f7"
+  "sha256": "e2edda75bfb089654705cf65a13b58933bfd5f57148e8ebda916f58a2474f1f7",
+  "patched_sha256": "d94ec49fb5568bca31ebf72247ddf148fc507b6e36056e942e8ef88b79d4ef89"
  },
  "git": {
   "version": "2.56.1.windows.1",

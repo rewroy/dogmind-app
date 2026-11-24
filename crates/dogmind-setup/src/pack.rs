@@ -90,9 +90,11 @@ pub fn is_shipped(relative: &str) -> bool {
 /// A path in the package: below its folder, and nothing that could lead out of it or into a stream of a file.
 pub fn is_safe(relative: &str) -> bool {
     // (Windows opens `a.` and `a ` as `a`, so that `.. ` can be `..`; and a device has its name in any folder)
-    const DEVICES: [&str; 26] = ["con", "prn", "aux", "nul", "conin$", "conout$", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "com0", "lpt0"];
+    const DEVICES: [&str; 32] = ["con", "prn", "aux", "nul", "conin$", "conout$", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "com0", "lpt0", "com\u{b9}", "com\u{b2}", "com\u{b3}", "lpt\u{b9}", "lpt\u{b2}", "lpt\u{b3}"];
     !relative.is_empty()
-        && relative.split('\\').all(|part| !part.is_empty() && !part.ends_with(['.', ' ']) && !DEVICES.contains(&part.to_ascii_lowercase().as_str()))
+        // (a device by its name before any dot, its spaces at the end left out: Windows opens `NUL.txt`, `con .log` and `COM1.tar.gz` as the device, and what
+        // is written to one is gone with no error; COM and LPT with a superscript digit are ports too)
+        && relative.split('\\').all(|part| !part.is_empty() && !part.ends_with(['.', ' ']) && !DEVICES.contains(&part.split('.').next().unwrap_or(part).trim_end_matches(' ').to_lowercase().as_str()))
         && !relative.contains(['/', ':', '*', '?', '"', '<', '>', '|'])
         && !relative.chars().any(char::is_control)
 }
@@ -167,7 +169,10 @@ impl Package {
         }
         let index_at = u64::from_le_bytes(header[16..24].try_into().expect("eight bytes"));
         let index_length = u64::from_le_bytes(header[24..32].try_into().expect("eight bytes"));
-        if index_length > 256 << 20 || base + index_at + index_length > file.metadata()?.len() {
+        // (added with a check: numbers a damaged or made-up header gives would wrap, and seem to fit)
+        let end = base.checked_add(index_at).and_then(|at| at.checked_add(index_length));
+        let length = file.metadata()?.len();
+        if index_length > 256 << 20 || end.is_none_or(|end| end > length) {
             return Err(invalid("this file is cut short: it did not all arrive"));
         }
         file.seek(SeekFrom::Start(base + index_at))?;
@@ -209,6 +214,10 @@ impl Package {
                 let count = source.read(&mut buffer)?;
                 if count == 0 {
                     return Ok(());
+                }
+                // (what unpacks to more than the entry says is damaged from that byte: it is not written out to the end first, however much more it is)
+                if written + count as u64 > entry.size {
+                    return Err(invalid(format!("{} unpacks to more than it was packed from: this file is damaged", entry.path)));
                 }
                 digest.update(&buffer[..count]);
                 out.write_all(&buffer[..count])?;
@@ -512,15 +521,31 @@ pub mod tests {
         let entry = package.entries[0].clone();
         assert!(package.extract(&entry, &mut Vec::new(), &mut |_| {}).unwrap_err().to_string().contains("damaged"));
 
+        // (an entry that says it is smaller than what it unpacks to stops where it says it ends, with nothing written past that)
+        let mut package = Package::open(&out).unwrap();
+        let mut small = package.entries[0].clone();
+        small.size = 1000;
+        let mut written = Vec::new();
+        assert!(package.extract(&small, &mut written, &mut |_| {}).unwrap_err().to_string().contains("more than it was packed from"));
+        assert!(written.len() <= 1000, "{}", written.len());
+
+        // (an index whose place and length would wrap past the end of the numbers is a cut file, and no panic)
+        let mut wrapped = bytes.clone();
+        wrapped[start + 16..start + 24].copy_from_slice(&u64::MAX.to_le_bytes());
+        let wrap = dir.path().join("wrap.exe");
+        std::fs::write(&wrap, &wrapped).unwrap();
+        assert!(Package::open(&wrap).err().unwrap().to_string().contains("did not all arrive"));
+
         assert!(Package::open(&own_exe()).is_err(), "a program with none");
     }
 
     #[test]
     fn a_name_cannot_lead_out_of_its_folder() {
-        for bad in ["..\\x", "a\\..\\..\\x", "C:\\x", "\\x", "a:stream", "a\\\\b", "", ".", "a/b", ".. \\x", "..\\ x\\..  \\y", "a\\... \\b", "a.", "a ", "NUL", "tools\\con", "a\nb"] {
+        for bad in ["..\\x", "a\\..\\..\\x", "C:\\x", "\\x", "a:stream", "a\\\\b", "", ".", "a/b", ".. \\x", "..\\ x\\..  \\y", "a\\... \\b", "a.", "a ", "NUL", "tools\\con", "a\nb",
+            "NUL.txt", "tools\\CON.log", "a\\com1.tar.gz", "con .txt", "LPT\u{b9}", "x\\com\u{b2}.dat"] {
             assert!(!is_safe(bad), "{bad}");
         }
-        for good in ["a", "a\\b.txt", "\u{65e5}\u{672c}\\c d", "node_modules\\.bin\\x"] {
+        for good in ["a", "a\\b.txt", "\u{65e5}\u{672c}\\c d", "node_modules\\.bin\\x", "console.log", "nulls.txt", "com10.txt", "a\\.nul"] {
             assert!(is_safe(good), "{good}");
         }
         assert!(is_shipped("a.exe") && !is_shipped("x\\A.PDB") && !is_shipped("tools\\.open-to-sandbox") && !is_shipped("dogmind-app.previous-002327.exe") && !is_shipped("x.dll.dogmind-new"));

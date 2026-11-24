@@ -946,6 +946,8 @@ fn on_the_cross(client: RECT, x: i32, y: i32, dpi: u32) -> bool {
 
 /// A small copy, in rounded corners, its alpha over what is there.
 pub(crate) unsafe fn draw_thumb(device: HDC, bitmap: HBITMAP, x: i32, y: i32, width: i32, height: i32, radius: i32) {
+    // (over what Direct2D drew before it, where the paint is drawn as one)
+    crate::render::flush(device);
     let source = CreateCompatibleDC(device);
     let previous = SelectObject(source, bitmap);
     let round = CreateRoundRectRgn(x, y, x + width + 1, y + height + 1, radius * 2, radius * 2);
@@ -1046,6 +1048,13 @@ unsafe extern "system" fn button_procedure(window: HWND, message: u32, wparam: W
             DeleteObject(bitmap);
             DeleteDC(device);
             EndPaint(window, &paint);
+            0
+        }
+        // (on a device it is given: a picture of the window where the system has none, as on a station with no display)
+        WM_PRINTCLIENT => {
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            draw_button(window, wparam as HDC, client, state);
             0
         }
         WM_MOUSEMOVE => {
@@ -1627,6 +1636,9 @@ mod button_style_tests {
     /// A button that has the style it is asked for is not drawn again, however often the layout asks; one that is given another is.
     #[test]
     fn a_button_is_drawn_again_only_when_its_style_changes() {
+        if crate::in_container::cannot_run(crate::in_container::SYSTEM) {
+            return;
+        }
         // SAFETY: a window of this test's own, off every screen and never activated, made and ended on this thread.
         unsafe {
             register_button_class();

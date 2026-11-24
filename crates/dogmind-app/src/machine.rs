@@ -400,14 +400,17 @@ mod tests {
             assert!(is_placeholder(online_only | 0x20));
         }
         assert!(!is_placeholder(0x20) && !is_placeholder(0x10));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "x").unwrap();
         assert!(!holds_placeholders(dir.path()));
     }
 
     #[test]
     fn this_machines_folders_read_as_they_are() {
-        let dir = tempfile::tempdir().unwrap();
+        if crate::in_container::cannot_run(crate::in_container::SYSTEM) {
+            return;
+        }
+        let dir = crate::in_container::tempdir().unwrap();
         let found = folder_facts(&dir.path().join("not").join("yet"));
         assert!(!found.remote && found.can_write && found.can_change_permissions && !found.file_system.is_empty(), "{found:?}");
         assert_eq!(model_folder_refusal(&found, false), None);
@@ -420,7 +423,7 @@ mod tests {
 
     #[test]
     fn free_space_is_read_from_the_nearest_folder_that_exists() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         assert!(free_bytes(&dir.path().join("not").join("yet")).is_some_and(|free| free > 0));
     }
 }

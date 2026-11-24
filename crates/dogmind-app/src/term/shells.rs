@@ -55,7 +55,7 @@ fn on_path(places: &Places, name: &str) -> Option<PathBuf> {
     places.path.iter().map(|folder| folder.join(name)).find(|program| is_there(program))
 }
 
-/// The installed shells, in the menu's order.
+/// The installed shells, PowerShell's first. A terminal opens in PowerShell (`powershell`); the others are found for the tests of the running app, which name the shell they start.
 pub fn discover(places: &Places) -> Vec<Shell> {
     let mut found = Vec::new();
     let system = places.system_root.clone().unwrap_or_else(|| PathBuf::from("C:\\Windows"));
@@ -101,9 +101,9 @@ pub fn command_line(shell: &Shell) -> String {
     line
 }
 
-/// The shell to open when none is named: the one remembered, if this PC still has it, and otherwise the first it has.
-pub fn chosen<'a>(shells: &'a [Shell], remembered: &str) -> Option<&'a Shell> {
-    shells.iter().find(|shell| shell.id == remembered).or_else(|| shells.first())
+/// The shell a terminal opens in: PowerShell 7 where this PC has it, and otherwise Windows PowerShell, which every Windows has.
+pub fn powershell(shells: &[Shell]) -> Option<&Shell> {
+    ["pwsh", "powershell"].into_iter().find_map(|id| shells.iter().find(|shell| shell.id == id))
 }
 
 #[cfg(test)]
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn a_pc_with_nothing_of_the_four_has_none_and_one_with_windows_has_the_two_it_ships() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::in_container::tempdir().unwrap();
         assert!(discover(&places(root.path())).is_empty());
         touch(root.path(), "Windows/System32/cmd.exe");
         touch(root.path(), "Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn powershell_7_is_found_where_it_installs_and_on_path_and_comes_first() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::in_container::tempdir().unwrap();
         touch(root.path(), "Windows/System32/cmd.exe");
         let installed = touch(root.path(), "Program Files/PowerShell/7/pwsh.exe");
         let shells = discover(&places(root.path()));
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn git_bash_is_there_with_a_full_git_for_windows_and_not_with_mingit_or_an_msys2() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::in_container::tempdir().unwrap();
         touch(root.path(), "Windows/System32/cmd.exe");
         // MinGit, as this app ships it: git on PATH from its cmd folder, and no bash.
         touch(root.path(), "tools/git/cmd/git.exe");
@@ -181,7 +181,7 @@ mod tests {
         assert!(shells[1].environment.contains(&("CHERE_INVOKING", "1")), "it stays in the folder it is started in");
         // (and one the person put elsewhere, found by where git is on PATH, whichever of its folders that is)
         for git_folder in ["cmd", "bin", "mingw64/bin"] {
-            let other = tempfile::tempdir().unwrap();
+            let other = crate::in_container::tempdir().unwrap();
             touch(other.path(), "Windows/System32/cmd.exe");
             touch(other.path(), "Tools/Git/cmd/git.exe");
             touch(other.path(), "Tools/Git/bin/bash.exe");
@@ -191,22 +191,28 @@ mod tests {
             assert_eq!(ids(&discover(&here)), ["cmd", "git-bash"], "git on PATH from {git_folder}");
         }
         // (or in the folder Git's per-user installer uses)
-        let local = tempfile::tempdir().unwrap();
+        let local = crate::in_container::tempdir().unwrap();
         touch(local.path(), "Local/Programs/Git/cmd/git.exe");
         touch(local.path(), "Local/Programs/Git/bin/bash.exe");
         assert_eq!(ids(&discover(&places(local.path()))), ["git-bash"]);
     }
 
     #[test]
-    fn the_shell_last_chosen_is_opened_when_this_pc_still_has_it_and_otherwise_the_first() {
-        let root = tempfile::tempdir().unwrap();
+    fn a_terminal_opens_in_powershell_7_where_it_is_and_otherwise_in_windows_powershell() {
+        let root = crate::in_container::tempdir().unwrap();
         touch(root.path(), "Windows/System32/cmd.exe");
         touch(root.path(), "Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
         let shells = discover(&places(root.path()));
-        assert_eq!(chosen(&shells, "cmd").map(|shell| shell.id), Some("cmd"));
-        assert_eq!(chosen(&shells, "git-bash").map(|shell| shell.id), Some("powershell"), "gone since");
-        assert_eq!(chosen(&shells, "").map(|shell| shell.id), Some("powershell"));
-        assert_eq!(chosen(&[], "cmd"), None);
+        assert_eq!(powershell(&shells).map(|shell| shell.id), Some("powershell"), "and not the Command Prompt, though it is found");
+        touch(root.path(), "Program Files/PowerShell/7/pwsh.exe");
+        let shells = discover(&places(root.path()));
+        assert_eq!(ids(&shells)[0], "pwsh", "{:?}", ids(&shells));
+        assert_eq!(powershell(&shells).map(|shell| shell.id), Some("pwsh"));
+        // (where a PC had neither, there is nothing to open, and the app says so)
+        let only_cmd = crate::in_container::tempdir().unwrap();
+        touch(only_cmd.path(), "Windows/System32/cmd.exe");
+        assert_eq!(powershell(&discover(&places(only_cmd.path()))).map(|shell| shell.id), None);
+        assert_eq!(powershell(&[]).map(|shell| shell.id), None);
     }
 
     #[test]

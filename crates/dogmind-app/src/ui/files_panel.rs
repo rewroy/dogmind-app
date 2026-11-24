@@ -38,7 +38,6 @@ impl MenuItem {
 pub(super) enum MenuFor {
     Nothing,
     Files,
-    Shells,
     Terminal,
 }
 
@@ -452,9 +451,11 @@ impl App {
     /// A file in its own app; what is a program or a script is shown in Explorer, as the app does not run what it did not write; a folder opens in Explorer.
     pub(super) unsafe fn files_open_in_app(&mut self, row: &Row) {
         let disk = self.tree_disk_path(row);
-        let (target, arguments) = if row.is_folder() {
-            ("explorer.exe".to_string(), format!("\"{}\"", disk.display()))
-        } else if disk.is_file() && cards::opens_in_app(&row.name) {
+        if row.is_folder() {
+            self.open_folder_in_explorer(&disk);
+            return;
+        }
+        let (target, arguments) = if disk.is_file() && cards::opens_in_app(&row.name) {
             (disk.display().to_string(), String::new())
         } else if disk.is_file() {
             ("explorer.exe".to_string(), format!("/select,\"{}\"", disk.display()))
@@ -467,8 +468,15 @@ impl App {
     /// Explorer, with the file selected in its folder; a folder is opened.
     unsafe fn files_show_in_explorer(&mut self, row: &Row) {
         let disk = self.tree_disk_path(row);
-        let arguments = if row.is_folder() { format!("\"{}\"", disk.display()) } else { format!("/select,\"{}\"", disk.display()) };
-        self.shell_open("explorer.exe", &arguments);
+        if row.is_folder() {
+            self.open_folder_in_explorer(&disk);
+        } else {
+            self.shell_open("explorer.exe", &format!("/select,\"{}\"", disk.display()));
+        }
+    }
+
+    pub(super) unsafe fn open_folder_in_explorer(&self, folder: &Path) {
+        self.shell_open("explorer.exe", &format!("\"{}\"", folder.display()));
     }
 
     unsafe fn shell_open(&self, target: &str, arguments: &str) {
@@ -551,10 +559,6 @@ impl App {
         }
         match whose {
             MenuFor::Nothing => {}
-            MenuFor::Shells => {
-                self.files_menu_close(true);
-                self.terminal_shell_chosen(at);
-            }
             MenuFor::Terminal => {
                 self.files_menu_close(true);
                 self.terminal_menu_chosen(at);

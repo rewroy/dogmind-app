@@ -181,7 +181,7 @@ struct Assembly {
     partial: Vec<String>,
     stop: String,
     prompt: u64,
-    cached: u64,
+    cached: Option<u64>,
     completion: u64,
     refused: Option<String>,
 }
@@ -194,7 +194,7 @@ impl Assembly {
                 if let Some(usage) = event.pointer("/message/usage") {
                     let count = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0);
                     self.prompt = count("input_tokens") + count("cache_read_input_tokens") + count("cache_creation_input_tokens");
-                    self.cached = count("cache_read_input_tokens");
+                    self.cached = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
                 }
             }
             "content_block_start" => {
@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(completion.content, "Reading.");
         assert_eq!(completion.tool_calls[0].function.arguments, "{\"path\":\"a\"}");
         let usage = completion.usage.clone().unwrap();
-        assert_eq!((usage.prompt, usage.cached, usage.completion), (115, 100, 9));
+        assert_eq!((usage.prompt, usage.cached, usage.completion), (115, Some(100), 9));
         let message = completion.message();
         let blocks = assistant_blocks(&message);
         assert_eq!(blocks[0], json!({"type": "thinking", "thinking": "hm", "signature": "sig"}));
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "low");
         assert_eq!(body["system"], "s");
-        assert_eq!(body["tools"].as_array().unwrap().len(), 17);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 20);
         assert_eq!(body["tools"][0]["eager_input_streaming"], true);
         assert!(body["tools"][0].get("input_schema").is_some());
         for field in ["temperature", "top_p", "top_k", "tool_choice"] {

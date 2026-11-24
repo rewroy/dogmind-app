@@ -12,7 +12,7 @@ use dogmind_agent::timeline::{self, Band, BandPart, CallRow, Heading, Lane, Part
 use serde_json::Value;
 
 use crate::cards::{duration_words, is_asking, token_count_words};
-use crate::lang::{t, tf};
+use crate::lang::{request_end_words, t, tf, tool_outcome_words};
 use crate::toolrun::{partial_value, size_text};
 use crate::ui::tool_name;
 
@@ -80,11 +80,15 @@ pub struct Inputs {
 pub const SHORTEST_SPAN: u64 = 50;
 
 /// Whether a step has what is looked for (`query`, in small letters): in why it was taken, its calls' tools (as named here and as the model named
-/// them) and what they were on, or what its helper did.
+/// them), their targets, results and exit codes, or what its helper did.
 fn step_has(step: &Step, query: &str) -> bool {
     let has = |text: &str| text.to_lowercase().contains(query);
+    let exit_label = t("Exit code").to_lowercase();
+    let exit_query = query.strip_prefix(&exit_label).map(|rest| rest.trim().trim_start_matches([':', '：']).trim());
     step.why.as_ref().is_some_and(|why| has(&why.text))
         || step.calls.iter().any(|call| has(&call.name) || has(t(tool_name(&call.name))) || call.target.as_deref().is_some_and(has)
+            || (!call.outcome.is_empty() && has(&call_result_words(call)))
+            || call.exit_code.zip(exit_query).is_some_and(|(code, wanted)| wanted.is_empty() || wanted.parse::<i64>() == Ok(code))
             || call.helper_steps.iter().any(|helper| helper.why.as_ref().is_some_and(|why| has(&why.text)) || helper.calls.iter().any(|(name, target)| has(name) || target.as_deref().is_some_and(has))))
         || match &step.kind {
             StepKind::Model => false,
@@ -103,7 +107,7 @@ enum Phase {
     Reading { done: u64, total: u64 },
     Thinking,
     /// The arguments of a call are being written (`Live::writing` says which).
-    Writing,
+    Writing { index: usize },
     Answering,
     /// The model's answer is whole; its calls are looked at before they run.
     Checking,
@@ -302,7 +306,7 @@ impl Live {
                     take -= 1;
                 }
                 writing.head.push_str(&piece[..take]);
-                self.enter(Phase::Writing, at);
+                self.enter(Phase::Writing { index: *index }, at);
             }
             Event::AssistantEnded => {
                 self.writing.clear();
@@ -378,7 +382,7 @@ impl Live {
             }
             Phase::Reading { .. } => (Lane::Requests, Part::Reading),
             Phase::Thinking => (Lane::Requests, Part::Thinking),
-            Phase::Writing | Phase::Answering => (Lane::Requests, Part::Writing),
+            Phase::Writing { .. } | Phase::Answering => (Lane::Requests, Part::Writing),
             Phase::Starting | Phase::Asking | Phase::Checking | Phase::Preparing | Phase::Compacting | Phase::Retrying { .. } | Phase::Restarting { .. } => (Lane::Requests, Part::Waiting),
         };
         Some((lane, part, self.since))
@@ -427,8 +431,8 @@ impl Live {
                 (Who::Model, tf("Reading the conversation: {0} of {1} tokens ({2}%)", &[&token_count_words(*done), &token_count_words(*total), &percent]), self.since)
             }
             Phase::Thinking => (Who::Model, t("Thinking…").to_string(), self.since),
-            Phase::Writing => {
-                let writing = self.writing.iter().max_by_key(|writing| writing.index);
+            Phase::Writing { index } => {
+                let writing = self.writing.iter().find(|writing| writing.index == *index);
                 let words = writing.map_or(String::new(), |writing| {
                     let target = partial_value(&writing.head, "path").map(|path| safe(&path)).unwrap_or_default();
                     tf("Writing the arguments of {0}: {1}", &[&call_words(&writing.tool, &target), &size_text(writing.bytes)])
@@ -1006,16 +1010,21 @@ fn in_calling_order(calls: &[CallRow]) -> Vec<&CallRow> {
     ordered
 }
 
+fn call_result_words(call: &CallRow) -> String {
+    tool_outcome_words(&call.outcome, call.exit_code.is_some_and(|code| code != 0))
+}
+
 fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, context: &Context) {
     let nested = call.id.contains('.');
     let running = is_live && context.live.is_running(&call.id);
     let failed_exit = call.exit_code.is_some_and(|code| code != 0);
+    let failed = !call.outcome.is_empty() && (call.outcome != "ok" || failed_exit);
     let (icon, tone, right) = match call.outcome.as_str() {
         _ if running => ("clock", Tone::App, t("running").to_string()),
         "" if is_live => ("clock", Tone::Muted, String::new()),
         "" => ("square", Tone::Muted, t("did not run").to_string()),
         "ok" if !failed_exit => ("check", Tone::Good, if call.ms > 0 { ms_words(call.ms) } else { String::new() }),
-        other => ("x", Tone::Bad, outcome_words(other, failed_exit)),
+        _ => ("x", Tone::Bad, call_result_words(call)),
     };
     let indent = if nested { 3 } else { 2 };
     let name = t(tool_name(&call.name)).to_string();
@@ -1028,13 +1037,14 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
         out.push(Row { kind: Kind::Pictures, indent: indent + 1, pictures: call.images.clone(), ..Row::default() });
     }
     let inner = indent + 1;
-    if !call.outcome.is_empty() && call.outcome != "ok" {
-        out.push(fact(inner, t("Result"), outcome_words(&call.outcome, false)));
+    if failed {
+        out.push(fact(inner, t("Result"), call_result_words(call)));
     }
     if let Some(code) = call.exit_code {
         out.push(fact(inner, t("Exit code"), code.to_string()));
     }
-    if let Some(wait) = call.wait_ms.filter(|wait| *wait > 0) {
+    let wait = call.wait_ms.unwrap_or(0).saturating_add(if call.answered_by_person() { call.ms } else { 0 });
+    if wait > 0 {
         out.push(fact(inner, t("Waited for you"), ms_words(wait)));
     }
     if call.ms > 0 && call.outcome == "ok" && !call.started.is_empty() {
@@ -1061,18 +1071,7 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
     }
     if let Some(output) = call.output.as_deref().filter(|output| !output.is_empty()) {
         out.push(Row { kind: Kind::Caption, text: t("Output").to_string(), indent: inner, ..Row::default() });
-        out.extend(code_rows(plain_lines(&safe(output)), inner, if call.outcome == "ok" || call.outcome.is_empty() { Tone::Plain } else { Tone::Bad }));
-    }
-}
-
-fn outcome_words(outcome: &str, failed_exit: bool) -> String {
-    match outcome {
-        "ok" if failed_exit => t("Failed").to_string(),
-        "error" => t("Failed").to_string(),
-        "timeout" => t("Timed out").to_string(),
-        "declined_person" => t("You declined").to_string(),
-        "cancelled" => t("Stopped").to_string(),
-        other => other.replace('_', " "),
+        out.extend(code_rows(plain_lines(&safe(output)), inner, if failed { Tone::Bad } else { Tone::Plain }));
     }
 }
 
@@ -1151,7 +1150,7 @@ fn request_facts(request: &RequestDetail, indent: u8, fold: (Key, bool)) -> Vec<
         facts.push(fact(indent, t("Speed"), tf("{0} tokens per second", &[&format!("{speed:.1}")])));
     }
     if !request.end.is_empty() {
-        facts.push(fact(indent, t("Ended"), end_words(&request.end)));
+        facts.push(fact(indent, t("Ended"), request_end_words(&request.end)));
     }
     if request.reasoning_chars > 0 {
         facts.push(fact(indent, t("Thought"), tf("{0} characters", &[&request.reasoning_chars])));
@@ -1255,21 +1254,6 @@ fn value_words(value: &Value) -> String {
         Value::Bool(false) => t("no").to_string(),
         Value::Null => String::new(),
         other => cap(&other.to_string(), 160),
-    }
-}
-
-/// How a request ended, in words: what the trajectory calls it is kept at the end of them.
-fn end_words(end: &str) -> String {
-    match end {
-        "stop" => t("It finished").to_string(),
-        "tool_calls" => t("It asked for calls").to_string(),
-        "length" => t("It ran out of room and was cut off").to_string(),
-        "cancelled_person" => t("You stopped it").to_string(),
-        other => match other.split_once(':') {
-            Some(("error", kind)) => tf("It failed: {0}", &[&kind.replace('_', " ")]),
-            Some(("stopped_app", why)) => tf("Dogmind stopped it: {0}", &[&why.replace('_', " ")]),
-            _ => other.replace('_', " "),
-        },
     }
 }
 
@@ -1407,6 +1391,71 @@ mod tests {
     }
 
     #[test]
+    fn a_timeline_search_finds_results_and_distinguishes_exit_codes() {
+        let cases = [
+            ("first", "ok", Some(7)), ("second", "ok", Some(70)), ("third", "ok", Some(0)),
+            ("fourth", "timeout", None), ("fifth", "", None), ("sixth", "error", None),
+        ];
+        let steps = cases.iter().map(|(label, outcome, code)| {
+            model(Some((label, WhySource::Content)), vec![CallRow { exit_code: *code, ..call(label, "execute_command", "python", outcome) }])
+        }).collect();
+        let timeline = Timeline { turns: vec![turn(1, "Investigate", steps, done(100))], heading: None };
+        let found = |q: &str| {
+            let inputs = Inputs { query: q.into(), ..Inputs::default() };
+            let rows = rows(Some(&timeline), &Live::new(Instant::now()), &inputs, &HashMap::new(), Instant::now());
+            cases.iter().filter_map(|(label, _, _)| rows.iter().any(|row| row.text == *label).then_some(*label)).collect::<Vec<_>>()
+        };
+        assert_eq!(found(t("Failed")), ["first", "second", "sixth"]);
+        assert_eq!(found(t("Done")), ["third"]);
+        assert_eq!(found(t("Timed out")), ["fourth"]);
+        let exit = t("Exit code");
+        for query in [format!("{exit}: 7"), format!("{exit} 7"), format!("{exit}：7")] {
+            assert_eq!(found(&query), ["first"]);
+        }
+        assert_eq!(found(exit), ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn command_results_agree_in_the_call_heading_and_its_open_details() {
+        for (outcome, code, reason) in [
+            ("ok", Some(7), Some("Failed")), ("ok", Some(0), None), ("ok", None, None),
+            ("timeout", None, Some("Timed out")), ("", None, None),
+        ] {
+            let call = CallRow { exit_code: code, output: Some("program output".into()), ..call("c", "execute_command", "python", outcome) };
+            let timeline = Timeline { turns: vec![turn(1, "Go", vec![model(None, vec![call])], done(100))], heading: None };
+            let rows = rows_for(&timeline, &Live::new(Instant::now()), &HashMap::from([(Key::Step(1, 0), true)]));
+            let heading = rows.iter().find(|row| row.kind == Kind::Call).unwrap();
+            let result = rows.iter().find(|row| row.label == t("Result"));
+            assert_eq!(result.map(|row| row.text.as_str()), reason.map(t), "{outcome} {code:?}");
+            if let Some(reason) = reason {
+                assert_eq!(heading.right, t(reason));
+            }
+            let output = rows.iter().find(|row| row.kind == Kind::Code && row.text == "program output").unwrap();
+            assert_eq!(output.tone, if reason.is_some() { Tone::Bad } else { Tone::Plain });
+            assert_eq!(rows.iter().find(|row| row.label == t("Exit code")).map(|row| row.text.clone()), code.map(|n| n.to_string()));
+        }
+    }
+
+    #[test]
+    fn saved_questions_and_plan_reviews_keep_their_wait_in_the_band_and_details() {
+        let stamp = "2026-11-24T12:43:45.930+09:00";
+        for (name, outcome, part) in [
+            ("ask_user", "ok", Part::Person), ("submit_plan", "ok", Part::Person),
+            ("ask_user", "error", Part::CallFailed), ("submit_plan", "error", Part::CallFailed),
+            ("present", "ok", Part::Call),
+        ] {
+            let call = CallRow { started: stamp.into(), ms: 148_039, ..call("c", name, "", outcome) };
+            let mut turn = turn(1, "Go", vec![model(None, vec![call])], done(148_039));
+            turn.started = stamp.into();
+            let band = timeline::band(&turn).unwrap();
+            assert_eq!(band.parts, [BandPart { lane: Lane::Calls, from: 0, to: 148_039, part }], "{name} {outcome}");
+            let timeline = Timeline { turns: vec![turn], heading: None };
+            let rows = rows_for(&timeline, &Live::new(Instant::now()), &HashMap::from([(Key::Step(1, 0), true)]));
+            assert_eq!(rows.iter().any(|row| row.label == t("Waited for you") && row.text == ms_words(148_039)), part == Part::Person);
+        }
+    }
+
+    #[test]
     fn with_no_turn_at_work_it_is_idle_or_waits_for_what_runs_in_the_background() {
         let at = Instant::now();
         let live = Live::new(at);
@@ -1436,6 +1485,26 @@ mod tests {
         assert_eq!(now(&live, 9).text, "Writing the arguments of Write  src/lib.rs: 4 KB");
         noted(&mut live, &[Event::RequestStarted, Event::Content("Done.".into())], later(at, 10));
         assert_eq!((now(&live, 11).who, now(&live, 11).text), (Who::Model, "Writing the answer".to_string()));
+    }
+
+    #[test]
+    fn interleaved_argument_updates_show_the_call_that_just_grew() {
+        let at = Instant::now();
+        let mut live = Live::new(at);
+        let piece = |index, text: &str| Event::ToolWriting { index, tool: "create_file".into(), piece: text.into() };
+        let first = r#"{"path":"first.html","content":""#;
+        let second = r#"{"path":"second.html","content":""#;
+        noted(&mut live, &[Event::TurnStarted, Event::RequestStarted, piece(0, first)], at);
+        live.note(&piece(1, second), later(at, 1));
+        assert!(live.now(&running(), later(at, 1)).text.contains("second.html"));
+        live.note(&piece(0, &"x".repeat(2048)), later(at, 2));
+        let now = live.now(&running(), later(at, 3));
+        assert_eq!(now.text, "Writing the arguments of Write  first.html: 2 KB");
+        assert_eq!(now.seconds, Some(3));
+        live.note(&piece(1, "y"), later(at, 4));
+        assert_eq!(live.now(&running(), later(at, 4)).text, format!("Writing the arguments of Write  second.html: {} B", second.len() + 1));
+        live.note(&Event::AssistantEnded, later(at, 5));
+        assert_eq!(live.now(&running(), later(at, 5)).text, "Checking the calls");
     }
 
     #[test]

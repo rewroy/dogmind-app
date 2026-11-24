@@ -170,6 +170,128 @@ fn short_lived(scene: &Path) -> Child {
 }
 
 #[test]
+fn installs_and_updates_keep_out_of_default_and_custom_session_folders() {
+    let scene = Scene::new();
+    let local = scene.path().join("Local");
+    let named = scene.path().join("my history");
+    let sessions = named.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(sessions.join("conversation.jsonl"), "saved conversation").unwrap();
+    let kept = contents(&named);
+    let package = pack(scene.path(), "2.0");
+    let install = |folder: &Path, profile: &Path| {
+        setup(&package).env("LOCALAPPDATA", &local).env("DOGMIND_DATA", profile)
+            .args(["--test", "--auto", "--dir"]).arg(folder).status().unwrap().code()
+    };
+    let default = local.join("DogmindApp");
+    for folder in [&named, &sessions.join("install"), &default] {
+        assert_eq!(install(folder, &named), Some(1), "{}", folder.display());
+    }
+    assert_eq!(contents(&named), kept);
+    assert!(!default.exists());
+    let sibling = scene.path().join("my history backup");
+    assert_eq!(install(&sibling, &named), Some(0));
+    assert_eq!(version_of(&sibling), "2.0");
+
+    // A previous install can become protected later if the person moves their profile.
+    let folder = scene.installed("1.0");
+    let before = contents(&folder);
+    let status = setup(&package).env("DOGMIND_DATA", folder.parent().unwrap())
+        .args(["--test", "--auto", "--update", "--dir"]).arg(&folder).status().unwrap();
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(contents(&folder), before);
+    assert!(running_from(&folder).is_empty());
+}
+
+#[test]
+fn an_unattended_uninstall_requires_a_named_test_app() {
+    let scene = Scene::new();
+    let folder = scene.installed("1.0");
+    let uninstall = |fixture: Option<&str>| {
+        let mut command = setup(Path::new(SETUP));
+        command.env_remove("DOGMIND_SETUP_APP_NAME").env("DOGMIND_DATA", scene.path().join("profile"));
+        if let Some(name) = fixture {
+            command.env("DOGMIND_SETUP_APP_NAME", name);
+        }
+        command.args(["--uninstall", "--test", "--auto", "--dir"]).arg(&folder).status().unwrap().code()
+    };
+    let default_app = folder.join("dogmind-app.exe");
+    std::fs::copy(folder.join(APP), &default_app).unwrap();
+    let before = contents(&folder);
+    let code = uninstall(None);
+    assert_eq!((code, running_from(&folder).len()), (Some(1), 0));
+    assert_eq!(contents(&folder), before);
+
+    // A missing default program must not turn the unattended check into a program-only removal.
+    std::fs::remove_file(&default_app).unwrap();
+    let before = contents(&folder);
+    assert_eq!(uninstall(None), Some(1));
+    assert_eq!(contents(&folder), before);
+    assert_eq!(uninstall(Some(APP)), Some(0));
+    assert_eq!(wait_for_the_app(&folder).len(), 1);
+}
+
+#[test]
+fn an_unattended_test_update_does_not_start_the_default_app() {
+    let scene = Scene::new();
+    let folder = scene.installed("1.0.0");
+    // A harmless stand-in with the product's default name makes an unintended launch observable.
+    std::fs::copy(folder.join(APP), folder.join("dogmind-app.exe")).unwrap();
+    let update = pack(scene.path(), "2.0.0");
+    for (setting, code, version) in [
+        (Some(("DOGMIND_SETUP_PRESS", "cancel-at-once")), 2, "1.0.0"),
+        (Some(("DOGMIND_SETUP_FAIL_AFTER", "0")), 1, "1.0.0"),
+        (None, 0, "2.0.0"),
+    ] {
+        let mut command = setup(&update);
+        command.env_remove("DOGMIND_SETUP_APP_NAME").env("DOGMIND_DATA", scene.path().join("profile"));
+        if let Some((name, value)) = setting {
+            command.env(name, value);
+        }
+        let status = command.args(["--update", "--test", "--auto", "--dir"]).arg(&folder).status().unwrap();
+        assert_eq!(status.code(), Some(code));
+        assert_eq!(manifest_version(&folder), version);
+        assert!(folder.join("dogmind-app.exe").is_file());
+        assert!(running_from(&folder).is_empty(), "test update started the default app with exit code {code}");
+    }
+}
+
+#[test]
+fn a_completed_update_reports_when_the_app_could_not_start() {
+    let scene = Scene::new();
+    let folder = scene.installed("1.0.0");
+    let update = pack(scene.path(), "2.0.0");
+    let status = setup(&update).env("DOGMIND_SETUP_APP_NAME", "missing-app.exe")
+        .args(["--update", "--test", "--auto", "--dir"]).arg(&folder).status().unwrap();
+    assert_eq!(manifest_version(&folder), "2.0.0");
+    assert_eq!(version_of(&folder), "2.0.0");
+    assert_eq!(status.code(), Some(1), "setup must report the requested launch failure");
+    assert!(running_from(&folder).is_empty());
+}
+
+#[test]
+fn no_launch_leaves_a_closed_app_closed_after_an_update() {
+    let scene = Scene::new();
+    let folder = scene.installed("1.0.0");
+    let update = pack(scene.path(), "2.0.0");
+    for (setting, code, version) in [
+        (Some(("DOGMIND_SETUP_PRESS", "cancel-at-once")), 2, "1.0.0"),
+        (Some(("DOGMIND_SETUP_FAIL_AFTER", "0")), 1, "1.0.0"),
+        (None, 0, "2.0.0"),
+    ] {
+        let mut command = setup(&update);
+        if let Some((name, value)) = setting {
+            command.env(name, value);
+        }
+        let status = command.args(["--update", "--test", "--auto", "--no-launch", "--dir"]).arg(&folder).status().unwrap();
+        assert_eq!(status.code(), Some(code));
+        assert_eq!(manifest_version(&folder), version);
+        assert_eq!(version_of(&folder), version);
+        assert!(running_from(&folder).is_empty(), "--no-launch started the test app on exit {code}");
+    }
+}
+
+#[test]
 fn an_update_waits_for_the_app_replaces_its_files_and_starts_it_again() {
     let scene = Scene::new();
     let folder = scene.installed("1.0.0");

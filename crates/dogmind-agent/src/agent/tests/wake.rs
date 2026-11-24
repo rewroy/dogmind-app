@@ -359,7 +359,7 @@ fn the_session_is_not_woken_when_there_is_nothing_to_answer_with() {
 /// Waking goes on through the loop, with nobody sending anything; a wait is the one thing here that the test's clock moves.
 #[test]
 fn a_session_in_the_loop_wakes_by_itself_for_a_wait_and_the_trajectory_says_why() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let (run, provider) = scripted(dir.path(), vec![calls(&[("wake_at", json!({"delay_seconds": 60, "note": "look at the server"}))]), says("I will look again in a minute."), says("Looked: all fine.")], Mode::Auto);
     run.handle.commands.send(Command::Send("check on it later".into())).unwrap();
     // (what the window is told it lists meanwhile: the wait, with when it is up)
@@ -398,7 +398,7 @@ fn a_session_in_the_loop_wakes_by_itself_for_a_wait_and_the_trajectory_says_why(
 /// A woken turn asks as any turn does, and waits: nothing approves for it, whatever it waited for.
 #[test]
 fn a_woken_turn_asks_and_waits_and_nothing_approves_for_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let (run, provider) = scripted(dir.path(), vec![
         calls(&[("wake_at", json!({"delay_seconds": 60, "note": "run the check"}))]),
         says("Waiting."),
@@ -435,7 +435,7 @@ fn a_woken_turn_asks_and_waits_and_nothing_approves_for_it() {
 #[cfg(windows)]
 #[test]
 fn a_real_background_command_wakes_the_session_when_it_ends() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::in_container::tempdir().unwrap();
     let (run, provider) = scripted(dir.path(), vec![
         calls(&[("execute_command", json!({"command": "echo finished-in-background", "background": true}))]),
         says("It is running; I will hear when it ends."),

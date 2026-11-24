@@ -30,6 +30,8 @@ pub struct Writing {
     pub raw: String,
     /// How long they were when a path was last looked for in them.
     looked_at: usize,
+    /// Order of the latest piece among calls in this run.
+    last_piece: u64,
 }
 
 impl RunEntry {
@@ -38,7 +40,7 @@ impl RunEntry {
     }
 
     pub fn being_written(index: usize, tool: String) -> RunEntry {
-        RunEntry { writing: Some(Writing { index, raw: String::new(), looked_at: 0 }), ..RunEntry::running(String::new(), tool, String::new()) }
+        RunEntry { writing: Some(Writing { index, raw: String::new(), looked_at: 0, last_piece: 0 }), ..RunEntry::running(String::new(), tool, String::new()) }
     }
 
     /// More of what the model is writing. What it has written of a path or a command is read as soon as it is whole.
@@ -65,6 +67,23 @@ impl RunEntry {
     pub fn ended(tool: String, summary: String, output: Vec<String>) -> RunEntry {
         RunEntry { id: String::new(), tool, summary, elapsed: None, done: true, output, writing: None, failure: None }
     }
+}
+
+/// Keep calls in the order they appeared, even when their argument pieces alternate.
+pub fn append_piece<'a>(entries: &'a mut Vec<RunEntry>, index: usize, tool: String, piece: &str) -> &'a RunEntry {
+    let next = entries.iter().filter_map(|entry| entry.writing.as_ref()).map(|writing| writing.last_piece).max().unwrap_or(0) + 1;
+    let place = entries.iter().position(|entry| entry.writing.as_ref().is_some_and(|writing| writing.index == index)).unwrap_or_else(|| {
+        entries.push(RunEntry::being_written(index, tool));
+        entries.len() - 1
+    });
+    let entry = &mut entries[place];
+    entry.more_written(piece);
+    entry.writing.as_mut().unwrap().last_piece = next;
+    entry
+}
+
+pub fn latest_writing(entries: &[RunEntry]) -> Option<&RunEntry> {
+    entries.iter().filter_map(|entry| entry.writing.as_ref().map(|writing| (writing.last_piece, entry))).max_by_key(|(order, _)| *order).map(|(_, entry)| entry)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,7 +143,7 @@ impl ToolRun {
 
     /// The call the row is about while the run goes on: the one the model is writing, or else the first still running, or else the last.
     fn current(&self) -> Option<&RunEntry> {
-        self.entries.iter().rev().find(|entry| entry.writing.is_some()).or_else(|| self.entries.iter().find(|entry| !entry.done)).or(self.entries.last())
+        latest_writing(&self.entries).or_else(|| self.entries.iter().find(|entry| !entry.done)).or(self.entries.last())
     }
 
     /// What the first line says. `units`: the room, in half-width characters. `since`: seconds from its first call.
@@ -518,8 +537,7 @@ pub fn full_summary(tool: &str, summary: &str, workspace: &Path) -> String {
 /// How a command ended, from what the agent reports: none if it did not run to its end at zero. (A command that fails is no failed call: the model reads
 /// its output and goes on. The person is who has to see it.)
 pub fn command_failed(output: &str) -> Option<String> {
-    let (_, rest) = output.rsplit_once("exit_code:")?;
-    let value = rest.lines().next().unwrap_or("").trim();
+    let value = dogmind_agent::tools::command_exit_status(output)?;
     match value {
         "0" => None,
         _ => match value.strip_prefix("none,") {
@@ -541,7 +559,18 @@ pub fn command_lines(output: &str) -> (usize, Vec<String>) {
 
 /// What a diff changed, without its file names.
 pub fn diff_lines(text: &str) -> Vec<&str> {
-    text.lines().filter(|line| !line.starts_with("--- ") && !line.starts_with("+++ ")).collect()
+    let lines = text.lines().map(|line| {
+        // The tool can cut a hunk in two. Show the omission as a note between the pieces.
+        if let Some(note) = line.strip_prefix("--- ").and_then(|s| s.strip_suffix(" ---")) {
+            if let Some((count, rest)) = note.strip_prefix("truncated: ").and_then(|s| s.split_once(" bytes left out")) {
+                if count.parse::<usize>().is_ok() && (rest.is_empty() || rest.starts_with("; ")) {
+                    return note;
+                }
+            }
+        }
+        line
+    });
+    dogmind_agent::tools::diff_lines_without_file_headers(lines).collect()
 }
 
 /// What a call that went well keeps for when its run is opened.
@@ -644,6 +673,7 @@ mod tests {
         assert!(command_failed("stdout:\n\nstderr:\nbad\n\nexit_code: 3").is_some_and(|how| how.contains('3')));
         assert_eq!(command_failed("stdout:\n\nstderr:\n\nexit_code: none, timed out after 30 s").as_deref(), Some("timed out after 30 s"));
         assert_eq!(command_failed("stdout:\nexit_code: 9 was printed\nstderr:\n\nexit_code: 0"), None, "the report's own last line counts");
+        assert_eq!(command_failed("exit_code: 0\nstdout:\nexample exit_code: none, timed out\nstderr:\n\nexit_code: 0\nfiles changed by this command:\n- created exit_code: 2.txt"), None);
         assert_eq!(command_failed("started in the background"), None);
     }
 
@@ -793,6 +823,27 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_pieces_keep_each_file_and_its_place_in_the_transcript() {
+        let mut run = ToolRun::new();
+        run.open = true;
+        let start = r#"{"path":"first.rs","content":""#;
+        append_piece(&mut run.entries, 0, "create_file".into(), start);
+        append_piece(&mut run.entries, 1, "create_file".into(), r#"{"path":"second.rs","#);
+        let entry = append_piece(&mut run.entries, 0, "create_file".into(), &"x".repeat(2048));
+        assert_eq!(entry.writing.as_ref().unwrap().raw.len(), start.len() + 2048);
+        let plain = writing_line(entry, &work());
+        let compact = run.head(&work(), 90, 0.0);
+        for line in [plain, compact] {
+            assert!(line.contains("first.rs") && line.contains("2 KB"), "{line}");
+        }
+        append_piece(&mut run.entries, 1, "create_file".into(), " ");
+        assert!(run.head(&work(), 90, 0.0).contains("second.rs"));
+        assert_eq!(run.entries.iter().map(|entry| entry.summary.as_str()).collect::<Vec<_>>(), ["first.rs", "second.rs"]);
+        run.entries[1].writing = None;
+        assert!(run.head(&work(), 90, 0.0).contains("first.rs"));
+    }
+
+    #[test]
     fn what_is_being_written_reads_from_its_end_however_it_was_cut() {
         assert_eq!(written_tail(r#"{"path":"a","content":"one\ntwo\n  thr"#), ["one", "two", "  thr"]);
         assert_eq!(written_tail(r#"{"path":"a","content":"cut in an escape\"#), ["cut in an escape"]);
@@ -825,6 +876,14 @@ mod tests {
         let mut run = ToolRun::new();
         run.entries = vec![call("read_file", "a.rs", 0.01)];
         assert!(!run.head(&work(), 80, 1.0).contains('s') || run.head(&work(), 80, 1.0).ends_with("a.rs"), "{}", run.head(&work(), 80, 1.0));
+    }
+
+    #[test]
+    fn header_like_content_stays_in_saved_patch_output() {
+        let diff = "--- a/one\n+++ b/one\n@@ -1 +1 @@\n--- old\n+++ new\n--- a/two\n+++ b/two\n@@ -0,0 +1 @@\n+++ another\n";
+        assert_eq!(kept_output("apply_patch", diff), ["@@ -1 +1 @@", "--- old", "+++ new", "@@ -0,0 +1 @@", "+++ another"]);
+        let capped = "--- applied_diff doc ---\n@@ -1,6 +1,6 @@\n--- old\n--- truncated: 128 bytes left out ---\n+last\n";
+        assert_eq!(kept_output("apply_patch", capped), ["@@ -1,6 +1,6 @@", "--- old", "truncated: 128 bytes left out", "+last"]);
     }
 
     #[test]

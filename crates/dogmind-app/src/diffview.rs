@@ -3,6 +3,7 @@
 
 use crate::highlight::{self, Kind};
 use crate::lang::t;
+use dogmind_agent::tools::diff_lines_without_file_headers;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
@@ -49,80 +50,97 @@ fn drawn(line: &str, show_tabs: bool) -> String {
     }
 }
 
-/// The lines of a diff, each without its newline and with its carriage return, if it has one: `str::lines` takes that away, and with it the difference this is about.
+// Keep the carriage returns so an edit to a line ending stays visible.
 fn diff_lines(diff: &str) -> impl Iterator<Item = &str> {
-    diff.split_inclusive('\n').map(|line| line.strip_suffix('\n').unwrap_or(line))
+    diff_lines_without_file_headers(diff.split_terminator('\n'))
 }
 
-/// A line of the diff, and what is told of it by the one it is set against.
-struct Prepared {
-    text: String,
-    /// It and the line it is paired with differ in tabs and spaces alone: the tabs are shown.
-    whitespace_only: bool,
-}
-
-/// The lines of a diff, with each removed line set against the added line in its place (the n-th of a block of removals against the n-th of the additions after it): two long lines that
-/// are the same as far as a line is drawn are cut where they differ and not at the end, and two that differ in tabs and spaces alone are marked.
-fn prepared(diff: &str) -> Vec<Prepared> {
-    let mut lines: Vec<Prepared> = diff_lines(diff).map(|line| Prepared { text: line.to_string(), whitespace_only: false }).collect();
-    let is = |line: &Prepared, mark: char| line.text.starts_with(mark) && !line.text.starts_with("--- ") && !line.text.starts_with("+++ ");
-    let mut at = 0;
-    while at < lines.len() {
-        let start = at;
-        while at < lines.len() && is(&lines[at], '-') {
-            at += 1;
-        }
-        let middle = at;
-        while at < lines.len() && is(&lines[at], '+') {
-            at += 1;
-        }
-        if middle == start || at == middle {
-            at = at.max(start + 1);
-            continue;
-        }
-        for k in 0..(middle - start).min(at - middle) {
-            let (old, new) = (start + k, middle + k);
-            let (a, b) = (lines[old].text[1..].trim_end_matches('\r').to_string(), lines[new].text[1..].trim_end_matches('\r').to_string());
-            if a == b {
-                continue;
+/// Each line and its counterpart in a consecutive block of removals and additions.
+fn paired_lines(diff: &str) -> impl Iterator<Item = (&str, Option<&str>)> {
+    let mut lines = diff_lines(diff).peekable();
+    let mut block = Vec::new();
+    let (mut at, mut added_start) = (0, 0);
+    std::iter::from_fn(move || {
+        if at == block.len() {
+            let first = lines.next()?;
+            if !first.starts_with('-') {
+                return Some((first, None));
             }
-            if a.replace('\t', "    ") == b.replace('\t', "    ") {
-                lines[old].whitespace_only = true;
-                lines[new].whitespace_only = true;
-            } else if a.chars().count() > LONGEST && b.chars().count() > LONGEST && a.chars().take(LONGEST).eq(b.chars().take(LONGEST)) {
-                // (a change past the cut would not show at all: where they differ is shown instead)
-                let first = a.chars().zip(b.chars()).position(|(x, y)| x != y).unwrap_or_else(|| a.chars().count().min(b.chars().count()));
-                let window = |text: &str| format!("…{}…", text.chars().skip(first.saturating_sub(AROUND)).take(2 * AROUND).collect::<String>());
-                lines[old].text = format!("-{}", window(&a));
-                lines[new].text = format!("+{}", window(&b));
+            block.clear();
+            block.push(first);
+            while let Some(old) = lines.next_if(|line| line.starts_with('-')) {
+                block.push(old);
+            }
+            added_start = block.len();
+            // Extra additions have no counterpart and can be returned directly from the input.
+            for _ in 0..added_start {
+                let Some(new) = lines.next_if(|line| line.starts_with('+')) else { break };
+                block.push(new);
+            }
+            at = 0;
+        }
+        let partner = if at < added_start { at + added_start } else { at - added_start };
+        let pair = (block[at], block.get(partner).copied());
+        at += 1;
+        Some(pair)
+    })
+}
+
+/// Draw a changed line, showing hidden whitespace or a difference beyond the usual cut.
+fn drawn_change(line: &str, partner: Option<&str>) -> (String, bool) {
+    let text = line[1..].trim_end_matches('\r');
+    if let Some(other) = partner {
+        let other = other[1..].trim_end_matches('\r');
+        if text != other {
+            if (text.contains('\t') || other.contains('\t')) && text.replace('\t', "    ") == other.replace('\t', "    ") {
+                return (drawn(text, true), true);
+            }
+            if text.len() > LONGEST && other.len() > LONGEST && text.chars().count() > LONGEST && other.chars().count() > LONGEST
+                && text.chars().take(LONGEST).eq(other.chars().take(LONGEST)) {
+                let first = text.chars().zip(other.chars()).position(|(a, b)| a != b).unwrap_or_else(|| text.chars().count().min(other.chars().count()));
+                let window = text.chars().skip(first.saturating_sub(AROUND)).take(2 * AROUND).collect::<String>();
+                return (drawn(&format!("…{window}…"), false), false);
             }
         }
     }
-    lines
+    (drawn(text, false), false)
 }
 
 /// Whether the diff changes nothing but line endings: every removed line is an added line with a carriage return more or less. Which way, if so.
 fn only_line_endings(diff: &str) -> Option<&'static str> {
-    let (mut removed, mut added): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
-    for line in diff_lines(diff) {
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
-            continue;
+    let mut lines = diff_lines(diff).peekable();
+    let mut direction = None;
+    let mut removed = Vec::new();
+    while let Some(line) = lines.next() {
+        if line.starts_with(['+', '\\']) {
+            // An unmatched addition or a missing final newline is a visible change.
+            return None;
         }
-        match line.chars().next() {
-            Some('-') => removed.push(&line[1..]),
-            Some('+') => added.push(&line[1..]),
-            _ => {}
+        let Some(first) = line.strip_prefix('-') else { continue };
+        removed.push(first);
+        while let Some(next) = lines.next_if(|s| s.starts_with('-')) {
+            removed.push(&next[1..]);
+        }
+        // Match replacements at this position. Comparing across context or hunk boundaries hides moves.
+        for old in removed.drain(..) {
+            let new = lines.next()?.strip_prefix('+')?;
+            if old == new {
+                continue;
+            }
+            let change = if !new.ends_with('\r') && old.strip_suffix('\r') == Some(new) {
+                "line endings only (CRLF → LF)"
+            } else if !old.ends_with('\r') && new.strip_suffix('\r') == Some(old) {
+                "line endings only (LF → CRLF)"
+            } else {
+                return None;
+            };
+            if direction.is_some_and(|earlier| earlier != change) {
+                return None;
+            }
+            direction = Some(change);
         }
     }
-    if removed.is_empty() || removed.len() != added.len() || !removed.iter().zip(&added).all(|(a, b)| a.trim_end_matches('\r') == b.trim_end_matches('\r')) {
-        return None;
-    }
-    let (with, without) = (removed.iter().filter(|line| line.ends_with('\r')).count(), added.iter().filter(|line| line.ends_with('\r')).count());
-    match (with, without) {
-        (0, 0) => None,
-        (more, fewer) if more >= fewer => Some("line endings only (CRLF → LF)"),
-        _ => Some("line endings only (LF → CRLF)"),
-    }
+    direction
 }
 
 /// `@@ -a,b +c,d @@ what it is in`: where the two sides begin, and the words.
@@ -134,7 +152,7 @@ fn hunk_head(line: &str) -> Option<(u32, u32, &str)> {
     Some((first(old)?, first(new)?, words.trim()))
 }
 
-/// The rows of a diff. Past `most` it stops, saying so: a file of a hundred thousand changed lines is not read here.
+/// Draw at most `most` rows, with an ellipsis if more follow. A visible line may have its counterpart beyond the cutoff.
 pub fn rows(diff: &str, path: &str, most: usize) -> Vec<Row> {
     // A file whose every line changed by its ending alone would be a wall of lines that read the same: said once.
     if let Some(words) = only_line_endings(diff) {
@@ -154,8 +172,7 @@ pub fn rows(diff: &str, path: &str, most: usize) -> Vec<Row> {
             None => vec![(text, Kind::Plain)],
         }
     };
-    for prepared_line in prepared(diff) {
-        let (line, tabs) = (prepared_line.text.as_str(), prepared_line.whitespace_only);
+    for (line, partner) in paired_lines(diff) {
         if found.len() >= most {
             found.push(Row { kind: RowKind::Note, old: None, new: None, runs: vec![("…".to_string(), Kind::Plain)] });
             break;
@@ -169,13 +186,14 @@ pub fn rows(diff: &str, path: &str, most: usize) -> Vec<Row> {
             continue;
         }
         // (what git says of the file and not of its lines: the row in the list says it is new or gone)
-        const GITS_OWN: [&str; 11] = ["--- ", "+++ ", "diff --git", "index ", "new file mode", "deleted file mode", "old mode", "new mode", "similarity index", "rename from", "rename to"];
+        const GITS_OWN: [&str; 9] = ["diff --git", "index ", "new file mode", "deleted file mode", "old mode", "new mode", "similarity index", "rename from", "rename to"];
         if GITS_OWN.iter().any(|own| line.starts_with(own)) {
             continue;
         }
         match line.chars().next() {
             Some('+') => {
-                let mut runs = colored(drawn(&line[1..], tabs), &mut open_new);
+                let (text, tabs) = drawn_change(line, partner);
+                let mut runs = colored(text, &mut open_new);
                 if tabs {
                     runs.push((format!("   ← {}", t("tabs and spaces only")), Kind::Comment));
                 }
@@ -183,7 +201,8 @@ pub fn rows(diff: &str, path: &str, most: usize) -> Vec<Row> {
                 new += 1;
             }
             Some('-') => {
-                found.push(Row { kind: RowKind::Removed, old: Some(old), new: None, runs: colored(drawn(&line[1..], tabs), &mut open_old) });
+                let (text, _) = drawn_change(line, partner);
+                found.push(Row { kind: RowKind::Removed, old: Some(old), new: None, runs: colored(text, &mut open_old) });
                 old += 1;
             }
             Some(' ') => {
@@ -295,6 +314,17 @@ mod tests {
     }
 
     #[test]
+    fn displayed_removals_use_their_partners_beyond_the_row_limit() {
+        let prefix = "字".repeat(LONGEST + 1);
+        let diff = format!("@@ -1,3 +1,2 @@\n-\titem\n-{prefix}old\n-unpaired\n+    item\n+{prefix}new\n");
+        let visible = rows(&diff, "a.txt", 2);
+        assert_eq!(visible.len(), 3);
+        assert!(visible[0].text().contains('→'));
+        assert!(visible[1].text().contains("old"));
+        assert_eq!((visible[1].old, visible[2].kind), (Some(2), RowKind::Note));
+    }
+
+    #[test]
     fn what_git_says_of_the_file_is_no_row() {
         let rows = rows("diff --git a/x b/x\nnew file mode 100644\nindex 0000000..abc\n--- /dev/null\n+++ b/x\n@@ -0,0 +1 @@\n+a\n", "x", 100);
         assert_eq!(rows.len(), 1);
@@ -333,6 +363,19 @@ mod tests {
         assert!(!rows[3].text().contains("tabs and spaces"), "{}", rows[3].text());
     }
 
+    #[test]
+    fn header_like_content_keeps_its_row_numbers_and_line_endings() {
+        let diff = "--- a/doc\n+++ b/doc\n@@ -1,2 +1,2 @@\n--- old\n+++ new\n context\n";
+        let visible = rows(diff, "doc", 20);
+        let got: Vec<_> = visible.iter().map(|r| (r.kind, r.old, r.new, r.text())).collect();
+        assert_eq!(got, [
+            (RowKind::Removed, Some(1), None, "-- old".into()),
+            (RowKind::Added, None, Some(1), "++ new".into()),
+            (RowKind::Same, Some(2), Some(2), "context".into()),
+        ]);
+        assert!(only_line_endings("@@ -1,2 +1,2 @@\n-same\r\n--- old\r\n+same\n+++ new\n").is_none());
+    }
+
     /// A file whose every line changed by its ending alone is said once.
     #[test]
     fn a_change_of_line_endings_alone_is_said_once() {
@@ -347,6 +390,24 @@ mod tests {
         assert!(super::rows(with_change, "a.txt", 100).len() > 1);
         assert_eq!(only_line_endings("@@ -1,1 +1,1 @@\n-a\n+a\n"), None, "nothing differs at all: not a change of endings");
         assert_eq!(only_line_endings("@@ -1,1 +1,1 @@\n context\n"), None);
+    }
+
+    #[test]
+    fn moved_crlf_lines_keep_their_old_and_new_positions() {
+        let diff = "@@ -1,2 +1 @@\n-moved\r\n keep\r\n@@ -15,1 +14,2 @@\n end\r\n+moved\r\n";
+        let visible = rows(diff, "doc.txt", 20);
+        assert!(visible.iter().any(|r| r.kind == RowKind::Removed && r.old == Some(1) && r.text() == "moved"));
+        assert!(visible.iter().any(|r| r.kind == RowKind::Added && r.new == Some(15) && r.text() == "moved"));
+        // Even when its ending changes as it moves, its position is an edit.
+        assert_eq!(only_line_endings("@@ -1,2 +1,2 @@\n-moved\r\n keep\n+moved\n"), None);
+    }
+
+    #[test]
+    fn the_ending_summary_requires_one_direction_and_a_final_newline() {
+        assert_eq!(only_line_endings("@@ -1,2 +1,2 @@\n-a\r\n-b\n+a\n+b\r\n"), None);
+        assert_eq!(only_line_endings("@@ -1 +1 @@\n-a\r\n+a\n\\ No newline at end of file\n"), None);
+        assert_eq!(only_line_endings("@@ -1 +1 @@\n-a\r\r\n+a\r\n"), None);
+        assert_eq!(only_line_endings("@@ -1 +1 @@\n-a\r\n+a\n@@ -9 +9 @@\n-b\r\n+b\n"), Some("line endings only (CRLF → LF)"));
     }
 
     #[test]

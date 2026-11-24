@@ -15,12 +15,14 @@ use dogmind_agent::anthropic::{self, Anthropic};
 use dogmind_agent::background::Waiting;
 use dogmind_agent::codex::{self, Codex};
 use dogmind_agent::llm::{self, Client, Health, Provider};
+use dogmind_agent::mcp::mcp_url;
 use dogmind_agent::message::Message;
 use dogmind_agent::prompt::typed_text;
 use dogmind_agent::rules;
 use dogmind_agent::read_folders;
 use dogmind_agent::safety::{AlwaysScope, Mode};
 use dogmind_agent::session;
+use dogmind_agent::trajectory::SessionUsage;
 use dogmind_agent::tools::{FileChange, GitInfo};
 use dogmind_agent::conversation_key::{self, Cipher, KeyError, Keystore, Pending, Policy};
 use dogmind_agent::conversion;
@@ -262,13 +264,13 @@ const ID_ATTACHED: isize = 9060; // ..+ attach::MOST_IMAGES
 /// The list of the Files view of the panel on the right, and the little menu of a row of it.
 const ID_FILES: isize = 9070;
 const ID_FILES_MENU: isize = 9071;
-/// The Terminal view's controls: a tab and its close for each terminal there can be, a new terminal and the shells beside it, the page's own two and the bar's one, and the field a tab is renamed in.
+/// The terminal panel's controls: a tab and its close for each terminal there can be, a new terminal, the title bar's button that opens and closes the panel, the page's own
+/// button and the bar's one, and the field a tab is renamed in.
 const ID_TERM_TAB: isize = 11000; // ..+ term::MOST_TERMINALS
 const ID_TERM_CLOSE: isize = 11010; // ..+ term::MOST_TERMINALS
 const ID_TERM_NEW: isize = 11020;
-const ID_TERM_SHELLS: isize = 11021;
+const ID_TERM_TOGGLE: isize = 11021;
 const ID_TERM_START: isize = 11022;
-const ID_TERM_START_SHELLS: isize = 11023;
 const ID_TERM_AGAIN: isize = 11024;
 const ID_TERM_RENAME: isize = 11025;
 /// How many pictures of a transcript are drawn at once: more than any view holds, and fewer than the small copies that are kept.
@@ -279,7 +281,6 @@ const M_DISPLAY: usize = 9310; // ..+ 3
 const M_THEME: usize = 9320; // ..+ 3
 const M_ANSWERS: usize = 9330; // ..+ 3
 const M_WEB_CHOICE: usize = 9350; // ..+ 2
-const M_COMPACT_CHOICE: usize = 9355; // ..+ 2
 const DISPLAY_LANGUAGES: [(&str, &str); 3] = [("system", "As Windows is set"), ("en", "English"), ("ja", "日本語")];
 const THEMES: [(&str, &str); 3] = [("system", "As Windows is set"), ("dark", "Dark"), ("light", "Light")];
 const ANSWER_LANGUAGES: [(&str, &str); 3] = [("auto", "As you write: Japanese on this system"), ("ja", "Japanese, always"), ("en", "English, always")];
@@ -519,7 +520,7 @@ const COMMANDS: [(&str, &str); 47] = [
     ("/plan", "Look and plan first, and change nothing until you say"),
     ("/skills", "The skills of this folder, from Claude's and Codex's folders too"),
     ("/memory", "What is kept between sessions"),
-    ("/mcp", "MCP servers: /mcp shows them, /mcp import takes Claude's and Codex's"),
+    ("/mcp", "MCP server status, /mcp candidates, /mcp import [NAME]"),
     ("/permissions", "What may always run in this folder"),
     ("/think", "Show or hide the thinking"),
     ("/tools", "Open another program's folder on PATH to sandboxed commands, with one Windows prompt"),
@@ -528,7 +529,7 @@ const COMMANDS: [(&str, &str); 47] = [
     ("/panel", "Show or hide the panel on the right"),
     ("/preview", "Show a web page or picture of the folder beside the conversation"),
     ("/files", "Show the files of the folder in the panel on the right"),
-    ("/terminal", "Switch to Terminal or open a shell"),
+    ("/terminal", "Open the terminal under the conversation"),
     ("/theme", "As Windows is set, dark, or light: the next of them"),
     ("/safe", "Allow safe commands without asking, or not"),
     ("/workspace", "Start a session in another folder"),
@@ -680,8 +681,24 @@ fn always_places(scope: &Option<AlwaysScope>) -> String {
         Some(AlwaysScope::File(file)) => file.display().to_string(),
         Some(AlwaysScope::Folders(folders)) => folders.iter().map(|folder| folder.display().to_string()).collect::<Vec<_>>().join(", "),
         Some(AlwaysScope::Network(reach)) => reach.clone(),
+        Some(AlwaysScope::Parts(parts)) => parts.join(", "),
         None => String::new(),
     }
+}
+
+/// The views the row over a session offers, by their words: none while nothing has been said in it (a new session is its conversation alone), and then the conversation and
+/// the timeline. The terminal is none of them: it is the panel under them, which the title bar's button opens.
+fn center_views(has_messages: bool) -> &'static [(&'static str, CenterView)] {
+    if has_messages {
+        &[("Conversation", CenterView::Conversation), ("Timeline", CenterView::Timeline)]
+    } else {
+        &[]
+    }
+}
+
+/// Whether the card in view has no "always" at all: a line of several commands that cannot each be allowed.
+fn without_always(pending: Option<&Approval>) -> bool {
+    pending.is_some_and(|approval| approval.no_always.is_some())
 }
 
 /// The files the settings name as holding keys: reading one asks, as for any place secrets are kept.
@@ -815,6 +832,8 @@ enum Note {
     ReadFolderProgress(u64),
     /// It has ended, with what to say of it, and whether that is a problem.
     ReadFolderDone(String, bool),
+    /// A workspace's grant for commands, begun when it was opened (`ready_folder`), has been given.
+    FolderReady(PathBuf),
     /// How many conversations and notes are changed, of how many.
     CryptProgress(usize, usize),
     CryptDone(CryptOutcome),
@@ -1003,6 +1022,8 @@ enum OverlayKey {
     Card(usize, usize),
     /// A picture of a message or an answer (`picture_blocks`) and its place among that message's pictures: opened beside the conversation.
     Picture(usize, usize),
+    /// The line that says how many pictures a call gave the model (`picture_blocks`): they are shown under it, or put away.
+    Pictures(usize),
 }
 
 /// Where an icon was drawn the last time the transcript was painted, in the transcript's own pixels.
@@ -1077,6 +1098,22 @@ struct TrajectoryPage {
     summary: dogmind_agent::trajectory_report::Summary,
     open: std::collections::BTreeSet<u64>,
     rows: Vec<crate::trajectory::Row>,
+    across: i32,
+    content_width: Option<i32>,
+}
+
+impl TrajectoryPage {
+    unsafe fn columns(&self, font: HFONT) -> ([(i32, i32); 6], i32) {
+        let headings = std::array::from_fn(|i| text_width(font, &self.rows[0].cells[i]));
+        crate::trajectory::column_bounds(text_width(font, "0").max(1), headings)
+    }
+
+    /// Measure the open rows only when the person first scrolls across this table.
+    unsafe fn measure_width(&self, font: HFONT) -> i32 {
+        let (_, notes) = self.columns(font);
+        let widest = self.rows.iter().filter(|row| !row.note.is_empty()).map(|row| text_width(font, &row.note)).max().unwrap_or(0);
+        notes + widest
+    }
 }
 
 /// The model's question that waits for the person: where the answer goes, the question as it was asked, and the card that shows it.
@@ -1101,7 +1138,42 @@ struct PictureBlock {
     start: i32,
     paths: Vec<PathBuf>,
     tiles: attach::Tiles,
+    /// The pictures a call gave the model, with whether they are shown: a line with their number stands over them, and they are put away until it is pressed. None: a
+    /// message's or an answer's, shown as they are.
+    fold: Option<bool>,
+    /// Where its row is in the transcript, and what it was made with, to make it again at another height.
+    span: (i32, i32),
+    width: i32,
+    alone: bool,
+    right: bool,
 }
+
+/// The height of the line over a call's pictures that says how many there are, in twips.
+const PICTURES_LINE: i32 = 330;
+/// The room a block of pictures has at its sides and above them, in twips.
+const PICTURES_ACROSS: i32 = 200;
+const PICTURES_DOWN: i32 = 100;
+/// The room a person's card keeps inside it, in twips: about 16 pixels at each side and 15 over and under at 100%, where the words had been tight against the card.
+const USER_CARD_PADDING: (i32, i32) = (240, 220);
+
+/// How wide a person's card is, in twips, in a column `column` twips wide: as its words want (`words`, without the card's room), or its pictures (their sizes), whichever
+/// is wider, and at most four fifths of the column. Taken from the column each time the card is written, so that one sent while the column was narrower (or no width at
+/// all, the window minimized) has the room of the column it is in.
+fn user_card_width(column: i32, dpi: u32, words: i32, sizes: &[(i32, i32)]) -> i32 {
+    let most = (column * 4 / 5).max(800);
+    let wanted = if words > 0 { words + 2 * USER_CARD_PADDING.0 + 120 } else { 0 };
+    let pictures = if sizes.is_empty() {
+        0
+    } else {
+        let room = i64::from(most - 2 * USER_CARD_PADDING.0) * i64::from(dpi) / 1440;
+        let tiles = attach::Tiles::of(sizes, room as i32, dpi);
+        (i64::from(tiles.total_width()) * 1440 / i64::from(dpi)) as i32 + 2 * USER_CARD_PADDING.0 + 40
+    };
+    wanted.max(pictures).clamp(800, most)
+}
+
+/// How wide the row of a call's pictures is while they are put away: room for the line that says how many, and no more.
+const PICTURES_SHUT_WIDTH: i32 = 1800;
 
 /// A small copy, and when it was last asked for.
 struct KeptThumb {
@@ -1354,9 +1426,23 @@ fn reads_as_command(line: &str) -> bool {
     first.strip_prefix('/').is_some_and(|name| !name.is_empty() && name.is_ascii() && !name.contains('/'))
 }
 
+fn is_builtin_command(word: &str) -> bool {
+    word == "/exit" || COMMANDS.iter().any(|(command, _)| *command == word)
+}
+
+/// A built-in typed with text its handler cannot use. Skills accept their whole line.
+fn command_with_unused_text(line: &str) -> Option<&str> {
+    let (name, _) = line.trim().split_once(char::is_whitespace)?;
+    if matches!(name, "/find" | "/search" | "/rename" | "/goal" | "/attach" | "/model" | "/effort" | "/mode" | "/preview" | "/mcp") {
+        return None;
+    }
+    is_builtin_command(name).then_some(name)
+}
+
 /// The fields of a page with a key.
 const KEY_FIELD: usize = 3;
 const VARIABLE_FIELD: usize = 4;
+const MCP_CWD_FIELD: usize = 5;
 
 /// The help, in sections: a `# ` line begins one.
 fn help_sections() -> Vec<(String, String)> {
@@ -1402,11 +1488,11 @@ struct Parked {
     queued: Vec<Outgoing>,
     interjected: Vec<String>,
     /// What the model has written so far of calls it has not finished.
-    writing: Vec<(usize, String, String)>,
+    writing: Vec<RunEntry>,
     used: u64,
     window_tokens: u64,
     rate: Option<f64>,
-    totals: (u64, u64, u64, u32),
+    totals: SessionUsage,
     /// What it said that no file keeps, for when it is opened.
     notices: Vec<(String, Style)>,
     /// Its turn ended in a failure.
@@ -1456,6 +1542,7 @@ enum Panel {
     Rename,
     /// Is this session to go?
     ConfirmDelete,
+    RemoveRemaining,
     ConfirmRemove,
     /// The sessions of this workspace, for `/resume`.
     Sessions,
@@ -1787,8 +1874,12 @@ enum Shown {
     Link(String, String, Para),
     /// `width`: none for the column's.
     Row { lines: Vec<String>, face: String, points: i32, color: u32, back: u32, width: Option<i32>, right: bool, padding: (i32, i32) },
-    /// An answer's text, for its copy button, and when it was given, as its row says it (or nothing).
-    Answer(String, String),
+    /// What the person sent: its words and its pictures, a card sized from the column each time it is written (`user_card`), as the column's width now is what it
+    /// has room for. A width kept from when it was sent kept a card narrow for ever: one sent while the window was minimized, whose column was no width at all,
+    /// stood one character to a line once the window was back.
+    Person { text: String, pictures: Vec<(PathBuf, (i32, i32))> },
+    /// An answer's text, time, and original message index when restored from a saved session.
+    Answer(String, String, Option<usize>),
     /// A line of code, coloured when it is drawn: `open` is whether a block comment runs into it.
     Code { line: String, language: String, open: bool },
     /// A Markdown table: its first row is the heading, and how each column lines up. Drawn afresh each time, as its colours and widths depend on the moment.
@@ -1796,8 +1887,8 @@ enum Shown {
     /// A block of code begins here: all of it, for its copy button.
     Block(String),
     /// The pictures of a message and their sizes, at the top of its card. `alone`: no text under them.
-    /// `right`: what the person sent; otherwise what a tool opened for the model.
-    Pictures { pictures: Vec<(PathBuf, (i32, i32))>, width: i32, alone: bool, right: bool },
+    /// `right`: what the person sent (kept as their `Person`, and not here); otherwise what a tool opened for the model.
+    Pictures { pictures: Vec<(PathBuf, (i32, i32))>, width: i32, alone: bool, right: bool, folds: bool },
     /// Tool calls as one row: which of `runs`.
     Run(usize),
     /// A card that asks something of the person or shows something of the work, in the state it is in now.
@@ -2002,7 +2093,7 @@ struct App {
     tree_menu_hover: Option<usize>,
     /// What the little list on screen offers and whose it is (a row of the tree, the shells a terminal can be started in, or what a right click on a terminal offers).
     panel_menu: files_panel::PanelMenu,
-    /// The Terminal view of the panel on the right (`term_panel`): its windows and its terminals.
+    /// The terminal panel under the conversation (`term_panel`): its windows and its terminals.
     term: term_panel::TermView,
     /// The central Timeline view (`timeline_view`): its window, the session's path read from its files, and what the events say between two reads.
     timeline: timeline_view::TimelineView,
@@ -2031,8 +2122,8 @@ struct App {
     overlay_tip_for: Option<(OverlayKey, RECT)>,
     proxies: Vec<HWND>,
     proxy_keys: Vec<Option<OverlayKey>>,
-    /// Where each answer ends in the transcript, and its text.
-    answers: Vec<(i32, String)>,
+    /// Where each answer ends in the transcript, its text, and its index in the saved conversation when known.
+    answers: Vec<(i32, String, Option<usize>)>,
     /// Each card of what the person wrote, in order: its corners are drawn over.
     user_cards: Vec<UserCard>,
     /// The person's messages, in order, for the rail of turns.
@@ -2128,9 +2219,10 @@ struct App {
     /// Whether what the form runs is a URL: it asks for headers then, and not for arguments and variables.
     mcp_form_url: bool,
     /// What the form said when it opened: leaving the page keeps a change, and only a change.
-    mcp_form_was: [String; 4],
+    mcp_form_was: [String; 5],
     /// The server just saved, while the page waits to say how its start went.
     mcp_saved: Option<String>,
+    mcp_page_states: Vec<(String, dogmind_agent::mcp::State)>,
     /// The sizes of the conversation's words, on the Appearance page.
     size_segments: [HWND; TEXT_SIZES.len()],
     /// A switch for each skill found, made when the Skills page first needs it.
@@ -2217,7 +2309,7 @@ struct App {
     side_search: HWND,
     side_query: String,
     side_hits: Option<Vec<session::Hit>>,
-    search_generation: u64,
+    search_generation: Arc<AtomicU64>,
     suggest: HWND,
     suggestions: Vec<Suggestion>,
     suggest_hover: Option<usize>,
@@ -2229,7 +2321,7 @@ struct App {
     crypt: Crypt,
     branch: Option<String>,
     session_title: String,
-    totals: (u64, u64, u64, u32), // prompt, cached, completion, requests
+    totals: SessionUsage,
     side_target: Option<usize>,
     rename_target: Option<PathBuf>,
     rename_seed: Option<String>,
@@ -2273,6 +2365,11 @@ struct App {
     // The panel on the right.
     right_width: i32,
     right_toggle: HWND,
+    /// The title bar's button for the terminal panel, beside the one for the panel on the right.
+    terminal_toggle: HWND,
+    /// The workspace whose grant for commands is being given, while it is (`ready_folder`), and the workspaces it has been given for in this run, by key.
+    readying: Option<PathBuf>,
+    readied: HashSet<String>,
     right_hits: Vec<(RECT, usize)>,
     /// What Windows sends when the taskbar comes back, and the tray has to be told again.
     taskbar_created: u32,
@@ -2351,7 +2448,7 @@ struct App {
     list_rows: Vec<ListRow>,
     list_hover: Option<usize>,
     /// The first ones as a panel says; `KEY_FIELD` and `VARIABLE_FIELD` on the pages with a key.
-    fields: [HWND; 5],
+    fields: [HWND; 6],
     labels: [String; 4],
     buttons: [HWND; 5],
     kind_chip: HWND,
@@ -2421,7 +2518,9 @@ struct App {
     /// The run the pointer is on.
     run_hover: Option<usize>,
     /// A call being written, with no run to show it in.
-    plain_writing: Option<RunEntry>,
+    plain_writing: Vec<RunEntry>,
+    /// Keep the two halves of a tool call in the same transcript format throughout a turn.
+    group_live_tools: bool,
     /// When a request under way last said how it was going.
     request_live: Option<std::time::Instant>,
     /// Where the block being written is kept in `shown`.
@@ -2462,9 +2561,13 @@ struct App {
     attach_button: HWND,
     /// What goes with the next message, and the windows that show it.
     attachments: Vec<Attached>,
+    /// The plain copy of an encrypted session's picture that is shown beside the conversation, if one is: it goes when another is shown and when the app ends.
+    shown_plain: Option<PathBuf>,
     attached_windows: Vec<HWND>,
     /// The pictures of the transcript's messages: drawn in its own paint, from the places that same frame gives their rooms.
     picture_blocks: Vec<PictureBlock>,
+    /// The calls' pictures the person has opened in this session, by their files: they stay open when the transcript is made again.
+    pictures_opened: HashSet<Vec<PathBuf>>,
     /// The small copies the view wants now: they are not the ones to be forgotten.
     thumb_wanted: std::collections::HashSet<(PathBuf, (i32, i32))>,
     thumbs: HashMap<(PathBuf, (i32, i32)), KeptThumb>,
@@ -2513,7 +2616,7 @@ struct App {
     /// Thinking has gone into the transcript and no answer has followed it yet: the answer begins on a line of its own, whether the thinking
     /// is shown by then or not.
     thinking_written: bool,
-    in_code: bool,
+    code_fence: Option<markdown::CodeFence>,
     /// The level of the heading being written; none is 0.
     heading: u8,
     italic: bool,
@@ -2526,7 +2629,7 @@ struct App {
     code_comment: bool,
     table: Vec<String>,
     bold: bool,
-    inline_code: bool,
+    inline_ticks: usize,
     thinking: String,
     activity: String,
     /// When the work the activity line tells of began: what it shows, with a turning ring, so that waiting is seen to be waiting.
@@ -2548,6 +2651,8 @@ struct App {
     model: String,
     used: u64,
     window_tokens: u64,
+    /// Latest measured cache reuse for each conversation during this app run.
+    session_cache_percent: HashMap<PathBuf, u64>,
     rate: Option<f64>,
     catalog: Vec<CatalogEntry>,
     /// This PC, as Straydog sees it, for who is choosing a model.
@@ -2752,11 +2857,12 @@ unsafe fn control(parent: HWND, class: &str, text: &str, style: u32, ex: u32, id
 }
 
 /// How an MCP server is, in the person's words: for its row in Settings and for /mcp.
-fn mcp_state_words(state: Option<&dogmind_agent::mcp::State>) -> String {
+fn mcp_state_words(name: &str, state: Option<&dogmind_agent::mcp::State>) -> String {
     match state {
         Some(dogmind_agent::mcp::State::Up(1)) => t("1 tool").to_string(),
         Some(dogmind_agent::mcp::State::Up(tools)) => tf("{0} tools", &[tools]),
-        Some(dogmind_agent::mcp::State::Failed(why)) => tf("Did not start: {0}", &[&mcp_why(why)]),
+        Some(dogmind_agent::mcp::State::Disconnected) => tf("Disconnected. Use /mcp import {0} to reconnect.", &[&name]),
+        Some(dogmind_agent::mcp::State::Failed(why)) => tf("Did not start: {0}. To retry, open this server in Settings > Tools and choose Save.", &[&mcp_why(why)]),
         _ => t("Starting…").to_string(),
     }
 }
@@ -2764,6 +2870,54 @@ fn mcp_state_words(state: Option<&dogmind_agent::mcp::State>) -> String {
 /// Why an MCP server did not start, with the words the app has for a program not found in the person's language.
 fn mcp_why(why: &str) -> String {
     why.replace(dogmind_agent::mcp::NOT_FOUND, t(dogmind_agent::mcp::NOT_FOUND))
+}
+
+fn mcp_action_and_name(argument: &str) -> (&str, &str) {
+    argument.split_once(char::is_whitespace).map_or((argument, ""), |(action, name)| (action, name.trim()))
+}
+
+/// Read the external server lists for a user command and report how many servers were added.
+fn mcp_import(home: &Path, codex_home: Option<&Path>, file: &Path, argument: &str) -> Result<(usize, String), String> {
+    use dogmind_agent::mcp;
+    let (action, name) = mcp_action_and_name(argument);
+    let preview = action.eq_ignore_ascii_case("candidates") && name.is_empty();
+    if !preview && !action.eq_ignore_ascii_case("import") {
+        return Err(t("Use /mcp for status, /mcp candidates to list names, or /mcp import [NAME].").into());
+    }
+    let (mut found, unreadable) = mcp::external_servers_in(home, codex_home);
+    let warning = if unreadable.is_empty() { String::new() } else {
+        tf("Could not read all MCP settings from {0}. Check the file format and permissions.", &[&unreadable.join(", ")])
+    };
+    let report = |message: String| if warning.is_empty() { message } else { format!("{message}\n{warning}") };
+    let already_configured = || tf("{0} is already configured in Dogmind.", &[&name]);
+    if !name.is_empty() && !found.contains_key(name) && mcp::readable_config(file)?.servers.contains_key(name) {
+        return Ok((0, report(already_configured())));
+    }
+    if found.is_empty() && !warning.is_empty() {
+        return Err(warning);
+    }
+    if preview {
+        let configured = mcp::readable_config(file)?.servers;
+        let names: Vec<_> = found.into_keys().filter(|name| !configured.contains_key(name)).collect();
+        let message = if names.is_empty() {
+            t("Claude and Codex list no server that is not here already.").into()
+        } else {
+            tf("Available to import with /mcp import NAME:\n{0}", &[&names.join("\n")])
+        };
+        return Ok((0, report(message)));
+    }
+    if !name.is_empty() {
+        let selected = found.remove_entry(name).ok_or_else(|| report(tf("No import candidate named {0}. Use /mcp candidates to list names.", &[&name])))?;
+        found = std::collections::BTreeMap::from([selected]);
+    }
+    let added = mcp::import(file, found)?;
+    let message = match (added, name.is_empty()) {
+        (0, true) => t("Claude and Codex list no server that is not here already.").into(),
+        (0, false) => already_configured(),
+        (_, false) => tf("Added {0}. The server is starting.", &[&name]),
+        (_, true) => tf("{0} servers added to {1}. They are starting.", &[&added, &file.display()]),
+    };
+    Ok((added, report(message)))
 }
 
 /// What an MCP server runs, or where it is, as its row says it. Its headers are not said: a key is among them.
@@ -2775,22 +2929,58 @@ fn mcp_runs(config: &dogmind_agent::mcp::ServerConfig) -> String {
     }
 }
 
-/// What was typed as a server's URL, with its scheme as the protocol writes it; none for what is not one.
 /// The server the Settings form says, as mcp.json keeps it, `was` the one it edits. The person's word on what it returns goes with it, under a new name too; and
 /// one of the older transport stays one, its stream asked for first: saved as `http`, it was asked with a POST of Streamable HTTP first, as a new one is.
-fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Option<String>, target: String, args: &str, pairs: std::collections::BTreeMap<String, String>) -> dogmind_agent::mcp::ServerConfig {
+fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Option<String>, target: String, original_args: &str, args: &str, pairs: std::collections::BTreeMap<String, String>) -> dogmind_agent::mcp::ServerConfig {
     use dogmind_agent::mcp;
-    let trusted = was.is_some_and(|config| config.trusted);
-    let kind = if was.is_some_and(|config| config.kind == "sse") { "sse" } else { "http" };
-    match url {
-        Some(url) => mcp::ServerConfig { kind: kind.into(), url, headers: pairs, trusted, ..Default::default() },
-        None => mcp::ServerConfig { command: target, args: mcp::args_of_line(args), env: pairs, trusted, ..Default::default() },
+    let previous = was.filter(|config| config.is_http() == url.is_some());
+    // Keep the saved transport spelling and fields the editor cannot display. A different config restarts the connection.
+    let mut config = previous.cloned().unwrap_or_else(|| mcp::ServerConfig {
+        kind: if url.is_some() { "http".into() } else { String::new() },
+        trusted: was.is_some_and(|config| config.trusted),
+        tool_selection: was.map(|config| config.tool_selection.clone()).unwrap_or_default(),
+        ..Default::default()
+    });
+    if let Some(url) = url {
+        config.url = url;
+        config.headers = pairs;
+    } else {
+        config.command = target;
+        config.env = pairs;
+        // The edit control normalizes line endings even when the person only changes another field.
+        if previous.is_none() || original_args != args {
+            config.args = mcp::args_of_line(args);
+        }
     }
+    config
 }
 
-fn mcp_url(typed: &str) -> Option<String> {
-    let lower = typed.to_ascii_lowercase();
-    ["http://", "https://"].into_iter().find(|scheme| lower.starts_with(scheme)).map(|scheme| format!("{scheme}{}", &typed[scheme.len()..]))
+/// The line editor cannot represent every stored value, such as a newline inside one variable.
+fn mcp_form_pairs(was: Option<&dogmind_agent::mcp::ServerConfig>, http: bool, original: &str, typed: &str) -> Result<std::collections::BTreeMap<String, String>, (usize, String)> {
+    if let Some(config) = was.filter(|config| config.is_http() == http && typed == original) {
+        return Ok(if http { config.headers.clone() } else { config.env.clone() });
+    }
+    dogmind_agent::mcp::pairs_of_lines(typed, if http { ':' } else { '=' })
+}
+
+/// Explorer's Copy as path wraps a single filesystem path in double quotes.
+fn mcp_path_text(typed: &str) -> &str {
+    let typed = typed.trim();
+    typed.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).filter(|path| !path.contains('"')).unwrap_or(typed)
+}
+
+fn mcp_working_directory(typed: &str) -> Option<PathBuf> {
+    let folder = mcp_path_text(typed);
+    (!folder.is_empty()).then(|| PathBuf::from(folder))
+}
+
+fn remember_request_cache(known: &mut HashMap<PathBuf, u64>, session: Option<&std::path::Path>, percent: Option<u64>) {
+    let Some(path) = session else { return };
+    if let Some(percent) = percent {
+        known.insert(path.to_owned(), percent);
+    } else {
+        known.remove(path);
+    }
 }
 
 unsafe fn set_text(window: HWND, text: &str) {
@@ -2802,7 +2992,20 @@ unsafe fn get_text(window: HWND) -> String {
     let length = GetWindowTextLengthW(window);
     let mut buffer = vec![0u16; length as usize + 1];
     let read = GetWindowTextW(window, buffer.as_mut_ptr(), length + 1);
-    String::from_utf16_lossy(&buffer[..read.max(0) as usize]).replace("\r\n", "\n").replace('\r', "\n")
+    normalized_newlines(&String::from_utf16_lossy(&buffer[..read.max(0) as usize]))
+}
+
+fn normalized_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn read_instruction_file(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Err(t("Save instructions.md as UTF-8 to edit it here.").to_string()),
+        Err(error) => Err(tf("Could not read instructions.md: {0}", &[&error.to_string()])),
+    }
 }
 
 /// WM_SETREDRAW, on a window that is showing only. Turned back on it sets WS_VISIBLE, so a transcript hidden behind Settings would come up over
@@ -3313,8 +3516,10 @@ impl App {
         self.links.push((self.last_inserted.0, self.last_inserted.1, url.to_string()));
     }
 
-    /// The pointer has moved on the transcript: whether it is on a link, and which.
-    unsafe fn track_link(&mut self, lparam: LPARAM) {
+    unsafe fn link_under(&self, lparam: LPARAM) -> Option<&str> {
+        if self.links.is_empty() {
+            return None;
+        }
         let (x, y) = ((lparam & 0xFFFF) as i16 as i32, ((lparam >> 16) & 0xFFFF) as i16 as i32);
         let at_point = POINT { x, y };
         let at = SendMessageW(self.transcript, EM_CHARFROMPOS_RICH, 0, std::ptr::addr_of!(at_point) as LPARAM) as i32;
@@ -3323,10 +3528,15 @@ impl App {
         // (the character nearest a pointer in empty space is not under it)
         let reach = scale(self.dpi, 32);
         let close = (x - near.x).abs() < reach && y >= near.y - scale(self.dpi, 4) && y < near.y + reach;
+        close.then(|| link_at(&self.links, at)).flatten()
+    }
+
+    /// The pointer has moved on the transcript: whether it is on a link, and which.
+    unsafe fn track_link(&mut self, lparam: LPARAM) {
         self.run_hover = self.run_under(lparam);
         let found = match self.run_hover {
             Some(run) => Some(self.runs[run].hover(&self.workspace)).filter(|words| !words.is_empty()),
-            None => close.then(|| link_at(&self.links, at)).flatten().map(str::to_string),
+            None => self.link_under(lparam).map(str::to_string),
         };
         if found != self.link_hover {
             if self.link_hover.is_none() {
@@ -3354,8 +3564,7 @@ impl App {
         ((x - near.x).abs() < reach && y >= near.y - scale(self.dpi, 4) && y < near.y + reach).then_some(run)
     }
 
-    /// A click on a link: to the browser if it is on the web, beside the conversation if it is a file here (at the lines it names, as
-    /// `src/app.js#L24`), and nowhere otherwise.
+    /// A web link opens in the browser, a file in the preview (at the lines it names), and a workspace folder in Explorer.
     unsafe fn open_link(&mut self, url: &str) {
         match markdown::web_address(url) {
             Some(address) => open_in_browser(&address),
@@ -3365,6 +3574,8 @@ impl App {
                     self.open_preview_at(path, lines);
                 } else if self.workspace.join(url).is_file() {
                     self.open_preview(url);
+                } else if let Some(folder) = workspace_folder_link(&self.workspace, url) {
+                    self.open_folder_in_explorer(&folder);
                 }
             }
         }
@@ -3372,7 +3583,7 @@ impl App {
 
     /// One row of a shaded block.
     unsafe fn append_row(&mut self, row: &rtf::Row) {
-        if !self.replaying {
+        if !self.replaying && !row.right {
             self.shown.push(Shown::Row { lines: row.lines.iter().map(|line| line.to_string()).collect(), face: row.face.to_string(), points: row.points, color: row.color, back: row.back, width: row.right.then_some(row.width), right: row.right, padding: row.padding });
         }
         let first = self.insert_rtf(rtf::row(row), Some(row.color));
@@ -3514,11 +3725,16 @@ impl App {
 
     /// RTF at the end of the transcript, its text in this colour.
     unsafe fn insert_rtf(&mut self, rtf: String, text_color: Option<u32>) -> i32 {
+        self.insert_rtf_span(rtf, text_color).0
+    }
+
+    /// `insert_rtf`, and where what went in ends.
+    unsafe fn insert_rtf_span(&mut self, rtf: String, text_color: Option<u32>) -> (i32, i32) {
         let bytes: Vec<u8> = rtf.into_bytes().into_iter().chain(std::iter::once(0)).collect();
         let how = SetTextEx { flags: ST_SELECTION, code_page: 65001 };
         let mut color = char_format(text_color.unwrap_or(0), 0, "", 0, None);
         color.mask = CFM_COLOR;
-        let mut first = 0;
+        let (mut first, mut last) = (0, 0);
         self.at_end(|edit| {
             let mut range = CharRange { first: 0, last: 0 };
             SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(range) as LPARAM);
@@ -3529,12 +3745,13 @@ impl App {
             let mut end = CharRange { first: 0, last: 0 };
             SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(end) as LPARAM);
             range.last = end.last;
+            last = end.last;
             if text_color.is_some() {
                 SendMessageW(edit, EM_EXSETSEL, 0, std::ptr::addr_of!(range) as LPARAM);
                 SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION as WPARAM, std::ptr::addr_of!(color) as LPARAM);
             }
         });
-        first
+        (first, last)
     }
 
     /// The transcript again, at the column's width now, with the view where it was.
@@ -3581,12 +3798,13 @@ impl App {
                     let width = width.map_or(self.text_twips, |width| width.min((self.text_twips * 4 / 5).max(800)));
                     self.append_row(&rtf::Row { lines: &lines, face, points: *points, color: *color, back: *back, width, right: *right, column: self.text_twips, padding: *padding });
                 }
-                Shown::Answer(text, at) => self.answer_row(text, at),
+                Shown::Person { text, pictures } => self.user_card(text, pictures),
+                Shown::Answer(text, at, index) => self.answer_row(text, at, *index),
                 Shown::Table(rows, aligns) => self.table_rows(rows, aligns),
                 Shown::Code { line, language, open } => {
                     self.code_row(line, language, *open);
                 }
-                Shown::Pictures { pictures, width, alone, right } => self.append_pictures(pictures, (*width).min((self.text_twips * 4 / 5).max(800)), *alone, *right),
+                Shown::Pictures { pictures, width, alone, right, folds } => self.append_pictures(pictures, (*width).min((self.text_twips * 4 / 5).max(800)), *alone, *right, *folds),
                 Shown::Run(at) => self.write_run(*at),
                 Shown::Card(card) => self.write_card(card),
                 Shown::Block(code) => {
@@ -3684,8 +3902,9 @@ impl App {
     unsafe fn copy_block(&mut self, at: usize) {
         let Some(block) = self.blocks.get(at) else { return };
         let text = block.text.clone();
-        self.copy_to_clipboard(text.trim_end_matches('\n'));
-        self.copied(OverlayKey::Block(at));
+        if self.copy_to_clipboard(text.trim_end_matches('\n')) {
+            self.copied(OverlayKey::Block(at));
+        }
     }
 
     /// What opens and closes a block: a little space, and what the code is in if it says.
@@ -3777,11 +3996,11 @@ impl App {
                 return;
             }
             if self.line_start {
-                if !self.in_code && !self.table.is_empty() && !pending.trim_start_matches([' ', '\t']).starts_with('|') {
+                if self.code_fence.is_none() && !self.table.is_empty() && !pending.trim_start_matches([' ', '\t']).starts_with('|') {
                     // Anything else on the line, a blank one too, ends the table.
                     self.flush_table();
                 }
-                if !self.in_code && pending.starts_with('\n') {
+                if self.code_fence.is_none() && pending.starts_with('\n') {
                     // (a blank line after an item: what follows, an item too, keeps a little away)
                     if matches!(self.para, Para::Item(..)) && self.para_next.is_none() {
                         self.para_next = Some(Para::AfterList);
@@ -3796,15 +4015,15 @@ impl App {
                     self.pending_text = pending;
                     return;
                 }
-                if trimmed.starts_with("```") {
+                if let Some((fence, info)) = markdown::CodeFence::opening(trimmed).filter(|_| self.code_fence.is_none_or(|open| open.closes(trimmed))) {
                     let Some(at) = newline else {
                         self.pending_text = pending;
                         return;
                     };
-                    self.in_code = !self.in_code;
                     self.pending_text = pending[at + 1..].to_string();
-                    if self.in_code {
-                        self.code_language = trimmed.trim_start_matches('`').trim().to_lowercase();
+                    if self.code_fence.take().is_none() {
+                        self.code_fence = Some(fence);
+                        self.code_language = info.to_lowercase();
                         self.code_comment = false;
                         let label = self.code_language.clone();
                         self.room_over_a_block();
@@ -3817,12 +4036,12 @@ impl App {
                     }
                     continue;
                 }
-                if !self.in_code && newline.is_some() && markdown::is_rule(trimmed) {
+                if self.code_fence.is_none() && newline.is_some() && markdown::is_rule(trimmed) {
                     self.pending_text = pending[newline.unwrap_or(0) + 1..].to_string();
                     self.rule_row();
                     continue;
                 }
-                if !self.in_code && trimmed.starts_with('|') {
+                if self.code_fence.is_none() && trimmed.starts_with('|') {
                     // A table is drawn when it has ended, as a column's width depends on all its rows.
                     let Some(at) = newline else {
                         self.pending_text = pending;
@@ -3832,7 +4051,7 @@ impl App {
                     self.pending_text = pending[at + 1..].to_string();
                     continue;
                 }
-                if self.in_code {
+                if self.code_fence.is_some() {
                     // A block is added to by the row, so a line waits until it is whole.
                     let Some(at) = newline else {
                         self.pending_text = pending;
@@ -3846,7 +4065,7 @@ impl App {
                 self.line_start = false;
                 self.heading = 0;
                 self.inline_before = None;
-                if !self.in_code {
+                if self.code_fence.is_none() {
                     let indent = pending.len() - pending.trim_start().len();
                     let marker = list_marker(trimmed);
                     if marker.is_none() {
@@ -3901,7 +4120,7 @@ impl App {
                 self.bold = false;
                 self.italic = false;
                 self.struck = false;
-                self.inline_code = false;
+                self.inline_ticks = 0;
                 self.heading = 0;
                 self.inline_before = None;
                 if std::mem::take(&mut self.quote) {
@@ -3911,12 +4130,26 @@ impl App {
                 return;
             }
             if c == '`' {
-                self.flush_run(&mut run);
-                self.inline_code = !self.inline_code;
+                let mut length = 1;
+                while chars.next_if(|(_, next)| *next == '`').is_some() {
+                    length += 1;
+                }
+                if chars.peek().is_none() {
+                    // More ticks in the next chunk may change this run's meaning.
+                    self.flush_run(&mut run);
+                    self.pending_text = text[at..].to_string();
+                    return;
+                }
+                if self.inline_ticks == 0 || self.inline_ticks == length {
+                    self.flush_run(&mut run);
+                    self.inline_ticks = if self.inline_ticks == 0 { length } else { 0 };
+                } else {
+                    run.push_str(&text[at..at + length]);
+                }
                 self.inline_before = Some(c);
                 continue;
             }
-            if !self.inline_code {
+            if self.inline_ticks == 0 {
                 let next = chars.peek().map(|(_, next)| *next);
                 let rest = &text[at..];
                 // What may mean more than it says, and has its meaning in what has not come.
@@ -4020,7 +4253,7 @@ impl App {
             1 => Style::Title,
             2 => Style::Heading,
             3..=6 => Style::Subheading,
-            _ if self.inline_code => Style::InlineCode,
+            _ if self.inline_ticks > 0 => Style::InlineCode,
             _ if self.bold => Style::Strong,
             _ if self.italic => Style::Emphasis,
             _ if self.struck => Style::Struck,
@@ -4041,20 +4274,24 @@ impl App {
     /// The end of an answer: what was waiting for more goes out as it is.
     unsafe fn finish_answer(&mut self) {
         let mut rest = std::mem::take(&mut self.pending_text);
-        if !self.in_code && !self.table.is_empty() && rest.trim_start().starts_with('|') {
+        if self.code_fence.is_none() && !self.table.is_empty() && rest.trim_start().starts_with('|') {
             // The answer ended on its table's last line.
             self.table.push(std::mem::take(&mut rest).trim_end().to_string());
         }
         self.flush_table();
         self.para_next = None;
-        if self.in_code {
+        if let Some(fence) = self.code_fence {
             // An answer that ended inside its block, or with the fence still on its last line.
-            if !rest.is_empty() && !rest.trim_start().starts_with("```") {
+            if !rest.is_empty() && !fence.closes(&rest) {
                 self.code_line(rest.trim_end_matches(['\r', '\n']));
             }
             self.block_edge("");
             self.open_block = None;
             self.line_start = true;
+        } else if self.inline_ticks > 0 && !rest.is_empty() && rest.bytes().all(|byte| byte == b'`') {
+            if rest.len() != self.inline_ticks {
+                self.append(&rest, Style::InlineCode);
+            }
         } else if markdown::is_rule(rest.trim()) {
             self.rule_row();
         } else if let markdown::BareUrl::Whole(length) = markdown::bare_url(&format!("{rest} ")) {
@@ -4068,21 +4305,21 @@ impl App {
             self.append(&rest, Style::Body);
         }
         self.end_line();
-        self.in_code = false;
+        self.code_fence = None;
         self.bold = false;
         self.italic = false;
         self.struck = false;
         self.quote = false;
-        self.inline_code = false;
+        self.inline_ticks = 0;
         self.heading = 0;
     }
 
     /// A run begins right under an answer: that was a remark on the way, and its copy row goes. What ends a turn keeps one.
     unsafe fn run_follows(&mut self, at: usize) {
-        if let Some(Shown::Answer(_, at)) = self.shown.last() {
+        if let Some(Shown::Answer(_, at, _)) = self.shown.last() {
             // (the row's tab and time, and its end)
             let length = if at.is_empty() { 1 } else { at.encode_utf16().count() as i32 + 2 };
-            if let Some((first, _)) = self.answers.pop() {
+            if let Some((first, _, _)) = self.answers.pop() {
                 self.shown.pop();
                 self.at_end(|edit| {
                     let row = CharRange { first, last: first + length };
@@ -4096,18 +4333,18 @@ impl App {
     }
 
     /// Below an answer, a row for its copy button, and when it was given (`at`, as it is to read: or nothing).
-    unsafe fn mark_answer(&mut self, text: &str, at: &str) {
+    unsafe fn mark_answer(&mut self, text: &str, at: &str, saved_index: Option<usize>) {
         self.end_line();
-        self.shown.push(Shown::Answer(text.to_string(), at.to_string()));
-        self.answer_row(text, at);
+        self.shown.push(Shown::Answer(text.to_string(), at.to_string(), saved_index));
+        self.answer_row(text, at, saved_index);
     }
 
-    unsafe fn answer_row(&mut self, text: &str, at: &str) {
+    unsafe fn answer_row(&mut self, text: &str, at: &str, saved_index: Option<usize>) {
         let mut end = CharRange { first: 0, last: 0 };
         self.at_end(|edit| {
             SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(end) as LPARAM);
         });
-        self.answers.push((end.first, text.to_string()));
+        self.answers.push((end.first, text.to_string(), saved_index));
         // (the answer has its own place in `shown`, which writes this row again)
         self.unkept = true;
         if !at.is_empty() {
@@ -4135,34 +4372,27 @@ impl App {
     /// A new session with the conversation through this answer, opened: to go on from there another way. The answer is found in the saved
     /// session by its words, and by how many answers before it have the same.
     unsafe fn fork_from_answer(&mut self, at: usize) {
-        if at >= self.answers.len() {
-            return;
-        }
-        let Some(path) = self.current_session.clone() else { return };
-        let words = self.answers[at].1.clone();
-        let same_before = self.answers[..at].iter().filter(|(_, other)| *other == words).count();
-        let messages = session::read(&path).unwrap_or_default();
-        let found = messages.iter().enumerate().filter(|(_, message)| message.role == "assistant" && message.content.as_deref().map(str::trim) == Some(words.trim())).nth(same_before).map(|(place, _)| place);
-        let Some(through) = found else {
-            self.say(t("This answer is not in the saved session yet, so there is nothing to branch from. Try again once it is."));
-            return;
-        };
+        let Some((_, words, saved_index)) = self.answers.get(at) else { return };
+        let Some(path) = self.current_session.as_deref() else { return };
+        let same_before = self.answers[..at].iter().filter(|(_, other, _)| other.trim() == words.trim()).count();
         // (one with no name yet is named by its first message, as the original is)
         let title = (!self.session_title.trim().is_empty()).then(|| tf("{0} (branch)", &[&self.session_title.trim()]));
-        match session::fork(&path, through, title.as_deref()) {
-            Ok(branch) => {
+        match session::fork_answer(path, words, *saved_index, same_before, title.as_deref()) {
+            Ok(Some(branch)) => {
                 self.refresh_sessions();
                 self.open_session(branch);
             }
+            Ok(None) => self.say(t("This answer is not in the saved session yet, so there is nothing to branch from. Try again once it is.")),
             Err(error) => self.say(&tf("The branch could not be made: {0}", &[&error])),
         }
     }
 
     unsafe fn copy_answer(&mut self, at: usize) {
-        let Some((_, text)) = self.answers.get(at) else { return };
+        let Some((_, text, _)) = self.answers.get(at) else { return };
         let text = text.clone();
-        self.copy_to_clipboard(&text);
-        self.copied(OverlayKey::Copy(at));
+        if self.copy_to_clipboard(&text) {
+            self.copied(OverlayKey::Copy(at));
+        }
     }
 
     /// An icon has copied: it shows a check mark for a moment.
@@ -4341,14 +4571,8 @@ impl App {
         if !self.answer.is_empty() {
             self.last_answer = std::mem::take(&mut self.answer);
             let answer = self.last_answer.clone();
-            self.mark_answer(&answer, &clock_now());
+            self.mark_answer(&answer, &clock_now(), None);
         }
-    }
-
-    /// What the model has written so far of each call, for a session put aside.
-    fn writing_now(&self) -> Vec<(usize, String, String)> {
-        let open = self.run_open.map_or(&[][..], |open| &self.runs[open].entries[..]);
-        open.iter().chain(&self.run_carry).filter_map(|entry| entry.writing.as_ref().map(|writing| (writing.index, entry.tool.clone(), writing.raw.clone()))).collect()
     }
 
     /// More of a call the model is writing. Only what is held grows, as this comes a few times a second: the row is written by `run_tick`.
@@ -4360,12 +4584,7 @@ impl App {
             self.end_line();
         }
         let at = self.open_run();
-        let entries = &mut self.runs[at].entries;
-        let place = entries.iter().position(of_it).unwrap_or_else(|| {
-            entries.push(RunEntry::being_written(index, tool));
-            entries.len() - 1
-        });
-        entries[place].more_written(piece);
+        toolrun::append_piece(&mut self.runs[at].entries, index, tool, piece);
         if !known {
             if !self.stop_asked {
                 self.set_activity(String::new());
@@ -4506,10 +4725,14 @@ impl App {
         };
         moved(&mut selection.first);
         moved(&mut selection.last);
-        self.answers.iter_mut().for_each(|(place, _)| moved(place));
+        self.answers.iter_mut().for_each(|(place, _, _)| moved(place));
         self.user_cards.iter_mut().for_each(|card| moved(&mut card.start));
         self.rail_turns.iter_mut().for_each(|turn| moved(&mut turn.start));
-        self.picture_blocks.iter_mut().for_each(|block| moved(&mut block.start));
+        self.picture_blocks.iter_mut().for_each(|block| {
+            moved(&mut block.start);
+            moved(&mut block.span.0);
+            moved(&mut block.span.1);
+        });
         self.blocks.iter_mut().for_each(|block| moved(&mut block.at));
         self.card_slots.iter_mut().for_each(|slot| moved(&mut slot.start));
         for (from, to, _) in &mut self.links {
@@ -4582,7 +4805,7 @@ impl App {
     }
 
     unsafe fn show_diff(&mut self, text: &str, limit: usize) {
-        let lines: Vec<&str> = text.lines().filter(|line| !line.starts_with("--- applied_diff") && !line.starts_with("--- ") && !line.starts_with("+++ ")).collect();
+        let lines = crate::toolrun::diff_lines(text);
         for line in lines.iter().take(limit) {
             let color = match line.chars().next() {
                 Some('+') => theme::good(),
@@ -4610,32 +4833,11 @@ impl App {
         if matches!(self.shown.last(), Some(Shown::Run(_) | Shown::Card(_))) {
             self.append("\n", Style::Gap);
         }
-        let lines: Vec<&str> = text.trim().lines().collect();
-        let device = GetDC(self.transcript);
-        let previous = SelectObject(device, self.fonts.body);
-        let widest = lines.iter().map(|line| width_on(device, self.fonts.body, line)).max().unwrap_or(0);
-        SelectObject(device, previous);
-        ReleaseDC(self.transcript, device);
-        // The body font is drawn a size larger in the transcript than it was measured here, and at the size the settings chose.
-        // (in twips: about 16 pixels at each side and 15 over and under at 100%, where the words had been tight against the card)
-        let padding = (240, 220);
-        let wanted = i64::from(widest) * 1440 * 115 * i64::from(text_scale()) / 10000 / i64::from(self.dpi) + i64::from(padding.0) * 2 + 120;
-        let most = (self.text_twips * 4 / 5).max(800);
-        let wanted = if images.is_empty() {
-            wanted as i32
-        } else {
-            let room = i64::from(most - 2 * padding.0) * i64::from(self.dpi) / 1440;
-            let sizes: Vec<(i32, i32)> = images.iter().map(|(_, size)| *size).collect();
-            let tiles = attach::Tiles::of(&sizes, room as i32, self.dpi);
-            let across = i64::from(tiles.total_width()) * 1440 / i64::from(self.dpi) + i64::from(padding.0) * 2 + 40;
-            (if lines.is_empty() { across } else { across.max(wanted) }) as i32
-        };
-        let width = wanted.clamp(800, most);
-        if !images.is_empty() {
-            self.append_pictures(images, width, lines.is_empty(), true);
-        }
-        if !lines.is_empty() {
-            self.append_row(&rtf::Row { lines: &lines, face: UI_FACE, points: 11, color: theme::text(), back: theme::user_back(), width, right: true, column: self.text_twips, padding });
+        if !text.trim().is_empty() || !images.is_empty() {
+            if !self.replaying {
+                self.shown.push(Shown::Person { text: text.to_string(), pictures: images.to_vec() });
+            }
+            self.user_card(text, images);
         }
         if at.is_empty() {
             self.append("\n", Style::Tool);
@@ -4653,6 +4855,27 @@ impl App {
                 self.reflow();
                 self.place_thumb();
             }
+        }
+    }
+
+    /// The card of what the person sent, against the right edge, as wide as its words and pictures want and the column now has room for (`user_card_width`):
+    /// its pictures at the top, its words under them.
+    unsafe fn user_card(&mut self, text: &str, images: &[(PathBuf, (i32, i32))]) {
+        let lines: Vec<&str> = text.trim().lines().collect();
+        let device = GetDC(self.transcript);
+        let previous = SelectObject(device, self.fonts.body);
+        let widest = lines.iter().map(|line| width_on(device, self.fonts.body, line)).max().unwrap_or(0);
+        SelectObject(device, previous);
+        ReleaseDC(self.transcript, device);
+        // The body font is drawn a size larger in the transcript than it was measured here, and at the size the settings chose.
+        let words = if lines.is_empty() { 0 } else { (i64::from(widest) * 1440 * 115 * i64::from(text_scale()) / 10000 / i64::from(self.dpi)) as i32 };
+        let sizes: Vec<(i32, i32)> = images.iter().map(|(_, size)| *size).collect();
+        let width = user_card_width(self.text_twips, self.dpi, words, &sizes);
+        if !images.is_empty() {
+            self.append_pictures(images, width, lines.is_empty(), true, false);
+        }
+        if !lines.is_empty() {
+            self.append_row(&rtf::Row { lines: &lines, face: UI_FACE, points: 11, color: theme::text(), back: theme::user_back(), width, right: true, column: self.text_twips, padding: USER_CARD_PADDING });
         }
     }
 
@@ -4693,7 +4916,7 @@ impl App {
         let sizes: Vec<(i32, i32)> = pictures.iter().map(|(_, size)| *size).collect();
         let tiles = attach::Tiles::of(&sizes, room as i32, self.dpi);
         let width = ((i64::from(tiles.total_width()) * 1440 / i64::from(self.dpi)) as i32 + 2 * ACROSS + 40).clamp(800, most);
-        self.append_pictures(pictures, width, true, false);
+        self.append_pictures(pictures, width, true, false, under_a_call);
         if under_a_call {
             self.append("\n", Style::Tool);
         }
@@ -4701,22 +4924,26 @@ impl App {
         self.para_next = Some(Para::AfterBlock);
     }
 
-    /// Room in a card for pictures, which come when they come into view: nothing is read now, however long the conversation.
-    unsafe fn append_pictures(&mut self, pictures: &[(PathBuf, (i32, i32))], width: i32, alone: bool, right: bool) {
-        if !self.replaying {
-            self.shown.push(Shown::Pictures { pictures: pictures.to_vec(), width, alone, right });
+    /// Room in a card for pictures, which come when they come into view: nothing is read now, however long the conversation. `folds`: the pictures a call gave the model,
+    /// which are a line that says how many until it is pressed (they were a picture of each in the conversation, 37 in a session of a day). Those the person sent or an
+    /// answer shows are shown as they are.
+    unsafe fn append_pictures(&mut self, pictures: &[(PathBuf, (i32, i32))], width: i32, alone: bool, right: bool, folds: bool) {
+        // (the person's are their card's, which is kept whole: `Shown::Person`)
+        if !self.replaying && !right {
+            self.shown.push(Shown::Pictures { pictures: pictures.to_vec(), width, alone, right, folds });
         }
-        const ACROSS: i32 = 200;
-        const DOWN: i32 = 100;
-        let room = i64::from(width - 2 * ACROSS) * i64::from(self.dpi) / 1440;
+        let room = i64::from(width - 2 * PICTURES_ACROSS) * i64::from(self.dpi) / 1440;
         let sizes: Vec<(i32, i32)> = pictures.iter().map(|(_, size)| *size).collect();
         let tiles = attach::Tiles::of(&sizes, room as i32, self.dpi);
-        // (the room above them is in the height of this row, and what is under them is the text's, or if none, this row's too)
-        let height = (i64::from(tiles.total_height()) * 1440 / i64::from(self.dpi)) as i32 + if alone { 2 * DOWN } else { DOWN };
+        let paths: Vec<PathBuf> = pictures.iter().map(|(path, _)| path.clone()).collect();
+        // (opened, they stay so when the transcript is made again at another width, until another session is opened)
+        let fold = folds.then(|| self.pictures_opened.contains(&paths));
+        let height = self.pictures_height(&tiles, alone, fold);
         let back = if right { theme::user_back() } else { theme::code_back() };
-        let first = self.insert_rtf(rtf::spacer_row(width, self.text_twips, height, back, (ACROSS, DOWN), right), None);
-        let start = text_start(self.transcript, first);
-        self.picture_blocks.push(PictureBlock { start, paths: pictures.iter().map(|(path, _)| path.clone()).collect(), tiles });
+        let shown_width = if fold == Some(false) { width.min(PICTURES_SHUT_WIDTH) } else { width };
+        let span = self.insert_rtf_span(rtf::spacer_row(shown_width, self.text_twips, height, back, (PICTURES_ACROSS, PICTURES_DOWN), right), None);
+        let start = text_start(self.transcript, span.0);
+        self.picture_blocks.push(PictureBlock { start, paths, tiles, fold, span, width, alone, right });
         // (a message's card begins at its pictures, whether words follow them or not)
         if alone || right {
             self.user_cards.push(UserCard { start, kind: if right { CardKind::Person } else { CardKind::Block }, shape: None, looked_at: None });
@@ -4728,6 +4955,62 @@ impl App {
                 self.place_rail();
             }
         }
+    }
+
+    /// How tall a block of pictures' row is, in twips: the room above them is in it, and what is under them is the text's, or if none, this row's too. A call's
+    /// pictures have the line that says how many over them, and put away they are that line alone.
+    fn pictures_height(&self, tiles: &attach::Tiles, alone: bool, fold: Option<bool>) -> i32 {
+        let line = if fold.is_some() { PICTURES_LINE } else { 0 };
+        let shown = if fold == Some(false) { 0 } else { (i64::from(tiles.total_height()) * 1440 / i64::from(self.dpi)) as i32 };
+        line + shown + if alone { 2 * PICTURES_DOWN } else { PICTURES_DOWN }
+    }
+
+    /// A call's pictures shown or put away where they stand. The row is made again at its new height in its place: it is as many characters as it was, so that
+    /// nothing after it moves in the text, and the view stays where it is.
+    unsafe fn toggle_pictures(&mut self, at: usize) {
+        let Some(block) = self.picture_blocks.get(at) else { return };
+        let Some(open) = block.fold else { return };
+        let (open, paths) = (!open, block.paths.clone());
+        if open {
+            self.pictures_opened.insert(paths);
+        } else {
+            self.pictures_opened.remove(&paths);
+        }
+        let block = &self.picture_blocks[at];
+        let height = self.pictures_height(&block.tiles, block.alone, Some(open));
+        let back = if block.right { theme::user_back() } else { theme::code_back() };
+        let shown_width = if open { block.width } else { block.width.min(PICTURES_SHUT_WIDTH) };
+        let row = rtf::spacer_row(shown_width, self.text_twips, height, back, (PICTURES_ACROSS, PICTURES_DOWN), block.right);
+        let (first, last) = block.span;
+        let edit = self.transcript;
+        let mut position = POINT { x: 0, y: 0 };
+        SendMessageW(edit, EM_GETSCROLLPOS, 0, std::ptr::addr_of_mut!(position) as LPARAM);
+        let mut selection = CharRange { first: 0, last: 0 };
+        SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(selection) as LPARAM);
+        redraw(edit, false);
+        let bytes: Vec<u8> = row.into_bytes().into_iter().chain(std::iter::once(0)).collect();
+        let how = SetTextEx { flags: ST_SELECTION, code_page: 65001 };
+        let range = CharRange { first, last };
+        SendMessageW(edit, EM_EXSETSEL, 0, std::ptr::addr_of!(range) as LPARAM);
+        SendMessageW(edit, EM_SETTEXTEX, std::ptr::addr_of!(how) as WPARAM, bytes.as_ptr() as LPARAM);
+        let mut end = CharRange { first: 0, last: 0 };
+        SendMessageW(edit, EM_EXGETSEL, 0, std::ptr::addr_of_mut!(end) as LPARAM);
+        // (a row of another length would leave what follows at other places: the places are found again from the text, as a reflow does)
+        let same = end.last == last;
+        SendMessageW(edit, EM_EXSETSEL, 0, std::ptr::addr_of!(selection) as LPARAM);
+        SendMessageW(edit, EM_SETSCROLLPOS, 0, std::ptr::addr_of!(position) as LPARAM);
+        redraw(edit, true);
+        if let Some(block) = self.picture_blocks.get_mut(at) {
+            block.fold = Some(open);
+        }
+        if !same {
+            self.reflow();
+        }
+        InvalidateRect(edit, std::ptr::null(), 0);
+        if self.find_open {
+            self.find_scan();
+        }
+        self.place_thumb();
     }
 
     /// A small copy of a file at a size, from what is kept, or asked for on another thread and not there yet.
@@ -4963,10 +5246,12 @@ impl App {
                 }
                 self.card_room(s(12), Vec::new());
             }
-            Card::Presented { files } => {
+            Card::Presented { files, interim } => {
                 let count = if files.len() == 1 { t("1 file").to_string() } else { tf("{0} files", &[&files.len()]) };
+                // (one the app put there while the model goes on with the page says so, until the model's own present takes its place or the turn ends)
+                let head = if *interim { format!("{}  ·  {count}  ·  {}", t("Files for you"), t("a version in the making")) } else { format!("{}  ·  {count}", t("Files for you")) };
                 self.card_row(&[" "], 6, theme::muted(), 80, true);
-                self.card_row(&[&format!("{}  ·  {count}", t("Files for you"))], 8, theme::muted(), 26, false);
+                self.card_row(&[&head], 8, theme::muted(), 26, false);
                 self.card_room(s(4), Vec::new());
                 for path in files {
                     let tip = if preview::can_show(path) { t("Show beside the conversation") } else if cards::opens_in_app(path) { t("Open in its app") } else { t("Show in Explorer") };
@@ -5016,6 +5301,11 @@ impl App {
                 }
                 Shown::Card(Card::Plan { state, .. }) if *state == PlanState::Waiting => {
                     *state = PlanState::Undecided;
+                    changed = true;
+                }
+                // (a page put there in the making is what the turn left: no longer in the making)
+                Shown::Card(Card::Presented { interim, .. }) if *interim => {
+                    *interim = false;
                     changed = true;
                 }
                 _ => {}
@@ -5271,6 +5561,7 @@ impl App {
                     self.open_picture(&path);
                 }
             }
+            OverlayKey::Pictures(block) => self.toggle_pictures(block),
         }
     }
 
@@ -5283,6 +5574,7 @@ impl App {
             OverlayKey::Run(_) => t("Show or hide these calls").to_string(),
             OverlayKey::Card(slot, part) => self.card_slots.get(slot).and_then(|room| room.parts.get(part)).map_or(String::new(), card_part_words),
             OverlayKey::Picture(block, at) => self.picture_blocks.get(block).and_then(|block| block.paths.get(at)).map_or(String::new(), |path| file_name_of(path)),
+            OverlayKey::Pictures(_) => t("Show or hide the pictures the model looked at").to_string(),
         }
     }
 
@@ -5382,9 +5674,17 @@ impl App {
             if point.y >= height {
                 continue;
             }
+            // (a call's: the line that says how many, and the pictures under it when they are shown)
+            let line = if block.fold.is_some() { (i64::from(PICTURES_LINE) * i64::from(dpi) / 1440) as i32 } else { 0 };
+            if block.fold.is_some() {
+                found.push(OverlayHit { area: picture_area(point, (0, 0), (scale(dpi, 160), line), dpi), key: OverlayKey::Pictures(at) });
+            }
+            if block.fold == Some(false) {
+                continue;
+            }
             for (index, path) in block.paths.iter().enumerate() {
                 let (x, y) = block.tiles.at(index);
-                let area = picture_area(point, (x, y), (block.tiles.width, block.tiles.height), dpi);
+                let area = picture_area(point, (x, y + line), (block.tiles.width, block.tiles.height), dpi);
                 if tile_is_in_view(&area, height) && wanted.len() < PICTURES_IN_VIEW {
                     found.push(OverlayHit { area, key: OverlayKey::Picture(at, index) });
                     wanted.push((path.clone(), (block.tiles.width, block.tiles.height)));
@@ -5426,6 +5726,20 @@ impl App {
                 }
                 continue;
             }
+            if let OverlayKey::Pictures(block) = key {
+                let Some((count, open)) = self.picture_blocks.get(block).map(|block| (block.paths.len(), block.fold == Some(true))) else { continue };
+                if lit || pressed {
+                    rounded(device, area, scale(dpi, ds::radius::SMALL), Some(if pressed { theme::raised() } else { theme::surface() }), None);
+                }
+                let mark = scale(dpi, ds::size::ICON) + scale(dpi, ds::space::S);
+                let color = if lit || pressed { theme::text() } else { theme::muted() };
+                icon::draw(device, if open { "chevron-down" } else { "chevron-right" }, RECT { left: area.left, top: area.top, right: area.left + mark, bottom: area.bottom }, scale(dpi, ds::size::ICON_SMALL), color);
+                draw_text(device, &tf("{0} pictures", &[&count]), RECT { left: area.left + mark, top: area.top, right: area.right, bottom: area.bottom }, self.fonts.small, color, ONE_LINE);
+                if ring && focused == Some(key) {
+                    rounded(device, RECT { left: area.left + 1, top: area.top + 1, right: area.right - 1, bottom: area.bottom - 1 }, scale(dpi, ds::radius::SMALL), None, Some(theme::accent()));
+                }
+                continue;
+            }
             if let OverlayKey::Picture(block, index) = key {
                 let Some((path, room)) = self.picture_blocks.get(block).and_then(|block| block.paths.get(index).map(|path| (path.clone(), (block.tiles.width, block.tiles.height)))) else { continue };
                 let thumb = self.thumb_of(&path, room);
@@ -5452,7 +5766,7 @@ impl App {
                 OverlayKey::Copy(_) | OverlayKey::Block(_) => "copy",
                 OverlayKey::Fork(_) => "git-branch",
                 OverlayKey::Run(at) if self.runs[at].expanded => "chevron-down",
-                OverlayKey::Run(_) | OverlayKey::Card(..) | OverlayKey::Picture(..) => "chevron-right",
+                OverlayKey::Run(_) | OverlayKey::Card(..) | OverlayKey::Picture(..) | OverlayKey::Pictures(_) => "chevron-right",
             };
             // As an icon button of the window draws: a shade under it when the pointer is on it, one up on a card of a block of code.
             if lit || pressed {
@@ -5811,11 +6125,16 @@ impl App {
         let shown = if dogmind_agent::images::is_sealed(path) {
             let folder = self.folder.join("attachments");
             let copy = folder.join(path.file_name().unwrap_or_default());
+            // (the one shown before goes: a plain copy is kept only while it is the one shown, and never past the app's end, where it was left until the next start)
+            if let Some(before) = self.shown_plain.take().filter(|before| *before != copy) {
+                let _ = std::fs::remove_file(before);
+            }
             let made = dogmind_agent::images::read_stored(path).and_then(|bytes| std::fs::create_dir_all(&folder).and_then(|()| std::fs::write(&copy, bytes)));
             if made.is_err() {
                 self.warn(t("This picture cannot be opened here."));
                 return;
             }
+            self.shown_plain = Some(copy.clone());
             copy
         } else {
             path.to_path_buf()
@@ -5846,8 +6165,9 @@ impl App {
         SendMessageW(self.note, EM_SETSEL, 0, 0);
     }
 
-    /// The folder's files for `@`, and its branch: on another thread, as a large tree takes a while.
-    unsafe fn look_at_workspace(&self) {
+    /// The folder's files for `@`, and its branch: on another thread, as a large tree takes a while. And its grant for commands, begun now (`ready_folder`).
+    unsafe fn look_at_workspace(&mut self) {
+        self.ready_folder(self.workspace.clone());
         let (poster, path) = (self.poster.clone(), self.workspace.clone());
         std::thread::spawn(move || {
             let files = dogmind_agent::tools::workspace_files(&path, 20000);
@@ -5943,8 +6263,21 @@ impl App {
 
     /// A line starting with `/`: `true` when it was a command, and has been done.
     unsafe fn run_command(&mut self, line: &str) -> bool {
-        let Some(rest) = line.strip_prefix('/') else { return false };
-        let (name, argument) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(name, argument)| (name, argument.trim()));
+        let (word, argument) = line.split_once(char::is_whitespace).map_or((line, ""), |(word, argument)| (word, argument.trim()));
+        let Some(name) = word.strip_prefix('/') else { return false };
+        if !is_builtin_command(word) {
+            if !self.skills.iter().any(|skill| skill.for_the_person && skill.name.eq_ignore_ascii_case(name)) {
+                return false;
+            }
+            if self.skill_enabled(name) {
+                set_text(self.composer, "");
+                self.send_or_wait(Outgoing::words(line.to_string()), false);
+            } else {
+                self.say(t("That skill is turned off. Settings > Skills turns it on."));
+            }
+            return true;
+        }
+        set_text(self.composer, "");
         match name {
             "help" => self.set_panel(Panel::Help),
             "report" => self.write_report(),
@@ -6013,10 +6346,7 @@ impl App {
                         self.rename_target = Some(path);
                         self.set_panel(Panel::Rename);
                     } else {
-                        let _ = session::rename(&path, argument);
-                        self.session_title = argument.to_string();
-                        self.refresh_sessions();
-                        self.layout();
+                        self.save_session_name(path, argument);
                     }
                 } else {
                     self.say(t("This session has no messages yet."));
@@ -6055,8 +6385,7 @@ impl App {
             "copy" => {
                 if self.last_answer.is_empty() {
                     self.say(t("There is no answer to copy yet."));
-                } else {
-                    self.copy_to_clipboard(&self.last_answer.clone());
+                } else if self.copy_to_clipboard(&self.last_answer.clone()) {
                     self.say(t("Copied the last answer."));
                 }
             }
@@ -6089,9 +6418,26 @@ impl App {
                 _ => self.say(t("This session has no trajectory yet: it is written as the session runs.")),
             },
             "usage" => {
-                let (prompt, cached, completion, requests) = self.totals;
-                let rate = self.rate.map_or(String::new(), |rate| tf(", last answer at {0} tok/s", &[&format!("{rate:.1}")]));
-                self.say(&tf("{0} requests: {1} prompt tokens, {2} of them from the cache, {3} written{4}. The conversation is {5} of {6}.", &[&requests, &prompt, &cached, &completion, &rate, &self.used, &self.window_tokens]));
+                let totals = self.totals;
+                let mut usage = if totals.requests == 0 {
+                    t("No token usage has been reported for this session.").to_string()
+                } else {
+                    tf("{0} metered requests: {1} prompt tokens, {2} written.", &[&totals.requests, &totals.prompt, &totals.completion])
+                };
+                if let Some(rate) = totals.last_rate {
+                    usage.push(' ');
+                    usage.push_str(&tf("Last answer: {0} tok/s.", &[&format!("{rate:.1}")]));
+                }
+                let cache = match totals.cache_percent() {
+                    Some(percent) => tf("Cache hit rate: {0}% ({1} of {2} prompt tokens with cache data).", &[&percent, &totals.cached, &totals.cache_prompt]),
+                    None => t("Cache hit rate: unavailable.").to_string(),
+                };
+                let context = if self.window_tokens > 0 {
+                    tf("Conversation length: {0} of {1} tokens.", &[&self.used, &self.window_tokens])
+                } else {
+                    tf("Conversation length: {0} tokens (limit unknown).", &[&self.used])
+                };
+                self.say(&format!("{usage}\n{cache}\n{context}"));
             }
             "init" => {
                 self.send_or_wait(Outgoing { text: INIT_PROMPT.to_string(), images: Vec::new(), card: "/init".to_string() }, false);
@@ -6146,14 +6492,14 @@ impl App {
             "skills" => self.set_panel(Panel::Skills),
             "mcp" => {
                 let file = self.folder.join("mcp.json");
-                if argument.eq_ignore_ascii_case("import") {
-                    let said = self.mcp_servers_imported();
+                if !argument.is_empty() {
+                    let said = self.mcp_servers_imported(argument);
                     self.say(&said);
                 } else if let Some(why) = self.mcp.unreadable() {
                     self.say(&tf("The list of servers could not be read, and none was started: {0}", &[&why]));
                 } else {
-                    let lines: Vec<String> = self.mcp.states().iter().map(|(name, state)| format!("{name}: {}", mcp_state_words(Some(state)))).collect();
-                    self.say(&if lines.is_empty() { tf("No server yet. {0} lists them, and /mcp import copies Claude's and Codex's in.", &[&file.display()]) } else { lines.join("\n") });
+                    let lines: Vec<String> = self.mcp.states().iter().map(|(name, state)| format!("{name}: {}", mcp_state_words(name, Some(state)))).collect();
+                    self.say(&if lines.is_empty() { tf("No server yet. {0} lists configured servers. Use /mcp candidates to find one to import.", &[&file.display()]) } else { lines.join("\n") });
                 }
             }
             "plan" => self.on_menu(M_MODE + 3),
@@ -6196,13 +6542,6 @@ impl App {
             "quit" | "exit" => {
                 DestroyWindow(self.window);
             }
-            known if self.skills.iter().any(|skill| skill.for_the_person && skill.name.eq_ignore_ascii_case(known)) => {
-                if self.skill_enabled(known) {
-                    self.send_or_wait(Outgoing::words(line.to_string()), false);
-                } else {
-                    self.say(t("That skill is turned off. Settings > Skills turns it on."));
-                }
-            }
             _ => return false,
         }
         true
@@ -6220,6 +6559,25 @@ impl App {
         let efforts = self.efforts();
         let effort = efforts.iter().find(|(known, _)| *known == self.settings.effort.as_deref()).map_or("Default", |(_, name)| name);
         set_text_if_changed(self.effort_chip, &tf("Effort: {0}", &[&t(effort)]));
+    }
+
+    /// The write grant of a workspace for commands, begun when a session opens in it, on a thread of its own: Windows rewrites the list of everything in a folder to give it
+    /// (0.1 to 0.15 ms a thing: 49.6 s for one of 329,000), and a first command that gave it waited all that time. Begun here, it is mostly done before the model's first
+    /// command, which waits only for what is left; given once, it stays while the folder is on the person's list, and the next session finds it at once. Meanwhile the status
+    /// row says so.
+    unsafe fn ready_folder(&mut self, folder: PathBuf) {
+        let key = folder.to_string_lossy().to_lowercase();
+        if folder == Path::new(".") || !folder.is_dir() || !self.readied.insert(key) {
+            return;
+        }
+        self.readying = Some(folder.clone());
+        InvalidateRect(self.window, &self.status_area, 0);
+        let poster = self.poster.clone();
+        std::thread::spawn(move || {
+            // (what goes wrong is said by the command that needs it, which gives it again)
+            let _ = dogmind_agent::sandbox::ready_workspace(&folder);
+            poster.send(Note::FolderReady(folder));
+        });
     }
 
     unsafe fn update_status(&mut self) {
@@ -6340,6 +6698,8 @@ impl App {
         // (no switch for what could not show)
         let toggles = chat && !bare && (self.preview_file.is_some() || self.steps.is_some() || room - s(ds::size::RIGHT_PANEL) >= s(RIGHT_NEEDS));
         show(self.right_toggle, toggles);
+        // (the terminal's is there in every session, a new one too: it is the way to a shell)
+        show(self.terminal_toggle, chat && !bare);
         show(self.folder_chip, conversation && !bare);
         if !conversation {
             show(self.start_folder, false);
@@ -6360,17 +6720,19 @@ impl App {
             // (at the right end of the conversation's own area, beside the panel it opens, not at the end of the column the words keep to)
             let toggle_x = main_left + main_width - toggle - s(ds::space::M);
             place(self.right_toggle, toggle_x, (strip - toggle) / 2, toggle, toggle);
+            // (the terminal's to the left of it, or in its place where it is not shown)
+            let terminal_x = if toggles { toggle_x - toggle - s(ds::space::XS) } else { toggle_x };
+            if !bare {
+                place(self.terminal_toggle, terminal_x, (strip - toggle) / 2, toggle, toggle);
+            }
             // (an empty session has no name to tell it by, and the dog says what it is)
             let (name, color) = if !self.session_title.is_empty() { (self.session_title.clone(), theme::text()) } else if self.has_messages { (t("New session").to_string(), theme::faint()) } else { (String::new(), theme::faint()) };
-            let title_room = if toggles { column.min(toggle_x - s(ds::space::S) - left) } else { column };
+            let title_room = if bare { column } else { column.min(terminal_x - s(ds::space::S) - left) };
             self.title_area = rect(left, 0, title_room, strip);
             shapes.push(Shape::Text { area: self.title_area, text: name, font: FontKind::Strong, color, flags: ONE_LINE });
-            if !bare {
-                let tabs = [
-                    (t("Conversation"), PanelTab::Center(CenterView::Conversation)),
-                    (t("Terminal"), PanelTab::Center(CenterView::Terminal)),
-                    (t("Timeline"), PanelTab::Center(CenterView::Timeline)),
-                ];
+            let views = center_views(self.has_messages);
+            if !bare && !views.is_empty() {
+                let tabs: Vec<(&str, PanelTab)> = views.iter().map(|(words, view)| (t(words), PanelTab::Center(*view))).collect();
                 self.layout_tabs(&mut shapes, left, column, strip, FontKind::Small, &tabs);
                 content_top += s(ds::size::NAV_ROW);
                 shapes.push(Shape::Fill { area: rect(main_left, content_top - s(ds::space::PIXEL), main_width, s(ds::space::PIXEL)), color: theme::line() });
@@ -6384,10 +6746,17 @@ impl App {
             self.status_area = rect(0, 0, 0, 0);
         }
         let margin = s(ds::size::RIGHT_GAP);
-        if self.terminal_shown() {
-            self.layout_terminal_view(&mut shapes, main_left + margin, main_width - 2 * margin, content_top, height);
-        } else if self.timeline_shown() {
-            self.layout_timeline_view(&mut shapes, main_left + margin, main_width - 2 * margin, content_top, height);
+        // The terminal panel, when it is open: at the foot of the conversation's area, with the conversation (or the timeline) over it in what is left. Its height is of the
+        // area under the title, with or without the row of views: the row comes with the first thing written in a session (a note of the app's too), and a terminal open
+        // then would lose a row of its own under the person.
+        let panel_room = if self.terminal_shown() { term_panel::terminal_panel_height(height - strip, dpi) } else { 0 };
+        if panel_room > 0 {
+            let panel_top = height - panel_room;
+            shapes.push(Shape::Fill { area: rect(main_left, panel_top, main_width, s(ds::space::PIXEL)), color: theme::line() });
+            self.layout_terminal_view(&mut shapes, main_left + margin, main_width - 2 * margin, panel_top, height);
+        }
+        if self.timeline_shown() {
+            self.layout_timeline_view(&mut shapes, main_left + margin, main_width - 2 * margin, content_top, height - panel_room);
         }
 
         for window in [self.composer, self.send, self.attach_button, self.model_chip, self.mode_chip, self.effort_chip] {
@@ -6415,7 +6784,7 @@ impl App {
         }
         let band = conversation && self.pending.is_some();
         for window in [self.note, self.approve, self.always, self.reject, self.feedback] {
-            show(window, band);
+            show(window, band && !(window == self.always && without_always(self.pending.as_ref())));
         }
         show(self.transcript, conversation && self.has_messages);
         if !(conversation && self.has_messages) {
@@ -6426,6 +6795,8 @@ impl App {
             show(window, finding);
         }
         if conversation {
+            // (over the terminal panel, when it is open)
+            let height = height - panel_room;
             let status_height = s(ds::size::STATUS);
             let inner = s(ds::size::COMPOSER_INSET);
             // Two lines' room to begin with; it grows with what is typed, up to about half the window, and then scrolls.
@@ -6656,10 +7027,12 @@ impl App {
                 }
                 let row = top + s(ds::size::MENU_ROW) + head_room + note_height + line;
                 let button = s(96);
+                // (with no "always", reject moves into its place)
+                let slots = if without_always(self.pending.as_ref()) { 2 } else { 3 };
                 place(self.approve, left + s(ds::space::L), row, button, s(ds::size::CONTROL));
                 place(self.always, left + s(ds::space::L) + button + s(ds::space::S), row, button, s(ds::size::CONTROL));
-                place(self.reject, left + s(ds::space::L) + 2 * (button + s(ds::space::S)), row, button, s(ds::size::CONTROL));
-                let after = left + s(ds::space::L) + 3 * (button + s(ds::space::S));
+                place(self.reject, left + s(ds::space::L) + (slots - 1) * (button + s(ds::space::S)), row, button, s(ds::size::CONTROL));
+                let after = left + s(ds::space::L) + slots * (button + s(ds::space::S));
                 shapes.push(Shape::Round { area: rect(after, row, left + column - s(ds::space::L) - after, s(ds::size::CONTROL)), radius: s(ds::radius::CONTROL), fill: Some(theme::raised()), border: None });
                 place(self.feedback, after + s(ds::space::M), row + s(ds::size::FIELD_INSET), left + column - s(ds::space::L) - after - 2 * s(ds::space::M), s(ds::size::FIELD_TEXT));
                 bottom = top - s(ds::space::S);
@@ -6675,7 +7048,8 @@ impl App {
             let (text_left, text_column) = (left + inset, column - 2 * inset);
             // The width text goes in at, whether or not there is any yet: what is written first would have to be written again, as soon as it had gone in.
             let twips = (i64::from(text_column) * 1440 / i64::from(self.dpi)) as i32;
-            if twips != self.text_twips {
+            // (a minimized window has no width to lay anything out in: what comes while it is so is written at the column it had, and is not all written again twice)
+            if twips != self.text_twips && IsIconic(self.window) == 0 {
                 self.text_twips = twips;
                 // Once the window has stopped moving: it writes the whole conversation again.
                 if self.has_messages {
@@ -7000,7 +7374,7 @@ impl App {
 
     /// Whether this panel is shown as a dialog over the app. The first run has the window to itself.
     fn is_dialog(&self, panel: Panel) -> bool {
-        matches!(panel, Panel::Rename | Panel::ConfirmDelete | Panel::ConfirmRemove | Panel::Sessions | Panel::Rewind | Panel::CryptoOn | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff | Panel::CryptoWork | Panel::Unlock) || (!self.onboarding && (matches!(panel, Panel::Help | Panel::About) || is_settings_place(panel)))
+        matches!(panel, Panel::Rename | Panel::ConfirmDelete | Panel::RemoveRemaining | Panel::ConfirmRemove | Panel::Sessions | Panel::Rewind | Panel::CryptoOn | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff | Panel::CryptoWork | Panel::Unlock) || (!self.onboarding && (matches!(panel, Panel::Help | Panel::About) || is_settings_place(panel)))
     }
 
     /// The controls that move between the window and a dialog as they are needed, and those that only a dialog has.
@@ -7128,7 +7502,7 @@ impl App {
         let margin = s(ds::DIALOG_MARGIN);
         let (rows, chosen) = self.nav_rows();
         let (card_width, wanted_height) = match self.panel {
-            Panel::Rename | Panel::ConfirmDelete | Panel::ConfirmRemove | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff => (s(ds::size::SHORT_DIALOG).min(width - 2 * margin), 0),
+            Panel::Rename | Panel::ConfirmDelete | Panel::RemoveRemaining | Panel::ConfirmRemove | Panel::CryptoPassphrase | Panel::CryptoCode | Panel::CryptoOff => (s(ds::size::SHORT_DIALOG).min(width - 2 * margin), 0),
             Panel::Sessions | Panel::Rewind => (s(ds::size::LIST_DIALOG).min(width - 2 * margin), 0),
             Panel::Help => ds::dialog_size((width, height), 80, (s(640), s(420)), (s(800), s(640)), margin),
             _ => ds::dialog_size((width, height), 80, (s(720), s(460)), (s(900), s(640)), margin),
@@ -7450,7 +7824,8 @@ impl App {
             }
             Panel::Tools => {
                 form.toggle(t("Web search and reading"), self.toggle_web);
-                form.toggle(t("Code Mode: let the model run a short program that calls several tools at once"), self.toggle_code_mode);
+                form.toggle(t("Code Mode"), self.toggle_code_mode);
+                form.note(t("Lets the model run a short program that calls several tools at once."), theme::muted());
                 let setting = self.settings.search_key.clone();
                 self.key_rows(form, &setting, t("Brave Search key"));
                 form.section(t("MCP servers"));
@@ -7463,7 +7838,7 @@ impl App {
                     form.toggle_beside(name, *toggle, t("Trust what it returns"));
                     let runs = configs.iter().find(|(known, _)| known == name).map_or(String::new(), |(_, config)| mcp_runs(config));
                     // (why one did not start needs the room of the page)
-                    let state = mcp_state_words(states.iter().find(|(known, _)| known == name).map(|(_, state)| state));
+                    let state = mcp_state_words(name, states.iter().find(|(known, _)| known == name).map(|(_, state)| state));
                     form.note_with_button(&format!("{runs}\n{state}"), *edit);
                 }
                 if !servers.is_empty() {
@@ -7481,6 +7856,7 @@ impl App {
                             form.note(t("A line each, as Name: value. An Authorization header goes here."), theme::muted());
                         } else {
                             form.field(t("Arguments"), self.fields[2]);
+                            form.field(t("Working directory (optional)"), self.fields[MCP_CWD_FIELD]);
                             form.area(t("Environment variables"), self.mcp_vars, 3);
                             form.note(t("A line each, as NAME=value."), theme::muted());
                         }
@@ -7553,13 +7929,14 @@ impl App {
                 form.buttons(0, &[self.buttons[0], self.buttons[1]]);
                 form.note(&log, log_color);
             }
-            Panel::ConfirmDelete => {
+            Panel::ConfirmDelete | Panel::RemoveRemaining => {
                 let title = self.delete_target.as_ref().map_or(String::new(), |(_, title)| title.clone());
                 form.shapes.push(Shape::Text { area: rect(0, form.y, form.width, s(ds::space::XL)), text: title, font: FontKind::Body, color: theme::text(), flags: ONE_LINE });
                 form.y += s(ds::space::XL);
                 form.note(t("This cannot be undone. Files in the folder stay."), theme::muted());
                 form.y += s(ds::space::XS);
                 form.buttons(0, &[self.buttons[0], self.buttons[1]]);
+                form.note(&log, log_color);
             }
             Panel::ConfirmRemove => {
                 match &self.leaving {
@@ -7753,14 +8130,30 @@ impl App {
             },
             Panel::Tools => self.keep_search_key() && self.mcp_keep_form(),
             Panel::Instructions => {
-                let text = get_text(self.doc).replace("\r\n", "\n").replace('\r', "\n");
-                let known = std::fs::read_to_string(self.folder.join("instructions.md")).unwrap_or_default();
-                if text.trim_end() == known.trim_end() {
+                if SendMessageW(self.doc, EM_GETMODIFY, 0, 0) == 0 {
                     return true;
                 }
+                let file = self.folder.join("instructions.md");
+                let known = match read_instruction_file(&file) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        self.problem_in_panel(&error);
+                        return false;
+                    }
+                };
+                let normalized = normalized_newlines(&known);
+                let text = get_text(self.doc);
+                if text == normalized {
+                    SendMessageW(self.doc, EM_SETMODIFY, 0, 0);
+                    return true;
+                }
+                let text = if known.contains("\r\n") && normalized.replace('\n', "\r\n") == known { text.replace('\n', "\r\n") } else { text };
                 // (whole or not at all: written over in place, a power cut leaves the person's instructions as zeros)
-                match settings::write_whole(&self.folder.join("instructions.md"), text.as_bytes()) {
-                    Ok(()) => true,
+                match settings::write_whole(&file, text.as_bytes()) {
+                    Ok(()) => {
+                        SendMessageW(self.doc, EM_SETMODIFY, 0, 0);
+                        true
+                    }
                     Err(error) => {
                         self.problem_in_panel(&error.to_string());
                         false
@@ -8011,8 +8404,8 @@ impl App {
         self.changes.iter().map(|change| change.path.clone()).find(|path| preview::is_page(path)).or_else(|| self.workspace.join("index.html").is_file().then(|| "index.html".to_string()))
     }
 
-    /// How many rows the list of what waits takes in the panel on the right: its heading, a row for each command and each wait (a second for what a command waits to read), what has stopped
-    /// waking, and the line that says these end with the app. At most so many are listed.
+    /// How many rows the list of what waits takes in the panel on the right: its heading, a row for each command and each wait (a second for what a command waits to read), and what has
+    /// stopped waking. At most so many are listed.
     fn background_rows(&self) -> usize {
         if self.waiting.is_empty() {
             return 0;
@@ -8020,10 +8413,11 @@ impl App {
         let listed = |count: usize| count.min(WAITING_LISTED);
         let commands = self.waiting.commands.iter().take(WAITING_LISTED).map(|command| 1 + usize::from(command.watching_for.is_some())).sum::<usize>();
         let (more_commands, more_waits) = (self.waiting.commands.len() > WAITING_LISTED, self.waiting.waits.len() > WAITING_LISTED);
-        1 + commands + listed(self.waiting.waits.len()) + usize::from(more_commands) + usize::from(more_waits) + if self.waiting.paused.is_some() { 3 } else { 0 } + 1
+        1 + commands + listed(self.waiting.waits.len()) + usize::from(more_commands) + usize::from(more_waits) + if self.waiting.paused.is_some() { 3 } else { 0 }
     }
 
-    /// The list of what the session has going or waiting in the background: each command and wait with a stop of its own, what stopped it from waking, and that these end with the app.
+    /// The list of what the session has going or waiting in the background: each command and wait with a stop of its own, and what stopped it from waking. (A line that said these end
+    /// with the app was taken out: the owner found it of no use, 2026-11-22.)
     /// The times are drawn as the window paints them (`paint`), so that they run on without the panel being laid out again. Returns where the next section begins.
     unsafe fn layout_waiting(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, mut y: i32) -> i32 {
         let dpi = self.dpi;
@@ -8081,8 +8475,7 @@ impl App {
             shapes.push(Shape::Text { area: rect(x, y, width, 3 * row), text: lang::notice(paused.sentence()), font: FontKind::Small, color: theme::warn(), flags: DT_WORDBREAK });
             y += 3 * row;
         }
-        shapes.push(Shape::Text { area: rect(x, y, width, row), text: t("These end when Dogmind quits.").to_string(), font: FontKind::Small, color: theme::faint(), flags: ONE_LINE });
-        y + row
+        y
     }
 
     /// What a row of the list says of its time now: how long a command has run, or has to run, and how long until a wait is up. Counted on from when the agent last said.
@@ -8122,6 +8515,9 @@ impl App {
     }
 
     unsafe fn layout_tabs(&mut self, shapes: &mut Vec<Shape>, x: i32, width: i32, top: i32, font: FontKind, views: &[(&str, PanelTab)]) {
+        if views.len() < 2 {
+            return;
+        }
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let words_top = top + s(ds::space::XS);
@@ -8143,8 +8539,10 @@ impl App {
         }
     }
 
+    /// The conversation is what the central panel shows: the view chosen, or a session in which nothing has been said yet, which has no row of views to choose another by
+    /// (`center_views`).
     fn conversation_shown(&self) -> bool {
-        self.panel == Panel::Chat && (self.onboarding || self.settings.center_view == CenterView::Conversation)
+        self.panel == Panel::Chat && (self.onboarding || !self.has_messages || self.settings.center_view == CenterView::Conversation)
     }
 
     unsafe fn set_center_view(&mut self, view: CenterView) {
@@ -8540,7 +8938,7 @@ impl App {
     fn rail_tip(&self, at: usize) -> String {
         let Some(turn) = self.rail_turns.get(at) else { return String::new() };
         let end = self.rail_turns.get(at + 1).map_or(i32::MAX, |next| next.start);
-        let answer = self.answers.iter().rev().find(|(place, _)| *place > turn.start && *place < end).map(|(_, text)| rail_words(text, 120)).unwrap_or_default();
+        let answer = self.answers.iter().rev().find(|(place, _, _)| *place > turn.start && *place < end).map(|(_, text, _)| rail_words(text, 120)).unwrap_or_default();
         if answer.is_empty() { turn.prompt.clone() } else { format!("{}\n{answer}", turn.prompt) }
     }
 
@@ -8681,29 +9079,6 @@ impl App {
             return;
         }
         let middle = (area.top + area.bottom) / 2;
-        let mut x = area.left + s(ds::space::S);
-        // Only what needs saying: at work, the stop button and the line above the input say so, and when all is well nothing does. (The engine that goes on while the faster-writing data
-        // is fetched says how far that has come, and then that it starts again.)
-        let beside = if self.drafter_restart_waits {
-            Some(drafter_restart_words())
-        } else {
-            Some(self.setup_status.as_str()).filter(|words| self.drafter_fetch.is_some() && !words.is_empty())
-        };
-        if !self.connected {
-            let dot = s(ds::space::S);
-            let color = if matches!(self.connection.as_str(), "not connected" | "no engine") { theme::bad() } else { theme::warn() };
-            rounded(device, rect(x, middle - dot / 2, dot, dot), dot / 2, Some(color), None);
-            x += dot + s(ds::space::S);
-            draw_text(device, t(self.connection.as_str()), RECT { left: x, right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
-        } else if let Some(words) = beside {
-            let tall = area.bottom - area.top;
-            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
-            draw_text(device, words, RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
-        } else if self.web_seen {
-            let tall = area.bottom - area.top;
-            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::warn());
-            draw_text(device, t("Web content is here: network commands ask"), RECT { left: x + s(ds::size::RIGHT_INDENT), right: (area.right - s(190)).max(x), ..area }, self.fonts.small, theme::warn(), ONE_LINE);
-        }
         let wide = area.right - area.left;
         let mut right = area.right - s(ds::space::S);
         let share = if self.window_tokens > 0 { (self.used as f64 / self.window_tokens as f64).clamp(0.0, 1.0) } else { 0.0 };
@@ -8722,9 +9097,54 @@ impl App {
                 right -= across + s(ds::space::M);
             }
         }
+        if wide >= s(250) {
+            let percent = self.current_session.as_ref().and_then(|path| self.session_cache_percent.get(path));
+            let words = percent.map_or_else(|| t("cached —").to_string(), |percent| tf("cached {0}%", &[&percent]));
+            let across = text_width(self.fonts.small, &words);
+            draw_text(device, &words, RECT { left: right - across, right, ..area }, self.fonts.small, theme::faint(), DT_RIGHT | ONE_LINE);
+            right -= across + s(ds::space::M);
+        }
         if let Some(rate) = self.rate.filter(|_| wide >= s(300)) {
             let block = s(70);
             draw_text(device, &format!("{rate:.1} tok/s"), RECT { left: right - block, right, ..area }, self.fonts.small, theme::faint(), DT_RIGHT | ONE_LINE);
+            right -= block + s(ds::space::M);
+        }
+        let notice_right = right.min(area.right - s(190));
+        let mut x = area.left + s(ds::space::S);
+        // Only what needs saying: at work, the stop button and the line above the input say so, and when all is well nothing does. (The engine that goes on while the faster-writing data
+        // is fetched says how far that has come, and then that it starts again.)
+        let beside = if self.drafter_restart_waits {
+            Some(drafter_restart_words())
+        } else {
+            Some(self.setup_status.as_str()).filter(|words| self.drafter_fetch.is_some() && !words.is_empty())
+        };
+        // (while the workspace's grant for commands is being given: said beside what else is said, as it comes when the app or a session opens, often while it connects)
+        let readying = self.readying.as_ref().is_some_and(|folder| folder.to_string_lossy().eq_ignore_ascii_case(&self.workspace.to_string_lossy()));
+        if !self.connected {
+            let dot = s(ds::space::S);
+            let color = if matches!(self.connection.as_str(), "not connected" | "no engine") { theme::bad() } else { theme::warn() };
+            rounded(device, rect(x, middle - dot / 2, dot, dot), dot / 2, Some(color), None);
+            x += dot + s(ds::space::S);
+            let words = t(self.connection.as_str());
+            draw_text(device, words, RECT { left: x, right: notice_right.max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+            let after = x + text_width(self.fonts.small, words) + s(ds::space::L);
+            if readying && after + s(ds::size::RIGHT_INDENT) < notice_right {
+                let tall = area.bottom - area.top;
+                icon::draw(device, "info", rect(after, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
+                draw_text(device, t("Getting the folder ready for commands…"), RECT { left: after + s(ds::size::RIGHT_INDENT), right: notice_right.max(after), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+            }
+        } else if let Some(words) = beside {
+            let tall = area.bottom - area.top;
+            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
+            draw_text(device, words, RECT { left: x + s(ds::size::RIGHT_INDENT), right: notice_right.max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+        } else if readying {
+            let tall = area.bottom - area.top;
+            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::muted());
+            draw_text(device, t("Getting the folder ready for commands…"), RECT { left: x + s(ds::size::RIGHT_INDENT), right: notice_right.max(x), ..area }, self.fonts.small, theme::muted(), ONE_LINE);
+        } else if self.web_seen {
+            let tall = area.bottom - area.top;
+            icon::draw(device, "info", rect(x, area.top, s(ds::size::ICON), tall), s(ds::size::ICON_SMALL), theme::warn());
+            draw_text(device, t("Web content is here: network commands ask"), RECT { left: x + s(ds::size::RIGHT_INDENT), right: notice_right.max(x), ..area }, self.fonts.small, theme::warn(), ONE_LINE);
         }
     }
 
@@ -8944,7 +9364,8 @@ impl App {
                 set_text(self.mcp_cancel, t("Cancel"));
                 self.mcp_form = None;
                 self.mcp_controls();
-                if self.mcp.states().iter().any(|(_, state)| *state == dogmind_agent::mcp::State::Starting) {
+                self.mcp_page_states = self.mcp.states();
+                if !self.mcp_page_states.is_empty() {
                     SetTimer(self.window, TIMER_MCP, 500, None);
                 }
             }
@@ -8960,6 +9381,12 @@ impl App {
                     self.set_button_kinds(&[ButtonKind::Danger, ButtonKind::Secondary]);
                     show(self.buttons[2], false);
                 }
+            }
+            Panel::RemoveRemaining => {
+                self.panel_title = t("Remove remaining session files").into();
+                set_text(self.buttons[0], t("Try again"));
+                set_text(self.buttons[1], t("Close"));
+                self.set_button_kinds(&[ButtonKind::Danger, ButtonKind::Secondary]);
             }
             Panel::ConfirmDelete => {
                 self.panel_title = t("Delete this session?").into();
@@ -9129,12 +9556,18 @@ impl App {
             }
             Panel::Instructions => {
                 self.panel_title = t("Your instructions").into();
-                let text = std::fs::read_to_string(self.folder.join("instructions.md")).unwrap_or_default();
-                self.show_document(&text.replace('\n', "\r\n"));
-                SendMessageW(self.doc, EM_SETREADONLY, 0, 0);
+                let loaded = read_instruction_file(&self.folder.join("instructions.md"));
+                let editable = loaded.is_ok();
+                match loaded {
+                    Ok(text) => self.show_document(&normalized_newlines(&text).replace('\n', "\r\n")),
+                    Err(error) => self.show_document(&error),
+                }
+                SendMessageW(self.doc, EM_SETREADONLY, usize::from(!editable), 0);
+                SendMessageW(self.doc, EM_SETMODIFY, 0, 0);
                 SendMessageW(self.doc, EM_SETBKGNDCOLOR, 0, theme::surface() as LPARAM);
                 set_text(self.buttons[0], t("Save"));
                 self.set_button_kinds(&[ButtonKind::Primary]);
+                EnableWindow(self.buttons[0], i32::from(editable));
             }
             Panel::Diff if self.trajectory.is_some() => {
                 self.panel_title = t("Trajectory").into();
@@ -9353,7 +9786,7 @@ impl App {
     unsafe fn show_trajectory(&mut self, summary: dogmind_agent::trajectory_report::Summary) {
         let open = std::collections::BTreeSet::new();
         let rows = crate::trajectory::rows(&summary, &open);
-        self.trajectory = Some(TrajectoryPage { summary, open, rows });
+        self.trajectory = Some(TrajectoryPage { summary, open, rows, across: 0, content_width: None });
         self.diff_scroll = 0;
         self.set_panel(Panel::Diff);
     }
@@ -9365,6 +9798,7 @@ impl App {
             page.open.insert(turn);
         }
         page.rows = crate::trajectory::rows(&page.summary, &page.open);
+        page.content_width = (page.across > 0).then(|| page.measure_width(self.fonts.code));
         self.clamp_diff();
         InvalidateRect(self.diff_view, std::ptr::null(), 0);
     }
@@ -9413,8 +9847,13 @@ impl App {
         }
     }
 
-    /// The rows chosen, or the whole of the file, as text.
-    unsafe fn copy_from_diff(&self) {
+    /// Copy the table on the trajectory page, or the selected lines (or whole file) on the changes page.
+    unsafe fn copy_from_diff(&mut self) {
+        if let Some(page) = &self.trajectory {
+            let text = crate::trajectory::table_text(&page.rows);
+            self.copy_to_clipboard(&text);
+            return;
+        }
         let chosen = self.diff_chosen.map(|(a, b)| (a.min(b), a.max(b)));
         let text: Vec<String> = self.diff_rows.iter().enumerate().filter(|(at, row)| chosen.map_or(true, |(a, b)| *at >= a && *at <= b) && !matches!(row.kind, RowKind::Hunk | RowKind::Note)).map(|(_, row)| {
             let mark = match row.kind {
@@ -9427,19 +9866,27 @@ impl App {
         self.copy_to_clipboard(&text.join("\r\n"));
     }
 
-    /// Sideways, as far as the longest line of the file wants and no further.
+    /// Sideways, bounded by the displayed table or file.
     unsafe fn diff_sideways(&mut self, steps: i32) {
         let room = child_area(self.diff_view, self.window).2;
-        // (what goes before a line's words, as near as it matters here)
-        let most = (diffview::longest(&self.diff_rows) as i32 * text_width(self.fonts.code, "0") + scale(self.dpi, 100) - room).max(0);
-        self.diff_across = (self.diff_across + steps * 2 * scale(self.dpi, ds::space::XXL)).clamp(0, most);
+        let step = steps * 2 * scale(self.dpi, ds::space::XXL);
+        if let Some(page) = &mut self.trajectory {
+            let width = page.content_width.unwrap_or_else(|| page.measure_width(self.fonts.code));
+            page.content_width = Some(width);
+            let most = (width + scale(self.dpi, ds::space::M) - room).max(0);
+            page.across = (page.across.min(most) + step).clamp(0, most);
+        } else {
+            // (what goes before a line's words, as near as it matters here)
+            let most = (diffview::longest(&self.diff_rows) as i32 * text_width(self.fonts.code, "0") + scale(self.dpi, 100) - room).max(0);
+            self.diff_across = (self.diff_across + step).clamp(0, most);
+        }
         InvalidateRect(self.diff_view, std::ptr::null(), 0);
     }
 
     /// Up and down, or with Shift across what is too long for the window.
     unsafe fn diff_wheel(&mut self, wparam: WPARAM) {
         let notches = i32::from(((wparam >> 16) & 0xFFFF) as u16 as i16) / 120;
-        if GetKeyState(VK_SHIFT as i32) < 0 {
+        if wparam & 0x0004 != 0 { // MK_SHIFT in the wheel message
             self.diff_sideways(-notches);
         } else {
             self.diff_to(self.diff_scroll - notches * 3 * scale(self.dpi, ds::size::DIFF_ROW));
@@ -9448,21 +9895,25 @@ impl App {
 
     /// The trajectory's table: each column at its own place across, in the characters of the monospace face, the header kept at the top, the rows in view under it.
     unsafe fn paint_trajectory(&self, device: HDC, client: RECT) {
-        use crate::trajectory::{column_starts, RowKind, COLUMNS};
+        use crate::trajectory::{RowKind, COLUMNS};
         let Some(page) = &self.trajectory else { return };
         let dpi = self.dpi;
         let s = |value: i32| scale(dpi, value);
         let row = s(ds::size::DIFF_ROW);
         let face = self.fonts.code;
-        let character = text_width(face, "0").max(1);
-        let (starts, notes) = column_starts();
-        let bar = s(ds::space::M);
-        let width = client.right - bar;
+        let Some(header) = page.rows.first() else { return };
+        let (bounds, notes) = page.columns(face);
+        let width = client.right - s(ds::space::M);
+        let across = page.across.min((page.content_width.unwrap_or(0) - width).max(0));
         SetBkMode(device, TRANSPARENT as _);
         let cell = |device: HDC, text: &str, column: usize, y: i32, color: u32| {
-            let (left, room) = (starts[column] as i32 * character, COLUMNS[column].chars as i32 * character);
+            let (left, right) = bounds[column];
+            let (left, right) = (left - across, right - across);
+            if right <= 0 {
+                return;
+            }
             let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | if COLUMNS[column].right { DT_RIGHT } else { 0 };
-            draw_text(device, text, RECT { left, right: left + room, top: y, bottom: y + row }, face, color, flags);
+            draw_text(device, text, RECT { left, right, top: y, bottom: y + row }, face, color, flags);
         };
         // (the header's row is the first, and stays where it is)
         let first = ((self.diff_scroll / row) as usize).max(1);
@@ -9488,13 +9939,13 @@ impl App {
                     _ => theme::muted(),
                 };
                 if let RowKind::Turn { open, .. } = line.kind {
-                    icon::draw(device, if open { "chevron-down" } else { "chevron-right" }, rect(0, y, s(ds::size::ICON), row), s(ds::size::ICON_SMALL), theme::muted());
+                    icon::draw(device, if open { "chevron-down" } else { "chevron-right" }, rect(-across, y, s(ds::size::ICON), row), s(ds::size::ICON_SMALL), theme::muted());
                 }
                 for (column, text) in line.cells.iter().enumerate() {
                     cell(device, text, column, y, color);
                 }
                 if !line.note.is_empty() {
-                    draw_text(device, &line.note, RECT { left: notes as i32 * character, right: width, top: y, bottom: y + row }, face, theme::faint(), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                    draw_text(device, &line.note, RECT { left: notes - across, right: width, top: y, bottom: y + row }, face, theme::faint(), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
                 }
             }
             y += row;
@@ -9504,10 +9955,8 @@ impl App {
         let brush = CreateSolidBrush(theme::background());
         FillRect(device, &head, brush);
         DeleteObject(brush);
-        if let Some(line) = page.rows.first() {
-            for (column, text) in line.cells.iter().enumerate() {
-                cell(device, text, column, 0, theme::faint());
-            }
+        for (column, text) in header.cells.iter().enumerate() {
+            cell(device, text, column, 0, theme::faint());
         }
         let rule = rect(0, row - 1, client.right, 1);
         let brush = CreateSolidBrush(theme::line());
@@ -9889,11 +10338,35 @@ impl App {
         }
     }
 
-    /// A word from the tray, only while the window is out of sight.
-    unsafe fn tray_note(&self, title: &str, words: &str) {
-        if IsWindowVisible(self.window) != 0 {
-            return;
+    /// Whether the person has the window in front of them: it, or a window of its own (a dialog), has the foreground, and it is not minimized.
+    unsafe fn in_front(&self) -> bool {
+        // (a debug build told to by a test: a window off the screen is given the foreground only by taking it from the person at the machine)
+        if cfg!(debug_assertions) {
+            if let Ok(front) = std::env::var("DOGMIND_TEST_IN_FRONT") {
+                return front == "1";
+            }
         }
+        let front = GetForegroundWindow();
+        !front.is_null() && (front == self.window || GetAncestor(front, GA_ROOTOWNER) == self.window) && IsIconic(self.window) == 0
+    }
+
+    /// A word from the tray of a new version: only while the window is hidden.
+    unsafe fn tray_note(&self, title: &str, words: &str) {
+        if tray_speaks(TrayWord::Version, IsWindowVisible(self.window) != 0, self.in_front()) {
+            self.balloon(title, words);
+        }
+    }
+
+    /// A word from the tray that the work wants the person (a turn's end, a question, an approval, a plan): whenever the window is not in front of them, hidden
+    /// or behind another. Only a hidden window had one, and a person working in another window behind which Dogmind sat was told nothing.
+    unsafe fn attention_note(&self, title: &str, words: &str) {
+        if tray_speaks(TrayWord::Attention, IsWindowVisible(self.window) != 0, self.in_front()) {
+            self.balloon(title, words);
+        }
+    }
+
+    /// The tray's balloon.
+    unsafe fn balloon(&self, title: &str, words: &str) {
         // (a debug build told to by a test writes down what the balloon says: off the screen, no one sees it)
         if cfg!(debug_assertions) {
             if let Some(path) = std::env::var_os("DOGMIND_TEST_TRAYLOG") {
@@ -10751,7 +11224,8 @@ impl App {
             }
             let mut named = settings.workspaces.clone();
             named.extend(session::list(&data.join("sessions")).into_iter().map(|summary| summary.workspace));
-            dogmind_agent::workspace_grants::sweep(&data, &named);
+            // (nothing is kept: the app is leaving the PC)
+            dogmind_agent::workspace_grants::sweep(&data, &named, &[]);
             // (the list of what was given goes with the folder: what could not be taken back, the person hears of now)
             for folder in dogmind_agent::workspace_grants::still_granted(&data) {
                 problems.push(tf("{0} may still be open to commands: what was given could not be taken back.", &[&shown_path(&folder)]));
@@ -11105,7 +11579,16 @@ impl App {
     unsafe fn start_session(&mut self, folder: PathBuf) {
         self.park_if_working();
         self.queued_back_to_composer();
-        self.settings.use_workspace(folder.clone());
+        // (what falls off the list has what commands were given there taken back, off this thread)
+        let fallen = self.settings.use_workspace(folder.clone());
+        if !fallen.is_empty() {
+            let data = self.folder.clone();
+            std::thread::spawn(move || {
+                for gone in fallen {
+                    dogmind_agent::workspace_grants::forget(&data, &gone);
+                }
+            });
+        }
         self.settings.set_up = true;
         self.onboarding = false;
         self.save();
@@ -11113,7 +11596,7 @@ impl App {
         self.workspace = folder.clone();
         self.preview_follows_workspace();
         self.session_title.clear();
-        self.totals = (0, 0, 0, 0);
+        self.totals = SessionUsage::default();
         self.rate = None;
         let _ = self.agent.commands.send(Command::NewSession(folder.clone()));
         // (its first message need not wait for the prompt and the tools: a Straydog reads them now, while the message is written)
@@ -11222,11 +11705,10 @@ impl App {
             return;
         }
         // (asked for above: what is on screen is about to go)
-        let writing = self.writing_now();
         self.close_run();
-        self.run_carry.clear();
+        let mut writing = std::mem::take(&mut self.plain_writing);
+        writing.extend(self.run_carry.drain(..).filter(|entry| entry.writing.is_some()));
         self.asked_calls.clear();
-        self.plain_writing = None;
         self.request_live = None;
         let (handle, events) = self.spawn_agent();
         let agent = std::mem::replace(&mut self.agent, handle);
@@ -11285,7 +11767,7 @@ impl App {
             self.find_opened();
             return;
         }
-        self.totals = (0, 0, 0, 0);
+        self.totals = SessionUsage::default();
         self.rate = None;
         self.current_session = Some(path.clone());
         let _ = self.agent.commands.send(Command::Resume(path));
@@ -11296,6 +11778,7 @@ impl App {
     /// A session at work comes back on screen: the whole messages from its file, and then what is on its way.
     unsafe fn take_up(&mut self, at: usize) {
         let parked = self.parked.remove(at);
+        self.group_live_tools = self.settings.compact_tools;
         let free = std::mem::replace(&mut self.agent, parked.agent);
         let _ = free.commands.send(Command::Quit);
         self.events = parked.events;
@@ -11345,10 +11828,29 @@ impl App {
             self.runs[at].entries = running;
             self.write_run(at);
         }
-        for (index, tool, raw) in parked.writing.into_iter().filter(|(_, tool, _)| !cards::is_asking(tool)) {
-            self.run_writes(index, tool, &raw);
+        let has_writing = !parked.writing.is_empty();
+        if has_writing {
+            if self.settings.compact_tools {
+                let at = self.open_run();
+                self.runs[at].entries.extend(parked.writing);
+                self.write_run(at);
+            } else {
+                self.plain_writing = parked.writing;
+            }
         }
-        self.set_activity(if !parked.running || parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
+        let activity = if !parked.running || parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some()
+            || (self.settings.compact_tools && (has_writing || !self.tools_running.is_empty())) {
+            String::new()
+        } else if let Some(entry) = toolrun::latest_writing(&self.plain_writing) {
+            toolrun::writing_line(entry, &self.workspace)
+        } else if !self.tools_running.is_empty() {
+            t("Working").to_string()
+        } else if parked.compacting {
+            t("Compacting the session…").to_string()
+        } else {
+            t("Thinking…").to_string()
+        };
+        self.set_activity(activity);
         self.update_buttons();
         self.update_status();
         if let Some(approval) = parked.pending {
@@ -11477,14 +11979,18 @@ impl App {
     unsafe fn search_now(&mut self) {
         KillTimer(self.window, TIMER_SEARCH);
         self.side_query = get_text(self.side_search).trim().to_string();
-        self.search_generation += 1;
+        let generation = self.search_generation.fetch_add(1, Ordering::Relaxed) + 1;
         if self.side_query.is_empty() {
             self.side_hits = None;
             self.fill_side();
             return;
         }
-        let (poster, folder, query, generation) = (self.poster.clone(), self.folder.join("sessions"), self.side_query.clone(), self.search_generation);
-        std::thread::spawn(move || poster.send(Note::Found(generation, session::search(&folder, &query))));
+        let (poster, folder, query, latest) = (self.poster.clone(), self.folder.join("sessions"), self.side_query.clone(), self.search_generation.clone());
+        std::thread::spawn(move || {
+            if let Some(hits) = session::search_while(&folder, &query, || latest.load(Ordering::Relaxed) == generation) {
+                poster.send(Note::Found(generation, hits));
+            }
+        });
     }
 
     /// The sidebar's list, read on another thread: there may be many sessions.
@@ -11636,11 +12142,12 @@ impl App {
     /// What earlier runs left writable, now that what this one uses is counted: the workspaces of the conversations are among what is counted, so it waits for the key.
     unsafe fn sweep_grants(&self) {
         let (data, mut named, poster) = (self.folder.clone(), self.settings.workspaces.clone(), self.poster.clone());
+        let listed = self.settings.workspaces.clone();
         std::thread::spawn(move || {
             named.extend(session::list(&data.join("sessions")).into_iter().map(|summary| summary.workspace));
             named.sort();
             named.dedup();
-            let left: Vec<String> = dogmind_agent::workspace_grants::sweep(&data, &named).iter().map(|folder| format!("{}: {}", folder.display(), t(dogmind_agent::workspace_grants::NOT_TAKEN_BACK))).collect();
+            let left: Vec<String> = dogmind_agent::workspace_grants::sweep(&data, &named, &listed).iter().map(|folder| format!("{}: {}", folder.display(), t(dogmind_agent::workspace_grants::NOT_TAKEN_BACK))).collect();
             if !left.is_empty() {
                 poster.send(Note::ReadFolderDone(left.join("\n"), true));
             }
@@ -11847,7 +12354,11 @@ impl App {
             // (the three dots a row shows under the pointer: what the right button offers)
             Some(SideRow::Session { .. }) if x > client.right - scale(self.dpi, 34) => self.on_side_menu(index),
             Some(SideRow::Session { path, .. }) => {
-                self.find_after_open = self.side_hits.as_ref().and_then(|_| self.side_query.split_whitespace().next().map(str::to_string));
+                let hit = self.side_hits.as_ref().and_then(|hits| hits.iter().find(|hit| hit.path == path));
+                self.find_after_open = hit.and_then(|hit| hit.find_in_conversation.clone());
+                if hit.is_some() && self.find_after_open.is_none() && self.find_open {
+                    self.close_find();
+                }
                 self.open_session(path);
             }
             _ => {}
@@ -11914,6 +12425,31 @@ impl App {
         }
         self.delete_target = Some((path, title));
         self.set_panel(Panel::ConfirmDelete);
+    }
+
+    unsafe fn save_session_name(&mut self, path: PathBuf, name: &str) {
+        if let Err(error) = session::rename(&path, name) {
+            self.rename_target = Some(path);
+            if self.panel != Panel::Rename {
+                self.rename_seed = Some(name.to_string());
+                self.set_panel(Panel::Rename);
+            }
+            self.problem_in_panel(&tf("The session could not be renamed: {0}", &[&error]));
+            return;
+        }
+        self.rename_target = None;
+        if self.current_session.as_ref() == Some(&path) {
+            self.session_title = name.to_string();
+        }
+        self.refresh_sessions();
+        if !self.side_query.is_empty() {
+            self.search_now();
+        }
+        if self.panel == Panel::Rename {
+            self.set_panel(Panel::Chat);
+        } else {
+            self.layout();
+        }
     }
 
     unsafe fn session_title_for_rename(&mut self, title: String) {
@@ -12170,26 +12706,27 @@ impl App {
         self.layout();
     }
 
-    /// What Claude's and Codex's settings list goes in with this app's, started at once, and how that went.
-    unsafe fn mcp_servers_imported(&mut self) -> String {
-        let file = self.folder.join("mcp.json");
-        let home = std::env::var_os("USERPROFILE").map_or(PathBuf::new(), PathBuf::from);
-        let mut found = dogmind_agent::mcp::servers_of_claude(&std::fs::read_to_string(home.join(".claude.json")).unwrap_or_default());
-        for (name, server) in dogmind_agent::mcp::servers_of_codex(&std::fs::read_to_string(home.join(".codex").join("config.toml")).unwrap_or_default()) {
-            found.entry(name).or_insert(server);
-        }
-        match dogmind_agent::mcp::import(&file, found) {
-            Ok(0) => t("Claude and Codex list no server that is not here already.").to_string(),
-            Ok(added) => {
-                self.mcp_changed();
-                tf("{0} servers added to {1}. They are starting.", &[&added, &file.display()])
+    unsafe fn mcp_servers_imported(&mut self, argument: &str) -> String {
+        let Some(home) = std::env::var_os("USERPROFILE") else { return t("The user profile could not be located.").into() };
+        match mcp_import(Path::new(&home), dogmind_agent::codex::configured_home().as_deref(), &self.folder.join("mcp.json"), argument) {
+            Ok((added, mut message)) => {
+                let (action, name) = mcp_action_and_name(argument);
+                if action.eq_ignore_ascii_case("import") {
+                    // Reload edits to mcp.json even when nothing was added. A named import can also recover a failed connection.
+                    let started = self.mcp_changed((!name.is_empty()).then_some(name));
+                    if added == 0 && started.iter().any(|server| server == name) {
+                        message.push('\n');
+                        message.push_str(&tf("Starting {0}.", &[&name]));
+                    }
+                }
+                message
             }
             Err(error) => error,
         }
     }
 
     unsafe fn import_mcp_servers(&mut self) {
-        let said = self.mcp_servers_imported();
+        let said = self.mcp_servers_imported("import");
         self.say_in_panel(&said);
     }
 
@@ -12214,16 +12751,16 @@ impl App {
     }
 
     /// mcp.json changed here: the servers start and end to match it at once, and the Tools page follows them as they come up.
-    unsafe fn mcp_changed(&mut self) {
-        self.mcp.reload();
+    unsafe fn mcp_changed(&mut self, retry_server: Option<&str>) -> Vec<String> {
+        let started = self.mcp.reload_retrying(retry_server);
         self.mcp_controls();
         SetTimer(self.window, TIMER_MCP, 500, None);
+        started
     }
 
-    /// While a server is starting, the Tools page is laid out again as it comes up.
+    /// Refresh the open Tools page when a server starts, changes its list, or disconnects.
     unsafe fn mcp_tick(&mut self) {
         let states = self.mcp.states();
-        let starting = states.iter().any(|(_, state)| *state == dogmind_agent::mcp::State::Starting);
         // (what was said when it was saved is no longer true of one that did not start: the page says that instead)
         if let Some(name) = self.mcp_saved.clone() {
             match states.iter().find(|(known, _)| *known == name).map(|(_, state)| state) {
@@ -12235,10 +12772,11 @@ impl App {
                 _ => self.mcp_saved = None,
             }
         }
-        if self.panel == Panel::Tools {
+        if self.panel == Panel::Tools && self.mcp_page_states != states {
+            self.mcp_page_states = states;
             self.layout();
         }
-        if !starting || self.panel != Panel::Tools {
+        if self.panel != Panel::Tools || !self.mcp_page_states.iter().any(|(_, state)| matches!(state, dogmind_agent::mcp::State::Up(_) | dogmind_agent::mcp::State::Starting)) {
             KillTimer(self.window, TIMER_MCP);
         }
     }
@@ -12251,13 +12789,15 @@ impl App {
         } else {
             (config.command.clone(), dogmind_agent::mcp::lines_of_pairs(&config.env, '='))
         };
-        let was = [name.clone().unwrap_or_default(), target, dogmind_agent::mcp::line_of_args(&config.args), vars];
-        for (field, text) in self.fields[..3].iter().zip(&was) {
+        let values = [name.clone().unwrap_or_default(), target, dogmind_agent::mcp::line_of_args(&config.args)];
+        for (field, text) in self.fields[..3].iter().zip(&values) {
             set_text(*field, text);
         }
-        set_text(self.mcp_vars, &was[3]);
+        set_text(self.mcp_vars, &vars);
+        set_text(self.fields[MCP_CWD_FIELD], &config.cwd.as_deref().map_or_else(Default::default, |path| path.to_string_lossy()));
         self.mcp_form_url = config.is_http();
-        self.mcp_form_was = was;
+        // Compare text as the controls return it, including normalized multiline headers and variables.
+        self.mcp_form_was = self.mcp_form_typed();
         let new = name.is_none();
         self.mcp_form = Some(name);
         self.panel_log.clear();
@@ -12273,17 +12813,18 @@ impl App {
             set_text(*field, "");
         }
         set_text(self.mcp_vars, "");
+        set_text(self.fields[MCP_CWD_FIELD], "");
         self.layout();
     }
 
     /// What the form says now.
-    unsafe fn mcp_form_typed(&self) -> [String; 4] {
-        [get_text(self.fields[0]), get_text(self.fields[1]), get_text(self.fields[2]), get_text(self.mcp_vars)]
+    unsafe fn mcp_form_typed(&self) -> [String; 5] {
+        [get_text(self.fields[0]), get_text(self.fields[1]), get_text(self.fields[2]), get_text(self.mcp_vars), get_text(self.fields[MCP_CWD_FIELD])]
     }
 
     /// What the form runs is a URL now, or is no longer one: it asks for what that needs.
     unsafe fn mcp_kind_changed(&mut self) {
-        let url = mcp_url(get_text(self.fields[1]).trim()).is_some();
+        let url = mcp_url(mcp_path_text(&get_text(self.fields[1]))).is_some();
         if url != self.mcp_form_url {
             self.mcp_form_url = url;
             self.layout();
@@ -12294,8 +12835,8 @@ impl App {
     unsafe fn mcp_save_form(&mut self) -> bool {
         use dogmind_agent::mcp;
         let Some(before) = self.mcp_form.clone() else { return true };
-        let [name, target, args, vars] = self.mcp_form_typed();
-        let (name, target) = (name.trim().to_string(), target.trim().to_string());
+        let [name, target, args, vars, cwd] = self.mcp_form_typed();
+        let (name, target) = (name.trim().to_string(), mcp_path_text(&target).to_string());
         if name.is_empty() {
             self.problem_in_panel(t("Give the server a name."));
             return false;
@@ -12310,20 +12851,23 @@ impl App {
             return false;
         }
         let url = mcp_url(&target);
-        let pairs = match mcp::pairs_of_lines(&vars, if url.is_some() { ':' } else { '=' }) {
+        let was = before.as_ref().and_then(|before| configs.iter().find(|(known, _)| known == before)).map(|(_, config)| config);
+        let pairs = match mcp_form_pairs(was, url.is_some(), &self.mcp_form_was[3], &vars) {
             Ok(pairs) => pairs,
             Err((line, said)) => {
                 self.problem_in_panel(&if url.is_some() { tf("Line {0} of the headers is not Name: value: {1}", &[&line, &said]) } else { tf("Line {0} of the variables is not NAME=value: {1}", &[&line, &said]) });
                 return false;
             }
         };
-        let was = before.as_ref().and_then(|before| configs.iter().find(|(known, _)| known == before)).map(|(_, config)| config);
-        let config = mcp_config_of_form(was, url, target, &args, pairs);
+        let mut config = mcp_config_of_form(was, url, target, &self.mcp_form_was[2], &args, pairs);
+        if !config.is_http() && cwd != self.mcp_form_was[4] {
+            config.cwd = mcp_working_directory(&cwd);
+        }
         if let Err(error) = mcp::save_server(&self.folder.join("mcp.json"), before.as_deref(), &name, config) {
-            self.problem_in_panel(&error);
+            self.problem_in_panel(t(&error));
             return false;
         }
-        self.mcp_changed();
+        self.mcp_changed(Some(&name));
         self.mcp_close_form();
         self.say_in_panel(&tf("{0} was saved. Once it is up, its tools join the conversation from your next message.", &[&name]));
         self.mcp_saved = Some(name);
@@ -12338,7 +12882,7 @@ impl App {
             self.problem_in_panel(&error);
             return;
         }
-        self.mcp_changed();
+        self.mcp_changed(None);
         self.mcp_close_form();
         self.say_in_panel(&tf("{0} was removed.", &[&name]));
         // (the page is scrolled to the form: what it says is under it)
@@ -12661,6 +13205,8 @@ impl App {
                     if let Ok(info) = &result {
                         client.suppresses_letters = info.suppresses_letters;
                         client.tool_writing = info.tool_writing;
+                        client.image_digests = info.image_digests;
+                        client.app_role = info.app_role();
                         client.vision = info.vision;
                     }
                     poster.send(match result {
@@ -12682,6 +13228,8 @@ impl App {
                         client.replay_reasoning = info.straydog;
                         client.suppresses_letters = info.suppresses_letters;
                         client.tool_writing = info.tool_writing;
+                        client.image_digests = info.image_digests;
+                        client.app_role = info.app_role();
                         client.vision = info.vision;
                         Ok::<_, String>((client, info))
                     })();
@@ -12727,11 +13275,11 @@ impl App {
             return;
         }
         if reads_as_command(&text) {
-            set_text(self.composer, "");
+            if let Some(name) = command_with_unused_text(&text) {
+                self.say(&tf("Enter {0} alone to run it. To send this draft to the model, put backticks around {0}.", &[&name]));
+                return;
+            }
             if !self.run_command(&text) {
-                // (nothing written is lost for a slip of the first word)
-                set_text(self.composer, &text);
-                SendMessageW(self.composer, EM_SETSEL, usize::MAX, -1);
                 self.say(&tf("No such command: {0}. /help lists them.", &[&text.split_whitespace().next().unwrap_or("")]));
             }
             return;
@@ -12917,6 +13465,7 @@ impl App {
 
     unsafe fn show_transcript(&mut self, messages: &[Message]) {
         set_text(self.transcript, "");
+        self.last_answer.clear();
         // (what the panel on the right showed of the session before is of it)
         self.steps = None;
         self.timeline_session_changed();
@@ -12927,6 +13476,7 @@ impl App {
         self.rail_turns.clear();
         self.turn_words_due = false;
         self.picture_blocks.clear();
+        self.pictures_opened.clear();
         self.blocks.clear();
         self.card_slots.clear();
         self.open_block = None;
@@ -12952,7 +13502,7 @@ impl App {
         self.reveal.clear();
         self.follow_end = true;
         self.line_start = true;
-        self.in_code = false;
+        self.code_fence = None;
         self.pending_text.clear();
         self.table.clear();
         self.heading = 0;
@@ -12993,14 +13543,15 @@ impl App {
                     }
                 }
                 "assistant" => {
-                    if let Some(text) = &message.content {
+                    // (a tool call it wrote out as text, which ran nothing, is not shown as words, as it was not while it streamed)
+                    if let Some(text) = message.content.as_deref().map(dogmind_agent::agent::shown_answer) {
                         if !text.trim().is_empty() {
                             self.flush_told_calls(&mut told);
                         }
                         self.append_answer(&crate::mask::hide_keys(text));
                         self.finish_answer();
-                        self.last_answer = text.clone();
-                        self.mark_answer(text, &written_words(message));
+                        self.last_answer = text.to_string();
+                        self.mark_answer(text, &written_words(message), Some(index));
                     }
                     for call in message.tool_calls.iter().flatten() {
                         // A question put to the person, a plan and a helper's look are cards of their own, with what came of them.
@@ -13059,7 +13610,7 @@ impl App {
             Event::Content(text) => parked.partial.push_str(&text),
             Event::AssistantEnded => parked.partial.clear(),
             Event::ToolStarted { id, tool, summary } => {
-                if let Some(place) = parked.writing.iter().position(|(_, writing, _)| *writing == tool) {
+                if let Some(place) = parked.writing.iter().position(|entry| entry.tool == tool) {
                     parked.writing.remove(place);
                 }
                 parked.tools_running.insert(id, (tool, summary.chars().take(160).collect()));
@@ -13069,10 +13620,9 @@ impl App {
                 parked.compacting = false;
             }
             Event::Compacting => parked.compacting = true,
-            Event::ToolWriting { index, tool, piece } => match parked.writing.iter_mut().find(|(at, _, _)| *at == index) {
-                Some((_, _, raw)) => raw.push_str(&piece),
-                None => parked.writing.push((index, tool, piece)),
-            },
+            Event::ToolWriting { index, tool, piece } if !cards::is_asking(&tool) => {
+                toolrun::append_piece(&mut parked.writing, index, tool, &piece);
+            }
             Event::ToolEnded { id, .. } => {
                 parked.tools_running.remove(&id);
             }
@@ -13108,7 +13658,7 @@ impl App {
                 parked.pending = Some(approval);
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.flash_for_attention(woken);
-                self.tray_note(t("Dogmind is waiting for you"), &tf("It asks to use {0}.", &[&t(tool_name(&tool))]));
+                self.attention_note(t("Dogmind is waiting for you"), &tf("It asks to use {0}.", &[&t(tool_name(&tool))]));
             }
             Event::Usage { used, window, usage } => {
                 parked.used = used;
@@ -13116,10 +13666,9 @@ impl App {
                 if usage.tokens_per_second.is_some() {
                     parked.rate = usage.tokens_per_second;
                 }
-                if usage.prompt > 0 {
-                    parked.totals = (parked.totals.0 + usage.prompt, parked.totals.1 + usage.cached, parked.totals.2 + usage.completion, parked.totals.3 + 1);
-                }
             }
+            Event::SessionUsage(totals) => parked.totals = totals,
+            Event::RequestCache(percent) => remember_request_cache(&mut self.session_cache_percent, parked.path.as_deref(), percent),
             Event::Interjected(text) => {
                 if let Some(place) = parked.interjected.iter().position(|known| *known == text) {
                     parked.interjected.remove(place);
@@ -13142,14 +13691,14 @@ impl App {
                 parked.question = Some(question);
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.flash_for_attention(woken);
-                self.tray_note(t("Dogmind is waiting for you"), &words);
+                self.attention_note(t("Dogmind is waiting for you"), &words);
             }
             Event::PlanReview(review) => {
                 let woken = parked.woken;
                 parked.plan_review = Some(review);
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.flash_for_attention(woken);
-                self.tray_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
+                self.attention_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
             }
             Event::TurnEnded { .. } => {
                 parked.pending = None;
@@ -13190,7 +13739,7 @@ impl App {
                 let (title, failed, woken) = (parked.title.clone(), std::mem::take(&mut parked.failed), std::mem::take(&mut parked.woken));
                 let (path, notices) = (parked.path.clone(), std::mem::take(&mut parked.notices));
                 let words = if title.is_empty() { t("The work is done.").to_string() } else { title };
-                self.tray_note(t(if failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &words);
+                self.attention_note(t(if failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &words);
                 if let (Some(path), true) = (&path, failed) {
                     self.failed_sessions.insert(path.clone());
                 }
@@ -13199,7 +13748,7 @@ impl App {
                 }
                 self.refresh_sessions();
                 InvalidateRect(self.side, std::ptr::null(), 0);
-                if GetForegroundWindow() != self.window {
+                if !self.in_front() {
                     self.flash_for_attention(woken);
                 }
             }
@@ -13369,6 +13918,7 @@ impl App {
                 self.refresh_sessions();
             }
             Event::TurnStarted => {
+                self.group_live_tools = self.settings.compact_tools;
                 // (a turn clears the flag as it begins: Stop was pressed before it did, while the engine warmed up)
                 if self.stop_asked {
                     self.agent.cancel.store(true, Ordering::Relaxed);
@@ -13429,7 +13979,7 @@ impl App {
                 // (the next answer does not start at the speed the last one ended)
                 (self.reveal_rate, self.reveal_carried) = (0.0, 0.0);
                 self.request_live = Some(std::time::Instant::now());
-                self.plain_writing = None;
+                self.plain_writing.clear();
                 self.run_carry.retain(|entry| entry.writing.is_none());
                 if let Some(open) = self.run_open {
                     self.runs[open].entries.retain(|entry| entry.writing.is_none());
@@ -13442,18 +13992,15 @@ impl App {
             // (a question or a plan is a card of its own: the call that makes it has no row among the calls)
             Event::ToolWriting { ref tool, .. } if cards::is_asking(tool) => {}
             Event::ToolWriting { index, tool, piece } => {
-                if self.settings.compact_tools {
+                if self.group_live_tools {
                     self.run_writes(index, tool, &piece);
                 } else {
-                    if !self.plain_writing.as_ref().is_some_and(|entry| entry.writing.as_ref().is_some_and(|writing| writing.index == index)) {
+                    if !self.plain_writing.iter().any(|entry| entry.writing.as_ref().is_some_and(|writing| writing.index == index)) {
                         self.end_of_answer();
-                        self.plain_writing = Some(RunEntry::being_written(index, tool));
                     }
-                    if let Some(entry) = &mut self.plain_writing {
-                        entry.more_written(&piece);
-                        let line = toolrun::writing_line(entry, &self.workspace);
-                        self.set_activity(line);
-                    }
+                    let entry = toolrun::append_piece(&mut self.plain_writing, index, tool, &piece);
+                    let line = toolrun::writing_line(entry, &self.workspace);
+                    self.set_activity(line);
                 }
             }
             Event::ToolStarted { id, tool, summary } if cards::is_asking(&tool) => {
@@ -13461,10 +14008,13 @@ impl App {
             }
             Event::ToolStarted { id, tool, summary } => {
                 let summary: String = summary.chars().take(160).collect();
-                if self.settings.compact_tools {
+                if self.group_live_tools {
                     self.tools_running.insert(id.clone(), (tool.clone(), summary.clone()));
                     self.run_started(id, tool, summary);
                 } else {
+                    if let Some(place) = self.plain_writing.iter().position(|entry| entry.tool == tool) {
+                        self.plain_writing.remove(place);
+                    }
                     self.set_activity(format!("{}  {summary}", t(tool_name(&tool))));
                     self.tools_running.insert(id, (tool, summary));
                 }
@@ -13484,14 +14034,14 @@ impl App {
             // (a helper's call has its card: what the call came to is said there, and not in a row of the calls)
             Event::ToolEnded { id, .. } if self.tools_running.get(&id).is_some_and(|(tool, _)| tool == "explore") && self.has_helper_card(&id) => {
                 self.tools_running.remove(&id);
-                if self.tools_running.is_empty() || !self.settings.compact_tools {
+                if self.tools_running.is_empty() || !self.group_live_tools {
                     self.set_activity(t("Thinking…").into());
                 }
             }
             Event::ToolEnded { id, ok, declined, elapsed, output, images } => {
                 self.end_line();
                 let (tool, summary) = self.tools_running.remove(&id).unwrap_or_default();
-                if self.tools_running.is_empty() || !self.settings.compact_tools {
+                if self.tools_running.is_empty() || !self.group_live_tools {
                     self.set_activity(t("Thinking…").into());
                 }
                 if matches!(tool.as_str(), "create_file" | "apply_patch" | "execute_command") {
@@ -13499,7 +14049,7 @@ impl App {
                     SetTimer(self.window, TIMER_CHANGES, 500, None);
                 }
                 let pictures = self.pictures_of(&images);
-                if self.settings.compact_tools {
+                if self.group_live_tools {
                     self.run_ended(&id, tool, summary, ok, declined, elapsed.as_secs_f64(), &output);
                     self.para_next = Some(Para::AfterBlock);
                     if !pictures.is_empty() {
@@ -13539,8 +14089,10 @@ impl App {
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::File(_))) => tf("Always allows this file, for this session: {0}", &[&always_places(&approval.scope)]),
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::Folders(_))) => tf("Always allows this folder, for this session: {0}", &[&always_places(&approval.scope)]),
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::Network(_))) => tf("Always allows this on the network, for this session: {0}", &[&always_places(&approval.scope)]),
+                    (_, true) if matches!(approval.scope, Some(AlwaysScope::Parts(_))) => tf("Always allows each part of this line (sites for this session): {0}", &[&always_places(&approval.scope)]),
                     (Some(rule), true) => tf("Always saves: {0}", &[&t(&rule.label())]),
-                    _ => String::new(),
+                    // (in its place, why there is none)
+                    _ => approval.no_always.as_deref().map_or(String::new(), |why| t(why).to_string()),
                 };
                 // (the rule is made of the command: what hides in it is shown as its mark here too, or the line under the buttons reads in another order than the command above)
                 let always = markdown::show_hidden(&always).into_owned();
@@ -13558,7 +14110,7 @@ impl App {
                 SendMessageW(self.note, EM_SCROLLCARET, 0, 0);
                 SendMessageW(self.note, WM_VSCROLL, SB_TOP as WPARAM, 0);
                 EnableWindow(self.always, i32::from(approval.always_allowed));
-                self.tray_note(t("Dogmind is waiting for you"), &tf("It asks to use {0}.", &[&t(tool_name(&approval.tool))]));
+                self.attention_note(t("Dogmind is waiting for you"), &tf("It asks to use {0}.", &[&t(tool_name(&approval.tool))]));
                 self.pending = Some(approval);
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 self.layout();
@@ -13592,9 +14144,6 @@ impl App {
                 if let Some(open) = self.run_open.filter(|_| usage.tokens_per_second.is_some()) {
                     self.runs[open].live_rate = usage.tokens_per_second;
                 }
-                if usage.prompt > 0 {
-                    self.totals = (self.totals.0 + usage.prompt, self.totals.1 + usage.cached, self.totals.2 + usage.completion, self.totals.3 + 1);
-                }
                 if live_report {
                     InvalidateRect(self.window, &self.status_area, 0);
                 } else {
@@ -13604,12 +14153,25 @@ impl App {
                     self.layout();
                 }
             }
+            Event::SessionUsage(totals) => self.totals = totals,
+            Event::RequestCache(percent) => {
+                remember_request_cache(&mut self.session_cache_percent, self.current_session.as_deref(), percent);
+                InvalidateRect(self.window, &self.status_area, 0);
+            }
             Event::WebSeen(on) => {
                 self.web_seen = on;
                 self.layout();
             }
-            Event::Presented { files, .. } => {
-                self.write_card(&Card::Presented { files });
+            Event::Presented { files, interim, .. } => {
+                // (the model's own present of files the app put there in the making takes that card's place: the latest is the one at the end)
+                if !interim {
+                    let before = self.shown.len();
+                    self.shown.retain(|item| !matches!(item, Shown::Card(Card::Presented { files: shown, interim: true }) if shown.iter().all(|file| files.contains(file))));
+                    if self.shown.len() != before {
+                        self.reflow();
+                    }
+                }
+                self.write_card(&Card::Presented { files, interim });
             }
             Event::Todos(items) => {
                 let lines: Vec<String> = items.iter().map(|item| format!("    {}  {}", task_mark(item["status"].as_str().unwrap_or("")), item["text"].as_str().unwrap_or(""))).collect();
@@ -13651,7 +14213,7 @@ impl App {
                 self.set_activity(String::new());
                 self.update_buttons();
                 InvalidateRect(self.side, std::ptr::null(), 0);
-                self.tray_note(t("Dogmind is waiting for you"), &words);
+                self.attention_note(t("Dogmind is waiting for you"), &words);
                 self.flash_for_attention(self.woken_turn);
                 // (what is written in the composer is an answer too, as is what is written in the card's field)
                 set_text(self.composer_cue, t("Write your own answer…"));
@@ -13673,7 +14235,7 @@ impl App {
                 self.set_activity(String::new());
                 self.update_buttons();
                 InvalidateRect(self.side, std::ptr::null(), 0);
-                self.tray_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
+                self.attention_note(t("Dogmind is waiting for you"), t("It has a plan for you."));
                 self.flash_for_attention(self.woken_turn);
                 self.focus_composer();
             }
@@ -13781,11 +14343,11 @@ impl App {
                 let failed = std::mem::take(&mut self.turn_failed);
                 if !cancelled {
                     let title = if self.session_title.is_empty() { t("The work is done.").to_string() } else { self.session_title.clone() };
-                    self.tray_note(t(if failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &title);
+                    self.attention_note(t(if failed { "Dogmind stopped with an error" } else { "Dogmind has finished" }), &title);
                 }
                 self.running = false;
                 self.request_live = None;
-                self.plain_writing = None;
+                self.plain_writing.clear();
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 SetTimer(self.window, TIMER_CHANGES, 200, None);
                 self.finish_answer();
@@ -13801,7 +14363,7 @@ impl App {
                 self.set_activity(String::new());
                 self.update_buttons();
                 self.refresh_sessions();
-                if GetForegroundWindow() != self.window {
+                if !self.in_front() {
                     self.flash_for_attention(woken);
                 }
                 self.flush_queue();
@@ -13966,7 +14528,7 @@ impl App {
                 }
             }
             Note::Found(generation, hits) => {
-                if generation == self.search_generation && !self.side_query.is_empty() {
+                if generation == self.search_generation.load(Ordering::Relaxed) && !self.side_query.is_empty() {
                     self.side_hits = Some(hits);
                     self.fill_side();
                 }
@@ -14034,6 +14596,12 @@ impl App {
                 }
             }
             Note::CryptDone(outcome) => self.crypt_finished(outcome),
+            Note::FolderReady(folder) => {
+                if self.readying.as_ref() == Some(&folder) {
+                    self.readying = None;
+                    InvalidateRect(self.window, &self.status_area, 0);
+                }
+            }
             Note::ReadFolderDone(words, problem) => {
                 self.read_folder_work = None;
                 self.read_folder_said = (words, problem);
@@ -14467,20 +15035,15 @@ impl App {
         preview::choose_folder(self.window as isize, t("Choose a folder"))
     }
 
-    unsafe fn copy_to_clipboard(&self, text: &str) {
-        let units: Vec<u16> = text.replace('\n', "\r\n").encode_utf16().chain(std::iter::once(0)).collect();
-        if OpenClipboard(self.window) == 0 {
-            return;
+    unsafe fn copy_to_clipboard(&mut self, text: &str) -> bool {
+        if put_clipboard_text(self.window, text) {
+            return true;
         }
-        EmptyClipboard();
-        let memory = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2);
-        if !memory.is_null() {
-            let target = GlobalLock(memory) as *mut u16;
-            std::ptr::copy_nonoverlapping(units.as_ptr(), target, units.len());
-            GlobalUnlock(memory);
-            SetClipboardData(13, memory); // CF_UNICODETEXT
+        if let Some(key) = self.overlay_copied.take() {
+            self.invalidate_overlay(key);
         }
-        CloseClipboard();
+        self.warn(t("Could not copy to the clipboard. Try again."));
+        false
     }
 
     unsafe fn on_button(&mut self, at: usize) {
@@ -14632,21 +15195,48 @@ impl App {
                     self.problem_in_panel(&error);
                 }
             }
-            (Panel::ConfirmDelete, 1) => {
+            (Panel::ConfirmDelete | Panel::RemoveRemaining, 1) => {
                 self.delete_target = None;
                 self.set_panel(Panel::Chat);
             }
-            (Panel::ConfirmDelete, 0) => {
-                self.set_panel(Panel::Chat);
-                if let Some((path, _)) = self.delete_target.take() {
-                    let current = self.current_session.as_ref() == Some(&path);
-                    let _ = std::fs::remove_file(&path);
-                    let _ = dogmind_agent::checkpoint::remove_for(&path);
-                    if current {
-                        let workspace = self.workspace.clone();
-                        self.start_session(workspace);
+            (Panel::ConfirmDelete | Panel::RemoveRemaining, 0) => {
+                if let Some((path, title)) = self.delete_target.take() {
+                    use dogmind_agent::checkpoint::{delete_session, DeleteError};
+                    let retry = self.panel == Panel::RemoveRemaining;
+                    let result = if retry {
+                        dogmind_agent::checkpoint::remove_remaining_if_absent(&path).map_err(DeleteError::RemainingFiles)
+                    } else {
+                        delete_session(&path).map(|()| true)
+                    };
+                    let restored = matches!(result, Ok(false));
+                    let leftover = match result {
+                        Err(DeleteError::Conversation(error)) => {
+                            self.delete_target = Some((path, title));
+                            self.problem_in_panel(&tf("The deletion could not be completed: {0}", &[&error]));
+                            return;
+                        }
+                        Err(DeleteError::RemainingFiles(error)) => Some(error),
+                        Ok(_) => None,
+                    };
+                    self.set_panel(Panel::Chat);
+                    if !restored {
+                        self.session_cache_percent.remove(&path);
+                    }
+                    if !retry && self.current_session.as_ref() == Some(&path) {
+                        self.start_session(self.workspace.clone());
                     }
                     self.refresh_sessions();
+                    if !self.side_query.is_empty() {
+                        self.search_now();
+                    }
+                    if restored {
+                        self.say(t("A conversation now exists at this location. Its files were kept."));
+                    }
+                    if let Some(error) = leftover {
+                        self.delete_target = Some((path, title));
+                        self.set_panel(Panel::RemoveRemaining);
+                        self.problem_in_panel(&tf("The conversation was deleted. Some files remain: {0}", &[&error]));
+                    }
                 }
             }
             (Panel::Privacy, 0) => self.set_panel(if self.crypt.keystore.is_some() { Panel::CryptoPassphrase } else { Panel::CryptoOn }),
@@ -14666,14 +15256,11 @@ impl App {
             (Panel::Rename, 0) => {
                 let name = get_text(self.fields[0]);
                 let name = name.trim().to_string();
-                if let (Some(path), false) = (self.rename_target.take(), name.is_empty()) {
-                    let _ = session::rename(&path, &name);
-                    if self.current_session.as_ref() == Some(&path) {
-                        self.session_title = name;
-                    }
-                    self.refresh_sessions();
+                if let Some(path) = self.rename_target.take().filter(|_| !name.is_empty()) {
+                    self.save_session_name(path, &name);
+                } else {
+                    self.set_panel(Panel::Chat);
                 }
-                self.set_panel(Panel::Chat);
             }
             (Panel::Sessions, 0) => {
                 if let Some(path) = self.list_selection().and_then(|at| self.resume_paths.get(at)).cloned() {
@@ -14785,6 +15372,7 @@ impl App {
             (self.help_button, t("Help")),
             (self.goal_clear, t("Clear the goal")),
             (self.right_toggle, t("Show or hide the panel on the right")),
+            (self.terminal_toggle, t("Show or hide the terminal")),
             (self.attach_button, t("Attach a picture")),
             (self.preview_reload, t("Reload")),
             (self.preview_browser, t("Open in browser")),
@@ -14868,7 +15456,9 @@ impl App {
                     let _ = self.agent.commands.send(Command::Compact);
                 }
             }
-            M_COPY => self.copy_to_clipboard(&self.last_answer.clone()),
+            M_COPY if !self.last_answer.is_empty() => {
+                self.copy_to_clipboard(&self.last_answer.clone());
+            }
             M_MODELS => self.set_panel(Panel::Models),
             M_PROVIDERS => self.set_panel(Panel::Providers),
             M_RESTART => self.connect(),
@@ -15174,7 +15764,7 @@ unsafe extern "system" fn transcript_subclass(window: HWND, message: u32, wparam
                 app.toggle_run(run);
                 return result;
             }
-            if let Some(url) = app.link_hover.clone() {
+            if let Some(url) = app.link_under(lparam).map(str::to_string) {
                 let result = CallWindowProcW(base, window, message, wparam, lparam);
                 app.open_link(&url);
                 return result;
@@ -15970,6 +16560,16 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             EndPaint(window, &paint);
             0
         }
+        // Drawn on a device it is given: a picture of the window where the system has none of it to give, as on a station with no display (the test hook's `shot`,
+        // in the sandbox), and PrintWindow where the window has no surface of its own.
+        WM_PRINTCLIENT => {
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(window, &mut client);
+            if client.right > 0 && client.bottom > 0 {
+                app.paint(wparam as HDC, client, client);
+            }
+            0
+        }
         WM_GETMINMAXINFO => {
             let info = &mut *(lparam as *mut MINMAXINFO);
             info.ptMinTrackSize = POINT { x: scale(app.dpi, ds::size::WINDOW_LEAST.0), y: scale(app.dpi, ds::size::WINDOW_LEAST.1) };
@@ -15988,6 +16588,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         WM_DPICHANGED => {
             app.dpi = (wparam & 0xffff) as u32;
             app.fonts = Fonts::new(app.dpi);
+            if let Some(page) = &mut app.trajectory {
+                page.across = 0;
+                page.content_width = None;
+            }
             set_button_fonts(app.fonts);
             for edit in app.fields.into_iter().chain([app.feedback, app.composer_cue, app.find_field, app.card_field, app.side_search, app.term.rename_field, app.timeline.search, app.picker_search, app.mcp_vars]) {
                 SendMessageW(edit, WM_SETFONT, app.fonts.field as WPARAM, 1);
@@ -16362,7 +16966,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             }
             if lparam as HWND == app.side_search {
                 if code == EN_CHANGE as usize {
-                    // Each file of each session is read: after the typing pauses.
+                    // Stop reading the old query now; start the next one after typing pauses.
+                    app.search_generation.fetch_add(1, Ordering::Relaxed);
                     SetTimer(window, TIMER_SEARCH, 200, None);
                 }
                 return 0;
@@ -16386,6 +16991,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                     }
                 }
                 ID_PANEL_TOGGLE => app.toggle_right_panel(),
+                ID_TERM_TOGGLE => app.terminal_toggle(),
                 ID_PREVIEW_RELOAD => {
                     if let Some(shown) = &app.preview {
                         shown.reload();
@@ -16408,8 +17014,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 ID_TERM_NEW | ID_TERM_START | ID_TERM_AGAIN => {
                     app.terminal_new(None);
                 }
-                ID_TERM_SHELLS => app.terminal_shells_menu(app.term.shells_button),
-                ID_TERM_START_SHELLS => app.terminal_shells_menu(app.term.start_shells),
                 _ if (ID_TERM_TAB..ID_TERM_TAB + crate::term::MOST_TERMINALS as isize).contains(&id) => app.terminal_tab_pressed((id - ID_TERM_TAB) as usize),
                 _ if (ID_TERM_CLOSE..ID_TERM_CLOSE + crate::term::MOST_TERMINALS as isize).contains(&id) => {
                     if let Some(terminal) = app.term.ids().get((id - ID_TERM_CLOSE) as usize).copied() {
@@ -16604,7 +17208,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 ID_PROVIDER_UP => app.move_provider(-1),
                 ID_PROVIDER_DOWN => app.move_provider(1),
-                ID_TOGGLE_COMPACT => app.on_menu(M_COMPACT_CHOICE + usize::from(app.settings.compact_tools)),
+                ID_TOGGLE_COMPACT => {
+                    app.settings.compact_tools = !app.settings.compact_tools;
+                    app.save();
+                    app.update_toggles();
+                }
                 ID_TOGGLE_WEB => app.on_menu(M_WEB_CHOICE + usize::from(app.settings.web_tools)),
                 ID_TOGGLE_CODE_MODE => app.code_mode_switched(),
                 ID_FILES => {
@@ -16709,6 +17317,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_DESTROY => {
+            app.search_generation.fetch_add(1, Ordering::Relaxed);
             let data = app.tray_data();
             Shell_NotifyIconW(NIM_DELETE, &data);
             app.remember_place();
@@ -16734,6 +17343,12 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             // (before the controls go, after this: the document holds the text services, and they hold the control's host, which goes with
             // its window whether anything holds it or not)
             release_document(std::mem::replace(&mut app.transcript_document, std::ptr::null_mut()));
+            // (the plain copy of an encrypted session's picture that was shown, and what was pasted and not sent, which the next start would take out: they go now, and are
+            // not left on the disk while the app is not running)
+            if let Some(shown) = app.shown_plain.take() {
+                let _ = std::fs::remove_file(shown);
+            }
+            let _ = std::fs::remove_dir_all(app.folder.join("attachments"));
             PostQuitMessage(0);
             0
         }
@@ -17325,6 +17940,20 @@ fn share_rows(room: i32, tasks: usize, changes: usize) -> (usize, usize) {
     }
 }
 
+/// Resolve a folder named relative to the workspace, including when it is reached through a directory link.
+fn workspace_folder_link(workspace: &Path, url: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let relative = Path::new(url);
+    if url.is_empty() || !workspace.is_absolute() || !relative.components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir)) {
+        return None;
+    }
+    let folder = workspace.join(relative.components().collect::<PathBuf>());
+    if !folder.is_dir() || !folder.canonicalize().ok()?.starts_with(workspace.canonicalize().ok()?) {
+        return None;
+    }
+    Some(folder)
+}
+
 /// The link at this character, if any: they are in order.
 fn link_at(links: &[(i32, i32, String)], at: i32) -> Option<&str> {
     let after = links.partition_point(|(first, _, _)| *first <= at);
@@ -17362,6 +17991,46 @@ fn send_command(out: Outgoing) -> Command {
     } else {
         Command::SendWith(out.text, out.images.into_iter().map(|attached| attached.picture).collect())
     }
+}
+
+fn clipboard_units(text: &str) -> Vec<u16> {
+    const CR: u16 = b'\r' as u16;
+    const LF: u16 = b'\n' as u16;
+    let mut units = Vec::with_capacity(text.len() + 1);
+    for unit in text.encode_utf16() {
+        if unit == LF && units.last() != Some(&CR) {
+            units.push(CR);
+        }
+        units.push(unit);
+    }
+    units.push(0);
+    units
+}
+
+/// Windows takes ownership of the movable allocation only when SetClipboardData succeeds.
+unsafe fn put_clipboard_text(window: HWND, text: &str) -> bool {
+    let units = clipboard_units(text);
+    let memory = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of_val(units.as_slice()));
+    if memory.is_null() {
+        return false;
+    }
+    let target = GlobalLock(memory) as *mut u16;
+    if target.is_null() {
+        GlobalFree(memory);
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(units.as_ptr(), target, units.len());
+    GlobalUnlock(memory);
+    if OpenClipboard(window) == 0 {
+        GlobalFree(memory);
+        return false;
+    }
+    let copied = EmptyClipboard() != 0 && !SetClipboardData(13, memory).is_null(); // CF_UNICODETEXT
+    CloseClipboard();
+    if !copied {
+        GlobalFree(memory);
+    }
+    copied
 }
 
 /// The files of a drop, or of what the Explorer put on the clipboard.
@@ -17585,12 +18254,13 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         // What earlier runs left writable, now that what this one uses is counted. (With the key to ask for, the conversations' workspaces are not known yet: after it.)
         if !crypt.sweep_due {
             let (data, mut named, poster) = (folder.clone(), saved.workspaces.clone(), poster.clone());
+            let listed = saved.workspaces.clone();
             std::thread::spawn(move || {
                 named.extend(session::list(&data.join("sessions")).into_iter().map(|summary| summary.workspace));
                 named.sort();
                 named.dedup();
                 // (a folder whose take-back left something behind stays on the list and is tried again at each start; the person is told, as they are of a folder they named for commands)
-                let left: Vec<String> = dogmind_agent::workspace_grants::sweep(&data, &named).iter().map(|folder| format!("{}: {}", folder.display(), t(dogmind_agent::workspace_grants::NOT_TAKEN_BACK))).collect();
+                let left: Vec<String> = dogmind_agent::workspace_grants::sweep(&data, &named, &listed).iter().map(|folder| format!("{}: {}", folder.display(), t(dogmind_agent::workspace_grants::NOT_TAKEN_BACK))).collect();
                 if !left.is_empty() {
                     poster.send(Note::ReadFolderDone(left.join("\n"), true));
                 }
@@ -17667,6 +18337,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let context_slider = control(window, "DogSlider", "", WS_TABSTOP, 0, 0);
         let chip = |id: isize, backdrop: u32| make_button(window, id, "", ButtonKind::Chip, backdrop);
         let app = Box::new(App {
+            group_live_tools: saved.compact_tools,
             window,
             folder,
             settings: saved,
@@ -17776,6 +18447,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             mcp_form_url: false,
             mcp_form_was: Default::default(),
             mcp_saved: None,
+            mcp_page_states: Vec::new(),
             size_segments: std::array::from_fn(|at| make_button(pane, ID_TEXT_SIZE + at as isize, "", ButtonKind::Segment, theme::surface())),
             skill_toggles: Vec::new(),
             skill_toggle_areas: Vec::new(),
@@ -17845,7 +18517,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             side_search: control(window, "EDIT", "", edit_style, 0, 0),
             side_query: String::new(),
             side_hits: None,
-            search_generation: 0,
+            search_generation: Arc::new(AtomicU64::new(0)),
             suggest: control(window, "LISTBOX", "", list_style, 0, ID_SUGGEST),
             suggestions: Vec::new(),
             suggest_hover: None,
@@ -17856,7 +18528,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             crypt,
             branch: None,
             session_title: String::new(),
-            totals: (0, 0, 0, 0),
+            totals: SessionUsage::default(),
             side_target: None,
             rename_target: None,
             rename_seed: None,
@@ -17885,6 +18557,9 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             goal_clear: make_button(window, ID_GOAL_CLEAR, "x", ButtonKind::Icon, theme::surface()),
             right_width: 0,
             right_toggle: make_button(window, ID_PANEL_TOGGLE, "panel-right", ButtonKind::Icon, theme::background()),
+            terminal_toggle: make_button(window, ID_TERM_TOGGLE, "terminal", ButtonKind::Icon, theme::background()),
+            readying: None,
+            readied: HashSet::new(),
             right_hits: Vec::new(),
             please_quit: {
                 let name = wide("DogmindApp.PleaseQuit");
@@ -17995,7 +18670,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             run_carry: Vec::new(),
             asked_calls: HashSet::new(),
             run_hover: None,
-            plain_writing: None,
+            plain_writing: Vec::new(),
             request_live: None,
             open_block: None,
             block_card_due: false,
@@ -18018,9 +18693,11 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             composer_typed_at: None,
             attach_button: make_button(window, ID_ATTACH, "paperclip", ButtonKind::Icon, theme::surface()),
             attachments: Vec::new(),
+            shown_plain: None,
             attached_windows: (0..attach::MOST_IMAGES).map(|at| make_button(window, ID_ATTACHED + at as isize, "", ButtonKind::Attached, theme::surface())).collect(),
             thumb_wanted: std::collections::HashSet::new(),
             picture_blocks: Vec::new(),
+            pictures_opened: HashSet::new(),
             thumbs: HashMap::new(),
             thumb_clock: 0,
             vision: None,
@@ -18054,7 +18731,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             scrolled_up_at: None,
             line_start: true,
             thinking_written: false,
-            in_code: false,
+            code_fence: None,
             heading: 0,
             italic: false,
             struck: false,
@@ -18065,7 +18742,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             code_comment: false,
             table: Vec::new(),
             bold: false,
-            inline_code: false,
+            inline_ticks: 0,
             thinking: String::new(),
             activity: String::new(),
             activity_since: None,
@@ -18080,6 +18757,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             model: String::new(),
             used: 0,
             window_tokens: 0,
+            session_cache_percent: HashMap::new(),
             rate: None,
             catalog: Vec::new(),
             machine_line: String::new(),
@@ -18224,6 +18902,38 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
     ExitCode::SUCCESS
 }
 
+/// What a balloon of the tray is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayWord {
+    /// A new version: what the main screen says to an open window is told already.
+    Version,
+    /// What the work wants of the person: a turn's end, a question, an approval, a plan.
+    Attention,
+}
+
+/// Whether the tray says a word, from whether the window is shown and whether it is in front of the person.
+fn tray_speaks(word: TrayWord, shown: bool, in_front: bool) -> bool {
+    match word {
+        TrayWord::Version => !shown,
+        TrayWord::Attention => !in_front,
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use super::*;
+
+    /// The work's words come from the tray whenever the window is not in front of the person: hidden, or behind another window. In front, the window says them
+    /// itself. A new version's, only while it is hidden.
+    #[test]
+    fn the_tray_speaks_for_the_work_whenever_the_window_is_not_in_front() {
+        // (in front; shown behind another window; hidden)
+        let cases = [(true, true), (true, false), (false, false)];
+        assert_eq!(cases.map(|(shown, in_front)| tray_speaks(TrayWord::Attention, shown, in_front)), [false, true, true]);
+        assert_eq!(cases.map(|(shown, in_front)| tray_speaks(TrayWord::Version, shown, in_front)), [false, false, true]);
+    }
+}
+
 #[cfg(test)]
 mod read_folder_words_tests {
     use super::*;
@@ -18277,6 +18987,83 @@ mod read_folder_words_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mcp_working_directory_accepts_pasted_paths_and_can_be_cleared() {
+        assert_eq!(mcp_working_directory("  \"C:\\Test Folder\\資料\"  "), Some(PathBuf::from("C:\\Test Folder\\資料")));
+        assert_eq!(mcp_working_directory("relative folder"), Some(PathBuf::from("relative folder")));
+        assert_eq!(mcp_working_directory("   "), None);
+        assert_eq!(mcp_working_directory("\"\""), None);
+    }
+
+    #[test]
+    fn mcp_form_preserves_line_endings_in_unedited_arguments() {
+        use dogmind_agent::mcp;
+        let was = mcp::ServerConfig { command: "old".into(), args: vec!["a\r\nb".into(), "c\rd".into(), "".into()], ..Default::default() };
+        let displayed = normalized_newlines(&mcp::line_of_args(&was.args));
+        let save = |args: &str| mcp_config_of_form(Some(&was), None, "new".into(), &displayed, args, Default::default());
+        assert_eq!(save(&displayed).args, was.args);
+        assert_eq!(save("--port 2").args, ["--port", "2"]);
+        assert!(save("").args.is_empty());
+    }
+
+    #[test]
+    fn mcp_form_reuses_raw_values_only_for_an_unchanged_field_of_the_same_transport() {
+        use dogmind_agent::mcp::{lines_of_pairs, ServerConfig};
+        use std::collections::BTreeMap;
+        let env = BTreeMap::from([("MESSAGE".into(), "  first\nNEXT=literal  ".into())]);
+        let server = ServerConfig { command: "example".into(), env: env.clone(), ..Default::default() };
+        let original = lines_of_pairs(&env, '=');
+        assert_eq!(mcp_form_pairs(Some(&server), false, &original, &original).unwrap(), env);
+        let edited = mcp_form_pairs(Some(&server), false, &original, "MESSAGE=edited").unwrap();
+        assert_eq!(edited, BTreeMap::from([("MESSAGE".into(), "edited".into())]));
+        assert!(mcp_form_pairs(Some(&server), true, &original, &original).is_err());
+        assert!(mcp_form_pairs(None, false, "invalid", "invalid").is_err());
+    }
+
+    #[test]
+    fn a_missing_instruction_file_can_be_created_but_read_errors_are_reported() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let path = dir.path().join("instructions.md");
+        assert_eq!(read_instruction_file(&path).unwrap(), "");
+        std::fs::write(&path, "日本語\r\n").unwrap();
+        assert_eq!(read_instruction_file(&path).unwrap(), "日本語\r\n");
+        std::fs::write(&path, [0xff, 0xfe, 0x41, 0x00]).unwrap();
+        assert!(read_instruction_file(&path).unwrap_err().contains("UTF-8"));
+        assert!(read_instruction_file(dir.path()).is_err());
+    }
+
+    #[test]
+    fn clipboard_line_breaks_preserve_existing_windows_endings() {
+        let diff = ["-before", "+after"].join("\r\n");
+        assert_eq!(clipboard_units(&diff), wide("-before\r\n+after"));
+        assert_eq!(clipboard_units("日本語🐕\n\nA\r\nB\rC\n"), wide("日本語🐕\r\n\r\nA\r\nB\rC\r\n"));
+        assert_eq!(clipboard_units(""), vec![0]);
+    }
+
+    /// The owner's card of 11-22, sent while the window was minimized: its column then was no width, and it kept a width of 800 twips, one character to a line, once
+    /// the window was back. Its width is the column's of the moment it is written.
+    #[test]
+    fn a_persons_card_has_the_room_of_the_column_it_is_written_in() {
+        let picture = [(1566, 745)];
+        // (a minimized window's column: the least a card is)
+        assert_eq!(user_card_width(0, 168, 3000, &picture), 800);
+        // (the same card in the column of a window of ordinary width: its words or its picture, whichever is wider, and no more than four fifths of the column)
+        let wide = user_card_width(13000, 168, 3000, &picture);
+        assert!(wide > 3000 && wide <= 13000 * 4 / 5, "{wide}");
+        assert_eq!(user_card_width(13000, 168, 3000, &[]), 3000 + 2 * USER_CARD_PADDING.0 + 120, "words alone are as wide as they want");
+        assert_eq!(user_card_width(13000, 168, 40000, &[]), 13000 * 4 / 5, "long words wrap at four fifths of the column");
+        assert_eq!(user_card_width(13000, 168, 0, &[]), 800);
+    }
+
+    #[test]
+    fn a_new_session_has_no_row_of_views_and_one_that_has_begun_has_the_conversation_and_the_timeline() {
+        assert!(center_views(false).is_empty());
+        let views: Vec<CenterView> = center_views(true).iter().map(|(_, view)| *view).collect();
+        assert_eq!(views, [CenterView::Conversation, CenterView::Timeline]);
+        // (each has its Japanese, as the row shows it)
+        assert!(center_views(true).iter().all(|(words, _)| crate::lang::has_japanese(words)));
+    }
+
     /// A server of the older transport edited in Settings stays one, and the person's word on it goes with it: saved as `http`, it was asked with a POST of
     /// Streamable HTTP first. A new server at a URL, and one that was `http`, are `http`; a program is a program.
     #[test]
@@ -18285,14 +19072,39 @@ mod tests {
         let at = |url: &str| (Some(url.to_string()), url.to_string());
         let older = ServerConfig { kind: "sse".into(), url: "http://127.0.0.1:9/sse".into(), trusted: true, ..Default::default() };
         let (url, target) = at("http://127.0.0.1:9/sse");
-        let edited = mcp_config_of_form(Some(&older), url, target, "", Default::default());
+        let edited = mcp_config_of_form(Some(&older), url, target, "", "", Default::default());
         assert_eq!((edited.kind.as_str(), edited.url.as_str(), edited.trusted), ("sse", "http://127.0.0.1:9/sse", true));
         let newer = ServerConfig { kind: "http".into(), url: "http://127.0.0.1:9/mcp".into(), ..Default::default() };
         let (url, target) = at("http://127.0.0.1:9/mcp");
-        assert_eq!(mcp_config_of_form(Some(&newer), url.clone(), target.clone(), "", Default::default()).kind, "http");
-        assert_eq!(mcp_config_of_form(None, url, target, "", Default::default()).kind, "http", "a new one");
-        let program = mcp_config_of_form(Some(&older), None, "node".into(), "server.js --port 1", Default::default());
+        assert_eq!(mcp_config_of_form(Some(&newer), url.clone(), target.clone(), "", "", Default::default()).kind, "http");
+        assert_eq!(mcp_config_of_form(None, url, target, "", "", Default::default()).kind, "http", "a new one");
+        let program = mcp_config_of_form(Some(&older), None, "node".into(), "", "server.js --port 1", Default::default());
         assert_eq!((program.command.as_str(), program.args.join(" "), program.kind.as_str(), program.trusted), ("node", "server.js --port 1".to_string(), "", true));
+    }
+
+    #[test]
+    fn a_copied_mcp_path_is_read_as_one_program() {
+        let path = r"C:\Program Files\試験\server.exe";
+        assert_eq!(mcp_path_text(&format!("  \"{path}\"  ")), path);
+        assert_eq!(mcp_path_text(path), path);
+        assert_eq!(mcp_path_text("\"\""), "");
+        for malformed in [r#""unterminated"#, r#""server.exe" "argument""#] {
+            assert_eq!(mcp_path_text(malformed), malformed);
+        }
+    }
+
+    #[test]
+    fn saving_an_unchanged_mcp_form_preserves_the_connection_config() {
+        use dogmind_agent::mcp::ServerConfig;
+        let remote = ServerConfig { url: "http://127.0.0.1:9/mcp".into(), ..Default::default() };
+        let local = ServerConfig { kind: "stdio".into(), command: "clock".into(), args: vec!["arg".into()], ..Default::default() };
+        let edited = |config: &ServerConfig, url: Option<String>, target: &str| {
+            mcp_config_of_form(Some(config), url, target.into(), "arg", "arg", Default::default())
+        };
+        assert_eq!(edited(&remote, Some(remote.url.clone()), &remote.url), remote);
+        assert_eq!(edited(&local, None, &local.command), local);
+        let next = "http://127.0.0.1:9/next";
+        assert_eq!(edited(&remote, Some(next.into()), next), ServerConfig { url: next.into(), ..remote });
     }
 
     #[test]
@@ -18568,7 +19380,7 @@ mod tests {
     /// The line goes to the report, once, and not while the app is taking itself off this PC.
     #[test]
     fn the_line_a_server_said_goes_to_the_report_and_nothing_is_written_while_the_app_leaves() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let text = llm::with_line(llm::SERVER_GONE, "GPU fault");
         keep_server_line(dir.path(), &Leaving::Going, &text);
         keep_server_line(dir.path(), &Leaving::Gone("done".into()), &text);
@@ -18674,7 +19486,7 @@ mod tests {
     #[test]
     fn a_key_given_to_the_agent_reaches_the_server_and_nothing_written() {
         const KEY: &str = "sk-never-written-0123456789";
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (told, seen) = channel();
@@ -18741,7 +19553,7 @@ mod tests {
 
     #[test]
     fn a_picture_reaches_the_server_as_a_data_url() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::in_container::tempdir().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (told, seen) = channel();
@@ -18821,12 +19633,175 @@ mod tests {
     }
 
     #[test]
+    fn mcp_import_identifies_unreadable_sources_and_keeps_valid_candidates() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("dogmind/mcp.json");
+        let run = |argument| mcp_import(home.path(), None, &file, argument);
+        assert!(run("candidates").is_ok());
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        let codex = home.path().join(".codex/config.toml");
+        std::fs::write(&codex, "[private-fixture").unwrap();
+        let problem = run("candidates").unwrap_err();
+        assert!(problem.contains(".codex/config.toml") && !problem.contains("private-fixture"));
+        assert!(!file.exists());
+        std::fs::write(home.path().join(".claude.json"), r#"{"mcpServers":{"editor":{"command":"fixture"}}}"#).unwrap();
+        let (_, candidates) = run("candidates").unwrap();
+        assert!(candidates.contains("editor") && candidates.contains(".codex/config.toml"));
+        assert!(run("import typo").unwrap_err().contains(".codex/config.toml"));
+        let (added, message) = run("import editor").unwrap();
+        assert_eq!(added, 1);
+        assert!(message.contains(".codex/config.toml") && !message.contains("private-fixture"));
+        std::fs::write(home.path().join(".claude.json"), "[").unwrap();
+        std::fs::remove_file(&codex).unwrap();
+        std::fs::create_dir(&codex).unwrap();
+        let both = run("import").unwrap_err();
+        assert!(both.contains(".claude.json") && both.contains(".codex/config.toml"));
+        assert_eq!(dogmind_agent::mcp::readable_config(&file).unwrap().servers.len(), 1);
+    }
+
+    #[test]
+    fn mcp_import_reports_partial_sources_and_imports_the_readable_servers() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path();
+        let file = folder.join("mcp.json");
+        let codex = folder.join("config.toml");
+        let claude = folder.join(".claude.json");
+        let run = |action| mcp_import(folder, Some(folder), &file, action);
+        std::fs::write(&claude, r#"{"mcpServers":{"broken":{"args":"private-value"},"one":{"command":"one"}}}"#).unwrap();
+        std::fs::write(&codex, "[mcp_servers.broken]\ncommand=7\n[mcp_servers.two]\ncommand='two'").unwrap();
+        let (_, choices) = run("candidates").unwrap();
+        for text in ["one", "two", ".claude.json", "$CODEX_HOME/config.toml"] {
+            assert!(choices.contains(text), "{choices}");
+        }
+        assert!(!choices.contains("private-value") && !file.exists());
+        assert_eq!(run("import").unwrap().0, 2);
+        std::fs::write(&claude, r#"{"mcpServers":{}}"#).unwrap();
+        std::fs::write(&codex, "[mcp_servers.off]\nenabled=false\nargs='unused'").unwrap();
+        let (_, empty) = run("candidates").unwrap();
+        assert!(!empty.contains(".claude.json") && !empty.contains("$CODEX_HOME"));
+        std::fs::write(&codex, "[mcp_servers.invalid]\nenabled='private-value'").unwrap();
+        let warning = run("candidates").unwrap_err();
+        assert!(warning.contains("$CODEX_HOME/config.toml") && !warning.contains("private-value"));
+    }
+
+    #[test]
+    fn mcp_import_uses_the_selected_codex_home_for_preview_and_import() {
+        let home = tempfile::tempdir().unwrap();
+        let custom = home.path().join("Codex 設定");
+        let default = home.path().join(".codex");
+        std::fs::create_dir(&default).unwrap();
+        std::fs::write(default.join("config.toml"), "[mcp_servers.default_clock]\ncommand='clock'").unwrap();
+        std::fs::write(home.path().join(".claude.json"), r#"{"mcpServers":{"claude_clock":{"command":"clock"}}}"#).unwrap();
+        let file = home.path().join("dogmind/mcp.json");
+        let run = |action| mcp_import(home.path(), Some(&custom), &file, action);
+        assert!(!run("candidates").unwrap().1.contains("default_clock"));
+        std::fs::create_dir(&custom).unwrap();
+        std::fs::write(custom.join("config.toml"), "[mcp_servers.custom_clock]\ncommand='clock'").unwrap();
+        let (_, choices) = run("candidates").unwrap();
+        assert!(choices.contains("custom_clock") && choices.contains("claude_clock") && !choices.contains("default_clock"));
+        assert!(!file.exists());
+        assert_eq!(run("import custom_clock").unwrap().0, 1);
+        assert_eq!(dogmind_agent::mcp::readable_config(&file).unwrap().servers.len(), 1);
+        std::fs::write(custom.join("config.toml"), "[malformed").unwrap();
+        let (_, warning) = run("candidates").unwrap();
+        assert!(warning.contains("$CODEX_HOME/config.toml") && !warning.contains("[malformed"));
+    }
+
+    #[test]
+    fn a_registered_mcp_server_is_recognized_after_its_import_source_is_removed() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("mcp.json");
+        let saved = r#"{"mcpServers":{"saved clock":{"command":"clock"}}}"#;
+        std::fs::write(&file, saved).unwrap();
+        let run = |name| mcp_import(home.path(), None, &file, name);
+        let expected = tf("{0} is already configured in Dogmind.", &[&"saved clock"]);
+        assert_eq!(run("import saved clock").unwrap(), (0, expected.clone()));
+        assert!(run("import missing").is_err());
+        std::fs::write(home.path().join(".claude.json"), "{").unwrap();
+        let (added, message) = run("import saved clock").unwrap();
+        assert_eq!(added, 0);
+        assert!(message.contains(&expected) && message.contains(".claude.json"));
+        assert!(run("import missing").unwrap_err().contains(".claude.json"));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), saved);
+    }
+
+    #[test]
+    fn mcp_candidates_have_names_that_can_be_copied_into_a_named_import() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("dogmind/mcp.json");
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".claude.json"), r#"{"mcpServers":{
+            "":{"command":"blank"}, " Editor Tools":{"command":"padded"},
+            "Editor Tools":{"command":"editor"}, "split\nname":{"command":"split"}
+        }}"#).unwrap();
+        std::fs::write(home.path().join(".codex/config.toml"), r#"
+            [mcp_servers." "]
+            command="blank"
+            [mcp_servers."Clock "]
+            command="padded"
+            [mcp_servers.Clock]
+            command="clock"
+        "#).unwrap();
+
+        let run = |args| mcp_import(home.path(), None, &file, args);
+        let (_, list) = run("candidates").unwrap();
+        assert!(!file.exists());
+        assert!(list.contains(".claude.json") && list.contains(".codex/config.toml"), "{list}");
+        assert!(list.lines().any(|line| line == "Editor Tools") && list.lines().any(|line| line == "Clock"), "{list}");
+        assert!(!list.lines().any(|line| line.trim().is_empty() || line != line.trim() || line == "split" || line == "name"), "{list}");
+
+        assert_eq!(run("import Editor Tools").unwrap().0, 1);
+        let selected = dogmind_agent::mcp::readable_config(&file).unwrap().servers;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected["Editor Tools"].command, "editor");
+        assert_eq!(run("import").unwrap().0, 1);
+        let all = dogmind_agent::mcp::readable_config(&file).unwrap().servers;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["Clock"].command, "clock");
+    }
+
+    #[test]
+    fn mcp_import_lists_names_and_only_adds_the_server_chosen() {
+        use dogmind_agent::mcp;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".claude.json"), r#"{"mcpServers":{"Unity Editor":{"command":"first"},"other":{"command":"private-launch-command"}}}"#).unwrap();
+        std::fs::write(home.path().join(".codex/config.toml"), "[mcp_servers.'Unity Editor']\ncommand='second'\n[mcp_servers.disabled]\ncommand='off'\nenabled=false").unwrap();
+        let file = home.path().join("dogmind/mcp.json");
+        let run = |argument| mcp_import(home.path(), None, &file, argument);
+        let (added, choices) = run("candidates").unwrap();
+        assert_eq!(added, 0);
+        assert!(choices.contains("Unity Editor") && choices.contains("other") && !choices.contains("disabled") && !choices.contains("private-launch-command"));
+        assert!(run("import Unity").is_err() && run("typo").is_err());
+        assert!(!file.exists());
+        assert_eq!(run("IMPORT  Unity Editor").unwrap().0, 1);
+        let config = mcp::readable_config(&file).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers["Unity Editor"].command, "first");
+        assert_eq!(run("import Unity Editor").unwrap().0, 0);
+        assert!(!run("candidates").unwrap().1.contains("Unity Editor"));
+        assert_eq!(run("import").unwrap().0, 1);
+        assert_eq!(mcp::readable_config(&file).unwrap().servers.len(), 2);
+    }
+
+    #[test]
     fn a_path_is_a_message_and_a_slash_word_is_a_command() {
         for command in ["/help", "/find 語句", "/model Claude", "/my-skill do it"] {
             assert!(reads_as_command(command), "{command}");
         }
         for message in ["", "hello", "/usr/bin/env は何？", "/ は何", "/日本語", "/etc/hosts"] {
             assert!(!reads_as_command(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn text_after_an_argumentless_command_stays_in_the_composer() {
+        for command in ["/new", "/clear", "/usage", "/quit", "/exit", "/delete"] {
+            assert_eq!(command_with_unused_text(&format!("{command}\n動作を説明して")), Some(command));
+            assert_eq!(command_with_unused_text(&format!("{command}  ")), None);
+        }
+        for command in ["/find", "/search", "/rename", "/goal", "/attach", "/model", "/effort", "/mode", "/preview", "/mcp", "/my-skill", "/unknown"] {
+            assert_eq!(command_with_unused_text(&format!("{command} example")), None, "{command}");
         }
     }
 
@@ -19239,6 +20214,22 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_link_names_an_existing_directory_in_the_workspace() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let workspace = dir.path().join("project");
+        let folder = workspace.join("vendor").join("three");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("draw.js"), "").unwrap();
+        let folder_with_spaces = workspace.join("参考 資料");
+        std::fs::create_dir(&folder_with_spaces).unwrap();
+        assert_eq!(workspace_folder_link(&workspace, "vendor/three/"), Some(folder));
+        assert_eq!(workspace_folder_link(&workspace, "./参考 資料"), Some(folder_with_spaces));
+        for name in ["", "../", "missing/", "vendor/three/draw.js", "vendor/three/#L2"] {
+            assert!(workspace_folder_link(&workspace, name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
     fn a_click_finds_its_link() {
         let links = [(10, 15, "a".to_string()), (20, 21, "b".to_string())];
         assert_eq!(link_at(&links, 9), None);
@@ -19339,7 +20330,7 @@ mod crypt_tests {
     /// What the start makes of the data folder: no key file is conversations as they are; a key file is a question, unless this Windows user has the key; one that cannot be read is no way in.
     #[test]
     fn the_start_asks_for_the_key_exactly_when_the_folder_says_it_must() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::in_container::tempdir().unwrap();
         let (crypt, policy) = Crypt::open(data.path());
         assert!(!crypt.is_locked() && crypt.keystore.is_none() && policy.writer().unwrap().is_none());
 
@@ -19371,7 +20362,7 @@ mod crypt_tests {
     /// Remove takes the key file with the conversations it was for, and the page's words are in both languages.
     #[test]
     fn the_key_file_goes_with_what_remove_takes() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::in_container::tempdir().unwrap();
         std::fs::write(data.path().join("settings.json"), r#"{"providers": []}"#).unwrap();
         std::fs::create_dir_all(data.path().join("sessions")).unwrap();
         Keystore::create(data.path(), "the passphrase of the test", false, None).unwrap();

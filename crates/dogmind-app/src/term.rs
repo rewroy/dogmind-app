@@ -1,4 +1,4 @@
-//! A terminal: the person's own shell, in a pseudo console, its output read into a screen with a scrollback. Nothing here knows the window; the Terminal view of the panel on the right
+//! A terminal: the person's own shell, in a pseudo console, its output read into a screen with a scrollback. Nothing here knows the window; the terminal panel under the conversation
 //! (`ui::term_panel`) draws what `Terminal::with_screen` gives and sends what `Terminal::write` is given.
 //!
 //! - `shells`: which shells are on this PC, and how each is started.
@@ -233,8 +233,8 @@ mod tests {
 
     #[test]
     fn a_shell_starts_in_the_sessions_folder_and_with_none_in_the_persons_own() {
-        let work = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let work = crate::in_container::tempdir().unwrap();
+        let home = crate::in_container::tempdir().unwrap();
         assert_eq!(start_folder(work.path(), Some(home.path())), work.path());
         // (no folder chosen yet is how the window says it: ".")
         assert_eq!(start_folder(Path::new("."), Some(home.path())), home.path());
@@ -309,6 +309,9 @@ mod tests {
 
     #[test]
     fn closing_a_terminal_ends_its_shell_and_what_it_started() {
+        if crate::in_container::cannot_run(crate::in_container::PROGRAMS) {
+            return;
+        }
         let (terminal, _) = started(80, 24);
         terminal.write(b"ping -n 60 127.0.0.1 >nul\r");
         let started = Instant::now();
