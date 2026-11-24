@@ -455,6 +455,8 @@ struct Spent {
     prefill: u64,
     generation: u64,
     helpers: u64,
+    // Helper request time already included in completed explore calls.
+    covered_helpers: u64,
     tools: BTreeMap<String, (u64, u64)>,
     // Time also present in a recorded parent call, retained in the per-tool breakdown.
     nested_ms: u64,
@@ -482,6 +484,7 @@ impl Spent {
         });
         spent.unfinished = lines.iter().any(|line| line.ev() == "turn_start") && ended.is_none();
         // Children finish first. Match their parent within this request, even if its row comes later.
+        let mut pending_helpers = 0;
         let mut parallel = HashMap::<&str, Vec<(i64, i64)>>::new();
         let tool_ids: std::collections::HashSet<_> = lines.iter().filter(|line| line.ev() == "tool")
             .filter_map(|line| Some((line.req(), line.v["id"].as_str()?))).collect();
@@ -491,10 +494,14 @@ impl Spent {
                     let (ms, first) = (line.u("ms").unwrap_or(0), line.u("first_ms").unwrap_or(0).min(line.u("ms").unwrap_or(0)));
                     match line.s("role") {
                         "main" => {
+                            pending_helpers = 0;
                             spent.prefill += first;
                             spent.generation += ms - first;
                         }
-                        "helper" => spent.helpers += ms,
+                        "helper" => {
+                            spent.helpers += ms;
+                            pending_helpers += ms;
+                        }
                         _ => {}
                     }
                     spent.retries += line.u("wait_ms").unwrap_or(0);
@@ -507,6 +514,11 @@ impl Spent {
                     entry.0 += 1;
                     let ms = line.u("ms").unwrap_or(0);
                     entry.1 += ms;
+                    // Explore writes its helper requests before its own completion. If interrupted,
+                    // only the requests are present, and their measured time still belongs to tools.
+                    if line.s("name") == "explore" {
+                        spent.covered_helpers += std::mem::take(&mut pending_helpers).min(ms);
+                    }
                     if line.v["parent"].as_str().is_some_and(|parent| tool_ids.contains(&(line.req(), parent))) {
                         spent.nested_ms += ms;
                     } else if line.u("parallel").unwrap_or(0) > 1 && !line.req().is_empty() && line.u("wait_ms").unwrap_or(0) == 0 {
@@ -543,6 +555,7 @@ impl Spent {
         self.prefill += other.prefill;
         self.generation += other.generation;
         self.helpers += other.helpers;
+        self.covered_helpers += other.covered_helpers;
         self.waits += other.waits;
         self.compaction += other.compaction;
         self.retries += other.retries;
@@ -555,6 +568,7 @@ impl Spent {
 
     fn tool_ms(&self) -> u64 {
         self.tools.values().map(|(_, ms)| ms).sum::<u64>() - self.nested_ms - self.parallel_overlap_ms
+            + (self.helpers - self.covered_helpers)
     }
 
     fn print(&self, out: &mut String, unfinished_note: &str) {
@@ -1137,6 +1151,32 @@ mod tests {
         assert_eq!(details.turns[0].tools_ms, 2100);
         let said = report(&input, None);
         assert!(said.contains("tools 2.1 s") && said.contains("read_file (calls: 6, total: 2.7 s)"), "{said}");
+    }
+
+    #[test]
+    fn an_interrupted_explore_counts_its_recorded_helper_requests() {
+        let lines = [
+            json!({"ev": "turn_start", "turn": 1}),
+            json!({"ev": "request", "role": "main", "turn": 1, "req": "s/1", "calls": ["explore", "explore"]}),
+            json!({"ev": "request", "role": "helper", "turn": 1, "req": "s/2", "ms": 600}),
+            json!({"ev": "tool", "turn": 1, "req": "s/1", "name": "explore", "ms": 650}),
+            json!({"ev": "request", "role": "helper", "turn": 1, "req": "s/3", "ms": 300}),
+            json!({"ev": "request", "role": "helper", "turn": 1, "req": "s/4", "ms": 200}),
+            // The previous explore's completion is missing. The next request finishes its own explore.
+            json!({"ev": "request", "role": "main", "turn": 1, "req": "s/5", "calls": ["explore"]}),
+            json!({"ev": "request", "role": "helper", "turn": 1, "req": "s/6", "ms": 100}),
+            json!({"ev": "tool", "turn": 1, "req": "s/5", "name": "explore", "ms": 125}),
+        ];
+        assert_eq!(summary(&text(&lines[..4])).total().tools_ms, 650);
+        assert_eq!(summary(&text(&lines[..6])).total().tools_ms, 1150);
+        let result = summary(&text(&lines));
+        assert_eq!(result.turns[0].tools_ms, 1275);
+        assert_eq!(result.total().tools_ms, 1275);
+        let mut both_turns = lines.to_vec();
+        both_turns.push(json!({"ev": "request", "role": "helper", "turn": 2, "ms": 500}));
+        both_turns.push(json!({"ev": "tool", "name": "explore", "turn": 2}));
+        let said = report(&text(&both_turns), None);
+        assert!(said.contains("tools 1.8 s") && said.contains("helper's own requests 1.7 s"), "{said}");
     }
 
     #[test]
