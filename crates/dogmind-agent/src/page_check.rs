@@ -743,30 +743,23 @@ fn served_origin_and_path(url: &str) -> (&str, &str) {
     }
 }
 
-/// The local path suggested by a served URL, relative to the server's root.
-fn served_relative_path(url: &str) -> Option<String> {
+/// A supported page name relative to the server root. A directory URL names its index.
+fn served_page_path(url: &str) -> Option<PathBuf> {
     let (_, path) = served_origin_and_path(url);
     let wanted = if path.ends_with('/') { format!("{path}index.html") } else { path.to_string() };
-    let wanted = wanted.trim_start_matches('/').replace('/', "\\");
-    if wanted.is_empty() || wanted.split('\\').any(|part| part == "..") {
-        return None;
-    }
-    Some(wanted)
-}
-
-/// The URL's workspace-relative page name and its verified canonical file, assuming the server is rooted here.
-fn direct_served_page(url: &str, root: &Path) -> Option<(PathBuf, PathBuf)> {
-    let relative = served_relative_path(url)?;
-    let relative = Path::new(&relative);
+    let relative = PathBuf::from(wanted.trim_start_matches('/').replace('/', "\\"));
     if !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
         return None;
     }
     let ext = relative.extension()?.to_str()?;
-    if !["html", "htm", "xhtml", "svg"].iter().any(|kind| ext.eq_ignore_ascii_case(kind)) {
-        return None;
-    }
-    let file = root.join(relative).canonicalize().ok()?;
-    (file.starts_with(root) && file.is_file()).then(|| (relative.to_path_buf(), file))
+    ["html", "htm", "xhtml", "svg"].iter().any(|kind| ext.eq_ignore_ascii_case(kind)).then_some(relative)
+}
+
+/// The URL's workspace-relative page name and its verified canonical file, assuming the server is rooted here.
+fn direct_served_page(url: &str, root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let relative = served_page_path(url)?;
+    let file = root.join(&relative).canonicalize().ok()?;
+    (file.starts_with(root) && file.is_file()).then_some((relative, file))
 }
 
 /// A dynamic route or a server rooted elsewhere may have no matching file. Keep the normal CPU path there.
@@ -778,37 +771,45 @@ fn served_draws_webgl(url: &str, root: &Path) -> bool {
     page_html(&file).is_ok_and(|html| draws_webgl(&[html]))
 }
 
-/// The page of the workspace that a local server's address gives, where one can be told: the address's path under the workspace, or the one file whose path ends so (a server
-/// started in a folder of the workspace), or of several the one written last. None for an address of no page that is there.
+/// Prefer the path under the workspace root. A server started in a subdirectory may match
+/// a suffix instead. A partial search or multiple matches cannot identify the served page.
 fn page_of_address(url: &str, workspace: &Path) -> Option<PathBuf> {
-    let wanted = served_relative_path(url)?;
+    let wanted = served_page_path(url)?;
     let direct = workspace.join(&wanted);
     if direct.is_file() {
-        return Some(direct);
+        let root = workspace.canonicalize().ok()?;
+        return direct.canonicalize().ok()?.starts_with(root).then_some(direct);
     }
-    let ending = format!("\\{}", wanted.to_ascii_lowercase());
-    let mut found: Vec<PathBuf> = Vec::new();
+    let ending = format!("\\{}", wanted.to_str()?.to_ascii_lowercase());
+    let mut found = None;
     let mut folders = vec![workspace.to_path_buf()];
     let mut looked = 0usize;
     while let Some(folder) = folders.pop() {
-        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
-        for entry in entries.flatten() {
+        for entry in std::fs::read_dir(folder).ok()? {
             looked += 1;
             if looked > 20_000 {
-                break;
+                return None;
             }
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if path.is_dir() {
+            let entry = entry.ok()?;
+            let kind = entry.file_type().ok()?;
+            if kind.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
                 if !matches!(name.as_str(), "node_modules" | ".git" | "target" | "dist" | "build") {
-                    folders.push(path);
+                    folders.push(entry.path());
                 }
-            } else if path.to_string_lossy().to_ascii_lowercase().ends_with(&ending) {
-                found.push(path);
+            } else if kind.is_file() {
+                let path = entry.path();
+                if !path.to_string_lossy().to_ascii_lowercase().ends_with(&ending) {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(path);
             }
         }
     }
-    found.into_iter().max_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
+    found
 }
 
 /// For a check through a local server: what the page does opened from its file, as the user opens it, where it differs. A three.js page served from its folder ran in every
@@ -2200,6 +2201,24 @@ mod tests {
         for path in ["plain.html?next=/index.html", "other/", "source.txt", "../index.html"] {
             assert!(!served_draws_webgl(&format!("http://localhost:8123/{path}"), &root), "{path}");
         }
+    }
+
+    #[test]
+    fn a_server_check_does_not_guess_between_sites_or_treat_a_script_as_a_page() {
+        let (dir, _) = page(&[
+            ("site-a/index.html", "<p>Plain page</p>"),
+            ("site-b/index.html", r#"<script type="module" src="app.js"></script>"#),
+            ("site-b/app.js", "export const value = 1;"),
+            ("app.js", "export const value = 2;"),
+            ("template.js", r#"const example = '<script type="module" src="app.js"></script>';"#),
+        ]);
+        let root = dir.path();
+        assert_eq!(opened_from_its_file("http://localhost:8000/template.js", root), None);
+        assert_eq!(page_of_address("http://localhost:8000/", root), None);
+        assert!(opened_from_its_file("http://localhost:8000/site-b/", root).is_some());
+        assert_eq!(opened_from_its_file("http://localhost:8000/site-a/", root), None);
+        std::fs::remove_file(root.join("site-a/index.html")).unwrap();
+        assert!(opened_from_its_file("http://localhost:8000/", root).unwrap().contains("site-b"));
     }
 
     #[test]
