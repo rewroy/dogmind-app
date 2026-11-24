@@ -29,10 +29,6 @@ const READ_LINES: usize = 2000;
 const MAX_LINE: usize = 2000;
 /// What a turn reads of files before it is told how much that is, and of explore: 96 KB, some 30,000 tokens.
 const READ_TOLD_PAST: usize = 96 * 1024;
-/// A file longer than this, or than `MAX_READ`, read with no place in it, is shown as where its parts begin: a review that read every file from the top
-/// had a context of 197K tokens for 6,600 lines, most of them of no use to it. One that fits in a read is read whole: a page of 1,153 lines came as its
-/// outline, and then in three more reads.
-const OUTLINE_PAST: usize = READ_LINES;
 /// Lines of a file's head shown with its outline: what it says it is, and what it brings in.
 const OUTLINE_HEAD: usize = 30;
 /// Lines of an outline: past this, only the ones at the left edge.
@@ -1604,29 +1600,31 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
     };
     let hash = sha16(&bytes);
     let text = if encoding == "utf-8" { text.strip_prefix('\u{feff}').unwrap_or(&text) } else { &text };
-    // A large file asked for with no place in it: where its parts begin, to read the one wanted, and not a full first page, which stays
-    // in the context for the rest of the conversation whether they were the part or not.
     let placed = arguments.get("start_line").is_some() || arguments.get("limit").is_some();
     // As in str::lines, a trailing newline terminates the last line.
     let line_count = memchr::memchr_iter(b'\n', text.as_bytes()).count()
         + usize::from(!text.is_empty() && !text.ends_with('\n'));
-    let mut out = if encoding == "utf-8" { String::new() } else { format!("--- encoding={encoding} ---\n") };
-    if !placed && (line_count > OUTLINE_PAST || text.len() > MAX_READ) {
-        let parts = outline(text);
-        if !parts.is_empty() {
-            return Ok((outlined(text, line_count, &parts, size, &out), (path, hash)));
-        }
-    }
     let limit = arguments.get("limit").and_then(Value::as_i64).unwrap_or(READ_LINES as i64).clamp(1, READ_LINES as i64) as usize;
     let start = arguments.get("start_line").and_then(Value::as_i64).unwrap_or(1);
     let first = if start < 0 { line_count.saturating_sub(start.unsigned_abs() as usize) } else { (start.max(1) as usize) - 1 };
     // (the guard on edits keeps its own hash: the model has no use for one)
+    let header = if encoding == "utf-8" { String::new() } else { format!("--- encoding={encoding} ---\n") };
+    let mut out = header.clone();
     if first >= line_count {
         // (nothing below this line could mean a file that ends here or a read that went past it)
         out.push_str(&if line_count == 0 { "--- the file is empty ---\n".to_string() } else { format!("--- the file has only {} lines ---\n", line_count) });
         return Ok((out, (path, hash)));
     }
     let next = append_read_page(&mut text.lines().skip(first).peekable(), first, limit, &mut out);
+    // Line numbers and the encoding header count towards the page budget. Check the
+    // actual first page before offering an outline. An oversized file with abbreviated
+    // lines still gets its outline even if every line number fits.
+    if !placed && (next < line_count || text.len() > MAX_READ) {
+        let parts = outline(text);
+        if !parts.is_empty() {
+            return Ok((outlined(text, line_count, &parts, size, &header), (path, hash)));
+        }
+    }
     if next > first && next < line_count {
         out.push_str(&format!("--- {} more lines; continue with start_line={} ---\n", line_count - next, next + 1));
     }
@@ -5400,6 +5398,21 @@ mod tests {
         assert_eq!(outline_read_count(&"row\n".repeat(20_001), 20_001, ""), "at least 11 reads");
         let text = format!("{}\n", "x".repeat(MAX_LINE)).repeat(300);
         assert_eq!(outline_read_count(&text, 300, ""), "at least 9 reads");
+    }
+
+    #[test]
+    fn a_file_that_only_overflows_after_numbering_still_shows_its_last_heading() {
+        let (dir, mut bench, cancel) = bench();
+        let text = format!("# Introduction\n{}# Appendix\n", "paragraph with thirty letters.\n".repeat(1983));
+        assert!(text.len() < MAX_READ && text.lines().count() < READ_LINES);
+        std::fs::write(dir.path().join("chapters.md"), &text).unwrap();
+        let read = |bench: &mut Workbench, args| bench.run("read_file", &args, dir.path(), &cancel).unwrap();
+        let outline = read(&mut bench, json!({"path":"chapters.md"}));
+        assert!(outline.contains("--- outline ---") && outline.contains("1985|# Appendix"), "{}", outline.lines().last().unwrap());
+        let first = read(&mut bench, json!({"path":"chapters.md", "start_line":1}));
+        assert!(first.contains("continue with start_line=1852") && !first.contains("--- outline ---"));
+        let last = read(&mut bench, json!({"path":"chapters.md", "start_line":1852}));
+        assert!(last.ends_with("1985|# Appendix\n"));
     }
 
     /// A long file read with no place in it comes as its head and where its parts begin; asked for a place, it comes as lines, as before;
