@@ -997,28 +997,38 @@ impl Gate {
         }
     }
 
+    /// Every path a call writes is looked at: one that is refused refuses the call, whatever comes before it, and otherwise the card asks at the
+    /// highest risk among them with every reason, each once. (The first path that was asked about was the answer: a call that wrote outside the
+    /// workspace and where keys are kept was asked about the first, and once allowed, wrote the second too.)
     fn write_verdict<'a>(&self, workspace: &Path, paths: impl Iterator<Item = &'a str>) -> Verdict {
+        let (mut risk, mut reasons): (Risk, Vec<String>) = (Risk::Low, Vec::new());
         for path in paths {
             let full = resolve(workspace, path);
-            if reaches_out(&full) {
-                return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_OUTSIDE_AND_OFF_THIS_PC, &[&full.display().to_string()])) };
-            }
             if self.is_secret(&full) {
                 return Verdict::Deny(format!("writes to a place secrets are kept: {}", full.display()));
             }
-            if !within(workspace, &full) {
-                return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_OUTSIDE, &[&full.display().to_string()])) };
-            }
+            let shown = full.display().to_string();
+            let asked = if reaches_out(&full) {
+                Some((Risk::High, reason_of(REASON_OUTSIDE_AND_OFF_THIS_PC, &[&shown])))
+            } else if !within(workspace, &full) {
+                Some((Risk::High, reason_of(REASON_OUTSIDE, &[&shown])))
             // A hook or a line of config there runs outside the sandbox, the next time a person uses git here.
-            if full.components().any(|part| part.as_os_str().eq_ignore_ascii_case(".git")) {
-                return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_GIT_FOLDER, &[&full.display().to_string()])) };
-            }
+            } else if full.components().any(|part| part.as_os_str().eq_ignore_ascii_case(".git")) {
+                Some((Risk::High, reason_of(REASON_GIT_FOLDER, &[&shown])))
             // A file too large for a rewind to keep a copy of: written over or taken away, it cannot be brought back, and the person is told so.
-            if std::fs::metadata(&full).is_ok_and(|found| found.is_file() && found.len() > crate::checkpoint::MOST_KEPT) {
-                return Verdict::Ask { risk: Risk::Medium, reason: Some(reason_of(REASON_TOO_LARGE_TO_KEEP, &[&full.display().to_string()])) };
+            } else if std::fs::metadata(&full).is_ok_and(|found| found.is_file() && found.len() > crate::checkpoint::MOST_KEPT) {
+                Some((Risk::Medium, reason_of(REASON_TOO_LARGE_TO_KEEP, &[&shown])))
+            } else {
+                None
+            };
+            if let Some((at, reason)) = asked {
+                risk = risk.max(at);
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
             }
         }
-        Verdict::Ask { risk: Risk::Low, reason: None }
+        Verdict::Ask { risk, reason: (!reasons.is_empty()).then(|| reasons.join("; ")) }
     }
 }
 
@@ -2068,6 +2078,25 @@ mod tests {
         }
         let patch = json!({"edits": [{"path": "large.bin", "old_string": "a", "new_string": "b"}], "expected_files": ["large.bin"]});
         assert!(matches!(gate.check("apply_patch", &patch, dir.path()), Verdict::Ask { reason: Some(_), .. }));
+    }
+
+    /// Every path a call writes is looked at: a place keys are kept refuses the call wherever it comes in it, and otherwise the card asks at the highest
+    /// risk among them, with every reason once.
+    #[test]
+    fn every_path_an_edit_writes_is_weighed_and_a_refused_one_refuses_the_call() {
+        let gate = Gate::new();
+        let dir = crate::in_container::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("large.bin")).unwrap().set_len(300 << 20).unwrap();
+        let edit = |paths: &[&str]| json!({"edits": paths.iter().map(|path| json!({"path": path, "old_string": "a", "new_string": "b"})).collect::<Vec<_>>(), "expected_files": paths});
+        let secret = "C:\\Users\\me\\.ssh\\id_rsa";
+        for paths in [["large.bin", secret], ["C:\\elsewhere\\x.txt", secret], [secret, "small.txt"]] {
+            assert!(matches!(gate.check("apply_patch", &edit(&paths), dir.path()), Verdict::Deny(_)), "{paths:?}");
+        }
+        match gate.check("apply_patch", &edit(&["large.bin", ".git/config"]), dir.path()) {
+            Verdict::Ask { risk: Risk::High, reason: Some(reason) } => assert!(reason.contains("larger than 256 MB") && reason.contains("inside git's own folder") && reason.matches("; ").count() == 1, "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(gate.check("apply_patch", &edit(&["a.txt", "b.txt"]), dir.path()), Verdict::Ask { risk: Risk::Low, reason: None });
     }
 
     #[test]
