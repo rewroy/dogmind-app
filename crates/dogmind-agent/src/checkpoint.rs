@@ -75,9 +75,10 @@ impl Saved {
     /// Whether the path leads somewhere else than when it was saved. One saved before that was kept has no "then" to compare with: a link or a junction on its way now is taken to lead
     /// elsewhere, as nothing says it did not.
     fn leads_elsewhere(&self) -> bool {
-        let key = |path: &Path| path_key(path);
+        // (exactly: both are the names the file system gave, so the same place reads the same, and any difference, of case or of anything
+        // else, is taken for somewhere else: a name the comparison only thought equal must not keep a restore going through a new link)
         match &self.real {
-            Some(then) => crate::safety::real_path(&self.path).is_none_or(|now| key(&now) != key(then)),
+            Some(then) => crate::safety::real_path(&self.path).is_none_or(|now| now != *then),
             None => has_a_link_on_its_way(&self.path),
         }
     }
