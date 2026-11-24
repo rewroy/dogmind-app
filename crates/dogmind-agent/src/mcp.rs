@@ -29,6 +29,18 @@ const MAX_TOOLS: usize = 1000;
 /// How much of a server's name goes into its tools' names.
 const MAX_PART: usize = 20;
 const ENDED: &str = "the server has ended";
+/// The most of one message a server sends: a line of its pipe, an event of its stream, the body of an HTTP answer. A server could otherwise fill the
+/// app's memory with one that does not end.
+const MOST_MESSAGE: usize = 64 << 20;
+/// What a call and the server's line say when the app ended a connection for that.
+const TOO_LARGE: &str = "the server sent a message larger than 64 MB, so the app ended its connection";
+/// The most a list of a server's tools takes, all its pages together: one that went on a page at a time held the start of a turn for many minutes.
+#[cfg(not(test))]
+const LIST_MOST: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const LIST_MOST: Duration = Duration::from_secs(2);
+/// What a server's line says when its list was cut short so.
+const LIST_CUT: &str = "its list of tools was cut short after 60 s, and it started with what it had listed";
 const PIPE: &str = "the server's pipe";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -436,6 +448,10 @@ struct Rpc {
     http: Option<Mutex<HttpLink>>,
     /// Set as the server says its list of tools changed (`LIST_CHANGED`), whenever it says it.
     changed: Arc<AtomicBool>,
+    /// Why its lines ended, where the app ended them (`TOO_LARGE`): for the call that finds them ended.
+    gone: Arc<Mutex<Option<String>>>,
+    /// Its last list of tools was cut short at `LIST_MOST`.
+    listed_short: Arc<AtomicBool>,
 }
 
 /// What a server says when it has tools it did not have, or no longer has some: as one does that adds tools on request.
@@ -473,12 +489,13 @@ struct Events {
 }
 
 impl Events {
-    fn read(&mut self, bytes: &[u8]) -> Vec<Value> {
-        self.read_named(bytes).into_iter().filter_map(|(_, data)| message_of(&data).ok()).collect()
+    /// Each whole event's message; none where one has grown past what a message may be (`read_named`).
+    fn read(&mut self, bytes: &[u8]) -> Option<Vec<Value>> {
+        Some(self.read_named(bytes)?.into_iter().filter_map(|(_, data)| message_of(&data).ok()).collect())
     }
 
     /// Each whole event's name (`message`, when it gives none) and data, of those that have data.
-    fn read_named(&mut self, bytes: &[u8]) -> Vec<(String, String)> {
+    fn read_named(&mut self, bytes: &[u8]) -> Option<Vec<(String, String)>> {
         self.pending.extend_from_slice(bytes);
         let find = |bytes: &[u8], what: &[u8]| bytes.windows(what.len()).position(|window| window == what).map(|at| (at, what.len()));
         let mut events = Vec::new();
@@ -493,7 +510,12 @@ impl Events {
             let name = field("event:").first().map_or("message", |name| name.trim()).to_string();
             events.push((name, data.join("\n")));
         }
-        events
+        // (what is left is an event not ended yet: one larger than a message may be is let go, and the stream with it)
+        if self.pending.len() > MOST_MESSAGE {
+            self.pending = Vec::new();
+            return None;
+        }
+        Some(events)
     }
 }
 
@@ -506,19 +528,20 @@ fn older_transport(url: &str, headers: &BTreeMap<String, String>, limit: Duratio
     let stop = Arc::new(AtomicBool::new(false));
     let (said, heard) = channel();
     let (told, where_to) = channel();
+    let gone: Arc<Mutex<Option<String>>> = Arc::default();
     {
-        let (stream, headers, stop) = (stream.clone(), headers.clone(), stop.clone());
-        std::thread::spawn(move || read_older_stream(&stream, &headers, &stop, &told, &said));
+        let (stream, headers, stop, gone) = (stream.clone(), headers.clone(), stop.clone(), gone.clone());
+        std::thread::spawn(move || read_older_stream(&gone, &stream, &headers, &stop, &told, &said));
     }
     let endpoint = where_to.recv_timeout(limit).unwrap_or_else(|_| Err(format!("{} said nowhere to post within {} s", stream.host, limit.as_secs())));
     let endpoint = endpoint.inspect_err(|_| stop.store(true, Ordering::Relaxed))?;
     let writer = Posting { url: endpoint, headers, stop, written: Vec::new() };
-    Ok(Rpc::over(Box::new(writer), BufReader::new(Heard { from: heard, pending: Vec::new() })))
+    Ok(Rpc::over_with(Box::new(writer), BufReader::new(Heard { from: heard, pending: Vec::new() }), gone))
 }
 
 /// The older transport's stream, read until `stop`: where to post, told once; each message after it, a line for `Rpc::over`'s reader. Its end ends the
 /// server, as a program's pipe does.
-fn read_older_stream(stream: &crate::http::Url, headers: &[(String, String)], stop: &AtomicBool, told: &std::sync::mpsc::Sender<Result<crate::http::Url, String>>, said: &std::sync::mpsc::Sender<Vec<u8>>) {
+fn read_older_stream(gone: &Mutex<Option<String>>, stream: &crate::http::Url, headers: &[(String, String)], stop: &AtomicBool, told: &std::sync::mpsc::Sender<Result<crate::http::Url, String>>, said: &std::sync::mpsc::Sender<Vec<u8>>) {
     let mut asking = headers.to_vec();
     asking.push(("Accept".into(), "text/event-stream".into()));
     let mut response = match crate::http::request("GET", stream, &asking, None, HTTP_CONNECT, stop) {
@@ -535,7 +558,11 @@ fn read_older_stream(stream: &crate::http::Url, headers: &[(String, String)], st
     }
     let mut events = Events::default();
     while let Ok(Some(bytes)) = response.next() {
-        for (name, data) in events.read_named(&bytes) {
+        let Some(read) = events.read_named(&bytes) else {
+            *gone.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TOO_LARGE.to_string());
+            return;
+        };
+        for (name, data) in read {
             if name == "endpoint" {
                 let _ = told.send(endpoint_of(stream, &data));
             } else if let Ok(message) = message_of(&data) {
@@ -545,6 +572,53 @@ fn read_older_stream(stream: &crate::http::Url, headers: &[(String, String)], st
             }
         }
     }
+}
+
+/// A line of `reader` into `line`, as `read_until` reads one, and no more of it than `most` bytes and one: past that, what was read is kept (ending
+/// with no line break) and the rest is left. How much was read; none at the end.
+fn read_line_within(reader: &mut impl BufRead, line: &mut Vec<u8>, most: usize) -> std::io::Result<usize> {
+    let mut read = 0;
+    loop {
+        let (ended, used) = {
+            let available = match reader.fill_buf() {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if available.is_empty() {
+                return Ok(read);
+            }
+            let room = (most + 1).saturating_sub(line.len());
+            match available.iter().take(room).position(|&byte| byte == b'\n') {
+                Some(at) => {
+                    line.extend_from_slice(&available[..=at]);
+                    (true, at + 1)
+                }
+                None => {
+                    let used = available.len().min(room);
+                    line.extend_from_slice(&available[..used]);
+                    (line.len() > most, used)
+                }
+            }
+        };
+        reader.consume(used);
+        read += used;
+        if ended {
+            return Ok(read);
+        }
+    }
+}
+
+/// An HTTP answer's body as text, no more of it than `most`: past it, a failure that ends the connection (`TOO_LARGE`).
+fn body_of(response: &mut crate::http::Response<'_>, most: usize) -> Result<String, String> {
+    let mut body = Vec::new();
+    while let Some(bytes) = response.next().map_err(|error| error.to_string())? {
+        body.extend_from_slice(&bytes);
+        if body.len() > most {
+            return Err(format!("{ENDED}: {TOO_LARGE}"));
+        }
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Where the older transport's stream says to post, as a URL: a path, or a whole URL of the stream's own origin, as what goes there carries the headers.
@@ -585,7 +659,7 @@ impl Write for Posting {
             let mut headers = self.headers.clone();
             headers.push(("Content-Type".into(), "application/json".into()));
             let mut response = crate::http::request("POST", &self.url, &headers, Some(&body), HTTP_CONNECT, &self.stop).map_err(|error| std::io::Error::other(error.to_string()))?;
-            let _ = response.text();
+            let _ = body_of(&mut response, MOST_MESSAGE);
             if response.status >= 300 {
                 return Err(std::io::Error::other(format!("the server answered {}", response.status)));
             }
@@ -608,7 +682,7 @@ impl Drop for Posting {
 /// with 202), sent with `posting`; its word that its tools changed kept in `changed`.
 fn heard(url: &crate::http::Url, posting: &[(String, String)], message: &Value, changed: &AtomicBool, cancel: &AtomicBool) {
     if let Some(reply) = answer_to_server(message) {
-        let _ = crate::http::request("POST", url, posting, Some(&reply.to_string()), HTTP_CONNECT, cancel).and_then(|mut answered| answered.text());
+        let _ = crate::http::request("POST", url, posting, Some(&reply.to_string()), HTTP_CONNECT, cancel).map(|mut answered| body_of(&mut answered, MOST_MESSAGE));
     }
     if message.get("method").and_then(Value::as_str) == Some(LIST_CHANGED) {
         changed.store(true, Ordering::Relaxed);
@@ -634,7 +708,9 @@ fn listen(url: &crate::http::Url, headers: &[(String, String)], changed: &Atomic
             let mut events = Events::default();
             while let Ok(Some(bytes)) = response.next() {
                 wait = Duration::from_secs(1);
-                for message in events.read(&bytes) {
+                // (an event larger than a message may be ends this stream, which is asked for again)
+                let Some(messages) = events.read(&bytes) else { break };
+                for message in messages {
                     heard(url, &posting, &message, changed, stop);
                 }
             }
@@ -735,13 +811,13 @@ impl HttpLink {
             return if response.status < 300 { Ok(None) } else { Err(format!("the server answered {}", response.status)) };
         }
         if response.status >= 300 {
-            let text: String = response.text().unwrap_or_default().chars().take(300).collect();
+            let text: String = body_of(&mut response, 4096).unwrap_or_default().chars().take(300).collect();
             return Err(format!("the server answered {}: {}", response.status, text.trim()));
         }
         let streamed = response.header("content-type").is_some_and(|kind| kind.to_ascii_lowercase().starts_with("text/event-stream"));
         let is_ours = |message: &Value| message.get("id").and_then(Value::as_u64) == id && message.get("method").is_none();
         if !streamed {
-            let text = response.text().map_err(|error| error.to_string())?;
+            let text = body_of(&mut response, MOST_MESSAGE)?;
             let answer: Value = message_of(&text).map_err(|error| format!("the server's answer is not JSON: {error}"))?;
             let found = match answer {
                 Value::Array(messages) => messages.into_iter().find(is_ours),
@@ -755,7 +831,9 @@ impl HttpLink {
             let Some(bytes) = response.next().map_err(|error| error.to_string())? else {
                 return Err("the server's event stream ended with no answer to this request".to_string());
             };
-            for message in events.read(&bytes) {
+            // (an event that does not end within what a message may be ends the connection)
+            let Some(messages) = events.read(&bytes) else { return Err(format!("{ENDED}: {TOO_LARGE}")) };
+            for message in messages {
                 if is_ours(&message) {
                     return Ok(Some(message));
                 }
@@ -780,7 +858,13 @@ impl Drop for HttpLink {
 impl Rpc {
     /// Reads the server's lines on a thread of its own; it answers what the server asks of it itself (see `answer_to_server`), as the server may wait on that.
     fn over(writer: Box<dyn Write + Send>, reader: impl BufRead + Send + 'static) -> Rpc {
+        Rpc::over_with(writer, reader, Arc::default())
+    }
+
+    /// `over`, with where the one that feeds `reader` says why it ended it (the older transport's stream).
+    fn over_with(writer: Box<dyn Write + Send>, reader: impl BufRead + Send + 'static, gone: Arc<Mutex<Option<String>>>) -> Rpc {
         let writer = Arc::new(Mutex::new(writer));
+        let ended_why = gone.clone();
         let (sender, answers) = channel();
         // Closing the last RPC writer lets a peer waiting for input leave, and its reader see EOF.
         let replies = Arc::downgrade(&writer);
@@ -792,7 +876,12 @@ impl Rpc {
             loop {
                 line.clear();
                 // (a line is read as bytes: one that is not UTF-8, a script's message in the machine's own encoding, must not end the reader)
-                if matches!(reader.read_until(b'\n', &mut line), Ok(0) | Err(_)) {
+                if matches!(read_line_within(&mut reader, &mut line, MOST_MESSAGE), Ok(0) | Err(_)) {
+                    return;
+                }
+                // (one that does not end within what a message may be ends the connection, and says why)
+                if line.len() > MOST_MESSAGE && !line.ends_with(b"\n") {
+                    *ended_why.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TOO_LARGE.to_string());
                     return;
                 }
                 let text = String::from_utf8_lossy(&line);
@@ -820,14 +909,14 @@ impl Rpc {
                 }
             }
         });
-        Rpc { writer, answers, next: 1, reader: Some(thread), http: None, changed }
+        Rpc { writer, answers, next: 1, reader: Some(thread), http: None, changed, gone, listed_short: Arc::default() }
     }
 
     /// For a server at a URL: its messages go by HTTP, and the pipes are none.
     fn http(link: HttpLink) -> Rpc {
         let (_, answers) = channel();
         let changed = link.changed.clone();
-        Rpc { writer: Arc::new(Mutex::new(Box::new(std::io::sink()))), answers, next: 1, reader: None, http: Some(Mutex::new(link)), changed }
+        Rpc { writer: Arc::new(Mutex::new(Box::new(std::io::sink()))), answers, next: 1, reader: None, http: Some(Mutex::new(link)), changed, gone: Arc::default(), listed_short: Arc::default() }
     }
 
     fn send(&self, message: &Value) -> Result<(), String> {
@@ -890,8 +979,16 @@ impl Rpc {
                     return Ok(answer.get("result").cloned().unwrap_or(Value::Null));
                 }
                 Ok(_) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return Err(ENDED.to_string()),
+                Err(RecvTimeoutError::Disconnected) => return Err(self.ended_words()),
             }
+        }
+    }
+
+    /// Why its lines ended, as a call is told it: the server's end, and what ended it where the app did.
+    fn ended_words(&self) -> String {
+        match self.gone.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_deref() {
+            Some(why) => format!("{ENDED}: {why}"),
+            None => ENDED.to_string(),
         }
     }
 
@@ -922,11 +1019,22 @@ impl Rpc {
     /// What tools the server has, across its pages, each given `limit` to answer. What it said of its list before this is answered by it.
     fn list_tools(&mut self, limit: Duration, cancel: Option<&AtomicBool>) -> Result<Vec<Value>, String> {
         self.changed.store(false, Ordering::Relaxed);
+        self.listed_short.store(false, Ordering::Relaxed);
+        let began = Instant::now();
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         for page_number in 1.. {
             let params = cursor.as_ref().map_or(json!({}), |cursor| json!({"cursor": cursor}));
-            let page = self.call("tools/list", params, limit, cancel)?;
+            // (all the pages have `LIST_MOST`: past it, the server starts with what it has listed, and its line says the list was cut short)
+            let left = LIST_MOST.saturating_sub(began.elapsed()).max(Duration::from_millis(1));
+            let page = match self.call("tools/list", params, limit.min(left), cancel) {
+                Ok(page) => page,
+                Err(_) if page_number > 1 && began.elapsed() >= LIST_MOST => {
+                    self.listed_short.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             tools.extend(page.get("tools").and_then(Value::as_array).cloned().unwrap_or_default());
             cursor = page.get("nextCursor").and_then(Value::as_str).map(str::to_string);
             // (a server that goes on past this keeps what it has given, and does not fail over the rest)
@@ -1265,17 +1373,19 @@ struct Running {
     /// Its tools left out as it gives their name to others too ([`same_named`]): how many, and under how many names.
     left_out: (usize, usize),
     process: Option<Arc<Process>>,
+    /// Its connection's `Rpc::listed_short`.
+    listed_short: Arc<AtomicBool>,
 }
 
 impl Running {
     /// Up, with the tools it listed as `schemas` (under its own names, and none placed yet).
     fn new(mut rpc: Rpc, schemas: Vec<Value>, process: Option<Process>) -> Running {
-        Running { reader: rpc.reader.take().map(Arc::new), changed: rpc.changed.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, left_out: (0, 0), process: process.map(Arc::new) }
+        Running { reader: rpc.reader.take().map(Arc::new), changed: rpc.changed.clone(), listed_short: rpc.listed_short.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, left_out: (0, 0), process: process.map(Arc::new) }
     }
 
     /// The same server with its tools as it lists them now.
     fn with_tools(&self, names: BTreeMap<String, String>, schemas: Vec<Value>) -> Running {
-        Running { reader: self.reader.clone(), rpc: self.rpc.clone(), changed: self.changed.clone(), names, schemas, left_out: self.left_out, process: self.process.clone() }
+        Running { reader: self.reader.clone(), rpc: self.rpc.clone(), changed: self.changed.clone(), listed_short: self.listed_short.clone(), names, schemas, left_out: self.left_out, process: self.process.clone() }
     }
 
     fn disconnected(&self) -> bool {
@@ -1303,6 +1413,8 @@ struct Slot {
     /// The names of the tools it no longer lists, as it said its list changed: a call for one is told so.
     dropped: Vec<String>,
     failed: Option<String>,
+    /// What the app last did to its connection, for its line (`TOO_LARGE`).
+    note: Option<String>,
     trusted: bool,
     /// What it was started from, and its part of its tools' names: a change of either starts it again.
     config: Option<ServerConfig>,
@@ -1636,7 +1748,7 @@ impl Hub {
         };
         let result = match answer {
             Ok(result) => result,
-            Err(error) if error == ENDED || error.starts_with(PIPE) => {
+            Err(error) if error.starts_with(ENDED) || error.starts_with(PIPE) => {
                 let error = match &running.process {
                     Some(process) => process.words.after(error),
                     None => error,
@@ -1686,6 +1798,7 @@ impl Hub {
             slot.and_then(|slot| {
                 // (its tools as it last listed them, which the call that found it ended may have had before)
                 slot.had = slot.running.as_ref().map_or_else(Vec::new, |running| running.names.keys().cloned().collect());
+                slot.note = error.contains(TOO_LARGE).then(|| TOO_LARGE.to_string());
                 slot.running = None;
                 slot.restarting = slot.start.is_some();
                 slot.start.clone()
@@ -1813,6 +1926,7 @@ impl Hub {
             let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             slots.iter().filter_map(|slot| Some((slot.name.clone(), slot.running.as_ref()?.left_out))).filter(|(_, (tools, _))| *tools > 0).collect()
         };
+        let notes = self.notes();
         let states: Vec<String> = self.states().into_iter().map(|(name, state)| {
             let state = match state {
                 State::Up(count) => match left_out.get(&name) {
@@ -1823,7 +1937,11 @@ impl Hub {
                 State::Disconnected => "disconnected".into(),
                 State::Failed(_) => "failed to start".into(),
             };
-            format!("{name}: {state}")
+            // (the app's own words of what it did to the connection)
+            match notes.get(&name) {
+                Some(note) => format!("{name}: {state} ({note})"),
+                None => format!("{name}: {state}"),
+            }
         }).collect();
         let mut status = states.join("; ");
         if self.unreadable().is_some() {
@@ -1837,13 +1955,30 @@ impl Hub {
         format!("Dogmind has a built-in MCP client outside the command sandbox. {status}. The user can enter `/mcp` for status, `/mcp candidates` for importable names, and `/mcp import NAME` to add and start one or retry it after disconnection or a startup failure. Bare `/mcp import` imports all available servers from Claude and Codex. To add one manually, the user opens Settings > Tools > MCP servers > Add a server. On connection its tools join this open conversation automatically, without a restart or reconnect command.")
     }
 
-    /// One line a server, for the person.
+    /// One line a server, for the person, with what the app did to its connection.
     pub fn status(&self) -> Vec<String> {
-        self.states().into_iter().map(|(name, state)| match state {
-            State::Up(tools) => format!("{name}: {tools} tools"),
-            State::Failed(error) => format!("{name}: did not start: {error}"),
-            State::Starting => format!("{name}: starting"),
-            State::Disconnected => format!("{name}: disconnected"),
+        let notes = self.notes();
+        self.states().into_iter().map(|(name, state)| {
+            let line = match state {
+                State::Up(tools) => format!("{name}: {tools} tools"),
+                State::Failed(error) => format!("{name}: did not start: {error}"),
+                State::Starting => format!("{name}: starting"),
+                State::Disconnected => format!("{name}: disconnected"),
+            };
+            match notes.get(&name) {
+                Some(note) => format!("{line} ({note})"),
+                None => line,
+            }
+        }).collect()
+    }
+
+    /// What the app did to a server's connection, by its name: ended it for a message too large, or cut its list of tools short.
+    fn notes(&self) -> BTreeMap<String, String> {
+        let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        slots.iter().filter_map(|slot| {
+            let short = slot.running.as_ref().is_some_and(|running| running.listed_short.load(Ordering::Relaxed)).then(|| LIST_CUT.to_string());
+            let said: Vec<String> = slot.note.iter().cloned().chain(short).collect();
+            (!said.is_empty()).then(|| (slot.name.clone(), said.join("; ")))
         }).collect()
     }
 
@@ -2401,6 +2536,59 @@ enabled = false
         assert!(stream.contains("mcp-session-id: s-1") && stream.contains("accept: text/event-stream"), "{stream}");
     }
 
+    /// One message larger than a message may be ends the connection, and says why: a line of a program's pipe, to the call and on the server's line;
+    /// an event of a stream that does not end, let go.
+    #[test]
+    fn a_message_larger_than_a_message_may_be_ends_the_connection_and_says_why() {
+        let mut huge = vec![b'x'; MOST_MESSAGE + 16];
+        huge.extend_from_slice(b"\n");
+        let mut rpc = Rpc::over(Box::new(std::io::sink()), Cursor::new(huge));
+        let error = rpc.call("tools/list", json!({}), Duration::from_secs(30), None).unwrap_err();
+        assert!(error.starts_with(ENDED) && error.contains(TOO_LARGE), "{error}");
+        let mut events = Events::default();
+        assert_eq!(events.read(b"data: {\"a\": 1}\n\n").unwrap(), [json!({"a": 1})]);
+        assert!(events.read(&vec![b'x'; MOST_MESSAGE + 16]).is_none(), "an event with no end");
+        assert_eq!(events.read(b"data: {\"b\": 2}\n\n").unwrap(), [json!({"b": 2})], "and what comes after it is read as new");
+        // (the server's line says it, as the call did)
+        let hub = Hub::default();
+        let mut huge = vec![b'x'; MOST_MESSAGE + 16];
+        huge.extend_from_slice(b"\n");
+        let rpc = Rpc::over(Box::new(std::io::sink()), Cursor::new(huge));
+        let (names, schemas) = place_tools("srv", "srv", &[tool("t")], None);
+        let running = Arc::new(Running { names, schemas, ..Running::new(rpc, Vec::new(), None) });
+        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), part: "srv".into(), running: Some(running), ..Slot::default() });
+        let said = hub.call_with_pictures("mcp__srv__t", &json!({}), &AtomicBool::new(false), false).err().unwrap();
+        assert!(said.contains(TOO_LARGE), "{said}");
+        assert!(hub.status().iter().any(|line| line.starts_with("srv:") && line.contains(TOO_LARGE)), "{:?}", hub.status());
+    }
+
+    /// A list of tools takes `LIST_MOST` in all its pages: a server that gives one a page at a time, slowly, starts with what it has listed by then,
+    /// and its line says the list was cut short.
+    #[test]
+    fn a_list_of_tools_past_its_time_keeps_what_was_listed_and_says_so() {
+        let (said, heard) = channel();
+        std::thread::spawn(move || {
+            for page in 1..=6u64 {
+                std::thread::sleep(Duration::from_millis(900));
+                let answer = json!({"jsonrpc": "2.0", "id": page, "result": {"tools": [tool(&format!("t{page}"))], "nextCursor": "more"}});
+                if said.send(format!("{answer}\n").into_bytes()).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut rpc = Rpc::over(Box::new(std::io::sink()), BufReader::new(Heard { from: heard, pending: Vec::new() }));
+        let began = Instant::now();
+        let tools = rpc.list_tools(Duration::from_secs(30), None).unwrap();
+        assert!(!tools.is_empty() && tools.len() < 6, "{}", tools.len());
+        assert!(began.elapsed() < LIST_MOST + Duration::from_secs(1), "{:?}", began.elapsed());
+        assert!(rpc.listed_short.load(Ordering::Relaxed));
+        let hub = Hub::default();
+        let (names, schemas) = place_tools("srv", "srv", &tools, None);
+        let running = Arc::new(Running { names, schemas, ..Running::new(rpc, Vec::new(), None) });
+        hub.slots.lock().unwrap().push(Slot { name: "srv".into(), part: "srv".into(), running: Some(running), ..Slot::default() });
+        assert!(hub.status().iter().any(|line| line.contains(LIST_CUT)), "{:?}", hub.status());
+    }
+
     /// Server-sent events are read whole, whichever pieces they come in.
     #[test]
     fn events_split_anywhere_are_read_whole() {
@@ -2408,8 +2596,8 @@ enabled = false
         for cut in 0..=text.len() {
             let mut events = Events::default();
             let (one, two) = text.as_bytes().split_at(cut);
-            let mut read = events.read(one);
-            read.extend(events.read(two));
+            let mut read = events.read(one).unwrap();
+            read.extend(events.read(two).unwrap());
             assert_eq!(read, [json!({"a": "\u{3042}"}), json!({"b": 2})], "cut at {cut}");
         }
     }
