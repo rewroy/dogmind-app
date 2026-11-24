@@ -10473,7 +10473,7 @@ Body").unwrap();
         run.handle.commands.send(Command::Send("go".into())).unwrap();
         until_end(&run, Decision::Reject);
         // (the first turn's message and its facts, and its answer: a fork through it has none of the second turn's)
-        let fork = crate::session::fork(&path, 2, None).unwrap();
+        let fork = crate::session::fork(&path, 2, None, &crate::conversation_key::Policy::default()).unwrap();
         run.handle.commands.send(Command::Resume(fork)).unwrap();
         for text in ["again", "and again"] {
             run.handle.commands.send(Command::Send(text.into())).unwrap();

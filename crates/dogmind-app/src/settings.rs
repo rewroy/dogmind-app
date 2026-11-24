@@ -605,10 +605,10 @@ pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
 }
 
 /// The folders this app makes in its data folder, by name.
-const MADE_FOLDERS: [&str; 8] = ["sessions", "memory", "preview", "crashes", "attachments", "models", "updates", "engine-updates"];
+const MADE_FOLDERS: [&str; 9] = ["sessions", "memory", "preview", "crashes", "attachments", "models", "updates", "engine-updates", "for-sandbox"];
 /// The beginnings of the names of the files it makes there: each as it is, written beside itself first (`.part`, `.partial`), or
 /// moved aside when it could not be read (`.broken`, `.unreadable-TIME.json`), or the engine's copies of its own (`engine.toml.old`).
-const MADE_FILES: [&str; 12] = ["settings.json", "engine.toml", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-", "workspace-grants.json", "read-folders.json", "mcp.json", "mcp.partial", "report.txt", "conversation-key.json"];
+const MADE_FILES: [&str; 13] = ["settings.json", "engine.toml", "engine.log", "permissions.json", "permissions.partial", "permissions.unreadable-", "workspace-grants.json", "read-folders.json", "mcp.json", "mcp.partial", "report.txt", "conversation-key.json", "workspace-sids.txt"];
 
 /// Whether the app makes this, at the top of its data folder: a name of its own, a folder as a folder and a file as a file.
 fn made_here(path: &Path) -> bool {

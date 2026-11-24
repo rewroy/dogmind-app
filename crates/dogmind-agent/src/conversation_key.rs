@@ -19,13 +19,21 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 pub const KEYSTORE: &str = "conversation-key.json";
+/// The key file's copy beside it, written with it each time: what opens the conversations when the file itself is damaged (`Keystore::restore_copy`).
+/// The same as the file and not the one before it: a copy of the one before would still open with a passphrase or a recovery code that was changed.
+pub const KEYSTORE_COPY: &str = "conversation-key.json.copy";
+/// Where a damaged key file is put when its copy takes its place.
+pub const KEYSTORE_DAMAGED_FILE: &str = "conversation-key.json.damaged";
 const VERSION: u32 = 1;
-/// scrypt's cost: 2^15 (32 MiB, a few tens of milliseconds), r 8, p 1, as the Python Dogmind has it.
-const SCRYPT_N: u32 = 1 << 15;
+/// scrypt's cost for what is wrapped now: 2^17 (128 MiB, about a quarter of a second here), r 8, p 1. The Python Dogmind's was 2^15, and a key made
+/// with it still says so in its file and opens as it was; a slot wrapped again takes this one.
+const SCRYPT_N: u32 = 1 << 17;
 const SCRYPT_R: u32 = 8;
 const SCRYPT_P: u32 = 1;
 /// What a keystore may ask of the machine to be opened: it is read from a file that anyone with the folder can change.
 const SCRYPT_MOST_BYTES: u64 = 256 << 20;
+/// And the most passes of it: each is the whole of the work again.
+const SCRYPT_MOST_P: u32 = 16;
 const SALT_BYTES: usize = 16;
 pub(crate) const NONCE_BYTES: usize = 12;
 pub(crate) const TAG_BYTES: usize = 16;
@@ -318,7 +326,7 @@ fn normalize_recovery(code: &str) -> String {
     }).collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ScryptCost {
     n: u32,
     r: u32,
@@ -342,6 +350,51 @@ struct Stored {
     /// A change of every conversation that has begun and not ended (`encrypt` or `decrypt`): the next start finishes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending: Option<String>,
+    /// The cost a slot was wrapped with where it is not `scrypt`'s: a passphrase or a recovery code set since the cost went up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    passphrase_scrypt: Option<ScryptCost>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_scrypt: Option<ScryptCost>,
+    /// SHA-256 of all the rest, in hex: a file changed or damaged since it was written says so, and is not taken for a passphrase typed wrong. A file
+    /// written before there was one has none, and is read as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check: Option<String>,
+}
+
+/// What a file's `check` is to be: the hash of the rest of it, as this app writes it.
+fn check_of(stored: &Stored) -> String {
+    use sha2::{Digest, Sha256};
+    let mut bare = stored.clone();
+    bare.check = None;
+    hex(&Sha256::digest(serde_json::to_string(&bare).unwrap_or_default().as_bytes()))
+}
+
+/// A file of the key written whole or not at all: beside it first, on the disk, and then renamed over it.
+fn write_whole(path: &Path, text: &str) -> std::io::Result<()> {
+    let part = path.with_extension(format!("{}.part", path.extension().and_then(|extension| extension.to_str()).unwrap_or("")));
+    std::fs::File::create(&part)
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, text.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&part, path))
+}
+
+/// What a key file holds, read and looked at: its form, its version and its check.
+fn read_stored(path: &Path) -> Result<Stored, KeyError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(KeyError::Missing),
+        Err(error) => return Err(KeyError::Failed(format!("{}: {error}", path.display()))),
+    };
+    let stored: Stored = serde_json::from_str(&text).map_err(|error| KeyError::Corrupt(error.to_string()))?;
+    if stored.version != VERSION || stored.kdf != "scrypt" {
+        return Err(KeyError::Corrupt("a version this app does not know".into()));
+    }
+    if stored.check.as_deref().is_some_and(|check| check != check_of(&stored)) {
+        return Err(KeyError::Corrupt("what it holds is not what its check says: it was changed or damaged".into()));
+    }
+    Ok(stored)
 }
 
 /// A change of all the conversations that is under way.
@@ -424,7 +477,7 @@ pub(crate) fn b64d_bytes(text: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn derive(secret: &str, salt: &[u8], cost: &ScryptCost) -> Result<[u8; 32], KeyError> {
-    if !cost.n.is_power_of_two() || cost.n < 2 || cost.r == 0 || cost.p == 0 || 128 * u64::from(cost.n) * u64::from(cost.r) > SCRYPT_MOST_BYTES {
+    if !cost.n.is_power_of_two() || cost.n < 2 || cost.r == 0 || cost.p == 0 || cost.p > SCRYPT_MOST_P || 128 * u64::from(cost.n) * u64::from(cost.r) > SCRYPT_MOST_BYTES {
         return Err(KeyError::Corrupt("its scrypt cost is not one this app uses".into()));
     }
     let params = scrypt::Params::new(cost.n.trailing_zeros() as u8, cost.r, cost.p, 32).map_err(|error| KeyError::Corrupt(error.to_string()))?;
@@ -499,32 +552,58 @@ pub fn exists(folder: &Path) -> bool {
 impl Keystore {
     pub fn load(folder: &Path) -> Result<Keystore, KeyError> {
         let path = path_in(folder);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(KeyError::Missing),
-            Err(error) => return Err(KeyError::Failed(format!("{}: {error}", path.display()))),
-        };
-        let stored: Stored = serde_json::from_str(&text).map_err(|error| KeyError::Corrupt(error.to_string()))?;
-        if stored.version != VERSION || stored.kdf != "scrypt" {
-            return Err(KeyError::Corrupt("a version this app does not know".into()));
-        }
-        Ok(Keystore { path, stored })
+        Ok(Keystore { stored: read_stored(&path)?, path })
     }
 
-    /// Whole or not at all: beside it first, on the disk, and then renamed over it.
+    /// Whether the key file's copy is there and whole: what is offered when the file itself is damaged.
+    pub fn copy_opens(folder: &Path) -> bool {
+        read_stored(&folder.join(KEYSTORE_COPY)).is_ok()
+    }
+
+    /// The copy in the damaged file's place, which is kept beside it as it was: asked for by the person, when the file itself does not read.
+    pub fn restore_copy(folder: &Path) -> Result<Keystore, KeyError> {
+        let copy = folder.join(KEYSTORE_COPY);
+        read_stored(&copy)?;
+        let text = std::fs::read_to_string(&copy).map_err(|error| KeyError::Failed(format!("{}: {error}", copy.display())))?;
+        let path = path_in(folder);
+        if path.exists() {
+            std::fs::rename(&path, folder.join(KEYSTORE_DAMAGED_FILE)).map_err(|error| KeyError::Failed(format!("{}: {error}", path.display())))?;
+        }
+        write_whole(&path, &text).map_err(|error| KeyError::Failed(format!("{}: {error}", path.display())))?;
+        Keystore::load(folder)
+    }
+
+    /// Whole or not at all, with its check, and its copy beside it written the same: a copy that could not be written leaves the file as it is.
     fn save(&self) -> Result<(), KeyError> {
-        let text = serde_json::to_string_pretty(&self.stored).map_err(|error| KeyError::Failed(error.to_string()))?;
+        let mut stored = self.stored.clone();
+        stored.check = Some(check_of(&stored));
+        let text = serde_json::to_string_pretty(&stored).map_err(|error| KeyError::Failed(error.to_string()))?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| KeyError::Failed(format!("{}: {error}", parent.display())))?;
         }
-        let part = self.path.with_extension("json.part");
-        std::fs::File::create(&part)
-            .and_then(|mut file| {
-                std::io::Write::write_all(&mut file, text.as_bytes())?;
-                file.sync_all()
-            })
-            .and_then(|()| std::fs::rename(&part, &self.path))
-            .map_err(|error| KeyError::Failed(format!("{}: {error}", self.path.display())))
+        write_whole(&self.path, &text).map_err(|error| KeyError::Failed(format!("{}: {error}", self.path.display())))?;
+        let _ = write_whole(&self.copy_path(), &text);
+        Ok(())
+    }
+
+    fn copy_path(&self) -> PathBuf {
+        self.path.with_file_name(KEYSTORE_COPY)
+    }
+
+    /// A copy of a file that opened, where there is none yet: one written before the app kept copies gets its own the first time it opens.
+    fn keep_a_copy(&self) {
+        let copy = self.copy_path();
+        if !copy.exists() {
+            if let Ok(text) = std::fs::read_to_string(&self.path) {
+                let _ = write_whole(&copy, &text);
+            }
+        }
+    }
+
+    /// The cost of a slot: its own where it has one, the file's otherwise.
+    fn cost_of(&self, slot: &str) -> &ScryptCost {
+        let own = if slot == "passphrase" { &self.stored.passphrase_scrypt } else { &self.stored.recovery_scrypt };
+        own.as_ref().unwrap_or(&self.stored.scrypt)
     }
 
     fn cost() -> ScryptCost {
@@ -557,6 +636,9 @@ impl Keystore {
             dek_wrapped_dpapi,
             dek_fingerprint: cipher.fingerprint.clone(),
             pending: pending.map(|pending| pending.word().to_string()),
+            passphrase_scrypt: None,
+            recovery_scrypt: None,
+            check: None,
         };
         let keystore = Keystore { path: path_in(folder), stored };
         keystore.save()?;
@@ -565,7 +647,7 @@ impl Keystore {
 
     fn open_slot(&self, secret: &str, salt: &str, wrapped: &str, slot: &str) -> Result<Arc<Cipher>, KeyError> {
         let salt = b64d(salt).ok_or_else(|| KeyError::Corrupt("a salt".into()))?;
-        let kek = derive(secret, &salt, &self.stored.scrypt)?;
+        let kek = derive(secret, &salt, self.cost_of(slot))?;
         let dek = unwrap_with(wrapped, &kek, slot).ok_or(KeyError::Wrong)?;
         let cipher = Cipher::from_dek(dek);
         // (a key that opens but is not the one this file is for: the file was changed)
@@ -573,6 +655,7 @@ impl Keystore {
             forget(&cipher.fingerprint);
             return Err(KeyError::Wrong);
         }
+        self.keep_a_copy();
         Ok(cipher)
     }
 
@@ -594,6 +677,7 @@ impl Keystore {
             forget(&cipher.fingerprint);
             return Err(KeyError::NotRemembered);
         }
+        self.keep_a_copy();
         Ok(cipher)
     }
 
@@ -629,10 +713,12 @@ impl Keystore {
         if new.is_empty() {
             return Err(KeyError::Empty);
         }
-        let salt = random_bytes::<SALT_BYTES>()?;
+        let (salt, cost) = (random_bytes::<SALT_BYTES>()?, Keystore::cost());
         let mut stored = self.stored.clone();
         stored.passphrase_salt = b64e(&salt);
-        stored.dek_wrapped_passphrase = wrap(&cipher.dek, &derive(new, &salt, &stored.scrypt)?, "passphrase")?;
+        stored.dek_wrapped_passphrase = wrap(&cipher.dek, &derive(new, &salt, &cost)?, "passphrase")?;
+        // (at the cost of now: a key file of the lower one keeps it for its other slot)
+        stored.passphrase_scrypt = (cost != stored.scrypt).then_some(cost);
         self.rewrap(stored)
     }
 
@@ -648,11 +734,12 @@ impl Keystore {
 
     /// A new recovery code, shown once, for the same key: the old one stops working.
     pub fn new_recovery_code(&mut self, cipher: &Cipher) -> Result<String, KeyError> {
-        let (raw, salt) = (random_bytes::<RECOVERY_BYTES>()?, random_bytes::<SALT_BYTES>()?);
+        let (raw, salt, cost) = (random_bytes::<RECOVERY_BYTES>()?, random_bytes::<SALT_BYTES>()?, Keystore::cost());
         let code = format_recovery(&raw);
         let mut stored = self.stored.clone();
         stored.recovery_salt = b64e(&salt);
-        stored.dek_wrapped_recovery = wrap(&cipher.dek, &derive(&normalize_recovery(&code), &salt, &stored.scrypt)?, "recovery")?;
+        stored.dek_wrapped_recovery = wrap(&cipher.dek, &derive(&normalize_recovery(&code), &salt, &cost)?, "recovery")?;
+        stored.recovery_scrypt = (cost != stored.scrypt).then_some(cost);
         self.rewrap(stored)?;
         Ok(code)
     }
@@ -666,6 +753,10 @@ impl Keystore {
 
     /// The key file gone: the conversations must have been decrypted before this.
     pub fn remove(folder: &Path) -> Result<(), KeyError> {
+        // (its copy, and a damaged one kept beside it, go with it: each holds the key, wrapped)
+        for name in [KEYSTORE_COPY, KEYSTORE_DAMAGED_FILE] {
+            let _ = std::fs::remove_file(folder.join(name));
+        }
         let path = path_in(folder);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -823,18 +914,76 @@ mod tests {
         let other = value["dek_wrapped_recovery"].clone();
         value["dek_wrapped_passphrase"] = other;
         std::fs::write(&path, value.to_string()).unwrap();
-        assert_eq!(Keystore::load(dir.path()).unwrap().unlock("a passphrase of the test").unwrap_err(), KeyError::Wrong);
-        // a cost that would take the machine: refused before scrypt runs
-        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        value["scrypt"]["n"] = serde_json::json!(1u64 << 30);
+        assert!(matches!(Keystore::load(dir.path()), Err(KeyError::Corrupt(_))), "its check");
+        // (a file with no check, as one written before there was one, is refused where the key opens)
+        value.as_object_mut().unwrap().remove("check");
         std::fs::write(&path, value.to_string()).unwrap();
-        assert!(matches!(Keystore::load(dir.path()).unwrap().unlock("x"), Err(KeyError::Corrupt(_))));
+        assert_eq!(Keystore::load(dir.path()).unwrap().unlock("a passphrase of the test").unwrap_err(), KeyError::Wrong);
+        // a cost that would take the machine, or passes without end: refused before scrypt runs
+        for (field, cost) in [("n", 1u64 << 30), ("p", 1u64 << 20)] {
+            let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            value["scrypt"][field] = serde_json::json!(cost);
+            value.as_object_mut().unwrap().remove("check");
+            std::fs::write(&path, value.to_string()).unwrap();
+            assert!(matches!(Keystore::load(dir.path()).unwrap().unlock("x"), Err(KeyError::Corrupt(_))), "{field}");
+        }
         std::fs::write(&path, "{not json").unwrap();
         assert!(matches!(Keystore::load(dir.path()), Err(KeyError::Corrupt(_))));
         std::fs::write(&path, text.replace("\"version\": 1", "\"version\": 9")).unwrap();
         assert!(matches!(Keystore::load(dir.path()), Err(KeyError::Corrupt(_))));
         std::fs::remove_file(&path).unwrap();
         assert_eq!(Keystore::load(dir.path()).unwrap_err(), KeyError::Missing);
+    }
+
+    /// A key file changed by one letter says it is damaged, and is not taken for a passphrase typed wrong; its copy beside it opens the key, in its place,
+    /// and the damaged one is kept.
+    #[test]
+    fn a_damaged_key_file_says_so_and_its_copy_opens_the_key() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (_, cipher, code) = create(dir.path(), false);
+        let (path, copy) = (path_in(dir.path()), dir.path().join(KEYSTORE_COPY));
+        assert_eq!(std::fs::read(&path).unwrap(), std::fs::read(&copy).unwrap(), "written with it");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let salt = value["passphrase_salt"].as_str().unwrap().to_string();
+        let changed = format!("{}{}", if salt.starts_with('A') { 'B' } else { 'A' }, &salt[1..]);
+        std::fs::write(&path, text.replace(&salt, &changed)).unwrap();
+        let damaged = Keystore::load(dir.path()).unwrap_err();
+        assert!(matches!(damaged, KeyError::Corrupt(_)) && damaged.to_string().starts_with(KEYSTORE_DAMAGED), "{damaged}");
+        assert!(Keystore::copy_opens(dir.path()));
+        let store = Keystore::restore_copy(dir.path()).unwrap();
+        assert_eq!(store.unlock("a passphrase of the test").unwrap().fingerprint(), cipher.fingerprint());
+        assert_eq!(store.unlock_with_recovery(&code).unwrap().fingerprint(), cipher.fingerprint());
+        assert!(std::fs::read_to_string(dir.path().join(KEYSTORE_DAMAGED_FILE)).unwrap().contains(&changed), "the damaged one is kept");
+        // a copy that is damaged too is not offered
+        std::fs::write(&copy, "{not json").unwrap();
+        assert!(!Keystore::copy_opens(dir.path()));
+    }
+
+    /// A key made now has scrypt's cost of now; one of the Python Dogmind's (2^15, no check, no copy) opens as it was, gets a copy when it opens, and a
+    /// passphrase set again takes the cost of now for its slot alone: the recovery code still opens at its own.
+    #[test]
+    fn a_key_of_the_lower_cost_opens_and_a_slot_wrapped_again_takes_the_cost_of_now() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (store, cipher, code) = create(dir.path(), false);
+        assert_eq!(store.stored.scrypt, ScryptCost { n: 1 << 17, r: 8, p: 1 });
+        let lower = ScryptCost { n: 1 << 15, r: 8, p: 1 };
+        let mut old = store.stored.clone();
+        old.scrypt = lower.clone();
+        let (pass_salt, rec_salt) = (b64d(&old.passphrase_salt).unwrap(), b64d(&old.recovery_salt).unwrap());
+        old.dek_wrapped_passphrase = wrap(&cipher.dek, &derive("old passphrase", &pass_salt, &lower).unwrap(), "passphrase").unwrap();
+        old.dek_wrapped_recovery = wrap(&cipher.dek, &derive(&normalize_recovery(&code), &rec_salt, &lower).unwrap(), "recovery").unwrap();
+        std::fs::write(path_in(dir.path()), serde_json::to_string_pretty(&old).unwrap()).unwrap();
+        std::fs::remove_file(dir.path().join(KEYSTORE_COPY)).unwrap();
+        let mut store = Keystore::load(dir.path()).unwrap();
+        assert_eq!(store.unlock("old passphrase").unwrap().fingerprint(), cipher.fingerprint());
+        assert!(Keystore::copy_opens(dir.path()), "a copy once it opened");
+        store.change_passphrase(&cipher, "new passphrase").unwrap();
+        let store = Keystore::load(dir.path()).unwrap();
+        assert_eq!((store.stored.scrypt.n, store.stored.passphrase_scrypt.as_ref().map(|cost| cost.n)), (1 << 15, Some(1 << 17)));
+        assert_eq!(store.unlock("new passphrase").unwrap().fingerprint(), cipher.fingerprint());
+        assert_eq!(store.unlock_with_recovery(&code).unwrap().fingerprint(), cipher.fingerprint());
+        assert_eq!(store.unlock("old passphrase").unwrap_err(), KeyError::Wrong);
     }
 
     #[test]
@@ -847,8 +996,9 @@ mod tests {
         store.set_pending(None).unwrap();
         assert_eq!(Keystore::load(dir.path()).unwrap().pending(), None);
         assert!(!dir.path().join("conversation-key.json.part").exists(), "written beside and renamed");
+        assert!(dir.path().join(KEYSTORE_COPY).exists());
         Keystore::remove(dir.path()).unwrap();
-        assert!(!exists(dir.path()));
+        assert!(!exists(dir.path()) && !dir.path().join(KEYSTORE_COPY).exists(), "its copy with it");
         Keystore::remove(dir.path()).unwrap();
     }
 

@@ -865,13 +865,13 @@ pub fn rename(path: &Path, title: &str) -> Result<(), String> {
 /// messages it keeps; `title`, when given, is its name. This one is only read. What changed in the workspace since is not undone: a branch
 /// of the conversation, not of the files. A branch of an encrypted session is encrypted, under the same key, with an id of its own; one of a conversation with lines that did not open is
 /// refused, as it would leave them out without a word.
-pub fn fork(path: &Path, through: usize, title: Option<&str>) -> Result<PathBuf, String> {
-    fork_loaded(path, load_for_fork(path)?, through, title)
+pub fn fork(path: &Path, through: usize, title: Option<&str>, policy: &Policy) -> Result<PathBuf, String> {
+    fork_loaded(path, load_for_fork(path)?, through, title, policy)
 }
 
 /// Fork at the selected answer in the same snapshot used to find it. A restored row knows its message number.
 /// A streamed row is identified by its displayed words and the number of earlier matching answers.
-pub fn fork_answer(path: &Path, words: &str, saved_index: Option<usize>, earlier_matches: usize, title: Option<&str>) -> Result<Option<PathBuf>, String> {
+pub fn fork_answer(path: &Path, words: &str, saved_index: Option<usize>, earlier_matches: usize, title: Option<&str>, policy: &Policy) -> Result<Option<PathBuf>, String> {
     let loaded = load_for_fork(path)?;
     let words = words.trim();
     let matches = |message: &Message| message.role == "assistant" && message.content.as_deref().is_some_and(|text| crate::agent::shown_answer(text).trim() == words);
@@ -879,7 +879,7 @@ pub fn fork_answer(path: &Path, words: &str, saved_index: Option<usize>, earlier
         Some(index) => loaded.messages.get(index).filter(|message| matches(message)).map(|_| index),
         None => loaded.messages.iter().enumerate().filter(|(_, message)| matches(message)).nth(earlier_matches).map(|(index, _)| index),
     };
-    through.map(|index| fork_loaded(path, loaded, index, title)).transpose()
+    through.map(|index| fork_loaded(path, loaded, index, title, policy)).transpose()
 }
 
 fn load_for_fork(path: &Path) -> Result<Loaded, String> {
@@ -890,7 +890,7 @@ fn load_for_fork(path: &Path) -> Result<Loaded, String> {
     Ok(loaded)
 }
 
-fn fork_loaded(path: &Path, loaded: Loaded, through: usize, title: Option<&str>) -> Result<PathBuf, String> {
+fn fork_loaded(path: &Path, loaded: Loaded, through: usize, title: Option<&str>, policy: &Policy) -> Result<PathBuf, String> {
     let Loaded { workspace, mut messages, .. } = loaded;
     if through >= messages.len() {
         return Err(format!("{}: it has {} messages, not {}", path.display(), messages.len(), through + 1));
@@ -899,7 +899,8 @@ fn fork_loaded(path: &Path, loaded: Loaded, through: usize, title: Option<&str>)
     complete_tool_calls(&mut messages);
     let folder = path.parent().ok_or_else(|| format!("{}: no folder", path.display()))?;
     let now = chrono::Local::now();
-    let writer = sealed_of(path).map_err(|error| format!("{}: {error}", path.display()))?.map(|sealed| sealed.cipher);
+    // (as the conversations are written now, not as the one it is of was: a plain one's branch, after they were encrypted, would stay plain)
+    let writer = policy.writer()?;
     let mut copy = Session::create_with(folder, &workspace, &now.format("%Y-%m-%d %H:%M:%S %:z").to_string(), &now.format("%Y%m%d-%H%M%S").to_string(), writer.as_ref())?;
     let result = write_branch(&mut copy, path, &messages, title);
     let branch = copy.path.clone();
@@ -1113,14 +1114,14 @@ mod tests {
         session.mark_web_seen().unwrap();
         let path = session.path.clone();
         drop(session);
-        let branch = fork(&path, 1, None).unwrap();
+        let branch = fork(&path, 1, None, &Policy::default()).unwrap();
         assert_eq!(web_sources(&branch), (vec!["https://example.com/".to_string()], false));
         let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261124-3").unwrap();
         session.append(&Message::text("user", "go")).unwrap();
         session.mark_web_seen().unwrap();
         let path = session.path.clone();
         drop(session);
-        let branch = fork(&path, 0, None).unwrap();
+        let branch = fork(&path, 0, None, &Policy::default()).unwrap();
         assert_eq!(web_sources(&branch), (vec![UNTOLD_SOURCE.to_string()], false), "a mark that could not say where stays one");
     }
 
@@ -1141,7 +1142,7 @@ mod tests {
         fs::create_dir_all(crate::images::folder_of(&path)).unwrap();
         fs::write(crate::images::folder_of(&path).join("a.png"), b"png").unwrap();
         let before = fs::read(&path).unwrap();
-        let branch = fork(&path, 2, Some("a title (branch)")).unwrap();
+        let branch = fork(&path, 2, Some("a title (branch)"), &Policy::default()).unwrap();
         assert_ne!(branch, path);
         assert_eq!(fs::read(&path).unwrap(), before, "the original is only read");
         let (_, workspace, messages) = Session::open(&branch).unwrap();
@@ -1151,7 +1152,7 @@ mod tests {
         assert!(tools_of(&branch).is_some());
         let listed = list(dir.path());
         assert!(listed.iter().any(|summary| summary.path == branch && summary.title == "a title (branch)"), "{listed:?}");
-        assert!(fork(&path, 9, None).is_err());
+        assert!(fork(&path, 9, None, &Policy::default()).is_err());
     }
 
     #[test]
@@ -1162,13 +1163,13 @@ mod tests {
             session.append(&Message::text(role, text)).unwrap();
         }
         for (saved_index, earlier_matches) in [(Some(3), 0), (None, 1)] {
-            let branch = fork_answer(&session.path, " Done ", saved_index, earlier_matches, None).unwrap().unwrap();
+            let branch = fork_answer(&session.path, " Done ", saved_index, earlier_matches, None, &Policy::default()).unwrap().unwrap();
             let messages = read(&branch).unwrap();
             assert_eq!(messages.iter().map(|m| m.content.as_deref().unwrap()).collect::<Vec<_>>(), ["first", "Done", "second", " Done "]);
         }
-        assert!(fork_answer(&session.path, "Done", Some(2), 0, None).unwrap().is_none());
-        assert!(fork_answer(&session.path, "unsaved", None, 0, None).unwrap().is_none());
-        assert!(fork_answer(&dir.path().join("absent.jsonl"), "Done", None, 0, None).is_err());
+        assert!(fork_answer(&session.path, "Done", Some(2), 0, None, &Policy::default()).unwrap().is_none());
+        assert!(fork_answer(&session.path, "unsaved", None, 0, None, &Policy::default()).unwrap().is_none());
+        assert!(fork_answer(&dir.path().join("absent.jsonl"), "Done", None, 0, None, &Policy::default()).is_err());
     }
 
     #[cfg(windows)]
@@ -1193,10 +1194,10 @@ mod tests {
             files
         };
         let before = entries();
-        assert!(fork(&session.path, 0, None).unwrap_err().contains("locked.png"));
+        assert!(fork(&session.path, 0, None, &Policy::default()).unwrap_err().contains("locked.png"));
         assert_eq!(entries(), before);
         drop(held);
-        let copy = fork(&session.path, 0, None).unwrap();
+        let copy = fork(&session.path, 0, None, &Policy::default()).unwrap();
         let copied = crate::images::folder_of(&copy);
         assert_eq!(fs::read(copied.join("first.png")).unwrap(), b"first");
         assert_eq!(fs::read(copied.join("locked.png")).unwrap(), b"second");
@@ -1235,7 +1236,7 @@ mod tests {
         drop(file);
         rename(&path, "named after the cut").unwrap();
         assert_eq!(list(dir.path())[0].title, "named after the cut");
-        let copy = fork(&path, 1, None).unwrap();
+        let copy = fork(&path, 1, None, &Policy::default()).unwrap();
         assert_eq!(Session::open(&copy).unwrap().2.len(), 2);
     }
 
@@ -1598,7 +1599,7 @@ mod notice_tests {
         assert_eq!(read(&path).unwrap().len(), 2);
         assert_eq!(Session::open(&path).unwrap().2.len(), 2);
         assert_eq!(list(dir.path())[0].messages, 2);
-        assert_eq!(Session::open(&fork(&path, 1, None).unwrap()).unwrap().2.len(), 2);
+        assert_eq!(Session::open(&fork(&path, 1, None, &Policy::default()).unwrap()).unwrap().2.len(), 2);
     }
 }
 

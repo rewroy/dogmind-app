@@ -2755,6 +2755,8 @@ struct Crypt {
     cipher: Option<Arc<Cipher>>,
     /// The key file is there and cannot be read: said at the start, and nothing is opened.
     damaged: Option<String>,
+    /// And its copy beside it reads: the person is asked whether to open the conversations with it.
+    copy: bool,
     /// At the unlock page: the recovery code is typed, with a new passphrase, in place of the passphrase.
     by_code: bool,
     work: Option<CryptWork>,
@@ -2775,11 +2777,13 @@ struct Crypt {
 impl Crypt {
     /// What the data folder says: no key file, conversations as they are; one, and the key is asked for unless Windows has it for this user.
     fn open(folder: &Path) -> (Crypt, Arc<Policy>) {
-        let mut crypt = Crypt { keystore: None, cipher: None, damaged: None, by_code: false, work: None, said: String::new(), said_is_a_problem: false, code: None, remember: true, resume: None, back: Panel::Chat, sweep_due: false };
+        let mut crypt = Crypt { keystore: None, cipher: None, damaged: None, copy: false, by_code: false, work: None, said: String::new(), said_is_a_problem: false, code: None, remember: true, resume: None, back: Panel::Chat, sweep_due: false };
         let policy = match Keystore::load(folder) {
             Err(KeyError::Missing) => Policy::off(),
             Err(error) => {
-                crypt.damaged = Some(error.to_string());
+                // (damaged in words the page has in each language; another failure as it is)
+                crypt.damaged = Some(if matches!(error, KeyError::Corrupt(_)) { conversation_key::KEYSTORE_DAMAGED.to_string() } else { error.to_string() });
+                crypt.copy = Keystore::copy_opens(folder);
                 Policy::locked()
             }
             Ok(keystore) => {
@@ -4389,7 +4393,7 @@ impl App {
         let same_before = self.answers[..at].iter().filter(|(_, other, _)| other.trim() == words.trim()).count();
         // (one with no name yet is named by its first message, as the original is)
         let title = (!self.session_title.trim().is_empty()).then(|| tf("{0} (branch)", &[&self.session_title.trim()]));
-        match session::fork_answer(path, words, *saved_index, same_before, title.as_deref()) {
+        match session::fork_answer(path, words, *saved_index, same_before, title.as_deref(), &self.policy) {
             Ok(Some(branch)) => {
                 self.refresh_sessions();
                 self.open_session(branch);
@@ -8041,7 +8045,13 @@ impl App {
             }
             Panel::Unlock => {
                 if let Some(why) = &self.crypt.damaged {
-                    form.note(&tf("{0} It is conversation-key.json in {1}. Put back a copy of it, and start Dogmind again.", &[&t(why), &self.folder.display()]), theme::bad());
+                    if self.crypt.copy {
+                        form.note(&tf("{0} It is conversation-key.json in {1}. The copy of it that Dogmind keeps beside it opens: open your conversations with that copy? The damaged file is kept as conversation-key.json.damaged.", &[&t(why), &self.folder.display()]), theme::bad());
+                        form.y += s(ds::space::XS);
+                        form.buttons(0, &[self.buttons[0]]);
+                    } else {
+                        form.note(&tf("{0} It is conversation-key.json in {1}. Put back a copy of it, and start Dogmind again.", &[&t(why), &self.folder.display()]), theme::bad());
+                    }
                 } else if !self.crypt.by_code {
                     form.note(t("Your conversations are encrypted. Type your passphrase to open them."), theme::muted());
                     form.field(t("Passphrase"), self.fields[0]);
@@ -9564,7 +9574,8 @@ impl App {
                 set_text(self.buttons[1], if self.crypt.by_code { t("Use the passphrase instead") } else { t("Use the recovery code instead") });
                 self.set_button_kinds(&[ButtonKind::Primary, ButtonKind::Link]);
                 if self.crypt.damaged.is_some() {
-                    show(self.buttons[0], false);
+                    set_text(self.buttons[0], t("Use the copy"));
+                    show(self.buttons[0], self.crypt.copy);
                     show(self.buttons[1], false);
                 }
             }
@@ -12193,6 +12204,9 @@ impl App {
 
     unsafe fn crypt_unlock(&mut self) {
         if self.crypt.damaged.is_some() {
+            if self.crypt.copy {
+                self.crypt_use_copy();
+            }
             return;
         }
         let by_code = self.crypt.by_code;
@@ -12219,6 +12233,25 @@ impl App {
                 set_text(self.fields[0], "");
                 self.problem_in_panel(t(&error.to_string()));
             }
+        }
+    }
+
+    /// The key file was damaged and its copy opens, and the person chose it: the copy takes its place, the damaged one is kept beside it, and the key is
+    /// asked for as at a start (or is here at once, where Windows keeps it for this user).
+    unsafe fn crypt_use_copy(&mut self) {
+        match Keystore::restore_copy(&self.folder) {
+            Ok(keystore) => {
+                self.crypt.damaged = None;
+                self.crypt.copy = false;
+                self.crypt.remember = keystore.is_remembered();
+                let remembered = keystore.unlock_remembered().ok();
+                self.crypt.keystore = Some(keystore);
+                match remembered {
+                    Some(cipher) => self.unlocked(cipher),
+                    None => self.set_panel(Panel::Unlock),
+                }
+            }
+            Err(error) => self.problem_in_panel(t(&error.to_string())),
         }
     }
 
@@ -20399,11 +20432,13 @@ mod crypt_tests {
         keystore.set_remembered(&cipher, false).unwrap();
         assert!(Crypt::open(data.path()).0.is_locked());
 
-        // a file that cannot be read is locked, and says why
+        // a file that cannot be read is locked, and says why; its copy, which opens, is offered
         std::fs::write(conversation_key::path_in(data.path()), "{not a key file").unwrap();
         let (crypt, policy) = Crypt::open(data.path());
-        assert!(crypt.is_locked() && crypt.damaged.is_some() && crypt.keystore.is_none());
+        assert!(crypt.is_locked() && crypt.damaged.as_deref() == Some(conversation_key::KEYSTORE_DAMAGED) && crypt.keystore.is_none() && crypt.copy);
         assert!(policy.writer().is_err());
+        std::fs::write(data.path().join(conversation_key::KEYSTORE_COPY), "{not a copy either").unwrap();
+        assert!(!Crypt::open(data.path()).0.copy, "a copy that does not read is not offered");
     }
 
     /// Remove takes the key file with the conversations it was for, and the page's words are in both languages.
@@ -20413,9 +20448,12 @@ mod crypt_tests {
         std::fs::write(data.path().join("settings.json"), r#"{"providers": []}"#).unwrap();
         std::fs::create_dir_all(data.path().join("sessions")).unwrap();
         Keystore::create(data.path(), "the passphrase of the test", false, None).unwrap();
+        // (and what the sandbox's commands are given of the app's: its folder for them, and the workspaces' SIDs)
+        std::fs::create_dir_all(data.path().join(dogmind_agent::sandbox::FOR_SANDBOX)).unwrap();
+        std::fs::write(data.path().join("workspace-sids.txt"), "S-1-5-21-1-2-3-4\tc:\\w\n").unwrap();
         let mut taken: Vec<String> = settings::what_remove_takes(data.path(), None, None).unwrap().into_iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         taken.sort();
-        assert_eq!(taken, ["conversation-key.json", "sessions", "settings.json"]);
+        assert_eq!(taken, ["conversation-key.json", "conversation-key.json.copy", "for-sandbox", "sessions", "settings.json", "workspace-sids.txt"]);
         assert!(settings::what_remove_leaves(data.path(), None).is_empty());
     }
 }
