@@ -104,23 +104,39 @@ fn prepared(diff: &str) -> Vec<Prepared> {
 
 /// Whether the diff changes nothing but line endings: every removed line is an added line with a carriage return more or less. Which way, if so.
 fn only_line_endings(diff: &str) -> Option<&'static str> {
-    let (mut removed, mut added): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
-    for line in diff_lines(diff) {
-        match line.chars().next() {
-            Some('-') => removed.push(&line[1..]),
-            Some('+') => added.push(&line[1..]),
-            _ => {}
+    let mut lines = diff_lines(diff).peekable();
+    let mut direction = None;
+    let mut removed = Vec::new();
+    while let Some(line) = lines.next() {
+        if line.starts_with(['+', '\\']) {
+            // An unmatched addition or a missing final newline is a visible change.
+            return None;
+        }
+        let Some(first) = line.strip_prefix('-') else { continue };
+        removed.push(first);
+        while let Some(next) = lines.next_if(|s| s.starts_with('-')) {
+            removed.push(&next[1..]);
+        }
+        // Match replacements at this position. Comparing across context or hunk boundaries hides moves.
+        for old in removed.drain(..) {
+            let new = lines.next()?.strip_prefix('+')?;
+            if old == new {
+                continue;
+            }
+            let change = if !new.ends_with('\r') && old.strip_suffix('\r') == Some(new) {
+                "line endings only (CRLF → LF)"
+            } else if !old.ends_with('\r') && new.strip_suffix('\r') == Some(old) {
+                "line endings only (LF → CRLF)"
+            } else {
+                return None;
+            };
+            if direction.is_some_and(|earlier| earlier != change) {
+                return None;
+            }
+            direction = Some(change);
         }
     }
-    if removed.is_empty() || removed.len() != added.len() || !removed.iter().zip(&added).all(|(a, b)| a.trim_end_matches('\r') == b.trim_end_matches('\r')) {
-        return None;
-    }
-    let (with, without) = (removed.iter().filter(|line| line.ends_with('\r')).count(), added.iter().filter(|line| line.ends_with('\r')).count());
-    match (with, without) {
-        (0, 0) => None,
-        (more, fewer) if more >= fewer => Some("line endings only (CRLF → LF)"),
-        _ => Some("line endings only (LF → CRLF)"),
-    }
+    direction
 }
 
 /// `@@ -a,b +c,d @@ what it is in`: where the two sides begin, and the words.
@@ -358,6 +374,24 @@ mod tests {
         assert!(super::rows(with_change, "a.txt", 100).len() > 1);
         assert_eq!(only_line_endings("@@ -1,1 +1,1 @@\n-a\n+a\n"), None, "nothing differs at all: not a change of endings");
         assert_eq!(only_line_endings("@@ -1,1 +1,1 @@\n context\n"), None);
+    }
+
+    #[test]
+    fn moved_crlf_lines_keep_their_old_and_new_positions() {
+        let diff = "@@ -1,2 +1 @@\n-moved\r\n keep\r\n@@ -15,1 +14,2 @@\n end\r\n+moved\r\n";
+        let visible = rows(diff, "doc.txt", 20);
+        assert!(visible.iter().any(|r| r.kind == RowKind::Removed && r.old == Some(1) && r.text() == "moved"));
+        assert!(visible.iter().any(|r| r.kind == RowKind::Added && r.new == Some(15) && r.text() == "moved"));
+        // Even when its ending changes as it moves, its position is an edit.
+        assert_eq!(only_line_endings("@@ -1,2 +1,2 @@\n-moved\r\n keep\n+moved\n"), None);
+    }
+
+    #[test]
+    fn the_ending_summary_requires_one_direction_and_a_final_newline() {
+        assert_eq!(only_line_endings("@@ -1,2 +1,2 @@\n-a\r\n-b\n+a\n+b\r\n"), None);
+        assert_eq!(only_line_endings("@@ -1 +1 @@\n-a\r\n+a\n\\ No newline at end of file\n"), None);
+        assert_eq!(only_line_endings("@@ -1 +1 @@\n-a\r\r\n+a\r\n"), None);
+        assert_eq!(only_line_endings("@@ -1 +1 @@\n-a\r\n+a\n@@ -9 +9 @@\n-b\r\n+b\n"), Some("line endings only (CRLF → LF)"));
     }
 
     #[test]
