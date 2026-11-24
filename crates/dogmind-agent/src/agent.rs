@@ -2216,7 +2216,14 @@ impl Agent {
 
     /// The tools and what the bench holds, with these skills.
     fn extras_with(&mut self, found: Vec<skills::Skill>) {
+        // (a server whose tools would pass the budget in full has them told by name in `describe_tools`, which is in the list: the same text from one
+        // conversation to the next while the servers are, which the engine keeps)
         let servers = self.mcp.as_ref().map_or(Vec::new(), |hub| hub.schemas());
+        let by_name = prompt::told_by_name(&servers);
+        let (named, mut servers): (Vec<Value>, Vec<Value>) = servers.into_iter().partition(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name| by_name.contains(name)));
+        if !named.is_empty() {
+            servers.push(tools::describe_tools_listing(&named));
+        }
         self.tool_schemas = tools::schemas_for(self.web.enabled, found.iter().any(|skill| skill.for_the_model), self.memory.is_some(), servers, self.code_mode);
         // (DeepSeek was taught to change a file with one exact replacement, by these names: offered it beside apply_patch, it wrote its edits as a list in a
         // string twice in one conversation, each refused and sent again)
@@ -2265,10 +2272,15 @@ impl Agent {
     fn servers_caught_up(&mut self) -> Option<String> {
         let hub = self.mcp.clone()?;
         let name = |tool: &Value| tool.pointer("/function/name").and_then(Value::as_str).map(str::to_string);
-        let known: std::collections::HashSet<String> = self.tool_schemas.as_array().into_iter().flatten().chain(&self.added_tools).filter_map(name).collect();
-        let more: Vec<Value> = hub.schemas().into_iter().filter(|tool| name(tool).is_some_and(|it| !known.contains(&it))).collect();
+        let mut known: std::collections::HashSet<String> = self.tool_schemas.as_array().into_iter().flatten().chain(&self.added_tools).filter_map(name).collect();
+        known.extend(tools::named_in_list(&self.tool_schemas));
+        let mut more: Vec<Value> = hub.schemas().into_iter().filter(|tool| name(tool).is_some_and(|it| !known.contains(&it))).collect();
         if more.is_empty() {
             return None;
+        }
+        // (tools told by name are called after `describe_tools`, which comes with them the first time)
+        if !prompt::told_by_name(&more).is_empty() && !known.contains(prompt::DESCRIBE_TOOLS) {
+            more.push(tools::describe_tools_schema());
         }
         self.added_tools.extend(more.iter().cloned());
         let added = Value::Array(self.added_tools.clone());
@@ -2591,7 +2603,8 @@ impl Agent {
         self.traj.write("turn_start", None, json!({"chars": text.chars().count(), "images": pictures.len() + kept.len(), "first": new_session}));
         (self.made_this_turn, self.scratch_told, self.polish, self.put_before, self.explored) = (Vec::new(), false, Polish::default(), Vec::new(), false);
         self.failed_check = None;
-        let added = if new_session { None } else { self.servers_caught_up() };
+        // (in a new one too: a server that came between the list's making and the first message)
+        let added = self.servers_caught_up();
         let mut images = kept;
         if let Some(session) = self.session.as_ref().map(|session| session.path.clone()) {
             let limit = self.image_limit();
@@ -4231,6 +4244,7 @@ impl Agent {
         let limits = code_mode::Limits::default().with_timeout_seconds(arguments.get("timeout_seconds").and_then(Value::as_f64));
         let mut offered = code_mode::callable(&self.tool_schemas);
         offered.extend(code_mode::callable(&Value::Array(self.added_tools.clone())));
+        offered.extend(tools::named_in_list(&self.tool_schemas));
         let names: Vec<&str> = offered.iter().map(String::as_str).collect();
         self.program = Some(Program { id: id.to_string(), description, calls: 0, waited: Duration::ZERO, stranger: false });
         let cancel = self.cancel.clone();
@@ -10323,7 +10337,56 @@ Body").unwrap();
         assert_eq!(bodies[1]["tools"], bodies[0]["tools"], "the tools offered stay as they were");
         assert!(!names(&bodies[0]).contains(&"mcp__srv__u".to_string()));
         let told = bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
-        assert!(told.contains("## Tools Added") && told.contains("`mcp__srv__u`") && told.contains("tools.mcp__srv__u({})"), "{told}");
+        assert!(told.contains("## Tools Added") && told.contains("`mcp__srv__u`") && told.contains("from run_code as `await tools.<name>({...})`"), "{told}");
+        assert_eq!(told.matches("mcp__srv__u").count(), 1, "told of once: {told}");
+    }
+
+    /// A server with too many tools to tell of in full, connected as a conversation begins: its tools are told by name in `describe_tools`, in the list
+    /// (a small server's are in it in full, once), and one is called after `describe_tools` gave its arguments, directly and, in the next conversation,
+    /// from a program. The next conversation begins as the first did: the same list and the same messages before the person's.
+    #[test]
+    fn a_big_servers_tools_are_told_by_name_at_the_start_and_called_after_their_description() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let listed = |count: usize, size: usize| -> Vec<Value> {
+            (0..count).map(|at| serde_json::json!({"name": format!("tool_{at}"), "description": format!("Tool {at}. {}", "It does a thing in the editor, with options. ".repeat(size / 90)), "inputSchema": {"type": "object", "properties": {"x": {"type": "string", "description": "y".repeat(size / 2)}}}})).collect()
+        };
+        let answer = |id: u32, text: &str| serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": text}]}});
+        let hub = mcp::Hub::scripted("editor", &listed(196, 700), &[answer(1, "tool 7 answered"), answer(2, "tool 8 answered")], true);
+        hub.add_scripted("modeler", &listed(3, 300), &[], true);
+        let (client, bodies) = server(vec![
+            call_answer("describe_tools", serde_json::json!({"names": ["mcp__editor__tool_7"]})),
+            call_answer("mcp__editor__tool_7", serde_json::json!({"x": "a"})),
+            text_answer("done"),
+            call_answer("run_code", serde_json::json!({"code": "return await tools.mcp__editor__tool_8({x: 'b'});", "description": "call tool 8"})),
+            text_answer("done again"),
+        ]);
+        let (sender, events) = channel();
+        let sessions = crate::in_container::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: true }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("Arguments (JSON Schema)") && line.contains("Tool 7.")), "{log:?}");
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("tool 7 answered")), "{log:?}");
+        run.handle.commands.send(Command::NewSession(dir.path().to_path_buf())).unwrap();
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (log, _) = until_end(&run, Decision::Reject);
+        assert!(log.iter().any(|line| line.starts_with("tool:true:false:") && line.contains("tool 8 answered")), "a program calls one too: {log:?}");
+        let bodies = bodies.lock().unwrap();
+        let names: Vec<String> = bodies[0]["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect();
+        assert!(!names.iter().any(|name| name.starts_with("mcp__editor__")) && names.contains(&"mcp__modeler__tool_1".to_string()) && names.contains(&"describe_tools".to_string()), "{names:?}");
+        let listing = bodies[0]["tools"].as_array().unwrap().iter().find(|tool| tool["function"]["name"] == "describe_tools").unwrap()["function"]["description"].as_str().unwrap().to_string();
+        assert!(listing.contains("- `mcp__editor__tool_7`: Tool 7.") && !listing.contains("mcp__modeler__"), "{listing}");
+        assert!(!bodies[0]["messages"].to_string().contains(prompt::TOOLS_ADDED), "nothing told in the first message");
+        // (the 196 in full would be some 140,000 characters in the list and as many again in run_code's declarations)
+        let tools_size = bodies[0]["tools"].to_string().chars().count();
+        assert!(tools_size < 60_000, "the list {tools_size} characters");
+        // The next conversation's first request: the same list, and the same messages before the person's.
+        assert_eq!(bodies[3]["tools"], bodies[0]["tools"]);
+        let before_person = |body: &Value| body["messages"].as_array().unwrap().iter().take_while(|message| message["role"] != "user").cloned().collect::<Vec<_>>();
+        assert!(!before_person(&bodies[0]).is_empty());
+        assert_eq!(before_person(&bodies[3]), before_person(&bodies[0]));
     }
 
     /// A fork of the conversation cut before an added server's tools were told of tells of them again in its next turn, and once.

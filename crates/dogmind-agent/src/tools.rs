@@ -236,6 +236,33 @@ pub fn edit_as_patch(arguments: &Value, workspace: &Path) -> Value {
 }
 
 /// All the tools of a session: those every session has, and those that depend on what is on.
+/// `describe_tools`: what MCP servers' tools told by name only are, and their arguments, before one is called.
+pub fn describe_tools_schema() -> Value {
+    describe_tools_listing(&[])
+}
+
+/// `describe_tools` with the tools it is for told by name in its description, as a conversation's list has it: there the text is the same from one
+/// conversation to the next while the servers are, and the engine keeps it, where a conversation's first message is new each time.
+pub fn describe_tools_listing(named: &[Value]) -> Value {
+    let mut description = String::from("What MCP servers' tools that were told by name only are, as fully as their servers say, with their arguments' JSON Schema. Ask before a tool's first call.");
+    if !named.is_empty() {
+        description.push_str("\nThese are told by name, as their servers say a lot about them, and are called as the tools in your list are once you have their arguments:");
+        for tool in named {
+            description.push('\n');
+            description.push_str(&crate::prompt::told_by_its_name(tool));
+        }
+    }
+    json!({"type": "function", "function": {"name": crate::prompt::DESCRIBE_TOOLS, "description": description, "parameters": {"type": "object", "properties": {
+        "names": {"type": "array", "items": {"type": "string"}, "description": "The tools' names, as told (mcp__server__tool)."}
+    }, "required": ["names"]}}})
+}
+
+/// The tools a list's `describe_tools` tells of by name: callable as the list's own are.
+pub fn named_in_list(list: &Value) -> std::collections::HashSet<String> {
+    let description = list.as_array().into_iter().flatten().find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some(crate::prompt::DESCRIBE_TOOLS)).and_then(|tool| tool.pointer("/function/description")?.as_str());
+    description.into_iter().flat_map(|text| text.lines()).filter_map(|line| line.strip_prefix("- `")?.split_once('`').map(|(name, _)| name.to_string())).filter(|name| name.starts_with("mcp__")).collect()
+}
+
 pub fn schemas_for(web: bool, skills: bool, memory: bool, mcp: Vec<Value>, code_mode: bool) -> Value {
     let mut all = schemas();
     let Some(list) = all.as_array_mut() else { return all };
@@ -894,6 +921,14 @@ impl Workbench {
             "todo" => self.todo(arguments),
             "present" => present(arguments, workspace).map(|files| format!("The person sees a card with {}.", files.join(", "))),
             "skill" => self.read_skill(arguments),
+            crate::prompt::DESCRIBE_TOOLS => {
+                let hub = self.mcp.as_ref().ok_or("no MCP server is running")?;
+                let names: Vec<String> = arguments.get("names").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+                if names.is_empty() {
+                    return Err("names is required: the tools' names, as told (mcp__server__tool)".to_string());
+                }
+                Ok(hub.describe(&names))
+            }
             _ if tool.starts_with("mcp__") => {
                 let hub = self.mcp.as_ref().ok_or("no MCP server is running")?;
                 // What a server says may come from anywhere: it is data, as a page is.

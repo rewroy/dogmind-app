@@ -1262,18 +1262,20 @@ struct Running {
     /// What each tool is called by its server, by the name the model knows it by.
     names: BTreeMap<String, String>,
     schemas: Vec<Value>,
+    /// Its tools left out as it gives their name to others too ([`same_named`]): how many, and under how many names.
+    left_out: (usize, usize),
     process: Option<Arc<Process>>,
 }
 
 impl Running {
     /// Up, with the tools it listed as `schemas` (under its own names, and none placed yet).
     fn new(mut rpc: Rpc, schemas: Vec<Value>, process: Option<Process>) -> Running {
-        Running { reader: rpc.reader.take().map(Arc::new), changed: rpc.changed.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, process: process.map(Arc::new) }
+        Running { reader: rpc.reader.take().map(Arc::new), changed: rpc.changed.clone(), rpc: Arc::new(Mutex::new(rpc)), names: BTreeMap::new(), schemas, left_out: (0, 0), process: process.map(Arc::new) }
     }
 
     /// The same server with its tools as it lists them now.
     fn with_tools(&self, names: BTreeMap<String, String>, schemas: Vec<Value>) -> Running {
-        Running { reader: self.reader.clone(), rpc: self.rpc.clone(), changed: self.changed.clone(), names, schemas, process: self.process.clone() }
+        Running { reader: self.reader.clone(), rpc: self.rpc.clone(), changed: self.changed.clone(), names, schemas, left_out: self.left_out, process: self.process.clone() }
     }
 
     fn disconnected(&self) -> bool {
@@ -1435,6 +1437,9 @@ fn schema_of(server: &str, part: &str, tool: &Value) -> Option<(String, String, 
 /// names from another server's.
 fn place_tools(server: &str, part: &str, tools: &[Value], selection: Option<&ToolSelection>) -> (BTreeMap<String, String>, Vec<Value>) {
     let mut listed: Vec<(String, String, Value)> = tools.iter().filter_map(|tool| schema_of(server, part, tool)).collect();
+    // (none of the tools a server gives one name to can be called by it: they are not offered, and the connection's facts say so)
+    let shared = same_named(tools).1;
+    listed.retain(|(_, real, _)| !shared.contains(real));
     listed.sort_by(|a, b| a.1.cmp(&b.1));
     let (mut names, mut schemas) = (BTreeMap::new(), Vec::new());
     for (base, real, mut schema) in listed {
@@ -1460,7 +1465,21 @@ fn ready(name: &str, part: &str, config: &ServerConfig) -> Result<Arc<Running>, 
     let mut running = start_server(config)?;
     let tools = std::mem::take(&mut running.schemas);
     (running.names, running.schemas) = place_tools(name, part, &tools, Some(&config.tool_selection));
+    running.left_out = same_named(&tools).0;
     Ok(Arc::new(running))
+}
+
+/// The names a server gives to more than one of its tools, and how many tools that is and under how many names. A call names the tool it wants, and
+/// to such a name the server cannot tell which is meant: a game editor's server lists seven tools as `status` (its editor's, its console's, its build's)
+/// and answers a call of any of them that "'status' names several commands".
+fn same_named(tools: &[Value]) -> ((usize, usize), BTreeSet<String>) {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for name in tools.iter().filter_map(|tool| tool.get("name")?.as_str()) {
+        *counts.entry(name).or_default() += 1;
+    }
+    let shared: BTreeSet<String> = counts.iter().filter(|(_, count)| **count > 1).map(|(name, _)| name.to_string()).collect();
+    let tools = counts.iter().filter(|(_, count)| **count > 1).map(|(_, count)| count).sum();
+    ((tools, shared.len()), shared)
 }
 
 impl Hub {
@@ -1646,7 +1665,7 @@ impl Hub {
         }
         slot.dropped.retain(|name| !names.contains_key(name));
         slot.dropped.extend(now.names.keys().filter(|name| !names.contains_key(*name)).cloned());
-        slot.running = Some(Arc::new(now.with_tools(names, schemas)));
+        slot.running = Some(Arc::new(Running { left_out: same_named(&tools).0, ..now.with_tools(names, schemas) }));
     }
 
     /// A server that has ended starts again, on a thread of its own: its handshake can take a minute, and a person who stops the turn does not wait for that. This call is
@@ -1701,6 +1720,22 @@ impl Hub {
     pub fn trusts_tool(&self, tool: &str) -> bool {
         let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         slots.iter().find(|slot| slot.running.as_ref().is_some_and(|running| running.names.contains_key(tool))).is_some_and(|slot| slot.trusted)
+    }
+
+    /// What each of these tools is, as fully as its server says it, with its arguments' JSON Schema: for tools told by name only, before a call.
+    pub fn describe(&self, names: &[String]) -> String {
+        let schemas = self.schemas();
+        let name_of = |schema: &Value| schema["function"]["name"].as_str().unwrap_or("").to_string();
+        names.iter().map(|name| {
+            // (a tool's own name, as its server has it, where one tool goes by it: a model asked for `get_hierarchy` as well as `mcp__unity__get_hierarchy`)
+            let exact: Vec<&Value> = schemas.iter().filter(|schema| name_of(schema) == *name).collect();
+            let found = if exact.is_empty() { schemas.iter().filter(|schema| name_of(schema).ends_with(&format!("__{name}"))).collect() } else { exact };
+            match found.as_slice() {
+                [schema] => format!("`{}`: {} Arguments (JSON Schema): {}", name_of(schema), schema["function"]["description"].as_str().unwrap_or("").trim(), schema["function"]["parameters"]),
+                [] => format!("`{name}`: no running server has a tool of this name"),
+                several => format!("`{name}`: several tools go by it; ask for one by its whole name: {}", several.iter().map(|schema| format!("`{}`", name_of(schema))).collect::<Vec<_>>().join(", ")),
+            }
+        }).collect::<Vec<_>>().join("\n")
     }
 
     /// The server a call of this tool reaches, by its name in the file; none when no running server has the tool.
@@ -1759,15 +1794,22 @@ impl Hub {
     #[cfg(test)]
     fn add_running(&self, server: &str, tools: &[Value], writer: Box<dyn Write + Send>, reader: impl BufRead + Send + 'static, trusted: bool) {
         let (names, schemas) = place_tools(server, &name_part(server), tools, None);
-        let running = Arc::new(Running { names, schemas, ..Running::new(Rpc::over(writer, reader), Vec::new(), None) });
+        let running = Arc::new(Running { names, schemas, left_out: same_named(tools).0, ..Running::new(Rpc::over(writer, reader), Vec::new(), None) });
         self.slots.lock().unwrap().push(Slot { name: server.into(), part: name_part(server), running: Some(running), trusted, ..Slot::default() });
     }
 
     /// The desktop client's current view. Keep launch arguments, headers and server error messages out of the prompt.
     pub(crate) fn connection_facts(&self) -> String {
+        let left_out: BTreeMap<String, (usize, usize)> = {
+            let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            slots.iter().filter_map(|slot| Some((slot.name.clone(), slot.running.as_ref()?.left_out))).filter(|(_, (tools, _))| *tools > 0).collect()
+        };
         let states: Vec<String> = self.states().into_iter().map(|(name, state)| {
             let state = match state {
-                State::Up(count) => format!("connected, tools: {count}"),
+                State::Up(count) => match left_out.get(&name) {
+                    Some((tools, names)) => format!("connected, tools: {count} ({tools} more are not offered: the server gives {names} of its tool names to more than one tool, and refuses a call by such a name)"),
+                    None => format!("connected, tools: {count}"),
+                },
                 State::Starting => "starting".into(),
                 State::Disconnected => "disconnected".into(),
                 State::Failed(_) => "failed to start".into(),
@@ -3000,6 +3042,25 @@ enabled = false
         hub.set_trusted("editor", true).unwrap();
         assert!(!std::fs::read_to_string(&file).unwrap().contains("trusted"), "back to the default: nothing said");
         assert!(hub.trust()[0].1);
+    }
+
+    /// A name a server gives to several of its tools calls none of them: they are not offered, and the connection's facts say how many there are.
+    #[test]
+    fn tools_a_server_gives_one_name_to_are_left_out_and_said_to_be() {
+        let tool = |name: &str, about: &str| json!({"name": name, "description": about, "inputSchema": {"type": "object"}});
+        let tools = [tool("status", "Editor status."), tool("status", "Build status."), tool("status", "Console status."), tool("get", "A setting."), tool("get", "A clip."), tool("batch", "Several commands.")];
+        let hub = Hub::scripted("unity", &tools, &[], true);
+        let names: Vec<String> = hub.schemas().iter().map(|schema| schema["function"]["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, ["mcp__unity__batch"], "none of status_2, get_2 and the like, which the server would refuse");
+        assert_eq!(hub.states(), [("unity".to_string(), State::Up(1))], "and the count is of what can be called");
+        let facts = hub.connection_facts();
+        assert!(facts.contains("unity: connected, tools: 1 (5 more are not offered: the server gives 2 of its tool names to more than one tool"), "{facts}");
+        // (describe_tools: by the whole name, and by the tool's own where one goes by it)
+        let told = hub.describe(&["mcp__unity__batch".to_string(), "batch".to_string(), "status".to_string()]);
+        assert_eq!(told.matches("`mcp__unity__batch`: From the MCP server unity. Several commands.").count(), 2, "{told}");
+        assert!(told.contains("`status`: no running server has a tool of this name"), "{told}");
+        hub.add_scripted("other", &[tool("batch", "Another.")], &[], true);
+        assert!(hub.describe(&["batch".to_string()]).contains("several tools go by it; ask for one by its whole name: `mcp__unity__batch`, `mcp__other__batch`"));
     }
 
     #[test]

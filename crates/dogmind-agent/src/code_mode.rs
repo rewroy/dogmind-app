@@ -634,11 +634,16 @@ pub fn schema(offered: &Json) -> Json {
 /// [`schema`], with the rules that push for programs or the default ones.
 fn schema_with(offered: &Json, eager: bool) -> Json {
     let mut description = String::from(if eager { RULES_EAGER } else { RULES });
-    for tool in offered.as_array().into_iter().flatten() {
+    // (an MCP server's tool is in the list in full: it is told of once, there, and a program calls it as any other)
+    let server = |tool: &&Json| tool.pointer("/function/name").and_then(Json::as_str).is_some_and(|name| name.starts_with("mcp__"));
+    for tool in offered.as_array().into_iter().flatten().filter(|tool| !server(tool)) {
         if let Some(line) = declaration(tool) {
             description.push('\n');
             description.push_str(&line);
         }
+    }
+    if offered.as_array().into_iter().flatten().any(|tool| server(&tool)) {
+        description.push_str("\nThe MCP servers' tools in your list (`mcp__...`) are called the same way, as `await tools.<name>({...})` (`tools[\"<name>\"]` for a name with `-` in it) with the arguments their schemas give.");
     }
     let time = format!("Its own running time in seconds, not counting the calls' waits. Default {}, at most {}.", TIME_DEFAULT.as_secs(), TIME_MOST.as_secs());
     json!({"type": "function", "function": {"name": "run_code", "description": description, "parameters": {"type": "object", "properties": {
@@ -1188,9 +1193,9 @@ mod tests {
         assert_eq!(lines[1], "tools.read_file({path, limit?}) — Read a text file.");
         assert_eq!(lines[2], "tools.todo({todos: [{id, status?: \"pending\"|\"done\"}], merge?}) — A checklist.");
         assert_eq!(lines[3], "tools.show_diff({scope: \"session\"|\"staged\", paths?: [string], depth?: [number]})");
-        assert_eq!(lines[4], "tools[\"mcp__a-b__c.d\"]({}) — Version 1.2 of it is here.");
-        assert_eq!(lines[5], "tools.mcp__s__t({})");
-        assert_eq!(lines.len(), 6);
+        // (an MCP server's tool is in the list in full, and is told of once: there)
+        assert!(lines[4].starts_with("The MCP servers' tools in your list") && !description.contains("Version 1.2"), "{description}");
+        assert_eq!(lines.len(), 5);
     }
 
     #[test]
