@@ -186,7 +186,7 @@ pub fn schemas() -> Value {
             "path": {"type": "string"},
             "url": {"type": "string", "description": "Instead of path: http://localhost:PORT/ on a running server, without steps."},
             "views": {"type": "array", "items": {"type": "string"}, "description": "desktop (default), mobile, or WxH"},
-            "wait_ms": {"type": "integer", "description": "At most 10000"},
+            "wait_ms": {"type": "integer", "description": "Virtual ms incl. waits. Default 1500 (steps 3000). Max 10000."},
             "steps": {"type": "string", "description": "JS run after load: await click/fill/press/check/select(sel, ...), wait(ms); text/count/visible(sel); console.log results. A reload (await reload()) starts the next part in the new load; variables do not carry over."}
         }), &[]),
         function("command_status", "A background command's state, and what it printed since the last look. Also your waits.", json!({"id": {"type": "string"}}), &[]),
