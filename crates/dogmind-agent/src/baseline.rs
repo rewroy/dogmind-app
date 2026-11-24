@@ -110,6 +110,26 @@ fn entry_of(folder: &Path, name: &str, path: &Path, data: &std::fs::Metadata, ke
     entry
 }
 
+/// A Git blob often has LF where its Windows checkout has CRLF. Show that difference
+/// once so the unified diff still locates the edited lines within the report limit.
+fn text_diff(name: &str, before: &str, after: &str) -> String {
+    fn uniform_crlf(text: &str) -> Option<bool> {
+        let mut ends = text.match_indices('\n').map(|(at, _)| text[..at].ends_with('\r'));
+        let first = ends.next()?;
+        ends.all(|crlf| crlf == first).then_some(first)
+    }
+
+    let diff = |old: &str, new: &str| FileChange::between(name, Some(old), Some(new)).diff;
+    if before.contains("\r\n") != after.contains("\r\n") {
+        match (uniform_crlf(before), uniform_crlf(after)) {
+            (Some(false), Some(true)) => return format!("line endings: LF to CRLF\n{}", diff(before, &after.replace("\r\n", "\n"))),
+            (Some(true), Some(false)) => return format!("line endings: CRLF to LF\n{}", diff(&before.replace("\r\n", "\n"), after)),
+            _ => {}
+        }
+    }
+    diff(before, after)
+}
+
 /// What was there before, as far as it is known.
 enum Before {
     Absent,
@@ -287,7 +307,8 @@ impl Baseline {
                 // (a file too large to have kept could have been created large as well: an answer has its limit)
                 (Before::Absent, Some(after)) if after.len() as u64 > MOST_COPIED => edited_diff(name),
                 (Before::Absent, after) => Some(FileChange::between(name, None, after.as_deref().map(text).as_deref()).diff),
-                (Before::Bytes(before), after) => Some(FileChange::between(name, Some(&text(before)), after.as_deref().map(text).as_deref()).diff),
+                (Before::Bytes(before), Some(after)) => Some(text_diff(name, &text(before), &text(after))),
+                (Before::Bytes(before), None) => Some(FileChange::between(name, Some(&text(before)), None).diff),
             };
             match diff {
                 Some(diff) => {
@@ -313,6 +334,19 @@ impl Baseline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checkout_with_other_line_endings_still_shows_the_edited_lines() {
+        let before = "first\nold\nlast\n";
+        let after = "first\r\nnew\r\nlast\r\n";
+        let report = text_diff("a", before, after);
+        assert!(report.starts_with("line endings: LF to CRLF\n"));
+        assert!(report.contains("-old\n+new\n") && !report.contains("-first"));
+        assert_eq!(text_diff("a", "x\r\n", "x\n"), "line endings: CRLF to LF\n");
+        assert!(text_diff("a", "a\nb\n", "a\r\nb").contains("No newline at end of file"));
+        let mixed = "first\r\nnew\nlast\r\n";
+        assert_eq!(text_diff("a", before, mixed), FileChange::between("a", Some(before), Some(mixed)).diff);
+    }
 
     fn fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
         let (work, sessions) = (crate::in_container::tempdir().unwrap(), crate::in_container::tempdir().unwrap());
