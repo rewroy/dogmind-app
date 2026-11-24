@@ -448,6 +448,7 @@ const JA: &[(&str, &str)] = &[
     ("Unpin", "ピン留めを外す"),
     ("Pin this session to the top of the sidebar, or unpin it", "このセッションをサイドバーの上にピン留め、または解除"),
     ("Trust what it returns", "返す内容を信頼する"),
+    ("Describe tools", "ツールの説明を取得"),
     ("What a trusted server returns no longer makes later commands ask. Its own tools still ask.", "信頼したサーバーの返す内容を理由に、以後のコマンドが確認することはなくなります。サーバー自身のツールは引き続き確認します。"),
     ("What this server returns no longer counts as web content, so later commands stop asking on its account. Its tools still ask, and in a session that already has web content they keep asking. What it returns is still marked as data.", "このサーバーの返す内容は Web の内容として扱われなくなり、それを理由に以後のコマンドが確認することはなくなります。ツール自体は引き続き確認し、すでに Web の内容がある会話では確認を続けます。返す内容は引き続きデータとして扱います。"),
     ("Needs an NVIDIA GPU. Downloads a model of about 75 GB", "NVIDIA の GPU が必要です。約 75 GB のモデルをダウンロードします"),

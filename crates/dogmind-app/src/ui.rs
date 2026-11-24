@@ -17940,6 +17940,7 @@ pub(crate) fn tool_name(tool: &str) -> &str {
         "check_page" => "Check a page",
         "explore" => "Look into",
         "run_code" => "Run a program",
+        "describe_tools" => "Describe tools",
         other => other,
     }
 }
