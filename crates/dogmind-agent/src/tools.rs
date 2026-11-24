@@ -2270,17 +2270,17 @@ pub fn workspace_changes(workspace: &Path) -> Result<Vec<FileChange>, String> {
 }
 
 /// The new files git knows of and does not track, under these paths or all. What it ignores is left out.
-pub(crate) fn untracked_names(workspace: &Path, paths: &[&str]) -> Vec<String> {
-    let mut args = vec!["--no-optional-locks", "-c", "core.quotepath=off", "ls-files", "--others", "--exclude-standard"];
+pub(crate) fn untracked_names(workspace: &Path, paths: &[&str]) -> Result<Vec<String>, String> {
+    let mut args = vec!["--no-optional-locks", "ls-files", "-z", "--others", "--exclude-standard"];
     if !paths.is_empty() {
         args.push("--");
         args.extend(paths);
     }
-    git(workspace, &args).map_or(Vec::new(), |names| names.lines().map(str::to_string).collect())
+    git(workspace, &args).map(|names| names.split_terminator('\0').map(str::to_string).collect())
 }
 
 fn untracked_changes(workspace: &Path, paths: &[&str]) -> Vec<FileChange> {
-    untracked_names(workspace, paths).iter().take(MAX_UNTRACKED_SHOWN).map(|name| {
+    untracked_names(workspace, paths).unwrap_or_default().iter().take(MAX_UNTRACKED_SHOWN).map(|name| {
         let path = workspace.join(name);
         let small = std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_UNTRACKED_BYTES);
         let content = if small { std::fs::read(&path).ok().and_then(|bytes| String::from_utf8(bytes).ok()) } else { None };

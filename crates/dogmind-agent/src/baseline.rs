@@ -4,7 +4,7 @@
 //! already changed before the session is not taken for this session's work. Outside one, or before the first commit: a list of the folder's files, with a copy of each small
 //! text file. What is too large or too much is listed or left out, and the answer says so. Neither copies a whole folder, and what `.gitignore` skips is skipped.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -85,14 +85,23 @@ fn modified(data: &std::fs::Metadata) -> Option<u128> {
     data.modified().ok()?.duration_since(UNIX_EPOCH).ok().map(|since| since.as_nanos())
 }
 
-/// Each path that differs and whether it existed in the given commit. Leave Git's optional locks free for other clients.
-fn differing(workspace: &Path, head: &str) -> Vec<(String, bool)> {
-    let output = git(workspace, &["--no-optional-locks", "diff", "--no-renames", "--name-status", "-z", "--relative", head]).unwrap_or_default();
-    let mut fields = output.split_terminator('\0');
-    std::iter::from_fn(|| {
-        let status = fields.next()?;
-        Some((fields.next()?.to_string(), status != "A"))
-    }).collect()
+/// Git candidates relative to the saved commit. Only a complete listing can establish that a new path has no old blob.
+fn git_candidates(workspace: &Path, head: &str) -> (BTreeMap<String, bool>, bool) {
+    let tracked = git(workspace, &["--no-optional-locks", "diff", "--no-renames", "--name-status", "-z", "--relative", head]);
+    let untracked = untracked_names(workspace, &[]);
+    let complete = tracked.is_ok() && untracked.is_ok();
+    let mut names = BTreeMap::new();
+    if let Ok(output) = tracked {
+        let mut fields = output.split_terminator('\0');
+        while let (Some(status), Some(name)) = (fields.next(), fields.next()) {
+            names.insert(name.to_string(), status != "A");
+        }
+    }
+    for name in untracked.unwrap_or_default() {
+        // A staged deletion can also appear as untracked if the file was recreated.
+        names.entry(name).or_insert(false);
+    }
+    (names, complete)
 }
 
 /// One file as it is now, with a copy of it if it is small text and within what may be kept.
@@ -142,6 +151,20 @@ enum Before {
     Unknown(u64),
 }
 
+/// If Git could not list changes, a path listed as untracked might still have belonged to the starting commit.
+fn committed_file(workspace: &Path, head: &str, name: &str, existed: bool, complete: bool) -> Result<Before, String> {
+    if !existed {
+        if complete {
+            return Ok(Before::Absent);
+        }
+        let entry = git(workspace, &["--no-optional-locks", "--literal-pathspecs", "ls-tree", "-z", head, "--", name])?;
+        if entry.split_whitespace().nth(1) != Some("blob") {
+            return Ok(Before::Absent);
+        }
+    }
+    git_raw(workspace, &["--no-optional-locks", "show", &format!("{head}:./{name}")]).map(Before::Bytes)
+}
+
 impl Baseline {
     /// A session's, as it was first taken; taken now if it has none.
     pub fn for_session(session: &Path, workspace: &Path) -> Baseline {
@@ -179,12 +202,13 @@ impl Baseline {
         let (mut files, mut kept, mut whole) = (BTreeMap::new(), 0u64, true);
         match &head {
             Some(head) => {
-                let names: BTreeSet<String> = differing(workspace, head).into_iter().map(|(name, _)| name).chain(untracked_names(workspace, &[])).collect();
+                let (names, complete) = git_candidates(workspace, head);
+                whole = complete;
                 // The time is for the copies. What git took to name the files is no reason to keep none of them: on a busy machine it
                 // was all of it, and what was changed before the session was taken for the session's work. Past the time each is still
                 // kept by its size and time, which costs nothing to ask, and only its copy is left out.
                 let started = Instant::now();
-                for name in names {
+                for name in names.into_keys() {
                     if files.len() >= MOST_FILES {
                         whole = false;
                         break;
@@ -220,17 +244,14 @@ impl Baseline {
 
     /// Each candidate and whether it existed at the start, followed by whether the list is complete.
     fn candidates(&self, workspace: &Path) -> (BTreeMap<String, bool>, bool) {
-        let mut names: BTreeMap<_, _> = self.files.iter().map(|(name, entry)| (name.clone(), !entry.gone)).collect();
+        let saved = self.files.iter().map(|(name, entry)| (name.clone(), !entry.gone));
         if let Some(head) = &self.head {
-            // A saved worktree entry takes precedence over the commit (including a deletion before the session).
-            for (name, in_commit) in differing(workspace, head) {
-                names.entry(name).or_insert(in_commit);
-            }
-            for name in untracked_names(workspace, &[]) {
-                names.entry(name).or_insert(false);
-            }
-            return (names, self.whole);
+            let (mut names, complete) = git_candidates(workspace, head);
+            // The saved worktree takes precedence over the commit, including pre-session deletions.
+            names.extend(saved);
+            return (names, self.whole && complete);
         }
+        let mut names: BTreeMap<_, _> = saved.collect();
         let started = Instant::now();
         let mut seen = 0;
         for entry in walker(workspace, true).build().flatten() {
@@ -282,7 +303,7 @@ impl Baseline {
             }
             // (nothing is shown of it, and to read it is to hold it: one larger than memory would end the app, with the person's conversation in it)
             if let Some(size) = now.as_ref().map(std::fs::Metadata::len).filter(|size| *size > MOST_READ) {
-                lines.push(format!("{} {name} ({size} bytes): too large to compare or show", if existed { "changed" } else { "created" }));
+                lines.push(format!("{} {name} ({size} bytes): too large to compare or show", if existed { "changed" } else if whole { "created" } else { "present" }));
                 continue;
             }
             let after = match now.map(|_| std::fs::read(&path)).transpose() {
@@ -300,7 +321,13 @@ impl Baseline {
                     None => Before::Unknown(entry.size),
                 },
                 None => match &self.head {
-                    Some(head) => git_raw(workspace, &["--no-optional-locks", "show", &format!("{head}:./{name}")]).map_or(Before::Absent, Before::Bytes),
+                    Some(head) => match committed_file(workspace, head, name, existed, whole) {
+                        Ok(before) => before,
+                        Err(error) => {
+                            lines.push(format!("could not compare {name} with the starting commit: {error}"));
+                            continue;
+                        }
+                    },
                     None => Before::Absent,
                 },
             };
@@ -346,7 +373,7 @@ impl Baseline {
                 None => lines.push(word),
             }
         }
-        let partly = if whole { "" } else { "--- too much to look through completely, so this may not be everything ---\n" };
+        let partly = if whole { "" } else { "--- could not list all files, so this may not be everything ---\n" };
         // (said every time: what changed before the starting point moved is not in this, and a model that reads "nothing changed" would take it for the whole session)
         let moved = self.moved.as_ref().map_or(String::new(), |time| format!("note: the record of where this session began could not be read, so it began again at {time}: what the session changed before then is not shown here, and the files themselves are the way to see it.\n"));
         if lines.is_empty() {
@@ -468,6 +495,30 @@ mod tests {
         std::fs::File::create(work.path().join("data.bin")).unwrap().set_len(MOST_READ + 1).unwrap();
         let said = baseline.changes(work.path(), &[]);
         assert!(said.contains("created data.bin") && said.contains("too large"), "{said}");
+    }
+
+    #[test]
+    fn a_recreated_untracked_path_still_compares_with_its_blob_if_git_cannot_list_changes() {
+        let (work, _keep, session) = fixture();
+        repository(work.path());
+        let baseline = Baseline::for_session(&session, work.path());
+        run_git(work.path(), &["rm", "--cached", "-q", "--", "a.txt"]);
+        std::fs::write(work.path().join("a.txt"), "recreated\n").unwrap();
+        std::fs::write(work.path().join("fresh.txt"), "new\n").unwrap();
+        let complete = baseline.changes(work.path(), &[]);
+        assert!(complete.contains("changed a.txt") && complete.contains("-committed") && complete.contains("+recreated"), "{complete}");
+        assert!(complete.contains("created fresh.txt"), "{complete}");
+        // The tracked diff fails, but Git still lists a.txt among the untracked paths and can read its original blob.
+        run_git(work.path(), &["config", "diff.orderFile", "missing-order-file"]);
+        let partial = baseline.changes(work.path(), &[]);
+        let (notice, changes) = partial.split_once('\n').unwrap();
+        assert!(notice.contains("could not list all files"), "{partial}");
+        assert_eq!(changes, complete);
+
+        let mut unavailable = baseline;
+        unavailable.head = Some("0000000000000000000000000000000000000000".to_string());
+        let report = unavailable.changes(work.path(), &["a.txt"]);
+        assert!(report.contains("could not compare a.txt with the starting commit") && !report.contains("created a.txt"), "{report}");
     }
 
     #[test]
