@@ -308,6 +308,10 @@ pub fn scratch_files(files: &[String], goal: bool) -> String {
     format!("{DRAFT_NOTE}Files you made in this turn that neither your answer nor the user names: {}. Delete those that were only for checking, in one command, and keep what the user's work needs; {then}.", files.join(", "))
 }
 
+/// What is said of a page whose module scripts load its own files: a browser refuses those from file://, which this check allows. It used to say to check it through a local server,
+/// and a model made a page that ran only so: the person opened it from its folder, by a double-click, and nothing of it ran.
+pub(crate) const LOCAL_MODULE_WORDS: &str = "Opened from its file, as the user opens a page by a double-click, its module scripts that load its own files do not run at all: a browser refuses them from file://, which this check allows. Unless the user is to open it from a server, put that code in plain <script> tags, or import only from CDN addresses.";
+
 /// After a page has passed check_page with no error, and has been changed and passed again and again, and the model has looked at its latest picture: to go through what was
 /// asked against that picture, and answer if nothing is missing. Two lottery turns went on so until their 25 minutes were up, with no answer written; and the owner: speed
 /// matters, and so does quality, so it is not told to stop, but to see whether all that was asked is there.

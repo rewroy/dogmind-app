@@ -3,6 +3,7 @@
 
 mod cdn;
 
+use crate::prompt::LOCAL_MODULE_WORDS;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -728,10 +729,6 @@ fn supports_virtual_screen(program: &Path) -> bool {
         (*fixed.cast::<VS_FIXEDFILEINFO>()).dwFileVersionMS >> 16 >= 142
     }
 }
-
-/// What is said of a page whose module scripts load its own files: a browser refuses those from file://, which this check allows. It used to say to check it through a local server,
-/// and a model made a page that ran only so: the person opened it from its folder, by a double-click, and nothing of it ran.
-const LOCAL_MODULE_WORDS: &str = "Opened from its file, as the user opens a page by a double-click, its module scripts that load its own files do not run at all: a browser refuses them from file://, which this check allows. Unless the user is to open it from a server, put that code in plain <script> tags, or import only from CDN addresses.";
 
 /// Origin and path of a validated local server URL. A slash in a query or fragment belongs to neither.
 fn served_origin_and_path(url: &str) -> (&str, &str) {

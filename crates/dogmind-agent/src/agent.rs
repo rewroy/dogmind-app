@@ -1053,7 +1053,7 @@ fn polish_due(polish: &Polish, pictures: bool) -> bool {
 /// Whether what check_page said is of a page that ran with nothing wrong: none of what it says of an error, a script that did not run or load, a file missing, a page
 /// that does not run opened from its file, or a check that could not be made.
 fn page_ran_clean(said: &str) -> bool {
-    const INCOMPLETE: &[&str] = &["MISSING:", "DID NOT RUN,", "NOT CHECKED:", "NOT LOADED,", "THE PAGE COULD NOT BE LOADED:", "AS THE USER OPENS IT:",
+    const INCOMPLETE: &[&str] = &["MISSING:", "DID NOT RUN,", "NOT CHECKED:", "NOT LOADED,", "THE PAGE COULD NOT BE LOADED:", "AS THE USER OPENS IT:", prompt::LOCAL_MODULE_WORDS,
         "STEPS FAILED:", "STEPS DID NOT END:", "Steps: they had not ended", "The steps reload the page "];
     const ERRORS: &[&str] = &["Uncaught", "Error", "error:", "Failed to"];
     let has_error = |line: &str| ERRORS.iter().any(|word| line.contains(word));
@@ -11133,6 +11133,13 @@ Body").unwrap();
         agent.note_outcome("apply_patch", &patch("other.css"), &Ok("--- applied".into()));
         agent.note_outcome("check_page", &check("kuji.html"), &clean);
         assert_eq!(agent.polish.checks, 4, "a change to another file is not one to the page");
+        let warning = Ok(format!("{}\nConsole: nothing, so no errors.", prompt::LOCAL_MODULE_WORDS));
+        agent.note_outcome("check_page", &check("kuji.html"), &warning);
+        assert_eq!((agent.polish.checks, agent.polish.page.is_none()), (0, true), "the page does not run from its file");
+        agent.note_outcome("check_page", &check("kuji.html"), &clean);
+        agent.note_outcome("apply_patch", &patch("kuji.html"), &Ok("--- applied".into()));
+        agent.note_outcome("check_page", &check("kuji.html"), &clean);
+        assert_eq!(agent.polish.checks, 1, "clean checks count again after repair");
         agent.note_outcome("check_page", &check("kuji.html"), &Ok("MISSING: missing.css.\nConsole: nothing, so no errors.".into()));
         assert_eq!((agent.polish.checks, agent.polish.page.is_none()), (0, true), "a missing stylesheet ends the clean run");
         agent.note_outcome("check_page", &check("kuji.html"), &clean);
