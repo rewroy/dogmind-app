@@ -1746,10 +1746,22 @@ fn patch_count_hint(text: &str, old: &str, found: usize, expected: usize) -> Str
 /// Where the first line of an edit that did not match is, if its words are there with other spacing.
 fn nearest_line(text: &str, old: &str) -> String {
     let squeeze = |line: &str| line.split_whitespace().collect::<Vec<_>>().join(" ");
-    let Some(first) = old.lines().map(squeeze).find(|line| !line.is_empty()) else { return String::new() };
-    let places: Vec<String> = text.lines().enumerate().filter(|(_, line)| squeeze(line) == first).map(|(at, _)| (at + 1).to_string()).take(5).collect();
+    let mut requested = old.lines().skip_while(|line| line.trim().is_empty());
+    let Some(first) = requested.next().map(squeeze) else { return String::new() };
+    let places: Vec<usize> = text.lines().enumerate().filter(|(_, line)| squeeze(line) == first).map(|(at, _)| at).take(5).collect();
+    if let [at] = places.as_slice() {
+        // A short complete excerpt is safe to copy. For long or ambiguous matches, give the locations.
+        let lines = 1 + requested.take(5).count();
+        if lines <= 5 {
+            let nearby: Vec<_> = text.lines().skip(*at).take(lines).collect();
+            if nearby.iter().map(|line| line.len() + 1).sum::<usize>() <= 640 {
+                return format!(". At this edit, the working text starting at line {} is:\n{}", at + 1, nearby.join("\n"));
+            }
+        }
+    }
     if !places.is_empty() {
-        return format!(". Its first line is at line {}, spaced differently or followed by other lines: read there", places.join(", "));
+        let numbers: Vec<_> = places.iter().map(|at| (at + 1).to_string()).collect();
+        return format!(". Its first line is at line {}, spaced differently or followed by other lines: read there", numbers.join(", "));
     }
     // One character different, as a Chinese form for a Japanese one, or one word, is what it cannot see in what it read: the line itself, to copy from, with no read for it.
     // How alike two lines are is how many of their pairs of letters they share, against how many they have: a long line that holds the same letters elsewhere is not
@@ -4087,6 +4099,17 @@ mod power_tests {
     fn an_edit_that_misses_says_where_its_line_is() {
         assert!(nearest_line("a\n  fn  main( ) {\nb", "fn main( ) {\n  x").contains("line 2"));
         assert_eq!(nearest_line("a\nb", "nowhere"), "");
+    }
+
+    #[test]
+    fn a_missing_patch_shows_a_short_unique_span_with_its_actual_indentation() {
+        let hint = nearest_line("prefix\r\n    色 = 青;  \r\n\tfinish();\r\nunrelated", "色  =  青;\n  finish();");
+        assert!(hint.ends_with("line 2 is:\n    色 = 青;  \n\tfinish();"), "{hint}");
+        let ambiguous = nearest_line("  color\na\n  color\nb", "color\nz");
+        assert!(ambiguous.contains("line 1, 3") && !ambiguous.contains('\n'));
+        let long = format!("color\n{}", "長".repeat(300));
+        assert!(!nearest_line(&long, "color\nz").contains('長'));
+        assert!(!nearest_line("color\na\nb\nc\nd\ne", "color\nz\nz\nz\nz\nz").contains('\n'));
     }
 
     #[test]
