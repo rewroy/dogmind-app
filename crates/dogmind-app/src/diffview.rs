@@ -3,6 +3,7 @@
 
 use crate::highlight::{self, Kind};
 use crate::lang::t;
+use dogmind_agent::tools::diff_lines_without_file_headers as diff_lines;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
@@ -49,11 +50,6 @@ fn drawn(line: &str, show_tabs: bool) -> String {
     }
 }
 
-/// The lines of a diff, each without its newline and with its carriage return, if it has one: `str::lines` takes that away, and with it the difference this is about.
-fn diff_lines(diff: &str) -> impl Iterator<Item = &str> {
-    diff.split_inclusive('\n').map(|line| line.strip_suffix('\n').unwrap_or(line))
-}
-
 /// A line of the diff, and what is told of it by the one it is set against.
 struct Prepared {
     text: String,
@@ -65,7 +61,7 @@ struct Prepared {
 /// are the same as far as a line is drawn are cut where they differ and not at the end, and two that differ in tabs and spaces alone are marked.
 fn prepared(diff: &str) -> Vec<Prepared> {
     let mut lines: Vec<Prepared> = diff_lines(diff).map(|line| Prepared { text: line.to_string(), whitespace_only: false }).collect();
-    let is = |line: &Prepared, mark: char| line.text.starts_with(mark) && !line.text.starts_with("--- ") && !line.text.starts_with("+++ ");
+    let is = |line: &Prepared, mark: char| line.text.starts_with(mark);
     let mut at = 0;
     while at < lines.len() {
         let start = at;
@@ -105,9 +101,6 @@ fn prepared(diff: &str) -> Vec<Prepared> {
 fn only_line_endings(diff: &str) -> Option<&'static str> {
     let (mut removed, mut added): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
     for line in diff_lines(diff) {
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
-            continue;
-        }
         match line.chars().next() {
             Some('-') => removed.push(&line[1..]),
             Some('+') => added.push(&line[1..]),
@@ -169,7 +162,7 @@ pub fn rows(diff: &str, path: &str, most: usize) -> Vec<Row> {
             continue;
         }
         // (what git says of the file and not of its lines: the row in the list says it is new or gone)
-        const GITS_OWN: [&str; 11] = ["--- ", "+++ ", "diff --git", "index ", "new file mode", "deleted file mode", "old mode", "new mode", "similarity index", "rename from", "rename to"];
+        const GITS_OWN: [&str; 9] = ["diff --git", "index ", "new file mode", "deleted file mode", "old mode", "new mode", "similarity index", "rename from", "rename to"];
         if GITS_OWN.iter().any(|own| line.starts_with(own)) {
             continue;
         }
@@ -331,6 +324,19 @@ mod tests {
         assert!(rows[2].text().starts_with("    indented") && rows[2].text().contains("tabs and spaces only"), "{}", rows[2].text());
         assert_eq!(rows[1].text(), "    second", "a pair that is more than whitespace is not marked: its tab is drawn as it was");
         assert!(!rows[3].text().contains("tabs and spaces"), "{}", rows[3].text());
+    }
+
+    #[test]
+    fn header_like_content_keeps_its_row_numbers_and_line_endings() {
+        let diff = "--- a/doc\n+++ b/doc\n@@ -1,2 +1,2 @@\n--- old\n+++ new\n context\n";
+        let visible = rows(diff, "doc", 20);
+        let got: Vec<_> = visible.iter().map(|r| (r.kind, r.old, r.new, r.text())).collect();
+        assert_eq!(got, [
+            (RowKind::Removed, Some(1), None, "-- old".into()),
+            (RowKind::Added, None, Some(1), "++ new".into()),
+            (RowKind::Same, Some(2), Some(2), "context".into()),
+        ]);
+        assert!(only_line_endings("@@ -1,2 +1,2 @@\n-same\r\n--- old\r\n+same\n+++ new\n").is_none());
     }
 
     /// A file whose every line changed by its ending alone is said once.

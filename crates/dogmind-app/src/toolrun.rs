@@ -559,7 +559,7 @@ pub fn command_lines(output: &str) -> (usize, Vec<String>) {
 
 /// What a diff changed, without its file names.
 pub fn diff_lines(text: &str) -> Vec<&str> {
-    text.lines().filter(|line| !line.starts_with("--- ") && !line.starts_with("+++ ")).collect()
+    dogmind_agent::tools::diff_lines_without_file_headers(text).map(|line| line.strip_suffix('\r').unwrap_or(line)).collect()
 }
 
 /// What a call that went well keeps for when its run is opened.
@@ -865,6 +865,12 @@ mod tests {
         let mut run = ToolRun::new();
         run.entries = vec![call("read_file", "a.rs", 0.01)];
         assert!(!run.head(&work(), 80, 1.0).contains('s') || run.head(&work(), 80, 1.0).ends_with("a.rs"), "{}", run.head(&work(), 80, 1.0));
+    }
+
+    #[test]
+    fn header_like_content_stays_in_saved_patch_output() {
+        let diff = "--- a/one\n+++ b/one\n@@ -1 +1 @@\n--- old\n+++ new\n--- a/two\n+++ b/two\n@@ -0,0 +1 @@\n+++ another\n";
+        assert_eq!(kept_output("apply_patch", diff), ["@@ -1 +1 @@", "--- old", "+++ new", "@@ -0,0 +1 @@", "+++ another"]);
     }
 
     #[test]

@@ -4805,7 +4805,7 @@ impl App {
     }
 
     unsafe fn show_diff(&mut self, text: &str, limit: usize) {
-        let lines: Vec<&str> = text.lines().filter(|line| !line.starts_with("--- applied_diff") && !line.starts_with("--- ") && !line.starts_with("+++ ")).collect();
+        let lines = crate::toolrun::diff_lines(text);
         for line in lines.iter().take(limit) {
             let color = match line.chars().next() {
                 Some('+') => theme::good(),

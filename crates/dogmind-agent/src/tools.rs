@@ -2212,9 +2212,40 @@ impl FileChange {
     }
 
     fn counted(path: String, diff: String) -> FileChange {
-        let changed = |mark: char, header: &str| diff.lines().filter(|line| line.starts_with(mark) && !line.starts_with(header)).count();
-        FileChange { added: changed('+', "+++"), removed: changed('-', "---"), path, diff }
+        let (mut added, mut removed) = (0, 0);
+        for line in diff_lines_without_file_headers(&diff) {
+            match line.as_bytes().first() {
+                Some(b'+') => added += 1,
+                Some(b'-') => removed += 1,
+                _ => {}
+            }
+        }
+        FileChange { added, removed, path, diff }
     }
+}
+
+/// Omit file headers and keep the original carriage returns. In a hunk, even
+/// `--- old` and `+++ new` are content. Its two ranges tell where headers can resume.
+pub fn diff_lines_without_file_headers(diff: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = 0usize;
+    diff.split_terminator('\n').filter(move |&line| {
+        if let Some(header) = line.strip_prefix("@@ -") {
+            let ranges = header.split_once(" @@").and_then(|(ranges, _)| ranges.split_once(" +"));
+            let length = |range: &str| range.split_once(',').map_or(Some(1), |(_, count)| count.parse::<usize>().ok());
+            remaining = ranges.and_then(|(old, new)| Some(length(old)?.saturating_add(length(new)?))).unwrap_or(0);
+            return true;
+        }
+        if remaining > 0 {
+            match line.as_bytes().first() {
+                Some(b' ') => remaining = remaining.saturating_sub(2),
+                Some(b'+' | b'-') => remaining -= 1,
+                Some(b'\\') => {} // The no-newline marker consumes neither side.
+                _ => remaining = 0,
+            }
+            return true;
+        }
+        !line.starts_with("--- ") && !line.starts_with("+++ ")
+    })
 }
 
 const MAX_UNTRACKED_SHOWN: usize = 200;
@@ -4287,6 +4318,15 @@ mod change_tests {
         for marker in ["marker1.txt", "marker2.txt", "marker3.txt", "marker4.txt"] {
             assert!(!dir.path().join(marker).exists(), "{marker} ran");
         }
+    }
+
+    #[test]
+    fn header_like_content_counts_as_file_changes() {
+        let change = FileChange::between("notes.patch", Some("-- old\n---\n"), Some("++ new\n+++\n"));
+        assert_eq!((change.added, change.removed), (2, 2));
+        let diff = "diff --git a/notes.patch b/notes.patch\n--- a/notes.patch\n+++ b/notes.patch\n@@ -1 +1 @@\n--- a/old\n+++ b/new\n";
+        let changes = split_git_diff(diff);
+        assert_eq!((&changes[0].path[..], changes[0].added, changes[0].removed), ("notes.patch", 1, 1));
     }
 
     #[test]
