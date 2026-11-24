@@ -1,7 +1,7 @@
 //! The tools, each behaving as its Dogmind namesake says it does in the schema the model reads.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(not(windows))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -615,7 +615,7 @@ pub struct Workbench {
     /// A file whose `create_file` the app cut off to get it on disk: the next write to it goes on from there, whether or not the model says append.
     cut_file: Option<PathBuf>,
     /// What has been read of each file and what it was then, while that is still in the conversation.
-    reads: HashMap<(PathBuf, i64, i64), String>,
+    reads: HashMap<PathBuf, (String, HashSet<[u8; 32]>)>,
     /// How many of each file's lines, from its first, the conversation has been shown as it is now: a file written whole over one
     /// seen only in part loses the rest without a word.
     covered: HashMap<PathBuf, usize>,
@@ -1073,7 +1073,7 @@ impl Workbench {
     }
 
     /// A read has come back. The same lines of the same file as they were are already in the conversation, and are not sent again to be paid for twice.
-    pub fn after_read(&mut self, arguments: &Value, path: PathBuf, hash: String, result: Result<String, String>) -> Result<String, String> {
+    pub fn after_read(&mut self, _arguments: &Value, path: PathBuf, hash: String, result: Result<String, String>) -> Result<String, String> {
         if self.saw(path.clone(), hash.clone()).is_some_and(|before| before != hash) {
             self.covered.remove(&path);
         }
@@ -1083,36 +1083,35 @@ impl Workbench {
         if self.in_program {
             return result;
         }
-        if let Ok(text) = &result {
-            // (the lines shown in a row from where what was seen ends: an outline's head counts, and its parts after a gap do not)
-            let mut covered = self.covered.get(&path).copied().unwrap_or(0);
-            for number in text.lines().filter_map(|line| line.split_once('|')?.0.parse::<usize>().ok()) {
-                if number > covered + 1 {
-                    break;
-                }
-                covered = covered.max(number);
+        let text = result?;
+        // (the lines shown in a row from where what was seen ends: an outline's head counts, and its parts after a gap do not)
+        let mut covered = self.covered.get(&path).copied().unwrap_or(0);
+        for number in text.lines().filter_map(|line| line.split_once('|')?.0.parse::<usize>().ok()) {
+            if number > covered + 1 {
+                break;
             }
-            self.covered.insert(path.clone(), covered);
+            covered = covered.max(number);
         }
-        let number = |name: &str, default: i64| arguments.get(name).and_then(Value::as_i64).unwrap_or(default);
-        let key = (path, number("start_line", 1), number("limit", 500));
-        let same = self.reads.get(&key) == Some(&hash);
-        self.reads.insert(key, hash);
-        if same && result.is_ok() {
+        self.covered.insert(path.clone(), covered);
+        // Compare what the conversation actually receives. An outline and the first page can
+        // start on the same line, while different limits can return exactly the same page.
+        let (version, pages) = self.reads.entry(path).or_default();
+        if *version != hash {
+            *version = hash;
+            pages.clear();
+        }
+        if !pages.insert(Sha256::digest(text.as_bytes()).into()) {
             return Ok(UNCHANGED_READ.to_string());
         }
         // At each so much more in a turn: what it read stays in every later request, and a look further can go to a helper. (Once was
         // not enough: a real model told at 96 KB went on to 390.)
-        let result = result.map(|text| {
-            self.read_this_turn += text.len();
-            if self.read_this_turn > READ_TOLD_PAST * (self.read_told + 1) {
-                self.read_told = self.read_this_turn / READ_TOLD_PAST;
-                format!("{text}--- this turn has read {} KB of files into the conversation, where it stays for every later request. To look further, give the question to explore: only its answer joins ---\n", self.read_this_turn / 1024)
-            } else {
-                text
-            }
-        });
-        result
+        self.read_this_turn += text.len();
+        if self.read_this_turn > READ_TOLD_PAST * (self.read_told + 1) {
+            self.read_told = self.read_this_turn / READ_TOLD_PAST;
+            Ok(format!("{text}--- this turn has read {} KB of files into the conversation, where it stays for every later request. To look further, give the question to explore: only its answer joins ---\n", self.read_this_turn / 1024))
+        } else {
+            Ok(text)
+        }
     }
 
     /// A new turn: what it reads is counted from nothing.
@@ -5596,6 +5595,29 @@ mod tests {
         assert_eq!(summary("apply_patch", &edit), "a.txt");
         assert_eq!(summary("apply_patch", &json!({"expected_files": ["b.txt"], "edits": [{"path": "b.txt"}]})), "b.txt", "a session from before");
         assert_eq!(summary("apply_patch", &json!({"edits": [{"path": "a"}, {"path": "b"}, {"path": "a"}]})), "a, b");
+    }
+
+    #[test]
+    fn the_range_recommended_by_an_outline_is_shown_before_it_is_marked_read() {
+        let (dir, mut bench, cancel) = bench();
+        let text = format!("# section\n{}", "body\n".repeat(READ_LINES));
+        std::fs::write(dir.path().join("large.md"), text).unwrap();
+        let mut read = |args| bench.run("read_file", &args, dir.path(), &cancel).unwrap();
+        let outline = json!({"path": "large.md"});
+        let first = json!({"path": "large.md", "start_line": 1});
+        let short = json!({"path": "large.md", "limit": 500});
+        assert!(read(outline.clone()).contains("--- outline ---"));
+        assert!(read(first.clone()).contains("2000|body\n"));
+        let part = read(short.clone());
+        assert!(part.contains("500|body\n") && !part.contains("501|body\n"));
+        assert_eq!(read(json!({"path": "large.md", "limit": READ_LINES})), UNCHANGED_READ);
+        for args in [outline, first.clone(), short] {
+            assert_eq!(read(args), UNCHANGED_READ);
+        }
+        // An edit beyond the first page starts a new version even if that page reads the same.
+        let updated = format!("# section\n{}new last line\n", "body\n".repeat(READ_LINES));
+        std::fs::write(dir.path().join("large.md"), updated).unwrap();
+        assert!(read(first).contains("2000|body\n"));
     }
 
     #[test]
