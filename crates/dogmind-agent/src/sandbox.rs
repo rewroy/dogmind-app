@@ -2648,9 +2648,15 @@ unsafe fn prepare(workspace: &Path, named: &Path, sid: PSID, writer: PSID, disar
     Ok(())
 }
 
-/// A folder of PATH in `workspace` is not opened: it is readable already, and a command could make it a junction to a place outside.
+/// A folder of PATH in `workspace`, as written or where it really is (a short name, or a junction of the person's into it, is in it too), is not opened: it is
+/// readable already, and a command could make it a junction to a place outside. The others are granted by a handle on each, which is no link or
+/// junction itself and leads where the folder did as it was looked at ([`grant_where_it_was`]).
 pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: Option<crate::bundled::Present>, sid: PSID, workspace: Option<&Path>) {
-    for folder in toolchain_folders(path_variable, home).into_iter().filter(|folder| !workspace.is_some_and(|workspace| crate::safety::inside(workspace, folder))) {
+    // (in it as written, or where both really are)
+    let in_workspace = |folder: &Path| workspace.is_some_and(|workspace| {
+        crate::safety::inside(workspace, folder) || crate::safety::real_path(workspace).zip(crate::safety::real_path(folder)).is_some_and(|(root, real)| crate::safety::inside(&root, &real))
+    });
+    for folder in toolchain_folders(path_variable, home).into_iter().filter(|folder| !in_workspace(folder)) {
         // (a person's own Python or Node is not what runs when the bundle has its own, so nothing is opened for it; where the bundle lacks one, theirs is)
         let replaced = bundled.is_some_and(|present| {
             let folder_key = key(&folder);
@@ -2659,8 +2665,10 @@ pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: 
                 || (present.node && (folder_key.contains("npm") || folder_key.contains("nvm")))
         });
         if folder.exists() && !replaced {
-            let _ = grant(&folder, sid, READ_EXECUTE, true);
-            hold_out_secrets(&folder, sid);
+            let Some(real) = crate::safety::real_path(&folder) else { continue };
+            if grant_where_it_was(&folder, &real, sid, READ_EXECUTE).is_ok() {
+                hold_out_secrets(&folder, sid);
+            }
         }
     }
 }
@@ -4223,6 +4231,47 @@ mod tests {
         assert_eq!(dacl_text(&target).unwrap(), before, "nothing granted at the place");
         std::fs::remove_dir(&temp).unwrap();
         assert_eq!(restricted("echo again").map(|out| out.status).unwrap_or_default(), Some(0), "its own temp folder made again, as it was");
+        // A remembered workspace that has become a link is refused as it is made ready, before anything is written down of it.
+        let link = work_folder("readied-link");
+        std::fs::remove_dir_all(&link).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&target).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        assert!(ready_workspace(&link).is_err_and(|error| error.contains(MOVED)));
+        assert_eq!(dacl_text(&target).unwrap(), before, "nothing granted at the place");
+        std::fs::remove_dir(&link).unwrap();
+    }
+
+    /// PATH's folders: one in the workspace, written by its short name, is not opened; one that is a junction itself is not; a plain one is, as before.
+    #[test]
+    fn a_toolchain_folder_in_the_workspace_or_that_is_a_junction_is_not_opened() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let home = outside_folder("toolchains-home");
+        let (work, plain, real_tools, link) = (home.join("project-with-a-long-name"), home.join("tools"), home.join("real-tools"), home.join("tools-link"));
+        for folder in [work.join(".venv").join("Scripts"), plain.clone(), real_tools.clone()] {
+            std::fs::create_dir_all(&folder).unwrap();
+        }
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&real_tools).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        // (the short name Windows has for the workspace's folder, where the volume keeps them)
+        let scripts = work.join(".venv").join("Scripts");
+        let short = {
+            let name = wide_path(&scripts);
+            let mut text = vec![0u16; 1024];
+            // SAFETY: the buffers live through the call, which is told the length of the one it writes.
+            let length = unsafe { GetShortPathNameW(name.as_ptr(), text.as_mut_ptr(), text.len() as u32) } as usize;
+            assert!(length > 0 && length < text.len());
+            PathBuf::from(String::from_utf16_lossy(&text[..length]).trim_start_matches("\\?\\").to_string())
+        };
+        let path = std::env::join_paths([short.clone(), plain.clone(), link.clone()]).unwrap();
+        // SAFETY: the SID lives as long as the process.
+        let sid = unsafe { profile_sid() }.unwrap();
+        unsafe { open_toolchains(&path.to_string_lossy(), &home, None, sid, Some(&work)) };
+        let id = profile_sid_text();
+        assert!(!dacl_text(&scripts).unwrap().contains(&id), "in the workspace, by {}", short.display());
+        assert!(!dacl_text(&real_tools).unwrap().contains(&id), "a junction is not gone through");
+        assert!(dacl_text(&plain).unwrap().contains(&id), "a plain one is opened");
     }
 
     #[test]

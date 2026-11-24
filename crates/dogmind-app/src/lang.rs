@@ -1027,6 +1027,7 @@ const JA: &[(&str, &str)] = &[
     ("Use the passphrase instead", "パスフレーズを使う"),
     ("Use the recovery code instead", "回復コードを使う"),
     ("Use the copy", "コピーを使う"),
+    (dogmind_agent::sandbox::MOVED, "このフォルダーは、アプリが準備した後で別の場所へのリンクに変わっています(コマンドが変えることがあります)。そのため、そこでは何も実行も許可もしていません。フォルダーそのものをワークスペースとしてもう一度開いてください。"),
     ("{0} It is conversation-key.json in {1}. The copy of it that Dogmind keeps beside it opens: open your conversations with that copy? The damaged file is kept as conversation-key.json.damaged.",
      "{0} 対象は {1} の conversation-key.json です。Dogmind が横に保存しているコピーなら開けます。このコピーで会話を開きますか？ 壊れたファイルは conversation-key.json.damaged として残します。"),
     ("The two passphrases are not the same.", "2 つのパスフレーズが一致しません。"),

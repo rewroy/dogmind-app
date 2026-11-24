@@ -597,6 +597,29 @@ fn data_folder_from(named: Option<PathBuf>, local: Option<PathBuf>, temp: PathBu
     local.filter(|folder| folder.is_absolute()).unwrap_or(temp).join("DogmindApp")
 }
 
+/// A folder the person has just chosen as the workspace (in the folder dialog, or given at the start): where it really is when it is a link or a
+/// junction itself. The moment it is chosen is the person's word on where it leads; a folder remembered that has become a link since may be a
+/// command's doing, and is opened as it is, and refused for commands (`sandbox::MOVED`).
+pub fn as_chosen(folder: PathBuf) -> PathBuf {
+    let link = std::fs::symlink_metadata(&folder).is_ok_and(|found| {
+        use std::os::windows::fs::MetadataExt;
+        found.file_type().is_symlink() || found.file_attributes() & 0x400 != 0
+    });
+    if !link {
+        return folder;
+    }
+    match std::fs::canonicalize(&folder) {
+        Ok(real) => {
+            let text = real.to_string_lossy().into_owned();
+            PathBuf::from(match text.strip_prefix("\\\\?\\UNC\\") {
+                Some(share) => format!("\\\\{share}"),
+                None => text.strip_prefix("\\\\?\\").unwrap_or(&text).to_string(),
+            })
+        }
+        Err(_) => folder,
+    }
+}
+
 /// Whether `path` is `folder` or lies under it, as the same folder may be spelled in another case by the system and by a dialog.
 pub fn same_or_inside(path: &Path, folder: &Path) -> bool {
     let key = |path: &Path| path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
@@ -646,6 +669,20 @@ pub fn what_remove_leaves(data: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A folder chosen that is a junction opens as the folder it leads to; one that is not, as it is.
+    #[test]
+    fn a_folder_chosen_that_is_a_junction_opens_as_where_it_leads() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let (real, link) = (dir.path().join("real"), dir.path().join("link"));
+        std::fs::create_dir_all(&real).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link).arg(&real).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stdout));
+        let real_spelled = super::as_chosen(link.clone());
+        assert!(super::same_or_inside(&real_spelled, &std::fs::canonicalize(&real).map(|path| std::path::PathBuf::from(path.to_string_lossy().trim_start_matches("\\\\?\\"))).unwrap()), "{}", real_spelled.display());
+        assert!(!real_spelled.to_string_lossy().starts_with("\\\\?\\"));
+        assert_eq!(super::as_chosen(real.clone()), real, "a folder as it is");
+    }
+
     /// A file of the person's is written whole, over what was there, and leaves no partial one beside it.
     #[test]
     fn a_file_written_whole_replaces_the_one_there_and_leaves_nothing_beside_it() {

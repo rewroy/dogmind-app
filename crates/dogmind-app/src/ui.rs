@@ -835,6 +835,8 @@ enum Note {
     ReadFolderDone(String, bool),
     /// A workspace's grant for commands, begun when it was opened (`ready_folder`), has been given.
     FolderReady(PathBuf),
+    /// That workspace's folder has become a link since the app made it ready, and commands are refused there (`sandbox::MOVED`).
+    FolderMoved(PathBuf),
     /// How many conversations and notes are changed, of how many.
     CryptProgress(usize, usize),
     CryptDone(CryptOutcome),
@@ -6601,8 +6603,10 @@ impl App {
         InvalidateRect(self.window, &self.status_area, 0);
         let poster = self.poster.clone();
         std::thread::spawn(move || {
-            // (what goes wrong is said by the command that needs it, which gives it again)
-            let _ = dogmind_agent::sandbox::ready_workspace(&folder);
+            // (what goes wrong is said by the command that needs it, which gives it again; a folder that has become a link is said now, as it is opened)
+            if dogmind_agent::sandbox::ready_workspace(&folder).is_err_and(|error| error.contains(dogmind_agent::sandbox::MOVED)) {
+                poster.send(Note::FolderMoved(folder.clone()));
+            }
             poster.send(Note::FolderReady(folder));
         });
     }
@@ -14655,6 +14659,7 @@ impl App {
                 }
             }
             Note::CryptDone(outcome) => self.crypt_finished(outcome),
+            Note::FolderMoved(folder) => self.warn(&format!("{}: {}", folder.display(), t(dogmind_agent::sandbox::MOVED))),
             Note::FolderReady(folder) => {
                 if self.readying.as_ref() == Some(&folder) {
                     self.readying = None;
@@ -15090,8 +15095,9 @@ impl App {
         });
     }
 
+    /// A folder the person chooses: where it really leads, if it is a link (`settings::as_chosen`).
     unsafe fn browse_folder(&mut self) -> Option<PathBuf> {
-        preview::choose_folder(self.window as isize, t("Choose a folder"))
+        preview::choose_folder(self.window as isize, t("Choose a folder")).map(settings::as_chosen)
     }
 
     unsafe fn copy_to_clipboard(&mut self, text: &str) -> bool {
@@ -18274,7 +18280,8 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         lang::set(&saved.display_language);
         // (before the transcript and the composer are made, whose first format takes it)
         TEXT_SCALE.store(saved.text_percent(), Ordering::Relaxed);
-        let chosen = folder_argument.filter(|path| path.is_dir()).or_else(|| saved.workspace.clone().filter(|path| path.is_dir()));
+        // (the folder given at the start is the person's choice, and opens where it leads; the one remembered opens as it is)
+        let chosen = folder_argument.map(settings::as_chosen).filter(|path| path.is_dir()).or_else(|| saved.workspace.clone().filter(|path| path.is_dir()));
         let needs_folder = chosen.is_none();
         // Until a folder is chosen the start panel stays over the chat, and nothing can be sent.
         let workspace = chosen.unwrap_or_else(|| Path::new(".").to_path_buf());
