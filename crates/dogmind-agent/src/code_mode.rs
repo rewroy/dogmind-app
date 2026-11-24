@@ -42,6 +42,9 @@ const GRACE: Duration = Duration::from_millis(300);
 /// The longest one wait of a program may be (`setTimeout`, `sleep`): a server that needs a moment after it starts (a game editor entering play mode, which
 /// a program wanted 6 s for), not a clock to keep. Longer is refused, and a program can wait again.
 pub const WAIT_MOST: Duration = Duration::from_secs(30);
+/// The most waits a program may have at once. What the host keeps of them is outside the program's memory limit, and a program a page led a
+/// model to write must not be able to grow the app's memory with it.
+pub const WAITS_MOST: usize = 10_000;
 /// How often a wait looks at the stop and the program's time limit: a person who stops the turn is not kept waiting for the rest of it.
 const WAIT_STEP: Duration = Duration::from_millis(20);
 /// The names a program is refused, which no tool is given as a global either.
@@ -273,7 +276,8 @@ const SETUP: &str = r#"(function (host, write, names, setTimer, clearTimer, wait
     globalThis.setTimeout = (fn, ms, ...args) => {
         if (typeof fn !== 'function') throw new TypeError('setTimeout takes a function, like setTimeout(resolve, 1000)');
         const id = setTimer(Number(ms) || 0);
-        if (id < 0) throw new RangeError('a wait is at most ' + waitMost + ' ms; to wait longer, wait again');
+        if (id === -1) throw new RangeError('a wait is at most ' + waitMost + ' ms; to wait longer, wait again');
+        if (id < 0) throw new RangeError('at most ' + (-id) + ' waits at a time');
         timers.set(id, () => fn(...args));
         return id;
     };
@@ -422,28 +426,39 @@ fn execute(program: &str, code: &str, names: &[String], limits: &Limits, shared:
             let log = log.clone();
             Function::new(ctx.clone(), move |line: String| log.borrow_mut().push(&line)).map_err(|error| describe_engine_error(&ctx, error))?
         };
-        // (the timers a program set, by when they are due; the program keeps what each one runs)
-        // (a heap, as a program may set many: each is taken in its turn, and one cleared is let go when it comes up)
+        // (the timers a program set, by when they are due, in a heap: each is taken in its turn. The program keeps what each one runs; the host keeps the
+        // ids still waiting, and one cleared is let go when it comes up, or when the heap is made again from the waiting ones)
         let timers: Rc<RefCell<std::collections::BinaryHeap<std::cmp::Reverse<(Instant, u32)>>>> = Rc::default();
-        let cleared: Rc<RefCell<std::collections::HashSet<u32>>> = Rc::default();
+        let waiting: Rc<RefCell<std::collections::HashSet<u32>>> = Rc::default();
         let set_timer = {
-            let (timers, next) = (timers.clone(), Cell::new(0u32));
+            let (timers, waiting, next) = (timers.clone(), waiting.clone(), Cell::new(0u32));
             Function::new(ctx.clone(), move |ms: f64| -> f64 {
                 let ms = if ms.is_finite() { ms.max(0.0) } else { 0.0 };
                 if ms > WAIT_MOST.as_secs_f64() * 1000.0 {
                     return -1.0;
                 }
+                let (mut timers, mut waiting) = (timers.borrow_mut(), waiting.borrow_mut());
+                if waiting.len() >= WAITS_MOST {
+                    return -(WAITS_MOST as f64);
+                }
+                // (cleared ones piled up in the heap: it is made again of the waiting ones, so that it is never much more than they are)
+                if timers.len() >= 2 * WAITS_MOST {
+                    let kept: Vec<_> = timers.drain().filter(|std::cmp::Reverse((_, id))| waiting.contains(id)).collect();
+                    timers.extend(kept);
+                }
                 next.set(next.get() + 1);
-                timers.borrow_mut().push(std::cmp::Reverse((Instant::now() + Duration::from_secs_f64(ms / 1000.0), next.get())));
+                timers.push(std::cmp::Reverse((Instant::now() + Duration::from_secs_f64(ms / 1000.0), next.get())));
+                waiting.insert(next.get());
                 f64::from(next.get())
             })
             .map_err(|error| describe_engine_error(&ctx, error))?
         };
         let clear_timer = {
-            let cleared = cleared.clone();
+            let waiting = waiting.clone();
+            // (only a waiting one is let go: any other id does nothing)
             Function::new(ctx.clone(), move |id: f64| {
                 if id >= 1.0 && id <= f64::from(u32::MAX) {
-                    cleared.borrow_mut().insert(id as u32);
+                    waiting.borrow_mut().remove(&(id as u32));
                 }
             })
             .map_err(|error| describe_engine_error(&ctx, error))?
@@ -468,10 +483,10 @@ fn execute(program: &str, code: &str, names: &[String], limits: &Limits, shared:
             }
             // Nothing left to do but a timer: the earliest is waited for, and run.
             let due = {
-                let (mut timers, mut cleared) = (timers.borrow_mut(), cleared.borrow_mut());
+                let (mut timers, mut waiting) = (timers.borrow_mut(), waiting.borrow_mut());
                 let mut due = None;
                 while let Some(std::cmp::Reverse((at, id))) = timers.pop() {
-                    if !cleared.remove(&id) {
+                    if waiting.remove(&id) {
                         due = Some((at, id));
                         break;
                     }
@@ -507,6 +522,11 @@ fn execute(program: &str, code: &str, names: &[String], limits: &Limits, shared:
     // A stop that the engine reports as an error of its own ("interrupted"), or as the error a call threw because the run was ending, says nothing the stop does not.
     if matches!(stopped, Some(Stop::Time | Stop::Calls | Stop::Cancelled)) {
         error = None;
+    }
+    // Out of memory as it made its own error, the engine throws nothing it can name, as a program's own `throw null` does: "null" alone told a model
+    // neither (a program that set thousands of waits ran out so). Both are said.
+    if error.as_deref() == Some("null") {
+        error = Some(format!("null: the program threw null, or ran out of its memory ({} MiB) as the engine made the error", limits.memory.max(MEMORY_LEAST) >> 20));
     }
     let hint = error.as_deref().filter(|error| error.starts_with("SyntaxError") && looks_like_typescript(code)).map(|_| TYPESCRIPT_HINT);
     Outcome { value, log, error, stopped, calls: Vec::new(), ms, hint }
@@ -1022,6 +1042,31 @@ mod tests {
             Ok(String::new())
         });
         assert_eq!(outcome.stopped, Some(Stop::Time));
+    }
+
+    /// What the host keeps of a program's waits is bounded: clearing ids it never made keeps nothing, a wait past the most at once is refused, and setting
+    /// and clearing again and again does not pile up.
+    #[test]
+    fn the_waits_the_host_keeps_are_bounded() {
+        let outcome = go_alone("for (let i = 1; i < 1000000; i++) clearTimeout(i); return 'cleared';");
+        assert_eq!(outcome.value.as_deref(), Some("cleared"), "{:?}", outcome.error);
+        let outcome = go_alone("for (let i = 0; i < 10000; i++) setTimeout(() => {}, 1);\ntry { setTimeout(() => {}, 1); return 'set'; } catch (error) { return error.message; }");
+        assert_eq!(outcome.value.as_deref(), Some("at most 10000 waits at a time"), "{:?}", outcome.error);
+        let began = Instant::now();
+        let outcome = go_alone("for (let i = 0; i < 50000; i++) clearTimeout(setTimeout(() => {}, 29000));\nawait sleep(1); return 'quick';");
+        assert_eq!(outcome.value.as_deref(), Some("quick"), "{:?}", outcome.error);
+        assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+    }
+
+    /// Out of memory as the engine made its own error, it throws nothing it can name, as `throw null` does: the error says both.
+    #[test]
+    fn a_nameless_error_says_it_may_be_the_memory_limit() {
+        // (out of memory with its waits: the memory limit is said, as a stop or in the nameless error, whichever way the engine went)
+        let small = Limits { memory: 4 << 20, ..limits() };
+        let outcome = run("const all = []; for (let i = 0; i < 9000; i++) all.push(sleep(i % 50)); await Promise.all(all); return 'all';", &[], &small, &AtomicBool::new(false), &mut |_, _| panic!("no call"));
+        assert!(outcome.stopped == Some(Stop::Memory) || outcome.error.as_deref().is_some_and(|error| error.contains("ran out of its memory (4 MiB)")), "{outcome:?}");
+        let thrown = go_alone("throw null;");
+        assert!(thrown.error.as_deref().is_some_and(|error| error.starts_with("null: the program threw null")), "{thrown:?}");
     }
 
     #[test]
