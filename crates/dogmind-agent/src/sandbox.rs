@@ -2795,6 +2795,14 @@ pub fn run_live_as_person(line: &str, cwd: &Path, workspace: &Path, timeout: Dur
     run_limited(line, cwd, workspace, true, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, Token::Person)
 }
 
+/// As `run_live`, started in `start_in` rather than in the workspace: a folder of the app's that commands can read and not write (`for_sandbox_folder`), for the
+/// guidance CLI (`tools::guidance_cli_line`), which a workspace's npm settings would otherwise have a say in. It is given to the process as its folder to start in:
+/// cmd's `cd` there was refused in the container, as it lists each folder on the way to get their names' case, and the folders above the app's are only to pass through.
+/// What it may write is what any command of the workspace may.
+pub fn run_live_from(line: &str, start_in: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, live: Option<Arc<crate::tools::Live>>) -> Result<Output, String> {
+    run_limited_in(line, workspace, workspace, Some(start_in), network, timeout, cancel, UI_LIMITS, Some(job_memory_cap()), false, live, Token::Container)
+}
+
 /// What a command runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Token {
@@ -2819,6 +2827,12 @@ pub fn run_browser(line: &str, cwd: &Path, workspace: &Path, timeout: Duration, 
 
 #[allow(clippy::too_many_arguments)]
 fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, closed_stdin: bool, live: Option<Arc<crate::tools::Live>>, token: Token) -> Result<Output, String> {
+    run_limited_in(line, cwd, workspace, None, network, timeout, cancel, ui_limits, memory_cap, closed_stdin, live, token)
+}
+
+/// `run_limited`, the process started in `start_in` where one is given, and in `cwd` otherwise.
+#[allow(clippy::too_many_arguments)]
+fn run_limited_in(line: &str, cwd: &Path, workspace: &Path, start_in: Option<&Path>, network: bool, timeout: Duration, cancel: &AtomicBool, ui_limits: u32, memory_cap: Option<u64>, closed_stdin: bool, live: Option<Arc<crate::tools::Live>>, token: Token) -> Result<Output, String> {
     let asked_at = Instant::now();
     // (what it makes from here is what is looked for after it: see `programs_to_medium`)
     let began_at = std::time::SystemTime::now();
@@ -2973,7 +2987,7 @@ fn run_limited(line: &str, cwd: &Path, workspace: &Path, network: bool, timeout:
         // (with a restricted token nothing stops the network: a command not let reach it is pointed away from it)
         let block = environment(temp.as_deref().filter(|_| token != Token::Person), &root, writer.is_some() && !network, token == Token::Person, || crate::msvc::found_before(asked_at.checked_add(timeout).unwrap_or(asked_at + Duration::from_secs(3600)), cancel));
         times.env = env_began.elapsed();
-        let place = wide_path(cwd);
+        let place = wide_path(start_in.unwrap_or(cwd));
         let mut process: PROCESS_INFORMATION = std::mem::zeroed();
         times.prepare = asked_at.elapsed();
         let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | if nested { CREATE_SUSPENDED } else { 0 };

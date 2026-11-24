@@ -3931,6 +3931,21 @@ fn git_init_first(line: &str) -> Option<(Vec<String>, String)> {
 }
 
 /// `live` has what it prints as it prints it.
+/// The guidance CLI's line as it runs (`safety::the_guidance_cli`): from `guidance` in the app's folder for the sandbox, which is empty and in which no command can write, with npm's
+/// registry the public one and its user config an empty file of the app's. npm reads the `.npmrc` of the project it runs in, and npx runs the project's own package of a name before it
+/// fetches one: from the workspace, a `.npmrc` that names a registry or a script, or a `package.json` that has a package of that name, would have had a say in what runs unasked with the
+/// network. The line, and the folder it is started in (`sandbox::run_live_from`).
+#[cfg(windows)]
+fn guidance_cli_line(runs: &str) -> Result<(String, PathBuf), String> {
+    let folder = crate::sandbox::for_sandbox_folder().ok_or("not run: the app's folder for the sandbox could not be made, and the guidance CLI runs from there")?;
+    let (from, config) = (folder.join("guidance"), folder.join("guidance.npmrc"));
+    crate::temp_writes::folder_for(&folder, &from)?;
+    if std::fs::metadata(&config).map_or(true, |found| found.len() != 0) {
+        crate::temp_writes::write(&folder, &config, "")?;
+    }
+    Ok((format!("set \"npm_config_registry=https://registry.npmjs.org/\"&& set \"npm_config_userconfig={}\"&& {runs}", config.display()), from))
+}
+
 #[cfg(windows)]
 fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, live: Option<Arc<Live>>) -> Result<String, String> {
     let line = on_one_line(text_arg(arguments, "command")?)?;
@@ -3985,6 +4000,13 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
     let as_person = crate::safety::outside_sandbox(arguments);
     // (as line_that_runs_at makes it, which is what the person was shown: the folder here is the one after a leading `cd` was left out)
     let runs = if as_person { line.to_string() } else { in_sandbox_form(line, &cwd) };
+    // The CLI of the skill that comes with the app runs with no one asked, and with the network: from a folder of the app's and with npm's settings the app's, and none of the workspace's.
+    let (runs, guidance_from) = if !as_person && crate::safety::the_guidance_cli(text_arg(arguments, "command")?) {
+        let (runs, from) = guidance_cli_line(&runs)?;
+        (runs, Some(from))
+    } else {
+        (runs, None)
+    };
     // One cargo command under the user folder, in a workspace that names its members by a pattern, which cargo expands looking at each folder from the drive's root: a
     // container may not look at C:\Users, so this one runs with a restricted token, reading as the person does and writing in the workspace alone (`run_live_restricted`).
     // Judged on the line as the model wrote it, which is what the gate judged and the person allowed (`REASON_CARGO_OUTSIDE`), and on what runs, which must be that line.
@@ -3995,6 +4017,8 @@ fn execute_command(arguments: &Value, workspace: &Path, cancel: &AtomicBool, liv
         crate::sandbox::run_live_as_person(&runs, &cwd, &root, timeout, cancel, live)
     } else if restricted {
         crate::sandbox::run_live_restricted(&runs, &cwd, &root, network, timeout, cancel, live)
+    } else if let Some(from) = &guidance_from {
+        crate::sandbox::run_live_from(&runs, from, &root, network, timeout, cancel, live)
     } else {
         crate::sandbox::run_live(&runs, &cwd, &root, network, timeout, cancel, live)
     };
@@ -6415,6 +6439,33 @@ mod tests {
         for line in ["taskkill /PID 1234", "type tasklist.txt.bak", "cargo build -p netstatus"] {
             assert!(!sandbox_notes(line, root, Some(1), "").contains("sees only the programs"), "{line}");
         }
+    }
+
+    /// The guidance CLI runs from a folder of the app's with npm's registry and user config the app's: a `.npmrc` and a `package.json` in the workspace have no say in it, and
+    /// the gate still lets it run unasked.
+    #[cfg(windows)]
+    #[test]
+    fn the_guidance_cli_runs_with_none_of_the_workspaces_npm_settings() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let data = crate::in_container::tempdir().unwrap();
+        crate::workspace_grants::use_test_folder(data.path());
+        let work = crate::in_container::tempdir().unwrap();
+        std::fs::write(work.path().join(".npmrc"), "registry=http://127.0.0.1:9/\nscript-shell=evil.cmd\n").unwrap();
+        std::fs::write(work.path().join("package.json"), r#"{"name": "w", "bin": {"modern-web-guidance": "evil.js"}}"#).unwrap();
+        let line = "npx -y modern-web-guidance@1.0.1 search grid";
+        assert!(matches!(crate::safety::Gate::new().check("execute_command", &json!({"command": line}), work.path()), crate::safety::Verdict::Allow));
+        // (what runs after the CLI's settings, here: the settings, and the folder it is in)
+        let (runs, from) = guidance_cli_line("set npm_config_ & cd").unwrap();
+        let done = crate::sandbox::run_live_from(&runs, &from, work.path(), false, Duration::from_secs(60), &AtomicBool::new(false), None).unwrap();
+        let out = String::from_utf8_lossy(&done.stdout).to_string();
+        let folder = data.path().join(crate::sandbox::FOR_SANDBOX);
+        assert!(out.contains("npm_config_registry=https://registry.npmjs.org/"), "{out}");
+        assert!(out.contains(&format!("npm_config_userconfig={}", folder.join("guidance.npmrc").display())), "{out}");
+        assert!(out.lines().any(|said| said.trim().eq_ignore_ascii_case(&folder.join("guidance").display().to_string())), "it runs from the app's folder: {out}");
+        assert_eq!(std::fs::read_to_string(folder.join("guidance.npmrc")).unwrap(), "");
+        assert_eq!(std::fs::read_dir(folder.join("guidance")).unwrap().count(), 0);
     }
 
     /// In the real sandbox: `tasklist` there says a password is wrong, and what the model is given says why.
