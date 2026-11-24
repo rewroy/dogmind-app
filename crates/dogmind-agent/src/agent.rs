@@ -1081,12 +1081,13 @@ fn names_folder(text: &str, folder: &str) -> bool {
         let before = &text[..at];
         let before = before.strip_suffix("./").unwrap_or(before).chars().next_back();
         let after = &text[at + folder.len()..];
-        if before.is_some_and(|c| !c.is_whitespace() && !"([`<\"'".contains(c)) {
+        if before.is_some_and(|c| !c.is_whitespace() && !"([`<\"'「『（".contains(c)) {
             return false;
         }
         match after.strip_prefix('/') {
-            Some(rest) => rest.chars().next().is_none_or(|c| c.is_whitespace() || ")]`>\"',。、「」".contains(c)),
-            None => matches!((before, after.chars().next()), (Some('('), Some(')')) | (Some('`'), Some('`')) | (Some('<'), Some('>'))),
+            Some(rest) => rest.chars().next().is_none_or(|c| c.is_whitespace() || ")]`>\"',。、「」』）".contains(c)),
+            None => matches!((before, after.chars().next()), (Some('('), Some(')')) | (Some('`'), Some('`')) | (Some('<'), Some('>'))
+                | (Some('「'), Some('」')) | (Some('『'), Some('』')) | (Some('（'), Some('）'))),
         }
     })
 }
@@ -10965,10 +10966,12 @@ Body").unwrap();
     /// The answer names the bundled directory, including files that no entry page imports.
     #[test]
     fn folder_mentions_match_the_whole_workspace_path() {
-        for named in ["[library](./vendor/lib)", "in vendor/lib/ today", "`vendor/lib/`", "[library](<vendor/lib/>)"] {
+        for named in ["[library](./vendor/lib)", "in vendor/lib/ today", "`vendor/lib/`", "[library](<vendor/lib/>)",
+            "同梱先は「vendor/lib/」です。", "配布先は『vendor/lib』です。", "配置先（./vendor/lib/）です。"] {
             assert!(names_folder(named, "vendor/lib"), "{named}");
         }
-        for named in ["[file](vendor/lib/main.js)", "[other](old/vendor/lib/)", "https://host/vendor/lib/", "vendor/library/", "vendor/libs"] {
+        for named in ["[file](vendor/lib/main.js)", "[other](old/vendor/lib/)", "https://host/vendor/lib/", "vendor/library/", "vendor/libs",
+            "「vendor/lib/main.js」", "『vendor/library/』", "（old/vendor/lib/）"] {
             assert!(!names_folder(named, "vendor/lib"), "{named}");
         }
         assert!(names_folder("[bundle](<two words/lib/>)", "two words/lib"));
@@ -10976,22 +10979,27 @@ Body").unwrap();
 
     #[test]
     fn bundled_folder_is_kept_while_neighboring_probe_is_reported() {
-        let dir = crate::in_container::tempdir().unwrap();
-        let (client, _) = server(vec![
-            call_answer("create_file", json!({"path": "vendor/three/addons/Draw.js", "content": "export default 1;"})),
-            call_answer("create_file", json!({"path": "vendor/three/LICENSE", "content": "license"})),
-            call_answer("create_file", json!({"path": "vendor/three-test/_probe.txt", "content": "test"})),
-            call_answer("execute_command", json!({"command": "echo checked"})),
-            text_answer("配布物は `[vendor/three/](vendor/three/)` に同梱しました。"),
-            text_answer("配布物は vendor/three/ にあります。"),
-        ]);
-        let run = run_agent(dir.path(), client, Mode::Auto);
-        run.handle.commands.send(Command::Send("配布物を用意してください".into())).unwrap();
-        until_end(&run, Decision::Approve);
-        let lines = trajectory_of(&run);
-        let told: Vec<_> = of_kind(&lines, "intervention").into_iter().filter(|line| line["kind"] == "scratch_files").collect();
-        assert_eq!(told.len(), 1);
-        assert_eq!(told[0]["files"], json!(["vendor/three-test/_probe.txt"]));
+        for (request, answer) in [
+            ("配布物を用意してください", "配布物は `[vendor/three/](vendor/three/)` に同梱しました。"),
+            ("配布物を「vendor/three/」に置いてください。", "準備できました。"),
+        ] {
+            let dir = crate::in_container::tempdir().unwrap();
+            let (client, _) = server(vec![
+                call_answer("create_file", json!({"path": "vendor/three/addons/Draw.js", "content": "export default 1;"})),
+                call_answer("create_file", json!({"path": "vendor/three/LICENSE", "content": "license"})),
+                call_answer("create_file", json!({"path": "vendor/three-test/_probe.txt", "content": "test"})),
+                call_answer("execute_command", json!({"command": "echo checked"})),
+                text_answer(answer),
+                text_answer("配布物は vendor/three/ にあります。"),
+            ]);
+            let run = run_agent(dir.path(), client, Mode::Auto);
+            run.handle.commands.send(Command::Send(request.into())).unwrap();
+            until_end(&run, Decision::Approve);
+            let lines = trajectory_of(&run);
+            let told: Vec<_> = of_kind(&lines, "intervention").into_iter().filter(|line| line["kind"] == "scratch_files").collect();
+            assert_eq!(told.len(), 1);
+            assert_eq!(told[0]["files"], json!(["vendor/three-test/_probe.txt"]));
+        }
     }
 
     /// With a goal, the files are told of when it is marked done, which is refused once for them while calls can still be made; the second finish closes it.
