@@ -2230,6 +2230,10 @@ impl Agent {
                 servers.push(tools::describe_tools_schema());
             }
         }
+        // (without code mode, where servers are set up: the way to call a tool told of after the conversation began, which is not in the list)
+        if !self.code_mode && self.mcp.as_ref().is_some_and(|hub| !hub.trust().is_empty()) {
+            servers.push(tools::call_added_tool_schema());
+        }
         self.tool_schemas = tools::schemas_for(self.web.enabled, found.iter().any(|skill| skill.for_the_model), self.memory.is_some(), servers, self.code_mode);
         // (DeepSeek was taught to change a file with one exact replacement, by these names: offered it beside apply_patch, it wrote its edits as a list in a
         // string twice in one conversation, each refused and sent again)
@@ -2294,7 +2298,7 @@ impl Agent {
             let _ = session.set_added(&added);
         }
         self.traj.write("tools_added", None, json!({"names": more.iter().filter_map(name).collect::<Vec<_>>(), "told": true}));
-        Some(prompt::tools_added(&more, self.code_mode))
+        Some(prompt::tools_added(&more, self.code_mode, self.offers(tools::CALL_ADDED_TOOL)))
     }
 
     /// Whether a tool told of after the conversation began is no longer told of in it: a rewind, or a fork, cut where it was.
@@ -2306,7 +2310,7 @@ impl Agent {
     /// All the tools told of after the conversation began, told of again in a message of the app's: after a compaction, which may have left out where they were.
     fn tell_added_again(&mut self) {
         if std::mem::take(&mut self.added_due) && !self.added_tools.is_empty() {
-            let note = prompt::tools_added(&self.added_tools, self.code_mode);
+            let note = prompt::tools_added(&self.added_tools, self.code_mode, self.offers(tools::CALL_ADDED_TOOL));
             self.push(Message::text("user", prompt::app_facts(&now(), None, &[note])));
         }
     }
@@ -2661,7 +2665,7 @@ impl Agent {
         }
         // (all of them after a compaction, and the new ones otherwise)
         if std::mem::take(&mut self.added_due) && !self.added_tools.is_empty() {
-            notes.push(prompt::tools_added(&self.added_tools, self.code_mode));
+            notes.push(prompt::tools_added(&self.added_tools, self.code_mode, self.offers(tools::CALL_ADDED_TOOL)));
         } else if let Some(note) = added {
             notes.push(note);
         }
@@ -4034,16 +4038,18 @@ impl Agent {
     }
 
     fn run_one(&mut self, call: &crate::message::ToolCall) -> usize {
-        let name = call.function.name.as_str();
         let started = Instant::now();
-        let arguments: Value = match parse_arguments(&call.function.arguments) {
-            Ok(arguments) => arguments,
+        let parsed = parse_arguments(&call.function.arguments).map_err(|error| format!("the arguments are not JSON: {error}"));
+        // (a tool told of after the conversation began, called through call_added_tool: the call of that tool, its gate, trust and record its own)
+        let (name, arguments) = match parsed.and_then(|arguments| tools::added_call(&call.function.name, arguments)) {
+            Ok(both) => both,
             Err(error) => {
-                self.tool_started(&call.id, name, None, &call.function.arguments, 1);
-                self.finish_call(&call.id, Err(format!("the arguments are not JSON: {error}")), false, started.elapsed());
+                self.tool_started(&call.id, &call.function.name, None, &call.function.arguments, 1);
+                self.finish_call(&call.id, Err(error), false, started.elapsed());
                 return 1;
             }
         };
+        let name = name.as_str();
         self.tool_started(&call.id, name, Some(&arguments), &call.function.arguments, 1);
         let ran = self.run_call(&call.id, name, &arguments, false);
         self.note_outcome(name, &arguments, &ran.result);
@@ -4666,6 +4672,11 @@ impl Agent {
         self.push(Message { images, helper, ..Message::tool_result(id, output) });
         // (a command may have been started, ended or stopped by this call, or a wait set)
         self.tell_waiting();
+    }
+
+    /// Whether the conversation's list has this tool.
+    fn offers(&self, tool: &str) -> bool {
+        self.tool_schemas.as_array().is_some_and(|list| list.iter().any(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some(tool)))
     }
 
     /// Whether what a stranger said is in this conversation: a page, a search, or a server the person does not trust now (one trusted since it
@@ -10490,6 +10501,57 @@ Body").unwrap();
         let told: Vec<String> = bodies[1]["messages"].as_array().unwrap().iter().filter_map(|message| message["content"].as_str()).filter(|text| text.contains("## Tools Added")).map(str::to_string).collect();
         assert_eq!(told.len(), 1, "{told:?}");
         assert!(told[0].contains("`mcp__late__u`") && told[0].contains("From the MCP server late."), "{}", told[0]);
+    }
+
+    /// Without code mode a tool told of after the conversation began is not in the list: a provider that offers only the listed tools calls it through
+    /// call_added_tool, which is in the list from the start where servers are set up. The call is the inner tool's: a server not trusted asks for it, as a
+    /// direct call does, under the tool's own name.
+    #[test]
+    fn a_tool_added_in_a_conversation_is_called_through_call_added_tool_and_asks_as_itself() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let tool = |name: &str| [serde_json::json!({"name": name, "description": "d", "inputSchema": {"type": "object"}})];
+        let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "the late one answered"}]}});
+        let hub = mcp::Hub::scripted("srv", &tool("t"), &[], true);
+        let (client, bodies) = server(vec![text_answer("one"), call_answer("call_added_tool", serde_json::json!({"name": "mcp__late__u", "arguments": {"a": 1}})), text_answer("done")]);
+        let (sender, events) = channel();
+        let sessions = crate::in_container::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub.clone()), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("hi".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        hub.add_scripted("late", &tool("u"), &[answer], false);
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let asked = approvals_and_reasons_with(&run, &[Decision::Approve]);
+        assert_eq!(asked.iter().map(|(tool, _, _)| tool.as_str()).collect::<Vec<_>>(), ["mcp__late__u"], "asked as itself: {asked:?}");
+        let bodies = bodies.lock().unwrap();
+        let names = |body: &Value| body["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert!(names(&bodies[0]).contains(&"call_added_tool".to_string()), "in the list from the start");
+        assert_eq!(bodies[1]["tools"], bodies[0]["tools"]);
+        let told: Vec<String> = bodies[1]["messages"].as_array().unwrap().iter().filter_map(|message| message["content"].as_str()).filter(|text| text.contains("## Tools Added")).map(str::to_string).collect();
+        assert!(told[0].contains("or as `call_added_tool({name: \"<name>\", arguments: {...}})`"), "{}", told[0]);
+        let result = bodies[2]["messages"].as_array().unwrap().iter().rev().find(|message| message["role"] == "tool").unwrap()["content"].as_str().unwrap().to_string();
+        assert!(result.contains("the late one answered") && result.contains("mcp__late__u"), "{result}");
+    }
+
+    /// With no server set up, and in code mode, there is no call_added_tool: nothing could be added, or a program reaches every tool.
+    #[test]
+    fn call_added_tool_is_only_where_servers_are_set_up_and_code_mode_is_off() {
+        for (servers, code_mode, expected) in [(false, false, false), (true, true, false), (true, false, true)] {
+            let dir = crate::in_container::tempdir().unwrap();
+            let hub = if servers { mcp::Hub::scripted("srv", &[serde_json::json!({"name": "t", "description": "d", "inputSchema": {"type": "object"}})], &[], true) } else { Arc::new(mcp::Hub::default()) };
+            let (client, bodies) = server(vec![text_answer("one")]);
+            let (sender, events) = channel();
+            let sessions = crate::in_container::tempdir().unwrap();
+            let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode }, sender, Box::new(|| {}));
+            handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+            let run = Run { handle, events, _sessions: sessions };
+            run.handle.commands.send(Command::Send("hi".into())).unwrap();
+            until_end(&run, Decision::Reject);
+            let bodies = bodies.lock().unwrap();
+            let offered = bodies[0]["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "call_added_tool");
+            assert_eq!(offered, expected, "servers {servers}, code mode {code_mode}");
+        }
     }
 
     #[test]

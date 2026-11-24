@@ -338,9 +338,15 @@ pub(crate) fn told_by_its_name(tool: &serde_json::Value) -> String {
 /// The tools that came after a conversation began, as the model is told of them where the conversation is: each once, with what its server says it is
 /// and its arguments' schema; those of a server past [`SERVER_TOOLS_BUDGET`] by name and a line, with how to get the rest (`describe_tools`, itself one of
 /// the tools then, and not listed).
-pub fn tools_added(tools: &[serde_json::Value], code_mode: bool) -> String {
+pub fn tools_added(tools: &[serde_json::Value], code_mode: bool, call_added: bool) -> String {
     let by_name = told_by_name(tools);
-    let how = if code_mode { ", directly or from run_code as `await tools.<name>({...})` (`tools[\"<name>\"]` for a name with `-` in it)" } else { "" };
+    let how = if code_mode {
+        ", directly or from run_code as `await tools.<name>({...})` (`tools[\"<name>\"]` for a name with `-` in it)"
+    } else if call_added {
+        ", or as `call_added_tool({name: \"<name>\", arguments: {...}})`"
+    } else {
+        ""
+    };
     let mut text = format!("{TOOLS_ADDED}\nThese tools came after this conversation began. They are not in your list of tools, which stays as it was, and are called the same way{how}:");
     let name = |tool: &serde_json::Value| tool.pointer("/function/name").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
     for tool in tools.iter().filter(|tool| !by_name.contains(&name(tool)) && name(tool) != DESCRIBE_TOOLS) {
@@ -750,7 +756,7 @@ mod tests {
         let (big, small) = (super::server_tools("editor", 196, 700), super::server_tools("modeler", 10, 1500));
         let mut tools: Vec<serde_json::Value> = big.iter().chain(&small).cloned().collect();
         tools.push(crate::tools::describe_tools_schema());
-        let told = super::tools_added(&tools, true);
+        let told = super::tools_added(&tools, true, false);
         for tool in &tools[..tools.len() - 1] {
             let name = tool["function"]["name"].as_str().unwrap();
             assert_eq!(told.matches(&format!("`{name}`")).count(), 1, "{name} told of once");

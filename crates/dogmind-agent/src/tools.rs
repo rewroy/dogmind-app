@@ -236,6 +236,38 @@ pub fn edit_as_patch(arguments: &Value, workspace: &Path) -> Value {
 }
 
 /// All the tools of a session: those every session has, and those that depend on what is on.
+/// The tool that calls a tool told of after the conversation began, by its name.
+pub const CALL_ADDED_TOOL: &str = "call_added_tool";
+
+/// `call_added_tool`: in the list from a conversation's start without code mode, where MCP servers are set up. A tool told of after the conversation
+/// began is not in the list (it stays as it was, for the engine keeps it), and a provider that offers only the tools in its list (Claude's, Codex's)
+/// could not call one otherwise.
+pub fn call_added_tool_schema() -> Value {
+    json!({"type": "function", "function": {"name": CALL_ADDED_TOOL, "description": "Calls a tool told of after this conversation began (an MCP server's, mcp__server__tool), which is not in your list: by its name, with its arguments.", "parameters": {"type": "object", "properties": {
+        "name": {"type": "string", "description": "The tool's name, as told (mcp__server__tool)."},
+        "arguments": {"type": "object", "description": "Its arguments, as its schema gives them."}
+    }, "required": ["name"]}}})
+}
+
+/// The call a call is: one of `call_added_tool` is the call of the tool it names, with that tool's arguments (and its gate, trust and record);
+/// any other is itself. Only a server's tool, or describe_tools, is called so.
+pub fn added_call(name: &str, arguments: Value) -> Result<(String, Value), String> {
+    if name != CALL_ADDED_TOOL {
+        return Ok((name.to_string(), arguments));
+    }
+    let inner = arguments.get("name").and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
+    if !(inner.starts_with("mcp__") || inner == crate::prompt::DESCRIBE_TOOLS) {
+        return Err(format!("{CALL_ADDED_TOOL} calls a tool told of after the conversation began (mcp__server__tool) or describe_tools; call {} directly", if inner.is_empty() { "a tool" } else { inner.as_str() }));
+    }
+    // (arguments written as a JSON string are read as the object they say)
+    let inner_arguments = match arguments.get("arguments") {
+        None | Some(Value::Null) => json!({}),
+        Some(Value::String(text)) => serde_json::from_str(text).map_err(|error| format!("arguments are not JSON: {error}"))?,
+        Some(other) => other.clone(),
+    };
+    Ok((inner, inner_arguments))
+}
+
 /// `describe_tools`: what MCP servers' tools told by name only are, and their arguments, before one is called.
 pub fn describe_tools_schema() -> Value {
     describe_tools_listing(&[])
