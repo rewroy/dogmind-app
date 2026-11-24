@@ -80,11 +80,15 @@ pub struct Inputs {
 pub const SHORTEST_SPAN: u64 = 50;
 
 /// Whether a step has what is looked for (`query`, in small letters): in why it was taken, its calls' tools (as named here and as the model named
-/// them) and what they were on, or what its helper did.
+/// them), their targets, results and exit codes, or what its helper did.
 fn step_has(step: &Step, query: &str) -> bool {
     let has = |text: &str| text.to_lowercase().contains(query);
+    let exit_label = t("Exit code").to_lowercase();
+    let exit_query = query.strip_prefix(&exit_label).map(|rest| rest.trim().trim_start_matches([':', '：']).trim());
     step.why.as_ref().is_some_and(|why| has(&why.text))
         || step.calls.iter().any(|call| has(&call.name) || has(t(tool_name(&call.name))) || call.target.as_deref().is_some_and(has)
+            || (!call.outcome.is_empty() && has(&call_result_words(call)))
+            || call.exit_code.zip(exit_query).is_some_and(|(code, wanted)| wanted.is_empty() || wanted.parse::<i64>() == Ok(code))
             || call.helper_steps.iter().any(|helper| helper.why.as_ref().is_some_and(|why| has(&why.text)) || helper.calls.iter().any(|(name, target)| has(name) || target.as_deref().is_some_and(has))))
         || match &step.kind {
             StepKind::Model => false,
@@ -1006,6 +1010,10 @@ fn in_calling_order(calls: &[CallRow]) -> Vec<&CallRow> {
     ordered
 }
 
+fn call_result_words(call: &CallRow) -> String {
+    tool_outcome_words(&call.outcome, call.exit_code.is_some_and(|code| code != 0))
+}
+
 fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, context: &Context) {
     let nested = call.id.contains('.');
     let running = is_live && context.live.is_running(&call.id);
@@ -1016,7 +1024,7 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
         "" if is_live => ("clock", Tone::Muted, String::new()),
         "" => ("square", Tone::Muted, t("did not run").to_string()),
         "ok" if !failed_exit => ("check", Tone::Good, if call.ms > 0 { ms_words(call.ms) } else { String::new() }),
-        other => ("x", Tone::Bad, tool_outcome_words(other, failed_exit)),
+        _ => ("x", Tone::Bad, call_result_words(call)),
     };
     let indent = if nested { 3 } else { 2 };
     let name = t(tool_name(&call.name)).to_string();
@@ -1030,7 +1038,7 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
     }
     let inner = indent + 1;
     if failed {
-        out.push(fact(inner, t("Result"), tool_outcome_words(&call.outcome, failed_exit)));
+        out.push(fact(inner, t("Result"), call_result_words(call)));
     }
     if let Some(code) = call.exit_code {
         out.push(fact(inner, t("Exit code"), code.to_string()));
@@ -1380,6 +1388,31 @@ mod tests {
 
     fn started(id: &str, tool: &str, summary: &str) -> Event {
         Event::ToolStarted { id: id.into(), tool: tool.into(), summary: summary.into() }
+    }
+
+    #[test]
+    fn a_timeline_search_finds_results_and_distinguishes_exit_codes() {
+        let cases = [
+            ("first", "ok", Some(7)), ("second", "ok", Some(70)), ("third", "ok", Some(0)),
+            ("fourth", "timeout", None), ("fifth", "", None), ("sixth", "error", None),
+        ];
+        let steps = cases.iter().map(|(label, outcome, code)| {
+            model(Some((label, WhySource::Content)), vec![CallRow { exit_code: *code, ..call(label, "execute_command", "python", outcome) }])
+        }).collect();
+        let timeline = Timeline { turns: vec![turn(1, "Investigate", steps, done(100))], heading: None };
+        let found = |q: &str| {
+            let inputs = Inputs { query: q.into(), ..Inputs::default() };
+            let rows = rows(Some(&timeline), &Live::new(Instant::now()), &inputs, &HashMap::new(), Instant::now());
+            cases.iter().filter_map(|(label, _, _)| rows.iter().any(|row| row.text == *label).then_some(*label)).collect::<Vec<_>>()
+        };
+        assert_eq!(found(t("Failed")), ["first", "second", "sixth"]);
+        assert_eq!(found(t("Done")), ["third"]);
+        assert_eq!(found(t("Timed out")), ["fourth"]);
+        let exit = t("Exit code");
+        for query in [format!("{exit}: 7"), format!("{exit} 7"), format!("{exit}：7")] {
+            assert_eq!(found(&query), ["first"]);
+        }
+        assert_eq!(found(exit), ["first", "second", "third"]);
     }
 
     #[test]
