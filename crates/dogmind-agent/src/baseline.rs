@@ -5,6 +5,7 @@
 //! text file. What is too large or too much is listed or left out, and the answer says so. Neither copies a whole folder, and what `.gitignore` skips is skipped.
 
 use std::collections::BTreeMap;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -77,8 +78,33 @@ fn may_hold_secrets(name: &str) -> bool {
     crate::safety::sensitive(Path::new(&format!("/{name}")))
 }
 
+const BINARY_SAMPLE: usize = 8192;
+
 fn binary(bytes: &[u8]) -> bool {
-    !(bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF])) && bytes.iter().take(8192).any(|&byte| byte == 0)
+    !(bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF])) && bytes.iter().take(BINARY_SAMPLE).any(|&byte| byte == 0)
+}
+
+/// The full size and the bytes needed for the report. A large new file gets its
+/// text diff from the edit history, so only the binary check needs current bytes.
+fn read_current(path: &Path, size: u64, new: bool) -> io::Result<(u64, Vec<u8>)> {
+    if size > MOST_READ {
+        return Ok((size, Vec::new()));
+    }
+    let bytes = if new && size > MOST_COPIED {
+        let mut file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        let mut bytes = Vec::new();
+        if size > MOST_COPIED {
+            file.take(BINARY_SAMPLE as u64).read_to_end(&mut bytes)?;
+            return Ok((size, bytes));
+        }
+        // It shrank before we opened it and now fits in a regular preview.
+        file.read_to_end(&mut bytes)?;
+        bytes
+    } else {
+        std::fs::read(path)?
+    };
+    Ok((bytes.len() as u64, bytes))
 }
 
 fn modified(data: &std::fs::Metadata) -> Option<u128> {
@@ -411,18 +437,18 @@ impl Baseline {
                 }
                 _ => {}
             }
-            // (nothing is shown of it, and to read it is to hold it: one larger than memory would end the app, with the person's conversation in it)
-            if let Some(size) = now.as_ref().map(std::fs::Metadata::len).filter(|size| *size > MOST_READ) {
-                lines.push(format!("{} {name} ({size} bytes): too large to compare or show", if existed { "changed" } else if whole { "created" } else { "present" }));
-                continue;
-            }
-            let after = match now.map(|_| std::fs::read(&path)).transpose() {
-                Ok(bytes) => bytes,
-                Err(error) if missing(&error) => None, // It disappeared after the metadata check.
-                Err(error) => {
+            let new = entry.map_or(!existed && whole, |entry| entry.gone);
+            let (size, after) = match now.map(|data| read_current(&path, data.len(), new)) {
+                Some(Ok((size, _))) if size > MOST_READ => {
+                    lines.push(format!("{} {name} ({size} bytes): too large to compare or show", if existed { "changed" } else if whole { "created" } else { "present" }));
+                    continue;
+                }
+                Some(Ok((size, bytes))) => (size, Some(bytes)),
+                Some(Err(error)) if !missing(&error) => {
                     lines.push(format!("could not compare {name}: {error}"));
                     continue;
                 }
+                _ => (0, None), // Missing, including a file that disappeared after the metadata check.
             };
             let before = match entry {
                 Some(entry) if entry.gone => Before::Absent,
@@ -451,7 +477,6 @@ impl Baseline {
             if matches!(before, Before::Absent) && after.is_none() {
                 continue;
             }
-            let size = after.as_ref().map_or(0, Vec::len);
             let word = match (&before, &after) {
                 (Before::Absent, _) => format!("created {name} ({size} bytes)"),
                 (Before::Unknown(known), None) if *known > MOST_READ => format!("deleted {name} ({known} bytes)"),
@@ -479,7 +504,7 @@ impl Baseline {
                 _ if is_binary => None,
                 (Before::Unknown(_), _) => edited_diff(name),
                 // (a file too large to have kept could have been created large as well: an answer has its limit)
-                (Before::Absent, Some(after)) if after.len() as u64 > MOST_COPIED => edited_diff(name),
+                (Before::Absent, Some(_)) if size > MOST_COPIED => edited_diff(name),
                 (Before::Absent, after) => Some(FileChange::between(name, None, after.as_deref().map(text).as_deref()).diff),
                 (Before::Bytes(before), Some(after)) => Some(text_diff(name, &text(before), &text(after))),
                 (Before::Bytes(before), None) => {
@@ -888,6 +913,22 @@ mod tests {
         std::fs::remove_file(folder_of(&session).join(copy)).unwrap();
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(original_time).unwrap();
         assert!(reopened.changes(work.path(), &[]).is_empty());
+    }
+
+    #[test]
+    fn large_new_files_supply_only_the_binary_sample_unless_they_shrank() {
+        let (work, _keep, _session) = fixture();
+        let path = work.path().join("new.dat");
+        std::fs::File::create(&path).unwrap().set_len(MOST_COPIED + 1).unwrap();
+        let (size, sample) = read_current(&path, MOST_COPIED + 1, true).unwrap();
+        assert_eq!(size, MOST_COPIED + 1);
+        assert_eq!(sample.len(), BINARY_SAMPLE);
+        assert!(binary(&sample));
+        assert_eq!(read_current(&path, size, false).unwrap().1.len() as u64, size);
+
+        let small = vec![b'x'; BINARY_SAMPLE + 1];
+        std::fs::write(&path, &small).unwrap();
+        assert_eq!(read_current(&path, size, true).unwrap(), (small.len() as u64, small));
     }
 
     #[test]
