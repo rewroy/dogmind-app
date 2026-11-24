@@ -281,7 +281,6 @@ const M_DISPLAY: usize = 9310; // ..+ 3
 const M_THEME: usize = 9320; // ..+ 3
 const M_ANSWERS: usize = 9330; // ..+ 3
 const M_WEB_CHOICE: usize = 9350; // ..+ 2
-const M_COMPACT_CHOICE: usize = 9355; // ..+ 2
 const DISPLAY_LANGUAGES: [(&str, &str); 3] = [("system", "As Windows is set"), ("en", "English"), ("ja", "日本語")];
 const THEMES: [(&str, &str); 3] = [("system", "As Windows is set"), ("dark", "Dark"), ("light", "Light")];
 const ANSWER_LANGUAGES: [(&str, &str); 3] = [("auto", "As you write: Japanese on this system"), ("ja", "Japanese, always"), ("en", "English, always")];
@@ -2520,6 +2519,8 @@ struct App {
     run_hover: Option<usize>,
     /// A call being written, with no run to show it in.
     plain_writing: Vec<RunEntry>,
+    /// Keep the two halves of a tool call in the same transcript format throughout a turn.
+    group_live_tools: bool,
     /// When a request under way last said how it was going.
     request_live: Option<std::time::Instant>,
     /// Where the block being written is kept in `shown`.
@@ -11777,6 +11778,7 @@ impl App {
     /// A session at work comes back on screen: the whole messages from its file, and then what is on its way.
     unsafe fn take_up(&mut self, at: usize) {
         let parked = self.parked.remove(at);
+        self.group_live_tools = self.settings.compact_tools;
         let free = std::mem::replace(&mut self.agent, parked.agent);
         let _ = free.commands.send(Command::Quit);
         self.events = parked.events;
@@ -13916,6 +13918,7 @@ impl App {
                 self.refresh_sessions();
             }
             Event::TurnStarted => {
+                self.group_live_tools = self.settings.compact_tools;
                 // (a turn clears the flag as it begins: Stop was pressed before it did, while the engine warmed up)
                 if self.stop_asked {
                     self.agent.cancel.store(true, Ordering::Relaxed);
@@ -13989,7 +13992,7 @@ impl App {
             // (a question or a plan is a card of its own: the call that makes it has no row among the calls)
             Event::ToolWriting { ref tool, .. } if cards::is_asking(tool) => {}
             Event::ToolWriting { index, tool, piece } => {
-                if self.settings.compact_tools {
+                if self.group_live_tools {
                     self.run_writes(index, tool, &piece);
                 } else {
                     if !self.plain_writing.iter().any(|entry| entry.writing.as_ref().is_some_and(|writing| writing.index == index)) {
@@ -14005,7 +14008,7 @@ impl App {
             }
             Event::ToolStarted { id, tool, summary } => {
                 let summary: String = summary.chars().take(160).collect();
-                if self.settings.compact_tools {
+                if self.group_live_tools {
                     self.tools_running.insert(id.clone(), (tool.clone(), summary.clone()));
                     self.run_started(id, tool, summary);
                 } else {
@@ -14031,14 +14034,14 @@ impl App {
             // (a helper's call has its card: what the call came to is said there, and not in a row of the calls)
             Event::ToolEnded { id, .. } if self.tools_running.get(&id).is_some_and(|(tool, _)| tool == "explore") && self.has_helper_card(&id) => {
                 self.tools_running.remove(&id);
-                if self.tools_running.is_empty() || !self.settings.compact_tools {
+                if self.tools_running.is_empty() || !self.group_live_tools {
                     self.set_activity(t("Thinking…").into());
                 }
             }
             Event::ToolEnded { id, ok, declined, elapsed, output, images } => {
                 self.end_line();
                 let (tool, summary) = self.tools_running.remove(&id).unwrap_or_default();
-                if self.tools_running.is_empty() || !self.settings.compact_tools {
+                if self.tools_running.is_empty() || !self.group_live_tools {
                     self.set_activity(t("Thinking…").into());
                 }
                 if matches!(tool.as_str(), "create_file" | "apply_patch" | "execute_command") {
@@ -14046,7 +14049,7 @@ impl App {
                     SetTimer(self.window, TIMER_CHANGES, 500, None);
                 }
                 let pictures = self.pictures_of(&images);
-                if self.settings.compact_tools {
+                if self.group_live_tools {
                     self.run_ended(&id, tool, summary, ok, declined, elapsed.as_secs_f64(), &output);
                     self.para_next = Some(Para::AfterBlock);
                     if !pictures.is_empty() {
@@ -17205,7 +17208,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 }
                 ID_PROVIDER_UP => app.move_provider(-1),
                 ID_PROVIDER_DOWN => app.move_provider(1),
-                ID_TOGGLE_COMPACT => app.on_menu(M_COMPACT_CHOICE + usize::from(app.settings.compact_tools)),
+                ID_TOGGLE_COMPACT => {
+                    app.settings.compact_tools = !app.settings.compact_tools;
+                    app.save();
+                    app.update_toggles();
+                }
                 ID_TOGGLE_WEB => app.on_menu(M_WEB_CHOICE + usize::from(app.settings.web_tools)),
                 ID_TOGGLE_CODE_MODE => app.code_mode_switched(),
                 ID_FILES => {
@@ -18330,6 +18337,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
         let context_slider = control(window, "DogSlider", "", WS_TABSTOP, 0, 0);
         let chip = |id: isize, backdrop: u32| make_button(window, id, "", ButtonKind::Chip, backdrop);
         let app = Box::new(App {
+            group_live_tools: saved.compact_tools,
             window,
             folder,
             settings: saved,
