@@ -85,10 +85,14 @@ fn modified(data: &std::fs::Metadata) -> Option<u128> {
     data.modified().ok()?.duration_since(UNIX_EPOCH).ok().map(|since| since.as_nanos())
 }
 
-/// The names of the files that differ from a commit, by what asks nothing of the repository: this takes no lock, as the person's own git may be at work.
-fn differing(workspace: &Path, head: &str) -> Vec<String> {
-    git(workspace, &["--no-optional-locks", "-c", "core.quotepath=off", "diff", "--no-renames", "--name-only", "--relative", head])
-        .map_or(Vec::new(), |names| names.lines().map(str::to_string).collect())
+/// Each path that differs and whether it existed in the given commit. Leave Git's optional locks free for other clients.
+fn differing(workspace: &Path, head: &str) -> Vec<(String, bool)> {
+    let output = git(workspace, &["--no-optional-locks", "diff", "--no-renames", "--name-status", "-z", "--relative", head]).unwrap_or_default();
+    let mut fields = output.split_terminator('\0');
+    std::iter::from_fn(|| {
+        let status = fields.next()?;
+        Some((fields.next()?.to_string(), status != "A"))
+    }).collect()
 }
 
 /// One file as it is now, with a copy of it if it is small text and within what may be kept.
@@ -175,7 +179,7 @@ impl Baseline {
         let (mut files, mut kept, mut whole) = (BTreeMap::new(), 0u64, true);
         match &head {
             Some(head) => {
-                let names: BTreeSet<String> = differing(workspace, head).into_iter().chain(untracked_names(workspace, &[])).collect();
+                let names: BTreeSet<String> = differing(workspace, head).into_iter().map(|(name, _)| name).chain(untracked_names(workspace, &[])).collect();
                 // The time is for the copies. What git took to name the files is no reason to keep none of them: on a busy machine it
                 // was all of it, and what was changed before the session was taken for the session's work. Past the time each is still
                 // kept by its size and time, which costs nothing to ask, and only its copy is left out.
@@ -214,12 +218,17 @@ impl Baseline {
         Baseline { head, files, whole, moved: None, session: PathBuf::new() }
     }
 
-    /// The files that may differ from the beginning, and whether that is all of them.
-    fn candidates(&self, workspace: &Path) -> (BTreeSet<String>, bool) {
-        let mut names: BTreeSet<String> = self.files.keys().cloned().collect();
+    /// Each candidate and whether it existed at the start, followed by whether the list is complete.
+    fn candidates(&self, workspace: &Path) -> (BTreeMap<String, bool>, bool) {
+        let mut names: BTreeMap<_, _> = self.files.iter().map(|(name, entry)| (name.clone(), !entry.gone)).collect();
         if let Some(head) = &self.head {
-            names.extend(differing(workspace, head));
-            names.extend(untracked_names(workspace, &[]));
+            // A saved worktree entry takes precedence over the commit (including a deletion before the session).
+            for (name, in_commit) in differing(workspace, head) {
+                names.entry(name).or_insert(in_commit);
+            }
+            for name in untracked_names(workspace, &[]) {
+                names.entry(name).or_insert(false);
+            }
             return (names, self.whole);
         }
         let started = Instant::now();
@@ -230,7 +239,7 @@ impl Baseline {
             }
             if entry.file_type().is_some_and(|kind| kind.is_file()) {
                 seen += 1;
-                names.insert(entry.path().strip_prefix(workspace).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/"));
+                names.entry(entry.path().strip_prefix(workspace).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/")).or_insert(false);
             }
         }
         (names, self.whole)
@@ -252,7 +261,7 @@ impl Baseline {
             // (a change with no diff is one of a binary or of a file too large to read: nothing is shown of it, as of any other)
             changes.iter().find(|change| change.path.replace('\\', "/") == name).map(|change| change.diff.clone()).filter(|diff| !diff.is_empty())
         };
-        for name in names.iter().filter(|name| wanted(name)) {
+        for (name, &existed) in names.iter().filter(|(name, _)| wanted(name)) {
             let path = workspace.join(name);
             let missing = |error: &std::io::Error| matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory);
             let now = match std::fs::metadata(&path) {
@@ -273,7 +282,7 @@ impl Baseline {
             }
             // (nothing is shown of it, and to read it is to hold it: one larger than memory would end the app, with the person's conversation in it)
             if let Some(size) = now.as_ref().map(std::fs::Metadata::len).filter(|size| *size > MOST_READ) {
-                lines.push(format!("{} {name} ({size} bytes): too large to compare or show", if entry.is_some_and(|entry| !entry.gone) { "changed" } else { "created" }));
+                lines.push(format!("{} {name} ({size} bytes): too large to compare or show", if existed { "changed" } else { "created" }));
                 continue;
             }
             let after = match now.map(|_| std::fs::read(&path)).transpose() {
@@ -459,6 +468,33 @@ mod tests {
         std::fs::File::create(work.path().join("data.bin")).unwrap().set_len(MOST_READ + 1).unwrap();
         let said = baseline.changes(work.path(), &[]);
         assert!(said.contains("created data.bin") && said.contains("too large"), "{said}");
+    }
+
+    #[test]
+    fn oversized_session_files_keep_their_status_from_the_starting_commit_and_worktree() {
+        let (repo, _keep, session) = fixture();
+        let work = repo.path().join("pkg");
+        std::fs::create_dir(&work).unwrap();
+        run_git(repo.path(), &["init", "-q"]);
+        for name in ["tracked.bin", "missing.bin"] {
+            std::fs::write(work.join(name), "committed").unwrap();
+        }
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-qm", "start"]);
+        std::fs::remove_file(work.join("missing.bin")).unwrap();
+        std::fs::write(work.join("already-new.bin"), "untracked at the start").unwrap();
+        let baseline = Baseline::for_session(&session, &work);
+        std::fs::write(work.join("committed-later.bin"), "after the start").unwrap();
+        run_git(&work, &["add", "committed-later.bin"]);
+        run_git(&work, &["commit", "-qm", "later"]);
+        for name in ["tracked.bin", "missing.bin", "already-new.bin", "committed-later.bin", "new.bin"] {
+            std::fs::File::create(work.join(name)).unwrap().set_len(MOST_READ + 1).unwrap();
+        }
+        let said = baseline.changes(&work, &[]);
+        for label in ["changed tracked.bin", "created missing.bin", "changed already-new.bin", "created committed-later.bin", "created new.bin"] {
+            assert!(said.contains(&format!("{label} ({} bytes): too large to compare or show", MOST_READ + 1)), "{said}");
+        }
+        assert_eq!(said.trim().lines().count(), 5, "{said}");
     }
 
     #[test]
