@@ -151,18 +151,59 @@ enum Before {
     Unknown(u64),
 }
 
-/// If Git could not list changes, a path listed as untracked might still have belonged to the starting commit.
-fn committed_file(workspace: &Path, head: &str, name: &str, existed: bool, complete: bool) -> Result<Before, String> {
-    if !existed {
-        if complete {
-            return Ok(Before::Absent);
+struct Blob {
+    id: String,
+    size: u64,
+}
+
+impl Blob {
+    fn from_tree_header(header: &str) -> Result<Option<Blob>, String> {
+        let mut fields = header.split_whitespace().skip(1);
+        if fields.next() != Some("blob") {
+            return Ok(None);
         }
-        let entry = git(workspace, &["--no-optional-locks", "--literal-pathspecs", "ls-tree", "-z", head, "--", name])?;
-        if entry.split_whitespace().nth(1) != Some("blob") {
-            return Ok(Before::Absent);
+        let id = fields.next().ok_or("missing blob ID in the starting tree")?;
+        let size = fields.next().and_then(|field| field.parse().ok()).ok_or("invalid blob size in the starting tree")?;
+        Ok(Some(Blob { id: id.to_string(), size }))
+    }
+
+    fn read(&self, workspace: &Path) -> Result<Before, String> {
+        if self.size > MOST_READ {
+            return Ok(Before::Unknown(self.size));
+        }
+        git_raw(workspace, &["--no-optional-locks", "cat-file", "blob", &self.id]).map(Before::Bytes)
+    }
+}
+
+/// Ask for sizes together, keeping literal path arguments comfortably within the Windows command-line limit.
+fn starting_blobs(workspace: &Path, head: &str, mut paths: &[&str]) -> BTreeMap<String, Result<Option<Blob>, String>> {
+    let mut entries = BTreeMap::new();
+    while !paths.is_empty() {
+        let mut bytes = 0;
+        let count = paths.iter().take_while(|path| {
+            bytes += path.len() + 3;
+            bytes <= 12 * 1024
+        }).count().max(1);
+        let (batch, rest) = paths.split_at(count);
+        paths = rest;
+        let mut args = vec!["--no-optional-locks", "--literal-pathspecs", "ls-tree", "-l", "-z", head, "--"];
+        args.extend_from_slice(batch);
+        match git(workspace, &args) {
+            Ok(output) => {
+                for entry in output.split_terminator('\0') {
+                    if let Some((header, name)) = entry.split_once('\t') {
+                        entries.insert(name.to_string(), Blob::from_tree_header(header));
+                    }
+                }
+            }
+            Err(error) => {
+                for name in batch {
+                    entries.insert((*name).to_string(), Err(error.clone()));
+                }
+            }
         }
     }
-    git_raw(workspace, &["--no-optional-locks", "show", &format!("{head}:./{name}")]).map(Before::Bytes)
+    entries
 }
 
 impl Baseline {
@@ -283,6 +324,23 @@ impl Baseline {
             // (a change with no diff is one of a binary or of a file too large to read: nothing is shown of it, as of any other)
             changes.iter().find(|change| change.path.replace('\\', "/") == name).map(|change| change.diff.clone()).filter(|diff| !diff.is_empty())
         };
+        let blobs = std::cell::OnceCell::new();
+        let committed_file = |head: &str, name: &str, existed: bool| -> Result<Before, String> {
+            if !existed && whole {
+                return Ok(Before::Absent);
+            }
+            let blobs = blobs.get_or_init(|| {
+                let paths: Vec<_> = names.iter().filter(|(path, existed)| (**existed || !whole) && !self.files.contains_key(*path) && wanted(path))
+                    .map(|(path, _)| path.as_str()).collect();
+                starting_blobs(workspace, head, &paths)
+            });
+            match blobs.get(name) {
+                Some(Ok(Some(blob))) => blob.read(workspace),
+                Some(Err(error)) => Err(error.clone()),
+                None if existed => Err("missing tree entry for the starting version".to_string()),
+                _ => Ok(Before::Absent),
+            }
+        };
         for (name, &existed) in names.iter().filter(|(name, _)| wanted(name)) {
             let path = workspace.join(name);
             let missing = |error: &std::io::Error| matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory);
@@ -322,7 +380,7 @@ impl Baseline {
                     None => Before::Unknown(entry.size),
                 },
                 None => match &self.head {
-                    Some(head) => match committed_file(workspace, head, name, existed, whole) {
+                    Some(head) => match committed_file(head, name, existed) {
                         Ok(before) => before,
                         Err(error) => {
                             lines.push(format!("could not compare {name} with the starting commit: {error}"));
@@ -344,12 +402,17 @@ impl Baseline {
             let size = after.as_ref().map_or(0, Vec::len);
             let word = match (&before, &after) {
                 (Before::Absent, _) => format!("created {name} ({size} bytes)"),
+                (Before::Unknown(known), None) if *known > MOST_READ => format!("deleted {name} ({known} bytes)"),
                 (_, None) => format!("deleted {name}"),
                 (Before::Bytes(before), Some(_)) => format!("changed {name} ({} to {size} bytes)", before.len()),
                 (Before::Unknown(known), Some(_)) => format!("changed {name} ({known} to {size} bytes)"),
             };
             if may_hold_secrets(name) {
                 lines.push(format!("{word}: it may hold secrets, so it is not shown"));
+                continue;
+            }
+            if matches!(before, Before::Unknown(known) if known > MOST_READ) {
+                lines.push(format!("{word}: previous content too large to compare or show"));
                 continue;
             }
             let text = |bytes: &[u8]| file_text(bytes).0;
@@ -520,6 +583,25 @@ mod tests {
         unavailable.head = Some("0000000000000000000000000000000000000000".to_string());
         let report = unavailable.changes(work.path(), &["a.txt"]);
         assert!(report.contains("could not compare a.txt with the starting commit") && !report.contains("created a.txt"), "{report}");
+    }
+
+    #[test]
+    fn an_oversized_committed_blob_is_reported_without_reading_its_contents() {
+        let (work, _keep, session) = fixture();
+        repository(work.path());
+        let blob = work.path().join("data.bin");
+        let size = MOST_READ + 1;
+        std::fs::File::create(&blob).unwrap().set_len(size).unwrap();
+        run_git(work.path(), &["add", "data.bin"]);
+        run_git(work.path(), &["commit", "-qm", "binary asset"]);
+        let baseline = Baseline::for_session(&session, work.path());
+        std::fs::remove_file(&blob).unwrap();
+        let report = baseline.changes(work.path(), &[]);
+        assert!(report.contains(&format!("deleted data.bin ({size} bytes)")) && report.contains("too large"), "{report}");
+        std::fs::write(&blob, b"tiny").unwrap();
+        let report = baseline.changes(work.path(), &[]);
+        assert!(report.contains(&format!("changed data.bin ({size} to 4 bytes)")) && report.contains("too large"), "{report}");
+        assert!(!report.contains("@@"), "{report}");
     }
 
     #[test]
