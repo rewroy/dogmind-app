@@ -423,7 +423,9 @@ fn execute(program: &str, code: &str, names: &[String], limits: &Limits, shared:
             Function::new(ctx.clone(), move |line: String| log.borrow_mut().push(&line)).map_err(|error| describe_engine_error(&ctx, error))?
         };
         // (the timers a program set, by when they are due; the program keeps what each one runs)
-        let timers: Rc<RefCell<Vec<(Instant, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+        // (a heap, as a program may set many: each is taken in its turn, and one cleared is let go when it comes up)
+        let timers: Rc<RefCell<std::collections::BinaryHeap<std::cmp::Reverse<(Instant, u32)>>>> = Rc::default();
+        let cleared: Rc<RefCell<std::collections::HashSet<u32>>> = Rc::default();
         let set_timer = {
             let (timers, next) = (timers.clone(), Cell::new(0u32));
             Function::new(ctx.clone(), move |ms: f64| -> f64 {
@@ -432,14 +434,19 @@ fn execute(program: &str, code: &str, names: &[String], limits: &Limits, shared:
                     return -1.0;
                 }
                 next.set(next.get() + 1);
-                timers.borrow_mut().push((Instant::now() + Duration::from_secs_f64(ms / 1000.0), next.get()));
+                timers.borrow_mut().push(std::cmp::Reverse((Instant::now() + Duration::from_secs_f64(ms / 1000.0), next.get())));
                 f64::from(next.get())
             })
             .map_err(|error| describe_engine_error(&ctx, error))?
         };
         let clear_timer = {
-            let timers = timers.clone();
-            Function::new(ctx.clone(), move |id: f64| timers.borrow_mut().retain(|(_, known)| f64::from(*known) != id)).map_err(|error| describe_engine_error(&ctx, error))?
+            let cleared = cleared.clone();
+            Function::new(ctx.clone(), move |id: f64| {
+                if id >= 1.0 && id <= f64::from(u32::MAX) {
+                    cleared.borrow_mut().insert(id as u32);
+                }
+            })
+            .map_err(|error| describe_engine_error(&ctx, error))?
         };
         let setup: Function = ctx.eval_with_options(SETUP, options("tools.js")).map_err(|error| describe_engine_error(&ctx, error))?;
         let wait_most = WAIT_MOST.as_secs_f64() * 1000.0;
@@ -461,9 +468,15 @@ fn execute(program: &str, code: &str, names: &[String], limits: &Limits, shared:
             }
             // Nothing left to do but a timer: the earliest is waited for, and run.
             let due = {
-                let mut timers = timers.borrow_mut();
-                timers.sort();
-                (!timers.is_empty()).then(|| timers.remove(0))
+                let (mut timers, mut cleared) = (timers.borrow_mut(), cleared.borrow_mut());
+                let mut due = None;
+                while let Some(std::cmp::Reverse((at, id))) = timers.pop() {
+                    if !cleared.remove(&id) {
+                        due = Some((at, id));
+                        break;
+                    }
+                }
+                due
             };
             let Some((at, id)) = due else {
                 // (a program waiting for what never comes, as the engine says it)
@@ -1222,6 +1235,19 @@ mod tests {
         assert_eq!(go_alone(code).value.as_deref(), Some("ba"));
         let outcome = go_alone("await sleep(31000); return 'late';");
         assert!(outcome.error.as_deref().is_some_and(|error| error.contains("a wait is at most 30000 ms")), "{:?}", outcome.error);
+    }
+
+    /// Many timers are taken in their turn without the time going on sorting them, and a cleared one is not waited for.
+    #[test]
+    fn many_timers_run_without_a_cost_of_their_own_and_a_cleared_one_is_not_waited_for() {
+        let began = Instant::now();
+        let outcome = go_alone("const all = []; for (let i = 0; i < 5000; i++) all.push(sleep(i % 50)); await Promise.all(all); return 'all ' + all.length;");
+        assert_eq!(outcome.value.as_deref(), Some("all 5000"), "{:?}", outcome.error);
+        assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+        let began = Instant::now();
+        let outcome = go_alone("const long = setTimeout(() => {}, 29000); clearTimeout(long); await sleep(10); return 'quick';");
+        assert_eq!(outcome.value.as_deref(), Some("quick"));
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
     }
 
     /// A wait past what is left of the program's time ends at its limit, and a stop in the middle of one ends it at once.

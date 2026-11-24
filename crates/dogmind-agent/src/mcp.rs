@@ -1461,6 +1461,15 @@ fn place_tools(server: &str, part: &str, tools: &[Value], selection: Option<&Too
     (names, schemas)
 }
 
+/// The server a tool is of: the running one that lists it, or, while none does (one starting again, one that has ended or dropped the tool), the one
+/// whose part begins the tool's name. A server gone from the file has none: what it said is no one's word now.
+fn slot_of<'a>(slots: &'a [Slot], tool: &str) -> Option<&'a Slot> {
+    slots.iter().find(|slot| slot.running.as_ref().is_some_and(|running| running.names.contains_key(tool))).or_else(|| {
+        let part = tool.strip_prefix("mcp__")?.split_once("__")?.0;
+        slots.iter().find(|slot| slot.part == part)
+    })
+}
+
 fn ready(name: &str, part: &str, config: &ServerConfig) -> Result<Arc<Running>, String> {
     let mut running = start_server(config)?;
     let tools = std::mem::take(&mut running.schemas);
@@ -1719,7 +1728,7 @@ impl Hub {
     /// Whether what this tool returns comes from a server the person trusts. The same server that a call of it reaches.
     pub fn trusts_tool(&self, tool: &str) -> bool {
         let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        slots.iter().find(|slot| slot.running.as_ref().is_some_and(|running| running.names.contains_key(tool))).is_some_and(|slot| slot.trusted)
+        slot_of(&slots, tool).is_some_and(|slot| slot.trusted)
     }
 
     /// What each of these tools is, as fully as its server says it, with its arguments' JSON Schema: for tools told by name only, before a call.
@@ -1741,7 +1750,7 @@ impl Hub {
     /// The server a call of this tool reaches, by its name in the file; none when no running server has the tool.
     pub fn server_of(&self, tool: &str) -> Option<String> {
         let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        slots.iter().find(|slot| slot.running.as_ref().is_some_and(|running| running.names.contains_key(tool))).map(|slot| slot.name.clone())
+        slot_of(&slots, tool).map(|slot| slot.name.clone())
     }
 
     /// The person's word on a server, from now on and in its file. Nothing is written unless the file lists it: one that cannot be read must not be replaced by one with less in it.
@@ -3042,6 +3051,21 @@ enabled = false
         hub.set_trusted("editor", true).unwrap();
         assert!(!std::fs::read_to_string(&file).unwrap().contains("trusted"), "back to the default: nothing said");
         assert!(hub.trust()[0].1);
+    }
+
+    /// A server starting again (no running one lists its tools for that while) is still the one its tools are of: its trust holds, and a card can
+    /// offer to trust it. One gone from the file is no one's.
+    #[test]
+    fn a_tool_is_of_its_server_while_the_server_starts_again() {
+        let tool = json!({"name": "t", "description": "d", "inputSchema": {"type": "object"}});
+        let hub = Hub::scripted("srv", &[tool], &[], true);
+        assert!(hub.trusts_tool("mcp__srv__t") && hub.server_of("mcp__srv__t").as_deref() == Some("srv"));
+        hub.slots.lock().unwrap()[0].running = None;
+        assert!(hub.trusts_tool("mcp__srv__t"), "its trust holds while it starts again");
+        assert_eq!(hub.server_of("mcp__srv__t").as_deref(), Some("srv"));
+        assert_eq!(hub.server_of("mcp__other__t"), None);
+        hub.slots.lock().unwrap().clear();
+        assert!(!hub.trusts_tool("mcp__srv__t") && hub.server_of("mcp__srv__t").is_none(), "gone from the file: no one's");
     }
 
     /// A name a server gives to several of its tools calls none of them: they are not offered, and the connection's facts say how many there are.
