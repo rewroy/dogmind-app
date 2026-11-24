@@ -66,9 +66,10 @@ pub struct ServerConfig {
     pub headers: BTreeMap<String, String>,
     #[serde(flatten)]
     pub tool_selection: ToolSelection,
-    /// The person's word that what this server returns is not a stranger's. In this app's own file, which neither a model's tools nor a command can write.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub trusted: bool,
+    /// The person's word on whether what this server returns is a stranger's, where it differs from the default ([`ServerConfig::trusts`]). In this app's own
+    /// file, which neither a model's tools nor a command can write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<bool>,
 }
 
 /// Normalize the HTTP scheme while preserving the exact server address, path and query.
@@ -90,6 +91,17 @@ impl ServerConfig {
     /// A server at a URL, and not a program.
     pub fn is_http(&self) -> bool {
         !self.url.is_empty() && self.command.is_empty()
+    }
+
+    /// Whether what it returns is taken as the person's own and not a stranger's. Unsaid, a program the person added is: it runs on their PC, as
+    /// they gave it, with all they can reach (an editor's bridge, a local tool). What a server at a URL returns comes from wherever that is.
+    pub fn trusts(&self) -> bool {
+        self.trusted.unwrap_or(!self.is_http())
+    }
+
+    /// The person's word to keep for `trusted`: nothing when it is what they would have without it.
+    pub fn trust_said(&self, trusted: bool) -> Option<bool> {
+        (trusted != !self.is_http()).then_some(trusted)
     }
 
     /// What is wrong with it as the person gave it, if anything.
@@ -404,8 +416,8 @@ pub fn import(file: &Path, more: BTreeMap<String, ServerConfig>) -> Result<usize
     let mut config = readable_config(file)?;
     let before = config.servers.len();
     for (name, server) in more {
-        // Trust is chosen for this app. An existing local choice is kept on reimport.
-        config.servers.entry(name).or_insert(ServerConfig { trusted: false, ..server });
+        // Trust is chosen for this app (another app's word on it is not taken): the default for its kind, or an existing local choice, kept on reimport.
+        config.servers.entry(name).or_insert(ServerConfig { trusted: None, ..server });
     }
     let added = config.servers.len() - before;
     if added > 0 {
@@ -1485,7 +1497,7 @@ impl Hub {
                 same.trusted = slot.config.as_ref().map_or(config.trusted, |was| was.trusted);
                 let retry = retry_server == Some(name.as_str()) && (slot.failed.is_some() || slot.running.as_ref().is_some_and(|server| server.disconnected()));
                 if !retry && slot.config.as_ref() == Some(&same) && slot.part == part {
-                    slot.trusted = config.trusted;
+                    slot.trusted = config.trusts();
                     slot.config = Some(config);
                     continue;
                 }
@@ -1494,7 +1506,7 @@ impl Hub {
                 let (name, part, config) = (name.clone(), part.clone(), config.clone());
                 Arc::new(move || ready(&name, &part, &config))
             };
-            let slot = Slot { name: name.clone(), start: Some(start.clone()), trusted: config.trusted, config: Some(config), part, ..Slot::default() };
+            let slot = Slot { name: name.clone(), start: Some(start.clone()), trusted: config.trusts(), config: Some(config), part, ..Slot::default() };
             match at {
                 Some(at) => slots[at] = slot,
                 None => slots.push(slot),
@@ -1524,7 +1536,7 @@ impl Hub {
         let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // (its trust as the person last set it, which is the slot's)
         slots.iter().filter_map(|slot| slot.config.clone().map(|mut config| {
-            config.trusted = slot.trusted;
+            config.trusted = config.trust_said(slot.trusted);
             (slot.name.clone(), config)
         })).collect()
     }
@@ -1691,19 +1703,32 @@ impl Hub {
         slots.iter().find(|slot| slot.running.as_ref().is_some_and(|running| running.names.contains_key(tool))).is_some_and(|slot| slot.trusted)
     }
 
+    /// The server a call of this tool reaches, by its name in the file; none when no running server has the tool.
+    pub fn server_of(&self, tool: &str) -> Option<String> {
+        let slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        slots.iter().find(|slot| slot.running.as_ref().is_some_and(|running| running.names.contains_key(tool))).map(|slot| slot.name.clone())
+    }
+
     /// The person's word on a server, from now on and in its file. Nothing is written unless the file lists it: one that cannot be read must not be replaced by one with less in it.
     pub fn set_trusted(&self, server: &str, trusted: bool) -> Result<(), String> {
         let file = self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone().ok_or("no file lists the servers")?;
         let mut config = readable_config(&file)?;
-        config.servers.get_mut(server).ok_or_else(|| format!("{}: lists no server {server}", file.display()))?.trusted = trusted;
+        let listed = config.servers.get_mut(server).ok_or_else(|| format!("{}: lists no server {server}", file.display()))?;
+        listed.trusted = listed.trust_said(trusted);
         write_config(&file, &config)?;
         if let Some(slot) = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter_mut().find(|slot| slot.name == server) {
             slot.trusted = trusted;
             if let Some(config) = &mut slot.config {
-                config.trusted = trusted;
+                config.trusted = config.trust_said(trusted);
             }
         }
         Ok(())
+    }
+
+    /// The file that lists the servers, so that the person's word on one can be kept: for the agent's tests, whose servers answer from a script.
+    #[cfg(test)]
+    pub(crate) fn listed_in(&self, file: &Path) {
+        *self.file.lock().unwrap() = Some(file.to_path_buf());
     }
 
     /// A server that answers from a script and is already up, for the agent's tests.
@@ -1985,17 +2010,18 @@ enabled = false
     fn imported_launch_settings_leave_trust_to_the_person_in_dogmind() {
         let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
-        let sources = servers_of_claude(r#"{"mcpServers":{"editor":{"command":"editor","args":["--stdio"],"trusted":true}}}"#);
+        let sources = servers_of_claude(r#"{"mcpServers":{"editor":{"command":"editor","args":["--stdio"],"trusted":false}}}"#);
         assert_eq!(import(&file, sources.clone()).unwrap(), 1);
         let mut editor = readable_config(&file).unwrap().servers.remove("editor").unwrap();
         assert_eq!(editor.args, ["--stdio"]);
-        assert!(!editor.trusted);
-        editor.trusted = true;
+        assert_eq!(editor.trusted, None, "the other app's word is not taken");
+        assert!(editor.trusts(), "a program the person added, on their PC");
+        editor.trusted = Some(false);
         save_server(&file, Some("editor"), "editor", editor).unwrap();
         let mut repeated = sources;
-        repeated.get_mut("editor").unwrap().trusted = false;
+        repeated.get_mut("editor").unwrap().trusted = Some(true);
         assert_eq!(import(&file, repeated).unwrap(), 0);
-        assert!(readable_config(&file).unwrap().servers["editor"].trusted);
+        assert!(!readable_config(&file).unwrap().servers["editor"].trusts(), "the person's word here is kept on reimport");
     }
 
     #[test]
@@ -2386,7 +2412,7 @@ enabled = false
         assert_eq!(hub.reload(), ["c"], "a renamed one is a new one, and the old name ends");
         assert_eq!(tools(&hub, 2), ["mcp__a__first", "mcp__c__second"]);
         let mut trusted = at(&one);
-        trusted.trusted = true;
+        trusted.trusted = Some(true);
         save_server(&file, Some("a"), "a", trusted).unwrap();
         assert!(hub.reload().is_empty(), "trust alone starts nothing again");
         assert!(hub.trust().contains(&("a".to_string(), true)));
@@ -2395,7 +2421,7 @@ enabled = false
         assert_eq!(tools(&hub, 1), ["mcp__c__second"]);
         assert_eq!(hub.configs().len(), 1);
         hub.set_trusted("c", true).unwrap();
-        assert!(hub.configs()[0].1.trusted, "Settings reads the trust back as the switch set it, so that a change made after keeps it");
+        assert_eq!(hub.configs()[0].1.trusted, Some(true), "Settings reads the trust back as the switch set it, so that a change made after keeps it");
         assert!(hub.reload().is_empty());
         assert!(save_server(&file, None, "x", ServerConfig::default()).unwrap_err().contains("needed"));
         // (what a power cut leaves of the file, its length in zeros, is no list to keep: a server is added to an empty one)
@@ -2749,13 +2775,13 @@ enabled = false
     fn trust_is_the_persons_word_kept_in_the_file_and_for_the_server_a_call_reaches() {
         let dir = crate::in_container::tempdir().unwrap();
         let file = dir.path().join("mcp.json");
-        std::fs::write(&file, r#"{"mcpServers": {"srv": {"command": "no-such-program-here", "args": ["a"]}}}"#).unwrap();
+        std::fs::write(&file, r#"{"mcpServers": {"srv": {"url": "http://127.0.0.1:9/mcp"}}}"#).unwrap();
         let hub = Hub::start(&file);
-        assert_eq!(hub.trust(), [("srv".to_string(), false)]);
+        assert_eq!(hub.trust(), [("srv".to_string(), false)], "a server at a URL is a stranger until the person says otherwise");
         hub.set_trusted("srv", true).unwrap();
         assert_eq!(hub.trust(), [("srv".to_string(), true)]);
         let saved = load_config(&file).servers["srv"].clone();
-        assert!(saved.trusted && saved.args == ["a"], "{saved:?}");
+        assert!(saved.trusted == Some(true) && saved.url == "http://127.0.0.1:9/mcp", "{saved:?}");
         assert!(Hub::start(&file).trust()[0].1, "and after a restart");
         hub.set_trusted("srv", false).unwrap();
         assert!(!std::fs::read_to_string(&file).unwrap().contains("trusted"), "nothing said when nothing is meant");
@@ -2959,6 +2985,23 @@ enabled = false
         start_a_mute_one(true);
     }
 
+    /// A program the person added runs on their PC, as they gave it: what it returns is theirs unless they say otherwise. A server at a URL is a
+    /// stranger until they say otherwise. Their word is kept only where it differs from that.
+    #[test]
+    fn a_program_the_person_added_is_trusted_and_a_url_is_not_until_they_say_otherwise() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        std::fs::write(&file, r#"{"mcpServers": {"editor": {"command": "no-such-program-here"}, "site": {"url": "http://127.0.0.1:9/mcp"}}}"#).unwrap();
+        let hub = Hub::start(&file);
+        assert_eq!(hub.trust(), [("editor".to_string(), true), ("site".to_string(), false)]);
+        hub.set_trusted("editor", false).unwrap();
+        assert_eq!(load_config(&file).servers["editor"].trusted, Some(false), "turned off: said in the file");
+        assert!(!Hub::start(&file).trust()[0].1, "and after a restart");
+        hub.set_trusted("editor", true).unwrap();
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("trusted"), "back to the default: nothing said");
+        assert!(hub.trust()[0].1);
+    }
+
     #[test]
     fn two_servers_whose_names_clean_to_one_keep_their_own_tools() {
         let dir = crate::in_container::tempdir().unwrap();
@@ -2966,7 +3009,7 @@ enabled = false
         for name in ["my.server", "my_server"] {
             let file = dir.path().join(format!("{name}.pid"));
             let mut config = fake(ANSWERING, &[name, &file.display().to_string()]);
-            config.trusted = name == "my_server";
+            config.trusted = Some(name == "my_server");
             servers.insert(name.to_string(), config);
             files.push(file);
         }

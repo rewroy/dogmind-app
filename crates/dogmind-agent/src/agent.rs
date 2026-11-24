@@ -218,7 +218,8 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Approve,
-    /// From now on: by the rule offered, or without one this exact call for the rest of the session.
+    /// From now on: by the rule offered, or without one this exact call (an MCP server's tool: the tool) for the rest of the session; where what a
+    /// server returned is why it asks, trust in that server (`AlwaysScope::Servers`).
     Always,
     Reject,
 }
@@ -785,7 +786,9 @@ fn both_weighed(written: Verdict, runs: Verdict) -> Verdict {
     }
 }
 
-/// What "this exact call, for the rest of the session" compares: all of it, as a call's summary shows only a command's first line and the start of a server's arguments.
+/// What "this exact call, for the rest of the session" compares: all of it, as a call's summary shows only a command's first line. An MCP server's tool
+/// is the person's to allow as a whole, whatever it is given: its arguments differ from one call to the next, and an "always" to one set of them was
+/// asked again at every other (a game editor's server, nine cards in two minutes, four for the same tool).
 fn always_key(tool: &str, arguments: &Value) -> String {
     match tool {
         // (the network too: "always" to a command is not to the same command with the network, which asks a person each time)
@@ -796,7 +799,7 @@ fn always_key(tool: &str, arguments: &Value) -> String {
             safety::wants_network(arguments),
             safety::outside_sandbox(arguments)
         ),
-        _ if tool.starts_with("mcp__") => format!("{tool}\n{arguments}"),
+        _ if tool.starts_with("mcp__") => tool.to_string(),
         _ => format!("{tool}\n{}", tools::summary(tool, arguments)),
     }
 }
@@ -1651,8 +1654,14 @@ struct Agent {
     interject: Arc<Mutex<Vec<String>>>,
     /// Calls of this response that have run before unchanged: their results say so.
     repeated: HashSet<String>,
-    /// Web content is in this conversation: what it says may have got as far as the model's next step.
-    web_seen: bool,
+    /// Where what a stranger said came into this conversation, by the tool that brought it (`web_read`, `web_search`, a server's tool): what it says
+    /// may have got as far as the model's next step. A server's counts for as long as the person does not trust it ([`Agent::web_seen`]).
+    web_from: Vec<String>,
+    /// Web content is in this conversation by a mark that cannot say where all of it came from (a session from before the sources were kept, whose
+    /// results do not name them): it counts whatever is trusted.
+    web_untold: bool,
+    /// What the app was last told of [`Agent::web_seen`].
+    web_told: bool,
     /// Files put back while the conversation stayed: the model still thinks them as it left them.
     rewound: Vec<PathBuf>,
     always: HashSet<String>,
@@ -1916,7 +1925,9 @@ impl Agent {
             live: Arc::new(Mutex::new(Live { mode: Mode::Default, effort: None, safe_commands: false })),
             instructions: config.instructions,
             repeated: HashSet::new(),
-            web_seen: false,
+            web_from: Vec::new(),
+            web_untold: false,
+            web_told: false,
             provider: None,
             server_answered: false,
             quiet_gave_up: false,
@@ -2315,7 +2326,7 @@ impl Agent {
         // (a goal left open for background work's end is that session's: another one starts with none)
         self.round_goal = None;
         self.emit(Event::Goal(None));
-        self.web_seen = false;
+        (self.web_from, self.web_untold, self.web_told) = (Vec::new(), false, false);
         self.japanese_session = false;
         self.rewound.clear();
         self.read_only = false;
@@ -2369,8 +2380,9 @@ impl Agent {
                 self.web_rules_due = false;
                 self.japanese_session = false;
                 self.rewound.clear();
-                self.web_seen = crate::session::web_seen(path);
-                self.emit(Event::WebSeen(self.web_seen));
+                (self.web_from, self.web_untold) = crate::session::web_sources(path);
+                self.web_told = self.web_seen();
+                self.emit(Event::WebSeen(self.web_told));
                 // (the history has said it already; a compaction will say it again)
                 (self.goal, self.goal_due) = (crate::session::goal_of(path), false);
                 self.round_goal = None;
@@ -4107,12 +4119,14 @@ impl Agent {
         let (result, images) = if name == "check_page" && !nested { self.with_check_pictures(result, images) } else { (result, images) };
         // A server's answer is as much a stranger's as a page: it may have come from one.
         let from_a_stranger = matches!(name, "web_search" | "web_read") || (name.starts_with("mcp__") && !self.mcp.as_ref().is_some_and(|hub| hub.trusts_tool(name)));
-        if from_a_stranger && result.is_ok() && !self.web_seen {
-            self.web_seen = true;
+        if from_a_stranger && result.is_ok() && !self.web_from.iter().any(|known| known == name) {
+            // (the plain mark too, as a version that does not read the sources reads it)
+            let first = self.web_from.is_empty() && !self.web_untold;
+            self.web_from.push(name.to_string());
             if let Some(session) = &mut self.session {
-                let _ = session.mark_web_seen();
+                let _ = session.mark_web_from(name, first);
             }
-            self.emit(Event::WebSeen(true));
+            self.tell_web_seen();
         }
         if name == "todo" && result.is_ok() {
             self.emit(Event::Todos(self.bench.todos.clone()));
@@ -4634,6 +4648,42 @@ impl Agent {
         self.tell_waiting();
     }
 
+    /// Whether what a stranger said is in this conversation: a page, a search, or a server the person does not trust now (one trusted since it
+    /// answered no longer counts, nor does one that runs on their PC as they added it, unless they turned that off).
+    fn web_seen(&self) -> bool {
+        self.web_untold || self.web_from.iter().any(|tool| !self.trusted_source(tool))
+    }
+
+    fn trusted_source(&self, tool: &str) -> bool {
+        tool.starts_with("mcp__") && self.mcp.as_ref().is_some_and(|hub| hub.trusts_tool(tool))
+    }
+
+    /// The servers whose answers alone make this conversation a stranger's: none when a page, a search or a mark that cannot say where it came
+    /// from does too, or when no running server has one of the tools now.
+    fn stranger_servers(&self) -> Option<Vec<String>> {
+        if self.web_untold {
+            return None;
+        }
+        let hub = self.mcp.as_ref()?;
+        let mut servers: Vec<String> = Vec::new();
+        for tool in self.web_from.iter().filter(|tool| !self.trusted_source(tool)) {
+            let server = if tool.starts_with("mcp__") { hub.server_of(tool)? } else { return None };
+            if !servers.contains(&server) {
+                servers.push(server);
+            }
+        }
+        (!servers.is_empty()).then_some(servers)
+    }
+
+    /// Tells the app of web content in the conversation when that has changed: a stranger's answer came in, or what one returned is trusted now.
+    fn tell_web_seen(&mut self) {
+        let seen = self.web_seen();
+        if seen != self.web_told {
+            self.web_told = seen;
+            self.emit(Event::WebSeen(seen));
+        }
+    }
+
     fn permission(&mut self, tool: &str, arguments: &Value) -> Permission {
         if let Some(guarded) = self.no_change_guard(tool, arguments) {
             return guarded;
@@ -4642,8 +4692,11 @@ impl Agent {
         let place = self.bench.scratch_for(arguments).filter(|_| tool == "execute_command").unwrap_or_else(|| self.workspace.clone());
         // What a page said may be why this is being done: keys are asked for each time then, and so is what a page could have planted.
         // A command that does not get the network is weighed as it would be with no web content here: the sandbox keeps it to the workspace, and the person chose this.
-        let web_asks = self.web_seen && if tool == "execute_command" { safety::wants_network(arguments) } else { tool.starts_with("mcp__") };
-        let from_web = web_asks || (self.web_seen && (tool == "remember" || tool == "forget"));
+        // (a server trusted since what it returned came in no longer counts, and the app's mark says so)
+        self.tell_web_seen();
+        let web_seen = self.web_seen();
+        let web_asks = web_seen && if tool == "execute_command" { safety::wants_network(arguments) } else { tool.starts_with("mcp__") };
+        let from_web = web_asks || (web_seen && (tool == "remember" || tool == "forget"));
         let (verdict, runs_as) = weigh(&self.gate, tool, arguments, &place);
         let (risk, mut reason) = match verdict {
             Verdict::Allow if tool == "web_read" => {
@@ -4654,7 +4707,7 @@ impl Agent {
                 // With a page in the conversation, a short address is no longer safe to take on trust: it was perhaps told to the model to
                 // put something in a path (`/hunter2`), and the person sees where it goes before it does.
                 let plain = crate::web::address_carries_nothing(url);
-                if plain && !self.web_seen {
+                if plain && !web_seen {
                     return Permission::Run;
                 }
                 // (a person need not be asked about what no one gave it)
@@ -4670,9 +4723,9 @@ impl Agent {
                 (Risk::Medium, Some(reason.to_string()))
             }
             // A note reaches every later session, so what a page says must not get there on its own.
-            Verdict::Allow if tool == "remember" && self.web_seen => (Risk::Medium, Some(safety::REASON_WEB_NOTE.to_string())),
+            Verdict::Allow if tool == "remember" && web_seen => (Risk::Medium, Some(safety::REASON_WEB_NOTE.to_string())),
             // (and so is dropping one: what a page planted must not be able to take the person's notes away either)
-            Verdict::Allow if tool == "forget" && self.web_seen => (Risk::Medium, Some(safety::REASON_WEB_FORGET.to_string())),
+            Verdict::Allow if tool == "forget" && web_seen => (Risk::Medium, Some(safety::REASON_WEB_FORGET.to_string())),
             Verdict::Allow => return Permission::Run,
             Verdict::Deny(reason) => return Permission::Denied(format!("denied: {reason}")),
             Verdict::Ask { risk, reason } => (risk, reason),
@@ -4700,9 +4753,16 @@ impl Agent {
         // A file in the folder that runs in place of the installed program: "always" was said of the program the line names, and that is not what this runs. (in the line that runs as well as the one as written)
         let planted = tool == "execute_command" && [Some(arguments), runs_as.as_ref()].into_iter().flatten().any(|call| self.gate.planted_program(call, &place).is_some());
         // Something to say "always" to wherever that is not the same as saying it to anything: never of a high-risk command, nor of what a page may have asked for.
+        // What a server the person does not trust returned is all that has this ask (no page, no search): "always" is trust in that server, which takes
+        // the reason away for its later calls too. Settings shows it, and turns it back.
+        let web_caused = matches!(reason.as_deref(), Some(safety::REASON_WEB_ASKED | safety::REASON_WEB_NOTE | safety::REASON_WEB_FORGET));
+        let scope = match self.stranger_servers().filter(|_| web_caused && risk < Risk::High) {
+            Some(servers) => Some(AlwaysScope::Servers(servers)),
+            None => scope,
+        };
         let offered = !planted && match &scope {
-            Some(AlwaysScope::Folders(_)) => true,
-            Some(_) => !self.web_seen,
+            Some(AlwaysScope::Folders(_) | AlwaysScope::Servers(_)) => true,
+            Some(_) => !web_seen,
             None => risk < Risk::High && !from_web,
         };
         if let Some(scope) = scope.as_ref().filter(|_| offered) {
@@ -4762,6 +4822,17 @@ impl Agent {
                         }
                         Some(AlwaysScope::Network(reach)) => {
                             self.always_networks.push(reach);
+                            break ("always", Permission::Run);
+                        }
+                        Some(AlwaysScope::Servers(servers)) => {
+                            if let Some(hub) = self.mcp.clone() {
+                                for server in &servers {
+                                    if let Err(error) = hub.set_trusted(server, true) {
+                                        self.emit(Event::Notice(format!("{server} could not be trusted: {error}")));
+                                    }
+                                }
+                            }
+                            self.tell_web_seen();
                             break ("always", Permission::Run);
                         }
                         Some(AlwaysScope::Parts(_)) => {
@@ -4828,7 +4899,7 @@ impl Agent {
         }
         let network = safety::wants_network(arguments);
         // (another reason is its own question, and after a page what gets the network is asked about each time)
-        let only_the_network = network && reason == Some(safety::REASON_NETWORK) && !self.web_seen;
+        let only_the_network = network && reason == Some(safety::REASON_NETWORK) && !self.web_seen();
         if !(reason.is_none() || only_the_network) {
             return None;
         }
@@ -6599,6 +6670,22 @@ note: the helper took")), "{log:?}");
     }
 
     /// Every approval of a turn answered with `decision`: the tool, whether "always" was on offer, and the reason it gave for asking (none for one that gave none).
+    /// The same, each card answered in turn from `decisions` (rejected past their end).
+    fn approvals_and_reasons_with(run: &Run, decisions: &[Decision]) -> Vec<(String, bool, Option<String>)> {
+        let mut asked = Vec::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::Approval(approval) => {
+                    let decision = decisions.get(asked.len()).copied().unwrap_or(Decision::Reject);
+                    asked.push((approval.tool.clone(), approval.always_allowed, approval.reason.clone()));
+                    approval.answer.send((decision, None)).unwrap();
+                }
+                Event::TurnEnded { .. } => return asked,
+                _ => {}
+            }
+        }
+    }
+
     fn approvals_and_reasons(run: &Run, decision: Decision) -> Vec<(String, bool, Option<String>)> {
         let mut asked = Vec::new();
         loop {
@@ -6746,9 +6833,10 @@ note: the helper took")), "{log:?}");
         assert!(cards(&run, &[]).is_empty(), "the rule answers for its part in another line");
     }
 
-    /// An MCP server's tool can do what a command can, outside the sandbox: it asks after a page with the web as its reason, and with no "always".
+    /// An MCP server's tool can do what a command can, outside the sandbox: after what a server the person does not trust returned, it asks with the
+    /// web as its reason, and "always" is trust in that server.
     #[test]
-    fn after_a_page_an_mcp_tool_asks_with_the_web_as_the_reason_and_no_always() {
+    fn after_an_untrusted_servers_answer_its_tool_asks_with_the_web_as_the_reason() {
         let dir = crate::in_container::tempdir().unwrap();
         let tools = [serde_json::json!({"name": "t", "description": "d", "inputSchema": {"type": "object"}})];
         let answer = |id: u32| serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": "an answer"}]}});
@@ -6765,7 +6853,74 @@ note: the helper took")), "{log:?}");
         handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
         let run = Run { handle, events, _sessions: sessions };
         run.handle.commands.send(Command::Send("go".into())).unwrap();
-        assert_eq!(approvals_and_reasons(&run, Decision::Reject), [("mcp__srv__t".to_string(), false, Some(safety::REASON_WEB_ASKED.to_string()))], "the first ran in auto, the second asks");
+        assert_eq!(approvals_and_reasons(&run, Decision::Reject), [("mcp__srv__t".to_string(), true, Some(safety::REASON_WEB_ASKED.to_string()))], "the first ran in auto, the second asks");
+    }
+
+    /// A server's tool in auto, after what that server returned: the card's "always" trusts the server, in its file, and the conversation's mark
+    /// of web content goes with it, so that its later calls run as the first did. (A game editor's server asked nine times in two minutes.)
+    #[test]
+    fn always_on_a_card_that_asks_for_a_servers_answer_trusts_the_server_and_its_calls_run() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let tools = [serde_json::json!({"name": "t", "description": "d", "inputSchema": {"type": "object"}})];
+        let answer = |id: u32| serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": "an answer"}]}});
+        let hub = mcp::Hub::scripted("srv", &tools, &[answer(1), answer(2), answer(3)], false);
+        let listed = dir.path().join("mcp.json");
+        std::fs::write(&listed, r#"{"mcpServers": {"srv": {"url": "http://127.0.0.1:9/mcp"}}}"#).unwrap();
+        hub.listed_in(&listed);
+        let (client, _) = server(vec![
+            call_answer("mcp__srv__t", serde_json::json!({"n": 1})),
+            call_answer("mcp__srv__t", serde_json::json!({"n": 2})),
+            call_answer("mcp__srv__t", serde_json::json!({"n": 3})),
+            text_answer("done"),
+        ]);
+        let (sender, events) = channel();
+        let sessions = crate::in_container::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Auto, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub.clone()), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let (mut asked, mut marks) = (Vec::new(), Vec::new());
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(20)).expect("the turn ended") {
+                Event::Approval(approval) => {
+                    asked.push((approval.scope.clone(), approval.always_allowed, approval.reason.clone()));
+                    approval.answer.send((Decision::Always, None)).unwrap();
+                }
+                Event::WebSeen(on) => marks.push(on),
+                Event::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(asked, [(Some(AlwaysScope::Servers(vec!["srv".into()])), true, Some(safety::REASON_WEB_ASKED.to_string()))], "the first ran in auto, the third as the first");
+        assert!(hub.trust().contains(&("srv".to_string(), true)));
+        assert!(std::fs::read_to_string(&listed).unwrap().contains("\"trusted\": true"), "in the person's file, where Settings shows it");
+        assert_eq!(marks, [true, false], "the mark came with its answer and went with the trust");
+    }
+
+    /// "Always" to a server's tool is to the tool: its arguments differ from one call to the next.
+    #[test]
+    fn always_to_an_mcp_tool_holds_for_its_other_arguments_and_not_for_another_tool() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let tools = [
+            serde_json::json!({"name": "t", "description": "d", "inputSchema": {"type": "object"}}),
+            serde_json::json!({"name": "u", "description": "d", "inputSchema": {"type": "object"}}),
+        ];
+        let answer = |id: u32| serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": "an answer"}]}});
+        let hub = mcp::Hub::scripted("srv", &tools, &[answer(1), answer(2), answer(3)], true);
+        let (client, _) = server(vec![
+            call_answer("mcp__srv__t", serde_json::json!({"operations": [{"command": "editor status"}]})),
+            call_answer("mcp__srv__t", serde_json::json!({"operations": [{"command": "console get"}]})),
+            call_answer("mcp__srv__u", serde_json::json!({})),
+            text_answer("done"),
+        ]);
+        let (sender, events) = channel();
+        let sessions = crate::in_container::tempdir().unwrap();
+        let handle = start(Config { workspace: dir.path().to_path_buf(), sessions: sessions.path().to_path_buf(), rules: sessions.path().join("permissions.json"), mode: Mode::Default, effort: None, web: WebSettings::default(), language: "auto".into(), japanese_system: false, instructions: None, home: None, skills_off: Vec::new(), skills_on: Vec::new(), memory: None, mcp: Some(hub), policy: Default::default(), code_mode: false }, sender, Box::new(|| {}));
+        handle.commands.send(Command::Provider(Arc::new(client), "model".into(), 100_000)).unwrap();
+        let run = Run { handle, events, _sessions: sessions };
+        run.handle.commands.send(Command::Send("go".into())).unwrap();
+        let asked = approvals_and_reasons_with(&run, &[Decision::Always, Decision::Approve]);
+        assert_eq!(asked, [("mcp__srv__t".to_string(), true, None), ("mcp__srv__u".to_string(), true, None)], "the second call of t ran on the first one's always");
     }
 
     #[test]
@@ -9453,7 +9608,8 @@ Body").unwrap();
         assert_ne!(always_key("execute_command", &command("make a & b\nfirst")), always_key("execute_command", &command("make a & b\nsecond")));
         assert_ne!(always_key("execute_command", &command("make")), always_key("execute_command", &serde_json::json!({"command": "make", "cwd": "sub"})));
         let long = "x".repeat(200);
-        assert_ne!(always_key("mcp__s__t", &serde_json::json!({"a": format!("{long}1")})), always_key("mcp__s__t", &serde_json::json!({"a": format!("{long}2")})));
+        assert_eq!(always_key("mcp__s__t", &serde_json::json!({"a": format!("{long}1")})), always_key("mcp__s__t", &serde_json::json!({"a": 2})), "an MCP tool's is the tool");
+        assert_ne!(always_key("mcp__s__t", &serde_json::json!({})), always_key("mcp__s__u", &serde_json::json!({})));
         assert_eq!(always_key("create_file", &serde_json::json!({"path": "a", "content": "1"})), always_key("create_file", &serde_json::json!({"path": "a", "content": "2"})));
     }
 

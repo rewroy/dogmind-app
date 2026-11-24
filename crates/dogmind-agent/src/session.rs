@@ -32,6 +32,8 @@ enum Line {
     Title { title: String },
     /// Web content has entered this conversation: for as long as the session lives, whatever a compaction leaves of it.
     WebSeen,
+    /// The tool that brought it, one line a tool (`web_read`, `web_search`, a server's tool): a server's counts while the person does not trust it.
+    WebFrom { tool: String },
     /// The tools this conversation is offered, the last of these lines counting: they are part of its prefix, and what is installed may differ when it is reopened.
     Tools { tools: serde_json::Value },
     /// What the session works toward, as the person set it (/goal), the last of these lines counting; none: cleared.
@@ -408,7 +410,7 @@ fn load_entries(entries: impl Iterator<Item = (u64, Entry)>) -> Loaded {
                 }
                 Ok(Line::Title { title: name }) => named = Some(name),
                 Ok(Line::Snapshot { messages: all }) => messages = all,
-                Ok(Line::WebSeen | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. } | Line::Seen { .. } | Line::SeenForgotten | Line::Stopped { .. }) => {}
+                Ok(Line::WebSeen | Line::WebFrom { .. } | Line::Tools { .. } | Line::Goal { .. } | Line::Added { .. } | Line::Seen { .. } | Line::SeenForgotten | Line::Stopped { .. }) => {}
                 Err(_) => {} // a line cut short by a crash, or of a kind that is not known
             },
         }
@@ -572,6 +574,14 @@ impl Session {
         self.write(&Line::WebSeen)
     }
 
+    /// What a stranger said came in by `tool`; `first`: the plain mark as well.
+    pub fn mark_web_from(&mut self, tool: &str, first: bool) -> Result<(), String> {
+        if first {
+            self.mark_web_seen()?;
+        }
+        self.write(&Line::WebFrom { tool: tool.to_string() })
+    }
+
     pub fn set_goal(&mut self, goal: Option<&str>) -> Result<(), String> {
         self.write(&Line::Goal { goal: goal.map(str::to_string) })
     }
@@ -648,6 +658,52 @@ fn ends_a_line(path: &Path) -> bool {
 pub fn web_seen(path: &Path) -> bool {
     let marked = serde_json::to_string(&Line::WebSeen).expect("a plain line serializes");
     lines_of(path).is_ok_and(|mut lines| lines.any(|line| line == marked))
+}
+
+/// Where a branch's web content came from when its session's could not be told: no server has this tool, so it is never trusted.
+const UNTOLD_SOURCE: &str = "(unknown)";
+
+/// Where what a stranger said came into a session, by the tool that brought it, and whether some of it cannot be told (then it counts whatever is
+/// trusted). A plain mark is also read from what the results hold: each stranger's block names where it came from (a server's tool, or a page's
+/// address), and a program's block (`run_code`) holds those of the calls it made. A mark with nothing found, or a line that does not open, is untold.
+pub fn web_sources(path: &Path) -> (Vec<String>, bool) {
+    let Ok(entries) = entries_of(path) else { return (Vec::new(), false) };
+    let marked = serde_json::to_string(&Line::WebSeen).expect("a plain line serializes");
+    let (mut tools, mut blocks, mut plain, mut damaged): (Vec<String>, Vec<String>, bool, bool) = (Vec::new(), Vec::new(), false, false);
+    let add = |tools: &mut Vec<String>, tool: String| {
+        if !tools.contains(&tool) {
+            tools.push(tool);
+        }
+    };
+    for (_, entry) in entries {
+        let Entry::Text(line) = entry else {
+            damaged = true;
+            continue;
+        };
+        if line == marked {
+            plain = true;
+        } else if line.starts_with("{\"kind\":\"web_from\"") {
+            if let Ok(Line::WebFrom { tool }) = serde_json::from_str(&line) {
+                add(&mut tools, tool);
+            }
+        } else if line.contains("untrusted") {
+            // (as many escapes deep as the block was quoted: a program's log holds its calls' results as strings)
+            let bare: String = line.chars().filter(|c| *c != '\\').collect();
+            for source in bare.split("source=\"").skip(1).filter_map(|rest| rest.split('"').next()) {
+                if source != "run_code" {
+                    add(&mut blocks, source.to_string());
+                }
+            }
+        }
+    }
+    // (the blocks are read only under a plain mark: a conversation with none has had no stranger's answer)
+    if plain {
+        for source in blocks {
+            add(&mut tools, source);
+        }
+    }
+    let untold = plain && (damaged || tools.is_empty());
+    (tools, untold)
 }
 
 /// What a session works toward, as the person last set it; none when it was never set or was cleared.
@@ -869,6 +925,12 @@ fn write_branch(copy: &mut Session, path: &Path, messages: &[Message], title: Op
     if web_seen(path) {
         copy.mark_web_seen()?;
     }
+    // (where it came from goes with it, read from the whole of this file: a branch keeps some of its lines, and not the blocks of what a compaction
+    // took; and a mark that could not say where stays one)
+    let (sources, untold) = web_sources(path);
+    for tool in sources.iter().map(String::as_str).chain(untold.then_some(UNTOLD_SOURCE)) {
+        copy.mark_web_from(tool, false)?;
+    }
     // The helpers the kept messages came from go with them, under the branch's own name and the numbers they had (the messages say them): copied as they are, line for line, so that
     // an encrypted one needs no key to be copied and a line that did not open is not lost in the copy.
     for number in messages.iter().filter_map(|message| message.helper.as_ref().map(|helper| helper.number)) {
@@ -1017,6 +1079,49 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen.get(Path::new("C:/w/a.txt")).map(String::as_str), Some("4444"));
         assert_eq!(Session::open(&path).unwrap().2.len(), 1);
+    }
+
+    /// Where web content came from: each tool's line; and for a plain mark from before those lines were kept, the blocks its results hold, a
+    /// program's calls' among them (as deep in quotes as the program's log put them). A plain mark with no block named is untold.
+    #[test]
+    fn where_web_content_came_from_is_read_from_its_lines_and_for_an_older_mark_from_the_blocks() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261124-1").unwrap();
+        session.append(&Message::text("user", "go")).unwrap();
+        assert_eq!(web_sources(&session.path), (Vec::new(), false), "none came");
+        session.mark_web_from("mcp__srv__t", true).unwrap();
+        session.mark_web_from("web_read", false).unwrap();
+        assert_eq!(web_sources(&session.path), (vec!["mcp__srv__t".to_string(), "web_read".to_string()], false));
+        assert!(web_seen(&session.path), "and the plain mark, which an older version reads");
+
+        let older = |content: &str| {
+            let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", &format!("20261124-{}", content.len())).unwrap();
+            session.append(&Message::text("tool", content)).unwrap();
+            session.mark_web_seen().unwrap();
+            web_sources(&session.path)
+        };
+        let nested = "<untrusted_web_content id=\"1\" source=\"run_code\">\nLog:\n\"<untrusted web content id=\\\"2\\\" source=\\\"mcp__unity__batch\\\">\\n{}\\n</untrusted web content id=\\\"2\\\">\"\n</untrusted_web_content id=\"1\">";
+        assert_eq!(older(nested), (vec!["mcp__unity__batch".to_string()], false), "a program's call's block");
+        assert_eq!(older("<untrusted_web_content id=\"3\" source=\"https://example.com/\">page</untrusted_web_content id=\"3\">"), (vec!["https://example.com/".to_string()], false), "a page");
+        assert_eq!(older("no block here"), (Vec::new(), true), "a mark that cannot say where");
+
+        // A branch keeps where it came from, read from the whole of its session: the block it came in by is past the branch's last message here.
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261124-2").unwrap();
+        session.append(&Message::text("user", "go")).unwrap();
+        session.append(&Message::text("assistant", "looking")).unwrap();
+        session.append(&Message::text("tool", "<untrusted_web_content id=\"4\" source=\"https://example.com/\">page</untrusted_web_content id=\"4\">")).unwrap();
+        session.mark_web_seen().unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let branch = fork(&path, 1, None).unwrap();
+        assert_eq!(web_sources(&branch), (vec!["https://example.com/".to_string()], false));
+        let mut session = Session::create(dir.path(), Path::new("C:/w"), "now", "20261124-3").unwrap();
+        session.append(&Message::text("user", "go")).unwrap();
+        session.mark_web_seen().unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let branch = fork(&path, 0, None).unwrap();
+        assert_eq!(web_sources(&branch), (vec![UNTOLD_SOURCE.to_string()], false), "a mark that could not say where stays one");
     }
 
     #[test]

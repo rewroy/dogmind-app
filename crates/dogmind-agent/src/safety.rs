@@ -374,6 +374,8 @@ pub enum AlwaysScope {
     Network(String),
     /// A line of several commands (see [`LineParts`]): what "always" allows of each one that would ask alone, as it is shown. The sites for this session, the rest as rules.
     Parts(Vec<String>),
+    /// What these MCP servers returned is why it asks, and nothing else: "always" trusts them, from now on and in their file (Settings turns it back).
+    Servers(Vec<String>),
 }
 
 /// What a card says in place of "always", where a line's parts cannot each be allowed (see [`LineParts`]).
@@ -1140,8 +1142,8 @@ pub fn covered(scope: &AlwaysScope, files: &[PathBuf], folders: &[PathBuf], netw
         AlwaysScope::File(file) => files.iter().any(|known| same(known, file)),
         AlwaysScope::Folders(wanted) => wanted.iter().all(|folder| folders.iter().any(|known| inside(known, folder))),
         AlwaysScope::Network(reach) => networks.contains(reach),
-        // (its parts are each looked at on their own, as they come)
-        AlwaysScope::Parts(_) => false,
+        // (its parts are each looked at on their own, as they come; a server's trust is in its file, and what it returns is no longer a reason)
+        AlwaysScope::Parts(_) | AlwaysScope::Servers(_) => false,
     }
 }
 

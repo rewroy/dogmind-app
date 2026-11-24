@@ -906,6 +906,8 @@ const JA: &[(&str, &str)] = &[
     ("Always allows this file, for this session: {0}", "常に許可: このセッションの間、このファイル: {0}"),
     ("Always allows this on the network, for this session: {0}", "常に許可: このセッションの間、次のネットワーク利用: {0}"),
     ("Always allows each part of this line (sites for this session): {0}", "常に許可: この行の部分ごとに(サイトはこのセッションの間): {0}"),
+    ("Always trusts what {0} returns, from now on. Settings > Tools turns it off.", "常に許可: 以後、{0} の返す内容を信頼します。設定 > ツール でオフにできます。"),
+    ("Always allows this tool, whatever it is given, for this session.", "常に許可: このセッションの間、このツール (引数を問わず)。"),
     ("Always cannot be used for this line.", "この行には常に許可を使えません。"),
     ("Folders commands can read", "コマンドが読めるフォルダー"),
     ("Commands can read everything in these folders, and that includes any keys or passwords kept there. They cannot write there, and the network stays off unless you approve it. Files that look like keys are left out only if they are there when you add the folder, not ones made later.", "コマンドはこれらのフォルダーの中身をすべて読めます。そこに置かれた鍵やパスワードも読めます。書き込みはできず、ネットワークも許可しない限り使えません。鍵に見えるファイルを除外するのは、追加したときに既にあったものだけで、後から作られたものは除外されません。"),
@@ -1467,7 +1469,7 @@ N / P\t次と前の変更 (変更の画面で)
 貼り付けたキーは Windows の資格情報マネージャーにだけ保存します。
 画像: クリップのボタン、/attach、貼り付け、ドロップ。PNG、JPEG、WebP、GIF。
 スキル: プロジェクトとホームの .claude/skills、.agents/skills、.codex/skills、.dogmind/skills。/スキル名 で始めます。
-MCP サーバー: 設定 > ツール で追加・変更・削除できます (プログラム、またはサーバーの URL)。返す内容を信頼することもできます。呼び出しのたびに確認します。
+MCP サーバー: 設定 > ツール で追加・変更・削除できます (プログラム、またはサーバーの URL)。自分で追加したプログラムの返す内容は信頼します (そこでオフにできます)。URL のサーバーの返す内容は、オンにしたときだけ信頼します。呼び出しのたびに確認し、常に許可はそのセッションの間、そのツールに効きます。
 Web: 返ってきた内容はデータとして扱い、会話に入ると以後のコマンドはすべて確認します。
 カスタム指示 (設定) は全セッション共通、DOGMIND.md はそのプロジェクト用です。/init でモデルに書かせることもできます。
 ターミナル: 右側のパネルの「ターミナル」は、あなた自身のシェルです。コマンドはエージェントの権限とは別に、あなた自身の権限で動き、そこに表示される内容はモデルには送られません。キーはすべてシェルに渡ります。Ctrl+C は選択があるときはコピー、ないときは実行中のものを止め、Ctrl+V は貼り付けです。

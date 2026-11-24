@@ -583,7 +583,7 @@ A command can write only in the session's folder, and has no network unless you 
 Keys you paste go to Windows Credential Manager, and nowhere else.
 Pictures: the paperclip, /attach, a paste or a drop. PNG, JPEG, WebP and GIF.
 Skills: .claude/skills, .agents/skills, .codex/skills and .dogmind/skills, in the project and in your home. /name starts one.
-MCP servers: Settings > Tools adds, changes and removes them (a program, or a server's URL), and can trust what one returns. Each call asks.
+MCP servers: Settings > Tools adds, changes and removes them (a program, or a server's URL). What a program you added returns is trusted, unless you turn that off there; what a server at a URL returns, only when you turn it on. Each call asks, and Always covers that tool for the session.
 Web: what comes back is marked as data, and once it is in a conversation every command asks.
 Your instructions (Settings) go for every session; a DOGMIND.md for its project. /init has the model write one.
 Terminal: the panel on the right has your own shell. Its commands run with your rights, apart from the agent's, and what it shows is not sent to the model. Every key goes to the shell: Ctrl+C copies when something is selected and otherwise stops what runs, and Ctrl+V pastes.
@@ -682,6 +682,7 @@ fn always_places(scope: &Option<AlwaysScope>) -> String {
         Some(AlwaysScope::Folders(folders)) => folders.iter().map(|folder| folder.display().to_string()).collect::<Vec<_>>().join(", "),
         Some(AlwaysScope::Network(reach)) => reach.clone(),
         Some(AlwaysScope::Parts(parts)) => parts.join(", "),
+        Some(AlwaysScope::Servers(servers)) => servers.join(", "),
         None => String::new(),
     }
 }
@@ -2948,7 +2949,7 @@ fn mcp_config_of_form(was: Option<&dogmind_agent::mcp::ServerConfig>, url: Optio
     // Keep the saved transport spelling and fields the editor cannot display. A different config restarts the connection.
     let mut config = previous.cloned().unwrap_or_else(|| mcp::ServerConfig {
         kind: if url.is_some() { "http".into() } else { String::new() },
-        trusted: was.is_some_and(|config| config.trusted),
+        trusted: was.and_then(|config| config.trusted),
         tool_selection: was.map(|config| config.tool_selection.clone()).unwrap_or_default(),
         ..Default::default()
     });
@@ -14112,6 +14113,9 @@ impl App {
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::Folders(_))) => tf("Always allows this folder, for this session: {0}", &[&always_places(&approval.scope)]),
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::Network(_))) => tf("Always allows this on the network, for this session: {0}", &[&always_places(&approval.scope)]),
                     (_, true) if matches!(approval.scope, Some(AlwaysScope::Parts(_))) => tf("Always allows each part of this line (sites for this session): {0}", &[&always_places(&approval.scope)]),
+                    // (what such a server returned is why it asks: Always takes that away, where the person can see it and turn it back)
+                    (_, true) if matches!(approval.scope, Some(AlwaysScope::Servers(_))) => tf("Always trusts what {0} returns, from now on. Settings > Tools turns it off.", &[&always_places(&approval.scope)]),
+                    (None, true) if approval.tool.starts_with("mcp__") => t("Always allows this tool, whatever it is given, for this session.").to_string(),
                     (Some(rule), true) => tf("Always saves: {0}", &[&t(&rule.label())]),
                     // (in its place, why there is none)
                     _ => approval.no_always.as_deref().map_or(String::new(), |why| t(why).to_string()),
@@ -19092,16 +19096,16 @@ mod tests {
     fn a_server_of_the_older_transport_edited_in_settings_stays_one() {
         use dogmind_agent::mcp::ServerConfig;
         let at = |url: &str| (Some(url.to_string()), url.to_string());
-        let older = ServerConfig { kind: "sse".into(), url: "http://127.0.0.1:9/sse".into(), trusted: true, ..Default::default() };
+        let older = ServerConfig { kind: "sse".into(), url: "http://127.0.0.1:9/sse".into(), trusted: Some(true), ..Default::default() };
         let (url, target) = at("http://127.0.0.1:9/sse");
         let edited = mcp_config_of_form(Some(&older), url, target, "", "", Default::default());
-        assert_eq!((edited.kind.as_str(), edited.url.as_str(), edited.trusted), ("sse", "http://127.0.0.1:9/sse", true));
+        assert_eq!((edited.kind.as_str(), edited.url.as_str(), edited.trusted), ("sse", "http://127.0.0.1:9/sse", Some(true)));
         let newer = ServerConfig { kind: "http".into(), url: "http://127.0.0.1:9/mcp".into(), ..Default::default() };
         let (url, target) = at("http://127.0.0.1:9/mcp");
         assert_eq!(mcp_config_of_form(Some(&newer), url.clone(), target.clone(), "", "", Default::default()).kind, "http");
         assert_eq!(mcp_config_of_form(None, url, target, "", "", Default::default()).kind, "http", "a new one");
         let program = mcp_config_of_form(Some(&older), None, "node".into(), "", "server.js --port 1", Default::default());
-        assert_eq!((program.command.as_str(), program.args.join(" "), program.kind.as_str(), program.trusted), ("node", "server.js --port 1".to_string(), "", true));
+        assert_eq!((program.command.as_str(), program.args.join(" "), program.kind.as_str(), program.trusted), ("node", "server.js --port 1".to_string(), "", Some(true)));
     }
 
     #[test]
