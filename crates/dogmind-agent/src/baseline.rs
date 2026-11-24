@@ -290,17 +290,25 @@ impl Baseline {
                     files.insert(name, entry);
                 }
             }
+            None if std::fs::read_dir(workspace).is_err() => whole = false,
             None => {
                 let started = Instant::now();
-                for entry in walker(workspace, true).build().flatten() {
+                for entry in walker(workspace, true).build() {
                     if files.len() >= MOST_FILES || started.elapsed() > looking {
                         whole = false;
                         break;
                     }
+                    let Ok(entry) = entry else {
+                        whole = false;
+                        continue;
+                    };
                     if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                         continue;
                     }
-                    let Ok(data) = entry.metadata() else { continue };
+                    let Ok(data) = entry.metadata() else {
+                        whole = false;
+                        continue;
+                    };
                     let name = entry.path().strip_prefix(workspace).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
                     let kept_entry = entry_of(folder, &name, entry.path(), &data, &mut kept);
                     files.insert(name, kept_entry);
@@ -322,20 +330,28 @@ impl Baseline {
         let mut names: BTreeMap<_, _> = saved.collect();
         let started = Instant::now();
         let mut seen = 0;
-        for entry in walker(workspace, true).build().flatten() {
+        let mut whole = self.whole;
+        for entry in walker(workspace, true).build() {
             if seen >= MOST_FILES || started.elapsed() > LOOKING {
                 return (names, false);
             }
+            let Ok(entry) = entry else {
+                whole = false;
+                continue;
+            };
             if entry.file_type().is_some_and(|kind| kind.is_file()) {
                 seen += 1;
                 names.entry(entry.path().strip_prefix(workspace).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/")).or_insert(false);
             }
         }
-        (names, self.whole)
+        (names, whole)
     }
 
     /// What has changed under the workspace since the session began: a line for each file, then what can be shown of them. Empty when nothing has.
     pub fn changes(&self, workspace: &Path, paths: &[&str]) -> String {
+        if let Err(error) = std::fs::read_dir(workspace) {
+            return format!("could not list the workspace for this session's differences: {error}");
+        }
         let filters: Vec<PathBuf> = paths.iter().filter(|path| !path.is_empty()).map(|path| {
             let normalized = path.replace('\\', "/");
             let path = Path::new(&normalized);
@@ -385,6 +401,10 @@ impl Baseline {
                 (Some(entry), None) if entry.gone => continue,
                 (Some(entry), Some(data)) if !entry.gone && entry.size == data.len() && entry.modified == modified(data) => continue,
                 (None, None) if self.head.is_none() => continue,
+                (None, Some(data)) if self.head.is_none() && !self.whole => {
+                    lines.push(format!("present {name} ({} bytes): its starting contents are unknown because the initial file list was incomplete", data.len()));
+                    continue;
+                }
                 _ => {}
             }
             // (nothing is shown of it, and to read it is to hold it: one larger than memory would end the app, with the person's conversation in it)
@@ -815,6 +835,32 @@ mod tests {
         assert!(report.contains(&format!("created {first_hidden} (3 bytes)")));
         assert!(!report.contains(&format!("--- {first_hidden} ---")));
         assert!(report.lines().any(|line| line.starts_with("changed z-unknown.txt") && line.contains("no copy was kept")));
+    }
+
+    #[test]
+    fn a_missing_workspace_is_neither_an_empty_start_nor_a_mass_deletion() {
+        let (parent, _keep, session) = fixture();
+        let work = parent.path().join("work");
+        let baseline = Baseline::for_session(&session, &work);
+        assert!(!baseline.whole);
+        assert!(baseline.changes(&work, &[]).contains("could not list the workspace"));
+
+        std::fs::create_dir(&work).unwrap();
+        let file = work.join("notes.txt");
+        std::fs::write(&file, "original").unwrap();
+        let reopened = Baseline::for_session(&session, &work);
+        let report = reopened.changes(&work, &[]);
+        assert!(report.contains("present notes.txt (8 bytes)") && !report.contains("created notes.txt"), "{report}");
+
+        let known = Baseline::for_session(&session.with_file_name("known.jsonl"), &work);
+        let offline = parent.path().join("offline");
+        std::fs::rename(&work, &offline).unwrap();
+        let report = known.changes(&work, &[]);
+        assert!(report.contains("could not list the workspace") && !report.contains("deleted notes.txt"), "{report}");
+        std::fs::rename(offline, &work).unwrap();
+        assert!(known.changes(&work, &[]).is_empty());
+        std::fs::remove_file(file).unwrap();
+        assert!(known.changes(&work, &[]).contains("deleted notes.txt"));
     }
 
     #[test]
