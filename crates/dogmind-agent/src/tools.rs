@@ -2220,15 +2220,18 @@ impl FileChange {
 const MAX_UNTRACKED_SHOWN: usize = 200;
 const MAX_UNTRACKED_BYTES: u64 = 256 * 1024;
 
+/// Before the first commit there is no HEAD. Hash empty input (git_raw closes
+/// stdin) so Git supplies the empty tree ID for this repository's object format.
+fn workspace_diff_base(workspace: &Path) -> Result<String, String> {
+    git(workspace, &["rev-parse", "--verify", "-q", "HEAD"])
+        .or_else(|_| git(workspace, &["hash-object", "-t", "tree", "--stdin"]))
+}
+
 /// What git says differs from the last commit under the workspace, new files included. An error: this is no repository.
 pub fn workspace_changes(workspace: &Path) -> Result<Vec<FileChange>, String> {
     git(workspace, &["rev-parse", "--is-inside-work-tree"])?;
-    let has_commit = git(workspace, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok();
-    let mut args = vec!["-c", "core.quotepath=off", "diff", "--no-ext-diff", "--no-color", "--relative"];
-    if has_commit {
-        args.push("HEAD");
-    }
-    let text = git(workspace, &args)?;
+    let base = workspace_diff_base(workspace)?;
+    let text = git(workspace, &["-c", "core.quotepath=off", "diff", "--no-ext-diff", "--no-color", "--relative", base.trim(), "--"])?;
     let mut changes = split_git_diff(&text);
     changes.extend(untracked_changes(workspace, &[]));
     Ok(changes)
@@ -2357,17 +2360,17 @@ fn show_diff(arguments: &Value, workspace: &Path, baseline: Option<&crate::basel
     // (only what is under the workspace: a workspace that is a folder of a larger repository saw that repository's every change, which is
     // not its work and may be what its owner never meant to show)
     let mut args = vec!["diff", "--no-ext-diff", "--no-color", "--relative"];
+    let base;
     match scope {
         "staged" => args.push("--cached"),
         "unstaged" => {}
-        // A repository with no commit yet has no HEAD to compare with.
-        _ if git(workspace, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok() => args.push("HEAD"),
-        _ => {}
+        _ => {
+            base = workspace_diff_base(workspace)?;
+            args.push(base.trim());
+        }
     }
-    if !paths.is_empty() {
-        args.push("--");
-        args.extend(paths.iter().copied());
-    }
+    args.push("--");
+    args.extend(paths.iter().copied());
     let mut diff = git(workspace, &args).map_err(|error| error.lines().next().unwrap_or("git could not show this").to_string())?;
     // (a new file is a change to a workspace, whatever git diff leaves out: creating only new files must not read as nothing done)
     if scope == "workspace" {
@@ -4519,6 +4522,37 @@ mod change_tests {
         let dir = crate::in_container::tempdir().unwrap();
         assert!(workspace_changes(dir.path()).is_err());
         assert_eq!(git_info(dir.path()), None);
+    }
+
+    #[test]
+    fn workspace_diffs_before_the_first_commit_compare_against_an_empty_tree() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let root = dir.path();
+        let pkg = root.join("pkg");
+        run_git(root, &["init", "-q"]);
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(root.join("outside.txt"), "outside\n").unwrap();
+        std::fs::write(pkg.join("file.txt"), "staged\n").unwrap();
+        run_git(root, &["add", "."]);
+        let show = |args| show_diff(&args, &pkg, None).unwrap();
+        assert!(show(json!({})).contains("+staged"));
+        assert_eq!(workspace_changes(&pkg).unwrap()[0].path, "file.txt");
+
+        std::fs::write(pkg.join("file.txt"), "working\n").unwrap();
+        std::fs::write(pkg.join("new.txt"), "untracked\n").unwrap();
+        let work = show(json!({}));
+        assert!(work.contains("+working") && work.contains("+untracked"), "{work}");
+        assert!(!work.contains("outside") && !work.contains("staged"), "{work}");
+        let one = show(json!({"paths":["file.txt"]}));
+        assert!(one.contains("+working") && !one.contains("new.txt"), "{one}");
+        let changes = workspace_changes(&pkg).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().any(|change| change.path == "file.txt" && change.diff.contains("+working")));
+        assert!(show(json!({"scope":"staged"})).contains("+staged"));
+        assert!(show(json!({"scope":"unstaged"})).contains("-staged"));
+
+        std::fs::remove_file(pkg.join("file.txt")).unwrap();
+        assert!(show(json!({"paths":["file.txt"]})).starts_with("no differences"));
     }
 
     #[test]
