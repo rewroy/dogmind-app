@@ -358,6 +358,7 @@ const JA: &[(&str, &str)] = &[
     (dogmind_agent::safety::REASON_WEB_FORGET, "この会話にはウェブの内容が含まれていて、メモを消すとこの先のすべてのセッションが変わります"),
     (dogmind_agent::safety::REASON_WEB_ASKED, "この会話にはウェブの内容が含まれていて、これはそこから求められたことかもしれません"),
     (dogmind_agent::safety::REASON_CARGO_OUTSIDE, "このワークスペースはサンドボックスの中の cargo では読めないため、サンドボックスの読み込みの制限を外して実行します。あなたが読めるファイルはすべて読め、ネットワークも止められません"),
+    (dogmind_agent::safety::REASON_TOO_LARGE_TO_KEEP, "このファイルは 256 MB より大きいため、巻き戻し用のコピーを取りません。書き換えたり消したりすると元に戻せません: {0}"),
     (dogmind_agent::safety::REASON_CARGO_CONFIG_RUNS, "ここの cargo の設定は {0} も実行し、同じ範囲に届きます"),
     (dogmind_agent::safety::REASON_OUTSIDE_SANDBOX, "サンドボックスの外で、あなたとして実行します。あなたが読み書きできるファイルはすべて読み書きでき、ネットワークにも届きます"),
     ("Needs tools this app does not have: mcp__{0}__…", "このアプリにないツールが必要です: mcp__{0}__…"),

@@ -116,13 +116,14 @@ pub const REASON_WEB_FORGET: &str = "web content is in this conversation, and fo
 pub const REASON_WEB_ASKED: &str = "web content is in this conversation, and it may have asked for this";
 pub const REASON_CARGO_OUTSIDE: &str = "cargo cannot read this workspace inside the sandbox, so it would run with the sandbox's read limits lifted: it can read every file you can, and its network cannot be stopped";
 pub const REASON_CARGO_CONFIG_RUNS: &str = "cargo's config here also runs {0}, with the same reach";
+pub const REASON_TOO_LARGE_TO_KEEP: &str = "this file is larger than 256 MB, so no copy of it is kept for a rewind: written over or taken away, it cannot be brought back: {0}";
 pub const REASON_OUTSIDE_SANDBOX: &str = "this runs outside the sandbox, as you: it can read and change every file you can, and reach the network";
 
 /// Every reason a card can give, for the test that each has its Japanese in the app.
-pub const REASONS: [&str; 18] = [
+pub const REASONS: [&str; 19] = [
     REASON_OFF_THIS_PC, REASON_SECRET_READ, REASON_RUNS_OFF_THIS_PC, REASON_PLANTED, REASON_NETWORK, REASON_OUTSIDE_AND_OFF_THIS_PC, REASON_OUTSIDE, REASON_GIT_FOLDER, REASON_LONG_QUERY,
     REASON_PRIVATE_QUERY, REASON_WEB_ADDRESS_PATH, REASON_WEB_UNKNOWN_ADDRESS, REASON_WEB_NOTE, REASON_WEB_FORGET, REASON_WEB_ASKED, REASON_CARGO_OUTSIDE, REASON_CARGO_CONFIG_RUNS,
-    REASON_OUTSIDE_SANDBOX,
+    REASON_OUTSIDE_SANDBOX, REASON_TOO_LARGE_TO_KEEP,
 ];
 
 /// `dir` or `type`, which cmd runs itself: nothing else is started.
@@ -1011,6 +1012,10 @@ impl Gate {
             // A hook or a line of config there runs outside the sandbox, the next time a person uses git here.
             if full.components().any(|part| part.as_os_str().eq_ignore_ascii_case(".git")) {
                 return Verdict::Ask { risk: Risk::High, reason: Some(reason_of(REASON_GIT_FOLDER, &[&full.display().to_string()])) };
+            }
+            // A file too large for a rewind to keep a copy of: written over or taken away, it cannot be brought back, and the person is told so.
+            if std::fs::metadata(&full).is_ok_and(|found| found.is_file() && found.len() > crate::checkpoint::MOST_KEPT) {
+                return Verdict::Ask { risk: Risk::Medium, reason: Some(reason_of(REASON_TOO_LARGE_TO_KEEP, &[&full.display().to_string()])) };
             }
         }
         Verdict::Ask { risk: Risk::Low, reason: None }
@@ -2043,6 +2048,26 @@ mod tests {
             }
             assert!(matches!(gate.check("create_file", &json!({"path": path, "content": ""}), root), Verdict::Deny(_)), "written: {path}");
         }
+    }
+
+    /// An edit that writes over or takes away a file larger than a rewind keeps a copy of is asked about with that said, which no rule, "always" or mode
+    /// answers; a smaller one, and a new one, as before.
+    #[test]
+    fn an_edit_of_a_file_too_large_to_keep_is_asked_with_that_said() {
+        let gate = Gate::new();
+        let dir = crate::in_container::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("large.bin")).unwrap().set_len(300 << 20).unwrap();
+        std::fs::write(dir.path().join("small.txt"), "x").unwrap();
+        for arguments in [json!({"path": "large.bin", "content": "x"}), json!({"path": "small.txt", "content": "y"}), json!({"path": "new.txt", "content": "z"})] {
+            let verdict = gate.check("create_file", &arguments, dir.path());
+            if arguments["path"] == "large.bin" {
+                assert!(matches!(&verdict, Verdict::Ask { reason: Some(reason), .. } if reason.contains("larger than 256 MB")), "{verdict:?}");
+            } else {
+                assert_eq!(verdict, Verdict::Ask { risk: Risk::Low, reason: None }, "{arguments}");
+            }
+        }
+        let patch = json!({"edits": [{"path": "large.bin", "old_string": "a", "new_string": "b"}], "expected_files": ["large.bin"]});
+        assert!(matches!(gate.check("apply_patch", &patch, dir.path()), Verdict::Ask { reason: Some(_), .. }));
     }
 
     #[test]
