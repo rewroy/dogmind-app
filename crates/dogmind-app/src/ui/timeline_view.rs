@@ -97,6 +97,12 @@ pub(super) struct TimelineView {
 }
 
 impl TimelineView {
+    /// Show the first match of a search, or keep the latest rows in sight when showing the whole session.
+    fn reset_scroll(&mut self) {
+        self.scroll = 0;
+        self.follow = self.query.is_empty();
+    }
+
     pub(super) unsafe fn new(parent: HWND) -> TimelineView {
         let instance = GetModuleHandleW(std::ptr::null());
         let class_name = wide(TIMELINE_CLASS);
@@ -258,8 +264,7 @@ impl App {
     /// What is looked for has changed: the path shows only what has it, at once (it is read from what is already there).
     pub(super) unsafe fn timeline_query_changed(&mut self) {
         self.timeline.query = get_text(self.timeline.search).trim().to_lowercase();
-        self.timeline.scroll = 0;
-        self.timeline.follow = self.timeline.query.is_empty();
+        self.timeline.reset_scroll();
         InvalidateRect(self.timeline.window, std::ptr::null(), 0);
     }
 
@@ -274,8 +279,7 @@ impl App {
         self.timeline.band_drag = None;
         self.timeline.selected = None;
         self.timeline.serial += 1;
-        self.timeline.follow = true;
-        self.timeline.scroll = 0;
+        self.timeline.reset_scroll();
         self.timeline.stale = true;
         self.timeline.first_request_due = false;
         // (calls the session had under way while it was out of sight, which no event said to this)
