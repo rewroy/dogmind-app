@@ -1612,10 +1612,9 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
     let line_count = memchr::memchr_iter(b'\n', text.as_bytes()).count()
         + usize::from(!text.is_empty() && !text.ends_with('\n'));
     if !placed && (line_count > OUTLINE_PAST || text.len() > MAX_READ) {
-        let lines: Vec<_> = text.lines().collect();
-        let parts = outline(&lines);
+        let parts = outline(text);
         if !parts.is_empty() {
-            return Ok((outlined(&lines, &parts, size), (path, hash)));
+            return Ok((outlined(text, line_count, &parts, size), (path, hash)));
         }
     }
     let limit = arguments.get("limit").and_then(Value::as_i64).unwrap_or(READ_LINES as i64).clamp(1, READ_LINES as i64) as usize;
@@ -1653,7 +1652,7 @@ fn read_file(arguments: &Value, workspace: &Path) -> Result<(String, (PathBuf, S
 
 /// Where a file's parts begin, by line: functions, types, classes, sections, in the languages a project is mostly written in. Empty
 /// for a file of none of them, which is then read as any other.
-fn outline(lines: &[&str]) -> Vec<(usize, usize)> {
+fn outline(text: &str) -> Vec<(usize, &str)> {
     static STARTS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let starts = STARTS.get_or_init(|| {
         regex::Regex::new(concat!(
@@ -1671,39 +1670,38 @@ fn outline(lines: &[&str]) -> Vec<(usize, usize)> {
         ))
         .unwrap()
     });
-    let mut parts: Vec<(usize, usize)> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(at, line)| {
-            let trimmed = line.trim_start();
-            let indent = line.len() - trimmed.len();
-            (indent <= 8 && starts.is_match(trimmed)).then_some((at, indent))
-        })
-        .collect();
+    let mut headings = text.lines().enumerate().filter(|(_, line)| {
+        let trimmed = line.trim_start();
+        line.len() - trimmed.len() <= 8 && starts.is_match(trimmed)
+    });
+    let mut parts: Vec<_> = headings.by_ref().take(OUTLINE_MOST + 1).collect();
     if parts.len() > OUTLINE_MOST {
-        parts.retain(|(_, indent)| *indent == 0);
+        // Once the outline overflows, only the first top-level headings are shown.
+        let top_level = |(_, line): &(usize, &str)| !line.starts_with(char::is_whitespace);
+        parts.retain(top_level);
         parts.truncate(OUTLINE_MOST);
+        parts.extend(headings.filter(top_level).take(OUTLINE_MOST - parts.len()));
     }
     parts
 }
 
 /// A large file, as its head and its outline: each part's first line with its number, to read with `start_line` and `limit`.
-fn outlined(lines: &[&str], parts: &[(usize, usize)], size: u64) -> String {
+fn outlined(text: &str, line_count: usize, parts: &[(usize, &str)], size: u64) -> String {
     let shown = |line: &str| -> String { if line.len() > 160 { format!("{}…", &line[..line.floor_char_boundary(160)]) } else { line.to_string() } };
     // (and the way to all of it, for a task that needs all of it, such as summing a document up: a model given only the outline once took
     // the long way round, a helper that read it all again, 105 s of a 186-s task)
-    let reads = lines.len().div_ceil(READ_LINES).max((size as usize).div_ceil(MAX_READ));
+    let reads = line_count.div_ceil(READ_LINES).max((size as usize).div_ceil(MAX_READ));
     let mut out = format!(
         "--- {} lines, {} KB: more than to read whole at once. Its first lines, then where its parts begin. All of it is {reads} reads: read_file with start_line=1, then from where each one says to go on ---\n",
-        lines.len(),
+        line_count,
         size / 1024
     );
-    for (at, line) in lines.iter().enumerate().take(OUTLINE_HEAD) {
+    for (at, line) in text.lines().enumerate().take(OUTLINE_HEAD) {
         out.push_str(&format!("{}|{}\n", at + 1, shown(line)));
     }
     out.push_str("--- outline ---\n");
-    for (at, _) in parts.iter().filter(|(at, _)| *at >= OUTLINE_HEAD) {
-        out.push_str(&format!("{}|{}\n", at + 1, shown(lines[*at])));
+    for (at, line) in parts.iter().filter(|(at, _)| *at >= OUTLINE_HEAD) {
+        out.push_str(&format!("{}|{}\n", at + 1, shown(line)));
     }
     out.push_str("--- read the part you need: read_file with start_line and limit, at a line above, or one search_files finds ---\n");
     out
@@ -5348,6 +5346,19 @@ mod tests {
         // (lines read again unchanged are not sent again, and count for nothing)
         std::fs::write(dir.path().join("big.txt"), (0..400).map(|at| format!("other {at} {}\n", "y".repeat(70))).collect::<String>()).unwrap();
         assert_eq!(notes(&mut bench), told, "and so again in the next");
+    }
+
+    #[test]
+    fn overflowing_outlines_keep_only_the_first_top_level_headings() {
+        let mut text = "  ## nested\n".repeat(OUTLINE_MOST - 1);
+        text.push_str("# first\n");
+        assert_eq!(outline(&text).len(), OUTLINE_MOST);
+        text.push_str("  ## one more\n");
+        assert_eq!(outline(&text), [(OUTLINE_MOST - 1, "# first")]);
+        text.push_str(&"# next\n".repeat(OUTLINE_MOST));
+        let parts = outline(&text);
+        assert_eq!(parts.len(), OUTLINE_MOST);
+        assert_eq!(parts.last(), Some(&(2 * OUTLINE_MOST - 1, "# next")));
     }
 
     /// A long file read with no place in it comes as its head and where its parts begin; asked for a place, it comes as lines, as before;
