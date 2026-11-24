@@ -76,7 +76,8 @@ impl Limits {
     /// [`TIME_LEAST`] and [`TIME_MOST`].
     pub fn with_timeout_seconds(mut self, seconds: Option<f64>) -> Self {
         if let Some(seconds) = seconds.filter(|seconds| seconds.is_finite()) {
-            self.time = Duration::from_secs_f64(seconds.max(0.0)).clamp(TIME_LEAST, TIME_MOST);
+            // (held as a number first: a Duration of 1e20 seconds is none, and making one panicked)
+            self.time = Duration::from_secs_f64(seconds.clamp(TIME_LEAST.as_secs_f64(), TIME_MOST.as_secs_f64()));
         }
         self
     }
@@ -321,6 +322,7 @@ pub fn run(code: &str, tools: &[&str], limits: &Limits, cancel: &AtomicBool, cal
     let mut in_calls = Duration::ZERO;
     let mut finished: Option<Outcome> = None;
     let mut abandoned = false;
+    let mut stopped_at: Option<Instant> = None;
     loop {
         match from_program.recv_timeout(POLL) {
             Ok(Message::Done(outcome)) => {
@@ -349,8 +351,15 @@ pub fn run(code: &str, tools: &[&str], limits: &Limits, cancel: &AtomicBool, cal
             Err(RecvTimeoutError::Timeout) => {
                 if cancel.load(Ordering::SeqCst) {
                     shared.cancel.store(true, Ordering::SeqCst);
+                    stopped_at.get_or_insert_with(Instant::now);
                 }
-                // A program the engine's interrupt cannot reach (it is inside something that does not look at the interrupt) is left behind once it is well past its time.
+                // A program the engine's interrupt cannot reach (it is inside something that does not look at the interrupt) is left behind once it is well past its time,
+                // or the grace after a stop: the person who stopped the turn does not wait out the rest of its time, which can be ten minutes.
+                if stopped_at.is_some_and(|at| at.elapsed() > GRACE) {
+                    shared.stop(Stop::Cancelled);
+                    abandoned = true;
+                    break;
+                }
                 if started.elapsed().saturating_sub(in_calls) > limits.time + GRACE {
                     shared.stop(Stop::Time);
                     abandoned = true;
@@ -1014,6 +1023,23 @@ mod tests {
         assert!(render(&outcome, &limits).contains("time limit"));
     }
 
+    /// A stop leaves such a program behind the grace after it, and not after the whole of its time.
+    #[test]
+    fn a_stop_leaves_a_program_the_interrupt_cannot_reach_behind_after_the_grace() {
+        let limits = Limits { time: Duration::from_secs(60), ..limits() };
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let stopper = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            stopper.store(true, Ordering::SeqCst);
+        });
+        let began = Instant::now();
+        let outcome = run("__test_sleep(4000); return 1;", &[], &limits, &cancel, &mut |_, _| panic!("no call"));
+        let waited = began.elapsed();
+        assert!(waited >= Duration::from_millis(200) + GRACE && waited < Duration::from_millis(2500), "left at the stop and the grace: {waited:?}");
+        assert_eq!((outcome.stopped, outcome.value.as_deref()), (Some(Stop::Cancelled), None));
+    }
+
     #[test]
     fn time_spent_inside_a_call_is_not_counted_against_the_program() {
         let limits = Limits { time: Duration::from_millis(200), ..limits() };
@@ -1367,6 +1393,9 @@ mod tests {
         assert_eq!(asked(Some(-5.0)), Duration::from_secs(1));
         assert_eq!(asked(Some(f64::NAN)), Duration::from_secs(120));
         assert_eq!(asked(Some(f64::INFINITY)), Duration::from_secs(120));
+        // (a number no Duration holds: making one of it panicked)
+        assert_eq!(asked(Some(1e20)), Duration::from_secs(600));
+        assert_eq!(asked(Some(f64::MAX)), Duration::from_secs(600));
         // A time set past the most is held to it by the run itself.
         let limits = Limits { time: Duration::from_secs(5000), ..limits() };
         assert!(run("return 1;", &[], &limits, &AtomicBool::new(false), &mut |_, _| panic!("no call")).value.is_some());
