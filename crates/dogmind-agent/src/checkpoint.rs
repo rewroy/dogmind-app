@@ -397,10 +397,11 @@ impl Checkpoints {
     /// no whole-file read; what is shown of the change is the text as the agent reads files (UTF-16, UTF-8, Shift_JIS). A file over what is read for a comparison (as `baseline` has it) or a binary
     /// one is said to have changed, with no diff.
     pub fn session_changes(&self, workspace: &Path) -> Vec<FileChange> {
-        self.session_changes_within(workspace, crate::baseline::MOST_READ)
+        self.session_changes_matching(workspace, crate::baseline::MOST_READ, |_| true)
     }
 
-    fn session_changes_within(&self, workspace: &Path, most_read: u64) -> Vec<FileChange> {
+    /// Select workspace-relative paths before opening files or rendering their patches.
+    pub(crate) fn session_changes_matching(&self, workspace: &Path, most_read: u64, wanted: impl Fn(&Path) -> bool) -> Vec<FileChange> {
         // (each file from the first word on it: what the agent saved, or what a command did to it, turn by turn)
         let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
         let mut seen = HashSet::new();
@@ -418,8 +419,11 @@ impl Checkpoints {
             }
         }
         first.into_iter().filter_map(|first| {
-            let path = match &first { Ok(saved) => saved.path.clone(), Err(touched) => touched.path.clone() };
-            let now = std::fs::metadata(&path).ok().filter(std::fs::Metadata::is_file).map(|_| path.clone());
+            let path = match &first { Ok(saved) => &saved.path, Err(touched) => &touched.path };
+            if !wanted(path.strip_prefix(workspace).unwrap_or(path)) {
+                return None;
+            }
+            let now = std::fs::metadata(path).ok().filter(std::fs::Metadata::is_file).map(|_| path.clone());
             match first {
                 Ok(saved) => self.change_of(&saved, now, workspace, most_read),
                 Err(touched) => self.touched_change(touched, now, workspace, most_read),
@@ -729,6 +733,27 @@ mod tests {
         assert_eq!((read(&folder.join("0.bin")), read(&folder.join("1.bin")), read(&folder.join("2.bin"))), ("old zero".to_string(), "old one".to_string(), "now".to_string()));
     }
 
+    #[test]
+    fn a_directory_filter_selects_saved_and_commanded_files_by_path_component() {
+        let mut f = fixture();
+        let root = f.file.parent().unwrap();
+        let src = root.join("src");
+        std::fs::create_dir(&src).unwrap();
+        let kept = src.join("saved.txt");
+        let command = src.join("command.txt");
+        let outside = root.join("src-extra.txt");
+        f.marks.begin("edit", "t", None).unwrap();
+        f.marks.before_edit(&[kept.clone(), outside.clone()]).unwrap();
+        f.marks.commanded(vec![Touched { path: command.clone(), made: true }]).unwrap();
+        for path in [kept, command, outside] {
+            std::fs::write(path, "new").unwrap();
+        }
+        let changes = f.marks.session_changes_matching(root, crate::baseline::MOST_READ, |path| path.starts_with("src"));
+        let paths: Vec<_> = changes.iter().map(|change| Path::new(&change.path)).collect();
+        assert_eq!(paths, [Path::new("src/saved.txt"), Path::new("src/command.txt")]);
+        assert_eq!(f.marks.session_changes(root).len(), 3);
+    }
+
     /// Two Shift_JIS files that differ, and that the lossy text of both is the same for (every byte of both is a bad UTF-8 byte), are told apart, and shown as they read.
     #[test]
     fn two_shift_jis_versions_that_differ_are_told_apart() {
@@ -758,7 +783,7 @@ mod tests {
         std::fs::write(&big, format!("{}last\n", "line\n".repeat(19_999))).unwrap();
         std::fs::write(&f.other, [b'M', b'Z', 0, 0, 1, 2, 4]).unwrap();
         let root = big.parent().unwrap();
-        let small_cap = f.marks.session_changes_within(root, 1024);
+        let small_cap = f.marks.session_changes_matching(root, 1024, |_| true);
         assert_eq!(small_cap.len(), 2, "both are changed");
         assert!(small_cap.iter().all(|change| change.diff.is_empty() && change.added == 0), "{small_cap:?}");
         let whole = f.marks.session_changes(root);

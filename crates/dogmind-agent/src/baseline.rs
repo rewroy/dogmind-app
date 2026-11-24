@@ -389,7 +389,11 @@ impl Baseline {
         // (of what the agent itself edited, the session has a first copy whatever its size)
         let edited = std::cell::OnceCell::new();
         let edited_diff = |name: &str| -> Option<String> {
-            let changes = edited.get_or_init(|| crate::checkpoint::Checkpoints::open(&self.session).session_changes(workspace));
+            let changes = edited.get_or_init(|| {
+                crate::checkpoint::Checkpoints::open(&self.session).session_changes_matching(workspace, MOST_READ, |path| {
+                    paths.is_empty() || wanted(&path.to_string_lossy().replace('\\', "/"))
+                })
+            });
             // (a change with no diff is one of a binary or of a file too large to read: nothing is shown of it, as of any other)
             changes.iter().find(|change| change.path.replace('\\', "/") == name).map(|change| change.diff.clone()).filter(|diff| !diff.is_empty())
         };
