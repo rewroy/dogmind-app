@@ -75,12 +75,25 @@ impl Saved {
     /// Whether the path leads somewhere else than when it was saved. One saved before that was kept has no "then" to compare with: a link or a junction on its way now is taken to lead
     /// elsewhere, as nothing says it did not.
     fn leads_elsewhere(&self) -> bool {
-        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
+        let key = |path: &Path| path_key(path);
         match &self.real {
             Some(then) => crate::safety::real_path(&self.path).is_none_or(|now| key(&now) != key(then)),
             None => has_a_link_on_its_way(&self.path),
         }
     }
+}
+
+/// A path as Windows compares names: each character upper-cased one for one (NTFS's table maps a UTF-16 unit to one unit), and a
+/// character whose upper case is more than one left as it is. `to_lowercase` folds whole strings: "İ" became "i" and a combining dot, the
+/// same as "i̇", and of two files Windows keeps apart, the edits and the commands kept one.
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").chars().map(|c| {
+        let mut upper = c.to_uppercase();
+        match (upper.next(), upper.next()) {
+            (Some(one), None) => one,
+            _ => c,
+        }
+    }).collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,7 +337,7 @@ impl Checkpoints {
     /// already, is left as it is (the first word on a file is what it was before the turn).
     pub fn commanded(&mut self, touched: Vec<Touched>) -> Result<(), String> {
         let Some(turn) = self.index.turns.last_mut() else { return Ok(()) };
-        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
+        let key = |path: &Path| path_key(path);
         let mut added = false;
         for one in touched {
             let known = turn.files.iter().any(|saved| key(&saved.path) == key(&one.path)) || turn.commanded.iter().any(|named| key(&named.path) == key(&one.path));
@@ -403,7 +416,7 @@ impl Checkpoints {
     /// Select workspace-relative paths before opening files or rendering their patches.
     pub(crate) fn session_changes_matching(&self, workspace: &Path, most_read: u64, wanted: impl Fn(&Path) -> bool) -> Vec<FileChange> {
         // (each file from the first word on it: what the agent saved, or what a command did to it, turn by turn)
-        let key = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
+        let key = |path: &Path| path_key(path);
         let mut seen = HashSet::new();
         let mut first: Vec<Result<Saved, &Touched>> = Vec::new();
         for turn in &self.index.turns {
