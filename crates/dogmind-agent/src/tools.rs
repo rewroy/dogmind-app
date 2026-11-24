@@ -4286,6 +4286,33 @@ mod power_tests {
 mod change_tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn session_diff_reports_locked_files_and_recovers_when_they_are_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let work = crate::in_container::tempdir().unwrap();
+        let sessions = crate::in_container::tempdir().unwrap();
+        let locked = work.path().join("locked.txt");
+        let fresh = work.path().join("fresh.txt");
+        std::fs::write(&locked, "original\n").unwrap();
+        let baseline = crate::baseline::Baseline::for_session(&sessions.path().join("s.jsonl"), work.path());
+        std::fs::write(&locked, "updated contents\n").unwrap();
+        std::fs::write(&fresh, "created\n").unwrap();
+        std::fs::write(work.path().join("other.txt"), "visible\n").unwrap();
+        let exclusive = |path| std::fs::OpenOptions::new().read(true).share_mode(0).open(path).unwrap();
+        let report = || show_diff(&json!({"scope": "session"}), work.path(), Some(&baseline)).unwrap();
+        let handles = (exclusive(&locked), exclusive(&fresh));
+        let said = report();
+        assert!(said.contains("could not compare locked.txt") && said.contains("could not compare fresh.txt"), "{said}");
+        assert!(!said.contains("deleted locked.txt") && !said.contains("-original"), "{said}");
+        assert!(said.contains("created other.txt") && said.contains("+visible"), "{said}");
+        drop(handles);
+        let said = report();
+        assert!(said.contains("changed locked.txt") && said.contains("+updated contents") && said.contains("created fresh.txt"), "{said}");
+        std::fs::remove_file(&locked).unwrap();
+        assert!(report().contains("deleted locked.txt"));
+    }
+
     fn run_git(dir: &Path, args: &[&str]) {
         let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.com"];
         all.extend(args);

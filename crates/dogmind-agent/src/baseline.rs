@@ -254,7 +254,16 @@ impl Baseline {
         };
         for name in names.iter().filter(|name| wanted(name)) {
             let path = workspace.join(name);
-            let now = std::fs::metadata(&path).ok();
+            let missing = |error: &std::io::Error| matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory);
+            let now = match std::fs::metadata(&path) {
+                Ok(data) if data.is_dir() => None, // A directory can replace a file that existed at the start.
+                Ok(data) => Some(data),
+                Err(error) if missing(&error) => None,
+                Err(error) => {
+                    lines.push(format!("could not compare {name}: {error}"));
+                    continue;
+                }
+            };
             let entry = self.files.get(name);
             match (entry, &now) {
                 (Some(entry), None) if entry.gone => continue,
@@ -267,6 +276,14 @@ impl Baseline {
                 lines.push(format!("{} {name} ({size} bytes): too large to compare or show", if entry.is_some_and(|entry| !entry.gone) { "changed" } else { "created" }));
                 continue;
             }
+            let after = match now.map(|_| std::fs::read(&path)).transpose() {
+                Ok(bytes) => bytes,
+                Err(error) if missing(&error) => None, // It disappeared after the metadata check.
+                Err(error) => {
+                    lines.push(format!("could not compare {name}: {error}"));
+                    continue;
+                }
+            };
             let before = match entry {
                 Some(entry) if entry.gone => Before::Absent,
                 Some(entry) => match entry.copy.as_ref().and_then(|copy| std::fs::read(folder_of(&self.session).join(copy)).ok()) {
@@ -278,7 +295,6 @@ impl Baseline {
                     None => Before::Absent,
                 },
             };
-            let after = now.as_ref().and_then(|_| std::fs::read(&path).ok());
             if let (Before::Bytes(before), Some(after)) = (&before, &after) {
                 // (touched and the same is no change)
                 if before == after {
