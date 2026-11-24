@@ -1489,7 +1489,7 @@ struct Parked {
     queued: Vec<Outgoing>,
     interjected: Vec<String>,
     /// What the model has written so far of calls it has not finished.
-    writing: Vec<(usize, String, String)>,
+    writing: Vec<RunEntry>,
     used: u64,
     window_tokens: u64,
     rate: Option<f64>,
@@ -2519,7 +2519,7 @@ struct App {
     /// The run the pointer is on.
     run_hover: Option<usize>,
     /// A call being written, with no run to show it in.
-    plain_writing: Option<RunEntry>,
+    plain_writing: Vec<RunEntry>,
     /// When a request under way last said how it was going.
     request_live: Option<std::time::Instant>,
     /// Where the block being written is kept in `shown`.
@@ -4574,12 +4574,6 @@ impl App {
         }
     }
 
-    /// What the model has written so far of each call, for a session put aside.
-    fn writing_now(&self) -> Vec<(usize, String, String)> {
-        let open = self.run_open.map_or(&[][..], |open| &self.runs[open].entries[..]);
-        open.iter().chain(&self.run_carry).filter_map(|entry| entry.writing.as_ref().map(|writing| (writing.index, entry.tool.clone(), writing.raw.clone()))).collect()
-    }
-
     /// More of a call the model is writing. Only what is held grows, as this comes a few times a second: the row is written by `run_tick`.
     unsafe fn run_writes(&mut self, index: usize, tool: String, piece: &str) {
         let of_it = |entry: &RunEntry| entry.writing.as_ref().is_some_and(|writing| writing.index == index);
@@ -4589,12 +4583,7 @@ impl App {
             self.end_line();
         }
         let at = self.open_run();
-        let entries = &mut self.runs[at].entries;
-        let place = entries.iter().position(of_it).unwrap_or_else(|| {
-            entries.push(RunEntry::being_written(index, tool));
-            entries.len() - 1
-        });
-        entries[place].more_written(piece);
+        toolrun::append_piece(&mut self.runs[at].entries, index, tool, piece);
         if !known {
             if !self.stop_asked {
                 self.set_activity(String::new());
@@ -11715,11 +11704,10 @@ impl App {
             return;
         }
         // (asked for above: what is on screen is about to go)
-        let writing = self.writing_now();
         self.close_run();
-        self.run_carry.clear();
+        let mut writing = std::mem::take(&mut self.plain_writing);
+        writing.extend(self.run_carry.drain(..).filter(|entry| entry.writing.is_some()));
         self.asked_calls.clear();
-        self.plain_writing = None;
         self.request_live = None;
         let (handle, events) = self.spawn_agent();
         let agent = std::mem::replace(&mut self.agent, handle);
@@ -11838,10 +11826,29 @@ impl App {
             self.runs[at].entries = running;
             self.write_run(at);
         }
-        for (index, tool, raw) in parked.writing.into_iter().filter(|(_, tool, _)| !cards::is_asking(tool)) {
-            self.run_writes(index, tool, &raw);
+        let has_writing = !parked.writing.is_empty();
+        if has_writing {
+            if self.settings.compact_tools {
+                let at = self.open_run();
+                self.runs[at].entries.extend(parked.writing);
+                self.write_run(at);
+            } else {
+                self.plain_writing = parked.writing;
+            }
         }
-        self.set_activity(if !parked.running || parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some() || (self.settings.compact_tools && !self.tools_running.is_empty()) { String::new() } else if !self.tools_running.is_empty() { t("Working").to_string() } else if parked.compacting { t("Compacting the session…").to_string() } else { t("Thinking…").to_string() });
+        let activity = if !parked.running || parked.pending.is_some() || parked.question.is_some() || parked.plan_review.is_some()
+            || (self.settings.compact_tools && (has_writing || !self.tools_running.is_empty())) {
+            String::new()
+        } else if let Some(entry) = toolrun::latest_writing(&self.plain_writing) {
+            toolrun::writing_line(entry, &self.workspace)
+        } else if !self.tools_running.is_empty() {
+            t("Working").to_string()
+        } else if parked.compacting {
+            t("Compacting the session…").to_string()
+        } else {
+            t("Thinking…").to_string()
+        };
+        self.set_activity(activity);
         self.update_buttons();
         self.update_status();
         if let Some(approval) = parked.pending {
@@ -13601,7 +13608,7 @@ impl App {
             Event::Content(text) => parked.partial.push_str(&text),
             Event::AssistantEnded => parked.partial.clear(),
             Event::ToolStarted { id, tool, summary } => {
-                if let Some(place) = parked.writing.iter().position(|(_, writing, _)| *writing == tool) {
+                if let Some(place) = parked.writing.iter().position(|entry| entry.tool == tool) {
                     parked.writing.remove(place);
                 }
                 parked.tools_running.insert(id, (tool, summary.chars().take(160).collect()));
@@ -13611,10 +13618,9 @@ impl App {
                 parked.compacting = false;
             }
             Event::Compacting => parked.compacting = true,
-            Event::ToolWriting { index, tool, piece } => match parked.writing.iter_mut().find(|(at, _, _)| *at == index) {
-                Some((_, _, raw)) => raw.push_str(&piece),
-                None => parked.writing.push((index, tool, piece)),
-            },
+            Event::ToolWriting { index, tool, piece } if !cards::is_asking(&tool) => {
+                toolrun::append_piece(&mut parked.writing, index, tool, &piece);
+            }
             Event::ToolEnded { id, .. } => {
                 parked.tools_running.remove(&id);
             }
@@ -13970,7 +13976,7 @@ impl App {
                 // (the next answer does not start at the speed the last one ended)
                 (self.reveal_rate, self.reveal_carried) = (0.0, 0.0);
                 self.request_live = Some(std::time::Instant::now());
-                self.plain_writing = None;
+                self.plain_writing.clear();
                 self.run_carry.retain(|entry| entry.writing.is_none());
                 if let Some(open) = self.run_open {
                     self.runs[open].entries.retain(|entry| entry.writing.is_none());
@@ -13986,15 +13992,12 @@ impl App {
                 if self.settings.compact_tools {
                     self.run_writes(index, tool, &piece);
                 } else {
-                    if !self.plain_writing.as_ref().is_some_and(|entry| entry.writing.as_ref().is_some_and(|writing| writing.index == index)) {
+                    if !self.plain_writing.iter().any(|entry| entry.writing.as_ref().is_some_and(|writing| writing.index == index)) {
                         self.end_of_answer();
-                        self.plain_writing = Some(RunEntry::being_written(index, tool));
                     }
-                    if let Some(entry) = &mut self.plain_writing {
-                        entry.more_written(&piece);
-                        let line = toolrun::writing_line(entry, &self.workspace);
-                        self.set_activity(line);
-                    }
+                    let entry = toolrun::append_piece(&mut self.plain_writing, index, tool, &piece);
+                    let line = toolrun::writing_line(entry, &self.workspace);
+                    self.set_activity(line);
                 }
             }
             Event::ToolStarted { id, tool, summary } if cards::is_asking(&tool) => {
@@ -14006,6 +14009,9 @@ impl App {
                     self.tools_running.insert(id.clone(), (tool.clone(), summary.clone()));
                     self.run_started(id, tool, summary);
                 } else {
+                    if let Some(place) = self.plain_writing.iter().position(|entry| entry.tool == tool) {
+                        self.plain_writing.remove(place);
+                    }
                     self.set_activity(format!("{}  {summary}", t(tool_name(&tool))));
                     self.tools_running.insert(id, (tool, summary));
                 }
@@ -14338,7 +14344,7 @@ impl App {
                 }
                 self.running = false;
                 self.request_live = None;
-                self.plain_writing = None;
+                self.plain_writing.clear();
                 InvalidateRect(self.side, std::ptr::null(), 0);
                 SetTimer(self.window, TIMER_CHANGES, 200, None);
                 self.finish_answer();
@@ -18656,7 +18662,7 @@ pub fn run(folder_argument: Option<PathBuf>, remove_first: bool, restart: Restar
             run_carry: Vec::new(),
             asked_calls: HashSet::new(),
             run_hover: None,
-            plain_writing: None,
+            plain_writing: Vec::new(),
             request_live: None,
             open_block: None,
             block_card_due: false,
