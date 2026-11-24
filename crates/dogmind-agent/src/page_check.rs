@@ -552,7 +552,7 @@ fn picture_limit(wait: u64, read_took: Option<Duration>) -> Duration {
     }
 }
 
-/// The wait past which a check with steps takes its pictures after its read, one at a time, and not beside it: measured with nothing else running, a WebGL
+/// The wait past which CPU or multi-view checks with steps take their pictures after the read: measured with nothing else running, a WebGL
 /// page drawn on the CPU with steps at a 10 s wait had its picture beside the read stopped at its limit, 36 s, in 2 of 4 checks (48 and 53 s in all, against
 /// 21 to 25 s one after another), where every other form was quicker beside it.
 const STEPS_AT_LENGTH: u64 = 2 * WAIT_MS;
@@ -1717,9 +1717,11 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         };
         // The read, with the pictures begun beside it. Its turn is taken first, so that the pictures do not take both before it; a slow read keeps it until the
         // pictures are done, and they go one at a time (`SLOW_READ`).
-        // Steps at a long wait are the most a check draws: there the pictures follow the read, one at a time, as before (`STEPS_AT_LENGTH`).
-        let beside = !(steps.is_some() && wait > STEPS_AT_LENGTH);
+        let long_steps = steps.is_some() && wait > STEPS_AT_LENGTH;
         let read_with_pictures = |wait: u64| {
+            // A single GPU-rendered view can take its picture alongside the read even for long steps.
+            // Check again on a retry, since the first run may have switched to the CPU.
+            let beside = !long_steps || (views.len() == 1 && on_gpu.load(Ordering::Relaxed));
             read_ms.store(u64::MAX, Ordering::Relaxed);
             let reading = slots.take(&never);
             let pictures = if beside { start(wait) } else { Vec::new() };
