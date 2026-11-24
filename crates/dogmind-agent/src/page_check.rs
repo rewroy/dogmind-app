@@ -1672,7 +1672,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
                 }
             }
             // (a browser that fell over while writing it leaves an empty file, or one that cannot be read)
-            let shot_image = written_by_the_sandbox(&shot).map_err(image::ImageError::IoError).and_then(|bytes| image::load_from_memory(&bytes));
+            let shot_image = written_by_the_sandbox(&shot).map_err(|error| error.to_string()).and_then(|bytes| crate::images::decode_picture(&bytes));
             #[cfg(test)]
             note_run(true, shot_image.is_err());
             if let Ok(whole) = shot_image {
@@ -1950,7 +1950,8 @@ fn forget_old_leftovers(temp: &Path, kept: Duration) {
 
 /// A file the browser in the sandbox wrote, as it is there: not through a link, nor one with another name too (a hard link). Its folder is the sandbox's, and a
 /// program there could put in the shot's place a link to a picture it cannot read itself: the app, which is not in the sandbox, would read it, and the picture cut from
-/// it would be put where commands read. What is read is read from the handle that was looked at.
+/// it would be put where commands read. What is read is read from the handle that was looked at, and no more of it than a picture may be: a file of
+/// gigabytes there would otherwise be read whole into the app's memory.
 fn written_by_the_sandbox(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     use std::os::windows::fs::OpenOptionsExt;
@@ -1965,8 +1966,15 @@ fn written_by_the_sandbox(path: &Path) -> std::io::Result<Vec<u8>> {
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || info.nNumberOfLinks != 1 {
         return Err(std::io::Error::other(format!("{} is a link, or has another name too", path.display())));
     }
+    let most = crate::images::MOST_BYTES as u64;
+    if (u64::from(info.nFileSizeHigh) << 32 | u64::from(info.nFileSizeLow)) > most {
+        return Err(std::io::Error::other(format!("{} is larger than a picture may be", path.display())));
+    }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    (&mut file).take(most + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > most {
+        return Err(std::io::Error::other(format!("{} is larger than a picture may be", path.display())));
+    }
     Ok(bytes)
 }
 
@@ -2002,6 +2010,33 @@ mod tests {
         if std::os::windows::fs::symlink_file(&elsewhere, &soft).is_ok() {
             assert!(written_by_the_sandbox(&soft).is_err(), "a link");
         }
+        // Nor one larger than a picture may be, or a picture whose head says more pixels than any is decoded to: the app's memory is not the program's to fill.
+        let large = dir.path().join("large.png");
+        std::fs::File::create(&large).unwrap().set_len(crate::images::MOST_BYTES as u64 + 1).unwrap();
+        assert!(written_by_the_sandbox(&large).is_err(), "larger than a picture");
+        // (a PNG's head says its size: 100 000 x 100 000, ten billion pixels, in a file of a few bytes)
+        let mut head = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        head.extend_from_slice(&100_000u32.to_be_bytes());
+        head.extend_from_slice(&100_000u32.to_be_bytes());
+        head.extend_from_slice(&[8, 0, 0, 0, 0]);
+        let crc = crc_of(&head[12..]);
+        head.extend_from_slice(&crc.to_be_bytes());
+        let bombed = dir.path().join("bomb.png");
+        std::fs::write(&bombed, &head).unwrap();
+        let bytes = written_by_the_sandbox(&bombed).unwrap();
+        assert!(crate::images::decode_picture(&bytes).is_err(), "not decoded");
+    }
+
+    /// The CRC-32 of a PNG chunk, for a head made by hand.
+    fn crc_of(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { 0xedb8_8320 ^ (crc >> 1) } else { crc >> 1 };
+            }
+        }
+        !crc
     }
 
     #[test]
