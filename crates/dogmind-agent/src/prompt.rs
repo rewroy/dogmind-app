@@ -200,24 +200,26 @@ pub fn workspace_state(cwd: &Path) -> String {
 
 fn workspace_git_state(cwd: &Path) -> String {
     // (no answer from git is not the same as no repository)
-    let none = if cwd.join(".git").exists() { "This folder has a `.git`, and the app could not run git on it." } else { "This folder is not a git repository." };
+    let Some(info) = crate::tools::git_info(cwd) else {
+        return if cwd.join(".git").exists() { "This folder has a `.git`, and the app could not run git on it." } else { "This folder is not a git repository." }.to_string();
+    };
+    let conflicts = if info.conflicted > 0 { format!(" Unresolved conflicts: {}.", info.conflicted) } else { String::new() };
     // (a folder of a larger repository: git, run outside the sandbox, finds that repository, and a command in the sandbox cannot reach it, so the model is told both)
-    let above = crate::tools::repository_above(cwd);
-    crate::tools::git_info(cwd).map_or(none.to_string(), |info| match &above {
+    match crate::tools::repository_above(cwd) {
         Some(top) => {
             let last = info.last_commit.as_ref().map_or(String::new(), |last| format!(" Its last commit: {last}."));
             format!(
-                "This folder is inside the git repository at `{}`, on {}, with {} changed, {} staged and {} new files in this folder.{last} {}",
+                "This folder is inside the git repository at `{}`, on {}, with {} changed, {} staged and {} new files in this folder.{conflicts}{last} {}",
                 top.display(),
                 info.branch,
                 info.changed,
                 info.staged,
                 info.untracked,
-                crate::tools::git_above_words(top)
+                crate::tools::git_above_words(&top)
             )
         }
-        None => format!("A git repository, on {}, with {} changed, {} staged and {} new files.", info.branch, info.changed, info.staged, info.untracked),
-    })
+        None => format!("A git repository, on {}, with {} changed, {} staged and {} new files.{conflicts}", info.branch, info.changed, info.staged, info.untracked),
+    }
 }
 
 /// What comes before the project's instruction files. They were put there for agents, often for others: a session on Dogmind's own source took a rule of its
@@ -1050,6 +1052,38 @@ mod tests {
         assert!(!missing.exists());
         let empty = crate::in_container::tempdir().unwrap();
         assert!(workspace_state(empty.path()).contains("The workspace is empty"));
+    }
+
+    #[test]
+    fn workspace_facts_count_only_unresolved_conflicts_in_the_open_folder() {
+        let repo = crate::in_container::tempdir().unwrap();
+        let root = repo.path();
+        let module = root.join("module");
+        let git = |args: &[&str]| crate::tools::git(root, args).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::create_dir(&module).unwrap();
+        let commit_files = |value: &str| {
+            std::fs::write(root.join("top.txt"), value).unwrap();
+            std::fs::write(module.join("part.txt"), value).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", value]);
+        };
+        commit_files("base");
+        git(&["checkout", "-qb", "other"]);
+        commit_files("other");
+        git(&["checkout", "-q", "main"]);
+        commit_files("main");
+        assert!(crate::tools::git(root, &["merge", "--no-edit", "other"]).is_err());
+        assert_eq!(crate::tools::git_info(root).unwrap().conflicted, 2);
+        assert!(workspace_state(root).contains("Unresolved conflicts: 2."));
+        assert!(workspace_state(&module).contains("Unresolved conflicts: 1."));
+
+        std::fs::write(module.join("part.txt"), "resolved").unwrap();
+        git(&["add", "module/part.txt"]);
+        assert!(!workspace_state(&module).contains("Unresolved conflicts"));
+        assert!(workspace_state(root).contains("Unresolved conflicts: 1."));
     }
 
     /// A folder of a larger repository: the first message names the repository and says that git cannot reach it from the sandbox; the top of a repository keeps the sentence it had.
