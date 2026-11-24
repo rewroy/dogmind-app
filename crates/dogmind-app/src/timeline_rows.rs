@@ -1034,7 +1034,8 @@ fn call_rows(out: &mut Vec<Row>, call: &CallRow, open: bool, is_live: bool, cont
     if let Some(code) = call.exit_code {
         out.push(fact(inner, t("Exit code"), code.to_string()));
     }
-    if let Some(wait) = call.wait_ms.filter(|wait| *wait > 0) {
+    let wait = call.wait_ms.unwrap_or(0).saturating_add(if call.answered_by_person() { call.ms } else { 0 });
+    if wait > 0 {
         out.push(fact(inner, t("Waited for you"), ms_words(wait)));
     }
     if call.ms > 0 && call.outcome == "ok" && !call.started.is_empty() {
@@ -1378,6 +1379,25 @@ mod tests {
 
     fn started(id: &str, tool: &str, summary: &str) -> Event {
         Event::ToolStarted { id: id.into(), tool: tool.into(), summary: summary.into() }
+    }
+
+    #[test]
+    fn saved_questions_and_plan_reviews_keep_their_wait_in_the_band_and_details() {
+        let stamp = "2026-11-24T12:43:45.930+09:00";
+        for (name, outcome, part) in [
+            ("ask_user", "ok", Part::Person), ("submit_plan", "ok", Part::Person),
+            ("ask_user", "error", Part::CallFailed), ("submit_plan", "error", Part::CallFailed),
+            ("present", "ok", Part::Call),
+        ] {
+            let call = CallRow { started: stamp.into(), ms: 148_039, ..call("c", name, "", outcome) };
+            let mut turn = turn(1, "Go", vec![model(None, vec![call])], done(148_039));
+            turn.started = stamp.into();
+            let band = timeline::band(&turn).unwrap();
+            assert_eq!(band.parts, [BandPart { lane: Lane::Calls, from: 0, to: 148_039, part }], "{name} {outcome}");
+            let timeline = Timeline { turns: vec![turn], heading: None };
+            let rows = rows_for(&timeline, &Live::new(Instant::now()), &HashMap::from([(Key::Step(1, 0), true)]));
+            assert_eq!(rows.iter().any(|row| row.label == t("Waited for you") && row.text == ms_words(148_039)), part == Part::Person);
+        }
     }
 
     #[test]

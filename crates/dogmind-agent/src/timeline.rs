@@ -177,6 +177,13 @@ pub struct CallRow {
     pub images: Vec<String>,
 }
 
+impl CallRow {
+    /// A successful question or plan review returned only after the person answered.
+    pub fn answered_by_person(&self) -> bool {
+        self.outcome == "ok" && matches!(self.name.as_str(), "ask_user" | "submit_plan")
+    }
+}
+
 /// A step of an `explore` helper's own conversation: why, in its words, and the calls it made (each its tool and what it was on).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HelperStep {
@@ -619,7 +626,7 @@ pub enum Part {
     Writing,
     /// After the first word, of a request kept before the band split it.
     Generating,
-    /// A call running, one that failed, and the person asked about a call before it ran.
+    /// A call running, one that failed, and time spent waiting for the person's answer or approval.
     Call,
     CallFailed,
     Person,
@@ -675,7 +682,13 @@ pub fn band(turn: &TurnPath) -> Option<Band> {
             if wait > 0 {
                 band.parts.push(BandPart { lane: Lane::Calls, from, to: from + wait, part: Part::Person });
             }
-            let part = if call.outcome == "ok" && !call.exit_code.is_some_and(|code| code != 0) { Part::Call } else { Part::CallFailed };
+            let part = if call.answered_by_person() {
+                Part::Person
+            } else if call.outcome == "ok" && !call.exit_code.is_some_and(|code| code != 0) {
+                Part::Call
+            } else {
+                Part::CallFailed
+            };
             band.parts.push(BandPart { lane: Lane::Calls, from: from + wait, to: from + wait + call.ms.max(1), part });
         }
     }
