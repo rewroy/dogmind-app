@@ -187,7 +187,9 @@ impl Web {
                 let unreadable = kind.starts_with("image/") && kind != "image/svg+xml" || kind.starts_with("audio/") || kind.starts_with("video/") || kind.starts_with("font/")
                     || matches!(kind.as_str(), "application/pdf" | "application/zip" | "application/octet-stream" | "application/gzip");
                 if unreadable || answer.body.iter().take(8192).any(|&byte| byte == 0) {
-                    return Err(format!("{url} is {}: web_read reads text and web pages only", if kind.is_empty() { "binary" } else { &kind }));
+                    // (the type as the server named it, where it is a type: what a server wrote otherwise is not in a failure, which nothing marks as the web's)
+                    let named = kind.len() <= 64 && kind.split_once('/').is_some_and(|(of, sub)| [of, sub].iter().all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || "!#$&^_.+-".contains(c))));
+                    return Err(format!("{url} is {}: web_read reads text and web pages only", if named { &kind } else { "binary" }));
                 }
                 let text = decode_text(&answer);
                 let page = if kind.contains("html") || (kind.is_empty() && text.trim_start().starts_with('<')) {
