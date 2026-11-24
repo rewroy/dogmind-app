@@ -5634,6 +5634,25 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["function"]["name"] == "skill"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_closed_workspaces_command_limit_reaches_the_first_model_request() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let closed = dir.path().join(".ssh");
+        std::fs::create_dir(&closed).unwrap();
+        let (client, bodies) = server(vec![text_answer("hello"), text_answer("again")]);
+        let run = run_agent(dir.path(), client, Mode::Default);
+        run.handle.commands.send(Command::Send("hello".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        run.handle.commands.send(Command::NewSession(closed)).unwrap();
+        run.handle.commands.send(Command::Send("hello".into())).unwrap();
+        until_end(&run, Decision::Reject);
+        let bodies = bodies.lock().unwrap();
+        let facts = |i: usize| bodies[i]["messages"][2]["content"].as_str().unwrap();
+        assert!(!facts(0).contains("a command does not run in it"));
+        assert!(facts(1).contains("a place keys are kept, so a command does not run in it"), "{}", facts(1));
+    }
+
     /// What the person typed goes to the model as it was typed, with nothing around it, and the app's facts (the time, the language, at the first message the workspace)
     /// come in a message of their own after it. A later request sends what was sent before to the byte, and adds the next message and its facts at the end.
     #[test]

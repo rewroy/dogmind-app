@@ -198,7 +198,15 @@ pub fn workspace_state(cwd: &Path) -> String {
         }
         None => format!("A git repository, on {}, with {} changed, {} staged and {} new files.", info.branch, info.changed, info.staged, info.untracked),
     });
-    format!("## The Workspace\n- Root, which relative paths start at: `{}`\n- {}\n- {git}", cwd.display(), folder_contents(cwd))
+    let state = format!("## The Workspace\n- Root, which relative paths start at: `{}`\n- {}\n- {git}", cwd.display(), folder_contents(cwd));
+    #[cfg(windows)]
+    {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        if let Some(reason) = crate::sandbox::refusal(cwd, home.as_deref()) {
+            return format!("{state}\n- {reason}");
+        }
+    }
+    state
 }
 
 /// What comes before the project's instruction files. They were put there for agents, often for others: a session on Dogmind's own source took a rule of its
