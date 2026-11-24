@@ -15,6 +15,11 @@ use serde_json::Value;
 /// How many failed calls in a row, or how many of one call, is worth a line.
 const FAILED_IN_A_ROW: usize = 3;
 
+/// These two tools complete successfully only after the person answers.
+pub(crate) fn answered_by_person(tool: &str, outcome: &str) -> bool {
+    outcome == "ok" && matches!(tool, "ask_user" | "submit_plan")
+}
+
 /// One line of a trajectory, and when it was written.
 pub(crate) struct Line {
     pub(crate) v: Value,
@@ -412,8 +417,11 @@ fn tool_notes(line: &Line) -> Vec<String> {
     if let Some(cut) = line.u("out_cut_bytes") {
         more.push(format!("{cut} of them cut"));
     }
-    if let Some(wait) = line.u("wait_ms") {
-        more.push(format!("{} waiting for the person", secs(wait)));
+    let approval = line.u("wait_ms");
+    let answered = answered_by_person(line.s("name"), line.s("outcome"));
+    if approval.is_some() || answered {
+        let answer = if answered { line.u("ms").unwrap_or(0) } else { 0 };
+        more.push(format!("{} waiting for the person", secs(approval.unwrap_or(0).saturating_add(answer))));
     }
     // (a command's time apart from the program's: what the app does before it starts and after it ends)
     if let Some(prepare) = line.u("prepare_ms") {
@@ -485,6 +493,9 @@ impl Spent {
                         _ => {}
                     }
                     spent.retries += line.u("wait_ms").unwrap_or(0);
+                }
+                "tool" if answered_by_person(line.s("name"), line.s("outcome")) => {
+                    spent.waits += line.u("ms").unwrap_or(0);
                 }
                 "tool" => {
                     let entry = spent.tools.entry(line.s("name").to_string()).or_default();
@@ -1050,6 +1061,25 @@ mod tests {
         assert_eq!((all.prefill_ms, all.tools_ms), (3000, 40));
         // The printed report is of the same trajectory, and says the same of it.
         assert!(report(&text(&lines), None).contains("tools 0.0 s (0%): create_file (calls: 1, total: 0.0 s)"));
+    }
+
+    #[test]
+    fn answered_questions_and_plan_reviews_are_person_time_in_the_report_and_summary() {
+        let lines = [
+            json!({"ev":"tool","turn":1,"name":"ask_user","outcome":"ok","ms":148039}),
+            json!({"ev":"tool","turn":1,"name":"submit_plan","outcome":"ok","ms":2000}),
+            json!({"ev":"approval","turn":1,"wait_ms":112374}),
+            json!({"ev":"tool","turn":1,"name":"execute_command","outcome":"declined_person","ms":5,"wait_ms":112374}),
+            json!({"ev":"tool","turn":1,"name":"ask_user","outcome":"error","ms":120}),
+            json!({"ev":"tool","turn":1,"name":"present","outcome":"ok","ms":50}),
+            json!({"ev":"turn_end","turn":1,"ms":300000}),
+        ];
+        let trace = text(&lines);
+        let totals = summary(&trace).total();
+        assert_eq!((totals.waits_ms, totals.tools_ms, totals.wall_ms), (262413, 175, 300000));
+        let printed = report(&trace, None);
+        assert!(printed.contains("waiting for the person 262.4 s"), "{printed}");
+        assert!(printed.lines().any(|line| line.contains("ask_user") && line.contains("148.0 s waiting for the person")), "{printed}");
     }
 
     #[test]

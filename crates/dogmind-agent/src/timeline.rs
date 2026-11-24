@@ -180,7 +180,7 @@ pub struct CallRow {
 impl CallRow {
     /// A successful question or plan review returned only after the person answered.
     pub fn answered_by_person(&self) -> bool {
-        self.outcome == "ok" && matches!(self.name.as_str(), "ask_user" | "submit_plan")
+        crate::trajectory_report::answered_by_person(&self.name, &self.outcome)
     }
 }
 
