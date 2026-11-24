@@ -88,6 +88,30 @@ impl Skill {
 
 /// The frontmatter's top-level words: plain, quoted, or a block (`>` or `|`). Nothing else of YAML is needed here, and anything
 /// else in it is left alone rather than refused, as the other readers of these files have fields this one does not know.
+/// A value without its comment, as YAML has it: a `#` after a space or tab begins one, outside quotes (a quoted value ends at its closing quote, and what
+/// follows that is dropped). `disable-model-invocation: true   # only when asked` says true.
+fn without_comment(value: &str) -> &str {
+    let mut chars = value.char_indices().peekable();
+    match chars.next() {
+        Some((_, quote @ ('"' | '\''))) => {
+            while let Some((at, c)) = chars.next() {
+                if quote == '"' && c == '\\' {
+                    chars.next();
+                } else if c == quote && quote == '\'' && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                } else if c == quote {
+                    return &value[..at + c.len_utf8()];
+                }
+            }
+            value
+        }
+        _ => {
+            let bytes = value.as_bytes();
+            (1..bytes.len()).find(|&at| bytes[at] == b'#' && matches!(bytes[at - 1], b' ' | b'\t')).map_or(value, |at| value[..at].trim_end())
+        }
+    }
+}
+
 pub fn frontmatter(text: &str) -> (Vec<(String, String)>, &str) {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let Some(rest) = text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) else { return (Vec::new(), text) };
@@ -118,7 +142,7 @@ pub fn frontmatter(text: &str) -> (Vec<(String, String)>, &str) {
             continue;
         }
         let Some((name, value)) = bare.split_once(':') else { continue };
-        let value = value.trim();
+        let value = without_comment(value.trim());
         if value.starts_with('>') || value.starts_with('|') {
             block = Some((name.trim().to_string(), value.starts_with('>'), Vec::new()));
             continue;
@@ -324,6 +348,22 @@ pub fn schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value's comment is not part of it, as in YAML: a skill the person keeps from the model by `disable-model-invocation: true  # ...` stays kept,
+    /// and a `#` inside quotes or a word is the value's.
+    #[test]
+    fn a_comment_after_a_value_is_not_part_of_it() {
+        let text = "---\nname: deploy\ndescription: \"Ships it # carefully\" # what it does\ndisable-model-invocation: true   # only when asked\nuser-invocable: 'yes' # quoted\nnote: C#9 and a#b\n---\nbody";
+        let (fields, body) = frontmatter(text);
+        let field = |name: &str| fields.iter().find(|(known, _)| known == name).map(|(_, value)| value.as_str());
+        assert_eq!(field("description"), Some("Ships it # carefully"));
+        assert_eq!(field("disable-model-invocation"), Some("true"));
+        assert_eq!(field("user-invocable"), Some("yes"));
+        assert_eq!(field("note"), Some("C#9 and a#b"));
+        assert_eq!(body, "body");
+        let skill = parse_skill(text, PathBuf::from("deploy"), "project", None).unwrap();
+        assert!(!skill.for_the_model, "kept from the model, as its frontmatter says");
+    }
 
     /// A skill's line is its first sentence, cut where a word ends when it is long, and never in the middle of one.
     #[test]
