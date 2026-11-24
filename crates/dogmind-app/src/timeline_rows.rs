@@ -103,7 +103,7 @@ enum Phase {
     Reading { done: u64, total: u64 },
     Thinking,
     /// The arguments of a call are being written (`Live::writing` says which).
-    Writing,
+    Writing { index: usize },
     Answering,
     /// The model's answer is whole; its calls are looked at before they run.
     Checking,
@@ -302,7 +302,7 @@ impl Live {
                     take -= 1;
                 }
                 writing.head.push_str(&piece[..take]);
-                self.enter(Phase::Writing, at);
+                self.enter(Phase::Writing { index: *index }, at);
             }
             Event::AssistantEnded => {
                 self.writing.clear();
@@ -378,7 +378,7 @@ impl Live {
             }
             Phase::Reading { .. } => (Lane::Requests, Part::Reading),
             Phase::Thinking => (Lane::Requests, Part::Thinking),
-            Phase::Writing | Phase::Answering => (Lane::Requests, Part::Writing),
+            Phase::Writing { .. } | Phase::Answering => (Lane::Requests, Part::Writing),
             Phase::Starting | Phase::Asking | Phase::Checking | Phase::Preparing | Phase::Compacting | Phase::Retrying { .. } | Phase::Restarting { .. } => (Lane::Requests, Part::Waiting),
         };
         Some((lane, part, self.since))
@@ -427,8 +427,8 @@ impl Live {
                 (Who::Model, tf("Reading the conversation: {0} of {1} tokens ({2}%)", &[&token_count_words(*done), &token_count_words(*total), &percent]), self.since)
             }
             Phase::Thinking => (Who::Model, t("Thinking…").to_string(), self.since),
-            Phase::Writing => {
-                let writing = self.writing.iter().max_by_key(|writing| writing.index);
+            Phase::Writing { index } => {
+                let writing = self.writing.iter().find(|writing| writing.index == *index);
                 let words = writing.map_or(String::new(), |writing| {
                     let target = partial_value(&writing.head, "path").map(|path| safe(&path)).unwrap_or_default();
                     tf("Writing the arguments of {0}: {1}", &[&call_words(&writing.tool, &target), &size_text(writing.bytes)])
@@ -1410,6 +1410,26 @@ mod tests {
         assert_eq!(now(&live, 9).text, "Writing the arguments of Write  src/lib.rs: 4 KB");
         noted(&mut live, &[Event::RequestStarted, Event::Content("Done.".into())], later(at, 10));
         assert_eq!((now(&live, 11).who, now(&live, 11).text), (Who::Model, "Writing the answer".to_string()));
+    }
+
+    #[test]
+    fn interleaved_argument_updates_show_the_call_that_just_grew() {
+        let at = Instant::now();
+        let mut live = Live::new(at);
+        let piece = |index, text: &str| Event::ToolWriting { index, tool: "create_file".into(), piece: text.into() };
+        let first = r#"{"path":"first.html","content":""#;
+        let second = r#"{"path":"second.html","content":""#;
+        noted(&mut live, &[Event::TurnStarted, Event::RequestStarted, piece(0, first)], at);
+        live.note(&piece(1, second), later(at, 1));
+        assert!(live.now(&running(), later(at, 1)).text.contains("second.html"));
+        live.note(&piece(0, &"x".repeat(2048)), later(at, 2));
+        let now = live.now(&running(), later(at, 3));
+        assert_eq!(now.text, "Writing the arguments of Write  first.html: 2 KB");
+        assert_eq!(now.seconds, Some(3));
+        live.note(&piece(1, "y"), later(at, 4));
+        assert_eq!(live.now(&running(), later(at, 4)).text, format!("Writing the arguments of Write  second.html: {} B", second.len() + 1));
+        live.note(&Event::AssistantEnded, later(at, 5));
+        assert_eq!(live.now(&running(), later(at, 5)).text, "Checking the calls");
     }
 
     #[test]
