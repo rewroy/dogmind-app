@@ -4325,7 +4325,7 @@ impl Agent {
         ran.result
     }
 
-    /// A look across many files, by a helper with a context of its own (`explore`), as Deepseek Harness's subagents do: what it reads fills
+    /// A look across many files, by a helper with a context of its own (`explore`): what it reads fills
     /// its context and not this one, and only its answer joins the conversation. It has the looking tools only, and each of its calls goes
     /// through the gate as the session's own do; one that would need the person's leave is not made, and it is told to say so.
     /// The helper's conversation is kept as a session of its own beside this one (`session::helper_file_of`), the window is told how it goes

@@ -835,7 +835,7 @@ pub(crate) fn cap_ends(first: &str, last: &str, total: usize, limit: usize) -> S
 
 /// As much of the end as of the start.
 /// What a command printed, whole, when its report shows only part of it: in a file to read the rest of with read_file or search_files,
-/// as Deepseek Harness keeps a long output, and not by running the command again (a build or a test run, minutes of it). Kept a week.
+/// and not by running the command again (a build or a test run, minutes of it). Kept a week.
 fn kept_whole(out: &str, err: &str) -> Option<PathBuf> {
     keep_whole_as("command", &format!("stdout:\n{out}\nstderr:\n{err}\n"))
 }
