@@ -3800,7 +3800,7 @@ impl Agent {
         match weigh(&self.gate, tool, arguments, &place).0 {
             Verdict::Allow => true,
             Verdict::Deny(_) => false,
-            Verdict::Ask { risk, reason } => self.mode != Mode::Plan && (delegated(self.mode, tool, risk, reason.as_deref(), self.safe_commands) || (risk < Risk::High && reason.is_none() && rules::allows(&self.rules, &self.gate, &place, tool, arguments))),
+            Verdict::Ask { risk, reason } => self.mode != Mode::Plan && (delegated(self.mode, tool, risk, reason.as_deref(), self.safe_commands) || (risk < Risk::High && reason.is_none() && rules::allows(&self.rules, &self.gate, &place, tool, arguments, risk))),
         }
     }
 
@@ -4800,7 +4800,7 @@ impl Agent {
             if safety::covered(scope, &self.always_files, &self.always_folders, &self.always_networks) {
                 return Permission::Run;
             }
-        } else if (offered && self.always.contains(&key)) || (free && rules::allows(&self.rules, &self.gate, &place, tool, arguments)) {
+        } else if (offered && self.always.contains(&key)) || (free && rules::allows(&self.rules, &self.gate, &place, tool, arguments, risk)) {
             return Permission::Run;
         }
         let rule = if free { rules::proposed(&self.gate, &place, tool, arguments, risk) } else { None };
@@ -4975,7 +4975,7 @@ impl Agent {
                 Verdict::Allow => {}
                 Verdict::Ask { risk, reason: None } if risk < Risk::High => {
                     let key = always_key(tool, &alone);
-                    if delegated(self.mode, tool, risk, None, self.safe_commands) || self.always.contains(&key) || rules::allows(&self.rules, &self.gate, place, tool, &alone) {
+                    if delegated(self.mode, tool, risk, None, self.safe_commands) || self.always.contains(&key) || rules::allows(&self.rules, &self.gate, place, tool, &alone, risk) {
                         continue;
                     }
                     let rule = rules::proposed(&self.gate, place, tool, &alone, risk);

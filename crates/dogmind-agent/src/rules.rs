@@ -101,19 +101,19 @@ pub fn proposed(gate: &Gate, workspace: &Path, tool: &str, arguments: &Value, ri
     }
     let (settings, command) = split(gate, arguments.get("command")?.as_str()?)?;
     let all = command_words(&command);
-    let mut parts = all.iter();
-    let first = parts.next().filter(|first| !first.is_empty())?;
+    let first = all.first().filter(|first| !first.is_empty())?;
     let program = program_of(first);
     // What deletes, moves or stops things, and what runs code it was handed, is allowed to the letter or not at all. A package runner runs the package it names.
     let runner = (risk < Risk::Medium && RUNNERS.contains(&program.as_str())).then(|| runner_prefix(&all)).flatten();
-    let exact = runner.is_none() && (risk >= Risk::Medium || INTERPRETERS.contains(&program.as_str()) || RUNNERS.contains(&program.as_str()));
-    let prefix = match (runner, exact) {
+    // A rule is a program and what it is asked to do (`git log`), never the program alone: with a switch first (`git -c core.pager=... log`, `cargo --locked
+    // build`) or nothing after it, the line is the rule, to the letter. git, cargo, npm and dotnet can run any code by a switch or a subcommand, and one
+    // "always" must not be to all of that.
+    let second = all.get(1).filter(|second| !second.starts_with(['-', '/']));
+    let exact = runner.is_none() && (risk >= Risk::Medium || INTERPRETERS.contains(&program.as_str()) || RUNNERS.contains(&program.as_str()) || second.is_none());
+    let prefix = match (runner, second.filter(|_| !exact)) {
         (Some(runner), _) => runner,
-        (None, true) => joined(&all),
-        (None, false) => match parts.next().filter(|second| !second.starts_with(['-', '/'])) {
-            Some(second) => joined(&[first.clone(), second.clone()]),
-            None => joined(std::slice::from_ref(first)),
-        },
+        (None, Some(second)) => joined(&[first.clone(), second.clone()]),
+        (None, None) => joined(&all),
     };
     // (the settings go with it, as written: the same command with other settings, `PATH` or `NODE_OPTIONS` among them, can run something else)
     let prefix = settings.map_or(prefix.clone(), |settings| format!("{settings} {prefix}"));
@@ -172,9 +172,12 @@ fn write(path: &Path, rules: &[Rule]) -> Result<(), String> {
 }
 
 /// Read each time, so that a rule removed in the window stops at once in every session.
-pub fn allows(path: &Path, gate: &Gate, workspace: &Path, tool: &str, arguments: &Value) -> bool {
+/// Whether a saved rule answers for this call, of this risk. A rule of a command's first words was made of a call below Medium (one at Medium or above is
+/// made to the letter): it answers only for calls below Medium too, so that "git log ..." does not let `git log --output=C:\\x\\y`, which writes a file,
+/// run unasked. A rule to the letter answers for its line, as it was.
+pub fn allows(path: &Path, gate: &Gate, workspace: &Path, tool: &str, arguments: &Value, risk: Risk) -> bool {
     let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    read(path).iter().any(|rule| matches(rule, gate, workspace, tool, arguments))
+    read(path).iter().any(|rule| (rule.exact || rule.tool == EDIT || risk < Risk::Medium) && matches(rule, gate, workspace, tool, arguments))
 }
 
 pub fn list(path: &Path) -> Vec<Rule> {
@@ -182,10 +185,15 @@ pub fn list(path: &Path) -> Vec<Rule> {
     read(path)
 }
 
+/// The same rule, whatever the case its workspace is written in (`C:\\w` and `c:\\w` are one folder, as `matches` reads them).
+fn same_rule(a: &Rule, b: &Rule) -> bool {
+    same_workspace(&a.workspace, &b.workspace) && a.tool == b.tool && a.prefix == b.prefix && a.exact == b.exact
+}
+
 pub fn add(path: &Path, rule: Rule) -> Result<(), String> {
     let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut rules = read_to_change(path)?;
-    if !rules.contains(&rule) {
+    if !rules.iter().any(|known| same_rule(known, &rule)) {
         rules.push(rule);
         write(path, &rules)?;
     }
@@ -195,7 +203,7 @@ pub fn add(path: &Path, rule: Rule) -> Result<(), String> {
 pub fn remove(path: &Path, rule: &Rule) -> Result<(), String> {
     let _one = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut rules = read_to_change(path)?;
-    rules.retain(|known| known != rule);
+    rules.retain(|known| !same_rule(known, rule));
     write(path, &rules)
 }
 
@@ -296,6 +304,59 @@ mod tests {
         }
     }
 
+    /// A rule of first words answers for the calls of the class it was made of: "git log ..." for `git log --stat`, not for `git log --output=x`, which
+    /// the gate puts higher as it writes a file.
+    #[test]
+    fn a_rule_of_first_words_does_not_answer_for_a_riskier_call() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let gate = Gate::new();
+        let root = Path::new("C:\\w");
+        let risk_of = |text: &str| match gate.check(COMMAND, &command(text), root) {
+            crate::safety::Verdict::Ask { risk, .. } => risk,
+            _ => Risk::Safe,
+        };
+        add(&path, proposed(&gate, root, COMMAND, &command("git log --oneline"), Risk::Low).unwrap()).unwrap();
+        assert!(allows(&path, &gate, root, COMMAND, &command("git log --stat"), risk_of("git log --stat")));
+        assert!(risk_of("git log --output=x") >= Risk::Medium, "the gate's word on it");
+        assert!(!allows(&path, &gate, root, COMMAND, &command("git log --output=x"), risk_of("git log --output=x")));
+        // (a rule to the letter answers for its line, of any risk below High)
+        add(&path, proposed(&gate, root, COMMAND, &command("del build.log"), Risk::Medium).unwrap()).unwrap();
+        assert!(allows(&path, &gate, root, COMMAND, &command("del build.log"), Risk::Medium));
+    }
+
+    /// A rule is never a program alone: with a switch first, or nothing after the program, it is the line to the letter (git and cargo run any code by
+    /// a switch or a subcommand), and the card shows that line.
+    #[test]
+    fn a_switch_first_or_nothing_after_makes_the_rule_the_line() {
+        let gate = Gate::new();
+        let root = Path::new("C:\\w");
+        for text in ["git -c core.pager=x log", "cargo --locked build", "make"] {
+            let rule = proposed(&gate, root, COMMAND, &command(text), Risk::Low).unwrap();
+            assert!(rule.exact && rule.prefix == text && rule.label() == text, "{text}: {rule:?}");
+            assert!(matches(&rule, &gate, root, COMMAND, &command(text)), "{text}");
+        }
+        let git = proposed(&gate, root, COMMAND, &command("git -c core.pager=x log"), Risk::Low).unwrap();
+        assert!(!matches(&git, &gate, root, COMMAND, &command("git log --oneline")));
+        assert!(!matches(&git, &gate, root, COMMAND, &command("git -c core.pager=y log")));
+        // (a subcommand first is a rule of it, as before)
+        let log = proposed(&gate, root, COMMAND, &command("git log --oneline"), Risk::Low).unwrap();
+        assert_eq!((log.prefix.as_str(), log.exact), ("git log", false));
+    }
+
+    /// One folder is one rule whatever the case it is written in: added twice it is kept once, and removed in either case it is gone.
+    #[test]
+    fn a_rule_is_one_whatever_the_case_of_its_folder() {
+        let dir = crate::in_container::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let rule = |folder: &str| Rule { workspace: PathBuf::from(folder), tool: COMMAND.to_string(), prefix: "git log".into(), exact: false };
+        add(&path, rule("C:\\w")).unwrap();
+        add(&path, rule("c:\\w\\")).unwrap();
+        assert_eq!(list(&path).len(), 1);
+        remove(&path, &rule("C:/W")).unwrap();
+        assert!(list(&path).is_empty());
+    }
+
     #[test]
     fn spaces_inside_quotes_are_kept_and_two_files_are_two_rules() {
         let gate = Gate::new();
@@ -317,7 +378,9 @@ mod tests {
         let root = Path::new("C:\\w");
         let rule = proposed(&gate, root, COMMAND, &command("cargo  build --release"), Risk::Low).unwrap();
         assert_eq!((rule.prefix.as_str(), rule.exact), ("cargo build", false));
-        assert_eq!(proposed(&gate, root, COMMAND, &command("make -j4"), Risk::Low).unwrap().prefix, "make");
+        // (a switch first: the line, to the letter, and not the program alone)
+        let make = proposed(&gate, root, COMMAND, &command("make -j4"), Risk::Low).unwrap();
+        assert_eq!((make.prefix.as_str(), make.exact), ("make -j4", true));
     }
 
     #[test]
@@ -374,14 +437,14 @@ mod tests {
         let path = dir.path().join("deep").join("permissions.json");
         let gate = Gate::new();
         let root = Path::new("C:\\w");
-        assert!(!allows(&path, &gate, root, COMMAND, &command("make")));
-        let rule = proposed(&gate, root, COMMAND, &command("make"), Risk::Low).unwrap();
+        assert!(!allows(&path, &gate, root, COMMAND, &command("make all"), Risk::Low));
+        let rule = proposed(&gate, root, COMMAND, &command("make all"), Risk::Low).unwrap();
         add(&path, rule.clone()).unwrap();
         add(&path, rule.clone()).unwrap();
         assert_eq!(list(&path).len(), 1);
-        assert!(allows(&path, &gate, root, COMMAND, &command("make all")));
+        assert!(allows(&path, &gate, root, COMMAND, &command("make all -j4"), Risk::Low));
         remove(&path, &rule).unwrap();
-        assert!(!allows(&path, &gate, root, COMMAND, &command("make all")));
+        assert!(!allows(&path, &gate, root, COMMAND, &command("make all -j4"), Risk::Low));
     }
 
     /// "Always" to a command keeps the program and its first word (`git status`, `cargo test`), and of a package runner the package (`npx -y some-cli@2.0.0`): the same with
@@ -428,6 +491,6 @@ mod tests {
         let dir = crate::in_container::tempdir().unwrap();
         let path = dir.path().join("permissions.json");
         std::fs::write(&path, "{ not json").unwrap();
-        assert!(!allows(&path, &Gate::new(), Path::new("C:\\w"), COMMAND, &command("make")));
+        assert!(!allows(&path, &Gate::new(), Path::new("C:\\w"), COMMAND, &command("make"), Risk::Low));
     }
 }
