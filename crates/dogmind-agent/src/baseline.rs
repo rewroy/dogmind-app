@@ -442,6 +442,12 @@ impl Baseline {
                 lines.push(format!("{word}: previous content too large to compare or show"));
                 continue;
             }
+            // Once the previews are full, only an unknown starting file may need a note
+            // about its missing copy. All other changes already have their summary.
+            if shown.len() == MOST_SHOWN && !matches!(before, Before::Unknown(_)) {
+                lines.push(word);
+                continue;
+            }
             let text = |bytes: &[u8]| file_text(bytes).0;
             let is_binary = after.as_deref().is_some_and(binary) || matches!(&before, Before::Bytes(bytes) if binary(bytes));
             let diff = match (&before, &after) {
@@ -452,11 +458,9 @@ impl Baseline {
                 (Before::Absent, after) => Some(FileChange::between(name, None, after.as_deref().map(text).as_deref()).diff),
                 (Before::Bytes(before), Some(after)) => Some(text_diff(name, &text(before), &text(after))),
                 (Before::Bytes(before), None) => {
-                    if shown.len() < MOST_SHOWN {
-                        let (text, _) = decode_file_text(before);
-                        let preview = deleted_preview(&text, MOST_SHOWN_OF_A_FILE);
-                        shown.push(format!("--- {name} ---\n{preview}"));
-                    }
+                    let (text, _) = decode_file_text(before);
+                    let preview = deleted_preview(&text, MOST_SHOWN_OF_A_FILE);
+                    shown.push(format!("--- {name} ---\n{preview}"));
                     lines.push(word);
                     continue;
                 }
@@ -792,6 +796,25 @@ mod tests {
         std::fs::write(work.path().join("a.txt"), "second\n").unwrap();
         let said = Baseline::for_session(&session, work.path()).changes(work.path(), &[]);
         assert!(said.contains("-first") && said.contains("+second"), "{said}");
+    }
+
+    #[test]
+    fn a_full_preview_list_still_explains_which_file_had_no_starting_copy() {
+        let (work, _keep, session) = fixture();
+        let unknown = work.path().join("z-unknown.txt");
+        std::fs::write(&unknown, vec![b'x'; MOST_COPIED as usize + 1]).unwrap();
+        let baseline = Baseline::for_session(&session, work.path());
+        for i in 0..=MOST_SHOWN {
+            std::fs::write(work.path().join(format!("a-{i:03}.txt")), "new").unwrap();
+        }
+        std::fs::write(unknown, "changed").unwrap();
+        let report = baseline.changes(work.path(), &[]);
+        let last_visible = format!("a-{:03}.txt", MOST_SHOWN - 1);
+        let first_hidden = format!("a-{MOST_SHOWN:03}.txt");
+        assert!(report.contains(&format!("--- {last_visible} ---")));
+        assert!(report.contains(&format!("created {first_hidden} (3 bytes)")));
+        assert!(!report.contains(&format!("--- {first_hidden} ---")));
+        assert!(report.lines().any(|line| line.starts_with("changed z-unknown.txt") && line.contains("no copy was kept")));
     }
 
     #[test]
