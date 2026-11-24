@@ -754,15 +754,15 @@ pub fn cap(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
     }
-    let boundary = |mut at: usize| {
-        while !text.is_char_boundary(at) {
-            at -= 1;
-        }
-        at
-    };
-    let head = boundary(limit * 3 / 4);
-    let tail = boundary(text.len() - limit / 4);
-    format!("{}\n--- truncated: {} bytes left out ---\n{}", &text[..head], tail - head, &text[tail..])
+    cap_ends(text, text, text.len(), limit)
+}
+
+/// The supplied ends contain at least the bytes to keep from each end of the full output.
+pub(crate) fn cap_ends(first: &str, last: &str, total: usize, limit: usize) -> String {
+    let head = &first[..first.floor_char_boundary(limit * 3 / 4)];
+    let tail = &last[last.floor_char_boundary(last.len() - limit / 4)..];
+    let omitted = total - head.len() - tail.len();
+    format!("{head}\n--- truncated: {omitted} bytes left out ---\n{tail}")
 }
 
 /// As much of the end as of the start.
@@ -1553,7 +1553,7 @@ pub(crate) fn file_text(bytes: &[u8]) -> (String, &'static str) {
     (text.into_owned(), encoding)
 }
 
-fn decode_file_text(bytes: &[u8]) -> (Cow<'_, str>, &'static str) {
+pub(crate) fn decode_file_text(bytes: &[u8]) -> (Cow<'_, str>, &'static str) {
     let wide = |pair: fn([u8; 2]) -> u16| String::from_utf16_lossy(&bytes[2..].chunks_exact(2).map(|two| pair([two[0], two[1]])).collect::<Vec<u16>>());
     if bytes.starts_with(&[0xFF, 0xFE]) {
         return (Cow::Owned(wide(u16::from_le_bytes)), "utf-16");

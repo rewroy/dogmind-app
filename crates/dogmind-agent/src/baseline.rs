@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::tools::{cap, file_text, git, git_raw, untracked_names, walker, FileChange};
+use crate::tools::{cap, cap_ends, decode_file_text, file_text, git, git_raw, untracked_names, walker, FileChange};
 
 /// What a first message may wait for, in a folder with no repository.
 const LOOKING: Duration = Duration::from_secs(3);
@@ -141,6 +141,33 @@ fn text_diff(name: &str, before: &str, after: &str) -> String {
         }
     }
     diff(before, after)
+}
+
+/// A deletion has one hunk and one '-' per original line. Its middle needs only a byte count.
+fn deleted_preview(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return cap(&similar::TextDiff::from_lines(text, "").unified_diff().to_string(), limit);
+    }
+    let missing_newline = !text.ends_with(['\r', '\n']);
+    let lone_cr = text.match_indices('\r').filter(|(at, _)| text.as_bytes().get(at + 1) != Some(&b'\n')).count();
+    let lines = text.matches('\n').count() + lone_cr + usize::from(missing_newline);
+    let header = if lines == 1 { "@@ -1 +0,0 @@\n".to_string() } else { format!("@@ -1,{lines} +0,0 @@\n") };
+    let hint = if missing_newline { "\n\\ No newline at end of file\n" } else { "" };
+    let total = header.len() + text.len() + lines + hint.len();
+
+    // Even if a slice cuts a line, its artificial edge is outside the part kept by cap_ends.
+    let mark = |out: &mut String, slice: &str| {
+        for line in similar::DiffableStr::tokenize_lines(slice) {
+            out.push('-');
+            out.push_str(line);
+        }
+    };
+    let mut first = header;
+    mark(&mut first, &text[..text.ceil_char_boundary(limit * 3 / 4)]);
+    let mut last = String::new();
+    mark(&mut last, &text[text.floor_char_boundary(text.len() - limit / 4)..]);
+    last.push_str(hint);
+    cap_ends(&first, &last, total, limit)
 }
 
 /// What was there before, as far as it is known.
@@ -424,7 +451,15 @@ impl Baseline {
                 (Before::Absent, Some(after)) if after.len() as u64 > MOST_COPIED => edited_diff(name),
                 (Before::Absent, after) => Some(FileChange::between(name, None, after.as_deref().map(text).as_deref()).diff),
                 (Before::Bytes(before), Some(after)) => Some(text_diff(name, &text(before), &text(after))),
-                (Before::Bytes(before), None) => Some(FileChange::between(name, Some(&text(before)), None).diff),
+                (Before::Bytes(before), None) => {
+                    if shown.len() < MOST_SHOWN {
+                        let (text, _) = decode_file_text(before);
+                        let preview = deleted_preview(&text, MOST_SHOWN_OF_A_FILE);
+                        shown.push(format!("--- {name} ---\n{preview}"));
+                    }
+                    lines.push(word);
+                    continue;
+                }
             };
             match diff {
                 Some(diff) => {
@@ -450,6 +485,19 @@ impl Baseline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capped_deletion_matches_the_complete_unified_diff_at_utf8_and_line_boundaries() {
+        for text in ["", "終", "行\r\n次\r最終\n", "a\r\r\n🌿x", "\n\n", "長い改行なし"] {
+            for copies in [1, 60] {
+                let text = text.repeat(copies);
+                let full = FileChange::between("a", Some(&text), None).diff;
+                for limit in 0..=64 {
+                    assert_eq!(deleted_preview(&text, limit), cap(&full, limit), "limit={limit}, text={text:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_checkout_with_other_line_endings_still_shows_the_edited_lines() {
