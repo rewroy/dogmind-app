@@ -364,6 +364,20 @@ pub(crate) fn real_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether what `found` is of is a reparse point (a junction or a mount point that `is_symlink` may not say).
+fn reparse_point(found: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        found.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = found;
+        false
+    }
+}
+
 /// What "Always" would allow, for the rest of a session, of a call that asks for a reason that a rule never answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlwaysScope {
@@ -1152,6 +1166,10 @@ fn command_path() -> Vec<PathBuf> {
 
 /// Inside the workspace as it is spelled and where it really leads: a link inside it to somewhere else is somewhere else.
 pub(crate) fn within(workspace: &Path, path: &Path) -> bool {
+    // (a workspace's root made a link since, by a command, leads wherever it likes: nothing is in it then)
+    if std::fs::symlink_metadata(workspace).is_ok_and(|found| found.file_type().is_symlink() || reparse_point(&found)) {
+        return false;
+    }
     inside(workspace, path) && match (real_path(workspace), real_path(path)) {
         (Some(root), Some(real)) => inside(&root, &real),
         _ => true,

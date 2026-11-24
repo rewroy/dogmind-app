@@ -594,11 +594,13 @@ pub fn ready_workspace(workspace: &Path) -> Result<(), String> {
     }
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     let root = writable_root(workspace, workspace, home.as_deref())?;
+    // (the folder as the person named it, looked at before anything is written down of it: one a command has made a link since is refused)
+    readied(workspace)?;
     // SAFETY: the capability lives as long as the process, and the call below is given nothing else.
     unsafe {
         let capability = workspace_capability(&root)?;
         let _one = crate::workspace_grants::before_grant(&root, capability)?;
-        grant(&root, capability, READ_WRITE_EXECUTE, true)
+        grant_in_place(workspace, capability, READ_WRITE_EXECUTE)
     }
 }
 
@@ -788,12 +790,13 @@ unsafe fn restricted_token(writer: PSID) -> Result<Handle, String> {
 /// What a command run with a restricted token needs before it starts: write for its SID in the workspace and in the temp folder its environment names (its own,
 /// `restricted_temp`, made here), and the workspace's repositories guarded for that SID as for the container's (no new config or hooks). Nothing to read is opened: it
 /// reads as the person does.
-unsafe fn prepare_restricted(workspace: &Path, writer: PSID, temp: Option<&Path>, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
+/// `named` is the workspace's root as the app names it (`workspace` is where it really is): it is granted as it was ([`grant_in_place`]).
+unsafe fn prepare_restricted(workspace: &Path, named: &Path, writer: PSID, temp: Option<&Path>, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
     let began = Instant::now();
-    grant(workspace, writer, READ_WRITE_EXECUTE, true)?;
+    grant_in_place(named, writer, READ_WRITE_EXECUTE)?;
     if let Some(temp) = temp {
         std::fs::create_dir_all(temp).map_err(|error| format!("{}: the temp folder of the command could not be made: {error}", temp.display()))?;
-        grant(temp, writer, READ_WRITE_EXECUTE, true)?;
+        grant_in_place(temp, writer, READ_WRITE_EXECUTE)?;
     }
     times.grant += began.elapsed();
     let began = Instant::now();
@@ -1887,6 +1890,37 @@ pub fn also_readable(folder: &Path) {
     }
 }
 
+/// What a command is told when its workspace's folder, or its temp folder, has become a link since the app made it ready.
+pub const MOVED: &str = "this folder has become a link to another place since the app made it ready (a command can make it one), so nothing was run or granted there: open the folder itself as the workspace again";
+
+/// Where each folder commands write in (a workspace's root, a restricted command's temp folder) really was when the app first made it ready in this
+/// process. A command can make such a folder a mount point to a place outside since: with a restricted token, which Windows does not count as a
+/// sandbox's, to a place it cannot write itself (tried: the root of a workspace made one to a folder of the person's). A grant by the folder's name
+/// would then land at that place, for every later command.
+static READIED: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
+
+/// Where `named` really is, where it is no link or junction itself and leads where it did when it was first made ready here; an error that says
+/// so otherwise.
+pub(crate) fn readied(named: &Path) -> Result<PathBuf, String> {
+    if std::fs::symlink_metadata(named).is_ok_and(|found| leads_elsewhere(&found)) {
+        return Err(format!("{}: {MOVED}", named.display()));
+    }
+    let real = crate::safety::real_path(named).ok_or_else(|| format!("{}: it cannot be found", named.display()))?;
+    let mut readied = READIED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let then = readied.get_or_insert_with(HashMap::new).entry(key(named)).or_insert_with(|| real.clone());
+    if *then != real {
+        return Err(format!("{}: {MOVED}", named.display()));
+    }
+    Ok(real)
+}
+
+/// `grant` of a folder commands write in, inherited by what is in it: where it is as it was ([`readied`]), and by a handle on the folder as named,
+/// which is looked at once more as it is granted ([`grant_where_it_was`]).
+unsafe fn grant_in_place(named: &Path, sid: PSID, mask: u32) -> Result<(), String> {
+    let real = readied(named)?;
+    grant_where_it_was(named, &real, sid, mask)
+}
+
 /// The path a handle has, as `safety::real_path` spells one: with no `\\?\` in front.
 unsafe fn final_path(handle: HANDLE) -> Option<PathBuf> {
     let mut text = vec![0u16; 4096];
@@ -2562,9 +2596,10 @@ pub fn take_timings() -> Vec<Timings> {
 }
 
 /// `sid` is the container's, `writer` the workspace's capability (`workspace_capability`).
-unsafe fn prepare(workspace: &Path, sid: PSID, writer: PSID, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
+/// `named` is the workspace's root as the app names it (`workspace` is where it really is): it is granted as it was ([`grant_in_place`]).
+unsafe fn prepare(workspace: &Path, named: &Path, sid: PSID, writer: PSID, disarmed: &mut Vec<String>, times: &mut Timings) -> Result<(), String> {
     let began = Instant::now();
-    grant(workspace, writer, READ_WRITE_EXECUTE, true)?;
+    grant_in_place(named, writer, READ_WRITE_EXECUTE)?;
     times.grant += began.elapsed();
     // Each repository in the workspace. If one cannot be guarded the command does not run, as with any other containment.
     let began = Instant::now();
@@ -2607,14 +2642,15 @@ unsafe fn prepare(workspace: &Path, sid: PSID, writer: PSID, disarmed: &mut Vec<
     #[cfg(not(test))]
     if let (Some(path), Some(home)) = (std::env::var_os("PATH"), std::env::var_os("USERPROFILE")) {
         let began = Instant::now();
-        open_toolchains(&path.to_string_lossy(), Path::new(&home), crate::bundled::root().map(|root| crate::bundled::Present::of(&root)), sid);
+        open_toolchains(&path.to_string_lossy(), Path::new(&home), crate::bundled::root().map(|root| crate::bundled::Present::of(&root)), sid, Some(workspace));
         times.toolchains += began.elapsed();
     }
     Ok(())
 }
 
-pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: Option<crate::bundled::Present>, sid: PSID) {
-    for folder in toolchain_folders(path_variable, home) {
+/// A folder of PATH in `workspace` is not opened: it is readable already, and a command could make it a junction to a place outside.
+pub(crate) unsafe fn open_toolchains(path_variable: &str, home: &Path, bundled: Option<crate::bundled::Present>, sid: PSID, workspace: Option<&Path>) {
+    for folder in toolchain_folders(path_variable, home).into_iter().filter(|folder| !workspace.is_some_and(|workspace| crate::safety::inside(workspace, folder))) {
         // (a person's own Python or Node is not what runs when the bundle has its own, so nothing is opened for it; where the bundle lacks one, theirs is)
         let replaced = bundled.is_some_and(|present| {
             let folder_key = key(&folder);
@@ -2957,11 +2993,14 @@ fn run_limited_in(line: &str, cwd: &Path, workspace: &Path, start_in: Option<&Pa
         let mut times = Timings::default();
         // (as the person, nothing is to be granted: it can do what they can)
         if token != Token::Person && !nested {
+            // (the root as the app names it, the workspace or the folder a command runs in, looked at before anything is written down of it)
+            let named = if crate::safety::real_path(workspace).is_some_and(|real| key(&real) == key(&root)) { workspace } else { cwd };
+            readied(named)?;
             let _one = crate::workspace_grants::before_grant(&root, grantee)?;
             if let Some(writer) = &writer {
-                prepare_restricted(&root, writer.0, temp.as_deref(), &mut disarmed, &mut times)?;
+                prepare_restricted(&root, named, writer.0, temp.as_deref(), &mut disarmed, &mut times)?;
             } else {
-                prepare(&root, sid, grantee, &mut disarmed, &mut times)?;
+                prepare(&root, named, sid, grantee, &mut disarmed, &mut times)?;
                 // (a file held out of a folder commands can read, saved anew since by an editor, inherited what the folder gives: it is held out again before this command can read it)
                 if let Some(folder) = crate::workspace_grants::data_folder() {
                     crate::read_folders::hold_out_again(&crate::read_folders::file_in(&folder));
@@ -4143,6 +4182,47 @@ mod tests {
             assert!(grant_where_it_was(&other, &target, sid, READ_EXECUTE).is_err(), "a folder that is not where it was");
             assert!(grant_where_it_was(&other, &other, sid, READ_EXECUTE).is_ok(), "and one that is");
         }
+    }
+
+    /// A workspace whose root a command has made a link to a place outside since (as a command with a restricted token can, to a place it cannot write)
+    /// is refused, in the container and with the restricted token: nothing runs and nothing is granted at the place. So is a restricted command's
+    /// temp folder made one. A workspace as it was runs as before.
+    #[test]
+    fn a_folder_commands_write_in_made_a_link_since_is_refused_and_not_granted() {
+        if crate::in_container::cannot_run(crate::in_container::SANDBOX) {
+            return;
+        }
+        let (work, target) = (work_folder("readied-root"), outside_folder("readied-target"));
+        let restricted = |line: &str| run_live_restricted(line, &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false), None);
+        assert_eq!(command("echo here", &work, false).status, Some(0));
+        let temp = decode(&restricted("echo %TEMP%").unwrap().stdout).trim().to_string();
+        assert!(!temp.is_empty());
+        let before = dacl_text(&target).unwrap();
+        // (what the command could have done itself: the root a mount point to the place)
+        std::fs::remove_dir_all(&work).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&work).arg(&target).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        let refused = run("echo x> there.txt", &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false)).err().unwrap_or_default();
+        assert!(refused.contains(MOVED), "{refused}");
+        let refused = restricted("echo x> there.txt").err().unwrap_or_default();
+        assert!(refused.contains(MOVED), "{refused}");
+        assert!(!target.join("there.txt").exists());
+        assert_eq!(dacl_text(&target).unwrap(), before, "nothing granted at the place");
+        // (nor within it, for the tools: a root that is a link holds nothing)
+        assert!(!crate::safety::within(&work, &work.join("there.txt")));
+        std::fs::remove_dir(&work).unwrap();
+        // The restricted command's temp folder made one too: refused, and nothing granted.
+        let work = work_folder("readied-root");
+        let restricted = |line: &str| run_live_restricted(line, &work, &work, false, Duration::from_secs(60), &AtomicBool::new(false), None);
+        let temp = PathBuf::from(decode(&restricted("echo %TEMP%").unwrap().stdout).trim());
+        std::fs::remove_dir_all(&temp).unwrap();
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&temp).arg(&target).output().unwrap();
+        assert!(made.status.success(), "{}", decode(&made.stdout));
+        let refused = restricted("echo x> there.txt").err().unwrap_or_default();
+        assert!(refused.contains(MOVED), "{refused}");
+        assert_eq!(dacl_text(&target).unwrap(), before, "nothing granted at the place");
+        std::fs::remove_dir(&temp).unwrap();
+        assert_eq!(restricted("echo again").map(|out| out.status).unwrap_or_default(), Some(0), "its own temp folder made again, as it was");
     }
 
     #[test]
