@@ -1063,6 +1063,19 @@ fn console_lines(err: &str, folder_url: &str) -> Vec<String> {
     lines
 }
 
+/// Chromium writes page console messages in UTF-8, while Windows diagnostics on
+/// the same pipe may use the system code page.
+fn browser_stderr(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let mut text = String::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        text.push_str(&crate::sandbox::decode(line));
+    }
+    text
+}
+
 /// Elements that have no end tag.
 const VOID: [&str; 14] = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
 
@@ -1567,7 +1580,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             let profile = profiles.next();
             let line = page_line(&program, &browser_flags(), virtual_screen, run_wait, &profile, &address);
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, cancel)?;
-            (dom, err) = (crate::sandbox::decode(&done.stdout), crate::sandbox::decode(&done.stderr));
+            (dom, err) = (crate::sandbox::decode(&done.stdout), browser_stderr(&done.stderr));
             #[cfg(debug_assertions)]
             if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
                 eprintln!("--- browser, {:?} {:?}:\n{err}\n--- dom: {} bytes", done.status, done.ended, dom.len());
@@ -1645,7 +1658,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             #[cfg(debug_assertions)]
             if std::env::var_os("DOGMIND_PAGE_DEBUG").is_some() {
                 if let Ok(done) = &done {
-                    eprintln!("--- picture, {:?} {:?}: shot {} bytes\n{}", done.status, done.ended, std::fs::metadata(&shot).map_or(0, |meta| meta.len()), crate::sandbox::decode(&done.stderr));
+                    eprintln!("--- picture, {:?} {:?}: shot {} bytes\n{}", done.status, done.ended, std::fs::metadata(&shot).map_or(0, |meta| meta.len()), browser_stderr(&done.stderr));
                 }
             }
             // (a browser that fell over while writing it leaves an empty file, or one that cannot be read)
@@ -1655,7 +1668,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             if let Ok(whole) = shot_image {
                 if whole.crop_imm(0, 0, view.width, view.height).save_with_format(&picture, image::ImageFormat::Png).is_ok() {
                     taken.picture = Some(picture.clone());
-                    taken.said_there = done.map(|done| page_console(&crate::sandbox::decode(&done.stderr), &base_url, page.as_deref().zip(copy_name.as_deref()))).unwrap_or_default();
+                    taken.said_there = done.map(|done| page_console(&browser_stderr(&done.stderr), &base_url, page.as_deref().zip(copy_name.as_deref()))).unwrap_or_default();
                     break;
                 }
             }
@@ -2202,6 +2215,15 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[1].starts_with("a.js:9: shader says: ERROR: 0:1: 'nonsense'"), "{lines:?}");
         assert!(lines[1].contains("syntax error"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_local_diagnostic_preserves_the_utf8_console_lines_around_it() {
+        let first = "日本語のエラー\r\n";
+        let diagnostic = b"Windows: \x83\x65\x83\x58\x83\x67\r\n";
+        let last = "超アタリ 的中！";
+        let bytes = [first.as_bytes(), diagnostic, last.as_bytes()].concat();
+        assert_eq!(browser_stderr(&bytes), format!("{first}{}{last}", crate::sandbox::decode(diagnostic)));
     }
 
     #[test]
@@ -3150,7 +3172,7 @@ mod tests {
             if let (Some(keep), Ok(done)) = (&keep, &done) {
                 let _ = std::fs::create_dir_all(keep);
                 let name = format!("{mode}-{at:03}-{}.txt", if well { "good" } else { "bad" });
-                let _ = std::fs::write(keep.join(name), format!("{:?} {:?}\n--- stdout {} bytes\n--- stderr\n{}", done.status, done.ended, done.stdout.len(), crate::sandbox::decode(&done.stderr)));
+                let _ = std::fs::write(keep.join(name), format!("{:?} {:?}\n--- stdout {} bytes\n--- stderr\n{}", done.status, done.ended, done.stdout.len(), browser_stderr(&done.stderr)));
             }
         }
         profiles.clear();
