@@ -696,6 +696,29 @@ fn browser() -> Option<(PathBuf, &'static str)> {
     PLACES.iter().find_map(|(variable, path, name)| Some((PathBuf::from(std::env::var_os(variable)?).join(path), *name)).filter(|(found, _)| found.is_file()))
 }
 
+/// Headless virtual screens are supported from Chromium 142. Older installations keep the framed viewport.
+fn supports_virtual_screen(program: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO};
+
+    let wide: Vec<u16> = program.as_os_str().encode_wide().chain(Some(0)).collect();
+    // All pointers refer to the executable's name or to the version block held here until the fixed information is read.
+    unsafe {
+        let size = GetFileVersionInfoSizeW(wide.as_ptr(), std::ptr::null_mut());
+        if size == 0 { return false; }
+        let mut block = vec![0u32; (size as usize).div_ceil(4)];
+        let data = block.as_mut_ptr().cast();
+        if GetFileVersionInfoW(wide.as_ptr(), 0, size, data) == 0 { return false; }
+        let mut fixed = std::ptr::null_mut();
+        let mut length = 0;
+        if VerQueryValueW(data, [b'\\' as u16, 0].as_ptr(), &mut fixed, &mut length) == 0
+            || fixed.is_null() || (length as usize) < std::mem::size_of::<VS_FIXEDFILEINFO>() {
+            return false;
+        }
+        (*fixed.cast::<VS_FIXEDFILEINFO>()).dwFileVersionMS >> 16 >= 142
+    }
+}
+
 /// What is said of a page whose module scripts load its own files: a browser refuses those from file://, which this check allows. It used to say to check it through a local server,
 /// and a model made a page that ran only so: the person opened it from its folder, by a double-click, and nothing of it ran.
 const LOCAL_MODULE_WORDS: &str = "Opened from its file, as the user opens a page by a double-click, its module scripts that load its own files do not run at all: a browser refuses them from file://, which this check allows. Unless the user is to open it from a server, put that code in plain <script> tags, or import only from CDN addresses.";
@@ -1572,6 +1595,7 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
     // (set when the turn is stopped, or when what the pictures were taking is of no use: each picture's run ends at it)
     let stop = AtomicBool::new(false);
     let slots = Slots::new(AT_ONCE);
+    let direct_url_picture = served.is_some() && supports_virtual_screen(&program);
     // (the read's own turn is never refused)
     let never = AtomicBool::new(false);
     // (what the read took, in ms, for the pictures begun after it: none while it goes on)
@@ -1584,12 +1608,16 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
         let run = next_run();
         let (frame, shot, picture) = (temp.join(frame_of(&run)), temp.join(shot_of(&run)), temp.join(format!("dogmind-page-{taken_at}-{tag}.png")));
         let _ = std::fs::remove_file(&picture);
-        // (with steps, each picture is of the page after them, as they run again in its load)
-        if std::fs::write(&frame, frame_page(&src, view)).is_err() {
-            return taken;
-        }
-        // (a window larger than the frame by what the browser takes of it, and at least its least width)
-        let (window_width, window_height) = (view.width.max(600) + 64, view.height + 160);
+        // A local server page in a file iframe can stay at its initial frame while the DOM read advances.
+        // As the top-level page on a virtual fullscreen display it gets both the clock and the exact viewport.
+        let capture = if direct_url_picture {
+            address.clone()
+        } else {
+            if std::fs::write(&frame, frame_page(&src, view)).is_err() { return taken; }
+            plain(&frame)
+        };
+        // Leave room for the browser frame. In kiosk mode the virtual screen itself bounds the viewport.
+        let window = (view.width.max(600) + 64, view.height + 160);
         let (mut trying, mut profiles) = (None, Profiles::new(&cwd, workspace));
         for _ in 0..TRIES {
             // (its turn among the check's runs: waiting for it is no part of the tries' time)
@@ -1603,7 +1631,11 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             let limit = picture_limit(wait, (read != u64::MAX).then(|| Duration::from_millis(read)));
             taken.limit = limit;
             let profile = profiles.next();
-            let line = shot_line(&program, &browser_flags(), (window_width, window_height), wait, &profile, &shot, &plain(&frame));
+            let mut flags = browser_flags();
+            if direct_url_picture {
+                flags.push_str(&format!(" --kiosk --screen-info={{{}x{}}}", view.width, view.height));
+            }
+            let line = shot_line(&program, &flags, window, wait, &profile, &shot, &capture);
             let done = crate::sandbox::run_browser(&line, &cwd, workspace, limit, &stop);
             let end = done.as_ref().map_or_else(|_| "not started".to_string(), |done| done.status.map_or(done.ended.to_string(), |code| format!("exit code {:#x}", code as u32)));
             taken.runs.push(BrowserRun { of: "picture", end, ms: started.elapsed().as_millis() as u64 });
@@ -1778,6 +1810,9 @@ fn check(arguments: &Value, workspace: &Path, cancel: &AtomicBool) -> Result<Str
             return Ok(said);
         }
         let mut out = said;
+        if served.is_some() && !direct_url_picture {
+            out.push_str("On this browser the URL pictures use a frame and may show an earlier state than the DOM.\n");
+        }
         let all = ended(pictures, false);
         drop(kept);
         for (view, taken) in views.iter().zip(all) {
@@ -2461,8 +2496,8 @@ mod tests {
     #[ignore = "starts a server and Edge in the sandbox"]
     fn a_page_a_local_server_gives_is_checked_by_its_url() {
         let (dir, _) = page(&[
-            ("index.html", "<!DOCTYPE html><title>served</title><div id=o>wait</div><script type=module src=app.mjs></script>"),
-            ("app.mjs", "import { word } from './word.mjs'; document.getElementById('o').textContent = word; console.log('module ran: ' + location.origin);"),
+            ("index.html", "<!DOCTYPE html><title>served</title><style>body{background:red}body.ready{background:lime}@media(width:390px) and (height:844px){body.ready{background:blue}}</style><div id=o>wait</div><script type=module src=app.mjs></script>"),
+            ("app.mjs", "import { word } from './word.mjs'; document.getElementById('o').textContent = word; console.log('module ran: ' + location.origin); setTimeout(() => document.body.className = 'ready', 600);"),
             ("word.mjs", "export const word = 'from a module';"),
         ]);
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -2470,7 +2505,7 @@ mod tests {
         let server = std::thread::spawn(move || crate::sandbox::run("python -m http.server 8765 --bind 127.0.0.1", &folder, &folder, false, Duration::from_secs(90), &halt));
         // (Python in the sandbox takes a few seconds to be listening the first time)
         std::thread::sleep(Duration::from_secs(8));
-        let said = check_page(&serde_json::json!({"url": "http://127.0.0.1:8765/index.html"}), dir.path(), &AtomicBool::new(false));
+        let said = check_page(&serde_json::json!({"url": "http://127.0.0.1:8765/index.html", "views": ["desktop", "mobile"], "wait_ms": 2000}), dir.path(), &AtomicBool::new(false));
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = server.join();
         let said = said.unwrap();
@@ -2478,6 +2513,15 @@ mod tests {
         assert!(said.contains("module ran: http://127.0.0.1:8765") && said.contains("text: from a module"), "{said}");
         assert!(!said.contains("Permissions-Policy"), "the browser's own words are not the page's: {said}");
         assert!(said.contains("How it looks at desktop"), "{said}");
+        if browser().is_some_and(|(program, _)| supports_virtual_screen(&program)) {
+            for (label, size, color) in [("desktop", (1280, 800), [0, 255, 0]), ("mobile", (390, 844), [0, 0, 255])] {
+                let line = said.lines().find(|line| line.starts_with(&format!("How it looks at {label} "))).unwrap();
+                let (_, path) = line.split_once("`read_file` ").unwrap();
+                let image = image::open(path).unwrap().to_rgb8();
+                assert_eq!(image.dimensions(), size);
+                assert_eq!(image.get_pixel(100, 100).0, color, "{label} at the requested virtual time");
+            }
+        }
     }
 
     /// With the real browser, in the real sandbox: a page a server gives runs its animation frames too, by the extension, as no copy of it is made.
